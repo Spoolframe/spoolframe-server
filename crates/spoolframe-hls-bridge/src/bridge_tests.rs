@@ -1,7 +1,6 @@
 //! A controllable backend exercises HTTP readers without a server or sleeps.
 use super::*;
 use spoolframe_client_sdk::{self as sdk, SdkError};
-use std::sync::Mutex;
 use crate::SdkSource;
 use sdk::{PlaybackBackend, PlaybackHandle, PlaybackOptions, Playback, Selection, BitmapSubtitles, PlaybackChange, Chunk, types};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,12 +42,7 @@ fn snapshot() -> Playback {
 
 fn stream(backend: Arc<Backend>) -> Arc<Stream<SdkSource>> {
     let playback = sdk::ManagedPlayback::adopt(backend, "plex:movie:1".parse().unwrap(), None, PlaybackOptions::default(), snapshot());
-    Arc::new(Stream {
-        playback: SdkSource::new(playback), retired: tokio::sync::watch::channel(false).0,
-        kind: Kind::Hls { epoch: Mutex::new(0) }, subtitle: None,
-        menu: Mutex::new(None), placeholder: Default::default(), stopped: Default::default(), expired: Default::default(),
-        notes: Default::default(),
-    })
+    Arc::new(Stream::new(SdkSource::new(playback), Kind::hls(), None, Default::default()))
 }
 
 async fn body(stream: Arc<Stream<SdkSource>>) -> Body {

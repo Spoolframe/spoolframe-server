@@ -38,16 +38,14 @@ impl SdkSource {
 impl From<SdkError> for Error {
     fn from(error: SdkError) -> Self {
         match error {
-            SdkError::PlaybackClosed => Error::PlaybackClosed,
-            SdkError::PlaybackExpired => Error::PlaybackExpired,
-            SdkError::PlaybackStopped => Error::PlaybackStopped,
-            SdkError::PlaybackRestarted { epoch } => Error::PlaybackRestarted { epoch },
-            SdkError::PlaybackResumed { at } => Error::PlaybackResumed { at },
-            SdkError::SubtitleNotReady { done_percent } => Error::SubtitleNotReady { done_percent },
-            SdkError::SubtitleChanged => Error::SubtitleChanged,
-            SdkError::InvalidInput(message) => Error::InvalidInput(message),
-            SdkError::Server(message) => Error::Server(message),
-            SdkError::Protocol(message) => Error::Protocol(message),
+            SdkError::PlaybackClosed | SdkError::PlaybackExpired => Error::Expired,
+            SdkError::PlaybackStopped => Error::Stopped,
+            SdkError::PlaybackRestarted { epoch } => Error::Restarted { epoch },
+            SdkError::PlaybackResumed { at } => Error::Resumed { at },
+            SdkError::SubtitleNotReady { done_percent } => Error::NotReady { done_percent },
+            // Rewritten while read: asked for again, as one not ready is.
+            SdkError::SubtitleChanged => Error::NotReady { done_percent: 0 },
+            SdkError::NotFound(_) => Error::NotFound,
             other => Error::Other(other.to_string()),
         }
     }

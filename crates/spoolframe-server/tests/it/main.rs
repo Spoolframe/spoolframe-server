@@ -21,6 +21,7 @@ mod forget_device;
 mod gpu_cards;
 mod gpu_pick;
 mod harden;
+mod http_playback;
 mod hwdec;
 mod invite_admin;
 mod invites;

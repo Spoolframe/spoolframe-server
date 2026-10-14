@@ -119,6 +119,7 @@ fn hello() -> Hello {
             subtitles: [SubtitleFormat::Srt].into(),
             ..ClientCapabilities::default()
         }),
+        experimental: Vec::new(),
     }
 }
 
@@ -370,6 +371,7 @@ fn every_reply_round_trips() {
             server_version: "0.1.0".into(),
             auth_methods: vec![AuthMethod::Password],
             web_url: Some("https://media.example.org".into()),
+            experimental: Vec::new(),
         }),
         Reply::AuthMethods {
             methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
@@ -996,6 +998,7 @@ fn server_info_without_a_server_id_does_not_decode() {
         server_version: "0.1.0".into(),
         auth_methods: vec![AuthMethod::Password],
         web_url: None,
+        experimental: Vec::new(),
     })
     .unwrap();
     let ciborium::Value::Map(fields) = &mut value else {
@@ -2357,4 +2360,198 @@ fn a_who_am_i_without_can_leave_lets_the_user_leave() {
         codec::decode::<Reply>(&older).unwrap(),
         Reply::WhoAmI(admin_who_am_i(true))
     );
+}
+
+/// PX-49: the experimental features a Hello asks for, and those a
+/// server's answer names.
+mod experimental_features {
+    use super::*;
+    use crate::MAX_HELLO_TEXT;
+    use crate::experimental::{self, HTTP_PLAYBACK, HttpPlaybackRefusal};
+
+    /// `Hello` as a server before PX-49 reads it, and as such a client
+    /// sends it.
+    #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+    struct OlderHello {
+        protocol_version: u32,
+        client_name: String,
+        client_version: String,
+        platform: spoolframe_types::Platform,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        device_name: Option<String>,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        capabilities: Option<ClientCapabilities>,
+    }
+
+    fn older(hello: &Hello) -> OlderHello {
+        OlderHello {
+            protocol_version: hello.protocol_version,
+            client_name: hello.client_name.clone(),
+            client_version: hello.client_version.clone(),
+            platform: hello.platform,
+            device_name: hello.device_name.clone(),
+            capabilities: hello.capabilities.clone(),
+        }
+    }
+
+    fn asking(names: &[&str]) -> Hello {
+        Hello {
+            experimental: names.iter().map(|n| n.to_string()).collect(),
+            ..hello()
+        }
+    }
+
+    #[test]
+    fn a_hello_round_trips_with_and_without_the_features_it_asks_for() {
+        round_trip(Request::Hello(asking(&[])));
+        round_trip(Request::Hello(asking(&[HTTP_PLAYBACK, "teleport"])));
+    }
+
+    #[test]
+    fn a_hello_asking_for_none_is_what_an_older_client_sends() {
+        assert_eq!(
+            codec::encode(&asking(&[])).unwrap(),
+            codec::encode(&older(&hello())).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_older_client_s_hello_asks_for_none() {
+        let bytes = codec::encode(&older(&hello())).unwrap();
+        let hello: Hello = codec::decode(&bytes).unwrap();
+        assert!(hello.experimental.is_empty());
+    }
+
+    #[test]
+    fn an_older_server_reads_a_hello_that_asks_for_features() {
+        let asked = asking(&[HTTP_PLAYBACK]);
+        let bytes = codec::encode(&asked).unwrap();
+        assert_eq!(codec::decode::<OlderHello>(&bytes).unwrap(), older(&asked));
+    }
+
+    fn info(experimental: Vec<String>) -> ServerInfo {
+        ServerInfo {
+            name: "Home Media".into(),
+            endpoint_id: "e9c1".into(),
+            server_id: "mzxw6ytbojtg633c".into(),
+            protocol_version: PROTOCOL_VERSION,
+            server_version: "0.8.0".into(),
+            auth_methods: vec![AuthMethod::Password],
+            web_url: None,
+            experimental,
+        }
+    }
+
+    #[test]
+    fn a_server_s_answer_names_what_it_turned_on_and_an_older_one_names_none() {
+        round_trip(Reply::ServerInfo(info(vec![HTTP_PLAYBACK.into()])));
+        let mut value = ciborium::Value::serialized(&info(vec![HTTP_PLAYBACK.into()])).unwrap();
+        let ciborium::Value::Map(fields) = &mut value else {
+            panic!("{value:?}");
+        };
+        fields.retain(|(key, _)| key.as_text() != Some("experimental"));
+        let older = codec::decode::<ServerInfo>(&codec::encode(&value).unwrap()).unwrap();
+        assert!(older.experimental.is_empty());
+        // And none named is no field: what an older server sends.
+        let none: ciborium::Value =
+            ciborium::from_reader(codec::encode(&info(Vec::new())).unwrap().as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = none else {
+            panic!("{none:?}");
+        };
+        assert!(
+            fields
+                .iter()
+                .all(|(k, _)| k.as_text() != Some("experimental"))
+        );
+    }
+
+    #[test]
+    fn a_server_turns_on_only_what_it_knows_has_on_and_was_asked() {
+        let asked: Vec<String> = ["teleport", HTTP_PLAYBACK, HTTP_PLAYBACK]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            experimental::turned_on(&asked, &[HTTP_PLAYBACK]),
+            vec![HTTP_PLAYBACK.to_owned()]
+        );
+        assert!(experimental::turned_on(&asked, &[]).is_empty());
+        assert!(experimental::turned_on(&[], &[HTTP_PLAYBACK]).is_empty());
+    }
+
+    #[test]
+    fn a_hello_keeps_a_bounded_list_of_bounded_names() {
+        let long = "x".repeat(MAX_HELLO_TEXT + 5);
+        let many: Vec<String> = (0..experimental::MAX_ASKED + 3)
+            .map(|n| format!("{long}{n}"))
+            .collect();
+        let hello = Hello {
+            experimental: many,
+            ..hello()
+        }
+        .within_bounds();
+        assert_eq!(hello.experimental.len(), experimental::MAX_ASKED);
+        assert!(
+            hello
+                .experimental
+                .iter()
+                .all(|n| n.chars().count() == MAX_HELLO_TEXT)
+        );
+    }
+
+    #[test]
+    fn the_http_playback_request_and_its_answers_round_trip() {
+        let handle = crate::PlaybackHandle("h".into());
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: Request::HttpPlaybackUrl {
+                handle: handle.clone(),
+            },
+        });
+        let bytes = codec::encode(&RequestEnvelope {
+            session: None,
+            request: Request::HttpPlaybackUrl { handle },
+        })
+        .unwrap();
+        assert_eq!(
+            codec::request_type(&bytes).as_deref(),
+            Some("http_playback_url")
+        );
+        round_trip(Reply::HttpPlaybackUrl {
+            url: "http://192.168.1.10:7422/abc/master.m3u8".into(),
+        });
+        for reason in [
+            HttpPlaybackRefusal::Off,
+            HttpPlaybackRefusal::RelayOnly,
+            HttpPlaybackRefusal::NoSuchPlayback,
+            HttpPlaybackRefusal::Unsupported,
+        ] {
+            round_trip(Reply::HttpPlaybackRefused { reason });
+        }
+    }
+
+    #[test]
+    fn a_refusal_from_a_newer_server_is_unknown() {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Newer {
+            HttpPlaybackRefused { reason: &'static str },
+        }
+        let bytes = codec::encode(&Newer::HttpPlaybackRefused { reason: "on_fire" }).unwrap();
+        assert_eq!(
+            codec::decode::<Reply>(&bytes).unwrap(),
+            Reply::HttpPlaybackRefused {
+                reason: HttpPlaybackRefusal::Unknown
+            }
+        );
+    }
+
+    #[test]
+    fn asking_for_a_url_needs_a_session_and_may_be_asked_again() {
+        let request = Request::HttpPlaybackUrl {
+            handle: crate::PlaybackHandle("h".into()),
+        };
+        assert!(!request.is_pre_auth());
+        assert!(crate::policy::retry_safe(&request));
+        assert_eq!(crate::policy::server_wait(&request), Duration::ZERO);
+    }
 }

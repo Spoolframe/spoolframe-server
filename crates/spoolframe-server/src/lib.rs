@@ -21,6 +21,7 @@ pub mod encode;
 mod events;
 pub mod files;
 pub mod gpu_status;
+pub mod http_playback;
 pub mod identity;
 mod ifaddrs;
 pub mod invites;

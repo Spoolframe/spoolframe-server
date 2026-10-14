@@ -502,6 +502,44 @@ impl Session {
         self.client.server_info(self.server)?.web_url
     }
 
+    /// The experimental features the server turned on for this device
+    /// (PX-49), as the Hello of the connection this session is on said:
+    /// those [`crate::ClientOptions::experimental`] asked for that the
+    /// server knows and has on. None before a connection, or from a server
+    /// that knows none. Read it when it matters: a reconnect may change it.
+    pub fn experimental(&self) -> crate::Experimental {
+        self.client
+            .server_info(self.server)
+            .map(|info| crate::Experimental::of(&info.experimental))
+            .unwrap_or_default()
+    }
+
+    /// Experimental (`http-playback`, PX-49): where a player with no Iroh
+    /// (an AirPlay receiver) fetches playback `handle` over plain HTTP from
+    /// the server's own port, or why not. Without the feature turned on
+    /// ([`Session::experimental`]) it is [`HttpPlaybackRefusal::Off`] and
+    /// the server is not asked. Asked again for the same playback, the
+    /// same URL while it lives.
+    ///
+    /// [`HttpPlaybackRefusal::Off`]: crate::HttpPlaybackRefusal::Off
+    pub async fn http_playback_url(
+        &self,
+        handle: &PlaybackHandle,
+    ) -> Result<crate::HttpPlayback, SdkError> {
+        use crate::{HttpPlayback, HttpPlaybackRefusal};
+        if !self.experimental().http_playback {
+            return Ok(HttpPlayback::Refused(HttpPlaybackRefusal::Off));
+        }
+        let request = Request::HttpPlaybackUrl {
+            handle: handle.clone(),
+        };
+        match self.call(request).await? {
+            Reply::HttpPlaybackUrl { url } => Ok(HttpPlayback::Url(url)),
+            Reply::HttpPlaybackRefused { reason } => Ok(HttpPlayback::Refused(reason)),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// How this device reaches the server now, for a player's
     /// diagnostics. Asks nothing and never dials: without a connection it
     /// is [`ConnectionPath::Unknown`].

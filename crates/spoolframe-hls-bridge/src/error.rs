@@ -1,42 +1,36 @@
-//! What a source's read can fail with. The variants the bridge tells apart
-//! are the client SDK's own (`SdkError`), so the moved code reads them as it
-//! did; anything else is [`Error::Other`].
+//! What a source's read can fail with: the bridge's own set (PX-49), what
+//! it answers the player by. A source maps its own errors onto it (the
+//! SDK's in `sdk.rs`, the server's in the server).
 
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    /// Gone for good: `410`, and [`Bridge::expired`](crate::Bridge::expired)
-    /// says so.
-    #[error("the playback is closed")]
-    PlaybackClosed,
-    /// As [`Self::PlaybackClosed`].
-    #[error("the playback has expired")]
-    PlaybackExpired,
-    /// The server's admin stopped it (P3-15): `410`, and
-    /// [`Bridge::stopped`](crate::Bridge::stopped) says so.
-    #[error("the playback was stopped on the server")]
-    PlaybackStopped,
-    /// The encode was replaced under the same playback (a seek, a track or
-    /// quality change): read the segment again from 0.
+    /// The encode was replaced under the same playback, at `epoch` (a
+    /// seek, a track or quality change): read the segment again from 0.
     #[error("the playback restarted (epoch {epoch})")]
-    PlaybackRestarted { epoch: u32 },
+    Restarted { epoch: u32 },
     /// The playback was started again in another encode, at `at`: read the
     /// segment again from 0.
     #[error("the playback was started again at {} s", at.as_secs())]
-    PlaybackResumed { at: Duration },
-    /// Not ready yet: `503`, and the player asks again.
-    #[error("the subtitle is still being read ({done_percent}% done)")]
-    SubtitleNotReady { done_percent: u8 },
-    /// Rewritten while read: `503`, and the player asks again.
-    #[error("the subtitle changed while it was read")]
-    SubtitleChanged,
-    #[error("{0}")]
-    InvalidInput(String),
-    #[error("server: {0}")]
-    Server(String),
-    #[error("protocol: {0}")]
-    Protocol(String),
+    Resumed { at: Duration },
+    /// Not ready yet, `done_percent` of it made (a subtitle being read):
+    /// `503`, and the player asks again.
+    #[error("not ready yet ({done_percent}% done)")]
+    NotReady { done_percent: u8 },
+    /// The server stopped it (its admin did, P3-15): `410`, and
+    /// [`Bridge::stopped`](crate::Bridge::stopped) says so.
+    #[error("the playback was stopped on the server")]
+    Stopped,
+    /// Gone for good (closed, idle too long, ended for a newer
+    /// connection's): `410`, and [`Bridge::expired`](crate::Bridge::expired)
+    /// says so.
+    #[error("the playback has expired")]
+    Expired,
+    /// The playback has no such resource: `404`.
+    #[error("not found")]
+    NotFound,
     /// Anything else: `502`.
     #[error("{0}")]
     Other(String),

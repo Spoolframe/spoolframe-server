@@ -149,6 +149,7 @@ async fn stream(
             server_version: "0".into(),
             auth_methods: vec![AuthMethod::Password],
             web_url: None,
+            experimental: Vec::new(),
         })),
         Request::Ping => Response::Ok(Reply::Pong),
         // S's own answer, as M's.

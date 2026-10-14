@@ -105,6 +105,12 @@
   tokenCredential = "/run/credentials/spoolframe.service/plex-token";
 
   quote = builtins.toJSON;
+  # The HTTP playback port (PX-49): the port of its listen address, when
+  # it is one.
+  httpPort =
+    if parsed cfg.httpPlayback.listen
+    then lib.toInt (lib.last (lib.splitString ":" cfg.httpPlayback.listen))
+    else null;
 
   # Each sign-in provider's client secret (P3-04), a systemd credential
   # as the Plex token is, so its file can stay root-only.
@@ -160,7 +166,7 @@
         ${lib.optionalString (cfg.uplink.maxStreams != null) "max_streams = ${toString cfg.uplink.maxStreams};"}
         ${lib.optionalString (cfg.uplink.ownerSharePercent != null) "owner_share_percent = ${toString cfg.uplink.ownerSharePercent};"}
       }
-      ''}
+    ''}
     }
     admin {
       ${lib.optionalString (cfg.admin.listen != null) "listen = ${quote cfg.admin.listen};"}
@@ -177,6 +183,12 @@
       ${lib.optionalString (cfg.transcode.toneMap != null) "tone_map = ${quote cfg.transcode.toneMap};"}
       ${lib.optionalString (cfg.transcode.videoCodecs != null) "video_codecs = [${lib.concatMapStringsSep ", " quote cfg.transcode.videoCodecs}];"}
     }
+    ${lib.optionalString (cfg.httpPlayback.listen != null) ''
+      http_playback {
+        listen = ${quote cfg.httpPlayback.listen};
+        ${lib.optionalString (cfg.httpPlayback.address != null) "address = ${quote cfg.httpPlayback.address};"}
+      }
+    ''}
     ${lib.optionalString cfg.experimental.libplaceboSharedOnAmd ''
       experimental {
         libplacebo_shared_on_amd = true;
@@ -500,6 +512,53 @@ in {
           };
         };
       });
+    };
+
+    httpPlayback = {
+      listen = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "0.0.0.0:7422";
+        description = ''
+          Where the HTTP playback port listens (`http_playback.listen`,
+          PX-49): an IP address and a TCP port. It serves a playback's HLS,
+          or its file, over plain HTTP to a player with no Iroh (an Apple
+          TV that a phone AirPlays to), under a token a signed-in app asks
+          for; nothing without one. Experimental: apps use it only when
+          they and the server both name it. Null, the default: off, and
+          nothing listens. Plain HTTP with no sign-in of its own: open it
+          to the LAN only ({option}`httpPlayback.interfaces`).
+        '';
+      };
+
+      address = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "media.home.arpa";
+        description = ''
+          The host a URL names for an app that reached the server through a
+          relay or over the Internet (`http_playback.address`): an IP
+          address or a name, no port. Null: such an app gets no URL. An app
+          on the LAN gets the address it reached the server at.
+        '';
+      };
+
+      openFirewall = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Open {option}`httpPlayback.listen`'s TCP port on every interface.
+          Leave it off and use {option}`httpPlayback.interfaces` when the
+          host has more networks than the LAN.
+        '';
+      };
+
+      interfaces = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [];
+        example = ["eno1"];
+        description = "The interfaces {option}`httpPlayback.listen`'s TCP port is opened on.";
+      };
     };
 
     openFirewall = lib.mkOption {
@@ -893,6 +952,15 @@ in {
         assertion = lib.all (e: e.pick == null || e.device == null) gpus;
         message = "services.spoolframe.transcode.gpus: an entry has pick or device, not both: pick chooses among the cards found, device names one.";
       }
+      # PX-49: the server parses it as admin.listen.
+      {
+        assertion = cfg.httpPlayback.listen == null || parsed cfg.httpPlayback.listen;
+        message = "services.spoolframe.httpPlayback.listen (${cfg.httpPlayback.listen}) must be an IP address and a port, such as 0.0.0.0:7422 or [::]:7422: the server does not look up names.";
+      }
+      {
+        assertion = cfg.httpPlayback.listen != null || !(cfg.httpPlayback.openFirewall || cfg.httpPlayback.interfaces != []);
+        message = "services.spoolframe.httpPlayback.openFirewall or interfaces is set, but httpPlayback.listen is null: there is no port to open. Set httpPlayback.listen.";
+      }
       {
         assertion = cfg.auth.oidc == [] || cfg.admin.publicUrl != null;
         message = "services.spoolframe.auth.oidc needs services.spoolframe.admin.publicUrl: the provider sends the browser back to <publicUrl>/auth/oidc/callback.";
@@ -946,9 +1014,16 @@ in {
     networking.firewall.allowedUDPPorts = lib.mkIf cfg.openFirewall (
       [cfg.port] ++ lib.optional cfg.mdns 5353 ++ lib.optional cfg.plexDiscovery.enable cfg.plexDiscovery.port
     );
-    networking.firewall.interfaces = lib.mkIf (cfg.plexDiscovery.enable && !cfg.openFirewall) (
-      lib.genAttrs cfg.plexDiscovery.interfaces (_: {allowedUDPPorts = [cfg.plexDiscovery.port];})
-    );
+    networking.firewall.interfaces = lib.mkMerge [
+      (lib.mkIf (cfg.plexDiscovery.enable && !cfg.openFirewall) (
+        lib.genAttrs cfg.plexDiscovery.interfaces (_: {allowedUDPPorts = [cfg.plexDiscovery.port];})
+      ))
+      # PX-49: plain HTTP, opened where it is asked to be and nowhere else.
+      (lib.mkIf (httpPort != null) (
+        lib.genAttrs cfg.httpPlayback.interfaces (_: {allowedTCPPorts = [httpPort];})
+      ))
+    ];
+    networking.firewall.allowedTCPPorts = lib.mkIf (httpPort != null && cfg.httpPlayback.openFirewall) [httpPort];
 
     users.users.spoolframe = {
       isSystemUser = true;

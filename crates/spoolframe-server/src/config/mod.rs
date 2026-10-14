@@ -151,6 +151,80 @@ pub struct ServerConfig {
     /// Switches that may change or go away without notice (PGPU-04).
     #[ucl(default)]
     pub experimental: ExperimentalConfig,
+    /// The HTTP playback port (PX-49): off unless `listen` is set.
+    #[ucl(default)]
+    pub http_playback: HttpPlaybackConfig,
+}
+
+/// `http_playback { listen = "0.0.0.0:7422"; address = "media.home.arpa"; }`
+/// (PX-49): a playback's HLS or file over plain HTTP, for players with no
+/// Iroh (AirPlay first), under a token a signed-in client asks for. Both
+/// optional; off unless `listen` is set.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct HttpPlaybackConfig {
+    /// Where the port listens: an IP address and a port. Left out, it is
+    /// off, and nothing listens.
+    #[ucl(default)]
+    pub listen: Option<String>,
+    /// The host a URL names for a client that reached the server through a
+    /// relay or over the Internet: an IP address or a name, no port. Left
+    /// out, such a client gets no URL; one on the LAN gets the address it
+    /// reached the server at, whatever this says.
+    #[ucl(default)]
+    pub address: Option<String>,
+}
+
+impl HttpPlaybackConfig {
+    pub fn settings(&self) -> Result<crate::http_playback::Settings, ConfigError> {
+        let listen = match self.listen.as_deref().map(str::trim) {
+            None => None,
+            Some(text) => Some(
+                text.parse::<SocketAddr>()
+                    .map_err(|e| ConfigError::Invalid {
+                        key: "http_playback.listen",
+                        message: format!(
+                            "{text:?}: {e}; an IP address and a port, as \"0.0.0.0:7422\""
+                        ),
+                    })?,
+            ),
+        };
+        let address = match self.address.as_deref().map(str::trim) {
+            None => None,
+            Some(text) => Some(url_host(text).ok_or_else(|| ConfigError::Invalid {
+                key: "http_playback.address",
+                message: format!(
+                    "{text:?}: an IP address or a host name, with no scheme, port or path"
+                ),
+            })?),
+        };
+        Ok(crate::http_playback::Settings {
+            listen,
+            address,
+            idle: crate::http_playback::IDLE,
+        })
+    }
+}
+
+/// `text`, an IP address or a host name, as a URL's host names it (an
+/// IPv6 address in brackets); `None` for anything else.
+fn url_host(text: &str) -> Option<String> {
+    if let Ok(ip) = text.parse::<std::net::IpAddr>() {
+        return Some(match ip {
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            ip => ip.to_string(),
+        });
+    }
+    let name = !text.is_empty()
+        && text.len() <= 253
+        && text.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    name.then(|| text.to_owned())
 }
 
 /// `experimental { libplacebo_shared_on_amd = false; }` (PGPU-04): switches
@@ -2385,6 +2459,7 @@ impl ServerConfig {
         parsed.previews.settings()?;
         parsed.logs.buffer_lines()?;
         parsed.telemetry.otlp.settings()?;
+        parsed.http_playback.settings()?;
         Ok(parsed)
     }
 
@@ -2799,6 +2874,59 @@ mod tests {
         assert_eq!(limits.read_ahead, Duration::from_secs(60));
         assert!(!limits.gpu_filters);
         assert_eq!(limits.tone_map, ToneMapSetting::Auto);
+    }
+
+    /// PX-49: `http_playback` is off unless `listen` is set; `listen` is
+    /// an IP address and a port, and `address` a host alone.
+    #[test]
+    fn the_http_playback_port_is_off_unless_set() {
+        let settings = |section: &str| plex(section).and_then(|c| c.http_playback.settings());
+        assert_eq!(
+            settings("").unwrap(),
+            crate::http_playback::Settings::default()
+        );
+        assert!(settings("").unwrap().listen.is_none());
+        let on =
+            settings(r#"http_playback { listen = "0.0.0.0:7422"; address = "media.home.arpa"; }"#)
+                .unwrap();
+        assert_eq!(on.listen, Some("0.0.0.0:7422".parse().unwrap()));
+        assert_eq!(on.address.as_deref(), Some("media.home.arpa"));
+        assert_eq!(on.idle, crate::http_playback::IDLE);
+        let v6 =
+            settings(r#"http_playback { listen = "[::]:7422"; address = "fd00::5"; }"#).unwrap();
+        assert_eq!(v6.address.as_deref(), Some("[fd00::5]"));
+        for bad in [
+            r#"http_playback { listen = "media:7422"; }"#,
+            r#"http_playback { listen = "0.0.0.0"; }"#,
+        ] {
+            assert!(
+                matches!(
+                    plex(bad),
+                    Err(ConfigError::Invalid {
+                        key: "http_playback.listen",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+        for bad in [
+            r#"http_playback { listen = "0.0.0.0:7422"; address = "http://media"; }"#,
+            r#"http_playback { listen = "0.0.0.0:7422"; address = "media:80"; }"#,
+            r#"http_playback { listen = "0.0.0.0:7422"; address = "media/x"; }"#,
+            r#"http_playback { listen = "0.0.0.0:7422"; address = ""; }"#,
+        ] {
+            assert!(
+                matches!(
+                    plex(bad),
+                    Err(ConfigError::Invalid {
+                        key: "http_playback.address",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     /// PX-46: `network.uplink` and `network.lan_prefixes`. Left out, no

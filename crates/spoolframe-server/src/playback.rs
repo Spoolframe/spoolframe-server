@@ -406,6 +406,8 @@ pub struct Playback {
     last_read: Option<Instant>,
     /// When the connection that started it closed.
     orphaned_at: Option<Instant>,
+    /// A player fetched it from the HTTP playback port (PX-49).
+    over_http: bool,
     last_checked: Instant,
 }
 
@@ -563,8 +565,9 @@ pub struct Playbacks {
     /// The last connection number given out.
     numbered: std::sync::atomic::AtomicU64,
     /// Called with each handle as its playback ends, however it ends:
-    /// the uplink's share is given back (PX-46).
-    on_end: std::sync::OnceLock<OnEnd>,
+    /// the uplink's share is given back (PX-46), its HTTP token ends
+    /// (PX-49).
+    on_end: parking_lot::RwLock<Vec<OnEnd>>,
 }
 
 /// What [`Playbacks::on_end`] calls.
@@ -650,6 +653,8 @@ pub struct Snapshot {
     pub start: StartTimes,
     /// Its device's link so far.
     pub link: crate::link_stats::Totals,
+    /// A player fetched it from the HTTP playback port (PX-49).
+    pub over_http: bool,
 }
 
 /// A playback's conversion at one moment (P3-15).
@@ -756,6 +761,7 @@ impl Playback {
             video_size: self.video_size,
             start: *self.start.lock(),
             link: self.link.lock().clone(),
+            over_http: self.over_http,
         }
     }
 }
@@ -829,14 +835,14 @@ impl Playbacks {
             clock: crate::clock::Clock::default(),
             connections: Mutex::default(),
             numbered: Default::default(),
-            on_end: std::sync::OnceLock::new(),
+            on_end: parking_lot::RwLock::default(),
         }
     }
 
-    /// Call `hook` with each playback's handle as it ends. Set once; a
-    /// second is ignored.
+    /// Call `hook` with each playback's handle as it ends, after the
+    /// hooks added before it.
     pub fn on_end(&self, hook: EndHook) {
-        let _ = self.on_end.set(OnEnd(hook));
+        self.on_end.write().push(OnEnd(hook));
     }
 
     /// Time idling and rechecks by `clock` (tests move it instead of
@@ -989,6 +995,7 @@ impl Playbacks {
                 last_used: now,
                 last_read: None,
                 orphaned_at: None,
+                over_http: false,
                 last_checked: now,
             },
         );
@@ -1160,6 +1167,14 @@ impl Playbacks {
         if let Some(playback) = self.lock().get_mut(&handle.0) {
             playback.quality = quality;
             playback.display = display;
+        }
+    }
+
+    /// A player fetched `handle`'s playback from the HTTP playback port
+    /// (PX-49): its activity row says so from now.
+    pub fn served_over_http(&self, handle: &PlaybackHandle) {
+        if let Some(playback) = self.lock().get_mut(&handle.0) {
+            playback.over_http = true;
         }
     }
 
@@ -1341,7 +1356,31 @@ impl Playbacks {
     /// End every playback of `endpoint`: it has been gone longer than the
     /// grace. Returns how many.
     pub fn end_device(&self, endpoint: &str) -> usize {
-        self.end_where(|p| p.endpoint == endpoint, EndReason::DeviceGone)
+        self.end_device_but(endpoint, |_| false)
+    }
+
+    /// [`Playbacks::end_device`], but for the playbacks whose handle
+    /// `kept` keeps: something besides the device still plays them (an
+    /// AirPlay receiver over the HTTP playback port, PX-49). Those end
+    /// as any playback does: stopped, signed out, or idle. `kept` is asked
+    /// with no lock held.
+    pub fn end_device_but(&self, endpoint: &str, kept: impl Fn(&str) -> bool) -> usize {
+        let of_device: Vec<String> = self
+            .lock()
+            .iter()
+            .filter(|(_, p)| p.endpoint == endpoint)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let ending: Vec<String> = of_device.into_iter().filter(|h| !kept(h)).collect();
+        let mut handles = self.lock();
+        let ended: Vec<(String, Playback)> = ending
+            .iter()
+            .filter_map(|h| handles.remove_entry(h))
+            .collect();
+        drop(handles);
+        let count = ended.len();
+        self.ended_all(ended, EndReason::DeviceGone);
+        count
     }
 
     /// The items open playbacks play, each once.
@@ -1460,7 +1499,7 @@ impl Playbacks {
                 );
             }
             log_link(&playback.id, &last.link);
-            if let Some(OnEnd(hook)) = self.on_end.get() {
+            for OnEnd(hook) in self.on_end.read().iter() {
                 hook(&handle);
             }
             kept.push(EndedPlayback { at, why, last });

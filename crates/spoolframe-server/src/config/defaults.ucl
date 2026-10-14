@@ -481,3 +481,22 @@ experimental {
   # that fails, as it does with Mesa's RADV today. NVIDIA always shares.
   libplacebo_shared_on_amd = false;
 }
+
+# HTTP playback (PX-49): a playback's HLS, or its file, over plain HTTP on
+# a TCP port of its own, for players with no Iroh: an Apple TV that a
+# phone AirPlays to, later a TV's own player. Experimental: apps use it
+# only when both they and the server name it ("http-playback"). Off unless
+# `listen` is set, and then nothing is served without a token: a
+# signed-in app asks for a URL for one of its playbacks, and the token in
+# it works until that playback ends or nothing has asked for 30 minutes.
+# Plain HTTP, with no sign-in of its own: open the port to the LAN only.
+# Applies after a restart.
+#
+# http_playback {
+#   # An IP address and a port.
+#   listen = "0.0.0.0:7422";
+#   # The host a URL names for an app that reached the server through a
+#   # relay or over the Internet; left out, such an app gets no URL. An app
+#   # on the LAN gets the address it reached the server at.
+#   address = "media.home.arpa";
+# }

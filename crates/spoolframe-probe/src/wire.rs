@@ -447,6 +447,7 @@ fn hello_full(
         platform: Platform::Cli,
         device_name,
         capabilities,
+        experimental: Vec::new(),
     })
 }
 

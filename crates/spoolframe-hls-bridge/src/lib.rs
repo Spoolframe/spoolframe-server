@@ -20,6 +20,9 @@
 //! A playlist may only name the playback's own resources (security audit
 //! FFI-002), and a segment may hold at most [`SEGMENT_MAX`] bytes (FFI-001).
 //!
+//! The crate reads no environment: what the app's bridge took from it is
+//! in [`BridgeOptions`]. It logs through `tracing`.
+//!
 //! Listening is the caller's choice: the app binds 127.0.0.1, the server
 //! its configured address. [`Bridge::serve`] takes a bound listener; the
 //! same bridge may be served again on a new one after the first stops.
@@ -39,7 +42,7 @@ mod http;
 mod sdk;
 mod source;
 
-pub use bridge::{Bridge, Kind, MenuEntry, Stream};
+pub use bridge::{Bridge, BridgeOptions, Kind, MenuEntry, RequestHook, Stream};
 pub use error::Error;
 pub use http::{Body, SEGMENT_MAX};
 #[cfg(feature = "sdk")]

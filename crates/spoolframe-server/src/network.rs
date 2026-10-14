@@ -477,6 +477,12 @@ pub(crate) async fn end_unserved_playbacks(catalog: &dyn Catalog, playbacks: &Pl
 pub enum NetworkError {
     #[error("cannot bind the endpoint on port {port:?}: {message}")]
     Bind { port: Option<u16>, message: String },
+    /// `http_playback.listen` could not be bound (PX-49).
+    #[error("cannot listen for HTTP playback on {addr}: {message}")]
+    HttpPlayback {
+        addr: std::net::SocketAddr,
+        message: String,
+    },
 }
 
 /// What the client protocol serves from.
@@ -518,6 +524,8 @@ pub struct Services {
     pub wan: crate::wan::Finders,
     /// The WAN uplink budget, the LAN, and the playbacks off it (PX-46).
     pub uplink: Arc<crate::uplink::Uplink>,
+    /// The HTTP playback port (PX-49), bound at start; off by default.
+    pub http_playback: crate::http_playback::Settings,
 }
 
 impl std::fmt::Debug for Services {
@@ -537,6 +545,8 @@ pub struct Server {
     /// Ends the playbacks of libraries no longer served; ends with the
     /// server.
     unserved: Option<tokio::task::JoinHandle<()>>,
+    /// The HTTP playback port (PX-49), when it is on.
+    http_playback: Option<Arc<crate::http_playback::HttpPlayback>>,
 }
 
 impl Server {
@@ -646,6 +656,8 @@ impl Server {
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             auth_methods: client::auth_methods(),
             web_url: services.public_url.clone(),
+            // Per connection, from its Hello (PX-49).
+            experimental: Vec::new(),
         };
         let connections = Connections::new(options.admission);
         services.metrics.observe_services(&services, &connections);
@@ -682,6 +694,19 @@ impl Server {
                 services.auth.clone(),
             )
         });
+        // Bound before the client protocol answers anyone, so a Hello
+        // never names a feature that is not served (PX-49).
+        let http_playback = match services.http_playback.listen {
+            None => None,
+            Some(addr) => {
+                crate::http_playback::HttpPlayback::start(&services.http_playback, &services)
+                    .await
+                    .map_err(|e| NetworkError::HttpPlayback {
+                        addr,
+                        message: e.to_string(),
+                    })?
+            }
+        };
         let client = ClientProtocol::new(
             endpoint.clone(),
             told.clone(),
@@ -689,6 +714,7 @@ impl Server {
             info,
             name.clone(),
             services,
+            http_playback.clone(),
         );
         let mut router = Router::builder(endpoint)
             .accept(CLIENT_ALPN, client)
@@ -703,6 +729,7 @@ impl Server {
             connections,
             sign_outs,
             unserved,
+            http_playback,
         })
     }
 
@@ -732,6 +759,11 @@ impl Server {
         &self.connections
     }
 
+    /// The HTTP playback port (PX-49), when it is on.
+    pub fn http_playback(&self) -> Option<&Arc<crate::http_playback::HttpPlayback>> {
+        self.http_playback.as_ref()
+    }
+
     /// Close every connection and the endpoint.
     pub async fn shutdown(self) {
         self.stop_tasks();
@@ -746,6 +778,9 @@ impl Server {
         self.sign_outs.abort();
         if let Some(unserved) = &self.unserved {
             unserved.abort();
+        }
+        if let Some(http_playback) = &self.http_playback {
+            http_playback.stop();
         }
     }
 }

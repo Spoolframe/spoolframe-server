@@ -104,6 +104,18 @@ pub trait PlaybackBackend: Send + Sync + 'static {
             "this playback backend cannot plan for its link".into(),
         ))
     }
+    /// Experimental (PX-49): the playback's HTTP URL
+    /// ([`Session::http_playback_url`]). A backend with no server keeps
+    /// the default: off.
+    async fn http_playback_url(
+        &self,
+        handle: &PlaybackHandle,
+    ) -> Result<crate::HttpPlayback, SdkError> {
+        let _ = handle;
+        Ok(crate::HttpPlayback::Refused(
+            crate::HttpPlaybackRefusal::Off,
+        ))
+    }
     /// An HLS playlist ([`Session::manifest`]). A backend with no HLS
     /// keeps the default, which refuses.
     async fn manifest(
@@ -249,6 +261,9 @@ impl PlaybackBackend for Session {
         v: u32,
     ) -> Result<String, SdkError> {
         Session::manifest(self, h, k, v).await
+    }
+    async fn http_playback_url(&self, h: &PlaybackHandle) -> Result<crate::HttpPlayback, SdkError> {
+        Session::http_playback_url(self, h).await
     }
     async fn read_segment(
         &self,
@@ -815,6 +830,18 @@ impl ManagedPlayback {
                 epoch: state.playback.epoch,
             },
         }
+    }
+    /// Experimental (`http-playback`, PX-49): where a player with no Iroh
+    /// (an AirPlay receiver) fetches this playback over plain HTTP, or why
+    /// not ([`Session::http_playback_url`]). The URL is bound to the
+    /// playback as it is now: one the SDK starts again behind the app (a
+    /// resume) has a new handle, and the old URL stops working; ask again.
+    pub async fn http_playback_url(&self) -> Result<crate::HttpPlayback, SdkError> {
+        let backend = &self.0.backend;
+        self.resuming(None, move |p| async move {
+            backend.http_playback_url(&p.handle).await
+        })
+        .await
     }
     /// An HLS playlist; a media playlist of rung `variant` (PX-21; 0 for
     /// one encode, and for the other kinds). One the server ended is

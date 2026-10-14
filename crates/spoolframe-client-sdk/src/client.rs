@@ -129,6 +129,10 @@ pub struct ClientOptions {
     /// life of the [`Client`]: an app whose user changes it opens a new
     /// one.
     pub relays: bool,
+    /// The experimental features to ask every server for, in each
+    /// connection's `Hello` (PX-49); none by default. Whether a server
+    /// turned one on is [`crate::Session::experimental`].
+    pub experimental: crate::Experimental,
 }
 
 impl Default for ClientOptions {
@@ -137,6 +141,7 @@ impl Default for ClientOptions {
             timeouts: Timeouts::default(),
             lan_discovery: true,
             relays: true,
+            experimental: crate::Experimental::default(),
         }
     }
 }
@@ -152,6 +157,8 @@ pub(crate) struct Inner {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) device: Device,
     pub(crate) timeouts: Timeouts,
+    /// What every Hello asks for (PX-49).
+    pub(crate) experimental: crate::Experimental,
     pub(crate) discovery: Discovery,
     /// Addresses the app gave for servers, and invites' hints (P6-01).
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
@@ -232,6 +239,7 @@ impl Client {
             timeouts,
             lan_discovery,
             relays,
+            experimental,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
         let reach = Arc::new(ReachLog::default());
@@ -298,6 +306,7 @@ impl Client {
                 storage: storage.clone(),
                 device,
                 timeouts,
+                experimental,
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
@@ -1831,6 +1840,7 @@ impl Client {
             &self.inner.endpoint,
             addr,
             &self.inner.device,
+            self.inner.experimental,
             &self.inner.timeouts,
         )
         .await;

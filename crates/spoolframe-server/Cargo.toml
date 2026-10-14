@@ -50,6 +50,9 @@ spoolframe-catalog = { workspace = true }
 spoolframe-media = { workspace = true }
 spoolframe-plex = { workspace = true }
 spoolframe-protocol = { workspace = true }
+# The HTTP playback port (PX-49): the bridge the apps use, without its
+# `sdk` feature, so the server never builds the client SDK.
+spoolframe-hls-bridge = { workspace = true }
 iroh = { workspace = true }
 # A relay of the operator's own (P6-04), and the relay the relayed
 # connection tests run on loopback (P6-03).

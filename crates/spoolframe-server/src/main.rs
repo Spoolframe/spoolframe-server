@@ -873,6 +873,7 @@ async fn run(
     // One value for what the status page says and what the endpoint is
     // built with.
     let endpoint_options = config.network.endpoint_options()?;
+    let http_playback = config.http_playback.settings()?;
     let status = Arc::new(
         StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
             .with_jobs(jobs.clone())
@@ -1122,6 +1123,7 @@ async fn run(
             metrics,
             wan: spoolframe_server::wan::Finders::system(),
             uplink: uplink.clone(),
+            http_playback,
         },
     )
     .await?;

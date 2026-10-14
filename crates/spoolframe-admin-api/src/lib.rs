@@ -2636,6 +2636,11 @@ pub struct PlaybackRow {
     /// shipped with the server, so an older server leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<PlaybackLink>,
+    /// A player fetched it from the HTTP playback port (PX-49), as well as
+    /// or instead of its device over Iroh: an AirPlay receiver, say.
+    /// False from an older server.
+    #[serde(default)]
+    pub over_http: bool,
 }
 
 /// A playback's link to its device (the server's "link" lines): the last

@@ -591,6 +591,7 @@ fn row(s: &Snapshot) -> api::PlaybackRow {
         made: made(s),
         start: start(&s.start),
         link: link(&s.link),
+        over_http: s.over_http,
     }
 }
 

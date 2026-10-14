@@ -253,9 +253,7 @@ async fn bridge() -> (Bridge<Src>, SocketAddr) {
 fn hls(bridge: &Bridge<Src>, source: &Src) -> String {
     bridge.register(Stream::new(
         source.clone(),
-        Kind::Hls {
-            epoch: std::sync::Mutex::new(0),
-        },
+        Kind::hls(),
         None,
         Default::default(),
     ))
@@ -369,10 +367,7 @@ async fn only_get_and_head_are_answered() {
 fn direct(bridge: &Bridge<Src>, file: &[u8]) -> String {
     bridge.register(Stream::new(
         Src::new(file),
-        Kind::Direct {
-            size: file.len() as u64,
-            mime: "video/mp4",
-        },
+        Kind::direct(file.len() as u64, "video/mp4"),
         None,
         Default::default(),
     ))
@@ -558,8 +553,8 @@ async fn a_segment_whose_encode_restarts_while_opening_is_opened_again() {
         0,
         2,
         vec![
-            Err(Error::PlaybackRestarted { epoch: 1 }),
-            Err(Error::PlaybackResumed { at: Duration::ZERO }),
+            Err(Error::Restarted { epoch: 1 }),
+            Err(Error::Resumed { at: Duration::ZERO }),
             Ok(Answer::whole(b"after", 1)),
         ],
     );
@@ -574,7 +569,7 @@ async fn a_segment_whose_encode_restarts_while_opening_is_opened_again() {
 async fn a_segment_that_keeps_restarting_is_given_up() {
     let (bridge, addr) = bridge().await;
     let source = Src::new(b"");
-    source.opens(0, 2, vec![Err(Error::PlaybackRestarted { epoch: 1 })]);
+    source.opens(0, 2, vec![Err(Error::Restarted { epoch: 1 })]);
     let token = hls(&bridge, &source);
     let answer = get(addr, &format!("/{token}/seg2.m4s")).await;
     assert_eq!(answer.status, StatusCode::BAD_GATEWAY);
@@ -648,9 +643,7 @@ async fn the_master_playlist_names_the_subtitle_menu() {
     );
     let token = bridge.register(Stream::new(
         source.clone(),
-        Kind::Hls {
-            epoch: std::sync::Mutex::new(0),
-        },
+        Kind::hls(),
         Some(0),
         Default::default(),
     ));
@@ -693,7 +686,7 @@ async fn subtitle_segments_are_served_or_asked_for_again() {
     let source = Src::new(b"");
     source.0.subtitles.lock().extend([
         (1, Ok(b"WEBVTT\n\ncue".to_vec())),
-        (2, Err(Error::SubtitleNotReady { done_percent: 0 })),
+        (2, Err(Error::NotReady { done_percent: 0 })),
     ]);
     let token = hls(&bridge, &source);
     let one = get(addr, &format!("/{token}/subs1.vtt")).await;
@@ -709,8 +702,8 @@ async fn subtitle_segments_are_served_or_asked_for_again() {
 async fn a_stopped_or_ended_playback_is_gone_and_says_why() {
     let (bridge, addr) = bridge().await;
     let source = Src::new(b"");
-    source.opens(0, 1, vec![Err(Error::PlaybackStopped)]);
-    source.opens(0, 2, vec![Err(Error::PlaybackExpired)]);
+    source.opens(0, 1, vec![Err(Error::Stopped)]);
+    source.opens(0, 2, vec![Err(Error::Expired)]);
     let token = hls(&bridge, &source);
     assert!(!bridge.stopped(&token) && !bridge.expired(&token));
     assert_eq!(
@@ -759,4 +752,93 @@ async fn the_same_bridge_serves_again_on_a_new_listener() {
         );
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn each_request_is_the_tokens_last() {
+    let (bridge, addr) = bridge().await;
+    let source = Src::new(b"");
+    source.playlist(ManifestKind::Media, 0, "#EXTM3U\n");
+    let token = hls(&bridge, &source);
+    let registered = bridge.last_request(&token).expect("from its registration");
+    assert!(bridge.last_request("nope").is_none());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    get(addr, &format!("/{token}/media.m3u8")).await;
+    let asked = bridge.last_request(&token).expect("still served");
+    assert!(asked > registered, "{asked:?} after {registered:?}");
+    // A wrong token is no request of this one's.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    get(addr, "/0123456789abcdef/media.m3u8").await;
+    assert_eq!(bridge.last_request(&token), Some(asked));
+    bridge.unregister(&token);
+    assert!(bridge.last_request(&token).is_none());
+}
+
+#[tokio::test]
+async fn a_files_type_may_be_made_at_run_time() {
+    let (bridge, addr) = bridge().await;
+    let mime = format!("video/{}", "x-matroska");
+    let token = bridge.register(Stream::new(
+        Src::new(b"mkv"),
+        Kind::direct(3, mime),
+        None,
+        Default::default(),
+    ));
+    let file = get(addr, &format!("/{token}/file")).await;
+    assert_eq!(file.header(CONTENT_TYPE), Some("video/x-matroska"));
+    assert_eq!(file.text(), "mkv");
+}
+
+#[tokio::test]
+async fn a_missing_resource_is_not_found_and_a_retired_stream_says_so() {
+    let (bridge, addr) = bridge().await;
+    let source = Src::new(b"");
+    source.0.subtitles.lock().insert(4, Err(Error::NotFound));
+    let token = hls(&bridge, &source);
+    assert_eq!(
+        get(addr, &format!("/{token}/subs4.vtt")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let stream = bridge.unregister(&token).expect("served");
+    assert!(stream.retired());
+    assert_eq!(stream.subtitle(), None);
+    assert!(!stream.stopped() && !stream.expired());
+}
+
+#[tokio::test]
+async fn a_token_the_caller_made_is_served_once_and_must_be_one_segment() {
+    let (bridge, addr) = bridge().await;
+    let source = Src::new(b"");
+    source.playlist(ManifestKind::Media, 0, "#EXTM3U\n");
+    let stream = || Stream::new(source.clone(), Kind::hls(), None, Default::default());
+    assert!(bridge.register_as("made-by_the_caller0", stream()));
+    assert!(
+        !bridge.register_as("made-by_the_caller0", stream()),
+        "taken"
+    );
+    for bad in ["", "a/b", "a b", "a?b", "..", "%2e"] {
+        assert!(!bridge.register_as(bad, stream()), "{bad:?}");
+    }
+    assert_eq!(
+        get(addr, "/made-by_the_caller0/media.m3u8").await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_request_hook_hears_each_served_token_before_its_answer() {
+    let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+    let hearing = heard.clone();
+    let bridge = Bridge::new().on_request(move |token| hearing.lock().push(token.to_owned()));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("binds");
+    let addr = listener.local_addr().expect("bound");
+    let serving = bridge.clone();
+    tokio::spawn(async move { serving.serve(listener).await });
+    let source = Src::new(b"");
+    source.playlist(ManifestKind::Media, 0, "#EXTM3U\n");
+    let token = hls(&bridge, &source);
+    get(addr, &format!("/{token}/media.m3u8")).await;
+    get(addr, &format!("/{token}/nothing-here")).await;
+    get(addr, "/0123456789abcdef/media.m3u8").await;
+    assert_eq!(*heard.lock(), vec![token.clone(), token]);
 }

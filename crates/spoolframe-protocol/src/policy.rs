@@ -79,7 +79,10 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::IdentityRecord { .. }
         | Request::IdentityRecordByHandle { .. }
         | Request::OfferPairing(_)
-        | Request::ListInvites => true,
+        | Request::ListInvites
+        // PX-49: asked again, the same playback's live token, or a new
+        // one bound to the same playback.
+        | Request::HttpPlaybackUrl { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

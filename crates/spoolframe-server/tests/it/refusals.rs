@@ -681,6 +681,7 @@ fn hello_of(revision: u32) -> Request {
         platform: spoolframe_types::Platform::Ios,
         device_name: Some("what the app says".into()),
         capabilities: None,
+        experimental: Vec::new(),
     })
 }
 

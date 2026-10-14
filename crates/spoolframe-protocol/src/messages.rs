@@ -641,6 +641,21 @@ pub enum Request {
         id: String,
     },
 
+    /// Experimental (`http-playback`, PX-49; see [`crate::experimental`]):
+    /// an HTTP URL for one of this session's playbacks, for a player with
+    /// no Iroh (AirPlay first): `HttpPlaybackUrl`, or
+    /// `HttpPlaybackRefused` with why not. Refused as `Off` unless this
+    /// connection's `Hello` named the feature and the server's answer
+    /// named it back. The URL is
+    /// `http://<address>:<port>/<token>/master.m3u8` for HLS, `.../file`
+    /// for direct play, its token unguessable and bound to this playback:
+    /// it works until the playback ends or is stopped, or nothing asks for
+    /// it for a while. Asked again, it may be the same URL. A newer
+    /// server may change or drop this.
+    HttpPlaybackUrl {
+        handle: PlaybackHandle,
+    },
+
     /// Leave this server (PX-47): `Done`, and every session of the user
     /// here is ended, this one too. Needs a recent sign-in
     /// (`RecentSignInRequired`): a local user confirms with
@@ -719,6 +734,12 @@ pub struct Hello {
     /// `Unsupported`.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub capabilities: Option<ClientCapabilities>,
+    /// The experimental features this client wants (PX-49), by name
+    /// ([`crate::experimental`]); the server's answer names those it
+    /// turned on. Left out when empty, so a client that wants none sends
+    /// what an older one did; an older server ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub experimental: Vec<String>,
 }
 
 /// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
@@ -736,6 +757,10 @@ impl Hello {
         cut(&mut self.client_name);
         cut(&mut self.client_version);
         if let Some(name) = &mut self.device_name {
+            cut(name);
+        }
+        self.experimental.truncate(crate::experimental::MAX_ASKED);
+        for name in &mut self.experimental {
             cut(name);
         }
         self
@@ -1133,6 +1158,16 @@ pub enum Reply {
     Invites {
         invites: Vec<InviteSummary>,
     },
+    /// Experimental (`http-playback`, PX-49): where a player with no Iroh
+    /// fetches the playback (`HttpPlaybackUrl`).
+    HttpPlaybackUrl {
+        url: String,
+    },
+    /// Experimental (`http-playback`, PX-49): why `HttpPlaybackUrl` gave
+    /// no URL.
+    HttpPlaybackRefused {
+        reason: crate::experimental::HttpPlaybackRefusal,
+    },
 }
 
 /// Which HLS playlist (P2-05).
@@ -1365,6 +1400,11 @@ pub struct ServerInfo {
     /// Plex account (P3-12). Absent without a public URL, since the
     /// listener's own address may be loopback or one no browser trusts.
     pub web_url: Option<String>,
+    /// The experimental features turned on for this connection (PX-49):
+    /// those its `Hello` named that this server knows and has on. Left
+    /// out when none, as an older server does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub experimental: Vec<String>,
 }
 
 /// Why a request failed. Typed, so clients act on the kind, not on text.

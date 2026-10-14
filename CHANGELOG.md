@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0 (2026-10-14)
+
 - PX-49: a new published crate, `spoolframe-hls-bridge` (MIT OR
   Apache-2.0), on the Coldsteel registry with the SDK crates. It is the
   Apple app's loopback bridge (`spoolframe-ffi/src/bridge.rs`) moved here
@@ -18,6 +20,100 @@
   `Source` trait; feature `sdk` adds `SdkSource` over the client SDK's
   `ManagedPlayback`, and without it the crate does not build the SDK. The
   server does not use it yet. No wire change.
+
+- PX-49: `spoolframe-hls-bridge`'s API, before the Apple app depends on
+  it (breaking for a caller of the first cut). `Error` is the crate's own
+  set: `Restarted { epoch }`, `Resumed { at }`, `NotReady { done_percent }`,
+  `Stopped`, `Expired`, `NotFound` and `Other(String)`, `#[non_exhaustive]`;
+  `SdkSource` maps `SdkError` onto it (`PlaybackClosed` and
+  `PlaybackExpired` are `Expired`, `SubtitleChanged` is `NotReady`,
+  `NotFound` is `NotFound`), and a `NotFound` read answers `404` where it
+  was `502`. The crate reads no environment: `Bridge::with_options(
+  BridgeOptions { log, master_rewrite })` takes what the app read from
+  `SPOOLFRAME_BRIDGE_LOG` and `SPOOLFRAME_MASTER_REWRITE`, both off by
+  default (`Bridge::new`), and logs through `tracing`. `Kind::Direct`'s
+  `mime` is a `Cow<'static, str>`; `Kind::direct(size, mime)` and
+  `Kind::hls()` make them. `Stream`'s fields are private: `Stream::new`
+  as before, and `playback()`, `kind()`, `subtitle()`, `notes()`,
+  `stopped()`, `expired()`, `retire()` and `retired()`.
+  `Bridge::last_request(token)` is when a token was last asked for
+  anything, or registered, so a server can expire idle tokens. `Bridge::register_as(token, stream)` serves a stream under a
+  token the caller made (the server makes its own as it makes session
+  tokens), and `Bridge::on_request(hook)` calls a hook with each served
+  request's token, so a server times idle tokens by its own clock.
+
+- PX-49: the protocol's first experimental feature, and how experimental
+  features work (`spoolframe_protocol::experimental`). `Hello` gains
+  `experimental`, the feature names the client wants, and `ServerInfo`
+  gains `experimental`, those the server turned on for the connection:
+  the ones it knows and has on. Both are left out of the wire when empty,
+  so a client that wants none sends what an older one did, and an older
+  server ignores the field and names none. A name either side does not
+  know is ignored, never an error; a server keeps at most 16 names of a
+  Hello, each cut to 128 characters. Experimental messages are outside
+  the protocol's stability: they may change or go away without
+  `PROTOCOL_VERSION` moving (still 15). The first, `http-playback`:
+  `Request::HttpPlaybackUrl { handle }` answers `Reply::HttpPlaybackUrl
+  { url }` or `Reply::HttpPlaybackRefused { reason }`, the reason one of
+  `off`, `relay_only`, `no_such_playback`, `unsupported`, or `Unknown`
+  from a newer server. It needs a session, and is safe to ask again
+  (`policy::retry_safe`). The server answers it `off` until it serves
+  HTTP playback.
+
+- PX-49: the server's HTTP playback port, the `http-playback`
+  experimental feature: a playback's HLS, or its file, over plain HTTP,
+  for a player with no Iroh (an Apple TV a phone AirPlays to). Off by
+  default; `http_playback.listen` (an IP address and a port, such as
+  "0.0.0.0:7422") turns it on, and then a Hello that names
+  `http-playback` gets it named back. A signed-in client asks
+  `HttpPlaybackUrl` for one of its own playbacks and gets
+  `http://<address>:<port>/<token>/master.m3u8` (HLS) or `/file` (direct
+  play, with byte ranges): the address is the server's own on the
+  client's path when that path is on the LAN, else
+  `http_playback.address` (a host), else the answer is `relay_only`. The
+  token, made as session tokens are, is bound to that playback: it ends
+  when the playback ends or is stopped (P3-15), and after 30 minutes with
+  no request; asked again, the same live token. A wrong or ended token is
+  404, and nothing else is served. Another user's playback, or none, is
+  `no_such_playback`; a progressive conversion is `unsupported`. The port
+  serves through `spoolframe-hls-bridge`, reading the transcode and
+  segment store directly as the client's own reads do: the same encode,
+  counted once, kept alive by the HTTP reads. Server › Playback's
+  overview says "over HTTP" for a playback a player fetched from the port
+  (`PlaybackRow.over_http`). Both settings apply after a restart, and
+  are not in the web UI's settings yet. No wire change beyond the
+  experimental messages.
+
+- PX-49: NixOS module: `services.spoolframe.httpPlayback.listen` and
+  `.address` write `http_playback`; `.openFirewall` opens the listen
+  address's TCP port on every interface and `.interfaces` on those named.
+  A listen address that is not an IP address and a port, or a port opened
+  while `listen` is null, is refused at evaluation.
+
+- PX-49: SDK: experimental features, and the `http-playback` calls.
+  `ClientOptions::experimental: Experimental { http_playback: bool }`
+  (none by default; `ClientOptions` stays `Copy`) is asked for in every
+  connection's Hello, and `Session::experimental()` says what the server
+  turned on, from the latest Hello. `Session::http_playback_url(&handle)`
+  and `ManagedPlayback::http_playback_url()` answer `Ok(HttpPlayback::Url
+  (url))` or `Ok(HttpPlayback::Refused(HttpPlaybackRefusal))`: a refusal
+  is a value, not an error, and without the feature turned on it is
+  `Off` with nothing sent. `PlaybackBackend` gains `http_playback_url`,
+  whose default answers `Off`. A URL is bound to the playback's handle: a
+  `ManagedPlayback` the SDK resumed behind the app needs a new one.
+  `Experimental`, `HttpPlayback` and `HttpPlaybackRefusal` are exported.
+  An app that builds `ClientOptions` field by field adds `experimental`.
+
+- PX-49: a playback served over HTTP outlives its device's connection. A
+  phone that AirPlays and locks is gone past the 30 s grace, and its
+  playbacks used to end then, the Apple TV's with them. Now a playback
+  with a live HTTP token is kept, and ends as any playback does: stopped
+  by its client or an admin, its session ended, or 30 minutes with no
+  use. The others end after the grace as before, so a killed app's
+  encode slot is still freed. An HTTP token now lives as long as an idle
+  playback (`http_playback::IDLE` = `playback::IDLE`, 30 minutes, up from
+  10), so a TV paused for a while finds its URL working. A phone that
+  comes back finds the same handle, and the URL it gave keeps working.
 
 ## 0.7.1 (2026-10-13)
 

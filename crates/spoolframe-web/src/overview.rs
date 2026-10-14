@@ -17,9 +17,10 @@ pub fn playing_lines(row: &PlaybackRow) -> (String, String) {
         PlanKind::Transcode => "transcode",
         PlanKind::Unsupported => "cannot play",
     };
+    let http = if row.over_http { " · over HTTP" } else { "" };
     (
         format!("{who} · {}", row.title.replace(" · ", " ")),
-        format!("{} · {plan}", row.device),
+        format!("{} · {plan}{http}", row.device),
     )
 }
 
@@ -86,6 +87,17 @@ mod tests {
                 "Alice · Severance S2 E4".to_owned(),
                 "Living room Apple TV · direct".to_owned()
             )
+        );
+    }
+
+    /// PX-49: one a player fetches from the HTTP playback port.
+    #[test]
+    fn a_playback_played_over_http_says_so() {
+        let mut over_http = row("Alice", "Alien", PlanKind::Transcode);
+        over_http.over_http = true;
+        assert_eq!(
+            playing_lines(&over_http).1,
+            "Living room Apple TV · transcode · over HTTP"
         );
     }
 

@@ -31,7 +31,7 @@ use spoolframe_protocol::{
     CLIENT_ALPN, Hello, LoginPassword, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response,
     SessionId,
 };
-use spoolframe_protocol::{MediaRead, MediaReadResponse, PlaybackHandle};
+use spoolframe_protocol::{MediaRead, MediaReadResponse, PlaybackHandle, ServerInfo};
 use spoolframe_server::artwork::ArtworkCache;
 use spoolframe_server::auth::{Auth, hash_password};
 use spoolframe_server::clock::Clock;
@@ -444,6 +444,8 @@ pub struct ServerOptions {
     /// `network.uplink` and `network.lan_prefixes` (PX-46): no budget
     /// unless a test is about it.
     pub uplink: spoolframe_server::uplink::UplinkSettings,
+    /// `http_playback` (PX-49): off unless a test is about it.
+    pub http_playback: spoolframe_server::http_playback::Settings,
 }
 
 impl Default for ServerOptions {
@@ -488,6 +490,7 @@ impl Default for ServerOptions {
             own_relays: Vec::new(),
             finders: offline_finders(),
             uplink: Default::default(),
+            http_playback: Default::default(),
         }
     }
 }
@@ -767,6 +770,7 @@ impl TestServer {
             uplink: Arc::new(spoolframe_server::uplink::Uplink::new(
                 options.uplink.clone(),
             )),
+            http_playback: options.http_playback.clone(),
         };
         let debug = Arc::new(spoolframe_server::playback_debug::PlaybackDebug {
             playbacks: services.playbacks.clone(),
@@ -1479,6 +1483,28 @@ impl TestClient {
             .await
     }
 
+    /// `Hello` from a Linux app that can play `capabilities`, naming the
+    /// experimental features `experimental` (PX-49): the server's info.
+    pub async fn hello_naming(
+        &self,
+        capabilities: ClientCapabilities,
+        experimental: &[&str],
+    ) -> ServerInfo {
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "test".into(),
+            client_version: "0".into(),
+            platform: spoolframe_types::Platform::Linux,
+            device_name: None,
+            capabilities: Some(capabilities),
+            experimental: experimental.iter().map(|n| n.to_string()).collect(),
+        };
+        match self.call(None, Request::Hello(hello)).await {
+            Response::Ok(Reply::ServerInfo(info)) => info,
+            other => panic!("no ServerInfo: {other:?}"),
+        }
+    }
+
     /// The server id the server names in `ServerInfo` (PX-14): what an app
     /// makes its passkeys' relying party of, once pinned.
     pub async fn server_id(&self) -> spoolframe_protocol::ServerId {
@@ -1504,6 +1530,7 @@ impl TestClient {
                 platform,
                 device_name: device_name.map(str::to_owned),
                 capabilities,
+                experimental: Vec::new(),
             }),
         )
         .await

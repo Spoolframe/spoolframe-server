@@ -94,6 +94,7 @@ mod tests {
             platform: Platform::Linux,
             device_name: Some(name.into()),
             capabilities: caps,
+            experimental: Vec::new(),
         }
     }
 

@@ -5,7 +5,9 @@
 //!
 //! Reads the real graph with `cargo metadata`, following normal and build
 //! dependencies only: the server's tests link the client SDK, and with it
-//! `bip39`, which is fine.
+//! `bip39`, which is fine. Every feature of the server and the protocol
+//! is on, and no other crate's: `spoolframe-hls-bridge`'s `sdk` feature
+//! builds the SDK, and the server takes the bridge without it (PX-49).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -17,7 +19,15 @@ const PHRASE_CRATE: &str = "bip39";
 fn metadata() -> Metadata {
     MetadataCommand::new()
         .manifest_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
-        .features(CargoOpt::AllFeatures)
+        .features(CargoOpt::SomeFeatures(
+            [
+                "spoolframe-server/embed-web",
+                "spoolframe-server/test-support",
+                "spoolframe-protocol/soft-key",
+            ]
+            .map(String::from)
+            .to_vec(),
+        ))
         .exec()
         .expect("cargo metadata runs on the workspace")
 }
@@ -76,6 +86,10 @@ fn neither_the_server_nor_the_protocol_builds_the_recovery_phrase_code() {
         assert!(
             !graph.contains(PHRASE_CRATE),
             "{root} builds with {PHRASE_CRATE}: a portable root could be made or read there"
+        );
+        assert!(
+            !graph.contains("spoolframe-client-sdk"),
+            "{root} builds the client SDK"
         );
     }
 }

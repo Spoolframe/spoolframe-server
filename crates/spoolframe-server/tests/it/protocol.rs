@@ -366,6 +366,7 @@ async fn hello_strings_are_cut_to_their_bound() {
         platform: spoolframe_types::Platform::Linux,
         device_name: Some(long.clone()),
         capabilities: None,
+        experimental: Vec::new(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

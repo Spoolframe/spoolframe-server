@@ -96,6 +96,9 @@ pub(crate) struct ClientProtocol {
     portable_sign_ins: Arc<crate::portable::SignInNonces>,
     /// Pairing requests held for root terminals with no camera (P7-08).
     pairing_relay: Arc<crate::pairing_relay::PairingRelay>,
+    /// The HTTP playback port (PX-49), when it is on: what turns the
+    /// `http-playback` experimental feature on.
+    http_playback: Option<Arc<crate::http_playback::HttpPlayback>>,
 }
 
 /// What one connection has said so far.
@@ -400,6 +403,7 @@ impl ClientProtocol {
         info: ServerInfo,
         name: ServerName,
         services: Services,
+        http_playback: Option<Arc<crate::http_playback::HttpPlayback>>,
     ) -> Self {
         let addresses = Addresses {
             streams: EventStreams::default(),
@@ -440,7 +444,17 @@ impl ClientProtocol {
             ties,
             portable_sign_ins,
             pairing_relay,
+            http_playback,
         }
+    }
+
+    /// The experimental features this server has on (PX-49).
+    fn experimental_on(&self) -> Vec<&'static str> {
+        let mut on = Vec::new();
+        if self.http_playback.is_some() {
+            on.push(spoolframe_protocol::experimental::HTTP_PLAYBACK);
+        }
+        on
     }
 
     /// One stream: its kind byte, then (for RPC) one request and its
@@ -786,8 +800,17 @@ impl ClientProtocol {
             // A device that kept a session is signed in already.
             self.addresses.tell(connection.stable_id());
         }
+        // The features this connection's Hello asked for that are on: from
+        // the Hello kept, the first (PX-49).
+        let experimental = state.hello.get().map_or_else(Vec::new, |hello| {
+            spoolframe_protocol::experimental::turned_on(
+                &hello.experimental,
+                &self.experimental_on(),
+            )
+        });
         Ok::<_, Error>(Reply::ServerInfo(ServerInfo {
             name: self.name.get(),
+            experimental,
             ..(*self.info).clone()
         }))
         .into()
@@ -1414,35 +1437,7 @@ impl ClientProtocol {
         read: impl FnOnce(&Playback) -> T,
     ) -> Result<T, Error> {
         let endpoint = connection.remote_id().to_string();
-        let playbacks = &self.services.playbacks;
-        let using = playbacks
-            .use_handle_with(handle, session, &endpoint, how, read)
-            .map_err(playback_refusal)?;
-        if using.recheck {
-            let live = self
-                .services
-                .auth
-                .endpoint_who(&session.0, &endpoint)
-                .await
-                .map_err(internal)?;
-            if live.is_none() {
-                playbacks.end_session(session);
-                return Err(Error::Unauthenticated);
-            }
-            // Beside the read, not before it: a Plex that is slow or down
-            // must not hold up a file this server reads on its own.
-            let catalog = self.services.catalog.clone();
-            let playbacks = playbacks.clone();
-            let item = using.item;
-            tokio::spawn(async move {
-                if let Err(e) = catalog.item(&item).await
-                    && unserved(&e)
-                {
-                    playbacks.end_item(&item, crate::playback::EndReason::AccessRemoved);
-                }
-            });
-        }
-        Ok(using.playback)
+        use_playback_checked(&self.services, handle, session, &endpoint, how, read).await
     }
 
     /// Log that the request in `frame` was refused with `error`, if that
@@ -1589,28 +1584,10 @@ impl ClientProtocol {
         n: u32,
     ) -> Result<Reply, Error> {
         let playback = self.use_playback(connection, handle, session).await?;
-        let span = playback
-            .conversion
-            .as_ref()
-            .filter(|c| c.subtitle_rendition().is_some())
-            .and_then(|c| c.segment_span(n));
-        let (Some((start_ms, end_ms)), Some(Sidecar::Made { state, .. })) =
-            (span, playback.subtitle)
-        else {
-            return Err(Error::NotFound {
-                what: format!("subtitle segment {n} in this playback"),
-            });
-        };
-        let path = read_text(state).await?;
-        let vtt = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
-            Error::Unavailable {
-                message: "the subtitle file could not be read".into(),
-            }
-        })?;
         Ok(Reply::Subtitle {
             format: SubtitleFormat::WebVtt,
-            bytes: hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes(),
+            bytes: subtitle_segment_of(playback.conversion.as_deref(), playback.subtitle, n)
+                .await?,
         })
     }
 
@@ -1649,43 +1626,7 @@ impl ClientProtocol {
             let keep_alive = || self.services.playbacks.touch(&read.handle);
             return converted_range(conversion, read, &keep_alive).await;
         }
-        let size = playback.size;
-        let sent = read
-            .length
-            .min(MAX_READ)
-            .min(size.saturating_sub(read.offset));
-        let unreadable = |e: std::io::Error| {
-            tracing::warn!(path = %playback.path.display(), error = %e, "cannot read a media file");
-            Error::Unavailable {
-                message: "the media file could not be read".into(),
-            }
-        };
-        let mut file = crate::files::open_nonblocking(&playback.path)
-            .await
-            .map_err(unreadable)?;
-        // The file the playback started with, or none (PX-09 B-1): the
-        // path may name another by now.
-        let now = FileId::of(&file.metadata().await.map_err(unreadable)?);
-        if playback.file != Some(now) {
-            tracing::warn!(path = %playback.path.display(), "a media file was replaced during its playback");
-            return Err(Error::Unavailable {
-                message: "the media file changed during playback".into(),
-            });
-        }
-        if sent > 0 {
-            file.seek(std::io::SeekFrom::Start(read.offset))
-                .await
-                .map_err(unreadable)?;
-        }
-        Ok((
-            file,
-            MediaReadReply {
-                sent,
-                size,
-                complete: true,
-                epoch: 0,
-            },
-        ))
+        direct_range(&playback, read).await
     }
 
     /// Fill in `principal`'s watch state on `items`, in one lookup.
@@ -2867,6 +2808,36 @@ impl ClientProtocol {
                 }
                 read
             }
+            // Experimental (PX-49): only when this connection's Hello
+            // named it and the port is on.
+            Request::HttpPlaybackUrl { handle } => {
+                use spoolframe_protocol::experimental::{HTTP_PLAYBACK, HttpPlaybackRefusal};
+                let refused = |reason| Ok(Reply::HttpPlaybackRefused { reason });
+                let asked = hello.experimental.iter().any(|n| n == HTTP_PLAYBACK);
+                let Some(http) = self.http_playback.as_ref().filter(|_| asked) else {
+                    return refused(HttpPlaybackRefusal::Off);
+                };
+                let playback = match self.use_playback(connection, &handle, &session).await {
+                    Ok(playback) => playback,
+                    Err(
+                        Error::PlaybackExpired | Error::PlaybackStopped | Error::Unauthenticated,
+                    ) => return refused(HttpPlaybackRefusal::NoSuchPlayback),
+                    Err(e) => return Err(e),
+                };
+                let lan = lan_address(connection, &self.services.uplink);
+                match http.url(&handle, &playback, lan) {
+                    Ok(url) => {
+                        tracing::info!(
+                            id = %playback.item,
+                            endpoint = %connection.remote_id().fmt_short(),
+                            lan = lan.is_some(),
+                            "a playback is served over HTTP"
+                        );
+                        Ok(Reply::HttpPlaybackUrl { url })
+                    }
+                    Err(reason) => refused(reason),
+                }
+            }
             Request::LookupDeviceSignIn { code } => {
                 let user = local(&who)?;
                 let (code, guess) = self.sign_in_code(connection, user, &code)?;
@@ -3826,12 +3797,19 @@ impl ClientProtocol {
     fn end_playbacks_unless_back(&self, endpoint: EndpointId) {
         let connections = self.connections.clone();
         let playbacks = self.services.playbacks.clone();
+        let http_playback = self.http_playback.clone();
         tokio::spawn(async move {
             tokio::time::sleep(playbacks.disconnect_grace()).await;
             if connections.has_endpoint(&endpoint) {
                 return;
             }
-            playbacks.end_device(&endpoint.to_string());
+            // A playback a player fetches over HTTP plays on without its
+            // device: a locked phone that AirPlays (PX-49).
+            playbacks.end_device_but(&endpoint.to_string(), |handle| {
+                http_playback
+                    .as_ref()
+                    .is_some_and(|http| http.holds(handle))
+            });
         });
     }
 
@@ -4379,6 +4357,46 @@ where
     }
 }
 
+/// The server's own address on `connection`'s path now, when that path is
+/// on the LAN (PX-49): what an HTTP playback URL names, so a receiver on
+/// the client's network reaches the server as the client did. `None`
+/// through a relay or over the Internet.
+fn lan_address(
+    connection: &Connection,
+    uplink: &crate::uplink::Uplink,
+) -> Option<std::net::IpAddr> {
+    let paths = connection.paths();
+    let path = paths.iter().find(|path| path.is_selected())?;
+    let iroh::TransportAddr::Ip(remote) = path.remote_addr() else {
+        return None;
+    };
+    if !uplink.is_lan(remote.ip()) {
+        return None;
+    }
+    match path.local_addr() {
+        iroh::endpoint::LocalTransportAddr::Ip(Some(ip)) if !ip.is_unspecified() => {
+            Some(ip.to_canonical())
+        }
+        // Not known on this host: the address the kernel would send to the
+        // client from.
+        _ => route_from(*remote),
+    }
+}
+
+/// This host's address that packets to `remote` leave from. Nothing is
+/// sent: connecting a UDP socket only picks the route.
+fn route_from(remote: std::net::SocketAddr) -> Option<std::net::IpAddr> {
+    let any: std::net::SocketAddr = if remote.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    socket.connect(remote).ok()?;
+    let ip = socket.local_addr().ok()?.ip().to_canonical();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
 /// The address `connection` reaches the server from now, if it is an IP
 /// path; `None` through a relay (P6-03), which hides it.
 fn remote_ip(connection: &Connection) -> Option<std::net::IpAddr> {
@@ -4883,6 +4901,50 @@ fn pin_error(e: UnlockError) -> Error {
     }
 }
 
+/// `handle`'s playback, as `session` on `endpoint` uses it `how`, taking
+/// only what `read` reads of it: what [`ClientProtocol::use_playback_with`]
+/// does for a request, and the HTTP playback port (PX-49) for the
+/// playback's own session and device. The session is checked again at
+/// most every `playback::RECHECK`, and whether its item is still served
+/// with it (B-10).
+pub(crate) async fn use_playback_checked<T>(
+    services: &Services,
+    handle: &PlaybackHandle,
+    session: &SessionId,
+    endpoint: &str,
+    how: Using,
+    read: impl FnOnce(&Playback) -> T,
+) -> Result<T, Error> {
+    let playbacks = &services.playbacks;
+    let using = playbacks
+        .use_handle_with(handle, session, endpoint, how, read)
+        .map_err(playback_refusal)?;
+    if using.recheck {
+        let live = services
+            .auth
+            .endpoint_who(&session.0, endpoint)
+            .await
+            .map_err(internal)?;
+        if live.is_none() {
+            playbacks.end_session(session);
+            return Err(Error::Unauthenticated);
+        }
+        // Beside the read, not before it: a Plex that is slow or down
+        // must not hold up a file this server reads on its own.
+        let catalog = services.catalog.clone();
+        let playbacks = playbacks.clone();
+        let item = using.item;
+        tokio::spawn(async move {
+            if let Err(e) = catalog.item(&item).await
+                && unserved(&e)
+            {
+                playbacks.end_item(&item, crate::playback::EndReason::AccessRemoved);
+            }
+        });
+    }
+    Ok(using.playback)
+}
+
 fn internal(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "request failed");
     Error::Internal
@@ -4901,7 +4963,7 @@ const READ_WAIT: Duration = spoolframe_protocol::policy::wait::READ;
 
 /// A range of a converted playback's progressive output (P2-04): the bytes
 /// written so far, waiting a while for more when the read is past them.
-async fn converted_range(
+pub(crate) async fn converted_range(
     conversion: &Conversion,
     read: &MediaRead,
     keep_alive: &(dyn Fn() + Sync),
@@ -5197,17 +5259,88 @@ fn subtitle_version(metadata: &std::fs::Metadata) -> u64 {
     u64::from_le_bytes(first)
 }
 
+/// WebVTT segment `n` of an HLS playback's subtitle rendition (P2-07),
+/// made from `subtitle`, its text: the cues over that segment's time.
+pub(crate) async fn subtitle_segment_of(
+    conversion: Option<&Conversion>,
+    subtitle: Option<Sidecar>,
+    n: u32,
+) -> Result<Vec<u8>, Error> {
+    let span = conversion
+        .filter(|c| c.subtitle_rendition().is_some())
+        .and_then(|c| c.segment_span(n));
+    let (Some((start_ms, end_ms)), Some(Sidecar::Made { state, .. })) = (span, subtitle) else {
+        return Err(Error::NotFound {
+            what: format!("subtitle segment {n} in this playback"),
+        });
+    };
+    let path = read_text(state).await?;
+    let vtt = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
+        Error::Unavailable {
+            message: "the subtitle file could not be read".into(),
+        }
+    })?;
+    Ok(hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes())
+}
+
+/// A range of a direct playback's file: at most [`MAX_READ`] bytes from
+/// `read.offset`, from the file the playback started with or not at all
+/// (PX-09 B-1).
+pub(crate) async fn direct_range(
+    playback: &RangeOf,
+    read: &MediaRead,
+) -> Result<(tokio::fs::File, MediaReadReply), Error> {
+    let size = playback.size;
+    let sent = read
+        .length
+        .min(MAX_READ)
+        .min(size.saturating_sub(read.offset));
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %playback.path.display(), error = %e, "cannot read a media file");
+        Error::Unavailable {
+            message: "the media file could not be read".into(),
+        }
+    };
+    let mut file = crate::files::open_nonblocking(&playback.path)
+        .await
+        .map_err(unreadable)?;
+    // The file the playback started with, or none (PX-09 B-1): the
+    // path may name another by now.
+    let now = FileId::of(&file.metadata().await.map_err(unreadable)?);
+    if playback.file != Some(now) {
+        tracing::warn!(path = %playback.path.display(), "a media file was replaced during its playback");
+        return Err(Error::Unavailable {
+            message: "the media file changed during playback".into(),
+        });
+    }
+    if sent > 0 {
+        file.seek(std::io::SeekFrom::Start(read.offset))
+            .await
+            .map_err(unreadable)?;
+    }
+    Ok((
+        file,
+        MediaReadReply {
+            sent,
+            size,
+            complete: true,
+            epoch: 0,
+        },
+    ))
+}
+
 /// What a range read uses of its playback (review 2026-10-11 M10).
-struct RangeOf {
-    revision: u64,
-    conversion: Option<Arc<Conversion>>,
-    size: u64,
-    path: PathBuf,
-    file: Option<FileId>,
+pub(crate) struct RangeOf {
+    pub(crate) revision: u64,
+    pub(crate) conversion: Option<Arc<Conversion>>,
+    pub(crate) size: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) file: Option<FileId>,
 }
 
 impl RangeOf {
-    fn of(playback: &Playback) -> Self {
+    pub(crate) fn of(playback: &Playback) -> Self {
         Self {
             revision: playback.revision,
             conversion: playback.conversion.clone(),

@@ -54,6 +54,9 @@
   deviceAllow = transcode: (evaluatedWith {inherit transcode;}).config.systemd.services.spoolframe.serviceConfig.DeviceAllow;
   gpuFailed = transcode: lib.any (lib.hasPrefix "services.spoolframe.transcode.gpus") (map (a: a.message) (lib.filter (a: !a.assertion) (evaluatedWith {inherit transcode;}).config.assertions));
   gpuWarned = transcode: lib.findFirst (lib.hasPrefix "services.spoolframe.transcode.hardware") null (evaluatedWith {inherit transcode;}).config.warnings;
+  # PX-49: the HTTP playback port's failed assertions, and what it opens.
+  httpFailed = httpPlayback: map (a: a.message) (lib.filter (a: !a.assertion && lib.hasPrefix "services.spoolframe.httpPlayback" a.message) (evaluatedWith {inherit httpPlayback;}).config.assertions);
+  firewall = httpPlayback: (evaluatedWith {inherit httpPlayback;}).config.networking.firewall;
   publicUrl = "https://media.example.org";
   # The relay module evaluated with `settings` set (P6-04, P6-07).
   relayWith = settings:
@@ -259,5 +262,39 @@ in
     http = "127.0.0.1:3340";
     access.everyone = "allow";
   });
+  # PX-49: the HTTP playback port is off unless listen is set, written as
+  # the server reads it, and its TCP port opened only where asked.
+  assert check "no HTTP playback port is written by default" (!lib.hasInfix "http_playback" (rendered {}));
+  assert check "the HTTP playback port is written as set" (lib.hasInfix ''listen = "0.0.0.0:7422";'' (rendered {
+      httpPlayback = {
+        listen = "0.0.0.0:7422";
+        address = "media.home.arpa";
+      };
+    })
+    && lib.hasInfix ''address = "media.home.arpa";'' (rendered {
+      httpPlayback = {
+        listen = "0.0.0.0:7422";
+        address = "media.home.arpa";
+      };
+    }));
+  assert check "the HTTP playback port is closed by default" (!lib.elem 7422 (firewall {listen = "0.0.0.0:7422";}).allowedTCPPorts);
+  assert check "openFirewall opens the HTTP playback port" (lib.elem 7422
+    (firewall {
+      listen = "0.0.0.0:7422";
+      openFirewall = true;
+    }).allowedTCPPorts);
+  assert check "an IPv6 listen address opens its port" (lib.elem 7422
+    (firewall {
+      listen = "[::]:7422";
+      openFirewall = true;
+    }).allowedTCPPorts);
+  assert check "the HTTP playback port opens on the interfaces named" ((firewall {
+      listen = "0.0.0.0:7422";
+      interfaces = ["eno1"];
+    }).interfaces.eno1.allowedTCPPorts
+    == [7422]);
+  assert check "an HTTP playback listen address that is a name is refused" (httpFailed {listen = "media:7422";} != []);
+  assert check "opening an HTTP playback port that is off is refused" (httpFailed {openFirewall = true;} != []);
+  assert check "an HTTP playback port set alone is accepted" (httpFailed {listen = "0.0.0.0:7422";} == []);
   assert check "the relay's memory is bounded" ((relayWith {}).systemd.services.spoolframe-relay.serviceConfig.MemoryMax == "1G");
     pkgs.runCommand "spoolframe-module-assertions" {} "touch $out"

@@ -11,6 +11,7 @@
 pub mod artwork;
 pub mod codec;
 pub mod device_sign_in;
+pub mod experimental;
 pub mod fingerprint;
 pub mod invite;
 pub mod invite_admin;

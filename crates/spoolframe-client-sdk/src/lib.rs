@@ -18,6 +18,7 @@ mod client;
 mod connection;
 mod discovery;
 mod error;
+mod experimental;
 mod invite_admin;
 mod invites;
 mod link;
@@ -36,6 +37,7 @@ pub mod storage;
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
 pub use error::SdkError;
+pub use experimental::{Experimental, HttpPlayback, HttpPlaybackRefusal};
 pub use invite_admin::{
     InviteCreator, InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite,
 };

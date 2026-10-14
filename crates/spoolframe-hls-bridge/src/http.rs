@@ -2,7 +2,9 @@
 //! `spoolframe-ffi/src/bridge.rs` (bc2eb28) with its functions as they were
 //! (PX-49): the playbacks are a [`Bridge`] value instead of globals, reads go
 //! through [`Source`], and the caller binds the listener. Not formatted by
-//! rustfmt, so it still diffs cleanly against the app's copy.
+//! rustfmt, so it still diffs cleanly against the app's copy. Since: the
+//! crate's own [`Error`], and [`BridgeOptions`] for what the app read from
+//! its environment.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use crate::bridge::{Bridge, Kind, MenuEntry, Stream};
+use crate::bridge::{Bridge, BridgeOptions, Kind, MenuEntry, Stream};
 use crate::source::{ManifestKind, Segment, Source};
 use crate::Error;
 
@@ -83,6 +85,9 @@ pub(crate) async fn answer<S: Source, B>(bridge: Bridge<S>, request: Request<B>)
     let Some(stream) = stream else {
         return Ok(status(StatusCode::NOT_FOUND));
     };
+    stream.asked();
+    if let Some(hook) = &bridge.on_request { hook(token); }
+    let log = bridge.options.log;
     let answer = async { match (&stream.kind, name) {
         (Kind::Direct { size, mime }, "file") => direct(stream.clone(), *size, mime, range, head),
         // A media segment streams as the server sends it (PX-46): AVPlayer
@@ -94,13 +99,13 @@ pub(crate) async fn answer<S: Source, B>(bridge: Bridge<S>, request: Request<B>)
                 Ok(opened) => streamed(stream.clone(), variant, n, opened, head, asked),
                 Err(e) => {
                     note(&stream, format!("bridge: v{variant}/seg{n} failed after {} ms: {e}", asked.elapsed().as_millis()));
-                    hls_failed(&stream, name, e)
+                    hls_failed(&stream, name, e, log)
                 }
             }
         }
         (Kind::Hls { .. }, _) => {
             let asked = std::time::Instant::now();
-            let answer = hls(&stream, name).await;
+            let answer = hls(&stream, name, &bridge.options).await;
             // A rung's init: how long the map took, for the playback log.
             if name.ends_with("init.mp4") {
                 let took = asked.elapsed().as_millis();
@@ -113,7 +118,7 @@ pub(crate) async fn answer<S: Source, B>(bridge: Bridge<S>, request: Request<B>)
             match answer {
                 Ok(Some((mime, body))) => whole(mime, body, head),
                 Ok(None) => status(StatusCode::NOT_FOUND),
-                Err(e) => hls_failed(&stream, name, e),
+                Err(e) => hls_failed(&stream, name, e, log),
             }
         }
         _ => status(StatusCode::NOT_FOUND),
@@ -192,10 +197,10 @@ fn direct<S: Source>(stream: Arc<Stream<S>>, size: u64, mime: &str, range: Optio
                 Ok(bytes) if bytes.is_empty() => Ok(None),
                 Ok(_) => Err(std::io::Error::other("read exceeded the requested range")),
                 Err(e) => {
-                    if matches!(e, Error::PlaybackStopped) {
+                    if matches!(e, Error::Stopped) {
                         stream.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    if matches!(e, Error::PlaybackExpired | Error::PlaybackClosed) {
+                    if matches!(e, Error::Expired) {
                         stream.expired.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     tracing::warn!(error = %e, offset, "bridge file read failed");
@@ -208,11 +213,12 @@ fn direct<S: Source>(stream: Arc<Stream<S>>, size: u64, mime: &str, range: Optio
 }
 
 /// A playlist, segment or subtitle segment, whole.
-async fn hls<S: Source>(stream: &Stream<S>, name: &str) -> Result<Option<(&'static str, Vec<u8>)>, Error> {
+async fn hls<S: Source>(stream: &Stream<S>, name: &str, options: &BridgeOptions) -> Result<Option<(&'static str, Vec<u8>)>, Error> {
     const PLAYLIST: &str = "application/vnd.apple.mpegurl";
+    let log = options.log;
     let manifest = |kind, variant| async move {
         let text = stream.playback.manifest(kind, variant).await?;
-        confine(&text).map(|()| text.into_bytes())
+        confine(&text, log).map(|()| text.into_bytes())
     };
     // A ladder rung's own: `v<n>/media.m3u8`, `v<n>/init.mp4`, `v<n>/seg<k>.m4s`.
     if let Some((rung, file)) = name.split_once('/') {
@@ -234,7 +240,7 @@ async fn hls<S: Source>(stream: &Stream<S>, name: &str) -> Result<Option<(&'stat
                 Some(entries) => with_menu(&String::from_utf8_lossy(&master), entries, stream.subtitle).into_bytes(),
                 None => master,
             };
-            (PLAYLIST, debug_rewrite(body))
+            (PLAYLIST, debug_rewrite(body, options.master_rewrite.as_deref()))
         }
         // As the server's own segments begin, with no cues.
         "empty.vtt" => ("text/vtt", b"WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n".to_vec()),
@@ -329,14 +335,14 @@ fn placeholder(media: &str) -> String {
 /// the bridge serves them: no scheme, host, path or `..`, in a URI line or a
 /// `URI="…"` attribute. Else AVPlayer would fetch from wherever a server
 /// pointed it, outside the pinned connection (security/audit FFI-002).
-fn confine(playlist: &str) -> Result<(), Error> {
+fn confine(playlist: &str, log: bool) -> Result<(), Error> {
     let refuse = |what: &str| {
-        // `SPOOLFRAME_BRIDGE_LOG=1`: say what was refused, for debugging a
+        // `BridgeOptions::log`: say what was refused, for debugging a
         // server's playlists.
-        if std::env::var_os("SPOOLFRAME_BRIDGE_LOG").is_some() {
-            eprintln!("bridge: refused playlist reference {what:?}");
+        if log {
+            tracing::info!(reference = what, "bridge: refused playlist reference");
         }
-        Err(Error::Protocol(format!("playlist names {what:?}, not one of this playback's resources")))
+        Err(Error::Other(format!("playlist names {what:?}, not one of this playback's resources")))
     };
     for line in playlist.lines() {
         let line = line.trim();
@@ -360,18 +366,18 @@ fn confine(playlist: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// `SPOOLFRAME_MASTER_REWRITE="from>to;from>to"`: replace text in the
-/// master playlist, to find which attribute a player refuses. A debugging
-/// switch: nothing sets it in a shipped app.
-fn debug_rewrite(master: Vec<u8>) -> Vec<u8> {
-    let Some(rules) = std::env::var_os("SPOOLFRAME_MASTER_REWRITE") else { return master };
+/// `BridgeOptions::master_rewrite`, `"from>to;from>to"`: replace text in
+/// the master playlist, to find which attribute a player refuses. A
+/// debugging switch: nothing sets it in a shipped app.
+fn debug_rewrite(master: Vec<u8>, rules: Option<&str>) -> Vec<u8> {
+    let Some(rules) = rules else { return master };
     let mut text = String::from_utf8_lossy(&master).into_owned();
-    for rule in rules.to_string_lossy().split(';') {
+    for rule in rules.split(';') {
         if let Some((from, to)) = rule.split_once('>') {
             text = text.replace(from, to);
         }
     }
-    eprintln!("bridge: master rewritten:\n{text}");
+    tracing::info!(master = %text, "bridge: master rewritten");
     text.into_bytes()
 }
 
@@ -418,7 +424,7 @@ fn number(name: &str, prefix: &str, suffix: &str) -> Option<u32> {
 /// from its start.
 async fn segment<S: Source>(stream: &Stream<S>, variant: u32, n: u32) -> Result<Vec<u8>, Error> {
     let Kind::Hls { epoch } = &stream.kind else {
-        return Err(Error::InvalidInput("not an HLS playback".into()));
+        return Err(Error::Other("not an HLS playback".into()));
     };
     let mut current = *epoch.lock().expect("never poisoned");
     let mut identity = stream.playback.changes();
@@ -426,10 +432,10 @@ async fn segment<S: Source>(stream: &Stream<S>, variant: u32, n: u32) -> Result<
     let mut waits = 0;
     let mut restarts = 0;
     let started = std::time::Instant::now();
-    let too_big = || Error::Server(format!("segment {n} is bigger than {} MiB", SEGMENT_MAX >> 20));
+    let too_big = || Error::Other(format!("segment {n} is bigger than {} MiB", SEGMENT_MAX >> 20));
     loop {
         if started.elapsed() > SEGMENT_DEADLINE {
-            return Err(Error::Server(format!("segment {n} took too long")));
+            return Err(Error::Other(format!("segment {n} took too long")));
         }
         if identity.has_changed().unwrap_or(true) {
             body.clear();
@@ -437,7 +443,7 @@ async fn segment<S: Source>(stream: &Stream<S>, variant: u32, n: u32) -> Result<
         }
         let deadline = tokio::time::Instant::from_std(started + SEGMENT_DEADLINE);
         let read = tokio::time::timeout_at(deadline, stream.playback.read_segment(variant, n, body.len() as u64, READ))
-            .await.map_err(|_| Error::Server(format!("segment {n} took too long")))?;
+            .await.map_err(|_| Error::Other(format!("segment {n} took too long")))?;
         if identity.has_changed().unwrap_or(true) {
             body.clear();
             identity = stream.playback.changes();
@@ -451,7 +457,7 @@ async fn segment<S: Source>(stream: &Stream<S>, variant: u32, n: u32) -> Result<
                 if chunk.epoch != current {
                     restarts += 1;
                     if restarts > SEGMENT_RESTARTS {
-                        return Err(Error::Server(format!("segment {n} keeps restarting")));
+                        return Err(Error::Other(format!("segment {n} keeps restarting")));
                     }
                     current = chunk.epoch;
                     *epoch.lock().expect("never poisoned") = current;
@@ -469,23 +475,23 @@ async fn segment<S: Source>(stream: &Stream<S>, variant: u32, n: u32) -> Result<
                     waits += 1;
                     // Each empty read is the server waiting up to 10 s.
                     if waits > 12 {
-                        return Err(Error::Server(format!("segment {n} isn't coming")));
+                        return Err(Error::Other(format!("segment {n} isn't coming")));
                     }
                 }
             }
             // Resumed by the SDK part-way through: the rest can't come from
             // the new encode, so the segment again from its start.
-            Err(Error::PlaybackResumed { .. }) => {
+            Err(Error::Resumed { .. }) => {
                 restarts += 1;
                 if restarts > SEGMENT_RESTARTS {
-                    return Err(Error::Server(format!("segment {n} keeps restarting")));
+                    return Err(Error::Other(format!("segment {n} keeps restarting")));
                 }
                 body.clear();
             }
-            Err(Error::PlaybackRestarted { epoch: next }) => {
+            Err(Error::Restarted { epoch: next }) => {
                 restarts += 1;
                 if restarts > SEGMENT_RESTARTS {
-                    return Err(Error::Server(format!("segment {n} keeps restarting")));
+                    return Err(Error::Other(format!("segment {n} keeps restarting")));
                 }
                 current = next;
                 *epoch.lock().expect("never poisoned") = next;
@@ -505,23 +511,25 @@ fn note<S: Source>(stream: &Stream<S>, line: String) {
 }
 
 /// What a failed HLS read answers.
-fn hls_failed<S: Source>(stream: &Stream<S>, name: &str, error: Error) -> Response<Body> {
+fn hls_failed<S: Source>(stream: &Stream<S>, name: &str, error: Error, log: bool) -> Response<Body> {
     match error {
         // Not ready, or rewritten while read: AVPlayer asks again.
-        Error::SubtitleNotReady { .. } | Error::SubtitleChanged => status(StatusCode::SERVICE_UNAVAILABLE),
-        Error::PlaybackStopped => {
+        Error::NotReady { .. } => status(StatusCode::SERVICE_UNAVAILABLE),
+        // The playback has no such resource (PX-49: the crate's own error).
+        Error::NotFound => status(StatusCode::NOT_FOUND),
+        Error::Stopped => {
             stream.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
             status(StatusCode::GONE)
         }
         // Gone for good: AVPlayer stops asking, and the app starts a new
         // playback where this one was.
-        Error::PlaybackExpired | Error::PlaybackClosed => {
+        Error::Expired => {
             stream.expired.store(true, std::sync::atomic::Ordering::Relaxed);
             status(StatusCode::GONE)
         }
         e => {
-            if std::env::var_os("SPOOLFRAME_BRIDGE_LOG").is_some() {
-                eprintln!("bridge: {name} failed: {e}");
+            if log {
+                tracing::info!(error = %e, name, "bridge: read failed");
             }
             tracing::warn!(error = %e, name, "bridge read failed");
             status(StatusCode::BAD_GATEWAY)
@@ -549,30 +557,30 @@ struct Opened<S: Source> {
 /// before anything is promised to AVPlayer.
 async fn open_segment<S: Source>(stream: &Stream<S>, variant: u32, n: u32) -> Result<Opened<S>, Error> {
     let Kind::Hls { epoch } = &stream.kind else {
-        return Err(Error::InvalidInput("not an HLS playback".into()));
+        return Err(Error::Other("not an HLS playback".into()));
     };
     let deadline = tokio::time::Instant::now() + SEGMENT_DEADLINE;
     let mut restarts = 0;
     loop {
         let identity = stream.playback.changes();
         let open = tokio::time::timeout_at(deadline, stream.playback.segment_stream(variant, n, 0, SEGMENT_MAX));
-        match open.await.map_err(|_| Error::Server(format!("segment {n} took too long")))? {
+        match open.await.map_err(|_| Error::Other(format!("segment {n} took too long")))? {
             Ok(body) => {
                 if body.size() > SEGMENT_MAX {
-                    return Err(Error::Server(format!("segment {n} is bigger than {} MiB", SEGMENT_MAX >> 20)));
+                    return Err(Error::Other(format!("segment {n} is bigger than {} MiB", SEGMENT_MAX >> 20)));
                 }
                 *epoch.lock().expect("never poisoned") = body.epoch();
                 if identity.has_changed().unwrap_or(true) {
                     restarts += 1;
-                    if restarts > SEGMENT_RESTARTS { return Err(Error::Server("playback keeps changing".into())); }
+                    if restarts > SEGMENT_RESTARTS { return Err(Error::Other("playback keeps changing".into())); }
                     continue;
                 }
                 return Ok(Opened { body, deadline, identity });
             }
-            Err(Error::PlaybackResumed { .. }) | Err(Error::PlaybackRestarted { .. }) => {
+            Err(Error::Resumed { .. }) | Err(Error::Restarted { .. }) => {
                 restarts += 1;
                 if restarts > SEGMENT_RESTARTS {
-                    return Err(Error::Server(format!("segment {n} keeps restarting")));
+                    return Err(Error::Other(format!("segment {n} keeps restarting")));
                 }
             }
             Err(e) => return Err(e),
@@ -693,20 +701,20 @@ impl<S: Source> Delivery<S> {
                 }
                 // This answer is all in: the segment may go on in another.
                 Ok(None) => self.reopen().await?,
-                Err(Error::PlaybackResumed { .. }) => {
+                Err(Error::Resumed { .. }) => {
                     return Err(self.short("the playback was resumed in another encode".into()));
                 }
                 // A seek, a track or quality change, or a step-down replaced
                 // the encode mid-segment: the rest would splice in another
                 // encode, so cut it short and AVPlayer asks again from 0.
-                Err(Error::PlaybackRestarted { epoch }) => {
+                Err(Error::Restarted { epoch }) => {
                     if let Kind::Hls { epoch: current } = &self.stream.kind {
                         *current.lock().expect("never poisoned") = epoch;
                     }
                     return Err(self.short("its encode restarted".into()));
                 }
-                Err(e @ (Error::PlaybackStopped | Error::PlaybackExpired | Error::PlaybackClosed)) => {
-                    let flag = if matches!(e, Error::PlaybackStopped) { &self.stream.stopped } else { &self.stream.expired };
+                Err(e @ (Error::Stopped | Error::Expired)) => {
+                    let flag = if matches!(e, Error::Stopped) { &self.stream.stopped } else { &self.stream.expired };
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     return Err(self.short(e.to_string()));
                 }
@@ -739,7 +747,7 @@ impl<S: Source> Delivery<S> {
         };
         let body = match open {
             Ok(body) => body,
-            Err(Error::PlaybackRestarted { epoch }) => {
+            Err(Error::Restarted { epoch }) => {
                 if let Kind::Hls { epoch: current } = &self.stream.kind {
                     *current.lock().expect("never poisoned") = epoch;
                 }
@@ -856,13 +864,13 @@ mod tests {
     #[test]
     fn playlists_name_only_their_own_resources() {
         let good = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\nseg0.m4s\nseg12.m4s\n#EXT-X-ENDLIST\n";
-        assert!(confine(good).is_ok());
+        assert!(confine(good, false).is_ok());
         let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"en\",URI=\"subtitles.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1\nmedia.m3u8\n";
-        assert!(confine(master).is_ok());
-        assert!(confine("#EXTM3U\nseg3.m4s?epoch=2\n#EXT-X-MAP:URI=\"init.mp4?v=1\"\n").is_ok());
+        assert!(confine(master, false).is_ok());
+        assert!(confine("#EXTM3U\nseg3.m4s?epoch=2\n#EXT-X-MAP:URI=\"init.mp4?v=1\"\n", false).is_ok());
         // A ladder's rungs (PX-21).
-        assert!(confine("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv0/media.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2\nv3/media.m3u8\n").is_ok());
-        assert!(confine("#EXTM3U\n#EXT-X-MAP:URI=\"v1/init.mp4\"\nv1/seg4.m4s\n").is_ok());
+        assert!(confine("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv0/media.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2\nv3/media.m3u8\n", false).is_ok());
+        assert!(confine("#EXTM3U\n#EXT-X-MAP:URI=\"v1/init.mp4\"\nv1/seg4.m4s\n", false).is_ok());
         for bad in [
             "#EXTM3U\nhttps://evil.example/seg0.m4s\n",
             "#EXTM3U\n//evil.example/seg0.m4s\n",
@@ -878,7 +886,7 @@ mod tests {
             "#EXTM3U\nv1/master.m3u8\n",
             "#EXTM3U\nv1/v2/seg0.m4s\n",
         ] {
-            assert!(confine(bad).is_err(), "{bad:?}");
+            assert!(confine(bad, false).is_err(), "{bad:?}");
         }
     }
 

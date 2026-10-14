@@ -506,6 +506,7 @@ fn answer(
             server_version: "0".into(),
             auth_methods: vec![AuthMethod::Password],
             web_url,
+            experimental: Vec::new(),
         }),
         Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
             request: "stub-request".into(),
