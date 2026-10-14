@@ -1758,7 +1758,10 @@ impl Client {
                 }
                 continue;
             };
+            // Set before the ping, so a request sent now waits for it.
+            let check = link.check();
             checks.spawn(async move {
+                let _check = check;
                 if !conn.answers(ping).await {
                     link.drop_dead(&conn);
                 }

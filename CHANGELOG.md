@@ -13,6 +13,14 @@
   when their version is not there yet. The other crates are
   `publish = false`.
 
+- SDK: a request sent while `Client::resume()` checks a server's
+  connection waits for that check (at most `Timeouts::ping` and half a
+  second), then goes on the connection that answered or on a new one.
+  Before, an app that sent a request as it came back to the foreground
+  sent it on the connection iOS had dropped while the app was away, and
+  it waited out `Timeouts::request` (up to about 45 s with the retry).
+  No API or wire change.
+
 ## 0.7.0 (2026-10-12)
 
 - SDK: `Portable::rename(id, name)` renames a portable identity on this

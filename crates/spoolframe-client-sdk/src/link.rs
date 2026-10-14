@@ -54,6 +54,9 @@ const MAX_RETRY: Duration = Duration::from_secs(5 * 60);
 const JITTER: f64 = 0.2;
 /// How long a call waits for a reconnect before it fails.
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
+/// How much longer than its `Ping` a call waits for a [`Link::check`]:
+/// the check drops a dead connection only after the ping's time limit.
+const CHECK_MARGIN: Duration = Duration::from_millis(500);
 
 /// Where a server's connection stands, for the app to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +214,19 @@ pub(crate) struct Link {
     closed: watch::Sender<bool>,
     /// How fast media comes from the server (P6-06), across connections.
     meter: Arc<LinkMeter>,
+    /// How many [`Link::check`]s of the open connection are under way.
+    checks: watch::Sender<u32>,
+}
+
+/// A check of a link's open connection, from [`Link::check`]: calls wait
+/// until it is dropped. A drop guard, so a cancelled `resume` does not
+/// leave calls waiting.
+pub(crate) struct Check(Arc<Link>);
+
+impl Drop for Check {
+    fn drop(&mut self) {
+        self.0.checks.send_modify(|n| *n -= 1);
+    }
 }
 
 impl Link {
@@ -227,6 +243,7 @@ impl Link {
             hurry: tokio::sync::Notify::new(),
             closed: watch::Sender::new(false),
             meter: Arc::default(),
+            checks: watch::Sender::new(0),
         })
     }
 
@@ -305,6 +322,11 @@ impl Link {
         self: &Arc<Self>,
         client: &Client,
     ) -> Result<Arc<ServerConnection>, SdkError> {
+        // The app comes back and sends a request as it calls `resume`:
+        // the connection may look open and be dead. Wait for the check,
+        // not the request's whole time limit on a dead connection.
+        let limit = client.inner.timeouts.ping + CHECK_MARGIN;
+        let _ = tokio::time::timeout(limit, self.checks.subscribe().wait_for(|n| *n == 0)).await;
         if let Some(conn) = self.open() {
             return Ok(conn);
         }
@@ -410,6 +432,13 @@ impl Link {
                 }
             }
         }
+    }
+
+    /// `resume` is checking whether the open connection answers: calls
+    /// wait in [`Link::connection`] until the returned guard is dropped.
+    pub(crate) fn check(self: &Arc<Self>) -> Check {
+        self.checks.send_modify(|n| *n += 1);
+        Check(self.clone())
     }
 
     /// `conn` has stopped answering: close it, so that no call uses it

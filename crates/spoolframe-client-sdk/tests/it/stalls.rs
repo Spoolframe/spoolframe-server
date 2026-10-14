@@ -270,6 +270,39 @@ async fn resume_drops_a_dead_connection_and_keeps_a_live_one() {
     .await;
 }
 
+/// The app comes back and sends a request as it calls `resume`: the
+/// request waits for the check, and goes on the new connection, not on
+/// the dead one, where it would wait out its time limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_during_resume_waits_for_the_check() {
+    within(async {
+        let stub = Stub::start().await;
+        let (client, alice) = signed_in(&stub).await;
+        let before = stub.count("who_am_i");
+        stub.kill_open_connections();
+
+        let resume = tokio::spawn({
+            let client = client.clone();
+            async move { client.resume().await }
+        });
+        // The check is on its way.
+        until(|| stub.count("ping") == 1).await;
+        let started = Instant::now();
+        alice.whoami().await.unwrap();
+        assert!(
+            started.elapsed() < TIMEOUTS.request,
+            "{:?}",
+            started.elapsed()
+        );
+        resume.await.unwrap();
+        let on = stub.requests_of("who_am_i");
+        assert_eq!(&on[before..], [1], "{on:?}");
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_does_not_dial_a_server_with_no_connection() {
     within(async {
