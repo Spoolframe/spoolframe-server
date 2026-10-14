@@ -341,7 +341,10 @@ async fn a_tied_account_ties_another_identity_and_keeps_the_first() {
         ties.iter().map(|t| t.id).collect::<Vec<_>>(),
         [identity(7), identity(8)]
     );
-    assert_eq!(ties[1].tied_at - ties[0].tied_at, 60);
+    // The clock is real time moved ahead, in whole seconds: a second
+    // may tick over between the two ties.
+    let apart = ties[1].tied_at - ties[0].tied_at;
+    assert!((60..=61).contains(&apart), "{apart} s apart");
     assert!(ties.iter().all(|t| t.last_used_at.is_none()), "{ties:?}");
 }
 
