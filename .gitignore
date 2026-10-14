@@ -21,3 +21,6 @@ result-*
 # cargo llvm-cov drops one per test process next to the crate root.
 *.profraw
 .jj/
+# Claude Code's per-checkout state, including agent worktrees: each is a
+# nested repo that `git add -A` would otherwise pick up.
+.claude/

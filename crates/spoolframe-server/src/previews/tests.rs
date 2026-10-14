@@ -169,7 +169,10 @@ impl Setup {
     }
 
     async fn ready(&self, id: &MediaId) -> (String, SetMeta) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        // Only a guard against a set that never finishes: 510 tiles, one
+        // ffmpeg each on one worker at idle priority, took 141 s on a CI
+        // runner shared with two other runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
         loop {
             match self.previews.state(id).await.unwrap() {
                 PreviewState::Ready { key, meta } => return (key, meta),
