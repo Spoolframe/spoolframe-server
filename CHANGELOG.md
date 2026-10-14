@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- PX-49: a new published crate, `spoolframe-hls-bridge` (MIT OR
+  Apache-2.0), on the Coldsteel registry with the SDK crates. It is the
+  Apple app's loopback bridge (`spoolframe-ffi/src/bridge.rs`) moved here
+  with its functions as they were: a playback served over HTTP under an
+  unguessable token, as a ranged file (`/file`) or as HLS (`master.m3u8`,
+  `media.m3u8`, `init.mp4`, `seg<n>.m4s`, `subs<n>.vtt`, the `v<n>/` ladder
+  rungs), segments streamed as they arrive, the restart and deadline
+  rules, the subtitle menu in the master playlist, and playlists confined
+  to the playback's own resources (FFI-001, FFI-002). The playbacks are a
+  `Bridge` value instead of globals (`register`, `unregister`, `playback`,
+  `replanned`, `notes`, `expired`, `stopped`, `set_menu`), served on a
+  listener the caller binds (`Bridge::serve`, `serve_connection`, or
+  `answer` for a caller's own HTTP server). What a playback reads is the
+  `Source` trait; feature `sdk` adds `SdkSource` over the client SDK's
+  `ManagedPlayback`, and without it the crate does not build the SDK. The
+  server does not use it yet. No wire change.
+
 ## 0.7.1 (2026-10-13)
 
 - The server and SDK live in their own repository,

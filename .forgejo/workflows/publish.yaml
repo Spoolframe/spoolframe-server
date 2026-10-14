@@ -1,9 +1,9 @@
 name: Publish
 
 # The SDK and the crates it needs (spoolframe-types, -protocol, -policy,
-# -client-sdk, -test-dir: every crate with `publish = ["coldsteel"]`) go to
-# the Coldsteel cargo registry, where the Linux and Apple clients take them
-# from. Adapted from foundry's publish.yaml.
+# -client-sdk, -test-dir, -hls-bridge: every crate with
+# `publish = ["coldsteel"]`) go to the Coldsteel cargo registry, where the
+# Linux and Apple clients take them from. Adapted from foundry's publish.yaml.
 #
 # Publishing is a consequence of landing on master, never of proposing to
 # it: no pull_request trigger. It runs on every master push, not only on a

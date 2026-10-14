@@ -6626,6 +6626,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "spoolframe-hls-bridge"
+version = "0.7.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "getrandom 0.4.3",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "spoolframe-client-sdk",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spoolframe-media"
 version = "0.7.1"
 dependencies = [

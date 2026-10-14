@@ -24,9 +24,9 @@ unprivileged user namespaces (`unshare`).
 `om ci run` (every flake output, NixOS VM test included) on pull requests
 to `master` and on pushes to it. `.forgejo/workflows/publish.yaml` runs
 `scripts/publish-changed.sh` on every push to `master`: each crate with
-`publish = ["coldsteel"]` (types, protocol, policy, client-sdk, test-dir)
-whose version is not on the Coldsteel registry yet is published, in
-dependency order. To see what it would do:
+`publish = ["coldsteel"]` (types, protocol, policy, client-sdk, test-dir,
+hls-bridge) whose version is not on the Coldsteel registry yet is
+published, in dependency order. To see what it would do:
 
 ```bash
 devenv shell -- scripts/publish-changed.sh .

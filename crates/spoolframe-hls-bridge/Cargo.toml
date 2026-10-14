@@ -1,0 +1,37 @@
+[package]
+name = "spoolframe-hls-bridge"
+description = "Serves a Spoolframe playback over HTTP as HLS or a ranged file, for players that only take a URL."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT OR Apache-2.0"
+publish = ["coldsteel"]
+
+[features]
+default = []
+# The source over the client SDK's `ManagedPlayback`, for the apps. Off by
+# default, so the server serves its own source without building the SDK.
+sdk = ["dep:spoolframe-client-sdk"]
+
+[dependencies]
+bytes = { workspace = true }
+futures-util = { workspace = true }
+# The playback tokens in the path.
+getrandom = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true }
+spoolframe-client-sdk = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The SDK reader tests' playback backend (bridge_tests.rs).
+async-trait = { workspace = true }
+# The tests fetch from the bridge over a real connection.
+hyper = { workspace = true, features = ["http1", "client"] }
+tokio = { workspace = true }
+# The in-memory source in tests/http.rs.
+parking_lot = { workspace = true }
