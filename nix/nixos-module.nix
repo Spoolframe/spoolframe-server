@@ -1017,7 +1017,11 @@ in {
         DeviceAllow =
           lib.optionals vaapiPicks ["char-drm rw"]
           ++ map (node: "${node} rw") vaapiDevices
-          ++ lib.optionals nvenc ["char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"];
+          # NVIDIA's major 195 (nvidia0, nvidiactl, nvidia-modeset) is
+          # `nvidia` in /proc/devices on current drivers (580 on NixOS) and
+          # `nvidia-frontend` on older ones; systemd matches the name, so
+          # both are allowed, and one the driver lacks matches nothing.
+          ++ lib.optionals nvenc ["char-nvidia rw" "char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"];
         # The GPU's device nodes belong to groups the service's user is in
         # (render), which a user namespace would hide.
         PrivateUsers = !gpu;

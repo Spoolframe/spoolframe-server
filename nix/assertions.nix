@@ -192,7 +192,7 @@ in
   assert check "the defaults are not warned of" (!warned {});
   # PGPU-05: transcode.gpus, and the deprecated hardware and vaapiDevice.
   assert check "by default no GPU setting is written" (!lib.hasInfix "hardware =" (rendered {}) && !lib.hasInfix "vaapi_device =" (rendered {}) && !lib.hasInfix "gpus =" (rendered {}));
-  assert check "by default every DRM node and NVIDIA's are allowed" (deviceAllow {} == ["char-drm rw" "char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"]);
+  assert check "by default every DRM node and NVIDIA's are allowed" (deviceAllow {} == ["char-drm rw" "char-nvidia rw" "char-nvidia-frontend rw" "char-nvidia-uvm rw" "char-nvidia-caps rw"]);
   assert check "gpus are written as the server takes them" (lib.hasInfix ''gpus = [{"api":"vaapi","pick":"dgpu"},{"api":"nvenc","device":"1","max_jobs":2}];'' (rendered {
     transcode.gpus = [
       {
