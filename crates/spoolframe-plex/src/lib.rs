@@ -32,7 +32,8 @@ use spoolframe_catalog::{
     SearchQuery, UnavailableFile,
 };
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, Namespace, PersonId,
+    ArtworkId, CalendarDate, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, Namespace,
+    PersonId,
 };
 use url::Url;
 
@@ -418,7 +419,10 @@ impl PlexCatalog {
         if !self.serves(section.as_ref()) {
             return Err(CatalogError::NotServed(id.to_string()));
         }
-        let item = convert::item(&metadata).map_err(|e| self.converted(&call, e))?;
+        let mut item = convert::item(&metadata).map_err(|e| self.converted(&call, e))?;
+        // Only an item's own response has its cast, with the ids people
+        // are listed by: here, not in `convert::item`, which listings use.
+        convert::add_cast(&mut item, &metadata);
         if item.id() != id {
             return Err(self.backend(
                 &call,
@@ -433,6 +437,32 @@ impl PlexCatalog {
             section: section.map(|s| s.0),
             call,
         })
+    }
+
+    /// The day the last of the show's episodes in Plex's order first
+    /// aired, from one episode asked of its `allLeaves`: the last of its
+    /// `leafCount`. Plex says nowhere whether a show has ended. It is
+    /// extra, so a failure leaves it out; anything but a show has none.
+    async fn last_aired(&self, id: &MediaId, fetched: &Fetched) -> Option<CalendarDate> {
+        if id.kind() != MediaKind::Show {
+            return None;
+        }
+        let last = fetched.metadata.leaf_count?.checked_sub(1)?;
+        let mut call = Call::get(format!("{}/allLeaves", fetched.call.path)).about(id);
+        call.headers = vec![
+            ("X-Plex-Container-Start", last.to_string()),
+            ("X-Plex-Container-Size", "1".to_owned()),
+        ];
+        match self.fetch(&call).await {
+            Ok(container) => container
+                .metadata
+                .first()
+                .and_then(|episode| episode.originally_available_at),
+            Err(e) => {
+                tracing::warn!(%id, error = %e, "a show is served without its last airing");
+                None
+            }
+        }
     }
 
     /// `tracks`, an album's listing, with each track's streams: Plex gives
@@ -622,6 +652,10 @@ impl PlexCatalog {
 /// The largest image passed on; posters and backgrounds are far smaller.
 const MAX_IMAGE_BYTES: usize = 32 << 20;
 
+/// The most pixels a side of a person's photo is asked for: the largest
+/// artwork size served (`Large`); the artwork proxy resizes from it.
+const PERSON_PHOTO_SIDE: &str = "1280";
+
 /// The most of a JSON answer read: a page of a library, or a show with its
 /// seasons, is well under a megabyte.
 pub(crate) const MAX_JSON_BYTES: usize = 64 << 20;
@@ -686,11 +720,21 @@ impl Catalog for PlexCatalog {
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
-        let fetched = self.metadata(id, has_markers(id.kind())).await?;
+        let mut fetched = self.metadata(id, has_markers(id.kind())).await?;
         if !has_children(id.kind()) {
             return self.with_children(&fetched, None, &[]);
         }
-        let (call, mut children, _) = self.children_of(id, &fetched.call.path, false).await?;
+        // A show's last airing is one more request, asked beside its
+        // seasons rather than after them.
+        let (children, last_aired) = futures_util::future::join(
+            self.children_of(id, &fetched.call.path, false),
+            self.last_aired(id, &fetched),
+        )
+        .await;
+        let (call, mut children, _) = children?;
+        if let Item::Show(show) = &mut fetched.item {
+            show.last_aired = last_aired;
+        }
         if id.kind() != MediaKind::Album {
             return self.with_children(&fetched, Some(&call), &children);
         }
@@ -781,6 +825,11 @@ impl Catalog for PlexCatalog {
         if id.namespace() != Namespace::Plex {
             return Err(CatalogError::ForeignId(id.to_string()));
         }
+        // A person's photo is in no library: anyone signed in may have
+        // it, as anyone may find the person in a search.
+        if convert::person_photo_url(id.key()).is_some() {
+            return Ok(());
+        }
         if !is_image_path(id.key()) {
             return Err(CatalogError::NotFound(id.to_string()));
         }
@@ -804,7 +853,23 @@ impl Catalog for PlexCatalog {
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
         self.authorize_artwork(id).await?;
-        let call = Call::get(id.key()).about(id);
+        // A person's photo is on Plex's people host. The PMS's photo
+        // transcoder fetches it, as Plex's own apps have it do, so the
+        // server reaches no host but the PMS and the token goes nowhere
+        // else; it is asked for no larger than PERSON_PHOTO_SIDE.
+        let photo = convert::person_photo_url(id.key());
+        let call = match &photo {
+            Some(url) => {
+                let mut call = Call::get("/photo/:/transcode").about(id);
+                call.query = vec![
+                    ("url", url.as_str()),
+                    ("width", PERSON_PHOTO_SIDE),
+                    ("height", PERSON_PHOTO_SIDE),
+                ];
+                call
+            }
+            None => Call::get(id.key()).about(id),
+        };
         let (bytes, content_type) = self.get_bytes(&call, "image/*", MAX_IMAGE_BYTES).await?;
         match content_type {
             Some(content_type) if content_type.starts_with("image/") => Ok(Image {

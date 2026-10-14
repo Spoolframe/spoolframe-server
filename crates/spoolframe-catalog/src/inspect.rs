@@ -270,6 +270,7 @@ mod tests {
             year: None,
             air_date: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         });

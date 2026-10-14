@@ -6,9 +6,9 @@
 use std::time::Duration;
 
 use spoolframe_types::{
-    Album, Artist, Artwork, ArtworkId, ArtworkKind, AudioCodec, CalendarDate, Episode, Item,
-    Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace,
-    PlaybackState, Season, Show, Track,
+    Album, Artist, Artwork, ArtworkId, ArtworkKind, AudioCodec, CalendarDate, CastMember, Episode,
+    Item, Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie,
+    Namespace, PersonRole, PlaybackState, Season, Show, Track,
 };
 
 use serde::Deserialize;
@@ -121,10 +121,14 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
         MediaKind::Movie => Item::Movie(Movie {
             id,
             title: m.title.clone(),
-            year: m.year,
+            // As on an episode: where Plex has only the date, the year is
+            // the date's.
+            year: m.year.or(m.originally_available_at.map(CalendarDate::year)),
+            release_date: m.originally_available_at,
             summary: summary(m),
             content_rating: content_rating(m),
             duration: duration(m),
+            cast: Vec::new(),
             artwork: artwork(m, ArtworkKind::Poster)?,
             playback: PlaybackState::default(),
         }),
@@ -136,6 +140,8 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             content_rating: content_rating(m),
             season_count: m.child_count,
             genres: m.genres.iter().map(|g| g.tag.clone()).collect(),
+            last_aired: None,
+            cast: Vec::new(),
             artwork: artwork(m, ArtworkKind::Poster)?,
         }),
         MediaKind::Season => Item::Season(Season {
@@ -161,6 +167,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             year: m.year.or(m.originally_available_at.map(CalendarDate::year)),
             air_date: m.originally_available_at,
             duration: duration(m),
+            cast: Vec::new(),
             // An episode's thumb is a still from it, not a poster; its
             // poster is its season's, else its show's.
             artwork: with_poster(
@@ -285,6 +292,86 @@ pub fn markers(m: &Metadata) -> Vec<Marker> {
         .collect();
     markers.sort_by_key(|marker| marker.start_ms);
     markers
+}
+
+/// The host Plex's own agent keeps people's photos on, and the artwork
+/// key a photo there is known by: `/metadata-static/<its path>`. A photo
+/// on another host (an older agent's, on TMDB) is left out, so an
+/// artwork id can never make the PMS fetch a URL of a client's choosing.
+const PEOPLE_HOST: &str = "metadata-static.plex.tv";
+const PEOPLE_KEY: &str = "/metadata-static/";
+
+/// `item`'s cast, from `m`, its own response: the cast comes only with
+/// an item's own read, never in listings, where Plex names a few people
+/// without the ids they are listed by.
+pub fn add_cast(item: &mut Item, m: &Metadata) {
+    match item {
+        Item::Movie(movie) => movie.cast = cast(m),
+        Item::Show(show) => show.cast = cast(m),
+        Item::Episode(episode) => episode.cast = cast(m),
+        Item::Season(_) | Item::Artist(_) | Item::Album(_) | Item::Track(_) => {}
+    }
+}
+
+/// The item's actors in billing order, then its directors. One Plex sends
+/// without an id, or in another shape, is left out: the item is whole
+/// without them.
+pub fn cast(m: &Metadata) -> Vec<CastMember> {
+    let people = |tags: &[serde_json::Value], role| {
+        tags.iter()
+            .filter_map(move |tag| match wire::Person::deserialize(tag) {
+                Ok(person) => Some(CastMember {
+                    id: crate::search::person_id(role, person.id),
+                    name: person.tag,
+                    character: person.role.filter(|r| !r.trim().is_empty()),
+                    photo: person.thumb.as_deref().and_then(person_photo),
+                    role,
+                }),
+                Err(e) => {
+                    tracing::debug!(
+                        rating_key = %m.rating_key,
+                        error = %e,
+                        "skipping a Plex person that cannot be read"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut cast = people(&m.roles, PersonRole::Actor);
+    cast.extend(people(&m.directors, PersonRole::Director));
+    cast
+}
+
+/// The artwork id of a person's photo at `url`, when it is on Plex's
+/// people host.
+fn person_photo(url: &str) -> Option<ArtworkId> {
+    let path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?
+        .strip_prefix(PEOPLE_HOST)?
+        .strip_prefix('/')?;
+    let key = format!("{PEOPLE_KEY}{path}");
+    person_photo_url(&key)?;
+    ArtworkId::new(Namespace::Plex, key).ok()
+}
+
+/// The URL of the person's photo an artwork key names, or `None` when it
+/// names none. Each part of the path is plain (letters, digits, `-`,
+/// `_`, `.`), so the URL cannot leave the path or the host.
+pub fn person_photo_url(key: &str) -> Option<String> {
+    let path = key.strip_prefix(PEOPLE_KEY)?;
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    path.split('/')
+        .all(plain)
+        .then(|| format!("https://{PEOPLE_HOST}/{path}"))
 }
 
 /// The media files Plex reports for the item: every part of its first
@@ -417,6 +504,7 @@ fn with_poster(
 mod tests {
     use super::*;
     use crate::wire::{Envelope, MediaContainer};
+    use spoolframe_types::PersonId;
 
     fn fixture(name: &str) -> MediaContainer {
         let path = format!("{}/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"));
@@ -977,6 +1065,198 @@ mod tests {
             media_files(&c.metadata[0]),
             ["/data/TVShows/12 Monkeys/Season 1/12.Monkeys.S01E01.Splinter.Bluray-1080p.Remux.mkv"]
         );
+    }
+
+    #[test]
+    fn a_movie_carries_the_day_it_came_out_and_its_year() {
+        let Item::Movie(movie) = only_item("metadata-movie-cast") else {
+            panic!("not a movie")
+        };
+        assert_eq!(
+            (movie.release_date, movie.year),
+            (CalendarDate::new(1979, 5, 25), Some(1979))
+        );
+    }
+
+    #[test]
+    fn a_movie_with_only_a_release_date_takes_its_year() {
+        let mut m = fixture("metadata-movie-cast").metadata.remove(0);
+        m.year = None;
+        let Item::Movie(movie) = item(&m).unwrap() else {
+            panic!("not a movie")
+        };
+        assert_eq!(movie.year, Some(1979));
+    }
+
+    /// The dates are in Plex's listings too, so a library's rows and the
+    /// home rows have them without each item's own read.
+    #[test]
+    fn listings_carry_the_release_and_air_dates_and_years() {
+        let dates: Vec<_> = fixture("watch-movies-watched")
+            .metadata
+            .iter()
+            .map(|m| match item(m).unwrap() {
+                Item::Movie(movie) => (movie.year, movie.release_date),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            dates,
+            [
+                (Some(1979), CalendarDate::new(1979, 5, 25)),
+                (Some(2017), CalendarDate::new(2017, 5, 9)),
+            ]
+        );
+        let dates: Vec<_> = fixture("watch-episodes-watched")
+            .metadata
+            .iter()
+            .map(|m| match item(m).unwrap() {
+                Item::Episode(ep) => (ep.year, ep.air_date),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            dates,
+            [
+                (Some(2015), CalendarDate::new(2015, 1, 16)),
+                (Some(2015), CalendarDate::new(2015, 1, 22)),
+            ]
+        );
+    }
+
+    fn person(key: &str) -> PersonId {
+        PersonId::new(Namespace::Plex, key).unwrap()
+    }
+
+    #[test]
+    fn an_item_s_cast_is_its_actors_in_billing_order_then_its_directors() {
+        let cast = cast(&fixture("metadata-movie-cast").metadata[0]);
+        let who: Vec<_> = cast
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.name.as_str(),
+                    c.role,
+                    c.character.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            who,
+            [
+                (
+                    person("actor-21052"),
+                    "Tom Skerritt",
+                    PersonRole::Actor,
+                    Some("Dallas")
+                ),
+                (
+                    person("actor-13434"),
+                    "Sigourney Weaver",
+                    PersonRole::Actor,
+                    Some("Ripley")
+                ),
+                (
+                    person("actor-30061"),
+                    "Veronica Cartwright",
+                    PersonRole::Actor,
+                    Some("Lambert")
+                ),
+                (
+                    person("actor-30062"),
+                    "Harry Dean Stanton",
+                    PersonRole::Actor,
+                    Some("Brett")
+                ),
+                (
+                    person("director-20469"),
+                    "Ridley Scott",
+                    PersonRole::Director,
+                    None
+                ),
+            ]
+        );
+    }
+
+    /// The id is the tag's, as a person search gives it, so the person's
+    /// items list from a cast member as from a found person.
+    #[test]
+    fn a_cast_member_has_the_id_a_person_search_gives() {
+        let cast = cast(&fixture("metadata-movie-cast").metadata[0]);
+        assert_eq!(
+            cast[1].id,
+            crate::search::person_id(PersonRole::Actor, 13434)
+        );
+    }
+
+    #[test]
+    fn a_cast_member_s_photo_on_plex_s_people_host_is_artwork() {
+        let cast = cast(&fixture("metadata-movie-cast").metadata[0]);
+        let photos: Vec<_> = cast
+            .iter()
+            .map(|c| c.photo.as_ref().map(|p| p.key().to_owned()))
+            .collect();
+        assert_eq!(
+            photos,
+            [
+                Some("/metadata-static/b/people/b4b9a3c1a1f6fc4b9a0f5b8e4f0e2a51.jpg".to_owned()),
+                Some("/metadata-static/9/people/9e3c2f9b7b1f2d6a4f1a2b3c4d5e6f70.jpg".to_owned()),
+                // No thumb.
+                None,
+                // An older agent's, on another host: not fetched.
+                None,
+                Some("/metadata-static/7/people/7a290cd6d0b1d82c84d1bd4a8a1e0e5d.jpg".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_photo_key_names_an_image_on_plex_s_people_host_and_nothing_else() {
+        assert_eq!(
+            person_photo_url("/metadata-static/9/people/9e3c.jpg").as_deref(),
+            Some("https://metadata-static.plex.tv/9/people/9e3c.jpg")
+        );
+        for key in [
+            "/library/metadata/1/thumb/2",
+            "/metadata-static/",
+            "/metadata-static/../library/sections",
+            "/metadata-static/9//x.jpg",
+            "/metadata-static/9/x.jpg?url=http://nas",
+            "/metadata-static/9/x%2e.jpg",
+            "/metadata-static/9/x.jpg#",
+        ] {
+            assert_eq!(person_photo_url(key), None, "{key}");
+        }
+    }
+
+    /// Plex's listings name only the first few people, without the ids
+    /// they are listed by: a listing's items have no cast.
+    #[test]
+    fn people_named_without_an_id_are_left_out() {
+        for name in ["watch-movies-watched", "watch-episodes-watched"] {
+            for m in &fixture(name).metadata {
+                assert_eq!(cast(m), Vec::new(), "{name}");
+            }
+        }
+    }
+
+    /// A cast comes only with an item's own read; `item` alone, as for a
+    /// listing, leaves it out.
+    #[test]
+    fn an_item_converted_alone_has_no_cast() {
+        let Item::Movie(movie) = only_item("metadata-movie-cast") else {
+            panic!("not a movie")
+        };
+        assert_eq!(movie.cast, Vec::new());
+    }
+
+    #[test]
+    fn a_person_in_another_shape_is_left_out_and_the_item_loads() {
+        let mut m = fixture("metadata-movie-cast").metadata.remove(0);
+        m.roles[0] = serde_json::json!({ "id": "not a number", "tag": 7 });
+        assert_eq!(cast(&m).len(), 4);
+        assert!(item(&m).is_ok());
     }
 
     #[test]

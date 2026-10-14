@@ -198,6 +198,32 @@ pub struct Metadata {
     /// one in another shape must not make the item unreadable.
     #[serde(rename = "Marker", default)]
     pub markers: Vec<serde_json::Value>,
+    /// The actors, in billing order, and the directors. An item's own
+    /// response has each with its tag id, the part played and a photo;
+    /// listings name only the first few (three actors, a director), by
+    /// name alone. Each is read as a [`Person`] on its own, as markers
+    /// are.
+    #[serde(rename = "Role", default)]
+    pub roles: Vec<serde_json::Value>,
+    #[serde(rename = "Director", default)]
+    pub directors: Vec<serde_json::Value>,
+}
+
+/// Someone in an item's credits, as an item's own response has them.
+#[derive(Debug, Deserialize)]
+pub struct Person {
+    /// The tag's id: what a listing is filtered by (`actor=<id>`), as a
+    /// search hub's person has it.
+    pub id: u64,
+    /// Their name.
+    pub tag: String,
+    /// The part an actor plays.
+    #[serde(default, deserialize_with = "lenient")]
+    pub role: Option<String>,
+    /// A photo's URL; Plex's own agent's are on
+    /// `https://metadata-static.plex.tv/`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub thumb: Option<String>,
 }
 
 /// A stretch of an item Plex detected.

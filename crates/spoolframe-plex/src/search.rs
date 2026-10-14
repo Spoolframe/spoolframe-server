@@ -45,7 +45,7 @@ fn role_name(role: PersonRole) -> &'static str {
 
 /// A person's id: their role and tag id, which together name what their
 /// items are listed by.
-fn person_id(role: PersonRole, tag: u64) -> PersonId {
+pub(crate) fn person_id(role: PersonRole, tag: u64) -> PersonId {
     PersonId::new(Namespace::Plex, format!("{}-{tag}", role_name(role))).expect("a key")
 }
 

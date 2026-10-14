@@ -15,8 +15,9 @@ use spoolframe_catalog::{
 };
 use spoolframe_protocol::codec::MAX_FRAME;
 use spoolframe_types::{
-    ArtworkId, Episode, Item, Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId,
-    MediaKind, Movie, Namespace, PersonId, PlaybackState, SearchKind, Season, Show,
+    ArtworkId, CalendarDate, CastMember, Episode, Item, Library, LibraryId, LibraryKind, Marker,
+    MarkerKind, MediaId, MediaKind, Movie, Namespace, PersonId, PersonRole, PlaybackState,
+    SearchKind, Season, Show,
 };
 
 /// The RPC request frames read as an `RpcRequest`, by every server in the
@@ -122,9 +123,26 @@ pub fn movie() -> Item {
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
         title: "Alien".into(),
         year: Some(1979),
+        release_date: CalendarDate::new(1979, 5, 25),
         summary: None,
         content_rating: None,
         duration: Some(Duration::from_secs(7020)),
+        cast: vec![
+            CastMember {
+                id: PersonId::new(Namespace::Plex, "actor-13434").unwrap(),
+                name: "Sigourney Weaver".into(),
+                role: PersonRole::Actor,
+                character: Some("Ripley".into()),
+                photo: None,
+            },
+            CastMember {
+                id: PersonId::new(Namespace::Plex, "director-20469").unwrap(),
+                name: "Ridley Scott".into(),
+                role: PersonRole::Director,
+                character: None,
+                photo: None,
+            },
+        ],
         artwork: Vec::new(),
         playback: PlaybackState::default(),
     })
@@ -137,9 +155,11 @@ pub fn second_copy() -> Item {
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "2").unwrap(),
         title: "Alien (4K)".into(),
         year: Some(1979),
+        release_date: None,
         summary: None,
         content_rating: None,
         duration: Some(Duration::from_secs(7020)),
+        cast: Vec::new(),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
     })
@@ -160,6 +180,8 @@ pub fn show() -> Item {
         content_rating: None,
         season_count: None,
         genres: Vec::new(),
+        last_aired: CalendarDate::new(2022, 4, 8),
+        cast: Vec::new(),
         artwork: Vec::new(),
     })
 }
@@ -187,9 +209,10 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
         title: format!("S{season}E{episode}"),
         summary: None,
         content_rating: None,
-        year: None,
-        air_date: None,
+        year: Some(2015),
+        air_date: CalendarDate::new(2015, 11, 23),
         duration: Some(Duration::from_secs(2640)),
+        cast: Vec::new(),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
     })

@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.9.0 (2026-10-14)
+
+- An item's cast, a movie's release date and a show's last airing, for
+  the film, show and episode pages. `Movie`, `Show` and `Episode` gain
+  `cast: Vec<CastMember>`: actors in the catalog's billing order, then
+  directors. A `CastMember` is `{ id: PersonId, name, role: PersonRole,
+  character: Option<String>, photo: Option<ArtworkId> }`; `id` lists the
+  person's items with `PersonItems` (SDK `Session::person_items`), as a
+  found person's does, and `photo` is fetched as any artwork
+  (`Session::artwork`). The cast comes only with an item's own read
+  (`Item`, SDK `Session::item`); it is empty in listings, search and the
+  home rows, where Plex names people without their ids, so listing a
+  library costs what it did. `Movie` gains `release_date:
+  Option<CalendarDate>` (Plex's `originallyAvailableAt`, in listings
+  too), and a movie's `year` falls back to it as an episode's does.
+  `Show` gains `last_aired: Option<CalendarDate>`: the air date of its
+  last episode in Plex's order, one more PMS request on the show's own
+  read, made beside the seasons request. Plex does not say whether a
+  show has ended, so a running show has one too. People's photos from
+  Plex's own agent (metadata-static.plex.tv) are fetched through the
+  PMS's photo transcoder; a photo on another host is left out. Wire:
+  added without a `PROTOCOL_VERSION` bump, as `Episode.year` and
+  `air_date` were: the new item fields are `compat(v1)`, read as `[]`
+  or `null` when an older server leaves them out, and older clients
+  ignore them. `CastMember`'s fields are all required. No native
+  catalog fills them yet (P9-05).
+
 ## 0.8.0 (2026-10-14)
 
 - PX-49: a new published crate, `spoolframe-hls-bridge` (MIT OR

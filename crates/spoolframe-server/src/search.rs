@@ -396,9 +396,11 @@ mod tests {
             id: id("movie", key),
             title: title.into(),
             year: Some(year),
+            release_date: None,
             summary: None,
             content_rating: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         })
@@ -413,6 +415,8 @@ mod tests {
             content_rating: None,
             season_count: None,
             genres: Vec::new(),
+            last_aired: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
         })
     }
@@ -431,6 +435,7 @@ mod tests {
             year: None,
             air_date: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         })

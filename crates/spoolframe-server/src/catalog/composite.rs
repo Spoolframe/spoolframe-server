@@ -525,9 +525,11 @@ mod tests {
             id: format!("plex:movie:{key}").parse().unwrap(),
             title: key.into(),
             year: None,
+            release_date: None,
             summary: None,
             content_rating: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         })

@@ -1006,3 +1006,153 @@ async fn an_answer_past_the_limit_is_not_read_to_its_end() {
     let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
     assert!(sent < 256 << 20, "the PMS got to send {} MiB", sent >> 20);
 }
+
+/// The cast is on the item's own response (Plex's listings name only a
+/// few people, by name alone), so it comes with the item's read and
+/// costs no request of its own.
+#[tokio::test]
+async fn a_movie_comes_with_its_cast_from_its_own_response() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/206736", "metadata-movie-cast").await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Movie, "206736"))
+        .await
+        .unwrap();
+    let Item::Movie(movie) = got.item else {
+        panic!("not a movie");
+    };
+    let names: Vec<_> = movie.cast.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Tom Skerritt",
+            "Sigourney Weaver",
+            "Veronica Cartwright",
+            "Harry Dean Stanton",
+            "Ridley Scott"
+        ]
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_library_s_items_have_no_cast() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections/2/all", "watch-movies-watched").await;
+    let page = catalog(&server)
+        .items(
+            &LibraryId::new(Namespace::Plex, "2").unwrap(),
+            Page {
+                offset: 0,
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap();
+    for item in &page.items {
+        let Item::Movie(movie) = item else {
+            panic!("not a movie");
+        };
+        assert!(movie.cast.is_empty(), "{}", movie.title);
+    }
+}
+
+/// A show's last airing is its last episode's: the last of its
+/// `leafCount`, one episode asked for.
+#[tokio::test]
+async fn a_show_says_when_its_latest_episode_aired() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/208618", "metadata-show").await;
+    serve(
+        &server,
+        "/library/metadata/208618/children",
+        "children-show",
+    )
+    .await;
+    Mock::given(path("/library/metadata/208618/allLeaves"))
+        .and(header("X-Plex-Container-Start", "45"))
+        .and(header("X-Plex-Container-Size", "1"))
+        .respond_with(json("metadata-episode"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Show, "208618"))
+        .await
+        .unwrap();
+    let Item::Show(show) = got.item else {
+        panic!("not a show");
+    };
+    assert_eq!(
+        show.last_aired,
+        spoolframe_types::CalendarDate::new(2015, 1, 16)
+    );
+}
+
+/// The last airing is extra: a show whose episodes cannot be listed
+/// still loads, without it.
+#[tokio::test]
+async fn a_show_whose_episodes_cannot_be_listed_loads_without_its_last_airing() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/metadata/208618", "metadata-show").await;
+    serve(
+        &server,
+        "/library/metadata/208618/children",
+        "children-show",
+    )
+    .await;
+    Mock::given(path("/library/metadata/208618/allLeaves"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let got = catalog(&server)
+        .item(&id(MediaKind::Show, "208618"))
+        .await
+        .unwrap();
+    let Item::Show(show) = got.item else {
+        panic!("not a show");
+    };
+    assert_eq!(show.last_aired, None);
+    assert_eq!(got.children.len(), 2);
+}
+
+/// A person's photo is on Plex's people host; the PMS's photo
+/// transcoder fetches it, so the token goes to the PMS alone.
+#[tokio::test]
+async fn a_person_s_photo_is_fetched_through_the_pms() {
+    let server = MockServer::start().await;
+    Mock::given(path("/photo/:/transcode"))
+        .and(query_param(
+            "url",
+            "https://metadata-static.plex.tv/9/people/9e3c.jpg",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"\xff\xd8 fake".to_vec(), "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let image = catalog(&server)
+        .artwork(&artwork_id("/metadata-static/9/people/9e3c.jpg"))
+        .await
+        .unwrap();
+    assert_eq!(image.content_type, "image/jpeg");
+    assert_eq!(image.bytes, b"\xff\xd8 fake");
+}
+
+#[tokio::test]
+async fn a_person_photo_key_off_the_people_host_never_reaches_the_pms() {
+    let server = MockServer::start().await;
+    for key in [
+        "/metadata-static/../library/sections",
+        "/metadata-static/9/x.jpg?url=http://nas",
+        "/metadata-static/",
+    ] {
+        let err = catalog(&server)
+            .artwork(&artwork_id(key))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::NotFound(_)), "{key}: {err}");
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

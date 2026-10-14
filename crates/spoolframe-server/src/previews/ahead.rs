@@ -281,9 +281,11 @@ mod tests {
             id: id(MediaKind::Movie, key),
             title: key.into(),
             year: None,
+            release_date: None,
             summary: None,
             content_rating: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         })
@@ -303,6 +305,7 @@ mod tests {
             year: None,
             air_date: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         })
@@ -340,6 +343,8 @@ mod tests {
                     content_rating: None,
                     season_count: None,
                     genres: Vec::new(),
+                    last_aired: None,
+                    cast: Vec::new(),
                     artwork: Vec::new(),
                 })],
                 _ => vec![Item::Artist(Artist {

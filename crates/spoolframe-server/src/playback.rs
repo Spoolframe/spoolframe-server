@@ -2387,6 +2387,7 @@ mod tests {
             year: None,
             air_date: None,
             duration: Some(Duration::from_secs(3000)),
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: Default::default(),
         });

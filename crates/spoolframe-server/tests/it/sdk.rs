@@ -7,7 +7,9 @@ use crate::support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_client_sdk::types::{ClientCapabilities, Item, PlaybackState, VideoCodec};
+use spoolframe_client_sdk::types::{
+    CalendarDate, ClientCapabilities, Item, PersonRole, PlaybackState, VideoCodec,
+};
 use spoolframe_client_sdk::{
     ArtworkSize, BitmapSubtitles, Client, ConnectionPath, ConnectionState, Device, MAX_READ,
     ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions, PlaybackPlan,
@@ -2275,4 +2277,54 @@ async fn an_old_session_confirms_before_it_makes_an_invite() {
         client.read_invite(&made.link).await.unwrap().kind,
         spoolframe_client_sdk::InviteLinkKind::PortableAccount
     );
+}
+
+/// What an item's page shows comes through the SDK as the server sends
+/// it: a movie's year, release date and cast, a show's last airing, an
+/// episode's year and air date.
+#[tokio::test]
+async fn an_item_s_dates_and_cast_come_through_the_sdk() {
+    let (server, client, _) = ready("item-page").await;
+    let alice = alice(&server, &client).await;
+    let Item::Movie(m) = alice.item(movie().id()).await.unwrap().item else {
+        panic!("not a movie");
+    };
+    assert_eq!(
+        (m.year, m.release_date),
+        (Some(1979), CalendarDate::new(1979, 5, 25))
+    );
+    let cast: Vec<_> = m
+        .cast
+        .iter()
+        .map(|c| (c.id.to_string(), c.role, c.character.as_deref()))
+        .collect();
+    assert_eq!(
+        cast,
+        [
+            (
+                "plex:actor-13434".to_owned(),
+                PersonRole::Actor,
+                Some("Ripley")
+            ),
+            ("plex:director-20469".to_owned(), PersonRole::Director, None),
+        ]
+    );
+    let Item::Show(s) = alice.item(show().id()).await.unwrap().item else {
+        panic!("not a show");
+    };
+    assert_eq!(s.last_aired, CalendarDate::new(2022, 4, 8));
+    let Item::Episode(e) = alice
+        .item(episode("15", "14", 2, 1).id())
+        .await
+        .unwrap()
+        .item
+    else {
+        panic!("not an episode");
+    };
+    assert_eq!(
+        (e.year, e.air_date),
+        (Some(2015), CalendarDate::new(2015, 11, 23))
+    );
+    client.close().await;
+    server.stop().await;
 }

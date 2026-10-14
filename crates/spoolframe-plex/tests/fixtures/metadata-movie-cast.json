@@ -1,0 +1,88 @@
+{
+  "MediaContainer": {
+    "size": 1,
+    "librarySectionID": 2,
+    "librarySectionTitle": "Movies",
+    "Metadata": [
+      {
+        "ratingKey": "206736",
+        "key": "/library/metadata/206736",
+        "guid": "plex://movie/5d7768254de0ee001fcc83a5",
+        "type": "movie",
+        "title": "Alien",
+        "contentRating": "R",
+        "librarySectionID": 2,
+        "summary": "During its return to the earth, commercial spaceship Nostromo intercepts a distress signal from a distant planet.",
+        "year": 1979,
+        "thumb": "/library/metadata/206736/thumb/1790505697",
+        "art": "/library/metadata/206736/art/1790505697",
+        "duration": 6996990,
+        "originallyAvailableAt": "1979-05-25",
+        "addedAt": 1716531416,
+        "Media": [
+          {
+            "id": 508738,
+            "container": "mkv",
+            "Part": [
+              {
+                "id": 790123,
+                "file": "/data/Movies/Alien (1979)/Alien.1979.2160p.mkv"
+              }
+            ]
+          }
+        ],
+        "Director": [
+          {
+            "id": 20469,
+            "filter": "director=20469",
+            "tag": "Ridley Scott",
+            "tagKey": "5d776827880197001ec90a2a",
+            "thumb": "https://metadata-static.plex.tv/7/people/7a290cd6d0b1d82c84d1bd4a8a1e0e5d.jpg"
+          }
+        ],
+        "Role": [
+          {
+            "id": 21052,
+            "filter": "actor=21052",
+            "tag": "Tom Skerritt",
+            "tagKey": "5d7768254de0ee001fcc839f",
+            "role": "Dallas",
+            "thumb": "https://metadata-static.plex.tv/b/people/b4b9a3c1a1f6fc4b9a0f5b8e4f0e2a51.jpg"
+          },
+          {
+            "id": 13434,
+            "filter": "actor=13434",
+            "tag": "Sigourney Weaver",
+            "tagKey": "5d7768254de0ee001fcc83a0",
+            "role": "Ripley",
+            "thumb": "https://metadata-static.plex.tv/9/people/9e3c2f9b7b1f2d6a4f1a2b3c4d5e6f70.jpg"
+          },
+          {
+            "id": 30061,
+            "filter": "actor=30061",
+            "tag": "Veronica Cartwright",
+            "tagKey": "5d7768254de0ee001fcc83a1",
+            "role": "Lambert"
+          },
+          {
+            "id": 30062,
+            "filter": "actor=30062",
+            "tag": "Harry Dean Stanton",
+            "tagKey": "5d7768254de0ee001fcc83a2",
+            "role": "Brett",
+            "thumb": "http://image.tmdb.org/t/p/original/fXQZGb1F6CSmkvvGW1qkmjG6NNt.jpg"
+          },
+          {
+            "tag": "Bolaji Badejo",
+            "role": "Alien"
+          }
+        ],
+        "Guid": [
+          {
+            "id": "imdb://tt0078748"
+          }
+        ]
+      }
+    ]
+  }
+}

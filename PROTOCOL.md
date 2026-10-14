@@ -95,6 +95,8 @@ protocol reset` in the code:
 | `servers` in pairing's `credential` frame | none |
 | `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent (these are also left out when empty) |
 | `year`, `air_date` on an item; `bit_rate` on a file's tracks and its video | `null` |
+| `release_date` on a movie, `last_aired` on a show | `null` |
+| `cast` on a movie, show and episode | `[]` |
 
 ## Connections and streams
 

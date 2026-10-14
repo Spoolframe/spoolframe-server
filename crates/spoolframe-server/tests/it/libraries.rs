@@ -8,7 +8,8 @@ use std::sync::Arc;
 use serde_json::json;
 use spoolframe_protocol::HomeScreen;
 use spoolframe_protocol::{
-    Error, MediaReadResponse, Reply, Request, Response, SearchRequest, SearchResults, SessionId,
+    ArtworkResponse, ArtworkSize, Error, MediaReadResponse, Reply, Request, Response,
+    SearchRequest, SearchResults, SessionId,
 };
 use spoolframe_server::catalog::LiveCatalog;
 use spoolframe_server::config::layers::{Layers, Locations};
@@ -17,8 +18,10 @@ use spoolframe_server::playback::EndReason;
 use spoolframe_server::principal::Principal;
 use spoolframe_server::runtime::{Live, RuntimeSettings};
 use spoolframe_server::store::watch::WatchUpdate;
-use spoolframe_types::{Item, Library, LibraryKind, MediaId, SearchKind, SearchScope};
-use wiremock::matchers::{header, method, path};
+use spoolframe_types::{
+    CalendarDate, Item, Library, LibraryKind, MediaId, PersonRole, SearchKind, SearchScope,
+};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::support::{self, ServerOptions, TestClient, TestServer, mkv_capabilities};
@@ -1306,4 +1309,119 @@ async fn the_last_path_check_outlives_a_reorder_and_a_restart_but_not_a_new_mapp
         .await
         .unwrap();
     assert_eq!(restarted.plex_last_path_check().await.unwrap(), None);
+}
+
+/// A 1 px PNG: a person's photo, as the PMS's transcoder answers it.
+fn png() -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+/// An item read over the protocol carries what its page shows: the day
+/// it came out, and its cast with ids that list each person's items and
+/// photos that come over the artwork stream. On a second Plex server, so
+/// every id in the cast must name it.
+#[tokio::test]
+async fn an_item_read_carries_its_cast_and_release_date() {
+    let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
+    let cabin = pms(
+        "Cabin",
+        &[(1, "movie", "Movies")],
+        &[film("11", 1, "Arrival", 200)],
+    )
+    .await;
+    // Arrival's own response, with its people, over the listing's.
+    let mut arrival = film("11", 1, "Arrival", 200).metadata();
+    arrival["originallyAvailableAt"] = json!("2016-11-11");
+    arrival["Role"] = json!([{
+        "id": 4089, "filter": "actor=4089", "tag": "Amy Adams",
+        "role": "Louise Banks",
+        "thumb": "https://metadata-static.plex.tv/3/people/3a9f.jpg",
+    }]);
+    arrival["Director"] = json!([{
+        "id": 20470, "filter": "director=20470", "tag": "Denis Villeneuve",
+    }]);
+    Mock::given(method("GET"))
+        .and(path("/library/metadata/11"))
+        .respond_with(container(
+            json!({ "librarySectionID": 1, "Metadata": [arrival] }),
+        ))
+        .with_priority(1)
+        .mount(&cabin)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/photo/:/transcode"))
+        .and(query_param(
+            "url",
+            "https://metadata-static.plex.tv/3/people/3a9f.jpg",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(png(), "image/png"))
+        .expect(1)
+        .mount(&cabin)
+        .await;
+    let file = two_servers(&cabin.uri(), FILMS_AND_CABIN).replace("{tower}", &tower.uri());
+    let served = Served::start("item-cast", &file).await;
+
+    let Item::Movie(movie) = served.item("plex:movie:cabin:11").await.unwrap() else {
+        panic!("not a movie");
+    };
+    assert_eq!(
+        (movie.year, movie.release_date),
+        (Some(2016), CalendarDate::new(2016, 11, 11))
+    );
+    let cast: Vec<_> = movie
+        .cast
+        .iter()
+        .map(|c| {
+            (
+                c.id.to_string(),
+                c.name.as_str(),
+                c.role,
+                c.character.as_deref(),
+                c.photo.as_ref().map(ToString::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cast,
+        [
+            (
+                "plex:cabin:actor-4089".to_owned(),
+                "Amy Adams",
+                PersonRole::Actor,
+                Some("Louise Banks"),
+                Some("plex:cabin:/metadata-static/3/people/3a9f.jpg".to_owned()),
+            ),
+            (
+                "plex:cabin:director-20470".to_owned(),
+                "Denis Villeneuve",
+                PersonRole::Director,
+                None,
+                None,
+            ),
+        ]
+    );
+
+    // "Their items", from the cast member's id.
+    let request = Request::PersonItems {
+        person: movie.cast[0].id.clone(),
+        offset: 0,
+        limit: 10,
+    };
+    let Response::Ok(Reply::Items { items, .. }) = served.call(request).await else {
+        panic!("no items");
+    };
+    assert_eq!(ids(&items), ["plex:movie:cabin:11"]);
+
+    // Their photo, over the artwork stream.
+    let photo = movie.cast[0].photo.clone().unwrap();
+    let (response, bytes) = served
+        .client
+        .artwork(&served.session, photo, ArtworkSize::Original)
+        .await;
+    assert!(matches!(response, ArtworkResponse::Ok(_)), "{response:?}");
+    assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 1);
 }

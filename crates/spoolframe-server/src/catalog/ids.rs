@@ -11,8 +11,8 @@
 
 use spoolframe_catalog::{Found, FoundGroup, ItemWithChildren};
 use spoolframe_types::{
-    Album, Artist, Artwork, ArtworkId, Episode, Item, LibraryId, MediaId, Movie, Person, PersonId,
-    Season, Show, Track,
+    Album, Artist, Artwork, ArtworkId, CastMember, Episode, Item, LibraryId, MediaId, Movie,
+    Person, PersonId, Season, Show, Track,
 };
 
 use crate::config::FIRST_PLEX_SERVER;
@@ -120,23 +120,37 @@ pub fn library(server: &str, id: LibraryId) -> LibraryId {
     LibraryId::new(id.namespace(), join(server, id.key())).expect("a key with a prefix")
 }
 
+fn artwork_id(server: &str, id: ArtworkId) -> ArtworkId {
+    if server == FIRST_PLEX_SERVER {
+        return id;
+    }
+    ArtworkId::new(id.namespace(), join(server, id.key())).expect("a key with a prefix")
+}
+
 fn artwork(server: &str, artwork: Vec<Artwork>) -> Vec<Artwork> {
     artwork
         .into_iter()
         .map(|a| Artwork {
-            id: if server == FIRST_PLEX_SERVER {
-                a.id
-            } else {
-                ArtworkId::new(a.id.namespace(), join(server, a.id.key()))
-                    .expect("a key with a prefix")
-            },
+            id: artwork_id(server, a.id),
             kind: a.kind,
         })
         .collect()
 }
 
+/// An item's cast from `server`: each person's id lists their items
+/// there, and their photo is fetched from there.
+fn cast(server: &str, cast: Vec<CastMember>) -> Vec<CastMember> {
+    cast.into_iter()
+        .map(|c| CastMember {
+            id: person(server, c.id),
+            photo: c.photo.map(|p| artwork_id(server, p)),
+            ..c
+        })
+        .collect()
+}
+
 /// `item` from `server`, with every ID in it (its own, its parents', its
-/// artwork's) naming that server.
+/// artwork's, its cast's) naming that server.
 pub fn item(server: &str, item: Item) -> Item {
     if server == FIRST_PLEX_SERVER {
         return item;
@@ -145,11 +159,13 @@ pub fn item(server: &str, item: Item) -> Item {
     match item {
         Item::Movie(v) => Item::Movie(Movie {
             id: m(v.id),
+            cast: cast(server, v.cast),
             artwork: artwork(server, v.artwork),
             ..v
         }),
         Item::Show(v) => Item::Show(Show {
             id: m(v.id),
+            cast: cast(server, v.cast),
             artwork: artwork(server, v.artwork),
             ..v
         }),
@@ -163,6 +179,7 @@ pub fn item(server: &str, item: Item) -> Item {
             id: m(v.id),
             show_id: m(v.show_id),
             season_id: m(v.season_id),
+            cast: cast(server, v.cast),
             artwork: artwork(server, v.artwork),
             ..v
         }),
@@ -190,7 +207,9 @@ pub fn item(server: &str, item: Item) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spoolframe_types::{ArtworkKind, MediaKind, Namespace, PlaybackState};
+    use spoolframe_types::{
+        ArtworkKind, CastMember, MediaKind, Namespace, PersonRole, PlaybackState,
+    };
 
     #[test]
     fn the_first_server_s_ids_are_as_they_were() {
@@ -253,6 +272,7 @@ mod tests {
             year: None,
             air_date: None,
             duration: None,
+            cast: Vec::new(),
             artwork: vec![Artwork {
                 id: "plex:/library/metadata/3/thumb/9".parse().unwrap(),
                 kind: ArtworkKind::Thumb,
@@ -268,6 +288,38 @@ mod tests {
         assert_eq!(
             e.artwork[0].id.to_string(),
             "plex:cabin:/library/metadata/3/thumb/9"
+        );
+    }
+
+    /// A cast member's id lists their items on the server the item is
+    /// from, and their photo is fetched from it.
+    #[test]
+    fn a_cast_member_s_id_and_photo_name_the_item_s_server() {
+        let movie = Item::Movie(Movie {
+            id: MediaId::new(Namespace::Plex, MediaKind::Movie, "3").unwrap(),
+            title: "Alien".into(),
+            year: None,
+            release_date: None,
+            summary: None,
+            content_rating: None,
+            duration: None,
+            cast: vec![CastMember {
+                id: "plex:actor-13434".parse().unwrap(),
+                name: "Sigourney Weaver".into(),
+                role: PersonRole::Actor,
+                character: Some("Ripley".into()),
+                photo: Some("plex:/metadata-static/9/people/9e3c.jpg".parse().unwrap()),
+            }],
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+        });
+        let Item::Movie(m) = item("cabin", movie) else {
+            unreachable!()
+        };
+        assert_eq!(m.cast[0].id.to_string(), "plex:cabin:actor-13434");
+        assert_eq!(
+            m.cast[0].photo.as_ref().map(ToString::to_string).as_deref(),
+            Some("plex:cabin:/metadata-static/9/people/9e3c.jpg")
         );
     }
 

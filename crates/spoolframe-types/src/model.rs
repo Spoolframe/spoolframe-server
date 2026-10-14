@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::codec::AudioCodec;
 use crate::date::CalendarDate;
 use crate::duration_ms;
-use crate::id::{ArtworkId, LibraryId, MediaId};
+use crate::id::{ArtworkId, LibraryId, MediaId, PersonId};
+use crate::search::PersonRole;
 
 /// What a library holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -60,13 +61,25 @@ pub struct PlaybackState {
 pub struct Movie {
     pub id: MediaId,
     pub title: String,
+    /// The year it came out: the catalog's own, else `release_date`'s.
     pub year: Option<u16>,
+    /// The day it came out, `"YYYY-MM-DD"`.
+    ///
+    /// This and `cast` were added without a PROTOCOL_VERSION bump, as
+    /// `Episode::air_date` was: a server from before them leaves the keys
+    /// out, and that reads as `None` and no one.
+    // compat(v1): required at the protocol reset
+    pub release_date: Option<CalendarDate>,
     pub summary: Option<String>,
     /// The age rating as the catalog has it ("R", "TV-MA"), shown as
     /// is; `None` when it has none.
     pub content_rating: Option<String>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
+    /// Who is in it and who directed it (see [`CastMember`]).
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub cast: Vec<CastMember>,
     pub artwork: Vec<Artwork>,
     pub playback: PlaybackState,
 }
@@ -87,6 +100,23 @@ pub struct Show {
     /// may hold only the first few: Plex gives two in listings and
     /// search, and all of them on the show itself.
     pub genres: Vec<String>,
+    /// The day its latest episode in the library first aired, for the
+    /// end of "2015–2018". Only the show's own item has it; `None` in
+    /// listings and search, and where no episode has a date.
+    ///
+    /// A catalog that does not know whether a show has ended (Plex does
+    /// not) still sets it on a running show: a client that shows a run
+    /// from it may show one that has not ended.
+    ///
+    /// This and `cast` were added without a PROTOCOL_VERSION bump, so a
+    /// server from before them leaves the keys out, and that reads as
+    /// `None` and no one.
+    // compat(v1): required at the protocol reset
+    pub last_aired: Option<CalendarDate>,
+    /// Who is in it and who directed it (see [`CastMember`]).
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub cast: Vec<CastMember>,
     pub artwork: Vec<Artwork>,
 }
 
@@ -132,8 +162,39 @@ pub struct Episode {
     pub air_date: Option<CalendarDate>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
+    /// Who is in it and who directed it (see [`CastMember`]): the
+    /// episode's own, which may leave out the show's regulars. Added
+    /// without a PROTOCOL_VERSION bump; left out, no one.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub cast: Vec<CastMember>,
     pub artwork: Vec<Artwork>,
     pub playback: PlaybackState,
+}
+
+/// Someone in a movie's, show's or episode's credits: an actor, with the
+/// part they play, or a director.
+///
+/// An item's `cast` is in the catalog's billing order, actors first, then
+/// directors. Only the item's own read (`Item`) has it; it is empty in
+/// listings, search and the home rows, where Plex gives names without
+/// the ids a person is listed by. A native catalog fills it with images
+/// and people (P9-05); until then only Plex does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastMember {
+    /// The id a person search gives them: their items are listed with
+    /// `PersonItems`, as a found person's are.
+    pub id: PersonId,
+    pub name: String,
+    pub role: PersonRole,
+    /// The part an actor plays ("Ellen Ripley"), as the catalog has it;
+    /// `None` for a director, and for an actor where it does not say.
+    #[serde(deserialize_with = "crate::required::option")]
+    pub character: Option<String>,
+    /// Their portrait, fetched through the client protocol as any
+    /// artwork is; `None` where the catalog has none.
+    #[serde(deserialize_with = "crate::required::option")]
+    pub photo: Option<ArtworkId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +342,115 @@ mod tests {
         }
     }
 
+    fn ripley() -> CastMember {
+        CastMember {
+            id: PersonId::new(Namespace::Plex, "actor-13").unwrap(),
+            name: "Sigourney Weaver".into(),
+            role: PersonRole::Actor,
+            character: Some("Ellen Ripley".into()),
+            photo: Some(ArtworkId::new(Namespace::Plex, "/people/1/a/b.jpg").unwrap()),
+        }
+    }
+
+    fn scott() -> CastMember {
+        CastMember {
+            id: PersonId::new(Namespace::Plex, "director-7").unwrap(),
+            name: "Ridley Scott".into(),
+            role: PersonRole::Director,
+            character: None,
+            photo: None,
+        }
+    }
+
+    #[test]
+    fn a_cast_member_is_their_person_id_role_and_photo_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(ripley()).unwrap(),
+            serde_json::json!({
+                "id": "plex:actor-13",
+                "name": "Sigourney Weaver",
+                "role": "actor",
+                "character": "Ellen Ripley",
+                "photo": "plex:/people/1/a/b.jpg",
+            })
+        );
+        round_trip(ripley());
+        round_trip(scott());
+    }
+
+    /// A new type, so every field is sent (PX-15): `null` for none.
+    #[test]
+    fn a_cast_member_s_character_and_photo_are_required() {
+        crate::test_support::assert_each_required(&scott(), &["character", "photo"]);
+    }
+
+    /// `cast`, `release_date` and `last_aired` came without a revision
+    /// bump: a server from before them leaves them out.
+    #[test]
+    fn items_from_a_server_without_cast_or_dates_still_decode() {
+        let movie = Movie {
+            id: media(MediaKind::Movie, "10"),
+            title: "Alien".into(),
+            year: Some(1979),
+            release_date: CalendarDate::new(1979, 5, 25),
+            summary: None,
+            content_rating: None,
+            duration: None,
+            cast: vec![ripley()],
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+        };
+        let mut json = serde_json::to_value(&movie).unwrap();
+        assert_eq!(json["release_date"], "1979-05-25");
+        let object = json.as_object_mut().unwrap();
+        object.remove("release_date");
+        object.remove("cast");
+        let older: Movie = serde_json::from_value(json).unwrap();
+        assert_eq!((older.release_date, older.cast), (None, Vec::new()));
+
+        let show = Show {
+            id: media(MediaKind::Show, "20"),
+            title: "The Expanse".into(),
+            year: Some(2015),
+            summary: None,
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
+            last_aired: CalendarDate::new(2022, 4, 8),
+            cast: vec![ripley()],
+            artwork: Vec::new(),
+        };
+        let mut json = serde_json::to_value(&show).unwrap();
+        assert_eq!(json["last_aired"], "2022-04-08");
+        let object = json.as_object_mut().unwrap();
+        object.remove("last_aired");
+        object.remove("cast");
+        let older: Show = serde_json::from_value(json).unwrap();
+        assert_eq!((older.last_aired, older.cast), (None, Vec::new()));
+
+        let episode = Episode {
+            id: media(MediaKind::Episode, "22"),
+            show_id: media(MediaKind::Show, "20"),
+            show_title: None,
+            season_id: media(MediaKind::Season, "21"),
+            season: 1,
+            episode: 1,
+            title: "Dulcinea".into(),
+            summary: None,
+            content_rating: None,
+            year: None,
+            air_date: None,
+            duration: None,
+            cast: vec![scott()],
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+        };
+        let mut json = serde_json::to_value(&episode).unwrap();
+        json.as_object_mut().unwrap().remove("cast");
+        let older: Episode = serde_json::from_value(json).unwrap();
+        assert_eq!(older.cast, Vec::new());
+    }
+
     #[test]
     fn durations_are_whole_milliseconds_on_the_wire() {
         let json = serde_json::to_value(halfway()).unwrap();
@@ -376,6 +546,8 @@ mod tests {
             content_rating: None,
             season_count: None,
             genres: Vec::new(),
+            last_aired: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
         });
         let json = serde_json::to_value(&item).unwrap();
@@ -410,6 +582,7 @@ mod tests {
             year: None,
             air_date: None,
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         };
@@ -443,6 +616,7 @@ mod tests {
             year: Some(2015),
             air_date: CalendarDate::new(2015, 11, 23),
             duration: None,
+            cast: Vec::new(),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
         };
@@ -466,9 +640,11 @@ mod tests {
             id: media(MediaKind::Movie, "10"),
             title: "Alien".into(),
             year: Some(1979),
+            release_date: CalendarDate::new(1979, 5, 25),
             summary: Some("In space no one can hear you scream.".into()),
             content_rating: Some("R".into()),
             duration: Some(Duration::from_secs(7020)),
+            cast: vec![ripley(), scott()],
             artwork: poster(),
             playback: halfway(),
         });
@@ -480,6 +656,8 @@ mod tests {
             content_rating: Some("TV-14".into()),
             season_count: Some(6),
             genres: vec!["Science Fiction".into(), "Drama".into()],
+            last_aired: CalendarDate::new(2022, 4, 8),
+            cast: vec![ripley()],
             artwork: poster(),
         });
         round_trip(Season {
@@ -503,6 +681,7 @@ mod tests {
             year: Some(2015),
             air_date: CalendarDate::new(2015, 11, 23),
             duration: Some(Duration::from_secs(2640)),
+            cast: vec![scott()],
             artwork: poster(),
             playback: PlaybackState::default(),
         });

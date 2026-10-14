@@ -42,9 +42,11 @@ fn movie() -> Item {
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
         title: "Alien".into(),
         year: Some(1979),
+        release_date: None,
         summary: None,
         content_rating: None,
         duration: Some(Duration::from_secs(7020)),
+        cast: Vec::new(),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
     })
