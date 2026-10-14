@@ -175,7 +175,12 @@ async fn stopping_a_playback_kills_its_encode_and_removes_its_files() {
         ffmpeg_for(&handle).is_empty()
     })
     .await;
-    assert!(!server.job_dir(&handle, 0).parent().unwrap().exists());
+    // Removed on the blocking pool after ffmpeg ends, so a moment later.
+    let dir = server.job_dir(&handle, 0).parent().unwrap().to_owned();
+    until("its files are gone", Duration::from_secs(5), || {
+        !dir.exists()
+    })
+    .await;
     client.close().await;
     server.stop().await;
 }
@@ -201,7 +206,12 @@ async fn an_idle_playback_s_encode_ends_with_it() {
         || ffmpeg_for(&handle).is_empty(),
     )
     .await;
-    assert!(!server.job_dir(&handle, 0).exists());
+    // Removed on the blocking pool after ffmpeg ends, so a moment later.
+    let dir = server.job_dir(&handle, 0);
+    until("its files are gone", Duration::from_secs(5), || {
+        !dir.exists()
+    })
+    .await;
     client.close().await;
     server.stop().await;
 }
