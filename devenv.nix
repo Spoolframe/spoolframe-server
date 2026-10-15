@@ -242,7 +242,8 @@ in {
   # `devenv tasks run spoolframe:nimble-setup` registers the first admin.
   #
   # LAN only: IPv4, no relays, no pkarr record and no `wan` section, so
-  # nothing outside the home reaches it. No watch sync with Plex.
+  # nothing outside the home reaches it; HTTP playback serves LAN clients
+  # only, with no `address` set. No watch sync with Plex.
   profiles.user.andoriyu.module = {pkgs, ...}: let
     nimbleConfig = pkgs.writeText "nimble.ucl" ''
       schema = "spoolframe.server.v1";
@@ -271,6 +272,11 @@ in {
         insecure_cookies = true;
         public_url = "http://localhost:7431";
         not_proxied = true;
+      }
+
+      # HTTP playback (PX-49), for AirPlay tests from the apps.
+      http_playback {
+        listen = "0.0.0.0:7422";
       }
 
       # Traces to nimble's Alloy (yard), which sends them on to Tempo.
