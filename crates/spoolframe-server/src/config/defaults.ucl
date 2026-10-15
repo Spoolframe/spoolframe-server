@@ -506,10 +506,12 @@ experimental {
 # Applies after a restart. The web UI sets it in Settings › Experimental.
 #
 # http_playback {
-#   # An IP address and a port.
-#   listen = "0.0.0.0:7422";
+#   # An IP address and a port. [::] is every address, IPv6 and IPv4: an
+#   # app that reached the server over IPv6 gets a URL that names IPv6.
+#   listen = "[::]:7422";
 #   # The host a URL names for an app that reached the server through a
 #   # relay or over the Internet; left out, such an app gets no URL. An app
-#   # on the LAN gets the address it reached the server at.
+#   # on the LAN gets the address it reached the server at, or another of
+#   # the same interface's that the port listens on.
 #   address = "media.home.arpa";
 # }

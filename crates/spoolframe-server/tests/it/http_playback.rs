@@ -233,6 +233,44 @@ async fn direct_play_is_fetched_whole_and_in_ranges_over_http() {
     server.stop().await;
 }
 
+/// A phone that reached the server over IPv6, and a port on `0.0.0.0`: the
+/// URL names an IPv4 address of the same interface, one the port listens
+/// on, not the IPv6 one the phone came in on, which nothing answers at.
+#[tokio::test]
+async fn a_client_over_ipv6_is_named_an_ipv4_address_the_port_listens_on() {
+    // In a namespace of its own, so ::1 is there even where the host or
+    // CI's container has no IPv6.
+    if !support::private_netns(
+        module_path!(),
+        "a_client_over_ipv6_is_named_an_ipv4_address_the_port_listens_on",
+    ) {
+        return;
+    }
+    let server = server("http-over-v6", true, false).await;
+    let file = server.write_media(4096);
+    let client = server
+        .loopback_client_at(std::net::Ipv6Addr::LOCALHOST.into())
+        .await;
+    let info = client
+        .hello_naming(mkv_capabilities(), &[HTTP_PLAYBACK])
+        .await;
+    assert_eq!(info.experimental, vec![HTTP_PLAYBACK.to_owned()]);
+    let session = client.login("alice", "correct horse").await;
+    let handle = start(&client, &session).await;
+    let url = url(&client, &session, &handle).await.expect("a URL");
+    let host = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(host, _)| host)
+        .expect("a host");
+    assert!(host.parse::<std::net::Ipv4Addr>().is_ok(), "{url}");
+    let (status, body, _) = get(&url, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, file);
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn another_users_playback_or_none_is_no_such_playback() {
     let server = server("http-not-yours", true, false).await;

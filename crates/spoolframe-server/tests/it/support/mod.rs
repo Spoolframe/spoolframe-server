@@ -1220,22 +1220,29 @@ impl TestServer {
     /// bound to `127.0.0.1` and it dials the server's IPv4 port there, so
     /// the server sees it at `127.0.0.1` whatever other paths this host has.
     pub async fn loopback_client(&self) -> TestClient {
+        self.loopback_client_at(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+    }
+
+    /// [`Self::loopback_client`] at `loopback`, `::1` for IPv6: it dials
+    /// the server's port of that family.
+    pub async fn loopback_client_at(&self, loopback: std::net::IpAddr) -> TestClient {
         let server = self.server.addr();
         let port = server
             .ip_addrs()
-            .find(|addr| addr.is_ipv4())
-            .expect("the server has an IPv4 address")
+            .find(|addr| addr.is_ipv4() == loopback.is_ipv4())
+            .expect("the server has an address of that family")
             .port();
         let endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
             .clear_ip_transports()
-            .bind_addr("127.0.0.1:0")
+            .bind_addr(std::net::SocketAddr::from((loopback, 0)))
             .unwrap()
             .bind()
             .await
             .unwrap();
         let loopback = iroh::EndpointAddr::new(server.id)
-            .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+            .with_ip_addr(std::net::SocketAddr::from((loopback, port)));
         let conn = endpoint.connect(loopback, CLIENT_ALPN).await.unwrap();
         TestClient {
             endpoint,
@@ -1714,4 +1721,42 @@ pub mod logs {
             .lines()
             .any(|line| parts.iter().all(|part| line.contains(part)))
     }
+}
+
+/// Whether this process is the one inside the namespace.
+const INSIDE_NETNS: &str = "SPOOLFRAME_TEST_PRIVATE_LAN";
+
+/// Run `test` of `module` again in a new user and network namespace
+/// (`unshare -rn`) with loopback up (127.0.0.1 and ::1, whatever the
+/// host or container has) and taking multicast, and assert that it passed there.
+/// Returns `true` in the copy inside, which then runs the test's body;
+/// `false` in the outer one, which has nothing left to do.
+pub fn private_netns(module: &str, test: &str) -> bool {
+    if std::env::var_os(INSIDE_NETNS).is_some() {
+        return true;
+    }
+    let exe = std::env::current_exe().unwrap();
+    // libtest's name for it: the module's path in the binary (`module`,
+    // the caller's `module_path!()`), then `test`.
+    let (_, module) = module.split_once("::").unwrap();
+    let test = format!("{module}::{test}");
+    let output = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--net", "sh", "-ec"])
+        .arg(
+            "ip link set lo up; ip link set lo multicast on; \
+             ip route add 224.0.0.0/4 dev lo; exec \"$0\" --exact \"$1\" --nocapture",
+        )
+        .arg(&exe)
+        .arg(&test)
+        .env(INSIDE_NETNS, "1")
+        .output()
+        .expect("unshare (util-linux) runs");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{test} in a private LAN:\n{log}");
+    assert!(log.contains("1 passed"), "{test} did not run:\n{log}");
+    false
 }

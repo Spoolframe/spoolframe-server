@@ -283,6 +283,11 @@ in
       listen = "0.0.0.0:7422";
       openFirewall = true;
     }).allowedTCPPorts);
+  assert check "openFirewall opens the port of an IPv6 listen" (lib.elem 7422
+    (firewall {
+      listen = "[::]:7422";
+      openFirewall = true;
+    }).allowedTCPPorts);
   assert check "an IPv6 listen address opens its port" (lib.elem 7422
     (firewall {
       listen = "[::]:7422";

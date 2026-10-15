@@ -518,10 +518,12 @@ in {
       listen = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        example = "0.0.0.0:7422";
+        example = "[::]:7422";
         description = ''
           Where the HTTP playback port listens (`http_playback.listen`,
-          PX-49): an IP address and a TCP port. It serves a playback's HLS,
+          PX-49): an IP address and a TCP port. `[::]` is every address,
+          IPv6 and IPv4: an app that reached the server over IPv6 gets a
+          URL that names IPv6. It serves a playback's HLS,
           or its file, over plain HTTP to a player with no Iroh (an Apple
           TV that a phone AirPlays to), under a token a signed-in app asks
           for; nothing without one. Experimental: apps use it only when
@@ -955,7 +957,7 @@ in {
       # PX-49: the server parses it as admin.listen.
       {
         assertion = cfg.httpPlayback.listen == null || parsed cfg.httpPlayback.listen;
-        message = "services.spoolframe.httpPlayback.listen (${cfg.httpPlayback.listen}) must be an IP address and a port, such as 0.0.0.0:7422 or [::]:7422: the server does not look up names.";
+        message = "services.spoolframe.httpPlayback.listen (${cfg.httpPlayback.listen}) must be an IP address and a port, such as [::]:7422 or 0.0.0.0:7422: the server does not look up names.";
       }
       {
         assertion = cfg.httpPlayback.listen != null || !(cfg.httpPlayback.openFirewall || cfg.httpPlayback.interfaces != []);

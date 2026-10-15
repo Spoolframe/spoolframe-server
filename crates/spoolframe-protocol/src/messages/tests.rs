@@ -2526,6 +2526,7 @@ mod experimental_features {
             HttpPlaybackRefusal::RelayOnly,
             HttpPlaybackRefusal::NoSuchPlayback,
             HttpPlaybackRefusal::Unsupported,
+            HttpPlaybackRefusal::NoAddress,
         ] {
             round_trip(Reply::HttpPlaybackRefused { reason });
         }

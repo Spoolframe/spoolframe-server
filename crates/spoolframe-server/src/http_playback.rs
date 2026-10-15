@@ -62,7 +62,8 @@ pub struct Settings {
     /// The host a URL names for a client that reached the server through a
     /// relay or over the Internet (`http_playback.address`); `None`: such a
     /// client gets no URL. A client on the LAN gets the address it reached
-    /// the server at.
+    /// the server at, or another of the same interface's that the port
+    /// listens on ([`host_for`]).
     pub address: Option<String>,
     /// How long a token lives with no request.
     pub idle: Duration,
@@ -86,10 +87,125 @@ enum Shape {
     Hls,
 }
 
+/// What addresses the port's socket accepts on: which of the server's a
+/// URL may name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    /// This one alone.
+    One(IpAddr),
+    /// Every IPv4 address (`0.0.0.0`).
+    AnyV4,
+    /// Every IPv6 address (`[::]`), and every IPv4 one too unless the
+    /// socket is IPv6-only (`net.ipv6.bindv6only`).
+    AnyV6 { v6_only: bool },
+}
+
+impl Bound {
+    fn of(addr: SocketAddr, v6_only: bool) -> Self {
+        match addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => Self::AnyV4,
+            IpAddr::V6(ip) if ip.is_unspecified() => Self::AnyV6 { v6_only },
+            ip => Self::One(ip),
+        }
+    }
+
+    fn accepts(self, ip: IpAddr) -> bool {
+        match self {
+            Self::One(one) => one == ip,
+            Self::AnyV4 => ip.is_ipv4(),
+            Self::AnyV6 { v6_only } => ip.is_ipv6() || !v6_only,
+        }
+    }
+}
+
+/// The host a URL names: an address the port accepts on. For a client on
+/// the LAN, reached at `lan`, that one if the port accepts on it; else
+/// another of the same interface's of the family the port listens on (a
+/// phone on the LAN by IPv6, and a port on `0.0.0.0`); else one of a LAN
+/// interface the server tells LAN devices. For any other client
+/// `address`. `NoAddress` with none to name: a URL no player can reach is
+/// worse than none.
+fn host_for(
+    bound: Bound,
+    lan: Option<IpAddr>,
+    address: Option<&str>,
+    interfaces: &[crate::announce::Interface],
+) -> Result<String, HttpPlaybackRefusal> {
+    let Some(lan) = lan else {
+        return address
+            .map(str::to_owned)
+            .ok_or(HttpPlaybackRefusal::RelayOnly);
+    };
+    let ip = match bound {
+        Bound::One(ip) => ip,
+        _ if bound.accepts(lan) => lan,
+        _ => {
+            // The port's family: the client's is the other one.
+            let v4 = lan.is_ipv6();
+            let named = |ip: &IpAddr| {
+                ip.is_ipv4() == v4
+                    && !ip.is_unspecified()
+                    && !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local())
+            };
+            let same = interfaces
+                .iter()
+                .find(|i| i.addrs.contains(&lan))
+                .and_then(|i| i.addrs.iter().copied().find(named));
+            let told = || {
+                interfaces
+                    .iter()
+                    .filter(|i| !crate::announce::is_virtual(&i.name))
+                    .flat_map(|i| i.addrs.iter().copied())
+                    .find(|ip| named(ip) && !ip.is_loopback() && for_the_lan(*ip))
+            };
+            same.or_else(told).ok_or(HttpPlaybackRefusal::NoAddress)?
+        }
+    };
+    Ok(match ip {
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        ip => ip.to_string(),
+    })
+}
+
+/// Whether a URL may name `ip`, of another interface than the client's:
+/// a private one of IPv4, not one the Internet reaches the host at; any
+/// of IPv6 (link-local ones are left out before), whose global ones are
+/// the LAN's too.
+fn for_the_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(_) => true,
+    }
+}
+
+/// Whether `listener`, on an IPv6 address, takes IPv6 alone: the
+/// system's `net.ipv6.bindv6only` decides it for `[::]`.
+fn v6_only(listener: &TcpListener) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    let mut on: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the descriptor is the listener's, open while it is borrowed;
+    // `on` is the int IPV6_V6ONLY is read into, and `len` its size.
+    let read = unsafe {
+        libc::getsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (&raw mut on).cast(),
+            &raw mut len,
+        )
+    };
+    if read != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(on != 0)
+}
+
 /// The port, listening, and the tokens it serves.
 pub struct HttpPlayback {
     bridge: Bridge<ServerSource>,
     addr: SocketAddr,
+    bound: Bound,
     settings: Settings,
     services: Services,
     clock: Clock,
@@ -121,6 +237,7 @@ impl HttpPlayback {
         };
         let listener = TcpListener::bind(listen).await?;
         let addr = listener.local_addr()?;
+        let bound = Bound::of(addr, addr.is_ipv6() && v6_only(&listener)?);
         let clock = services.auth.store().clock().clone();
         let asked: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>> = Arc::default();
         let hearing = (asked.clone(), clock.clone());
@@ -134,6 +251,7 @@ impl HttpPlayback {
         let this = Arc::new(Self {
             bridge,
             addr,
+            bound,
             settings: settings.clone(),
             services: services.clone(),
             clock,
@@ -184,20 +302,21 @@ impl HttpPlayback {
 
     /// The URL `handle`'s `playback` is fetched at, for its own session and
     /// device: by `lan`, the server's address on the client's LAN path, if
-    /// it reached the server by one; else `http_playback.address`. Its
-    /// live token again if it has one for the same shape.
+    /// it reached the server by one, or one the port listens on of the same
+    /// interface ([`host_for`]); else `http_playback.address`. Its live
+    /// token again if it has one for the same shape.
     pub(crate) fn url(
         &self,
         handle: &PlaybackHandle,
         playback: &Playback,
         lan: Option<IpAddr>,
     ) -> Result<String, HttpPlaybackRefusal> {
-        let host = match (lan, &self.settings.address) {
-            (Some(IpAddr::V6(ip)), _) => format!("[{ip}]"),
-            (Some(ip), _) => ip.to_string(),
-            (None, Some(address)) => address.clone(),
-            (None, None) => return Err(HttpPlaybackRefusal::RelayOnly),
-        };
+        let host = host_for(
+            self.bound,
+            lan,
+            self.settings.address.as_deref(),
+            &crate::announce::interfaces(),
+        )?;
         let shape = match &playback.conversion {
             None => Shape::Direct,
             Some(conversion) if conversion.delivery == Delivery::Hls => Shape::Hls,
@@ -612,5 +731,141 @@ fn bridge_error(error: Error) -> BridgeError {
         Error::PlaybackExpired | Error::Unauthenticated => BridgeError::Expired,
         Error::NotFound { .. } => BridgeError::NotFound,
         other => BridgeError::Other(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::announce::Interface;
+
+    fn interface(name: &str, addrs: &[&str]) -> Interface {
+        Interface {
+            name: name.to_owned(),
+            addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+        }
+    }
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    /// A host on a dual-stack LAN, with a docker bridge and loopback.
+    fn host() -> Vec<Interface> {
+        vec![
+            interface("lo", &["127.0.0.1", "::1"]),
+            interface("eth0", &["192.168.1.10", "fe80::1", "2603:6000::10"]),
+            interface("docker0", &["172.17.0.1"]),
+        ]
+    }
+
+    #[test]
+    fn a_v4_port_names_an_ipv6_client_a_v4_address_of_its_interface() {
+        let host = host_for(Bound::AnyV4, ip("2603:6000::10"), None, &host());
+        assert_eq!(host, Ok("192.168.1.10".to_owned()));
+    }
+
+    #[test]
+    fn a_v4_port_names_an_ipv4_client_the_address_it_reached() {
+        let host = host_for(Bound::AnyV4, ip("172.17.0.1"), None, &host());
+        assert_eq!(host, Ok("172.17.0.1".to_owned()));
+    }
+
+    #[test]
+    fn with_no_v4_on_the_interface_a_private_one_of_another_is_named() {
+        let interfaces = vec![
+            interface("lo", &["127.0.0.1"]),
+            interface("docker0", &["172.17.0.1"]),
+            interface("wan0", &["203.0.113.5"]),
+            interface("eth1", &["fd00::10"]),
+            interface("eth0", &["10.0.0.2"]),
+        ];
+        let host = host_for(Bound::AnyV4, ip("fd00::10"), None, &interfaces);
+        assert_eq!(host, Ok("10.0.0.2".to_owned()));
+    }
+
+    #[test]
+    fn with_no_v4_to_name_the_url_is_refused() {
+        let interfaces = vec![
+            interface("lo", &["127.0.0.1"]),
+            interface("eth0", &["2603:6000::10", "fe80::1"]),
+            interface("wan0", &["203.0.113.5"]),
+        ];
+        let host = host_for(Bound::AnyV4, ip("2603:6000::10"), None, &interfaces);
+        assert_eq!(host, Err(HttpPlaybackRefusal::NoAddress));
+    }
+
+    #[test]
+    fn a_port_on_one_address_names_it_whatever_the_client_reached() {
+        let one = Bound::One("192.168.1.10".parse().unwrap());
+        assert_eq!(
+            host_for(one, ip("2603:6000::10"), None, &host()),
+            Ok("192.168.1.10".to_owned())
+        );
+        let one = Bound::One("2603:6000::10".parse().unwrap());
+        assert_eq!(
+            host_for(one, ip("192.168.1.10"), None, &host()),
+            Ok("[2603:6000::10]".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_dual_stack_port_names_the_address_reached() {
+        let any = Bound::AnyV6 { v6_only: false };
+        assert_eq!(
+            host_for(any, ip("2603:6000::10"), None, &host()),
+            Ok("[2603:6000::10]".to_owned())
+        );
+        assert_eq!(
+            host_for(any, ip("192.168.1.10"), None, &host()),
+            Ok("192.168.1.10".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_v6_only_port_names_an_ipv4_client_a_v6_address_of_its_interface() {
+        let only = Bound::AnyV6 { v6_only: true };
+        assert_eq!(
+            host_for(only, ip("192.168.1.10"), None, &host()),
+            Ok("[2603:6000::10]".to_owned())
+        );
+        let interfaces = vec![interface("eth0", &["192.168.1.10", "fe80::1"])];
+        assert_eq!(
+            host_for(only, ip("192.168.1.10"), None, &interfaces),
+            Err(HttpPlaybackRefusal::NoAddress)
+        );
+    }
+
+    #[test]
+    fn off_the_lan_the_address_set_is_named_or_none() {
+        assert_eq!(
+            host_for(Bound::AnyV4, None, Some("tv.example"), &host()),
+            Ok("tv.example".to_owned())
+        );
+        assert_eq!(
+            host_for(Bound::AnyV4, None, None, &host()),
+            Err(HttpPlaybackRefusal::RelayOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bound_is_read_from_the_socket() {
+        let v4 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            Bound::of(v4.local_addr().unwrap(), false),
+            Bound::One("127.0.0.1".parse().unwrap())
+        );
+        let Ok(v6) = TcpListener::bind("[::]:0").await else {
+            return; // No IPv6 here.
+        };
+        let only = v6_only(&v6).unwrap();
+        let expected = std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(only);
+        assert_eq!(only, expected);
+        assert_eq!(
+            Bound::of(v6.local_addr().unwrap(), only),
+            Bound::AnyV6 { v6_only: only }
+        );
     }
 }

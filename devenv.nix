@@ -276,7 +276,7 @@ in {
 
       # HTTP playback (PX-49), for AirPlay tests from the apps.
       http_playback {
-        listen = "0.0.0.0:7422";
+        listen = "[::]:7422";
       }
 
       # Traces to nimble's Alloy (yard), which sends them on to Tempo.

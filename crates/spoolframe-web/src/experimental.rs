@@ -66,11 +66,13 @@ impl Listen {
             Ok(0) | Err(_) => return Err("The port is a number from 1 to 65535.".into()),
             Ok(port) => port,
         };
-        let v6 = matches!(self, Listen::Any { v6: true, .. });
-        Ok(Some(if v6 {
-            format!("[::]:{port}")
-        } else {
+        // Every address of both families, unless it was IPv4's alone: a
+        // client reached over IPv6 gets a URL that names IPv6.
+        let v4 = matches!(self, Listen::Any { v6: false, .. });
+        Ok(Some(if v4 {
             format!("0.0.0.0:{port}")
+        } else {
+            format!("[::]:{port}")
         }))
     }
 }
@@ -85,8 +87,8 @@ mod tests {
         assert_eq!(off, Listen::Off);
         assert!(!off.on());
         assert_eq!(off.port_text(), "7422");
-        // Turned on with the port as shown: every IPv4 address.
-        assert_eq!(off.setting(true, "7422"), Ok(Some("0.0.0.0:7422".into())));
+        // Turned on with the port as shown: every address, IPv6 and IPv4.
+        assert_eq!(off.setting(true, "7422"), Ok(Some("[::]:7422".into())));
         assert_eq!(off.setting(false, "7422"), Ok(None));
     }
 
@@ -140,7 +142,7 @@ mod tests {
             one.setting(true, "7500"),
             Ok(Some("192.168.1.5:7500".into()))
         );
-        assert_eq!(one.setting(true, "7600"), Ok(Some("0.0.0.0:7600".into())));
+        assert_eq!(one.setting(true, "7600"), Ok(Some("[::]:7600".into())));
         let odd = Listen::of("media:7422");
         assert_eq!(odd, Listen::Other("media:7422".into()));
         assert_eq!(odd.port_text(), "7422");

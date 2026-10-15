@@ -144,40 +144,9 @@ async fn decoy(service: &str, user_data: Option<&str>) -> Endpoint {
     builder.bind().await.unwrap()
 }
 
-/// Whether this process is the one inside the namespace.
-const INSIDE: &str = "SPOOLFRAME_TEST_PRIVATE_LAN";
-
-/// Run `test` again in a new user and network namespace (`unshare -rn`)
-/// with loopback up and taking multicast, and assert that it passed there.
-/// Returns `true` in the copy inside, which then runs the test's body;
-/// `false` in the outer one, which has nothing left to do.
+/// [`support::private_netns`] for a test of this module.
 fn private_lan(test: &str) -> bool {
-    if std::env::var_os(INSIDE).is_some() {
-        return true;
-    }
-    let exe = std::env::current_exe().unwrap();
-    // libtest's name for it: this module's path in the binary, then `test`.
-    let (_, module) = module_path!().split_once("::").unwrap();
-    let test = format!("{module}::{test}");
-    let output = std::process::Command::new("unshare")
-        .args(["--user", "--map-root-user", "--net", "sh", "-ec"])
-        .arg(
-            "ip link set lo up; ip link set lo multicast on; \
-             ip route add 224.0.0.0/4 dev lo; exec \"$0\" --exact \"$1\" --nocapture",
-        )
-        .arg(&exe)
-        .arg(&test)
-        .env(INSIDE, "1")
-        .output()
-        .expect("unshare (util-linux) runs");
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "{test} in a private LAN:\n{log}");
-    assert!(log.contains("1 passed"), "{test} did not run:\n{log}");
-    false
+    support::private_netns(module_path!(), test)
 }
 
 fn on_lan(name: &str) -> ServerOptions {

@@ -159,7 +159,7 @@ pub struct ServerConfig {
     pub http_playback: HttpPlaybackConfig,
 }
 
-/// `http_playback { listen = "0.0.0.0:7422"; address = "media.home.arpa"; }`
+/// `http_playback { listen = "[::]:7422"; address = "media.home.arpa"; }`
 /// (PX-49): a playback's HLS or file over plain HTTP, for players with no
 /// Iroh (AirPlay first), under a token a signed-in client asks for. Both
 /// optional; off unless `listen` is set.
@@ -187,7 +187,7 @@ impl HttpPlaybackConfig {
                     .map_err(|e| ConfigError::Invalid {
                         key: "http_playback.listen",
                         message: format!(
-                            "{text:?}: {e}; an IP address and a port, as \"0.0.0.0:7422\""
+                            "{text:?}: {e}; an IP address and a port, as \"[::]:7422\""
                         ),
                     })?,
             ),

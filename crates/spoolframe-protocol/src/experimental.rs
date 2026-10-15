@@ -57,6 +57,11 @@ pub enum HttpPlaybackRefusal {
     /// The playback is planned as something the HTTP side does not serve:
     /// a conversion read as one growing file rather than HLS.
     Unsupported,
+    /// The port listens on no address of the family the client's network
+    /// reaches the server by: an IPv4 port and an IPv6 client on an
+    /// interface, and a host, with no IPv4 address on the LAN, or the
+    /// reverse with an IPv6-only port.
+    NoAddress,
     /// A reason this build does not know.
     #[serde(other)]
     Unknown,

@@ -2,12 +2,24 @@
 
 ## Unreleased
 
+- Fixed: AirPlay failed from a phone that reached the server over IPv6
+  with `http_playback.listen` on `0.0.0.0`. Its URL named the IPv6
+  address the phone came in on, where the port does not listen, so the
+  Apple TV could not connect. A URL now names an address the port
+  accepts on: the one it is bound to, if one; the client's own if the
+  port takes its family (`[::]` takes both unless the socket is
+  IPv6-only); else another of the same interface's of the port's
+  family, else a private one of another LAN interface. With none, the
+  app is refused with the new `no_address` reason instead of a URL
+  nothing answers at. `[::]:7422` is the example and the Settings ›
+  Experimental default now, and the Nimble dev profile listens there.
+
 - Server › Settings › Experimental: every experimental switch in one
   tab, shown whether or not the advanced settings are. HTTP playback for
   AirPlay (PX-49), until now the config file's and the CLI's only, is a
   switch, a port (7422 by default) and an optional "Address for apps
-  outside your home": on sets `http_playback.listen` to `0.0.0.0:<port>`
-  (`[::]:<port>` if it listened on IPv6), off unsets it, and a listen
+  outside your home": on sets `http_playback.listen` to `[::]:<port>`
+  (`0.0.0.0:<port>` if it listened on IPv4 alone), off unsets it, and a listen
   address of another kind is shown as it is and kept until the switch or
   the port changes. Both apply after a restart, with the usual now and
   after-restart lines and Restart now. The tab says the port is plain
