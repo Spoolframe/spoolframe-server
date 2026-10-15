@@ -235,6 +235,106 @@ in {
     '';
   };
   profiles.user.andoriyu.extends = ["coldsteel"];
+  # The dev server on nimble, against the household PMS: `devenv up nimble`
+  # builds the web bundle and a release server with it embedded, then runs
+  # it with its state in .dev-state/ (ignored by git). Not started by a
+  # plain `devenv up`, the web UI's dev loop. Once it is up,
+  # `devenv tasks run spoolframe:nimble-setup` registers the first admin.
+  #
+  # LAN only: IPv4, no relays, no pkarr record and no `wan` section, so
+  # nothing outside the home reaches it. No watch sync with Plex.
+  profiles.user.andoriyu.module = {pkgs, ...}: let
+    nimbleConfig = pkgs.writeText "nimble.ucl" ''
+      schema = "spoolframe.server.v1";
+      name = "Nimble";
+
+      plex {
+        # fulcrum's PMS; LAN clients need no token.
+        url = "http://192.168.86.176:32400";
+        # fulcrum's /slow/media, mounted read-only here.
+        path_mapping = [ { from = "/slow/media"; to = "/mnt/plex-media"; } ];
+      }
+
+      network {
+        # 7430/7431, beside a server on the defaults (7420/7421).
+        port = 7430;
+        ipv6 = false;
+        relays = [];
+        pkarr = "off";
+      }
+
+      # insecure_cookies: sign in over plain HTTP from the LAN; the session
+      # cookie loses Secure (it keeps HttpOnly). localhost is where web
+      # passkeys work: WebAuthn refuses an IP address over plain HTTP.
+      admin {
+        listen = "0.0.0.0:7431";
+        insecure_cookies = true;
+        public_url = "http://localhost:7431";
+        not_proxied = true;
+      }
+
+      # Traces to nimble's Alloy (yard), which sends them on to Tempo.
+      telemetry {
+        otlp {
+          endpoint = "http://127.0.0.1:4317";
+          protocol = "grpc";
+          traces = true;
+          metrics = false;
+          logs = false;
+        }
+      }
+    '';
+  in {
+    tasks."spoolframe:nimble-build" = {
+      description = "Build the release server with the web bundle embedded";
+      exec = ''
+        set -euo pipefail
+        ${webFontsCopy webFonts}
+        tailwindcss -i crates/spoolframe-web/input.css -o crates/spoolframe-web/assets/tailwind.css
+        rm -rf target/dx/spoolframe-web/release/web/public
+        WASM_BINDGEN="$(command -v wasm-bindgen)" \
+          dx bundle --package spoolframe-web --platform web --release --profile wasm-release
+        # rust-embed reads the bundle at compile time and cargo does not see
+        # it change: without this, a web-only change embeds the old pages.
+        touch crates/spoolframe-server/src/web.rs
+        SPOOLFRAME_WEB_DIST="$PWD/target/dx/spoolframe-web/release/web/public" \
+          cargo build --release -p spoolframe-server --features embed-web
+      '';
+    };
+
+    processes.nimble = {
+      start.enable = false;
+      after = ["spoolframe:nimble-build"];
+      exec = ''
+        set -euo pipefail
+        mkdir -p .dev-state
+        # The log is kept for spoolframe:nimble-setup, which reads the
+        # setup code from it.
+        exec > >(tee -a .dev-state/server.log) 2>&1
+        exec target/release/spoolframe-server --config ${nimbleConfig} --state-dir .dev-state
+      '';
+    };
+
+    # The first admin, `andoriyu`, with a generated password kept in
+    # .dev-state/admin-password (made once, readable by the owner only).
+    tasks."spoolframe:nimble-setup" = {
+      description = "Register the dev server's first admin";
+      exec = ''
+        set -euo pipefail
+        umask 077
+        pw=.dev-state/admin-password
+        [ -s "$pw" ] || python3 -c 'import secrets; print(secrets.token_urlsafe(18), end="")' >"$pw"
+        code="$(grep -o 'the setup code is [A-Z0-9-]*' .dev-state/server.log | tail -1 | awk '{print $NF}')"
+        if [ -z "$code" ]; then
+          echo "no setup code in .dev-state/server.log: is the server up, with no users yet?" >&2
+          exit 1
+        fi
+        target/release/spoolframe-server --config ${nimbleConfig} --state-dir .dev-state \
+          setup --code "$code" --username andoriyu --password-stdin <"$pw"
+        echo "admin andoriyu, password in $pw"
+      '';
+    };
+  };
 
   profiles.ci.extends = ["coldsteel"];
   profiles.ci.module = {pkgs, ...}: {
