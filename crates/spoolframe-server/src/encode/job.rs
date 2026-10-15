@@ -2484,8 +2484,12 @@ pub(super) mod tests {
         };
         let killed = run(0);
         killed.stop_because("seek");
+        let started = std::time::Instant::now();
         let finished = run(1);
         done(&finished).await.unwrap();
+        // The run is timed from just after ffmpeg is spawned to its exit,
+        // so within what the test waited for it.
+        let waited = started.elapsed().as_secs_f64();
         let family = histograms.family(&crate::metrics::histogram::CONVERSION_SPEED);
         let [sample] = family.samples.as_slice() else {
             panic!("{family:?}");
@@ -2495,8 +2499,17 @@ pub(super) mod tests {
             panic!("{sample:?}");
         };
         assert_eq!(h.count, 1);
-        // 3 s of media in a little over 1.5 s.
-        assert!((1.0..2.0).contains(&h.sum), "{}", h.sum);
+        // 3 s of media over the time it ran: no faster than the 1.5 s
+        // sleep allows, less 5 % for ffmpeg starting just before its timer
+        // does, and no slower than over all the time the test waited (a
+        // loaded machine stretches the sleep).
+        let fastest = 3.0 / (1.5 * 0.95);
+        let slowest = 3.0 / waited;
+        assert!(
+            (slowest..=fastest).contains(&h.sum),
+            "{} not within {slowest:.3}..={fastest:.3}",
+            h.sum
+        );
     }
 
     #[tokio::test]
