@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.1 (2026-10-15)
+
 - Home asks Plex for each Next up show's episodes in one request (the
   show's `allLeaves`), not three for the show and two per season: on
   fulcrum a Home with Next up to work out made 104 Plex requests, now

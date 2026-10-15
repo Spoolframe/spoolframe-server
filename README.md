@@ -56,7 +56,7 @@ nix build .#docker && ./result | docker load
 docker run -d --name spoolframe \
   -v spoolframe:/var/lib/spoolframe -v /srv/media:/srv/media:ro \
   -p 7420:7420/udp -p 7421:7421 \
-  ghcr.io/spoolframe/spoolframe-server:0.9.0
+  ghcr.io/spoolframe/spoolframe-server:0.9.1
 docker logs spoolframe   # the web UI's address and the setup code
 ```
 
@@ -73,10 +73,10 @@ drivers':
 
 | tag | for | size |
 |---|---|---|
-| `:0.9.0` (`.#docker`), the default | any GPU, or not sure: AMD (old and new), Intel (old and new), NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2, d3d12) | about 1.5 GiB |
-| `:0.9.0-slim` (`.#docker-slim`) | a recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | about 590 MiB |
-| `:0.9.0-nvidia` (`.#docker-nvidia`) | NVIDIA | about 450 MiB |
-| `:0.9.0-cpu` | no GPU: the `-nvidia` image under a second tag | about 450 MiB |
+| `:0.9.1` (`.#docker`), the default | any GPU, or not sure: AMD (old and new), Intel (old and new), NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2, d3d12) | about 1.5 GiB |
+| `:0.9.1-slim` (`.#docker-slim`) | a recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | about 590 MiB |
+| `:0.9.1-nvidia` (`.#docker-nvidia`) | NVIDIA | about 450 MiB |
+| `:0.9.1-cpu` | no GPU: the `-nvidia` image under a second tag | about 450 MiB |
 
 Pass an AMD or Intel GPU's render node in with `--device
 /dev/dri/renderD128` and `--group-add` its group (often `render`). With no
