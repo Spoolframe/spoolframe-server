@@ -33,8 +33,6 @@ const BY_TAB: &[(&str, &[&str])] = &[
             "catalog.memory_mb",
             "watch.started_after_secs",
             "watch.watched_percent",
-            // PGPU-04: in the tab's Experimental section.
-            "experimental.libplacebo_shared_on_amd",
             "transcode.gpus",
         ],
     ),
@@ -177,6 +175,20 @@ mod tests {
         ] {
             assert!(!is_advanced(key), "{key}");
         }
+    }
+
+    /// Settings › Experimental is shown whole, the switch on or off: AirPlay
+    /// is looked for, and the tab is where experimental switches are.
+    #[test]
+    fn the_experimental_tab_s_settings_are_not() {
+        for key in [
+            "http_playback.listen",
+            "http_playback.address",
+            "experimental.libplacebo_shared_on_amd",
+        ] {
+            assert!(!is_advanced(key), "{key}");
+        }
+        assert!(on_tab("experimental").is_empty());
     }
 
     #[test]

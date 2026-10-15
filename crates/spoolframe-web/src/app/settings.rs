@@ -6,6 +6,7 @@ use dioxus::prelude::*;
 
 use super::Route;
 use super::admin::{Said, Toast, say};
+use super::experimental::ExperimentalForm;
 use super::remote::RemoteAccessForm;
 use super::restart::PendingRestart;
 use super::sso::SsoForm;
@@ -27,6 +28,9 @@ const TABS: &[(&str, &str)] = &[
     ("security", "Security"),
     ("sso", "Sign-in providers"),
     ("telemetry", "Telemetry"),
+    // Always shown, not with the advanced settings only: AirPlay is
+    // looked for.
+    ("experimental", "Experimental"),
 ];
 
 /// "Show advanced settings" (PX-22), for the forms under the tabs: off in
@@ -186,6 +190,7 @@ pub fn Settings(tab: String) -> Element {
                             "paths" => rsx! { PathsForm { key: "{n}", mode: Mode::Settings, on_done } },
                             "playback" => rsx! { PlaybackForm { key: "{n}", mode: Mode::Settings, on_done } },
                             "access" => rsx! { AccessForm { key: "{n}", mode: Mode::Settings, on_done } },
+                            "experimental" => rsx! { ExperimentalForm { key: "{n}", on_done } },
                             _ => rsx! { p { key: "{n}", "There is no such tab." } },
                         }
                     }

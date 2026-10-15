@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Server › Settings › Experimental: every experimental switch in one
+  tab, shown whether or not the advanced settings are. HTTP playback for
+  AirPlay (PX-49), until now the config file's and the CLI's only, is a
+  switch, a port (7422 by default) and an optional "Address for apps
+  outside your home": on sets `http_playback.listen` to `0.0.0.0:<port>`
+  (`[::]:<port>` if it listened on IPv6), off unsets it, and a listen
+  address of another kind is shown as it is and kept until the switch or
+  the port changes. Both apply after a restart, with the usual now and
+  after-restart lines and Restart now. The tab says the port is plain
+  HTTP, with a token per playback in each URL, to open to the home
+  network only, and that apps use it only with their own experimental
+  HTTP playback on. libplacebo's shared Vulkan device on AMD
+  (`experimental.libplacebo_shared_on_amd`) moved here from the foot of
+  Settings › Playback; the setup wizard never showed it.
+
+- `http_playback.listen` and `http_playback.address` are sensitive
+  settings, as `network.*` is: an admin signed in over an hour ago
+  confirms it is them before changing either. The listener opens a port
+  of plain HTTP, and the address is the host in every URL apps are
+  given, each with a playback's token.
+
 - Server › Activity says what the memory is: the Process card lists the
   heap, mapped files and shared memory (RssAnon, RssFile and RssShmem),
   and within the heap each cache's memory tier, the rest as "Other

@@ -85,7 +85,7 @@ pub(super) fn locked(settings: &Settings, key: &str) -> bool {
 }
 
 /// A typed text as the setting it is: empty takes the runtime value out.
-fn typed(text: &str) -> Option<Value> {
+pub(super) fn typed(text: &str) -> Option<Value> {
     let text = text.trim();
     (!text.is_empty()).then(|| Value::String(text.to_owned()))
 }
@@ -1600,7 +1600,6 @@ fn PlaybackFields(
         "" => "auto".to_owned(),
         other => other.to_owned(),
     });
-    let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
     // PGPU-06: Settings only, as the tone map.
     let codec_rows = use_signal(|| setup::codec_rows(value(&settings, "transcode.video_codecs")));
     // PGPU-05: `transcode.gpus`, advanced; the deprecated `hardware` and
@@ -1714,10 +1713,6 @@ fn PlaybackFields(
                         number("Started after", &started())?,
                     ),
                     ("watch.watched_percent", watched),
-                    (
-                        "experimental.libplacebo_shared_on_amd",
-                        Some(json!(shared_on_amd())),
-                    ),
                 ]);
             }
             Ok(changes)
@@ -2165,29 +2160,6 @@ fn PlaybackFields(
                 }
             }
             span { class: "text-xs text-ctp-subtext0", {setup::ocr_note(ocr(), !languages.is_empty())} }
-        }
-        // PGPU-04: switches that may change or go away, with the advanced
-        // settings only.
-        if advanced {
-            div { class: "flex flex-col gap-2",
-                h2 { "Experimental" }
-                p { class: "text-xs text-ctp-subtext0", {setup::EXPERIMENTAL_NOTE} }
-                div { class: "flex items-start gap-3",
-                    button {
-                        class: "switch mt-0.5",
-                        role: "switch",
-                        aria_checked: "{shared_on_amd()}",
-                        aria_label: "libplacebo shares ffmpeg's Vulkan device on AMD",
-                        disabled: locked(&settings, "experimental.libplacebo_shared_on_amd"),
-                        onclick: move |_| shared_on_amd.toggle(),
-                    }
-                    span { class: "choice-what",
-                        b { "libplacebo shares ffmpeg's Vulkan device on AMD" }
-                        "The frames stay on the GPU from decode to tone map, rather than going through memory to a device of libplacebo's own. Tried at start; where it fails, as it does with Mesa's RADV today, libplacebo uses its own."
-                    }
-                }
-                Note { settings: settings.clone(), setting: "experimental.libplacebo_shared_on_amd", on_changed: move |_| on_reload.call(()) }
-            }
         }
         if let Some(text) = error() {
             Alert { text }

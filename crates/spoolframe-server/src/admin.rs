@@ -1336,8 +1336,12 @@ fn recent(user: &ApiSessionUser, now: i64) -> RpcResult<()> {
 /// P6-02) are where signed-in devices are told to connect. Pinning keeps
 /// another host from passing for this server, but a device still
 /// connects out to an address it is given and so shows where it is.
+/// And HTTP playback (`http_playback.*`, PX-49): `listen` opens a port of
+/// plain HTTP, and `address` is the host in every URL apps are given,
+/// each carrying a playback's token, so whoever names it is sent them.
 fn sensitive_setting(key: &str) -> bool {
     key.starts_with("admin.")
+        || key.starts_with("http_playback.")
         || key.starts_with("auth.")
         || key.starts_with("media.")
         || key.starts_with("network.")

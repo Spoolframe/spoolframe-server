@@ -503,7 +503,7 @@ experimental {
 # signed-in app asks for a URL for one of its playbacks, and the token in
 # it works until that playback ends or nothing has asked for 30 minutes.
 # Plain HTTP, with no sign-in of its own: open the port to the LAN only.
-# Applies after a restart.
+# Applies after a restart. The web UI sets it in Settings › Experimental.
 #
 # http_playback {
 #   # An IP address and a port.

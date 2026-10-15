@@ -275,6 +275,24 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             "settingSet(network.port)",
             outcome(root.setting_set("network.port".into(), json!(7421)).await),
         ),
+        (
+            "settingSet(http_playback.listen)",
+            outcome(
+                root.setting_set("http_playback.listen".into(), json!("0.0.0.0:7422"))
+                    .await,
+            ),
+        ),
+        (
+            "settingSet(http_playback.address)",
+            outcome(
+                root.setting_set("http_playback.address".into(), json!("tv.example.org"))
+                    .await,
+            ),
+        ),
+        (
+            "settingUnset(http_playback.listen)",
+            outcome(root.setting_unset("http_playback.listen".into()).await),
+        ),
         // Every device connected drops, and a server started by hand runs
         // whatever binary is now at its path. Nothing in these tests
         // starts it again: it is only asked for.
@@ -315,6 +333,8 @@ async fn an_old_admin_session_cannot_make_sensitive_changes() {
         "plex.token_file",
         "telemetry.otlp.endpoint",
         "telemetry.otlp.headers",
+        "http_playback.listen",
+        "http_playback.address",
     ] {
         let entry = settings.entries.iter().find(|e| e.key == key);
         assert!(entry.is_some_and(|e| !e.set), "{entry:?}");
@@ -403,7 +423,7 @@ async fn a_confirmed_admin_session_makes_sensitive_changes() {
     for (call, outcome) in sensitive(&root).await {
         assert_ne!(outcome, Some(error_code::RECENT_SIGN_IN_REQUIRED), "{call}");
         // Nothing else stands in their way here: each is made.
-        if call.contains("(network.") {
+        if call.contains("(network.") || call.contains("(http_playback.") {
             assert_eq!(outcome, None, "{call}");
         }
     }

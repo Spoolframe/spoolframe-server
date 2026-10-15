@@ -1018,6 +1018,38 @@ mod tests {
         assert_eq!(entry.running, None);
     }
 
+    /// HTTP playback (PX-49) is set from the web UI as from the CLI: a
+    /// listen address waits for a restart, and one that is not an IP
+    /// address and a port is refused, nothing saved.
+    #[tokio::test]
+    async fn http_playback_is_set_for_the_next_start_and_checked() {
+        let (settings, dir) = settings(None).await;
+        let entry = settings
+            .set(
+                "http_playback.listen",
+                &serde_json::json!("[::]:7422"),
+                "root",
+            )
+            .unwrap();
+        assert!(entry.restart_pending);
+        assert_eq!(entry.running, None);
+        assert_eq!(entry.value, Some(serde_json::json!("[::]:7422")));
+        let refused = settings
+            .set(
+                "http_playback.listen",
+                &serde_json::json!("media:7422"),
+                "root",
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("http_playback.listen"),
+            "{refused}"
+        );
+        let saved = std::fs::read_to_string(dir.as_ref().join("runtime.ucl")).unwrap();
+        assert!(saved.contains("[::]:7422"), "{saved}");
+        assert!(!saved.contains("media:7422"), "{saved}");
+    }
+
     /// Without a supervisor a restart is still asked for: the server
     /// starts itself again in place.
     #[tokio::test]

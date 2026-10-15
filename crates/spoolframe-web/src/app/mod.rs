@@ -8,6 +8,7 @@ mod catalog_debug;
 mod catalog_item;
 mod codecs;
 mod device;
+mod experimental;
 mod gpus;
 mod http;
 mod icons;
