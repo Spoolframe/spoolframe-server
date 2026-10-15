@@ -3278,6 +3278,23 @@
     font: 12px/1.5 var(--font-mono);
     color: var(--ctp-subtext1);
   }
+  /* Open source licenses: a component's name opens its text, which
+   * wraps as the license's own lines do. */
+  .license-name {
+    font-weight: 600;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+  }
+  .license-text {
+    margin: 0;
+    padding: 14px;
+    border-radius: 8px;
+    background: var(--ctp-crust);
+    font: 12px/1.55 var(--font-mono);
+    color: var(--ctp-subtext1);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
   .cat-path-grid {
     display: grid;
     grid-template-columns: 120px minmax(0, 1fr);

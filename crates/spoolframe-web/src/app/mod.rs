@@ -13,6 +13,7 @@ mod http;
 mod icons;
 mod invites;
 mod libraries;
+mod licenses;
 mod logs;
 mod overview;
 mod playback;
@@ -38,6 +39,7 @@ use catalog_item::CatalogItem;
 use device::DeviceApproval;
 use invites::Invites;
 use libraries::{AddLibrary, Libraries};
+use licenses::LicensesPage;
 use logs::LogsPage;
 use overview::AdminHome;
 use playback::{PlaybackDetail, PlaybackPage};
@@ -123,6 +125,10 @@ enum Route {
             CatalogItem { library: String, id: String, tab: String },
             #[route("/settings")]
             SettingsHome {},
+            // What the server and this web app are built from, and their
+            // licenses; opened from Server. `open`: a component's text.
+            #[route("/licenses?:open")]
+            LicensesPage { open: String },
             #[route("/settings/:tab")]
             Settings { tab: String },
         #[end_nest]
@@ -1404,6 +1410,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
+        Route::LicensesPage { .. } => "Licenses",
         Route::Settings { ref tab } if tab == "plex" => "Plex",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
         _ => "Users",

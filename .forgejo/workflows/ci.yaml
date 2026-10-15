@@ -56,8 +56,9 @@ jobs:
         run: devenv --no-tui tasks run --profile ci ci:style
 
       # ci:static runs spoolframe:licenses first (scripts/check-licenses.sh:
-      # cargo deny over the server, the SDK and the fuzz workspace), then
-      # clippy for the host and for wasm32.
+      # cargo deny over the server, the SDK and the fuzz workspace) and
+      # spoolframe:licenses-list (the admin pages' open source license list
+      # is current with Cargo.lock), then clippy for the host and for wasm32.
       - name: ci:static
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:static

@@ -162,6 +162,16 @@
   histogram is declared once (`metrics::histogram::ALL`), and the export
   makes its instrument from that.
 
+- Server › Open source licenses, linked from the This server card: every
+  crate the server binary and the web app are built from, with its
+  license and the license's text, and what the web app brings to the
+  browser besides crates (the Catppuccin palette, the Lucide icons, the
+  Outfit, Figtree, JetBrains Mono and Bricolage Grotesque fonts and
+  Tailwind CSS). Search, license chips, and a picker for a crate offered
+  under several licenses. The list is a committed file the page fetches
+  when it opens; `scripts/gen-licenses.py` writes it from Cargo.lock and
+  the web app's assets, and CI fails when it is out of date.
+
 ## 0.9.0 (2026-10-14)
 
 - An item's cast, a movie's release date and a show's last airing, for

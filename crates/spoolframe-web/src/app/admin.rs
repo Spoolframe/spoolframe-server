@@ -1733,6 +1733,11 @@ fn ThisServer() -> Element {
                     Some(Ok(s)) => rsx! {
                         Pair { label: "Name", b { "{s.name}" } }
                         Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
+                        // What it and this web app are built from, and
+                        // their licenses.
+                        Pair { label: "Licenses",
+                            Link { to: Route::LicensesPage { open: String::new() }, "Open source licenses" }
+                        }
                         Pair { label: "Fingerprint", class: "pair-stack",
                             match s.fingerprint {
                                 Some(fingerprint) => rsx! {

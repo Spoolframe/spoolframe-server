@@ -21,6 +21,8 @@ mod invites;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod libraries;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod licenses;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod logic;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod logs;

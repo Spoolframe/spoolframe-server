@@ -44,6 +44,9 @@ in {
       # The OCR tests draw text with ffmpeg's drawtext, which needs a font
       # file; fontconfig finds none in the shell.
       SPOOLFRAME_TEST_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
+      # scripts/gen-licenses.py reads the web fonts' name tables here: their
+      # licenses and copyrights, as the bundle carries them.
+      SPOOLFRAME_WEB_FONTS = "${webFonts}/share/fonts/truetype";
     }
     // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (let
       triple = pkgs.stdenv.hostPlatform.rust.cargoEnvVarTarget;
@@ -99,6 +102,8 @@ in {
     tailwindcss_4
     # wasm-opt, which dx runs on the release bundle.
     binaryen
+    # scripts/gen-licenses.py, the open source license list.
+    python3
   ];
 
   # spoolframe-web/assets/tailwind.css is generated and committed (dx
@@ -110,7 +115,14 @@ in {
       description = "Check server and public SDK license boundaries";
       exec = "bash scripts/check-licenses.sh";
     };
-    "ci:static".after = ["spoolframe:licenses"];
+    # The admin pages' Open source licenses read a committed list
+    # (crates/spoolframe-web/assets/licenses.json); it fails here when
+    # Cargo.lock or the web app's assets moved without it.
+    "spoolframe:licenses-list" = {
+      description = "Check the open source license list is current";
+      exec = "python3 scripts/gen-licenses.py --check";
+    };
+    "ci:static".after = ["spoolframe:licenses" "spoolframe:licenses-list"];
     "spoolframe:tailwind-fresh" = {
       description = "The committed Tailwind stylesheet matches a fresh build";
       exec = ''

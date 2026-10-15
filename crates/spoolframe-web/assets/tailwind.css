@@ -339,6 +339,9 @@
   .max-w-\[680px\] {
     max-width: 680px;
   }
+  .max-w-\[720px\] {
+    max-width: 720px;
+  }
   .max-w-\[760px\] {
     max-width: 760px;
   }
@@ -652,6 +655,9 @@
   }
   .whitespace-nowrap {
     white-space: nowrap;
+  }
+  .whitespace-pre-line {
+    white-space: pre-line;
   }
   .text-\[\#e5a00d\] {
     color: #e5a00d;
@@ -3918,6 +3924,21 @@
     background: var(--ctp-crust);
     font: 12px/1.5 var(--font-mono);
     color: var(--ctp-subtext1);
+  }
+  .license-name {
+    font-weight: 600;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+  }
+  .license-text {
+    margin: 0;
+    padding: 14px;
+    border-radius: 8px;
+    background: var(--ctp-crust);
+    font: 12px/1.55 var(--font-mono);
+    color: var(--ctp-subtext1);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .cat-path-grid {
     display: grid;
