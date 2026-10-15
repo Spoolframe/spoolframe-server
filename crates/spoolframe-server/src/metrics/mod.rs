@@ -8,6 +8,7 @@
 //! asked for, so nothing is counted twice and nothing is kept that the
 //! parts do not already know.
 
+pub mod histogram;
 pub mod history;
 pub mod process;
 mod prometheus;
@@ -15,15 +16,17 @@ mod prometheus;
 use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
+pub use histogram::Histograms;
 pub use prometheus::{CONTENT_TYPE, render};
 
 use crate::admin::AddressRanges;
 use crate::artwork::ArtworkCache;
 use crate::catalog::LiveCatalog;
 use crate::encode::job::{Jobs, Load};
+use crate::link_stats::{PathKind, Punch};
 use crate::network::{Connections, Services};
 use crate::playback::{Plan, Playbacks};
 use crate::plex_sync::WatchSync;
@@ -247,6 +250,7 @@ struct Sources {
     subtitles: Option<Arc<Subtitles>>,
     plex_sync: Option<Arc<WatchSync>>,
     catalog: Option<Arc<LiveCatalog>>,
+    auth: Option<crate::auth::Auth>,
 }
 
 /// One user's live sessions, by binding.
@@ -283,7 +287,54 @@ pub struct Metrics {
     /// by signal: traces, metrics, logs (P3-14).
     telemetry_dropped: [Counter; 3],
     telemetry_failed: [Counter; 3],
+    /// Histogram values for the OTLP export, as they are observed.
+    histograms: Arc<Histograms>,
+    /// Whether the NAT maps ports per destination, as iroh's last net
+    /// report said: [`NAT_UNKNOWN`] until one says.
+    nat_mapping: AtomicU8,
+    /// Client requests answered, by type and outcome.
+    client_requests: parking_lot::Mutex<std::collections::BTreeMap<(String, String), u64>>,
+    /// Whether the endpoint has a home relay: [`RELAY_NONE`] while it has
+    /// no relays to have one of.
+    home_relay: AtomicU8,
+    /// Bytes client connections carried, by [`LINK_PATHS`], sent and
+    /// received.
+    link_bytes: [[Counter; 2]; 4],
+    /// Connections that started on a relay, and those of them that went
+    /// direct.
+    hole_punches: [Counter; 2],
+    /// Each library's items by kind, as Plex last counted them.
+    library_items: RwLock<Vec<LibraryItems>>,
 }
+
+/// How often the libraries' items are counted: each count asks Plex.
+pub const LIBRARY_ITEMS_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A library's items of one kind, as Plex counted them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibraryItems {
+    /// Its id: the Plex server's id in the config and the section's key,
+    /// never its title, which its owner chose.
+    library: String,
+    kind: spoolframe_types::MediaKind,
+    count: u64,
+}
+
+const RELAY_NONE: u8 = 0;
+const RELAY_LOST: u8 = 1;
+const RELAY_HOME: u8 = 2;
+
+/// The paths a connection's bytes are counted by.
+const LINK_PATHS: [PathKind; 4] = [
+    PathKind::Lan,
+    PathKind::Direct,
+    PathKind::Relay,
+    PathKind::Unknown,
+];
+
+const NAT_UNKNOWN: u8 = 0;
+const NAT_SAME: u8 = 1;
+const NAT_VARIES: u8 = 2;
 
 impl std::fmt::Debug for Metrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -310,6 +361,13 @@ impl Default for Metrics {
             playback_failed: Counter::default(),
             telemetry_dropped: Default::default(),
             telemetry_failed: Default::default(),
+            histograms: Arc::default(),
+            nat_mapping: AtomicU8::new(NAT_UNKNOWN),
+            client_requests: parking_lot::Mutex::default(),
+            home_relay: AtomicU8::new(RELAY_NONE),
+            link_bytes: Default::default(),
+            hole_punches: Default::default(),
+            library_items: RwLock::default(),
         }
     }
 }
@@ -335,7 +393,10 @@ impl Metrics {
 
     /// Read the client protocol's parts, and its open connections.
     pub fn observe_services(&self, services: &Services, connections: &Connections) {
+        services.playbacks.record_into(self.histograms.clone());
+        services.jobs.record_into(self.histograms.clone());
         let mut sources = self.sources();
+        sources.auth = Some(services.auth.clone());
         sources.connections = Some(connections.clone());
         sources.playbacks = Some(services.playbacks.clone());
         sources.jobs = Some(services.jobs.clone());
@@ -343,14 +404,34 @@ impl Metrics {
         sources.previews = Some(services.previews.clone());
         sources.subtitles = Some(services.subtitles.clone());
         if let Some(sync) = &services.plex_sync {
+            sync.record_into(self.histograms.clone());
             sources.plex_sync = Some(sync.clone());
         }
     }
 
     /// Read each Plex server's requests from the catalog, as its settings
-    /// make it now.
+    /// make it now, and have each one's time recorded as it ends.
     pub fn observe_catalog(&self, catalog: Arc<LiveCatalog>) {
+        let histograms = self.histograms.clone();
+        catalog.on_replace(move |composite| {
+            for server in composite.servers() {
+                let histograms = histograms.clone();
+                let labels = [opentelemetry::KeyValue::new("server", server.id.clone())];
+                server.catalog.observe_requests(Arc::new(move |took| {
+                    histograms.record(
+                        &histogram::PLEX_REQUEST_DURATION,
+                        took.as_secs_f64(),
+                        &labels,
+                    );
+                }));
+            }
+        });
         self.sources().catalog = Some(catalog);
+    }
+
+    /// Where histogram values go as they are observed: the OTLP export.
+    pub fn histograms(&self) -> &Histograms {
+        &self.histograms
     }
 
     /// Count live sessions from `store`, at each [`Metrics::refresh`].
@@ -418,9 +499,68 @@ impl Metrics {
             .collect()
     }
 
-    /// [`Metrics::sample`] every [`history::SAMPLE_EVERY`], for as long as
-    /// the metrics are held anywhere else.
+    /// Count each library's items, of each kind it has, from its Plex
+    /// server. A library whose count fails keeps its last one; one no
+    /// longer served goes.
+    pub async fn count_library_items(&self) {
+        use spoolframe_catalog::{Catalog as _, Inspect as _};
+        let composite = self
+            .sources
+            .read()
+            .catalog
+            .as_ref()
+            .and_then(|c| c.composite());
+        let Some(composite) = composite else {
+            return;
+        };
+        let libraries = match composite.libraries().await {
+            Ok(libraries) => libraries,
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot list the libraries to count their items");
+                return;
+            }
+        };
+        let last = self.library_items.read().clone();
+        let mut now = Vec::new();
+        for library in libraries {
+            let id = library.id.to_string();
+            for &kind in crate::admin::library_kinds(library.kind) {
+                match composite.count(&library.id, kind).await {
+                    Ok(count) => now.push(LibraryItems {
+                        library: id.clone(),
+                        kind,
+                        count: u64::from(count),
+                    }),
+                    Err(e) => {
+                        tracing::debug!(library = %id, error = %e, "cannot count a library's items");
+                        now.extend(
+                            last.iter()
+                                .filter(|l| l.library == id && l.kind == kind)
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+        }
+        *self.library_items.write() = now;
+    }
+
+    /// [`Metrics::sample`] every [`history::SAMPLE_EVERY`], and
+    /// [`Metrics::count_library_items`] every [`LIBRARY_ITEMS_EVERY`], for
+    /// as long as the metrics are held anywhere else. Apart: a Plex that
+    /// is slow to count holds up no sample.
     pub fn spawn_sampler(self: &Arc<Self>) {
+        let counting = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(LIBRARY_ITEMS_EVERY);
+            loop {
+                tick.tick().await;
+                let Some(metrics) = counting.upgrade() else {
+                    return;
+                };
+                metrics.count_library_items().await;
+            }
+        });
         let metrics = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(history::SAMPLE_EVERY);
@@ -432,6 +572,180 @@ impl Metrics {
                 metrics.sample().await;
             }
         });
+    }
+
+    /// What iroh's net report says of the NAT: whether the public address
+    /// it maps this server to varies by destination; `None` when it cannot
+    /// tell. Logged once each time it changes, where iroh warns at every
+    /// report.
+    pub fn nat_mapping_varies(&self, varies: Option<bool>) {
+        let Some(varies) = varies else {
+            return;
+        };
+        let now = if varies { NAT_VARIES } else { NAT_SAME };
+        if self.nat_mapping.swap(now, Ordering::Relaxed) == now {
+            return;
+        }
+        if varies {
+            tracing::info!(
+                "the NAT maps this server to a different public port for each destination: \
+                 hole punching is harder, so more devices may go through a relay"
+            );
+        } else {
+            tracing::info!("the NAT maps this server to one public port for every destination");
+        }
+    }
+
+    /// A client request of type `request` answered with `outcome` (`ok`,
+    /// or the error's type on the wire, as its span says) in `took`. The
+    /// type is one this build knows, or `unknown`: the client chooses it.
+    pub fn client_request(&self, request: &str, outcome: &str, took: std::time::Duration) {
+        *self
+            .client_requests
+            .lock()
+            .entry((request.to_owned(), outcome.to_owned()))
+            .or_default() += 1;
+        self.histograms.observe(
+            &histogram::CLIENT_REQUEST_DURATION,
+            took.as_secs_f64(),
+            &[("request", request)],
+        );
+    }
+
+    fn requests(&self, families: &mut Vec<Family>) {
+        families.push(Family {
+            name: "spoolframe_client_requests_total",
+            help: "Client requests answered, by type (`unknown` for one this build does not \
+                   know) and outcome: `ok`, or the error's type on the wire.",
+            kind: Kind::Counter,
+            samples: self
+                .client_requests
+                .lock()
+                .iter()
+                .map(|((request, outcome), n)| {
+                    Sample::labelled(&[("request", request), ("outcome", outcome)], *n as f64)
+                })
+                .collect(),
+        });
+    }
+
+    fn refusals(&self, families: &mut Vec<Family>) {
+        let sources = self.sources.read();
+        let counts = sources
+            .auth
+            .as_ref()
+            .map(crate::auth::Auth::refusal_counts)
+            .unwrap_or_default();
+        families.push(Family {
+            name: "spoolframe_requests_refused_total",
+            help: "Requests refused, as the spoolframe::refused log lines say, those left out \
+                   of the log too: by kind (sign_in_failed, unauthenticated, no_session, \
+                   forbidden, rate_limited, recent_sign_in_required, profile_locked, \
+                   hello_refused) and channel (quic, the apps'; admin_api, the web UI's and \
+                   CLI's socket; web, the admin listener's HTTP routes).",
+            kind: Kind::Counter,
+            samples: counts
+                .into_iter()
+                .map(|(kind, channel, n)| {
+                    Sample::labelled(
+                        &[("kind", kind.as_str()), ("channel", channel.as_str())],
+                        n as f64,
+                    )
+                })
+                .collect(),
+        });
+    }
+
+    /// The histograms kept as they are observed ([`histogram::KEPT`]).
+    fn observed(&self, families: &mut Vec<Family>) {
+        for spec in histogram::KEPT {
+            families.push(self.histograms.family(spec));
+        }
+    }
+
+    /// Whether the endpoint is connected to a home relay now.
+    pub fn home_relay(&self, connected: bool) {
+        let now = if connected { RELAY_HOME } else { RELAY_LOST };
+        self.home_relay.store(now, Ordering::Relaxed);
+    }
+
+    /// A client connection carried `sent` and `received` bytes more, on a
+    /// path of kind `path`.
+    pub fn link_bytes(&self, path: PathKind, sent: u64, received: u64) {
+        let at = LINK_PATHS
+            .iter()
+            .position(|&p| p == path)
+            .expect("in LINK_PATHS");
+        self.link_bytes[at][0].add(sent);
+        self.link_bytes[at][1].add(received);
+    }
+
+    /// A client connection's round-trip time on the path it goes by, of
+    /// kind `path`.
+    pub fn link_rtt(&self, path: PathKind, rtt: std::time::Duration) {
+        self.histograms.observe(
+            &histogram::CONNECTION_RTT,
+            rtt.as_secs_f64(),
+            &[("path", path.as_str())],
+        );
+    }
+
+    /// A connection started on a relay, or went direct from one.
+    pub fn hole_punch(&self, punch: Punch) {
+        match punch {
+            Punch::Attempt => self.hole_punches[0].inc(),
+            Punch::Success => self.hole_punches[1].inc(),
+        }
+    }
+
+    fn network(&self, families: &mut Vec<Family>) {
+        families.push(Family {
+            name: "spoolframe_home_relay_connected",
+            help: "1 while the server is connected to a home relay from network.relays, 0 \
+                   while it is not: devices that cannot dial in cannot connect. No sample on a \
+                   server with no relays.",
+            kind: Kind::Gauge,
+            samples: match self.home_relay.load(Ordering::Relaxed) {
+                RELAY_NONE => Vec::new(),
+                now => vec![Sample::labelled(
+                    &[],
+                    f64::from(u8::from(now == RELAY_HOME)),
+                )],
+            },
+        });
+        families.push(Family {
+            name: "spoolframe_connection_bytes_total",
+            help: "UDP bytes client connections carried, by the kind of path they went by \
+                   (lan, direct, relay; unknown before one is selected) and direction (sent, \
+                   received). Read from each connection every 10 s and as it closes, so bytes \
+                   go to the path it was on at each reading.",
+            kind: Kind::Counter,
+            samples: LINK_PATHS
+                .iter()
+                .zip(&self.link_bytes)
+                .flat_map(|(path, [sent, received])| {
+                    [("sent", sent), ("received", received)].map(|(direction, n)| {
+                        Sample::labelled(
+                            &[("path", path.as_str()), ("direction", direction)],
+                            n.get() as f64,
+                        )
+                    })
+                })
+                .collect(),
+        });
+        families.push(Family::single(
+            "spoolframe_hole_punch_attempts_total",
+            "Client connections whose first path was a relay: each one iroh tries to take \
+             direct by punching a hole through NAT.",
+            Kind::Counter,
+            self.hole_punches[0].get() as f64,
+        ));
+        families.push(Family::single(
+            "spoolframe_hole_punch_successes_total",
+            "Client connections that went from a relay to a direct (or LAN) path.",
+            Kind::Counter,
+            self.hole_punches[1].get() as f64,
+        ));
     }
 
     /// A span or log record the OTLP queue had no room for.
@@ -476,6 +790,9 @@ impl Metrics {
     pub fn families(&self) -> Vec<Family> {
         let mut families = Vec::new();
         self.connections(&mut families);
+        self.network(&mut families);
+        self.requests(&mut families);
+        self.refusals(&mut families);
         self.playbacks(&mut families);
         self.conversions(&mut families);
         self.reads(&mut families);
@@ -483,6 +800,7 @@ impl Metrics {
         self.background(&mut families);
         self.telemetry(&mut families);
         self.process(&mut families);
+        self.observed(&mut families);
         families
     }
 
@@ -517,23 +835,30 @@ impl Metrics {
                 Sample::labelled(&[("path", "relay")], relayed as f64),
             ],
         });
-        let mut samples = Vec::new();
-        for s in self.sessions() {
-            let user = format!("local:{}", s.user);
-            samples.push(Sample::labelled(
-                &[("user", &user), ("kind", "app")],
-                s.app as f64,
-            ));
-            samples.push(Sample::labelled(
-                &[("user", &user), ("kind", "web")],
-                s.web as f64,
-            ));
-        }
+        families.push(Family::single(
+            "spoolframe_nat_mapping_varies",
+            "1 when the NAT maps this server to a different public port for each destination \
+             (iroh's net report), which makes hole punching harder; 0 when it does not, or is \
+             not known yet.",
+            Kind::Gauge,
+            f64::from(u8::from(
+                self.nat_mapping.load(Ordering::Relaxed) == NAT_VARIES,
+            )),
+        ));
+        // Every user's together: a label per user would add series with
+        // every user. The activity page has them by user.
+        let (app, web) = self
+            .sessions()
+            .iter()
+            .fold((0, 0), |(app, web), s| (app + s.app, web + s.web));
         families.push(Family {
             name: "spoolframe_sessions",
-            help: "Live sessions by user: app (a device's) and web (the admin API's).",
+            help: "Live sessions: app (devices') and web (the admin API's).",
             kind: Kind::Gauge,
-            samples,
+            samples: vec![
+                Sample::labelled(&[("kind", "app")], app as f64),
+                Sample::labelled(&[("kind", "web")], web as f64),
+            ],
         });
     }
 
@@ -635,6 +960,18 @@ impl Metrics {
             Kind::Counter,
             counts.stalled as f64,
         ));
+        families.push(Family {
+            name: "spoolframe_conversion_restarts_total",
+            help: "ffmpeg runs started to replace a playback's running one, by why: seek, \
+                   switch (to another rung), restart (at a segment far from where the run \
+                   was) or change (of subtitle or quality).",
+            kind: Kind::Counter,
+            samples: crate::encode::job::RESTART_REASONS
+                .iter()
+                .zip(counts.restarts)
+                .map(|(reason, n)| Sample::labelled(&[("reason", reason)], n as f64))
+                .collect(),
+        });
         families.push(Family::single(
             "spoolframe_conversion_output_seconds_total",
             "Seconds of media encoded; its rate is seconds of output per second.",
@@ -717,10 +1054,28 @@ impl Metrics {
             samples: errors,
         });
         families.push(Family {
-            name: "spoolframe_plex_request_duration_seconds",
-            help: "How long requests to each Plex server took.",
+            name: histogram::PLEX_REQUEST_DURATION.name,
+            help: histogram::PLEX_REQUEST_DURATION.help,
             kind: Kind::Histogram,
             samples: latency,
+        });
+        families.push(Family {
+            name: "spoolframe_library_items",
+            help: "Each library's items by kind (movie; show, season, episode; artist, album, \
+                   track), as its Plex server counted them, every 5 minutes. `library` is its \
+                   id: the Plex server's id and the section's key, never its name.",
+            kind: Kind::Gauge,
+            samples: self
+                .library_items
+                .read()
+                .iter()
+                .map(|l| {
+                    Sample::labelled(
+                        &[("library", &l.library), ("kind", media_kind(l.kind))],
+                        l.count as f64,
+                    )
+                })
+                .collect(),
         });
         let (ok, failed) = sources
             .plex_sync
@@ -810,6 +1165,20 @@ impl Metrics {
     }
 }
 
+/// A kind of item as the metrics name it.
+fn media_kind(kind: spoolframe_types::MediaKind) -> &'static str {
+    use spoolframe_types::MediaKind;
+    match kind {
+        MediaKind::Movie => "movie",
+        MediaKind::Show => "show",
+        MediaKind::Season => "season",
+        MediaKind::Episode => "episode",
+        MediaKind::Artist => "artist",
+        MediaKind::Album => "album",
+        MediaKind::Track => "track",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,5 +1235,225 @@ mod tests {
         ] {
             assert!(names.contains(&name), "{names:?}");
         }
+    }
+
+    #[test]
+    fn the_nat_gauge_flips_and_each_change_is_logged_once() {
+        use crate::logs::{LogRing, RingLayer};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let metrics = Metrics::default();
+        let gauge = || {
+            metrics
+                .families()
+                .into_iter()
+                .find(|f| f.name == "spoolframe_nat_mapping_varies")
+                .and_then(|f| f.value(&[]))
+        };
+        let ring = Arc::new(LogRing::new(10));
+        let subscriber = tracing_subscriber::registry().with(RingLayer(ring.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(gauge(), Some(0.0));
+            // A report every 20 s, the same each time.
+            for _ in 0..3 {
+                metrics.nat_mapping_varies(Some(true));
+            }
+            assert_eq!(gauge(), Some(1.0));
+            // A report that cannot tell changes nothing.
+            metrics.nat_mapping_varies(None);
+            assert_eq!(gauge(), Some(1.0));
+            metrics.nat_mapping_varies(Some(false));
+            metrics.nat_mapping_varies(Some(false));
+            assert_eq!(gauge(), Some(0.0));
+        });
+        let lines = ring.page(&spoolframe_admin_api::LogQuery::default()).lines;
+        let seen: Vec<_> = lines.iter().map(|l| (l.level, l.text.as_str())).collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    spoolframe_admin_api::LogLevel::Info,
+                    "the NAT maps this server to a different public port for each \
+                     destination: hole punching is harder, so more devices may go through \
+                     a relay"
+                ),
+                (
+                    spoolframe_admin_api::LogLevel::Info,
+                    "the NAT maps this server to one public port for every destination"
+                ),
+            ]
+        );
+    }
+
+    /// Sessions are counted by kind, every user's together: a `user`
+    /// label would add series with every user.
+    #[test]
+    fn sessions_are_by_kind_without_the_user() {
+        let metrics = Metrics::default();
+        *metrics.sessions.write() = vec![
+            UserSessions {
+                user: LocalUserId::generate(),
+                app: 2,
+                web: 1,
+            },
+            UserSessions {
+                user: LocalUserId::generate(),
+                app: 1,
+                web: 0,
+            },
+        ];
+        let sessions = metrics
+            .families()
+            .into_iter()
+            .find(|f| f.name == "spoolframe_sessions")
+            .unwrap();
+        let samples: Vec<_> = sessions
+            .samples
+            .iter()
+            .map(|s| (s.labels.clone(), s.value.clone()))
+            .collect();
+        assert_eq!(
+            samples,
+            [
+                (vec![("kind", "app".to_owned())], Value::Number(3.0)),
+                (vec![("kind", "web".to_owned())], Value::Number(1.0)),
+            ]
+        );
+    }
+
+    /// Each library's items are counted by kind from its Plex server, and
+    /// labelled by its id, not its name.
+    #[tokio::test]
+    async fn each_library_s_items_are_counted_by_kind() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let pms = MockServer::start().await;
+        let container = |body: serde_json::Value| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "MediaContainer": body }))
+        };
+        Mock::given(method("GET"))
+            .and(path("/library/sections"))
+            .respond_with(container(serde_json::json!({ "Directory": [
+                { "key": "2", "type": "movie", "title": "Dad's films" },
+                { "key": "1", "type": "show", "title": "TV Shows" },
+            ] })))
+            .mount(&pms)
+            .await;
+        for (section, kind, total) in [("2", "1", 7), ("1", "2", 3), ("1", "3", 9), ("1", "4", 120)]
+        {
+            Mock::given(method("GET"))
+                .and(path(format!("/library/sections/{section}/all")))
+                .and(query_param("type", kind))
+                .respond_with(container(
+                    serde_json::json!({ "totalSize": total, "Metadata": [] }),
+                ))
+                .mount(&pms)
+                .await;
+        }
+        let plex = spoolframe_plex::PlexCatalog::new(pms.uri().parse().unwrap(), None).unwrap();
+        let metrics = Metrics::default();
+        metrics.observe_catalog(Arc::new(LiveCatalog::new(Some(Arc::new(
+            crate::catalog::Composite::single("Tower", plex),
+        )))));
+        let items = || {
+            metrics
+                .families()
+                .into_iter()
+                .find(|f| f.name == "spoolframe_library_items")
+                .unwrap()
+        };
+        assert!(items().samples.is_empty());
+        metrics.count_library_items().await;
+        let items = items();
+        assert_eq!(items.kind, Kind::Gauge);
+        let mut seen: Vec<_> = items
+            .samples
+            .iter()
+            .map(|s| (s.labels.clone(), s.value.clone()))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        let label = |library: &str, kind: &str| {
+            vec![("library", library.to_owned()), ("kind", kind.to_owned())]
+        };
+        assert_eq!(
+            seen,
+            [
+                (label("plex:1", "episode"), Value::Number(120.0)),
+                (label("plex:1", "season"), Value::Number(9.0)),
+                (label("plex:1", "show"), Value::Number(3.0)),
+                (label("plex:2", "movie"), Value::Number(7.0)),
+            ]
+        );
+    }
+
+    /// Every histogram is declared, so the OTLP export has an instrument
+    /// for it: one that is not would never be exported.
+    #[test]
+    fn every_histogram_is_declared_for_the_export() {
+        for family in Metrics::default().families() {
+            if family.kind == Kind::Histogram {
+                let spec = histogram::ALL.iter().find(|s| s.name == family.name);
+                assert!(spec.is_some_and(|s| s.help == family.help), "{family:?}");
+            }
+        }
+    }
+
+    /// The Plex request histogram in `/metrics` is as it was before the
+    /// OTLP export recorded it on its own: names, labels and buckets.
+    #[tokio::test]
+    async fn the_plex_histogram_s_prometheus_text_is_unchanged() {
+        let metrics = Metrics::default();
+        let plex =
+            spoolframe_plex::PlexCatalog::new("http://127.0.0.1:9".parse().unwrap(), None).unwrap();
+        let live = Arc::new(LiveCatalog::new(Some(Arc::new(
+            crate::catalog::Composite::single("Tower", plex),
+        ))));
+        metrics.observe_catalog(live.clone());
+        let _ = live.plex().unwrap().server_name().await;
+        let families: Vec<_> = metrics
+            .families()
+            .into_iter()
+            .filter(|f| f.name == "spoolframe_plex_request_duration_seconds")
+            .collect();
+        let text = render(&families);
+        let le = |text: &str| {
+            text.lines()
+                .filter_map(|l| l.split("le=\"").nth(1)?.split('"').next())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            le(&text),
+            [
+                "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10",
+                "+Inf"
+            ],
+            "{text}"
+        );
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines[..2],
+            [
+                "# HELP spoolframe_plex_request_duration_seconds How long requests to each Plex \
+                 server took.",
+                "# TYPE spoolframe_plex_request_duration_seconds histogram",
+            ]
+        );
+        assert!(
+            lines.contains(
+                &"spoolframe_plex_request_duration_seconds_bucket{server=\"plex\",le=\"+Inf\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            lines.contains(&"spoolframe_plex_request_duration_seconds_count{server=\"plex\"} 1"),
+            "{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l
+                    .starts_with("spoolframe_plex_request_duration_seconds_sum{server=\"plex\"} ")),
+            "{text}"
+        );
     }
 }

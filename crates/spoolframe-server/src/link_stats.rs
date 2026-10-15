@@ -56,6 +56,16 @@ pub enum PathKind {
 }
 
 impl PathKind {
+    /// What a span's `connection.path` says.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Unknown => "unknown",
+        }
+    }
+
     /// The kind of a path named as [`PathNow::name`] names it.
     pub fn of(name: &str) -> Self {
         match name.split(' ').next() {
@@ -223,9 +233,80 @@ impl PathLog {
     }
 }
 
+/// Whether a connection punched a hole through NAT, as far as the server
+/// can tell from the paths its packets go by: one that starts on a relay
+/// is one iroh tries to take direct, and it did once a direct (or LAN)
+/// path is selected. One that is direct from the start needed no hole.
+/// iroh counts its own attempts only on the side that dials, and only
+/// with its `metrics` feature, so the server counts these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HolePunch {
+    /// No path selected yet.
+    #[default]
+    Unknown,
+    /// Direct from the start.
+    NotNeeded,
+    /// On a relay, not direct yet.
+    Trying,
+    /// On a relay first, direct since.
+    Punched,
+}
+
+/// What a path change says of a connection's hole punching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Punch {
+    /// Its first path is a relay: iroh tries to go direct.
+    Attempt,
+    /// It went direct from a relay.
+    Success,
+}
+
+impl HolePunch {
+    /// The path packets go by is `kind` now: an attempt or a success, the
+    /// first time either happens.
+    pub fn path(&mut self, kind: PathKind) -> Option<Punch> {
+        let direct = matches!(kind, PathKind::Lan | PathKind::Direct);
+        match (*self, kind) {
+            (Self::Unknown, PathKind::Relay) => {
+                *self = Self::Trying;
+                Some(Punch::Attempt)
+            }
+            (Self::Unknown, _) if direct => {
+                *self = Self::NotNeeded;
+                None
+            }
+            (Self::Trying, _) if direct => {
+                *self = Self::Punched;
+                Some(Punch::Success)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_on_a_relay_first_is_an_attempt_and_going_direct_its_success() {
+        let mut punch = HolePunch::default();
+        assert_eq!(punch.path(PathKind::Unknown), None);
+        assert_eq!(punch.path(PathKind::Relay), Some(Punch::Attempt));
+        assert_eq!(punch.path(PathKind::Relay), None);
+        assert_eq!(punch.path(PathKind::Direct), Some(Punch::Success));
+        // Back on the relay and direct again: one success per connection.
+        assert_eq!(punch.path(PathKind::Relay), None);
+        assert_eq!(punch.path(PathKind::Lan), None);
+    }
+
+    #[test]
+    fn a_connection_direct_from_the_start_punched_nothing() {
+        let mut punch = HolePunch::default();
+        assert_eq!(punch.path(PathKind::Lan), None);
+        assert_eq!(punch.path(PathKind::Relay), None);
+        assert_eq!(punch.path(PathKind::Direct), None);
+    }
 
     fn counters(sent: u64, datagrams: u64, lost: u64, congestion: u64, switches: u64) -> Counters {
         Counters {

@@ -268,6 +268,12 @@ impl PlexCatalog {
         self.stats.counts()
     }
 
+    /// Tell `observer` how long each request to this PMS takes, from this
+    /// catalog and every view made of it. Only the first one is kept.
+    pub fn observe_requests(&self, observer: stats::Observer) {
+        self.stats.observe(observer);
+    }
+
     /// What the PMS calls itself; asking is also how to tell it is up.
     pub async fn server_name(&self) -> Result<Option<String>, CatalogError> {
         Ok(self.identity().await?.0)
@@ -750,6 +756,30 @@ impl Catalog for PlexCatalog {
             }
         }
         Ok(got)
+    }
+
+    /// From the show's `allLeaves`: one request, where its seasons are two
+    /// each and the show three.
+    async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
+        let key = plex_key(show.namespace(), show.key(), show)?;
+        let call = Call::get(format!("/library/metadata/{key}/allLeaves")).about(show);
+        let container = self.fetch(&call).await?;
+        if !self.serves(container.library_section_id.as_ref()) {
+            return Err(CatalogError::NotServed(show.to_string()));
+        }
+        // A key Plex gave to an item of another kind since lists no
+        // episodes of this show.
+        let episodes = container
+            .metadata
+            .iter()
+            .filter(|m| convert::media_kind(&m.kind) == Some(MediaKind::Episode))
+            .map(convert::item)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| self.converted(&call, e))?;
+        Ok(episodes
+            .into_iter()
+            .filter(|e| matches!(e, Item::Episode(e) if e.show_id == *show))
+            .collect())
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {

@@ -391,10 +391,32 @@ impl Connections {
     }
 }
 
+/// Tell `metrics` whether the NAT maps this server's port per
+/// destination, from each net report iroh makes, until the endpoint
+/// closes. iroh's public API has it only behind `unstable-net-report`.
+async fn watch_nat_mapping(endpoint: Endpoint, metrics: Arc<crate::metrics::Metrics>) {
+    use iroh::Watcher as _;
+    let mut reports = endpoint.net_report();
+    let closed = endpoint.closed();
+    tokio::pin!(closed);
+    loop {
+        metrics.nat_mapping_varies(reports.get().and_then(|r| r.mapping_varies_by_dest()));
+        tokio::select! {
+            () = &mut closed => return,
+            updated = reports.updated() => {
+                if updated.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Log the home relay iroh picks from `network.relays` by latency, and
 /// each time it fails over or loses it, until the endpoint closes: the
-/// admin's proof that relays are up (P6-03).
-async fn log_home_relay(endpoint: Endpoint) {
+/// admin's proof that relays are up (P6-03); and say whether it has one
+/// in the metrics.
+async fn log_home_relay(endpoint: Endpoint, metrics: Arc<crate::metrics::Metrics>) {
     use iroh::Watcher as _;
     let mut status = endpoint.home_relay_status();
     let closed = endpoint.closed();
@@ -407,6 +429,7 @@ async fn log_home_relay(endpoint: Endpoint) {
             .filter(|s| s.is_connected())
             .map(|s| s.url().to_string())
             .collect();
+        metrics.home_relay(!connected.is_empty());
         if logged.as_ref() != Some(&connected) {
             if connected.is_empty() {
                 if logged.is_some() {
@@ -618,8 +641,12 @@ impl Server {
             .await
             .map_err(|e| bind_failed(e.to_string()))?;
         if !options.relays.is_empty() {
-            tokio::spawn(log_home_relay(endpoint.clone()));
+            tokio::spawn(log_home_relay(endpoint.clone(), services.metrics.clone()));
         }
+        tokio::spawn(watch_nat_mapping(
+            endpoint.clone(),
+            services.metrics.clone(),
+        ));
         crate::relay_nat::watch(endpoint.clone(), &options.relays, public.clone(), sides);
 
         // Idle playbacks end on their own, conversions with them.

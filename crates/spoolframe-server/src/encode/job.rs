@@ -16,7 +16,7 @@ use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool, Vulkan};
 
 use super::JobLimits;
 use super::args::{Made, PLAYLIST};
-use crate::metrics::Counter;
+use crate::metrics::{Counter, Histograms};
 
 /// How often a job looks at its output.
 const POLL: Duration = Duration::from_millis(200);
@@ -475,7 +475,15 @@ struct JobCounters {
     stalled: Counter,
     /// Media time encoded, in ms, by every job.
     output_ms: Counter,
+    /// Runs started to replace another, by [`RESTART_REASONS`].
+    restarts: [Counter; 4],
+    /// Where each run's speed and each read's wait go.
+    histograms: std::sync::OnceLock<Arc<Histograms>>,
 }
+
+/// Why a run replaced another: a seek, a switch to another rung, a
+/// restart at a segment far from the run, a change of subtitle or quality.
+pub const RESTART_REASONS: [&str; 4] = ["seek", "switch", "restart", "change"];
 
 /// The jobs now (P3-14).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -490,6 +498,8 @@ pub struct JobCounts {
     pub stalled: u64,
     /// Seconds of media encoded since the server started.
     pub output_seconds: f64,
+    /// Runs started to replace another, in [`RESTART_REASONS`]' order.
+    pub restarts: [u64; 4],
 }
 
 /// How many conversions run now, an encode or a remux, and playbacks
@@ -658,6 +668,35 @@ impl Jobs {
             refused: self.counters.refused.get(),
             stalled: self.counters.stalled.get(),
             output_seconds: self.counters.output_ms.get() as f64 / 1000.0,
+            restarts: self.counters.restarts.each_ref().map(Counter::get),
+        }
+    }
+
+    /// Observe each run's speed and each read's wait into `histograms`
+    /// (P3-14).
+    pub fn record_into(&self, histograms: Arc<Histograms>) {
+        let _ = self.counters.histograms.set(histograms);
+    }
+
+    /// A run started for `reason`: counted if it replaced another, as
+    /// one of [`RESTART_REASONS`] (`start` does not).
+    pub fn started_for(&self, reason: &str) {
+        if let Some(at) = RESTART_REASONS.iter().position(|r| *r == reason) {
+            self.counters.restarts[at].inc();
+        }
+    }
+
+    /// Kill every job's ffmpeg: the server is stopping. Each run's span
+    /// ends now, while the export can still send it.
+    pub fn stop_all(&self) {
+        let live: Vec<_> = self
+            .live
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for job in live {
+            job.stop_because("server_stopping");
         }
     }
 
@@ -708,6 +747,7 @@ impl Jobs {
             card: _,
             ffmpeg,
             aligned_until,
+            span,
         } = run;
         let ffmpeg = ffmpeg.unwrap_or_else(|| self.ffmpeg.clone());
         let limits = self.limits();
@@ -743,6 +783,13 @@ impl Jobs {
             paused: AtomicBool::new(false),
             counted: AtomicU64::new(0),
             stderr: parking_lot::Mutex::default(),
+            span: RunSpan(parking_lot::Mutex::new(span)),
+            began: std::time::Instant::now(),
+            paused_for: parking_lot::Mutex::default(),
+            first_ready: AtomicBool::new(false),
+            load,
+            histograms: self.counters.histograms.get().cloned(),
+            ended: AtomicBool::new(false),
         });
         let supervisor = Supervisor {
             ffmpeg: ffmpeg.clone(),
@@ -834,6 +881,8 @@ pub struct Run {
     /// where the playlist says: its list of keyframes to force stopped
     /// short (`args::forced_through`). Worked out once, when it starts.
     pub aligned_until: Option<u32>,
+    /// Its `conversion` span, ended when ffmpeg exits or is killed.
+    pub span: Option<tracing::Span>,
 }
 
 /// A run decoding in software, in place of one decoding on the GPU.
@@ -885,9 +934,82 @@ struct Shared {
     counted: AtomicU64,
     /// ffmpeg's last [`STDERR_KEPT`] lines of stderr.
     stderr: parking_lot::Mutex<VecDeque<String>>,
+    /// Its `conversion` span, while ffmpeg runs.
+    span: RunSpan,
+    /// When it was spawned.
+    began: std::time::Instant,
+    /// Since when it is held back for its reader, and for how long it was
+    /// before: its speed is over the time it ran.
+    paused_for: parking_lot::Mutex<(Option<std::time::Instant>, Duration)>,
+    /// It has written its first segment (or its first bytes).
+    first_ready: AtomicBool,
+    load: Load,
+    /// Where its speed and its readers' waits go, if anywhere.
+    histograms: Option<Arc<Histograms>>,
+    /// [`Shared::end`] has run.
+    ended: AtomicBool,
 }
 
 impl Shared {
+    /// Held back for its reader from now, or not.
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+        let mut paused_for = self.paused_for.lock();
+        match (paused, paused_for.0) {
+            (true, None) => paused_for.0 = Some(std::time::Instant::now()),
+            (false, Some(since)) => *paused_for = (None, paused_for.1 + since.elapsed()),
+            _ => {}
+        }
+    }
+
+    /// The run ended, `outcome`, with `more` said of it: its span ends,
+    /// with what it did, and its speed is observed; once, whoever ends it
+    /// first (its supervisor, or a kill).
+    ///
+    /// Its speed is the media time it encoded from `start_ms` to
+    /// `encoded_ms` over the time it ran, paused time left out: 2.0 is
+    /// twice real time.
+    fn end(
+        &self,
+        outcome: &'static str,
+        start_ms: u64,
+        encoded_ms: u64,
+        more: Option<opentelemetry::KeyValue>,
+    ) {
+        use opentelemetry::KeyValue;
+        if self.ended.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let paused = {
+            let paused_for = self.paused_for.lock();
+            paused_for.1 + paused_for.0.map_or(Duration::ZERO, |since| since.elapsed())
+        };
+        let running = self.began.elapsed().saturating_sub(paused);
+        let encoded = encoded_ms.saturating_sub(start_ms);
+        let mut ran = vec![
+            KeyValue::new("conversion.encoded_ms", encoded as i64),
+            KeyValue::new("conversion.running_ms", running.as_millis() as i64),
+            KeyValue::new("conversion.paused_ms", paused.as_millis() as i64),
+        ];
+        if !running.is_zero() {
+            let speed = encoded as f64 / running.as_millis().max(1) as f64;
+            ran.push(KeyValue::new("conversion.speed", speed));
+            // A run killed as it started (a seek straight after another)
+            // says nothing of how fast it goes.
+            if let Some(histograms) = &self.histograms
+                && running >= Duration::from_secs(1)
+            {
+                histograms.observe(
+                    &crate::metrics::histogram::CONVERSION_SPEED,
+                    speed,
+                    &[("kind", self.load.as_str())],
+                );
+            }
+        }
+        ran.extend(more);
+        self.span.end(outcome, ran);
+    }
+
     fn stderr_line(&self, line: String) {
         let mut kept = self.stderr.lock();
         if kept.len() == STDERR_KEPT {
@@ -903,6 +1025,40 @@ impl Shared {
             .skip(kept.len().saturating_sub(STDERR_LINES))
             .cloned()
             .collect()
+    }
+}
+
+/// A run's `conversion` span: from ffmpeg's spawn to its exit, or its
+/// kill. Ended there, whoever holds the job on: a playback holds its last
+/// run until it ends, and Tempo gets a span only when it ends.
+#[derive(Debug, Default)]
+struct RunSpan(parking_lot::Mutex<Option<tracing::Span>>);
+
+impl RunSpan {
+    fn event(&self, name: &'static str, attributes: Vec<opentelemetry::KeyValue>) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        if let Some(span) = &*self.0.lock() {
+            span.add_event(name, attributes);
+        }
+    }
+
+    fn set(&self, key: &'static str, value: impl Into<opentelemetry::Value>) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        if let Some(span) = &*self.0.lock() {
+            span.set_attribute(key, value);
+        }
+    }
+
+    /// End it, `outcome`, with `attributes`; once.
+    fn end(&self, outcome: &'static str, attributes: Vec<opentelemetry::KeyValue>) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let Some(span) = self.0.lock().take() else {
+            return;
+        };
+        for attribute in attributes {
+            span.set_attribute(attribute.key, attribute.value);
+        }
+        span.set_attribute("outcome", outcome);
     }
 }
 
@@ -938,8 +1094,15 @@ impl EncodeJob {
     /// Kill ffmpeg now and let go of its slot, though readers may still
     /// hold the job: one replaced at a seek must not encode on.
     pub fn stop(&self) {
+        self.stop_because("ended");
+    }
+
+    /// [`EncodeJob::stop`], for `why` (`seek`, `server_stopping`): its
+    /// span ends there, killed, if ffmpeg still ran.
+    pub fn stop_because(&self, why: &'static str) {
         self.task.abort();
-        if self.progress.borrow().done.is_none() {
+        let running = self.progress.borrow().done.is_none();
+        if running {
             let pid = self.pid();
             if self.shared.paused.load(Ordering::Relaxed) {
                 signal(pid, libc::SIGCONT);
@@ -947,6 +1110,41 @@ impl EncodeJob {
             signal(pid, libc::SIGKILL);
         }
         self.slot.lock().take();
+        if running {
+            let encoded_ms = self.progress.borrow().encoded_ms;
+            self.shared.end(
+                "killed",
+                self.start_ms,
+                encoded_ms,
+                Some(opentelemetry::KeyValue::new("conversion.killed_by", why)),
+            );
+        }
+    }
+
+    /// A read waited `waited` for the encode to get where it asked, or
+    /// found it there already (`None`): for the metrics, where a read
+    /// that did not wait is 0.
+    pub fn read_waited(&self, waited: Option<Duration>) {
+        if let Some(histograms) = &self.shared.histograms {
+            histograms.observe(
+                &crate::metrics::histogram::SEGMENT_READ_WAIT,
+                waited.map_or(0.0, |w| w.as_secs_f64()),
+                &[],
+            );
+        }
+    }
+
+    /// Replaced by a run started `why` (`seek`, `switch`, `restart`) at
+    /// `at_ms` in the film: said on its span, then stopped.
+    pub fn replaced(&self, why: &'static str, at_ms: u64) {
+        self.shared.span.event(
+            "replaced",
+            vec![
+                opentelemetry::KeyValue::new("conversion.reason", why),
+                opentelemetry::KeyValue::new("position_ms", at_ms as i64),
+            ],
+        );
+        self.stop_because(why);
     }
 
     /// End the encode where it is (P3-15's End conversion): ffmpeg is
@@ -970,7 +1168,7 @@ impl EncodeJob {
                 true
             });
         }
-        self.shared.paused.store(false, Ordering::Relaxed);
+        self.shared.set_paused(false);
     }
 
     /// Where its reader is in the film, ms, as the throttle reckons it.
@@ -1237,13 +1435,15 @@ impl Supervisor {
         self.shared.pid.store(pid, Ordering::Relaxed);
         self.shared.hardware_decode.store(false, Ordering::Relaxed);
         *self.shared.made.lock() = fallback.made.clone();
-        self.shared.paused.store(false, Ordering::Relaxed);
+        self.shared.set_paused(false);
         let mut command = vec![self.ffmpeg.program().display().to_string()];
         command.extend(fallback.args.iter().cloned());
         *self.shared.command.lock() = command;
         self.shared.stderr_line(
             "(the GPU failed: running again, decoding and filtering on the CPU)".into(),
         );
+        self.shared.span.event("software decode", Vec::new());
+        self.shared.span.set("conversion.decode", "sw");
         tracing::debug!(pid, dir = %self.dir.display(), "encode running again, decoding in software");
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
@@ -1259,8 +1459,32 @@ impl Supervisor {
         }
     }
 
-    /// How the job ended, said once ffmpeg will not run again.
+    /// How the job ended, said once ffmpeg will not run again; its span
+    /// ends with it.
     fn conclude(&self, ended: Ended) {
+        let outcome = match &ended {
+            Ended::Exited(Ok(status)) => {
+                use std::os::unix::process::ExitStatusExt;
+                let mut exited = Vec::new();
+                if let Some(code) = status.code() {
+                    exited.push(opentelemetry::KeyValue::new("exit_code", i64::from(code)));
+                    self.shared
+                        .span
+                        .set("conversion.exit_code", i64::from(code));
+                }
+                if let Some(signal) = status.signal() {
+                    exited.push(opentelemetry::KeyValue::new("signal", i64::from(signal)));
+                }
+                self.shared.span.event("exited", exited);
+                if status.success() { "ok" } else { "failed" }
+            }
+            Ended::Exited(Err(_)) => "failed",
+            Ended::Stalled => "stalled",
+            Ended::ScratchFull => "scratch_full",
+            Ended::NotRelaunched => "not_relaunched",
+        };
+        let encoded_ms = self.progress.borrow().encoded_ms;
+        self.shared.end(outcome, self.start_ms, encoded_ms, None);
         match ended {
             Ended::Exited(Ok(status)) if status.success() => self.finish(Ok(())),
             Ended::Exited(Ok(status)) => {
@@ -1313,6 +1537,24 @@ impl Supervisor {
         self.shared.pid.load(Ordering::Relaxed)
     }
 
+    /// Say on the span, once, when the run has something for its reader:
+    /// its first segment finished, or its first bytes.
+    fn first_ready(&self, bytes: u64, last_segment: Option<u32>) {
+        let ready = match self.written {
+            Written::Hls => last_segment.is_some(),
+            Written::Progressive { .. } => bytes > 0,
+        };
+        if ready && !self.shared.first_ready.swap(true, Ordering::Relaxed) {
+            self.shared.span.event(
+                "first segment ready",
+                vec![opentelemetry::KeyValue::new(
+                    "after_ms",
+                    self.shared.began.elapsed().as_millis() as i64,
+                )],
+            );
+        }
+    }
+
     /// Watch one ffmpeg until it ends, or is ended.
     async fn attempt(
         &self,
@@ -1355,6 +1597,7 @@ impl Supervisor {
                 _ = tick.tick() => {
                     let (bytes, last_segment, output) = self.measure_and_count(encoded_ms).await;
                     self.count(bytes);
+                    self.first_ready(bytes, last_segment);
                     self.throttle(encoded_ms, base_ms, bytes, last_segment);
                     self.progress.send_modify(|p| {
                         p.bytes = bytes;
@@ -1380,6 +1623,13 @@ impl Supervisor {
                             "an encode stalled"
                         );
                         self.counters.stalled.inc();
+                        self.shared.span.event(
+                            "stalled",
+                            vec![opentelemetry::KeyValue::new(
+                                "after_ms",
+                                self.stalled_after.as_millis() as i64,
+                            )],
+                        );
                         return Ended::Stalled;
                     }
                     // Only a job that wrote since it last looked can be the
@@ -1433,6 +1683,8 @@ impl Supervisor {
         let encoded_ms = self.progress.borrow().encoded_ms.max(encoded_ms);
         let (bytes, last_segment, output) = self.measure_and_count(encoded_ms).await;
         self.count(bytes);
+        // A run that wrote all it had before it was first looked at.
+        self.first_ready(bytes, last_segment);
         self.progress.send_modify(|p| {
             p.bytes = bytes;
             p.last_segment = last_segment;
@@ -1458,7 +1710,7 @@ impl Supervisor {
     }
 
     fn finish(&self, done: Result<(), Failure>) {
-        self.shared.paused.store(false, Ordering::Relaxed);
+        self.shared.set_paused(false);
         self.progress.send_modify(|p| p.done = Some(done));
     }
 
@@ -1546,11 +1798,11 @@ impl Supervisor {
         let paused = self.shared.paused.load(Ordering::Relaxed);
         if !paused && ahead > self.read_ahead {
             signal(self.pid(), libc::SIGSTOP);
-            self.shared.paused.store(true, Ordering::Relaxed);
+            self.shared.set_paused(true);
             tracing::debug!(pid = self.pid(), ?ahead, "encode paused for its reader");
         } else if paused && ahead <= self.read_ahead / 2 {
             signal(self.pid(), libc::SIGCONT);
-            self.shared.paused.store(false, Ordering::Relaxed);
+            self.shared.set_paused(false);
             tracing::debug!(pid = self.pid(), ?ahead, "encode resumed");
         }
     }
@@ -2200,6 +2452,51 @@ pub(super) mod tests {
             done(&job).await.unwrap_err(),
             "out.mkv: Invalid data found when processing input"
         );
+    }
+
+    /// A run's speed is observed as it ends, by its kind: the media time
+    /// it encoded over the time it ran. One killed as it started is not.
+    #[tokio::test]
+    async fn a_run_s_speed_is_observed_at_its_end_and_a_short_run_s_is_not() {
+        let (jobs, _dir) = jobs(
+            "speed",
+            "printf 'abc' > \"$1\"; echo out_time_us=3000000; sleep 1.5",
+            2,
+            Duration::from_secs(60),
+        )
+        .await;
+        let histograms = Arc::new(Histograms::default());
+        jobs.record_into(histograms.clone());
+        let run = |n: u32| {
+            let dir = jobs.dir().join(format!("h/{n}"));
+            let file = dir.join("out.mkv");
+            jobs.start(
+                dir,
+                vec![file.display().to_string()],
+                Written::Progressive { file },
+                Load::Remux,
+                n,
+                0,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+        let killed = run(0);
+        killed.stop_because("seek");
+        let finished = run(1);
+        done(&finished).await.unwrap();
+        let family = histograms.family(&crate::metrics::histogram::CONVERSION_SPEED);
+        let [sample] = family.samples.as_slice() else {
+            panic!("{family:?}");
+        };
+        assert_eq!(sample.labels, [("kind", "remux".to_owned())]);
+        let crate::metrics::Value::Histogram(h) = &sample.value else {
+            panic!("{sample:?}");
+        };
+        assert_eq!(h.count, 1);
+        // 3 s of media in a little over 1.5 s.
+        assert!((1.0..2.0).contains(&h.sum), "{}", h.sum);
     }
 
     #[tokio::test]

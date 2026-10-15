@@ -309,6 +309,8 @@ pub struct WatchSync {
     /// (P3-14). A dry run is not one.
     runs_ok: crate::metrics::Counter,
     runs_failed: crate::metrics::Counter,
+    /// Where each run's time goes.
+    histograms: std::sync::OnceLock<Arc<crate::metrics::Histograms>>,
 }
 
 impl std::fmt::Debug for WatchSync {
@@ -354,7 +356,13 @@ impl WatchSync {
             tasks: Mutex::default(),
             runs_ok: Default::default(),
             runs_failed: Default::default(),
+            histograms: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Observe each run's time into `histograms` (P3-14).
+    pub fn record_into(&self, histograms: Arc<crate::metrics::Histograms>) {
+        let _ = self.histograms.set(histograms);
     }
 
     /// Runs that synced, and runs that could not, since the server started
@@ -386,12 +394,28 @@ impl WatchSync {
     /// One run of `user`'s: plan, and apply unless `dry_run`.
     pub async fn run(&self, user: LocalUserId, dry_run: bool) -> Result<Report, SyncError> {
         use tracing::Instrument as _;
-        let span = tracing::info_span!("plex sync run", user = %format!("local:{user}"), dry_run);
+        // Never the user: spans are exported (P3-14). The run's log lines
+        // name them.
+        let span = tracing::info_span!("plex sync run", dry_run);
+        let began = std::time::Instant::now();
         let ran = self.run_once(user, dry_run).instrument(span).await;
         if !dry_run {
-            match &ran {
-                Ok(_) => self.runs_ok.inc(),
-                Err(_) => self.runs_failed.inc(),
+            let outcome = match &ran {
+                Ok(_) => {
+                    self.runs_ok.inc();
+                    "ok"
+                }
+                Err(_) => {
+                    self.runs_failed.inc();
+                    "failed"
+                }
+            };
+            if let Some(histograms) = self.histograms.get() {
+                histograms.observe(
+                    &crate::metrics::histogram::PLEX_SYNC_DURATION,
+                    began.elapsed().as_secs_f64(),
+                    &[("outcome", outcome)],
+                );
             }
         }
         ran
@@ -1036,6 +1060,76 @@ mod tests {
         assert_eq!(sync.run_counts(), (0, 0));
         assert!(sync.run(alice, false).await.is_err());
         assert_eq!(sync.run_counts(), (0, 1));
+    }
+
+    /// Each run is timed by its outcome; a dry run is not.
+    #[tokio::test]
+    async fn runs_are_timed_and_dry_runs_are_not() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-sync-timed").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", spoolframe_types::Role::Consumer)
+            .await
+            .unwrap();
+        let sync = WatchSync::new(Arc::default(), accounts_at(&dir, store), STARTED, STARTED);
+        let histograms = Arc::new(crate::metrics::Histograms::default());
+        sync.record_into(histograms.clone());
+        let _ = sync.run(alice, true).await;
+        let _ = sync.run(alice, false).await;
+        let family = histograms.family(&crate::metrics::histogram::PLEX_SYNC_DURATION);
+        let counts: Vec<_> = family
+            .samples
+            .iter()
+            .map(|s| match &s.value {
+                crate::metrics::Value::Histogram(h) => (s.labels.clone(), h.count),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(counts, [(vec![("outcome", "failed".to_owned())], 1)]);
+    }
+
+    /// A run's span says whether it was a dry run, never whose it was:
+    /// spans are exported, and no span names a user (P3-14).
+    #[tokio::test]
+    async fn a_run_s_span_does_not_name_its_user() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// Each span opened: its name and its fields' names.
+        type Opened = Vec<(&'static str, Vec<&'static str>)>;
+
+        #[derive(Clone, Default)]
+        struct Fields(Arc<Mutex<Opened>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _: &tracing::span::Id,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let names = attrs.fields().iter().map(|f| f.name()).collect();
+                self.0.lock().push((attrs.metadata().name(), names));
+            }
+        }
+
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-sync-span").await;
+        let store = crate::store::Store::open(dir.as_ref()).await.unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", spoolframe_types::Role::Consumer)
+            .await
+            .unwrap();
+        let sync = WatchSync::new(Arc::default(), accounts_at(&dir, store), STARTED, STARTED);
+        let fields = Fields::default();
+        let subscriber = tracing_subscriber::registry().with(fields.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _ = sync.run(alice, false).await;
+        let spans = fields.0.lock().clone();
+        assert!(
+            spans
+                .iter()
+                .any(|(name, fields)| *name == "plex sync run" && fields == &["dry_run"]),
+            "{spans:?}"
+        );
     }
 
     fn id(kind: MediaKind, key: &str) -> MediaId {

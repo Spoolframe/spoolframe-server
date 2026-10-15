@@ -601,36 +601,18 @@ impl Watch {
             // Only in progress: that episode is in Continue watching.
             return Ok(None);
         }
-        let seasons = match self.catalog.item(show).await {
-            Ok(found) => found.children,
+        // All of them at once: one request to Plex, not one per season.
+        let mut episodes = match self.catalog.episodes(show).await {
+            Ok(episodes) => episodes,
             Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         // Specials (season 0) are not part of the run.
-        let mut seasons: Vec<_> = seasons
-            .into_iter()
-            .filter_map(|s| match s {
-                Item::Season(s) if s.season > 0 => Some(s),
-                _ => None,
-            })
-            .collect();
-        seasons.sort_by_key(|s| s.season);
-        let mut episodes = Vec::new();
-        let mut fetched = stream::iter(seasons)
-            .map(|season| async move { self.catalog.item(&season.id).await })
-            .buffered(CATALOG_FETCHES);
-        while let Some(season) = fetched.next().await {
-            let mut in_season: Vec<_> = season?
-                .children
-                .into_iter()
-                .filter(|e| matches!(e, Item::Episode(_)))
-                .collect();
-            in_season.sort_by_key(|e| match e {
-                Item::Episode(e) => e.episode,
-                _ => u32::MAX,
-            });
-            episodes.extend(in_season);
-        }
+        episodes.retain(|e| matches!(e, Item::Episode(e) if e.season > 0));
+        episodes.sort_by_key(|e| match e {
+            Item::Episode(e) => (e.season, e.episode),
+            _ => (u32::MAX, u32::MAX),
+        });
         // The most recently watched, not the furthest: a rewatch (or a
         // show picked up again from the middle) goes on from where the
         // person is, as Plex's On Deck does. A season marked watched at

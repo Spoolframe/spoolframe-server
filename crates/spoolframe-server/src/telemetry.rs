@@ -4,20 +4,23 @@
 //! Alloy in front of the household's Grafana stack.
 //!
 //! Off unless an endpoint is set. A live setting: [`Telemetry::apply`]
-//! builds the exporters and swaps the `tracing` layer that feeds them, and
-//! stops the old ones in the background.
+//! builds the exporters, swaps the tracer the spans' layer sends to
+//! ([`spans_layer`], in the subscriber for good) and the logs' layer in
+//! the subscriber's slot, and stops the old ones in the background.
 //!
 //! An endpoint that is down never slows the server. Spans and log records
 //! go into a bounded queue each, and are exported in batches by a task of
 //! their own; when a queue is full the record is dropped and counted
 //! (`spoolframe_telemetry_dropped_total`). Metrics are read from the
-//! registry at each export, so nothing of theirs queues. A failed export
+//! registry at each export, so nothing of theirs queues; histograms are
+//! recorded as they are observed, into the SDK's buckets. A failed export
 //! is counted and logged at WARN, at most once a minute per signal.
 //!
-//! What is exported names users only as `local:<uuid>`, and never a token
-//! or a secret: the spans and logs are the ones the journal has, which
-//! never carry them, and the headers set for the collector are never
-//! logged.
+//! What is exported never carries a token or a secret: the logs are the
+//! ones the journal has, which never carry them, and the headers set for
+//! the collector are never logged. Spans are only the server's own, and
+//! carry no log lines and no user, session, address or path: a log record
+//! says which trace and span it was logged in instead.
 
 use std::sync::Arc;
 
@@ -48,10 +51,164 @@ use tracing_subscriber::{Layer, Registry};
 use crate::metrics::{Family, Kind, Metrics, Value};
 use crate::network::ServerName;
 
-/// The layer the subscriber's reload slot holds while exporting.
+/// The layer the subscriber's reload slot holds while exporting logs.
 pub type OtelLayer = Box<dyn Layer<Registry> + Send + Sync>;
 /// Puts a layer in the subscriber's slot, or empties it.
 pub type Swap = Box<dyn Fn(Option<OtelLayer>) + Send + Sync>;
+
+/// The tracer the spans' layer ([`spans_layer`]) sends to: the export's
+/// while it sends traces, none otherwise. Swapped as the setting changes,
+/// where the layer stays in the subscriber for good: a layer in a reload
+/// slot cannot be downcast to, and tracing-opentelemetry's span extension
+/// (a span's context, a link or an event added to it) finds its layer by
+/// downcasting. In the slot, every one of those did nothing.
+#[derive(Clone, Default)]
+pub struct Tracer(Arc<parking_lot::RwLock<Option<opentelemetry_sdk::trace::SdkTracer>>>);
+
+impl std::fmt::Debug for Tracer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Tracer").field(&self.on()).finish()
+    }
+}
+
+impl Tracer {
+    fn set(&self, tracer: Option<opentelemetry_sdk::trace::SdkTracer>) {
+        *self.0.write() = tracer;
+    }
+
+    fn on(&self) -> bool {
+        self.0.read().is_some()
+    }
+}
+
+impl opentelemetry::trace::Tracer for Tracer {
+    type Span = TracedSpan;
+
+    fn build_with_context(
+        &self,
+        builder: opentelemetry::trace::SpanBuilder,
+        parent_cx: &opentelemetry::Context,
+    ) -> Self::Span {
+        match &*self.0.read() {
+            Some(tracer) => TracedSpan::Sdk(tracer.build_with_context(builder, parent_cx)),
+            None => TracedSpan::Off(opentelemetry::trace::noop::NoopSpan::DEFAULT),
+        }
+    }
+}
+
+/// A span of the export's tracer, or none while it is off.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the SDK's span is the one made while spans are; boxed, each would cost an allocation"
+)]
+pub enum TracedSpan {
+    Sdk(opentelemetry_sdk::trace::Span),
+    Off(opentelemetry::trace::noop::NoopSpan),
+}
+
+impl opentelemetry::trace::Span for TracedSpan {
+    fn add_event_with_timestamp<T>(
+        &mut self,
+        name: T,
+        timestamp: std::time::SystemTime,
+        attributes: Vec<KeyValue>,
+    ) where
+        T: Into<std::borrow::Cow<'static, str>>,
+    {
+        match self {
+            Self::Sdk(span) => span.add_event_with_timestamp(name, timestamp, attributes),
+            Self::Off(span) => span.add_event_with_timestamp(name, timestamp, attributes),
+        }
+    }
+
+    fn span_context(&self) -> &opentelemetry::trace::SpanContext {
+        match self {
+            Self::Sdk(span) => span.span_context(),
+            Self::Off(span) => span.span_context(),
+        }
+    }
+
+    fn is_recording(&self) -> bool {
+        match self {
+            Self::Sdk(span) => span.is_recording(),
+            Self::Off(span) => span.is_recording(),
+        }
+    }
+
+    fn set_attribute(&mut self, attribute: KeyValue) {
+        match self {
+            Self::Sdk(span) => span.set_attribute(attribute),
+            Self::Off(span) => span.set_attribute(attribute),
+        }
+    }
+
+    fn set_status(&mut self, status: opentelemetry::trace::Status) {
+        match self {
+            Self::Sdk(span) => span.set_status(status),
+            Self::Off(span) => span.set_status(status),
+        }
+    }
+
+    fn update_name<T>(&mut self, new_name: T)
+    where
+        T: Into<std::borrow::Cow<'static, str>>,
+    {
+        match self {
+            Self::Sdk(span) => span.update_name(new_name),
+            Self::Off(span) => span.update_name(new_name),
+        }
+    }
+
+    fn add_link(
+        &mut self,
+        span_context: opentelemetry::trace::SpanContext,
+        attributes: Vec<KeyValue>,
+    ) {
+        match self {
+            Self::Sdk(span) => span.add_link(span_context, attributes),
+            Self::Off(span) => span.add_link(span_context, attributes),
+        }
+    }
+
+    fn end_with_timestamp(&mut self, timestamp: std::time::SystemTime) {
+        match self {
+            Self::Sdk(span) => span.end_with_timestamp(timestamp),
+            Self::Off(span) => span.end_with_timestamp(timestamp),
+        }
+    }
+}
+
+/// What a span's `outcome` says of `result`: `ok`, or the error's kind as
+/// the wire names it (`playback_expired`, `busy`), never its words, which
+/// may quote what was asked.
+pub fn outcome<T>(result: &Result<T, spoolframe_protocol::Error>) -> String {
+    match result {
+        Ok(_) => "ok".into(),
+        Err(error) => error_kind(error),
+    }
+}
+
+/// `error`'s `type` on the wire.
+pub fn error_kind(error: &spoolframe_protocol::Error) -> String {
+    serde_json::to_value(error)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The layer that makes the server's spans OpenTelemetry spans, for
+/// `tracer`: in the subscriber for good, outside the reload slot. While
+/// the export sends no traces it opens none, and costs a check per span.
+pub fn spans_layer<S>(tracer: &Tracer) -> impl Layer<S> + Send + Sync + use<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
+{
+    Spans {
+        inner: tracing_opentelemetry::layer().with_tracer(tracer.clone()),
+        tracer: tracer.clone(),
+    }
+}
 
 /// What `service.name` says.
 pub const SERVICE_NAME: &str = "spoolframe-server";
@@ -131,6 +288,7 @@ impl Default for Timings {
 /// The export of one server, on or off.
 pub struct Telemetry {
     swap: Swap,
+    tracer: Tracer,
     metrics: Arc<Metrics>,
     name: ServerName,
     endpoint_id: String,
@@ -187,14 +345,22 @@ enum Msg<T> {
 }
 
 impl Telemetry {
-    /// Export for the server called `name`, whose key is `endpoint_id`,
-    /// through `swap`, the subscriber's slot.
-    pub fn new(swap: Swap, metrics: Arc<Metrics>, name: ServerName, endpoint_id: String) -> Self {
-        Self::with_timings(swap, metrics, name, endpoint_id, Timings::default())
+    /// Export for the server called `name`, whose key is `endpoint_id`:
+    /// its logs through `swap`, the subscriber's slot, and its spans
+    /// through `tracer`, which the subscriber's [`spans_layer`] sends to.
+    pub fn new(
+        swap: Swap,
+        tracer: Tracer,
+        metrics: Arc<Metrics>,
+        name: ServerName,
+        endpoint_id: String,
+    ) -> Self {
+        Self::with_timings(swap, tracer, metrics, name, endpoint_id, Timings::default())
     }
 
     pub fn with_timings(
         swap: Swap,
+        tracer: Tracer,
         metrics: Arc<Metrics>,
         name: ServerName,
         endpoint_id: String,
@@ -202,6 +368,7 @@ impl Telemetry {
     ) -> Self {
         Self {
             swap,
+            tracer,
             metrics,
             name,
             endpoint_id,
@@ -238,10 +405,21 @@ impl Telemetry {
                     "exporting telemetry over OTLP"
                 );
                 (self.swap)(Some(layer));
+                self.tracer
+                    .set(now.tracer.as_ref().map(|p| p.tracer(SERVICE_NAME)));
                 *running = Some(now);
             }
-            None => (self.swap)(None),
+            None => {
+                (self.swap)(None);
+                self.tracer.set(None);
+            }
         }
+        // Histogram values go to the new export's meter, or nowhere.
+        let meter = running
+            .as_ref()
+            .and_then(|r| r.meter.as_ref())
+            .map(|p| p.meter(SERVICE_NAME));
+        self.metrics.histograms().export_to(meter.as_ref());
         drop(running);
         if let Some(old) = old {
             tokio::spawn(old.stop(self.timings));
@@ -252,6 +430,8 @@ impl Telemetry {
     pub async fn shutdown(&self) {
         let old = self.running.lock().take();
         (self.swap)(None);
+        self.tracer.set(None);
+        self.metrics.histograms().export_to(None);
         if let Some(old) = old
             && tokio::time::timeout(SHUTDOWN_BUDGET, old.stop(self.timings))
                 .await
@@ -401,15 +581,11 @@ impl Telemetry {
             observe(&provider, &self.metrics);
             running.meter = Some(provider);
         }
-        let traces = running
-            .tracer
-            .as_ref()
-            .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer(SERVICE_NAME)));
         let logs = running
             .logger
             .as_ref()
             .map(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new);
-        let layer: OtelLayer = Box::new(Quiet(Layer::and_then(traces, logs)));
+        let layer: OtelLayer = Box::new(Quiet(logs));
         Ok((running, layer))
     }
 }
@@ -799,25 +975,6 @@ impl Families {
             })
             .collect()
     }
-
-    /// A histogram's sum or count, as a number per labelled series.
-    fn histogram(&self, name: &str, sum: bool) -> Vec<(f64, Vec<KeyValue>)> {
-        let families = self.now();
-        let Some(family) = families.iter().find(|f| f.name == name) else {
-            return Vec::new();
-        };
-        family
-            .samples
-            .iter()
-            .filter_map(|s| match &s.value {
-                Value::Histogram(h) => Some((
-                    if sum { h.sum } else { h.count as f64 },
-                    attributes(&s.labels),
-                )),
-                Value::Number(_) => None,
-            })
-            .collect()
-    }
 }
 
 fn attributes(labels: &[(&'static str, String)]) -> Vec<KeyValue> {
@@ -868,46 +1025,10 @@ fn observe(provider: &SdkMeterProvider, metrics: &Arc<Metrics>) {
                     })
                     .build();
             }
-            // No observable histogram in OpenTelemetry: its sum and count,
-            // from which a mean is had.
-            Kind::Histogram => {
-                for sum in [true, false] {
-                    let read = families.clone();
-                    let leaked: &'static str = if sum {
-                        histogram_sum(name)
-                    } else {
-                        histogram_count(name)
-                    };
-                    meter
-                        .f64_observable_counter(leaked)
-                        .with_description(help)
-                        .with_callback(move |o| {
-                            for (v, attrs) in read.histogram(name, sum) {
-                                o.observe(v, &attrs);
-                            }
-                        })
-                        .build();
-                }
-            }
+            // No observable histogram in OpenTelemetry: each value is
+            // recorded as it is observed instead (`metrics::histogram`).
+            Kind::Histogram => {}
         }
-    }
-}
-
-fn histogram_sum(name: &str) -> &'static str {
-    match name {
-        "spoolframe_plex_request_duration_seconds" => {
-            "spoolframe_plex_request_duration_seconds_sum"
-        }
-        _ => "spoolframe_histogram_sum",
-    }
-}
-
-fn histogram_count(name: &str) -> &'static str {
-    match name {
-        "spoolframe_plex_request_duration_seconds" => {
-            "spoolframe_plex_request_duration_seconds_count"
-        }
-        _ => "spoolframe_histogram_count",
     }
 }
 
@@ -938,6 +1059,19 @@ fn loud(meta: &Metadata<'_>) -> bool {
                 .strip_prefix(quiet)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
         })
+}
+
+/// Whether a span is the server's own, the only ones exported. A
+/// library's span can stay open as long as a connection or the endpoint
+/// does: iroh's socket span never closed, so its `poll_send` children made
+/// traces whose root Tempo never got, a span every few seconds. A span of
+/// the server's opened under one of those is a root of its own.
+fn ours(meta: &Metadata<'_>) -> bool {
+    let target = meta.target();
+    loud(meta)
+        && target
+            .strip_prefix("spoolframe")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_') || rest.starts_with("::"))
 }
 
 /// A layer that never sees the export's own libraries, nor
@@ -998,6 +1132,79 @@ where
 
     fn on_id_change(&self, old: &tracing::span::Id, new: &tracing::span::Id, ctx: Context<'_, S>) {
         self.0.on_id_change(old, new, ctx);
+    }
+}
+
+/// The spans' layer: only the server's own spans ([`ours`]), while the
+/// export sends traces, and no log line as a span event. A log line
+/// names a user, a device's endpoint or a path with its address, which a
+/// span must not: it goes out as a log record, with the trace and span it
+/// was logged in, and a span's events are only those the server adds to
+/// it.
+struct Spans<L> {
+    inner: L,
+    tracer: Tracer,
+}
+
+impl<S, L> Layer<S> for Spans<L>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    L: Layer<S>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        if ours(attrs.metadata()) && self.tracer.on() {
+            self.inner.on_new_span(attrs, id, ctx);
+        }
+    }
+
+    fn on_record(
+        &self,
+        span: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: Context<'_, S>,
+    ) {
+        self.inner.on_record(span, values, ctx);
+    }
+
+    fn on_follows_from(
+        &self,
+        span: &tracing::span::Id,
+        follows: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        self.inner.on_follows_from(span, follows, ctx);
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
+        self.inner.on_enter(id, ctx);
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
+        self.inner.on_exit(id, ctx);
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+        self.inner.on_close(id, ctx);
+    }
+
+    fn on_id_change(&self, old: &tracing::span::Id, new: &tracing::span::Id, ctx: Context<'_, S>) {
+        self.inner.on_id_change(old, new, ctx);
+    }
+
+    /// Through to tracing-opentelemetry's layer, which its span extension
+    /// downcasts to.
+    unsafe fn downcast_raw(&self, id: std::any::TypeId) -> Option<*const ()> {
+        if id == std::any::TypeId::of::<Self>() {
+            return Some(self as *const Self as *const ());
+        }
+        // SAFETY: the inner layer is a field of this one, which is never
+        // swapped out, so the pointer lives as long as the subscriber.
+        unsafe { self.inner.downcast_raw(id) }
     }
 }
 

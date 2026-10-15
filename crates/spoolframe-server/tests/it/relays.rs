@@ -575,3 +575,74 @@ async fn handshake(
     .await
     .unwrap()
 }
+
+/// The value of gauge or counter `name` in `server`'s metrics, if it has
+/// a sample.
+fn metric(server: &TestServer, name: &str) -> Option<f64> {
+    server
+        .metrics
+        .families()
+        .into_iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("no {name}"))
+        .value(&[])
+}
+
+/// The metrics say whether the server has a home relay: 1 once it has
+/// one, 0 while it has relays and none answers, and nothing on a server
+/// with no relays.
+#[tokio::test]
+async fn the_home_relay_gauge_says_whether_it_has_one() {
+    let (relay, url) = relay().await;
+    let server = server_on("relay-gauge", &url).await;
+    let connected = |server: &TestServer| metric(server, "spoolframe_home_relay_connected");
+    // The address names the relay a moment before its status says so.
+    let up = tokio::time::timeout(Duration::from_secs(10), async {
+        while connected(&server) != Some(1.0) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(up.is_ok(), "{:?}", connected(&server));
+    server.stop().await;
+    drop(relay);
+
+    let options = ServerOptions {
+        relays: vec![Relay::Custom("http://127.0.0.1:9".parse().unwrap())],
+        ..ServerOptions::default()
+    };
+    let server =
+        TestServer::start_with(support::fresh_dir("relay-gauge-down").await, options).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(connected(&server), Some(0.0));
+    server.stop().await;
+
+    let server = TestServer::start("relay-gauge-none").await;
+    assert_eq!(connected(&server), None);
+    server.stop().await;
+}
+
+/// A device that reaches the server through a relay alone starts on the
+/// relay: an attempt to punch a hole, counted once.
+#[tokio::test]
+async fn a_connection_that_starts_on_a_relay_is_a_hole_punch_attempt() {
+    let (relay, url) = relay().await;
+    let server = server_on("relay-punch", &url).await;
+    let attempts = |server: &TestServer| metric(server, "spoolframe_hole_punch_attempts_total");
+    assert_eq!(attempts(&server), Some(0.0));
+    let client = device(true).await;
+    client
+        .connect_invite(&relay_only_link(&server))
+        .await
+        .unwrap();
+    let counted = tokio::time::timeout(Duration::from_secs(10), async {
+        while attempts(&server) != Some(1.0) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(counted.is_ok(), "{:?}", attempts(&server));
+    client.close().await;
+    server.stop().await;
+    drop(relay);
+}

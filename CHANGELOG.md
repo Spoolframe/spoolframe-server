@@ -2,6 +2,166 @@
 
 ## Unreleased
 
+- Home asks Plex for each Next up show's episodes in one request (the
+  show's `allLeaves`), not three for the show and two per season: on
+  fulcrum a Home with Next up to work out made 104 Plex requests, now
+  about one per show. The rows, their items and their order are the
+  same.
+
+- The catalog in the metrics: `spoolframe_library_items{library,kind}`
+  (each library's items by kind, as its Plex server counts them every
+  5 minutes; `library` is its id, never its name) and
+  `spoolframe_plex_sync_duration_seconds{outcome}` (each watch state sync
+  run with a linked Plex account, `ok` or `failed`). Spoolframe has no
+  library scan of its own: its catalog is read from Plex as it is asked.
+
+- `spoolframe_requests_refused_total{kind,channel}` counts every refused
+  request the `spoolframe::refused` log lines are about, those the log
+  leaves out too: `kind` as the lines say it (`sign_in_failed`,
+  `unauthenticated`, `no_session`, `forbidden`, `rate_limited`,
+  `recent_sign_in_required`, `profile_locked`, `hello_refused`),
+  `channel` too (`quic`, `admin_api`, `web`). Never the user or the
+  source.
+
+- The network in the metrics: `spoolframe_home_relay_connected` (1 with
+  a home relay, 0 without one while `network.relays` names some, no
+  sample with none: what was only the log line "no home relay"),
+  `spoolframe_connection_bytes_total{path,direction}` (UDP bytes client
+  connections carried, by `lan`, `direct`, `relay` or `unknown`, `sent`
+  or `received`), `spoolframe_connection_rtt_seconds{path}` (each
+  connection's round-trip time every 10 s) and
+  `spoolframe_hole_punch_attempts_total` /
+  `spoolframe_hole_punch_successes_total` (connections that started on a
+  relay, and those that went direct from it).
+
+- Playback quality in the metrics:
+  `spoolframe_playback_first_segment_seconds{plan}` (from StartPlayback
+  to the first read of the playback's media answered with bytes, the
+  HLS init segment not counted: a player's time to its first frame, its
+  own fetches included), `spoolframe_segment_read_wait_seconds` (how
+  long each read of a conversion's output waited for the encode; 0, in
+  the `le="0"` bucket, for a read the encode was already past),
+  `spoolframe_conversion_speed{kind}` (each ffmpeg run's speed at its
+  end, as its span's `conversion.speed`; runs under a second left out)
+  and `spoolframe_conversion_restarts_total{reason}` (runs started to
+  replace another: `seek`, `switch`, `restart`, `change`).
+
+- `spoolframe_client_requests_total{request,outcome}` counts the client
+  requests answered, and `spoolframe_client_request_duration_seconds{request}`
+  times them, from the frame read to the answer made: `request` is the
+  request's type (`unknown` for a type this build does not know, which
+  the client chose), `outcome` `ok` or the error's type on the wire, as
+  on the `client request` span. Both are in `/metrics` and the OTLP
+  export.
+
+- The `plex sync run` span no longer has a `user` attribute
+  (`local:<id>`): no exported span names a user. The run's log lines
+  still do.
+
+- A `client request` span says more than its `request` type: `outcome`
+  (`ok`, or the error's type on the wire, e.g. `not_found`),
+  `connection.path` (`lan`, `direct`, `relay` or `unknown`, as the
+  connection goes when the request comes), and once the device has said
+  Hello, `client.platform`, `client.name` and `protocol.version`. Never
+  its session, its user, a token or its arguments.
+
+- A `conversion` span for each ffmpeg run of a playback's conversion,
+  from its spawn to its exit or its kill: a root, with `playback.id` and
+  a link to the `playback` span, as a run can last a whole film. What it
+  is: `conversion.reason` (`start`, `change` for a new subtitle or
+  quality, `seek`, `switch` to another rung, `restart` at a segment far
+  from the run), `conversion.rung`, `conversion.epoch`,
+  `conversion.start_ms`, `conversion.delivery`, `conversion.plan`
+  (`transcode` or `remux`), `conversion.load`, `conversion.encoder`
+  (ffmpeg's name, or `copy`), `conversion.hardware` (`gpu` or `cpu`),
+  `conversion.gpu` (the card), `conversion.decode` (`hw`, `sw` or
+  `none`), `conversion.filters` (`tonemap:gpu`, `burn_in:cpu`, …, or
+  `none`) and `conversion.tone_mapper`. Events: `first segment ready`
+  (`after_ms`), `software decode` (the GPU failed and it runs again on the
+  CPU), `stalled`, `replaced` (`conversion.reason`, `position_ms`: a seek
+  says where to) and `exited` (`exit_code` or `signal`). At its end:
+  `outcome` (`ok`, `failed`, `stalled`, `scratch_full`, `not_relaunched`,
+  `killed`, or `busy`, `spawn_failed`, `prepare_failed` for a run that
+  never started), `conversion.killed_by` (`seek`, `switch`, `restart`,
+  `ended`, `server_stopping`), `conversion.exit_code`,
+  `conversion.encoded_ms`, `conversion.running_ms`, `conversion.paused_ms`
+  (held back for its reader) and `conversion.speed` (media time over the
+  time it ran: 2.0 is twice real time). The server kills every ffmpeg as
+  it stops, before the export's last flush, so a running conversion's
+  span is sent. Numbers on the new spans are integers, for TraceQL's
+  comparisons (`span.read.wait_ms > 2000`).
+
+- A `segment read` span for each read of a playback's media (a resource
+  stream: an HLS segment, or a range of the file or of the progressive
+  output), from the request to the last byte sent: `playback.id` and a
+  link to the `playback` span, `segment.index` and `segment.rung` for an
+  HLS segment, `read.offset` and `read.length` as asked, `read.bytes`
+  sent, `read.waited_for_encode` and `read.wait_ms` when it is a
+  conversion's, `conversion.epoch`, and `outcome` (`ok`, the error's
+  type, or `send_failed` when the stream broke). About one per 6 s
+  segment per playback; nothing is added per byte.
+
+- A playback in Tempo: `start_playback` opens a `playback` span, a root
+  that ends as the start does (`playback.id`, `playback.plan`,
+  `playback.delivery`, `playback.start_ms`, `outcome`). `playback.id` is
+  the id Server › Playback shows. Every later span about the playback
+  carries `playback.id` and a span link to it: the start's own `client
+  request`, and every request naming its handle (progress, quality,
+  subtitle, seek, stop, revision, manifest, HTTP URL). In Tempo,
+  `{ span.playback.id = "…" }` finds them all. The spans' layer is now in
+  the subscriber for good, its tracer swapped as `telemetry.otlp`
+  changes: in the reload slot, tracing-opentelemetry's span extension
+  (a span's context, a link, an event) found no layer and did nothing.
+
+- Traces in Tempo: a request that changes something (`start_playback`,
+  `update_playback_progress`, `stop_playback`, …) runs in a task of its
+  own, which started outside its `client request` span; what it did, a
+  Plex request say, went to Tempo as a trace of its own (most `plex
+  request` traces were these). It runs in the request's span now. Only
+  the server's own spans are exported: iroh's socket span stays open as
+  long as the endpoint, so its `poll_send` spans, every few seconds, made
+  traces whose root Tempo never got. A span carries no log lines as
+  events any more (they name users, devices and addresses); each log
+  record sent over OTLP carries the trace and span it was logged in
+  instead (opentelemetry-appender-tracing's
+  `experimental_use_tracing_span_context`), for Grafana's logs of a span.
+  A `client request` trace with no duration in Tempo's search had its
+  root: Tempo's search gives whole milliseconds, and leaves out a 0, for
+  a request answered in under one.
+
+- `spoolframe_sessions` loses its `user` label: it is
+  `spoolframe_sessions{kind="app"|"web"}`, every user's sessions
+  together. A series per user (`local:<uuid>`) grew with the users, and
+  no dashboard used it. The admin activity page still lists sessions by
+  user.
+
+- A new gauge, `spoolframe_nat_mapping_varies`: 1 when the NAT maps the
+  server to a different public port for each destination, which makes
+  hole punching harder (so more devices may go through a relay), 0 when
+  it does not or is not known yet. It is read from iroh's net report
+  (iroh's `unstable-net-report` feature), and the server logs one INFO
+  line each time it changes. iroh's own warning of it (`IPv4 address
+  detected by QAD varies by destination`, about every 20 s, nearly every
+  WARN of a day behind such a NAT) is filtered out of the default log
+  filter (`iroh::net_report::report=error`); iroh's other warnings stay.
+  A `SPOOLFRAME_LOG` filter replaces the default, this part included.
+
+- The server's log lines have no colour codes when stderr is not a
+  terminal: under systemd the journal kept them as text
+  (`\x1b[33m WARN`). At a terminal they are coloured as before, unless
+  `NO_COLOR` is set.
+
+- The OTLP export sends `spoolframe_plex_request_duration_seconds` as
+  an OpenTelemetry histogram, with the bounds `/metrics` has (5 ms to
+  10 s), so a collector that writes to Prometheus or Mimir gets its
+  `_bucket`, `_sum` and `_count` series and a p95 can be had. Before, it
+  went out as two counters, `spoolframe_plex_request_duration_seconds_sum`
+  and `_count` (`_sum_total` and `_count_total` in Mimir), which only gave
+  a mean; those are gone. Each request's time is recorded as it ends,
+  only while the export sends metrics. `/metrics` is unchanged. A
+  histogram is declared once (`metrics::histogram::ALL`), and the export
+  makes its instrument from that.
+
 ## 0.9.0 (2026-10-14)
 
 - An item's cast, a movie's release date and a show's last airing, for

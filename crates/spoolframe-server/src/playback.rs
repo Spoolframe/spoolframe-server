@@ -354,8 +354,10 @@ pub async fn time_first_segment(
 #[derive(Debug, Clone)]
 pub struct Playback {
     /// What playback debug (P3-15) names it by: random, and never the
-    /// handle, which is a secret of the session's.
+    /// handle, which is a secret of the session's. Its spans' `playback.id`.
     pub id: String,
+    /// What its spans link to.
+    pub traced: PlaybackTrace,
     pub viewer: Viewer,
     pub shown: Shown,
     /// The plan it plays by, as the client got it.
@@ -394,6 +396,11 @@ pub struct Playback {
     pub video_size: Option<(u32, u32)>,
     /// How long it took to start (PX-24).
     pub start: Arc<Mutex<StartTimes>>,
+    /// When its `StartPlayback` came.
+    requested: Instant,
+    /// A read of its media has been answered with bytes: the first one
+    /// was timed, for the metrics.
+    served: bool,
     /// What its device's connection carried while it was live, read every
     /// [`crate::link_stats::EVERY`]: logged when it ends, and its last
     /// interval shown in its detail.
@@ -458,6 +465,8 @@ impl Playback {
 /// A playback to open.
 #[derive(Debug)]
 pub struct Opened {
+    /// Its id and its `playback` span ([`PlaybackTrace::begin`]).
+    pub trace: PlaybackTrace,
     pub viewer: Viewer,
     pub shown: Shown,
     pub planned: PlaybackPlan,
@@ -479,6 +488,8 @@ pub struct Opened {
     /// How long it took to start (PX-24); its first segment filled in
     /// once ready.
     pub start: Arc<Mutex<StartTimes>>,
+    /// When its `StartPlayback` came.
+    pub requested: Instant,
     /// The connection starting it ([`Playbacks::connection_closed`]).
     pub connection: u64,
 }
@@ -568,6 +579,8 @@ pub struct Playbacks {
     /// the uplink's share is given back (PX-46), its HTTP token ends
     /// (PX-49).
     on_end: parking_lot::RwLock<Vec<OnEnd>>,
+    /// Where the time to a playback's first media goes (P3-14).
+    histograms: std::sync::OnceLock<Arc<crate::metrics::Histograms>>,
 }
 
 /// What [`Playbacks::on_end`] calls.
@@ -771,6 +784,56 @@ fn debug_id() -> String {
     format!("{:08x}", OsRng.next_u32())
 }
 
+/// What ties a playback's spans together: its id (playback debug's), and
+/// the context of its `playback` span, which every later span about it
+/// links to. Not one trace for the whole playback: that needs a span open
+/// as long as the playback, and Tempo gets a span only when it ends.
+#[derive(Debug, Clone)]
+pub struct PlaybackTrace {
+    pub id: String,
+    context: opentelemetry::trace::SpanContext,
+}
+
+impl PlaybackTrace {
+    /// A playback starting now: its trace, and its `playback` span, a root
+    /// that ends as the start does. Its plan and how the start went are
+    /// recorded on it then.
+    pub fn begin() -> (Self, tracing::Span) {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let id = debug_id();
+        let span = tracing::info_span!(
+            parent: None,
+            "playback",
+            playback.id = %id,
+            playback.plan = tracing::field::Empty,
+            playback.delivery = tracing::field::Empty,
+            playback.start_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let context = span.context().span().span_context().clone();
+        (Self { id, context }, span)
+    }
+
+    /// A playback no span is about: a test's.
+    pub fn untraced() -> Self {
+        Self {
+            id: debug_id(),
+            context: opentelemetry::trace::SpanContext::empty_context(),
+        }
+    }
+
+    /// Mark `span` as about this playback: its id, and a link to its
+    /// `playback` span.
+    pub fn mark(&self, span: &tracing::Span) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        span.set_attribute("playback.id", self.id.clone());
+        if self.context.is_valid() {
+            span.add_link(self.context.clone());
+        }
+    }
+}
+
 /// How a playback is served (P3-14): the file as it is, a conversion that
 /// only copies its streams into another container, or one that encodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -836,7 +899,14 @@ impl Playbacks {
             connections: Mutex::default(),
             numbered: Default::default(),
             on_end: parking_lot::RwLock::default(),
+            histograms: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Observe the time to each playback's first media into `histograms`
+    /// (P3-14).
+    pub fn record_into(&self, histograms: Arc<crate::metrics::Histograms>) {
+        let _ = self.histograms.set(histograms);
     }
 
     /// Call `hook` with each playback's handle as it ends, after the
@@ -967,7 +1037,8 @@ impl Playbacks {
         handles.insert(
             handle.0.clone(),
             Playback {
-                id: debug_id(),
+                id: opened.trace.id.clone(),
+                traced: opened.trace,
                 viewer: opened.viewer,
                 shown: opened.shown,
                 planned: opened.planned,
@@ -990,6 +1061,8 @@ impl Playbacks {
                 display: opened.display,
                 video_size: opened.video_size,
                 start: opened.start,
+                requested: opened.requested,
+                served: false,
                 link: Arc::default(),
                 connection: opened.connection,
                 last_used: now,
@@ -1089,6 +1162,11 @@ impl Playbacks {
         })
     }
 
+    /// What `handle`'s spans link to, if it is open. Not a use of it.
+    pub fn traced(&self, handle: &PlaybackHandle) -> Option<PlaybackTrace> {
+        self.lock().get(&handle.0).map(|p| p.traced.clone())
+    }
+
     /// What `handle` plays, if it is open: for the log, which never names
     /// the handle itself. Not a use of it.
     pub fn item(&self, handle: &PlaybackHandle) -> Option<MediaId> {
@@ -1107,19 +1185,35 @@ impl Playbacks {
 
     /// `handle` read `sent` bytes at `offset`, of HLS segment `segment` if
     /// it names one (P3-15): where that is in the film, and how far its
-    /// conversion had got, go on its chart.
+    /// conversion had got, go on its chart. The first such read with
+    /// bytes, but for the init segment, is its time to first media
+    /// (P3-14).
     pub fn read(&self, handle: &PlaybackHandle, offset: u64, sent: u64, segment: Option<u32>) {
         // What the chart needs, not the whole playback (M10).
-        let Some((trace, conversion, duration_ms, size)) = self.lock().get(&handle.0).map(|p| {
-            (
-                p.trace.clone(),
-                p.conversion.clone(),
-                p.shown.duration_ms,
-                p.size,
-            )
-        }) else {
+        let Some((trace, conversion, duration_ms, size, first)) =
+            self.lock().get_mut(&handle.0).map(|p| {
+                let first = (!p.served && sent > 0 && segment != Some(0)).then(|| {
+                    p.served = true;
+                    (p.plan(), p.requested.elapsed())
+                });
+                (
+                    p.trace.clone(),
+                    p.conversion.clone(),
+                    p.shown.duration_ms,
+                    p.size,
+                    first,
+                )
+            })
+        else {
             return;
         };
+        if let (Some((plan, took)), Some(histograms)) = (first, self.histograms.get()) {
+            histograms.observe(
+                &crate::metrics::histogram::PLAYBACK_FIRST_SEGMENT,
+                took.as_secs_f64(),
+                &[("plan", plan.as_str())],
+            );
+        }
         let (epoch, read_ms, converted_ms, mark) = match &conversion {
             None => {
                 // Bounded today by every caller, but not by this type.
@@ -1723,6 +1817,7 @@ mod tests {
     /// Session `s`'s playback of the movie on `endpoint`.
     fn opened_on(endpoint: &str) -> Opened {
         Opened {
+            trace: PlaybackTrace::untraced(),
             viewer: viewer(),
             shown: Shown {
                 title: "Alien".into(),
@@ -1746,6 +1841,7 @@ mod tests {
                 keyframes: None,
                 first_segment: FirstSegment::Direct,
             })),
+            requested: Instant::now(),
             connection: 0,
             display: None,
         }

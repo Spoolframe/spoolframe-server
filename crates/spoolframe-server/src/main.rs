@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::connected::Connected;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
-use spoolframe_server::logs::{LogRing, RingLayer};
+use spoolframe_server::logs::{self, LogRing, RingLayer};
 use spoolframe_server::metrics::Metrics;
 use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::oidc::Oidc;
@@ -38,7 +39,7 @@ use spoolframe_server::previews::{self, PreviewSources, Previews};
 use spoolframe_server::runtime::{self, Live, RuntimeSettings, reload};
 use spoolframe_server::store::Store;
 use spoolframe_server::subtitles::Subtitles;
-use spoolframe_server::telemetry::{OtelLayer, Swap, Telemetry};
+use spoolframe_server::telemetry::{self, OtelLayer, Swap, Telemetry};
 use spoolframe_server::transcode::{self, Transcoding};
 use spoolframe_server::watch::Watch;
 use spoolframe_types::MediaId;
@@ -525,7 +526,7 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
     // expression, e.g. `SPOOLFRAME_LOG=spoolframe_server=trace`.
     let filter = std::env::var("SPOOLFRAME_LOG")
         .map(EnvFilter::new)
-        .unwrap_or_else(|_| EnvFilter::new(level));
+        .unwrap_or_else(|_| EnvFilter::new(logs::default_filter(level)));
     // Logs go to stderr: stdout is the output of `id`, `media probe` and
     // `plex check-paths`, and must stay parseable.
     // And into memory for the web UI's Logs page (P3-14): the same lines,
@@ -539,10 +540,20 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
             tracing::warn!(error = %e, "cannot change the OTLP export's layer");
         }
     });
+    // Spans go to the export's tracer, swapped as the setting changes,
+    // through a layer that stays: one in the slot cannot be downcast to.
+    let tracer = telemetry::Tracer::default();
     tracing_subscriber::registry()
         .with(otlp)
+        .with(telemetry::spans_layer(&tracer))
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(logs::text_layer(
+            std::io::stderr,
+            logs::colours(
+                std::io::stderr().is_terminal(),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ),
+        ))
         .with(RingLayer(ring.clone()))
         .init();
     log_hardened(&hardened);
@@ -574,7 +585,7 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
     reload::shadowed_warnings(&layers);
 
     let done = match cli.command {
-        None => return run(&config, &layers, state_dir, ring, swap).await,
+        None => return run(&config, &layers, state_dir, ring, swap, tracer).await,
         Some(Command::Config {
             command: ConfigCommand::Defaults,
         }) => unreachable!("printed before the layers are read"),
@@ -757,6 +768,7 @@ async fn run(
     state_dir: &Path,
     logs: Arc<LogRing>,
     swap: Swap,
+    tracer: telemetry::Tracer,
 ) -> Result<Option<RestartMode>> {
     logs.set_capacity(config.logs.buffer_lines()?);
     // Before anything is logged: whatever waits for "listening" (a service
@@ -1008,6 +1020,7 @@ async fn run(
     let metrics = Arc::new(Metrics::default());
     let telemetry = Arc::new(Telemetry::new(
         swap,
+        tracer,
         metrics.clone(),
         name.clone(),
         endpoint_id.clone(),
@@ -1117,7 +1130,7 @@ async fn run(
             app_passkeys: Arc::new(AppPasskeys::new(server_id)),
             watch,
             transcoding,
-            jobs,
+            jobs: jobs.clone(),
             subtitles,
             previews,
             metrics,
@@ -1168,6 +1181,9 @@ async fn run(
     within(SHUTDOWN_STEP, "the endpoint", server.shutdown()).await;
     let _ = admin.stop();
     within(SHUTDOWN_STEP, "the admin API", admin.stopped()).await;
+    // Every ffmpeg killed, so each conversion's span ends while the
+    // export can still send it.
+    jobs.stop_all();
     // What is queued for the collector goes before the process does.
     telemetry.shutdown().await;
     within(

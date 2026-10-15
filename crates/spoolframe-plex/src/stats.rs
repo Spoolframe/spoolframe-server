@@ -3,6 +3,7 @@
 //! knows nothing of how they are reported.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// The upper bounds of the latency buckets, in seconds: a LAN PMS answers
@@ -12,15 +13,28 @@ pub const LATENCY_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Told how long each request took, as it ends: for a histogram recorded
+/// value by value (the OTLP export's) rather than read as buckets.
+pub type Observer = Arc<dyn Fn(Duration) + Send + Sync>;
+
 /// Counted for every request to one PMS, whichever view of its catalog
 /// made it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RequestStats {
     requests: AtomicU64,
     errors: AtomicU64,
     /// Requests in each bucket alone, not cumulative.
     buckets: [AtomicU64; LATENCY_BUCKETS.len()],
     sum_micros: AtomicU64,
+    observer: OnceLock<Observer>,
+}
+
+impl std::fmt::Debug for RequestStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestStats")
+            .field("counts", &self.counts())
+            .finish_non_exhaustive()
+    }
 }
 
 /// [`RequestStats`] as they are now.
@@ -47,6 +61,15 @@ impl RequestStats {
         }
         self.sum_micros
             .fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        if let Some(observer) = self.observer.get() {
+            observer(took);
+        }
+    }
+
+    /// Tell `observer` of every request from now on. Only the first is
+    /// kept: the stats are one PMS's, and so is whoever watches them.
+    pub fn observe(&self, observer: Observer) {
+        let _ = self.observer.set(observer);
     }
 
     pub fn counts(&self) -> RequestCounts {
@@ -86,5 +109,19 @@ mod tests {
         // Over the last bound: only in +Inf, which is `requests`.
         assert_eq!(counts.buckets.last(), Some(&(10.0, 2)));
         assert!((counts.sum_seconds - 20.303).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_observer_is_told_each_request_s_time() {
+        let stats = RequestStats::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let told = seen.clone();
+        stats.observe(Arc::new(move |took| told.lock().unwrap().push(took)));
+        stats.record(Duration::from_millis(3), false);
+        stats.record(Duration::from_millis(300), true);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Duration::from_millis(3), Duration::from_millis(300)]
+        );
     }
 }

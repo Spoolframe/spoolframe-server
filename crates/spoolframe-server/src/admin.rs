@@ -75,6 +75,7 @@ use spoolframe_plex::account::{PinState, PlexTv};
 mod catalog;
 
 pub use catalog::PathChecks;
+pub(crate) use catalog::kinds as library_kinds;
 
 /// The address the caller is at: its connection's, or behind a trusted
 /// proxy the one the proxy forwards for, `None` if the proxy named none
@@ -922,7 +923,7 @@ impl AdminApi {
             .and_then(|Peer(ip)| *ip)
             .map_or_else(|| "-".to_owned(), |ip| ip.to_canonical().to_string());
         let refusals = self.auth.refusals();
-        if !refusals.admit(&source, kind) {
+        if !refusals.admit(&source, kind, channel) {
             return;
         }
         let owner = match bearer {

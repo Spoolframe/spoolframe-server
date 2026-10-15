@@ -951,6 +951,16 @@ impl Auth {
         &self.refusals
     }
 
+    /// Every refusal so far, a refused `Hello` too, by kind and channel
+    /// (P3-14).
+    pub fn refusal_counts(&self) -> Vec<(crate::refusals::Kind, crate::refusals::Channel, u64)> {
+        self.refusals
+            .counts()
+            .zip(self.hellos.counts())
+            .map(|((kind, channel, a), (_, _, b))| (kind, channel, a + b))
+            .collect()
+    }
+
     /// Which refused `Hello`s are logged ([`Refusals::hellos`]).
     pub fn refused_hellos(&self) -> &Refusals {
         &self.hellos

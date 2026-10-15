@@ -28,6 +28,7 @@ use self::hls::Segments;
 pub use self::job::{BudgetUse, Encoding, EncodingGuard, Load, Measured, Units};
 use self::job::{EncodeJob, Fallback, JobError, Jobs, Run, Slot, Written};
 use self::pick::RunOn;
+use crate::playback::PlaybackTrace;
 use crate::transcode::{Detected, Gpu};
 
 /// What the server allows encodes (`transcode { … }`).
@@ -107,6 +108,8 @@ pub struct Conversion {
     epochs: std::sync::atomic::AtomicU32,
     /// Ended by an admin (P3-15): no encode starts again for it.
     ended: std::sync::atomic::AtomicBool,
+    /// Its playback's, which each run's span links to.
+    trace: PlaybackTrace,
     /// Every switch it logged, for tests to read: log capture races
     /// other tests' (tracing caches a callsite's interest process-wide).
     #[cfg(test)]
@@ -220,6 +223,8 @@ pub struct ConversionSource<'a> {
     /// For a ladder (PX-21), the rung its first encode is: the one the
     /// player is told to start on.
     pub start_rung: u32,
+    /// The playback's, which each run's `conversion` span links to.
+    pub trace: PlaybackTrace,
 }
 
 impl Conversion {
@@ -357,6 +362,15 @@ impl Conversion {
                 first_segment,
                 source.slot,
                 keyframe_cuts(*video, first_video, segments.as_ref()),
+                RunWhy {
+                    playback: &source.trace,
+                    reason: if source.first_epoch == 0 {
+                        "start"
+                    } else {
+                        "change"
+                    },
+                    rung: start_rung,
+                },
             )?;
             Ok(Arc::new(Self {
                 jobs,
@@ -380,6 +394,7 @@ impl Conversion {
                     left: None,
                 }),
                 ended: Default::default(),
+                trace: source.trace,
                 #[cfg(test)]
                 switches: Arc::default(),
             }))
@@ -653,8 +668,11 @@ impl Conversion {
         rung: u32,
         start: Option<Duration>,
         from: u32,
+        reason: &'static str,
     ) -> NextRun {
         NextRun {
+            rung,
+            reason,
             parts: self.parts(rung),
             epoch: self
                 .epochs
@@ -681,6 +699,11 @@ impl Conversion {
             run.from,
             run.slot,
             run.cuts,
+            RunWhy {
+                playback: &self.trace,
+                reason: run.reason,
+                rung: run.rung,
+            },
         )
     }
 
@@ -784,7 +807,13 @@ impl Conversion {
         again: impl FnOnce() -> Result<T, JobError>,
     ) -> Result<T, JobError> {
         let (start, from) = run_at(segments, n, rung_video(self.video, &self.ladder, rung));
-        let run = self.next_run(&current, rung, start, from);
+        // Another rung, or the same one far from where its run is.
+        let reason = if rung == current.rung {
+            "restart"
+        } else {
+            "switch"
+        };
+        let run = self.next_run(&current, rung, start, from, reason);
         let (replaces, was) = (current.job.epoch, current.rung);
         drop(current);
         let next = self.start_run(run)?;
@@ -795,7 +824,7 @@ impl Conversion {
             return again();
         }
         let left = std::mem::replace(&mut current.job, next);
-        left.stop();
+        left.replaced(reason, start.map_or(0, |s| s.as_millis() as u64));
         // A rung's init is kept when the player leaves it; a run restarted
         // on its own rung keeps its init as it was.
         if rung != was {
@@ -935,7 +964,7 @@ impl Conversion {
         if self.ended() {
             return Err(JobError::Prepare(ENDED.into()));
         }
-        let run = self.next_run(&current, current.rung, Some(start), start_number);
+        let run = self.next_run(&current, current.rung, Some(start), start_number, "seek");
         let epoch = run.epoch;
         drop(current);
         // Started with the lock let go (M4). A seek is the client's last
@@ -945,7 +974,7 @@ impl Conversion {
         if self.ended() {
             return Err(JobError::Prepare(ENDED.into()));
         }
-        current.job.stop();
+        current.job.replaced("seek", start.as_millis() as u64);
         current.job = job;
         // What the rung left wrote is from before the seek: let it go.
         current.left = None;
@@ -1200,6 +1229,9 @@ fn segment_seek(segments: &Segments, n: u32, video: Option<ConvertedVideo>) -> O
 /// A run worked out under a conversion's lock, to be started with it let
 /// go ([`Conversion::next_run`]).
 struct NextRun {
+    rung: u32,
+    /// Why it starts, for its span: `seek`, `switch` or `restart`.
+    reason: &'static str,
     parts: Parts,
     epoch: u32,
     start: Option<Duration>,
@@ -1233,6 +1265,7 @@ fn spawn(
     start_number: u32,
     slot: Option<Slot>,
     cuts: Cuts,
+    why: RunWhy<'_>,
 ) -> Result<Arc<EncodeJob>, JobError> {
     let job_dir = dir.join(epoch.to_string());
     let aligned_until = aligned_until(&cuts, start, start_number);
@@ -1333,7 +1366,17 @@ fn spawn(
     {
         inputs.push(link_target(pictures)?);
     }
-    jobs.start(
+    let load = load(video, audio, gpu_encode, args::all_on_gpu(&spec));
+    let span = conversion_span(
+        &why,
+        &spec,
+        delivery,
+        made.as_ref(),
+        run_on.gpu().filter(|_| gpu != GpuUse::None),
+        load,
+        (epoch, start_ms),
+    );
+    let started = jobs.start(
         job_dir,
         Run {
             args,
@@ -1348,14 +1391,87 @@ fn spawn(
             card: run_on.gpu().filter(|_| gpu_encode).map(|g| g.limit()),
             ffmpeg: run_on.gpu().map(|g| g.ffmpeg.clone()),
             aligned_until,
+            span: Some(span.clone()),
         },
         written,
-        load(video, audio, gpu_encode, args::all_on_gpu(&spec)),
+        load,
         epoch,
         first_segment,
         start_ms,
         slot,
-    )
+    );
+    if let Err(e) = &started {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let outcome = match e {
+            JobError::Busy => "busy",
+            JobError::Prepare(_) => "prepare_failed",
+            JobError::Spawn(_) => "spawn_failed",
+        };
+        span.set_attribute("outcome", outcome);
+    } else {
+        jobs.started_for(why.reason);
+    }
+    started
+}
+
+/// Why a run starts, for its `conversion` span.
+struct RunWhy<'a> {
+    playback: &'a PlaybackTrace,
+    /// `start`, `change` (the playback's subtitle or quality changed),
+    /// `seek`, `switch` (to another rung) or `restart` (at a segment far
+    /// from where the run was).
+    reason: &'static str,
+    rung: u32,
+}
+
+/// A run's `conversion` span, from ffmpeg's spawn to its exit or kill: a
+/// root linked to its playback's start, as a conversion can last a whole
+/// film. What it is: why it started, where, with which encoder, on which
+/// GPU, decoding how, through which filters. How it went is added as it
+/// runs ([`job::EncodeJob`]).
+fn conversion_span(
+    why: &RunWhy<'_>,
+    spec: &EncodeSpec<'_>,
+    delivery: Delivery,
+    made: Option<&Made>,
+    gpu: Option<&Arc<Gpu>>,
+    load: Load,
+    (epoch, start_ms): (u32, u64),
+) -> tracing::Span {
+    let encoder = made.and_then(|m| m.encoder.as_ref());
+    let decode = match made.map(|m| m.decoder) {
+        None | Some(Decoder::None) => "none",
+        Some(Decoder::Software) => "sw",
+        Some(Decoder::Hardware(_) | Decoder::Vulkan) => "hw",
+    };
+    let filters: Vec<String> = made
+        .into_iter()
+        .flat_map(|m| [("tonemap", m.tone_map), ("burn_in", m.burn_in)])
+        .filter_map(|(filter, on)| match on {
+            FilterOn::None => None,
+            FilterOn::Gpu => Some(format!("{filter}:gpu")),
+            FilterOn::Cpu => Some(format!("{filter}:cpu")),
+        })
+        .collect();
+    let span = tracing::info_span!(
+        parent: None,
+        "conversion",
+        conversion.reason = why.reason,
+        conversion.rung = i64::from(why.rung),
+        conversion.epoch = i64::from(epoch),
+        conversion.start_ms = start_ms as i64,
+        conversion.delivery = %delivery,
+        conversion.plan = if encodes(spec.video, spec.audio) { "transcode" } else { "remux" },
+        conversion.load = load.as_str(),
+        conversion.encoder = encoder.map_or("copy", |e| e.name.as_str()),
+        conversion.hardware = if encoder.is_some_and(|e| e.hardware.is_some()) { "gpu" } else { "cpu" },
+        conversion.gpu = gpu.map(|g| g.card().place()).as_deref(),
+        conversion.decode = decode,
+        conversion.filters = if filters.is_empty() { "none".to_owned() } else { filters.join(",") },
+        conversion.tone_mapper = made.and_then(|m| m.tone_mapper).map(|t| t.label()),
+    );
+    why.playback.mark(&span);
+    span
 }
 
 /// The first segment a run from `start` (segment `from`) cut at `cuts`
@@ -1733,6 +1849,7 @@ pub(crate) mod tests {
         let conversion = Conversion::start(
             jobs,
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,
@@ -2114,6 +2231,7 @@ pub(crate) mod tests {
         let conversion = Conversion::start(
             jobs,
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,
@@ -2200,6 +2318,7 @@ pub(crate) mod tests {
         let started = Conversion::start(
             jobs.clone(),
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,
@@ -2313,6 +2432,7 @@ pub(crate) mod tests {
         let conversion = Conversion::start(
             jobs.clone(),
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,
@@ -2437,6 +2557,7 @@ pub(crate) mod tests {
         let conversion = Conversion::start(
             jobs.clone(),
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,
@@ -2560,6 +2681,7 @@ pub(crate) mod tests {
         let conversion = Conversion::start(
             jobs.clone(),
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,
@@ -2692,6 +2814,7 @@ pub(crate) mod tests {
         let conversion = Conversion::start(
             jobs.clone(),
             ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
                 descriptor,

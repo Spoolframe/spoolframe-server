@@ -237,13 +237,9 @@ async fn a_direct_playback_its_reads_and_its_end_move_the_counts() {
     metrics.refresh().await;
     let sessions = metrics.sessions();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
-    let alice = format!("local:{}", sessions[0].user);
+    // By kind only: a label per user would grow with the users.
     assert_eq!(
-        value(
-            metrics,
-            "spoolframe_sessions",
-            &[("user", &alice), ("kind", "app")]
-        ),
+        value(metrics, "spoolframe_sessions", &[("kind", "app")]),
         1.0
     );
     client.close().await;
@@ -520,6 +516,7 @@ async fn the_telemetry_status_says_who_was_refused_and_what_an_export_carries() 
     let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
     let telemetry = Arc::new(spoolframe_server::telemetry::Telemetry::new(
         Box::new(|_| {}),
+        Default::default(),
         metrics.clone(),
         spoolframe_server::network::ServerName::new("Den"),
         "f00dfeed".into(),
@@ -564,4 +561,345 @@ async fn the_telemetry_status_says_who_was_refused_and_what_an_export_carries() 
         "{:?}",
         status.resource
     );
+}
+
+/// The `# TYPE` line of `name` in the Prometheus text, and its lines.
+fn exposed(metrics: &Metrics, name: &str) -> (String, Vec<String>) {
+    let text = spoolframe_server::metrics::render(&metrics.families());
+    let kind = text
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("# TYPE {name} ")))
+        .unwrap_or_else(|| panic!("no {name} in {text}"))
+        .to_owned();
+    let lines = text
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.starts_with(name))
+        .map(str::to_owned)
+        .collect();
+    (kind, lines)
+}
+
+/// Each client request is counted by its type and how it went, and its
+/// time is in a histogram by type. A type this build does not know is
+/// `unknown`, not what the client said: the client chooses it.
+#[tokio::test]
+async fn client_requests_are_counted_by_type_and_outcome_and_timed() {
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Newer {
+        JoinFederation { code: String },
+    }
+    #[derive(serde::Serialize)]
+    struct Envelope {
+        session: Option<String>,
+        request: Newer,
+    }
+
+    let server = TestServer::start("requests").await;
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello().await;
+    let refused = client
+        .call(
+            None,
+            Request::LoginPassword(spoolframe_protocol::LoginPassword {
+                username: "alice".into(),
+                password: "wrong".into(),
+                remember: false,
+            }),
+        )
+        .await;
+    let Response::Err(error) = &refused else {
+        panic!("{refused:?}");
+    };
+    let refused_as = serde_json::to_value(error).unwrap()["type"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client.login("alice", "correct horse").await;
+    client
+        .send(&Envelope {
+            session: None,
+            request: Newer::JoinFederation { code: "abc".into() },
+        })
+        .await;
+    let metrics = &server.metrics;
+    let requests = |request, outcome| {
+        value(
+            metrics,
+            "spoolframe_client_requests_total",
+            &[("request", request), ("outcome", outcome)],
+        )
+    };
+    assert_eq!(requests("hello", "ok"), 1.0);
+    assert_eq!(requests("login_password", "ok"), 1.0);
+    assert_eq!(requests("login_password", &refused_as), 1.0);
+    assert_eq!(requests("unknown", "unsupported"), 1.0);
+    let (kind, lines) = exposed(metrics, "spoolframe_client_requests_total");
+    assert_eq!(kind, "counter");
+    assert!(
+        lines.iter().all(|l| !l.contains("join_federation")),
+        "{lines:?}"
+    );
+
+    let (kind, lines) = exposed(metrics, "spoolframe_client_request_duration_seconds");
+    assert_eq!(kind, "histogram");
+    assert!(
+        lines.contains(
+            &"spoolframe_client_request_duration_seconds_count{request=\"login_password\"} 2"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(
+            &"spoolframe_client_request_duration_seconds_bucket{request=\"hello\",le=\"+Inf\"} 1"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The `_count` of histogram `name`'s series with `labels` (written as
+/// Prometheus writes them, `a="x"`), or 0 when it has none.
+fn histogram_count(metrics: &Metrics, name: &str, labels: &str) -> u64 {
+    let (_, lines) = exposed(metrics, name);
+    let series = if labels.is_empty() {
+        format!("{name}_count ")
+    } else {
+        format!("{name}_count{{{labels}}} ")
+    };
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix(&series))
+        .map_or(0, |n| n.parse().unwrap())
+}
+
+/// A direct playback's first read with bytes is its time to first media,
+/// once: the reads after it are not.
+#[tokio::test]
+async fn a_playback_s_first_read_is_its_time_to_first_media() {
+    let server = TestServer::start("first-media").await;
+    server.write_media(1 << 20);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(mkv_capabilities())).await;
+    let session = client.login("alice", "correct horse").await;
+    let metrics = &server.metrics;
+    let name = "spoolframe_playback_first_segment_seconds";
+    let (kind, _) = exposed(metrics, name);
+    assert_eq!(kind, "histogram");
+    let handle = start(&client, &session).await;
+    assert_eq!(histogram_count(metrics, name, "plan=\"direct\""), 0);
+    for offset in [0, 4096] {
+        let (response, _) = client.read(&session, &handle, offset, 4096).await;
+        assert!(matches!(response, MediaReadResponse::Ok(_)));
+    }
+    assert_eq!(histogram_count(metrics, name, "plan=\"direct\""), 1);
+    // A direct playback's reads never wait for an encode.
+    assert_eq!(
+        histogram_count(metrics, "spoolframe_segment_read_wait_seconds", ""),
+        0
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// An HLS conversion's reads say how long they waited for the encode, a
+/// read the encode is past 0; its first segment is its time to first
+/// media; a seek's run is a restart. Real ffmpeg.
+#[tokio::test]
+async fn an_hls_conversion_s_waits_first_segment_and_seek_are_measured() {
+    let server = TestServer::start_with(
+        fresh_dir("hls-quality").await,
+        ServerOptions {
+            real_media: true,
+            read_ahead: Duration::from_secs(2),
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(60, "libx264", "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client
+        .hello_with(None, Some(crate::support::hls_capabilities()))
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    let metrics = &server.metrics;
+    let handle = start(&client, &session).await;
+    let segment = |n| spoolframe_protocol::MediaRead {
+        session: session.clone(),
+        handle: handle.clone(),
+        offset: 0,
+        length: spoolframe_protocol::MAX_READ,
+        epoch: 0,
+        segment: Some(n),
+        variant: 0,
+    };
+    // The first waits for the encode; the same again does not.
+    for _ in 0..2 {
+        let (read, bytes) = client.media(segment(1)).await;
+        assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");
+        assert!(!bytes.is_empty());
+    }
+    let wait = "spoolframe_segment_read_wait_seconds";
+    let (kind, lines) = exposed(metrics, wait);
+    assert_eq!(kind, "histogram");
+    assert_eq!(histogram_count(metrics, wait, ""), 2, "{lines:?}");
+    assert!(
+        lines.contains(&format!("{wait}_bucket{{le=\"0\"}} 1")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        histogram_count(
+            metrics,
+            "spoolframe_playback_first_segment_seconds",
+            "plan=\"transcode\""
+        ),
+        1
+    );
+
+    let restarts = |reason| {
+        value(
+            metrics,
+            "spoolframe_conversion_restarts_total",
+            &[("reason", reason)],
+        )
+    };
+    assert_eq!(restarts("seek"), 0.0);
+    let seeked = client
+        .call(
+            Some(&session),
+            Request::SeekPlayback {
+                handle: handle.clone(),
+                position_ms: 30_000,
+            },
+        )
+        .await;
+    assert!(
+        matches!(seeked, Response::Ok(Reply::PlaybackSeeked { .. })),
+        "{seeked:?}"
+    );
+    assert_eq!(restarts("seek"), 1.0);
+    assert_eq!(restarts("switch"), 0.0);
+    let (kind, _) = exposed(metrics, "spoolframe_conversion_restarts_total");
+    assert_eq!(kind, "counter");
+    client.close().await;
+    server.stop().await;
+}
+
+/// What a client connection carried is counted by the path it went by,
+/// the rest of it as it closes.
+#[tokio::test]
+async fn a_connection_s_bytes_are_counted_by_its_path() {
+    let server = TestServer::start("link-bytes").await;
+    let metrics = server.metrics.clone();
+    let (kind, lines) = exposed(&metrics, "spoolframe_connection_bytes_total");
+    assert_eq!(kind, "counter");
+    for path in ["lan", "direct", "relay", "unknown"] {
+        for direction in ["sent", "received"] {
+            assert!(
+                lines.iter().any(|l| l.starts_with(&format!(
+                    "spoolframe_connection_bytes_total{{path=\"{path}\",direction=\"{direction}\"}}"
+                ))),
+                "{lines:?}"
+            );
+        }
+    }
+    let bytes = |direction| {
+        ["lan", "direct", "relay", "unknown"]
+            .iter()
+            .map(|path| {
+                value(
+                    &metrics,
+                    "spoolframe_connection_bytes_total",
+                    &[("path", path), ("direction", direction)],
+                )
+            })
+            .sum::<f64>()
+    };
+    let client = server.client().await;
+    client.hello().await;
+    for _ in 0..3 {
+        client.call(None, Request::Ping).await;
+    }
+    client.close().await;
+    until("the closed connection's bytes are counted", || {
+        bytes("sent") > 0.0 && bytes("received") > 0.0
+    })
+    .await;
+    // Not a relay: the test's client dials the server directly.
+    assert_eq!(
+        value(
+            &metrics,
+            "spoolframe_connection_bytes_total",
+            &[("path", "relay"), ("direction", "sent")]
+        ),
+        0.0
+    );
+    // A connection is read every 10 s, its round-trip time with it: the
+    // first reading is at once.
+    let (kind, lines) = exposed(&metrics, "spoolframe_connection_rtt_seconds");
+    assert_eq!(kind, "histogram");
+    assert!(
+        lines.iter().any(|l| {
+            l.starts_with("spoolframe_connection_rtt_seconds_count{path=\"")
+                && !l.starts_with("spoolframe_connection_rtt_seconds_count{path=\"relay\"")
+        }),
+        "{lines:?}"
+    );
+    server.stop().await;
+}
+
+/// Refused requests are counted by kind and channel, every one, never
+/// by who or from where.
+#[tokio::test]
+async fn refused_requests_are_counted_by_kind_and_channel() {
+    let server = TestServer::start("refused").await;
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello().await;
+    let metrics = &server.metrics;
+    let refused = |kind| {
+        value(
+            metrics,
+            "spoolframe_requests_refused_total",
+            &[("kind", kind), ("channel", "quic")],
+        )
+    };
+    assert_eq!(refused("sign_in_failed"), 0.0);
+    for _ in 0..2 {
+        let response = client
+            .call(
+                None,
+                Request::LoginPassword(spoolframe_protocol::LoginPassword {
+                    username: "alice".into(),
+                    password: "wrong".into(),
+                    remember: false,
+                }),
+            )
+            .await;
+        assert!(matches!(response, Response::Err(_)), "{response:?}");
+    }
+    assert_eq!(refused("sign_in_failed"), 2.0);
+    let (kind, lines) = exposed(metrics, "spoolframe_requests_refused_total");
+    assert_eq!(kind, "counter");
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.contains("alice") && !l.contains("source")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(
+            &"spoolframe_requests_refused_total{kind=\"rate_limited\",channel=\"admin_api\"} 0"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    client.close().await;
+    server.stop().await;
 }

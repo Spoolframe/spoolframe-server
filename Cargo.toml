@@ -208,7 +208,10 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_periodicreader_with_async_runtime"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-client", "trace", "metrics", "logs", "tls-aws-lc"] }
 tracing-opentelemetry = { version = "0.32", default-features = false }
-opentelemetry-appender-tracing = { version = "0.31", default-features = false }
+# `experimental_use_tracing_span_context`: a log record carries the trace
+# and span it was logged in, read from tracing-opentelemetry's span data,
+# as a span carries no log lines (the server's `telemetry::Spans`).
+opentelemetry-appender-tracing = { version = "0.31", default-features = false, features = ["experimental_use_tracing_span_context"] }
 # The headers sent to a gRPC collector, and the test collector's server.
 tonic = { version = "0.14", default-features = false }
 # The test collector decodes what arrives.

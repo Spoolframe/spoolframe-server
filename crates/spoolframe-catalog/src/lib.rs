@@ -141,6 +141,25 @@ pub trait Catalog: Send + Sync {
     /// One item, with its direct children.
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError>;
 
+    /// Every episode of the show `show`, specials included, in no order
+    /// promised: what [`Catalog::item`] finds walking the show's seasons.
+    /// A backend that can list them at once does so in one request.
+    async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
+        let mut episodes = Vec::new();
+        for season in self.item(show).await?.children {
+            if let Item::Season(season) = season {
+                episodes.extend(
+                    self.item(&season.id)
+                        .await?
+                        .children
+                        .into_iter()
+                        .filter(|e| matches!(e, Item::Episode(_))),
+                );
+            }
+        }
+        Ok(episodes)
+    }
+
     /// The stable identities of the item now under `id`, as
     /// [`ItemWithChildren::external_ids`], without its children or
     /// markers: the cheapest way to ask what a key holds. `NotFound` when

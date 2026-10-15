@@ -1116,6 +1116,65 @@ async fn a_show_whose_episodes_cannot_be_listed_loads_without_its_last_airing() 
     assert_eq!(got.children.len(), 2);
 }
 
+fn show_leaves(section: u32) -> ResponseTemplate {
+    let episode = |key: &str, show: &str, season: u32, episode: u32| {
+        serde_json::json!({
+            "ratingKey": key,
+            "type": "episode",
+            "title": key,
+            "grandparentRatingKey": show,
+            "parentRatingKey": format!("{show}{season}"),
+            "parentIndex": season,
+            "index": episode,
+        })
+    };
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "MediaContainer": {
+            "librarySectionID": section,
+            "Metadata": [
+                episode("11", "1", 0, 1),
+                episode("21", "1", 1, 1),
+                episode("22", "1", 1, 2),
+                // Another show's: not this show's episode, whatever Plex
+                // lists.
+                episode("91", "9", 1, 1),
+            ],
+        }
+    }))
+}
+
+/// A show's episodes, every season's and the specials, are one request.
+#[tokio::test]
+async fn a_show_s_episodes_are_its_all_leaves() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/metadata/1/allLeaves"))
+        .respond_with(show_leaves(1))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let episodes = catalog(&server)
+        .episodes(&id(MediaKind::Show, "1"))
+        .await
+        .unwrap();
+    let keys: Vec<&str> = episodes.iter().map(|e| e.id().key()).collect();
+    assert_eq!(keys, ["11", "21", "22"]);
+}
+
+#[tokio::test]
+async fn a_show_s_episodes_in_a_library_not_served_are_not_served() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/metadata/1/allLeaves"))
+        .respond_with(show_leaves(2))
+        .mount(&server)
+        .await;
+    let err = catalog(&server)
+        .serving(Some(["1".to_owned()].into()))
+        .episodes(&id(MediaKind::Show, "1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::NotServed(_)), "{err}");
+}
+
 /// A person's photo is on Plex's people host; the PMS's photo
 /// transcoder fetches it, so the token goes to the PMS alone.
 #[tokio::test]

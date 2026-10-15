@@ -125,6 +125,11 @@ struct ConnectionState {
     path_log: parking_lot::Mutex<crate::link_stats::PathLog>,
     /// What tells the LAN from the WAN (PX-46).
     uplink: Arc<crate::uplink::Uplink>,
+    /// Its UDP bytes sent and received counted into the metrics so far.
+    counted: parking_lot::Mutex<(u64, u64)>,
+    /// Whether it punched a hole, as its paths say (P3-14).
+    punch: parking_lot::Mutex<crate::link_stats::HolePunch>,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl ConnectionState {
@@ -135,6 +140,42 @@ impl ConnectionState {
             .last()
             .cloned()
             .unwrap_or_else(|| "none".into())
+    }
+
+    /// Its packets go by `path` now (named by [`path_name`]): an attempt to
+    /// punch a hole, or its success, counted (P3-14).
+    fn path_is(&self, path: &str) {
+        let punch = self
+            .punch
+            .lock()
+            .path(crate::link_stats::PathKind::of(path));
+        if let Some(punch) = punch {
+            self.metrics.hole_punch(punch);
+        }
+    }
+
+    /// Count what `connection` carried since the last count into the
+    /// metrics, as the path it goes by now; and, with `rtt`, that path's
+    /// round-trip time. Its bytes are the whole connection's, every path's,
+    /// so none is lost as paths close.
+    fn count_link(&self, connection: &iroh::endpoint::Connection, rtt: bool) {
+        let stats = connection.stats();
+        let (sent, received) = (stats.udp_tx.bytes, stats.udp_rx.bytes);
+        let kind = crate::link_stats::PathKind::of(&self.path());
+        {
+            let mut counted = self.counted.lock();
+            self.metrics.link_bytes(
+                kind,
+                sent.saturating_sub(counted.0),
+                received.saturating_sub(counted.1),
+            );
+            *counted = (sent.max(counted.0), received.max(counted.1));
+        }
+        if rtt && let Some(path) = connection.paths().iter().find(|p| p.is_selected()) {
+            let kind =
+                crate::link_stats::PathKind::of(&path_name(path.remote_addr(), &self.uplink));
+            self.metrics.link_rtt(kind, path.rtt());
+        }
     }
 
     /// Every path it went by, oldest first, for the log.
@@ -215,6 +256,7 @@ async fn log_paths(
             }
             before.unwrap_or_else(|| "none".into())
         };
+        state.path_is(&selected);
         state
             .switches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -276,10 +318,10 @@ fn link_reading(
     (counters, path)
 }
 
-/// Every [`crate::link_stats::EVERY`] while its device has a playback open,
-/// log what `connection` carried and add it to those playbacks' link
-/// totals: for telling a link too slow for the film from a relay or from a
-/// path that will not hold still.
+/// Every [`crate::link_stats::EVERY`], count what `connection` carried into
+/// the metrics; and while its device has a playback open, log it and add
+/// it to those playbacks' link totals: for telling a link too slow for the
+/// film from a relay or from a path that will not hold still.
 async fn watch_link(
     connection: iroh::endpoint::WeakConnectionHandle,
     endpoint_hex: String,
@@ -303,13 +345,14 @@ async fn watch_link(
         let Some(state) = state.upgrade() else {
             return;
         };
+        let Some(live) = connection.upgrade() else {
+            return;
+        };
+        state.count_link(&live, true);
         if !playbacks.live_on(&endpoint_hex) {
             from = None;
             continue;
         }
-        let Some(live) = connection.upgrade() else {
-            return;
-        };
         let now = std::time::Instant::now();
         let (counters, path) = link_reading(&live, &state);
         drop(live);
@@ -516,13 +559,60 @@ impl ClientProtocol {
         };
         let response = match &request {
             Ok(bytes) => {
-                // One span per request, named by its type: never its
-                // session or its arguments (P3-14).
+                // One span per request, named by its type, with how it went,
+                // the path its connection takes now and what kind of app
+                // asked: never its session, its user or its arguments
+                // (P3-14).
                 use tracing::Instrument as _;
-                let span = tracing::info_span!("client request", request = name.as_str());
-                self.answer(&connection, &state, bytes, &name)
-                    .instrument(span)
-                    .await
+                let span = tracing::info_span!(
+                    "client request",
+                    request = name.as_str(),
+                    outcome = tracing::field::Empty,
+                    connection.path = crate::link_stats::PathKind::of(&state.path()).as_str(),
+                    client.platform = tracing::field::Empty,
+                    client.name = tracing::field::Empty,
+                    protocol.version = tracing::field::Empty,
+                );
+                let began = std::time::Instant::now();
+                let (reply, known) = async {
+                    match decode_request(bytes) {
+                        Ok(wire) => {
+                            let known = !matches!(wire.envelope.request, Request::Unknown);
+                            (
+                                self.answer(&connection, &state, bytes, wire, &name).await,
+                                known,
+                            )
+                        }
+                        Err(e) => (
+                            Response::Err(Error::Malformed {
+                                message: e.to_string(),
+                            })
+                            .into(),
+                            false,
+                        ),
+                    }
+                }
+                .instrument(span.clone())
+                .await;
+                let outcome = match &reply.response {
+                    Response::Err(error) => crate::telemetry::error_kind(error),
+                    _ => "ok".into(),
+                };
+                span.record("outcome", outcome.as_str());
+                // The type as the metrics name it: one this build knows,
+                // as the client chooses what it sends (C-12).
+                self.services.metrics.client_request(
+                    if known { name.as_str() } else { "unknown" },
+                    &outcome,
+                    began.elapsed(),
+                );
+                // Once it has said Hello: a Hello's own span too.
+                if let Some(hello) = state.hello.get() {
+                    span.record("client.platform", hello.platform.as_str());
+                    span.record("client.name", hello.client_name.as_str());
+                    span.record("protocol.version", i64::from(hello.protocol_version));
+                }
+                reply
             }
             Err(e) => Response::Err(Error::Malformed {
                 message: e.to_string(),
@@ -583,17 +673,9 @@ impl ClientProtocol {
         connection: &Connection,
         state: &Arc<ConnectionState>,
         bytes: &[u8],
+        wire: RpcRequest,
         name: &str,
     ) -> RpcReply {
-        let wire = match decode_request(bytes) {
-            Ok(wire) => wire,
-            Err(e) => {
-                return Response::Err(Error::Malformed {
-                    message: e.to_string(),
-                })
-                .into();
-            }
-        };
         // The session a mutation was authenticated with for its operation,
         // handed to its execution so it is not looked up twice (Review
         // 2026-10-11 N2.3): set below, before the execution runs.
@@ -730,7 +812,10 @@ impl ClientProtocol {
         let session = wire.envelope.session.clone();
         if let Some(send) = invocation.execute {
             let operations = operations.clone();
-            let execute = execute(wire);
+            // In the request's span: a spawned task starts with none, and
+            // what the execution did (a Plex request, its log lines) went
+            // to Tempo as traces of their own, the request's span empty.
+            let execute = tracing::Instrument::in_current_span(execute(wire));
             tokio::spawn(async move {
                 let reply = execute.await;
                 operations.finish(
@@ -1100,13 +1185,56 @@ impl ClientProtocol {
         &self,
         connection: &Connection,
         state: &ConnectionState,
-        mut send: SendStream,
+        send: SendStream,
         frame: Result<Vec<u8>, codec::CodecError>,
     ) {
         let request = frame
             .as_ref()
             .map_err(ToString::to_string)
             .and_then(|bytes| codec::decode::<ResourceRequest>(bytes).map_err(|e| e.to_string()));
+        // A read of a playback's media is a span; no other resource is.
+        let span = match &request {
+            Ok(ResourceRequest::Media { request, .. }) => self.segment_read_span(request),
+            _ => tracing::Span::none(),
+        };
+        use tracing::Instrument as _;
+        self.send_resource(connection, state, send, frame, request)
+            .instrument(span)
+            .await;
+    }
+
+    /// The `segment read` span of `read`, which its answer runs in: an HLS
+    /// segment, or a range of the file or the progressive output. About
+    /// one per 6 s segment, per playback.
+    fn segment_read_span(&self, read: &MediaRead) -> tracing::Span {
+        use tracing::field::Empty;
+        let span = tracing::info_span!(
+            "segment read",
+            segment.index = read.segment.map(i64::from),
+            segment.rung = read.segment.map(|_| i64::from(read.variant)),
+            read.offset = read.offset as i64,
+            read.length = read.length as i64,
+            read.bytes = Empty,
+            read.waited_for_encode = Empty,
+            read.wait_ms = Empty,
+            conversion.epoch = Empty,
+            outcome = Empty,
+        );
+        if let Some(trace) = self.services.playbacks.traced(&read.handle) {
+            trace.mark(&span);
+        }
+        span
+    }
+
+    /// The answer to a resource stream's `request`, in the span it runs in.
+    async fn send_resource(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        mut send: SendStream,
+        frame: Result<Vec<u8>, codec::CodecError>,
+        request: Result<ResourceRequest, String>,
+    ) {
         let result = match request {
             Ok(request) => self.open_resource(connection, state, request).await,
             Err(message) => Err(Error::Malformed { message }),
@@ -1115,6 +1243,18 @@ impl ClientProtocol {
             self.refused(connection, Frame::Resource(bytes), error)
                 .await;
         }
+        let span = tracing::Span::current();
+        match &result {
+            Ok((ResourceMetadata::Media { epoch, .. }, length, _)) => {
+                span.record("read.bytes", *length as i64);
+                span.record("conversion.epoch", i64::from(*epoch));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                span.record("outcome", crate::telemetry::error_kind(error));
+            }
+        }
+        let opened = result.is_ok();
         let stall = self.connections.admission().stalled_read;
         let sent = async {
             match result {
@@ -1153,10 +1293,14 @@ impl ClientProtocol {
             Ok(()) => {
                 let _ = send.finish();
                 delivered(&send).await;
+                if opened {
+                    span.record("outcome", "ok");
+                }
             }
             Err(e) => {
                 tracing::debug!(error = %e, "resource read failed");
                 let _ = send.reset(0u32.into());
+                span.record("outcome", "send_failed");
             }
         }
     }
@@ -1463,7 +1607,7 @@ impl ClientProtocol {
         };
         let source = connection.remote_id().fmt_short().to_string();
         let auth = &self.services.auth;
-        if !auth.refusals().admit(&source, kind) {
+        if !auth.refusals().admit(&source, kind, Channel::Quic) {
             return;
         }
         let asked = Asked::of(frame);
@@ -1525,7 +1669,7 @@ impl ClientProtocol {
             .services
             .auth
             .refused_hellos()
-            .admit(&source, Kind::HelloRefused)
+            .admit(&source, Kind::HelloRefused, Channel::Quic)
         {
             return;
         }
@@ -1660,6 +1804,13 @@ impl ClientProtocol {
     ) -> Result<Reply, Error> {
         let catalog = &self.services.catalog;
         let principal = who.principal();
+        // A request about a playback says which in its span, and links to
+        // the playback's start.
+        if let Some(handle) = playback_of(&request)
+            && let Some(trace) = self.services.playbacks.traced(handle)
+        {
+            trace.mark(&tracing::Span::current());
+        }
         // Hold across preparation and publication, and re-read the handle
         // inside the handler. QUIC requests may arrive concurrently.
         let _control = match &request {
@@ -2389,101 +2540,85 @@ impl ClientProtocol {
                 quality,
                 display,
             } => {
-                // The start's breakdown is timed from here (PX-24).
-                let requested = std::time::Instant::now();
-                let caps = capabilities(state, display.as_ref());
-                // Off the LAN, this playback takes a share of the uplink
-                // (PX-46), and may be one too many.
-                let wan = (!on_lan(&state.path())).then(|| uplink_class(&who));
-                // The place is held from here: a start that fails on the
-                // way gives it back when `admission` is dropped.
-                let admission = match wan {
-                    Some(class) => Some(self.services.uplink.reserve(class).map_err(|full| {
-                        Error::WanStreamsFull {
-                            max: u32::try_from(full.max).unwrap_or(u32::MAX),
+                // Its spans link to its `playback` span, a root that ends as
+                // this start does, and this request's does too.
+                let (trace, span) = crate::playback::PlaybackTrace::begin();
+                trace.mark(&tracing::Span::current());
+                let started = async {
+                    // The start's breakdown is timed from here (PX-24).
+                    let requested = std::time::Instant::now();
+                    let caps = capabilities(state, display.as_ref());
+                    // Off the LAN, this playback takes a share of the uplink
+                    // (PX-46), and may be one too many.
+                    let wan = (!on_lan(&state.path())).then(|| uplink_class(&who));
+                    // The place is held from here: a start that fails on the
+                    // way gives it back when `admission` is dropped.
+                    let admission = match wan {
+                        Some(class) => {
+                            Some(self.services.uplink.reserve(class).map_err(|full| {
+                                Error::WanStreamsFull {
+                                    max: u32::try_from(full.max).unwrap_or(u32::MAX),
+                                }
+                            })?)
                         }
-                    })?),
-                    None => None,
-                };
-                let share = admission.as_ref().and_then(|a| a.share());
-                let (path, descriptor) = self.describe(&id).await?;
-                let (selection, chosen) = self
-                    .selection(principal, &id, &descriptor, selection)
-                    .await?;
-                let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = self.plan(
-                    state,
-                    &descriptor,
-                    caps.as_ref(),
-                    quality,
-                    share,
-                    selection,
-                    bitmap,
-                );
-                let planned_in = requested.elapsed();
-                // The item's markers go with the playback (P2-10), so a
-                // player needs no second request for them.
-                let found = catalog.item(&id).await.map_err(catalog_error)?;
-                let markers = found.markers;
-                let mut shown = crate::playback::Shown::of(&found.item);
-                if shown.duration_ms.is_none() {
-                    shown.duration_ms = descriptor.duration.map(|d| d.as_millis() as u64);
-                }
-                let viewer = crate::playback::Viewer {
-                    user_id: principal.to_string(),
-                    username: who.log_name(),
-                    display_name: who.display_name().to_owned(),
-                    device_name: hello.device_name.clone(),
-                    client_name: hello.client_name.clone(),
-                    platform: hello.platform,
-                };
-                let handle = Playbacks::new_handle();
-                // A device keeps "now + next": the one playing and this
-                // one, which may be the next track it prepares while that
-                // plays (iOS gapless audio). Its other encodes, not read
-                // lately, are abandoned: free their slots before this one
-                // takes one. One still read is never ended for it.
-                let endpoint = connection.remote_id().to_string();
-                match self
-                    .services
-                    .playbacks
-                    .make_room_for_next(&endpoint, state.number)
-                {
-                    Ok(_) => {}
-                    Err(crate::playback::DeviceFull) => {
-                        tracing::info!(
-                            %endpoint,
-                            "a device reading all its conversions is refused another"
-                        );
-                        return Err(Error::Busy);
-                    }
-                }
-                let start = start_ms.map(Duration::from_millis);
-                let prepared = match self
-                    .prepare(
-                        &handle,
-                        &id,
-                        (&path, &descriptor),
-                        &plan,
+                        None => None,
+                    };
+                    let share = admission.as_ref().and_then(|a| a.share());
+                    let (path, descriptor) = self.describe(&id).await?;
+                    let (selection, chosen) = self
+                        .selection(principal, &id, &descriptor, selection)
+                        .await?;
+                    let bitmap = self.bitmap(principal, bitmap).await?;
+                    let plan = self.plan(
+                        state,
+                        &descriptor,
+                        caps.as_ref(),
                         quality,
-                        start,
-                        None,
-                    )
-                    .await
-                {
-                    // No slot free, and the device holds one it does not
-                    // read: what it starts now comes before that, as it did
-                    // before "now + next" (one slot, a film started again).
-                    // One it reads plays on, and this start is busy.
-                    // Another device's slot is never taken.
-                    Err(Error::Busy)
-                        if self
-                            .services
-                            .playbacks
-                            .end_conversions_on(&endpoint, state.number)
-                            > 0 =>
+                        share,
+                        selection,
+                        bitmap,
+                    );
+                    let planned_in = requested.elapsed();
+                    // The item's markers go with the playback (P2-10), so a
+                    // player needs no second request for them.
+                    let found = catalog.item(&id).await.map_err(catalog_error)?;
+                    let markers = found.markers;
+                    let mut shown = crate::playback::Shown::of(&found.item);
+                    if shown.duration_ms.is_none() {
+                        shown.duration_ms = descriptor.duration.map(|d| d.as_millis() as u64);
+                    }
+                    let viewer = crate::playback::Viewer {
+                        user_id: principal.to_string(),
+                        username: who.log_name(),
+                        display_name: who.display_name().to_owned(),
+                        device_name: hello.device_name.clone(),
+                        client_name: hello.client_name.clone(),
+                        platform: hello.platform,
+                    };
+                    let handle = Playbacks::new_handle();
+                    // A device keeps "now + next": the one playing and this
+                    // one, which may be the next track it prepares while that
+                    // plays (iOS gapless audio). Its other encodes, not read
+                    // lately, are abandoned: free their slots before this one
+                    // takes one. One still read is never ended for it.
+                    let endpoint = connection.remote_id().to_string();
+                    match self
+                        .services
+                        .playbacks
+                        .make_room_for_next(&endpoint, state.number)
                     {
-                        self.prepare(
+                        Ok(_) => {}
+                        Err(crate::playback::DeviceFull) => {
+                            tracing::info!(
+                                %endpoint,
+                                "a device reading all its conversions is refused another"
+                            );
+                            return Err(Error::Busy);
+                        }
+                    }
+                    let start = start_ms.map(Duration::from_millis);
+                    let prepared = match self
+                        .prepare(
                             &handle,
                             &id,
                             (&path, &descriptor),
@@ -2491,102 +2626,139 @@ impl ClientProtocol {
                             quality,
                             start,
                             None,
+                            &trace,
                         )
                         .await
-                    }
-                    prepared => prepared,
-                };
-                let (subtitle, (size, file), conversion, keyframes) = prepared?;
-                let start_times = Arc::new(parking_lot::Mutex::new(StartTimes {
-                    plan: planned_in,
-                    keyframes,
-                    first_segment: if conversion.is_some() {
-                        FirstSegment::Waiting
-                    } else {
-                        FirstSegment::Direct
-                    },
-                }));
-                // The first encode's progress, to time its first segment.
-                let first_run = conversion
-                    .as_ref()
-                    .map(|c| (c.job().progress(), c.delivery == Delivery::Hls));
-                // Its previews next, if it has none yet: the player asks
-                // for them as soon as it shows a seek bar.
-                self.services.previews.played(&id);
-                let _progress = self
-                    .services
-                    .playbacks
-                    .progress_control(&session, &id)
-                    .await;
-                let handle = self.services.playbacks.start(
-                    handle,
-                    Opened {
-                        viewer,
-                        shown,
-                        planned: plan.clone(),
-                        session,
-                        endpoint,
-                        item: id.clone(),
-                        selection,
-                        path,
-                        size,
-                        file,
-                        subtitle,
-                        conversion,
-                        quality,
-                        display,
-                        video_size: descriptor.video.as_ref().map(|v| (v.width, v.height)),
-                        start: start_times.clone(),
-                        connection: state.number,
-                    },
-                );
-                // Counted off the LAN from now (PX-46): the others' shares
-                // follow once starts settle.
-                if let Some(admission) = admission {
-                    admission.started(&handle.0, connection.stable_id());
-                }
-                // What was decided, so a playback that then goes quiet
-                // can be read from the log; the endpoint as the
-                // connection lines print it.
-                let decided = planner::summary(&plan);
-                tracing::info!(
-                    %id,
-                    user = %who.log_name(),
-                    endpoint = %connection.remote_id().fmt_short(),
-                    plan = %decided.kind,
-                    delivery = %decided.delivery,
-                    video = %decided.video,
-                    audio = %decided.audio,
-                    subtitle = %decided.subtitle,
-                    start_ms = start_ms.unwrap_or(0),
-                    ?quality,
-                    path = %state.path(),
-                    wan = wan.is_some(),
-                    share,
-                    "playback started"
-                );
-                // Then how long it took: for direct play now, for a
-                // conversion once its first segment is ready.
-                match first_run {
-                    Some((progress, hls)) => {
-                        tokio::spawn(crate::playback::time_first_segment(
-                            start_times,
+                    {
+                        // No slot free, and the device holds one it does not
+                        // read: what it starts now comes before that, as it did
+                        // before "now + next" (one slot, a film started again).
+                        // One it reads plays on, and this start is busy.
+                        // Another device's slot is never taken.
+                        Err(Error::Busy)
+                            if self
+                                .services
+                                .playbacks
+                                .end_conversions_on(&endpoint, state.number)
+                                > 0 =>
+                        {
+                            self.prepare(
+                                &handle,
+                                &id,
+                                (&path, &descriptor),
+                                &plan,
+                                quality,
+                                start,
+                                None,
+                                &trace,
+                            )
+                            .await
+                        }
+                        prepared => prepared,
+                    };
+                    let (subtitle, (size, file), conversion, keyframes) = prepared?;
+                    let start_times = Arc::new(parking_lot::Mutex::new(StartTimes {
+                        plan: planned_in,
+                        keyframes,
+                        first_segment: if conversion.is_some() {
+                            FirstSegment::Waiting
+                        } else {
+                            FirstSegment::Direct
+                        },
+                    }));
+                    // The first encode's progress, to time its first segment.
+                    let first_run = conversion
+                        .as_ref()
+                        .map(|c| (c.job().progress(), c.delivery == Delivery::Hls));
+                    // Its previews next, if it has none yet: the player asks
+                    // for them as soon as it shows a seek bar.
+                    self.services.previews.played(&id);
+                    let _progress = self
+                        .services
+                        .playbacks
+                        .progress_control(&session, &id)
+                        .await;
+                    let handle = self.services.playbacks.start(
+                        handle,
+                        Opened {
+                            trace: trace.clone(),
+                            viewer,
+                            shown,
+                            planned: plan.clone(),
+                            session,
+                            endpoint,
+                            item: id.clone(),
+                            selection,
+                            path,
+                            size,
+                            file,
+                            subtitle,
+                            conversion,
+                            quality,
+                            display,
+                            video_size: descriptor.video.as_ref().map(|v| (v.width, v.height)),
+                            start: start_times.clone(),
                             requested,
-                            progress,
-                            hls,
-                            id.clone(),
-                        ));
+                            connection: state.number,
+                        },
+                    );
+                    // Counted off the LAN from now (PX-46): the others' shares
+                    // follow once starts settle.
+                    if let Some(admission) = admission {
+                        admission.started(&handle.0, connection.stable_id());
                     }
-                    None => start_times.lock().log(&id),
+                    // What was decided, so a playback that then goes quiet
+                    // can be read from the log; the endpoint as the
+                    // connection lines print it.
+                    let decided = planner::summary(&plan);
+                    span.record("playback.plan", decided.kind);
+                    span.record(
+                        "playback.delivery",
+                        tracing::field::display(decided.delivery),
+                    );
+                    span.record("playback.start_ms", start_ms.unwrap_or(0) as i64);
+                    tracing::info!(
+                        %id,
+                        user = %who.log_name(),
+                        endpoint = %connection.remote_id().fmt_short(),
+                        plan = %decided.kind,
+                        delivery = %decided.delivery,
+                        video = %decided.video,
+                        audio = %decided.audio,
+                        subtitle = %decided.subtitle,
+                        start_ms = start_ms.unwrap_or(0),
+                        ?quality,
+                        path = %state.path(),
+                        wan = wan.is_some(),
+                        share,
+                        "playback started"
+                    );
+                    // Then how long it took: for direct play now, for a
+                    // conversion once its first segment is ready.
+                    match first_run {
+                        Some((progress, hls)) => {
+                            tokio::spawn(crate::playback::time_first_segment(
+                                start_times,
+                                requested,
+                                progress,
+                                hls,
+                                id.clone(),
+                            ));
+                        }
+                        None => start_times.lock().log(&id),
+                    }
+                    Ok::<_, Error>(Reply::PlaybackStarted {
+                        handle,
+                        plan,
+                        size,
+                        chosen,
+                        epoch: 0,
+                        markers,
+                    })
                 }
-                Ok(Reply::PlaybackStarted {
-                    handle,
-                    plan,
-                    size,
-                    chosen,
-                    epoch: 0,
-                    markers,
-                })
+                .await;
+                span.record("outcome", crate::telemetry::outcome(&started));
+                started
             }
             Request::ChangeSubtitle {
                 handle,
@@ -2624,6 +2796,7 @@ impl ClientProtocol {
                         quality,
                         Some(Duration::from_millis(position_ms)),
                         Some(&playback),
+                        &playback.traced,
                     )
                     .await?;
                 let epoch = conversion.as_ref().map_or(0, |c| c.job().epoch);
@@ -2693,6 +2866,7 @@ impl ClientProtocol {
                         quality,
                         Some(Duration::from_millis(position_ms)),
                         Some(&playback),
+                        &playback.traced,
                     )
                     .await?;
                 let epoch = conversion.as_ref().map_or(0, |c| c.job().epoch);
@@ -3871,7 +4045,8 @@ impl ClientProtocol {
     /// started at `start`, and how long its keyframes took to read and
     /// where from, if it needed them (PX-24). `replaces` is the playback as it was, when this
     /// is a subtitle change: direct play goes on reading the file it began
-    /// with, or none.
+    /// with, or none. `trace` is the playback's, which its conversion's
+    /// spans link to.
     #[expect(
         clippy::too_many_arguments,
         reason = "the call sites name each part; a struct would only repeat them"
@@ -3885,6 +4060,7 @@ impl ClientProtocol {
         quality: spoolframe_protocol::Quality,
         start: Option<Duration>,
         replaces: Option<&Playback>,
+        trace: &crate::playback::PlaybackTrace,
     ) -> Result<
         (
             Option<Sidecar>,
@@ -4025,6 +4201,7 @@ impl ClientProtocol {
                         first_epoch,
                         slot: replaced.and_then(|job| job.slot()),
                         start_rung: planner::start_rung(plan, quality),
+                        trace: trace.clone(),
                     },
                     start,
                 )
@@ -4247,7 +4424,13 @@ impl ProtocolHandler for ClientProtocol {
             switches: std::sync::atomic::AtomicU64::new(0),
             path_log: parking_lot::Mutex::default(),
             uplink: self.services.uplink.clone(),
+            counted: parking_lot::Mutex::default(),
+            punch: parking_lot::Mutex::default(),
+            metrics: self.services.metrics.clone(),
         });
+        if let Some(path) = state.paths.lock().last() {
+            state.path_is(path);
+        }
         tokio::spawn(log_paths(
             connection.weak_handle(),
             connection.path_events(),
@@ -4272,6 +4455,8 @@ impl ProtocolHandler for ClientProtocol {
             }
         };
 
+        // What it carried since the last count: the rest of its bytes.
+        state.count_link(&connection, false);
         self.addresses.streams.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
@@ -4945,6 +5130,24 @@ pub(crate) async fn use_playback_checked<T>(
     Ok(using.playback)
 }
 
+/// The playback `request` is about, if it is about one.
+fn playback_of(request: &Request) -> Option<&PlaybackHandle> {
+    match request {
+        Request::UpdatePlaybackProgress { handle, .. }
+        | Request::ChangeSubtitle { handle, .. }
+        | Request::ChangeQuality { handle, .. }
+        | Request::SeekPlayback { handle, .. }
+        | Request::StopPlayback { handle }
+        | Request::PlaybackProgressSequence { handle }
+        | Request::PlaybackRevision { handle }
+        | Request::GetManifest { handle, .. }
+        | Request::ReadSubtitle { handle, .. }
+        | Request::ReadSubtitleSegment { handle, .. }
+        | Request::HttpPlaybackUrl { handle } => Some(handle),
+        _ => None,
+    }
+}
+
 fn internal(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "request failed");
     Error::Internal
@@ -5020,18 +5223,29 @@ async fn wait_for(
     ready: impl Fn(&Progress) -> bool,
 ) -> Progress {
     let mut progress = job.progress();
-    let deadline = tokio::time::Instant::now() + READ_WAIT;
-    loop {
+    // Whether the read waited for the encode, and how long, on its
+    // `segment read` span.
+    let waited = !ready(&progress.borrow());
+    let began = tokio::time::Instant::now();
+    let deadline = began + READ_WAIT;
+    let now = loop {
         keep_alive();
         let slice = tokio::time::timeout(Duration::from_secs(1), progress.wait_for(&ready)).await;
         match slice {
-            Ok(Ok(p)) => return p.clone(),
-            Ok(Err(_)) => break,
-            Err(_) if tokio::time::Instant::now() >= deadline => break,
+            Ok(Ok(p)) => break p.clone(),
+            Ok(Err(_)) => break job.progress().borrow().clone(),
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                break job.progress().borrow().clone();
+            }
             Err(_) => {}
         }
-    }
-    job.progress().borrow().clone()
+    };
+    let took = began.elapsed();
+    let span = tracing::Span::current();
+    span.record("read.waited_for_encode", waited);
+    span.record("read.wait_ms", took.as_millis() as i64);
+    job.read_waited(waited.then_some(took));
+    now
 }
 
 /// `file` at `offset`, to send `sent` bytes from. With nothing to send the

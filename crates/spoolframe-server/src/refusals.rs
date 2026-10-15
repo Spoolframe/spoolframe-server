@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::clock::Clock;
+use crate::metrics::Counter;
 
 /// The target every refused-request line has.
 pub const TARGET: &str = "spoolframe::refused";
@@ -70,6 +71,17 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 8] = [
+        Kind::NoSession,
+        Kind::Unauthenticated,
+        Kind::Forbidden,
+        Kind::RecentSignInRequired,
+        Kind::ProfileLocked,
+        Kind::SignInFailed,
+        Kind::RateLimited,
+        Kind::HelloRefused,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::NoSession => "no_session",
@@ -96,6 +108,8 @@ pub enum Channel {
 }
 
 impl Channel {
+    pub const ALL: [Channel; 3] = [Channel::AdminApi, Channel::Web, Channel::Quic];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Channel::AdminApi => "admin_api",
@@ -166,6 +180,9 @@ pub struct Refusals {
     windows: Mutex<Windows>,
     clock: Clock,
     limit: Limit,
+    /// Every refusal, logged or not, by [`Kind::ALL`] and
+    /// [`Channel::ALL`]: for the metrics (P3-14).
+    counts: [[Counter; 3]; 8],
 }
 
 impl Refusals {
@@ -175,6 +192,7 @@ impl Refusals {
             windows: Mutex::default(),
             clock,
             limit: Limit::default(),
+            counts: Default::default(),
         }
     }
 
@@ -188,13 +206,16 @@ impl Refusals {
                 per_window: 1,
                 window: HELLO_WINDOW,
             },
+            counts: Default::default(),
         }
     }
 
-    /// Whether a refusal of `kind` from `source` is to be logged now. The
-    /// summaries of windows that have ended are logged first. Cheap: the
-    /// caller looks up what the line names only when this says yes.
-    pub fn admit(&self, source: &str, kind: Kind) -> bool {
+    /// Whether a refusal of `kind` from `source` on `channel` is to be
+    /// logged now; it is counted either way. The summaries of windows that
+    /// have ended are logged first. Cheap: the caller looks up what the
+    /// line names only when this says yes.
+    pub fn admit(&self, source: &str, kind: Kind, channel: Channel) -> bool {
+        self.counts[kind as usize][channel as usize].inc();
         let now = self.clock.now();
         let mut summaries = Vec::new();
         let admitted = {
@@ -208,9 +229,23 @@ impl Refusals {
         admitted
     }
 
+    /// Every refusal so far, logged or not, by kind and channel: every
+    /// pair, 0 for those not seen.
+    pub fn counts(&self) -> impl Iterator<Item = (Kind, Channel, u64)> + '_ {
+        Kind::ALL.into_iter().flat_map(move |kind| {
+            Channel::ALL.into_iter().map(move |channel| {
+                (
+                    kind,
+                    channel,
+                    self.counts[kind as usize][channel as usize].get(),
+                )
+            })
+        })
+    }
+
     /// Log `refusal` if [`Refusals::admit`] lets it in.
     pub fn refuse(&self, refusal: &Refusal) {
-        if self.admit(&refusal.source, refusal.kind) {
+        if self.admit(&refusal.source, refusal.kind, refusal.channel) {
             log(refusal);
         }
     }
@@ -414,7 +449,7 @@ mod tests {
 
     fn admitted(refusals: &Refusals, source: &str, n: usize) -> usize {
         (0..n)
-            .filter(|_| refusals.admit(source, Kind::Forbidden))
+            .filter(|_| refusals.admit(source, Kind::Forbidden, Channel::Quic))
             .count()
     }
 
@@ -431,12 +466,32 @@ mod tests {
         assert_eq!(logged.chars().count(), 64);
     }
 
+    /// Every refusal is counted by kind and channel, those left out of the
+    /// log too.
+    #[test]
+    fn every_refusal_is_counted_logged_or_not() {
+        let refusals = Refusals::default();
+        for _ in 0..PER_WINDOW + 5 {
+            refusals.admit("a", Kind::SignInFailed, Channel::Web);
+        }
+        refusals.admit("b", Kind::RateLimited, Channel::Quic);
+        let counts: Vec<_> = refusals.counts().filter(|(_, _, n)| *n > 0).collect();
+        assert_eq!(
+            counts,
+            [
+                (Kind::SignInFailed, Channel::Web, u64::from(PER_WINDOW) + 5),
+                (Kind::RateLimited, Channel::Quic, 1),
+            ]
+        );
+        assert_eq!(refusals.counts().count(), 24);
+    }
+
     #[test]
     fn a_source_gets_its_share_a_window_and_others_theirs() {
         let refusals = Refusals::default();
         assert_eq!(admitted(&refusals, "a", 100), PER_WINDOW as usize);
         assert_eq!(admitted(&refusals, "b", 100), PER_WINDOW as usize);
-        assert!(refusals.admit("a", Kind::SignInFailed));
+        assert!(refusals.admit("a", Kind::SignInFailed, Channel::Quic));
     }
 
     #[test]
@@ -452,10 +507,10 @@ mod tests {
     fn sources_past_the_cap_share_one_count() {
         let refusals = Refusals::default();
         for i in 0..MAX_KEYS {
-            refusals.admit(&i.to_string(), Kind::Forbidden);
+            refusals.admit(&i.to_string(), Kind::Forbidden, Channel::Quic);
         }
         let fresh = (0..1000)
-            .filter(|i| refusals.admit(&format!("new-{i}"), Kind::Forbidden))
+            .filter(|i| refusals.admit(&format!("new-{i}"), Kind::Forbidden, Channel::Quic))
             .count();
         assert_eq!(fresh, PER_WINDOW as usize);
         assert!(refusals.windows.lock().by_key.len() <= MAX_KEYS + 1);
@@ -465,23 +520,23 @@ mod tests {
     fn a_refused_hello_is_admitted_once_an_hour_per_source() {
         let clock = Clock::default();
         let hellos = Refusals::hellos(clock.clone());
-        assert!(hellos.admit("phone", Kind::HelloRefused));
-        assert!(!hellos.admit("phone", Kind::HelloRefused));
-        assert!(hellos.admit("tablet", Kind::HelloRefused));
+        assert!(hellos.admit("phone", Kind::HelloRefused, Channel::Quic));
+        assert!(!hellos.admit("phone", Kind::HelloRefused, Channel::Quic));
+        assert!(hellos.admit("tablet", Kind::HelloRefused, Channel::Quic));
         clock.advance(HELLO_WINDOW - Duration::from_secs(1));
-        assert!(!hellos.admit("phone", Kind::HelloRefused));
+        assert!(!hellos.admit("phone", Kind::HelloRefused, Channel::Quic));
         clock.advance(Duration::from_secs(1));
-        assert!(hellos.admit("phone", Kind::HelloRefused));
+        assert!(hellos.admit("phone", Kind::HelloRefused, Channel::Quic));
     }
 
     #[test]
     fn refused_hellos_from_endpoints_past_the_cap_share_one_line() {
         let hellos = Refusals::hellos(Clock::default());
         for i in 0..MAX_KEYS {
-            hellos.admit(&i.to_string(), Kind::HelloRefused);
+            hellos.admit(&i.to_string(), Kind::HelloRefused, Channel::Quic);
         }
         let fresh = (0..1000)
-            .filter(|i| hellos.admit(&format!("new-{i}"), Kind::HelloRefused))
+            .filter(|i| hellos.admit(&format!("new-{i}"), Kind::HelloRefused, Channel::Quic))
             .count();
         assert_eq!(fresh, 1);
         assert!(hellos.windows.lock().by_key.len() <= MAX_KEYS + 1);
@@ -492,10 +547,10 @@ mod tests {
         let clock = Clock::default();
         let refusals = Refusals::new(clock.clone());
         for i in 0..100 {
-            refusals.admit(&i.to_string(), Kind::Forbidden);
+            refusals.admit(&i.to_string(), Kind::Forbidden, Channel::Quic);
         }
         clock.advance(WINDOW);
-        refusals.admit("late", Kind::Forbidden);
+        refusals.admit("late", Kind::Forbidden, Channel::Quic);
         assert_eq!(refusals.windows.lock().by_key.len(), 1);
     }
 }

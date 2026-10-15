@@ -174,6 +174,36 @@ impl LogRing {
     }
 }
 
+/// The filter when `SPOOLFRAME_LOG` does not give one: `level`, and only
+/// errors from iroh's net report. Behind a NAT that maps ports per
+/// destination it warns of it at every report, about every 20 s, which
+/// was nearly every WARN of a day; the condition is the
+/// `spoolframe_nat_mapping_varies` gauge instead, logged once when it
+/// changes. iroh's other warnings stay.
+pub fn default_filter(level: &str) -> String {
+    format!("{level},iroh::net_report::report=error")
+}
+
+/// Whether stderr's lines are coloured: only at a terminal. Under systemd
+/// stderr is the journal, which keeps the escape codes as text
+/// (`\x1b[33m WARN`). `no_color` is `NO_COLOR`, which turns them off at a
+/// terminal too, as `tracing_subscriber` does on its own.
+pub fn colours(terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+/// The layer that writes the server's lines to `writer` (stderr), in
+/// colour or not.
+pub fn text_layer<S, W>(writer: W, colour: bool) -> impl Layer<S> + Send + Sync
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(colour)
+}
+
 /// The layer that fills a [`LogRing`].
 pub struct RingLayer(pub Arc<LogRing>);
 
@@ -246,6 +276,64 @@ impl Fields {
 mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// iroh's warning that the NAT's mapping varies is filtered out by
+    /// default; its other warnings are not.
+    #[test]
+    fn the_default_filter_drops_only_the_net_report_s_warnings() {
+        let ring = Arc::new(LogRing::new(10));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(default_filter("info")))
+            .with(RingLayer(ring.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "iroh::net_report::report",
+                "IPv4 address detected by QAD varies by destination"
+            );
+            tracing::warn!(target: "iroh::socket", "no home relay");
+            tracing::info!(target: "spoolframe_server::network", "listening");
+        });
+        assert_eq!(
+            texts(&ring.page(&LogQuery::default())),
+            ["no home relay", "listening"]
+        );
+    }
+
+    #[test]
+    fn lines_are_coloured_only_at_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(colours(true, None));
+        assert!(!colours(false, None));
+        assert!(!colours(true, Some(OsStr::new("1"))));
+        // An empty NO_COLOR is unset, as no-color.org says.
+        assert!(colours(true, Some(OsStr::new(""))));
+    }
+
+    /// What the journal gets when stderr is not a terminal.
+    #[test]
+    fn a_warning_off_a_terminal_has_no_escape_codes() {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let written = buffer.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(text_layer(move || written.clone(), colours(false, None)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(server = "plex", "Plex server unavailable");
+        });
+        let text = String::from_utf8(buffer.0.lock().clone()).unwrap();
+        assert!(text.contains(" WARN "), "{text:?}");
+        assert!(!text.contains('\x1b'), "{text:?}");
+    }
 
     fn ring_of(lines: &[(LogLevel, &str)], capacity: usize) -> LogRing {
         let ring = LogRing::new(capacity);

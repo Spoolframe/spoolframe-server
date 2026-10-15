@@ -9,7 +9,7 @@ pub mod ids;
 
 use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
@@ -23,12 +23,23 @@ pub use composite::{Composite, PlexSource, Served, Synced};
 
 /// The libraries now, if there are any. Every call without them is
 /// [`CatalogError::NotSetUp`].
-#[derive(Debug)]
 pub struct LiveCatalog {
     now: RwLock<Option<Arc<Composite>>>,
     /// Bumped at each [`LiveCatalog::replace`]: libraries may have gone
     /// (B-10).
     replaced: tokio::sync::watch::Sender<u64>,
+    /// Shown each composite before it is served.
+    hook: OnceLock<Hook>,
+}
+
+type Hook = Box<dyn Fn(&Composite) + Send + Sync>;
+
+impl std::fmt::Debug for LiveCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveCatalog")
+            .field("now", &self.now)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for LiveCatalog {
@@ -42,6 +53,21 @@ impl LiveCatalog {
         Self {
             now: RwLock::new(now),
             replaced: tokio::sync::watch::Sender::new(0),
+            hook: OnceLock::new(),
+        }
+    }
+
+    /// Show `hook` the composite now, and each one that replaces it before
+    /// it is served: how the metrics see every Plex request as it ends.
+    /// Only the first hook is kept.
+    pub fn on_replace(&self, hook: impl Fn(&Composite) + Send + Sync + 'static) {
+        if self.hook.set(Box::new(hook)).is_err() {
+            return;
+        }
+        // After the hook is in place: a composite replacing this one now
+        // is shown it by `replace`, and at worst twice.
+        if let (Some(now), Some(hook)) = (self.composite(), self.hook.get()) {
+            hook(&now);
         }
     }
 
@@ -66,6 +92,9 @@ impl LiveCatalog {
 
     /// Serve from `now` from now on; `None` is not set up.
     pub fn replace(&self, now: Option<Arc<Composite>>) {
+        if let (Some(now), Some(hook)) = (&now, self.hook.get()) {
+            hook(now);
+        }
         *self.now.write() = now;
         self.replaced.send_modify(|n| *n = n.wrapping_add(1));
     }
@@ -87,6 +116,10 @@ impl Catalog for LiveCatalog {
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
         self.current()?.item(id).await
+    }
+
+    async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
+        self.current()?.episodes(show).await
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
@@ -138,6 +171,23 @@ mod tests {
             live.media_path(&id).await,
             Err(CatalogError::NotSetUp)
         ));
+    }
+
+    #[test]
+    fn the_hook_is_shown_the_composite_now_and_each_replacing_it() {
+        let single = || {
+            let plex = PlexCatalog::new("http://127.0.0.1:9".parse().unwrap(), None).unwrap();
+            Some(Arc::new(Composite::single("Tower", plex)))
+        };
+        let live = LiveCatalog::new(single());
+        let shown = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = shown.clone();
+        live.on_replace(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        live.replace(None);
+        live.replace(single());
+        assert_eq!(shown.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
