@@ -32,6 +32,9 @@ parking_lot = "0.12.5"
 # A body shared by every upload of the uplink measurement, sliced.
 # Already in the build through reqwest and iroh.
 bytes = "1.12"
+# The artwork and previews caches (a memory tier in front of a disk tier)
+# and the Plex replies' memory cache. Apache-2.0.
+foyer = "0.22.5"
 # Internal crates. The ones the SDK publishes (`publish = ["coldsteel"]`:
 # types, protocol, policy, client-sdk, test-dir, hls-bridge) carry the
 # workspace version as well, which `cargo publish` needs to turn the path

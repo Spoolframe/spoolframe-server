@@ -282,6 +282,12 @@ async fn spans_metrics_and_logs_reach_an_http_collector_with_the_resource() {
         .collect();
     for name in [
         "spoolframe_process_uptime_seconds",
+        "spoolframe_process_memory_bytes",
+        "spoolframe_cache_memory_bytes",
+        "spoolframe_cache_disk_bytes",
+        "spoolframe_cache_requests",
+        "spoolframe_cache_evictions",
+        "spoolframe_plex_replies_invalidated",
         // A counter goes without `_total`, which Prometheus adds back.
         "spoolframe_playbacks_started",
         "spoolframe_telemetry_dropped",
@@ -1062,6 +1068,60 @@ async fn a_client_request_says_how_it_went_and_from_what_never_who() {
     ] {
         assert!(!exported.contains(secret), "{secret} in {exported}");
     }
+}
+
+/// A request that reads the catalog says on its span whether the kept
+/// replies had what it read: the first read of an item asks Plex, the
+/// next finds it kept. No span is made for the read itself.
+#[tokio::test]
+async fn a_catalog_read_says_whether_the_kept_replies_had_it() {
+    if !support::alone("telemetry::a_catalog_read_says_whether_the_kept_replies_had_it") {
+        return;
+    }
+    use spoolframe_plex::PlexCatalog;
+    use spoolframe_server::catalog::{Composite, LiveCatalog};
+    use spoolframe_types::{MediaId, MediaKind, Namespace};
+    let pms = crate::watch::pms_with_a_show().await;
+    let plex = PlexCatalog::new(pms.uri().parse().unwrap(), None).unwrap();
+    let live = LiveCatalog::new(Some(Arc::new(Composite::single("fulcrum-ng", plex))));
+    let traced = Traced::start_with(
+        "trace-cache-hit",
+        ServerOptions {
+            catalog: Some(Arc::new(live)),
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let (client, session) = traced.alice().await;
+    let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "211").unwrap();
+    for _ in 0..2 {
+        let read = client
+            .call(
+                Some(&session),
+                Request::Item {
+                    id: episode.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(read, Response::Ok(Reply::Item { .. })), "{read:?}");
+    }
+    traced
+        .until_spans("both item requests", |spans| {
+            named(spans, "client request")
+                .iter()
+                .filter(|s| attribute(&s.attributes, "request").as_deref() == Some("item"))
+                .count()
+                == 2
+        })
+        .await;
+    let spans = traced.spans().await;
+    let hits: Vec<_> = named(&spans, "client request")
+        .into_iter()
+        .filter(|s| attribute(&s.attributes, "request").as_deref() == Some("item"))
+        .map(|s| attribute(&s.attributes, "cache.hit"))
+        .collect();
+    assert_eq!(hits, [Some("false".into()), Some("true".into())]);
+    assert!(named(&spans, "cache read").is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

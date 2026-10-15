@@ -9,8 +9,8 @@ use spoolframe_admin_api::{Activity, ActivityPoint, AdminApiClient, TelemetrySta
 use super::admin::sleep;
 use super::{Alert, Route, icons, now_ms, rpc};
 use crate::activity::{
-    Spark, bytes_per_sec, megabytes, output_speed, percent, plex_line, rate, series, session_rows,
-    sparkline, updated_line, uptime, work_line,
+    Spark, bytes_per_sec, megabytes, memory_rows, output_speed, percent, plex_line, rate, series,
+    session_rows, sparkline, updated_line, uptime, work_line,
 };
 use crate::logic::{ApiError, thousands};
 use crate::telemetry::{export_state, export_summary};
@@ -235,6 +235,11 @@ fn Cards(seen: Seen, now: i64, version: Option<String>) -> Element {
                 unit: "MB memory",
                 tone: "act-grey",
                 spark: spark(a, now, |p| p.memory_bytes.unwrap_or(0) as f64),
+                if let Some(memory) = &p.memory {
+                    for (label, value) in memory_rows(memory) {
+                        Line { key: "{label}", label: rsx! { "{label}" }, "{value}" }
+                    }
+                }
                 Line { label: rsx! { "Open files" }, {p.open_files.map(thousands).unwrap_or_else(|| "—".into())} }
                 Line { label: rsx! { "Uptime" }, "{uptime(t.uptime_secs)}" }
                 if let Some(v) = version {

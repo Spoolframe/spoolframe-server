@@ -67,8 +67,10 @@ pub struct PreviewSettings {
     pub when: When,
     /// The time between two tiles.
     pub interval: Duration,
-    /// The most the cache may hold.
+    /// The most the cache may hold on disk; a change applies at restart.
     pub cache_limit_bytes: u64,
+    /// The most the cache may hold in memory.
+    pub memory_limit_bytes: u64,
     /// Files made ahead at once, while no encode runs.
     pub workers: usize,
 }
@@ -295,7 +297,7 @@ impl std::fmt::Debug for Previews {
 
 impl Previews {
     /// Previews kept in `dir`, made by workers started here.
-    pub fn start(
+    pub async fn start(
         dir: &Path,
         settings: PreviewSettings,
         sources: PreviewSources,
@@ -308,17 +310,21 @@ impl Previews {
             counted = %default.counted,
             "previews made ahead at once"
         );
-        Self::start_with(dir, settings, sources, maker)
+        Self::start_with(dir, settings, sources, maker).await
     }
 
     /// [`Previews::start`], making tiles with `maker`.
-    fn start_with(
+    async fn start_with(
         dir: &Path,
         settings: PreviewSettings,
         sources: PreviewSources,
         maker: Arc<dyn make::MakeTile>,
     ) -> std::io::Result<Arc<Self>> {
-        let cache = Cache::open(dir, settings.cache_limit_bytes)?;
+        let tiers = crate::hybrid::Tiers {
+            memory: settings.memory_limit_bytes,
+            disk: settings.cache_limit_bytes,
+        };
+        let cache = Cache::open(dir, tiers).await?;
         let work = dir.join(WORK);
         if work.exists() {
             std::fs::remove_dir_all(&work)?;
@@ -358,10 +364,11 @@ impl Previews {
     }
 
     /// Use `settings` from now on. A new interval names new sets; a lower
-    /// limit evicts at once; `never` empties the queue; more workers start
-    /// at once, and with fewer the files being made are finished.
+    /// memory limit evicts from memory at once (the disk's applies at
+    /// restart); `never` empties the queue; more workers start at once,
+    /// and with fewer the files being made are finished.
     pub fn set_settings(&self, settings: PreviewSettings) {
-        self.cache.set_limit(settings.cache_limit_bytes);
+        self.cache.set_memory_limit(settings.memory_limit_bytes);
         let mut queue = self.queue.lock();
         match settings.when {
             When::Never => {
@@ -404,9 +411,24 @@ impl Previews {
         }
     }
 
-    /// Bytes in the cache now.
+    /// Bytes in the cache on disk now.
     pub fn cache_total(&self) -> u64 {
         self.cache.total()
+    }
+
+    /// The cache's memory, disk, reads and evictions now (P3-14).
+    pub fn cache_stats(&self) -> crate::metrics::caches::CacheStats {
+        self.cache.stats()
+    }
+
+    /// Bytes in the cache's memory tier now.
+    pub fn memory_bytes(&self) -> u64 {
+        self.cache.memory_bytes()
+    }
+
+    /// The cache's last writes finished: as the server stops.
+    pub async fn close(&self) {
+        self.cache.close().await;
     }
 
     fn lock_queue(&self) -> parking_lot::MutexGuard<'_, Queue> {
@@ -454,7 +476,7 @@ impl Previews {
             // media_path has just read it: gone since.
             return Ok(PreviewState::None);
         };
-        if let Some(meta) = self.cache.get(&key) {
+        if let Some(meta) = self.cache.get(&key).await {
             self.shown.lock().insert(key.clone(), id.clone());
             return Ok(PreviewState::Ready { key, meta });
         }
@@ -480,7 +502,7 @@ impl Previews {
         let Ok(key) = key(&path, settings.interval).await else {
             return Ok(PreviewPeek::None("the file could not be read"));
         };
-        if let Some(meta) = self.cache.get(&key) {
+        if let Some(meta) = self.cache.get(&key).await {
             return Ok(PreviewPeek::Ready(meta));
         }
         if settings.when == When::Never {
@@ -652,7 +674,7 @@ impl Previews {
             .map_err(|e| e.to_string())?;
         let _making = self.sets.lock(&key).await;
         // Whoever held it before may have made the set, or failed to.
-        if self.cache.get(&key).is_some() {
+        if self.cache.has(&key).await {
             return Ok(());
         }
         if let Some(reason) = self.failed.lock().get(&key) {

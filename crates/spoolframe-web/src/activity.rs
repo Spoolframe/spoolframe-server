@@ -2,7 +2,7 @@
 //! graphs' lines and how its numbers read. Host-compiled, so `cargo test`
 //! covers it.
 
-use spoolframe_admin_api::{ActivityPoint, PlexServerActivity, UserSessionCount};
+use spoolframe_admin_api::{ActivityPoint, MemoryParts, PlexServerActivity, UserSessionCount};
 
 use crate::logic::thousands;
 
@@ -157,6 +157,26 @@ pub fn work_line(queued: u64, done: u64, failed: u64) -> String {
     )
 }
 
+/// The Process card's memory rows, in MB: each cache's memory tier, the
+/// rest of the heap, then the mapped files and shared memory.
+pub fn memory_rows(memory: &MemoryParts) -> Vec<(String, String)> {
+    let mb = |n| format!("{} MB", megabytes(n));
+    let mut rows: Vec<(String, String)> = memory
+        .caches
+        .iter()
+        .map(|c| (format!("Cache · {}", c.name), mb(c.bytes)))
+        .collect();
+    let heap = if memory.caches.is_empty() {
+        "Heap"
+    } else {
+        "Other heap"
+    };
+    rows.push((heap.to_owned(), mb(memory.other_heap_bytes())));
+    rows.push(("Mapped files".to_owned(), mb(memory.files_bytes)));
+    rows.push(("Shared".to_owned(), mb(memory.shared_bytes)));
+    rows
+}
+
 /// The Connections card's users: "Sessions · <username>" and how many,
 /// the most first.
 pub fn session_rows(sessions: &[UserSessionCount]) -> Vec<(String, u64)> {
@@ -195,6 +215,7 @@ pub fn updated_line(paused: bool, now_ms: i64, updated_at: Option<i64>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_admin_api::MemoryPart;
 
     const NOW: i64 = 1_791_000_000_000;
 
@@ -316,6 +337,39 @@ mod tests {
             plex_line(&server),
             ("1,204 requests · 1 error".into(), true)
         );
+    }
+
+    #[test]
+    fn memory_rows_take_the_caches_out_of_the_heap() {
+        let mut memory = MemoryParts {
+            heap_bytes: 300_000_000,
+            files_bytes: 20_000_000,
+            shared_bytes: 1_000_000,
+            caches: Vec::new(),
+        };
+        let row = |label: &str, value: &str| (label.to_owned(), value.to_owned());
+        assert_eq!(
+            memory_rows(&memory),
+            [
+                row("Heap", "300 MB"),
+                row("Mapped files", "20 MB"),
+                row("Shared", "1 MB"),
+            ]
+        );
+        memory.caches = vec![MemoryPart {
+            name: "Artwork".into(),
+            bytes: 120_000_000,
+        }];
+        assert_eq!(
+            memory_rows(&memory)[..2],
+            [
+                row("Cache · Artwork", "120 MB"),
+                row("Other heap", "180 MB")
+            ]
+        );
+        // A cache counted larger than the heap leaves none, not a wrap.
+        memory.caches[0].bytes = 400_000_000;
+        assert_eq!(memory_rows(&memory)[1], row("Other heap", "0 MB"));
     }
 
     #[test]

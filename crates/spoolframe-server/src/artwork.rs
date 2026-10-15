@@ -1,5 +1,6 @@
 //! The artwork proxy's cache (P1-05): images from the catalog, resized on
-//! the server, kept on disk under a size limit.
+//! the server, kept in memory and on disk under a size limit each
+//! ([`crate::hybrid`]).
 //!
 //! Clients never reach Plex for images (§5). The original is fetched once
 //! per artwork id and every size is made from it, here rather than by the
@@ -8,7 +9,6 @@
 //! timestamp), so nothing is ever invalidated, only evicted.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use spoolframe_catalog::{Catalog, CatalogError, Image};
 use spoolframe_protocol::ArtworkSize;
 use spoolframe_types::ArtworkId;
 
+use crate::hybrid::{self, Tiers};
 use crate::metrics::Counter;
 
 /// JPEG quality for resized images without transparency.
@@ -56,78 +57,54 @@ pub enum ArtworkError {
     Io(#[from] std::io::Error),
 }
 
-/// One file in the cache.
-#[derive(Debug, Clone)]
-struct Entry {
-    file: PathBuf,
+/// An image as the cache keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stored {
     content_type: String,
-    size: u64,
-    /// Larger is more recently used.
-    used: u64,
+    bytes: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
-struct Index {
-    entries: HashMap<String, Entry>,
-    total: u64,
-    clock: u64,
-}
-
-impl Index {
-    fn touch(&mut self, key: &str) -> Option<Entry> {
-        self.clock += 1;
-        let clock = self.clock;
-        let entry = self.entries.get_mut(key)?;
-        entry.used = clock;
-        Some(entry.clone())
+impl foyer::Code for Stored {
+    fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
+        hybrid::put_bytes(writer, self.content_type.as_bytes())?;
+        hybrid::put_bytes(writer, &self.bytes)
     }
 
-    /// Record `entry`, then evict least recently used files until the
-    /// total fits `limit` (never the one just added).
-    fn insert(&mut self, key: String, mut entry: Entry, limit: u64) -> Vec<PathBuf> {
-        self.clock += 1;
-        entry.used = self.clock;
-        self.total += entry.size;
-        let mut evicted = Vec::new();
-        let file = entry.file.clone();
-        if let Some(old) = self.entries.insert(key.clone(), entry) {
-            self.total -= old.size;
-            // The same image under another extension (its content type
-            // changed): the old file is nobody's now (review 2026-10-11
-            // L24).
-            if old.file != file {
-                evicted.push(old.file);
-            }
-        }
-        while self.total > limit {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .filter(|(k, _)| **k != key)
-                .min_by_key(|(_, e)| e.used)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            let gone = self.entries.remove(&oldest).expect("just found");
-            self.total -= gone.size;
-            evicted.push(gone.file);
-        }
-        evicted
+    fn decode(reader: &mut impl std::io::Read) -> foyer::Result<Self> {
+        let content_type = String::from_utf8(hybrid::get_bytes(reader)?)
+            .map_err(|e| foyer::Error::io_error(std::io::Error::other(e)))?;
+        let bytes = hybrid::get_bytes(reader)?;
+        Ok(Self {
+            content_type,
+            bytes,
+        })
+    }
+
+    fn estimated_size(&self) -> usize {
+        16 + self.content_type.len() + self.bytes.len()
     }
 }
+
+/// About the largest image kept on disk; a larger one is kept in memory
+/// only. A poster or a backdrop is a few MB at most.
+const LARGEST: u64 = 8 << 20;
 
 pub struct ArtworkCache {
     dir: PathBuf,
-    limit: u64,
+    tiers: Tiers,
     catalog: Arc<dyn Catalog>,
-    index: Mutex<Index>,
+    /// By [`cache_key`].
+    cache: foyer::HybridCache<String, Stored>,
     /// One fetch or resize per key at a time; others wait and then find it
     /// cached.
     inflight: crate::keyed_locks::KeyedLocks,
     /// Images asked for, and of those found in the cache (P3-14).
     requests: Counter,
     hits: Counter,
+    /// Images asked for that the cache did not have.
+    misses: Counter,
+    /// What the memory tier evicted.
+    evictions: Arc<Counter>,
     /// Artwork the catalog said this server serves, and when: asked again
     /// only after [`AUTHORIZED_FOR`], or once the catalog changed (review
     /// 2026-10-11 H3). Plex answers it with a GET of the item, so a grid of
@@ -168,7 +145,7 @@ impl std::fmt::Debug for ArtworkCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArtworkCache")
             .field("dir", &self.dir)
-            .field("limit", &self.limit)
+            .field("tiers", &self.tiers)
             .finish_non_exhaustive()
     }
 }
@@ -181,93 +158,39 @@ fn cache_key(id: &ArtworkId, size: ArtworkSize) -> String {
     hasher.finalize().to_hex()[..32].to_owned()
 }
 
-fn extension(content_type: &str) -> &'static str {
-    match content_type {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => "img",
-    }
-}
-
-fn content_type_of(extension: &str) -> &'static str {
-    match extension {
-        "jpg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => "application/octet-stream",
-    }
-}
-
 impl ArtworkCache {
-    /// A cache in `dir` holding at most `limit` bytes, filled from
-    /// `catalog`. Files already in `dir` are kept, the most recently
-    /// written counting as most recently used.
-    pub fn open(dir: &Path, limit: u64, catalog: Arc<dyn Catalog>) -> std::io::Result<Self> {
-        crate::files::private_dir(dir)?;
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            // One unreadable entry is skipped, not the whole cache (and the
-            // server's start) refused (review 2026-10-11 L24).
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    tracing::warn!(dir = %dir.display(), error = %e, "an artwork cache entry cannot be read; skipped");
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let (Some(stem), Some(ext)) = (
-                path.file_stem().and_then(|s| s.to_str()),
-                path.extension().and_then(|s| s.to_str()),
-            ) else {
-                continue;
-            };
-            if ext == "tmp" {
-                // A write that never finished.
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(e) => {
-                    tracing::warn!(file = %path.display(), error = %e, "an artwork cache file cannot be read; skipped");
-                    continue;
-                }
-            };
-            found.push((
-                meta.modified().ok(),
-                stem.to_owned(),
-                path.clone(),
-                ext.to_owned(),
-                meta.len(),
-            ));
-        }
-        found.sort_by_key(|(modified, ..)| *modified);
-        let mut index = Index::default();
-        let mut evicted = Vec::new();
-        for (_, key, file, ext, size) in found {
-            let entry = Entry {
-                file,
-                content_type: content_type_of(&ext).to_owned(),
-                size,
-                used: 0,
-            };
-            evicted.extend(index.insert(key, entry, limit));
-        }
-        for file in evicted {
-            let _ = std::fs::remove_file(file);
-        }
+    /// A cache in `dir` holding at most `tiers`' bytes in memory and on
+    /// disk, filled from `catalog`. Images already on disk are kept; a
+    /// `dir` of an older server's, a file per image, is emptied.
+    pub async fn open(
+        dir: &Path,
+        tiers: Tiers,
+        catalog: Arc<dyn Catalog>,
+    ) -> std::io::Result<Self> {
+        let evictions = Arc::new(Counter::default());
+        let cache = hybrid::open(
+            dir,
+            hybrid::Options {
+                name: "artwork",
+                tiers,
+                largest: LARGEST,
+                weigh: |key: &String, image: &Stored| {
+                    key.len() + image.content_type.len() + image.bytes.len()
+                },
+                evictions: evictions.clone(),
+            },
+        )
+        .await?;
         Ok(Self {
             dir: dir.to_owned(),
-            limit,
+            tiers,
             catalog,
-            index: Mutex::new(index),
+            cache,
             inflight: Default::default(),
             requests: Counter::default(),
             hits: Counter::default(),
+            misses: Counter::default(),
+            evictions,
             authorized: Mutex::default(),
             changes: None,
             resizes: tokio::sync::Semaphore::new(
@@ -316,13 +239,37 @@ impl ArtworkCache {
         }
     }
 
-    /// Bytes in the cache now.
-    pub fn total(&self) -> u64 {
-        self.lock().total
+    /// Writes still queued for the disk finished, and the disk tier
+    /// closed: as the server stops.
+    pub async fn close(&self) {
+        if let Err(e) = self.cache.close().await {
+            tracing::warn!(error = %e, "the artwork cache did not close cleanly");
+        }
     }
 
-    fn lock(&self) -> parking_lot::MutexGuard<'_, Index> {
-        self.index.lock()
+    /// Change the memory tier's limit; a lower one evicts from memory at
+    /// once, the images staying on disk. The disk tier's is fixed at start.
+    pub fn set_memory_limit(&self, bytes: u64) {
+        if let Err(e) = self.cache.memory().resize(bytes as usize) {
+            tracing::warn!(error = %e, "cannot change the artwork's memory limit");
+        }
+    }
+
+    /// Its memory, disk, reads and evictions now (P3-14). Reads are the
+    /// images served: an original fetched only to make a size is not one.
+    pub fn stats(&self) -> crate::metrics::caches::CacheStats {
+        crate::metrics::caches::CacheStats {
+            memory_bytes: self.memory_bytes(),
+            disk_bytes: Some(crate::metrics::caches::disk_bytes(&self.dir)),
+            hits: self.hits.get(),
+            misses: self.misses.get(),
+            evictions: self.evictions.get(),
+        }
+    }
+
+    /// Bytes in the memory tier now.
+    pub fn memory_bytes(&self) -> u64 {
+        self.cache.memory().usage() as u64
     }
 
     /// The image for `id` at `size`. Counted once, as asked for: the
@@ -332,7 +279,10 @@ impl ArtworkCache {
         let (image, hit) = self.fetch(id, size).await?;
         if hit {
             self.hits.inc();
+        } else {
+            self.misses.inc();
         }
+        crate::metrics::caches::record_hit(hit);
         Ok(image)
     }
 
@@ -369,7 +319,7 @@ impl ArtworkCache {
             return Ok((hit, true));
         }
         let image = self.make(id, size).await?;
-        Ok((self.store(&key, image).await?, false))
+        Ok((self.store(&key, image), false))
     }
 
     async fn make(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Image, ArtworkError> {
@@ -396,59 +346,27 @@ impl ArtworkCache {
     }
 
     async fn read(&self, key: &str) -> Result<Option<Artwork>, ArtworkError> {
-        let Some(entry) = self.lock().touch(key) else {
-            return Ok(None);
-        };
-        match tokio::fs::read(&entry.file).await {
-            // Empty: a write a power loss cut short (review 2026-10-11
-            // L19). Made again, as if missing.
-            Ok(bytes) if bytes.is_empty() => {
-                tracing::warn!(file = %entry.file.display(), "a cached artwork is empty; made again");
-                let mut index = self.lock();
-                if let Some(gone) = index.entries.remove(key) {
-                    index.total -= gone.size;
-                }
-                Ok(None)
-            }
-            Ok(bytes) => Ok(Some(Artwork {
-                bytes,
-                content_type: entry.content_type,
-                etag: key.to_owned(),
-            })),
-            // Removed behind our back: forget it and fetch again.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut index = self.lock();
-                if let Some(gone) = index.entries.remove(key) {
-                    index.total -= gone.size;
-                }
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        }
+        let entry = self.cache.get(key).await.map_err(std::io::Error::other)?;
+        Ok(entry.map(|entry| Artwork {
+            bytes: entry.value().bytes.clone(),
+            content_type: entry.value().content_type.clone(),
+            etag: key.to_owned(),
+        }))
     }
 
-    async fn store(&self, key: &str, image: Image) -> Result<Artwork, ArtworkError> {
-        let file = self
-            .dir
-            .join(format!("{key}.{}", extension(&image.content_type)));
-        let tmp = file.with_extension("tmp");
-        crate::files::write_synced(&tmp, &image.bytes).await?;
-        tokio::fs::rename(&tmp, &file).await?;
-        let entry = Entry {
-            file,
-            content_type: image.content_type.clone(),
-            size: image.bytes.len() as u64,
-            used: 0,
-        };
-        let evicted = self.lock().insert(key.to_owned(), entry, self.limit);
-        for file in evicted {
-            let _ = tokio::fs::remove_file(file).await;
-        }
-        Ok(Artwork {
+    fn store(&self, key: &str, image: Image) -> Artwork {
+        self.cache.insert(
+            key.to_owned(),
+            Stored {
+                content_type: image.content_type.clone(),
+                bytes: image.bytes.clone(),
+            },
+        );
+        Artwork {
             bytes: image.bytes,
             content_type: image.content_type,
             etag: key.to_owned(),
-        })
+        }
     }
 }
 
@@ -630,15 +548,22 @@ mod tests {
         ArtworkId::new(Namespace::Plex, format!("/library/metadata/{n}/thumb/1")).unwrap()
     }
 
+    /// Room for everything a test puts in.
+    const ROOMY: Tiers = Tiers {
+        memory: 64 << 20,
+        disk: 8 << 20,
+    };
+
     /// The cache, its catalog, and its directory, kept for the test.
     async fn cache(
         test: &str,
-        limit: u64,
+        tiers: Tiers,
     ) -> (ArtworkCache, Arc<Counting>, spoolframe_test_dir::TestDir) {
         let catalog = Arc::new(Counting::default());
         let (tmp, path) = dir(test).await;
         (
-            ArtworkCache::open(&path, limit, catalog.clone())
+            ArtworkCache::open(&path, tiers, catalog.clone())
+                .await
                 .unwrap()
                 .with_changes(catalog.changed.subscribe()),
             catalog,
@@ -652,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn removing_a_library_denies_cached_originals_and_resized_images() {
-        let (cache, catalog, _dir) = cache("authorization", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("authorization", ROOMY).await;
         cache.get(&id(1), ArtworkSize::Small).await.unwrap();
         let fetched = catalog.fetches.load(Ordering::SeqCst);
         catalog.denied.store(true, Ordering::SeqCst);
@@ -672,7 +597,7 @@ mod tests {
     /// Review 2026-10-11 H3.
     #[tokio::test]
     async fn a_cached_image_is_not_authorized_again_until_the_catalog_changes() {
-        let (cache, catalog, _dir) = cache("authorized-once", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("authorized-once", ROOMY).await;
         let asked = || catalog.authorizations.load(Ordering::SeqCst);
         for _ in 0..3 {
             cache.get(&id(1), ArtworkSize::Small).await.unwrap();
@@ -685,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_request_is_served_from_the_cache() {
-        let (cache, catalog, _dir) = cache("hit", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("hit", ROOMY).await;
         let first = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         let second = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         assert_eq!(first, second);
@@ -697,11 +622,14 @@ mod tests {
                 hits: 1
             }
         );
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (1, 1));
+        assert!(stats.memory_bytes > 0);
     }
 
     #[tokio::test]
     async fn parallel_requests_share_one_fetch() {
-        let (cache, catalog, _dir) = cache("single-flight", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("single-flight", ROOMY).await;
         let cache = Arc::new(cache);
         let tasks: Vec<_> = (0..8)
             .map(|_| {
@@ -717,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn sizes_are_made_from_one_fetch_of_the_original() {
-        let (cache, catalog, _dir) = cache("sizes", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("sizes", ROOMY).await;
         let small = cache.get(&id(1), ArtworkSize::Small).await.unwrap();
         let medium = cache.get(&id(1), ArtworkSize::Medium).await.unwrap();
         assert_eq!(fetches(&catalog), 1);
@@ -729,45 +657,68 @@ mod tests {
 
     #[tokio::test]
     async fn a_size_larger_than_the_original_is_not_scaled_up() {
-        let (cache, _, _dir) = cache("no-upscale", u64::MAX).await;
+        let (cache, _, _dir) = cache("no-upscale", ROOMY).await;
         let large = cache.get(&id(1), ArtworkSize::Large).await.unwrap();
         assert_eq!(image::load_from_memory(&large.bytes).unwrap().width(), 800);
     }
 
+    fn in_memory(cache: &ArtworkCache, n: u32) -> bool {
+        let key = cache_key(&id(n), ArtworkSize::Original);
+        cache.cache.memory().contains(&key)
+    }
+
+    /// The memory tier keeps what was used last, within its limit; what it
+    /// lets go of is still served from disk, without the catalog.
     #[tokio::test]
-    async fn the_cache_stays_under_its_limit_evicting_the_least_recently_used() {
-        let one = png(800, 400).len() as u64;
-        // Room for two originals.
-        let (cache, catalog, _dir) = cache("evict", one * 2 + one / 2).await;
+    async fn memory_keeps_the_most_recently_used_and_disk_the_rest() {
+        let one = png(800, 400).len() as u64 + 64;
+        // Room for two originals in memory.
+        let tiers = Tiers {
+            memory: one * 2 + one / 2,
+            ..ROOMY
+        };
+        let (cache, catalog, _dir) = cache("evict", tiers).await;
         cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         cache.get(&id(2), ArtworkSize::Original).await.unwrap();
         // Use 1 again, so 2 is the least recently used.
         cache.get(&id(1), ArtworkSize::Original).await.unwrap();
         cache.get(&id(3), ArtworkSize::Original).await.unwrap();
-        assert!(cache.total() <= one * 2 + one / 2);
+        assert!(
+            cache.memory_bytes() <= tiers.memory,
+            "{}",
+            cache.memory_bytes()
+        );
+        assert!(in_memory(&cache, 1) && in_memory(&cache, 3));
+        assert!(!in_memory(&cache, 2), "2 should have left memory");
+        assert!(cache.stats().evictions >= 1);
         assert_eq!(fetches(&catalog), 3);
-        cache.get(&id(1), ArtworkSize::Original).await.unwrap();
-        assert_eq!(fetches(&catalog), 3, "1 should still be cached");
         cache.get(&id(2), ArtworkSize::Original).await.unwrap();
-        assert_eq!(fetches(&catalog), 4, "2 should have been evicted");
+        assert_eq!(fetches(&catalog), 3, "2 should be read from disk");
     }
 
     #[tokio::test]
     async fn a_restart_keeps_what_is_on_disk() {
         let catalog = Arc::new(Counting::default());
         let (_dir, path) = dir("restart").await;
-        let first = ArtworkCache::open(&path, u64::MAX, catalog.clone()).unwrap();
+        let first = ArtworkCache::open(&path, ROOMY, catalog.clone())
+            .await
+            .unwrap();
         first.get(&id(1), ArtworkSize::Small).await.unwrap();
+        first.close().await;
         drop(first);
-        let again = ArtworkCache::open(&path, u64::MAX, catalog.clone()).unwrap();
+        let again = ArtworkCache::open(&path, ROOMY, catalog.clone())
+            .await
+            .unwrap();
         let small = again.get(&id(1), ArtworkSize::Small).await.unwrap();
         assert_eq!(small.content_type, "image/jpeg");
         assert_eq!(fetches(&catalog), 1);
+        // Its blocks were written: they take room on disk.
+        assert!(again.stats().disk_bytes.unwrap() > 0);
     }
 
     #[tokio::test]
     async fn a_missing_image_is_not_cached_and_says_not_found() {
-        let (cache, catalog, _dir) = cache("missing", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("missing", ROOMY).await;
         let missing = ArtworkId::new(Namespace::Plex, "/library/metadata/1/thumb/404").unwrap();
         for _ in 0..2 {
             assert!(matches!(
@@ -776,12 +727,12 @@ mod tests {
             ));
         }
         assert_eq!(fetches(&catalog), 2);
-        assert_eq!(cache.total(), 0);
+        assert_eq!(cache.memory_bytes(), 0);
     }
 
     #[tokio::test]
     async fn an_unknown_size_is_refused() {
-        let (cache, catalog, _dir) = cache("bad-size", u64::MAX).await;
+        let (cache, catalog, _dir) = cache("bad-size", ROOMY).await;
         assert!(matches!(
             cache.get(&id(1), ArtworkSize::Unknown).await,
             Err(ArtworkError::BadSize(_))
@@ -854,37 +805,5 @@ mod tests {
         let image = resize(artwork(png(800, 400)), 320).unwrap();
         let resized = image::load_from_memory(&image.bytes).unwrap();
         assert_eq!((resized.width(), resized.height()), (320, 160));
-    }
-
-    /// A cached file a power loss left empty is made again, not served
-    /// empty. Review 2026-10-11 L19.
-    #[tokio::test]
-    async fn an_empty_cached_file_is_made_again() {
-        let (cache, catalog, _dir) = cache("empty", u64::MAX).await;
-        cache.get(&id(1), ArtworkSize::Original).await.unwrap();
-        let file = cache.lock().entries.values().next().unwrap().file.clone();
-        std::fs::write(&file, b"").unwrap();
-        let again = cache.get(&id(1), ArtworkSize::Original).await.unwrap();
-        assert!(!again.bytes.is_empty());
-        assert_eq!(fetches(&catalog), 2);
-    }
-
-    /// An image stored again under another content type leaves no file of
-    /// the old one behind. Review 2026-10-11 L24.
-    #[tokio::test]
-    async fn an_image_stored_as_another_type_removes_the_old_file() {
-        let (cache, _, dir) = cache("retype", u64::MAX).await;
-        let image = |content_type: &str| Image {
-            bytes: vec![1, 2, 3],
-            content_type: content_type.to_owned(),
-        };
-        cache.store("k", image("image/png")).await.unwrap();
-        cache.store("k", image("image/jpeg")).await.unwrap();
-        let files: Vec<_> = std::fs::read_dir(dir.as_ref().join("cache"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(files, ["k.jpg"]);
-        assert_eq!(cache.total(), 3);
     }
 }

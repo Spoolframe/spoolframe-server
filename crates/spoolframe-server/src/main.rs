@@ -790,6 +790,7 @@ async fn run(
     );
     let plex = runtime::plex_catalog(config, layers, &Secrets::new(state_dir))?.map(Arc::new);
     let live = Arc::new(LiveCatalog::new(plex.clone()));
+    live.replies().set_limit(config.catalog.memory_bytes());
     let catalog: Arc<dyn Catalog> = live.clone();
     let catalog_changes = live.changes();
     match &plex {
@@ -879,8 +880,11 @@ async fn run(
             encoding: jobs.encoding(),
         },
     )
+    .await
     .with_context(|| format!("cannot open the previews cache {}", previews_dir.display()))?;
     previews.watch_catalog(live.changes());
+    // Closed as the server stops, its last writes on disk.
+    let previews_cache = previews.clone();
     let name = ServerName::new(config.server_name());
     // One value for what the status page says and what the endpoint is
     // built with.
@@ -894,10 +898,13 @@ async fn run(
     );
     let artwork_dir = state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
-        ArtworkCache::open(&artwork_dir, config.artwork.cache_bytes(), catalog.clone())
+        ArtworkCache::open(&artwork_dir, config.artwork.tiers(), catalog.clone())
+            .await
             .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?
             .with_changes(live.changes()),
     );
+    // Closed as the server stops, its last writes on disk.
+    let artwork_cache = artwork.clone();
 
     let store = Store::open(state_dir).await?;
     // Closed last, as the server stops.
@@ -1047,6 +1054,7 @@ async fn run(
             watch: Some(watch.clone()),
             jobs: Some(jobs.clone()),
             previews: Some(previews.clone()),
+            artwork: Some(artwork_cache.clone()),
             oidc: Some(oidc.clone()),
             metrics: Some(metrics.clone()),
             logs: Some(logs.clone()),
@@ -1184,6 +1192,8 @@ async fn run(
     // Every ffmpeg killed, so each conversion's span ends while the
     // export can still send it.
     jobs.stop_all();
+    within(SHUTDOWN_STEP, "the artwork cache", artwork_cache.close()).await;
+    within(SHUTDOWN_STEP, "the previews cache", previews_cache.close()).await;
     // What is queued for the collector goes before the process does.
     telemetry.shutdown().await;
     within(

@@ -83,6 +83,7 @@ opentelemetry-appender-tracing = { workspace = true }
 tonic = { workspace = true, features = ["tls-webpki-roots"] }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+foyer = { workspace = true }
 tokio = { workspace = true }
 uclicious = { workspace = true }
 webauthn-rs = { workspace = true }

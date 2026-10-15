@@ -8,6 +8,7 @@
 //! asked for, so nothing is counted twice and nothing is kept that the
 //! parts do not already know.
 
+pub mod caches;
 pub mod histogram;
 pub mod history;
 pub mod process;
@@ -800,6 +801,7 @@ impl Metrics {
         self.background(&mut families);
         self.telemetry(&mut families);
         self.process(&mut families);
+        self.caches(&mut families);
         self.observed(&mut families);
         families
     }
@@ -1154,6 +1156,21 @@ impl Metrics {
                 bytes as f64,
             ));
         }
+        // Always the family, if empty: the OTLP export makes its
+        // instruments of the families there are when it starts.
+        let parts = process::resident_parts();
+        families.push(Family {
+            name: "spoolframe_process_memory_bytes",
+            help: "The server's resident memory by kind: heap (anonymous), files (mapped), shared.",
+            kind: Kind::Gauge,
+            samples: parts.map_or_else(Vec::new, |parts| {
+                vec![
+                    Sample::labelled(&[("kind", "heap")], parts.heap as f64),
+                    Sample::labelled(&[("kind", "files")], parts.files as f64),
+                    Sample::labelled(&[("kind", "shared")], parts.shared as f64),
+                ]
+            }),
+        });
         if let Some(files) = process::open_files() {
             families.push(Family::single(
                 "spoolframe_process_open_files",
@@ -1162,6 +1179,56 @@ impl Metrics {
                 files as f64,
             ));
         }
+    }
+}
+
+impl Metrics {
+    /// Each cache's memory, disk, reads and evictions, by the `cache`
+    /// label the Activity page names it by ([`history`]).
+    fn caches(&self, families: &mut Vec<Family>) {
+        let sources = self.sources.read();
+        // A cache not there yet is there with nothing in it, as the other
+        // parts' counts are: a family the OTLP export starts with has its
+        // samples then, or it is not exported.
+        let hybrid = caches::CacheStats {
+            disk_bytes: Some(0),
+            ..caches::CacheStats::default()
+        };
+        let caches = [
+            (
+                "artwork",
+                sources.artwork.as_ref().map_or(hybrid, |a| a.stats()),
+            ),
+            (
+                "previews",
+                sources
+                    .previews
+                    .as_ref()
+                    .map_or(hybrid, |p| p.cache_stats()),
+            ),
+            (
+                "plex_replies",
+                sources
+                    .catalog
+                    .as_ref()
+                    .map_or_else(caches::CacheStats::default, |c| c.replies().stats()),
+            ),
+        ];
+        caches::families(&caches, families);
+        let invalidated = sources
+            .catalog
+            .as_ref()
+            .map(|c| c.replies().invalidated())
+            .unwrap_or_default();
+        families.push(Family {
+            name: "spoolframe_plex_replies_invalidated_total",
+            help: "Plex replies let go of: all of them as the catalog was replaced (once per replace), or one found past its minute.",
+            kind: Kind::Counter,
+            samples: vec![
+                Sample::labelled(&[("reason", "replaced")], invalidated.replaced as f64),
+                Sample::labelled(&[("reason", "expired")], invalidated.expired as f64),
+            ],
+        });
     }
 }
 
@@ -1231,6 +1298,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         for name in [
             "spoolframe_process_resident_memory_bytes",
+            "spoolframe_process_memory_bytes",
             "spoolframe_process_open_files",
         ] {
             assert!(names.contains(&name), "{names:?}");

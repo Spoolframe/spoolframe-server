@@ -1587,6 +1587,10 @@ fn PlaybackFields(
     };
     let previews_cache = use_signal(|| in_gib("previews.cache_mb"));
     let artwork_cache = use_signal(|| in_gib("artwork.cache_mb"));
+    // The memory tiers, in MiB: a GiB is too coarse for them.
+    let previews_memory = use_signal(|| text(&settings, "previews.memory_mb"));
+    let artwork_memory = use_signal(|| text(&settings, "artwork.memory_mb"));
+    let replies_memory = use_signal(|| text(&settings, "catalog.memory_mb"));
     let started = use_signal(|| text(&settings, "watch.started_after_secs"));
     let watched = use_signal(|| text(&settings, "watch.watched_percent"));
     let mut ocr = use_signal(|| flag(&settings, "subtitles.ocr"));
@@ -1693,6 +1697,18 @@ fn PlaybackFields(
                         gib("Previews cache", previews_cache())?,
                     ),
                     ("artwork.cache_mb", gib("Artwork cache", artwork_cache())?),
+                    (
+                        "previews.memory_mb",
+                        number("Previews in memory", &previews_memory())?,
+                    ),
+                    (
+                        "artwork.memory_mb",
+                        number("Artwork in memory", &artwork_memory())?,
+                    ),
+                    (
+                        "catalog.memory_mb",
+                        number("Plex replies in memory", &replies_memory())?,
+                    ),
                     (
                         "watch.started_after_secs",
                         number("Started after", &started())?,
@@ -2071,8 +2087,13 @@ fn PlaybackFields(
                     }
                     div { class: "flex flex-col gap-1.5",
                         Limit { label: "Cache", value: previews_cache, unit: "GiB", disabled: locked(&settings, "previews.cache_mb") }
-                        span { class: "text-xs text-ctp-subtext0", "Default 4 GiB · the least recently used go first; a two-hour film's take a few MiB" }
+                        span { class: "text-xs text-ctp-subtext0", "Default 4 GiB · the oldest go first; a two-hour film's take a few MiB" }
                         Note { settings: settings.clone(), setting: "previews.cache_mb", on_changed: move |_| on_reload.call(()) }
+                    }
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "In memory", value: previews_memory, unit: "MiB", disabled: locked(&settings, "previews.memory_mb") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 64 MiB · the films scrubbed last, kept in memory as well" }
+                        Note { settings: settings.clone(), setting: "previews.memory_mb", on_changed: move |_| on_reload.call(()) }
                     }
                 }
             }
@@ -2085,6 +2106,21 @@ fn PlaybackFields(
                         Limit { label: "Cache", value: artwork_cache, unit: "GiB", disabled: locked(&settings, "artwork.cache_mb") }
                         span { class: "text-xs text-ctp-subtext0", "Default 1 GiB · posters and backdrops kept for the apps" }
                         Note { settings: settings.clone(), setting: "artwork.cache_mb", on_changed: move |_| on_reload.call(()) }
+                    }
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "In memory", value: artwork_memory, unit: "MiB", disabled: locked(&settings, "artwork.memory_mb") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 128 MiB · the ones shown most, served without reading the disk" }
+                        Note { settings: settings.clone(), setting: "artwork.memory_mb", on_changed: move |_| on_reload.call(()) }
+                    }
+                }
+            }
+            div { class: "flex flex-col gap-2",
+                h2 { "Plex replies" }
+                div { class: "limits",
+                    div { class: "flex flex-col gap-1.5",
+                        Limit { label: "In memory", value: replies_memory, unit: "MiB", disabled: locked(&settings, "catalog.memory_mb") }
+                        span { class: "text-xs text-ctp-subtext0", "Default 64 MiB · libraries and items kept a minute, so Home asks Plex less" }
+                        Note { settings: settings.clone(), setting: "catalog.memory_mb", on_changed: move |_| on_reload.call(()) }
                     }
                 }
             }

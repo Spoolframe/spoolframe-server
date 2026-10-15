@@ -308,6 +308,17 @@ auth {
 # The artwork cache under the state directory, in MiB.
 artwork {
   cache_mb = 1024;
+  # The posters and backdrops kept in memory as well, the most recently
+  # used: served without reading the disk. Out of the 256 MiB the caches
+  # take in memory by default, the artwork has half.
+  memory_mb = 128;
+}
+
+# The catalog's replies (libraries, pages, items) kept in memory for a
+# minute, so Home and browsing ask Plex less. No one's watch state is in
+# them: each user's is added from the server's own as it is sent.
+catalog {
+  memory_mb = 64;
 }
 
 # When an item counts as started, and as watched (without credits markers).
@@ -436,9 +447,11 @@ previews {
   when = "ahead";
   interval_secs = 10;
   # The most the previews under the state directory's cache/previews may
-  # take, in MiB; the least recently used go first. A two-hour film's are
-  # a few MiB.
+  # take, in MiB; the oldest made go first. A two-hour film's are a few
+  # MiB. A change applies at restart, and empties the cache.
   cache_mb = 4096;
+  # The previews kept in memory as well, the films scrubbed last.
+  memory_mb = 64;
   # Files made ahead at once, only while nothing is being encoded: they
   # wait while an encode runs, and go on where they were when it ends.
   # What is played, or asked for, is made at once, encodes or not. The

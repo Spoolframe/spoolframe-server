@@ -120,6 +120,9 @@ pub struct ServerConfig {
     /// The artwork cache.
     #[ucl(default)]
     pub artwork: ArtworkConfig,
+    /// The catalog's replies kept in memory.
+    #[ucl(default)]
+    pub catalog: CatalogConfig,
     /// When an item counts as started and watched.
     #[ucl(default)]
     pub watch: WatchConfig,
@@ -740,7 +743,7 @@ impl SubtitlesConfig {
 }
 
 /// `previews { when = "ahead"; interval_secs = 10; cache_mb = 4096;
-/// workers = 8; }`, all optional.
+/// memory_mb = 64; workers = 8; }`, all optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct PreviewsConfig {
@@ -754,6 +757,9 @@ pub struct PreviewsConfig {
     /// out.
     #[ucl(default)]
     pub cache_mb: Option<u64>,
+    /// The most of them kept in memory, in MiB; 64 if left out.
+    #[ucl(default)]
+    pub memory_mb: Option<u64>,
     /// Files made ahead at once while nothing is encoded; the physical
     /// cores the server may use if left out.
     #[ucl(default)]
@@ -763,6 +769,9 @@ pub struct PreviewsConfig {
 impl PreviewsConfig {
     pub const DEFAULT_INTERVAL_SECS: u64 = 10;
     pub const DEFAULT_CACHE_MB: u64 = 4096;
+    /// A quarter of the 256 MiB the caches' memory tiers take by default:
+    /// a set is read only while its film is scrubbed.
+    pub const DEFAULT_MEMORY_MB: u64 = 64;
 
     pub fn settings(&self) -> Result<PreviewSettings, ConfigError> {
         let when = match self.when.as_deref().unwrap_or("ahead") {
@@ -797,6 +806,7 @@ impl PreviewsConfig {
             when,
             interval: Duration::from_secs(interval),
             cache_limit_bytes: self.cache_mb.unwrap_or(Self::DEFAULT_CACHE_MB) << 20,
+            memory_limit_bytes: self.memory_mb.unwrap_or(Self::DEFAULT_MEMORY_MB) << 20,
             workers,
         })
     }
@@ -1215,7 +1225,7 @@ impl TranscodeConfig {
     }
 }
 
-/// `artwork { cache_mb = 1024; }`, optional.
+/// `artwork { cache_mb = 1024; memory_mb = 128; }`, optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct ArtworkConfig {
@@ -1223,14 +1233,49 @@ pub struct ArtworkConfig {
     /// MiB; 1024 if left out.
     #[ucl(default)]
     pub cache_mb: Option<u64>,
+    /// The most of it kept in memory, in MiB; 128 if left out.
+    #[ucl(default)]
+    pub memory_mb: Option<u64>,
 }
 
 impl ArtworkConfig {
     pub const DEFAULT_CACHE_MB: u64 = 1024;
+    /// Half of the 256 MiB the caches' memory tiers take by default: the
+    /// artwork is what every page shows.
+    pub const DEFAULT_MEMORY_MB: u64 = 128;
 
     /// The cache limit in bytes.
     pub fn cache_bytes(&self) -> u64 {
         self.cache_mb.unwrap_or(Self::DEFAULT_CACHE_MB) << 20
+    }
+
+    /// The cache's memory and disk limits in bytes.
+    pub fn tiers(&self) -> crate::hybrid::Tiers {
+        crate::hybrid::Tiers {
+            memory: self.memory_mb.unwrap_or(Self::DEFAULT_MEMORY_MB) << 20,
+            disk: self.cache_bytes(),
+        }
+    }
+}
+
+/// `catalog { memory_mb = 64; }`, optional: the catalog's replies kept in
+/// memory for a minute. Its own section, not under `plex`, which is left
+/// out until a Plex server is set up; it covers every Plex server.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct CatalogConfig {
+    /// The most the replies may take, in MiB; 64 if left out.
+    #[ucl(default)]
+    pub memory_mb: Option<u64>,
+}
+
+impl CatalogConfig {
+    /// A quarter of the 256 MiB the caches' memory tiers take by default.
+    pub const DEFAULT_MEMORY_MB: u64 = 64;
+
+    /// The replies' limit in bytes.
+    pub fn memory_bytes(&self) -> u64 {
+        self.memory_mb.unwrap_or(Self::DEFAULT_MEMORY_MB) << 20
     }
 }
 
@@ -2697,12 +2742,14 @@ mod tests {
                 when: When::Ahead,
                 interval: Duration::from_secs(10),
                 cache_limit_bytes: 4096 << 20,
+                memory_limit_bytes: 64 << 20,
                 workers: crate::previews::workers::default_workers().count,
             }
         );
         let config = plex(
             r#"plex { url = "http://nas:32400"; }
-               previews { when = "on_play"; interval_secs = 5; cache_mb = 100; workers = 3; }"#,
+               previews { when = "on_play"; interval_secs = 5; cache_mb = 100; memory_mb = 16;
+                          workers = 3; }"#,
         )
         .unwrap();
         assert_eq!(
@@ -2711,6 +2758,7 @@ mod tests {
                 when: When::OnPlay,
                 interval: Duration::from_secs(5),
                 cache_limit_bytes: 100 << 20,
+                memory_limit_bytes: 16 << 20,
                 workers: 3,
             }
         );
@@ -4418,10 +4466,26 @@ mod tests {
     #[test]
     fn the_artwork_cache_limit_is_read_in_mib() {
         let config =
-            plex(r#"plex { url = "http://nas:32400"; } artwork { cache_mb = 64; }"#).unwrap();
+            plex(r#"plex { url = "http://nas:32400"; } artwork { cache_mb = 64; memory_mb = 8; }"#)
+                .unwrap();
         assert_eq!(config.artwork.cache_bytes(), 64 << 20);
+        assert_eq!(config.artwork.tiers().memory, 8 << 20);
         let default = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert_eq!(default.artwork.cache_bytes(), 1024 << 20);
+        assert_eq!(default.artwork.tiers().memory, 128 << 20);
+    }
+
+    /// The caches' memory tiers take 256 MiB by default: the artwork 128,
+    /// the previews 64 and the catalog's replies 64.
+    #[test]
+    fn the_caches_take_256_mib_of_memory_by_default() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        let total = config.artwork.tiers().memory
+            + config.previews.settings().unwrap().memory_limit_bytes
+            + config.catalog.memory_bytes();
+        assert_eq!(total, 256 << 20);
+        let set = plex(r#"plex { url = "http://nas:32400"; } catalog { memory_mb = 8; }"#).unwrap();
+        assert_eq!(set.catalog.memory_bytes(), 8 << 20);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use spoolframe_admin_api::{ActivityPoint, ActivityTotals};
+use spoolframe_admin_api::{ActivityPoint, ActivityTotals, MemoryPart, MemoryParts};
 
 use super::Family;
 
@@ -31,6 +31,7 @@ pub struct Reading {
     pub previews_queued: u64,
     pub ocr_queued: u64,
     pub memory_bytes: Option<u64>,
+    pub memory: Option<MemoryParts>,
     pub open_files: Option<u64>,
     pub output_seconds: f64,
     pub plex_requests: u64,
@@ -48,6 +49,49 @@ fn number(families: &[Family], name: &str, labels: &[(&str, &str)]) -> Option<f6
 
 fn whole(families: &[Family], name: &str, labels: &[(&str, &str)]) -> u64 {
     number(families, name, labels).unwrap_or(0.0) as u64
+}
+
+/// The resident memory's parts, and each cache's memory tier by the name
+/// the Activity page shows.
+fn memory(families: &[Family]) -> Option<MemoryParts> {
+    let kind = |kind| {
+        number(
+            families,
+            "spoolframe_process_memory_bytes",
+            &[("kind", kind)],
+        )
+    };
+    let caches = find(families, "spoolframe_cache_memory_bytes").map_or_else(Vec::new, |f| {
+        f.samples
+            .iter()
+            .filter_map(|s| {
+                let (_, cache) = s.labels.iter().find(|(k, _)| *k == "cache")?;
+                let super::Value::Number(bytes) = s.value else {
+                    return None;
+                };
+                Some(MemoryPart {
+                    name: cache_name(cache).to_owned(),
+                    bytes: bytes as u64,
+                })
+            })
+            .collect()
+    });
+    Some(MemoryParts {
+        heap_bytes: kind("heap")? as u64,
+        files_bytes: kind("files")? as u64,
+        shared_bytes: kind("shared")? as u64,
+        caches,
+    })
+}
+
+/// A cache's `cache` label as the Activity page names it.
+fn cache_name(label: &str) -> &str {
+    match label {
+        "artwork" => "Artwork",
+        "previews" => "Previews",
+        "plex_replies" => "Plex replies",
+        other => other,
+    }
 }
 
 /// Every number sample of `name` added up: a counter across its labels.
@@ -72,6 +116,7 @@ impl Reading {
             ocr_queued: whole(f, "spoolframe_ocr_queued", &[]),
             memory_bytes: number(f, "spoolframe_process_resident_memory_bytes", &[])
                 .map(|v| v as u64),
+            memory: memory(f),
             open_files: number(f, "spoolframe_process_open_files", &[]).map(|v| v as u64),
             output_seconds: number(f, "spoolframe_conversion_output_seconds_total", &[])
                 .unwrap_or(0.0),
@@ -157,6 +202,7 @@ impl Reading {
             previews_queued: self.previews_queued,
             ocr_queued: self.ocr_queued,
             memory_bytes: self.memory_bytes,
+            memory: self.memory.clone(),
             open_files: self.open_files,
         }
     }
@@ -243,6 +289,53 @@ mod tests {
         );
         let idle = reading(20_000, 50, 6, 1).point(Some(&reading(10_000, 30, 6, 1)));
         assert_eq!(idle.artwork_hit_rate, None);
+    }
+
+    #[test]
+    fn the_memory_is_read_with_each_cache_by_name() {
+        use super::super::{Kind, Sample};
+        let families = [
+            Family {
+                name: "spoolframe_process_memory_bytes",
+                help: "",
+                kind: Kind::Gauge,
+                samples: vec![
+                    Sample::labelled(&[("kind", "heap")], 300.0),
+                    Sample::labelled(&[("kind", "files")], 20.0),
+                    Sample::labelled(&[("kind", "shared")], 1.0),
+                ],
+            },
+            Family {
+                name: "spoolframe_cache_memory_bytes",
+                help: "",
+                kind: Kind::Gauge,
+                samples: vec![
+                    Sample::labelled(&[("cache", "artwork")], 100.0),
+                    Sample::labelled(&[("cache", "plex_replies")], 50.0),
+                ],
+            },
+        ];
+        let memory = Reading::of(&families, 0).memory.unwrap();
+        assert_eq!(
+            (memory.heap_bytes, memory.files_bytes, memory.shared_bytes),
+            (300, 20, 1)
+        );
+        assert_eq!(
+            memory.caches,
+            [
+                MemoryPart {
+                    name: "Artwork".into(),
+                    bytes: 100
+                },
+                MemoryPart {
+                    name: "Plex replies".into(),
+                    bytes: 50
+                },
+            ]
+        );
+        assert_eq!(memory.other_heap_bytes(), 150);
+        // Without the kinds (not Linux), no parts at all.
+        assert_eq!(Reading::of(&families[1..], 0).memory, None);
     }
 
     #[test]

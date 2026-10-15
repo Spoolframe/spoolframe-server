@@ -48,6 +48,8 @@ pub struct Live {
     pub jobs: Option<Arc<Jobs>>,
     /// `previews.*`.
     pub previews: Option<Arc<Previews>>,
+    /// `artwork.memory_mb`.
+    pub artwork: Option<Arc<crate::artwork::ArtworkCache>>,
     /// `auth.oidc` (P3-04).
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
     /// `admin.metrics` and `admin.metrics_from` (P3-14).
@@ -550,6 +552,12 @@ impl RuntimeSettings {
         if let (Some(previews), Ok(settings)) = (&live.previews, config.previews.settings()) {
             previews.set_settings(settings);
         }
+        if let Some(artwork) = &live.artwork {
+            artwork.set_memory_limit(config.artwork.tiers().memory);
+        }
+        live.catalog
+            .replies()
+            .set_limit(config.catalog.memory_bytes());
         if let Some(oidc) = &live.oidc {
             oidc.set_providers(&config.auth.oidc);
         }
@@ -679,6 +687,18 @@ mod tests {
         )
     }
 
+    /// The catalog's replies' memory is a live setting: a lower limit
+    /// reaches the catalog the server serves from at once.
+    #[tokio::test]
+    async fn the_catalog_replies_memory_limit_is_live() {
+        let (settings, _dir) = settings(None).await;
+        assert_eq!(settings.catalog().replies().limit(), 64 << 20);
+        settings
+            .set("catalog.memory_mb", &serde_json::json!(8), "root")
+            .unwrap();
+        assert_eq!(settings.catalog().replies().limit(), 8 << 20);
+    }
+
     #[tokio::test]
     async fn a_live_setting_reaches_the_running_server_at_once() {
         let (settings, _dir) = settings(None).await;
@@ -749,6 +769,7 @@ mod tests {
                 encoding: Default::default(),
             },
         )
+        .await
         .unwrap();
         settings.live.previews = Some(previews.clone());
         settings

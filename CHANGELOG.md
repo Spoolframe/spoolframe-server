@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- Server › Activity says what the memory is: the Process card lists the
+  heap, mapped files and shared memory (RssAnon, RssFile and RssShmem),
+  and within the heap each cache's memory tier, the rest as "Other
+  heap". `spoolframe_process_memory_bytes{kind="heap"|"files"|"shared"}`
+  has the split; `spoolframe_process_resident_memory_bytes` is as it
+  was.
+
+- The caches in `/metrics` and the OTLP export alike, `cache` being
+  `artwork`, `previews` or `plex_replies`: `spoolframe_cache_memory_bytes`
+  (the memory tier), `spoolframe_cache_disk_bytes` (the blocks the disk
+  tier takes on disk; artwork and previews only),
+  `spoolframe_cache_requests_total{result="hit"|"miss"}` and
+  `spoolframe_cache_evictions_total` (what the memory tier evicted; foyer
+  says nothing of its disk tier's). `spoolframe_plex_replies_invalidated_total{reason}`
+  counts the Plex replies dropped as the catalog was replaced
+  (`replaced`, once per replace) or found past their minute (`expired`).
+  A read of a cache sets `cache.hit` on the span it runs in, if any: a
+  `client request` reading the catalog or looking up a preview set. No
+  span is made for a read; artwork and preview sheets read over QUIC
+  run in none.
+
+- The artwork and previews caches are foyer caches, each a memory tier
+  in front of its disk tier: `artwork.memory_mb` (128) and
+  `previews.memory_mb` (64), both live settings, beside `cache_mb`,
+  which stays the disk tier's size. What was made outlives a crash: an
+  entry is on disk once written, checksummed, and one cut short by a
+  power loss is a miss, never served in part. A preview set is one
+  entry, so it is whole or missing.
+
+- The first start after this empties `cache/artwork` and
+  `cache/previews` (one INFO line each): the old layout is not read.
+  Artwork is fetched and previews made again as they are asked for.
+  Changing `artwork.cache_mb` or `previews.cache_mb` empties that cache
+  too, and now applies at restart; `previews.cache_mb` applied at once
+  before. The disk tiers evict the oldest written first; the memory
+  tiers the least recently used.
+
+- The catalog's replies (libraries, library pages, items, a show's
+  episodes, recently added) are kept in memory for a minute, so Home
+  and browsing ask Plex less: `catalog { memory_mb = 64; }`, a live
+  setting. No user's watch state is in them; it is added from the
+  server's own as each reply is sent, so a position or a sync shows at
+  once. A library or Plex server added, removed or changed forgets them
+  all.
+
+- The caches' memory tiers take 256 MiB in all by default. foyer's
+  write buffers (two per disk tier, a block each: 8 MiB for the
+  artwork, 16 MiB for the previews) are heap outside them, so they show
+  in "Other heap".
+
 ## 0.9.1 (2026-10-15)
 
 - Home asks Plex for each Next up show's episodes in one request (the

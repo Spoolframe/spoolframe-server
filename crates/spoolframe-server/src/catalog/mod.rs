@@ -6,6 +6,7 @@
 
 pub mod composite;
 pub mod ids;
+pub mod replies;
 
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -20,6 +21,9 @@ use spoolframe_plex::PlexCatalog;
 use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, PersonId};
 
 pub use composite::{Composite, PlexSource, Served, Synced};
+pub use replies::{Invalidated, Replies};
+
+use replies::{Call, Reply};
 
 /// The libraries now, if there are any. Every call without them is
 /// [`CatalogError::NotSetUp`].
@@ -30,6 +34,8 @@ pub struct LiveCatalog {
     replaced: tokio::sync::watch::Sender<u64>,
     /// Shown each composite before it is served.
     hook: OnceLock<Hook>,
+    /// Replies kept for a short while; forgotten at each replace.
+    replies: Replies,
 }
 
 type Hook = Box<dyn Fn(&Composite) + Send + Sync>;
@@ -38,6 +44,7 @@ impl std::fmt::Debug for LiveCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveCatalog")
             .field("now", &self.now)
+            .field("replies", &self.replies)
             .finish_non_exhaustive()
     }
 }
@@ -54,7 +61,13 @@ impl LiveCatalog {
             now: RwLock::new(now),
             replaced: tokio::sync::watch::Sender::new(0),
             hook: OnceLock::new(),
+            replies: Replies::new(crate::config::CatalogConfig::DEFAULT_MEMORY_MB << 20),
         }
+    }
+
+    /// The replies kept: their memory, their limit, their counts.
+    pub fn replies(&self) -> &Replies {
+        &self.replies
     }
 
     /// Show `hook` the composite now, and each one that replaces it before
@@ -96,6 +109,7 @@ impl LiveCatalog {
             hook(now);
         }
         *self.now.write() = now;
+        self.replies.forget();
         self.replaced.send_modify(|n| *n = n.wrapping_add(1));
     }
 
@@ -107,23 +121,67 @@ impl LiveCatalog {
 #[async_trait]
 impl Catalog for LiveCatalog {
     async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
-        self.current()?.libraries().await
+        self.replies
+            .read(
+                Call::Libraries,
+                |r| match r {
+                    Reply::Libraries(l) => Some(l),
+                    _ => None,
+                },
+                Reply::Libraries,
+                async { self.current()?.libraries().await },
+            )
+            .await
     }
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
-        self.current()?.items(library, page).await
+        self.replies
+            .read(
+                Call::Items(library.to_string(), page.offset, page.limit),
+                |r| match r {
+                    Reply::Page(p) => Some(p),
+                    _ => None,
+                },
+                Reply::Page,
+                async { self.current()?.items(library, page).await },
+            )
+            .await
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
-        self.current()?.item(id).await
+        self.replies
+            .read(
+                Call::Item(id.to_string()),
+                |r| match r {
+                    Reply::Item(i) => Some(i.as_ref()),
+                    _ => None,
+                },
+                |i| Reply::Item(Box::new(i)),
+                async { self.current()?.item(id).await },
+            )
+            .await
     }
 
     async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
-        self.current()?.episodes(show).await
+        self.replies
+            .read(Call::Episodes(show.to_string()), list, Reply::List, async {
+                self.current()?.episodes(show).await
+            })
+            .await
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
-        self.current()?.external_ids(id).await
+        self.replies
+            .read(
+                Call::ExternalIds(id.to_string()),
+                |r| match r {
+                    Reply::Ids(i) => Some(i),
+                    _ => None,
+                },
+                Reply::Ids,
+                async { self.current()?.external_ids(id).await },
+            )
+            .await
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
@@ -131,7 +189,14 @@ impl Catalog for LiveCatalog {
     }
 
     async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {
-        self.current()?.person_items(id).await
+        self.replies
+            .read(
+                Call::PersonItems(id.to_string()),
+                list,
+                Reply::List,
+                async { self.current()?.person_items(id).await },
+            )
+            .await
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
@@ -139,7 +204,11 @@ impl Catalog for LiveCatalog {
     }
 
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError> {
-        self.current()?.recently_added(limit).await
+        self.replies
+            .read(Call::RecentlyAdded(limit), list, Reply::List, async {
+                self.current()?.recently_added(limit).await
+            })
+            .await
     }
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
@@ -152,6 +221,14 @@ impl Catalog for LiveCatalog {
 
     async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
         self.current()?.preview_frames(id).await
+    }
+}
+
+/// A list of items in `reply`, if it is one.
+fn list(reply: &Reply) -> Option<&Vec<Item>> {
+    match reply {
+        Reply::List(items) => Some(items),
+        _ => None,
     }
 }
 

@@ -202,7 +202,7 @@ fn plex_container(metadata: Vec<serde_json::Value>) -> ResponseTemplate {
 
 /// A PMS with one show: specials (season 0: 201), season 1 (211, 212)
 /// and season 2 (221, 222).
-async fn pms_with_a_show() -> MockServer {
+pub(crate) async fn pms_with_a_show() -> MockServer {
     let pms = MockServer::start().await;
     let episodes = [
         (201, 0, 1),
@@ -329,6 +329,53 @@ async fn home_asks_the_pms_for_a_show_s_episodes_at_once() {
             .to_string()]
     );
     assert_eq!(asked.len(), 2, "{asked:?}");
+    tv.close().await;
+    server.stop().await;
+}
+
+/// The catalog's replies are kept for a while, but a user's watch state
+/// is never part of one: it is filled in from the store at each read. An
+/// episode marked watched shows as watched on the very next read, which
+/// Plex is not asked for again.
+#[tokio::test]
+async fn a_kept_reply_shows_a_watch_state_written_since() {
+    let pms = pms_with_a_show().await;
+    let plex = PlexCatalog::new(pms.uri().parse().unwrap(), None).unwrap();
+    let live = LiveCatalog::new(Some(Arc::new(Composite::single("fulcrum-ng", plex))));
+    let options = ServerOptions {
+        catalog: Some(Arc::new(live)),
+        ..ServerOptions::default()
+    };
+    let server = TestServer::start_with(support::fresh_dir("kept-reply").await, options).await;
+    server.add_user("alice", "correct horse", None).await;
+    let tv = server.client().await;
+    tv.hello().await;
+    let alice = tv.login("alice", "correct horse").await;
+    let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "211").unwrap();
+    let asked_for_it = || async {
+        pms.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/library/metadata/211")
+            .count()
+    };
+    assert_eq!(
+        state_of(&tv, &alice, &episode).await,
+        PlaybackState::default()
+    );
+    let marked = tv
+        .call(
+            Some(&alice),
+            Request::MarkWatched {
+                id: episode.clone(),
+            },
+        )
+        .await;
+    assert_eq!(marked, Response::Ok(Reply::Done));
+    let asked = asked_for_it().await;
+    assert!(state_of(&tv, &alice, &episode).await.watched);
+    assert_eq!(asked_for_it().await, asked, "the reply was not kept");
     tv.close().await;
     server.stop().await;
 }

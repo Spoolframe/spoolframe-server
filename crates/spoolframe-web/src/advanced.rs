@@ -27,7 +27,10 @@ const BY_TAB: &[(&str, &[&str])] = &[
         &[
             "previews.interval_secs",
             "previews.cache_mb",
+            "previews.memory_mb",
             "artwork.cache_mb",
+            "artwork.memory_mb",
+            "catalog.memory_mb",
             "watch.started_after_secs",
             "watch.watched_percent",
             // PGPU-04: in the tab's Experimental section.
@@ -149,7 +152,10 @@ mod tests {
             "media.tesseract",
             "previews.interval_secs",
             "previews.cache_mb",
+            "previews.memory_mb",
             "artwork.cache_mb",
+            "artwork.memory_mb",
+            "catalog.memory_mb",
             "watch.started_after_secs",
             "watch.watched_percent",
             "transcode.gpus",

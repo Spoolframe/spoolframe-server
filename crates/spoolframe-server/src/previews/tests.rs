@@ -122,8 +122,8 @@ async fn setup_making(
     };
     let dir = tmp.as_ref().join("previews");
     let previews = match maker {
-        Some(maker) => Previews::start_with(&dir, settings, sources, maker),
-        None => Previews::start(&dir, settings, sources),
+        Some(maker) => Previews::start_with(&dir, settings, sources, maker).await,
+        None => Previews::start(&dir, settings, sources).await,
     }
     .unwrap();
     Setup {
@@ -139,6 +139,7 @@ fn settings() -> PreviewSettings {
         when: When::OnPlay,
         interval: Duration::from_secs(10),
         cache_limit_bytes: 1 << 30,
+        memory_limit_bytes: 64 << 20,
         workers: 1,
     }
 }
@@ -584,11 +585,11 @@ async fn previews_made_ahead_stop_when_the_cache_is_full_and_a_play_still_gets_i
     };
     let (key_a, key_b) = (set("a").await, set("b").await);
     assert!(
-        setup.previews.cache.get(&key_a).is_some(),
+        setup.previews.cache.get(&key_a).await.is_some(),
         "a was made ahead"
     );
     assert!(
-        setup.previews.cache.get(&key_b).is_none(),
+        setup.previews.cache.get(&key_b).await.is_none(),
         "b was made ahead, evicting a"
     );
     // b is played: made, though it evicts a.
@@ -776,7 +777,7 @@ async fn n_workers_make_n_files_ahead_at_once() {
         let path = gated.setup.files.files.lock()[id.key()].clone();
         let key = key(&path, Duration::from_secs(10)).await.unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while gated.setup.previews.cache.get(&key).is_none() {
+        while gated.setup.previews.cache.get(&key).await.is_none() {
             assert!(std::time::Instant::now() < deadline, "{id} not made");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

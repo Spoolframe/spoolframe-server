@@ -2080,8 +2080,42 @@ pub struct ActivityPoint {
     /// The server's resident memory; `None` where it cannot be read.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub memory_bytes: Option<u64>,
+    /// What that memory is; `None` where it cannot be read.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub memory: Option<MemoryParts>,
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub open_files: Option<u64>,
+}
+
+/// The server's resident memory by what it is. `heapBytes`, `filesBytes`
+/// and `sharedBytes` add up to the resident memory; the caches' memory
+/// tiers are part of the heap.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryParts {
+    /// Anonymous memory: the heap and stacks.
+    pub heap_bytes: u64,
+    /// Pages of files mapped in: the binary and its libraries, mostly.
+    pub files_bytes: u64,
+    pub shared_bytes: u64,
+    /// Each cache's memory tier, by its name ("Artwork").
+    pub caches: Vec<MemoryPart>,
+}
+
+impl MemoryParts {
+    /// The heap that is not a cache's.
+    pub fn other_heap_bytes(&self) -> u64 {
+        let caches: u64 = self.caches.iter().map(|c| c.bytes).sum();
+        self.heap_bytes.saturating_sub(caches)
+    }
+}
+
+/// One named part of the memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryPart {
+    pub name: String,
+    pub bytes: u64,
 }
 
 /// Counts since the server started (P3-14).
@@ -4050,7 +4084,7 @@ mod required_field_tests {
     fn activity_logs_and_telemetry() {
         assert_each_required(
             &ActivityPoint::default(),
-            &["artworkHitRate", "memoryBytes", "openFiles"],
+            &["artworkHitRate", "memoryBytes", "memory", "openFiles"],
         );
         assert_each_required(
             &PlexServerActivity {

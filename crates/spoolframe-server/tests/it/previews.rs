@@ -21,6 +21,7 @@ fn on_play() -> PreviewSettings {
         when: When::OnPlay,
         interval: Duration::from_secs(10),
         cache_limit_bytes: 1 << 30,
+        memory_limit_bytes: 16 << 20,
         workers: 2,
     }
 }
@@ -213,12 +214,15 @@ async fn a_server_that_makes_none_says_so() {
 }
 
 /// The sets in the previews cache.
+/// Sets made, as the metrics count them.
 fn sets(server: &TestServer) -> usize {
-    std::fs::read_dir(server.dir.join("cache").join("previews"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.path().join("previews.json").exists())
-        .count()
+    server
+        .metrics
+        .families()
+        .iter()
+        .find(|f| f.name == "spoolframe_previews_total")
+        .and_then(|f| f.value(&[("outcome", "done")]))
+        .unwrap_or(0.0) as usize
 }
 
 async fn start(client: &TestClient, session: &SessionId) -> Response {
@@ -250,9 +254,7 @@ async fn starting_a_playback_makes_its_previews() {
         assert!(Instant::now() < deadline, "the playback made no previews");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Made before the player asked. The set is renamed into place a moment
-    // before the cache's index has it, so the first ask may still hear
-    // "not ready"; it cannot be what made them, as they are on disk.
+    // Made before the player asked; the asks below only find them.
     loop {
         match get_previews(&client, &session).await {
             Response::Ok(Reply::Previews(_)) => break,

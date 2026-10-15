@@ -476,6 +476,7 @@ impl Default for ServerOptions {
                 when: When::Never,
                 interval: Duration::from_secs(10),
                 cache_limit_bytes: 1 << 30,
+                memory_limit_bytes: 16 << 20,
                 workers: 1,
             },
             previews_ffmpeg: PathBuf::from("ffmpeg"),
@@ -652,8 +653,13 @@ impl TestServer {
             }
             None => fake.clone(),
         };
-        let mut artwork =
-            ArtworkCache::open(&dir.join("cache/artwork"), 64 << 20, catalog.clone()).unwrap();
+        let tiers = spoolframe_server::hybrid::Tiers {
+            memory: 16 << 20,
+            disk: 64 << 20,
+        };
+        let mut artwork = ArtworkCache::open(&dir.join("cache/artwork"), tiers, catalog.clone())
+            .await
+            .unwrap();
         if let Some(live) = &options.catalog {
             artwork = artwork.with_changes(live.changes());
         }
@@ -719,6 +725,7 @@ impl TestServer {
                 encoding: jobs.encoding(),
             },
         )
+        .await
         .unwrap();
         if let Some(live) = options.catalog.as_ref() {
             previews.watch_catalog(live.changes());

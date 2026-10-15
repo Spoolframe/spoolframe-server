@@ -1028,6 +1028,7 @@ async fn a_player_finds_the_frame_for_a_time_in_an_item_s_previews() {
             when: When::OnPlay,
             interval: Duration::from_secs(10),
             cache_limit_bytes: 1 << 30,
+            memory_limit_bytes: 16 << 20,
             workers: 1,
         },
         ..ServerOptions::default()
