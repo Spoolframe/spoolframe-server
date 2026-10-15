@@ -304,7 +304,11 @@ mod tests {
         store.tie(alice, portable(7), "root").await.unwrap();
         store.tie(alice, portable(8), "root").await.unwrap();
         store.clock().advance(std::time::Duration::from_secs(60));
+        // Whole seconds of the system clock: the use may land on the next
+        // second after `before`.
+        let before = store.now();
         store.tie_used(alice, portable(8)).await.unwrap();
+        let after = store.now();
         let used = |id| {
             let ties = store.ties_of(alice);
             async move {
@@ -317,7 +321,11 @@ mod tests {
             }
         };
         assert_eq!(used(portable(7)).await, None);
-        assert_eq!(used(portable(8)).await, Some(store.now()));
+        let last = used(portable(8)).await.expect("the tie's use is recorded");
+        assert!(
+            (before..=after).contains(&last),
+            "{before} ≤ {last} ≤ {after}"
+        );
     }
 
     /// Before migration 0028 an account had one tie at most: each is

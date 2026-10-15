@@ -250,11 +250,22 @@ async fn starting_a_playback_makes_its_previews() {
         assert!(Instant::now() < deadline, "the playback made no previews");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Made before the player asked.
-    assert!(matches!(
-        get_previews(&client, &session).await,
-        Response::Ok(Reply::Previews(_))
-    ));
+    // Made before the player asked. The set is renamed into place a moment
+    // before the cache's index has it, so the first ask may still hear
+    // "not ready"; it cannot be what made them, as they are on disk.
+    loop {
+        match get_previews(&client, &session).await {
+            Response::Ok(Reply::Previews(_)) => break,
+            Response::Err(Error::PreviewsNotReady { .. }) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the made previews were never ready"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("previews made by the playback: {other:?}"),
+        }
+    }
     client.close().await;
     server.stop().await;
 }
