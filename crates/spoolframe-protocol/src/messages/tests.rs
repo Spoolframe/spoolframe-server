@@ -2787,6 +2787,27 @@ mod playlists {
         assert!(retry_safe(&Request::Unlike { items: Vec::new() }));
     }
 
+    /// `spoolframe:last-viewed`: a playback state carries when it was
+    /// last viewed, and leaves the key out when it does not say.
+    #[test]
+    fn a_last_view_round_trips_and_is_left_out_when_unknown() {
+        let mut seen = movie();
+        if let spoolframe_types::Item::Movie(m) = &mut seen {
+            m.playback.last_viewed_at = Some(1_791_000_000);
+        }
+        let json = serde_json::to_value(&seen).unwrap();
+        assert_eq!(json["playback"]["last_viewed_at"], 1_791_000_000);
+        round_trip(Response::Ok(Reply::Home(crate::HomeScreen {
+            continue_watching: vec![seen],
+            next_up: Vec::new(),
+            recently_added: Vec::new(),
+        })));
+        let json = serde_json::to_value(movie()).unwrap();
+        assert!(json["playback"].get("last_viewed_at").is_none(), "{json}");
+        let read: spoolframe_types::Item = serde_json::from_value(json).unwrap();
+        assert_eq!(read, movie());
+    }
+
     /// PX-43: a built-in playlist says which it is, an album says how
     /// much of it is liked and which of its tracks, and an entry or the
     /// one playing has its heart.

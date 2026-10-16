@@ -55,6 +55,15 @@ pub struct PlaybackState {
     #[serde(with = "duration_ms::option")]
     pub position: Option<Duration>,
     pub watched: bool,
+    /// When the user last viewed it, Unix seconds: their last progress
+    /// report on it from any device, or its last mark as watched or
+    /// unwatched. Sent only to a client that listed the
+    /// `spoolframe:last-viewed` feature, and only where its reply says
+    /// so (Home's rows, an item's details); `None` elsewhere, and for an
+    /// item never viewed.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_viewed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +348,7 @@ mod tests {
         PlaybackState {
             position: Some(Duration::from_millis(2_220_500)),
             watched: false,
+            last_viewed_at: None,
         }
     }
 
@@ -718,6 +728,7 @@ mod tests {
             playback: PlaybackState {
                 position: None,
                 watched: true,
+                last_viewed_at: None,
             },
         });
     }

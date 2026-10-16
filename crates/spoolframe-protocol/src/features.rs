@@ -33,8 +33,17 @@ pub const PLAYLISTS: &str = "spoolframe:playlists";
 /// keeps working against a server that has it.
 pub const LIKED: &str = "spoolframe:liked";
 
+/// When each item was last viewed: `PlaybackState::last_viewed_at`
+/// (Unix seconds) on Home's `continue_watching` and `next_up` items and
+/// on `Item`'s item and children, from the user's last progress report
+/// on it from any device (or its last mark as watched or unwatched). What
+/// a client needs to show only what was watched lately, such as the Apple
+/// TV's Top Shelf, which a guess from the device's own playing would get
+/// wrong. A session whose client did not list it is never sent the field.
+pub const LAST_VIEWED: &str = "spoolframe:last-viewed";
+
 /// Every regular feature this build knows.
-pub const ALL: &[&str] = &[PLAYLISTS, LIKED];
+pub const ALL: &[&str] = &[PLAYLISTS, LIKED, LAST_VIEWED];
 
 /// The ones that change what a client can do before it has a session:
 /// what the answer to `Hello` lists. None yet.
@@ -70,6 +79,12 @@ mod tests {
     fn playlists_are_not_pre_auth() {
         assert!(ALL.contains(&PLAYLISTS));
         assert!(!PRE_AUTH.contains(&PLAYLISTS));
+    }
+
+    #[test]
+    fn last_viewed_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&LAST_VIEWED));
+        assert!(!PRE_AUTH.contains(&LAST_VIEWED));
     }
 
     #[test]

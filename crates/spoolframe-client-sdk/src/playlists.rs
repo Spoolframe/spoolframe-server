@@ -13,7 +13,7 @@
 //! `builtin` saying which. A server without the feature lists neither and
 //! [`Session::like`] is [`SdkError::Unsupported`].
 
-use spoolframe_protocol::features::{LIKED, PLAYLISTS};
+use spoolframe_protocol::features::{LAST_VIEWED, LIKED, PLAYLISTS};
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
     PlaylistSummary, Visibility,
@@ -31,6 +31,9 @@ pub struct Features {
     pub playlists: bool,
     /// Liked and All, and hearts (PX-43).
     pub liked: bool,
+    /// When each item was last viewed: `PlaybackState::last_viewed_at` on
+    /// Home's rows and an item's details. Data only, nothing to call.
+    pub last_viewed: bool,
 }
 
 impl Features {
@@ -41,6 +44,7 @@ impl Features {
             playlists: spoolframe_protocol::features::has(names, PLAYLISTS),
             liked: spoolframe_protocol::features::has(names, PLAYLISTS)
                 && spoolframe_protocol::features::has(names, LIKED),
+            last_viewed: spoolframe_protocol::features::has(names, LAST_VIEWED),
         }
     }
 }
@@ -344,6 +348,7 @@ mod tests {
         assert!(Features::of(&[PLAYLISTS.to_owned(), LIKED.to_owned()]).liked);
         // Liked is a part of playlists: without them, none.
         assert!(!Features::of(&[LIKED.to_owned()]).liked);
+        assert!(Features::of(&[LAST_VIEWED.to_owned()]).last_viewed);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }

@@ -461,6 +461,33 @@ impl Watch {
         Ok(())
     }
 
+    /// Set `last_viewed_at` on `items` from `principal`'s watch state:
+    /// when it was last saved, by a progress report from any device of
+    /// theirs, a mark as watched or unwatched, or a Plex sync with Plex's
+    /// own time. Asked for only where a reply carries it to a client that
+    /// takes it (`spoolframe:last-viewed`); [`Watch::fill`] leaves it out.
+    pub async fn fill_last_viewed(
+        &self,
+        principal: Principal,
+        items: &mut [&mut Item],
+    ) -> Result<(), WatchError> {
+        let ids: Vec<String> = items
+            .iter()
+            .filter(|i| tracked(i.id()))
+            .map(|i| i.id().to_string())
+            .collect();
+        let states = self.store.watch_states(principal, &ids).await?;
+        for item in items.iter_mut() {
+            let at = states.get(&item.id().to_string()).map(|row| row.updated_at);
+            match item {
+                Item::Movie(m) => m.playback.last_viewed_at = at,
+                Item::Episode(e) => e.playback.last_viewed_at = at,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// A page of what `principal` watched or started, the most recently
     /// first (PX-42's `watch_history`): each item as the catalog has it,
     /// with their state, and how many states there are. An item gone from

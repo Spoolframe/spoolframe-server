@@ -155,7 +155,7 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
                 "continue_watching",
                 "What the user started and has not finished, most recent first, and the next \
                  episode of each show they are watching: what \"what haven't I finished?\" \
-                 asks.",
+                 asks. Each says when it was last viewed (lastViewedAt, Unix seconds).",
             ))
             .annotate(reads()),
         },
@@ -164,7 +164,8 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
             tool: schema::<PageArgs>(tool(
                 "watch_history",
                 "What the user watched or started, most recent first, a page at a time, with \
-                 their progress and whether each is watched.",
+                 their progress, whether each is watched, and when it was last viewed \
+                 (lastViewedAt, Unix seconds).",
             ))
             .annotate(reads()),
         },
@@ -600,10 +601,15 @@ fn secs(d: std::time::Duration) -> u64 {
 /// place it, and the user's state; no artwork, no paths.
 pub fn item_json(item: &Item) -> Value {
     let state = |p: &spoolframe_types::PlaybackState| {
-        json!({
+        let mut state = json!({
             "watched": p.watched,
             "positionSecs": p.position.map(secs),
-        })
+        });
+        // Where a tool filled it: when it was last viewed, Unix seconds.
+        if let Some(at) = p.last_viewed_at {
+            state["lastViewedAt"] = json!(at);
+        }
+        state
     };
     match item {
         Item::Movie(m) => json!({
@@ -865,7 +871,16 @@ impl McpServer {
 
     async fn continue_watching(&self, caller: &McpCaller) -> ToolResult {
         let library = self.library()?;
-        let home = library.watch.home(caller.principal()).await?;
+        let mut home = library.watch.home(caller.principal()).await?;
+        let mut rows: Vec<&mut Item> = home
+            .continue_watching
+            .iter_mut()
+            .chain(home.next_up.iter_mut())
+            .collect();
+        library
+            .watch
+            .fill_last_viewed(caller.principal(), &mut rows)
+            .await?;
         Ok(json!({
             "continueWatching": items_json(&home.continue_watching),
             "nextUp": items_json(&home.next_up),
@@ -875,9 +890,14 @@ impl McpServer {
     async fn watch_history(&self, caller: &McpCaller, a: PageArgs) -> ToolResult {
         let library = self.library()?;
         let (offset, limit) = a.page();
-        let (items, total) = library
+        let (mut items, total) = library
             .watch
             .history(caller.principal(), offset, limit)
+            .await?;
+        let mut rows: Vec<&mut Item> = items.iter_mut().collect();
+        library
+            .watch
+            .fill_last_viewed(caller.principal(), &mut rows)
             .await?;
         Ok(json!({ "items": items_json(&items), "offset": offset, "total": total }))
     }

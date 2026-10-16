@@ -281,7 +281,11 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
     );
     assert_eq!(
         status.features,
-        ["spoolframe:playlists", "spoolframe:liked"]
+        [
+            "spoolframe:playlists",
+            "spoolframe:liked",
+            "spoolframe:last-viewed"
+        ]
     );
     assert!(status.pre_auth_features.is_empty());
     assert_eq!(status.experimental_features, ["http-playback"]);

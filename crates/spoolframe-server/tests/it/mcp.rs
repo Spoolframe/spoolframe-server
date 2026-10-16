@@ -271,7 +271,7 @@ async fn a_client_initializes_and_lists_the_tools_of_its_scopes_only() {
         lines,
         [
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
-            "features: spoolframe:playlists, spoolframe:liked",
+            "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed",
             "pre-auth features: none",
             "experimental features on: http-playback",
         ]
@@ -331,6 +331,8 @@ async fn the_watch_history_is_the_user_s_newest_first_a_page_at_a_time() {
         .unwrap();
     assert_eq!(ids(&first["items"]), ["plex:episode:13"]);
     assert_eq!(first["total"], 2);
+    // When each was last viewed, as saved.
+    assert_eq!(first["items"][0]["state"]["lastViewedAt"], 200);
     let next = mcp
         .call("watch_history", json!({ "offset": 1, "limit": 1 }))
         .await

@@ -228,6 +228,7 @@ async fn progress_reports_while_paused_keep_a_playback_past_the_idle_limit() {
         spoolframe_types::PlaybackState {
             position: Some(paused_at),
             watched: false,
+            last_viewed_at: None,
         }
     );
     server.clock.advance(PLAYBACK_IDLE);

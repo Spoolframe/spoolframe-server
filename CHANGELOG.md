@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- When each item was last viewed, for the Apple TV's Top Shelf, which
+  shows Continue watching from the last 48 hours only and cannot tell it
+  from the device's own playing. Behind a new regular feature,
+  `spoolframe:last-viewed` (the protocol version is unchanged): a client
+  that lists it gets `last_viewed_at` (Unix seconds) in the playback
+  state of Home's `continue_watching` and `next_up` items and of an
+  item's details and its children. It is the user's last progress report
+  on the item from any device, or its last mark as watched or unwatched,
+  or Plex's time for a view synced from Plex; another user's viewing does
+  not move it. A client without the feature is never sent it. SDK:
+  `Features::last_viewed`, and `PlaybackState::last_viewed_at`. MCP:
+  `continue_watching` and `watch_history` give each item's
+  `state.lastViewedAt`. The Server page, `--version` and MCP's server
+  info list the new feature.
+
 - The client protocol's version and features are shown: on the Server
   page's This server card (Client protocol, Features, Pre-auth features,
   Experimental), by `spoolframe-server --version` after its first line,

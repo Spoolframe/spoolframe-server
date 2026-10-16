@@ -28,6 +28,7 @@ mod index_ahead;
 mod invite_admin;
 mod invites;
 mod lan;
+mod last_viewed;
 mod leave;
 mod libraries;
 mod license_boundary;

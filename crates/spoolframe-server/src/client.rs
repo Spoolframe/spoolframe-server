@@ -1817,6 +1817,8 @@ impl ClientProtocol {
         // PX-43: Liked and All, and hearts, only for a client that knows
         // them; one that does not would offer to rename or delete them.
         let liked_listed = playlists_listed && features::has(&hello.features, features::LIKED);
+        // When each item was last viewed, only for a client that takes it.
+        let last_viewed_listed = features::has(&hello.features, features::LAST_VIEWED);
         if playlists_listed {
             self.playlist_listeners
                 .note(connection.stable_id(), principal, liked_listed);
@@ -2381,6 +2383,17 @@ impl ClientProtocol {
                     std::iter::once(&mut found.item).chain(found.children.iter_mut()),
                 )
                 .await?;
+                if last_viewed_listed {
+                    let mut items: Vec<&mut spoolframe_types::Item> =
+                        std::iter::once(&mut found.item)
+                            .chain(found.children.iter_mut())
+                            .collect();
+                    self.services
+                        .watch
+                        .fill_last_viewed(principal, &mut items)
+                        .await
+                        .map_err(watch_error)?;
+                }
                 // PX-40: only for a client that takes them.
                 let playlists = if playlists_listed {
                     Some(
@@ -2673,13 +2686,27 @@ impl ClientProtocol {
                     .map_err(watch_error)?;
                 Ok(Reply::Done)
             }
-            Request::Home => Ok(Reply::Home(
-                self.services
+            Request::Home => {
+                let mut home = self
+                    .services
                     .watch
                     .home(principal)
                     .await
-                    .map_err(watch_error)?,
-            )),
+                    .map_err(watch_error)?;
+                if last_viewed_listed {
+                    let mut rows: Vec<&mut spoolframe_types::Item> = home
+                        .continue_watching
+                        .iter_mut()
+                        .chain(home.next_up.iter_mut())
+                        .collect();
+                    self.services
+                        .watch
+                        .fill_last_viewed(principal, &mut rows)
+                        .await
+                        .map_err(watch_error)?;
+                }
+                Ok(Reply::Home(home))
+            }
             Request::Tracks { id } => {
                 let (_, descriptor) = self.describe(&id).await?;
                 Ok(Reply::Tracks(descriptor.tracks()))

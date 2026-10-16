@@ -30,7 +30,13 @@ async fn alice_and_bob(test: &str) -> (TestServer, TestClient, SessionId, Sessio
     (server, tv, alice, bob)
 }
 
-async fn progress(server: &TestServer, tv: &TestClient, who: &SessionId, id: &MediaId, secs: u64) {
+pub(crate) async fn progress(
+    server: &TestServer,
+    tv: &TestClient,
+    who: &SessionId,
+    id: &MediaId,
+    secs: u64,
+) {
     server.write_media(1000);
     server.write_episode(id.key());
     let started = tv
@@ -62,7 +68,7 @@ async fn progress(server: &TestServer, tv: &TestClient, who: &SessionId, id: &Me
     assert_eq!(response, Response::Ok(Reply::Done));
 }
 
-async fn state_of(tv: &TestClient, who: &SessionId, id: &MediaId) -> PlaybackState {
+pub(crate) async fn state_of(tv: &TestClient, who: &SessionId, id: &MediaId) -> PlaybackState {
     match tv.call(Some(who), Request::Item { id: id.clone() }).await {
         Response::Ok(Reply::Item {
             item: Item::Movie(m),
@@ -76,7 +82,7 @@ async fn state_of(tv: &TestClient, who: &SessionId, id: &MediaId) -> PlaybackSta
     }
 }
 
-async fn home(tv: &TestClient, who: &SessionId) -> HomeScreen {
+pub(crate) async fn home(tv: &TestClient, who: &SessionId) -> HomeScreen {
     match tv.call(Some(who), Request::Home).await {
         Response::Ok(Reply::Home(home)) => home,
         other => panic!("no home: {other:?}"),

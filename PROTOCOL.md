@@ -1605,6 +1605,19 @@ says which the session's server has (from `WhoAmI`), and
 `PlaylistEvent { server, change }` the servers tell, `change` one of
 `Changed { id, revision }`, `Gone { id }` and `PinsChanged`.
 
+## When an item was last viewed
+
+Feature `spoolframe:last-viewed`. A client that lists it gets
+`last_viewed_at`, Unix seconds, in an item's `PlaybackState`: on Home's
+`continue_watching` and `next_up` items, and on `Item`'s item and
+children. It is when the user's watch state on the item was last saved:
+a progress report from any device of theirs, a mark as watched or
+unwatched, or a view synced from Plex at Plex's time. Another user's
+viewing never moves it. The key is left out for an item never viewed,
+everywhere else, and always for a client that did not list the feature.
+What it is for: showing only what was watched lately (the Apple TV's
+Top Shelf, the last 48 hours), across the user's devices.
+
 ## Liked and All
 
 Feature `spoolframe:liked` (PX-43), on top of `spoolframe:playlists`.

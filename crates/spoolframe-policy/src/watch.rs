@@ -37,6 +37,7 @@ impl WatchRules {
         PlaybackState {
             position: position.filter(|p| *p >= self.started_after && !watched),
             watched,
+            last_viewed_at: None,
         }
     }
 
@@ -96,7 +97,8 @@ mod tests {
             rules.playback_state(Some(position), watched),
             PlaybackState {
                 position: None,
-                watched: true
+                watched: true,
+                last_viewed_at: None,
             }
         );
     }
