@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 (2026-10-16)
+
 - MCP: an agent deletes, shares and renames playlists. `delete_playlist`
   deletes one (marked destructive, so the client asks first): the
   user's own, or with the admin scope a server-wide one; Liked and All
