@@ -2464,3 +2464,39 @@ async fn the_sdk_likes_an_album_and_reads_its_hearts() {
     phone.close().await;
     server.stop().await;
 }
+
+/// PX-16: an app that lists no regular feature, as `ClientOptions`
+/// default to, has none on a server that has them all, and its playlist
+/// calls are refused before they are sent.
+#[tokio::test]
+async fn an_app_listing_no_feature_has_none() {
+    let server = TestServer::start("no-features").await;
+    server
+        .add_user("alice", "correct horse", Some("Alice"))
+        .await;
+    let options = spoolframe_client_sdk::ClientOptions {
+        lan_discovery: false,
+        ..spoolframe_client_sdk::ClientOptions::default()
+    };
+    let client = Client::open_with_options(
+        Arc::new(MemoryStorage::default()),
+        device(mkv_capabilities()),
+        options,
+    )
+    .await
+    .unwrap();
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    client.add_address(&id(&server), addrs).unwrap();
+    pin(&client, &server).await;
+    let session = alice(&server, &client).await;
+    assert_eq!(
+        session.features(),
+        spoolframe_client_sdk::Features::default()
+    );
+    assert!(matches!(
+        session.playlists().await,
+        Err(SdkError::Unsupported { .. })
+    ));
+    client.close().await;
+    server.stop().await;
+}

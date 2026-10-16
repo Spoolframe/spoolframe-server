@@ -1395,7 +1395,10 @@ are built with, and each uses only what both list. This build has the
 slice of PX-16 that playlists need; the update advisory and a test
 server's mask come later.
 
-- `Hello.features`: every regular feature the client is built with.
+- `Hello.features`: the regular features the client handles. An SDK
+  lists only those its app said it handles, not every one it knows: an
+  app that moves to a newer SDK must not be sent what its code would
+  misread.
 - `ServerInfo.features`: only the server's pre-auth features (none yet).
 - `LoggedIn.features` and `WhoAmI`'s `features`: all of the server's.
   `WhoAmI` carries them for a client holding a session from before, or
@@ -1408,7 +1411,9 @@ know is ignored; no feature is required. All three fields are left out
 when empty, so an older peer sends and reads what it did before.
 
 Regular features differ from experimental ones (PX-49,
-`Hello.experimental`): a build that has one always lists it.
+`Hello.experimental`): a server that has one always lists it, where an
+operator turns an experimental one on. A client lists either kind only
+when its code handles it.
 
 New wire capability comes as a regular feature, not a new protocol
 version: an app built before a feature keeps working against a server
@@ -1591,8 +1596,11 @@ again on connecting.
 
 ### SDK
 
-The SDK lists every feature it uses in its `Hello`. `Session::features()`
-says which the session's server has (from `WhoAmI`), and
+The SDK lists in its `Hello` the features the app gives in
+`ClientOptions::features` (a `Features`; none by default), and no other.
+`Session::features()` says which the session has: those the app listed
+that the server listed too (from `WhoAmI`). One the app did not list is
+false even when the server has it.
 `Features::playlists` gates every playlist call: without it the call is
 `SdkError::Unsupported { feature }` and nothing is sent. The calls are
 `Session::playlists`, `playlist`, `create_playlist`, `update_playlist`

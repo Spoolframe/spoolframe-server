@@ -1,19 +1,30 @@
-//! Playlists (PX-40) from a server without them: the SDK refuses the call
-//! itself, and sends nothing.
+//! Playlists (PX-40) and the other regular features (PX-16) the SDK
+//! gates: from a server without them, or in an app that did not list them,
+//! the SDK refuses the call itself, and sends nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
 use spoolframe_client_sdk::{
-    Client, ClientOptions, Device, Kinds, MemoryStorage, SdkError, Timeouts, Visibility,
+    Client, ClientOptions, Device, Features, Kinds, MemoryStorage, SdkError, Session, Timeouts,
+    Visibility,
 };
+use spoolframe_protocol::features::{LIKED, PLAYLISTS};
+use spoolframe_types::{MediaId, MediaKind, Namespace};
 
 use crate::stub::Stub;
 
-#[tokio::test]
-async fn a_server_without_playlists_is_not_asked_for_them() {
-    let stub = Stub::start().await;
+/// Every regular feature this SDK knows, as an app that handles them all.
+const ALL: Features = Features {
+    playlists: true,
+    liked: true,
+    last_viewed: true,
+    playlist_sharing: true,
+};
+
+/// Alice, signed in on `stub` from an app that lists `features`.
+async fn alice_listing(stub: &Stub, features: Features) -> (Client, Session) {
     let client = Client::open_with_options(
         Arc::new(MemoryStorage::default()),
         Device {
@@ -29,6 +40,7 @@ async fn a_server_without_playlists_is_not_asked_for_them() {
                 ping: Duration::from_secs(1),
             },
             lan_discovery: false,
+            features,
             ..ClientOptions::default()
         },
     )
@@ -41,6 +53,13 @@ async fn a_server_without_playlists_is_not_asked_for_them() {
         .sign_in(&stub.id(), "alice", "correct horse", false)
         .await
         .unwrap();
+    (client, session)
+}
+
+#[tokio::test]
+async fn a_server_without_playlists_is_not_asked_for_them() {
+    let stub = Stub::start().await;
+    let (_client, session) = alice_listing(&stub, ALL).await;
     assert!(!session.features().playlists);
     let made = session
         .create_playlist("Heists", Kinds::default(), Visibility::Personal)
@@ -57,4 +76,62 @@ async fn a_server_without_playlists_is_not_asked_for_them() {
     ));
     assert!(stub.requests_of("create_playlist").is_empty());
     assert!(stub.requests_of("list_playlists").is_empty());
+}
+
+/// An app that lists no feature, the default, is sent none and has none,
+/// though the server has them all: an SDK knowing a feature does not turn
+/// it on for an app whose code does not handle it.
+#[tokio::test]
+async fn by_default_an_app_lists_no_feature_and_has_none() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    let (client, session) = alice_listing(&stub, Features::default()).await;
+    assert_eq!(stub.hello_features(), vec![Vec::<String>::new()]);
+    assert_eq!(session.features(), Features::default());
+    // Found again rather than made: from `WhoAmI`, the same.
+    let found = client.profiles(&stub.id()).await.unwrap();
+    assert_eq!(found[0].features(), Features::default());
+}
+
+/// An app that lists playlists and Liked is sent exactly those, and has
+/// only those of the server's.
+#[tokio::test]
+async fn an_app_has_only_the_features_it_lists() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    let listed = Features {
+        playlists: true,
+        liked: true,
+        ..Features::default()
+    };
+    let (_client, session) = alice_listing(&stub, listed).await;
+    assert_eq!(
+        stub.hello_features(),
+        vec![vec![PLAYLISTS.to_owned(), LIKED.to_owned()]]
+    );
+    assert_eq!(session.features(), listed);
+}
+
+/// An app that did not list Liked cannot like, even on a server that has
+/// it: the SDK refuses, and sends nothing.
+#[tokio::test]
+async fn an_app_not_listing_liked_does_not_send_a_like() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    let listed = Features {
+        playlists: true,
+        ..Features::default()
+    };
+    let (_client, session) = alice_listing(&stub, listed).await;
+    let album = MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap();
+    assert_eq!(
+        session
+            .like(std::slice::from_ref(&album))
+            .await
+            .unwrap_err(),
+        SdkError::Unsupported {
+            feature: LIKED.into()
+        }
+    );
+    assert!(stub.requests_of("like").is_empty());
 }

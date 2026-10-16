@@ -2,8 +2,9 @@
 //! when both list them. This is the slice playlists (PX-40) need; the rest
 //! of PX-16 (the update advisory, a test server's mask) comes with it.
 //!
-//! A client lists every regular feature it is built with in
-//! [`Hello::features`]. A server lists those it has: its answer to `Hello`
+//! A client lists the regular features its code handles in
+//! [`Hello::features`]; an SDK lists those its app names, not every one it
+//! knows. A server lists those it has: its answer to `Hello`
 //! ([`ServerInfo::features`]) only the pre-auth ones, and every reply that
 //! grants a session (`LoggedIn`), and `WhoAmI`, all of them. Each side
 //! then uses only what both list: the server sends no reply field or event
@@ -12,7 +13,7 @@
 //! never an error, and no feature is required.
 //!
 //! Unlike [`crate::experimental`] features, regular ones are always on in
-//! a build that has them: neither an operator nor a user turns them off.
+//! a server that has them: neither an operator nor a user turns them off.
 //!
 //! [`Hello::features`]: crate::Hello::features
 //! [`ServerInfo::features`]: crate::ServerInfo::features

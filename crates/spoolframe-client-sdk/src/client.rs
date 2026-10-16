@@ -133,6 +133,15 @@ pub struct ClientOptions {
     /// connection's `Hello` (PX-49); none by default. Whether a server
     /// turned one on is [`crate::Session::experimental`].
     pub experimental: crate::Experimental,
+    /// The regular features (PX-16) this app handles, listed in each
+    /// connection's `Hello`; none by default. A server sends a feature's
+    /// reply fields, events and rows (Liked and All among a user's
+    /// playlists, for one) only when the app lists it, and the SDK's
+    /// calls of a feature not listed are [`SdkError::Unsupported`],
+    /// unsent. An app lists only what its code handles: a newer SDK
+    /// knowing a feature does not turn it on. What a session has is
+    /// [`crate::Session::features`].
+    pub features: crate::Features,
 }
 
 impl Default for ClientOptions {
@@ -142,6 +151,7 @@ impl Default for ClientOptions {
             lan_discovery: true,
             relays: true,
             experimental: crate::Experimental::default(),
+            features: crate::Features::default(),
         }
     }
 }
@@ -159,6 +169,8 @@ pub(crate) struct Inner {
     pub(crate) timeouts: Timeouts,
     /// What every Hello asks for (PX-49).
     pub(crate) experimental: crate::Experimental,
+    /// [`ClientOptions::features`]: what every Hello lists (PX-16).
+    pub(crate) features: crate::Features,
     pub(crate) discovery: Discovery,
     /// Addresses the app gave for servers, and invites' hints (P6-01).
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
@@ -242,6 +254,7 @@ impl Client {
             lan_discovery,
             relays,
             experimental,
+            features,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
         let reach = Arc::new(ReachLog::default());
@@ -309,6 +322,7 @@ impl Client {
                 device,
                 timeouts,
                 experimental,
+                features,
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
@@ -1245,7 +1259,7 @@ impl Client {
             can_leave,
             remembered: Some(remembered),
             password_change_required: Arc::default(),
-            features: crate::playlists::Features::of(&features),
+            features: self.inner.features.both(&features),
         })
     }
 
@@ -1309,7 +1323,7 @@ impl Client {
                     can_leave,
                     remembered: None,
                     password_change_required: Arc::default(),
-                    features: crate::playlists::Features::of(&features),
+                    features: self.inner.features.both(&features),
                 }),
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
                     tracing::info!(
@@ -1861,6 +1875,7 @@ impl Client {
             addr,
             &self.inner.device,
             self.inner.experimental,
+            self.inner.features,
             &self.inner.timeouts,
         )
         .await;

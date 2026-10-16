@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Breaking (SDK): an app lists the regular features it handles. The
+  SDK's `Hello` listed every regular feature the SDK knew, so an app
+  that moved to a newer SDK was sent features its code did not handle:
+  on SDK 0.11 an app with no Liked UI would get Liked and All among its
+  playlists, could not tell them from ordinary ones, and would offer to
+  rename and delete them. Now `ClientOptions` has
+  `features: Features`, none by default, and the `Hello` lists only
+  what is set there. `Session::features()` is what both the app and the
+  server list: one the app did not set is false even when the server has
+  it, and its calls (`playlists`, `like`, `share_candidates`, ...) are
+  `SdkError::Unsupported` without being sent. An app keeps what it had
+  by setting the features it handles when it opens its `Client`:
+
+  ```rust
+  let options = ClientOptions {
+      features: Features {
+          playlists: true,        // spoolframe:playlists
+          liked: true,            // spoolframe:liked (needs playlists)
+          last_viewed: true,      // spoolframe:last-viewed
+          playlist_sharing: true, // spoolframe:playlist-sharing (needs playlists)
+      },
+      ..ClientOptions::default()
+  };
+  let client = Client::open_with_options(storage, device, options).await?;
+  ```
+
+  `Client::open` and `Client::open_with` list none. `SdkError::Unsupported`
+  now reads "<feature> is not on for this session". The wire is
+  unchanged.
+
 - Playlists are shared by name. Behind a new regular feature,
   `spoolframe:playlist-sharing` (the protocol version is unchanged):
   `ListShareCandidates { id, query, offset, limit }` answers a page of

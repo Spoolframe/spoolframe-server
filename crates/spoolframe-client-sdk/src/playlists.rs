@@ -30,8 +30,10 @@ use spoolframe_types::MediaId;
 
 use crate::{SdkError, Session};
 
-/// The regular features a server has (PX-16) that this SDK uses, as the
-/// session's `WhoAmI` listed them.
+/// Regular features (PX-16) this SDK knows: those an app handles
+/// ([`crate::ClientOptions::features`], none by default), and those a
+/// session has ([`Session::features`]), which are the ones both the app
+/// and the session's server list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Features {
     /// Playlists (PX-40).
@@ -47,6 +49,33 @@ pub struct Features {
 }
 
 impl Features {
+    /// The names a `Hello` carries, each once.
+    pub(crate) fn names(self) -> Vec<String> {
+        [
+            (self.playlists, PLAYLISTS),
+            (self.liked, LIKED),
+            (self.last_viewed, LAST_VIEWED),
+            (self.playlist_sharing, PLAYLIST_SHARING),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| name.to_owned())
+        .collect()
+    }
+
+    /// What a session has: those of `server`, a server's list, that the
+    /// app (`self`) listed too. One the app did not list is off even when
+    /// the server has it, so its calls are refused here, unsent.
+    pub(crate) fn both(self, server: &[String]) -> Self {
+        let ours = self.names();
+        let shared: Vec<String> = server
+            .iter()
+            .filter(|name| ours.contains(name))
+            .cloned()
+            .collect();
+        Self::of(&shared)
+    }
+
     /// What `names`, a server's list, has. A name this SDK does not know
     /// is ignored.
     pub(crate) fn of(names: &[String]) -> Self {
@@ -104,8 +133,10 @@ fn unexpected(reply: Reply) -> SdkError {
 }
 
 impl Session {
-    /// The regular features the server has that this SDK uses, as it
-    /// listed them when this session was made or found.
+    /// The regular features this session has: those the app listed
+    /// ([`crate::ClientOptions::features`]) that the server listed too
+    /// when this session was made or found. One the app did not list is
+    /// off here even when the server has it.
     pub fn features(&self) -> Features {
         self.features
     }
@@ -399,5 +430,28 @@ mod tests {
         assert!(!Features::of(&[PLAYLIST_SHARING.to_owned()]).playlist_sharing);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
+    }
+
+    #[test]
+    fn an_app_lists_only_what_it_set_and_has_only_what_both_list() {
+        assert!(Features::default().names().is_empty());
+        let all = spoolframe_protocol::features::names(spoolframe_protocol::features::ALL);
+        let every = Features::of(&all);
+        assert_eq!(every.names(), all);
+        assert_eq!(Features::of(&every.names()), every);
+        assert_eq!(Features::default().both(&all), Features::default());
+        let app = Features {
+            playlists: true,
+            liked: true,
+            ..Features::default()
+        };
+        assert_eq!(app.both(&all), app);
+        // Liked still needs playlists, the app's or the server's.
+        let liked_only = Features {
+            liked: true,
+            ..Features::default()
+        };
+        assert_eq!(liked_only.both(&all), Features::default());
+        assert!(!app.both(&[LIKED.to_owned()]).liked);
     }
 }

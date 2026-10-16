@@ -60,6 +60,9 @@ struct State {
     protocol: Mutex<Option<u32>>,
     /// The server id `ServerInfo` says, when not the one made from the key.
     server_id: Mutex<Option<String>>,
+    /// `LoggedIn` and `WhoAmI` list every regular feature (PX-16), as a
+    /// server that has them all; otherwise none.
+    all_features: AtomicBool,
 }
 
 pub struct Stub {
@@ -142,6 +145,22 @@ impl Stub {
     /// another protocol revision.
     pub fn refuse_hellos(&self) {
         self.state.refuse_hellos.store(true, Ordering::SeqCst);
+    }
+
+    /// List every regular feature from now on, as a server that has them.
+    pub fn have_all_features(&self) {
+        self.state.all_features.store(true, Ordering::SeqCst);
+    }
+
+    /// The regular features each `Hello` listed, in the order received.
+    pub fn hello_features(&self) -> Vec<Vec<String>> {
+        self.invocations("hello")
+            .into_iter()
+            .map(|wire| match wire.envelope.request {
+                Request::Hello(hello) => hello.features,
+                other => panic!("not a Hello: {other:?}"),
+            })
+            .collect()
     }
 
     /// Answer `Hello` with protocol revision `revision` from now on.
@@ -491,6 +510,11 @@ fn answer(
         )
         .to_string()
     });
+    let features = if state.all_features.load(Ordering::SeqCst) {
+        spoolframe_protocol::features::names(spoolframe_protocol::features::ALL)
+    } else {
+        Vec::new()
+    };
     let reply = match envelope.request {
         // What the server answers a Hello of another revision.
         Request::Hello(_) if state.refuse_hellos.load(Ordering::SeqCst) => {
@@ -526,8 +550,8 @@ fn answer(
             }),
             remembered: false,
             password_change_required: login.password == "one-time",
-            // A server without playlists (PX-40).
-            features: Vec::new(),
+            // A server without playlists (PX-40), unless it has them all.
+            features: features.clone(),
         },
         Request::ChangePassword(_) => Reply::Done,
         Request::LeaveServer if state.last_admin.load(Ordering::SeqCst) => {
@@ -545,7 +569,7 @@ fn answer(
                 portable: Vec::new(),
             },
             can_leave: !state.last_admin.load(Ordering::SeqCst),
-            features: Vec::new(),
+            features,
         }),
         Request::Libraries => Reply::Libraries {
             libraries: Vec::new(),

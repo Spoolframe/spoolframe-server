@@ -53,12 +53,21 @@ use tokio::io::AsyncWriteExt;
 /// in `Client::servers`, so a test's result would depend on the network.
 /// The test servers are dialled at the addresses a test gives. Only the
 /// LAN tests, in their private network namespace, listen.
+///
+/// It lists every regular feature, as an app handling them all would: the
+/// server's side of each is what these tests check.
 pub async fn sdk_client(
     storage: Arc<dyn spoolframe_client_sdk::Storage>,
     device: spoolframe_client_sdk::Device,
 ) -> Result<spoolframe_client_sdk::Client, spoolframe_client_sdk::SdkError> {
     let options = spoolframe_client_sdk::ClientOptions {
         lan_discovery: false,
+        features: spoolframe_client_sdk::Features {
+            playlists: true,
+            liked: true,
+            last_viewed: true,
+            playlist_sharing: true,
+        },
         ..spoolframe_client_sdk::ClientOptions::default()
     };
     spoolframe_client_sdk::Client::open_with_options(storage, device, options).await
