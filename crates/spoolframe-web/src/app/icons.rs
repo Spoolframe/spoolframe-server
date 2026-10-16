@@ -480,6 +480,26 @@ pub fn Music(#[props(default = 18)] size: u32) -> Element {
     }
 }
 
+/// A heart (PX-43): outlined when empty, filled when `full`, its left
+/// half filled when `half`.
+#[component]
+pub fn Heart(
+    #[props(default = 16)] size: u32,
+    #[props(default)] full: bool,
+    #[props(default)] half: bool,
+) -> Element {
+    const WHOLE: &str = "M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z";
+    const LEFT: &str = "M12 5c-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z";
+    rsx! {
+        Stroke { size,
+            if half {
+                path { d: LEFT, fill: "currentColor", stroke: "none" }
+            }
+            path { d: WHOLE, fill: if full { "currentColor" } else { "none" } }
+        }
+    }
+}
+
 /// A row's handle for reordering.
 #[component]
 pub fn Grip(#[props(default = 15)] size: u32) -> Element {

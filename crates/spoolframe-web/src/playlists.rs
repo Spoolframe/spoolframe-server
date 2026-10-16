@@ -1,10 +1,11 @@
 //! Playlists (PX-40): what the pages say of them, which ones an item can
-//! be added to, and the edits a move or the sharing dialog makes. Plain
-//! logic, tested on the host.
+//! be added to, and the edits a move or the sharing dialog makes; and the
+//! hearts and the built-in Liked and All (PX-43). Plain logic, tested on
+//! the host.
 
 use spoolframe_admin_api::{
-    CatalogKind, PlaylistEntryInfo, PlaylistInfo, PlaylistKinds, PlaylistOwner, PlaylistShare,
-    PlaylistSharing, PlexPlaylistImport, ShareableUser,
+    CatalogKind, PlaylistBuiltin, PlaylistEntryInfo, PlaylistInfo, PlaylistKinds, PlaylistOwner,
+    PlaylistShare, PlaylistSharing, PlexPlaylistImport, ShareableUser,
 };
 
 use crate::logic::count;
@@ -22,12 +23,97 @@ pub fn takes(kinds: PlaylistKinds, kind: CatalogKind) -> bool {
 
 /// The playlists "Add to playlist" offers for an item of `kind`: those the
 /// caller may change whose kinds take it, so a film never sees a music
-/// playlist.
+/// playlist. Never Liked or All: a track goes into Liked by its heart.
 pub fn add_targets(list: &[PlaylistInfo], kind: CatalogKind) -> Vec<PlaylistInfo> {
     list.iter()
-        .filter(|p| p.can_edit && takes(p.kinds, kind))
+        .filter(|p| p.can_edit && p.builtin.is_none() && takes(p.kinds, kind))
         .cloned()
         .collect()
+}
+
+/// What a built-in playlist is, under its name.
+pub fn builtin_line(builtin: PlaylistBuiltin) -> &'static str {
+    match builtin {
+        PlaylistBuiltin::Liked => "The tracks you liked, newest first",
+        PlaylistBuiltin::All => "Every track you can play, as the library has it now",
+    }
+}
+
+/// What an empty playlist's page says.
+pub fn empty_text(builtin: Option<PlaylistBuiltin>, admin: bool) -> &'static str {
+    match builtin {
+        Some(PlaylistBuiltin::Liked) => {
+            "Nothing liked yet. Like a track or an album with its heart, here or in the apps."
+        }
+        Some(PlaylistBuiltin::All) => "There's no music in the libraries yet.",
+        None if admin => {
+            "Nothing in it yet. Add films, episodes and music from the Spoolframe apps, or from an item's page in Libraries."
+        }
+        None => "Nothing in it yet. Add films, episodes and music from the Spoolframe apps.",
+    }
+}
+
+/// A track's or an album's heart (PX-43).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heart {
+    /// The track is liked; every track of the album is.
+    Full,
+    /// Some of the album's tracks are liked.
+    Half,
+    Empty,
+}
+
+impl Heart {
+    /// The heart in an item's details (`CatalogItem::reply`'s `liked`):
+    /// `None` for an item that has none, and from a server without
+    /// hearts.
+    pub fn of_reply(reply: &serde_json::Value) -> Option<Heart> {
+        Some(match reply.get("liked")?.as_str()? {
+            "all" => Heart::Full,
+            "some" => Heart::Half,
+            _ => Heart::Empty,
+        })
+    }
+
+    /// A track's, from whether it is liked.
+    pub fn of_track(liked: bool) -> Heart {
+        if liked { Heart::Full } else { Heart::Empty }
+    }
+
+    /// Whether a click likes (`me.like`) rather than unlikes: a half
+    /// heart likes the album's other tracks.
+    pub fn likes(self) -> bool {
+        self != Heart::Full
+    }
+
+    /// What a click on it does, in words, for an item of `kind`.
+    pub fn action(self, kind: CatalogKind) -> &'static str {
+        let album = kind == CatalogKind::Album;
+        match (self, album) {
+            (Heart::Full, false) => "Unlike",
+            (Heart::Full, true) => "Unlike every track",
+            (Heart::Half, _) => "Like the other tracks",
+            (Heart::Empty, false) => "Like",
+            (Heart::Empty, true) => "Like every track",
+        }
+    }
+
+    /// The button's word beside the heart.
+    pub fn word(self) -> &'static str {
+        match self {
+            Heart::Full => "Liked",
+            Heart::Half => "Partly liked",
+            Heart::Empty => "Like",
+        }
+    }
+}
+
+/// The album's tracks an item's details say are liked, by id.
+pub fn liked_children(reply: &serde_json::Value) -> Vec<String> {
+    reply
+        .get("liked_children")
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// What "Add to playlist" says when no playlist takes an item.
@@ -245,6 +331,9 @@ pub struct HeldIn {
     pub id: String,
     pub name: String,
     pub owner_kind: String,
+    /// `liked` for Liked (PX-43).
+    #[serde(default)]
+    pub builtin: Option<String>,
 }
 
 /// The playlists an item's details (`CatalogItem::reply`) say hold it;
@@ -529,10 +618,63 @@ mod tests {
             [HeldIn {
                 id: "p1".into(),
                 name: "Heists".into(),
-                owner_kind: "mine".into()
+                owner_kind: "mine".into(),
+                builtin: None,
             }]
         );
         assert!(held_in(&serde_json::json!({ "type": "item" })).is_empty());
+    }
+
+    #[test]
+    fn liked_and_all_are_never_offered_to_add_to() {
+        let mut liked = playlist("Liked", MUSIC, PlaylistOwner::Mine, true);
+        liked.builtin = Some(PlaylistBuiltin::Liked);
+        let list = [
+            liked,
+            playlist("Road trip", MUSIC, PlaylistOwner::Mine, true),
+        ];
+        let names: Vec<String> = add_targets(&list, CatalogKind::Track)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["Road trip"]);
+    }
+
+    #[test]
+    fn a_heart_is_read_from_an_item_s_details() {
+        let album = serde_json::json!({
+            "liked": "some",
+            "liked_children": ["plex:track:32"],
+        });
+        assert_eq!(Heart::of_reply(&album), Some(Heart::Half));
+        assert_eq!(liked_children(&album), ["plex:track:32"]);
+        let film = serde_json::json!({ "type": "item" });
+        assert_eq!(Heart::of_reply(&film), None);
+        assert!(liked_children(&film).is_empty());
+        assert_eq!(
+            Heart::of_reply(&serde_json::json!({ "liked": "all" })),
+            Some(Heart::Full)
+        );
+    }
+
+    #[test]
+    fn a_full_heart_unlikes_and_any_other_likes() {
+        assert!(!Heart::Full.likes());
+        assert!(Heart::Half.likes());
+        assert!(Heart::Empty.likes());
+        assert_eq!(
+            Heart::Half.action(CatalogKind::Album),
+            "Like the other tracks"
+        );
+        assert_eq!(Heart::Full.action(CatalogKind::Track), "Unlike");
+        assert_eq!(Heart::of_track(true), Heart::Full);
+    }
+
+    #[test]
+    fn a_builtin_s_empty_page_says_how_it_fills() {
+        assert!(empty_text(Some(PlaylistBuiltin::Liked), false).contains("heart"));
+        assert!(empty_text(None, true).contains("Libraries"));
+        assert!(!empty_text(None, false).contains("Libraries"));
     }
 
     #[test]

@@ -3,15 +3,20 @@
 //! Plex import, the admin's Libraries › Playlists for server-wide ones,
 //! and "Add to playlist" and the Playlists card on an item's page.
 //!
+//! Liked and All (PX-43) are listed first among the user's own: the
+//! server sends them so, and says they cannot be managed, so they have no
+//! Edit, Share or Delete; All, which nobody edits, no move or remove
+//! either. A heart likes a track or an album (`me.like`, `me.unlike`).
+//!
 //! Every call is a `me.playlist*` one: the server decides who may do
 //! what, and the pages only leave out what the answer says the user
 //! cannot do. The web UI plays nothing: playing a playlist is the apps'.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
-    CatalogKind, Item, MeApiClient, NewPlaylist, PlaylistChanges, PlaylistDetail, PlaylistEditOp,
-    PlaylistInfo, PlaylistKinds, PlaylistOwner, PlaylistSharing, PlexPlaylistImport, ShareableUser,
-    UserInfo, error_code,
+    CatalogKind, Item, MeApiClient, NewPlaylist, PlaylistBuiltin, PlaylistChanges, PlaylistDetail,
+    PlaylistEditOp, PlaylistInfo, PlaylistKinds, PlaylistOwner, PlaylistSharing,
+    PlexPlaylistImport, ShareableUser, UserInfo, error_code,
 };
 
 use super::admin::{Said, Toast, say};
@@ -19,8 +24,8 @@ use super::{Alert, Field, Route, icons, rpc};
 use crate::catalog::{item_context, item_kind, row_title};
 use crate::logic::ApiError;
 use crate::playlists::{
-    Access, HeldIn, add_targets, count_line, kinds_line, move_target, no_target_text, sections,
-    share_rows, sharing_line, sharing_of, widened,
+    Access, Heart, HeldIn, add_targets, builtin_line, count_line, empty_text, kinds_line,
+    move_target, no_target_text, sections, share_rows, sharing_line, sharing_of, widened,
 };
 
 /// How many entries one page of a playlist shows.
@@ -49,8 +54,75 @@ async fn edit(id: String, revision: u64, edits: Vec<PlaylistEditOp>) -> Result<u
         .map_err(rpc::error)
 }
 
+/// Like `items` (`like`), or unlike them.
+async fn like_items(items: Vec<String>, like: bool) -> Result<PlaylistInfo, ApiError> {
+    let client = rpc::client().await?;
+    let liked = if like {
+        client.like(items).await
+    } else {
+        client.unlike(items).await
+    };
+    liked.map_err(rpc::error)
+}
+
 fn is_admin() -> bool {
     use_context::<UserInfo>().role.is_admin()
+}
+
+/// A playlist's icon: a heart for Liked, else what it holds.
+#[component]
+fn PlaylistIcon(kinds: PlaylistKinds, builtin: Option<PlaylistBuiltin>) -> Element {
+    match builtin {
+        Some(PlaylistBuiltin::Liked) => rsx! { icons::Heart { size: 18, full: true } },
+        _ => rsx! { KindsIcon { kinds } },
+    }
+}
+
+/// A track's or an album's heart, as a button: a click likes it (an
+/// album's tracks not liked yet), or, full, unlikes it; `on_changed`
+/// then, to read the page again. With `word`, "Like" or "Liked" beside
+/// it, as on an item's page; without, the heart alone, as in a list.
+#[component]
+pub fn HeartButton(
+    id: String,
+    heart: Heart,
+    kind: CatalogKind,
+    title: String,
+    #[props(default)] word: bool,
+    on_changed: EventHandler<()>,
+) -> Element {
+    let mut busy = use_signal(|| false);
+    let toast = use_signal(|| None::<Said>);
+    let action = heart.action(kind);
+    let click = move |_| {
+        busy.set(true);
+        let id = id.clone();
+        spawn(async move {
+            match like_items(vec![id], heart.likes()).await {
+                Ok(_) => on_changed.call(()),
+                Err(e) => say(toast, false, e.explain()),
+            }
+            busy.set(false);
+        });
+    };
+    let shown = rsx! {
+        span { class: if heart == Heart::Empty { "text-ctp-subtext0" } else { "text-ctp-red" },
+            icons::Heart { size: if word { 14 } else { 16 }, full: heart == Heart::Full, half: heart == Heart::Half }
+        }
+    };
+    rsx! {
+        if word {
+            button { class: "btn shrink-0", aria_label: "{action}: {title}", title: "{action}", aria_pressed: "{heart != Heart::Empty}", disabled: busy(), onclick: click,
+                {shown}
+                "{heart.word()}"
+            }
+        } else {
+            button { class: "icon-button", aria_label: "{action}: {title}", title: "{action}", aria_pressed: "{heart != Heart::Empty}", disabled: busy(), onclick: click,
+                {shown}
+            }
+        }
+        Toast { said: toast }
+    }
 }
 
 /// The icon of what a playlist holds: music, else films and episodes.
@@ -187,14 +259,20 @@ fn PlaylistRow(playlist: PlaylistInfo, people: Vec<ShareableUser>) -> Element {
     } else {
         " · View only"
     };
+    let line = match p.builtin {
+        Some(builtin) => builtin_line(builtin).to_owned(),
+        None => format!(
+            "{} · {}{rights}",
+            kinds_line(p.kinds),
+            sharing_line(&p.sharing, &people)
+        ),
+    };
     rsx! {
         Link { class: "cat-child", to: Route::PlaylistView { id: p.id.clone() },
-            span { class: "text-ctp-teal", KindsIcon { kinds: p.kinds } }
+            span { class: "text-ctp-teal", PlaylistIcon { kinds: p.kinds, builtin: p.builtin } }
             span { class: "flex min-w-0 flex-grow flex-col",
                 b { class: "truncate text-sm", "{p.name}" }
-                span { class: "text-xs text-ctp-subtext0",
-                    "{kinds_line(p.kinds)} · {sharing_line(&p.sharing, &people)}{rights}"
-                }
+                span { class: "text-xs text-ctp-subtext0", "{line}" }
             }
             span { class: "text-ctp-subtext0", icons::ChevronRight { size: 16 } }
         }
@@ -397,11 +475,14 @@ pub fn PlaylistView(id: String) -> Element {
             Link { class: "text-sm", to: back_to.clone(), "‹ {back_label}" }
             div { class: "page-head",
                 span { class: "flex min-w-0 items-center gap-3",
-                    span { class: "text-ctp-teal", KindsIcon { kinds: p.kinds } }
+                    span { class: "text-ctp-teal", PlaylistIcon { kinds: p.kinds, builtin: p.builtin } }
                     span { class: "flex min-w-0 flex-col gap-1",
                         h1 { class: "page-title m-0", "{p.name}" }
                         span { class: "text-sm text-ctp-subtext0",
-                            "{count_line(p.kinds, detail.total, detail.playable)} · {kinds_line(p.kinds)} · {sharing_line(&p.sharing, &names)}"
+                            match p.builtin {
+                                Some(builtin) => format!("{} · {}", count_line(p.kinds, detail.total, detail.playable), builtin_line(builtin)),
+                                None => format!("{} · {} · {}", count_line(p.kinds, detail.total, detail.playable), kinds_line(p.kinds), sharing_line(&p.sharing, &names)),
+                            }
                         }
                     }
                 }
@@ -418,17 +499,17 @@ pub fn PlaylistView(id: String) -> Element {
             if !p.can_edit {
                 div { class: "alert alert-info", role: "note",
                     icons::Eye {}
-                    span { "You can play this playlist in the apps, not change it." }
+                    if p.builtin == Some(PlaylistBuiltin::All) {
+                        span { "All is every track you can play, kept up to date by the server. Play it from the apps; shuffle plays the whole library." }
+                    } else {
+                        span { "You can play this playlist in the apps, not change it." }
+                    }
                 }
             }
             section { class: "card",
                 div { class: "card-body gap-0 py-0",
                     if detail.entries.is_empty() {
-                        p { class: "py-4 text-sm text-ctp-subtext0",
-                            "Nothing in it yet. Add films, episodes and music from the Spoolframe apps"
-                            if admin { ", or from an item's page in Libraries" }
-                            "."
-                        }
+                        p { class: "py-4 text-sm text-ctp-subtext0", "{empty_text(p.builtin, admin)}" }
                     }
                     for (i, entry) in detail.entries.iter().cloned().enumerate() {
                         {
@@ -455,6 +536,15 @@ pub fn PlaylistView(id: String) -> Element {
                                         span { class: "state state-warn cat-child-state", title: "Its file can't be read now; it's skipped when playing.",
                                             icons::Warning { size: 14 }
                                             "Unavailable"
+                                        }
+                                    }
+                                    if music {
+                                        HeartButton {
+                                            id: entry.item.id().to_string(),
+                                            heart: Heart::of_track(entry.liked),
+                                            kind: CatalogKind::Track,
+                                            title: title.clone(),
+                                            on_changed: move |_| page.restart(),
                                         }
                                     }
                                     if p.can_edit {
@@ -957,6 +1047,10 @@ pub fn HeldInCard(held: Vec<HeldIn>) -> Element {
                 }
                 for p in held {
                     Link { key: "{p.id}", to: Route::PlaylistView { id: p.id.clone() },
+                        if p.builtin.as_deref() == Some("liked") {
+                            span { class: "text-ctp-red", icons::Heart { size: 13, full: true } }
+                            " "
+                        }
                         "{p.name}"
                         if p.owner_kind == "server_wide" {
                             span { class: "cat-quiet text-xs", " · server-wide" }

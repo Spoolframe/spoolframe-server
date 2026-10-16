@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Hearts, Liked and All in the web UI (PX-43). My playlists lists Liked
+  and All first among your own, each with a line saying what it is and
+  no Edit, Share or Delete; Liked's tracks can be moved and removed, All
+  is read-only. Every track in a playlist has a heart; an item's page in
+  Libraries has one for a track or an album (full, half or empty, the
+  album's liking or unliking every track), its Children tab marks the
+  liked tracks, and its Playlists card shows Liked with a heart. "Add to
+  playlist" never offers Liked or All. The web UI still plays nothing.
+
 - Liked and All, built-in music playlists (PX-43). Every user has two,
   made the first time they are needed and listed first among their
   playlists while a music library is served: Liked, the tracks they

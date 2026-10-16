@@ -1,7 +1,8 @@
 //! An item of a library (P3-16), as the WebCatalogItem,
 //! WebCatalogFiles, WebCatalogItemTabs and WebCatalogStates boards draw
 //! it: what clients get, its external IDs, its files and the paths they
-//! map to, its artwork, markers and children. Read-only.
+//! map to, its artwork, markers and children. Read-only, but for the
+//! caller's own playlists and hearts (PX-40, PX-43).
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
@@ -45,8 +46,8 @@ fn reply(seen: &ItemView) -> Option<Reply> {
 
 #[component]
 pub fn CatalogItem(library: String, id: String, tab: String) -> Element {
-    let mut seen = use_resource(use_reactive((&id,), |(id,)| load_item(id)));
-    let current = seen.read().clone();
+    let mut loaded = use_resource(use_reactive((&id,), |(id,)| load_item(id)));
+    let current = loaded.read().clone();
     let tab = if tab.is_empty() {
         "overview".to_owned()
     } else {
@@ -65,7 +66,7 @@ pub fn CatalogItem(library: String, id: String, tab: String) -> Element {
                 match error.code {
                     spoolframe_admin_api::error_code::FORBIDDEN => rsx! { Forbidden {} },
                     spoolframe_admin_api::error_code::UNAVAILABLE => rsx! {
-                        Unreachable { error, on_retry: move |_| seen.restart() }
+                        Unreachable { error, on_retry: move |_| loaded.restart() }
                     },
                     _ => rsx! { Alert { text: error.explain() } },
                 }
@@ -76,7 +77,7 @@ pub fn CatalogItem(library: String, id: String, tab: String) -> Element {
                 rsx! { Alert { text: "The server's answer for this item could not be read.".to_owned() } }
             }
             Some(reply) => rsx! {
-                Page { library, seen, reply_item: reply.item, client_children: reply.children, markers: reply.markers, tab }
+                Page { library, seen, reply_item: reply.item, client_children: reply.children, markers: reply.markers, tab, on_reload: move |_| loaded.restart() }
             },
         },
     }
@@ -90,8 +91,11 @@ fn Page(
     client_children: Vec<Item>,
     markers: Vec<Marker>,
     tab: String,
+    /// Read the item again: its heart changed.
+    on_reload: EventHandler<()>,
 ) -> Element {
     let item = reply_item;
+    let heart = crate::playlists::Heart::of_reply(&seen.reply);
     let id = item.id().to_string();
     let kind = item_kind(&item);
     let title = match &item {
@@ -156,6 +160,9 @@ fn Page(
                             }
                         }
                     }
+                }
+                if let Some(heart) = heart {
+                    super::playlists::HeartButton { id: id.clone(), heart, kind, title: title.clone(), word: true, on_changed: on_reload }
                 }
                 super::playlists::AddToPlaylist { item: item.clone() }
                 if let Some(link) = &seen.open_in_plex {
@@ -604,6 +611,8 @@ fn Markers(markers: Vec<Marker>, duration: Option<u64>, server: String) -> Eleme
 fn Children(library: String, seen: ItemView, client_children: Vec<Item>) -> Element {
     let rows = seen.children.clone();
     let checked = matches!(seen.paths, PathsChecked::Checked { .. });
+    // An album's tracks the caller liked (PX-43).
+    let liked = crate::playlists::liked_children(&seen.reply);
     rsx! {
         section { class: "card",
             div { class: "card-body gap-0 py-0",
@@ -629,6 +638,11 @@ fn Children(library: String, seen: ItemView, client_children: Vec<Item>) -> Elem
                                 span { class: "flex min-w-0 flex-grow flex-col",
                                     b { class: "text-sm", "{row_title(&row.item)}" }
                                     span { class: "cat-mono cat-quiet text-xs", "{id}" }
+                                }
+                                if liked.contains(&id) {
+                                    span { class: "text-ctp-red", title: "Liked", aria_label: "Liked",
+                                        icons::Heart { size: 14, full: true }
+                                    }
                                 }
                                 span { class: "cat-child-count", "{count}" }
                                 span {
