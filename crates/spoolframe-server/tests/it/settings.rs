@@ -69,6 +69,18 @@ pub(crate) async fn serve_syncing(
     wizard: Wizard,
     start: bool,
 ) -> (SocketAddr, Store) {
+    serve_syncing_with(dir, file, wizard, start, false).await
+}
+
+/// [`serve_syncing`], and with `library` the Plex catalog's watch state
+/// and playlists for the methods that read them (PX-40).
+pub(crate) async fn serve_syncing_with(
+    dir: &std::path::Path,
+    file: &str,
+    wizard: Wizard,
+    start: bool,
+    library: bool,
+) -> (SocketAddr, Store) {
     let file_path = dir.join("server.ucl");
     std::fs::write(&file_path, file).unwrap();
     let layers = Layers::load(&Locations {
@@ -121,9 +133,32 @@ pub(crate) async fn serve_syncing(
         std::mem::forget(never);
     }
     let store = auth.store().clone();
+    let library = library.then(|| {
+        let catalog: Arc<dyn spoolframe_catalog::Catalog> = catalog.clone();
+        let watch = Arc::new(spoolframe_server::watch::Watch::new(
+            store.clone(),
+            catalog.clone(),
+            // Nothing these tests call probes a file.
+            Arc::new(spoolframe_media::Prober::new(
+                spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
+                spoolframe_media::Prober::DEFAULT_TIMEOUT,
+            )),
+            spoolframe_server::watch::WatchRules::default(),
+        ));
+        spoolframe_server::mcp::Library {
+            playlists: Arc::new(spoolframe_server::playlists::Playlists::new(
+                store.clone(),
+                catalog.clone(),
+                watch.clone(),
+            )),
+            catalog,
+            watch,
+        }
+    });
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
+            library,
             plex: catalog,
             cookies,
             settings: Some(Arc::new(settings)),

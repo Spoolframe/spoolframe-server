@@ -203,6 +203,16 @@ pub mod error_code {
     /// Not an app connected to the caller's account (PX-42), or for an
     /// admin, to any account.
     pub const NO_SUCH_APP: i32 = -32028;
+    /// Not a playlist the caller sees (PX-40).
+    pub const NO_SUCH_PLAYLIST: i32 = -32029;
+    /// A playlist the caller sees but may not make this change to: an
+    /// entry edit on a read-only share, or a rename by an editor.
+    pub const PLAYLIST_READ_ONLY: i32 = -32030;
+    /// An item of a kind the playlist does not take.
+    pub const KIND_NOT_ALLOWED: i32 = -32031;
+    /// Someone changed the playlist in a way the edit cannot be redone
+    /// over; `data` is `{"revision": n}`, the playlist's now.
+    pub const PLAYLIST_CONFLICT: i32 = -32032;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -2991,6 +3001,184 @@ pub struct ItemDebug {
     pub previews: PreviewCache,
 }
 
+/// The kinds of item a playlist may hold (PX-40), ticked when it is made;
+/// they can later only be widened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistKinds {
+    pub movies: bool,
+    pub episodes: bool,
+    pub tracks: bool,
+}
+
+/// One user a playlist is shared with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistShare {
+    /// `local:<uuid>` or `portable:<hex>`, as `playlistShareCandidates`
+    /// lists them.
+    pub user_id: String,
+    /// They may add, remove and move its entries; never rename it, change
+    /// its kinds or sharing, or delete it.
+    pub can_edit: bool,
+}
+
+/// Who sees a playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PlaylistSharing {
+    /// Its owner alone.
+    Personal,
+    /// Its owner and these users. Listed only to whoever manages it;
+    /// anyone else gets it empty.
+    Shared { with: Vec<PlaylistShare> },
+    /// Every user of the server; admins edit it. Only an admin makes one.
+    ServerWide,
+}
+
+/// How a playlist stands to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaylistOwner {
+    /// Theirs, personal or shared by them.
+    Mine,
+    /// Someone else's, shared with them.
+    SharedWithMe,
+    /// Seen by every user.
+    ServerWide,
+}
+
+/// A playlist as the caller sees it, without its entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistInfo {
+    pub id: String,
+    pub name: String,
+    pub kinds: PlaylistKinds,
+    pub owner: PlaylistOwner,
+    pub sharing: PlaylistSharing,
+    /// They may change its entries (`me.playlistEdit`).
+    pub can_edit: bool,
+    /// They may rename it, widen its kinds, change its sharing
+    /// (`me.playlistUpdate`), and delete it.
+    pub can_manage: bool,
+    /// What `me.playlistEdit` names; raised by every change.
+    pub revision: u64,
+}
+
+/// One entry of a playlist: its item as the catalog has it now, with the
+/// caller's watch state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistEntryInfo {
+    /// Its place in the playlist, as edits name it; the same item may be
+    /// in a playlist twice.
+    pub entry: u64,
+    pub item: Item,
+    /// Still in the library, but its file cannot be read now.
+    pub unavailable: bool,
+}
+
+/// A playlist and one page of its entries (`me.playlist`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistDetail {
+    pub playlist: PlaylistInfo,
+    pub entries: Vec<PlaylistEntryInfo>,
+    /// Where `entries` start in the whole list.
+    pub offset: u32,
+    /// How many entries the caller sees in all.
+    pub total: u32,
+    /// How many of them can be played now.
+    pub playable: u32,
+}
+
+/// A playlist to make (`me.playlistCreate`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewPlaylist {
+    /// 1 to 100 characters.
+    pub name: String,
+    /// At least one.
+    pub kinds: PlaylistKinds,
+    pub sharing: PlaylistSharing,
+}
+
+/// What `me.playlistUpdate` changes; `None` leaves it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistChanges {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Only wider than now.
+    #[serde(default)]
+    pub kinds: Option<PlaylistKinds>,
+    #[serde(default)]
+    pub sharing: Option<PlaylistSharing>,
+}
+
+/// One change to a playlist's entries (`me.playlistEdit`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PlaylistEditOp {
+    /// Add item `id` (a MediaId) before entry `before`, or at the end. A
+    /// season, show, album or artist adds its episodes or tracks.
+    Add {
+        id: String,
+        before: Option<u64>,
+    },
+    Remove {
+        entry: u64,
+    },
+    /// Put the entry before `before`, or at the end.
+    Move {
+        entry: u64,
+        before: Option<u64>,
+    },
+}
+
+/// Someone a playlist can be shared with: a local user, or a portable user
+/// granted access here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareableUser {
+    /// As `PlaylistShare::user_id` takes it.
+    pub user_id: String,
+    pub display_name: String,
+}
+
+/// What importing the caller's Plex playlists made, or would make.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexPlaylistImport {
+    /// One per Plex playlist with at least one item found here.
+    pub made: Vec<PlexPlaylistMade>,
+    /// The items, or whole playlists, not found here, and why.
+    pub unmapped: Vec<PlexPlaylistUnmapped>,
+    /// Plex servers that could not be read for the caller, and why.
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexPlaylistMade {
+    /// Its name in Plex, and here.
+    pub name: String,
+    /// The playlist made; `None` on a dry run.
+    pub playlist_id: Option<String>,
+    pub entries: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexPlaylistUnmapped {
+    /// The Plex playlist's name.
+    pub playlist: String,
+    /// The item's title; `None` for the whole playlist.
+    pub title: Option<String>,
+    pub reason: String,
+}
+
 /// The caller's own account, for every role.
 /// Only with `client` or `server`: the macro makes one or both.
 #[cfg(any(feature = "client", feature = "server"))]
@@ -3272,6 +3460,72 @@ pub trait MeApi {
     /// `NOT_CONFIGURED` for a link the config file makes.
     #[method(name = "plexUnlink", with_extensions)]
     async fn plex_unlink(&self) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Every playlist the caller sees (PX-40): their own, those shared with
+    /// them, and the server-wide ones, by name. An admin manages every
+    /// server-wide one; `NOT_CONFIGURED` on a server without a library.
+    #[method(name = "playlists", with_extensions)]
+    async fn playlists(&self) -> jsonrpsee::core::RpcResult<Vec<PlaylistInfo>>;
+
+    /// One playlist and a page of its entries, from `offset`, at most
+    /// `limit` (200). `NO_SUCH_PLAYLIST` for one the caller does not see.
+    #[method(name = "playlist", with_extensions)]
+    async fn playlist(
+        &self,
+        id: String,
+        offset: u32,
+        limit: u32,
+    ) -> jsonrpsee::core::RpcResult<PlaylistDetail>;
+
+    /// Make a playlist owned by the caller. A server-wide one is an
+    /// admin's to make (`FORBIDDEN`).
+    #[method(name = "playlistCreate", with_extensions)]
+    async fn playlist_create(
+        &self,
+        playlist: NewPlaylist,
+    ) -> jsonrpsee::core::RpcResult<PlaylistInfo>;
+
+    /// Rename a playlist, widen its kinds, or change its sharing: its
+    /// owner's to do, or any admin's for a server-wide one
+    /// (`PLAYLIST_READ_ONLY` for anyone else who sees it).
+    #[method(name = "playlistUpdate", with_extensions)]
+    async fn playlist_update(
+        &self,
+        id: String,
+        changes: PlaylistChanges,
+    ) -> jsonrpsee::core::RpcResult<PlaylistInfo>;
+
+    /// Change a playlist's entries, as of `revision`: its new revision. An
+    /// edit someone else's change overtook is redone when it can be, else
+    /// `PLAYLIST_CONFLICT` (`data`: `{"revision": n}`, the one now).
+    /// `KIND_NOT_ALLOWED` for an item of a kind it does not take;
+    /// `PLAYLIST_READ_ONLY` on a read-only share.
+    #[method(name = "playlistEdit", with_extensions)]
+    async fn playlist_edit(
+        &self,
+        id: String,
+        revision: u64,
+        edits: Vec<PlaylistEditOp>,
+    ) -> jsonrpsee::core::RpcResult<u64>;
+
+    /// Delete a playlist: its owner's, or any admin's for a server-wide
+    /// one.
+    #[method(name = "playlistDelete", with_extensions)]
+    async fn playlist_delete(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Who the caller can share a playlist with: every other enabled local
+    /// user and every portable user granted access, by name.
+    #[method(name = "playlistShareCandidates", with_extensions)]
+    async fn playlist_share_candidates(&self) -> jsonrpsee::core::RpcResult<Vec<ShareableUser>>;
+
+    /// Import the caller's Plex playlists once, as personal playlists of
+    /// theirs; with `dryRun`, say what would be made and changed nothing.
+    /// `NOT_CONFIGURED` when they have no Plex account linked.
+    #[method(name = "playlistPlexImport", with_extensions)]
+    async fn playlist_plex_import(
+        &self,
+        dry_run: bool,
+    ) -> jsonrpsee::core::RpcResult<PlexPlaylistImport>;
 }
 
 /// Other users and the server: admins only.

@@ -6,6 +6,7 @@
 mod support;
 
 mod admin;
+mod admin_playlists;
 mod admin_web;
 mod admission;
 mod app_passkeys;

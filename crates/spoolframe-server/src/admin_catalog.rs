@@ -681,11 +681,34 @@ impl AdminApi {
                 .await
                 .map_err(super::internal)?;
         }
+        // The playlists the caller sees that hold it, as a client's item
+        // details list them (PX-40): the item screen's Playlists row.
+        let playlists = match &self.library {
+            Some(library) => {
+                let actor = crate::principal::Actor {
+                    principal: Principal::LocalUser(user),
+                    // Only admins browse the catalog here.
+                    admin: true,
+                };
+                Some(
+                    library
+                        .playlists
+                        .holding(&actor, &found.item, &found.children)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(%id, error = %e, "cannot list the playlists holding an item");
+                            e
+                        })
+                        .unwrap_or_default(),
+                )
+            }
+            None => None,
+        };
         let reply = spoolframe_protocol::Reply::Item {
             item: found.item,
             children: found.children,
             markers: found.markers,
-            playlists: None,
+            playlists,
         };
         let reply = serde_json::to_value(&reply).map_err(super::internal)?;
         // Only the crumb needs them: an item still shows without one.

@@ -20,6 +20,7 @@ mod licenses;
 mod logs;
 mod overview;
 mod playback;
+mod playlists;
 mod plex;
 mod portable;
 mod profile;
@@ -48,6 +49,7 @@ use licenses::LicensesPage;
 use logs::LogsPage;
 use overview::AdminHome;
 use playback::{PlaybackDetail, PlaybackPage};
+use playlists::{MyPlaylists, PlaylistView, ServerPlaylists};
 use plex::PlexSignedIn;
 use profile::Profile;
 use settings::{Settings, SettingsHome};
@@ -127,6 +129,10 @@ enum Route {
             Libraries {},
             // `back`: where Cancel and the back link go (the wizard's Plex
             // step, or Settings › Plex); Libraries when empty.
+            // Server-wide playlists (PX-40): Libraries › Playlists. Before
+            // the library routes, whose `:library` would take the name.
+            #[route("/libraries/playlists")]
+            ServerPlaylists {},
             #[route("/libraries/add?:back")]
             AddLibrary { back: String },
             // A library's items (P3-16): where the table is is in the
@@ -146,6 +152,12 @@ enum Route {
         #[end_nest]
         #[route("/profile")]
         Profile {},
+        // My playlists (PX-40): a consumer's Playlists tab, an admin's
+        // sidebar link.
+        #[route("/playlists")]
+        MyPlaylists {},
+        #[route("/playlists/:id")]
+        PlaylistView { id: String },
     #[end_layout]
     #[route("/:..rest")]
     NotFound { rest: Vec<String> },
@@ -1400,6 +1412,7 @@ fn SignedIn(user: UserInfo) -> Element {
     let link = |to: Route, label: &'static str, divider: bool| {
         let here = match (&route, &to) {
             (Route::UserSessions { .. }, Route::Users {}) => true,
+            (Route::PlaylistView { .. }, Route::MyPlaylists {}) => true,
             (a, b) => a == b,
         };
         let class = match (here, divider) {
@@ -1423,6 +1436,8 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
+        Route::ServerPlaylists {} => "Libraries",
+        Route::MyPlaylists {} | Route::PlaylistView { .. } => "Playlists",
         Route::LicensesPage { .. } => "Licenses",
         Route::Settings { ref tab } if tab == "plex" => "Plex",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
@@ -1465,7 +1480,22 @@ fn SignedIn(user: UserInfo) -> Element {
                         }
                     }
                 }
-                main { class: "consumer-page", Outlet::<Route> {} }
+                main { class: "consumer-page",
+                    // My profile and Playlists (PX-40): a consumer's two pages.
+                    nav { class: "cat-tabs mb-6", aria_label: "Pages",
+                        Link {
+                            class: if matches!(route, Route::Profile {}) { "cat-tab cat-tab-here" } else { "cat-tab" },
+                            to: Route::Profile {},
+                            "My profile"
+                        }
+                        Link {
+                            class: if matches!(route, Route::MyPlaylists {} | Route::PlaylistView { .. }) { "cat-tab cat-tab-here" } else { "cat-tab" },
+                            to: Route::MyPlaylists {},
+                            "Playlists"
+                        }
+                    }
+                    Outlet::<Route> {}
+                }
             }
         };
     }
@@ -1490,6 +1520,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     {server_links(&route)}
                     {link(plex_page(), "Plex", false)}
                     {link(Route::Profile {}, "My profile", true)}
+                    {link(Route::MyPlaylists {}, "My playlists", false)}
                 }
                 div { class: "mt-auto flex items-center gap-2.5 rounded-[10px] bg-ctp-base p-2",
                     span { class: avatar, "{initial(&name)}" }
@@ -1532,6 +1563,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     {server_links(&route)}
                     {link(plex_page(), "Plex", false)}
                     {link(Route::Profile {}, "My profile", true)}
+                    {link(Route::MyPlaylists {}, "My playlists", false)}
                 }
             }
             main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1200px] p-3.5 md:px-10 md:py-8",
@@ -1611,6 +1643,7 @@ fn server_links(route: &Route) -> Element {
                     | Route::AddLibrary { .. }
                     | Route::CatalogLibrary { .. }
                     | Route::CatalogItem { .. }
+                    | Route::ServerPlaylists {}
             ),
         ),
         (

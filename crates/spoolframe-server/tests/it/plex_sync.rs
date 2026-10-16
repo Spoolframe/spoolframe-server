@@ -21,7 +21,7 @@ use crate::settings::serve_syncing;
 /// One film an account has seen on the stand-in Plex server. Its key's
 /// first digit is its section: `11` is in section 1.
 #[derive(Clone, Copy)]
-struct Seen {
+pub(crate) struct Seen {
     key: &'static str,
     /// When it was last viewed, Unix seconds.
     at: i64,
@@ -76,7 +76,7 @@ impl Respond for Item {
 /// A stand-in Plex server called Tower, with three movie sections; each
 /// account (by the token it uses there, `None` for no token) has seen
 /// what it is given.
-async fn tower(accounts: &[(Option<&str>, &[Seen])]) -> MockServer {
+pub(crate) async fn tower(accounts: &[(Option<&str>, &[Seen])]) -> MockServer {
     let pms = MockServer::start().await;
     let json = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
     Mock::given(method("GET"))
@@ -177,7 +177,11 @@ fn scrobble(key: &str, token: Option<&str>) -> (String, String, Option<String>) 
 
 /// plex.tv's list of the servers each of these accounts reaches: Tower,
 /// with that account's own token there.
-async fn mount_resources(tv: &MockServer, tower: &MockServer, accounts: &[(&str, &str)]) {
+pub(crate) async fn mount_resources(
+    tv: &MockServer,
+    tower: &MockServer,
+    accounts: &[(&str, &str)],
+) {
     for &(account, on_tower) in accounts {
         Mock::given(method("GET"))
             .and(path("/api/v2/resources"))
@@ -241,7 +245,7 @@ fn of<'a>(reports: &'a [PlexSyncReport], username: &str) -> &'a PlexSyncReport {
         .unwrap_or_else(|| panic!("no report for {username}: {reports:?}"))
 }
 
-fn library(name: &str, section: &str, sync: &str) -> String {
+pub(crate) fn library(name: &str, section: &str, sync: &str) -> String {
     format!(
         r#"{{ name = "{name}"; kind = "movies"; plex {{ server = "plex"; section = "{section}"; sync = "{sync}"; }} }}"#
     )

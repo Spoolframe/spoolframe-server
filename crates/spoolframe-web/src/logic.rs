@@ -100,6 +100,13 @@ impl ApiError {
                     .into()
             }
             error_code::FORBIDDEN => "Only an admin can do that.".into(),
+            error_code::PLAYLIST_CONFLICT => {
+                "Someone changed this playlist; it has been reloaded. Try again.".into()
+            }
+            error_code::NO_SUCH_PLAYLIST => {
+                "That playlist is gone, or no longer shared with you.".into()
+            }
+            error_code::PLAYLIST_READ_ONLY => "You can't change this playlist.".into(),
             0 => format!("The server cannot be reached ({}).", self.message),
             _ => self.message.clone(),
         }
@@ -1250,6 +1257,11 @@ mod tests {
         // The server's reason, where it has one.
         assert_eq!(explain(error_code::NOT_CONFIGURED), "server words");
         assert_eq!(explain(error_code::LAST_SIGN_IN_METHOD), "server words");
+        // Playlists (PX-40): two editors at once is said as the ticket says it.
+        assert!(
+            explain(error_code::PLAYLIST_CONFLICT).starts_with("Someone changed this playlist")
+        );
+        assert!(explain(error_code::NO_SUCH_PLAYLIST).contains("no longer shared"));
     }
 
     #[test]

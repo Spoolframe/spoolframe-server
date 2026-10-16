@@ -126,6 +126,7 @@ pub fn Libraries() -> Element {
                     }
                 }
             }
+            super::playlists::LibrariesTabs { playlists: false }
             p { class: "lede m-0 max-w-[760px]",
                 "What apps show, in this order. Each library comes from a source; today that's one library of a Plex server. Watch sync keeps each linked person's watched state in step with their own Plex account."
             }

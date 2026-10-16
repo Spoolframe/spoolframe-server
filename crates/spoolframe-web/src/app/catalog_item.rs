@@ -157,6 +157,7 @@ fn Page(
                         }
                     }
                 }
+                super::playlists::AddToPlaylist { item: item.clone() }
                 if let Some(link) = &seen.open_in_plex {
                     a { class: "btn shrink-0", href: "{link}", target: "_blank", rel: "noopener noreferrer",
                         icons::ExternalLink { size: 14 }
@@ -301,6 +302,8 @@ fn Overview(seen: ItemView, item: Item, library: String) -> Element {
                 }
             }
             div { class: "flex flex-col gap-4",
+                // The playlists holding it (PX-40), as clients list them.
+                super::playlists::HeldInCard { held: crate::playlists::held_in(&seen.reply) }
                 section { class: "card",
                     div { class: "card-head",
                         h2 { "External IDs" }

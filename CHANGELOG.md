@@ -4,6 +4,27 @@
 
 ## 0.10.0 (2026-10-16)
 
+- Playlists in the web UI (PX-40). A consumer gets a Playlists tab beside
+  My profile; an admin, My playlists in the sidebar. It lists the user's
+  own playlists, those shared with them and the server-wide ones; makes
+  one (a name and the kinds it holds); and imports the user's Plex
+  playlists, a dry run first that shows what would be made and what
+  didn't map. A playlist's page counts its entries ("18 episodes · 17
+  playable"), marks the unavailable ones, and lets anyone who may edit it
+  move and remove entries; its owner (or any admin, for a server-wide
+  one) renames it, widens its kinds, shares it with users here, each to
+  view or to edit, and deletes it. Server-wide playlists are made and
+  managed under Libraries › Playlists. An item's page in Libraries has
+  Add to playlist, which offers only the playlists that take its kind,
+  and a Playlists card with the playlists that hold it; its client reply
+  now carries `playlists`. The web UI plays nothing: playing is the
+  apps'. Admin API (every call acts as the session's user, through the
+  same playlists service as the apps and MCP): `me.playlists`,
+  `me.playlist`, `me.playlistCreate`, `me.playlistUpdate`,
+  `me.playlistEdit`, `me.playlistDelete`, `me.playlistShareCandidates`,
+  `me.playlistPlexImport`, and the error codes `NO_SUCH_PLAYLIST`,
+  `PLAYLIST_READ_ONLY`, `KIND_NOT_ALLOWED` and `PLAYLIST_CONFLICT`.
+
 - An MCP server in the server (PX-42), so an AI agent such as Claude can
   act for a user: `/mcp` on the admin listener, MCP's Streamable HTTP
   transport, stateless. Off by default: `mcp.enabled`, a live setting,

@@ -41,6 +41,10 @@ use spoolframe_admin_api::{
     InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant, ServerLink,
 };
 use spoolframe_admin_api::{LookupStatus, MappingStatus};
+use spoolframe_admin_api::{
+    NewPlaylist, PlaylistChanges, PlaylistDetail, PlaylistEditOp, PlaylistInfo, PlexPlaylistImport,
+    ShareableUser,
+};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
 
@@ -77,6 +81,8 @@ use spoolframe_plex::account::{PinState, PlexTv};
 
 #[path = "admin_catalog.rs"]
 mod catalog;
+#[path = "admin_playlists.rs"]
+mod playlists;
 
 pub use catalog::PathChecks;
 pub(crate) use catalog::kinds as library_kinds;
@@ -2635,6 +2641,71 @@ impl MeApiServer for AdminApi {
             .filter(|g| g.user == user.user)
             .ok_or_else(no_such_app)?;
         self.revoke_app(&user, grant).await
+    }
+
+    async fn playlists(&self, ext: &Extensions) -> RpcResult<Vec<PlaylistInfo>> {
+        let (_, user) = self.caller(ext).await?;
+        self.my_playlists(user).await
+    }
+
+    async fn playlist(
+        &self,
+        ext: &Extensions,
+        id: String,
+        offset: u32,
+        limit: u32,
+    ) -> RpcResult<PlaylistDetail> {
+        let (_, user) = self.caller(ext).await?;
+        self.my_playlist(user, &id, offset, limit).await
+    }
+
+    async fn playlist_create(
+        &self,
+        ext: &Extensions,
+        playlist: NewPlaylist,
+    ) -> RpcResult<PlaylistInfo> {
+        let (_, user) = self.caller(ext).await?;
+        self.create_playlist(user, playlist).await
+    }
+
+    async fn playlist_update(
+        &self,
+        ext: &Extensions,
+        id: String,
+        changes: PlaylistChanges,
+    ) -> RpcResult<PlaylistInfo> {
+        let (_, user) = self.caller(ext).await?;
+        self.update_playlist(user, &id, changes).await
+    }
+
+    async fn playlist_edit(
+        &self,
+        ext: &Extensions,
+        id: String,
+        revision: u64,
+        edits: Vec<PlaylistEditOp>,
+    ) -> RpcResult<u64> {
+        let (_, user) = self.caller(ext).await?;
+        self.edit_playlist(user, &id, revision, edits).await
+    }
+
+    async fn playlist_delete(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        self.delete_playlist(user, &id).await
+    }
+
+    async fn playlist_share_candidates(&self, ext: &Extensions) -> RpcResult<Vec<ShareableUser>> {
+        let (_, user) = self.caller(ext).await?;
+        self.share_candidates(user).await
+    }
+
+    async fn playlist_plex_import(
+        &self,
+        ext: &Extensions,
+        dry_run: bool,
+    ) -> RpcResult<PlexPlaylistImport> {
+        let (_, user) = self.caller(ext).await?;
+        self.import_plex_playlists(user, dry_run).await
     }
 }
 
