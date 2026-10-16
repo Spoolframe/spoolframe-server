@@ -2626,6 +2626,53 @@ mod playlists {
             pinned: Some(0),
             builtin: None,
             owner_name: None,
+            artwork: None,
+            custom_art: false,
+        }
+    }
+
+    /// `spoolframe:playlist-art` (PX-53): a summary's picture, and the two
+    /// requests; the fields are left out when not given, and an older
+    /// peer's summary, without them, reads as none.
+    #[test]
+    fn playlist_art_round_trips_and_is_left_out_when_not_given() {
+        let cover: spoolframe_types::ArtworkId = "image:playlist/0f3a".parse().unwrap();
+        let with = PlaylistSummary {
+            artwork: Some(cover.clone()),
+            custom_art: true,
+            ..summary()
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["artwork"], "image:playlist/0f3a");
+        assert_eq!(json["custom_art"], true);
+        round_trip(Response::Ok(Reply::PlaylistInfo(with)));
+        let json = serde_json::to_value(summary()).unwrap();
+        assert!(json.get("artwork").is_none(), "{json}");
+        assert!(json.get("custom_art").is_none(), "{json}");
+        let remove = Request::RemovePlaylistArt { id: "x".into() };
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: remove.clone(),
+        });
+        assert!(crate::policy::retry_safe(&remove));
+        round_trip(crate::resource::ResourceRequest::SetPlaylistArt {
+            session: SessionId("s".into()),
+            id: "x".into(),
+            length: 1234,
+        });
+        round_trip(crate::resource::ResourceResponse::Ready {
+            length: 0,
+            metadata: crate::resource::ResourceMetadata::PlaylistArt { artwork: cover },
+        });
+        for error in [
+            Error::NotAllowed,
+            Error::ImageTooLarge {
+                max_bytes: crate::playlists::MAX_ART_BYTES,
+                max_pixels: crate::playlists::MAX_ART_PIXELS,
+            },
+            Error::ImageUnreadable,
+        ] {
+            round_trip(Response::Err(error));
         }
     }
 

@@ -86,6 +86,7 @@ mod playlists;
 
 pub use catalog::PathChecks;
 pub(crate) use catalog::kinds as library_kinds;
+pub(crate) use playlists::playlists_error;
 
 /// The address the caller is at: its connection's, or behind a trusted
 /// proxy the one the proxy forwards for, `None` if the proxy named none
@@ -2723,6 +2724,11 @@ impl MeApiServer for AdminApi {
     async fn playlist_delete(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         let (_, user) = self.caller(ext).await?;
         self.delete_playlist(user, &id).await
+    }
+
+    async fn playlist_remove_art(&self, ext: &Extensions, id: String) -> RpcResult<PlaylistInfo> {
+        let (_, user) = self.caller(ext).await?;
+        self.remove_playlist_art(user, &id).await
     }
 
     async fn playlist_share_candidates(&self, ext: &Extensions) -> RpcResult<Vec<ShareableUser>> {

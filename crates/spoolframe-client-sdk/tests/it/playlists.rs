@@ -22,6 +22,7 @@ const ALL: Features = Features {
     last_viewed: true,
     playlist_sharing: true,
     play_history: true,
+    playlist_art: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.
@@ -111,6 +112,34 @@ async fn an_app_has_only_the_features_it_lists() {
         vec![vec![PLAYLISTS.to_owned(), LIKED.to_owned()]]
     );
     assert_eq!(session.features(), listed);
+}
+
+/// An app that did not list playlist covers cannot upload or remove one,
+/// even on a server that has them: the SDK refuses, and sends nothing.
+#[tokio::test]
+async fn an_app_not_listing_playlist_art_does_not_send_a_cover() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    let listed = Features {
+        playlists: true,
+        ..Features::default()
+    };
+    let (_client, session) = alice_listing(&stub, listed).await;
+    let unsupported = SdkError::Unsupported {
+        feature: spoolframe_protocol::features::PLAYLIST_ART.into(),
+    };
+    assert_eq!(
+        session
+            .set_playlist_art("p", b"\xff\xd8\xff".to_vec())
+            .await
+            .unwrap_err(),
+        unsupported
+    );
+    assert_eq!(
+        session.remove_playlist_art("p").await.unwrap_err(),
+        unsupported
+    );
+    assert!(stub.requests_of("remove_playlist_art").is_empty());
 }
 
 /// An app that did not list Liked cannot like, even on a server that has

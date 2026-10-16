@@ -27,6 +27,7 @@
     --leading-normal: 1.5;
     --leading-relaxed: 1.625;
     --radius-lg: 0.5rem;
+    --radius-xl: 0.75rem;
     --animate-spin: spin 1s linear infinite;
     --default-font-family: Figtree, system-ui, sans-serif;
     --default-mono-font-family: "JetBrains Mono", ui-monospace, monospace;
@@ -183,6 +184,17 @@
   }
 }
 @layer utilities {
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border-width: 0;
+  }
   .\!fixed {
     position: fixed !important;
   }
@@ -285,6 +297,9 @@
   .table {
     display: table;
   }
+  .aspect-square {
+    aspect-ratio: 1 / 1;
+  }
   .h-7 {
     height: calc(var(--spacing) * 7);
   }
@@ -299,6 +314,9 @@
   }
   .h-11 {
     height: calc(var(--spacing) * 11);
+  }
+  .h-24 {
+    height: calc(var(--spacing) * 24);
   }
   .h-\[30px\] {
     height: 30px;
@@ -318,8 +336,17 @@
   .w-8 {
     width: calc(var(--spacing) * 8);
   }
+  .w-10 {
+    width: calc(var(--spacing) * 10);
+  }
+  .w-24 {
+    width: calc(var(--spacing) * 24);
+  }
   .w-32 {
     width: calc(var(--spacing) * 32);
+  }
+  .w-60 {
+    width: calc(var(--spacing) * 60);
   }
   .w-\[220px\] {
     width: 220px;
@@ -518,6 +545,9 @@
   .rounded-lg {
     border-radius: var(--radius-lg);
   }
+  .rounded-xl {
+    border-radius: var(--radius-xl);
+  }
   .border-0 {
     border-style: var(--tw-border-style);
     border-width: 0px;
@@ -527,6 +557,9 @@
   }
   .bg-ctp-surface0 {
     background-color: var(--ctp-surface0);
+  }
+  .object-cover {
+    object-fit: cover;
   }
   .p-0 {
     padding: 0px;

@@ -94,7 +94,9 @@ pub fn retry_safe(request: &Request) -> bool {
         // A read.
         | Request::ListShareCandidates { .. }
         // PX-52: a read.
-        | Request::RecentlyPlayed { .. } => true,
+        | Request::RecentlyPlayed { .. }
+        // Taken away twice is taken away once (PX-53).
+        | Request::RemovePlaylistArt { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

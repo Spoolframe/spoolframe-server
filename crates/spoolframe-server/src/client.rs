@@ -558,7 +558,8 @@ impl ClientProtocol {
             return;
         };
         if kind == bi::RESOURCE {
-            self.resource(&connection, &state, send, request).await;
+            self.resource(&connection, &state, send, recv, request)
+                .await;
             return;
         }
         // Named once, from its `type` alone, and the name is used
@@ -1197,6 +1198,7 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         send: SendStream,
+        recv: RecvStream,
         frame: Result<Vec<u8>, codec::CodecError>,
     ) {
         let request = frame
@@ -1209,7 +1211,7 @@ impl ClientProtocol {
             _ => tracing::Span::none(),
         };
         use tracing::Instrument as _;
-        self.send_resource(connection, state, send, frame, request)
+        self.send_resource(connection, state, send, recv, frame, request)
             .instrument(span)
             .await;
     }
@@ -1243,11 +1245,12 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         mut send: SendStream,
+        recv: RecvStream,
         frame: Result<Vec<u8>, codec::CodecError>,
         request: Result<ResourceRequest, String>,
     ) {
         let result = match request {
-            Ok(request) => self.open_resource(connection, state, request).await,
+            Ok(request) => self.open_resource(connection, state, request, recv).await,
             Err(message) => Err(Error::Malformed { message }),
         };
         if let (Err(error), Ok(bytes)) = (&result, &frame) {
@@ -1321,11 +1324,26 @@ impl ClientProtocol {
         connection: &Connection,
         state: &ConnectionState,
         request: ResourceRequest,
+        recv: RecvStream,
     ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
         let Some(hello) = state.hello.get() else {
             return Err(Error::HandshakeRequired);
         };
         match request {
+            ResourceRequest::SetPlaylistArt {
+                session,
+                id,
+                length,
+            } => {
+                let artwork = self
+                    .set_playlist_art(connection, state, hello, session, &id, length, recv)
+                    .await?;
+                Ok((
+                    ResourceMetadata::PlaylistArt { artwork },
+                    0,
+                    ResourceBody::Bytes(Vec::new()),
+                ))
+            }
             ResourceRequest::Artwork { request, max_bytes } => {
                 let image = self.find_artwork(connection, state, request).await?;
                 let length = image.bytes.len() as u64;
@@ -1454,16 +1472,111 @@ impl ClientProtocol {
         }
     }
 
+    /// `SetPlaylistArt` (PX-53): who may, and how large, are checked
+    /// before the picture is read off the stream; then it is read, within
+    /// the stall limit, and decoded and kept. The cover's id.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_playlist_art(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        hello: &spoolframe_protocol::Hello,
+        session: SessionId,
+        id: &str,
+        length: u64,
+        mut recv: RecvStream,
+    ) -> Result<ArtworkId, Error> {
+        if !(features::has(&hello.features, features::PLAYLISTS)
+            && features::has(&hello.features, features::PLAYLIST_ART))
+        {
+            return Err(Error::Unsupported {
+                request: format!("playlist art without {}", features::PLAYLIST_ART),
+            });
+        }
+        let (session, who) = self
+            .authenticate_unrestricted(connection, state, Some(session))
+            .await?;
+        state.locks.lock().use_session(&session)?;
+        let actor = who.actor();
+        let playlists = &self.services.playlists;
+        // Liked and All are not there for a client that does not take them.
+        if !features::has(&hello.features, features::LIKED)
+            && playlists
+                .builtin_of(id)
+                .await
+                .map_err(playlists_error)?
+                .is_some()
+        {
+            return Err(playlists_error(crate::playlists::PlaylistsError::NotFound));
+        }
+        playlists
+            .may_set_art(&actor, id)
+            .await
+            .map_err(playlists_error)?;
+        if length > spoolframe_protocol::playlists::MAX_ART_BYTES {
+            return Err(image_too_large());
+        }
+        let stall = self.connections.admission().stalled_read;
+        // Held as it arrives: one that says 20 MB and sends little holds
+        // little.
+        let mut bytes = Vec::new();
+        let mut chunk = vec![0; 64 << 10];
+        while (bytes.len() as u64) < length {
+            let want = ((length - bytes.len() as u64) as usize).min(chunk.len());
+            let read = tokio::time::timeout(
+                stall,
+                tokio::io::AsyncReadExt::read(&mut recv, &mut chunk[..want]),
+            )
+            .await
+            .map_err(|_| Error::Malformed {
+                message: "the picture stopped arriving".into(),
+            })?
+            .map_err(|e| Error::Malformed {
+                message: format!("the picture could not be read: {e}"),
+            })?;
+            if read == 0 {
+                return Err(Error::Malformed {
+                    message: format!(
+                        "the stream ended {} bytes into a picture of {length}",
+                        bytes.len()
+                    ),
+                });
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let summary = playlists
+            .set_art(&actor, id, &bytes)
+            .await
+            .map_err(playlists_error)?;
+        summary.artwork.ok_or(Error::Internal)
+    }
+
     async fn find_artwork(
         &self,
         connection: &Connection,
         state: &ConnectionState,
         request: ArtworkRequest,
     ) -> Result<Artwork, Error> {
-        let (session, _) = self
+        let (session, who) = self
             .authenticate(connection, state, Some(request.session))
             .await?;
         state.locks.lock().use_session(&session)?;
+        // An uploaded cover (PX-53) is a user's photo: only for who sees a
+        // playlist that has it.
+        if matches!(
+            crate::covers::local(&request.id),
+            Some(crate::covers::Local::Cover(_))
+        ) && !self
+            .services
+            .playlists
+            .sees_art(&who.actor(), &request.id)
+            .await
+            .map_err(playlists_error)?
+        {
+            return Err(Error::NotFound {
+                what: request.id.to_string(),
+            });
+        }
         if request.id.namespace() == Namespace::Preview {
             return self.preview_sheet(&request.id, request.size).await;
         }
@@ -1841,6 +1954,13 @@ impl ClientProtocol {
                 request: format!("share candidates without {}", features::PLAYLIST_SHARING),
             });
         }
+        // PX-53: playlists' pictures, only for a client that takes them.
+        let art_listed = playlists_listed && features::has(&hello.features, features::PLAYLIST_ART);
+        if !art_listed && matches!(request, Request::RemovePlaylistArt { .. }) {
+            return Err(Error::Unsupported {
+                request: format!("playlist art without {}", features::PLAYLIST_ART),
+            });
+        }
         if playlists_listed {
             self.playlist_listeners
                 .note(connection.stable_id(), principal, liked_listed);
@@ -1862,6 +1982,7 @@ impl ClientProtocol {
                 | Request::PlayPlaylist { id, .. }
                 | Request::NextInPlaylist { id, .. }
                 | Request::ListShareCandidates { id, .. }
+                | Request::RemovePlaylistArt { id }
                     if self
                         .services
                         .playlists
@@ -2469,7 +2590,7 @@ impl ClientProtocol {
                 Ok(Reply::Playlists {
                     playlists: playlists
                         .into_iter()
-                        .map(|p| named(p, sharing_listed))
+                        .map(|p| named(p, sharing_listed, art_listed))
                         .collect(),
                     pin_notes,
                 })
@@ -2483,7 +2604,7 @@ impl ClientProtocol {
                     if !liked_listed {
                         page.entries.iter_mut().for_each(|e| e.liked = false);
                     }
-                    page.playlist = named(page.playlist, sharing_listed);
+                    page.playlist = named(page.playlist, sharing_listed, art_listed);
                     Reply::Playlist(page)
                 })
                 .map_err(playlists_error),
@@ -2496,7 +2617,7 @@ impl ClientProtocol {
                 .playlists
                 .create(&actor, &name, kinds, visibility)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
                 .map_err(playlists_error),
             Request::UpdatePlaylist {
                 id,
@@ -2516,7 +2637,7 @@ impl ClientProtocol {
                     },
                 )
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
                 .map_err(playlists_error),
             Request::EditPlaylist {
                 id,
@@ -2528,6 +2649,13 @@ impl ClientProtocol {
                 .edit(&actor, &id, revision, edits)
                 .await
                 .map(|revision| Reply::PlaylistEdited { revision })
+                .map_err(playlists_error),
+            Request::RemovePlaylistArt { id } => self
+                .services
+                .playlists
+                .remove_art(&actor, &id)
+                .await
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
                 .map_err(playlists_error),
             Request::DeletePlaylist { id } => self
                 .services
@@ -2620,14 +2748,14 @@ impl ClientProtocol {
                 .playlists
                 .like(&actor, &items)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
                 .map_err(playlists_error),
             Request::Unlike { items } => self
                 .services
                 .playlists
                 .unlike(&actor, &items)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
                 .map_err(playlists_error),
             Request::ListShareCandidates {
                 id,
@@ -5193,6 +5321,9 @@ impl Asked {
             Ok(ResourceRequest::SubtitleSegment { session, .. }) => {
                 ("subtitle_segment", Some(session))
             }
+            Ok(ResourceRequest::SetPlaylistArt { session, .. }) => {
+                ("set_playlist_art", Some(session))
+            }
             Err(_) => ("resource", None),
         };
         Self {
@@ -6029,7 +6160,13 @@ fn playing(next: Option<spoolframe_protocol::playlists::PlaylistNext>, liked: bo
 fn named(
     mut summary: spoolframe_protocol::playlists::PlaylistSummary,
     sharing: bool,
+    art: bool,
 ) -> spoolframe_protocol::playlists::PlaylistSummary {
+    // A picture only for a client that takes it (PX-53).
+    if !art {
+        summary.artwork = None;
+        summary.custom_art = false;
+    }
     if !sharing {
         summary.owner_name = None;
         if let spoolframe_protocol::playlists::Visibility::Shared { with } = &mut summary.visibility
@@ -6060,8 +6197,24 @@ fn playlists_error(e: crate::playlists::PlaylistsError) -> Error {
         }
         PlaylistsError::InvalidInput(message) => Error::InvalidInput { message },
         PlaylistsError::Conflict { revision } => Error::PlaylistConflict { revision },
+        PlaylistsError::NotAllowed => Error::NotAllowed,
+        PlaylistsError::ImageTooLarge => image_too_large(),
+        PlaylistsError::ImageUnreadable(why) => {
+            tracing::debug!(why, "an uploaded cover was refused");
+            Error::ImageUnreadable
+        }
+        PlaylistsError::Unavailable(message) => Error::Unavailable { message },
         PlaylistsError::Catalog(e) => catalog_error(e),
         PlaylistsError::Store(e) => internal(e),
+        PlaylistsError::Io(e) => internal(e),
+    }
+}
+
+/// A cover past the limits (PX-53), saying them.
+fn image_too_large() -> Error {
+    Error::ImageTooLarge {
+        max_bytes: spoolframe_protocol::playlists::MAX_ART_BYTES,
+        max_pixels: spoolframe_protocol::playlists::MAX_ART_PIXELS,
     }
 }
 

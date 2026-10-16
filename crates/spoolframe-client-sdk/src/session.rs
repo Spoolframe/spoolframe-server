@@ -681,7 +681,7 @@ impl Session {
         }
     }
 
-    async fn failed(&self, error: spoolframe_protocol::Error) -> SdkError {
+    pub(crate) async fn failed(&self, error: spoolframe_protocol::Error) -> SdkError {
         let error = SdkError::from_server(error);
         if error == SdkError::SignInRequired
             && let Err(e) = self.client.end_session(self.server, &self.token).await

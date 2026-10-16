@@ -35,8 +35,9 @@ use spoolframe_protocol::playlists::{
     Kinds, PinNote, PinNoteReason, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage,
     PlaylistRef, PlaylistShare, PlaylistSummary, ShareCandidatePage, Visibility,
 };
-use spoolframe_types::{Item, LibraryKind, Marker, MediaId, MediaKind};
+use spoolframe_types::{ArtworkId, ArtworkKind, Item, LibraryKind, Marker, MediaId, MediaKind};
 
+use crate::covers::{CoverError, Covers, Tile};
 use crate::principal::{Actor, Principal};
 use crate::store::playlists::PlaceRow;
 use crate::store::playlists::{
@@ -92,10 +93,40 @@ pub enum PlaylistsError {
     /// playlist's now.
     #[error("someone changed this playlist; reload")]
     Conflict { revision: u64 },
+    /// Not the actor's to do (PX-53): a cover set or taken away by
+    /// someone who may not edit the playlist, or on Liked or All.
+    #[error("you are not allowed to do that")]
+    NotAllowed,
+    /// A cover over the size limits, refused before it was decoded.
+    #[error("the picture is too large")]
+    ImageTooLarge,
+    /// A cover that is not a picture taken, or did not decode.
+    #[error("the picture cannot be read: {0}")]
+    ImageUnreadable(String),
+    /// Covers cannot be kept here now: none set up, or ffmpeg did not run.
+    #[error("{0}")]
+    Unavailable(String),
+    /// A cover could not be written or read.
+    #[error("covers: {0}")]
+    Io(std::io::Error),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl From<CoverError> for PlaylistsError {
+    fn from(e: CoverError) -> Self {
+        match e {
+            CoverError::TooLarge(_) => PlaylistsError::ImageTooLarge,
+            CoverError::Unreadable(e) => PlaylistsError::ImageUnreadable(e.to_string()),
+            CoverError::Tool(e) => {
+                tracing::error!(error = %e, "a playlist cover could not be decoded: ffmpeg did not run");
+                PlaylistsError::Unavailable("covers cannot be read on this server now".into())
+            }
+            CoverError::Io(e) => PlaylistsError::Io(e),
+        }
+    }
 }
 
 impl From<PlaylistError> for PlaylistsError {
@@ -201,6 +232,24 @@ pub struct PlaylistUpdate {
     pub visibility: Option<Visibility>,
 }
 
+/// How long a playlist's mosaic, as worked out for one viewer at one
+/// revision, is kept: the catalog's covers change too (an update gives a
+/// poster a new id), and nothing else tells the playlist.
+const MOSAIC_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The most mosaics kept; then all are forgotten at once.
+const MOST_MOSAICS: usize = 4096;
+
+/// The most entries' items looked up for one mosaic: a playlist of one
+/// album's tracks has a single cover however long it is.
+const MOSAIC_LOOKUPS: usize = 16;
+
+/// Each playlist's picture as last worked out, by playlist, revision and
+/// viewer.
+type Mosaics = parking_lot::Mutex<
+    std::collections::HashMap<(String, u64, String), (std::time::Instant, ArtworkId)>,
+>;
+
 /// An entry's item, as the catalog has it now.
 enum Resolved {
     /// There, readable or not.
@@ -228,6 +277,9 @@ pub struct Playlists {
     watch: Arc<Watch>,
     visibility: Arc<dyn ItemVisibility>,
     news: tokio::sync::broadcast::Sender<PlaylistNews>,
+    /// Uploaded covers (PX-53); without, uploads are `Unavailable`.
+    covers: Option<Arc<Covers>>,
+    mosaics: Mosaics,
 }
 
 impl std::fmt::Debug for Playlists {
@@ -254,7 +306,15 @@ impl Playlists {
             watch,
             visibility,
             news: tokio::sync::broadcast::Sender::new(NEWS),
+            covers: None,
+            mosaics: Mosaics::default(),
         }
+    }
+
+    /// Keep uploaded covers in `covers` (PX-53).
+    pub fn with_covers(mut self, covers: Arc<Covers>) -> Self {
+        self.covers = Some(covers);
+        self
     }
 
     /// Every change, as it is made.
@@ -354,7 +414,23 @@ impl Playlists {
             pinned,
             builtin: row.builtin,
             owner_name: names.of_principal(&row.owner),
+            // Filled by `summarized`, which may ask the catalog.
+            artwork: None,
+            custom_art: row.art.is_some(),
         }
+    }
+
+    /// [`Self::summary`], with its picture.
+    async fn summarized(
+        &self,
+        actor: &Actor,
+        row: &PlaylistRow,
+        pinned: Option<u32>,
+        names: &Names,
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        let mut summary = Self::summary(actor, row, pinned, names);
+        summary.artwork = Some(self.art_of(actor, row).await?);
+        Ok(summary)
     }
 
     /// Where `id` is in `actor`'s Pinned.
@@ -394,13 +470,18 @@ impl Playlists {
         });
         let pins = self.store.pins(&principal).await?;
         let names = Names::of(&self.store).await?;
-        let summaries = rows
+        // Each may ask the catalog for its mosaic's covers: a few at once.
+        let summarizing: Vec<_> = rows
             .iter()
             .map(|row| {
                 let pinned = pins.iter().position(|p| *p == row.id).map(|n| n as u32);
-                Self::summary(actor, row, pinned, &names)
+                self.summarized(actor, row, pinned, &names)
             })
             .collect();
+        let summaries = stream::iter(summarizing)
+            .buffered(CATALOG_FETCHES)
+            .try_collect()
+            .await?;
         let notes = self
             .store
             .pin_notes(&principal)
@@ -472,12 +553,14 @@ impl Playlists {
             .await?
             .unwrap_or_default();
         Ok(PlaylistPage {
-            playlist: Self::summary(
-                actor,
-                &row,
-                self.pinned(actor, id).await?,
-                &Names::of(&self.store).await?,
-            ),
+            playlist: self
+                .summarized(
+                    actor,
+                    &row,
+                    self.pinned(actor, id).await?,
+                    &Names::of(&self.store).await?,
+                )
+                .await?,
             entries: page,
             offset: start as u32,
             total,
@@ -705,12 +788,8 @@ impl Playlists {
             })
             .await?;
         self.told_playlist(&row.id, row.revision, None, Some(Seen::of(&row)));
-        Ok(Self::summary(
-            actor,
-            &row,
-            None,
-            &Names::of(&self.store).await?,
-        ))
+        self.summarized(actor, &row, None, &Names::of(&self.store).await?)
+            .await
     }
 
     /// `visibility` as rows: whether server-wide, and the shares. Only an
@@ -831,12 +910,13 @@ impl Playlists {
                 self.tell(PlaylistNews::Pins { principal });
             }
         }
-        Ok(Self::summary(
+        self.summarized(
             actor,
             &after,
             self.pinned(actor, id).await?,
             &Names::of(&self.store).await?,
-        ))
+        )
+        .await
     }
 
     /// Apply `edits`, made on `revision`, to playlist `id`'s entries: its
@@ -979,6 +1059,7 @@ impl Playlists {
         self.store
             .delete_playlist(id, &actor.principal.to_string())
             .await?;
+        self.let_go_of(row.art.as_deref()).await;
         self.told_playlist(id, row.revision + 1, Some(Seen::of(&row)), None);
         for principal in pinned.iter().filter_map(|p| p.parse::<Principal>().ok()) {
             self.tell(PlaylistNews::Pins { principal });
@@ -1455,12 +1536,13 @@ impl Playlists {
             .playlist(id)
             .await?
             .ok_or(PlaylistsError::NotFound)?;
-        Ok(Self::summary(
+        self.summarized(
             actor,
             &row,
             self.pinned(actor, id).await?,
             &Names::of(&self.store).await?,
-        ))
+        )
+        .await
     }
 
     /// Put `entries` at the top of Liked `row`, newest first: its new
@@ -1696,6 +1778,227 @@ impl Playlists {
     }
 }
 
+/// Covers (PX-53): uploaded, a mosaic of the first four, or a tile.
+impl Playlists {
+    /// `row`'s picture as `actor` sees it: Liked's or All's tile, its
+    /// uploaded cover, else its mosaic.
+    async fn art_of(&self, actor: &Actor, row: &PlaylistRow) -> Result<ArtworkId, PlaylistsError> {
+        match row.builtin {
+            Some(Builtin::Liked) => return Ok(crate::covers::tile_id(Tile::Liked)),
+            Some(Builtin::All) => return Ok(crate::covers::tile_id(Tile::All)),
+            _ => {}
+        }
+        if let Some(art) = row.art.as_deref().and_then(|a| a.parse().ok()) {
+            return Ok(art);
+        }
+        self.mosaic(actor, row).await
+    }
+
+    /// The covers of `row`'s first four different albums, shows or films
+    /// that `actor` may see, in its order: their mosaic; the first alone
+    /// when there are fewer; the placeholder when there are none. Kept a
+    /// while per revision and viewer.
+    async fn mosaic(&self, actor: &Actor, row: &PlaylistRow) -> Result<ArtworkId, PlaylistsError> {
+        let key = (row.id.clone(), row.revision, actor.principal.to_string());
+        if let Some((at, id)) = self.mosaics.lock().get(&key)
+            && at.elapsed() < MOSAIC_FOR
+        {
+            return Ok(id.clone());
+        }
+        let entries = self.store.playlist_entries(&row.id).await?;
+        let mut groups = HashSet::new();
+        let mut covers: Vec<ArtworkId> = Vec::new();
+        let mut lookups = 0;
+        // A catalog that could not be asked: worked out again next time.
+        let mut complete = true;
+        for entry in &entries {
+            if covers.len() == 4 || lookups == MOSAIC_LOOKUPS {
+                break;
+            }
+            // An album's tracks are one cover: the album is asked for
+            // once. A show's episodes are not: each season has its own
+            // poster.
+            let group = entry
+                .album_id
+                .clone()
+                .unwrap_or_else(|| entry.media_id.clone());
+            if !groups.insert(group) {
+                continue;
+            }
+            let Ok(id) = entry.media_id.parse::<MediaId>() else {
+                continue;
+            };
+            lookups += 1;
+            let item = match self.catalog.item(&id).await {
+                Ok(found) => found.item,
+                Err(e) if crate::client::unserved(&e) => continue,
+                Err(e) => {
+                    tracing::debug!(error = %e, playlist = %row.id, "a mosaic's cover could not be looked up");
+                    complete = false;
+                    continue;
+                }
+            };
+            if !self.visibility.may_see(actor, &item) {
+                continue;
+            }
+            if let Some(poster) = poster_of(&item)
+                && !covers.contains(poster)
+            {
+                covers.push(poster.clone());
+            }
+        }
+        let art = match covers.len() {
+            0 => crate::covers::tile_id(Tile::Empty),
+            4 => crate::covers::mosaic_id(&covers),
+            _ => covers.swap_remove(0),
+        };
+        if complete {
+            let mut kept = self.mosaics.lock();
+            if kept.len() >= MOST_MOSAICS {
+                kept.clear();
+            }
+            kept.insert(key, (std::time::Instant::now(), art.clone()));
+        }
+        Ok(art)
+    }
+
+    /// Playlist `id`, if `actor` may change its cover: who may edit its
+    /// entries, on a playlist that is not Liked or All. What an upload is
+    /// checked by before its bytes are read.
+    pub async fn may_set_art(
+        &self,
+        actor: &Actor,
+        id: &str,
+    ) -> Result<PlaylistRow, PlaylistsError> {
+        let (row, access) = self.seen(actor, id).await?;
+        if row.builtin.is_some() || !access.can_edit() {
+            return Err(PlaylistsError::NotAllowed);
+        }
+        Ok(row)
+    }
+
+    /// Give playlist `id` the cover in `bytes`, decoded and kept: the
+    /// playlist after. Every user who sees it sees the cover.
+    pub async fn set_art(
+        &self,
+        actor: &Actor,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        self.may_set_art(actor, id).await?;
+        let covers = self.covers.as_ref().ok_or_else(|| {
+            PlaylistsError::Unavailable("this server keeps no playlist covers".into())
+        })?;
+        let art = covers.ingest(bytes).await?;
+        self.put_art(actor, id, Some(art)).await
+    }
+
+    /// Take playlist `id`'s uploaded cover away: its mosaic again.
+    pub async fn remove_art(
+        &self,
+        actor: &Actor,
+        id: &str,
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        let row = self.may_set_art(actor, id).await?;
+        if row.art.is_none() {
+            return self.summary_now(actor, id).await;
+        }
+        self.put_art(actor, id, None).await
+    }
+
+    /// Set playlist `id`'s cover to `art`, tell who sees it, and let go of
+    /// the one it had.
+    async fn put_art(
+        &self,
+        actor: &Actor,
+        id: &str,
+        art: Option<ArtworkId>,
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        let art = art.map(|a| a.to_string());
+        let (revision, had) = self.store.set_playlist_art(id, art.as_deref()).await?;
+        if had != art {
+            self.let_go_of(had.as_deref()).await;
+        }
+        let row = self
+            .store
+            .playlist(id)
+            .await?
+            .ok_or(PlaylistsError::NotFound)?;
+        self.told_playlist(id, revision, Some(Seen::of(&row)), Some(Seen::of(&row)));
+        self.summary_now(actor, id).await
+    }
+
+    /// Delete cover `art`'s file if no playlist has it now.
+    async fn let_go_of(&self, art: Option<&str>) {
+        let (Some(art), Some(covers)) = (art, &self.covers) else {
+            return;
+        };
+        match self.store.playlist_art_used(art).await {
+            Ok(false) => {
+                if let Ok(id) = art.parse() {
+                    covers.remove(&id).await;
+                }
+            }
+            Ok(true) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot tell whether a cover is still used; kept"),
+        }
+    }
+
+    /// Whether `actor` sees a playlist whose uploaded cover is `art`: who
+    /// may fetch it.
+    pub async fn sees_art(&self, actor: &Actor, art: &ArtworkId) -> Result<bool, PlaylistsError> {
+        Ok(self
+            .store
+            .playlist_art_seen_by(&actor.principal.to_string(), &art.to_string())
+            .await?)
+    }
+
+    /// Playlist `id`'s picture as `actor` sees it, if they see it: what
+    /// the web UI shows.
+    pub async fn art(&self, actor: &Actor, id: &str) -> Result<ArtworkId, PlaylistsError> {
+        let (row, _) = self.seen(actor, id).await?;
+        self.art_of(actor, &row).await
+    }
+
+    /// Delete the kept covers no playlist has: at start.
+    pub async fn sweep_covers(&self) -> Result<usize, PlaylistsError> {
+        let Some(covers) = &self.covers else {
+            return Ok(0);
+        };
+        let used = self.store.playlist_art_in_use().await?;
+        covers.sweep(&used).await.map_err(PlaylistsError::Io)
+    }
+
+    /// Give playlist `id`, just imported for `actor`, the cover in
+    /// `bytes`: a Plex playlist's own (PX-53).
+    pub async fn import_art(
+        &self,
+        actor: &Actor,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<(), PlaylistsError> {
+        self.set_art(actor, id, bytes).await.map(|_| ())
+    }
+}
+
+/// An item's cover: an album's, a show's or season's poster (an episode's
+/// and a track's carry theirs), a film's poster.
+fn poster_of(item: &Item) -> Option<&ArtworkId> {
+    let artwork = match item {
+        Item::Movie(m) => &m.artwork,
+        Item::Episode(e) => &e.artwork,
+        Item::Track(t) => &t.artwork,
+        Item::Album(a) => &a.artwork,
+        Item::Show(s) => &s.artwork,
+        Item::Season(s) => &s.artwork,
+        Item::Artist(a) => &a.artwork,
+    };
+    artwork
+        .iter()
+        .find(|a| a.kind == ArtworkKind::Poster)
+        .map(|a| &a.id)
+}
+
 /// Where page `offset`, at most `limit` ([`MAX_PAGE`]), of `len` entries
 /// starts and ends.
 fn cut(len: usize, offset: u32, limit: u32) -> (usize, usize) {
@@ -1807,3 +2110,6 @@ mod tests;
 
 #[cfg(test)]
 mod builtin_tests;
+
+#[cfg(test)]
+mod art_tests;

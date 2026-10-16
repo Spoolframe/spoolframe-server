@@ -135,6 +135,27 @@ pub enum GrantCommand {
     Revoke { id: String },
 }
 
+/// Playlists (PX-40), as the user who logs in sees them: their own,
+/// those shared with them, and the server-wide ones.
+#[derive(Subcommand)]
+pub enum PlaylistCommand {
+    /// The playlists you see, with their ids and whether each has a cover
+    /// of its own.
+    List,
+    /// Give a playlist a cover (PX-53): a JPEG, PNG, WebP or HEIC of at
+    /// most 20 MB and 40 megapixels, kept as its centre square, with
+    /// nothing of the file but its picture. Whoever may edit the
+    /// playlist; not Liked or All.
+    SetArt {
+        /// The playlist's id, as `playlist list` shows it.
+        id: String,
+        /// The picture.
+        file: std::path::PathBuf,
+    },
+    /// Take a playlist's cover away: its mosaic of what it holds again.
+    RemoveArt { id: String },
+}
+
 /// `12h` or `7d` as seconds.
 fn expiry(text: &str) -> Result<u64, String> {
     let (number, unit) = text.split_at(text.len().saturating_sub(1));
@@ -770,6 +791,80 @@ async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
         }
         InviteCommand::Link => {
             println!("{}", api.invite_link().await.map_err(api_error)?.share_link);
+        }
+    }
+    Ok(())
+}
+
+/// List playlists, or set or remove one's cover (PX-53), as the user who
+/// logs in.
+pub async fn playlist(listen: SocketAddr, command: PlaylistCommand) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = run_playlist(&api, listen, &login.token, command).await;
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    result
+}
+
+async fn run_playlist(
+    api: &WsClient,
+    listen: SocketAddr,
+    token: &str,
+    command: PlaylistCommand,
+) -> Result<()> {
+    match command {
+        PlaylistCommand::List => {
+            let playlists = api.playlists().await.map_err(api_error)?;
+            if playlists.is_empty() {
+                println!("you see no playlists");
+            }
+            for p in &playlists {
+                println!(
+                    "{}  {}{}",
+                    p.id,
+                    p.name,
+                    if p.custom_art { "  (own cover)" } else { "" }
+                );
+            }
+        }
+        PlaylistCommand::SetArt { id, file } => {
+            let picture =
+                std::fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            // The picture goes as an HTTP body, as the web UI sends it: a
+            // JSON-RPC message is no place for 20 MB.
+            let url = format!(
+                "{}/playlists/art?id={}",
+                url(listen).replacen("ws://", "http://", 1),
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            );
+            let response = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(token)
+                .body(picture)
+                .send()
+                .await
+                .with_context(|| format!("cannot reach the admin API at {url}"))?;
+            if !response.status().is_success() {
+                let said: serde_json::Value = response.json().await.unwrap_or_default();
+                bail!(
+                    "{}",
+                    said["message"]
+                        .as_str()
+                        .unwrap_or("the server refused the cover")
+                );
+            }
+            let after: spoolframe_admin_api::PlaylistInfo = response.json().await?;
+            println!("{} has its cover", after.name);
+        }
+        PlaylistCommand::RemoveArt { id } => {
+            let after = api.playlist_remove_art(id).await.map_err(api_error)?;
+            println!("{} shows its mosaic again", after.name);
         }
     }
     Ok(())

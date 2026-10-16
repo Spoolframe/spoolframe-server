@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- Playlist covers (PX-53). Every playlist now has a picture: a cover an
+  editor uploaded, the same for everyone who sees it; else a 2×2 mosaic
+  of the first four different album covers or posters in it, in its
+  order, made on demand and never stored as the cover; one cover alone
+  when it has fewer; a placeholder when it has none. Liked and All have
+  fixed tiles and take no cover. Whoever may edit a playlist may set or
+  remove its cover; a read-only user, and anyone for Liked or All, is
+  refused `NotAllowed`. An upload is a JPEG, PNG, WebP or HEIC of at most
+  20 MB and 40 megapixels, refused before decoding past either
+  (`ImageTooLarge`); it is decoded by ffmpeg, confined, on one thread,
+  under a memory, CPU and time limit, so a decompression bomb fails as
+  `ImageUnreadable` and the server goes on; and only its centre square,
+  at most 2048 px, is kept, as a JPEG the server encodes, with no EXIF,
+  GPS or other metadata. Covers are kept in `state_dir/images/playlists/`
+  by hash and served as artwork (`image:` ids) at every size; a file
+  goes when no playlist has it, and ones left over are swept at start.
+  Behind a new regular feature, `spoolframe:playlist-art` (the protocol
+  version is unchanged): `PlaylistSummary::artwork` and `custom_art`,
+  the `SetPlaylistArt` resource request (the picture's bytes follow it
+  on its stream), `RemovePlaylistArt`, and the errors `NotAllowed`,
+  `ImageTooLarge` and `ImageUnreadable`. SDK: `Features::playlist_art`,
+  `Session::set_playlist_art` and `Session::remove_playlist_art`. Admin
+  API: `PlaylistInfo::artwork` and `customArt`, `me.playlistRemoveArt`,
+  and `POST /playlists/art?id=…` to upload and `GET /playlists/art` to
+  fetch; CLI: `spoolframe-server playlist list|set-art|remove-art`. The
+  web UI shows covers wherever playlists are listed and has Change cover
+  and Remove cover, with a square preview, on a playlist's page. The Plex
+  import brings a playlist's own Plex picture, through the PMS's photo
+  transcoder; Plex's composite mosaics are left for ours. Migration 0034
+  adds `playlists.art`. A new fuzz target, `picture_header`, reads an
+  upload's header as the server does.
+
 ## 0.11.0 (2026-10-16)
 
 - MCP: an agent deletes, shares and renames playlists. `delete_playlist`

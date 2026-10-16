@@ -167,6 +167,10 @@ pub struct Metadata {
     pub last_rated_at: Option<i64>,
     /// A playlist's: `video`, `audio` or `photo` (PX-40).
     pub playlist_type: Option<String>,
+    /// A playlist's mosaic of what it holds, which Plex makes itself
+    /// (`/playlists/<key>/composite/<time>`); its `thumb` is set only
+    /// when someone gave it a picture of its own (PX-53).
+    pub composite: Option<String>,
     /// A playlist made by rules rather than by hand (PX-40).
     #[serde(default, deserialize_with = "lenient")]
     pub smart: Option<bool>,

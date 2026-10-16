@@ -47,6 +47,8 @@ pub struct PlaylistRow {
     pub shares: Vec<ShareRow>,
     /// Liked or All (PX-43); `None` for one a user made.
     pub builtin: Option<Builtin>,
+    /// Its uploaded cover's `ArtworkId` (PX-53); `None` for its mosaic.
+    pub art: Option<String>,
 }
 
 impl PlaylistRow {
@@ -229,6 +231,7 @@ type PlaylistTuple = (
     i64,
     i64,
     Option<String>,
+    Option<String>,
 );
 
 fn builtin_text(builtin: Builtin) -> &'static str {
@@ -270,10 +273,10 @@ type EntryTuple = (
 );
 
 const PLAYLIST_COLUMNS: &str = "p.id, p.owner, p.name, p.kinds, p.server_wide, p.revision, \
-     p.created_at, p.updated_at, p.builtin";
+     p.created_at, p.updated_at, p.builtin, p.art";
 
 fn playlist_of(row: PlaylistTuple, shares: Vec<ShareRow>) -> PlaylistRow {
-    let (id, owner, name, kinds, server_wide, revision, created_at, updated_at, builtin) = row;
+    let (id, owner, name, kinds, server_wide, revision, created_at, updated_at, builtin, art) = row;
     PlaylistRow {
         id,
         owner,
@@ -285,6 +288,7 @@ fn playlist_of(row: PlaylistTuple, shares: Vec<ShareRow>) -> PlaylistRow {
         updated_at,
         shares,
         builtin: builtin.as_deref().map(builtin_of),
+        art,
     }
 }
 
@@ -324,6 +328,7 @@ impl Store {
             updated_at: now,
             shares: new.shares.clone(),
             builtin: None,
+            art: None,
         })
     }
 
@@ -570,6 +575,69 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Set playlist `id`'s uploaded cover to `art`, or take it away with
+    /// `None` (PX-53): its new revision, and the cover it had.
+    pub async fn set_playlist_art(
+        &self,
+        id: &str,
+        art: Option<&str>,
+    ) -> Result<(u64, Option<String>), PlaylistError> {
+        let now = self.now();
+        let mut tx = self.begin_write().await?;
+        let had: Option<Option<String>> =
+            sqlx::query_scalar("SELECT art FROM playlists WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let had = had.ok_or(PlaylistError::NotFound)?;
+        sqlx::query("UPDATE playlists SET art = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(art)
+            .execute(&mut *tx)
+            .await?;
+        let revision = bump(&mut tx, id, now).await?;
+        tx.commit().await?;
+        Ok((revision, had))
+    }
+
+    /// Whether any playlist has `art` as its cover.
+    pub async fn playlist_art_used(&self, art: &str) -> Result<bool, StoreError> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM playlists WHERE art = ?1)")
+                .bind(art)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Whether `principal` sees a playlist whose cover is `art`: theirs,
+    /// shared with them, or server-wide.
+    pub async fn playlist_art_seen_by(
+        &self,
+        principal: &str,
+        art: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM playlists p WHERE p.art = ?2 \
+               AND (p.owner = ?1 OR p.server_wide = 1 \
+                    OR EXISTS (SELECT 1 FROM playlist_shares s \
+                               WHERE s.playlist_id = p.id AND s.principal = ?1)))",
+        )
+        .bind(principal)
+        .bind(art)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Every cover a playlist has: what the covers kept are swept by.
+    pub async fn playlist_art_in_use(&self) -> Result<HashSet<String>, StoreError> {
+        let art: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT art FROM playlists WHERE art IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(art.into_iter().collect())
     }
 
     /// A playlist's entries, in order.

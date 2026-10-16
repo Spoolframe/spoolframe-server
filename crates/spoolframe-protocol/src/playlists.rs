@@ -8,10 +8,18 @@
 //! their own.
 
 use serde::{Deserialize, Serialize};
-use spoolframe_types::{MediaId, MediaKind};
+use spoolframe_types::{ArtworkId, MediaId, MediaKind};
 
 /// One place in a playlist. Never reused, in any playlist.
 pub type EntryId = u64;
+
+/// The largest cover a `SetPlaylistArt` takes, in bytes (PX-53): past it,
+/// `ImageTooLarge`, and the bytes are not read.
+pub const MAX_ART_BYTES: u64 = 20 << 20;
+
+/// The most pixels a cover may have (PX-53): past it, `ImageTooLarge`,
+/// from the picture's header, before it is decoded.
+pub const MAX_ART_PIXELS: u64 = 40_000_000;
 
 /// The kinds of item a playlist may hold, ticked when it is made. They
 /// can change later only to allow more.
@@ -285,6 +293,22 @@ pub struct PlaylistSummary {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_name: Option<String>,
+    /// Its picture, for a client that listed `spoolframe:playlist-art`
+    /// (PX-53), fetched as any artwork is: the cover an editor uploaded;
+    /// else a 2×2 mosaic of the first four different album covers or
+    /// posters in it; one alone when it has fewer; a placeholder when it
+    /// has none. Liked's and All's are fixed tiles. Changes when any of
+    /// that does.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkId>,
+    /// `artwork` is a cover an editor uploaded, which `RemovePlaylistArt`
+    /// takes away; false for a mosaic, a placeholder or a built-in tile.
+    /// Sent only when true, and only to a client that listed
+    /// `spoolframe:playlist-art`.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom_art: bool,
 }
 
 /// A playlist holding an item, as the item's details list it.

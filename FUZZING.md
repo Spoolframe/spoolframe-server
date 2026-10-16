@@ -27,6 +27,7 @@ the dev shell to fuzz.
 | `plex_json` | a PMS JSON response, decoded and converted to items | `spoolframe-plex` `wire.rs`, `convert.rs` |
 | `ffprobe_json` | ffprobe's JSON for a file, made into a `MediaDescriptor` | the vendored `easy-ffprobe` model, `spoolframe-media` `descriptor.rs` |
 | `keyframe_index` | a media file's own keyframe index: Matroska `Cues`, MP4 `stss` (PX-25) | `spoolframe-media` `keyframe_index.rs` |
+| `picture_header` | an uploaded playlist cover's header: its format (JPEG, PNG, WebP, HEIC) and size, read before anything is decoded (PX-53) | `spoolframe-media` `picture.rs` |
 
 The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
 in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
@@ -47,6 +48,11 @@ states), and keeps at most about 4 million times (32 MiB).
 An input it does not follow is a `NoIndex` error (the server then reads the
 keyframes with ffprobe, confined), never a panic.
 
+`picture_header` runs in the server process too, on any editor's upload:
+it walks JPEG markers, PNG's `IHDR`, WebP's first chunk and HEIF's boxes
+without allocating from a length the file states. The picture itself is
+decoded by ffmpeg, confined, which this target does not reach.
+
 ## Running
 
 ```sh
@@ -56,7 +62,8 @@ FUZZ_FLAGS="-jobs=8 -workers=8" scripts/fuzz.sh 3600 protocol_cbor
 ```
 
 Each target starts from its seeds in `fuzz/seeds/TARGET/` and, for `bif`,
-`plex_json` and `ffprobe_json`, from its crate's test fixtures. It grows its
+`plex_json`, `ffprobe_json` and `picture_header`, from its crate's test
+fixtures. It grows its
 corpus in `fuzz/corpus/TARGET/`. A crash goes to `fuzz/artifacts/TARGET/`, and
 the script exits 1 after it runs the other targets. The corpus and the
 artifacts are not tracked.

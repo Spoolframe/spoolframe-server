@@ -286,7 +286,8 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
             "spoolframe:liked",
             "spoolframe:last-viewed",
             "spoolframe:playlist-sharing",
-            "spoolframe:play-history"
+            "spoolframe:play-history",
+            "spoolframe:playlist-art"
         ]
     );
     assert!(status.pre_auth_features.is_empty());

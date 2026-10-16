@@ -18,8 +18,9 @@ use image::imageops::FilterType;
 use image::{ImageFormat, ImageReader, Limits};
 use spoolframe_catalog::{Catalog, CatalogError, Image};
 use spoolframe_protocol::ArtworkSize;
-use spoolframe_types::ArtworkId;
+use spoolframe_types::{ArtworkId, Namespace};
 
+use crate::covers::Local;
 use crate::hybrid::{self, Tiers};
 use crate::metrics::Counter;
 
@@ -115,6 +116,9 @@ pub struct ArtworkCache {
     changes: Option<tokio::sync::watch::Receiver<u64>>,
     /// Resizes running at once, one per core.
     resizes: tokio::sync::Semaphore,
+    /// Playlists' uploaded covers (PX-53), for `image:playlist/…` ids.
+    /// Mosaics and tiles need none.
+    covers: Option<Arc<crate::covers::Covers>>,
 }
 
 /// How long the catalog's word that an artwork is served is taken: a
@@ -196,7 +200,14 @@ impl ArtworkCache {
             resizes: tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(2, |n| n.get()),
             ),
+            covers: None,
         })
+    }
+
+    /// Serve playlists' uploaded covers from `covers` (PX-53).
+    pub fn with_covers(mut self, covers: Arc<crate::covers::Covers>) -> Self {
+        self.covers = Some(covers);
+        self
     }
 
     /// Forget what the catalog said each time it changes (`changes`, the
@@ -295,11 +306,88 @@ impl ArtworkCache {
         if size == ArtworkSize::Unknown {
             return Err(ArtworkError::BadSize(size));
         }
-        if !self.authorized_lately(id) {
+        if id.namespace() == Namespace::Image {
+            self.authorize_local(id).await?;
+        } else if !self.authorized_lately(id) {
             self.catalog.authorize_artwork(id).await?;
             self.remember_authorized(id);
         }
         self.get_authorized(id, size).await
+    }
+
+    /// Whether `image:` id `id` is served (PX-53): a cover kept, a
+    /// mosaic of four covers the catalog serves, a tile. Who may see a
+    /// cover is the caller's to check first.
+    async fn authorize_local(&self, id: &ArtworkId) -> Result<(), ArtworkError> {
+        let not_found = || ArtworkError::Catalog(CatalogError::NotFound(id.to_string()));
+        match crate::covers::local(id) {
+            Some(Local::Cover(_)) => match &self.covers {
+                Some(covers) if covers.has(id).await => Ok(()),
+                _ => Err(not_found()),
+            },
+            Some(Local::Mosaic(parts)) => {
+                for part in &parts {
+                    if !self.authorized_lately(part) {
+                        self.catalog.authorize_artwork(part).await?;
+                        self.remember_authorized(part);
+                    }
+                }
+                Ok(())
+            }
+            Some(Local::Tile(_)) => Ok(()),
+            None => Err(not_found()),
+        }
+    }
+
+    /// The original of `image:` id `id`: a cover's file, a mosaic made of
+    /// its four at the medium size, a tile drawn.
+    async fn local_original(&self, id: &ArtworkId) -> Result<Image, ArtworkError> {
+        let jpeg = |bytes| Image {
+            bytes,
+            content_type: "image/jpeg".to_owned(),
+        };
+        match crate::covers::local(id) {
+            Some(Local::Cover(_)) => match &self.covers {
+                Some(covers) => Ok(jpeg(covers.read(id).await.map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        ArtworkError::Catalog(CatalogError::NotFound(id.to_string()))
+                    } else {
+                        ArtworkError::Io(e)
+                    }
+                })?)),
+                None => Err(ArtworkError::Catalog(CatalogError::NotFound(
+                    id.to_string(),
+                ))),
+            },
+            Some(Local::Mosaic(parts)) => {
+                let mut tiles = Vec::with_capacity(parts.len());
+                for part in &parts {
+                    let (tile, _) =
+                        Box::pin(self.get_authorized(part, ArtworkSize::Medium)).await?;
+                    tiles.push(tile.bytes);
+                }
+                let _turn = self
+                    .resizes
+                    .acquire()
+                    .await
+                    .map_err(|e| ArtworkError::Image(e.to_string()))?;
+                let made = tokio::task::spawn_blocking(move || crate::covers::compose(&tiles))
+                    .await
+                    .map_err(|e| ArtworkError::Image(e.to_string()))?
+                    .map_err(ArtworkError::Image)?;
+                Ok(jpeg(made))
+            }
+            Some(Local::Tile(tile)) => {
+                let drawn = tokio::task::spawn_blocking(move || crate::covers::draw(tile))
+                    .await
+                    .map_err(|e| ArtworkError::Image(e.to_string()))?
+                    .map_err(ArtworkError::Image)?;
+                Ok(jpeg(drawn))
+            }
+            None => Err(ArtworkError::Catalog(CatalogError::NotFound(
+                id.to_string(),
+            ))),
+        }
     }
 
     /// The image, the caller allowed to see it, and whether the cache had
@@ -324,6 +412,9 @@ impl ArtworkCache {
 
     async fn make(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Image, ArtworkError> {
         let Some(width) = size.width() else {
+            if id.namespace() == Namespace::Image {
+                return self.local_original(id).await;
+            }
             return Ok(self.catalog.artwork(id).await?);
         };
         // Every size is made from the cached original, so the catalog is
@@ -399,6 +490,12 @@ fn reader(bytes: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>, ArtworkError> {
     limits.max_alloc = Some(MAX_ALLOC);
     reader.limits(limits);
     Ok(reader)
+}
+
+/// `bytes`, from the catalog or the cache, decoded within the same limits
+/// as a resize: a mosaic's tiles (PX-53).
+pub(crate) fn decode(bytes: &[u8]) -> Result<image::DynamicImage, ArtworkError> {
+    reader(bytes)?.decode().map_err(image_error)
 }
 
 /// `e` from the image crate; a limit's names the limits.

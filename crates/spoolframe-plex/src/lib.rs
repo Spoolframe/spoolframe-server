@@ -657,7 +657,7 @@ impl PlexCatalog {
 }
 
 /// The largest image passed on; posters and backgrounds are far smaller.
-const MAX_IMAGE_BYTES: usize = 32 << 20;
+pub(crate) const MAX_IMAGE_BYTES: usize = 32 << 20;
 
 /// The most pixels a side of a person's photo is asked for: the largest
 /// artwork size served (`Large`); the artwork proxy resizes from it.

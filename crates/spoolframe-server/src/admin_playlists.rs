@@ -166,6 +166,79 @@ impl AdminApi {
         Ok(info(&liked.map_err(playlists_error)?))
     }
 
+    /// Take playlist `id`'s uploaded cover away (PX-53).
+    pub(super) async fn remove_playlist_art(
+        &self,
+        user: ApiSessionUser,
+        id: &str,
+    ) -> RpcResult<PlaylistInfo> {
+        let after = self
+            .playlists_service()?
+            .remove_art(&actor(&user), id)
+            .await
+            .map_err(playlists_error)?;
+        Ok(info(&after))
+    }
+
+    /// Give playlist `id` the cover in `bytes` (PX-53): the web UI's and
+    /// the CLI's upload, over HTTP, as the caller in `ext`.
+    pub(crate) async fn set_playlist_art(
+        &self,
+        ext: &jsonrpsee::Extensions,
+        id: &str,
+        bytes: &[u8],
+    ) -> RpcResult<PlaylistInfo> {
+        let (_, user) = self.caller(ext).await?;
+        let after = self
+            .playlists_service()?
+            .set_art(&actor(&user), id, bytes)
+            .await
+            .map_err(playlists_error)?;
+        Ok(info(&after))
+    }
+
+    /// Whether the caller in `ext` may change playlist `id`'s cover: what
+    /// an upload is checked by before its body is read.
+    pub(crate) async fn may_set_playlist_art(
+        &self,
+        ext: &jsonrpsee::Extensions,
+        id: &str,
+    ) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        self.playlists_service()?
+            .may_set_art(&actor(&user), id)
+            .await
+            .map(|_| ())
+            .map_err(playlists_error)
+    }
+
+    /// Playlist `id`'s picture at `size`, for the caller in `ext` who
+    /// sees it (PX-53), and its artwork id.
+    pub(crate) async fn playlist_art_image(
+        &self,
+        ext: &jsonrpsee::Extensions,
+        id: &str,
+        size: spoolframe_protocol::ArtworkSize,
+    ) -> RpcResult<(String, crate::artwork::Artwork)> {
+        let (_, user) = self.caller(ext).await?;
+        let art = self
+            .playlists_service()?
+            .art(&actor(&user), id)
+            .await
+            .map_err(playlists_error)?;
+        let Some(cache) = &self.artwork else {
+            return Err(error(
+                error_code::NOT_CONFIGURED,
+                "this server serves no artwork",
+            ));
+        };
+        let image = cache.get(&art, size).await.map_err(|e| match e {
+            crate::artwork::ArtworkError::Catalog(e) => super::catalog::catalog_error(e),
+            other => internal(other),
+        })?;
+        Ok((art.to_string(), image))
+    }
+
     pub(super) async fn delete_playlist(&self, user: ApiSessionUser, id: &str) -> RpcResult<()> {
         self.playlists_service()?
             .delete(&actor(&user), id)
@@ -327,11 +400,13 @@ fn info(p: &PlaylistSummary) -> PlaylistInfo {
             Builtin::All => Some(PlaylistBuiltin::All),
             Builtin::Unknown => None,
         }),
+        artwork: p.artwork.as_ref().map(ToString::to_string),
+        custom_art: p.custom_art,
     }
 }
 
 /// The service's refusal, as the admin API says it.
-fn playlists_error(e: PlaylistsError) -> ErrorObjectOwned {
+pub(crate) fn playlists_error(e: PlaylistsError) -> ErrorObjectOwned {
     match e {
         PlaylistsError::NotFound => error(error_code::NO_SUCH_PLAYLIST, "no such playlist"),
         PlaylistsError::NoItem(_) | PlaylistsError::InvalidInput(_) => {
@@ -349,8 +424,19 @@ fn playlists_error(e: PlaylistsError) -> ErrorObjectOwned {
             e.to_string(),
             Some(serde_json::json!({ "revision": revision })),
         ),
+        PlaylistsError::NotAllowed => error(error_code::NOT_ALLOWED, e.to_string()),
+        PlaylistsError::ImageTooLarge => error(
+            error_code::IMAGE_TOO_LARGE,
+            "the picture is too large: at most 20 MB and 40 megapixels",
+        ),
+        PlaylistsError::ImageUnreadable(_) => error(
+            error_code::IMAGE_UNREADABLE,
+            "the picture cannot be read: a JPEG, PNG, WebP or HEIC is taken",
+        ),
+        PlaylistsError::Unavailable(message) => error(error_code::UNAVAILABLE, message),
         PlaylistsError::Catalog(e) => super::catalog::catalog_error(e),
         PlaylistsError::Store(e) => internal(e),
+        PlaylistsError::Io(e) => internal(e),
     }
 }
 

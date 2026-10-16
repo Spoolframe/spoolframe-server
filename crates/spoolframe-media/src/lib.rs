@@ -19,6 +19,7 @@ pub mod keyframe_index;
 mod keyframe_store;
 pub mod ocr;
 pub mod pgs;
+pub mod picture;
 mod probe;
 mod record;
 pub mod roles;

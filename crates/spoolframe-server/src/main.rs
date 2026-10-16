@@ -136,7 +136,7 @@ unsafe impl std::alloc::GlobalAlloc for Allocator {
     }
 }
 
-use admin_cli::{GrantCommand, InviteCommand, UserCommand};
+use admin_cli::{GrantCommand, InviteCommand, PlaylistCommand, UserCommand};
 
 /// How many items per library the startup check samples.
 const STARTUP_SAMPLE: u32 = 5;
@@ -237,6 +237,12 @@ enum Command {
     Grant {
         #[command(subcommand)]
         command: GrantCommand,
+    },
+    /// List playlists, and set or remove one's cover (PX-53), through the
+    /// running server's admin API, logged in as the user whose they are.
+    Playlist {
+        #[command(subcommand)]
+        command: PlaylistCommand,
     },
     /// The server's settings, and the layers they come from.
     Config {
@@ -635,6 +641,9 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
             admin_cli::invite(config.admin.listen()?, command).await
         }
         Some(Command::Grant { command }) => admin_cli::grant(config.admin.listen()?, command).await,
+        Some(Command::Playlist { command }) => {
+            admin_cli::playlist(config.admin.listen()?, command).await
+        }
         Some(Command::Status) => admin_cli::status(config.admin.listen()?).await,
         Some(Command::Id) => {
             let key = identity::load_or_create(state_dir)?;
@@ -895,7 +904,7 @@ async fn run(
             catalog: catalog.clone(),
             prober: prober.clone(),
             transcoding: transcoding.clone(),
-            ffmpeg,
+            ffmpeg: ffmpeg.clone(),
             encoding: jobs.encoding(),
         },
     )
@@ -918,12 +927,21 @@ async fn run(
             ))
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
+    // Playlists' uploaded covers (PX-53), decoded by the same confined
+    // ffmpeg, served through the artwork cache.
+    spoolframe_server::files::private_dir(&state_dir.join("images"))
+        .with_context(|| format!("cannot prepare the images in {}", state_dir.display()))?;
+    let covers = Arc::new(spoolframe_server::covers::Covers::new(
+        state_dir,
+        ffmpeg.clone(),
+    ));
     let artwork_dir = state_dir.join("cache").join("artwork");
     let artwork = Arc::new(
         ArtworkCache::open(&artwork_dir, config.artwork.tiers(), catalog.clone())
             .await
             .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?
-            .with_changes(live.changes()),
+            .with_changes(live.changes())
+            .with_covers(covers.clone()),
     );
     // Closed as the server stops, its last writes on disk.
     let artwork_cache = artwork.clone();
@@ -1117,11 +1135,21 @@ async fn run(
     let connected: Arc<Connected> = Arc::default();
     // Shared by the client protocol and MCP's tools (PX-42), which act
     // on them alike.
-    let playlists = Arc::new(spoolframe_server::playlists::Playlists::new(
-        auth.store().clone(),
-        catalog.clone(),
-        watch.clone(),
-    ));
+    let playlists = Arc::new(
+        spoolframe_server::playlists::Playlists::new(
+            auth.store().clone(),
+            catalog.clone(),
+            watch.clone(),
+        )
+        .with_covers(covers),
+    );
+    // Covers whose playlists went while the server was down, or with a
+    // user who left, and uploads a crash left.
+    match playlists.sweep_covers().await {
+        Ok(0) => {}
+        Ok(swept) => tracing::info!(swept, "playlist covers no playlist has deleted"),
+        Err(e) => tracing::warn!(error = %e, "cannot sweep the playlist covers"),
+    }
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = (auth.store().user_count().await? == 0).then(SetupCode::generate);

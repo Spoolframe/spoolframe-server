@@ -333,6 +333,19 @@ pub enum SdkError {
     /// `revision` is its revision now. Nothing changed.
     #[error("someone changed this playlist; reload")]
     PlaylistConflict { revision: u64 },
+    /// Not the user's to do (PX-53): a playlist's cover set or taken away
+    /// by someone who may not edit it, or on Liked or All. Nothing
+    /// changed.
+    #[error("you are not allowed to do that")]
+    NotAllowed,
+    /// A cover over `max_bytes`, or over `max_pixels` by its header
+    /// (PX-53): not decoded. Nothing changed.
+    #[error("the picture is too large: at most {max_bytes} bytes and {max_pixels} pixels")]
+    ImageTooLarge { max_bytes: u64, max_pixels: u64 },
+    /// Not a JPEG, PNG, WebP or HEIC picture the server can decode
+    /// (PX-53). Nothing changed.
+    #[error("the picture cannot be read")]
+    ImageUnreadable,
     /// Pairing this device with a portable identity, or a phone with a
     /// device, did not happen (P7-03); [`PairingError`] says why.
     #[error(transparent)]
@@ -405,6 +418,15 @@ impl SdkError {
             ServerError::PlaylistReadOnly => SdkError::PlaylistReadOnly,
             ServerError::KindNotAllowed { kind } => SdkError::KindNotAllowed { kind },
             ServerError::PlaylistConflict { revision } => SdkError::PlaylistConflict { revision },
+            ServerError::NotAllowed => SdkError::NotAllowed,
+            ServerError::ImageTooLarge {
+                max_bytes,
+                max_pixels,
+            } => SdkError::ImageTooLarge {
+                max_bytes,
+                max_pixels,
+            },
+            ServerError::ImageUnreadable => SdkError::ImageUnreadable,
             other => SdkError::Server(other.to_string()),
         }
     }

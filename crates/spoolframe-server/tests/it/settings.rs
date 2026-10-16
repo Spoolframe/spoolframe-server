@@ -146,11 +146,17 @@ pub(crate) async fn serve_syncing_with(
             spoolframe_server::watch::WatchRules::default(),
         ));
         spoolframe_server::mcp::Library {
-            playlists: Arc::new(spoolframe_server::playlists::Playlists::new(
-                store.clone(),
-                catalog.clone(),
-                watch.clone(),
-            )),
+            playlists: Arc::new(
+                spoolframe_server::playlists::Playlists::new(
+                    store.clone(),
+                    catalog.clone(),
+                    watch.clone(),
+                )
+                .with_covers(Arc::new(spoolframe_server::covers::Covers::new(
+                    dir,
+                    spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
+                ))),
+            ),
             catalog,
             watch,
         }

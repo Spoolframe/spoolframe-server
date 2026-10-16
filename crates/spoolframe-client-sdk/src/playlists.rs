@@ -19,15 +19,25 @@
 //! it is shared with (`PlaylistShare::display_name`, `kind`). A server
 //! without the feature sends no names, and the call is
 //! [`SdkError::Unsupported`].
+//!
+//! Covers (PX-53, feature `spoolframe:playlist-art`): each summary's
+//! `artwork`, fetched with [`Session::artwork`] as any artwork is (the
+//! uploaded cover, else a mosaic of its first four covers, else a
+//! placeholder; Liked's and All's fixed tiles), and `custom_art`;
+//! [`Session::set_playlist_art`] uploads a cover, and
+//! [`Session::remove_playlist_art`] takes it away. Without the feature
+//! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_SHARING, PLAYLISTS,
+    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLISTS,
 };
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
     PlaylistSummary, ShareCandidatePage, Visibility,
 };
+use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::{Reply, Request};
+use spoolframe_types::ArtworkId;
 use spoolframe_types::MediaId;
 
 use crate::{SdkError, Session};
@@ -52,6 +62,9 @@ pub struct Features {
     /// `PlaybackState::play_count` and `last_played_at` on an item's
     /// details and on Recently played's items.
     pub play_history: bool,
+    /// Playlist covers (PX-53): a summary's `artwork` and `custom_art`,
+    /// [`Session::set_playlist_art`] and [`Session::remove_playlist_art`].
+    pub playlist_art: bool,
 }
 
 impl Features {
@@ -63,6 +76,7 @@ impl Features {
             (self.last_viewed, LAST_VIEWED),
             (self.playlist_sharing, PLAYLIST_SHARING),
             (self.play_history, PLAY_HISTORY),
+            (self.playlist_art, PLAYLIST_ART),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -85,6 +99,7 @@ impl Features {
             last_viewed: self.last_viewed && other.last_viewed,
             playlist_sharing: self.playlist_sharing && other.playlist_sharing,
             play_history: self.play_history && other.play_history,
+            playlist_art: self.playlist_art && other.playlist_art,
         }
         .needing_playlists()
     }
@@ -99,6 +114,7 @@ impl Features {
             last_viewed: has(LAST_VIEWED),
             playlist_sharing: has(PLAYLIST_SHARING),
             play_history: has(PLAY_HISTORY),
+            playlist_art: has(PLAYLIST_ART),
         }
         .needing_playlists()
     }
@@ -108,6 +124,7 @@ impl Features {
         Self {
             liked: self.liked && self.playlists,
             playlist_sharing: self.playlist_sharing && self.playlists,
+            playlist_art: self.playlist_art && self.playlists,
             ..self
         }
     }
@@ -263,6 +280,64 @@ impl Session {
         };
         match self.playlist_call(request).await? {
             Reply::PlaylistEdited { revision } => Ok(revision),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Give playlist `id` the picture in `bytes` as its cover (PX-53): a
+    /// JPEG, PNG, WebP or HEIC of at most
+    /// [`spoolframe_protocol::playlists::MAX_ART_BYTES`] and
+    /// [`spoolframe_protocol::playlists::MAX_ART_PIXELS`]. Its new
+    /// `artwork`. Sent on a stream of its own after the request, not in a
+    /// frame. Whoever may edit its entries may; anyone else, and anyone
+    /// for Liked and All, gets [`SdkError::NotAllowed`]; a picture past
+    /// the limits [`SdkError::ImageTooLarge`], one the server cannot
+    /// decode [`SdkError::ImageUnreadable`]. Every user who sees the
+    /// playlist is told it changed.
+    pub async fn set_playlist_art(&self, id: &str, bytes: Vec<u8>) -> Result<ArtworkId, SdkError> {
+        if !self.features.playlist_art {
+            return Err(SdkError::Unsupported {
+                feature: PLAYLIST_ART.into(),
+            });
+        }
+        let request = ResourceRequest::SetPlaylistArt {
+            session: self.token.clone(),
+            id: id.into(),
+            length: bytes.len() as u64,
+        };
+        let (request, bytes) = (&request, &bytes);
+        // The picture's way there and its decode, a few seconds at most.
+        let limit = self.client.inner.timeouts.request + std::time::Duration::from_secs(60);
+        let uploaded = self
+            .client
+            .on_connection(self.server, Some(&self.token), false, |conn| async move {
+                conn.upload(request, bytes, limit).await
+            })
+            .await?;
+        match uploaded {
+            ResourceResponse::Ready {
+                metadata: ResourceMetadata::PlaylistArt { artwork },
+                ..
+            } => Ok(artwork),
+            ResourceResponse::Error { error } => Err(self.failed(error).await),
+            other => Err(SdkError::Protocol(format!(
+                "unexpected answer to an upload: {other:?}"
+            ))),
+        }
+    }
+
+    /// Take playlist `id`'s uploaded cover away (PX-53): the playlist
+    /// after, its `artwork` the mosaic again. Who may is as for
+    /// [`Session::set_playlist_art`].
+    pub async fn remove_playlist_art(&self, id: &str) -> Result<PlaylistSummary, SdkError> {
+        if !self.features.playlist_art {
+            return Err(SdkError::Unsupported {
+                feature: PLAYLIST_ART.into(),
+            });
+        }
+        let request = Request::RemovePlaylistArt { id: id.into() };
+        match self.playlist_call(request).await? {
+            Reply::PlaylistInfo(summary) => Ok(summary),
             other => Err(unexpected(other)),
         }
     }
@@ -478,5 +553,20 @@ mod tests {
         };
         assert_eq!(liked_only.both(&all), Features::default());
         assert!(!app.both(&[LIKED.to_owned()]).liked);
+        // Covers need playlists too.
+        let art_only = Features {
+            playlist_art: true,
+            ..Features::default()
+        };
+        assert_eq!(art_only.both(&all), Features::default());
+        assert!(
+            Features {
+                playlists: true,
+                playlist_art: true,
+                ..Features::default()
+            }
+            .both(&all)
+            .playlist_art
+        );
     }
 }

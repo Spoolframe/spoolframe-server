@@ -42,7 +42,8 @@ must be updated together. The changes per revision are in
 - [Home rows and "Remove"](#home-rows-and-remove)
 - [Leaving a server](#leaving-a-server)
 - [Features](#features), [playlists](#playlists),
-  [sharing by name](#sharing-by-name) and [Liked and All](#liked-and-all)
+  [sharing by name](#sharing-by-name), [Liked and All](#liked-and-all)
+  and [playlist covers](#playlist-covers)
 - [Portable identities](#portable-identities)
 
 ## Basics
@@ -1107,8 +1108,15 @@ stream.
 | `media { request, revision }` | a `MediaRead { session, handle, offset, length, epoch, segment, variant }` | `media { size, complete, epoch, revision }` |
 | `subtitle { session, handle, revision, offset, version }` | a chunk of a whole-file subtitle | `subtitle { format, total, version, revision }` |
 | `subtitle_segment { session, handle, revision, segment }` | an HLS subtitle segment | `subtitle { … }` |
+| `set_playlist_art { session, id, length }` | an upload: `length` bytes of a picture follow the request | `playlist_art { artwork }`, no body |
 
 `ResourceResponse` is `ready { length, metadata }` or `error { error }`.
+
+`set_playlist_art` (see "Playlist covers") is the one request whose
+stream goes on past its frame: the client writes exactly `length` raw
+bytes after it, then finishes its side. The server may answer, with an
+error, before it reads them; it then stops the stream, so the client's
+write can fail while the answer is already there to read.
 
 Media and subtitle requests carry the playback revision. The server
 checks it before serving and refuses reads that a change made during
@@ -1791,6 +1799,76 @@ Plex's import (`ImportPlexPlaylists`) likes the tracks the user rated in
 Plex, the last rated first, instead of making a playlist of them: in
 `PlexImport` they are a `PlexImported` named "Liked", `entries` the
 tracks newly liked.
+
+## Playlist covers
+
+Feature `spoolframe:playlist-art` (PX-53), on top of
+`spoolframe:playlists`. Every playlist has a picture, which
+`PlaylistSummary` carries as `artwork`, an `ArtworkId` fetched on a
+resource stream as any artwork is, at any `ArtworkSize`:
+
+- a cover an editor uploaded (`custom_art: true`), the same for every
+  user who sees the playlist;
+- else a 2×2 mosaic of the first four different album covers or posters
+  among its entries, in its order (a track brings its album's cover, an
+  episode its season's poster, a film its poster), made by the server
+  when asked and never stored as the cover: moving an entry into the
+  first four changes it, and removing the cover brings it back;
+- with one to three covers, the first alone; with none, a placeholder
+  tile;
+- Liked's and All's fixed tiles, a heart and "All", the same in every
+  app. They take no cover.
+
+`artwork` changes whenever the picture does, so a client may keep an
+image under it. An uploaded cover is fetched only by who sees a playlist
+that has it; `NotFound` for anyone else.
+
+| Request | Reply | Who |
+|---|---|---|
+| `set_playlist_art { session, id, length }` (a resource stream) | `ready { length: 0, playlist_art { artwork } }` | its editors |
+| `RemovePlaylistArt { id }` | `PlaylistInfo` | its editors |
+
+The upload is `length` bytes of a JPEG, PNG, WebP or HEIC picture after
+the request, on its own stream (see "Resource streams"), not in a frame.
+Its editors are who may `EditPlaylist`: its owner, users it is shared
+with to edit, admins for a server-wide one. In order, before a byte of
+the picture is read:
+
+- a session whose client did not list the feature: `Unsupported`;
+- a playlist the user does not see: `NotFound`;
+- one they see and may not edit, or Liked or All: `NotAllowed`;
+- `length` over 20 MiB (`MAX_ART_BYTES`): `ImageTooLarge { max_bytes,
+  max_pixels }`.
+
+Then the server reads the picture, with no pause longer than a read's
+stall limit, and its header: a picture of more than 40 megapixels
+(`MAX_ART_PIXELS`) is `ImageTooLarge` before it is decoded, and anything
+but the four formats `ImageUnreadable`. It is decoded by ffmpeg,
+confined, on one thread, under a memory, CPU and time limit; a picture
+that fails to decode, or hits a limit, is `ImageUnreadable`. What is
+kept is the picture's centre square, at most 2048 pixels a side,
+encoded again as JPEG by the server: no EXIF, GPS, colour profile or
+other block of the file survives. The same picture uploaded twice is one
+file. Every user who sees the playlist is sent `PlaylistChanged`.
+
+`RemovePlaylistArt` takes the cover away (`NotAllowed` as above); one
+without a cover is no change, and it is sent again on a new connection.
+A cover's file goes when no playlist has it, also when its playlist is
+deleted.
+
+A session whose client did not list the feature is sent neither
+`artwork` nor `custom_art`, and both requests are `Unsupported`.
+
+Plex's import brings a Plex playlist's own picture (its `thumb`), fetched
+through the PMS's photo transcoder and taken as an upload; Plex's
+composite of what a playlist holds is left, and the playlist gets the
+mosaic.
+
+The SDK: `Features::playlist_art`; `Session::set_playlist_art(id,
+bytes)` uploads (`SdkError::NotAllowed`, `ImageTooLarge { max_bytes,
+max_pixels }`, `ImageUnreadable`) and answers the new `ArtworkId`;
+`Session::remove_playlist_art(id)` answers the `PlaylistSummary`. Both
+are `SdkError::Unsupported`, unsent, without the feature.
 
 ## Portable identities
 

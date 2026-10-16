@@ -46,6 +46,7 @@ mod pin;
 mod playback;
 mod playback_authz;
 mod playback_debug;
+mod playlist_art;
 mod playlist_sharing;
 mod playlists;
 mod plays;

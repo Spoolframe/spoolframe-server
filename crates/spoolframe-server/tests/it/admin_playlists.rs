@@ -675,3 +675,213 @@ async fn a_plex_import_likes_the_rated_tracks() {
     let track = root.catalog_item("plex:track:41".into()).await.unwrap();
     assert_eq!(track.reply["liked"], "all");
 }
+
+fn picture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../spoolframe-media/tests/fixtures/pictures/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+/// A cover `POST`ed as the web UI sends it: the picture as the body, the
+/// session cookie, and `origin`.
+async fn post_cover(
+    addr: SocketAddr,
+    cookie: &str,
+    origin: &str,
+    id: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/playlists/art?id={id}"))
+        .header("cookie", cookie)
+        .header("origin", origin)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// PX-53 in the web UI: an editor uploads over HTTP, refused from another
+/// origin, past the size limit and to who may not; the picture is served
+/// to who sees the playlist, kept by the browser while it names it; and
+/// `me.playlistRemoveArt` brings back the placeholder.
+#[tokio::test]
+async fn the_web_ui_uploads_shows_and_removes_a_cover() {
+    use crate::mcp::signed_in;
+    use crate::passkeys::ORIGIN;
+    use reqwest::StatusCode;
+    let f = four("web-playlists-art").await;
+    let made = f
+        .alice
+        .playlist_create(new("Road trip", EPISODES, shared_with(&f.bob_id, false)))
+        .await
+        .unwrap();
+    assert!(!made.custom_art);
+    let placeholder = made.artwork.clone().expect("a picture");
+    let alice = signed_in(f.addr, "alice").await;
+    let bob = signed_in(f.addr, "bob").await;
+    let carol = signed_in(f.addr, "carol").await;
+
+    let foreign = post_cover(
+        f.addr,
+        &alice,
+        "https://evil.example",
+        &made.id,
+        picture("tall.png"),
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    let viewer = post_cover(f.addr, &bob, ORIGIN, &made.id, picture("tall.png")).await;
+    assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+    let stranger = post_cover(f.addr, &carol, ORIGIN, &made.id, picture("tall.png")).await;
+    assert_eq!(stranger.status(), StatusCode::NOT_FOUND);
+    let mut big = picture("tall.png");
+    big.resize(25 << 20, 0);
+    let too_large = post_cover(f.addr, &alice, ORIGIN, &made.id, big).await;
+    assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let not_a_picture = post_cover(f.addr, &alice, ORIGIN, &made.id, b"%PDF".to_vec()).await;
+    assert_eq!(not_a_picture.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let uploaded = post_cover(f.addr, &alice, ORIGIN, &made.id, picture("photo.heic")).await;
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    let info: PlaylistInfo = uploaded.json().await.unwrap();
+    assert!(info.custom_art);
+    let cover = info.artwork.clone().unwrap();
+    assert_ne!(cover, placeholder);
+    // Bob, who views it, sees it in his list and is served it.
+    let bobs = f.bob.playlists().await.unwrap();
+    assert_eq!(
+        named(&bobs, "Road trip").unwrap().artwork.as_ref(),
+        Some(&cover)
+    );
+    let served = reqwest::Client::new()
+        .get(format!(
+            "http://{}/playlists/art?id={}&size=small&art={cover}",
+            f.addr, made.id
+        ))
+        .header("cookie", &bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(served.headers()["content-type"], "image/jpeg");
+    assert!(
+        served.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+    let bytes = served.bytes().await.unwrap();
+    assert!(image::load_from_memory(&bytes).is_ok());
+    let hidden = reqwest::Client::new()
+        .get(format!("http://{}/playlists/art?id={}", f.addr, made.id))
+        .header("cookie", &carol)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let refused = f
+        .bob
+        .playlist_remove_art(made.id.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(code(refused), error_code::NOT_ALLOWED);
+    let removed = f.alice.playlist_remove_art(made.id.clone()).await.unwrap();
+    assert!(!removed.custom_art);
+    assert_eq!(removed.artwork, Some(placeholder));
+    drop(f.server);
+}
+
+/// PX-53's Plex import: a playlist given a picture of its own in Plex
+/// brings it, fetched through the PMS's photo transcoder; one with only
+/// Plex's composite gets the mosaic here.
+#[tokio::test]
+async fn a_plex_import_brings_a_playlist_s_own_picture_and_not_plex_s_composite() {
+    use crate::plex_link::{link, mount_pin, reaching, root_and_alice};
+    use crate::plex_sync::{library, mount_resources, tower};
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let pms = tower(&[(Some("alice-on-tower"), &[])]).await;
+    let film = |key: &str| {
+        json!({ "ratingKey": key, "type": "movie", "title": format!("Film {key}"),
+                "librarySectionID": 1, "duration": 3_600_000,
+                "Media": [{ "Part": [{ "file": format!("/data/movies/{key}.mkv"), "size": 1 }] }] })
+    };
+    Mock::given(method("GET"))
+        .and(path("/library/metadata/11"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "MediaContainer": { "Metadata": [film("11")] } })),
+        )
+        .with_priority(1)
+        .mount(&pms)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/playlists"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "MediaContainer": {
+            "Metadata": [
+                { "ratingKey": "601", "type": "playlist", "title": "With a photo",
+                  "playlistType": "video", "smart": false,
+                  "thumb": "/library/metadata/601/thumb/1700000000",
+                  "composite": "/playlists/601/composite/1700000000" },
+                { "ratingKey": "602", "type": "playlist", "title": "Composite only",
+                  "playlistType": "video", "smart": false,
+                  "composite": "/playlists/602/composite/1700000000" },
+            ],
+        } })),
+        )
+        .mount(&pms)
+        .await;
+    for key in ["601", "602"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/playlists/{key}/items")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "MediaContainer": { "Metadata": [film("11")] } })),
+            )
+            .mount(&pms)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/photo/:/transcode"))
+        .and(query_param("url", "/library/metadata/601/thumb/1700000000"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(picture("tall.png"), "image/png"))
+        .expect(1)
+        .mount(&pms)
+        .await;
+    let tv = wiremock::MockServer::start().await;
+    mount_pin(&tv, 77, "tok-alice", "alice").await;
+    mount_resources(&tv, &pms, &[("tok-alice", "alice-on-tower")]).await;
+    let file = format!(
+        "plex {{ url = \"{}\"; }} libraries [ {} ]",
+        pms.uri(),
+        library("Movies", "1", "both")
+    );
+    let dir = crate::admin::state_dir("web-playlists-plex-art").await;
+    let (addr, _store) =
+        crate::settings::serve_syncing_with(dir.as_ref(), &file, reaching(&tv), false, true).await;
+    let (_root, alice) = root_and_alice(addr).await;
+    link(&alice).await;
+    let done = alice.playlist_plex_import(false).await.unwrap();
+    assert_eq!(done.made.len(), 2, "{done:?}");
+    assert!(done.notes.is_empty(), "{:?}", done.notes);
+    let made = alice.playlists().await.unwrap();
+    let own = named(&made, "With a photo").unwrap();
+    assert!(own.custom_art, "{own:?}");
+    let composite = named(&made, "Composite only").unwrap();
+    assert!(!composite.custom_art, "{composite:?}");
+    assert!(
+        !composite
+            .artwork
+            .as_deref()
+            .unwrap_or_default()
+            .contains("composite"),
+        "{composite:?}"
+    );
+}

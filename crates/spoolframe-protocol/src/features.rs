@@ -58,6 +58,15 @@ pub const PLAYLIST_SHARING: &str = "spoolframe:playlist-sharing";
 /// sent neither field, and its `RecentlyPlayed` is `Unsupported`.
 pub const PLAY_HISTORY: &str = "spoolframe:play-history";
 
+/// Playlist covers (PX-53), on top of [`PLAYLISTS`]: a summary's
+/// `artwork` (its uploaded cover, else a mosaic of its first four
+/// covers, else a placeholder; Liked's and All's fixed tiles) and
+/// `custom_art`; the `SetPlaylistArt` resource request, which uploads a
+/// cover, and the `RemovePlaylistArt` request. A session whose client did
+/// not list it is sent neither field, and both requests are
+/// `Unsupported`.
+pub const PLAYLIST_ART: &str = "spoolframe:playlist-art";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,
@@ -65,6 +74,7 @@ pub const ALL: &[&str] = &[
     LAST_VIEWED,
     PLAYLIST_SHARING,
     PLAY_HISTORY,
+    PLAYLIST_ART,
 ];
 
 /// The ones that change what a client can do before it has a session:
@@ -119,6 +129,12 @@ mod tests {
     fn play_history_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&PLAY_HISTORY));
         assert!(!PRE_AUTH.contains(&PLAY_HISTORY));
+    }
+
+    #[test]
+    fn playlist_art_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&PLAYLIST_ART));
+        assert!(!PRE_AUTH.contains(&PLAYLIST_ART));
     }
 
     #[test]

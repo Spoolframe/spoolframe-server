@@ -58,6 +58,8 @@ pub struct FakeCatalog {
     /// Whether its music is a library of its own (PX-43): the artist,
     /// albums and tracks are items either way.
     music: Mutex<bool>,
+    /// Whether its films, episodes and tracks have posters (PX-53).
+    posters: Mutex<bool>,
 }
 
 /// What a key holds after the catalog gave its item a new one. A key the
@@ -87,7 +89,16 @@ impl FakeCatalog {
             rekeyed: Mutex::default(),
             unreadable: Mutex::default(),
             music: Mutex::default(),
+            posters: Mutex::default(),
         }
+    }
+
+    /// Give each film, episode and track a poster, as a PMS does: a
+    /// film's own, an episode's season's, a track's album's, each at
+    /// [`poster_of`] and served as a picture of its own colour
+    /// ([`poster_color`]). Without, items have none (PX-53).
+    pub fn show_posters(&self) {
+        *self.posters.lock() = true;
     }
 
     /// Serve its music as a second library, `plex:library:2`, holding
@@ -476,8 +487,12 @@ impl Catalog for FakeCatalog {
             Some(OldKey::Unreachable) => return Err(Self::unreachable()),
             None => {}
         }
+        let posters = *self.posters.lock();
         self.current(id)
-            .map(|(item, children)| {
+            .map(|(mut item, children)| {
+                if posters {
+                    with_poster(&mut item);
+                }
                 let markers = if id.key() == "15" {
                     markers()
                 } else {
@@ -618,10 +633,12 @@ impl Catalog for FakeCatalog {
     }
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
-        if id.key() != POSTER {
-            return Err(CatalogError::NotFound(id.to_string()));
-        }
-        let img = image::RgbImage::from_pixel(400, 200, image::Rgb([10, 120, 200]));
+        let color = match (*self.posters.lock(), poster_color(id)) {
+            (true, Some(color)) => color,
+            _ if id.key() == POSTER => [10, 120, 200],
+            _ => return Err(CatalogError::NotFound(id.to_string())),
+        };
+        let img = image::RgbImage::from_pixel(400, 200, image::Rgb(color));
         let mut out = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut out, image::ImageFormat::Png)
@@ -631,6 +648,38 @@ impl Catalog for FakeCatalog {
             content_type: "image/png".into(),
         })
     }
+}
+
+/// The poster of the item keyed `key`, with [`FakeCatalog::show_posters`].
+pub fn poster_of(key: &str) -> ArtworkId {
+    ArtworkId::new(Namespace::Plex, format!("/library/metadata/{key}/thumb/9")).unwrap()
+}
+
+/// The colour of a poster [`poster_of`] names: one of its own per key.
+pub fn poster_color(id: &ArtworkId) -> Option<[u8; 3]> {
+    let key: u32 = id
+        .key()
+        .strip_prefix("/library/metadata/")?
+        .strip_suffix("/thumb/9")?
+        .parse()
+        .ok()?;
+    let k = (key % 251) as u8;
+    Some([k.wrapping_mul(37), k.wrapping_mul(91), k.wrapping_mul(53)])
+}
+
+/// `item` with its poster, as [`FakeCatalog::show_posters`] gives one.
+fn with_poster(item: &mut Item) {
+    let (artwork, key) = match item {
+        Item::Movie(m) => (&mut m.artwork, m.id.key().to_owned()),
+        Item::Episode(e) => (&mut e.artwork, e.season_id.key().to_owned()),
+        Item::Track(t) => (&mut t.artwork, t.album_id.key().to_owned()),
+        Item::Album(a) => (&mut a.artwork, a.id.key().to_owned()),
+        _ => return,
+    };
+    artwork.push(spoolframe_types::Artwork {
+        id: poster_of(&key),
+        kind: spoolframe_types::ArtworkKind::Poster,
+    });
 }
 
 /// Where an episode's file goes, next to the movie's. The stand-in ffprobe

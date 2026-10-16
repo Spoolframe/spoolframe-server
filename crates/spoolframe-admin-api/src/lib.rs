@@ -213,6 +213,16 @@ pub mod error_code {
     /// Someone changed the playlist in a way the edit cannot be redone
     /// over; `data` is `{"revision": n}`, the playlist's now.
     pub const PLAYLIST_CONFLICT: i32 = -32032;
+    /// Not the caller's to do to what they see (PX-53): a playlist's
+    /// cover set or taken away by someone who may not edit it, or on
+    /// Liked or All.
+    pub const NOT_ALLOWED: i32 = -32033;
+    /// A picture over 20 MB, or over 40 megapixels by its header (PX-53):
+    /// not decoded.
+    pub const IMAGE_TOO_LARGE: i32 = -32034;
+    /// Not a JPEG, PNG, WebP or HEIC picture the server can decode
+    /// (PX-53).
+    pub const IMAGE_UNREADABLE: i32 = -32035;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -3139,6 +3149,16 @@ pub struct PlaylistInfo {
     /// Which built-in playlist it is (PX-43); `None` for one a user made.
     #[serde(default)]
     pub builtin: Option<PlaylistBuiltin>,
+    /// Its picture's artwork id (PX-53): the uploaded cover, else the
+    /// mosaic of its first four covers, a placeholder, or Liked's or
+    /// All's tile. Fetched from `GET /playlists/art?id=<playlist>&size=…`;
+    /// it changes when the picture does.
+    #[serde(default)]
+    pub artwork: Option<String>,
+    /// The picture is an uploaded cover, which `me.playlistRemoveArt`
+    /// takes away.
+    #[serde(default)]
+    pub custom_art: bool,
 }
 
 /// One entry of a playlist: its item as the catalog has it now, with the
@@ -3590,6 +3610,15 @@ pub trait MeApi {
     /// one.
     #[method(name = "playlistDelete", with_extensions)]
     async fn playlist_delete(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Take a playlist's uploaded cover away (PX-53): its mosaic again.
+    /// Whoever may edit its entries; anyone else who sees it, and anyone
+    /// for Liked and All, `NOT_ALLOWED`. A cover is uploaded with
+    /// `POST /playlists/art?id=<playlist>`, the picture as the body (a
+    /// JSON-RPC message is no place for 20 MB), answered with the
+    /// `PlaylistInfo` after, or this API's error as JSON.
+    #[method(name = "playlistRemoveArt", with_extensions)]
+    async fn playlist_remove_art(&self, id: String) -> jsonrpsee::core::RpcResult<PlaylistInfo>;
 
     /// Who the caller can share a playlist with: every other enabled local
     /// user and every portable user granted access, by name.

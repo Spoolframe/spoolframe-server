@@ -2,7 +2,7 @@
 //! binary resource. Playback revisions are independent of encoder epochs.
 use crate::{ArtworkRequest, Error, MediaRead, PlaybackHandle, SessionId};
 use serde::{Deserialize, Serialize};
-use spoolframe_types::SubtitleFormat;
+use spoolframe_types::{ArtworkId, SubtitleFormat};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -28,6 +28,18 @@ pub enum ResourceRequest {
         revision: u64,
         segment: u32,
     },
+    /// Upload a cover for playlist `id` (PX-53, `spoolframe:playlist-art`):
+    /// the only request whose stream goes on past it, with exactly
+    /// `length` bytes of a JPEG, PNG, WebP or HEIC picture. Answered
+    /// `ready { length: 0, playlist_art { artwork } }`, with no body.
+    /// Refused before the picture is read when the user may not edit the
+    /// playlist (`NotAllowed`) or `length` is past
+    /// [`crate::playlists::MAX_ART_BYTES`] (`ImageTooLarge`).
+    SetPlaylistArt {
+        session: SessionId,
+        id: String,
+        length: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +60,10 @@ pub enum ResourceMetadata {
         total: u64,
         version: u64,
         revision: u64,
+    },
+    /// The cover `SetPlaylistArt` stored: the playlist's `artwork` now.
+    PlaylistArt {
+        artwork: ArtworkId,
     },
 }
 

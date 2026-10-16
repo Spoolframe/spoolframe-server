@@ -23,7 +23,7 @@ cd "$(dirname "$0")/.."
 
 seconds=${1:-60}
 shift || true
-all=(protocol_frame protocol_cbor invite_link webauthn pgs dvb vobsub bif plex_json ffprobe_json keyframe_index)
+all=(protocol_frame protocol_cbor invite_link webauthn pgs dvb vobsub bif plex_json ffprobe_json keyframe_index picture_header)
 targets=("${@:-${all[@]}}")
 
 # Read-only seed directories for a target, beyond fuzz/seeds/TARGET.
@@ -31,6 +31,7 @@ fixtures() {
   case "$1" in
   bif | plex_json) echo crates/spoolframe-plex/tests/fixtures ;;
   ffprobe_json) echo crates/spoolframe-media/tests/fixtures ;;
+  picture_header) echo crates/spoolframe-media/tests/fixtures/pictures ;;
   esac
 }
 

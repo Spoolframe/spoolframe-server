@@ -460,6 +460,13 @@ fn router(
         .route("/auth/oidc/begin", post(sso_begin))
         .route("/auth/oidc/callback", get(sso_callback))
         .route("/catalog/artwork", get(catalog_artwork))
+        // A cover's body is read by its handler, held to the picture limit.
+        .route(
+            "/playlists/art",
+            get(playlist_art)
+                .post(set_playlist_art)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .route("/metrics", get(metrics_page))
         .with_state(api)
         // The socket: `/jsonrpc` for the web UI, and any other path's
@@ -798,7 +805,11 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
         | error_code::NO_SUCH_PLAYBACK
         | error_code::NO_SUCH_INVITE
         | error_code::NO_SUCH_GRANT
-        | error_code::NO_SUCH_APP => StatusCode::NOT_FOUND,
+        | error_code::NO_SUCH_APP
+        | error_code::NO_SUCH_PLAYLIST => StatusCode::NOT_FOUND,
+        error_code::NOT_ALLOWED | error_code::PLAYLIST_READ_ONLY => StatusCode::FORBIDDEN,
+        error_code::IMAGE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+        error_code::IMAGE_UNREADABLE => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         error_code::INVALID_INPUT => StatusCode::BAD_REQUEST,
         error_code::NOT_CONFIGURED => StatusCode::NOT_IMPLEMENTED,
         // Plex, or a sign-in provider, did not answer: the server is
@@ -1286,6 +1297,103 @@ async fn catalog_artwork(State(api): State<AdminApi>, req: Request) -> Response<
             response
         }
         Err(e) => refused(&api, "/catalog/artwork", &ext, e).await,
+    }
+}
+
+/// The playlist a `/playlists/art` request is about (`id`), the size
+/// asked for (`size`, a thumb if left out), and the picture's artwork id
+/// the page has (`art`), if it said.
+fn playlist_art_query(
+    query: Option<&str>,
+) -> Option<(String, spoolframe_protocol::ArtworkSize, Option<String>)> {
+    let mut id = None;
+    let mut art = None;
+    let mut size = spoolframe_protocol::ArtworkSize::Thumb;
+    for (key, value) in url::form_urlencoded::parse(query?.as_bytes()) {
+        match &*key {
+            "id" => id = Some(value.into_owned()),
+            "art" => art = Some(value.into_owned()),
+            "size" => {
+                size = serde_json::from_value(serde_json::Value::String(value.into_owned()))
+                    .ok()
+                    .filter(|s| *s != spoolframe_protocol::ArtworkSize::Unknown)?;
+            }
+            _ => {}
+        }
+    }
+    Some((id?, size, art))
+}
+
+/// A playlist's picture (PX-53), for whoever sees the playlist: its
+/// uploaded cover, mosaic or tile, as the apps fetch it by its artwork
+/// id. Kept by the browser when the page named the picture it shows
+/// (`art`), which changes with it.
+async fn playlist_art(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let Some((id, size, art)) = playlist_art_query(req.uri().query()) else {
+        return (StatusCode::BAD_REQUEST, "id, and a size clients use").into_response();
+    };
+    let ext = as_caller(&req);
+    match api.playlist_art_image(&ext, &id, size).await {
+        Ok((now, image)) if is_raster(&image.content_type) => {
+            let keep = if art.as_deref() == Some(now.as_str()) {
+                "private, max-age=86400, immutable"
+            } else {
+                "private, no-cache"
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, image.content_type),
+                    (header::CACHE_CONTROL, keep.to_owned()),
+                ],
+                image.bytes,
+            )
+                .into_response()
+        }
+        Ok(_) => (
+            StatusCode::BAD_GATEWAY,
+            "the picture is not a JPEG, PNG or WebP image",
+        )
+            .into_response(),
+        Err(e) => refused(&api, "/playlists/art", &ext, e).await,
+    }
+}
+
+/// Upload a playlist's cover (PX-53): the picture is the body, at most
+/// [`spoolframe_protocol::playlists::MAX_ART_BYTES`]. Who may is checked
+/// before the body is read, and a body past the limit is not read on. As
+/// any POST here, refused from another origin; the session is the cookie
+/// (the web UI) or the Bearer token (the CLI). Answered with the
+/// playlist after, as `me.playlist*` answer.
+async fn set_playlist_art(State(api): State<AdminApi>, req: Request) -> Response<Body> {
+    let Some((id, _, _)) = playlist_art_query(req.uri().query()) else {
+        return (StatusCode::BAD_REQUEST, "id").into_response();
+    };
+    let ext = as_caller(&req);
+    if let Err(e) = api.may_set_playlist_art(&ext, &id).await {
+        return refused(&api, "/playlists/art", &ext, e).await;
+    }
+    let most = spoolframe_protocol::playlists::MAX_ART_BYTES as usize;
+    let too_large = || {
+        failure(crate::admin::playlists_error(
+            crate::playlists::PlaylistsError::ImageTooLarge,
+        ))
+    };
+    let said = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if said.is_some_and(|length| length > most as u64) {
+        return too_large();
+    }
+    let bytes = match axum::body::to_bytes(req.into_body(), most).await {
+        Ok(bytes) => bytes,
+        // Past the limit, or the connection went: either way no picture.
+        Err(_) => return too_large(),
+    };
+    match api.set_playlist_art(&ext, &id, &bytes).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(e) => refused(&api, "/playlists/art", &ext, e).await,
     }
 }
 

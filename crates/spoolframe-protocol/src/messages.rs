@@ -827,6 +827,16 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
+    /// Take away a playlist's uploaded cover (PX-53): `PlaylistInfo`, its
+    /// `artwork` the mosaic again. Whoever may edit its entries may, as
+    /// they may upload one (`SetPlaylistArt`, a resource request); anyone
+    /// else who sees it, and anyone at all for Liked and All, gets
+    /// `NotAllowed`. One without a cover is no change. Only from a client
+    /// that listed `spoolframe:playlist-art`; from any other,
+    /// `Unsupported`.
+    RemovePlaylistArt {
+        id: String,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -1826,6 +1836,20 @@ pub enum Error {
     /// changed.
     #[error("someone changed this playlist; reload (revision {revision})")]
     PlaylistConflict { revision: u64 },
+    /// The user may not do this to what they see (PX-53): a cover set or
+    /// taken away by someone who may not edit the playlist, or on Liked
+    /// or All, whose tiles are fixed. Nothing was changed.
+    #[error("you are not allowed to do that")]
+    NotAllowed,
+    /// The picture is over `max_bytes` long, or over `max_pixels` by its
+    /// header (PX-53). Refused before it was decoded; nothing was
+    /// changed.
+    #[error("the picture is too large: at most {max_bytes} bytes and {max_pixels} pixels")]
+    ImageTooLarge { max_bytes: u64, max_pixels: u64 },
+    /// Not a JPEG, PNG, WebP or HEIC picture the server can decode, or
+    /// one that hit the decoder's limits (PX-53). Nothing was changed.
+    #[error("the picture cannot be read: a JPEG, PNG, WebP or HEIC is taken")]
+    ImageUnreadable,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

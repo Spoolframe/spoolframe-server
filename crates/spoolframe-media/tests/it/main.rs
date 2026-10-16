@@ -6,6 +6,7 @@
 mod dvb;
 mod keyframes;
 mod ocr;
+mod picture;
 mod prober;
 mod records;
 mod samples;

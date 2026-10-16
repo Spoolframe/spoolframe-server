@@ -8,6 +8,12 @@
 //! Edit, Share or Delete; All, which nobody edits, no move or remove
 //! either. A heart likes a track or an album (`me.like`, `me.unlike`).
 //!
+//! Each playlist shows its picture (PX-53): its uploaded cover, else the
+//! server's mosaic of its first four covers, or Liked's and All's tiles.
+//! Whoever may edit one changes or removes its cover on its page: a file
+//! picked, shown square as the server will keep it, then sent over HTTP
+//! (`POST /playlists/art`), the one call here that is not JSON-RPC.
+//!
 //! Every call is a `me.playlist*` one: the server decides who may do
 //! what, and the pages only leave out what the answer says the user
 //! cannot do. The web UI plays nothing: playing a playlist is the apps'.
@@ -24,8 +30,9 @@ use super::{Alert, Field, Route, icons, rpc};
 use crate::catalog::{item_context, item_kind, row_title};
 use crate::logic::ApiError;
 use crate::playlists::{
-    Access, Heart, HeldIn, add_targets, builtin_line, count_line, empty_text, kinds_line,
-    move_target, no_target_text, sections, share_rows, sharing_line, sharing_of, widened,
+    Access, COVER_ACCEPT, Heart, HeldIn, add_targets, builtin_line, count_line, cover_refused,
+    cover_src, cover_upload, empty_text, kinds_line, may_change_cover, move_target, no_target_text,
+    sections, share_rows, sharing_line, sharing_of, widened,
 };
 
 /// How many entries one page of a playlist shows.
@@ -122,6 +129,27 @@ pub fn HeartButton(
             }
         }
         Toast { said: toast }
+    }
+}
+
+/// A playlist's picture, square, `class` its size; its icon while the
+/// server has given none.
+#[component]
+fn PlaylistCover(playlist: PlaylistInfo, size: String, class: String) -> Element {
+    match &playlist.artwork {
+        Some(art) => rsx! {
+            img {
+                class: "{class} shrink-0 rounded-lg bg-ctp-surface0 object-cover",
+                src: cover_src(&playlist.id, Some(art), &size),
+                alt: "",
+                loading: "lazy",
+            }
+        },
+        None => rsx! {
+            span { class: "{class} flex shrink-0 items-center justify-center rounded-lg bg-ctp-surface0 text-ctp-teal",
+                PlaylistIcon { kinds: playlist.kinds, builtin: playlist.builtin }
+            }
+        },
     }
 }
 
@@ -269,7 +297,7 @@ fn PlaylistRow(playlist: PlaylistInfo, people: Vec<ShareableUser>) -> Element {
     };
     rsx! {
         Link { class: "cat-child", to: Route::PlaylistView { id: p.id.clone() },
-            span { class: "text-ctp-teal", PlaylistIcon { kinds: p.kinds, builtin: p.builtin } }
+            PlaylistCover { playlist: p.clone(), size: "thumb", class: "h-10 w-10" }
             span { class: "flex min-w-0 flex-grow flex-col",
                 b { class: "truncate text-sm", "{p.name}" }
                 span { class: "text-xs text-ctp-subtext0", "{line}" }
@@ -432,6 +460,8 @@ pub fn PlaylistView(id: String) -> Element {
     let mut editing = use_signal(|| false);
     let mut sharing = use_signal(|| false);
     let mut deleting = use_signal(|| false);
+    let mut covering = use_signal(|| false);
+    let mut uncovering = use_signal(|| false);
     let admin = is_admin();
     let current = page.read().clone();
     let names = people
@@ -474,14 +504,48 @@ pub fn PlaylistView(id: String) -> Element {
         div { class: "flex flex-col gap-5",
             Link { class: "text-sm", to: back_to.clone(), "‹ {back_label}" }
             div { class: "page-head",
-                span { class: "flex min-w-0 items-center gap-3",
-                    span { class: "text-ctp-teal", PlaylistIcon { kinds: p.kinds, builtin: p.builtin } }
+                span { class: "flex min-w-0 items-center gap-4",
+                    PlaylistCover { playlist: p.clone(), size: "small", class: "h-24 w-24" }
                     span { class: "flex min-w-0 flex-col gap-1",
                         h1 { class: "page-title m-0", "{p.name}" }
                         span { class: "text-sm text-ctp-subtext0",
                             match p.builtin {
                                 Some(builtin) => format!("{} · {}", count_line(p.kinds, detail.total, detail.playable), builtin_line(builtin)),
                                 None => format!("{} · {} · {}", count_line(p.kinds, detail.total, detail.playable), kinds_line(p.kinds), sharing_line(&p.sharing, &names)),
+                            }
+                        }
+                    }
+                }
+                if may_change_cover(&p) || p.can_manage {
+                    span { class: "flex flex-wrap gap-2",
+                        if may_change_cover(&p) {
+                            button { class: "btn", onclick: move |_| covering.set(true), icons::Pencil {} "Change cover" }
+                            if p.custom_art {
+                                button {
+                                    class: "btn",
+                                    disabled: uncovering(),
+                                    onclick: {
+                                        let id = p.id.clone();
+                                        move |_| {
+                                            uncovering.set(true);
+                                            let id = id.clone();
+                                            spawn(async move {
+                                                let removed = async {
+                                                    let client = rpc::client().await?;
+                                                    client.playlist_remove_art(id).await.map_err(rpc::error)
+                                                };
+                                                match removed.await {
+                                                    Ok(_) => say(toast, true, "Cover removed".into()),
+                                                    Err(e) => say(toast, false, e.explain()),
+                                                }
+                                                uncovering.set(false);
+                                                page.restart();
+                                            });
+                                        }
+                                    },
+                                    icons::X {}
+                                    "Remove cover"
+                                }
                             }
                         }
                     }
@@ -640,6 +704,18 @@ pub fn PlaylistView(id: String) -> Element {
         }
         if deleting() {
             DeleteDialog { playlist: p.clone(), back: back_to, on_cancel: move |_| deleting.set(false) }
+        }
+        if covering() {
+            CoverDialog {
+                playlist: p.clone(),
+                on_done: move |said: Option<String>| {
+                    covering.set(false);
+                    if let Some(text) = said {
+                        say(toast, true, text);
+                        page.restart();
+                    }
+                },
+            }
         }
         Toast { said: toast }
     }
@@ -800,6 +876,160 @@ fn ShareDialog(playlist: PlaylistInfo, on_done: EventHandler<Option<String>>) ->
                 div { class: "dialog-actions",
                     button { class: "btn-dialog btn-dialog-grey", onclick: move |_| on_done.call(None), "Cancel" }
                     button { class: "btn-dialog btn-dialog-primary", disabled: busy() || !matches!(*people.read(), Some(Ok(_))), onclick: save, "Save" }
+                }
+            }
+        }
+    }
+}
+
+/// A picked file, read: its bytes, its type, and a `blob:` address for
+/// its preview.
+#[derive(Clone, PartialEq)]
+struct Picked {
+    name: String,
+    bytes: Vec<u8>,
+    content_type: String,
+    preview: Option<String>,
+}
+
+/// A `blob:` address showing `bytes` of `content_type`, for the preview.
+fn blob_url(bytes: &[u8], content_type: &str) -> Option<String> {
+    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(content_type);
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options).ok()?;
+    web_sys::Url::create_object_url_with_blob(&blob).ok()
+}
+
+/// Send `bytes` as playlist `id`'s cover: the playlist after.
+async fn upload_cover(
+    id: &str,
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<PlaylistInfo, ApiError> {
+    let unreachable = |e: gloo_net::Error| ApiError::transport(e.to_string());
+    let response = gloo_net::http::Request::post(&cover_upload(id))
+        .header("content-type", content_type)
+        .body(js_sys::Uint8Array::from(bytes))
+        .map_err(unreachable)?
+        .send()
+        .await
+        .map_err(unreachable)?;
+    if !response.ok() {
+        return Err(response
+            .json::<ApiError>()
+            .await
+            .unwrap_or_else(|_| ApiError::transport(format!("HTTP {}", response.status()))));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| ApiError::transport(e.to_string()))
+}
+
+/// Change a playlist's cover: a picture picked, shown as the server keeps
+/// it (its centre square), then sent.
+#[component]
+fn CoverDialog(playlist: PlaylistInfo, on_done: EventHandler<Option<String>>) -> Element {
+    let mut picked = use_signal(|| None::<Picked>);
+    let mut no_preview = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    // The preview's address goes with the dialog.
+    use_drop(move || {
+        if let Some(url) = picked.peek().as_ref().and_then(|p| p.preview.clone()) {
+            let _ = web_sys::Url::revoke_object_url(&url);
+        }
+    });
+    let choose = move |e: FormEvent| {
+        let Some(file) = e.files().into_iter().next() else {
+            return;
+        };
+        error.set(None);
+        no_preview.set(false);
+        if let Some(why) = cover_refused(file.size()) {
+            error.set(Some(why));
+            return;
+        }
+        spawn(async move {
+            match file.read_bytes().await {
+                Ok(bytes) => {
+                    let content_type = file
+                        .content_type()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| "application/octet-stream".into());
+                    let preview = blob_url(&bytes, &content_type);
+                    if let Some(old) = picked.peek().as_ref().and_then(|p| p.preview.clone()) {
+                        let _ = web_sys::Url::revoke_object_url(&old);
+                    }
+                    picked.set(Some(Picked {
+                        name: file.name(),
+                        bytes: bytes.to_vec(),
+                        content_type,
+                        preview,
+                    }));
+                }
+                Err(e) => error.set(Some(format!("Cannot read the file: {e}"))),
+            }
+        });
+    };
+    let id = playlist.id.clone();
+    let save = move |_| {
+        let Some(chosen) = picked() else {
+            return;
+        };
+        busy.set(true);
+        let id = id.clone();
+        spawn(async move {
+            match upload_cover(&id, &chosen.bytes, &chosen.content_type).await {
+                Ok(_) => on_done.call(Some("Cover saved".into())),
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    };
+    let shown = picked();
+    rsx! {
+        div { class: "scrim",
+            section { class: "dialog w-[440px]", role: "dialog",
+                div { class: "dialog-head",
+                    icons::Pencil { size: 22 }
+                    h1 { "Cover for “{playlist.name}”" }
+                }
+                p { "Everyone who sees this playlist sees its cover. It's kept as the square in the middle of the picture, at most 2048 pixels, with nothing else of the file: no place or camera details." }
+                label { class: "btn self-start",
+                    "Choose a picture…"
+                    input { class: "sr-only", r#type: "file", accept: COVER_ACCEPT, onchange: choose }
+                }
+                span { class: "hint", "JPEG, PNG, WebP or HEIC, up to 20 MB." }
+                if let Some(chosen) = &shown {
+                    div { class: "flex flex-col items-center gap-2",
+                        match (&chosen.preview, no_preview()) {
+                            (Some(url), false) => rsx! {
+                                img {
+                                    class: "aspect-square w-60 rounded-xl bg-ctp-surface0 object-cover",
+                                    src: "{url}",
+                                    alt: "The cover as it will be kept",
+                                    onerror: move |_| no_preview.set(true),
+                                }
+                            },
+                            _ => rsx! {
+                                span { class: "flex aspect-square w-60 items-center justify-center rounded-xl bg-ctp-surface0 p-4 text-center text-sm text-ctp-subtext0",
+                                    "This browser can't show this picture; the server can still take it."
+                                }
+                            },
+                        }
+                        span { class: "truncate text-xs text-ctp-subtext0", "{chosen.name}" }
+                    }
+                }
+                if let Some(text) = error() {
+                    Alert { text }
+                }
+                div { class: "dialog-actions",
+                    button { class: "btn-dialog btn-dialog-grey", onclick: move |_| on_done.call(None), "Cancel" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || shown.is_none(), onclick: save,
+                        if busy() { "Saving…" } else { "Save cover" }
+                    }
                 }
             }
         }

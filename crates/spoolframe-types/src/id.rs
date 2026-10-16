@@ -31,6 +31,10 @@ pub enum Namespace {
     /// Something the server made itself rather than a catalog: a sheet of
     /// frame previews (P3-13), an [`ArtworkId`] like `preview:<set>/<n>`.
     Preview,
+    /// An image the server keeps or draws itself (PX-53): a playlist's
+    /// uploaded cover (`image:playlist/<hash>`), its mosaic, a built-in
+    /// playlist's tile. Only ever an [`ArtworkId`].
+    Image,
 }
 
 impl Namespace {
@@ -38,6 +42,7 @@ impl Namespace {
         match self {
             Namespace::Plex => "plex",
             Namespace::Preview => "preview",
+            Namespace::Image => "image",
         }
     }
 }
@@ -49,6 +54,7 @@ impl FromStr for Namespace {
         match s {
             "plex" => Ok(Namespace::Plex),
             "preview" => Ok(Namespace::Preview),
+            "image" => Ok(Namespace::Image),
             other => Err(IdError::UnknownNamespace(other.to_owned())),
         }
     }
@@ -360,6 +366,14 @@ mod tests {
         assert_eq!(id.namespace(), Namespace::Preview);
         assert_eq!(id.key(), "0f3a/2");
         assert_eq!(id.to_string(), "preview:0f3a/2");
+    }
+
+    #[test]
+    fn a_stored_image_s_id_is_in_a_namespace_of_its_own() {
+        let id: ArtworkId = "image:playlist/0f3a".parse().unwrap();
+        assert_eq!(id.namespace(), Namespace::Image);
+        assert_eq!(id.key(), "playlist/0f3a");
+        assert_eq!(id.to_string(), "image:playlist/0f3a");
     }
 
     #[test]

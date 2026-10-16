@@ -4,6 +4,11 @@
 //! does not map is reported. Nothing is synced afterwards: the playlist
 //! is ours only. A smart playlist is imported as what it holds now.
 //!
+//! A playlist given a picture of its own in Plex brings it as its cover
+//! (PX-53), fetched through the PMS's photo transcoder and taken as any
+//! upload is; one with only Plex's composite of what it holds gets this
+//! server's mosaic instead.
+//!
 //! The tracks the user rated in Plex, with any number of stars, are
 //! liked here (PX-43): Plex's rating is what its apps' heart sets, so
 //! they go into Liked, the last rated at the top, not into a playlist of
@@ -131,6 +136,22 @@ pub async fn import(
                     reason: "nothing in it is in this server's libraries".into(),
                 });
                 continue;
+            }
+            if let (Some(id), Some(art)) = (&playlist_id, &list.art) {
+                let cover = async {
+                    let image = plex.playlist_art(art).await.map_err(|e| e.to_string())?;
+                    playlists
+                        .import_art(actor, id, &image.bytes)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = cover.await {
+                    tracing::warn!(server, error = %e, "cannot import a Plex playlist's picture");
+                    notes.push(format!(
+                        "the picture of the Plex playlist {} could not be imported",
+                        list.title
+                    ));
+                }
             }
             made.push(PlexImported {
                 name: list.title.clone(),

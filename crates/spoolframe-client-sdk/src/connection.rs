@@ -431,6 +431,43 @@ impl ServerConnection {
         Ok((response, body))
     }
 
+    /// `request`, then `body` on the same stream (PX-53's cover upload):
+    /// the response, which has no body of its own. A refusal the server
+    /// sends before reading the body (it then stops the stream, so the
+    /// body's write fails) is the answer, not the failed write.
+    pub async fn upload(
+        &self,
+        request: &ResourceRequest,
+        body: &[u8],
+        limit: Duration,
+    ) -> Result<ResourceResponse, SdkError> {
+        let conn = &self.conn;
+        let codec = |e: CodecError| match e {
+            CodecError::Io(e) => lost(conn, e),
+            other => SdkError::Protocol(other.to_string()),
+        };
+        let exchange = async {
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| lost(conn, e))?;
+            send.write_u8(bi::RESOURCE)
+                .await
+                .map_err(|e| lost(conn, e))?;
+            write_frame(&mut send, request).await.map_err(codec)?;
+            let wrote = send.write_all(body).await;
+            let _ = send.finish();
+            match read_frame(&mut recv).await {
+                Ok(response) => Ok(response),
+                // Neither the body nor an answer got through.
+                Err(e) => match wrote {
+                    Err(written) => Err(lost(conn, written)),
+                    Ok(()) => Err(codec(e)),
+                },
+            }
+        };
+        tokio::time::timeout(limit, exchange)
+            .await
+            .map_err(|_| timed_out(conn, "an upload", limit))?
+    }
+
     pub async fn artwork(
         &self,
         request: &ArtworkRequest,

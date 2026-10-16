@@ -68,6 +68,7 @@ pub async fn sdk_client(
             last_viewed: true,
             playlist_sharing: true,
             play_history: true,
+            playlist_art: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };
@@ -427,6 +428,8 @@ pub struct ServerOptions {
     pub previews: PreviewSettings,
     /// The ffmpeg previews are made with: real, or a stand-in script.
     pub previews_ffmpeg: PathBuf,
+    /// What decoding an uploaded playlist cover may use (PX-53).
+    pub cover_limits: spoolframe_media::picture::DecodeLimits,
     /// How long an app passkey's challenge lives (P3-19).
     pub passkey_lifetime: Duration,
     /// What the stand-in ffprobe says the movie is: a file in
@@ -492,6 +495,7 @@ impl Default for ServerOptions {
                 workers: 1,
             },
             previews_ffmpeg: PathBuf::from("ffmpeg"),
+            cover_limits: spoolframe_media::picture::DecodeLimits::DEFAULT,
             passkey_lifetime: spoolframe_server::passkeys::CEREMONY_LIFETIME,
             ffprobe_fixture: "mkv-forced-subs.json",
             admission: spoolframe_server::admission::Admission::default(),
@@ -642,6 +646,9 @@ pub struct TestServer {
     /// read (PX-42).
     pub watch: Arc<Watch>,
     pub playlists: Arc<spoolframe_server::playlists::Playlists>,
+    /// Its artwork cache: what an admin API beside it serves pictures
+    /// from (PX-53).
+    pub artwork: Arc<ArtworkCache>,
 }
 
 impl TestServer {
@@ -674,12 +681,20 @@ impl TestServer {
             memory: 16 << 20,
             disk: 64 << 20,
         };
+        let sandbox = media_sandbox(&dir);
+        // Playlist covers (PX-53), decoded by real ffmpeg, confined.
+        let covers = Arc::new(
+            spoolframe_server::covers::Covers::new(&dir, tool(Path::new("ffmpeg"), &sandbox))
+                .with_limits(options.cover_limits),
+        );
         let mut artwork = ArtworkCache::open(&dir.join("cache/artwork"), tiers, catalog.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .with_covers(covers.clone());
         if let Some(live) = &options.catalog {
             artwork = artwork.with_changes(live.changes());
         }
+        let artwork = Arc::new(artwork);
         let ffprobe = if let Some(ffprobe) = &options.real_ffprobe {
             ffprobe.clone()
         } else if options.real_media {
@@ -687,7 +702,6 @@ impl TestServer {
         } else {
             fake_ffprobe(&dir, options.ffprobe_fixture)
         };
-        let sandbox = media_sandbox(&dir);
         let ffprobe = tool(&ffprobe, &sandbox);
         let keyframes =
             spoolframe_media::KeyframeStore::open(&dir.join("cache").join("keyframes")).unwrap();
@@ -776,11 +790,14 @@ impl TestServer {
         ));
         let metrics = Arc::new(spoolframe_server::metrics::Metrics::default());
         metrics.observe_store(store.clone());
-        let playlists = Arc::new(spoolframe_server::playlists::Playlists::new(
-            store.clone(),
-            catalog.clone(),
-            watch.clone(),
-        ));
+        let playlists = Arc::new(
+            spoolframe_server::playlists::Playlists::new(
+                store.clone(),
+                catalog.clone(),
+                watch.clone(),
+            )
+            .with_covers(covers),
+        );
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -791,7 +808,7 @@ impl TestServer {
             catalog,
             catalog_changes: options.catalog.as_ref().map(|live| live.changes()),
             prober,
-            artwork: Arc::new(artwork),
+            artwork: artwork.clone(),
             playbacks: Arc::new(
                 Playbacks::new(PLAYBACK_IDLE, PLAYBACK_RECHECK)
                     .with_disconnect_grace(options.disconnect_grace)
@@ -860,6 +877,7 @@ impl TestServer {
             jobs,
             watch,
             playlists,
+            artwork,
         }
     }
 

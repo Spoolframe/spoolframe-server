@@ -704,6 +704,10 @@ impl From<crate::playlists::PlaylistsError> for ToolError {
                 tracing::error!(error = %e, "an MCP tool");
                 ToolError("internal error".into())
             }
+            E::Io(e) => {
+                tracing::error!(error = %e, "an MCP tool");
+                ToolError("internal error".into())
+            }
             e => ToolError(e.to_string()),
         }
     }

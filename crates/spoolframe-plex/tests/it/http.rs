@@ -1314,6 +1314,54 @@ async fn an_account_s_playlists_and_their_items_are_read_with_what_does_not_map(
     ));
 }
 
+/// PX-53: a playlist's own picture is its `thumb`; Plex's composite of
+/// what it holds is not one, whether or not `thumb` names it too. The
+/// picture is fetched through the photo transcoder, at most 2048 a side.
+#[tokio::test]
+async fn a_playlist_s_own_picture_is_told_from_plex_s_composite() {
+    let server = MockServer::start().await;
+    let body = |value: serde_json::Value| {
+        ResponseTemplate::new(200).set_body_raw(value.to_string(), "application/json")
+    };
+    Mock::given(method("GET"))
+        .and(path("/playlists"))
+        .respond_with(body(serde_json::json!({ "MediaContainer": { "Metadata": [
+            { "ratingKey": "500", "type": "playlist", "title": "Own", "playlistType": "video",
+              "thumb": "/library/metadata/500/thumb/17", "composite": "/playlists/500/composite/17" },
+            { "ratingKey": "501", "type": "playlist", "title": "Composite", "playlistType": "audio",
+              "composite": "/playlists/501/composite/17" },
+            { "ratingKey": "502", "type": "playlist", "title": "Thumb is composite",
+              "playlistType": "audio", "thumb": "/playlists/502/composite/17",
+              "composite": "/playlists/502/composite/17" },
+            { "ratingKey": "503", "type": "playlist", "title": "Elsewhere", "playlistType": "audio",
+              "thumb": "https://example.com/x.jpg" },
+        ] } })))
+        .mount(&server)
+        .await;
+    Mock::given(path("/photo/:/transcode"))
+        .and(query_param("url", "/library/metadata/500/thumb/17"))
+        .and(query_param("width", "2048"))
+        .and(query_param("height", "2048"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"\xff\xd8 fake".to_vec(), "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plex = catalog(&server);
+    let lists = plex.playlists().await.unwrap();
+    let art: Vec<_> = lists.iter().map(|l| l.art.as_deref()).collect();
+    assert_eq!(
+        art,
+        [Some("/library/metadata/500/thumb/17"), None, None, None]
+    );
+    let image = plex
+        .playlist_art("/library/metadata/500/thumb/17")
+        .await
+        .unwrap();
+    assert_eq!(image.content_type, "image/jpeg");
+}
+
 /// PX-43's All: a music section's tracks are one listing of its leaves,
 /// page by page, not a request per album.
 #[tokio::test]

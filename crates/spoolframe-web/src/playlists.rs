@@ -31,6 +31,59 @@ pub fn add_targets(list: &[PlaylistInfo], kind: CatalogKind) -> Vec<PlaylistInfo
         .collect()
 }
 
+/// The largest cover the server takes (PX-53): a larger file is refused
+/// here, before it is sent.
+pub const MAX_COVER_BYTES: u64 = 20 << 20;
+
+/// What a picture chosen as a cover may be: the four the server decodes.
+pub const COVER_ACCEPT: &str = "image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif";
+
+/// `text` for a URL's query: everything but letters, digits and `-_.~`
+/// escaped.
+fn query_part(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Where playlist `id`'s picture is at `size` (PX-53). With `art`, the
+/// picture the page shows, the browser keeps it until it changes.
+pub fn cover_src(id: &str, art: Option<&str>, size: &str) -> String {
+    let mut src = format!("/playlists/art?id={}&size={size}", query_part(id));
+    if let Some(art) = art {
+        src.push_str("&art=");
+        src.push_str(&query_part(art));
+    }
+    src
+}
+
+/// Where a cover is uploaded for playlist `id`.
+pub fn cover_upload(id: &str) -> String {
+    format!("/playlists/art?id={}", query_part(id))
+}
+
+/// Whether the user may change `p`'s cover: who edits it, and never Liked
+/// or All, whose tiles are fixed.
+pub fn may_change_cover(p: &PlaylistInfo) -> bool {
+    p.can_edit && p.builtin.is_none()
+}
+
+/// Why a file of `bytes` is not sent as a cover, if it is not.
+pub fn cover_refused(bytes: u64) -> Option<String> {
+    (bytes > MAX_COVER_BYTES).then(|| {
+        format!(
+            "That picture is {:.1} MB; a cover is at most 20 MB.",
+            bytes as f64 / 1e6
+        )
+    })
+}
+
 /// What a built-in playlist is, under its name.
 pub fn builtin_line(builtin: PlaylistBuiltin) -> &'static str {
     match builtin {
@@ -403,7 +456,38 @@ mod tests {
             can_manage: can_edit,
             revision: 0,
             builtin: None,
+            artwork: None,
+            custom_art: false,
         }
+    }
+
+    #[test]
+    fn a_cover_s_address_names_the_playlist_and_the_picture() {
+        assert_eq!(
+            cover_src("0192-ab", Some("image:playlist/0f3a"), "thumb"),
+            "/playlists/art?id=0192-ab&size=thumb&art=image%3Aplaylist%2F0f3a"
+        );
+        assert_eq!(
+            cover_src("x&y", None, "medium"),
+            "/playlists/art?id=x%26y&size=medium"
+        );
+        assert_eq!(cover_upload("a b"), "/playlists/art?id=a%20b");
+    }
+
+    #[test]
+    fn only_an_editor_changes_a_cover_and_never_liked_s() {
+        let mut p = playlist("Heists", EPISODES, PlaylistOwner::Mine, true);
+        assert!(may_change_cover(&p));
+        p.builtin = Some(PlaylistBuiltin::Liked);
+        assert!(!may_change_cover(&p));
+        let viewer = playlist("Heists", EPISODES, PlaylistOwner::SharedWithMe, false);
+        assert!(!may_change_cover(&viewer));
+    }
+
+    #[test]
+    fn a_cover_past_20_mb_is_refused_before_it_is_sent() {
+        assert_eq!(cover_refused(20 << 20), None);
+        assert!(cover_refused(25_000_000).unwrap().contains("25.0 MB"));
     }
 
     fn user(id: &str, name: &str) -> ShareableUser {
