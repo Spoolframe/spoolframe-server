@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Settings › MCP lists the apps allowed to sign in
+  (`mcp.allowed_redirects`), each a name and a pattern of the redirect
+  URIs it returns to: Claude Code, Claude (claude.ai and desktop) and
+  Codex by default. Registration refuses an app none of whose redirect
+  URIs is listed (`invalid_redirect_uri`), and `/authorize` checks
+  again, so removing an app stops its new sign-ins; tokens already given
+  keep working until the app is disconnected. Before, any app with an
+  https or loopback redirect URI could register.
+- MCP's `create_playlist` makes a server-wide playlist with
+  `server_wide: true`: only for an admin whose connection was granted
+  the admin scope, and kept in the audit list as the admin tools' calls
+  are. `playlists:write` alone still makes the user's own. An MCP
+  connection has an admin's rights over server-wide playlists only with
+  the admin scope: with `playlists:write` alone, an admin's agent reads
+  another admin's server-wide playlist as any user does and cannot
+  change it. `add_to_playlist`, `remove_from_playlist` and
+  `move_in_playlist` on a server-wide playlist with those rights are
+  kept in the audit list too.
 - The Server page's "This server" card is two, side by side: This
   server (name, version, protocol and features, fingerprint, passkey
   domain, key, encode budget) and Network (LAN discovery, addresses,

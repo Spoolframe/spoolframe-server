@@ -493,6 +493,21 @@ telemetry {
 # Internet it needs admin.public_url, with TLS.
 mcp {
   enabled = false;
+  # The apps allowed to sign in, by the redirect URIs they return to: an
+  # app none of whose redirect URIs matches is refused at registration
+  # and at every sign-in. In a pattern, * as the port is any port, and a
+  # path ending in * is any path below. https, or plain http on loopback
+  # only; no query. [] lets no app sign in. Tokens already given keep
+  # working; My profile disconnects an app.
+  # Claude Code listens on localhost at a port it picks; codex mcp login
+  # on 127.0.0.1 at a port it picks, at /callback/<an id per MCP server>.
+  # Mirrors spoolframe_admin_api::mcp::DEFAULT_ALLOWED_REDIRECTS, the list
+  # in force when this is left out; a layers test checks the two agree.
+  allowed_redirects = [
+    { name = "Claude Code", pattern = "http://localhost:*/callback" },
+    { name = "Claude (claude.ai and desktop)", pattern = "https://claude.ai/api/mcp/auth_callback" },
+    { name = "Codex", pattern = "http://127.0.0.1:*/callback/*" }
+  ];
 }
 
 # Switches that may change or go away in any release, without notice. The

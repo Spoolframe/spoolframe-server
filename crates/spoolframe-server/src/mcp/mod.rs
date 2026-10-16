@@ -86,10 +86,15 @@ impl McpCaller {
         Principal::LocalUser(self.user)
     }
 
+    /// The user as the playlists service judges them. An admin's rights
+    /// over what every user sees (server-wide playlists) go with the
+    /// admin scope, as the admin tools do: an admin who granted an app
+    /// only their playlists has not granted it the server's. Without it
+    /// the user reads a server-wide playlist as anyone does.
     fn actor(&self) -> Actor {
         Actor {
             principal: self.principal(),
-            admin: self.admin,
+            admin: self.may(Scope::Admin),
         }
     }
 
@@ -197,7 +202,9 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
             scope: Scope::PlaylistsWrite,
             tool: schema::<CreatePlaylistArgs>(tool(
                 "create_playlist",
-                "Make a playlist of the user's own, empty: its id, for add_to_playlist.",
+                "Make a playlist, empty: its id, for add_to_playlist. The user's own, or with \
+                 server_wide, one every user of the server sees, which only an admin's \
+                 connection granted the admin scope may make.",
             ))
             .annotate(writes()),
         },
@@ -422,6 +429,10 @@ struct CreatePlaylistArgs {
     /// What it may hold: any of "movies", "episodes" and "tracks". All
     /// three if left out.
     kinds: Option<Vec<String>>,
+    /// Seen by every user of the server, portable guests included, and
+    /// edited by admins, rather than the user's own. Needs the admin
+    /// scope; false if left out.
+    server_wide: Option<bool>,
 }
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
@@ -960,41 +971,54 @@ impl McpServer {
                 kinds
             }
         };
+        if a.server_wide != Some(true) {
+            let made = library
+                .playlists
+                .create(&caller.actor(), &a.name, kinds, Visibility::Personal)
+                .await?;
+            return Ok(playlist_json(&made));
+        }
+        // What every user sees is an admin's act: the admin scope, not
+        // playlists:write alone, and kept in the audit list as the admin
+        // tools' calls are.
+        if !caller.may(Scope::Admin) {
+            return Err(ToolError(
+                "a server-wide playlist needs the admin scope, which this connection was not \
+                 granted"
+                    .into(),
+            ));
+        }
         let made = library
             .playlists
-            .create(&caller.actor(), &a.name, kinds, Visibility::Personal)
-            .await?;
-        Ok(playlist_json(&made))
+            .create(&caller.actor(), &a.name, kinds, Visibility::ServerWide)
+            .await
+            .map_err(ToolError::from);
+        let target = made.as_ref().ok().map(|p| p.id.clone());
+        self.audit_result(caller, "create_playlist", target.as_deref(), &made)
+            .await;
+        Ok(playlist_json(&made?))
     }
 
     /// Make `edits` on playlist `id` at its revision now, again on a newer
     /// one if someone else's change overtook it: the playlist's revision
-    /// after.
-    async fn edit(&self, caller: &McpCaller, id: &str, edits: Vec<PlaylistEdit>) -> ToolResult {
+    /// after. `tool` names the call: an edit of a server-wide playlist
+    /// with an admin's rights is kept in the audit list, as its making is.
+    async fn edit(
+        &self,
+        caller: &McpCaller,
+        tool: &str,
+        id: &str,
+        edits: Vec<PlaylistEdit>,
+    ) -> ToolResult {
         let library = self.library()?;
         if edits.is_empty() || edits.len() > MAX_EDITS {
             return Err(ToolError(format!("between 1 and {MAX_EDITS} at a time")));
         }
-        let actor = caller.actor();
-        for _ in 0..EDIT_TRIES {
-            let revision = library
-                .playlists
-                .get(&actor, id, 0, 1)
-                .await?
-                .playlist
-                .revision;
-            match library
-                .playlists
-                .edit(&actor, id, revision, edits.clone())
-                .await
-            {
-                Err(crate::playlists::PlaylistsError::Conflict { .. }) => continue,
-                done => return Ok(json!({ "revision": done? })),
-            }
+        let (edited, audited) = edit_retrying(library, &caller.actor(), id, edits).await?;
+        if audited {
+            self.audit_result(caller, tool, Some(id), &edited).await;
         }
-        Err(ToolError::new(
-            "the playlist kept changing under this edit; look at it again and retry",
-        ))
+        Ok(json!({ "revision": edited? }))
     }
 
     async fn add_to_playlist(&self, caller: &McpCaller, a: AddArgs) -> ToolResult {
@@ -1008,7 +1032,8 @@ impl McpServer {
                 })
             })
             .collect::<Result<Vec<_>, ToolError>>()?;
-        self.edit(caller, &a.playlist, edits).await
+        self.edit(caller, "add_to_playlist", &a.playlist, edits)
+            .await
     }
 
     async fn remove_from_playlist(&self, caller: &McpCaller, a: RemoveArgs) -> ToolResult {
@@ -1017,7 +1042,8 @@ impl McpServer {
             .iter()
             .map(|&entry| PlaylistEdit::Remove { entry })
             .collect();
-        self.edit(caller, &a.playlist, edits).await
+        self.edit(caller, "remove_from_playlist", &a.playlist, edits)
+            .await
     }
 
     async fn move_in_playlist(&self, caller: &McpCaller, a: MoveArgs) -> ToolResult {
@@ -1025,7 +1051,8 @@ impl McpServer {
             entry: a.entry,
             before: a.before,
         }];
-        self.edit(caller, &a.playlist, edits).await
+        self.edit(caller, "move_in_playlist", &a.playlist, edits)
+            .await
     }
 
     fn read_logs(&self, a: LogsArgs) -> ToolResult {
@@ -1046,6 +1073,22 @@ impl McpServer {
             limit: Some(a.limit.unwrap_or(100).clamp(1, 500)),
         };
         serde_json::to_value(self.api.log_page(&query)?).map_err(|e| ToolError(e.to_string()))
+    }
+
+    /// [`Self::audit`] with how `result` went: "ok", or "failed: " and
+    /// the tool's own words.
+    async fn audit_result<T>(
+        &self,
+        caller: &McpCaller,
+        tool: &str,
+        target: Option<&str>,
+        result: &Result<T, ToolError>,
+    ) {
+        let outcome = match result {
+            Ok(_) => "ok".to_owned(),
+            Err(ToolError(why)) => format!("failed: {why}"),
+        };
+        self.audit(caller, tool, target, &outcome).await;
     }
 
     /// Record an admin tool's call in the audit list: who, through which
@@ -1078,6 +1121,34 @@ fn playlist_json(p: &PlaylistSummary) -> Value {
         "pinned": p.pinned,
         "builtin": p.builtin,
     })
+}
+
+/// Make `edits` on playlist `id` at its revision now, again on a newer one
+/// if someone else's change overtook it: how it went, and whether it was a
+/// server-wide playlist edited with an admin's rights. A playlist that
+/// cannot be read is the call's error, as it is not edited.
+async fn edit_retrying(
+    library: &Library,
+    actor: &Actor,
+    id: &str,
+    edits: Vec<PlaylistEdit>,
+) -> Result<(Result<u64, ToolError>, bool), ToolError> {
+    let mut as_admin = false;
+    for _ in 0..EDIT_TRIES {
+        let playlist = library.playlists.get(actor, id, 0, 1).await?.playlist;
+        as_admin = actor.admin && playlist.visibility == Visibility::ServerWide;
+        match library
+            .playlists
+            .edit(actor, id, playlist.revision, edits.clone())
+            .await
+        {
+            Err(crate::playlists::PlaylistsError::Conflict { .. }) => continue,
+            done => return Ok((done.map_err(ToolError::from), as_admin)),
+        }
+    }
+    let kept_changing =
+        ToolError::new("the playlist kept changing under this edit; look at it again and retry");
+    Ok((Err(kept_changing), as_admin))
 }
 
 /// What an admin tool acts on, from its arguments, for the audit list.
@@ -1189,11 +1260,7 @@ impl ServerHandler for McpServer {
         let answer = self.run(&caller, &name, request.arguments).await;
         let outcome = if answer.is_ok() { "ok" } else { "failed" };
         if entry.scope == Scope::Admin {
-            let recorded = match &answer {
-                Ok(_) => "ok".to_owned(),
-                Err(ToolError(why)) => format!("failed: {why}"),
-            };
-            self.audit(&caller, &name, target.as_deref(), &recorded)
+            self.audit_result(&caller, &name, target.as_deref(), &answer)
                 .await;
         }
         tracing::info!(

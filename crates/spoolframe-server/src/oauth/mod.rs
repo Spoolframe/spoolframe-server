@@ -26,6 +26,10 @@ use crate::store::oauth::{ClientRecord, NewGrant, NewTokens, OauthAccess, Redeem
 use crate::store::users::LocalUserId;
 use crate::store::{Store, StoreError};
 
+pub mod redirects;
+
+use redirects::RedirectPattern;
+
 /// How long an access token works.
 pub const ACCESS_TOKEN: Duration = Duration::from_secs(3600);
 /// How long a refresh token works after its last use (its rotation).
@@ -164,9 +168,25 @@ fn loopback(host: Option<url::Host<&str>>) -> bool {
     }
 }
 
+/// Why a redirect URI, or an allowed pattern of them, cannot return to
+/// `scheme` on `host`, if it cannot: `https` anywhere, or plain `http` on
+/// loopback only (a native app's own listener); no other scheme. Worded to
+/// follow the URI or pattern.
+fn redirect_scheme_refused(scheme: &str, host: Option<url::Host<&str>>) -> Option<String> {
+    match scheme {
+        "https" if host.is_some() => None,
+        "https" => Some("has no host".into()),
+        "http" if loopback(host) => None,
+        "http" => {
+            Some("is plain http, which is only for loopback (127.0.0.1, [::1] or localhost)".into())
+        }
+        other => Some(format!("has the scheme {other:?}; use https")),
+    }
+}
+
 /// `uri` as a redirect URI a client may register: `https` anywhere, or
-/// plain `http` on loopback only (a native app's own listener); never a
-/// fragment, nor credentials. Other schemes are refused.
+/// plain `http` on loopback only ([`redirect_scheme_refused`]); never a
+/// fragment, nor credentials.
 pub fn check_redirect(uri: &str) -> Result<url::Url, String> {
     let url = url::Url::parse(uri).map_err(|e| format!("{uri:?} is not a URL: {e}"))?;
     if url.fragment().is_some() {
@@ -175,15 +195,9 @@ pub fn check_redirect(uri: &str) -> Result<url::Url, String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(format!("{uri:?} carries credentials"));
     }
-    match url.scheme() {
-        "https" if url.host().is_some() => Ok(url),
-        "http" if loopback(url.host()) => Ok(url),
-        "http" => Err(format!(
-            "{uri:?}: plain http is only for loopback (127.0.0.1, [::1] or localhost)"
-        )),
-        other => Err(format!(
-            "{uri:?}: the scheme {other:?} is not taken; use https"
-        )),
+    match redirect_scheme_refused(url.scheme(), url.host()) {
+        None => Ok(url),
+        Some(why) => Err(format!("{uri:?} {why}")),
     }
 }
 
@@ -227,24 +241,58 @@ pub fn hash(secret: &str) -> String {
     blake3::hash(secret.as_bytes()).to_hex().to_string()
 }
 
-/// Whether MCP and its OAuth endpoints are on (`mcp.enabled`): a live
-/// setting, read at every request. Off, they are not found.
-#[derive(Debug, Clone, Default)]
-pub struct McpSwitch(Arc<AtomicBool>);
+/// MCP's live settings, read at every request: whether MCP and its OAuth
+/// endpoints are on (`mcp.enabled`; off, they are not found), and the
+/// apps allowed to sign in (`mcp.allowed_redirects`).
+#[derive(Debug, Clone)]
+pub struct McpSwitch {
+    on: Arc<AtomicBool>,
+    allowed: Arc<parking_lot::RwLock<Arc<[RedirectPattern]>>>,
+}
+
+impl Default for McpSwitch {
+    /// Off, with the default apps allowed.
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
 
 impl McpSwitch {
+    /// On or off, with the default apps allowed.
     pub fn new(on: bool) -> Self {
-        Self(Arc::new(AtomicBool::new(on)))
+        Self {
+            on: Arc::new(AtomicBool::new(on)),
+            allowed: Arc::new(parking_lot::RwLock::new(redirects::defaults().into())),
+        }
     }
 
     pub fn on(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.on.load(Ordering::Relaxed)
     }
 
     pub fn set(&self, on: bool) {
-        self.0.store(on, Ordering::Relaxed);
+        self.on.store(on, Ordering::Relaxed);
+    }
+
+    /// The apps allowed to sign in now.
+    pub fn allowed(&self) -> Arc<[RedirectPattern]> {
+        self.allowed.read().clone()
+    }
+
+    pub fn set_allowed(&self, allowed: Vec<RedirectPattern>) {
+        *self.allowed.write() = allowed.into();
+    }
+
+    /// Whether an app returning to `redirect_uri` may sign in now.
+    pub fn redirect_allowed(&self, redirect_uri: &str) -> bool {
+        redirects::allowed(&self.allowed.read(), redirect_uri)
     }
 }
+
+/// Why a client was refused for its redirect URIs: none is one an admin
+/// allows.
+const NOT_ALLOWED: &str = "none of the redirect_uris is an app this server allows; an admin \
+                           allows apps in the web UI, Settings › MCP, Allowed redirects";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
@@ -400,6 +448,8 @@ impl Pair {
 #[derive(Debug)]
 pub struct OAuth {
     store: Store,
+    /// The apps allowed to sign in (`mcp.allowed_redirects`), live.
+    mcp: McpSwitch,
     pending: parking_lot::Mutex<HashMap<String, Pending>>,
     /// Registrations per address in the current window, and when each
     /// address's window began (Unix seconds). `None`: callers a trusted
@@ -408,9 +458,10 @@ pub struct OAuth {
 }
 
 impl OAuth {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Store, mcp: McpSwitch) -> Self {
         Self {
             store,
+            mcp,
             pending: parking_lot::Mutex::default(),
             registrations: parking_lot::Mutex::default(),
         }
@@ -447,7 +498,9 @@ impl OAuth {
     /// Register a client (RFC 7591): its name (trimmed, at most
     /// [`MAX_CLIENT_NAME`] characters, no control characters; "Unnamed
     /// app" when it gives none) and its redirect URIs, each one
-    /// [`check_redirect`] takes.
+    /// [`check_redirect`] takes and at least one an app allowed in
+    /// `mcp.allowed_redirects`. The others are kept, but `/authorize`
+    /// takes none that is not allowed.
     pub async fn register(
         &self,
         name: Option<&str>,
@@ -482,6 +535,13 @@ impl OAuth {
                 message,
             })?;
         }
+        if !redirect_uris.iter().any(|u| self.mcp.redirect_allowed(u)) {
+            tracing::info!(client = %name, redirect_uris = ?redirect_uris, "an OAuth client was refused: no redirect URI is allowed");
+            return Err(RegisterError::Invalid {
+                code: "invalid_redirect_uri",
+                message: NOT_ALLOWED.into(),
+            });
+        }
         let id = secret();
         self.store
             .add_oauth_client(&id, &name, redirect_uris)
@@ -515,6 +575,14 @@ impl OAuth {
             .any(|r| redirect_matches(r, redirect_uri))
         {
             return broken("The app asked to return to an address it did not register.");
+        }
+        // Checked again, as an admin may have removed the app since it
+        // registered: it signs no one in from then on.
+        if !self.mcp.redirect_allowed(redirect_uri) {
+            return broken(
+                "This server no longer allows this app to sign in. An admin allows apps in \
+                 Settings › MCP.",
+            );
         }
         if request.response_type.as_deref() != Some("code") {
             return broken("The app asked for something other than a code (response_type).");
@@ -609,6 +677,14 @@ impl OAuth {
         // Answered once: taken now, whatever comes of it.
         if self.pending.lock().remove(id).is_none() {
             return Err(DecideError::NoSuchRequest);
+        }
+        // An app removed from the list while its user was on the consent
+        // page gets nothing, not even a denial: never a redirect to an
+        // address the server does not allow.
+        if !self.mcp.redirect_allowed(&request.redirect_uri) {
+            return Err(DecideError::Invalid(
+                "this server no longer allows this app to sign in".into(),
+            ));
         }
         let mut to = url::Url::parse(&request.redirect_uri)
             .map_err(|e| DecideError::Invalid(e.to_string()))?;

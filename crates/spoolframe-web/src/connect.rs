@@ -1,8 +1,10 @@
 //! What the pages about connected apps say (PX-42), apart from the
 //! pages: the consent page's words for each scope, which of them are
 //! granted, the address an MCP client is given in Settings › MCP and the
-//! commands that add it to Claude Code and Codex, and Connected apps' and
-//! the audit list's lines.
+//! commands that add it to Claude Code and Codex, the list of apps allowed
+//! to sign in there, and Connected apps' and the audit list's lines.
+
+use spoolframe_admin_api::mcp::{AllowedRedirect, default_allowed_redirects};
 
 /// What a scope lets an app do, as consent words it: a title and a line.
 /// `None` for one this page does not know, which it never offers.
@@ -103,9 +105,115 @@ pub fn audit_action(action: &str) -> String {
     }
 }
 
+/// `mcp.allowed_redirects` as Settings › MCP lists it: the entries saved,
+/// or the defaults when no layer has it. A value that is not the list
+/// shows as empty, not as the defaults: what the editor saves is then
+/// what it showed.
+pub fn allowed_redirects(value: Option<&serde_json::Value>) -> Vec<AllowedRedirect> {
+    match value {
+        None | Some(serde_json::Value::Null) => default_allowed_redirects(),
+        Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
+    }
+}
+
+/// The default apps (Claude Code, Claude, Codex) no longer on `list`,
+/// by pattern: while there is one, "Restore Claude and Codex" is offered.
+pub fn missing_defaults(list: &[AllowedRedirect]) -> Vec<AllowedRedirect> {
+    default_allowed_redirects()
+        .into_iter()
+        .filter(|d| !list.iter().any(|e| e.pattern == d.pattern))
+        .collect()
+}
+
+/// `list` with each default app it lacks put back at the end, the
+/// admin's own entries kept.
+pub fn restore_defaults(list: &[AllowedRedirect]) -> Vec<AllowedRedirect> {
+    [list.to_vec(), missing_defaults(list)].concat()
+}
+
+/// `list` with the typed `name` and `pattern` added, both trimmed; or why
+/// not. Only what the page can tell: the server checks the pattern. The
+/// page offers Add only once both are typed.
+pub fn add_redirect(
+    list: &[AllowedRedirect],
+    name: &str,
+    pattern: &str,
+) -> Result<Vec<AllowedRedirect>, String> {
+    let (name, pattern) = (name.trim(), pattern.trim());
+    if list.iter().any(|e| e.pattern == pattern) {
+        return Err(format!("{pattern} is listed already."));
+    }
+    let mut added = list.to_vec();
+    added.push(AllowedRedirect {
+        name: name.to_owned(),
+        pattern: pattern.to_owned(),
+    });
+    Ok(added)
+}
+
+/// `list` as the setting's value.
+pub fn redirects_value(list: &[AllowedRedirect]) -> serde_json::Value {
+    serde_json::to_value(list).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(name: &str, pattern: &str) -> AllowedRedirect {
+        AllowedRedirect {
+            name: name.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    #[test]
+    fn the_allowed_list_is_the_defaults_until_saved() {
+        assert_eq!(allowed_redirects(None), default_allowed_redirects());
+        let saved = serde_json::json!([{ "name": "Mine", "pattern": "https://a.example/cb" }]);
+        assert_eq!(
+            allowed_redirects(Some(&saved)),
+            [entry("Mine", "https://a.example/cb")]
+        );
+        assert!(allowed_redirects(Some(&serde_json::json!([]))).is_empty());
+        assert_eq!(
+            redirects_value(&allowed_redirects(Some(&saved))),
+            saved,
+            "saved as it was read"
+        );
+    }
+
+    #[test]
+    fn restoring_puts_back_only_the_defaults_missing() {
+        let mine = entry("Mine", "https://a.example/cb");
+        let defaults = default_allowed_redirects();
+        assert!(missing_defaults(&defaults).is_empty());
+        let without_codex: Vec<_> = defaults
+            .iter()
+            .filter(|e| e.name != "Codex")
+            .cloned()
+            .chain([mine.clone()])
+            .collect();
+        assert_eq!(
+            missing_defaults(&without_codex),
+            [entry("Codex", "http://127.0.0.1:*/callback/*")]
+        );
+        let restored = restore_defaults(&without_codex);
+        assert!(missing_defaults(&restored).is_empty());
+        assert_eq!(restored.len(), defaults.len() + 1);
+        assert!(restored.contains(&mine));
+        assert_eq!(restore_defaults(&restored), restored);
+    }
+
+    #[test]
+    fn an_entry_added_needs_a_new_pattern() {
+        let list = add_redirect(&[], " Mine ", " https://a.example/cb ").unwrap();
+        assert_eq!(list, [entry("Mine", "https://a.example/cb")]);
+        assert_eq!(
+            add_redirect(&list, "Again", " https://a.example/cb"),
+            Err("https://a.example/cb is listed already.".to_owned())
+        );
+    }
 
     #[test]
     fn every_scope_the_server_offers_has_words() {

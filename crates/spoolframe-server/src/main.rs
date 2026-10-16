@@ -1072,6 +1072,7 @@ async fn run(
     metrics.spawn_sampler();
     // MCP and its OAuth sign-in (PX-42): a live setting.
     let mcp = McpSwitch::new(config.mcp.enabled());
+    mcp.set_allowed(config.mcp.allowed_redirects()?);
     if mcp.on() {
         tracing::info!("mcp.enabled: MCP clients may sign users in at /authorize and call /mcp");
     }

@@ -137,3 +137,9 @@ with TLS; without it, only a client that reaches the server at its own
 address (an IP or `localhost`) can connect. Users see and disconnect
 their apps in My profile › Connected apps; admins see what was done in
 Server › Audit.
+
+Only the apps in `mcp.allowed_redirects` may sign in, matched by the
+redirect URI each returns to: Claude Code, Claude (claude.ai and
+desktop) and Codex until an admin changes the list in Settings › MCP ›
+Allowed redirects. Another agent needs its redirect URI added there
+first.

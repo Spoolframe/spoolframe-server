@@ -96,6 +96,8 @@ pub const SETTINGS: &[Setting] = &[
     live("admin.metrics"),
     live("admin.metrics_from"),
     live("mcp.enabled"),
+    // The whole list, as the web UI saves it.
+    live("mcp.allowed_redirects"),
     live("auth.oidc"),
     restart("auth.trust_idle_days"),
     restart("artwork.cache_mb"),

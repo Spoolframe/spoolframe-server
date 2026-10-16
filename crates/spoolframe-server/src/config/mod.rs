@@ -172,11 +172,44 @@ pub struct McpConfig {
     /// Off if left out.
     #[ucl(default)]
     pub enabled: Option<bool>,
+    /// The apps allowed to sign in, by the redirect URIs they return to;
+    /// Claude and Codex if left out. `[]`: none.
+    #[ucl(default)]
+    pub allowed_redirects: Option<Vec<AllowedRedirectConfig>>,
+}
+
+/// One entry of `mcp.allowed_redirects`:
+/// `{ name = "Claude Code"; pattern = "http://localhost:*/callback"; }`.
+#[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct AllowedRedirectConfig {
+    pub name: String,
+    pub pattern: String,
 }
 
 impl McpConfig {
     pub fn enabled(&self) -> bool {
         self.enabled.unwrap_or(false)
+    }
+
+    /// The apps allowed to sign in, each checked
+    /// ([`crate::oauth::redirects::RedirectPattern::parse`]).
+    pub fn allowed_redirects(
+        &self,
+    ) -> Result<Vec<crate::oauth::redirects::RedirectPattern>, ConfigError> {
+        use crate::oauth::redirects;
+        match &self.allowed_redirects {
+            None => Ok(redirects::defaults()),
+            Some(entries) => redirects::parse_all(
+                entries
+                    .iter()
+                    .map(|e| (e.name.as_str(), e.pattern.as_str())),
+            )
+            .map_err(|message| ConfigError::Invalid {
+                key: "mcp.allowed_redirects",
+                message,
+            }),
+        }
     }
 }
 
@@ -2540,6 +2573,7 @@ impl ServerConfig {
         parsed.logs.buffer_lines()?;
         parsed.telemetry.otlp.settings()?;
         parsed.http_playback.settings()?;
+        parsed.mcp.allowed_redirects()?;
         Ok(parsed)
     }
 

@@ -985,6 +985,10 @@ mod tests {
             documented.auth.trust_idle().unwrap(),
             bare.auth.trust_idle().unwrap()
         );
+        assert_eq!(
+            documented.mcp.allowed_redirects().unwrap(),
+            bare.mcp.allowed_redirects().unwrap()
+        );
     }
 
     #[test]

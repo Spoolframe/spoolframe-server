@@ -237,6 +237,50 @@ pub mod invite {
     const DAY: u64 = 24 * 3600;
 }
 
+/// MCP's sign-in (PX-42): the apps allowed to sign in.
+pub mod mcp {
+    use serde::{Deserialize, Serialize};
+
+    /// The setting that lists them, each an [`AllowedRedirect`].
+    pub const ALLOWED_REDIRECTS: &str = "mcp.allowed_redirects";
+
+    /// The apps a server lets sign in until an admin changes the list, as
+    /// (name, pattern). Claude Code listens on `localhost` at a port it
+    /// picks, at `/callback`. Codex's `codex mcp login` listens on
+    /// `127.0.0.1` at a port it picks and, as this server does not send
+    /// `iss` in its authorization response, returns to `/callback/<id>`,
+    /// an id per MCP server (openai/codex, codex-rs/rmcp-client:
+    /// `local_redirect_uri`, `append_callback_id_to_redirect_uri`).
+    pub const DEFAULT_ALLOWED_REDIRECTS: [(&str, &str); 3] = [
+        ("Claude Code", "http://localhost:*/callback"),
+        (
+            "Claude (claude.ai and desktop)",
+            "https://claude.ai/api/mcp/auth_callback",
+        ),
+        ("Codex", "http://127.0.0.1:*/callback/*"),
+    ];
+
+    /// One app allowed to sign in: a name for the admin, and the redirect
+    /// URIs it returns to. In the pattern, `*` as the port is any port,
+    /// and a path ending in `*` is any path that starts with the rest.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AllowedRedirect {
+        pub name: String,
+        pub pattern: String,
+    }
+
+    /// [`DEFAULT_ALLOWED_REDIRECTS`] as entries.
+    pub fn default_allowed_redirects() -> Vec<AllowedRedirect> {
+        DEFAULT_ALLOWED_REDIRECTS
+            .iter()
+            .map(|(name, pattern)| AllowedRedirect {
+                name: (*name).to_owned(),
+                pattern: (*pattern).to_owned(),
+            })
+            .collect()
+    }
+}
+
 /// What redeeming an invite does (P6-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

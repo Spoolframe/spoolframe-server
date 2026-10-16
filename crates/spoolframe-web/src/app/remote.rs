@@ -7,7 +7,8 @@
 //! on the host.
 //!
 //! And Settings › MCP (PX-42), its own tab: the `mcp.enabled` switch and
-//! how to add the server to an agent. It was a card of Remote access; it
+//! how to add the server to an agent, and the apps allowed to sign in
+//! (`mcp.allowed_redirects`). It was a card of Remote access; it
 //! stays in this file for the switch, notice and save parts it shares.
 
 use dioxus::prelude::*;
@@ -811,13 +812,151 @@ pub fn McpForm(on_done: EventHandler<()>) -> Element {
             }
         }
         for g in [generation()] {
-            McpFields {
-                key: "{g}",
-                settings: loaded.clone(),
-                on_done,
-                on_reload: move |_| generation += 1,
+            Fragment { key: "{g}",
+                McpFields {
+                    settings: loaded.clone(),
+                    on_done,
+                    on_reload: move |_| generation += 1,
+                }
+                AllowedRedirectsFields {
+                    settings: loaded.clone(),
+                    on_done,
+                    on_reload: move |_| generation += 1,
+                }
             }
         }
+    }
+}
+
+/// `mcp.allowed_redirects`: the apps allowed to sign in, each a name and
+/// the redirect URIs it returns to. Claude Code, Claude and Codex until
+/// the admin changes it; the logic is `crate::connect`'s.
+#[component]
+fn AllowedRedirectsFields(
+    settings: Settings,
+    on_done: EventHandler<()>,
+    on_reload: EventHandler<()>,
+) -> Element {
+    use spoolframe_admin_api::mcp::ALLOWED_REDIRECTS as KEY;
+    let mut list = use_signal(|| crate::connect::allowed_redirects(value(&settings, KEY)));
+    let mut name = use_signal(String::new);
+    let mut pattern = use_signal(String::new);
+    let mut refusal = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let confirming = use_signal(|| None::<String>);
+    let fixed = locked(&settings, KEY);
+    let s = settings.clone();
+    let on_save = use_callback(move |()| {
+        let s = s.clone();
+        let changed = crate::connect::redirects_value(&list.peek());
+        busy.set(true);
+        error.set(None);
+        spawn(async move {
+            match save(&s, vec![(KEY, Some(changed))]).await {
+                Ok(()) => on_done.call(()),
+                Err(e)
+                    if asks_to_confirm(&e, confirming, "changing the apps allowed to sign in") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    });
+    let mut add = move || {
+        let added = crate::connect::add_redirect(&list.peek(), &name.peek(), &pattern.peek());
+        match added {
+            Ok(added) => {
+                list.set(added);
+                name.set(String::new());
+                pattern.set(String::new());
+                refusal.set(None);
+            }
+            Err(why) => refusal.set(Some(why)),
+        }
+    };
+    let missing = !crate::connect::missing_defaults(&list()).is_empty();
+    rsx! {
+        section { class: "card tele-card",
+            div { class: "wan-part",
+                span { class: "flex flex-col gap-0.5",
+                    b { class: "text-[15px]", "Allowed redirects" }
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "The apps that may sign in, by the address each returns to after sign-in. An app none of whose addresses is listed cannot connect. In a pattern, * as the port is any port, and a * at the end of the path is any path below it. Removing an app stops new sign-ins; apps already connected keep working until disconnected in My profile."
+                    }
+                }
+                Note { settings: settings.clone(), setting: KEY, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                div { class: "wan-statics",
+                    for (i, entry) in list().into_iter().enumerate() {
+                        div { key: "{i}-{entry.pattern}", class: "wan-static",
+                            span { class: "flex min-w-0 flex-col gap-0.5",
+                                span { class: "text-sm font-semibold", "{entry.name}" }
+                                span { class: "mono-value min-w-0 break-all text-xs", "{entry.pattern}" }
+                            }
+                            button {
+                                class: "icon-button",
+                                r#type: "button",
+                                aria_label: "Remove {entry.name}",
+                                disabled: fixed,
+                                onclick: move |_| {
+                                    list.write().remove(i);
+                                },
+                                icons::Trash {}
+                            }
+                        }
+                    }
+                    if list().is_empty() {
+                        Notice { "No app is allowed: none can connect. Apps already connected keep working until disconnected." }
+                    }
+                    if !fixed {
+                        // Enter adds, as the button does, rather than saving.
+                        form {
+                            class: "wan-add",
+                            onsubmit: move |e: FormEvent| {
+                                e.prevent_default();
+                                add();
+                            },
+                            Field { label: "Name", value: name, placeholder: "My agent" }
+                            Field {
+                                label: "Redirect URI pattern",
+                                value: pattern,
+                                placeholder: "https://agent.example/oauth/callback",
+                                error: refusal(),
+                            }
+                            button {
+                                class: "btn-dialog btn-dialog-grey mt-[22px]",
+                                r#type: "submit",
+                                disabled: name().trim().is_empty() || pattern().trim().is_empty(),
+                                icons::Plus {}
+                                "Add"
+                            }
+                        }
+                    }
+                    if missing && !fixed {
+                        button {
+                            class: "link-button self-start text-xs",
+                            r#type: "button",
+                            onclick: move |_| {
+                                let restored = crate::connect::restore_defaults(&list.peek());
+                                list.set(restored);
+                            },
+                            "Restore Claude and Codex"
+                        }
+                    }
+                }
+            }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+            div { class: "wizard-foot",
+                span { class: "wizard-foot-end",
+                    button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || fixed, onclick: move |_| on_save.call(()), "Save" }
+                }
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
     }
 }
 

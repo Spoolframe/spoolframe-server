@@ -533,6 +533,18 @@ impl RuntimeSettings {
         }
         live.cookies.set_insecure(config.admin.insecure_cookies());
         live.mcp.set(config.mcp.enabled());
+        // `layers.config()` checked the list just now, so this fails only
+        // if that check and this read ever part ways; then the list in
+        // force stays, and it is said.
+        match config.mcp.allowed_redirects() {
+            Ok(allowed) => live.mcp.set_allowed(allowed),
+            Err(e) => tracing::error!(
+                error = %e,
+                key,
+                by,
+                "mcp.allowed_redirects does not load; the apps allowed to sign in are left as they were"
+            ),
+        }
         if let (Some(metrics), Ok(from)) = (&live.metrics, config.admin.metrics_from()) {
             metrics.access().set(config.admin.metrics(), from);
         }
@@ -737,6 +749,44 @@ mod tests {
         assert!(settings.live.mcp.on());
         settings.unset("mcp.enabled", "root").unwrap();
         assert!(!settings.live.mcp.on());
+    }
+
+    /// The apps allowed to sign in change for the next registration or
+    /// sign-in; a pattern that is not one is refused, and the list kept.
+    #[tokio::test]
+    async fn mcp_s_allowed_redirects_change_live_and_are_checked() {
+        let (settings, _dir) = settings(None).await;
+        let claude = "http://localhost:4000/callback";
+        assert!(settings.live.mcp.redirect_allowed(claude));
+        let entry = settings
+            .set(
+                "mcp.allowed_redirects",
+                &serde_json::json!([{ "name": "Agent", "pattern": "https://agent.example/cb" }]),
+                "root",
+            )
+            .unwrap();
+        assert!(!entry.restart_pending);
+        assert!(!settings.live.mcp.redirect_allowed(claude));
+        assert!(
+            settings
+                .live
+                .mcp
+                .redirect_allowed("https://agent.example/cb")
+        );
+        let refused = settings.set(
+            "mcp.allowed_redirects",
+            &serde_json::json!([{ "name": "Agent", "pattern": "http://agent.example/cb" }]),
+            "root",
+        );
+        assert!(refused.is_err());
+        assert!(
+            settings
+                .live
+                .mcp
+                .redirect_allowed("https://agent.example/cb")
+        );
+        settings.unset("mcp.allowed_redirects", "root").unwrap();
+        assert!(settings.live.mcp.redirect_allowed(claude));
     }
 
     #[tokio::test]
@@ -1035,6 +1085,47 @@ mod tests {
         let shown = settings.layers().show(settings.secrets());
         assert!(shown.contains("telemetry.otlp.headers = (set);"), "{shown}");
         assert!(!shown.contains("s3cr3t"), "{shown}");
+    }
+
+    /// A list of apps allowed to sign in that does not load when settings
+    /// are applied (the file holds one no change checked) is logged at
+    /// error level, and the list in force is kept. Loading the settings
+    /// checks the list, so it is that check that says so; the list's own
+    /// read in `apply` logs too, should the two ever part ways.
+    #[tokio::test]
+    async fn an_allowed_redirects_list_that_does_not_load_is_logged_and_kept() {
+        if !alone("an_allowed_redirects_list_that_does_not_load_is_logged_and_kept") {
+            return;
+        }
+        let file = r#"mcp { allowed_redirects = [{ name = "Agent"; pattern = "http://agent.example/cb"; }]; }"#;
+        let (settings, _dir) = settings(Some(file)).await;
+        let (logged, _guard) = {
+            let ring = Arc::new(crate::logs::LogRing::default());
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber =
+                tracing_subscriber::registry().with(crate::logs::RingLayer(ring.clone()));
+            (ring, tracing::subscriber::set_default(subscriber))
+        };
+        // A change that applies every setting without checking them all:
+        // the Plex token, a secret.
+        settings
+            .set_server_token(FIRST_PLEX_SERVER, Some("token"), "root")
+            .unwrap();
+        let page = logged.page(&Default::default());
+        assert!(
+            page.lines
+                .iter()
+                .any(|l| l.level == spoolframe_admin_api::LogLevel::Error
+                    && l.text.contains("mcp.allowed_redirects")),
+            "{page:?}"
+        );
+        assert!(
+            settings
+                .live
+                .mcp
+                .redirect_allowed("http://localhost:4000/callback"),
+            "the list in force was not kept"
+        );
     }
 
     #[tokio::test]

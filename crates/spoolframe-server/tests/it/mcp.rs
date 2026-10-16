@@ -942,3 +942,138 @@ async fn the_audit_list_shows_an_admin_tool_call() {
         ("disable_user", "root", "Claude", Some("bob"), "ok")
     );
 }
+
+/// An admin's agent makes a playlist every user sees; without the admin
+/// scope it may not, and the making is kept in the audit list.
+#[tokio::test]
+async fn an_admin_with_the_admin_scope_makes_a_server_wide_playlist() {
+    let (server, addr) = beside("mcp-server-wide").await;
+    user(&server, "root", Role::Admin).await;
+    user(&server, "bob", Role::Consumer).await;
+    let admin = Mcp::connect(addr, "root", &["playlists:write", "admin"]).await;
+    let made = admin
+        .call(
+            "create_playlist",
+            json!({ "name": "Movie night", "kinds": ["movies"], "server_wide": true }),
+        )
+        .await
+        .unwrap();
+    let id = made["id"].as_str().unwrap().to_owned();
+
+    let bob = Mcp::connect(addr, "bob", &["playlists:read"]).await;
+    let seen = bob.call("list_playlists", json!({})).await.unwrap();
+    let names: Vec<&str> = seen["playlists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["id"] == id.as_str())
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Movie night"], "{seen}");
+
+    let (events, _) = server.store.audit_page(0, 10).await.unwrap();
+    let made = events
+        .iter()
+        .find(|e| e.action == "create_playlist")
+        .expect("the making is in the audit list");
+    assert_eq!(made.outcome, "ok");
+}
+
+#[tokio::test]
+async fn without_the_admin_scope_no_server_wide_playlist_is_made() {
+    let (server, addr) = beside("mcp-server-wide-refused").await;
+    user(&server, "root", Role::Admin).await;
+    let mcp = Mcp::connect(addr, "root", &["playlists:write"]).await;
+    let refused = mcp
+        .call(
+            "create_playlist",
+            json!({ "name": "Movie night", "server_wide": true }),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("admin scope"), "{refused}");
+    let listed = mcp.call("list_playlists", json!({})).await.unwrap();
+    assert!(
+        !listed["playlists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "Movie night"),
+        "{listed}"
+    );
+}
+
+/// A server-wide playlist, made by `admin`'s admin-scoped agent: its id.
+async fn movie_night(addr: SocketAddr, admin: &str) -> String {
+    let admin = Mcp::connect(addr, admin, &["playlists:write", "admin"]).await;
+    let made = admin
+        .call(
+            "create_playlist",
+            json!({ "name": "Movie night", "kinds": ["movies"], "server_wide": true }),
+        )
+        .await
+        .unwrap();
+    made["id"].as_str().unwrap().to_owned()
+}
+
+/// An admin who granted an app only their playlists has not granted it
+/// what every user sees: it reads another admin's server-wide playlist,
+/// and may not change it.
+#[tokio::test]
+async fn playlists_write_alone_does_not_edit_a_server_wide_playlist() {
+    let (server, addr) = beside("mcp-server-wide-edit-refused").await;
+    user(&server, "root", Role::Admin).await;
+    user(&server, "carol", Role::Admin).await;
+    let id = movie_night(addr, "carol").await;
+    let mcp = Mcp::connect(addr, "root", &["playlists:write"]).await;
+    let page = mcp
+        .call("get_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert_eq!(page["playlist"]["name"], "Movie night", "{page}");
+    assert_eq!(page["playlist"]["canEdit"], false, "{page}");
+    let refused = mcp
+        .call(
+            "add_to_playlist",
+            json!({ "playlist": id, "items": ["plex:movie:1"] }),
+        )
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    let page = mcp
+        .call("get_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert!(page["entries"].as_array().unwrap().is_empty(), "{page}");
+}
+
+/// With the admin scope, an edit of a server-wide playlist is made, and
+/// kept in the audit list as the making is.
+#[tokio::test]
+async fn an_admin_scoped_edit_of_a_server_wide_playlist_is_audited() {
+    let (server, addr) = beside("mcp-server-wide-edit").await;
+    user(&server, "root", Role::Admin).await;
+    user(&server, "carol", Role::Admin).await;
+    let id = movie_night(addr, "carol").await;
+    let mcp = Mcp::connect(addr, "root", &["playlists:write", "admin"]).await;
+    mcp.call(
+        "add_to_playlist",
+        json!({ "playlist": id, "items": ["plex:movie:1"] }),
+    )
+    .await
+    .unwrap();
+    let page = mcp
+        .call("get_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1, "{page}");
+
+    let (events, _) = server.store.audit_page(0, 10).await.unwrap();
+    let edit = events
+        .iter()
+        .find(|e| e.action == "add_to_playlist")
+        .expect("the edit is in the audit list");
+    assert_eq!(
+        (edit.target.as_deref(), edit.outcome.as_str()),
+        (Some(id.as_str()), "ok")
+    );
+}

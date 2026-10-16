@@ -608,3 +608,174 @@ async fn registrations_are_held_to_https_or_loopback() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
     }
 }
+
+/// An admin listener at [`ORIGIN`] with runtime settings, MCP turned on
+/// in its file, and the settings' MCP switch the listener's, as a server
+/// has them: what the admin saves applies at once.
+async fn mcp_server_with_settings(test: &str) -> (SocketAddr, spoolframe_test_dir::TestDir) {
+    use spoolframe_server::config::layers::{Layers, Locations};
+    use spoolframe_server::runtime::{Live, RuntimeSettings};
+    let dir = state_dir(test).await;
+    let file = dir.as_ref().join("server.ucl");
+    std::fs::write(
+        &file,
+        r#"schema = "spoolframe.server.v1"; mcp { enabled = true; }"#,
+    )
+    .unwrap();
+    let layers = Layers::load(&Locations {
+        state_dir: dir.as_ref().to_owned(),
+        config: Some(file),
+    })
+    .unwrap();
+    let mcp = McpSwitch::new(true);
+    let settings = RuntimeSettings::new(
+        layers,
+        dir.as_ref(),
+        Live {
+            mcp: mcp.clone(),
+            ..Live::default()
+        },
+        spoolframe_admin_api::RestartMode::InPlace,
+    );
+    let auth = Auth::new(Store::open(dir.as_ref()).await.unwrap());
+    let origins = Origins::Exactly(ORIGIN.to_owned());
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Admin {
+            passkeys: std::sync::Arc::new(Passkeys::new(&origins, &server_id())),
+            settings: Some(std::sync::Arc::new(settings)),
+            mcp,
+            ..crate::admin::admin(auth, Some(SetupCode::new(CODE)))
+        },
+        origins,
+        TrustedProxies::default(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    (addr, dir)
+}
+
+/// Where Claude Code has the code sent: its own listener, at a port it
+/// picks.
+const CLAUDE_CODE_RETURN: &str = "http://localhost:53682/callback";
+
+/// A registration of `name` returning to `redirect_uris`, as sent.
+async fn register_returning(
+    addr: SocketAddr,
+    name: &str,
+    redirect_uris: &[&str],
+) -> reqwest::Response {
+    browser()
+        .post(format!("http://{addr}/register"))
+        .json(&json!({ "client_name": name, "redirect_uris": redirect_uris }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The admin sets `mcp.allowed_redirects` to `entries` (name, pattern).
+async fn allow(root: &WsClient, entries: &[(&str, &str)]) {
+    let list: Vec<Value> = entries
+        .iter()
+        .map(|(name, pattern)| json!({ "name": name, "pattern": pattern }))
+        .collect();
+    root.setting_set("mcp.allowed_redirects".into(), Value::Array(list))
+        .await
+        .unwrap();
+}
+
+/// Claude Code registers by default; once the admin takes it off the
+/// list, the same registration is refused for its redirect URI, naming
+/// where the list is.
+#[tokio::test]
+async fn an_app_registers_while_the_admin_allows_it() {
+    let (addr, _dir) = mcp_server_with_settings("oauth-allowed-register").await;
+    let (root, _alice) = users(addr).await;
+    let registered = register_returning(addr, "Claude Code", &[CLAUDE_CODE_RETURN]).await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+
+    allow(
+        &root,
+        &[("Claude", "https://claude.ai/api/mcp/auth_callback")],
+    )
+    .await;
+    let refused = register_returning(addr, "Claude Code", &[CLAUDE_CODE_RETURN]).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_redirect_uri");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("Settings › MCP"),
+        "{body}"
+    );
+}
+
+/// A client registered while allowed is refused at its next sign-in once
+/// the admin removes it: the server's own page, and no redirect.
+#[tokio::test]
+async fn an_app_the_admin_removes_is_refused_at_its_next_sign_in() {
+    let (addr, _dir) = mcp_server_with_settings("oauth-allowed-authorize").await;
+    let (root, _alice) = users(addr).await;
+    let client = register(addr, "Claude").await;
+    begin(addr, &client, "library:read").await;
+
+    allow(&root, &[("Claude Code", "http://localhost:*/callback")]).await;
+    let response = authorize(addr, &authorize_query(&client, "library:read")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.headers().get("location").is_none());
+    let page = response.text().await.unwrap();
+    assert!(page.contains("Settings › MCP"), "{page}");
+}
+
+/// An app of the admin's own: its https redirect URI added, it registers.
+#[tokio::test]
+async fn an_app_the_admin_adds_registers() {
+    let (addr, _dir) = mcp_server_with_settings("oauth-allowed-add").await;
+    let (root, _alice) = users(addr).await;
+    let mine = "https://agent.home.example/oauth/callback";
+    let refused = register_returning(addr, "Mine", &[mine]).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+    allow(
+        &root,
+        &[
+            ("Claude Code", "http://localhost:*/callback"),
+            ("Mine", "https://agent.home.example/oauth/*"),
+        ],
+    )
+    .await;
+    let registered = register_returning(addr, "Mine", &[mine]).await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+}
+
+/// A pattern registration could never take is refused when saved: plain
+/// http off loopback, a query, no name.
+#[tokio::test]
+async fn the_allowed_list_is_checked_when_saved() {
+    let (addr, _dir) = mcp_server_with_settings("oauth-allowed-invalid").await;
+    let (root, _alice) = users(addr).await;
+    for (name, pattern) in [
+        ("Agent", "http://agent.example/cb"),
+        ("Agent", "https://agent.example/cb?x=1"),
+        ("", "https://agent.example/cb"),
+    ] {
+        let refused = root
+            .setting_set(
+                "mcp.allowed_redirects".into(),
+                json!([{ "name": name, "pattern": pattern }]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::admin::code(refused),
+            spoolframe_admin_api::error_code::INVALID_INPUT,
+            "{pattern}"
+        );
+    }
+    // Still the defaults: Claude Code registers.
+    let registered = register_returning(addr, "Claude Code", &[CLAUDE_CODE_RETURN]).await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+}

@@ -13,6 +13,7 @@ const CHALLENGE: &str = "v5EpdpfSvdxcI3-JDrrt8W3BNL0gE6xL5Fxd211vTEY";
 
 struct World {
     oauth: OAuth,
+    mcp: McpSwitch,
     clock: Clock,
     alice: LocalUserId,
     _store: TestStore,
@@ -25,8 +26,10 @@ async fn world(test: &str) -> World {
         .add_user("alice", None, "phc", Role::Consumer)
         .await
         .unwrap();
+    let mcp = McpSwitch::default();
     World {
-        oauth: OAuth::new(store.store.clone().with_clock(clock.clone())),
+        oauth: OAuth::new(store.store.clone().with_clock(clock.clone()), mcp.clone()),
+        mcp,
         clock,
         alice,
         _store: store,
@@ -199,6 +202,67 @@ async fn a_registration_is_held_to_its_rules() {
     }
     let unnamed = w.oauth.register(None, &[RETURN.to_owned()]).await.unwrap();
     assert_eq!(unnamed.name, "Unnamed app");
+}
+
+/// A client none of whose redirect URIs an admin allows is refused, and
+/// one of them allowed is enough.
+#[tokio::test]
+async fn a_registration_needs_a_redirect_uri_the_admin_allows() {
+    let w = world("register-allowed").await;
+    let elsewhere = "https://agent.example/cb".to_owned();
+    let refused = w
+        .oauth
+        .register(Some("Agent"), std::slice::from_ref(&elsewhere))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(RegisterError::Invalid {
+                code: "invalid_redirect_uri",
+                ref message,
+            }) if message.contains("Settings › MCP")
+        ),
+        "{refused:?}"
+    );
+    w.oauth
+        .register(Some("Agent"), &[elsewhere.clone(), RETURN.to_owned()])
+        .await
+        .unwrap();
+    w.mcp.set_allowed(vec![
+        redirects::RedirectPattern::parse("Agent", "https://agent.example/cb").unwrap(),
+    ]);
+    w.oauth.register(Some("Agent"), &[elsewhere]).await.unwrap();
+    assert!(
+        w.oauth
+            .register(Some("Claude"), &[RETURN.to_owned()])
+            .await
+            .is_err()
+    );
+}
+
+/// An app the admin removes signs no one in from then on: `/authorize`
+/// refuses it, and so does consent already on screen, with no redirect.
+#[tokio::test]
+async fn an_app_removed_from_the_list_signs_no_one_in() {
+    let w = world("removed").await;
+    let client = w.client().await;
+    let waiting = w
+        .oauth
+        .authorize(&request(&client, "library:read"))
+        .await
+        .unwrap();
+    w.mcp.set_allowed(Vec::new());
+    assert!(matches!(
+        w.oauth.authorize(&request(&client, "library:read")).await,
+        Err(AuthorizeError::Broken(_))
+    ));
+    let chosen = ["library:read".to_owned()];
+    assert!(matches!(
+        w.oauth
+            .decide(&waiting, w.alice, false, true, &chosen)
+            .await,
+        Err(DecideError::Invalid(_))
+    ));
 }
 
 /// A change to a good request.

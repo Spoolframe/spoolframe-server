@@ -636,7 +636,10 @@ pub async fn serve(
             .map_or_else(PathChecks::default, |s| PathChecks::kept_in(s.state_dir())),
     );
     let api = AdminApi {
-        oauth: Arc::new(crate::oauth::OAuth::new(admin.auth.store().clone())),
+        oauth: Arc::new(crate::oauth::OAuth::new(
+            admin.auth.store().clone(),
+            admin.mcp.clone(),
+        )),
         auth: admin.auth,
         setup_code: admin.setup_code,
         status: admin.status,
@@ -4374,7 +4377,10 @@ mod tests {
         );
         let origins = Origins::Exactly("https://media.example.org".into());
         AdminApi {
-            oauth: Arc::new(crate::oauth::OAuth::new(auth.store().clone())),
+            oauth: Arc::new(crate::oauth::OAuth::new(
+                auth.store().clone(),
+                crate::oauth::McpSwitch::default(),
+            )),
             mcp: crate::oauth::McpSwitch::default(),
             library: None,
             auth,
