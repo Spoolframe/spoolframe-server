@@ -49,6 +49,7 @@ pub mod plex_sync;
 pub mod portable;
 pub mod previews;
 pub mod principal;
+pub mod protocol_info;
 pub mod redact;
 pub mod refusals;
 pub mod relay_access;

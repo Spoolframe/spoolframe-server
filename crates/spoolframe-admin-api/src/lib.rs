@@ -862,6 +862,18 @@ pub struct ServerStatus {
     /// How many files frame previews are made of ahead at once when
     /// `previews.workers` is not set (P3-13).
     pub preview_workers_default: DefaultWorkers,
+    /// The client protocol's version (`spoolframe_protocol::
+    /// PROTOCOL_VERSION`). New capability comes as a feature, not a new
+    /// version, so the lists below say what this server speaks.
+    pub protocol_version: u32,
+    /// Its regular features (`spoolframe:playlists`, …): always on in
+    /// this build, used with each client that lists them too.
+    pub features: Vec<String>,
+    /// Those a client sees before signing in. Empty today.
+    pub pre_auth_features: Vec<String>,
+    /// The experimental features turned on here, each by its setting
+    /// (`http-playback` by `http_playback.listen`).
+    pub experimental_features: Vec<String>,
 }
 
 /// A public address the server advertises (P6-02).
@@ -4483,8 +4495,20 @@ mod required_field_tests {
                     count: 1,
                     counted: CoreCount::LogicalCpus,
                 },
+                protocol_version: 15,
+                features: vec!["spoolframe:playlists".into()],
+                pre_auth_features: Vec::new(),
+                experimental_features: Vec::new(),
             },
-            &["endpointId", "fingerprint", "mdns", "addresses"],
+            &[
+                "endpointId",
+                "fingerprint",
+                "mdns",
+                "addresses",
+                "protocolVersion",
+                "preAuthFeatures",
+                "experimentalFeatures",
+            ],
         );
         assert_each_required(
             &PlexStatus {

@@ -33,8 +33,26 @@ async fn version_names_the_binary_and_its_version() {
     let output = server().arg("--version").output().expect("the binary runs");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("--version prints UTF-8");
+    let mut lines = stdout.lines();
+    // The first line alone is what the image's smoke test reads.
     assert_eq!(
-        stdout.trim(),
+        lines.next(),
+        Some(format!("spoolframe-server {}", env!("CARGO_PKG_VERSION")).as_str())
+    );
+    let rest: Vec<&str> = lines.collect();
+    assert_eq!(
+        rest,
+        [
+            format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
+            "features: spoolframe:playlists, spoolframe:liked",
+            "pre-auth features: none",
+            "experimental features (each on by its setting): http-playback",
+        ]
+    );
+    // `-V` is the crate's version alone.
+    let short = server().arg("-V").output().expect("the binary runs");
+    assert_eq!(
+        String::from_utf8(short.stdout).unwrap().trim(),
         format!("spoolframe-server {}", env!("CARGO_PKG_VERSION"))
     );
 }

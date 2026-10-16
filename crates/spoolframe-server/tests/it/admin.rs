@@ -18,13 +18,15 @@ use spoolframe_server::store::Store;
 /// The setup code the test servers accept.
 pub(crate) const CODE: &str = "K7QD-M2XP-9RTB";
 
-/// The status of a server whose key is the first fingerprint test vector.
+/// The status of a server whose key is the first fingerprint test vector,
+/// with HTTP playback on.
 fn status() -> std::sync::Arc<admin::StatusSource> {
     let status = admin::StatusSource::new(
         spoolframe_server::network::ServerName::new("Den"),
         server_id(),
         crate::support::transcoding(),
-    );
+    )
+    .with_experimental(spoolframe_server::protocol_info::experimental_on(true));
     status.set_endpoint_id(VECTOR.0.to_owned());
     std::sync::Arc::new(status)
 }
@@ -271,6 +273,18 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
     assert_eq!(status.endpoint_id.as_deref(), Some(VECTOR.0));
     assert_eq!(status.fingerprint.as_deref(), Some(VECTOR.1));
     assert_eq!(status.server_id, SERVER_ID);
+    // What it speaks: the protocol's version and every feature list, an
+    // empty one too.
+    assert_eq!(
+        status.protocol_version,
+        spoolframe_protocol::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        status.features,
+        ["spoolframe:playlists", "spoolframe:liked"]
+    );
+    assert!(status.pre_auth_features.is_empty());
+    assert_eq!(status.experimental_features, ["http-playback"]);
     // Nothing detected in tests: the software baseline.
     assert_eq!(status.transcoding.video_encoders, ["libx264"]);
     assert_eq!(status.transcoding.audio_encoders, ["aac"]);

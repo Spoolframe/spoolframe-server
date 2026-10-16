@@ -503,11 +503,7 @@ impl ClientProtocol {
 
     /// The experimental features this server has on (PX-49).
     fn experimental_on(&self) -> Vec<&'static str> {
-        let mut on = Vec::new();
-        if self.http_playback.is_some() {
-            on.push(spoolframe_protocol::experimental::HTTP_PLAYBACK);
-        }
-        on
+        crate::protocol_info::experimental_on(self.http_playback.is_some())
     }
 
     /// One stream: its kind byte, then (for RPC) one request and its

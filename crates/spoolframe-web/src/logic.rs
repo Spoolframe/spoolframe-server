@@ -629,6 +629,16 @@ pub fn passkey_domain(server_id: &str) -> String {
     format!("{server_id}.{}", spoolframe_admin_api::APP_RP_DOMAIN)
 }
 
+/// A list of feature names as the Server page shows it: comma-separated,
+/// and "none" when empty, so an empty list is shown, not left out.
+pub fn feature_list(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Plex's version to its minor, as the boards show it: `1.41.0.8992-…`
 /// is 1.41.
 pub fn plex_version(v: &str) -> String {
@@ -797,6 +807,15 @@ pub fn address_parts(address: &str) -> (&str, &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_feature_list_says_none_when_empty() {
+        assert_eq!(feature_list(&[]), "none");
+        assert_eq!(
+            feature_list(&["spoolframe:playlists".into(), "spoolframe:liked".into()]),
+            "spoolframe:playlists, spoolframe:liked"
+        );
+    }
 
     #[test]
     fn a_typed_list_splits_at_commas_and_spaces() {

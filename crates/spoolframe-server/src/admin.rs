@@ -228,6 +228,9 @@ pub struct StatusSource {
     /// The languages subtitles are read as text in.
     pub ocr_languages: Vec<String>,
     web_urls: OnceLock<Vec<String>>,
+    /// The experimental features on (PX-49), fixed at start as the
+    /// settings that turn them on need a restart.
+    experimental: Vec<&'static str>,
 }
 
 /// The default of `previews.workers` on this machine, as the settings page
@@ -262,7 +265,20 @@ impl StatusSource {
             told: OnceLock::new(),
             ocr_languages: Vec::new(),
             web_urls: OnceLock::new(),
+            experimental: Vec::new(),
         }
+    }
+
+    /// The experimental features on, as the client protocol's `Hello`
+    /// gets them ([`crate::protocol_info::experimental_on`]).
+    pub fn with_experimental(mut self, on: Vec<&'static str>) -> Self {
+        self.experimental = on;
+        self
+    }
+
+    /// The client protocol's version and this server's features.
+    pub fn protocol(&self) -> crate::protocol_info::ProtocolInfo {
+        crate::protocol_info::ProtocolInfo::new(self.experimental.clone())
     }
 
     pub fn with_jobs(mut self, jobs: Arc<crate::encode::job::Jobs>) -> Self {
@@ -317,6 +333,8 @@ impl StatusSource {
 
     fn status(&self) -> ServerStatus {
         let detected = self.transcoding.detected();
+        let protocol = self.protocol();
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
         let encoders = detected.encoders.clone();
         let budget_now = self.jobs.as_ref().map(|jobs| jobs.budget());
         let limits = self.jobs.as_ref().map(|jobs| jobs.limits());
@@ -429,6 +447,10 @@ impl StatusSource {
             ocr_languages: self.ocr_languages.clone(),
             web_urls: self.web_urls.get().cloned().unwrap_or_default(),
             preview_workers_default: preview_workers_default(),
+            protocol_version: protocol.version,
+            features: names(&protocol.features),
+            pre_auth_features: names(&protocol.pre_auth),
+            experimental_features: names(&protocol.experimental),
         }
     }
 }
@@ -925,6 +947,12 @@ impl AdminApi {
         } else {
             Err(no_such_playback(id))
         }
+    }
+
+    /// The client protocol's version and this server's features, as MCP's
+    /// server info says them.
+    pub(crate) fn protocol(&self) -> crate::protocol_info::ProtocolInfo {
+        self.status.protocol()
     }
 
     /// What MCP's library tools read, if this server has it.

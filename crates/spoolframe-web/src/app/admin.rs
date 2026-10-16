@@ -1621,8 +1621,9 @@ fn UserPasskeys(username: String, name: String) -> Element {
     }
 }
 
-/// The design's WebServer board: this server, Plex, and the media paths
-/// check, side by side where there is room.
+/// The design's WebServer board: this server across the page, its card
+/// being the tallest, then Plex and the media paths check side by side
+/// where there is room.
 #[component]
 pub fn Server() -> Element {
     rsx! {
@@ -1634,15 +1635,13 @@ pub fn Server() -> Element {
                 h1 { class: "page-title page-title-admin max-md:hidden", "Server" }
                 super::restart::RestartButton { label: "Restart server", class: "btn" }
             }
+            ThisServer {}
             div { class: "server-grid",
-                ThisServer {}
-                div { class: "flex flex-col gap-4",
-                    Plex {}
-                    PathCheck {}
-                }
+                Plex {}
+                PathCheck {}
             }
-            // Under "This server"'s encode budget, the whole width: the
-            // cards it is spent on, and where each conversion goes.
+            // Last, the whole width: the cards "This server"'s encode
+            // budget is spent on, and where each conversion goes.
             super::gpus::Gpus {}
         }
     }
@@ -1734,6 +1733,22 @@ fn ThisServer() -> Element {
                     Some(Ok(s)) => rsx! {
                         Pair { label: "Name", b { "{s.name}" } }
                         Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
+                        // What it speaks to the apps: new capability comes
+                        // as a feature, not a new protocol version, so each
+                        // list is shown, an empty one as "none". Not on a
+                        // phone, as WebAdminPhone 3 keeps to the three
+                        // above.
+                        Pair { label: "Client protocol", class: "max-md:hidden", span { class: "mono-value", "{s.protocol_version}" } }
+                        Pair { label: "Features", class: "pair-stack max-md:hidden",
+                            span { class: "mono-value", {crate::logic::feature_list(&s.features)} }
+                        }
+                        Pair { label: "Pre-auth features", class: "pair-stack max-md:hidden",
+                            span { class: "mono-value", {crate::logic::feature_list(&s.pre_auth_features)} }
+                        }
+                        Pair { label: "Experimental", class: "pair-stack max-md:hidden",
+                            span { class: "mono-value", {crate::logic::feature_list(&s.experimental_features)} }
+                            div { class: "mt-1 text-xs text-ctp-subtext0", "On here, each by its setting; apps use one only when they ask for it." }
+                        }
                         // What it and this web app are built from, and
                         // their licenses.
                         Pair { label: "Licenses",

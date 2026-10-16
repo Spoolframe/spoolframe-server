@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The client protocol's version and features are shown: on the Server
+  page's This server card (Client protocol, Features, Pre-auth features,
+  Experimental), by `spoolframe-server --version` after its first line,
+  and in MCP's server info, its description. Each list is shown, an empty
+  one as "none". New wire capability now comes as a regular feature
+  rather than a new protocol version, so the version alone no longer
+  says what a server speaks. Admin API: `ServerStatus`'s
+  `protocolVersion`, `features`, `preAuthFeatures` and
+  `experimentalFeatures`. The This server card takes the page's whole
+  width, with Plex and Media paths side by side under it.
+
 - Hearts, Liked and All in the web UI (PX-43). My playlists lists Liked
   and All first among your own, each with a line saying what it is and
   no Edit, Share or Delete; Liked's tracks can be moved and removed, All

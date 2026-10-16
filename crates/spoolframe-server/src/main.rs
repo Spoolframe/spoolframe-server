@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use spoolframe_admin_api::RestartMode;
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
@@ -345,7 +345,13 @@ fn main() -> Result<()> {
     // before anything else: the program as it was started.
     let exe = std::env::current_exe();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let cli = Cli::parse();
+    // `--version` names the client protocol's version and features after
+    // the crate's (`-V`, the crate's alone); its first line stays
+    // `spoolframe-server X.Y.Z`, which the image's smoke test reads.
+    let long_version: &'static str =
+        Box::leak(spoolframe_server::protocol_info::long_version().into_boxed_str());
+    let cli = Cli::from_arg_matches(&Cli::command().long_version(long_version).get_matches())
+        .unwrap_or_else(|e| e.exit());
     // Before any runtime, thread or log: the decoder is a child the server
     // started, confined, which only reads its input and writes pictures.
     if let Some(Command::DecodeSubtitle {
@@ -907,6 +913,9 @@ async fn run(
         StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
             .with_jobs(jobs.clone())
             .with_mdns(endpoint_options.mdns)
+            .with_experimental(spoolframe_server::protocol_info::experimental_on(
+                http_playback.listen.is_some(),
+            ))
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
     let artwork_dir = state_dir.join("cache").join("artwork");

@@ -1076,9 +1076,20 @@ fn caller(context: &RequestContext<RoleServer>) -> Result<McpCaller, ErrorData> 
 }
 
 impl ServerHandler for McpServer {
+    /// The server's name and version, and in its description the client
+    /// protocol's version and features, one per line, as the Server page
+    /// lists them: for an agent asked what this server speaks.
     fn get_info(&self) -> ServerConfig {
+        let protocol = self
+            .api
+            .protocol()
+            .lines("experimental features on")
+            .join("\n");
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("spoolframe", env!("CARGO_PKG_VERSION")))
+            .with_server_info(
+                Implementation::new("spoolframe", env!("CARGO_PKG_VERSION"))
+                    .with_description(protocol),
+            )
             .with_instructions(
                 "Spoolframe is a media server. These tools act as the signed-in user, with \
                  what they allowed: their library, what they watch, their playlists, and for \

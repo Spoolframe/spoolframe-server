@@ -261,6 +261,21 @@ async fn a_client_initializes_and_lists_the_tools_of_its_scopes_only() {
         )
         .await;
     assert_eq!(init["result"]["serverInfo"]["name"], "spoolframe");
+    // What the server speaks, as the Server page lists it (this one's
+    // HTTP playback is on); a list with nothing in it says "none".
+    let described = init["result"]["serverInfo"]["description"]
+        .as_str()
+        .expect("a description");
+    let lines: Vec<&str> = described.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
+            "features: spoolframe:playlists, spoolframe:liked",
+            "pre-auth features: none",
+            "experimental features on: http-playback",
+        ]
+    );
     assert!(init["result"]["capabilities"]["tools"].is_object());
     assert_eq!(mcp.tools().await, LIBRARY_TOOLS);
     // Nothing streams: no GET.
