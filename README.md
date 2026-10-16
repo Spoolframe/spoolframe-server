@@ -124,3 +124,16 @@ A debug server with `embed-web` reads the bundle directory as it is, so
 after a change: bundle, reload.
 `crates/spoolframe-web/assets/tailwind.css` is generated but committed;
 `ci:style` fails when it is stale.
+
+### MCP (AI agents)
+
+The server has an MCP server at `/mcp` on the admin listener (PX-42), off
+until `mcp.enabled` is on (Settings › Remote access, or the config file).
+To connect Claude, add a custom connector with the web UI's address and
+`/mcp`, e.g. `https://media.example.org/mcp`: Claude registers itself,
+opens the server's sign-in and consent page, and gets a token for the
+scopes the user allows. Over the Internet that needs `admin.public_url`
+with TLS; without it, only a client that reaches the server at its own
+address (an IP or `localhost`) can connect. Users see and disconnect
+their apps in My profile › Connected apps; admins see what was done in
+Server › Audit.

@@ -159,6 +159,11 @@ pub struct Metadata {
     pub media: Vec<Media>,
     /// Plex's own stable id, `plex://movie/…`.
     pub guid: Option<String>,
+    /// A playlist's: `video`, `audio` or `photo` (PX-40).
+    pub playlist_type: Option<String>,
+    /// A playlist made by rules rather than by hand (PX-40).
+    #[serde(default, deserialize_with = "lenient")]
+    pub smart: Option<bool>,
     /// Other agents' ids (`imdb://…`); only on single-item responses, or
     /// listings asked with `includeGuids=1`.
     #[serde(rename = "Guid", default)]

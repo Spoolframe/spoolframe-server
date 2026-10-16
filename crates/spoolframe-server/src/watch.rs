@@ -461,6 +461,46 @@ impl Watch {
         Ok(())
     }
 
+    /// A page of what `principal` watched or started, the most recently
+    /// first (PX-42's `watch_history`): each item as the catalog has it,
+    /// with their state, and how many states there are. An item gone from
+    /// the catalog, not served now, or on a Plex server that is down is
+    /// left out of the page, as Continue watching leaves it out.
+    pub async fn history(
+        &self,
+        principal: Principal,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<Item>, u32), WatchError> {
+        let (rows, total) = self.store.watch_history(principal, offset, limit).await?;
+        let ids: Vec<MediaId> = rows
+            .into_iter()
+            .filter_map(|row| row.media_id.parse::<MediaId>().ok())
+            .collect();
+        let found: Vec<(MediaId, Result<_, CatalogError>)> = stream::iter(ids)
+            .map(|id| async move {
+                let item = self.catalog.item(&id).await;
+                (id, item)
+            })
+            .buffered(CATALOG_FETCHES)
+            .collect()
+            .await;
+        let mut items = Vec::new();
+        for (id, item) in found {
+            match item {
+                Ok(found) => items.push(found.item),
+                Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
+                Err(e) if is_down(&e) => {
+                    tracing::warn!(item = %id, error = %e, "watch history: left out");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut all: Vec<&mut Item> = items.iter_mut().collect();
+        self.fill(principal, &mut all).await?;
+        Ok((items, total))
+    }
+
     /// `principal`'s home screen.
     pub async fn home(&self, principal: Principal) -> Result<HomeScreen, WatchError> {
         // Cards removed (P1-22): movies and episodes, each by its own id.

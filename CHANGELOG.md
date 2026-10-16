@@ -2,6 +2,94 @@
 
 ## Unreleased
 
+- An MCP server in the server (PX-42), so an AI agent such as Claude can
+  act for a user: `/mcp` on the admin listener, MCP's Streamable HTTP
+  transport, stateless. Off by default: `mcp.enabled`, a live setting,
+  turned on in Settings › Remote access; off, `/mcp` and every OAuth
+  endpoint are not found. A client connects by the URL alone: the server
+  is its own OAuth 2.1 authorization server, with the metadata documents
+  (RFC 8414, RFC 9728), dynamic client registration (RFC 7591, public
+  clients, 20 an hour per address) and the authorization code with PKCE
+  (S256 only). The user signs in on the web UI as always (password,
+  passkey or provider, with their login policy) and consents at
+  `/connect`, which names the app as it named itself, in quotes, and the
+  host its answer goes to, in bold, with PX-23's warning over plain HTTP;
+  they grant all or some of `library:read`, `playlists:write` and, to an
+  admin only, `admin`. A scope the server does not have (`playback`) is
+  dropped. A broken request (unknown client, unregistered redirect URI,
+  no PKCE) is answered on the server's own page and redirects nowhere.
+  Access tokens last an hour; refresh tokens rotate and last 30 days from
+  their last use, and a reused one ends the grant; all are stored hashed.
+  Consent replaces the client's earlier grant for that user.
+  Tools, listed only when the token's scopes cover them and refused
+  otherwise: `search`, `get_item`, `list_recent`, `continue_watching`,
+  `watch_history`; `list_playlists`, `get_playlist`, `create_playlist`,
+  `add_to_playlist`, `remove_from_playlist`, `move_in_playlist`,
+  `pin_playlist`, `unpin_playlist`, `set_watched`; and for admins
+  `list_users`, `disable_user`, `list_sessions`, `end_session`,
+  `list_playbacks`, `stop_playback`, `read_logs`. `disable_user`,
+  `end_session`, `stop_playback` and `remove_from_playlist` carry MCP's
+  destructive annotation. Every call is logged under
+  `spoolframe_server::audit` (Server › Logs); admin tool calls, and apps
+  connected and disconnected, are kept in a new audit list, Server ›
+  Audit. My profile › Connected apps lists each app with its scopes,
+  last call and calls today (UTC), and disconnects it at once, for good;
+  an admin sees and disconnects anyone's from the user's page. A disabled
+  user's or a disconnected app's tokens stop at their next call.
+  Admin API: `me.connectedApps`, `me.revokeConnectedApp`,
+  `admin.connectedApps`, `admin.revokeConnectedApp`, `admin.auditList`;
+  types `ConnectedApp`, `AuditEvent`, `AuditPage`; error `NO_SUCH_APP`.
+  `mcp.*` is a sensitive setting. Not yet: `scan_library`, the debug
+  package (PX-34), `like`/`unlike` (PX-43) and the `playback` scope
+  (PX-05).
+
+- Playlists (PX-40), the server and the wire: ordered lists of movies,
+  episodes and tracks a user makes, shares and pins, behind the first
+  regular feature, `spoolframe:playlists`. New requests
+  `ListPlaylists`, `GetPlaylist`, `CreatePlaylist`, `UpdatePlaylist`,
+  `EditPlaylist`, `DeletePlaylist`, `PinPlaylist`, `UnpinPlaylist` and
+  `DismissPinNotes`; replies `Playlists`, `Playlist`, `PlaylistInfo` and
+  `PlaylistEdited`; errors `PlaylistReadOnly`, `KindNotAllowed` and
+  `PlaylistConflict`; events `PlaylistChanged`, `PlaylistGone` and
+  `PinsChanged`. `Item` carries the playlists holding it, for a client
+  that lists the feature. A playlist is personal, shared with chosen
+  users (read-only or editable) or server-wide (made by an admin, seen
+  by everyone); two editors' edits on one revision are both kept unless
+  they touch the same entry. An item whose file cannot be read is
+  listed as unavailable, one that left the library drops out, and one
+  Plex gave a new key is followed to it. Pins are per user and kept by
+  the server; a pinned playlist unshared or deleted leaves Pinned with a
+  note. The types are in `spoolframe_protocol::playlists`. A portable
+  user who leaves takes their playlists with them.
+  Playing: `PlayPlaylist { id, from, shuffle, repeat, skip_watched }`
+  and `NextInPlaylist { id, after }` answer `PlaylistItem` (the entry,
+  its item with the user's watch state, and its markers, for skipping
+  credits) or `PlaylistFinished`. The server keeps each user's place
+  and settings per playlist (`GetPlaylist`'s `place` and `settings`):
+  Continue resumes the entry in progress or the one after the last
+  finished, unavailable and (optionally) watched entries are passed,
+  and shuffle with repeat plays every entry once per round.
+  In the SDK: `Session::features()` (`Features { playlists }`); the
+  calls `playlists`, `playlist`, `create_playlist`, `update_playlist`
+  (`PlaylistUpdate`), `edit_playlist`, `delete_playlist`,
+  `pin_playlist`, `unpin_playlist`, `dismiss_pin_notes`,
+  `play_playlist`, `next_in_playlist`, each `SdkError::Unsupported`
+  without sending anything when the server lacks the feature;
+  `ItemDetail::playlists`; `Client::playlist_events()` with
+  `PlaylistEvent { server, change: PlaylistChange }`; and the errors
+  `SdkError::PlaylistReadOnly`, `KindNotAllowed` and `PlaylistConflict`.
+  The SDK's `Hello` now lists its features.
+  Importing from Plex: `ImportPlexPlaylists { dry_run }` (SDK
+  `import_plex_playlists`) turns each video and music playlist of the
+  user's linked Plex account into a personal playlist here, once, and
+  answers `PlexImport { made, unmapped, notes }`; nothing is synced
+  afterwards.
+- Features (PX-16's first slice): `Hello.features`, the client's
+  regular features; `ServerInfo.features`, the server's pre-auth ones
+  (none yet); `LoggedIn.features` and `WhoAmI`'s `features`, all of
+  them. Each side uses only what both list; all are left out when
+  empty. `spoolframe_protocol::features` names them.
+
 - Invites are sent as https links on spoolframe.app (PX-45), which
   Messages, Mail and chat apps make tappable and the apps open as a
   universal link: `https://spoolframe.app/i#<the spoolframe:// link's

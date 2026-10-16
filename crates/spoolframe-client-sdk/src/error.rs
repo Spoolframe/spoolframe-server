@@ -310,6 +310,27 @@ pub enum SdkError {
     /// server is still saved here.
     #[error("you are the only admin; make someone else an admin first")]
     LastAdmin,
+    /// The server does not have this feature (PX-16): nothing was sent.
+    /// Hide what needs it ([`crate::Session::features`]).
+    #[error("this server does not have {feature}")]
+    Unsupported { feature: String },
+    /// The user sees the playlist and may not make this change (PX-40):
+    /// an edit on a read-only share, or a rename, sharing change or
+    /// delete by anyone but its owner (or an admin, for a server-wide
+    /// one).
+    #[error("you cannot change this playlist")]
+    PlaylistReadOnly,
+    /// The playlist does not take items of this kind (PX-40). Offer "Add
+    /// to playlist" only for playlists whose kinds take the item.
+    #[error("this playlist does not take a {kind:?}")]
+    KindNotAllowed {
+        kind: spoolframe_protocol::playlists::ItemKind,
+    },
+    /// Someone changed the playlist's same entries since the revision the
+    /// edit was made on (PX-40): "Someone changed this playlist; reload".
+    /// `revision` is its revision now. Nothing changed.
+    #[error("someone changed this playlist; reload")]
+    PlaylistConflict { revision: u64 },
     /// Pairing this device with a portable identity, or a phone with a
     /// device, did not happen (P7-03); [`PairingError`] says why.
     #[error(transparent)]
@@ -379,6 +400,9 @@ impl SdkError {
             ServerError::AdminRequired => SdkError::AdminRequired,
             ServerError::PasswordChangeRequired => SdkError::PasswordChangeRequired,
             ServerError::LastAdmin => SdkError::LastAdmin,
+            ServerError::PlaylistReadOnly => SdkError::PlaylistReadOnly,
+            ServerError::KindNotAllowed { kind } => SdkError::KindNotAllowed { kind },
+            ServerError::PlaylistConflict { revision } => SdkError::PlaylistConflict { revision },
             other => SdkError::Server(other.to_string()),
         }
     }

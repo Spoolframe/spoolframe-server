@@ -35,6 +35,7 @@ use spoolframe_admin_api::{
 use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
+use spoolframe_admin_api::{AuditEvent, AuditPage, ConnectedApp};
 use spoolframe_admin_api::{ConfigReload, UplinkMeasurement};
 use spoolframe_admin_api::{
     InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant, ServerLink,
@@ -55,6 +56,7 @@ use crate::config::{FIRST_PLEX_SERVER, PlexConfig};
 use crate::device_sign_in::ClaimError;
 use crate::libraries::{self, LibraryError};
 use crate::network::ServerName;
+use crate::oauth::DecideError;
 use crate::oidc::{Begun, Identity, Oidc, OidcError, Purpose, ReturnTo};
 use crate::passkeys::{CeremonyError, Passkeys, SignInError};
 use crate::plex_accounts::{Link, LinkError, Linking, PlexAccounts};
@@ -499,6 +501,11 @@ pub struct Admin {
     /// What plays, for playback debug (P3-15); `None` in tests without,
     /// where its methods are `NOT_CONFIGURED`.
     pub playback: Option<Arc<crate::playback_debug::PlaybackDebug>>,
+    /// Whether MCP and its OAuth endpoints answer (`mcp.enabled`, PX-42).
+    pub mcp: crate::oauth::McpSwitch,
+    /// What MCP's library and playlist tools read (PX-42); `None` in
+    /// tests without, where those tools say so.
+    pub library: Option<crate::mcp::Library>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -601,6 +608,7 @@ pub async fn serve(
             .map_or_else(PathChecks::default, |s| PathChecks::kept_in(s.state_dir())),
     );
     let api = AdminApi {
+        oauth: Arc::new(crate::oauth::OAuth::new(admin.auth.store().clone())),
         auth: admin.auth,
         setup_code: admin.setup_code,
         status: admin.status,
@@ -618,6 +626,8 @@ pub async fn serve(
         logs: admin.logs,
         telemetry: admin.telemetry,
         playback: admin.playback,
+        mcp: admin.mcp,
+        library: admin.library,
         checks,
         pins: Arc::default(),
         signed_in: Arc::default(),
@@ -649,6 +659,10 @@ pub(crate) struct AdminApi {
     logs: Option<Arc<crate::logs::LogRing>>,
     telemetry: Option<Arc<crate::telemetry::Telemetry>>,
     playback: Option<Arc<crate::playback_debug::PlaybackDebug>>,
+    /// The OAuth authorization server MCP clients sign in through (PX-42).
+    oauth: Arc<crate::oauth::OAuth>,
+    mcp: crate::oauth::McpSwitch,
+    library: Option<crate::mcp::Library>,
     /// Each library's last path check (P3-16).
     checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
@@ -808,6 +822,205 @@ impl AdminApi {
             "insecureCookies": self.cookies.insecure(),
             "sso": self.oidc.names(),
         })
+    }
+
+    /// The OAuth authorization server MCP clients sign in through
+    /// (PX-42).
+    pub(crate) fn oauth(&self) -> &crate::oauth::OAuth {
+        &self.oauth
+    }
+
+    // What an admin does, by the admin API or by MCP's admin tools
+    // (PX-42): the caller is checked by each, these act.
+
+    /// Every user.
+    pub(crate) async fn users(&self) -> RpcResult<Vec<UserInfo>> {
+        Ok(self
+            .auth
+            .store()
+            .list_users()
+            .await?
+            .into_iter()
+            .map(|u| self.info(u))
+            .collect())
+    }
+
+    /// Disable `username`: every session of theirs ends. How many.
+    pub(crate) async fn disable(&self, username: &str) -> RpcResult<u64> {
+        let revoked = self.auth.store().disable_user(username).await?;
+        tracing::info!(%username, revoked, "user disabled");
+        Ok(revoked)
+    }
+
+    /// `username`'s live sessions; `current` is the caller's own, if it
+    /// is one of them (a token hash).
+    pub(crate) async fn sessions_of(
+        &self,
+        username: &str,
+        current: &str,
+    ) -> RpcResult<Vec<SessionEntry>> {
+        let user = self.record(username).await?;
+        let sessions = self
+            .auth
+            .store()
+            .list_sessions(user.id)
+            .await
+            .map_err(internal)?;
+        Ok(sessions
+            .into_iter()
+            .map(|s| session_entry(s, current))
+            .collect())
+    }
+
+    /// End `username`'s session `id` (as `sessions_of` names it).
+    pub(crate) async fn end_session_of(&self, username: &str, id: &str) -> RpcResult<()> {
+        let user = self.record(username).await?;
+        let sessions = self
+            .auth
+            .store()
+            .list_sessions(user.id)
+            .await
+            .map_err(internal)?;
+        let Some(session) = sessions
+            .into_iter()
+            .find(|s| session_id(&s.token_hash) == id)
+        else {
+            return Err(error(error_code::NO_SUCH_SESSION, "no such session"));
+        };
+        self.auth
+            .store()
+            .revoke_session(&session.token_hash)
+            .await
+            .map_err(internal)?;
+        tracing::info!(%username, "session revoked by an admin");
+        Ok(())
+    }
+
+    /// A page of the server's last log lines.
+    pub(crate) fn log_page(&self, query: &LogQuery) -> RpcResult<LogPage> {
+        match &self.logs {
+            Some(ring) => Ok(ring.page(query)),
+            None => Err(error(
+                error_code::NOT_CONFIGURED,
+                "this server keeps no log lines",
+            )),
+        }
+    }
+
+    /// The playbacks open now, and those that ended in the last hour.
+    pub(crate) fn playback_list(&self) -> RpcResult<spoolframe_admin_api::PlaybackList> {
+        Ok(self.playback_debug()?.list())
+    }
+
+    /// Stop playback `id`.
+    pub(crate) fn stop_playback(&self, id: &str) -> RpcResult<()> {
+        if self.playback_debug()?.stop(id) {
+            Ok(())
+        } else {
+            Err(no_such_playback(id))
+        }
+    }
+
+    /// What MCP's library tools read, if this server has it.
+    pub(crate) fn mcp_library(&self) -> Option<&crate::mcp::Library> {
+        self.library.as_ref()
+    }
+
+    /// Whether MCP and its OAuth endpoints answer now (`mcp.enabled`).
+    pub(crate) fn mcp_on(&self) -> bool {
+        self.mcp.on()
+    }
+
+    /// Where browsers reach the web UI (`admin.public_url`), if anywhere.
+    pub(crate) fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
+    }
+
+    /// The waiting authorization request `id`, as consent shows it to the
+    /// caller: `admin` is offered only if they are one.
+    pub(crate) async fn oauth_pending(
+        &self,
+        ext: &Extensions,
+        id: &str,
+    ) -> RpcResult<crate::oauth::PendingView> {
+        let (_, user) = self.caller(ext).await?;
+        self.oauth.pending(id, user.role.is_admin()).ok_or_else(|| {
+            error(
+                error_code::INVALID_INPUT,
+                DecideError::NoSuchRequest.to_string(),
+            )
+        })
+    }
+
+    /// Disconnect `grant` at `by`'s word: its tokens stop now. Kept in
+    /// the audit list.
+    async fn revoke_app(
+        &self,
+        by: &ApiSessionUser,
+        grant: crate::store::oauth::GrantRecord,
+    ) -> RpcResult<()> {
+        self.auth
+            .store()
+            .revoke_oauth_grant(&grant.id)
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            client = %grant.client_name,
+            user = %grant.username,
+            by = %by.user,
+            "a connected app was revoked"
+        );
+        let target = format!("{} ({})", grant.client_name, grant.username);
+        self.audit_web(by.user, "app.revoke", &target).await;
+        Ok(())
+    }
+
+    /// Record in the audit list what `actor` did in the web UI. A failure
+    /// to record is logged; what was done stands.
+    async fn audit_web(&self, actor: crate::store::users::LocalUserId, action: &str, target: &str) {
+        let actor = actor.to_string();
+        let event = crate::store::audit::NewAuditEvent {
+            actor: &actor,
+            client: "web",
+            action,
+            target: Some(target),
+            outcome: "ok",
+        };
+        if let Err(e) = self.auth.store().record_audit(event).await {
+            tracing::error!(error = %e, action, "cannot record in the audit list");
+        }
+    }
+
+    /// The caller's answer to the waiting request `id`: where to send
+    /// their browser.
+    pub(crate) async fn oauth_decide(
+        &self,
+        ext: &Extensions,
+        id: &str,
+        allow: bool,
+        scopes: &[String],
+    ) -> RpcResult<String> {
+        let (_, user) = self.caller(ext).await?;
+        let client = self
+            .oauth
+            .pending(id, user.role.is_admin())
+            .map(|p| p.client_name);
+        match self
+            .oauth
+            .decide(id, user.user, user.role.is_admin(), allow, scopes)
+            .await
+        {
+            Ok(to) => {
+                if let (true, Some(client)) = (allow, client) {
+                    self.audit_web(user.user, "app.connect", &client).await;
+                }
+                Ok(to.to_string())
+            }
+            Err(e @ (DecideError::NoSuchRequest | DecideError::Invalid(_))) => {
+                Err(error(error_code::INVALID_INPUT, e.to_string()))
+            }
+            Err(DecideError::Store(e)) => Err(internal(e)),
+        }
     }
 
     /// Note that the session `token` is the web UI's: what set it as a
@@ -1341,8 +1554,11 @@ fn recent(user: &ApiSessionUser, now: i64) -> RpcResult<()> {
 /// And HTTP playback (`http_playback.*`, PX-49): `listen` opens a port of
 /// plain HTTP, and `address` is the host in every URL apps are given,
 /// each carrying a playback's token, so whoever names it is sent them.
+/// And MCP (`mcp.*`, PX-42): it opens an authorization server through
+/// which apps get tokens that act for users.
 fn sensitive_setting(key: &str) -> bool {
     key.starts_with("admin.")
+        || key.starts_with("mcp.")
         || key.starts_with("http_playback.")
         || key.starts_with("auth.")
         || key.starts_with("media.")
@@ -2395,6 +2611,31 @@ impl MeApiServer for AdminApi {
             .await
             .map_err(internal)
     }
+
+    async fn connected_apps(&self, ext: &Extensions) -> RpcResult<Vec<ConnectedApp>> {
+        let (_, user) = self.caller(ext).await?;
+        let grants = self
+            .auth
+            .store()
+            .oauth_grants(Some(user.user))
+            .await
+            .map_err(internal)?;
+        Ok(grants.into_iter().map(connected_app).collect())
+    }
+
+    async fn revoke_connected_app(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        // Only among the caller's own: anyone else's is not found.
+        let grant = self
+            .auth
+            .store()
+            .oauth_grant(&id)
+            .await
+            .map_err(internal)?
+            .filter(|g| g.user == user.user)
+            .ok_or_else(no_such_app)?;
+        self.revoke_app(&user, grant).await
+    }
 }
 
 #[async_trait]
@@ -2491,14 +2732,7 @@ impl AdminApiServer for AdminApi {
 
     async fn user_list(&self, ext: &Extensions) -> RpcResult<Vec<UserInfo>> {
         self.admin(ext).await?;
-        Ok(self
-            .auth
-            .store()
-            .list_users()
-            .await?
-            .into_iter()
-            .map(|u| self.info(u))
-            .collect())
+        self.users().await
     }
 
     async fn user_add(&self, ext: &Extensions, user: NewUser) -> RpcResult<UserInfo> {
@@ -2595,9 +2829,7 @@ impl AdminApiServer for AdminApi {
 
     async fn user_disable(&self, ext: &Extensions, username: String) -> RpcResult<u64> {
         self.admin(ext).await?;
-        let revoked = self.auth.store().disable_user(&username).await?;
-        tracing::info!(%username, revoked, "user disabled");
-        Ok(revoked)
+        self.disable(&username).await
     }
 
     async fn user_enable(&self, ext: &Extensions, username: String) -> RpcResult<()> {
@@ -2705,18 +2937,7 @@ impl AdminApiServer for AdminApi {
         username: String,
     ) -> RpcResult<Vec<SessionEntry>> {
         let (session, _) = self.admin_session(ext).await?;
-        let user = self.record(&username).await?;
-        let current = session;
-        let sessions = self
-            .auth
-            .store()
-            .list_sessions(user.id)
-            .await
-            .map_err(internal)?;
-        Ok(sessions
-            .into_iter()
-            .map(|s| session_entry(s, &current))
-            .collect())
+        self.sessions_of(&username, &session).await
     }
 
     async fn user_revoke_session(
@@ -2726,26 +2947,7 @@ impl AdminApiServer for AdminApi {
         id: String,
     ) -> RpcResult<()> {
         self.admin(ext).await?;
-        let user = self.record(&username).await?;
-        let sessions = self
-            .auth
-            .store()
-            .list_sessions(user.id)
-            .await
-            .map_err(internal)?;
-        let Some(session) = sessions
-            .into_iter()
-            .find(|s| session_id(&s.token_hash) == id)
-        else {
-            return Err(error(error_code::NO_SUCH_SESSION, "no such session"));
-        };
-        self.auth
-            .store()
-            .revoke_session(&session.token_hash)
-            .await
-            .map_err(internal)?;
-        tracing::info!(%username, "session revoked by an admin");
-        Ok(())
+        self.end_session_of(&username, &id).await
     }
 
     async fn user_passkeys(
@@ -3270,6 +3472,54 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
+    async fn all_connected_apps(&self, ext: &Extensions) -> RpcResult<Vec<ConnectedApp>> {
+        self.admin(ext).await?;
+        let grants = self
+            .auth
+            .store()
+            .oauth_grants(None)
+            .await
+            .map_err(internal)?;
+        Ok(grants.into_iter().map(connected_app).collect())
+    }
+
+    async fn revoke_any_connected_app(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let admin = self.admin(ext).await?;
+        let grant = self
+            .auth
+            .store()
+            .oauth_grant(&id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(no_such_app)?;
+        self.revoke_app(&admin, grant).await
+    }
+
+    async fn audit_list(&self, ext: &Extensions, offset: u32, limit: u32) -> RpcResult<AuditPage> {
+        self.admin(ext).await?;
+        let (events, total) = self
+            .auth
+            .store()
+            .audit_page(offset, limit.clamp(1, AUDIT_PAGE))
+            .await
+            .map_err(internal)?;
+        Ok(AuditPage {
+            events: events
+                .into_iter()
+                .map(|e| AuditEvent {
+                    id: e.id,
+                    at: e.at,
+                    actor: e.actor_name.unwrap_or(e.actor),
+                    client: e.client,
+                    action: e.action,
+                    target: e.target,
+                    outcome: e.outcome,
+                })
+                .collect(),
+            total,
+        })
+    }
+
     async fn grant_list(&self, ext: &Extensions) -> RpcResult<Vec<PortableGrant>> {
         self.admin(ext).await?;
         let grants = self.auth.store().grants().await.map_err(internal)?;
@@ -3710,18 +3960,12 @@ impl AdminApiServer for AdminApi {
 
     async fn logs(&self, ext: &Extensions, query: LogQuery) -> RpcResult<LogPage> {
         self.admin(ext).await?;
-        match &self.logs {
-            Some(ring) => Ok(ring.page(&query)),
-            None => Err(error(
-                error_code::NOT_CONFIGURED,
-                "this server keeps no log lines",
-            )),
-        }
+        self.log_page(&query)
     }
 
     async fn playbacks(&self, ext: &Extensions) -> RpcResult<spoolframe_admin_api::PlaybackList> {
         self.admin(ext).await?;
-        Ok(self.playback_debug()?.list())
+        self.playback_list()
     }
 
     async fn playback(
@@ -3738,11 +3982,7 @@ impl AdminApiServer for AdminApi {
 
     async fn playback_stop(&self, ext: &Extensions, id: String) -> RpcResult<()> {
         self.admin(ext).await?;
-        if self.playback_debug()?.stop(&id) {
-            Ok(())
-        } else {
-            Err(no_such_playback(&id))
-        }
+        self.stop_playback(&id)
     }
 
     async fn playback_end_conversion(&self, ext: &Extensions, id: String) -> RpcResult<()> {
@@ -3780,6 +4020,27 @@ impl AdminApiServer for AdminApi {
             .plan_for(&id, &request)
             .await
             .map_err(debug_error)
+    }
+}
+
+/// The most entries one page of the audit list holds.
+const AUDIT_PAGE: u32 = 200;
+
+fn no_such_app() -> ErrorObjectOwned {
+    error(error_code::NO_SUCH_APP, "no such connected app")
+}
+
+/// A grant as Connected apps shows it.
+fn connected_app(g: crate::store::oauth::GrantRecord) -> ConnectedApp {
+    ConnectedApp {
+        return_host: crate::oauth::return_host(&g.redirect_uri),
+        scopes: g.scopes.split_whitespace().map(str::to_owned).collect(),
+        id: g.id,
+        client_name: g.client_name,
+        connected_at: g.created_at,
+        last_call_at: g.last_call_at,
+        calls_today: g.calls_today,
+        username: g.username,
     }
 }
 
@@ -4004,6 +4265,9 @@ mod tests {
         );
         let origins = Origins::Exactly("https://media.example.org".into());
         AdminApi {
+            oauth: Arc::new(crate::oauth::OAuth::new(auth.store().clone())),
+            mcp: crate::oauth::McpSwitch::default(),
+            library: None,
             auth,
             setup_code: None,
             status: Arc::new(StatusSource::new(

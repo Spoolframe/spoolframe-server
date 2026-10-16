@@ -318,6 +318,31 @@ impl Catalog for Composite {
             .map_err(|e| named(e, &local, id))
     }
 
+    /// The first server that has it; a server that cannot say makes the
+    /// whole answer "cannot say", unless another has it.
+    async fn find_external(
+        &self,
+        kind: MediaKind,
+        external_ids: &[String],
+    ) -> Result<Option<MediaId>, CatalogError> {
+        let ids = external_ids.to_vec();
+        let answers = self
+            .each(|plex| {
+                let ids = ids.clone();
+                async move { plex.find_guid(kind, &ids).await }
+            })
+            .await;
+        let mut failed = None;
+        for (source, answer) in answers {
+            match answer {
+                Ok(Some(id)) => return Ok(Some(ids::media(&source.id, id))),
+                Ok(None) => {}
+                Err(e) => failed = Some(e),
+            }
+        }
+        failed.map_or(Ok(None), Err)
+    }
+
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
         if let Some(library) = &query.library {
             let (server, local) = ids::library_local(library);

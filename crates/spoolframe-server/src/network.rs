@@ -521,6 +521,8 @@ pub struct Services {
     pub artwork: Arc<ArtworkCache>,
     pub playbacks: Arc<Playbacks>,
     pub watch: Arc<Watch>,
+    /// Playlists (PX-40).
+    pub playlists: Arc<crate::playlists::Playlists>,
     /// The encoders the planner may use (P2-02).
     pub transcoding: Arc<Transcoding>,
     /// Running encodes (P2-03).
@@ -685,6 +687,8 @@ impl Server {
             web_url: services.public_url.clone(),
             // Per connection, from its Hello (PX-49).
             experimental: Vec::new(),
+            // PX-16: only the pre-auth ones before a session.
+            features: spoolframe_protocol::features::names(spoolframe_protocol::features::PRE_AUTH),
         };
         let connections = Connections::new(options.admission);
         services.metrics.observe_services(&services, &connections);

@@ -685,6 +685,7 @@ impl AdminApi {
             item: found.item,
             children: found.children,
             markers: found.markers,
+            playlists: None,
         };
         let reply = serde_json::to_value(&reply).map_err(super::internal)?;
         // Only the crumb needs them: an item still shows without one.

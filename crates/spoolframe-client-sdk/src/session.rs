@@ -152,6 +152,9 @@ pub struct ItemDetail {
     /// The item's intro and credits (P2-10), in order of start. Empty when
     /// it has none, or the server is too old to send them.
     pub markers: Vec<Marker>,
+    /// The playlists the user sees that hold it (PX-40). Empty when none,
+    /// or the server has no playlists.
+    pub playlists: Vec<spoolframe_protocol::playlists::PlaylistRef>,
 }
 
 /// How the server would play an item.
@@ -459,6 +462,8 @@ pub struct Session {
     /// may only change the password or sign out until it does. Shared by
     /// every clone, so a change made through one is seen by all (C5).
     pub(crate) password_change_required: Arc<AtomicBool>,
+    /// The regular features the server listed in this session's `WhoAmI`.
+    pub(crate) features: crate::playlists::Features,
 }
 
 /// A profile explicitly selected by the application. All session operations
@@ -744,10 +749,12 @@ impl Session {
                 item,
                 children,
                 markers,
+                playlists,
             } => Ok(ItemDetail {
                 item,
                 children,
                 markers,
+                playlists: playlists.unwrap_or_default(),
             }),
             other => Err(unexpected(other)),
         }

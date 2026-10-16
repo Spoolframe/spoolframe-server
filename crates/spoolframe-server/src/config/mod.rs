@@ -157,6 +157,27 @@ pub struct ServerConfig {
     /// The HTTP playback port (PX-49): off unless `listen` is set.
     #[ucl(default)]
     pub http_playback: HttpPlaybackConfig,
+    /// MCP and its OAuth sign-in on the admin listener (PX-42): off
+    /// unless `enabled`.
+    #[ucl(default)]
+    pub mcp: McpConfig,
+}
+
+/// `mcp { enabled = true; }` (PX-42): an MCP server at `/mcp` on the
+/// admin listener, with the OAuth endpoints its clients sign in through.
+/// Off, every one of them is not found. A live setting.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Off if left out.
+    #[ucl(default)]
+    pub enabled: Option<bool>,
+}
+
+impl McpConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
 }
 
 /// `http_playback { listen = "[::]:7422"; address = "media.home.arpa"; }`

@@ -95,6 +95,7 @@ pub const SETTINGS: &[Setting] = &[
     live("admin.insecure_cookies"),
     live("admin.metrics"),
     live("admin.metrics_from"),
+    live("mcp.enabled"),
     live("auth.oidc"),
     restart("auth.trust_idle_days"),
     restart("artwork.cache_mb"),

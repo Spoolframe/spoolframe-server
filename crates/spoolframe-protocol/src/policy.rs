@@ -82,7 +82,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ListInvites
         // PX-49: asked again, the same playback's live token, or a new
         // one bound to the same playback.
-        | Request::HttpPlaybackUrl { .. } => true,
+        | Request::HttpPlaybackUrl { .. }
+        // PX-40: reads. A read may drop entries whose items left the
+        // library, which a second read would drop too.
+        | Request::ListPlaylists
+        | Request::GetPlaylist { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)
@@ -148,6 +152,20 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::RevokeInvite { .. }
         // Leaving ends every session; a second try finds none (PX-47).
         | Request::LeaveServer
+        // PX-40: a second create is a second playlist; an edit's adds
+        // would be added twice; pins move.
+        | Request::CreatePlaylist { .. }
+        | Request::UpdatePlaylist { .. }
+        | Request::EditPlaylist { .. }
+        | Request::DeletePlaylist { .. }
+        | Request::PinPlaylist { .. }
+        | Request::UnpinPlaylist { .. }
+        | Request::DismissPinNotes
+        // Each moves the user's place on.
+        | Request::PlayPlaylist { .. }
+        | Request::NextInPlaylist { .. }
+        // Imported twice is made twice.
+        | Request::ImportPlexPlaylists { .. }
         | Request::Unknown => false,
     }
 }

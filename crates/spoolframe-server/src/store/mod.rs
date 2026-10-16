@@ -4,11 +4,14 @@
 //! Only the running server opens it. Admin tools go through the admin
 //! API, so users, sessions and rate limits have a single owner.
 
+pub mod audit;
 pub mod grants;
 pub mod identities;
 pub mod invites;
+pub mod oauth;
 pub mod passkeys;
 pub mod pins;
+pub mod playlists;
 pub mod portable;
 pub mod sessions;
 pub mod ties;
@@ -125,6 +128,7 @@ from_sqlx_through_store_error!(
     invites::InviteError,
     passkeys::PasskeyError,
     pins::PinError,
+    playlists::PlaylistError,
     portable::IdentityStateError,
     ties::TieError,
     trust::TrustError,

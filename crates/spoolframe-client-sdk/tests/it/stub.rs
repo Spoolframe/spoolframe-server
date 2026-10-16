@@ -507,6 +507,7 @@ fn answer(
             auth_methods: vec![AuthMethod::Password],
             web_url,
             experimental: Vec::new(),
+            features: Vec::new(),
         }),
         Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
             request: "stub-request".into(),
@@ -525,6 +526,8 @@ fn answer(
             }),
             remembered: false,
             password_change_required: login.password == "one-time",
+            // A server without playlists (PX-40).
+            features: Vec::new(),
         },
         Request::ChangePassword(_) => Reply::Done,
         Request::LeaveServer if state.last_admin.load(Ordering::SeqCst) => {
@@ -542,6 +545,7 @@ fn answer(
                 portable: Vec::new(),
             },
             can_leave: !state.last_admin.load(Ordering::SeqCst),
+            features: Vec::new(),
         }),
         Request::Libraries => Reply::Libraries {
             libraries: Vec::new(),

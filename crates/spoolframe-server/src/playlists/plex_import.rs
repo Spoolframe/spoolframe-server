@@ -1,0 +1,126 @@
+//! Importing a user's Plex playlists, once (PX-40): each video or music
+//! playlist of their linked account, on every Plex server here, becomes a
+//! personal playlist of theirs, its items mapped to this server's. What
+//! does not map is reported. Nothing is synced afterwards: the playlist
+//! is ours only. A smart playlist is imported as what it holds now.
+
+use spoolframe_plex::playlists::PlexPlaylistItem;
+use spoolframe_protocol::playlists::{PlexImport, PlexImported, PlexUnmapped};
+use spoolframe_types::{Item, MediaId};
+
+use super::{Playlists, PlaylistsError};
+use crate::plex_sync::{SyncError, WatchSync};
+use crate::principal::Actor;
+use crate::store::users::LocalUserId;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ImportError {
+    /// The user has no Plex account linked, or the server links none.
+    #[error("no Plex account is linked")]
+    NotLinked,
+    #[error(transparent)]
+    Sync(SyncError),
+    #[error(transparent)]
+    Playlists(#[from] PlaylistsError),
+}
+
+impl From<SyncError> for ImportError {
+    fn from(e: SyncError) -> Self {
+        match e {
+            SyncError::NotLinked => ImportError::NotLinked,
+            other => ImportError::Sync(other),
+        }
+    }
+}
+
+/// What a Plex item is called, for the report.
+fn title(item: &Item) -> String {
+    match item {
+        Item::Movie(m) => m.title.clone(),
+        Item::Show(s) => s.title.clone(),
+        Item::Season(s) => s.title.clone(),
+        Item::Episode(e) => e.title.clone(),
+        Item::Artist(a) => a.name.clone(),
+        Item::Album(a) => a.title.clone(),
+        Item::Track(t) => t.title.clone(),
+    }
+}
+
+/// Import `user`'s Plex playlists as `actor` (the same person), or with
+/// `dry_run` say what would be made.
+pub async fn import(
+    playlists: &Playlists,
+    sync: &WatchSync,
+    actor: &Actor,
+    user: LocalUserId,
+    dry_run: bool,
+) -> Result<PlexImport, ImportError> {
+    let (views, mut notes) = sync.user_views(user).await?;
+    let (mut made, mut unmapped) = (Vec::new(), Vec::new());
+    for (server, plex) in views {
+        let lists = match plex.playlists().await {
+            Ok(lists) => lists,
+            Err(e) => {
+                tracing::warn!(server, error = %e, "cannot read a Plex account's playlists");
+                notes.push(format!(
+                    "the playlists on Plex server {server} could not be read"
+                ));
+                continue;
+            }
+        };
+        for list in lists {
+            let entries = match plex.playlist_items(&list.key).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::warn!(server, error = %e, "cannot read a Plex playlist");
+                    unmapped.push(PlexUnmapped {
+                        playlist: list.title.clone(),
+                        title: None,
+                        reason: "Plex did not give its items".into(),
+                    });
+                    continue;
+                }
+            };
+            let mut items: Vec<(MediaId, String)> = Vec::new();
+            for entry in entries {
+                match entry {
+                    PlexPlaylistItem::Item(item) => {
+                        let id = crate::catalog::ids::media(&server, item.id().clone());
+                        items.push((id, title(&item)));
+                    }
+                    PlexPlaylistItem::Unmapped { title, why } => unmapped.push(PlexUnmapped {
+                        playlist: list.title.clone(),
+                        title: Some(title),
+                        reason: why,
+                    }),
+                }
+            }
+            let (playlist_id, count, left_out) = playlists
+                .import(actor, &list.title, &items, dry_run)
+                .await?;
+            unmapped.extend(left_out.into_iter().map(|(title, reason)| PlexUnmapped {
+                playlist: list.title.clone(),
+                title: Some(title),
+                reason,
+            }));
+            if count == 0 {
+                unmapped.push(PlexUnmapped {
+                    playlist: list.title.clone(),
+                    title: None,
+                    reason: "nothing in it is in this server's libraries".into(),
+                });
+                continue;
+            }
+            made.push(PlexImported {
+                name: list.title.clone(),
+                playlist_id,
+                entries: count,
+            });
+        }
+    }
+    Ok(PlexImport {
+        made,
+        unmapped,
+        notes,
+    })
+}

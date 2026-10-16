@@ -23,6 +23,9 @@ use crate::passkeys::{
     PasskeySignInBegun,
 };
 use crate::playback::{BitmapSubtitles, ChosenTracks, PlaybackPlan, Quality, Selection};
+use crate::playlists::{
+    Kinds, PinNote, PlaylistEdit, PlaylistPage, PlaylistRef, PlaylistSummary, Visibility,
+};
 use crate::plex::PlexLink;
 use crate::portable::{
     IdentityRecord, PortableIdentityState, PortableUserId, TieProof, UserDeviceCredential,
@@ -674,6 +677,112 @@ pub enum Request {
     /// `LastAdmin`. Nothing was changed then.
     LeaveServer,
 
+    /// Playlists (PX-40, feature `spoolframe:playlists`): every playlist
+    /// the session user sees, theirs, shared with them and server-wide,
+    /// each with whether it is pinned and where; and the notes of pinned
+    /// ones that left their Pinned. `Playlists`.
+    ListPlaylists,
+    /// One playlist and a page of its entries, from `offset`, at most
+    /// `limit` (200): `Playlist`. Items the user may not see are neither
+    /// listed nor counted; an item whose file cannot be read now is
+    /// listed as unavailable. One they do not see is `NotFound`.
+    GetPlaylist {
+        id: String,
+        offset: u32,
+        limit: u32,
+    },
+    /// Make a playlist the session user owns: `PlaylistInfo`. A name is 1
+    /// to 100 characters; `kinds` ticks at least one. `ServerWide` is an
+    /// admin's only (`AdminRequired`); a share naming someone who is not a
+    /// user here is `InvalidInput`.
+    CreatePlaylist {
+        name: String,
+        kinds: Kinds,
+        visibility: Visibility,
+    },
+    /// Rename a playlist, widen its kinds (never narrow them:
+    /// `InvalidInput`), or change who sees it: `PlaylistInfo`. `None`
+    /// leaves each as it is. Its owner's, or any admin's for a
+    /// server-wide one; anyone else who sees it gets `PlaylistReadOnly`.
+    /// Whoever no longer sees it is sent `PlaylistGone`, and loses its pin
+    /// with a note.
+    UpdatePlaylist {
+        id: String,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        name: Option<String>,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        kinds: Option<Kinds>,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        visibility: Option<Visibility>,
+    },
+    /// Change a playlist's entries, as seen at `revision`: `PlaylistEdited`
+    /// with its new revision. 1 to 100 edits, applied in order, all or
+    /// none. Made on an older revision, the edits are redone on the newer
+    /// one unless one removes or moves an entry changed since:
+    /// `PlaylistConflict` ("Someone changed this playlist; reload"). An
+    /// item of a kind the playlist does not take is `KindNotAllowed`. A
+    /// read-only share gets `PlaylistReadOnly`.
+    EditPlaylist {
+        id: String,
+        revision: u64,
+        edits: Vec<PlaylistEdit>,
+    },
+    /// Delete a playlist: `Done`. Its owner's, or any admin's for a
+    /// server-wide one. Whoever had it pinned gets a note.
+    DeletePlaylist {
+        id: String,
+    },
+    /// Pin a playlist the session user sees to their Pinned at `position`
+    /// (0 first; past the end, last), or move it there: `Done`. Every
+    /// device of theirs is sent `PinsChanged`.
+    PinPlaylist {
+        id: String,
+        position: u32,
+    },
+    /// Take a playlist out of their Pinned: `Done`, also when it was not
+    /// there.
+    UnpinPlaylist {
+        id: String,
+    },
+    /// Start or go on playing a playlist: `PlaylistItem`, the entry to
+    /// play, or `PlaylistFinished` when nothing is left to play. With
+    /// `from`, that entry (or the next playable one after it); without,
+    /// the user's place: the entry they were in, if they had not finished
+    /// it, else the one after it; with no place, the top. The settings are
+    /// kept for the user and playlist, for `NextInPlaylist` and the next
+    /// time. Unavailable entries, and with `skip_watched` watched ones,
+    /// are passed. The client plays the item itself (`StartPlayback`),
+    /// skipping its credits, and records progress as any playback does.
+    PlayPlaylist {
+        id: String,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        from: Option<crate::playlists::EntryId>,
+        shuffle: bool,
+        repeat: crate::playlists::Repeat,
+        skip_watched: bool,
+    },
+    /// What plays after entry `after` ended or was skipped:
+    /// `PlaylistItem`, or `PlaylistFinished` at the end with repeat off,
+    /// which clears the place so the next `PlayPlaylist` starts at the
+    /// top. The server keeps the place.
+    NextInPlaylist {
+        id: String,
+        after: crate::playlists::EntryId,
+    },
+    /// Import the session user's Plex playlists, once (PX-40): each video
+    /// or music playlist of their linked Plex account, on every Plex
+    /// server here, becomes a personal playlist of theirs, its items
+    /// mapped to this server's: `PlexImport`, what was made and what did
+    /// not map. Nothing is synced afterwards. With `dry_run`, nothing is
+    /// made. Without a linked Plex account, `NotFound`; a portable user
+    /// has none (`NotForPortableUsers`). Imported twice, made twice.
+    ImportPlexPlaylists {
+        dry_run: bool,
+    },
+    /// Forget the notes `ListPlaylists` gave: a client showed them.
+    /// `Done`. Notes are per user, not per device.
+    DismissPinNotes,
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -740,6 +849,11 @@ pub struct Hello {
     /// what an older one did; an older server ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental: Vec<String>,
+    /// Every regular feature this client is built with (PX-16), by name
+    /// ([`crate::features`]). The server uses only what both list.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
@@ -761,6 +875,10 @@ impl Hello {
         }
         self.experimental.truncate(crate::experimental::MAX_ASKED);
         for name in &mut self.experimental {
+            cut(name);
+        }
+        self.features.truncate(crate::features::MAX_LISTED);
+        for name in &mut self.features {
             cut(name);
         }
         self
@@ -990,6 +1108,11 @@ pub enum Reply {
         // compat(v1): required at the protocol reset
         #[serde(default)]
         password_change_required: bool,
+        /// Every regular feature this server has (PX-16,
+        /// [`crate::features`]), pre-auth or not.
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     /// The users this device is trusted for (`TrustedProfiles`), by
     /// username.
@@ -1025,6 +1148,13 @@ pub enum Reply {
         /// The item's intro and credits (P2-10), in order of start; empty
         /// for an item that has none.
         markers: Vec<Marker>,
+        /// The playlists the user sees that hold it (PX-40): a movie,
+        /// episode or track itself; any of a season's or a show's
+        /// episodes; any of an album's or an artist's tracks. Only for a
+        /// client that listed `spoolframe:playlists`; left out otherwise.
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        playlists: Option<Vec<PlaylistRef>>,
     },
     Search(SearchResults),
     Tracks(MediaTracks),
@@ -1168,6 +1298,27 @@ pub enum Reply {
     HttpPlaybackRefused {
         reason: crate::experimental::HttpPlaybackRefusal,
     },
+    /// The playlists the user sees (`ListPlaylists`, PX-40), oldest first,
+    /// and the notes of pinned ones that left their Pinned.
+    Playlists {
+        playlists: Vec<PlaylistSummary>,
+        pin_notes: Vec<PinNote>,
+    },
+    /// One playlist and a page of its entries (`GetPlaylist`).
+    Playlist(PlaylistPage),
+    /// A playlist as it is now (`CreatePlaylist`, `UpdatePlaylist`).
+    PlaylistInfo(PlaylistSummary),
+    /// The playlist's revision after `EditPlaylist`.
+    PlaylistEdited {
+        revision: u64,
+    },
+    /// The entry to play now (`PlayPlaylist`, `NextInPlaylist`).
+    PlaylistItem(crate::playlists::PlaylistNext),
+    /// Nothing is left to play: the end, with repeat off, or no entry can
+    /// be played. The user's place is cleared.
+    PlaylistFinished,
+    /// What importing Plex playlists made, or would (`ImportPlexPlaylists`).
+    PlexImport(crate::playlists::PlexImport),
 }
 
 /// Which HLS playlist (P2-05).
@@ -1249,6 +1400,12 @@ pub struct WhoAmIReply {
     // compat(v1): required at the protocol reset
     #[serde(default = "WhoAmIReply::can_leave_by_default")]
     pub can_leave: bool,
+    /// Every regular feature this server has (PX-16), as `LoggedIn` gives
+    /// them: for a client holding a session from before, or from before
+    /// the server was upgraded.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 impl WhoAmIReply {
@@ -1405,6 +1562,12 @@ pub struct ServerInfo {
     /// out when none, as an older server does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental: Vec<String>,
+    /// The pre-auth regular features this server has (PX-16,
+    /// [`crate::features`]); the rest come with a session (`LoggedIn`,
+    /// `WhoAmI`). Left out when none.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// Why a request failed. Typed, so clients act on the kind, not on text.
@@ -1588,6 +1751,23 @@ pub enum Error {
     /// one a password, first. Nothing was changed.
     #[error("you are the only admin; make someone else an admin first")]
     LastAdmin,
+    /// The user sees the playlist and may not make this change (PX-40): an
+    /// edit on a read-only share, or a rename, sharing change or delete by
+    /// anyone but its owner (or an admin, for a server-wide one). Nothing
+    /// was changed.
+    #[error("you cannot change this playlist")]
+    PlaylistReadOnly,
+    /// The playlist does not take items of this kind (PX-40): its kinds
+    /// were ticked when it was made. Nothing was changed. A season or
+    /// show is episodes, an album or artist tracks.
+    #[error("this playlist does not take a {kind:?}")]
+    KindNotAllowed { kind: crate::playlists::ItemKind },
+    /// Someone changed the playlist since the revision the edit was made
+    /// on, and touched an entry the edit touches (PX-40): "Someone changed
+    /// this playlist; reload". `revision` is its revision now. Nothing was
+    /// changed.
+    #[error("someone changed this playlist; reload (revision {revision})")]
+    PlaylistConflict { revision: u64 },
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.
@@ -1635,6 +1815,16 @@ pub enum Event {
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         max_bitrate: Option<u64>,
     },
+    /// A playlist the user sees was made or changed (PX-40): its entries,
+    /// name, kinds or sharing. Read it again if it is shown. Only to a
+    /// client that listed `spoolframe:playlists`.
+    PlaylistChanged { id: String, revision: u64 },
+    /// A playlist the user saw is gone to them: deleted, or no longer
+    /// shared with them. Close it if it is shown.
+    PlaylistGone { id: String },
+    /// The user's Pinned, or its notes, changed on another device or by
+    /// another user's change: `ListPlaylists` again.
+    PinsChanged,
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,

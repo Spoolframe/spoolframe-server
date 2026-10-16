@@ -367,6 +367,7 @@ async fn hello_strings_are_cut_to_their_bound() {
         device_name: Some(long.clone()),
         capabilities: None,
         experimental: Vec::new(),
+        features: Vec::new(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

@@ -485,6 +485,16 @@ telemetry {
   }
 }
 
+# An MCP server at /mcp on the admin listener (PX-42), for AI agents such
+# as Claude: they connect by the web UI's URL and sign the user in with
+# OAuth, as the web UI does, then act with that user's rights and only
+# the scopes the user allowed. Off, /mcp and the OAuth endpoints are not
+# found. A live setting; the web UI sets it in Settings › Remote. Over the
+# Internet it needs admin.public_url, with TLS.
+mcp {
+  enabled = false;
+}
+
 # Switches that may change or go away in any release, without notice. The
 # server logs the ones set at start.
 experimental {

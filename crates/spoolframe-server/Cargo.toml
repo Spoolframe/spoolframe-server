@@ -36,10 +36,13 @@ anyhow = { workspace = true }
 argon2 = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
+# PKCE's S256 (PX-42): SHA-256, as RFC 7636 specifies.
+sha2 = { workspace = true }
 password-hash = { workspace = true }
 clap = { workspace = true }
 image = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server", "ws-client"] }
+rmcp = { workspace = true }
 rpassword = { workspace = true }
 spoolframe-admin-api = { workspace = true, features = ["server", "client"] }
 tower = { workspace = true }

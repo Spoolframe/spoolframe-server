@@ -682,6 +682,7 @@ fn hello_of(revision: u32) -> Request {
         device_name: Some("what the app says".into()),
         capabilities: None,
         experimental: Vec::new(),
+        features: Vec::new(),
     })
 }
 

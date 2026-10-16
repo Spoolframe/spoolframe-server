@@ -38,6 +38,9 @@ use crate::admin::{AdminApi, Attempt, Bearer, PageOrigin, Peer, SsoOutcome};
 use crate::auth::API_SESSION;
 use crate::refusals::Channel;
 
+#[path = "admin_oauth.rs"]
+mod oauth;
+
 /// The browser's session cookie: an admin API session token, as the CLI's
 /// Bearer token is.
 pub const COOKIE: &str = "spoolframe_session";
@@ -433,6 +436,9 @@ fn router(
         }
     });
     let web = crate::web::Web::default();
+    // MCP's clients' endpoints (PX-42): outside the web UI's origin check
+    // and cookie, with layers of their own.
+    let clients = oauth::client_routes(api.clone(), proxies.clone());
     // Anyone can post to these: a sign-in's or a setup's JSON is a few
     // hundred bytes, a passkey's a few KiB (CR-11 N10).
     let auth = Router::new()
@@ -449,6 +455,7 @@ fn router(
         .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT));
     Router::new()
         .merge(auth)
+        .merge(oauth::browser_routes())
         // Reads its body itself, held to `SMALL_BODY`.
         .route("/auth/oidc/begin", post(sso_begin))
         .route("/auth/oidc/callback", get(sso_callback))
@@ -474,6 +481,8 @@ fn router(
         .layer(middleware::from_fn(request_timeout))
         // Outermost: refusals get the headers too.
         .layer(middleware::from_fn(security_headers))
+        // After the layers, so none of them applies: these have their own.
+        .merge(clients)
 }
 
 /// The web UI's content policy (PX-11 finding 37), fitted to the Dioxus
@@ -713,6 +722,19 @@ async fn credentials(
     next.run(req).await
 }
 
+/// The address the caller is at, as [`credentials`] finds it, and
+/// nothing else: for the endpoints that read no cookie.
+async fn peer(
+    State(proxies): State<TrustedProxies>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Response<Body> {
+    let caller = proxies.caller(peer.ip(), req.headers());
+    req.extensions_mut().insert(Peer(caller));
+    next.run(req).await
+}
+
 fn token(headers: &HeaderMap) -> Option<String> {
     if let Some(bearer) = headers
         .get(header::AUTHORIZATION)
@@ -775,7 +797,8 @@ fn failure(e: ErrorObjectOwned) -> Response<Body> {
         | error_code::NO_SUCH_LINK
         | error_code::NO_SUCH_PLAYBACK
         | error_code::NO_SUCH_INVITE
-        | error_code::NO_SUCH_GRANT => StatusCode::NOT_FOUND,
+        | error_code::NO_SUCH_GRANT
+        | error_code::NO_SUCH_APP => StatusCode::NOT_FOUND,
         error_code::INVALID_INPUT => StatusCode::BAD_REQUEST,
         error_code::NOT_CONFIGURED => StatusCode::NOT_IMPLEMENTED,
         // Plex, or a sign-in provider, did not answer: the server is

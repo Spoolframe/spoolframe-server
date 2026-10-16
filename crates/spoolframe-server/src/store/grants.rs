@@ -190,12 +190,15 @@ impl Store {
     /// `portable` leaves this server (PX-47): its grant revoked as
     /// [`Store::revoke_grant`] revokes it, its sessions ended, and what it
     /// kept here deleted: watch state, hidden rows, track preferences and
-    /// overrides. `false` if it had no live grant.
+    /// overrides, its playlists, pins and places. `false` if it had no live
+    /// grant.
     pub async fn leave_portable(&self, portable: PortableUserId) -> Result<bool, StoreError> {
         let principal = crate::principal::Principal::PortableUser(portable).to_string();
         let mut tx = self.begin_write().await?;
         let removed = revoke_grant_in(&mut tx, portable, self.now()).await?;
-        // The `_ids` tables first: they refer to their parents' rows.
+        // The `_ids` tables first: they refer to their parents' rows. Their
+        // playlists go (PX-40), and whoever pinned one is told, as for any
+        // playlist deleted; the rest of a playlist's rows go with it.
         for delete in [
             "DELETE FROM watch_state_ids WHERE principal = ?1",
             "DELETE FROM watch_state WHERE principal = ?1",
@@ -203,6 +206,17 @@ impl Store {
             "DELETE FROM continue_hidden WHERE principal = ?1",
             "DELETE FROM track_overrides WHERE principal = ?1",
             "DELETE FROM track_preferences WHERE principal = ?1",
+            "INSERT INTO playlist_pin_notes (principal, playlist_id, name, reason, noted_at) \
+             SELECT n.principal, n.playlist_id, p.name, 'deleted', unixepoch() \
+             FROM playlist_pins n JOIN playlists p ON p.id = n.playlist_id \
+             WHERE p.owner = ?1 AND n.principal != ?1 \
+             ON CONFLICT (principal, playlist_id) DO UPDATE SET \
+               name = excluded.name, reason = excluded.reason, noted_at = excluded.noted_at",
+            "DELETE FROM playlists WHERE owner = ?1",
+            "DELETE FROM playlist_shares WHERE principal = ?1",
+            "DELETE FROM playlist_pins WHERE principal = ?1",
+            "DELETE FROM playlist_pin_notes WHERE principal = ?1",
+            "DELETE FROM playlist_places WHERE principal = ?1",
         ] {
             sqlx::query(delete)
                 .bind(&principal)

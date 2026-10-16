@@ -1215,3 +1215,101 @@ async fn a_person_photo_key_off_the_people_host_never_reaches_the_pms() {
     }
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+/// PX-40: a playlist's entry finds its item again after a rebuild by
+/// Plex's guid, asked of the served sections that hold its kind.
+#[tokio::test]
+async fn an_item_is_found_by_its_plex_guid_in_the_sections_of_its_kind() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections", "sections").await;
+    let guid = "plex://movie/5d776c85fb0d55001f589f07";
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/all"))
+        .and(query_param("type", "1"))
+        .and(query_param("guid", guid))
+        .respond_with(json("metadata-movie"))
+        .mount(&server)
+        .await;
+    let ids = ["imdb://tt0078748".to_owned(), guid.to_owned()];
+    let found = catalog(&server)
+        .find_external(MediaKind::Movie, &ids)
+        .await
+        .unwrap();
+    assert_eq!(found, Some(id(MediaKind::Movie, "134883")));
+}
+
+#[tokio::test]
+async fn an_item_no_section_has_is_not_found_by_its_guid() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections", "sections").await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/all"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"MediaContainer":{"size":0}}"#, "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let plex = catalog(&server);
+    let gone = ["plex://movie/0000000000000000000000ff".to_owned()];
+    assert_eq!(
+        plex.find_external(MediaKind::Movie, &gone).await.unwrap(),
+        None
+    );
+    // Agents' ids alone are not asked about.
+    let agents = ["imdb://tt0078748".to_owned()];
+    let before = server.received_requests().await.unwrap().len();
+    assert_eq!(
+        plex.find_external(MediaKind::Movie, &agents).await.unwrap(),
+        None
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+}
+
+/// PX-40's import: an account's video and music playlists, photos left
+/// out, and what each holds as items of this catalog, with what is not.
+#[tokio::test]
+async fn an_account_s_playlists_and_their_items_are_read_with_what_does_not_map() {
+    let server = MockServer::start().await;
+    let body = |value: serde_json::Value| {
+        ResponseTemplate::new(200).set_body_raw(value.to_string(), "application/json")
+    };
+    Mock::given(method("GET"))
+        .and(path("/playlists"))
+        .and(header("X-Plex-Token", "alice-token"))
+        .respond_with(body(serde_json::json!({ "MediaContainer": { "Metadata": [
+            { "ratingKey": "500", "type": "playlist", "title": "Heists",
+              "playlistType": "video", "smart": false },
+            { "ratingKey": "501", "type": "playlist", "title": "Holiday",
+              "playlistType": "photo", "smart": false },
+            { "ratingKey": "502", "type": "playlist", "title": "Recent",
+              "playlistType": "audio", "smart": true },
+        ] } })))
+        .mount(&server)
+        .await;
+    let movie = serde_json::from_str::<serde_json::Value>(&fixture("metadata-movie")).unwrap()
+        ["MediaContainer"]["Metadata"][0]
+        .clone();
+    Mock::given(method("GET"))
+        .and(path("/playlists/500/items"))
+        .respond_with(body(serde_json::json!({ "MediaContainer": { "Metadata": [
+            movie,
+            { "ratingKey": "77", "type": "clip", "title": "A trailer" },
+        ] } })))
+        .mount(&server)
+        .await;
+    let plex = PlexCatalog::new(server.uri().parse().unwrap(), Some("alice-token".into())).unwrap();
+    let lists = plex.playlists().await.unwrap();
+    let names: Vec<_> = lists.iter().map(|l| (l.title.as_str(), l.smart)).collect();
+    assert_eq!(names, [("Heists", false), ("Recent", true)]);
+    let items = plex.playlist_items("500").await.unwrap();
+    assert!(
+        matches!(&items[0], spoolframe_plex::playlists::PlexPlaylistItem::Item(item)
+            if *item.id() == id(MediaKind::Movie, "134883")),
+        "{items:?}"
+    );
+    assert!(matches!(
+        &items[1],
+        spoolframe_plex::playlists::PlexPlaylistItem::Unmapped { title, .. } if title == "A trailer"
+    ));
+}

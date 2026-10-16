@@ -7,6 +7,7 @@ mod addresses;
 mod closing;
 mod leave;
 mod one_time_password;
+mod playlists;
 mod reachability;
 mod reconnect;
 mod stalls;

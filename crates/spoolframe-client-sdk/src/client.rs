@@ -192,6 +192,8 @@ pub(crate) struct Inner {
     /// Playbacks whose share of a server's uplink changed (PX-46), as the
     /// servers told: each managed playback in Auto follows its own.
     pub(crate) shares: tokio::sync::broadcast::Sender<crate::PlaybackShare>,
+    /// Playlist changes the servers told (PX-40).
+    pub(crate) playlist_events: tokio::sync::broadcast::Sender<crate::PlaylistEvent>,
 }
 
 impl std::fmt::Debug for Client {
@@ -324,6 +326,7 @@ impl Client {
                 pairing: Arc::default(),
                 refusals: Arc::default(),
                 shares: tokio::sync::broadcast::channel(16).0,
+                playlist_events: tokio::sync::broadcast::channel(64).0,
             }),
         };
         // Where saved servers publish (P6-05): looked up there from the
@@ -431,6 +434,15 @@ impl Client {
     /// last). Changes before the call are not seen.
     pub fn playback_shares(&self) -> tokio::sync::broadcast::Receiver<crate::PlaybackShare> {
         self.inner.shares.subscribe()
+    }
+
+    /// Every playlist change a server this device is connected to tells
+    /// it of (PX-40): a playlist made, changed or gone, or the pins
+    /// changed, for a user signed in there. Changes before the call, or
+    /// while not connected, are not seen: read what is shown again on
+    /// connecting.
+    pub fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<crate::PlaylistEvent> {
+        self.inner.playlist_events.subscribe()
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:
@@ -892,6 +904,7 @@ impl Client {
                     session,
                     remembered,
                     password_change_required,
+                    ..
                 }) => (session, remembered, password_change_required),
                 Response::Ok(other) => {
                     return Err(SdkError::Protocol(format!("login answered {other:?}")));
@@ -1178,7 +1191,11 @@ impl Client {
         remembered: bool,
         portable: Option<PortableUserId>,
     ) -> Result<Session, SdkError> {
-        let spoolframe_protocol::WhoAmIReply { user, can_leave } = who;
+        let spoolframe_protocol::WhoAmIReply {
+            user,
+            can_leave,
+            features,
+        } = who;
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let pinned = servers::load(storage)
@@ -1228,6 +1245,7 @@ impl Client {
             can_leave,
             remembered: Some(remembered),
             password_change_required: Arc::default(),
+            features: crate::playlists::Features::of(&features),
         })
     }
 
@@ -1282,6 +1300,7 @@ impl Client {
                 Response::Ok(Reply::WhoAmI(spoolframe_protocol::WhoAmIReply {
                     user,
                     can_leave,
+                    features,
                 })) => profiles.push(Session {
                     client: self.clone(),
                     server,
@@ -1290,6 +1309,7 @@ impl Client {
                     can_leave,
                     remembered: None,
                     password_change_required: Arc::default(),
+                    features: crate::playlists::Features::of(&features),
                 }),
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
                     tracing::info!(
@@ -2444,6 +2464,7 @@ mod tests {
                 spoolframe_protocol::WhoAmIReply {
                     user,
                     can_leave: true,
+                    features: Vec::new(),
                 },
                 Some(SignInMethod::Password),
                 false,

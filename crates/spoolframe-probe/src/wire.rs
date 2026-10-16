@@ -448,6 +448,7 @@ fn hello_full(
         device_name,
         capabilities,
         experimental: Vec::new(),
+        features: Vec::new(),
     })
 }
 

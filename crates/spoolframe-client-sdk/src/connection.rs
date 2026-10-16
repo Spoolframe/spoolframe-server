@@ -166,6 +166,8 @@ impl ServerConnection {
             // What the app asked for (PX-49); the answer names what the
             // server turned on.
             experimental: experimental.names(),
+            // Every regular feature this SDK uses (PX-16).
+            features: spoolframe_protocol::features::names(spoolframe_protocol::features::ALL),
         });
         // A server that takes the connection and then says nothing is as
         // unreachable as one that never answered the dial.

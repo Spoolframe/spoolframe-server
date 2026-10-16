@@ -200,6 +200,9 @@ pub mod error_code {
     /// to: it may only `me.setPassword` (with the one-time password as the
     /// current one), `logout` or `whoAmI` until then.
     pub const PASSWORD_CHANGE_REQUIRED: i32 = -32027;
+    /// Not an app connected to the caller's account (PX-42), or for an
+    /// admin, to any account.
+    pub const NO_SUCH_APP: i32 = -32028;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -608,6 +611,61 @@ pub struct SessionEntry {
     /// `None` for a device not seen since before the server kept it, or
     /// an admin API session from before it kept which.
     pub platform: Option<Platform>,
+}
+
+/// An app connected to a user's account through MCP's OAuth sign-in
+/// (PX-42): what My profile › Connected apps lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectedApp {
+    /// For `revokeConnectedApp`.
+    pub id: String,
+    /// The name the app registered: its own word for itself.
+    pub client_name: String,
+    /// The host its sign-in returned to (`claude.ai`).
+    pub return_host: String,
+    /// What the user allowed it: `library:read`, `playlists:write`,
+    /// `admin`.
+    pub scopes: Vec<String>,
+    /// When the user connected it, Unix seconds.
+    pub connected_at: i64,
+    /// Its last call, Unix seconds; `None` before its first.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub last_call_at: Option<i64>,
+    /// Its calls since midnight UTC.
+    pub calls_today: u32,
+    /// Whose account it acts for.
+    pub username: String,
+}
+
+/// One entry of the audit list (PX-42): what was done, by whom, through
+/// what.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEvent {
+    pub id: i64,
+    /// Unix seconds.
+    pub at: i64,
+    /// Who: their username, or their id when they are no user here now.
+    pub actor: String,
+    /// Through what: an MCP client's name, or `web`.
+    pub client: String,
+    /// What: an MCP tool's name, `app.connect` or `app.revoke`.
+    pub action: String,
+    /// To what: a username, an app's name, a session's or playback's id.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub target: Option<String>,
+    /// `ok`, or why not.
+    pub outcome: String,
+}
+
+/// A page of the audit list, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPage {
+    pub events: Vec<AuditEvent>,
+    /// How many there are in all.
+    pub total: u32,
 }
 
 /// One of a user's devices (P2-08).
@@ -2992,6 +3050,17 @@ pub trait MeApi {
     #[method(name = "revokeSession", with_extensions)]
     async fn revoke_session(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 
+    /// The apps connected to the caller's account through MCP (PX-42),
+    /// most recently connected first.
+    #[method(name = "connectedApps", with_extensions)]
+    async fn connected_apps(&self) -> jsonrpsee::core::RpcResult<Vec<ConnectedApp>>;
+
+    /// Disconnect one of them: its tokens stop at once, for good.
+    /// Reconnecting means signing in and consenting again. `NO_SUCH_APP`
+    /// for one that is not the caller's.
+    #[method(name = "revokeConnectedApp", with_extensions)]
+    async fn revoke_connected_app(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
     /// End every session of the caller's but this one, on every device
     /// (P3-03); how many.
     #[method(name = "revokeOtherSessions", with_extensions)]
@@ -3811,6 +3880,22 @@ pub trait AdminApi {
     #[method(name = "inviteLink", with_extensions)]
     async fn invite_link(&self) -> jsonrpsee::core::RpcResult<ServerLink>;
 
+    /// The apps connected to every account through MCP (PX-42), most
+    /// recently connected first.
+    #[method(name = "connectedApps", with_extensions)]
+    async fn all_connected_apps(&self) -> jsonrpsee::core::RpcResult<Vec<ConnectedApp>>;
+
+    /// Disconnect any user's app: its tokens stop at once, for good.
+    /// `NO_SUCH_APP` for one that is not connected.
+    #[method(name = "revokeConnectedApp", with_extensions)]
+    async fn revoke_any_connected_app(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A page of the audit list (PX-42), newest first: what admins did
+    /// through MCP clients, and which apps were connected and
+    /// disconnected. `limit` is at most 200.
+    #[method(name = "auditList", with_extensions)]
+    async fn audit_list(&self, offset: u32, limit: u32) -> jsonrpsee::core::RpcResult<AuditPage>;
+
     /// The portable users granted access here (P7-06), oldest first.
     #[method(name = "grantList", with_extensions)]
     async fn grant_list(&self) -> jsonrpsee::core::RpcResult<Vec<PortableGrant>>;
@@ -3861,6 +3946,36 @@ mod required_field_tests {
                 "{field}: {error}"
             );
         }
+    }
+
+    /// PX-42.
+    #[test]
+    fn connected_apps_and_the_audit_list() {
+        assert_each_required(
+            &ConnectedApp {
+                id: "g".into(),
+                client_name: "Claude".into(),
+                return_host: "claude.ai".into(),
+                scopes: vec!["library:read".into()],
+                connected_at: 1,
+                last_call_at: None,
+                calls_today: 0,
+                username: "alice".into(),
+            },
+            &["lastCallAt", "callsToday", "scopes", "returnHost"],
+        );
+        assert_each_required(
+            &AuditEvent {
+                id: 1,
+                at: 1,
+                actor: "root".into(),
+                client: "Claude".into(),
+                action: "disable_user".into(),
+                target: None,
+                outcome: "ok".into(),
+            },
+            &["target", "outcome", "client"],
+        );
     }
 
     #[test]

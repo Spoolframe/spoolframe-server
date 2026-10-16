@@ -139,6 +139,12 @@ webauthn-authenticator-rs = { version = "0.5.5", default-features = false, featu
 # The admin API: JSON-RPC over WebSocket, as kiln and scribe
 # serve theirs. Crates opt into server/client features.
 jsonrpsee = { version = "0.25", default-features = false }
+# MCP (PX-42): the protocol's server side and its Streamable HTTP
+# transport, mounted on the admin listener. Pinned: 3.5.1's macros crate
+# is missing from the mirror, and the macros are not used (the tools are
+# listed by hand, each with its scope). Not `auth`: the server is its own
+# authorization server (crate::oauth).
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 # Admin CLI password prompts.
 rpassword = "7"
 # Tower services: the admin listener mounts jsonrpsee as one.

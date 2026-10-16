@@ -668,10 +668,38 @@ async fn events(conn: &Connection) -> Option<RecvStream> {
     (recv.read_u8().await.ok()? == uni::EVENTS).then_some(recv)
 }
 
+/// Pass a playlist change from server `id` on; nobody listening is fine.
+fn tell_playlists(client: &Weak<Inner>, id: EndpointId, change: crate::PlaylistChange) {
+    if let Some(inner) = client.upgrade() {
+        let _ = inner.playlist_events.send(crate::PlaylistEvent {
+            server: id.to_string(),
+            change,
+        });
+    }
+}
+
 /// Apply `event` from server `id`; `Break` on `ShuttingDown`.
 async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::ControlFlow<()> {
     match event {
         Event::ShuttingDown => return std::ops::ControlFlow::Break(()),
+        // PX-40: for whoever shows playlists.
+        Event::PlaylistChanged {
+            id: playlist,
+            revision,
+        } => {
+            tell_playlists(
+                client,
+                id,
+                crate::PlaylistChange::Changed {
+                    id: playlist,
+                    revision,
+                },
+            );
+        }
+        Event::PlaylistGone { id: playlist } => {
+            tell_playlists(client, id, crate::PlaylistChange::Gone { id: playlist });
+        }
+        Event::PinsChanged => tell_playlists(client, id, crate::PlaylistChange::PinsChanged),
         Event::ServerAddresses {
             addrs,
             relays,

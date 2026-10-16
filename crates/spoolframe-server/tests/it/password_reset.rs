@@ -136,6 +136,7 @@ async fn a_reset_ends_what_rested_on_the_password_and_opens_one_session_to_chang
         session,
         remembered: false,
         password_change_required: true,
+        ..
     }) = login(&tv, "alice", &one_time.password).await
     else {
         panic!("the one-time password did not sign in");

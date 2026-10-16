@@ -625,6 +625,10 @@ pub struct TestServer {
     pub debug: Arc<spoolframe_server::playback_debug::PlaybackDebug>,
     /// Its conversions, and the encode budget they take.
     pub jobs: Arc<Jobs>,
+    /// Each user's watch state, and playlists: what MCP's tools beside it
+    /// read (PX-42).
+    pub watch: Arc<Watch>,
+    pub playlists: Arc<spoolframe_server::playlists::Playlists>,
 }
 
 impl TestServer {
@@ -745,12 +749,18 @@ impl TestServer {
         ));
         let metrics = Arc::new(spoolframe_server::metrics::Metrics::default());
         metrics.observe_store(store.clone());
+        let playlists = Arc::new(spoolframe_server::playlists::Playlists::new(
+            store.clone(),
+            catalog.clone(),
+            watch.clone(),
+        ));
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
             plex_accounts: Some(plex_accounts.clone()),
             plex_sync: None,
-            watch,
+            playlists: playlists.clone(),
+            watch: watch.clone(),
             catalog,
             catalog_changes: options.catalog.as_ref().map(|live| live.changes()),
             prober,
@@ -820,6 +830,8 @@ impl TestServer {
             metrics,
             debug,
             jobs,
+            watch,
+            playlists,
         }
     }
 
@@ -1512,6 +1524,26 @@ impl TestClient {
             device_name: None,
             capabilities: Some(capabilities),
             experimental: experimental.iter().map(|n| n.to_string()).collect(),
+            features: Vec::new(),
+        };
+        match self.call(None, Request::Hello(hello)).await {
+            Response::Ok(Reply::ServerInfo(info)) => info,
+            other => panic!("no ServerInfo: {other:?}"),
+        }
+    }
+
+    /// `Hello` from a Linux app listing the regular features `features`
+    /// (PX-16): the server's info.
+    pub async fn hello_listing(&self, features: &[&str]) -> ServerInfo {
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "test".into(),
+            client_version: "0".into(),
+            platform: spoolframe_types::Platform::Linux,
+            device_name: None,
+            capabilities: None,
+            experimental: Vec::new(),
+            features: features.iter().map(|n| n.to_string()).collect(),
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -1545,6 +1577,7 @@ impl TestClient {
                 device_name: device_name.map(str::to_owned),
                 capabilities,
                 experimental: Vec::new(),
+                features: Vec::new(),
             }),
         )
         .await

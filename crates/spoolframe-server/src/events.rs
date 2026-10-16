@@ -13,7 +13,7 @@
 //! the last frame a device gets is never older than the one before it.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iroh::endpoint::SendStream;
@@ -22,6 +22,8 @@ use spoolframe_protocol::codec::write_frame;
 
 use crate::announce::Told;
 use crate::network::Connections;
+use crate::playlists::PlaylistNews;
+use crate::principal::Principal;
 
 /// One connection's events stream, and the turn to write on it.
 pub(crate) type EventStream = Arc<tokio::sync::Mutex<SendStream>>;
@@ -186,6 +188,86 @@ impl Addresses {
     }
 }
 
+/// The users each connection that listed `spoolframe:playlists` has
+/// made requests as, by its stable id: who to tell of playlist changes
+/// (PX-40). A connection carries any number of sessions; each one used is
+/// noted, and all go when it closes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlaylistListeners(Arc<Mutex<HashMap<usize, HashSet<Principal>>>>);
+
+impl PlaylistListeners {
+    pub(crate) fn note(&self, id: usize, principal: Principal) {
+        self.0.lock().entry(id).or_default().insert(principal);
+    }
+
+    pub(crate) fn remove(&self, id: usize) {
+        self.0.lock().remove(&id);
+    }
+
+    fn each(&self) -> Vec<(usize, Vec<Principal>)> {
+        self.0
+            .lock()
+            .iter()
+            .map(|(id, who)| (*id, who.iter().copied().collect()))
+            .collect()
+    }
+}
+
+/// The event `news` is for a connection whose users are `who`, if any: a
+/// playlist one of them sees now changed; one some saw is gone to all of
+/// them; the pins of one of them changed.
+fn playlist_event(news: &PlaylistNews, who: &[Principal]) -> Option<Event> {
+    match news {
+        PlaylistNews::Playlist {
+            id,
+            revision,
+            before,
+            after,
+        } => {
+            let sees = |seen: &Option<crate::playlists::Seen>| {
+                seen.as_ref()
+                    .is_some_and(|seen| who.iter().any(|p| seen.sees(*p)))
+            };
+            if sees(after) {
+                Some(Event::PlaylistChanged {
+                    id: id.clone(),
+                    revision: *revision,
+                })
+            } else if sees(before) {
+                Some(Event::PlaylistGone { id: id.clone() })
+            } else {
+                None
+            }
+        }
+        PlaylistNews::Pins { principal } => who.contains(principal).then_some(Event::PinsChanged),
+    }
+}
+
+/// Tell each listening connection of the playlist changes it is concerned
+/// with, as they are made, until the playlists' news ends.
+pub(crate) async fn tell_playlist_news(
+    mut news: tokio::sync::broadcast::Receiver<PlaylistNews>,
+    listeners: PlaylistListeners,
+    streams: EventStreams,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let told = match news.recv().await {
+            Ok(told) => told,
+            Err(RecvError::Lagged(missed)) => {
+                tracing::debug!(missed, "playlist changes went untold");
+                continue;
+            }
+            Err(RecvError::Closed) => return,
+        };
+        for (id, who) in listeners.each() {
+            if let Some(event) = playlist_event(&told, &who) {
+                streams.send(id, event);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +283,44 @@ mod tests {
         assert!(backlog.enter().is_none());
         drop(held);
         assert!(backlog.enter().is_some());
+    }
+
+    fn principal(n: u128) -> Principal {
+        Principal::LocalUser(crate::store::users::LocalUserId::from_uuid(
+            uuid::Uuid::from_u128(n),
+        ))
+    }
+
+    #[test]
+    fn a_playlist_change_is_told_to_who_sees_it_and_its_loss_to_who_saw_it() {
+        let (alice, bob, carol) = (principal(1), principal(2), principal(3));
+        let shared = crate::playlists::Seen::for_tests(alice, false, &[bob]);
+        let personal = crate::playlists::Seen::for_tests(alice, false, &[]);
+        let unshared = PlaylistNews::Playlist {
+            id: "p".into(),
+            revision: 4,
+            before: Some(shared),
+            after: Some(personal),
+        };
+        assert_eq!(
+            playlist_event(&unshared, &[alice]),
+            Some(Event::PlaylistChanged {
+                id: "p".into(),
+                revision: 4
+            })
+        );
+        assert_eq!(
+            playlist_event(&unshared, &[bob]),
+            Some(Event::PlaylistGone { id: "p".into() })
+        );
+        assert_eq!(playlist_event(&unshared, &[carol]), None);
+        // A connection Bob and Alice both use sees it still.
+        assert!(matches!(
+            playlist_event(&unshared, &[bob, alice]),
+            Some(Event::PlaylistChanged { .. })
+        ));
+        let pins = PlaylistNews::Pins { principal: bob };
+        assert_eq!(playlist_event(&pins, &[bob]), Some(Event::PinsChanged));
+        assert_eq!(playlist_event(&pins, &[alice]), None);
     }
 }

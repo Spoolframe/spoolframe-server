@@ -29,6 +29,7 @@ use spoolframe_server::identity;
 use spoolframe_server::logs::{self, LogRing, RingLayer};
 use spoolframe_server::metrics::Metrics;
 use spoolframe_server::network::{Server, ServerName, Services};
+use spoolframe_server::oauth::McpSwitch;
 use spoolframe_server::oidc::Oidc;
 use spoolframe_server::passkeys::Passkeys;
 use spoolframe_server::playback::Playbacks;
@@ -1038,6 +1039,11 @@ async fn run(
         .set(config.admin.metrics(), config.admin.metrics_from()?);
     metrics.observe_catalog(live.clone());
     metrics.spawn_sampler();
+    // MCP and its OAuth sign-in (PX-42): a live setting.
+    let mcp = McpSwitch::new(config.mcp.enabled());
+    if mcp.on() {
+        tracing::info!("mcp.enabled: MCP clients may sign users in at /authorize and call /mcp");
+    }
     // The WAN uplink budget (PX-46): a live setting, read by the client
     // protocol's plans and the admin API's measurement.
     let uplink = Arc::new(spoolframe_server::uplink::Uplink::new(
@@ -1060,6 +1066,7 @@ async fn run(
             logs: Some(logs.clone()),
             telemetry: Some(telemetry.clone()),
             transcoding: Some(transcoding.clone()),
+            mcp: mcp.clone(),
         },
         restart_mode,
     ));
@@ -1070,6 +1077,13 @@ async fn run(
     // admin API's playback debug (P3-15), which looks at them.
     let playbacks: Arc<Playbacks> = Arc::default();
     let connected: Arc<Connected> = Arc::default();
+    // Shared by the client protocol and MCP's tools (PX-42), which act
+    // on them alike.
+    let playlists = Arc::new(spoolframe_server::playlists::Playlists::new(
+        auth.store().clone(),
+        catalog.clone(),
+        watch.clone(),
+    ));
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = (auth.store().user_count().await? == 0).then(SetupCode::generate);
@@ -1102,6 +1116,12 @@ async fn run(
                 previews: previews.clone(),
                 jobs: Some(jobs.clone()),
             })),
+            mcp,
+            library: Some(spoolframe_server::mcp::Library {
+                catalog: catalog.clone(),
+                watch: watch.clone(),
+                playlists: playlists.clone(),
+            }),
         },
         admin_origins,
         admin_proxies,
@@ -1136,6 +1156,7 @@ async fn run(
             playbacks: playbacks.clone(),
             connected: connected.clone(),
             app_passkeys: Arc::new(AppPasskeys::new(server_id)),
+            playlists,
             watch,
             transcoding,
             jobs: jobs.clone(),

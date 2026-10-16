@@ -13,7 +13,8 @@
 use futures_util::future::try_join_all;
 use spoolframe_catalog::{Catalog, CatalogError, Found, FoundGroup, SearchQuery};
 use spoolframe_types::{
-    Item, Library, LibraryId, LibraryKind, Namespace, Person, PersonId, PersonRole, SearchKind,
+    Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, Namespace, Person, PersonId,
+    PersonRole, SearchKind,
 };
 
 use crate::wire::SectionKey;
@@ -122,6 +123,44 @@ impl PlexCatalog {
             .find(|l| l.id == *id)
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
         Ok(vec![library])
+    }
+
+    /// The item of `kind` with Plex's guid (`plex://…`) among
+    /// `external_ids`, in the served sections that hold that kind: what a
+    /// playlist's entry finds its item by after a library is rebuilt
+    /// (PX-40). Agents' ids (`imdb://…`) are not asked: Plex filters a
+    /// listing by its own guid only. `None` when none has it.
+    pub async fn find_guid(
+        &self,
+        kind: MediaKind,
+        external_ids: &[String],
+    ) -> Result<Option<MediaId>, CatalogError> {
+        let Some(guid) = external_ids.iter().find(|id| id.starts_with("plex://")) else {
+            return Ok(None);
+        };
+        let (holds, number) = match kind {
+            MediaKind::Movie => (LibraryKind::Movies, "1"),
+            MediaKind::Show => (LibraryKind::Shows, "2"),
+            MediaKind::Season => (LibraryKind::Shows, "3"),
+            MediaKind::Episode => (LibraryKind::Shows, "4"),
+            MediaKind::Artist => (LibraryKind::Music, "8"),
+            MediaKind::Album => (LibraryKind::Music, "9"),
+            MediaKind::Track => (LibraryKind::Music, "10"),
+        };
+        for section in self.libraries().await?.iter().filter(|l| l.kind == holds) {
+            let mut call = Call::get(format!("/library/sections/{}/all", section.id.key()))
+                .about(format!("guid {guid}"));
+            call.query = vec![("type", number), ("guid", guid)];
+            let container = self.fetch(&call).await?;
+            let found = container.metadata.iter().find(|m| {
+                convert::media_kind(&m.kind) == Some(kind) && m.guid.as_deref() == Some(guid)
+            });
+            if let Some(m) = found {
+                let item = convert::item(m).map_err(|e| self.converted(&call, e))?;
+                return Ok(Some(item.id().clone()));
+            }
+        }
+        Ok(None)
     }
 
     async fn find_kind(

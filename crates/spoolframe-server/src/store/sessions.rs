@@ -761,7 +761,8 @@ impl Store {
     }
 
     /// Purge dead sessions every [`PURGE_EVERY`], keeping
-    /// [`DEAD_SESSION_KEEP_SECS`] of them, until the store is closed.
+    /// [`DEAD_SESSION_KEEP_SECS`] of them, and spent OAuth codes and
+    /// tokens, until the store is closed.
     pub fn spawn_session_purge(&self) {
         let store = self.clone();
         tokio::spawn(async move {
@@ -774,6 +775,16 @@ impl Store {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(removed = n, "purged dead sessions"),
                     Err(e) => tracing::warn!(error = %e, "cannot purge dead sessions"),
+                }
+                // OAuth's codes and tokens past their time, and clients
+                // nobody granted anything (PX-42).
+                match store
+                    .purge_oauth(crate::oauth::UNUSED_CLIENT.as_secs() as i64)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(removed = n, "purged spent OAuth codes and tokens"),
+                    Err(e) => tracing::warn!(error = %e, "cannot purge OAuth codes and tokens"),
                 }
             }
         });

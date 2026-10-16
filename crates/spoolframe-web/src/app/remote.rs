@@ -13,9 +13,9 @@ use wasm_bindgen::JsValue;
 use super::admin::sleep;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::wizard::{
-    Limit, ListField, Note, entry, load_settings, loading, locked, number, save, text, value,
+    Limit, ListField, Note, entry, flag, load_settings, loading, locked, number, save, text, value,
 };
-use super::{Alert, Field, icons, rpc};
+use super::{Alert, Field, Notice, icons, plain_http_page, rpc};
 use crate::logic::{ApiError, list_setting, string_values};
 use crate::network::{Pkarr, pkarr_form, pkarr_setting, relays_form, relays_list};
 use crate::remote::{
@@ -198,6 +198,14 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
                 key: "{g}",
                 settings: loaded.clone(),
                 advanced,
+                on_done,
+                on_reload: move |_| generation += 1,
+            }
+        }
+        for g in [generation()] {
+            McpFields {
+                key: "{g}",
+                settings: loaded.clone(),
                 on_done,
                 on_reload: move |_| generation += 1,
             }
@@ -777,6 +785,80 @@ fn UplinkFields(
                 span { class: "wizard-foot-end",
                     button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
                     button { class: "btn-dialog btn-dialog-primary", disabled: busy() || all_fixed, onclick: move |_| on_save.call(()), "Save" }
+                }
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
+    }
+}
+
+/// `mcp.enabled` (PX-42): an MCP server at `/mcp`, for AI agents such
+/// as Claude, which sign users in through OAuth. Off by default.
+#[component]
+fn McpFields(
+    settings: Settings,
+    on_done: EventHandler<()>,
+    on_reload: EventHandler<()>,
+) -> Element {
+    const KEY: &str = "mcp.enabled";
+    let on = use_signal(|| flag(&settings, KEY));
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    // `mcp.*` is sensitive: from an old session, "Confirm it's you" first.
+    let confirming = use_signal(|| None::<String>);
+    let site = use_resource(super::site);
+    let public_url = site.read().as_ref().and_then(|s| s.public_url.clone());
+    let origin = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default();
+    let address = crate::connect::mcp_url(public_url.as_deref(), &origin);
+    let s = settings.clone();
+    let on_save = use_callback(move |()| {
+        let s = s.clone();
+        busy.set(true);
+        spawn(async move {
+            match save(&s, vec![(KEY, Some(serde_json::json!(on())))]).await {
+                Ok(()) => on_done.call(()),
+                Err(e) if asks_to_confirm(&e, confirming, "turning MCP on or off") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    });
+    let fixed = locked(&settings, KEY);
+    rsx! {
+        section { class: "card tele-card",
+            div { class: "wan-part",
+                PartHead {
+                    title: "AI agents (MCP)",
+                    about: "Let an agent such as Claude act for a user: search the library, see what they haven't finished, make playlists, and for an admin look after the server. Each user signs in and chooses what it may do; My profile lists the apps connected, and disconnects them.",
+                    on,
+                    disabled: fixed,
+                }
+                Note { settings: settings.clone(), setting: KEY, on_changed: move |_| on_reload.call(()) }
+            }
+            if on() {
+                div { class: "wan-part",
+                    span { class: "text-[13px] text-ctp-subtext0", "Connect an agent by this address:" }
+                    span { class: "mono-value text-xs", "{address}" }
+                    if public_url.is_none() {
+                        Notice {
+                            "Over the Internet an agent needs the web UI's public address, with HTTPS (admin.public_url). Without one, only an agent that reaches this server at its own address can connect."
+                        }
+                    } else if plain_http_page() {
+                        Notice {
+                            "This page is plain HTTP across the network: an agent's sign-in here crosses it in clear."
+                        }
+                    }
+                }
+            }
+            if let Some(text) = error() {
+                Alert { text }
+            }
+            div { class: "wizard-foot",
+                span { class: "wizard-foot-end",
+                    button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || fixed, onclick: move |_| on_save.call(()), "Save" }
                 }
             }
         }

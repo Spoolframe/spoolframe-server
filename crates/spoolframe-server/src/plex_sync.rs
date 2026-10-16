@@ -421,6 +421,36 @@ impl WatchSync {
         ran
     }
 
+    /// Each Plex server as `user`'s linked account sees it: its own
+    /// token there, every section (PX-40's import reads their playlists),
+    /// by the server's id here. A server the account has no access to is
+    /// left out, with a note.
+    pub async fn user_views(
+        &self,
+        user: LocalUserId,
+    ) -> Result<(Vec<(String, PlexCatalog)>, Vec<String>), SyncError> {
+        let link = self.accounts.link(user)?.ok_or(SyncError::NotLinked)?;
+        let composite = self.catalog.composite().ok_or(CatalogError::NotSetUp)?;
+        let (mut views, mut notes) = (Vec::new(), Vec::new());
+        let mut refreshed = false;
+        for server in composite.servers() {
+            let plex = match &link {
+                Link::Owner => server.catalog.unrestricted(),
+                Link::Account(account) => {
+                    match self.token_on(user, account, server, &mut refreshed).await {
+                        Ok(token) => server.catalog.with_token(Some(token)),
+                        Err(reason) => {
+                            notes.push(reason);
+                            continue;
+                        }
+                    }
+                }
+            };
+            views.push((server.id.clone(), plex));
+        }
+        Ok((views, notes))
+    }
+
     async fn run_once(&self, user: LocalUserId, dry_run: bool) -> Result<Report, SyncError> {
         let runs = self.runs(user);
         let _running = runs.running.lock().await;

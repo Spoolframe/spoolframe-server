@@ -18,7 +18,7 @@ use spoolframe_catalog::{
     SearchQuery,
 };
 use spoolframe_plex::PlexCatalog;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, PersonId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, PersonId};
 
 pub use composite::{Composite, PlexSource, Served, Synced};
 pub use replies::{Invalidated, Replies};
@@ -182,6 +182,14 @@ impl Catalog for LiveCatalog {
                 async { self.current()?.external_ids(id).await },
             )
             .await
+    }
+
+    async fn find_external(
+        &self,
+        kind: MediaKind,
+        external_ids: &[String],
+    ) -> Result<Option<MediaId>, CatalogError> {
+        self.current()?.find_external(kind, external_ids).await
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {

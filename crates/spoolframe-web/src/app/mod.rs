@@ -7,6 +7,8 @@ mod catalog;
 mod catalog_debug;
 mod catalog_item;
 mod codecs;
+mod connect;
+mod connected;
 mod device;
 mod experimental;
 mod gpus;
@@ -37,6 +39,8 @@ use activity::ActivityPage;
 use admin::{Server, UserSessions, Users};
 use catalog::CatalogLibrary;
 use catalog_item::CatalogItem;
+use connect::Connect;
+use connected::AuditPageView;
 use device::DeviceApproval;
 use invites::Invites;
 use libraries::{AddLibrary, Libraries};
@@ -84,6 +88,10 @@ enum Route {
     // on the code.
     #[route("/auth/device?:code")]
     DeviceApproval { code: String },
+    // Where an MCP client's `/authorize` sends its user (PX-42): signs in
+    // by itself, and stays on the request.
+    #[route("/connect?:request")]
+    Connect { request: String },
     // Where Plex's sign-in ends (P3-10, P3-12): the window it opened in,
     // which closes itself; the page that opened it is the one waiting.
     // The server's `forwardUrl` names this path.
@@ -107,6 +115,9 @@ enum Route {
             ActivityPage {},
             #[route("/logs")]
             LogsPage {},
+            // What admins did through MCP, and apps connected (PX-42).
+            #[route("/audit")]
+            AuditPageView {},
             // What plays now, and one playback (P3-15).
             #[route("/playback")]
             PlaybackPage {},
@@ -1408,6 +1419,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Invites {} => "Invites",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
+        Route::AuditPageView {} => "Audit",
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
@@ -1584,6 +1596,11 @@ fn server_links(route: &Route) -> Element {
             Route::LogsPage {},
             "Logs",
             matches!(route, Route::LogsPage {}),
+        ),
+        (
+            Route::AuditPageView {},
+            "Audit",
+            matches!(route, Route::AuditPageView {}),
         ),
         (
             Route::Libraries {},

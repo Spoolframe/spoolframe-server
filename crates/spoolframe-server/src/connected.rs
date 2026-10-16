@@ -95,6 +95,7 @@ mod tests {
             device_name: Some(name.into()),
             capabilities: caps,
             experimental: Vec::new(),
+            features: Vec::new(),
         }
     }
 

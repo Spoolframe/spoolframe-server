@@ -19,6 +19,7 @@ use spoolframe_protocol::codec::{self, write_frame};
 use spoolframe_protocol::device_sign_in::{
     normalize as device_sign_in_code, web_link as device_sign_in_web_link,
 };
+use spoolframe_protocol::features;
 use spoolframe_protocol::invite_admin::{InviteCreated, InviteCreator, InviteSummary};
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::rpc::{
@@ -99,6 +100,8 @@ pub(crate) struct ClientProtocol {
     /// The HTTP playback port (PX-49), when it is on: what turns the
     /// `http-playback` experimental feature on.
     http_playback: Option<Arc<crate::http_playback::HttpPlayback>>,
+    /// Who each connection that takes playlist events acts as (PX-40).
+    playlist_listeners: crate::events::PlaylistListeners,
 }
 
 /// What one connection has said so far.
@@ -475,6 +478,12 @@ impl ClientProtocol {
         let pairing_relay = Arc::new(crate::pairing_relay::PairingRelay::new(
             services.auth.store().clock().clone(),
         ));
+        let playlist_listeners = crate::events::PlaylistListeners::default();
+        tokio::spawn(crate::events::tell_playlist_news(
+            services.playlists.news(),
+            playlist_listeners.clone(),
+            addresses.streams.clone(),
+        ));
         Self {
             id: endpoint.id(),
             connections,
@@ -488,6 +497,7 @@ impl ClientProtocol {
             portable_sign_ins,
             pairing_relay,
             http_playback,
+            playlist_listeners,
         }
     }
 
@@ -1804,6 +1814,14 @@ impl ClientProtocol {
     ) -> Result<Reply, Error> {
         let catalog = &self.services.catalog;
         let principal = who.principal();
+        let actor = who.actor();
+        // PX-40: a connection that takes playlist events is told of the
+        // changes to what each user it acts as sees.
+        let playlists_listed = features::has(&hello.features, features::PLAYLISTS);
+        if playlists_listed {
+            self.playlist_listeners
+                .note(connection.stable_id(), principal);
+        }
         // A request about a playback says which in its span, and links to
         // the playback's start.
         if let Some(handle) = playback_of(&request)
@@ -1879,6 +1897,7 @@ impl ClientProtocol {
                                 portable: Vec::new(),
                             },
                             can_leave: true,
+                            features: features::names(features::ALL),
                         }));
                     }
                 };
@@ -1906,6 +1925,7 @@ impl ClientProtocol {
                             .collect(),
                     },
                     can_leave,
+                    features: features::names(features::ALL),
                 }))
             }
             Request::BeginPasskeyRegistration => {
@@ -2333,12 +2353,172 @@ impl ClientProtocol {
                     std::iter::once(&mut found.item).chain(found.children.iter_mut()),
                 )
                 .await?;
+                // PX-40: only for a client that takes them.
+                let playlists = if playlists_listed {
+                    Some(
+                        self.services
+                            .playlists
+                            .holding(&actor, &found.item, &found.children)
+                            .await
+                            .map_err(playlists_error)?,
+                    )
+                } else {
+                    None
+                };
                 Ok(Reply::Item {
                     item: found.item,
                     children: found.children,
                     markers: found.markers,
+                    playlists,
                 })
             }
+            Request::ListPlaylists => {
+                let (playlists, pin_notes) = self
+                    .services
+                    .playlists
+                    .list(&actor)
+                    .await
+                    .map_err(playlists_error)?;
+                Ok(Reply::Playlists {
+                    playlists,
+                    pin_notes,
+                })
+            }
+            Request::GetPlaylist { id, offset, limit } => self
+                .services
+                .playlists
+                .get(&actor, &id, offset, limit)
+                .await
+                .map(Reply::Playlist)
+                .map_err(playlists_error),
+            Request::CreatePlaylist {
+                name,
+                kinds,
+                visibility,
+            } => self
+                .services
+                .playlists
+                .create(&actor, &name, kinds, visibility)
+                .await
+                .map(Reply::PlaylistInfo)
+                .map_err(playlists_error),
+            Request::UpdatePlaylist {
+                id,
+                name,
+                kinds,
+                visibility,
+            } => self
+                .services
+                .playlists
+                .update(
+                    &actor,
+                    &id,
+                    crate::playlists::PlaylistUpdate {
+                        name,
+                        kinds,
+                        visibility,
+                    },
+                )
+                .await
+                .map(Reply::PlaylistInfo)
+                .map_err(playlists_error),
+            Request::EditPlaylist {
+                id,
+                revision,
+                edits,
+            } => self
+                .services
+                .playlists
+                .edit(&actor, &id, revision, edits)
+                .await
+                .map(|revision| Reply::PlaylistEdited { revision })
+                .map_err(playlists_error),
+            Request::DeletePlaylist { id } => self
+                .services
+                .playlists
+                .delete(&actor, &id)
+                .await
+                .map(|()| Reply::Done)
+                .map_err(playlists_error),
+            Request::PinPlaylist { id, position } => self
+                .services
+                .playlists
+                .pin(&actor, &id, position)
+                .await
+                .map(|()| Reply::Done)
+                .map_err(playlists_error),
+            Request::UnpinPlaylist { id } => self
+                .services
+                .playlists
+                .unpin(&actor, &id)
+                .await
+                .map(|()| Reply::Done)
+                .map_err(playlists_error),
+            Request::PlayPlaylist {
+                id,
+                from,
+                shuffle,
+                repeat,
+                skip_watched,
+            } => self
+                .services
+                .playlists
+                .play(
+                    &actor,
+                    &id,
+                    from,
+                    spoolframe_protocol::playlists::PlaySettings {
+                        shuffle,
+                        repeat,
+                        skip_watched,
+                    },
+                )
+                .await
+                .map(|next| next.map_or(Reply::PlaylistFinished, Reply::PlaylistItem))
+                .map_err(playlists_error),
+            Request::NextInPlaylist { id, after } => self
+                .services
+                .playlists
+                .next(&actor, &id, after)
+                .await
+                .map(|next| next.map_or(Reply::PlaylistFinished, Reply::PlaylistItem))
+                .map_err(playlists_error),
+            Request::ImportPlexPlaylists { dry_run } => {
+                let user = local(&who)?;
+                let Some(sync) = &self.services.plex_sync else {
+                    return Err(Error::NotFound {
+                        what: "a linked Plex account".into(),
+                    });
+                };
+                crate::playlists::plex_import::import(
+                    &self.services.playlists,
+                    sync,
+                    &actor,
+                    user.user,
+                    dry_run,
+                )
+                .await
+                .map(Reply::PlexImport)
+                .map_err(|e| match e {
+                    crate::playlists::plex_import::ImportError::NotLinked => Error::NotFound {
+                        what: "a linked Plex account".into(),
+                    },
+                    crate::playlists::plex_import::ImportError::Playlists(e) => playlists_error(e),
+                    crate::playlists::plex_import::ImportError::Sync(e) => {
+                        tracing::warn!(error = %e, "a Plex playlist import failed");
+                        Error::Unavailable {
+                            message: "Plex could not be read".into(),
+                        }
+                    }
+                })
+            }
+            Request::DismissPinNotes => self
+                .services
+                .playlists
+                .dismiss_pin_notes(&actor)
+                .await
+                .map(|()| Reply::Done)
+                .map_err(playlists_error),
             Request::Search(mut search) => {
                 search.limit = search.limit.min(MAX_PAGE);
                 let mut results =
@@ -3717,6 +3897,7 @@ impl ClientProtocol {
             session: SessionId(token.0),
             remembered: false,
             password_change_required: false,
+            features: features::names(features::ALL),
         })
     }
 
@@ -4307,6 +4488,7 @@ impl ClientProtocol {
             session: SessionId(token.0),
             remembered,
             password_change_required,
+            features: features::names(features::ALL),
         }
     }
 
@@ -4459,6 +4641,7 @@ impl ProtocolHandler for ClientProtocol {
         // What it carried since the last count: the rest of its bytes.
         state.count_link(&connection, false);
         self.addresses.streams.remove(id);
+        self.playlist_listeners.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
         self.services.playbacks.connection_closed(state.number);
@@ -5636,6 +5819,26 @@ pub(crate) fn unserved(e: &CatalogError) -> bool {
             | CatalogError::NotServed(_)
             | CatalogError::NotSetUp
     )
+}
+
+/// A playlist failure as the client sees it (PX-40).
+fn playlists_error(e: crate::playlists::PlaylistsError) -> Error {
+    use crate::playlists::PlaylistsError;
+    match e {
+        PlaylistsError::NotFound => Error::NotFound {
+            what: "playlist".into(),
+        },
+        PlaylistsError::NoItem(id) => Error::NotFound {
+            what: id.to_string(),
+        },
+        PlaylistsError::ReadOnly => Error::PlaylistReadOnly,
+        PlaylistsError::AdminRequired => Error::AdminRequired,
+        PlaylistsError::KindNotAllowed(kind) => Error::KindNotAllowed { kind: kind.into() },
+        PlaylistsError::InvalidInput(message) => Error::InvalidInput { message },
+        PlaylistsError::Conflict { revision } => Error::PlaylistConflict { revision },
+        PlaylistsError::Catalog(e) => catalog_error(e),
+        PlaylistsError::Store(e) => internal(e),
+    }
 }
 
 fn watch_error(e: WatchError) -> Error {

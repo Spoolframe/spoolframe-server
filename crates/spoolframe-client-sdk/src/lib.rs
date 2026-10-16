@@ -25,6 +25,7 @@ mod link;
 mod link_meter;
 pub mod pairing;
 mod pairing_relay;
+mod playlists;
 pub mod portable;
 mod portable_sign_in;
 mod reachability;
@@ -50,6 +51,7 @@ pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities (P7-01) and their device credentials (P7-02).
 pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
+pub use playlists::{Features, PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
 pub use portable::{
     CredentialError, DevicePublicKey, GuestPairing, GuestServer, HANDLE_LEN, IdentityGenesis,
     IdentityRecord, KeyAssertion, MAX_IDENTITY_NAME, PORTABLE_RP, PhraseError, Portable,
@@ -62,10 +64,16 @@ pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
     Reachability, SavedAddr,
 };
+// Playlists' wire types (PX-40), as the calls take and return them.
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ChunkStream, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange,
     PlaybackOptions, PlaybackQuality, ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
+};
+pub use spoolframe_protocol::playlists::{
+    EntryId, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings, PlaylistEdit, PlaylistEntry,
+    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare, PlaylistSummary,
+    PlexImport, PlexImported, PlexUnmapped, Repeat, Visibility,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{

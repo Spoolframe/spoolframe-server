@@ -15,9 +15,9 @@ use spoolframe_catalog::{
 };
 use spoolframe_protocol::codec::MAX_FRAME;
 use spoolframe_types::{
-    ArtworkId, CalendarDate, CastMember, Episode, Item, Library, LibraryId, LibraryKind, Marker,
-    MarkerKind, MediaId, MediaKind, Movie, Namespace, PersonId, PersonRole, PlaybackState,
-    SearchKind, Season, Show,
+    Album, Artist, ArtworkId, CalendarDate, CastMember, Episode, Item, Library, LibraryId,
+    LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie, Namespace, PersonId, PersonRole,
+    PlaybackState, SearchKind, Season, Show, Track,
 };
 
 /// The RPC request frames read as an `RpcRequest`, by every server in the
@@ -36,6 +36,10 @@ pub fn poster() -> ArtworkId {
 /// reply that cannot be sent.
 pub const A_TITLE_OVER_A_FRAME: &str = "a title over a frame";
 
+/// What finds the show's "heist episodes", episodes 12 and 15: the
+/// stand-in for "every heist episode of Brooklyn Nine-Nine" (PX-42).
+pub const HEIST: &str = "heist";
+
 /// One library holding one movie, `plex:movie:1`.
 #[derive(Debug)]
 pub struct FakeCatalog {
@@ -45,6 +49,12 @@ pub struct FakeCatalog {
     old_keys: Mutex<HashMap<MediaId, OldKey>>,
     /// Each `item` and `external_ids` call: the method and the id.
     calls: Mutex<Vec<(&'static str, MediaId)>>,
+    /// Items taken out of the library: not found any more.
+    removed: Mutex<Vec<MediaId>>,
+    /// Items given a new key (a rebuild): the old key, and the new one.
+    rekeyed: Mutex<Vec<(MediaId, MediaId)>>,
+    /// Items still in the library whose file cannot be read.
+    unreadable: Mutex<Vec<MediaId>>,
 }
 
 /// What a key holds after the catalog gave its item a new one. A key the
@@ -70,6 +80,52 @@ impl FakeCatalog {
             media,
             old_keys: Mutex::default(),
             calls: Mutex::default(),
+            removed: Mutex::default(),
+            rekeyed: Mutex::default(),
+            unreadable: Mutex::default(),
+        }
+    }
+
+    /// Take `id` out of the library: it is not found from now on, under
+    /// any key.
+    pub fn remove(&self, id: &MediaId) {
+        self.removed.lock().push(id.clone());
+    }
+
+    /// Give `id` the key `key`, as a rebuilt library does: the old key is
+    /// not found, the new one holds the item, and its external ids find
+    /// it there.
+    pub fn rekey(&self, id: &MediaId, key: &str) -> MediaId {
+        let new = MediaId::new(id.namespace(), id.kind(), key).unwrap();
+        self.rekeyed.lock().push((id.clone(), new.clone()));
+        new
+    }
+
+    /// Make `id`'s file unreadable: a drive offline, a file moved. The item
+    /// stays in the library.
+    pub fn unreadable(&self, id: &MediaId) {
+        self.unreadable.lock().push(id.clone());
+    }
+
+    /// What the fake's tree has under `id` now, with its children: none
+    /// for a removed item or a key given away, the item for its new key.
+    fn current(&self, id: &MediaId) -> Option<(Item, Vec<Item>)> {
+        if self.removed.lock().contains(id) || self.rekeyed.lock().iter().any(|(old, _)| old == id)
+        {
+            return None;
+        }
+        let old = self
+            .rekeyed
+            .lock()
+            .iter()
+            .find(|(_, new)| new == id)
+            .map(|(old, _)| old.clone());
+        match old {
+            Some(old) => tree()
+                .into_iter()
+                .find(|(item, _)| *item.id() == old)
+                .map(|(item, children)| (with_id(item, id), children)),
+            None => tree().into_iter().find(|(item, _)| item.id() == id),
         }
     }
 
@@ -116,6 +172,20 @@ fn external_ids(item: &Item) -> Vec<String> {
         item
     };
     vec![format!("test://{}", of.id().key())]
+}
+
+/// `item` under the key of `id`.
+fn with_id(item: Item, id: &MediaId) -> Item {
+    let id = id.clone();
+    match item {
+        Item::Movie(m) => Item::Movie(Movie { id, ..m }),
+        Item::Show(s) => Item::Show(Show { id, ..s }),
+        Item::Season(s) => Item::Season(Season { id, ..s }),
+        Item::Episode(e) => Item::Episode(Episode { id, ..e }),
+        Item::Artist(a) => Item::Artist(Artist { id, ..a }),
+        Item::Album(a) => Item::Album(Album { id, ..a }),
+        Item::Track(t) => Item::Track(Track { id, ..t }),
+    }
 }
 
 pub fn movie() -> Item {
@@ -218,6 +288,56 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
     })
 }
 
+/// An artist, `plex:artist:30`, with two albums: `plex:album:31`
+/// (2001: tracks 33 and 32, listed in that order, numbered 1 and 2) and
+/// `plex:album:34` (1997: track 35).
+pub fn artist() -> Item {
+    Item::Artist(Artist {
+        id: media(MediaKind::Artist, "30"),
+        name: "Daft Punk".into(),
+        summary: None,
+        artwork: Vec::new(),
+    })
+}
+
+pub fn album(key: &str) -> Item {
+    let (title, year) = if key == "31" {
+        ("Discovery", 2001)
+    } else {
+        ("Homework", 1997)
+    };
+    Item::Album(Album {
+        id: media(MediaKind::Album, key),
+        artist_id: media(MediaKind::Artist, "30"),
+        artist_name: Some("Daft Punk".into()),
+        title: title.into(),
+        year: Some(year),
+        track_count: None,
+        artwork: Vec::new(),
+    })
+}
+
+/// Track `key`, number `number` of album `album`.
+pub fn track(key: &str, album: &str, number: u32) -> Item {
+    Item::Track(Track {
+        id: media(MediaKind::Track, key),
+        album_id: media(MediaKind::Album, album),
+        artist_id: media(MediaKind::Artist, "30"),
+        artist_name: Some("Daft Punk".into()),
+        album_title: None,
+        title: format!("Track {key}"),
+        track: Some(number),
+        disc: Some(1),
+        album_track_count: None,
+        codec: None,
+        bit_depth: None,
+        sample_rate: None,
+        duration: Some(Duration::from_secs(240)),
+        artwork: Vec::new(),
+        playback: PlaybackState::default(),
+    })
+}
+
 /// The markers of episode 15, the only item that has any: an intro, and
 /// credits that run to the end, starting after the point P1-14's rule
 /// calls the episode watched at (39:00 of its 44:00).
@@ -257,6 +377,15 @@ fn tree() -> Vec<(Item, Vec<Item>)> {
         (episode("12", "11", 1, 1), Vec::new()),
         (episode("13", "11", 1, 2), Vec::new()),
         (episode("15", "14", 2, 1), Vec::new()),
+        (artist(), vec![album("31"), album("34")]),
+        (
+            album("31"),
+            vec![track("33", "31", 2), track("32", "31", 1)],
+        ),
+        (album("34"), vec![track("35", "34", 1)]),
+        (track("32", "31", 1), Vec::new()),
+        (track("33", "31", 2), Vec::new()),
+        (track("35", "34", 1), Vec::new()),
     ]
 }
 
@@ -317,9 +446,7 @@ impl Catalog for FakeCatalog {
             Some(OldKey::Unreachable) => return Err(Self::unreachable()),
             None => {}
         }
-        tree()
-            .into_iter()
-            .find(|(item, _)| item.id() == id)
+        self.current(id)
             .map(|(item, children)| {
                 let markers = if id.key() == "15" {
                     markers()
@@ -345,15 +472,35 @@ impl Catalog for FakeCatalog {
             Some(OldKey::Unreachable) => return Err(Self::unreachable()),
             None => {}
         }
-        tree()
-            .iter()
-            .find(|(item, _)| item.id() == id)
-            .map(|(item, _)| external_ids(item))
+        self.current(id)
+            .map(|(item, _)| external_ids(&item))
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
     }
 
+    /// An item of the tree with one of `ids`, under its key now.
+    async fn find_external(
+        &self,
+        kind: MediaKind,
+        ids: &[String],
+    ) -> Result<Option<MediaId>, CatalogError> {
+        let rekeyed = self.rekeyed.lock().clone();
+        for (item, _) in tree() {
+            if item.id().kind() != kind || !external_ids(&item).iter().any(|i| ids.contains(i)) {
+                continue;
+            }
+            let now = rekeyed
+                .iter()
+                .find(|(old, _)| old == item.id())
+                .map_or_else(|| item.id().clone(), |(_, new)| new.clone());
+            if self.current(&now).is_some() {
+                return Ok(Some(now));
+            }
+        }
+        Ok(None)
+    }
+
     /// The movie, for a part of "alien" or for [`A_TITLE_OVER_A_FRAME`];
-    /// nothing else.
+    /// two episodes for [`HEIST`]; nothing else.
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
         let text = query.text.to_lowercase();
         let found = if text == A_TITLE_OVER_A_FRAME {
@@ -370,6 +517,11 @@ impl Catalog for FakeCatalog {
         } else {
             Vec::new()
         };
+        let episodes = if text == HEIST {
+            vec![episode("12", "11", 1, 1), episode("15", "14", 2, 1)]
+        } else {
+            Vec::new()
+        };
         let groups = query
             .kinds
             .iter()
@@ -377,6 +529,11 @@ impl Catalog for FakeCatalog {
                 SearchKind::Movies => FoundGroup {
                     total: found.len() as u32,
                     items: found.clone(),
+                    ..FoundGroup::empty(kind)
+                },
+                SearchKind::Episodes => FoundGroup {
+                    total: episodes.len() as u32,
+                    items: episodes.clone(),
                     ..FoundGroup::empty(kind)
                 },
                 _ => FoundGroup::empty(kind),
@@ -391,6 +548,21 @@ impl Catalog for FakeCatalog {
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
+        if self.removed.lock().contains(id) || self.rekeyed.lock().iter().any(|(old, _)| old == id)
+        {
+            return Err(CatalogError::NotFound(id.to_string()));
+        }
+        if self.unreadable.lock().contains(id) {
+            return Err(CatalogError::MediaFileUnavailable(Box::new(
+                spoolframe_catalog::UnavailableFile {
+                    id: id.clone(),
+                    reported: PathBuf::from("/media/offline"),
+                    mapping: None,
+                    local: PathBuf::from("/media/offline"),
+                    reason: "no such file".into(),
+                },
+            )));
+        }
         let path = if id == movie().id() {
             self.media.clone()
         } else {

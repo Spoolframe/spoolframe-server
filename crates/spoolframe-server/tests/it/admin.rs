@@ -58,6 +58,8 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         logs: None,
         telemetry: None,
         playback: None,
+        mcp: Default::default(),
+        library: None,
     }
 }
 

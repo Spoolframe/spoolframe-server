@@ -852,6 +852,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
             on_clear: move |_| asking.set(Some(Ask::ClearPin)),
         }
         UserPasskeys { username: username.clone(), name: name.clone() }
+        super::connected::ConnectedApps { whose: super::connected::Whose::User(username.clone()) }
         if resetting() {
             ResetPassword {
                 username: username.clone(),

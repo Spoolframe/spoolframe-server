@@ -2345,3 +2345,94 @@ async fn an_item_s_dates_and_cast_come_through_the_sdk() {
     client.close().await;
     server.stop().await;
 }
+
+/// PX-40: two devices of one user see each other's pins and edits as
+/// events; an edit made on a revision the other overtook is a typed
+/// conflict; an item's details carry its playlists.
+#[tokio::test]
+async fn two_devices_see_each_other_s_playlist_changes() {
+    use spoolframe_client_sdk::{Kinds, PlaylistChange, PlaylistEdit, Visibility};
+    let (server, phone, _) = ready("playlists-two-devices").await;
+    let laptop = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    let on_phone = alice(&server, &phone).await;
+    let on_laptop = alice(&server, &laptop).await;
+    assert!(on_phone.features().playlists);
+    let episodes = Kinds {
+        movies: false,
+        episodes: true,
+        tracks: false,
+    };
+    let made = on_phone
+        .create_playlist("Heists", episodes, Visibility::Personal)
+        .await
+        .unwrap();
+    let revision = on_phone
+        .edit_playlist(
+            &made.id,
+            made.revision,
+            vec![PlaylistEdit::Add {
+                id: show().id().clone(),
+                before: None,
+            }],
+        )
+        .await
+        .unwrap();
+    // The laptop shows its playlists, and so is told of changes.
+    assert_eq!(on_laptop.playlists().await.unwrap().playlists.len(), 1);
+    let mut laptop_events = laptop.playlist_events();
+    let mut phone_events = phone.playlist_events();
+    on_phone.pin_playlist(&made.id, 0).await.unwrap();
+    let told = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = laptop_events.recv().await.unwrap();
+            if event.change == PlaylistChange::PinsChanged {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("the laptop was not told of the pin");
+    assert_eq!(told.server, id(&server));
+    let listed = on_laptop.playlists().await.unwrap();
+    assert_eq!(listed.playlists[0].pinned, Some(0));
+
+    let page = on_laptop.playlist(&made.id, 0, 10).await.unwrap();
+    let first = page.entries[0].entry;
+    on_laptop
+        .edit_playlist(
+            &made.id,
+            revision,
+            vec![PlaylistEdit::Remove { entry: first }],
+        )
+        .await
+        .unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let PlaylistChange::Changed { id, .. } = phone_events.recv().await.unwrap().change {
+                return id;
+            }
+        }
+    })
+    .await
+    .expect("the phone was not told of the edit");
+    assert_eq!(changed, made.id);
+    let refused = on_phone
+        .edit_playlist(
+            &made.id,
+            revision,
+            vec![PlaylistEdit::Move {
+                entry: first,
+                before: None,
+            }],
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(SdkError::PlaylistConflict { revision: now }) if now > revision),
+        "{refused:?}"
+    );
+    let detail = on_phone.item(show().id()).await.unwrap();
+    assert_eq!(detail.playlists.len(), 1);
+    phone.close().await;
+    laptop.close().await;
+    server.stop().await;
+}

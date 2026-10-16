@@ -318,6 +318,33 @@ impl Store {
         .await?)
     }
 
+    /// `principal`'s states, the most recently changed first: a page of
+    /// `limit` from `offset`, and how many there are (PX-42's
+    /// `watch_history`). By the `watch_state_recent` index.
+    pub async fn watch_history(
+        &self,
+        principal: Principal,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<WatchRow>, u32), StoreError> {
+        let rows = sqlx::query_as(
+            "SELECT media_id, show_id, position_ms, duration_ms, watched, updated_at \
+             FROM watch_state WHERE principal = ?1 \
+             ORDER BY updated_at DESC, media_id LIMIT ?2 OFFSET ?3",
+        )
+        .bind(principal.to_string())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let (total,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM watch_state WHERE principal = ?1")
+                .bind(principal.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok((rows, u32::try_from(total).unwrap_or(u32::MAX)))
+    }
+
     /// The states of `media_ids`, in one query.
     pub async fn watch_states(
         &self,
@@ -503,6 +530,34 @@ mod tests {
             watched: false,
             unhide: true,
         }
+    }
+
+    /// PX-42: the most recently changed first, a page at a time, the
+    /// principal's own only.
+    #[tokio::test]
+    async fn the_watch_history_is_newest_first_paged_and_one_s_own() {
+        let store = store("history").await;
+        for (id, at) in [
+            ("plex:movie:1", 100),
+            ("plex:movie:2", 300),
+            ("plex:movie:3", 200),
+        ] {
+            store
+                .save_watch_at(ALICE, self::at(id, 1_000, &[]), at)
+                .await
+                .unwrap();
+        }
+        store
+            .save_watch_at(BOB, self::at("plex:movie:9", 1_000, &[]), 400)
+            .await
+            .unwrap();
+        let (page, total) = store.watch_history(ALICE, 0, 2).await.unwrap();
+        assert_eq!(total, 3);
+        let ids: Vec<&str> = page.iter().map(|r| r.media_id.as_str()).collect();
+        assert_eq!(ids, ["plex:movie:2", "plex:movie:3"]);
+        let (rest, _) = store.watch_history(ALICE, 2, 2).await.unwrap();
+        assert_eq!(rest[0].media_id, "plex:movie:1");
+        assert_eq!(rest.len(), 1);
     }
 
     #[tokio::test]

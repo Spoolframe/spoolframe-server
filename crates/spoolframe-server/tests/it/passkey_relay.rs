@@ -150,6 +150,7 @@ async fn stream(
             auth_methods: vec![AuthMethod::Password],
             web_url: None,
             experimental: Vec::new(),
+            features: Vec::new(),
         })),
         Request::Ping => Response::Ok(Reply::Pong),
         // S's own answer, as M's.

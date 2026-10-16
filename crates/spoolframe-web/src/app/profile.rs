@@ -57,6 +57,7 @@ pub fn Profile() -> Element {
                         div { style: "order:4", DevicesAndSessions { has_pin } }
                         div { style: "order:6", super::plex::PlexAccountCard {} }
                         div { style: "order:7", MyPortable { tied: user.portable.clone() } }
+                        div { style: "order:8", super::connected::ConnectedApps { whose: super::connected::Whose::Mine } }
                     }
                 }
             }
@@ -85,6 +86,7 @@ pub fn Profile() -> Element {
             DevicesAndSessions { has_pin }
             PinCard { has_password, has_pin }
             Playback {}
+            super::connected::ConnectedApps { whose: super::connected::Whose::Mine }
         }
     }
 }

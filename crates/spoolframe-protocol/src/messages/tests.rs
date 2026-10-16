@@ -122,6 +122,7 @@ fn hello() -> Hello {
             ..ClientCapabilities::default()
         }),
         experimental: Vec::new(),
+        features: vec![crate::features::PLAYLISTS.to_owned()],
     }
 }
 
@@ -374,6 +375,7 @@ fn every_reply_round_trips() {
             auth_methods: vec![AuthMethod::Password],
             web_url: Some("https://media.example.org".into()),
             experimental: Vec::new(),
+            features: Vec::new(),
         }),
         Reply::AuthMethods {
             methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
@@ -460,6 +462,7 @@ fn every_reply_round_trips() {
             session: SessionId("s".into()),
             remembered: false,
             password_change_required: true,
+            features: vec![crate::features::PLAYLISTS.to_owned()],
         },
         Reply::TrustedProfiles {
             profiles: vec![crate::TrustedProfile {
@@ -486,6 +489,17 @@ fn every_reply_round_trips() {
             item: movie(),
             children: Vec::new(),
             markers: markers(),
+            playlists: None,
+        },
+        Reply::Item {
+            item: movie(),
+            children: Vec::new(),
+            markers: Vec::new(),
+            playlists: Some(vec![crate::playlists::PlaylistRef {
+                id: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+                name: "Heists".into(),
+                owner_kind: crate::playlists::PlaylistOwnerKind::SharedWithMe,
+            }]),
         },
         Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
@@ -500,6 +514,7 @@ fn every_reply_round_trips() {
                 portable: ties(),
             },
             can_leave: true,
+            features: vec![crate::features::PLAYLISTS.to_owned()],
         }),
         Reply::Devices {
             devices: vec![crate::DeviceInfo {
@@ -1001,6 +1016,7 @@ fn server_info_without_a_server_id_does_not_decode() {
         auth_methods: vec![AuthMethod::Password],
         web_url: None,
         experimental: Vec::new(),
+        features: Vec::new(),
     })
     .unwrap();
     let ciborium::Value::Map(fields) = &mut value else {
@@ -1589,6 +1605,7 @@ fn an_older_client_reads_an_item_that_has_markers() {
         item: movie(),
         children: Vec::new(),
         markers: markers(),
+        playlists: None,
     })
     .unwrap();
     let before_markers::Reply::Item { item, children } = codec::decode(&bytes).unwrap() else {
@@ -1853,6 +1870,7 @@ fn a_reply_missing_a_field_is_refused() {
             item: movie(),
             children: Vec::new(),
             markers: Vec::new(),
+            playlists: None,
         },
         &["markers"],
     );
@@ -2327,6 +2345,7 @@ fn admin_who_am_i(can_leave: bool) -> WhoAmIReply {
             portable: ties(),
         },
         can_leave,
+        features: Vec::new(),
     }
 }
 
@@ -2399,6 +2418,7 @@ mod experimental_features {
     fn asking(names: &[&str]) -> Hello {
         Hello {
             experimental: names.iter().map(|n| n.to_string()).collect(),
+            features: Vec::new(),
             ..hello()
         }
     }
@@ -2441,6 +2461,7 @@ mod experimental_features {
             auth_methods: vec![AuthMethod::Password],
             web_url: None,
             experimental,
+            features: Vec::new(),
         }
     }
 
@@ -2556,5 +2577,243 @@ mod experimental_features {
         assert!(!request.is_pre_auth());
         assert!(crate::policy::retry_safe(&request));
         assert_eq!(crate::policy::server_wait(&request), Duration::ZERO);
+    }
+}
+
+/// PX-40's messages, and what an older peer makes of them.
+mod playlists {
+    use super::*;
+    use crate::playlists::{
+        ItemKind, Kinds, PinNote, PinNoteReason, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind,
+        PlaylistPage, PlaylistShare, PlaylistSummary, Visibility,
+    };
+
+    const EPISODES: Kinds = Kinds {
+        movies: false,
+        episodes: true,
+        tracks: false,
+    };
+
+    fn summary() -> PlaylistSummary {
+        PlaylistSummary {
+            id: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+            name: "Heists".into(),
+            kinds: EPISODES,
+            owner_kind: PlaylistOwnerKind::Mine,
+            visibility: Visibility::Shared {
+                with: vec![PlaylistShare {
+                    user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4d".into(),
+                    can_edit: true,
+                }],
+            },
+            can_edit: true,
+            can_manage: true,
+            revision: 7,
+            pinned: Some(0),
+        }
+    }
+
+    #[test]
+    fn every_playlist_message_round_trips() {
+        let id = "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".to_owned();
+        for request in [
+            Request::ListPlaylists,
+            Request::GetPlaylist {
+                id: id.clone(),
+                offset: 0,
+                limit: 50,
+            },
+            Request::CreatePlaylist {
+                name: "Heists".into(),
+                kinds: EPISODES,
+                visibility: Visibility::ServerWide,
+            },
+            Request::UpdatePlaylist {
+                id: id.clone(),
+                name: None,
+                kinds: Some(EPISODES),
+                visibility: Some(Visibility::Personal),
+            },
+            Request::EditPlaylist {
+                id: id.clone(),
+                revision: 7,
+                edits: vec![
+                    PlaylistEdit::Add {
+                        id: movie().id().clone(),
+                        before: Some(3),
+                    },
+                    PlaylistEdit::Remove { entry: 4 },
+                    PlaylistEdit::Move {
+                        entry: 5,
+                        before: None,
+                    },
+                ],
+            },
+            Request::DeletePlaylist { id: id.clone() },
+            Request::PinPlaylist {
+                id: id.clone(),
+                position: 2,
+            },
+            Request::PlayPlaylist {
+                id: id.clone(),
+                from: Some(3),
+                shuffle: false,
+                repeat: crate::playlists::Repeat::One,
+                skip_watched: true,
+            },
+            Request::NextInPlaylist {
+                id: id.clone(),
+                after: 3,
+            },
+            Request::ImportPlexPlaylists { dry_run: true },
+            Request::UnpinPlaylist { id },
+            Request::DismissPinNotes,
+        ] {
+            assert!(!request.is_pre_auth(), "{request:?}");
+            round_trip(RequestEnvelope {
+                session: Some(SessionId("s".into())),
+                request,
+            });
+        }
+        for reply in [
+            Reply::Playlists {
+                playlists: vec![summary()],
+                pin_notes: vec![PinNote {
+                    playlist_id: "x".into(),
+                    name: "Gone".into(),
+                    reason: PinNoteReason::Deleted,
+                }],
+            },
+            Reply::Playlist(PlaylistPage {
+                playlist: summary(),
+                entries: vec![PlaylistEntry {
+                    entry: 3,
+                    item: movie(),
+                    unavailable: true,
+                }],
+                offset: 0,
+                total: 18,
+                playable: 17,
+                place: Some(3),
+                settings: crate::playlists::PlaySettings {
+                    shuffle: true,
+                    repeat: crate::playlists::Repeat::All,
+                    skip_watched: true,
+                },
+            }),
+            Reply::PlaylistItem(crate::playlists::PlaylistNext {
+                entry: 3,
+                item: movie(),
+                markers: markers(),
+            }),
+            Reply::PlaylistFinished,
+            Reply::PlexImport(crate::playlists::PlexImport {
+                made: vec![crate::playlists::PlexImported {
+                    name: "Heists".into(),
+                    playlist_id: None,
+                    entries: 18,
+                }],
+                unmapped: vec![crate::playlists::PlexUnmapped {
+                    playlist: "Heists".into(),
+                    title: Some("A trailer".into()),
+                    reason: "a clip is not something Spoolframe plays".into(),
+                }],
+                notes: vec!["Cabin skipped".into()],
+            }),
+            Reply::PlaylistInfo(summary()),
+            Reply::PlaylistEdited { revision: 8 },
+        ] {
+            round_trip(Response::Ok(reply));
+        }
+        for error in [
+            Error::PlaylistReadOnly,
+            Error::KindNotAllowed {
+                kind: ItemKind::Movie,
+            },
+            Error::PlaylistConflict { revision: 9 },
+        ] {
+            round_trip(Response::Err(error));
+        }
+        for event in [
+            Event::PlaylistChanged {
+                id: "x".into(),
+                revision: 1,
+            },
+            Event::PlaylistGone { id: "x".into() },
+            Event::PinsChanged,
+        ] {
+            round_trip(event);
+        }
+    }
+
+    #[test]
+    fn reads_are_retried_and_changes_are_not() {
+        use crate::policy::retry_safe;
+        assert!(retry_safe(&Request::ListPlaylists));
+        assert!(retry_safe(&Request::GetPlaylist {
+            id: "x".into(),
+            offset: 0,
+            limit: 1,
+        }));
+        assert!(!retry_safe(&Request::EditPlaylist {
+            id: "x".into(),
+            revision: 0,
+            edits: Vec::new(),
+        }));
+        assert!(!retry_safe(&Request::PinPlaylist {
+            id: "x".into(),
+            position: 0,
+        }));
+    }
+
+    /// A client without the feature never gets `playlists`; one with it
+    /// reads an older server's `Item`, which has none, as `None`.
+    #[test]
+    fn an_item_s_playlists_are_left_out_when_not_given() {
+        let without = Reply::Item {
+            item: movie(),
+            children: Vec::new(),
+            markers: Vec::new(),
+            playlists: None,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json.get("playlists").is_none(), "{json}");
+        let read: Reply = serde_json::from_value(json).unwrap();
+        assert_eq!(read, without);
+    }
+
+    #[test]
+    fn a_hello_or_a_session_without_features_reads_as_none() {
+        let mut older = hello();
+        older.features = Vec::new();
+        let json = serde_json::to_value(&older).unwrap();
+        assert!(json.get("features").is_none(), "{json}");
+        let read: Hello = serde_json::from_value(json).unwrap();
+        assert!(read.features.is_empty());
+        let logged_in: Reply = serde_json::from_value(serde_json::json!({
+            "type": "logged_in",
+            "session": "s",
+            "remembered": false,
+        }))
+        .unwrap();
+        assert!(matches!(logged_in, Reply::LoggedIn { features, .. } if features.is_empty()));
+    }
+
+    #[test]
+    fn a_hello_keeps_a_bounded_list_of_features() {
+        let mut long = hello();
+        long.features = vec!["x".repeat(1_000); 100];
+        let kept = long.within_bounds();
+        assert_eq!(kept.features.len(), crate::features::MAX_LISTED);
+        assert_eq!(kept.features[0].chars().count(), crate::MAX_HELLO_TEXT);
+    }
+
+    #[test]
+    fn playlist_parts_from_a_newer_peer_decode_as_unknown() {
+        let visibility: Visibility =
+            serde_json::from_value(serde_json::json!({"type": "friends_of_friends"})).unwrap();
+        assert_eq!(visibility, Visibility::Unknown);
+        let kind: PlaylistOwnerKind = serde_json::from_value(serde_json::json!("family")).unwrap();
+        assert_eq!(kind, PlaylistOwnerKind::Unknown);
     }
 }

@@ -293,6 +293,11 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             "settingUnset(http_playback.listen)",
             outcome(root.setting_unset("http_playback.listen".into()).await),
         ),
+        // PX-42: an authorization server whose tokens act for users.
+        (
+            "settingSet(mcp.enabled)",
+            outcome(root.setting_set("mcp.enabled".into(), json!(true)).await),
+        ),
         // Every device connected drops, and a server started by hand runs
         // whatever binary is now at its path. Nothing in these tests
         // starts it again: it is only asked for.
@@ -340,7 +345,12 @@ async fn an_old_admin_session_cannot_make_sensitive_changes() {
         assert!(entry.is_some_and(|e| !e.set), "{entry:?}");
     }
     // Some have defaults, so each is as it was.
-    for key in ["network.wan", "network.announce.add", "network.port"] {
+    for key in [
+        "network.wan",
+        "network.announce.add",
+        "network.port",
+        "mcp.enabled",
+    ] {
         let entry =
             |s: &spoolframe_admin_api::Settings| s.entries.iter().find(|e| e.key == key).cloned();
         assert!(entry(&before).is_some(), "{key}");

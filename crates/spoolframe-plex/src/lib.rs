@@ -14,6 +14,7 @@ mod convert;
 pub mod gdm;
 pub mod inspect;
 pub mod paths;
+pub mod playlists;
 mod search;
 pub mod stats;
 mod watch;
@@ -803,6 +804,14 @@ impl Catalog for PlexCatalog {
             }
             _ => Err(CatalogError::NotFound(id.to_string())),
         }
+    }
+
+    async fn find_external(
+        &self,
+        kind: MediaKind,
+        external_ids: &[String],
+    ) -> Result<Option<MediaId>, CatalogError> {
+        self.find_guid(kind, external_ids).await
     }
 
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError> {

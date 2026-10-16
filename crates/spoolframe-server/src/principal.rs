@@ -31,6 +31,42 @@ impl fmt::Display for Principal {
     }
 }
 
+impl std::str::FromStr for Principal {
+    type Err = InvalidPrincipal;
+
+    /// What [`Principal`]'s `Display` writes.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(id) = s.strip_prefix("local:") {
+            return id
+                .parse()
+                .map(Principal::LocalUser)
+                .map_err(|_| InvalidPrincipal);
+        }
+        if let Some(id) = s.strip_prefix("portable:") {
+            return id
+                .parse()
+                .map(Principal::PortableUser)
+                .map_err(|_| InvalidPrincipal);
+        }
+        Err(InvalidPrincipal)
+    }
+}
+
+/// Text that names no principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a user id")]
+pub struct InvalidPrincipal;
+
+/// Who is acting, with the rights they act with: what every call into a
+/// service that judges access takes (playlists, PX-40), whether it comes
+/// from a client's session or, later, an MCP tool acting for them (PX-42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Actor {
+    pub principal: Principal,
+    /// An admin here. Never a portable user.
+    pub admin: bool,
+}
+
 /// Whose a live endpoint session is: a local user's, or a granted
 /// portable user's (P7-06). The tied case is a local user's: a credential
 /// for a tied identity signs in as the account (§58).
@@ -45,6 +81,14 @@ impl Who {
         match self {
             Who::Local(user) => Principal::LocalUser(user.user),
             Who::Portable(user) => Principal::PortableUser(user.user),
+        }
+    }
+
+    /// Them, acting with their rights.
+    pub fn actor(&self) -> Actor {
+        Actor {
+            principal: self.principal(),
+            admin: matches!(self, Who::Local(user) if user.role == spoolframe_types::Role::Admin),
         }
     }
 
@@ -95,6 +139,23 @@ impl Who {
         match self {
             Who::Local(user) => user.pin_required,
             Who::Portable(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_principal_reads_back_from_what_it_writes() {
+        let local = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(7)));
+        let portable = Principal::PortableUser(PortableUserId::from_bytes([9; 32]).unwrap());
+        for principal in [local, portable] {
+            assert_eq!(principal.to_string().parse::<Principal>(), Ok(principal));
+        }
+        for text in ["local:", "local:7", "portable:ab", "remote:x", ""] {
+            assert_eq!(text.parse::<Principal>(), Err(InvalidPrincipal), "{text}");
         }
     }
 }

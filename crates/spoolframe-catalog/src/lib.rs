@@ -20,7 +20,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, Marker, MediaId, PersonId};
+use spoolframe_types::{ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaKind, PersonId};
 
 /// Which slice of a library to list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +166,20 @@ pub trait Catalog: Send + Sync {
     /// the catalog has no item of that kind under that key, also when the
     /// key now names an item of another kind.
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError>;
+
+    /// The item of `kind` that has one of `external_ids` now, in the
+    /// libraries served: how something kept by an item's stable ids (a
+    /// playlist's entry, PX-40) finds it again after its key changed.
+    /// `None` when no item has them, or when this catalog cannot look
+    /// items up by them. An error is "cannot say": the caller keeps what
+    /// it has.
+    async fn find_external(
+        &self,
+        _kind: MediaKind,
+        _external_ids: &[String],
+    ) -> Result<Option<MediaId>, CatalogError> {
+        Ok(None)
+    }
 
     /// Each kind `query` asks for, in the libraries it covers (P3-09).
     /// The catalog's backend applies the scope; nothing is filtered out

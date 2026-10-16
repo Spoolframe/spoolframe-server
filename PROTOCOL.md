@@ -41,6 +41,7 @@ must be updated together. The changes per revision are in
   [idle playbacks](#paused-playback-and-the-idle-limit)
 - [Home rows and "Remove"](#home-rows-and-remove)
 - [Leaving a server](#leaving-a-server)
+- [Features](#features) and [playlists](#playlists)
 - [Portable identities](#portable-identities)
 
 ## Basics
@@ -1365,8 +1366,10 @@ What leaving does:
 
 - **A portable user**: its grant is taken away (kept as a tombstone, as
   an admin's revoke keeps it, so an invite made before does not bring it
-  back), its sessions here end, and its watch state, hidden rows and
-  track preferences here are deleted. Coming back takes a new invite.
+  back), its sessions here end, and its watch state, hidden rows,
+  track preferences, playlists, pins and playlist places here are
+  deleted (whoever had one of its playlists pinned gets a note). Coming
+  back takes a new invite.
 - **A local account**: set aside, not deleted. It is disabled and marked
   as left, its sessions end, and no device stays trusted for it; its
   data, passkeys and ties to portable identities stay. Signing in is
@@ -1382,6 +1385,219 @@ exactly when `LeaveServer` would answer `LastAdmin`, by the same check,
 and `true` for everyone else (a portable user always). It is as of that
 answer: an admin made or demoted later changes it, and `LeaveServer`
 still refuses. It sits beside the user's fields in the same map.
+
+## Features
+
+A regular feature (PX-16) is a namespaced name, `spoolframe:playlists`,
+for a set of requests, replies and events. Both sides list the ones they
+are built with, and each uses only what both list. This build has the
+slice of PX-16 that playlists need; the update advisory and a test
+server's mask come later.
+
+- `Hello.features`: every regular feature the client is built with.
+- `ServerInfo.features`: only the server's pre-auth features (none yet).
+- `LoggedIn.features` and `WhoAmI`'s `features`: all of the server's.
+  `WhoAmI` carries them for a client holding a session from before, or
+  from before the server was upgraded.
+
+The server never sends a reply field or event of a feature the client
+did not list in its `Hello` on that connection, and a client sends no
+request of one the server did not list. A name either side does not
+know is ignored; no feature is required. All three fields are left out
+when empty, so an older peer sends and reads what it did before.
+
+Regular features differ from experimental ones (PX-49,
+`Hello.experimental`): a build that has one always lists it.
+
+## Playlists
+
+Feature `spoolframe:playlists` (PX-40). A playlist is a name, an owner,
+the kinds of item it may hold (`Kinds { movies, episodes, tracks }`,
+ticked when it is made and only ever widened), and an ordered list of
+entries. An entry is one place in the list (`EntryId`), so an item may be
+in a playlist twice; edits name entries, never items.
+
+| Request | Reply | Who |
+|---|---|---|
+| `ListPlaylists` | `Playlists { playlists, pin_notes }` | anyone |
+| `GetPlaylist { id, offset, limit }` | `Playlist(PlaylistPage)` | who sees it |
+| `CreatePlaylist { name, kinds, visibility }` | `PlaylistInfo` | anyone; `ServerWide` an admin |
+| `UpdatePlaylist { id, name?, kinds?, visibility? }` | `PlaylistInfo` | its manager |
+| `EditPlaylist { id, revision, edits }` | `PlaylistEdited { revision }` | its editors |
+| `DeletePlaylist { id }` | `Done` | its manager |
+| `PinPlaylist { id, position }` | `Done` | who sees it |
+| `UnpinPlaylist { id }` | `Done` | anyone |
+| `DismissPinNotes` | `Done` | anyone |
+| `PlayPlaylist { id, from?, shuffle, repeat, skip_watched }` | `PlaylistItem` or `PlaylistFinished` | who sees it |
+| `NextInPlaylist { id, after }` | `PlaylistItem` or `PlaylistFinished` | who sees it |
+| `ImportPlexPlaylists { dry_run }` | `PlexImport` | a local user with a linked Plex account |
+
+`ListPlaylists` and `GetPlaylist` are reads, sent again on a new
+connection; the rest are mutations.
+
+### Who sees it
+
+`visibility` is `Personal` (the owner alone), `Shared { with }` (the
+owner and these users, each `PlaylistShare { user_id, can_edit }` with
+`user_id` as `WhoAmI` gives it), or `ServerWide` (every user, portable
+guests included). Only an admin makes a playlist server-wide
+(`AdminRequired`); a share naming someone who is not a user here is
+`InvalidInput`.
+
+- The owner manages it: renames it, widens its kinds, changes its
+  sharing, deletes it. So does any admin for a server-wide one.
+- An editor share (`can_edit: true`) changes its entries; a read-only
+  one only reads it.
+- Anyone else does not see it: it is not listed, and asking for it is
+  `NotFound { what: "playlist" }`, the same answer as for none.
+
+A change someone who sees it may not make is `PlaylistReadOnly`. A
+`PlaylistSummary` says what the user may do (`can_edit`, `can_manage`),
+how it stands to them (`owner_kind`: `mine`, `shared_with_me`,
+`server_wide`), its `revision`, and its place in their Pinned
+(`pinned`, `None` when not pinned). Who else a playlist is shared with
+is listed only to whoever manages it; anyone else gets `Shared` with an
+empty list.
+
+### Entries
+
+`GetPlaylist` gives a page (at most 200) of `PlaylistEntry { entry, item,
+unavailable }`, with the user's watch state on each item, and the whole
+list's `total` and `playable`, for a header such as "18 episodes · 17
+playable".
+
+- An item the user may not see is neither listed nor counted.
+- An item still in the library whose file cannot be read now (a drive
+  offline, a file moved) is listed with `unavailable: true`, counted in
+  `total` and not in `playable`, and skipped when the playlist plays.
+- An item that left the library drops out of the playlist. One whose
+  key changed (Plex rebuilt the library) is followed to its new key,
+  keeping its entry id and place.
+- An item in a library not served now is hidden, and comes back with
+  the library.
+- When the library cannot be asked (Plex down), the read fails with
+  `Unavailable` and nothing is dropped.
+
+### Editing
+
+`EditPlaylist { id, revision, edits }` applies 1 to 100 edits, in order,
+all or none, and answers the new revision:
+
+- `Add { id, before }` adds an item before entry `before`, or at the
+  end. A movie, episode or track adds itself; a season its episodes; a
+  show every episode, seasons in order and specials last; an album its
+  tracks in disc and track order; an artist its albums' tracks, the
+  oldest album first. An item of a kind the playlist does not take is
+  `KindNotAllowed { kind }`. Clients offer "Add to playlist" only for
+  playlists whose kinds take the item.
+- `Remove { entry }` takes an entry out.
+- `Move { entry, before }` puts an entry before another, or at the end.
+
+`revision` is the one the editor saw. When someone changed the playlist
+since, the edits are redone on the new revision unless one removes or
+moves an entry that was removed or moved since (also by the server,
+dropping an item that left the library): then it is
+`PlaylistConflict { revision }`, with the revision now, and nothing
+changed. Show "Someone changed this playlist; reload". An add is always
+redone; an add or move whose `before` entry is gone goes to the end. An
+editor more than 500 revisions behind reloads.
+
+### Playing
+
+The server keeps each user's place in each playlist and how they play
+it (`PlaySettings { shuffle, repeat, skip_watched }`, `repeat` one of
+`off`, `one`, `all`); `GetPlaylist` gives both (`place`, `settings`).
+The client plays each item as any other (`StartPlayback`, progress), and
+asks the server what comes next:
+
+- `PlayPlaylist { id, from, shuffle, repeat, skip_watched }` keeps the
+  settings and answers `PlaylistItem(PlaylistNext { entry, item,
+  markers })`: the entry to play, its item with the user's watch state
+  (start at its position), and its intro and credits markers. With
+  `from`, that entry; without, the user's place: the entry they were in
+  if they have not watched it, else the one after it ("Continue"); with
+  no place, the top.
+- `NextInPlaylist { id, after }` when entry `after` ended, at its
+  credits for an episode (PX-06), or was skipped.
+- Unavailable entries are passed, and with `skip_watched` watched ones
+  (not the one chosen with `from`, resumed, or repeated).
+- `repeat: one` plays the same entry again; `all` starts a new round
+  after the last. With `shuffle`, a round is a shuffled order of every
+  entry, each once; `from` starts a new round with that entry first.
+  Entries added during a round play at its end.
+- `PlaylistFinished` when nothing is left: the end with repeat off, or
+  no entry that can be played. The place is cleared, so the next
+  `PlayPlaylist` starts at the top; the settings are kept.
+
+Both are mutations (they move the place), never sent again on a new
+connection.
+
+### Importing from Plex
+
+`ImportPlexPlaylists { dry_run }` imports the session user's Plex
+playlists once: each video or music playlist of their linked Plex
+account, on every Plex server here, becomes a personal playlist of
+theirs with the same name, its kinds those of the items found, its items
+mapped to this server's. A smart playlist is imported as what it holds
+now. `PlexImport { made, unmapped, notes }` lists each playlist made
+(`PlexImported { name, playlist_id, entries }`, `playlist_id` `None` on
+a dry run), each item or playlist not imported and why
+(`PlexUnmapped { playlist, title, reason }`; `title` `None` for a
+playlist none of whose items are here), and Plex servers that could not
+be read. Nothing is synced afterwards, and importing twice makes the
+playlists twice. Without a linked Plex account it is `NotFound`; a
+portable user has none (`NotForPortableUsers`).
+
+### Pinned
+
+Pins are per user, kept by the server, in the order the user sets:
+`PinPlaylist { id, position }` pins at `position` (0 first) or moves a
+pinned one there. A pinned playlist that leaves the user's sight
+(unshared from them, made personal again, deleted) leaves their Pinned,
+and `ListPlaylists` carries a `PinNote { playlist_id, name, reason }`
+(`unshared` or `deleted`) until a client of theirs sends
+`DismissPinNotes`: once per user, not per device. Whoever deletes a
+playlist gets no note for it.
+
+### Item details
+
+`Item` carries `playlists: Some([PlaylistRef { id, name, owner_kind }])`
+for a client that listed the feature: the playlists the user sees that
+hold a movie, episode or track itself, any of a season's or show's
+episodes, or any of an album's or artist's tracks. For any other client
+the field is left out.
+
+### Events
+
+To a connection that listed the feature, for each user it has made a
+request as on that connection (from the first such request until it
+closes):
+
+- `PlaylistChanged { id, revision }`: a playlist the user sees was made
+  or changed (entries, name, kinds, sharing). Read it again if shown.
+- `PlaylistGone { id }`: a playlist the user saw is no longer theirs to
+  see: deleted, or unshared from them.
+- `PinsChanged`: the user's Pinned or its notes changed, here, on
+  another device, or by another user's change. `ListPlaylists` again.
+
+An app that missed events (it was not connected) reads what it shows
+again on connecting.
+
+### SDK
+
+The SDK lists every feature it uses in its `Hello`. `Session::features()`
+says which the session's server has (from `WhoAmI`), and
+`Features::playlists` gates every playlist call: without it the call is
+`SdkError::Unsupported { feature }` and nothing is sent. The calls are
+`Session::playlists`, `playlist`, `create_playlist`, `update_playlist`
+(`PlaylistUpdate`), `edit_playlist`, `delete_playlist`, `pin_playlist`,
+`unpin_playlist`, `dismiss_pin_notes`, `play_playlist`,
+`next_in_playlist` and `import_plex_playlists`; `ItemDetail::playlists` lists an item's playlists
+(empty from a server without them). Refusals are typed:
+`SdkError::PlaylistReadOnly`, `KindNotAllowed { kind }` and
+`PlaylistConflict { revision }`. `Client::playlist_events()` gives every
+`PlaylistEvent { server, change }` the servers tell, `change` one of
+`Changed { id, revision }`, `Gone { id }` and `PinsChanged`.
 
 ## Portable identities
 

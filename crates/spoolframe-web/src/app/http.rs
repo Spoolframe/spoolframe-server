@@ -300,3 +300,54 @@ pub async fn setup_state() -> Result<SetupState, ApiError> {
 pub async fn setup_open() -> Result<bool, ApiError> {
     setup_state().await.map(|state| state.open)
 }
+
+/// A waiting request to connect an app (PX-42), as the consent page shows
+/// it to whoever is signed in.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectRequest {
+    /// The name the app registered: its own word for itself.
+    pub client_name: String,
+    /// The host the app's answer goes to (`claude.ai`).
+    pub return_host: String,
+    /// The scopes the user may grant.
+    pub scopes: Vec<String>,
+}
+
+/// The waiting request `id`.
+pub async fn connect_request(id: &str) -> Result<ConnectRequest, ApiError> {
+    let id: String = js_sys::encode_uri_component(id).into();
+    let response = Request::get(&format!("/oauth/pending/{id}"))
+        .send()
+        .await
+        .map_err(unreachable)?;
+    if !response.ok() {
+        return Err(error_of(response).await);
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| ApiError::transport(e.to_string()))
+}
+
+/// Answer the waiting request `id`: allowed with `scopes`, or denied.
+/// Where to send the browser: the app's address, with its answer.
+pub async fn connect_decide(id: &str, allow: bool, scopes: &[String]) -> Result<String, ApiError> {
+    let response = post(
+        "/oauth/decide",
+        json!({ "request": id, "allow": allow, "scopes": scopes }),
+    )
+    .await?;
+    if !response.ok() {
+        return Err(error_of(response).await);
+    }
+    #[derive(Deserialize)]
+    struct Decided {
+        redirect: String,
+    }
+    response
+        .json::<Decided>()
+        .await
+        .map(|d| d.redirect)
+        .map_err(|e| ApiError::transport(e.to_string()))
+}

@@ -64,6 +64,8 @@ pub struct Live {
     /// `network.uplink.*`, `network.lan_prefixes` and
     /// `network.wan_prefixes` (PX-46).
     pub uplink: Option<Arc<crate::uplink::Uplink>>,
+    /// `mcp.enabled` (PX-42).
+    pub mcp: crate::oauth::McpSwitch,
 }
 
 /// Why a change was not made.
@@ -528,6 +530,7 @@ impl RuntimeSettings {
             name.set(config.server_name());
         }
         live.cookies.set_insecure(config.admin.insecure_cookies());
+        live.mcp.set(config.mcp.enabled());
         if let (Some(metrics), Ok(from)) = (&live.metrics, config.admin.metrics_from()) {
             metrics.access().set(config.admin.metrics(), from);
         }
@@ -714,6 +717,21 @@ mod tests {
         assert!(settings.live.cookies.insecure());
         settings.unset("admin.insecure_cookies", "root").unwrap();
         assert!(!settings.live.cookies.insecure());
+    }
+
+    /// MCP (PX-42) is off until turned on, and turns off again at once:
+    /// the listener reads the switch at every request.
+    #[tokio::test]
+    async fn mcp_is_off_by_default_and_switched_live() {
+        let (settings, _dir) = settings(None).await;
+        assert!(!settings.live.mcp.on());
+        let entry = settings
+            .set("mcp.enabled", &serde_json::json!(true), "root")
+            .unwrap();
+        assert!(!entry.restart_pending);
+        assert!(settings.live.mcp.on());
+        settings.unset("mcp.enabled", "root").unwrap();
+        assert!(!settings.live.mcp.on());
     }
 
     #[tokio::test]
