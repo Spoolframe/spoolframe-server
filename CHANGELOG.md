@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0 (2026-10-16)
+
 - An MCP server in the server (PX-42), so an AI agent such as Claude can
   act for a user: `/mcp` on the admin listener, MCP's Streamable HTTP
   transport, stateless. Off by default: `mcp.enabled`, a live setting,
