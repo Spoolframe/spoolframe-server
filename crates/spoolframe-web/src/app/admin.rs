@@ -1621,9 +1621,8 @@ fn UserPasskeys(username: String, name: String) -> Element {
     }
 }
 
-/// The design's WebServer board: this server across the page, its card
-/// being the tallest, then Plex and the media paths check side by side
-/// where there is room.
+/// The design's WebServer board: this server and its network side by
+/// side, then Plex and the media paths check, where there is room.
 #[component]
 pub fn Server() -> Element {
     rsx! {
@@ -1713,6 +1712,8 @@ fn PublicAddresses(
     }
 }
 
+/// What the server is, and beside it how it is reached: one card was
+/// as tall as the two side by side, with the right half of the page empty.
 #[component]
 fn ThisServer() -> Element {
     let status = use_resource(|| async {
@@ -1720,97 +1721,101 @@ fn ThisServer() -> Element {
         client.server_status().await.map_err(rpc::error)
     });
     let current = status.read().clone();
-    rsx! {
-        section { class: "card",
-            div { class: "card-head",
-                icons::Server {}
-                h2 { "This server" }
-            }
-            div { class: "card-body",
-                match current {
-                    None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
-                    Some(Err(e)) => rsx! { Alert { text: e.explain() } },
-                    Some(Ok(s)) => rsx! {
-                        Pair { label: "Name", b { "{s.name}" } }
-                        Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
-                        // What it speaks to the apps: new capability comes
-                        // as a feature, not a new protocol version, so each
-                        // list is shown, an empty one as "none". Not on a
-                        // phone, as WebAdminPhone 3 keeps to the three
-                        // above.
-                        Pair { label: "Client protocol", class: "max-md:hidden", span { class: "mono-value", "{s.protocol_version}" } }
-                        Pair { label: "Features", class: "pair-stack max-md:hidden",
-                            span { class: "mono-value", {crate::logic::feature_list(&s.features)} }
+    match current {
+        None => rsx! { ServerCard { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } } },
+        Some(Err(e)) => rsx! { ServerCard { Alert { text: e.explain() } } },
+        Some(Ok(s)) => rsx! {
+            div { class: "server-grid",
+                ServerCard {
+                    Pair { label: "Name", b { "{s.name}" } }
+                    Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
+                    // What it speaks to the apps: new capability comes
+                    // as a feature, not a new protocol version, so each
+                    // list is shown, an empty one as "none". Not on a
+                    // phone, as WebAdminPhone 3 keeps to the three
+                    // above.
+                    Pair { label: "Client protocol", class: "max-md:hidden", span { class: "mono-value", "{s.protocol_version}" } }
+                    Pair { label: "Features", class: "pair-stack max-md:hidden",
+                        span { class: "mono-value", {crate::logic::feature_list(&s.features)} }
+                    }
+                    Pair { label: "Pre-auth features", class: "pair-stack max-md:hidden",
+                        span { class: "mono-value", {crate::logic::feature_list(&s.pre_auth_features)} }
+                    }
+                    Pair { label: "Experimental", class: "pair-stack max-md:hidden",
+                        span { class: "mono-value", {crate::logic::feature_list(&s.experimental_features)} }
+                        div { class: "mt-1 text-xs text-ctp-subtext0", "On here, each by its setting; apps use one only when they ask for it." }
+                    }
+                    // What it and this web app are built from, and
+                    // their licenses.
+                    Pair { label: "Licenses",
+                        Link { to: Route::LicensesPage { open: String::new() }, "Open source licenses" }
+                    }
+                    Pair { label: "Fingerprint", class: "pair-stack",
+                        match s.fingerprint {
+                            Some(fingerprint) => rsx! {
+                                div { class: "fingerprint", "{fingerprint}" }
+                                div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Clients show this when they first connect." }
+                            },
+                            None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
                         }
-                        Pair { label: "Pre-auth features", class: "pair-stack max-md:hidden",
-                            span { class: "mono-value", {crate::logic::feature_list(&s.pre_auth_features)} }
-                        }
-                        Pair { label: "Experimental", class: "pair-stack max-md:hidden",
-                            span { class: "mono-value", {crate::logic::feature_list(&s.experimental_features)} }
-                            div { class: "mt-1 text-xs text-ctp-subtext0", "On here, each by its setting; apps use one only when they ask for it." }
-                        }
-                        // What it and this web app are built from, and
-                        // their licenses.
-                        Pair { label: "Licenses",
-                            Link { to: Route::LicensesPage { open: String::new() }, "Open source licenses" }
-                        }
-                        Pair { label: "Fingerprint", class: "pair-stack",
-                            match s.fingerprint {
-                                Some(fingerprint) => rsx! {
-                                    div { class: "fingerprint", "{fingerprint}" }
-                                    div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Clients show this when they first connect." }
-                                },
-                                None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
+                    }
+                    // The apps' passkeys for this server (PX-14): what a
+                    // password manager lists them under.
+                    Pair { label: "Passkey domain", class: "pair-stack",
+                        {
+                            let domain = crate::logic::passkey_domain(&s.server_id);
+                            rsx! {
+                                div { class: "flex items-start gap-2.5",
+                                    span { class: "mono-value min-w-0", "{domain}" }
+                                    CopyButton { text: domain }
+                                }
+                                div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Passkeys made in the apps are saved for this domain." }
                             }
                         }
-                        // The apps' passkeys for this server (PX-14): what a
-                        // password manager lists them under.
-                        Pair { label: "Passkey domain", class: "pair-stack",
-                            {
-                                let domain = crate::logic::passkey_domain(&s.server_id);
-                                rsx! {
-                                    div { class: "flex items-start gap-2.5",
-                                        span { class: "mono-value min-w-0", "{domain}" }
-                                        CopyButton { text: domain }
-                                    }
-                                    div { class: "mt-1 text-xs text-ctp-subtext0 max-md:hidden", "Passkeys made in the apps are saved for this domain." }
+                    }
+                    // On a phone the key itself is too long to read:
+                    // the board offers it to copy only.
+                    if let Some(key) = s.endpoint_id.clone() {
+                        div { class: "md:hidden",
+                            CopyButton { text: key, label: "Copy key", wide: true }
+                        }
+                    }
+                    Pair { label: "Key", class: "max-md:hidden",
+                        match s.endpoint_id {
+                            Some(key) => rsx! {
+                                div { class: "flex items-start gap-2.5",
+                                    span { class: "mono-value min-w-0", "{key}" }
+                                    CopyButton { text: key }
+                                }
+                            },
+                            None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
+                        }
+                    }
+                    // `transcode.max_jobs` and the caps beside it: what
+                    // the conversions running take now.
+                    if let Some(budget) = s.transcoding.budget {
+                        Pair { label: "Encode budget", class: "max-md:hidden",
+                            div { class: "flex flex-col gap-1",
+                                span { "{budget.used_of_max()} used" }
+                                span { class: "text-xs text-ctp-subtext0",
+                                    "Remuxes {budget.remuxes} of {budget.max_remux} · GPU jobs {budget.gpu_jobs} of {budget.max_gpu_jobs}"
                                 }
                             }
                         }
-                        // On a phone the key itself is too long to read:
-                        // the board offers it to copy only.
-                        if let Some(key) = s.endpoint_id.clone() {
-                            div { class: "md:hidden",
-                                CopyButton { text: key, label: "Copy key", wide: true }
-                            }
-                        }
-                        Pair { label: "Key", class: "max-md:hidden",
-                            match s.endpoint_id {
-                                Some(key) => rsx! {
-                                    div { class: "flex items-start gap-2.5",
-                                        span { class: "mono-value min-w-0", "{key}" }
-                                        CopyButton { text: key }
-                                    }
-                                },
-                                None => rsx! { span { class: "text-ctp-subtext0", "starting…" } },
-                            }
-                        }
-                        // `transcode.max_jobs` and the caps beside it: what
-                        // the conversions running take now.
-                        if let Some(budget) = s.transcoding.budget {
-                            Pair { label: "Encode budget", class: "max-md:hidden",
-                                div { class: "flex flex-col gap-1",
-                                    span { "{budget.used_of_max()} used" }
-                                    span { class: "text-xs text-ctp-subtext0",
-                                        "Remuxes {budget.remuxes} of {budget.max_remux} · GPU jobs {budget.gpu_jobs} of {budget.max_gpu_jobs}"
-                                    }
-                                }
-                            }
-                        }
-                        Pair { label: "LAN discovery", class: "max-md:hidden",
+                    }
+                }
+                // Every row of it is left out on a phone (WebAdminPhone 3),
+                // so the card is too.
+                section { class: "card max-md:hidden",
+                    div { class: "card-head",
+                        icons::Globe { size: 18 }
+                        h2 { "Network" }
+                    }
+                    div { class: "card-body",
+                        Pair { label: "LAN discovery",
                             LanDiscovery { running: s.mdns }
                         }
-                        Pair { label: "Addresses", class: "max-md:hidden",
+                        Pair { label: "Addresses",
                             if s.addresses.is_empty() {
                                 span { class: "text-ctp-subtext0", "starting…" }
                             } else {
@@ -1819,7 +1824,7 @@ fn ThisServer() -> Element {
                         }
                         // The ones a signed-in device is told to dial (PX-12):
                         // `network.announce` leaves out container bridges.
-                        Pair { label: "Told to devices", class: "max-md:hidden",
+                        Pair { label: "Told to devices",
                             if s.told_addresses.is_empty() {
                                 span { class: "text-ctp-subtext0", "none" }
                             } else {
@@ -1830,13 +1835,27 @@ fn ThisServer() -> Element {
                         // `network.wan` (P6-02): what a device off the LAN
                         // dials, each with where it came from.
                         if s.wan {
-                            Pair { label: "Public addresses", class: "max-md:hidden",
+                            Pair { label: "Public addresses",
                                 PublicAddresses { addresses: s.public_addresses, notes: s.public_notes }
                             }
                         }
-                    },
+                    }
                 }
             }
+        },
+    }
+}
+
+/// The "This server" card around `children`.
+#[component]
+fn ServerCard(children: Element) -> Element {
+    rsx! {
+        section { class: "card",
+            div { class: "card-head",
+                icons::Server {}
+                h2 { "This server" }
+            }
+            div { class: "card-body", {children} }
         }
     }
 }

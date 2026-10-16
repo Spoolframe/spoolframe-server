@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The Server page's "This server" card is two, side by side: This
+  server (name, version, protocol and features, fingerprint, passkey
+  domain, key, encode budget) and Network (LAN discovery, addresses,
+  what devices are told, public addresses). The one card was as tall as
+  both, with half the page empty beside it.
 - Breaking (SDK): an app lists the regular features it handles. The
   SDK's `Hello` listed every regular feature the SDK knew, so an app
   that moved to a newer SDK was sent features its code did not handle:
