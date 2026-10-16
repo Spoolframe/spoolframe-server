@@ -243,7 +243,7 @@ pub fn LogsPage() -> Element {
                     div { class: "log-tail", "{current.tail_line()}" }
                 }
             }
-            p { class: "m-0 text-xs text-ctp-subtext0",
+            p { class: "m-0 max-w-[820px] text-xs text-ctp-subtext0",
                 "The server's last lines at its log level, kept in memory (logs.buffer_lines). Secrets and tokens are never logged; this is what the journal shows. Download saves the lines shown, for a bug report."
             }
         }

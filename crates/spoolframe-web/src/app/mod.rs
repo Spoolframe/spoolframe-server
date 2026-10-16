@@ -1566,7 +1566,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     {link(Route::MyPlaylists {}, "My playlists", false)}
                 }
             }
-            main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1200px] p-3.5 md:px-10 md:py-8",
+            main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1600px] p-3.5 md:px-10 md:py-8",
                 if plain {
                     div { class: "banner", role: "alert",
                         icons::Warning {}

@@ -90,14 +90,14 @@ fn GpusBody(transcoding: TranscodingStatus) -> Element {
             }
         }
         for note in t.gpu_notes.iter() {
-            p { key: "{note}", class: "m-0 text-xs text-ctp-subtext0", "{note}" }
+            p { key: "{note}", class: "m-0 max-w-[820px] text-xs text-ctp-subtext0", "{note}" }
         }
         if !picks.is_empty() {
             div { class: "row-label", "A 4K HDR10 film becomes" }
             for line in picks.iter() {
                 p { key: "{line}", class: "m-0 text-sm", "{line}" }
             }
-            p { class: "m-0 text-xs text-ctp-subtext0",
+            p { class: "m-0 max-w-[820px] text-xs text-ctp-subtext0",
                 "The first codec of Output codecs the device plays, HDR kept where its screen shows HDR. Set in "
                 Link { to: Route::Settings { tab: "playback".into() }, "Settings › Playback" }
                 "."
@@ -147,11 +147,11 @@ fn GpusBody(transcoding: TranscodingStatus) -> Element {
                     }
                 }
             }
-            p { class: "m-0 text-xs text-ctp-subtext0",
+            p { class: "m-0 max-w-[820px] text-xs text-ctp-subtext0",
                 "First choice; when it's busy, the next. \"CPU\": every card that encodes H.264 is full, so a new playback is encoded in software while the CPU budget (transcode.max_jobs) has room; software encodes H.264 only. \"next codec\": every card that encodes it is full, so a new playback takes the next of Output codecs. Each cell is the server's own pick, for a 1080p source to 720p, a 4K HDR10 one to 1080p SDR or with its HDR kept, and a 1080p one with picture subtitles."
             }
             if filters_off_matter(&t.routes) {
-                p { class: "m-0 text-xs text-ctp-subtext0",
+                p { class: "m-0 max-w-[820px] text-xs text-ctp-subtext0",
                     "GPU filters are off, so these tone maps and burn-ins run on the CPU. Turn them on in "
                     Link { to: Route::Settings { tab: "playback".into() }, "Settings › Playback" }
                     "."

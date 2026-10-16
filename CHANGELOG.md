@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The web UI's pages are up to 1600px wide, where they stopped at 1200px
+  and left a wide empty strip on a large window. The GPU card's and the
+  Logs page's longer notes keep to a readable width.
+
 - When each item was last viewed, for the Apple TV's Top Shelf, which
   shows Continue watching from the last 48 hours only and cannot tell it
   from the device's own playing. Behind a new regular feature,
