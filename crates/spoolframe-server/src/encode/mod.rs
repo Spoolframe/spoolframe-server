@@ -92,6 +92,9 @@ pub struct Conversion {
     video: Option<ConvertedVideo>,
     audio: Option<ConvertedAudio>,
     subtitle: Option<ConvertedSubtitle>,
+    /// Its audio starts after a run's first cut ([`late_audio`]): every
+    /// run encodes it, filled with silence from where the run starts.
+    pad_audio: bool,
     /// The GPU its runs go to, picked once at its start (PGPU-05): a seek
     /// or another rung stays on it, as on one encoder (PGPU-02).
     run_on: RunOn,
@@ -213,6 +216,9 @@ pub struct ConversionSource<'a> {
     pub gpus: Arc<Detected>,
     /// For HLS of a copied video: the source's keyframes, its only cuts.
     pub keyframes: Option<Arc<spoolframe_media::KeyframeTimes>>,
+    /// For HLS of an AC-3 or E-AC-3 track: where its first packet is, ms
+    /// ([`late_audio`]). `None` where it was not read.
+    pub audio_first_ms: Option<u64>,
     /// The epoch of its first encode: 0 for a new playback; one past the
     /// last for a conversion that replaces another (a subtitle change), so
     /// reads of the old one are told to start over.
@@ -308,6 +314,25 @@ impl Conversion {
                 }
                 _ => None,
             };
+            // Where the segments are cut is the plan's either way: an AC-3
+            // track encoded is cut as one copied is.
+            let late = late_audio(segments.as_ref(), *audio, source.audio_first_ms);
+            let padded = audio
+                .filter(|_| late)
+                .and_then(|a| encoded(&source.descriptor, a, &source.gpus.software));
+            let pad_audio = padded.is_some();
+            let audio = &match padded {
+                Some(_) => padded,
+                None => *audio,
+            };
+            if late {
+                tracing::info!(
+                    handle = source.handle,
+                    first_ms = source.audio_first_ms,
+                    audio = ?audio.map(|a| a.action),
+                    "the audio starts after the first cut: encoded, from silence"
+                );
+            }
             let start_rung = if ladder.is_empty() {
                 0
             } else {
@@ -362,6 +387,7 @@ impl Conversion {
                 first_segment,
                 source.slot,
                 keyframe_cuts(*video, first_video, segments.as_ref()),
+                pad_audio,
                 RunWhy {
                     playback: &source.trace,
                     reason: if source.first_epoch == 0 {
@@ -383,6 +409,7 @@ impl Conversion {
                 video: *video,
                 audio: *audio,
                 subtitle: *subtitle,
+                pad_audio,
                 run_on,
                 segments,
                 ladder: ladder.clone(),
@@ -514,6 +541,7 @@ impl Conversion {
                 dir: self.dir.clone(),
                 start_number: 1,
                 cuts: Cuts::Own,
+                pad_audio: false,
             },
         })
     }
@@ -699,6 +727,7 @@ impl Conversion {
             run.from,
             run.slot,
             run.cuts,
+            self.pad_audio,
             RunWhy {
                 playback: &self.trace,
                 reason: run.reason,
@@ -1120,6 +1149,81 @@ fn header_first(descriptor: &MediaDescriptor, audio: Option<ConvertedAudio>) -> 
     record && sound
 }
 
+/// How long before a run's first cut an AC-3 or E-AC-3 track's first
+/// packet must come to reach the muxer first: a copied video's keyframe
+/// is handed over by its decode time, up to a few frames before it shows.
+const LATE_AUDIO_MARGIN_MS: u64 = 250;
+
+/// Whether the MP4 muxer writes `action`'s sample entry from its first
+/// packet: AC-3 and E-AC-3 (`dac3`, `dec3`), copied or encoded.
+pub fn sample_entry_from_packets(action: AudioAction) -> bool {
+    matches!(
+        action,
+        AudioAction::Copy {
+            codec: AudioCodec::Ac3 | AudioCodec::Eac3
+        } | AudioAction::Encode {
+            codec: AudioCodec::Ac3 | AudioCodec::Eac3,
+            ..
+        }
+    )
+}
+
+/// Whether an HLS conversion's audio starts too late for its `init.mp4`:
+/// an AC-3 or E-AC-3 track whose first packet, at `first_ms`, comes after
+/// where a run from the start makes its first cut. The HLS muxer writes
+/// `init.mp4` at that cut, its `moov` before any packet of the track
+/// came, and the MP4 muxer cannot make the track's sample entry: the
+/// `moov` says size 0, and no player opens it (Saw, 2004: an Italian dub
+/// 6.2 s in, copied as AC-3, with keyframes every 0.9 s).
+fn late_audio(
+    segments: Option<&Segments>,
+    audio: Option<ConvertedAudio>,
+    first_ms: Option<u64>,
+) -> bool {
+    let (Some(segments), Some(first_ms)) = (segments, first_ms) else {
+        return false;
+    };
+    let cut = segments.end(1).unwrap_or(segments.total_ms);
+    audio.is_some_and(|a| sample_entry_from_packets(a.action))
+        && first_ms + LATE_AUDIO_MARGIN_MS >= cut
+}
+
+/// `audio` encoded: a copy as its own codec where the server encodes it,
+/// else as AAC, which every HLS player plays and whose sample entry needs
+/// no packet; at the bitrate the planner gives that encode. An encode as
+/// it is. `None` where neither encodes here.
+fn encoded(
+    descriptor: &MediaDescriptor,
+    audio: ConvertedAudio,
+    encoders: &spoolframe_media::encoders::Encoders,
+) -> Option<ConvertedAudio> {
+    let AudioAction::Copy { codec } = audio.action else {
+        return Some(audio);
+    };
+    let codec = [codec, AudioCodec::Aac]
+        .into_iter()
+        .find(|c| encoders.audio_encoder(*c).is_some())?;
+    let channels = descriptor
+        .audio
+        .get(audio.index as usize)
+        .and_then(|a| a.channels)
+        .unwrap_or(2)
+        .clamp(1, 6);
+    let bitrate = match (codec, channels > 2) {
+        (AudioCodec::Aac, true) => 384_000,
+        (_, true) => 640_000,
+        _ => 192_000,
+    };
+    Some(ConvertedAudio {
+        action: AudioAction::Encode {
+            codec,
+            channels,
+            bitrate,
+        },
+        ..audio
+    })
+}
+
 /// The video of `rung`: a ladder's rung at its own height and cap, the
 /// rest of the encode as `video`'s; for one encode, `video`.
 fn rung_video(video: Option<ConvertedVideo>, ladder: &[Rung], rung: u32) -> Option<ConvertedVideo> {
@@ -1265,6 +1369,7 @@ fn spawn(
     start_number: u32,
     slot: Option<Slot>,
     cuts: Cuts,
+    pad_audio: bool,
     why: RunWhy<'_>,
 ) -> Result<Arc<EncodeJob>, JobError> {
     let job_dir = dir.join(epoch.to_string());
@@ -1275,6 +1380,7 @@ fn spawn(
                 dir: job_dir.clone(),
                 start_number,
                 cuts,
+                pad_audio,
             },
             Written::Hls,
         ),
@@ -1688,6 +1794,89 @@ pub(crate) mod tests {
         assert!(!header_first(&film_of(1080), sound(aac)));
     }
 
+    /// Only AC-3 and E-AC-3 that start at or past a run's first cut are
+    /// encoded: one a few frames late is copied still.
+    #[test]
+    fn audio_is_late_only_past_the_first_cut_and_only_ac3() {
+        let segments = Segments::at_keyframes(&[0, 2000, 4000], 6000);
+        let ac3 = sound(AudioAction::Copy {
+            codec: AudioCodec::Ac3,
+        });
+        let aac = sound(AudioAction::Copy {
+            codec: AudioCodec::Aac,
+        });
+        assert!(late_audio(Some(&segments), ac3, Some(3000)));
+        assert!(late_audio(Some(&segments), ac3, Some(1800)));
+        assert!(!late_audio(Some(&segments), ac3, Some(40)));
+        assert!(!late_audio(Some(&segments), aac, Some(3000)));
+        assert!(!late_audio(Some(&segments), ac3, None));
+        assert!(!late_audio(None, ac3, Some(3000)));
+    }
+
+    /// A late copy is encoded as its own codec, or as AAC where the server
+    /// does not encode that; an encode is left as it is.
+    #[test]
+    fn a_late_copy_is_encoded_as_its_own_codec() {
+        use spoolframe_media::encoders::{AudioEncoder, Encoders};
+        let aac_only = Encoders::software_baseline();
+        let with_eac3 = Encoders {
+            audio: vec![AudioEncoder {
+                codec: AudioCodec::Eac3,
+                name: "eac3".into(),
+            }],
+            ..Encoders::software_baseline()
+        };
+        let none = Encoders {
+            audio: Vec::new(),
+            ..Encoders::software_baseline()
+        };
+        let mut film = whole_record();
+        film.audio = vec![spoolframe_media::AudioStream {
+            index: 1,
+            codec: "eac3".into(),
+            profile: None,
+            channels: Some(8),
+            channel_layout: None,
+            language: None,
+            title: None,
+            default: true,
+            role: spoolframe_types::AudioRole::Main,
+        }];
+        let copy = ConvertedAudio {
+            index: 0,
+            action: AudioAction::Copy {
+                codec: AudioCodec::Eac3,
+            },
+        };
+        let action = |encoders| encoded(&film, copy, encoders).map(|a| a.action);
+        assert_eq!(
+            action(&with_eac3),
+            Some(AudioAction::Encode {
+                codec: AudioCodec::Eac3,
+                channels: 6,
+                bitrate: 640_000,
+            })
+        );
+        assert_eq!(
+            action(&aac_only),
+            Some(AudioAction::Encode {
+                codec: AudioCodec::Aac,
+                channels: 6,
+                bitrate: 384_000,
+            })
+        );
+        assert_eq!(action(&none), None);
+        let stereo = ConvertedAudio {
+            action: AudioAction::Encode {
+                codec: AudioCodec::Ac3,
+                channels: 2,
+                bitrate: 192_000,
+            },
+            ..copy
+        };
+        assert_eq!(encoded(&film, stereo, &none), Some(stereo));
+    }
+
     /// Review 2026-10-11 M2: a lower rung's run is handed the copy's cuts,
     /// one per source keyframe (172k for two hours of an all-intra film);
     /// it shares the conversion's list rather than copying it per run.
@@ -1857,6 +2046,7 @@ pub(crate) mod tests {
                 gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 3,
             },
@@ -2242,6 +2432,7 @@ pub(crate) mod tests {
                     first_ms: 0,
                 })),
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 1,
             },
@@ -2326,6 +2517,7 @@ pub(crate) mod tests {
                 gpus: Arc::new(Detected::software_baseline()),
                 keyframes: None,
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 0,
             },
@@ -2440,6 +2632,7 @@ pub(crate) mod tests {
                 gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 0,
             },
@@ -2565,6 +2758,7 @@ pub(crate) mod tests {
                 gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 0,
             },
@@ -2689,6 +2883,7 @@ pub(crate) mod tests {
                 gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 0,
             },
@@ -2822,6 +3017,7 @@ pub(crate) mod tests {
                 gpus: one_gpu(encoders, &ffmpeg),
                 keyframes: None,
                 first_epoch: 0,
+                audio_first_ms: None,
                 slot: None,
                 start_rung: 0,
             },

@@ -190,6 +190,7 @@ fn run_as(
             dir: dir.to_path_buf(),
             start_number: from,
             cuts: keyframe_cuts(Some(COPY), Some(video), Some(segments)),
+            pad_audio: false,
         },
     };
     let args = ffmpeg_args(&spec).unwrap();

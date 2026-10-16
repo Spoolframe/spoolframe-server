@@ -877,6 +877,25 @@ impl TestServer {
         self.generate(secs, video, audio, "0.5");
     }
 
+    /// As [`TestServer::generate_media`], with the sound starting 3 s after
+    /// the picture, as a dub muxed late does (Saw, 2004: 6.2 s): the first
+    /// audio packet is past the second keyframe.
+    pub fn generate_media_with_late_audio(&self, secs: u32, video: &str, audio: &str) {
+        std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25"])
+            .args(["-f", "lavfi", "-itsoffset", "3"])
+            .args(["-i", "sine=frequency=440:sample_rate=48000"])
+            .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", "50"])
+            .args(["-sc_threshold", "0"])
+            .args(["-c:v", video, "-c:a", audio, "-ac", "2"])
+            .arg(&self.media)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not make the test media");
+    }
+
     /// As [`TestServer::generate_media`], then cut with stream copy 40 ms
     /// after its second keyframe, into MP4: the file starts at that
     /// keyframe, at -0.04 s, and the next are at 1.96 s, 3.96 s and so on.

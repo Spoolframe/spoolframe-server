@@ -466,6 +466,33 @@ impl Prober {
         Ok(Arc::new(keyframe_times(&String::from_utf8_lossy(&output))))
     }
 
+    /// When stream `index`'s first packet is, in ms from the file's
+    /// start; `None` for a stream with no packet. Only the file up to that
+    /// packet is read. A Matroska track's start says 0 even where its
+    /// first packet is seconds in (a dub muxed late): the packet is what
+    /// counts. Not cached.
+    pub async fn first_packet_ms(
+        &self,
+        path: &Path,
+        index: u32,
+    ) -> Result<Option<u64>, ProbeError> {
+        let mut cmd = self.command(path).await?;
+        cmd.args(["-v", "error", "-select_streams"])
+            .arg(index.to_string())
+            .args([
+                "-read_intervals",
+                "%+#1",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+                "-i",
+            ])
+            .arg(path);
+        let output = self.output(cmd, path, 4096, self.timeout).await?;
+        Ok(first_time_ms(&String::from_utf8_lossy(&output)))
+    }
+
     /// ffprobe confined to media `path` ([`Jail::media`]), made off the
     /// async workers ([`crate::sandbox::Tool::command_off_thread`]).
     async fn command(&self, path: &Path) -> Result<crate::sandbox::Command, ProbeError> {
@@ -577,6 +604,15 @@ fn keyframe_listing(cmd: &mut crate::sandbox::Command, path: &Path, intervals: O
     .arg(path);
 }
 
+/// The first `pts_time` line's time in ms, one before 0 as 0; `None` for
+/// none (or `N/A`).
+fn first_time_ms(csv: &str) -> Option<u64> {
+    let secs: f64 = csv
+        .lines()
+        .find_map(|line| line.trim().trim_end_matches(',').parse().ok())?;
+    Some((secs.max(0.0) * 1000.0).round() as u64)
+}
+
 /// `pts_time,flags` lines (`12.345000,K__`) → the keyframes' times in ms,
 /// ascending. A keyframe before time 0 counts as at 0: it is still the
 /// file's first keyframe (an MP4 cut with stream copy starts at the
@@ -634,8 +670,17 @@ async fn stamp(path: &Path) -> Result<Stamp, ProbeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lru, keyframe_times};
+    use super::{Lru, first_time_ms, keyframe_times};
     use std::path::{Path, PathBuf};
+
+    /// A dub muxed 6.2 s in (Saw, 2004); one before 0 is at 0.
+    #[test]
+    fn a_first_packet_is_its_time_in_ms() {
+        assert_eq!(first_time_ms("6.200000\n"), Some(6200));
+        assert_eq!(first_time_ms("-0.021000,\n"), Some(0));
+        assert_eq!(first_time_ms("N/A\n0.500000\n"), Some(500));
+        assert_eq!(first_time_ms(""), None);
+    }
 
     /// Past its bound the entry used longest ago goes, not the newest.
     /// Review 2026-10-11 M34.

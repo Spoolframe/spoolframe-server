@@ -223,6 +223,10 @@ pub enum Output {
         dir: PathBuf,
         start_number: u32,
         cuts: Cuts,
+        /// The encoded audio is filled with silence from where the run
+        /// starts, for a track whose first packet comes after the run's
+        /// first cut (`encode::late_audio`).
+        pad_audio: bool,
     },
 }
 
@@ -1654,6 +1658,23 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                     s("-b:a"),
                     s(bitrate),
                 ]);
+                // The MP4 muxer writes an AC-3 or E-AC-3 sample entry from
+                // the track's first packet, and the HLS muxer writes
+                // `init.mp4` at its first cut: a track that starts after
+                // that cut gets a `moov` of size 0, and nothing plays.
+                // Silence from the run's start puts a packet first.
+                // `first_pts` counts samples at the rate set here; the run's
+                // times are the film's own from a seek (`-copyts`).
+                if let Output::Hls {
+                    pad_audio: true, ..
+                } = spec.output
+                {
+                    let from = spec.start.map_or(0, |at| at.as_millis()) * 48;
+                    args.extend([
+                        s("-af"),
+                        format!("aresample=48000:async=1:first_pts={from}"),
+                    ]);
+                }
             }
             AudioAction::Unknown => return Err(s("an audio action this build does not know")),
         }
@@ -1720,6 +1741,7 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
             dir,
             start_number,
             cuts,
+            ..
         } => {
             // A copied video is cut at every keyframe (see `hls`): a length
             // under any GOP does that. So is a remux ladder's encoded rung,
@@ -3317,6 +3339,7 @@ mod tests {
             dir: "/scratch/h/0".into(),
             start_number: 1,
             cuts: Cuts::Own,
+            pad_audio: false,
         };
         let eac3 = AudioAction::Encode {
             codec: AudioCodec::Eac3,
@@ -3340,6 +3363,38 @@ mod tests {
         );
         // Copied video keeps the source's keyframes.
         assert!(!args.contains(&s("-force_key_frames")));
+        // Sound that starts on time is not padded.
+        assert!(!args.contains(&s("-af")));
+    }
+
+    /// Audio that starts after the run's first cut is filled with silence
+    /// from where the run starts: from 0, or from a seek, in samples at
+    /// the 48 kHz it is resampled to.
+    #[test]
+    fn late_audio_is_padded_from_where_the_run_starts() {
+        let (film, enc) = (film(), encoders(false));
+        let eac3 = AudioAction::Encode {
+            codec: AudioCodec::Eac3,
+            channels: 6,
+            bitrate: 640_000,
+        };
+        let padded = || Output::Hls {
+            dir: "/scratch/h/0".into(),
+            start_number: 1,
+            cuts: Cuts::Own,
+            pad_audio: true,
+        };
+        let args = ffmpeg_args(&spec(&film, &enc, COPY_HEVC, eac3, None, padded())).unwrap();
+        assert_eq!(after(&args, "-af"), "aresample=48000:async=1:first_pts=0");
+        let sought = EncodeSpec {
+            start: Some(Duration::from_millis(3_250)),
+            ..spec(&film, &enc, COPY_HEVC, eac3, None, padded())
+        };
+        let args = ffmpeg_args(&sought).unwrap();
+        assert_eq!(
+            after(&args, "-af"),
+            "aresample=48000:async=1:first_pts=156000"
+        );
     }
 
     fn hls() -> Output {
@@ -3347,6 +3402,7 @@ mod tests {
             dir: "/scratch/h/0".into(),
             start_number: 1,
             cuts: Cuts::Own,
+            pad_audio: false,
         }
     }
 
@@ -3360,6 +3416,7 @@ mod tests {
                 starts: std::sync::Arc::from(vec![0, 3500, 6083, 9000]),
                 from_ms,
             },
+            pad_audio: false,
         }
     }
 
@@ -3819,6 +3876,7 @@ mod tests {
                 dir: "/scratch/h/0".into(),
                 start_number: 1,
                 cuts: Cuts::Own,
+                pad_audio: false,
             };
             let video = ConvertedVideo::Encode {
                 codec,
@@ -3864,6 +3922,7 @@ mod tests {
             dir: "/scratch/h/0".into(),
             start_number,
             cuts: Cuts::Own,
+            pad_audio: false,
         };
         let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
         spec.start = start;
@@ -3915,6 +3974,7 @@ mod tests {
             dir: "/scratch/h/0".into(),
             start_number: 23,
             cuts: Cuts::Own,
+            pad_audio: false,
         };
         let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, output);
         spec.start = Some(Duration::from_secs(122));
@@ -3933,6 +3993,7 @@ mod tests {
                 dir: "/scratch/h/0".into(),
                 start_number: 632,
                 cuts: Cuts::Own,
+                pad_audio: false,
             };
             let mut spec = spec(&film, &enc, video, audio, None, output);
             spec.start = start;
@@ -3981,6 +4042,7 @@ mod tests {
                 dir: "/scratch/h/0".into(),
                 start_number,
                 cuts: Cuts::Forced(cuts.clone().into()),
+                pad_audio: false,
             };
             let mut spec = spec(&film, &enc, video, COPY_DTS, None, output);
             spec.start = start;
@@ -4061,6 +4123,7 @@ mod tests {
             dir: "/scratch/h/0".into(),
             start_number: 1,
             cuts: Cuts::Own,
+            pad_audio: false,
         };
         let args = ffmpeg_args(&spec(&film, &enc, COPY_HEVC, COPY_DTS, None, output)).unwrap();
         assert!(!args.contains(&s("-hls_init_time")), "{args:?}");

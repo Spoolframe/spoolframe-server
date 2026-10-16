@@ -1548,6 +1548,75 @@ async fn hls_of_a_copied_hevc_video_is_hvc1_as_the_playlist_says() {
     server.stop().await;
 }
 
+/// An Apple TV given a remux of a film with AC-3 it plays as it is (Saw,
+/// 2004, its Italian dub) got an `init.mp4` whose `moov` said size 0, and
+/// nothing played: the MP4 muxer writes an AC-3 track's sample entry from
+/// its first packet, and the dub's came 6.2 s in, after the HLS muxer's
+/// first cut, where it writes `init.mp4`.
+#[tokio::test]
+async fn hls_of_a_remux_with_its_ac3_starting_late_has_a_whole_init() {
+    use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
+    use spoolframe_types::{AudioCodec, VideoCodec};
+    let caps = ClientCapabilities {
+        video: [VideoCodec::H264, VideoCodec::Hevc].into(),
+        audio: [AudioCodec::Aac, AudioCodec::Ac3, AudioCodec::Eac3].into(),
+        ..hls_capabilities()
+    };
+    let (server, client, session) = hls_ready("hls-ac3-late", caps).await;
+    server.generate_media_with_late_audio(12, "libx265", "ac3");
+    let handle = match start(&client, &session, None).await {
+        Response::Ok(Reply::PlaybackStarted {
+            handle,
+            plan:
+                PlaybackPlan::Converted {
+                    video: Some(ConvertedVideo::Copy { .. }),
+                    audio:
+                        Some(ConvertedAudio {
+                            action:
+                                AudioAction::Copy {
+                                    codec: AudioCodec::Ac3,
+                                },
+                            ..
+                        }),
+                    ..
+                },
+            ..
+        }) => handle,
+        other => panic!("no remux with its AC-3 copied: {other:?}"),
+    };
+    let init = segment(&client, &session, &handle, 0).await;
+    let mut boxes = Mp4Times::default();
+    mp4_times(&init, &mut boxes);
+    // Encoded, from silence: the test server encodes AAC alone (its
+    // software baseline), where a detected ffmpeg encodes AC-3 again.
+    assert_eq!(
+        boxes.sample_entries,
+        ["hvc1", "mp4a"],
+        "{} bytes",
+        init.len()
+    );
+
+    // And each segment's packets are read with it, the sound's too.
+    let durations =
+        media_segments(&manifest(&client, &session, &handle, ManifestKind::Media).await);
+    let mut stream = init;
+    for n in 1..=durations.len() as u32 {
+        stream.extend(segment(&client, &session, &handle, n).await);
+    }
+    let file = write(&server, "ac3.mp4", &stream);
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let packets = String::from_utf8_lossy(&out.stdout).lines().count();
+    // 12 s, the last 9 s of it sound: AC-3 frames are 32 ms.
+    assert!(packets > 250, "{packets} audio packets");
+    client.close().await;
+    server.stop().await;
+}
+
 /// An Apple TV's playback failed with nothing in the server's log: its
 /// app serves the playlists to AVPlayer and fetches each segment as it is
 /// asked for, and a failed fetch was said only to the app. A segment or a

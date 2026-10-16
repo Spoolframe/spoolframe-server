@@ -122,6 +122,17 @@
   nothing answers at. `[::]:7422` is the example and the Settings ›
   Experimental default now, and the Nimble dev profile listens there.
 
+- HLS of a film whose AC-3 or E-AC-3 track starts after the first
+  segment's cut (a dub muxed seconds in: Saw, 2004, its Italian track at
+  6.2 s) plays. Its `init.mp4` had a `moov` of size 0, which no player
+  opens: the MP4 muxer makes that track's sample entry from its first
+  packet, and the HLS muxer writes `init.mp4` at its first cut. The
+  server reads where the track's first packet is when the playback
+  starts, and where it is past that cut, encodes the track (as its own
+  codec where it encodes that, else as AAC), filled with silence from
+  where each run starts. A track that starts on time is copied as
+  before.
+
 - Server › Settings › Experimental: every experimental switch in one
   tab, shown whether or not the advanced settings are. HTTP playback for
   AirPlay (PX-49), until now the config file's and the CLI's only, is a

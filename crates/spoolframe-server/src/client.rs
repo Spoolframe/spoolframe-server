@@ -4293,6 +4293,7 @@ impl ClientProtocol {
             PlaybackPlan::Converted {
                 delivery,
                 video,
+                audio,
                 subtitle,
                 ..
             } => {
@@ -4357,6 +4358,29 @@ impl ClientProtocol {
                     }
                     _ => None,
                 };
+                // An AC-3 or E-AC-3 track in fMP4 needs a packet before
+                // the first cut: where its first one is, read up to it. A
+                // read that fails leaves the conversion as planned.
+                let audio_first_ms = match (delivery, audio) {
+                    (Delivery::Hls, Some(a))
+                        if crate::encode::sample_entry_from_packets(a.action) =>
+                    {
+                        match descriptor.audio.get(a.index as usize) {
+                            Some(stream) => self
+                                .services
+                                .prober
+                                .first_packet_ms(path, stream.index)
+                                .await
+                                .inspect_err(|e| {
+                                    tracing::warn!(%id, error = %e, "cannot read where the audio starts");
+                                })
+                                .ok()
+                                .flatten(),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
                 // A new conversion's first epoch is past the old one's, so
                 // reads of the old one are told to start over. The old one
                 // runs until the new one has started, so the new one takes
@@ -4380,6 +4404,7 @@ impl ClientProtocol {
                         plan,
                         gpus: transcoding.detected(),
                         keyframes,
+                        audio_first_ms,
                         first_epoch,
                         slot: replaced.and_then(|job| job.slot()),
                         start_rung: planner::start_rung(plan, quality),
