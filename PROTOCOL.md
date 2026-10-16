@@ -1592,6 +1592,7 @@ playlist gets no note for it.
 ### Item details
 
 `Item` carries `playlists: Some([PlaylistRef { id, name, owner_kind }])`
+(with `builtin` and, for `spoolframe:playlist-sharing`, `owner_name`)
 for a client that listed the feature: the playlists the user sees that
 hold a movie, episode or track itself, any of a season's or show's
 episodes, or any of an album's or artist's tracks. For any other client
@@ -1654,7 +1655,9 @@ user id, and show who it is shared with and whose it is.
   `kind`. Someone no longer here (a deleted account, a revoked grant)
   is listed by `user_id` alone. A disabled account is still named.
 - `PlaylistSummary` carries `owner_name`, what its owner is shown as,
-  so a row can say whose it is; `None` for an owner no longer here.
+  so a row can say whose it is; `None` for an owner no longer here. So
+  does each `PlaylistRef` in an item's `playlists`, so an item's page
+  can say whose a playlist holding it is.
 
 A request reads only `user_id` and `can_edit` of a share; the names are
 the server's to say. A session whose client did not list the feature is

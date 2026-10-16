@@ -2556,7 +2556,10 @@ impl ClientProtocol {
                             .playlists
                             .holding(&actor, &found.item, &found.children, liked_listed)
                             .await
-                            .map_err(playlists_error)?,
+                            .map_err(playlists_error)?
+                            .into_iter()
+                            .map(|held| named_ref(held, sharing_listed))
+                            .collect(),
                     )
                 } else {
                     None
@@ -6178,6 +6181,19 @@ fn named(
         }
     }
     summary
+}
+
+/// An item's playlist reference as a session sees it: whose it is only
+/// for a client that listed `spoolframe:playlist-sharing`, as `named`
+/// does for a summary.
+fn named_ref(
+    mut held: spoolframe_protocol::playlists::PlaylistRef,
+    sharing: bool,
+) -> spoolframe_protocol::playlists::PlaylistRef {
+    if !sharing {
+        held.owner_name = None;
+    }
+    held
 }
 
 /// A playlist failure as the client sees it (PX-40).

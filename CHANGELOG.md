@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- An item's playlists (`Item`'s `playlists`, each a `PlaylistRef`) now
+  say whose each is, `owner_name`, for a client that listed
+  `spoolframe:playlist-sharing`, as a playlist's summary does. Without
+  it an item's page could only say "Shared with you" of someone else's
+  playlist. A client that did not list the feature is sent no name.
 - Playlist covers (PX-53). Every playlist now has a picture: a cover an
   editor uploaded, the same for everyone who sees it; else a 2×2 mosaic
   of the first four different album covers or posters in it, in its

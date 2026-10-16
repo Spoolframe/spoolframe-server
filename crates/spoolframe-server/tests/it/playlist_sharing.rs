@@ -225,3 +225,61 @@ async fn a_client_without_the_feature_gets_no_names_and_cannot_list_candidates()
         Response::Err(Error::Unsupported { .. })
     ));
 }
+
+/// The playlists holding an item, on its page, say whose each is, for a
+/// client that listed the feature: a row of someone else's playlist
+/// reads "Alice's", not "Shared with you". Another client is sent no
+/// name.
+#[tokio::test]
+async fn an_item_s_playlists_are_named_only_for_a_client_that_takes_names() {
+    let (server, named_client) = four_users("named-refs", &[PLAYLISTS, PLAYLIST_SHARING]).await;
+    let alice = named_client.login("alice", "correct horse").await;
+    let bob = named_client.login("bob", "correct horse").await;
+    let made = shared(
+        &named_client,
+        &alice,
+        vec![user_id(&named_client, &bob).await],
+    )
+    .await;
+    let episode = spoolframe_types::MediaId::new(
+        spoolframe_types::Namespace::Plex,
+        spoolframe_types::MediaKind::Episode,
+        "12",
+    )
+    .unwrap();
+    let added = named_client
+        .call(
+            Some(&alice),
+            Request::EditPlaylist {
+                id: made.id.clone(),
+                revision: made.revision,
+                edits: vec![spoolframe_protocol::playlists::PlaylistEdit::Add {
+                    id: episode.clone(),
+                    before: None,
+                }],
+            },
+        )
+        .await;
+    assert!(
+        matches!(added, Response::Ok(Reply::PlaylistEdited { .. })),
+        "{added:?}"
+    );
+    let held = |reply: Response| match reply {
+        Response::Ok(Reply::Item { playlists, .. }) => playlists.expect("its playlists"),
+        other => panic!("{other:?}"),
+    };
+    let item = || Request::Item {
+        id: episode.clone(),
+    };
+    let named = held(named_client.call(Some(&bob), item()).await);
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].owner_name.as_deref(), Some("Alice Liddell"));
+
+    let plain = server.client().await;
+    plain.hello_listing(&[PLAYLISTS]).await;
+    let bob_plain = plain.login("bob", "correct horse").await;
+    let unnamed = held(plain.call(Some(&bob_plain), item()).await);
+    assert_eq!(unnamed.len(), 1);
+    assert_eq!(unnamed[0].owner_name, None);
+    server.stop().await;
+}

@@ -502,6 +502,7 @@ fn every_reply_round_trips() {
                 name: "Heists".into(),
                 owner_kind: crate::playlists::PlaylistOwnerKind::SharedWithMe,
                 builtin: None,
+                owner_name: None,
             }]),
             liked: None,
             liked_children: None,
@@ -2962,6 +2963,24 @@ mod playlists {
         round_trip(Response::Ok(Reply::PlaylistInfo(named)));
         let json = serde_json::to_value(summary()).unwrap();
         assert!(json.get("owner_name").is_none(), "{json}");
+        // An item's reference to a playlist names its owner too, and
+        // leaves the name out when it has none.
+        let held = crate::playlists::PlaylistRef {
+            id: "x".into(),
+            name: "Heists".into(),
+            owner_kind: PlaylistOwnerKind::SharedWithMe,
+            builtin: None,
+            owner_name: Some("Carol".into()),
+        };
+        assert_eq!(serde_json::to_value(&held).unwrap()["owner_name"], "Carol");
+        round_trip(held.clone());
+        let unnamed = crate::playlists::PlaylistRef {
+            owner_name: None,
+            ..held
+        };
+        let json = serde_json::to_value(&unnamed).unwrap();
+        assert!(json.get("owner_name").is_none(), "{json}");
+        round_trip(unnamed);
         assert!(
             json["visibility"]["with"][0].get("display_name").is_none(),
             "{json}"

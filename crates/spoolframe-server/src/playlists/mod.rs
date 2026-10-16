@@ -1444,17 +1444,22 @@ impl Playlists {
             .store
             .playlists_holding(&actor.principal.to_string(), by, &values)
             .await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Read once for every reference: whose each is, as a summary says.
+        let names = Names::of(&self.store).await?;
         Ok(rows
             .iter()
             .filter(|row| builtins || row.builtin.is_none())
             .map(|row| {
-                // A reference names no one.
-                let summary = Self::summary(actor, row, None, &Names::default());
+                let summary = Self::summary(actor, row, None, &names);
                 PlaylistRef {
                     id: summary.id,
                     name: summary.name,
                     owner_kind: summary.owner_kind,
                     builtin: summary.builtin,
+                    owner_name: summary.owner_name,
                 }
             })
             .collect())

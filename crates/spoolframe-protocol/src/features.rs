@@ -46,9 +46,9 @@ pub const LAST_VIEWED: &str = "spoolframe:last-viewed";
 /// Sharing a playlist by name, on top of [`PLAYLISTS`]: the
 /// `ListShareCandidates` request, whom its manager may share it with, by
 /// name; and the `display_name` and `kind` of each user a playlist is
-/// shared with, and a summary's `owner_name`. A session whose client did
-/// not list it is sent none of these fields, and its `ListShareCandidates`
-/// is `Unsupported`.
+/// shared with, and the `owner_name` of a summary and of an item's
+/// `PlaylistRef`. A session whose client did not list it is sent none of
+/// these fields, and its `ListShareCandidates` is `Unsupported`.
 pub const PLAYLIST_SHARING: &str = "spoolframe:playlist-sharing";
 
 /// Play history (PX-52): every play the server saw kept, tracks

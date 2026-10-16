@@ -15,8 +15,9 @@
 //!
 //! Sharing by name (feature `spoolframe:playlist-sharing`): whom a
 //! playlist can be shared with ([`Session::share_candidates`]), and the
-//! names of a playlist's owner (`PlaylistSummary::owner_name`) and of who
-//! it is shared with (`PlaylistShare::display_name`, `kind`). A server
+//! names of a playlist's owner (`PlaylistSummary::owner_name`, and an
+//! item's `PlaylistRef::owner_name`) and of who it is shared with
+//! (`PlaylistShare::display_name`, `kind`). A server
 //! without the feature sends no names, and the call is
 //! [`SdkError::Unsupported`].
 //!

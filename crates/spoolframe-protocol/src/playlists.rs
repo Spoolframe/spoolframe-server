@@ -322,6 +322,13 @@ pub struct PlaylistRef {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<Builtin>,
+    /// What its owner is shown as, for a client that listed
+    /// `spoolframe:playlist-sharing`, as [`PlaylistSummary::owner_name`]:
+    /// what an item's row says "Alice's" by. `None` for an owner no
+    /// longer here.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
 }
 
 /// One entry of a playlist, with its item as the catalog has it now and
