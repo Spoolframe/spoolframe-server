@@ -251,7 +251,7 @@ async fn the_metadata_documents_name_this_server_and_its_endpoints() {
     assert_eq!(server["code_challenge_methods_supported"], json!(["S256"]));
     assert_eq!(
         server["scopes_supported"],
-        json!(["library:read", "playlists:write", "admin"])
+        json!(["library:read", "playlists:read", "playlists:write", "admin"])
     );
     for path in [
         "/.well-known/oauth-protected-resource",

@@ -87,7 +87,7 @@ impl Mcp {
             addr,
             &cookie,
             &client_id,
-            "library:read playlists:write admin",
+            "library:read playlists:read playlists:write admin",
             scopes,
         )
         .await;
@@ -524,6 +524,54 @@ async fn without_the_scope_the_playlist_tools_are_absent_and_refused() {
     };
     // Nothing was made, for anyone.
     assert!(server.playlists.list(&actor).await.unwrap().0.is_empty());
+}
+
+/// With playlists:read alone an app reads playlists and changes none:
+/// list_playlists and get_playlist are listed, the writing tools are not,
+/// and a direct call to one is refused.
+#[tokio::test]
+async fn with_playlists_read_the_playlists_are_read_and_not_changed() {
+    let (server, addr) = beside("mcp-read-only").await;
+    let alice = user(&server, "alice", Role::Consumer).await;
+    let actor = spoolframe_server::principal::Actor {
+        principal: alice,
+        admin: false,
+    };
+    let made = server
+        .playlists
+        .create(
+            &actor,
+            "Heists",
+            spoolframe_protocol::playlists::Kinds {
+                movies: false,
+                episodes: true,
+                tracks: false,
+            },
+            spoolframe_protocol::playlists::Visibility::Personal,
+        )
+        .await
+        .unwrap();
+    let mcp = Mcp::connect(addr, "alice", &["playlists:read"]).await;
+    let tools = mcp.tools().await;
+    for tool in ["list_playlists", "get_playlist"] {
+        assert!(tools.contains(&tool.to_string()), "{tool}: {tools:?}");
+    }
+    for tool in PLAYLIST_TOOLS
+        .iter()
+        .filter(|t| !["list_playlists", "get_playlist"].contains(t))
+    {
+        assert!(!tools.contains(&tool.to_string()), "{tool}");
+    }
+    let listed = mcp.call("list_playlists", json!({})).await.unwrap();
+    assert!(listed.to_string().contains("Heists"), "{listed}");
+    let refused = mcp
+        .call("create_playlist", json!({ "name": "Capers" }))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("playlists:write"), "{refused}");
+    let (mine, _) = server.playlists.list(&actor).await.unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].id, made.id);
 }
 
 #[tokio::test]

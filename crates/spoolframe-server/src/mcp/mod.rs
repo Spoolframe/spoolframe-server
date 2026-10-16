@@ -92,7 +92,9 @@ impl McpCaller {
     /// Whether the token covers `scope`: granted, and `admin` only while
     /// its user is one.
     pub fn may(&self, scope: Scope) -> bool {
-        self.scopes.contains(&scope) && (scope != Scope::Admin || self.admin)
+        let granted = self.scopes.contains(&scope)
+            || (scope == Scope::PlaylistsRead && self.scopes.contains(&Scope::PlaylistsWrite));
+        granted && (scope != Scope::Admin || self.admin)
     }
 }
 
@@ -167,7 +169,7 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
             .annotate(reads()),
         },
         Entry {
-            scope: Scope::PlaylistsWrite,
+            scope: Scope::PlaylistsRead,
             tool: schema::<NoArgs>(tool(
                 "list_playlists",
                 "The playlists the user sees: their own, those shared with them and the \
@@ -176,7 +178,7 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
             .annotate(reads()),
         },
         Entry {
-            scope: Scope::PlaylistsWrite,
+            scope: Scope::PlaylistsRead,
             tool: schema::<GetPlaylistArgs>(tool(
                 "get_playlist",
                 "A playlist's entries, a page at a time, in order. Each entry has an entry \
@@ -1132,6 +1134,14 @@ mod tests {
         assert!(!caller(&[Scope::Admin], false).may(Scope::Admin));
         assert!(!caller(&[Scope::LibraryRead], true).may(Scope::Admin));
         assert!(!caller(&[Scope::LibraryRead], false).may(Scope::PlaylistsWrite));
+    }
+
+    #[test]
+    fn playlists_write_covers_reading_them_and_read_covers_no_write() {
+        assert!(caller(&[Scope::PlaylistsWrite], false).may(Scope::PlaylistsRead));
+        assert!(caller(&[Scope::PlaylistsRead], false).may(Scope::PlaylistsRead));
+        assert!(!caller(&[Scope::PlaylistsRead], false).may(Scope::PlaylistsWrite));
+        assert!(!caller(&[Scope::LibraryRead], false).may(Scope::PlaylistsRead));
     }
 
     #[test]

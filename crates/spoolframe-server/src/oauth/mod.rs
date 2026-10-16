@@ -57,7 +57,10 @@ const TOKEN_PREFIX: &str = "sfo_";
 pub enum Scope {
     /// Search, item details, what's new, the user's watch history.
     LibraryRead,
-    /// Make, fill and edit playlists; mark watched or unwatched.
+    /// See the user's playlists and what is in them, and change nothing.
+    PlaylistsRead,
+    /// Make, fill and edit playlists; mark watched or unwatched. Covers
+    /// [`Scope::PlaylistsRead`]: an app that changes playlists reads them.
     PlaylistsWrite,
     /// Users, sessions, playbacks and the log: admins only.
     Admin,
@@ -65,11 +68,17 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope the server has, in the order consent lists them.
-    pub const ALL: [Scope; 3] = [Scope::LibraryRead, Scope::PlaylistsWrite, Scope::Admin];
+    pub const ALL: [Scope; 4] = [
+        Scope::LibraryRead,
+        Scope::PlaylistsRead,
+        Scope::PlaylistsWrite,
+        Scope::Admin,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Scope::LibraryRead => "library:read",
+            Scope::PlaylistsRead => "playlists:read",
             Scope::PlaylistsWrite => "playlists:write",
             Scope::Admin => "admin",
         }

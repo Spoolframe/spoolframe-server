@@ -16,8 +16,9 @@
   passkey or provider, with their login policy) and consents at
   `/connect`, which names the app as it named itself, in quotes, and the
   host its answer goes to, in bold, with PX-23's warning over plain HTTP;
-  they grant all or some of `library:read`, `playlists:write` and, to an
-  admin only, `admin`. A scope the server does not have (`playback`) is
+  they grant all or some of `library:read`, `playlists:read` (see them,
+  change nothing), `playlists:write` (which covers reading them) and, to
+  an admin only, `admin`. A scope the server does not have (`playback`) is
   dropped. A broken request (unknown client, unregistered redirect URI,
   no PKCE) is answered on the server's own page and redirects nowhere.
   Access tokens last an hour; refresh tokens rotate and last 30 days from
@@ -25,7 +26,8 @@
   Consent replaces the client's earlier grant for that user.
   Tools, listed only when the token's scopes cover them and refused
   otherwise: `search`, `get_item`, `list_recent`, `continue_watching`,
-  `watch_history`; `list_playlists`, `get_playlist`, `create_playlist`,
+  `watch_history`; `list_playlists`, `get_playlist` (`playlists:read`);
+  `create_playlist`,
   `add_to_playlist`, `remove_from_playlist`, `move_in_playlist`,
   `pin_playlist`, `unpin_playlist`, `set_watched`; and for admins
   `list_users`, `disable_user`, `list_sessions`, `end_session`,

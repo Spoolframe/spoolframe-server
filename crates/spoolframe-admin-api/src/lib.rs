@@ -624,8 +624,8 @@ pub struct ConnectedApp {
     pub client_name: String,
     /// The host its sign-in returned to (`claude.ai`).
     pub return_host: String,
-    /// What the user allowed it: `library:read`, `playlists:write`,
-    /// `admin`.
+    /// What the user allowed it: `library:read`, `playlists:read`,
+    /// `playlists:write`, `admin`.
     pub scopes: Vec<String>,
     /// When the user connected it, Unix seconds.
     pub connected_at: i64,

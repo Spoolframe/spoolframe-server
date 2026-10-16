@@ -11,6 +11,10 @@ pub fn scope_words(scope: &str) -> Option<(&'static str, &'static str)> {
             "See your library and what you watch",
             "Search, item details, what's new, what you're watching and what you watched.",
         )),
+        "playlists:read" => Some((
+            "See your playlists",
+            "Your playlists, those shared with you and the server's, and what is in them. It changes nothing.",
+        )),
         "playlists:write" => Some((
             "Change your playlists and watched marks",
             "Make playlists, add, move and remove what is in them, pin them, and mark items watched or unwatched.",
@@ -53,6 +57,7 @@ pub fn return_to(request: &str) -> String {
 pub fn scope_name(scope: &str) -> &str {
     match scope {
         "library:read" => "Library",
+        "playlists:read" => "Playlists (read)",
         "playlists:write" => "Playlists",
         "admin" => "Admin",
         other => other,
