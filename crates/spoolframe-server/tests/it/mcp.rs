@@ -245,6 +245,39 @@ async fn a_session_cookie_does_not_reach_mcp() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// MCP 2026-07-28 makes `ttlMs` and `cacheScope` required on a list
+/// result: Claude Code refused the tool list without them.
+#[tokio::test]
+async fn the_tool_list_says_how_long_and_by_whom_it_may_be_kept() {
+    let (server, addr) = beside("mcp-list-cache").await;
+    user(&server, "alice", Role::Consumer).await;
+    let mcp = Mcp::connect(addr, "alice", &["library:read"]).await;
+    let answer: Value = browser()
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", format!("Bearer {}", mcp.token))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/list")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            } },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let result = &answer["result"];
+    assert!(result["ttlMs"].as_u64().is_some(), "{answer}");
+    assert_eq!(result["cacheScope"], "private", "{answer}");
+}
+
 #[tokio::test]
 async fn a_client_initializes_and_lists_the_tools_of_its_scopes_only() {
     let (server, addr) = beside("mcp-list").await;

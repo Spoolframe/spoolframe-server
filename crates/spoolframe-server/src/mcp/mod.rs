@@ -20,9 +20,9 @@ use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
-    ToolAnnotations,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -47,6 +47,10 @@ pub const AUDIT: &str = "spoolframe_server::audit";
 pub const MAX_PAGE: u32 = 100;
 /// A page's size when the agent does not say.
 const DEFAULT_PAGE: u32 = 20;
+
+/// How long a client may keep the tool list: a token's scopes never
+/// change, and a new grant gets a new token, which lists afresh.
+const TOOLS_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// What the library tools read: the catalog clients browse, each user's
 /// watch state, and playlists. `None` in admin API tests without them,
@@ -1128,7 +1132,12 @@ impl ServerHandler for McpServer {
             .filter(|e| caller.may(e.scope))
             .map(|e| e.tool.clone())
             .collect();
-        Ok(ListToolsResult::with_all_items(tools))
+        // MCP 2026-07-28 (SEP-2549) requires both on a list result, and
+        // Claude Code refuses a tools/list without them; an older client
+        // ignores them. Private: the list is the token's scopes'.
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(TOOLS_TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

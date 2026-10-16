@@ -16,6 +16,10 @@
   `Session::share_candidates`, `PlaylistShare::new`. The admin API's
   `me.playlistShareCandidates` reads the same list.
 
+- Fixed: Claude Code refused MCP's tool list ("Invalid result for
+  tools/list", `ttlMs` and `cacheScope`). A client on MCP 2026-07-28
+  now gets both on the list, which that version requires: the list may
+  be kept 5 minutes, by that user's client only.
 - MCP has its own Settings tab, Settings › MCP, out of Remote access:
   the `mcp.enabled` switch (unchanged, still live) and, while it is on,
   this server's MCP address and the commands that add it to Claude Code
