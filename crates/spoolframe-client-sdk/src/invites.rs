@@ -165,6 +165,7 @@ impl Client {
                     conn.reached(),
                     true,
                 );
+                server.connected_over(conn.selected_addr());
                 hint(&mut server, invite, now);
                 tracing::info!(id = %invite.server, name = server.name, "pinned a server from an invite");
                 saved.push(server.clone());

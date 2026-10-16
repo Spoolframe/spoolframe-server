@@ -316,7 +316,8 @@ async fn a_pushed_share_reaches_the_app_with_its_bitrate() {
 
 /// A second push replaces what the first told: an address the server no
 /// longer tells (a Docker bridge it now ignores) is gone at once, and the
-/// one this device reached stays though the server leaves it out.
+/// one this device last reached it at stays though the server leaves it
+/// out.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_push_replaces_the_told_addresses_and_keeps_the_reached_one() {
     within(async {
@@ -444,6 +445,203 @@ async fn the_entry_shows_exactly_what_the_server_advertised_last() {
         assert_eq!(addrs, [lan]);
         client.close().await;
         stub.stop().await;
+    })
+    .await;
+}
+
+/// A UDP forwarder to `target`, each packet to it `delay` late: a path to
+/// the server slower than one to another address. Its address, and the
+/// task to abort when done.
+async fn slow_path(
+    target: SocketAddr,
+    delay: Duration,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use std::collections::HashMap;
+    use tokio::net::UdpSocket;
+
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        // One socket towards the server for each client socket, so that
+        // its answers go back to where the packet came from.
+        let mut backs: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        let mut buf = vec![0u8; 65_536];
+        while let Ok((n, from)) = front.recv_from(&mut buf).await {
+            let back = match backs.get(&from) {
+                Some(back) => back.clone(),
+                None => {
+                    let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    let (answers, front) = (back.clone(), front.clone());
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_536];
+                        while let Ok((n, _)) = answers.recv_from(&mut buf).await {
+                            let _ = front.send_to(&buf[..n], from).await;
+                        }
+                    });
+                    backs.insert(from, back.clone());
+                    back
+                }
+            };
+            let packet = buf[..n].to_vec();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = back.send_to(&packet, target).await;
+            });
+        }
+    });
+    (addr, task)
+}
+
+/// A servers file as the Linux client had it for Fulcrum: reached last at
+/// `stale`, a port that a server of another key has taken since, and told
+/// that `current` is where it is now.
+async fn poisoned(storage: &Arc<MemoryStorage>, id: &str, stale: SocketAddr, current: SocketAddr) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let file = serde_json::json!([{
+        "name": "Fulcrum",
+        "endpoint_id": id,
+        "known_addrs": [
+            {"addr": stale, "last_seen": now, "source": "reached"},
+            {"addr": current, "last_seen": now - 60, "source": "told"},
+        ],
+        "verified": true,
+        "advertised_addrs": [current],
+        "advertised_at": now - 60,
+        // No relays or lookups: the dial is given only the two addresses.
+        "use_relays": false,
+    }]);
+    storage
+        .set_data(keys::SERVERS, Some(serde_json::to_vec(&file).unwrap()))
+        .await
+        .unwrap();
+}
+
+/// The Linux client's Fulcrum (2026-10-16): another server answers first,
+/// with its own key, at an address where this device once reached the
+/// server, and the server is at the address it tells. Iroh settles the
+/// handshake on the first answer, so a dial given both fails outright.
+/// The server's list leaves that address out, and it is not the last
+/// path, so it is not kept, and the dial reaches the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_key_at_an_address_reached_before_cannot_stop_the_dial() {
+    within(async {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let server = Stub::start_on(key, &["127.0.0.1:0".parse().unwrap()]).await;
+        // It answers half a second after the other: the other wins any race.
+        let (current, forwarder) = slow_path(server.bound()[0], Duration::from_millis(500)).await;
+        let other = Stub::start_on(SecretKey::generate(), &["[::1]:0".parse().unwrap()]).await;
+        let stale = other.bound()[0];
+        let storage = Arc::new(MemoryStorage::default());
+        poisoned(&storage, &id, stale, current).await;
+
+        let client = open(&storage).await;
+        client
+            .connect(&id)
+            .await
+            .expect("the server is reached at the address it tells");
+        client.close().await;
+        forwarder.abort();
+        server.stop().await;
+        other.stop().await;
+    })
+    .await;
+}
+
+/// A port forward the server was never told of (no `network.wan`): this
+/// device reaches the server only at an address its list leaves out. That
+/// address carried the last connection, so it is kept and dialled.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unadvertised_address_that_last_worked_is_dialled() {
+    within(async {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let stub = Stub::start_on(key, &["127.0.0.1:0".parse().unwrap()]).await;
+        let forwarded = stub.bound()[0];
+        // What the server advertises: nothing answers there from here.
+        let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let advertised = gone.local_addr().unwrap();
+        stub.tell(&[advertised]);
+        let storage = Arc::new(MemoryStorage::default());
+        let client = signed_in_via(&storage, &stub, forwarded).await;
+        until_saved(&client, &id, advertised).await;
+        client.close().await;
+
+        let client = open(&storage).await;
+        client
+            .connect(&id)
+            .await
+            .expect("the server is reached where it was last");
+        client.close().await;
+        stub.stop().await;
+    })
+    .await;
+}
+
+/// The address that carried the last connection, where another key
+/// answers now (the port went to another server), and the server is away
+/// from where it advertises it is: the dial fails at the handshake, and
+/// the address is let go. Once the server is back where it advertises, it
+/// is reached there, and the other key is not dialled at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_last_path_where_another_key_answers_now_is_let_go() {
+    within(async {
+        let key = SecretKey::generate();
+        let id = key.public().to_string();
+        let other = Stub::start_on(SecretKey::generate(), &["[::1]:0".parse().unwrap()]).await;
+        let stale = other.bound()[0];
+        // The server is away from where it advertises it is, for now.
+        let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let away = gone.local_addr().unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        poisoned(&storage, &id, stale, away).await;
+        let file = storage.data(keys::SERVERS).await.unwrap().unwrap();
+        let mut servers: serde_json::Value = serde_json::from_slice(&file).unwrap();
+        servers[0]["last_path"] = serde_json::json!(stale);
+        storage
+            .set_data(keys::SERVERS, Some(serde_json::to_vec(&servers).unwrap()))
+            .await
+            .unwrap();
+        assert!(
+            saved_addrs(&storage, &id).await.contains(&stale),
+            "the last path is kept until it fails"
+        );
+
+        let client = open(&storage).await;
+        client
+            .connect(&id)
+            .await
+            .expect_err("another key answers at the last path");
+        client.close().await;
+        let file = storage.data(keys::SERVERS).await.unwrap().unwrap();
+        let servers: serde_json::Value = serde_json::from_slice(&file).unwrap();
+        assert_eq!(servers[0].get("last_path"), None, "{servers}");
+        assert!(
+            !servers[0]["known_addrs"]
+                .to_string()
+                .contains(&stale.to_string()),
+            "let go: {servers}"
+        );
+
+        // The server is back where it advertises it is.
+        drop(gone);
+        let server = Stub::start_on(key, &[away]).await;
+        let client = open(&storage).await;
+        client
+            .connect(&id)
+            .await
+            .expect("the server is reached at the address it tells");
+        assert_eq!(
+            other.connections(),
+            0,
+            "the other key was handed a connection"
+        );
+        client.close().await;
+        server.stop().await;
+        other.stop().await;
     })
     .await;
 }

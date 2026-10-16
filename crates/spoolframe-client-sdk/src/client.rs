@@ -25,7 +25,7 @@ use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
 use crate::portable::{Portable, PortableUserId};
 use crate::reachability::{
-    self, DialReport, KnownPath, LivePath, PathKind, ReachLog, Reachability,
+    self, DialReport, DialStage, KnownPath, LivePath, PathKind, ReachLog, Reachability,
 };
 use crate::relay_policy::{RelayFiltered, RelayPolicy};
 use crate::servers::{self, SavedServer, ServerEntry};
@@ -580,13 +580,14 @@ impl Client {
         let _saving = self.inner.saving.lock().await;
         // Read under the lock: an address the connection reaches from now
         // on is saved by `save_reached`, which waits for it.
-        let server = SavedServer::pinned_now(
+        let mut server = SavedServer::pinned_now(
             conn.info.name.clone(),
             endpoint_id.to_owned(),
             conn.info.server_id.clone(),
             conn.reached(),
             verified,
         );
+        server.connected_over(conn.selected_addr());
         let mut saved = servers::load(storage).await?;
         // Nor this way, by a new key that says it is a saved server.
         if let Some(old) = same_server(&saved, id, &conn.info.server_id) {
@@ -631,13 +632,14 @@ impl Client {
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         // The user checked the new key's fingerprint to get here.
-        let server = SavedServer::pinned_now(
+        let mut server = SavedServer::pinned_now(
             conn.info.name.clone(),
             new_id.to_owned(),
             conn.info.server_id.clone(),
             conn.reached(),
             true,
         );
+        server.connected_over(conn.selected_addr());
         let mut saved = servers::load(storage).await?;
         let Some(at) = saved.iter().position(|s| s.endpoint_id == saved_id) else {
             return Err(SdkError::UnknownServer(saved_id.to_owned()));
@@ -1836,6 +1838,12 @@ impl Client {
 
     /// Dial `id`. Once it answers as itself, a saved server's name and
     /// addresses are refreshed; an unsaved one stays unsaved.
+    ///
+    /// Every address is dialled at once: what was given, what is heard on
+    /// the LAN, and what is saved, with the relays and lookups. Iroh
+    /// settles the handshake on the first answer, so an address where
+    /// another key answers fails the whole dial; which addresses are saved
+    /// is decided when they are saved ([`SavedServer::told`]), not here.
     pub(crate) async fn dial(&self, id: EndpointId) -> Result<ServerConnection, SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let pinned = saved.iter().find(|s| s.endpoint_id == id.to_string());
@@ -1847,38 +1855,30 @@ impl Client {
         if pinned.is_none() && heard.is_none() && manual.is_none() && !invited {
             return Err(SdkError::UnknownServer(id.to_string()));
         }
-        // Every address known: iroh tries them all at once.
         let addrs = listed([
             manual.unwrap_or_default(),
-            heard.as_ref().map(|h| h.addrs.clone()).unwrap_or_default(),
+            heard.map(|h| h.addrs).unwrap_or_default(),
             pinned.map(SavedServer::addrs).unwrap_or_default(),
         ]);
+        let last_path = pinned.and_then(|s| s.last_path);
         let relays = self.relays_of(id, pinned);
-        let addr = EndpointAddr::from_parts(
-            id,
-            addrs
-                .iter()
-                .copied()
-                .map(TransportAddr::Ip)
-                .chain(relays.into_iter().map(TransportAddr::Relay)),
-        );
-        let dialled = addr
-            .addrs
-            .iter()
-            .filter_map(PathKind::of)
-            .map(|(_, addr)| addr)
-            .take(reachability::MAX_LISTED)
-            .collect();
         let (at, started) = (servers::now(), std::time::Instant::now());
         let dial = ServerConnection::dial(
             &self.inner.endpoint,
-            addr,
+            endpoint_addr(id, &addrs, &relays),
             &self.inner.device,
             self.inner.experimental,
             self.inner.features,
             &self.inner.timeouts,
         )
         .await;
+        let dialled = endpoint_addr(id, &addrs, &relays)
+            .addrs
+            .iter()
+            .filter_map(PathKind::of)
+            .map(|(_, addr)| addr)
+            .take(reachability::MAX_LISTED)
+            .collect();
         let failed = dial.as_ref().err();
         let report = DialReport {
             at,
@@ -1891,6 +1891,11 @@ impl Client {
         };
         if let Some(failed) = failed {
             tracing::debug!(server = %id, stage = ?failed.stage, error = %failed.error, "dial failed");
+            if failed.stage == DialStage::Handshake
+                && let Some(path) = last_path
+            {
+                self.lost_path(id, path).await;
+            }
         }
         self.inner.reach.dialled(id, report);
         let conn = dial.map_err(|f| f.error)?;
@@ -1909,7 +1914,13 @@ impl Client {
         let reached = conn.reached.clone();
         let saving = reached.borrow().clone();
         if let Err(e) = self
-            .refresh(id, &conn.info.name, &conn.info.server_id, saving.clone())
+            .refresh(
+                id,
+                &conn.info.name,
+                &conn.info.server_id,
+                saving.clone(),
+                conn.selected_addr(),
+            )
             .await
         {
             conn.conn.close(0u32.into(), b"not the server pinned");
@@ -1925,8 +1936,9 @@ impl Client {
     }
 
     /// A saved server's name, as it answered now, that it answered now,
-    /// and that it was reached at `addrs`, which join those known. The key
-    /// is the match, so a pin is never moved to another key.
+    /// and that it was reached at `addrs`, which join those known, over
+    /// `path` ([`SavedServer::last_path`]). The key is the match, so a pin
+    /// is never moved to another key.
     ///
     /// `server_id` is the server id it answered with: one pinned before
     /// must be it, or nothing is kept and the answer is
@@ -1938,6 +1950,7 @@ impl Client {
         name: &str,
         server_id: &str,
         addrs: Vec<SocketAddr>,
+        path: Option<SocketAddr>,
     ) -> Result<(), SdkError> {
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
@@ -1964,11 +1977,32 @@ impl Client {
         }
         server.name = name.to_owned();
         let now = servers::now();
+        server.connected_over(path);
         server.saw(addrs, now);
         server.last_connected_at = Some(now);
         servers::save(storage, &saved).await?;
         self.inner.discovery.changed();
         Ok(())
+    }
+
+    /// A dial with `path`, saved server `id`'s last path, in it failed at
+    /// the handshake: something answered and not as the server. The last
+    /// path is the one address kept that the server's list may leave out
+    /// ([`SavedServer::lost_path`]); were another key there, it would
+    /// fail every dial with it, and nothing else would ever replace it.
+    /// Any other failure (no network, no answer) keeps it.
+    async fn lost_path(&self, id: EndpointId, path: SocketAddr) {
+        let lost = self
+            .sighted(id, |server, _| {
+                server.last_path == Some(path) && server.lost_path()
+            })
+            .await;
+        match lost {
+            Ok(()) => {
+                tracing::info!(server = %id, %path, "the handshake failed with the last path in the dial; it is the last path no more")
+            }
+            Err(e) => tracing::warn!(server = %id, error = %e, "the last path was not let go"),
+        }
     }
 
     /// Saved server `id` was reached at `addrs` just now: they join those
@@ -2297,6 +2331,18 @@ pub(crate) fn newest_first<T: PartialEq + Clone>(new: &[T], known: &[T], max: us
 }
 
 /// The addresses of `groups`, in order, each once.
+/// `addrs` and `relays` as a dial gives them to iroh for server `id`.
+fn endpoint_addr(id: EndpointId, addrs: &[SocketAddr], relays: &[RelayUrl]) -> EndpointAddr {
+    EndpointAddr::from_parts(
+        id,
+        addrs
+            .iter()
+            .copied()
+            .map(TransportAddr::Ip)
+            .chain(relays.iter().cloned().map(TransportAddr::Relay)),
+    )
+}
+
 pub(crate) fn listed(groups: impl IntoIterator<Item = Vec<SocketAddr>>) -> Vec<SocketAddr> {
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for addr in groups.into_iter().flatten() {

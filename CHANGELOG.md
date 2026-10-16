@@ -10,6 +10,20 @@
   again, so removing an app stops its new sign-ins; tokens already given
   keep working until the app is disconnected. Before, any app with an
   https or loopback redirect URI could register.
+- Fix (SDK): an address where a saved server was once reached, now
+  answered by a server of another key, no longer stops every dial. Iroh
+  settles the handshake on the first answer, so the other server's key
+  failed the dial ("invalid peer certificate: UnknownIssuer") even when
+  the server answered at the address it tells. Which addresses are kept
+  is now decided when they are saved: once a server has told its
+  addresses, a reached address it leaves out is dropped, but for the one
+  the last connection used (a port forward the server was not told of).
+  They go when the server's list comes, when a connection succeeds over
+  another path, and when the servers file is read, so a file that holds
+  such addresses now recovers at once. The address the last connection
+  used is let go when a dial with it fails at the handshake. A server
+  that never told its addresses keeps every reached one for 30 days, as
+  before. A dial goes to everything kept at once, as before 0.11.
 - MCP's `create_playlist` makes a server-wide playlist with
   `server_wide: true`: only for an admin whose connection was granted
   the admin scope, and kept in the audit list as the admin tools' calls

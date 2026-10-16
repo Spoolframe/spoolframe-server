@@ -333,8 +333,15 @@ Nothing in the API needs calling.
 
 - The list replaces the *told* addresses saved before. A told address
   not in the new list is removed at once.
-- A *reached* address stays, whether the list has it or not. It ages out
-  after 30 days without being reached.
+- A *reached* address stays while the list has it. Of the reached
+  addresses the list leaves out, only one is kept: the server's address
+  on the path of the device's last connection (a port forward the server
+  was not told of). The rest are removed when the list comes, when a
+  connection succeeds over another path, and when the servers file is
+  read. The kept one is let go when a dial with it fails at the
+  handshake: something else answers there.
+- Until the server has told a list, every reached address is kept.
+- A reached address ages out after 30 days without being reached.
 - A new address is saved as told, with the time it was told, and becomes
   reached when a connection reaches it.
 - At most 32 addresses are kept per server: the newest reached ones
@@ -342,8 +349,12 @@ Nothing in the API needs calling.
 - The relays are saved with the server (`relays` in the servers file).
   The SDK's endpoint has relays off, so it only keeps them.
 
-An event for a server that is not saved is ignored. Every saved address
-is dialled, told or reached.
+An event for a server that is not saved is ignored. A dial goes to
+every saved address at once, told or reached, with those heard on the
+LAN and given by the app, and the relays and lookup. Iroh settles the
+handshake on the first answer, so an address where a server of another
+key answers would fail the whole dial: that is why the SDK keeps only
+what the server tells, and its last path.
 
 `ServerEntry` shows the last event as it came, so an app can show the
 server's advertised addresses apart from every dial hint in `addrs`:

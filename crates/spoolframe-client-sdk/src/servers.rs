@@ -24,11 +24,23 @@
 //! the same way, marked [`AddrSource::Told`]. Each list the server tells
 //! replaces the told addresses before it: one it no longer tells goes at
 //! once. An address is told until the device reaches it; once reached it
-//! stays reached, and only ages out. Under the cap a told
+//! stays reached while the list has it (see below). Under the cap a told
 //! address never pushes out a reached one: every reached address is kept
 //! first, newest first, and told ones fill what room is left, newest
 //! first. So a server that tells many addresses (a host full of container
 //! bridges) cannot make a device forget where it has really reached it.
+//!
+//! Once the server has told a list, a reached address it leaves out is
+//! not kept, but for one: the path of the last connection
+//! ([`SavedServer::last_path`]), which may be a port forward the server
+//! was not told of. The rest go when the list comes, when a connection
+//! succeeds over another path, and when the file is read. Iroh sends the
+//! first packet to every address it is given and settles the handshake
+//! on the first answer, so an address where another key answers now
+//! fails the whole dial: what is saved is decided here, and a dial goes
+//! to all of it at once. A server that never told a list keeps what it
+//! was reached at, each for [`MAX_ADDR_AGE`]: nothing says which it
+//! still has.
 
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -132,6 +144,14 @@ pub(crate) struct SavedServer {
     /// it. Absent from a file written before the SDK kept it: false.
     #[serde(default)]
     pub relays_edited: bool,
+    /// Where the last connect reached it: the server's address on the
+    /// selected path, when that was an IP path; `None` after one over a
+    /// relay. The one reached address kept though the server's list
+    /// leaves it out (a port forward it was not told of, `network.wan`
+    /// unset). Absent from a file written before the SDK kept it: none,
+    /// so such a file keeps no address its server's list leaves out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_path: Option<SocketAddr>,
 }
 
 /// n0's public pkarr relay, where a server with `network.pkarr = "n0"`
@@ -199,6 +219,7 @@ impl SavedServer {
             advertised_at: None,
             use_relays: None,
             relays_edited: false,
+            last_path: None,
         };
         server.saw(addrs, now);
         server
@@ -281,7 +302,10 @@ impl SavedServer {
         known.extend(older);
         // Stable: those seen together keep the order they were seen in.
         known.sort_by_key(|k| std::cmp::Reverse(k.last_seen));
-        known.retain(|k| now.saturating_sub(k.last_seen) <= MAX_ADDR_AGE);
+        known.retain(|k| {
+            let age = now.saturating_sub(k.last_seen);
+            age <= MAX_ADDR_AGE && !self.left_out(k)
+        });
         keep_reached_first(&mut known);
         self.known_addrs = known;
         let after = self.addrs();
@@ -293,15 +317,60 @@ impl SavedServer {
         self.known_addrs.iter().map(|k| k.addr).collect()
     }
 
+    /// Whether `known` is an address a connect reached that the server's
+    /// list, once it has one, leaves out, and not the last path: one that
+    /// is not kept.
+    fn left_out(&self, known: &KnownAddr) -> bool {
+        self.advertised_at.is_some()
+            && known.source == AddrSource::Reached
+            && !self.advertised_addrs.contains(&known.addr)
+            && self.last_path != Some(known.addr)
+    }
+
+    /// A connect reached it just now over `path` ([`Self::last_path`]).
+    /// The reached address it replaces goes at the next sighting, if the
+    /// server's list leaves it out.
+    pub fn connected_over(&mut self, path: Option<SocketAddr>) {
+        self.last_path = path.map(canonical);
+    }
+
+    /// A dial failed at the handshake with the last path in it: something
+    /// answered there, and not as this server, or the dial would have
+    /// connected. It is no longer the last path, so if the server's list
+    /// leaves it out it goes now. Whether an address went.
+    pub fn lost_path(&mut self) -> bool {
+        if self.last_path.take().is_none() {
+            return false;
+        }
+        self.drop_left_out()
+    }
+
+    /// Drop the reached addresses [`Self::left_out`]. Whether any went.
+    fn drop_left_out(&mut self) -> bool {
+        let before = self.known_addrs.len();
+        let kept: Vec<KnownAddr> = self
+            .known_addrs
+            .iter()
+            .filter(|k| !self.left_out(k))
+            .copied()
+            .collect();
+        self.known_addrs = kept;
+        self.known_addrs.len() != before
+    }
+
     /// A server from a file written before PX-12: the last connection's
     /// addresses become known from `now`. Not from when it last
     /// connected, which may be over [`MAX_ADDR_AGE`] ago: they would be
     /// dropped at the first sighting of any other address.
+    ///
+    /// A file written by an SDK that kept every address reached loses
+    /// those its server's list leaves out, but the last path, here.
     fn migrate(&mut self, now: u64) {
         let legacy = std::mem::take(&mut self.legacy_addrs);
         if !legacy.is_empty() {
             self.saw(legacy, now);
         }
+        self.drop_left_out();
     }
 }
 
@@ -477,6 +546,7 @@ mod tests {
                     advertised_at: None,
                     use_relays: None,
                     relays_edited: false,
+                    last_path: None,
                 },
                 SavedServer {
                     name: "Cabin".into(),
@@ -494,6 +564,7 @@ mod tests {
                     advertised_at: None,
                     use_relays: None,
                     relays_edited: false,
+                    last_path: None,
                 },
             ]
         );
@@ -724,6 +795,7 @@ mod tests {
     fn a_told_address_not_told_for_30_days_is_dropped() {
         let mut server = server();
         server.told([addr("10.10.0.2:4433")], 1_000);
+        server.connected_over(Some(addr("192.168.1.10:4433")));
         server.saw([addr("192.168.1.10:4433")], 1_000 + 30 * DAY + 1);
         assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
     }
@@ -735,11 +807,12 @@ mod tests {
             .map(|p| SocketAddr::from(([192, 168, 1, 10], 1000 + p)))
             .collect();
         server.saw(reached.clone(), 1_000);
-        // Newer, and more than the cap on their own.
+        // Newer, and more than the cap on their own; the list has the
+        // reached ones too, last.
         let told: Vec<SocketAddr> = (0..40u16)
             .map(|p| SocketAddr::from(([172, 17, 0, 1], 2000 + p)))
             .collect();
-        server.told(told.clone(), 2_000);
+        server.told(told.iter().chain(&reached).copied(), 2_000);
         let kept = server.addrs();
         assert_eq!(kept.len(), MAX_KNOWN_ADDRS);
         assert!(reached.iter().all(|a| kept.contains(a)), "{kept:?}");
@@ -747,14 +820,16 @@ mod tests {
             kept.iter().filter(|a| told.contains(a)).count(),
             MAX_KNOWN_ADDRS - reached.len()
         );
-        // Newest first all the same: the told ones were seen last.
+        // In the list's order all the same.
         assert_eq!(kept.first(), Some(&told[0]));
     }
 
     #[test]
     fn reached_addresses_push_out_told_ones_and_each_other_by_age() {
         let mut server = server();
-        server.told([addr("10.10.0.2:4433")], 1_000);
+        // An invite's hint: the server has told no list, so every address
+        // reached is kept.
+        server.hinted([addr("10.10.0.2:4433")], 1_000);
         for port in 0..40u16 {
             server.saw(
                 [SocketAddr::from(([192, 168, 1, 10], 1000 + port))],
@@ -797,10 +872,11 @@ mod tests {
 
     /// Each push is the server's whole list (revision 7): a told address
     /// it no longer tells is gone at once, not 30 days later. Where this
-    /// device reached the server stays, told or not.
+    /// device last reached the server stays, told or not.
     #[test]
-    fn a_new_told_list_replaces_the_told_addresses_and_keeps_the_reached_ones() {
+    fn a_new_told_list_replaces_the_told_addresses_and_keeps_the_last_path() {
         let mut server = server();
+        server.connected_over(Some(addr("192.168.1.10:4433")));
         server.saw([addr("192.168.1.10:4433")], 1_000);
         server.told(
             [
@@ -825,6 +901,7 @@ mod tests {
     #[test]
     fn an_invite_s_hints_join_as_told_and_replace_nothing() {
         let mut server = server();
+        server.connected_over(Some(addr("192.168.1.10:4433")));
         server.saw([addr("192.168.1.10:4433")], 1_000);
         server.told([addr("10.10.0.2:4433")], 2_000);
         assert!(server.hinted([addr("203.0.113.9:7420")], 3_000));
@@ -840,12 +917,138 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_told_list_leaves_only_the_reached_addresses() {
+    fn an_empty_told_list_leaves_only_the_last_path() {
         let mut server = server();
+        server.connected_over(Some(addr("192.168.1.10:4433")));
         server.saw([addr("192.168.1.10:4433")], 1_000);
         server.told([addr("172.17.0.1:4433")], 2_000);
         assert!(server.told([], 3_000));
         assert_eq!(server.addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    /// The Linux client's Fulcrum: reached at a dev server's port that a
+    /// server of another key took since. The server's list leaves it out,
+    /// so it goes when the list comes.
+    #[test]
+    fn a_told_list_drops_the_reached_addresses_it_leaves_out() {
+        let mut server = server();
+        server.saw([addr("10.10.0.6:7430"), addr("10.10.0.1:7420")], 1_000);
+        assert!(server.told([addr("10.10.0.1:7420"), addr("192.168.86.10:7420")], 2_000));
+        assert_eq!(
+            sources(&server),
+            [
+                (addr("10.10.0.1:7420"), AddrSource::Reached),
+                (addr("192.168.86.10:7420"), AddrSource::Told),
+            ]
+        );
+    }
+
+    /// A server that never told a list: nothing says which it still has,
+    /// so what it was reached at is kept the 30 days.
+    #[test]
+    fn a_server_that_never_told_keeps_every_address_reached() {
+        let mut server = server();
+        server.saw([addr("10.10.0.6:7430")], 1_000);
+        server.connected_over(Some(addr("10.10.0.1:7420")));
+        server.saw([addr("10.10.0.1:7420")], 1_000 + 8 * DAY);
+        assert_eq!(
+            server.addrs(),
+            [addr("10.10.0.1:7420"), addr("10.10.0.6:7430")]
+        );
+    }
+
+    /// A port forward the server was not told of: reached there last,
+    /// though its list leaves it out. It is kept, and is the only such
+    /// address kept; a connection over another path lets it go.
+    #[test]
+    fn the_last_path_is_the_one_address_kept_that_the_list_leaves_out() {
+        let mut server = server();
+        server.saw([addr("203.0.113.7:7420"), addr("198.51.100.4:7420")], 1_000);
+        server.connected_over(Some(addr("203.0.113.7:7420")));
+        server.told([addr("10.10.0.1:7420")], 2_000);
+        assert_eq!(
+            server.addrs(),
+            [addr("10.10.0.1:7420"), addr("203.0.113.7:7420")]
+        );
+
+        server.connected_over(Some(addr("10.10.0.1:7420")));
+        server.saw([addr("10.10.0.1:7420")], 3_000);
+        assert_eq!(server.addrs(), [addr("10.10.0.1:7420")]);
+    }
+
+    /// Over a relay there is no last path: no address the list leaves out
+    /// is kept.
+    #[test]
+    fn a_connection_over_a_relay_keeps_no_address_the_list_leaves_out() {
+        let mut server = server();
+        server.saw([addr("203.0.113.7:7420")], 1_000);
+        server.connected_over(Some(addr("203.0.113.7:7420")));
+        server.told([addr("10.10.0.1:7420")], 2_000);
+        server.connected_over(None);
+        server.saw([], 3_000);
+        assert_eq!(server.addrs(), [addr("10.10.0.1:7420")]);
+    }
+
+    /// The last path that failed a dial at the handshake is let go, and
+    /// with it the address, if the server's list leaves it out; one the
+    /// list has stays.
+    #[test]
+    fn a_lost_last_path_goes_unless_the_list_has_it() {
+        let mut server = server();
+        server.saw([addr("10.10.0.6:7430"), addr("10.10.0.1:7420")], 1_000);
+        server.connected_over(Some(addr("10.10.0.6:7430")));
+        server.told([addr("10.10.0.1:7420")], 2_000);
+        assert!(server.lost_path());
+        assert_eq!(server.last_path, None);
+        assert_eq!(server.addrs(), [addr("10.10.0.1:7420")]);
+
+        server.connected_over(Some(addr("10.10.0.1:7420")));
+        assert!(!server.lost_path(), "the list has it");
+        assert_eq!(server.addrs(), [addr("10.10.0.1:7420")]);
+    }
+
+    /// Fulcrum's file as the SDK left it before: eleven reached addresses
+    /// on a port another key holds now, which the server's list leaves
+    /// out. They are gone when it is read; with a last path among them,
+    /// that one alone is kept.
+    #[tokio::test]
+    async fn a_poisoned_file_keeps_only_what_the_list_has_and_the_last_path() {
+        let stale: Vec<String> = (1..=11).map(|n| format!("10.10.0.{n}:7430")).collect();
+        let file = |last_path: Option<&str>| {
+            let mut known: Vec<serde_json::Value> = stale
+                .iter()
+                .map(|a| serde_json::json!({"addr": a, "last_seen": 2_000, "source": "reached"}))
+                .collect();
+            known.push(serde_json::json!(
+                {"addr": "10.10.0.1:7420", "last_seen": 1_000, "source": "told"}
+            ));
+            let mut server = serde_json::json!({
+                "name": "Fulcrum", "endpoint_id": ID, "server_id": SERVER_ID,
+                "known_addrs": known,
+                "advertised_addrs": ["10.10.0.1:7420"], "advertised_at": 1_000,
+            });
+            if let Some(path) = last_path {
+                server["last_path"] = serde_json::json!(path);
+            }
+            serde_json::to_vec(&[server]).unwrap()
+        };
+        let storage = MemoryStorage::default();
+        storage
+            .set_data(keys::SERVERS, Some(file(None)))
+            .await
+            .unwrap();
+        let servers = load(&storage).await.unwrap();
+        assert_eq!(servers[0].addrs(), [addr("10.10.0.1:7420")]);
+
+        storage
+            .set_data(keys::SERVERS, Some(file(Some("10.10.0.6:7430"))))
+            .await
+            .unwrap();
+        let servers = load(&storage).await.unwrap();
+        assert_eq!(
+            servers[0].addrs(),
+            [addr("10.10.0.6:7430"), addr("10.10.0.1:7420")]
+        );
     }
 
     /// P6-07, glm E-3: what a server pushes is held to an invite's limits.

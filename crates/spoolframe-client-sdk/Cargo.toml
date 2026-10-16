@@ -42,5 +42,6 @@ uuid = { workspace = true }
 socket2 = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true }
+# `net`: a UDP forwarder stands in for a slow path to a server.
+tokio = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true }

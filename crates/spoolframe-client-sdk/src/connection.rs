@@ -236,6 +236,17 @@ impl ServerConnection {
         })
     }
 
+    /// The server's address on the selected path, if that is an IP path:
+    /// where this connection reaches it now. `None` over a relay.
+    pub fn selected_addr(&self) -> Option<SocketAddr> {
+        let paths = self.conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        match selected.remote_addr() {
+            TransportAddr::Ip(addr) => Some(*addr),
+            _ => None,
+        }
+    }
+
     /// The path packets to the server take now: the selected one.
     pub fn path(&self) -> ConnectionPath {
         let paths = self.conn.paths();
