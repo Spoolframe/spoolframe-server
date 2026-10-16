@@ -12,13 +12,17 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::Prober;
 use spoolframe_protocol::HomeScreen;
-use spoolframe_types::{Item, MediaId, MediaKind};
+use spoolframe_types::{Item, MediaId, MediaKind, PlaybackState};
 
 use crate::principal::Principal;
+use crate::store::plays::PlayedKind;
 use crate::store::watch::WatchUpdate;
 use crate::store::{Store, StoreError};
 pub use spoolframe_policy::watch::WatchRules;
 use spoolframe_policy::watch::credits_to_end;
+
+mod plays;
+pub use plays::Plays;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -90,8 +94,33 @@ fn is_down(e: &CatalogError) -> bool {
 /// so, and treats it as a change.
 const CHANGES: usize = 256;
 
-fn tracked(id: &MediaId) -> bool {
+/// Whether `id` has a watch state: movies and episodes. A track has its
+/// plays alone ([`Plays`]).
+pub fn tracked(id: &MediaId) -> bool {
     matches!(id.kind(), MediaKind::Movie | MediaKind::Episode)
+}
+
+/// The length an item is judged by: `probed`, the server's own probe of
+/// its file, else the catalog's; never a client's. The one length its
+/// watch state, its plays and the Playback page all use, tracks included.
+pub fn length(probed: Option<Duration>, item: &Item) -> Option<Duration> {
+    probed.or(match item {
+        Item::Movie(m) => m.duration,
+        Item::Episode(e) => e.duration,
+        Item::Track(t) => t.duration,
+        _ => None,
+    })
+}
+
+/// The watch state and plays `item` carries: a film's, an episode's or a
+/// track's; nothing else has them.
+fn playback_mut(item: &mut Item) -> Option<&mut PlaybackState> {
+    match item {
+        Item::Movie(m) => Some(&mut m.playback),
+        Item::Episode(e) => Some(&mut e.playback),
+        Item::Track(t) => Some(&mut t.playback),
+        _ => None,
+    }
 }
 
 fn ms(d: Duration) -> i64 {
@@ -353,11 +382,7 @@ impl Watch {
                 .and_then(|d| d.duration),
             Err(_) => None,
         };
-        probed.or(match item {
-            Item::Movie(m) => m.duration,
-            Item::Episode(e) => e.duration,
-            _ => None,
-        })
+        length(probed, item)
     }
 
     /// If `id` had state under an earlier key, bring it over (P1-14's
@@ -373,20 +398,41 @@ impl Watch {
         external_ids: &[String],
     ) -> Result<(), WatchError> {
         let media_id = id.to_string();
-        if tracked(id)
-            && let Some(old) = self
-                .store
-                .watch_under_another_key(principal, &media_id, external_ids)
-                .await?
+        // The three lookups are reads of separate tables: asked side by
+        // side. The moves after them stay in order.
+        let (watch, plays, hidden) = tokio::try_join!(
+            async {
+                if !tracked(id) {
+                    return Ok(None);
+                }
+                self.store
+                    .watch_under_another_key(principal, &media_id, external_ids)
+                    .await
+            },
+            // Its plays follow it (PX-52), all but those of a copy.
+            async {
+                if PlayedKind::of(id.kind()).is_none() {
+                    return Ok(None);
+                }
+                self.store
+                    .plays_under_another_key(principal, &media_id, external_ids)
+                    .await
+            },
+            // A hide follows it too (P1-22).
+            self.store
+                .hidden_under_another_key(principal, &media_id, external_ids),
+        )?;
+        if let Some(old) = watch
             && self.left(&old, &media_id, external_ids).await
         {
             self.store.move_watch(principal, &old, &media_id).await?;
         }
-        // A hide follows it too (P1-22).
-        if let Some(old) = self
-            .store
-            .hidden_under_another_key(principal, &media_id, external_ids)
-            .await?
+        if let Some(old) = plays
+            && self.left(&old, &media_id, external_ids).await
+        {
+            self.store.move_plays(principal, &old, &media_id).await?;
+        }
+        if let Some(old) = hidden
             && self.left(&old, &media_id, external_ids).await
         {
             self.store.move_hidden(principal, &old, &media_id).await?;
@@ -451,11 +497,9 @@ impl Watch {
             let position = row
                 .position_ms
                 .map(|p| Duration::from_millis(p.max(0) as u64));
-            let state = self.rules().playback_state(position, row.watched);
-            match item {
-                Item::Movie(m) => m.playback = state,
-                Item::Episode(e) => e.playback = state,
-                _ => {}
+            // Only a movie or an episode has a row: `ids` holds no other.
+            if let Some(playback) = playback_mut(item) {
+                *playback = self.rules().playback_state(position, row.watched);
             }
         }
         Ok(())
@@ -478,11 +522,12 @@ impl Watch {
             .collect();
         let states = self.store.watch_states(principal, &ids).await?;
         for item in items.iter_mut() {
+            if !tracked(item.id()) {
+                continue;
+            }
             let at = states.get(&item.id().to_string()).map(|row| row.updated_at);
-            match item {
-                Item::Movie(m) => m.playback.last_viewed_at = at,
-                Item::Episode(e) => e.playback.last_viewed_at = at,
-                _ => {}
+            if let Some(playback) = playback_mut(item) {
+                playback.last_viewed_at = at;
             }
         }
         Ok(())
@@ -500,9 +545,25 @@ impl Watch {
         limit: u32,
     ) -> Result<(Vec<Item>, u32), WatchError> {
         let (rows, total) = self.store.watch_history(principal, offset, limit).await?;
-        let ids: Vec<MediaId> = rows
+        let mut items = self
+            .look_up(rows.into_iter().map(|row| row.media_id), "watch history")
+            .await?;
+        let mut all: Vec<&mut Item> = items.iter_mut().collect();
+        self.fill(principal, &mut all).await?;
+        Ok((items, total))
+    }
+
+    /// The items of `ids` as the catalog has them, in their order, a few
+    /// at a time. One gone from the catalog, not served now, or on a Plex
+    /// server that is down is left out (logged as left out of `list`).
+    async fn look_up(
+        &self,
+        ids: impl IntoIterator<Item = String>,
+        list: &'static str,
+    ) -> Result<Vec<Item>, WatchError> {
+        let ids: Vec<MediaId> = ids
             .into_iter()
-            .filter_map(|row| row.media_id.parse::<MediaId>().ok())
+            .filter_map(|id| id.parse::<MediaId>().ok())
             .collect();
         let found: Vec<(MediaId, Result<_, CatalogError>)> = stream::iter(ids)
             .map(|id| async move {
@@ -518,14 +579,12 @@ impl Watch {
                 Ok(found) => items.push(found.item),
                 Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
                 Err(e) if is_down(&e) => {
-                    tracing::warn!(item = %id, error = %e, "watch history: left out");
+                    tracing::warn!(item = %id, error = %e, "{list}: left out");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-        let mut all: Vec<&mut Item> = items.iter_mut().collect();
-        self.fill(principal, &mut all).await?;
-        Ok((items, total))
+        Ok(items)
     }
 
     /// `principal`'s home screen.

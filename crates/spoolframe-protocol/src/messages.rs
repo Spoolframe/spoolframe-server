@@ -814,6 +814,19 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
+    /// What the session user played lately (PX-52): `Items`, each item
+    /// once, by its latest counted play, newest first; a page from
+    /// `offset`, at most `limit` (500), and how many in all. `kinds` keeps
+    /// films, episodes or tracks only; `None`, every kind. An item gone
+    /// from the library is left out of the page. Each item's
+    /// `PlaybackState` has its `play_count` and `last_played_at`. Only
+    /// from a client that listed `spoolframe:play-history`; from any
+    /// other, `Unsupported`.
+    RecentlyPlayed {
+        kinds: Option<crate::playlists::Kinds>,
+        offset: u32,
+        limit: u32,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].

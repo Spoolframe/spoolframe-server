@@ -2,5 +2,6 @@
 //! No transport, persistence, or media-engine dependencies.
 
 pub mod playlists;
+pub mod plays;
 pub mod tracks;
 pub mod watch;

@@ -110,14 +110,16 @@ pub struct Shown {
 }
 
 impl Shown {
-    /// `item` as the Playback page names it.
-    pub fn of(item: &Item) -> Self {
-        let ms = |d: Option<Duration>| d.map(|d| d.as_millis() as u64);
+    /// `item` as the Playback page names it, `probed` long by the
+    /// server's probe of its file, if it has one: its length is
+    /// [`crate::watch::length`], the one its watch state and plays use.
+    pub fn of(item: &Item, probed: Option<Duration>) -> Self {
+        let duration_ms = crate::watch::length(probed, item).map(|d| d.as_millis() as u64);
         match item {
             Item::Movie(m) => Shown {
                 title: m.title.clone(),
                 subtitle: None,
-                duration_ms: ms(m.duration),
+                duration_ms,
             },
             Item::Episode(e) => Shown {
                 title: match &e.show_title {
@@ -125,12 +127,12 @@ impl Shown {
                     None => format!("S{} E{}", e.season, e.episode),
                 },
                 subtitle: Some(e.title.clone()),
-                duration_ms: ms(e.duration),
+                duration_ms,
             },
             Item::Track(t) => Shown {
                 title: t.title.clone(),
                 subtitle: t.artist_name.clone(),
-                duration_ms: ms(t.duration),
+                duration_ms,
             },
             other => Shown {
                 title: other.id().to_string(),
@@ -496,6 +498,43 @@ pub struct Opened {
     pub requested: Instant,
     /// The connection starting it ([`Playbacks::connection_closed`]).
     pub connection: u64,
+    /// What it plays and for whom, for its observers ([`Observer`]).
+    pub played: Played,
+}
+
+/// What a playback plays, for whom, and from where: what its observers
+/// ([`Observer::started`]) need beyond what it serves. Its endpoint, its
+/// device's name and its id are [`Opened`]'s own.
+#[derive(Debug, Clone)]
+pub struct Played {
+    pub principal: crate::principal::Principal,
+    /// The item as the catalog has it: its kind, and its show, or its
+    /// album and artist.
+    pub item: Item,
+    pub external_ids: Vec<String>,
+    /// Its length ([`crate::watch::length`]).
+    pub duration: Option<Duration>,
+    /// Where its credits that run to the end start, when known.
+    pub credits: Option<Duration>,
+    /// Where in it the playback starts.
+    pub from: Duration,
+}
+
+/// What follows each playback through its life, as play history does
+/// (PX-52): told as it starts, as its client reports where it is, and as
+/// it ends, however it ends. Each call is made on the path that changes
+/// the playback (a request, the sweep), and can neither fail nor hold it
+/// up: an observer does what it writes in the background.
+pub trait Observer: Send + Sync {
+    /// `handle` is about to be registered as `opened`. Nothing can end it
+    /// before this returns, so whatever ends it finds what this keeps.
+    fn started(&self, handle: &str, opened: &Opened);
+    /// Its client reported `position`. `over_http`: a player fetched it
+    /// from the HTTP playback port (PX-49).
+    fn progressed(&self, handle: &str, position: Duration, over_http: bool);
+    /// It ended: its client stopped it, it expired, an admin stopped it,
+    /// its session or device ended, another took its place.
+    fn ended(&self, handle: &str, over_http: bool);
 }
 
 /// What a playback becomes when its subtitle or its quality changes.
@@ -583,6 +622,8 @@ pub struct Playbacks {
     /// the uplink's share is given back (PX-46), its HTTP token ends
     /// (PX-49).
     on_end: parking_lot::RwLock<Vec<OnEnd>>,
+    /// Told of each playback's start, progress and end ([`Observer`]).
+    observers: parking_lot::RwLock<Vec<Arc<dyn Observer>>>,
     /// Where the time to a playback's first media goes (P3-14).
     histograms: std::sync::OnceLock<Arc<crate::metrics::Histograms>>,
 }
@@ -591,6 +632,12 @@ pub struct Playbacks {
 pub type EndHook = Box<dyn Fn(&str) + Send + Sync>;
 
 struct OnEnd(EndHook);
+
+impl std::fmt::Debug for dyn Observer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Observer")
+    }
+}
 
 impl std::fmt::Debug for OnEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -903,6 +950,7 @@ impl Playbacks {
             connections: Mutex::default(),
             numbered: Default::default(),
             on_end: parking_lot::RwLock::default(),
+            observers: parking_lot::RwLock::default(),
             histograms: std::sync::OnceLock::new(),
         }
     }
@@ -917,6 +965,12 @@ impl Playbacks {
     /// hooks added before it.
     pub fn on_end(&self, hook: EndHook) {
         self.on_end.write().push(OnEnd(hook));
+    }
+
+    /// Tell `observer` of every playback's start, progress and end from
+    /// now, after the observers added before it.
+    pub fn observe(&self, observer: Arc<dyn Observer>) {
+        self.observers.write().push(observer);
     }
 
     /// Time idling and rechecks by `clock` (tests move it instead of
@@ -1003,6 +1057,10 @@ impl Playbacks {
     /// Open `opened` as `handle`; the session was checked by the caller
     /// just now.
     pub fn start(&self, handle: PlaybackHandle, opened: Opened) -> PlaybackHandle {
+        // Before it is registered: nothing can end it until it is.
+        for observer in self.observers.read().iter() {
+            observer.started(&handle.0, &opened);
+        }
         let now = self.clock.now();
         let mut handles = self.lock();
         // Forget idle handles here rather than on a timer.
@@ -1317,6 +1375,18 @@ impl Playbacks {
         Ok(())
     }
 
+    /// The client reported `position`: its observers are told. Before its
+    /// watch state, which a catalog that is down can fail
+    /// ([`Self::record_progress`] after it).
+    pub(crate) fn progressed(&self, handle: &PlaybackHandle, position: Duration) {
+        let Some(over_http) = self.lock().get(&handle.0).map(|p| p.over_http) else {
+            return;
+        };
+        for observer in self.observers.read().iter() {
+            observer.progressed(&handle.0, position, over_http);
+        }
+    }
+
     /// The client reported `position_ms` as `sequence`.
     pub(crate) fn record_progress(&self, handle: &PlaybackHandle, sequence: u64, position_ms: u64) {
         if let Some(playback) = self.lock().get_mut(&handle.0) {
@@ -1600,6 +1670,9 @@ impl Playbacks {
             for OnEnd(hook) in self.on_end.read().iter() {
                 hook(&handle);
             }
+            for observer in self.observers.read().iter() {
+                observer.ended(&handle, playback.over_http);
+            }
             kept.push(EndedPlayback { at, why, last });
         }
         if kept.is_empty() {
@@ -1768,7 +1841,7 @@ fn take_where(
         .collect()
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::clock::Clock;
 
@@ -1819,7 +1892,7 @@ mod tests {
     }
 
     /// Session `s`'s playback of the movie on `endpoint`.
-    fn opened_on(endpoint: &str) -> Opened {
+    pub(crate) fn opened_on(endpoint: &str) -> Opened {
         Opened {
             trace: PlaybackTrace::untraced(),
             viewer: viewer(),
@@ -1848,6 +1921,21 @@ mod tests {
             requested: Instant::now(),
             connection: 0,
             display: None,
+            played: played(),
+        }
+    }
+
+    /// The movie, from its start, for Alice.
+    pub(crate) fn played() -> Played {
+        Played {
+            principal: crate::principal::Principal::LocalUser(
+                crate::store::users::LocalUserId::from_uuid(uuid::Uuid::nil()),
+            ),
+            item: crate::test_support::movie(),
+            external_ids: Vec::new(),
+            duration: Some(Duration::from_secs(10)),
+            credits: None,
+            from: Duration::ZERO,
         }
     }
 
@@ -2491,10 +2579,23 @@ mod tests {
             artwork: Vec::new(),
             playback: Default::default(),
         });
-        let shown = Shown::of(&item);
+        let shown = Shown::of(&item, None);
         assert_eq!(shown.title, "Severance · S2 E4");
         assert_eq!(shown.subtitle.as_deref(), Some("Woe's Hollow"));
         assert_eq!(shown.duration_ms, Some(3_000_000));
+    }
+
+    /// The Playback page shows the length watch state and plays judge
+    /// the item by: the server's probe, over the catalog's.
+    #[test]
+    fn a_probed_length_is_shown_over_the_catalog_s() {
+        let item = crate::test_support::track("32", "31", 1);
+        let probed = Some(Duration::from_millis(1_309_472));
+        assert_eq!(Shown::of(&item, probed).duration_ms, Some(1_309_472));
+        assert_eq!(
+            Shown::of(&item, None).duration_ms,
+            crate::watch::length(None, &item).map(|d| d.as_millis() as u64)
+        );
     }
 
     #[test]

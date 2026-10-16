@@ -67,6 +67,7 @@ pub async fn sdk_client(
             liked: true,
             last_viewed: true,
             playlist_sharing: true,
+            play_history: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };

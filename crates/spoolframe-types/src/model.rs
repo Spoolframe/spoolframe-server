@@ -64,6 +64,23 @@ pub struct PlaybackState {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_viewed_at: Option<i64>,
+    /// How many times the user played it through: their counted plays
+    /// from any device (PX-52). Sent only to a client that listed the
+    /// `spoolframe:play-history` feature, and only where its reply says
+    /// so (an item's details, Recently played); left out when 0.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub play_count: u32,
+    /// When the user last played it, Unix seconds: the end of their
+    /// latest counted play. Sent where `play_count` is; `None` for an
+    /// item never played.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played_at: Option<i64>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +366,8 @@ mod tests {
             position: Some(Duration::from_millis(2_220_500)),
             watched: false,
             last_viewed_at: None,
+            play_count: 0,
+            last_played_at: None,
         }
     }
 
@@ -729,6 +748,8 @@ mod tests {
                 position: None,
                 watched: true,
                 last_viewed_at: None,
+                play_count: 0,
+                last_played_at: None,
             },
         });
     }

@@ -20,7 +20,9 @@
 //! without the feature sends no names, and the call is
 //! [`SdkError::Unsupported`].
 
-use spoolframe_protocol::features::{LAST_VIEWED, LIKED, PLAYLIST_SHARING, PLAYLISTS};
+use spoolframe_protocol::features::{
+    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_SHARING, PLAYLISTS,
+};
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
     PlaylistSummary, ShareCandidatePage, Visibility,
@@ -46,6 +48,10 @@ pub struct Features {
     /// Sharing by name: [`Session::share_candidates`], and the names of a
     /// playlist's owner and of who it is shared with.
     pub playlist_sharing: bool,
+    /// Play history (PX-52): [`Session::recently_played`], and
+    /// `PlaybackState::play_count` and `last_played_at` on an item's
+    /// details and on Recently played's items.
+    pub play_history: bool,
 }
 
 impl Features {
@@ -56,6 +62,7 @@ impl Features {
             (self.liked, LIKED),
             (self.last_viewed, LAST_VIEWED),
             (self.playlist_sharing, PLAYLIST_SHARING),
+            (self.play_history, PLAY_HISTORY),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -67,25 +74,41 @@ impl Features {
     /// app (`self`) listed too. One the app did not list is off even when
     /// the server has it, so its calls are refused here, unsent.
     pub(crate) fn both(self, server: &[String]) -> Self {
-        let ours = self.names();
-        let shared: Vec<String> = server
-            .iter()
-            .filter(|name| ours.contains(name))
-            .cloned()
-            .collect();
-        Self::of(&shared)
+        self.and(Self::of(server))
+    }
+
+    /// What `self` and `other` both have.
+    fn and(self, other: Self) -> Self {
+        Self {
+            playlists: self.playlists && other.playlists,
+            liked: self.liked && other.liked,
+            last_viewed: self.last_viewed && other.last_viewed,
+            playlist_sharing: self.playlist_sharing && other.playlist_sharing,
+            play_history: self.play_history && other.play_history,
+        }
+        .needing_playlists()
     }
 
     /// What `names`, a server's list, has. A name this SDK does not know
     /// is ignored.
     pub(crate) fn of(names: &[String]) -> Self {
+        let has = |name| spoolframe_protocol::features::has(names, name);
         Self {
-            playlists: spoolframe_protocol::features::has(names, PLAYLISTS),
-            liked: spoolframe_protocol::features::has(names, PLAYLISTS)
-                && spoolframe_protocol::features::has(names, LIKED),
-            last_viewed: spoolframe_protocol::features::has(names, LAST_VIEWED),
-            playlist_sharing: spoolframe_protocol::features::has(names, PLAYLISTS)
-                && spoolframe_protocol::features::has(names, PLAYLIST_SHARING),
+            playlists: has(PLAYLISTS),
+            liked: has(LIKED),
+            last_viewed: has(LAST_VIEWED),
+            playlist_sharing: has(PLAYLIST_SHARING),
+            play_history: has(PLAY_HISTORY),
+        }
+        .needing_playlists()
+    }
+
+    /// Off what needs playlists, without them: Liked and sharing.
+    fn needing_playlists(self) -> Self {
+        Self {
+            liked: self.liked && self.playlists,
+            playlist_sharing: self.playlist_sharing && self.playlists,
+            ..self
         }
     }
 }
@@ -428,6 +451,8 @@ mod tests {
             Features::of(&[PLAYLISTS.to_owned(), PLAYLIST_SHARING.to_owned()]).playlist_sharing
         );
         assert!(!Features::of(&[PLAYLIST_SHARING.to_owned()]).playlist_sharing);
+        // Play history stands alone: no playlists needed.
+        assert!(Features::of(&[PLAY_HISTORY.to_owned()]).play_history);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }

@@ -465,6 +465,11 @@ impl ClientProtocol {
                 uplink.ended(handle);
             }
         }));
+        // PX-52: every playback's play is kept, from its start to its end,
+        // however it ends; the HTTP playback port's included.
+        services
+            .playbacks
+            .observe(Arc::new(crate::watch::Plays::new(services.watch.clone())));
         tokio::spawn(crate::uplink::tell_shares(
             Arc::downgrade(&services.uplink),
             addresses.streams.clone(),
@@ -1819,6 +1824,14 @@ impl ClientProtocol {
         let liked_listed = playlists_listed && features::has(&hello.features, features::LIKED);
         // When each item was last viewed, only for a client that takes it.
         let last_viewed_listed = features::has(&hello.features, features::LAST_VIEWED);
+        // PX-52: play counts and Recently played, only for a client that
+        // takes them.
+        let play_history_listed = features::has(&hello.features, features::PLAY_HISTORY);
+        if !play_history_listed && matches!(request, Request::RecentlyPlayed { .. }) {
+            return Err(Error::Unsupported {
+                request: format!("recently played without {}", features::PLAY_HISTORY),
+            });
+        }
         // Sharing by name: whom to share with, and the names of owners and
         // shares, only for a client that takes them.
         let sharing_listed =
@@ -2404,6 +2417,17 @@ impl ClientProtocol {
                         .await
                         .map_err(watch_error)?;
                 }
+                if play_history_listed {
+                    let mut items: Vec<&mut spoolframe_types::Item> =
+                        std::iter::once(&mut found.item)
+                            .chain(found.children.iter_mut())
+                            .collect();
+                    self.services
+                        .watch
+                        .fill_plays(principal, &mut items)
+                        .await
+                        .map_err(watch_error)?;
+                }
                 // PX-40: only for a client that takes them.
                 let playlists = if playlists_listed {
                     Some(
@@ -2634,6 +2658,19 @@ impl ClientProtocol {
                 self.fill(principal, items).await?;
                 Ok(Reply::Search(results))
             }
+            Request::RecentlyPlayed {
+                kinds,
+                offset,
+                limit,
+            } => {
+                let (items, total) = self
+                    .services
+                    .watch
+                    .recently_played(principal, kinds, offset, limit.min(MAX_PAGE))
+                    .await
+                    .map_err(watch_error)?;
+                Ok(Reply::Items { items, total })
+            }
             Request::PersonItems {
                 person,
                 offset,
@@ -2670,11 +2707,18 @@ impl ClientProtocol {
                     .progress_control(&session, &item)
                     .await;
                 self.services.playbacks.check_progress(&handle, sequence)?;
-                self.services
-                    .watch
-                    .progress(principal, &item, Duration::from_millis(position_ms))
-                    .await
-                    .map_err(watch_error)?;
+                let position = Duration::from_millis(position_ms);
+                // Its observers first: they need no catalog, so a Plex that
+                // is down does not stop them.
+                self.services.playbacks.progressed(&handle, position);
+                // A track has no watch state, only its plays (PX-52).
+                if crate::watch::tracked(&item) {
+                    self.services
+                        .watch
+                        .progress(principal, &item, position)
+                        .await
+                        .map_err(watch_error)?;
+                }
                 self.services
                     .playbacks
                     .record_progress(&handle, sequence, position_ms);
@@ -2874,11 +2918,12 @@ impl ClientProtocol {
                     // The item's markers go with the playback (P2-10), so a
                     // player needs no second request for them.
                     let found = catalog.item(&id).await.map_err(catalog_error)?;
+                    let credits = spoolframe_policy::watch::credits_to_end(&found.markers);
                     let markers = found.markers;
-                    let mut shown = crate::playback::Shown::of(&found.item);
-                    if shown.duration_ms.is_none() {
-                        shown.duration_ms = descriptor.duration.map(|d| d.as_millis() as u64);
-                    }
+                    // One length for the Playback page, the play and its
+                    // watch state.
+                    let duration = crate::watch::length(descriptor.duration, &found.item);
+                    let shown = crate::playback::Shown::of(&found.item, descriptor.duration);
                     let viewer = crate::playback::Viewer {
                         user_id: principal.to_string(),
                         username: who.log_name(),
@@ -2992,6 +3037,14 @@ impl ClientProtocol {
                             start: start_times.clone(),
                             requested,
                             connection: state.number,
+                            played: crate::playback::Played {
+                                principal,
+                                item: found.item,
+                                external_ids: found.external_ids,
+                                duration,
+                                credits,
+                                from: start.unwrap_or_default(),
+                            },
                         },
                     );
                     // Counted off the LAN from now (PX-46): the others' shares

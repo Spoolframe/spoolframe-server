@@ -1671,6 +1671,70 @@ everywhere else, and always for a client that did not list the feature.
 What it is for: showing only what was watched lately (the Apple TV's
 Top Shelf, the last 48 hours), across the user's devices.
 
+## Play history
+
+Feature `spoolframe:play-history` (PX-52). The server keeps every play,
+whichever client made it and whether or not it listed the feature: a
+play opens at `StartPlayback`, moves on with each
+`UpdatePlaybackProgress`, and closes at `StopPlayback`, or when the
+playback ends otherwise (it expires, an admin stops it, its session
+ends). Tracks are played like films: a track's `UpdatePlaybackProgress`
+is `Done`, not `NotFound`, and is kept as its play only; a track has no
+resume position and is never in Continue watching. Plays are written in
+the background: no reply waits for one, and one that cannot be written
+fails no request.
+
+A play counts when:
+
+- a track has played for half its length or 4 minutes, whichever comes
+  first (4 minutes when its length is not known), in a play that
+  started before that point;
+- a film or an episode reached the point its watch state calls watched
+  (its credits that run to the end, else 95% of its length), in a play
+  that started before that point and played something, and at least
+  half of the stretch the play covered, from where it started to where
+  it got, was played.
+
+So a track or a film stopped past that point and resumed in a new
+playback has counted once, and the resumed play does not count again.
+
+Time played is measured by the server, not taken from the position:
+between two reports, what the position moved by, never more than the
+time that passed, and never more than 30 s for one report. Paused,
+nothing is added, nor by a seek either way; seeking to the end and
+stopping is not a play. While playing, report progress every 10 s: a
+report after a longer silence is credited at most 30 s, whatever the
+position moved by. A play that does not
+count is kept as history, and counts nowhere below.
+
+A client that lists the feature gets, in an item's `PlaybackState` on
+`Item`'s item and children (an album's tracks) and on Recently played's
+items:
+
+- `play_count`: the user's counted plays of it, from any device; left
+  out when 0;
+- `last_played_at`: Unix seconds, when the latest of them ended; left
+  out when never.
+
+`RecentlyPlayed { kinds, offset, limit }` answers `Items { items, total
+}`: the session user's items, each once, by their latest counted play,
+newest first, a page from `offset` of at most `limit` (500), and how
+many there are. `kinds` (the `Kinds` playlists use: `movies`,
+`episodes`, `tracks`) keeps only those ticked; `null` keeps every kind,
+and kinds that tick none list nothing. An item gone from the library is
+left out of the page. Another user's plays never show or count. A
+session whose client did not list the feature is sent neither field,
+and its `RecentlyPlayed` is `Unsupported`.
+
+Plays are per user and follow an item to a new id by its external ids,
+as watch state does. A portable user's plays go when they leave the
+server; a local user who leaves is set aside with their plays, as with
+the rest of their data.
+
+SDK: `Features::play_history`; `Session::recently_played(kinds, offset,
+limit)` returns an `ItemsPage` (`SdkError::Unsupported` without the
+feature); the fields arrive on `ItemDetail.item` and `children`.
+
 ## Liked and All
 
 Feature `spoolframe:liked` (PX-43), on top of `spoolframe:playlists`.

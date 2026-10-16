@@ -92,7 +92,9 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::Like { .. }
         | Request::Unlike { .. }
         // A read.
-        | Request::ListShareCandidates { .. } => true,
+        | Request::ListShareCandidates { .. }
+        // PX-52: a read.
+        | Request::RecentlyPlayed { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

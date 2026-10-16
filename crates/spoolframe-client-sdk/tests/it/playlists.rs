@@ -21,6 +21,7 @@ const ALL: Features = Features {
     liked: true,
     last_viewed: true,
     playlist_sharing: true,
+    play_history: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.

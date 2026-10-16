@@ -48,6 +48,7 @@ mod playback_authz;
 mod playback_debug;
 mod playlist_sharing;
 mod playlists;
+mod plays;
 mod plex_link;
 mod plex_sync;
 mod portable_root_boundary;

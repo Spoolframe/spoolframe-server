@@ -956,6 +956,11 @@ async fn run(
         prober.clone(),
         config.watch.rules()?,
     ));
+    // PX-52: the plays a server that stopped left open end as they stood.
+    let closed = watch.close_open_plays().await?;
+    if closed > 0 {
+        tracing::info!(plays = closed, "plays left open closed");
+    }
     let wizard = wizard()?;
     let accounts = Arc::new(PlexAccounts::new(
         Secrets::new(state_dir),

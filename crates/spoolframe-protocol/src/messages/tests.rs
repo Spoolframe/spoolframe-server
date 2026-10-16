@@ -1557,6 +1557,10 @@ mod before_markers {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "an older peer's reply, made once to be encoded; as the real Reply"
+    )]
     pub enum Reply {
         Item {
             item: Item,
@@ -2968,5 +2972,63 @@ mod playlists {
         assert_eq!(visibility, Visibility::Unknown);
         let kind: PlaylistOwnerKind = serde_json::from_value(serde_json::json!("family")).unwrap();
         assert_eq!(kind, PlaylistOwnerKind::Unknown);
+    }
+}
+
+/// PX-52, `spoolframe:play-history`: Recently played asks for a page,
+/// of some kinds or all, and an item's playback state carries its play
+/// count and last play, each left out when there is none, so an older
+/// peer reads what it did.
+mod play_history {
+    use super::*;
+    use crate::playlists::Kinds;
+
+    #[test]
+    fn recently_played_round_trips_and_is_safe_to_retry() {
+        let music = Request::RecentlyPlayed {
+            kinds: Some(Kinds {
+                tracks: true,
+                ..Kinds::default()
+            }),
+            offset: 20,
+            limit: 20,
+        };
+        let json = serde_json::to_value(&music).unwrap();
+        assert_eq!(json["type"], "recently_played");
+        assert_eq!(json["kinds"]["tracks"], true);
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: music.clone(),
+        });
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: Request::RecentlyPlayed {
+                kinds: None,
+                offset: 0,
+                limit: 50,
+            },
+        });
+        assert!(crate::policy::retry_safe(&music));
+    }
+
+    #[test]
+    fn a_play_count_round_trips_and_is_left_out_when_none() {
+        let mut played = movie();
+        if let Item::Movie(m) = &mut played {
+            m.playback.play_count = 2;
+            m.playback.last_played_at = Some(1_791_000_000);
+        }
+        let json = serde_json::to_value(&played).unwrap();
+        assert_eq!(json["playback"]["play_count"], 2);
+        assert_eq!(json["playback"]["last_played_at"], 1_791_000_000);
+        round_trip(Response::Ok(Reply::Items {
+            items: vec![played],
+            total: 1,
+        }));
+        let json = serde_json::to_value(movie()).unwrap();
+        assert!(json["playback"].get("play_count").is_none(), "{json}");
+        assert!(json["playback"].get("last_played_at").is_none(), "{json}");
+        let read: Item = serde_json::from_value(json).unwrap();
+        assert_eq!(read, movie());
     }
 }

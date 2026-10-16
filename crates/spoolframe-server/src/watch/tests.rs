@@ -101,7 +101,7 @@ fn only_credits_that_run_to_the_end_give_the_watched_point() {
 /// an episode's file as Brooklyn Nine-Nine S07E01 (1309.472 s).
 struct Harness {
     // Declared first, so the store closes before its directory goes.
-    watch: Watch,
+    watch: Arc<Watch>,
     store: Store,
     catalog: Arc<FakeCatalog>,
     /// The store's, and so the watch's: moved on instead of sleeping.
@@ -126,12 +126,12 @@ async fn harness(test: &str) -> Harness {
         Tool::unconfined(ffprobe),
         Prober::DEFAULT_TIMEOUT,
     ));
-    let watch = Watch::new(
+    let watch = Arc::new(Watch::new(
         store.clone(),
         catalog.clone(),
         prober,
         WatchRules::default(),
-    );
+    ));
     let mut users = Vec::new();
     for name in ["alice", "bob"] {
         let id = store
@@ -791,4 +791,116 @@ async fn unhide_restores_at_once() {
         ids(&h.home(h.alice).await.continue_watching),
         [id.to_string()]
     );
+}
+
+/// PX-52: one counted play of `media_id`, by `who`, with the film's
+/// external id.
+async fn played_under(h: &Harness, who: Principal, media_id: &str) {
+    let external_ids = [format!("test://{}", movie().id().key())];
+    let row = h
+        .store
+        .open_play(
+            who,
+            crate::store::plays::NewPlay {
+                media_id,
+                kind: crate::store::plays::PlayedKind::Movie,
+                show_id: None,
+                album_id: None,
+                artist_id: None,
+                external_ids: &external_ids,
+                duration_ms: Some(7_020_000),
+                endpoint_id: None,
+                device_name: None,
+                playback_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let closed = crate::store::plays::PlayUpdate {
+        played_ms: 7_000_000,
+        counted: true,
+        over_http: false,
+        close: true,
+    };
+    h.store.update_play(row, closed).await.unwrap();
+}
+
+/// `who`'s play count of `item`, re-linked first as a client's look is.
+async fn play_count(h: &Harness, who: Principal, item: Item) -> u32 {
+    let mut item = item;
+    let found = h.catalog.item(item.id()).await.unwrap();
+    h.watch
+        .relink(who, item.id(), &found.external_ids)
+        .await
+        .unwrap();
+    h.watch.fill_plays(who, &mut [&mut item]).await.unwrap();
+    match item {
+        Item::Movie(m) => m.playback.play_count,
+        other => panic!("not a film: {other:?}"),
+    }
+}
+
+/// Plex gave the film a new key: its plays follow it by its external id,
+/// as its watch state does.
+#[tokio::test]
+async fn plays_under_an_old_key_move_to_the_new_key() {
+    let h = harness("plays-relink").await;
+    played_under(&h, h.alice, &old_key().to_string()).await;
+    h.catalog.set_old_key(
+        &old_key(),
+        OldKey::AnotherItem(vec!["test://another-film".into()]),
+    );
+    assert_eq!(play_count(&h, h.alice, movie()).await, 1);
+    assert_eq!(play_count(&h, h.bob, movie()).await, 0);
+    let rows = h.store.all_plays(h.alice).await.unwrap();
+    assert_eq!(rows[0].media_id, movie().id().to_string());
+}
+
+/// The same film in a second library shares its external ids: the copy
+/// played is still there, so its plays stay its own.
+#[tokio::test]
+async fn a_copy_s_plays_stay_with_it() {
+    let h = harness("plays-copy").await;
+    played_under(&h, h.alice, &movie().id().to_string()).await;
+    assert_eq!(play_count(&h, h.alice, second_copy()).await, 0);
+    assert_eq!(play_count(&h, h.alice, movie()).await, 1);
+}
+
+/// Plays are kept by observing the playbacks, not by the requests: a
+/// playback ended a way no request handler knows of (its session ended),
+/// at once after it started, closes its play, opened first.
+#[tokio::test]
+async fn a_playback_ended_however_it_ends_closes_its_play() {
+    use crate::playback::tests::{opened_on, played};
+    use crate::playback::{Opened, Playbacks, Played};
+
+    let h = harness("plays-observed").await;
+    let playbacks = Playbacks::default();
+    playbacks.observe(Arc::new(Plays::new(h.watch.clone())));
+    playbacks.start(
+        Playbacks::new_handle(),
+        Opened {
+            played: Played {
+                principal: h.alice,
+                item: movie(),
+                ..played()
+            },
+            ..opened_on("tv")
+        },
+    );
+    assert_eq!(
+        playbacks.end_session(&spoolframe_protocol::SessionId("s".into())),
+        1
+    );
+    let mut rows = h.store.all_plays(h.alice).await.unwrap();
+    for _ in 0..100 {
+        if rows.first().is_some_and(|r| r.closed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        rows = h.store.all_plays(h.alice).await.unwrap();
+    }
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].closed, "{rows:?}");
+    assert_eq!(rows[0].media_id, movie().id().to_string());
 }

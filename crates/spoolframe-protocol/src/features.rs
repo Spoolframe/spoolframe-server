@@ -51,8 +51,21 @@ pub const LAST_VIEWED: &str = "spoolframe:last-viewed";
 /// is `Unsupported`.
 pub const PLAYLIST_SHARING: &str = "spoolframe:playlist-sharing";
 
+/// Play history (PX-52): every play the server saw kept, tracks
+/// included. `PlaybackState::play_count` and `last_played_at` on `Item`'s
+/// item and children and on Recently played's items, and the
+/// `RecentlyPlayed` request. A session whose client did not list it is
+/// sent neither field, and its `RecentlyPlayed` is `Unsupported`.
+pub const PLAY_HISTORY: &str = "spoolframe:play-history";
+
 /// Every regular feature this build knows.
-pub const ALL: &[&str] = &[PLAYLISTS, LIKED, LAST_VIEWED, PLAYLIST_SHARING];
+pub const ALL: &[&str] = &[
+    PLAYLISTS,
+    LIKED,
+    LAST_VIEWED,
+    PLAYLIST_SHARING,
+    PLAY_HISTORY,
+];
 
 /// The ones that change what a client can do before it has a session:
 /// what the answer to `Hello` lists. None yet.
@@ -100,6 +113,12 @@ mod tests {
     fn playlist_sharing_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&PLAYLIST_SHARING));
         assert!(!PRE_AUTH.contains(&PLAYLIST_SHARING));
+    }
+
+    #[test]
+    fn play_history_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&PLAY_HISTORY));
+        assert!(!PRE_AUTH.contains(&PLAY_HISTORY));
     }
 
     #[test]

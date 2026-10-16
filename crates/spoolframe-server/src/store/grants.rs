@@ -189,9 +189,9 @@ impl Store {
 
     /// `portable` leaves this server (PX-47): its grant revoked as
     /// [`Store::revoke_grant`] revokes it, its sessions ended, and what it
-    /// kept here deleted: watch state, hidden rows, track preferences and
-    /// overrides, its playlists, pins and places. `false` if it had no live
-    /// grant.
+    /// kept here deleted: watch state, plays (PX-52), hidden rows, track
+    /// preferences and overrides, its playlists, pins and places. `false`
+    /// if it had no live grant.
     pub async fn leave_portable(&self, portable: PortableUserId) -> Result<bool, StoreError> {
         let principal = crate::principal::Principal::PortableUser(portable).to_string();
         let mut tx = self.begin_write().await?;
@@ -202,6 +202,8 @@ impl Store {
         for delete in [
             "DELETE FROM watch_state_ids WHERE principal = ?1",
             "DELETE FROM watch_state WHERE principal = ?1",
+            "DELETE FROM play_ids WHERE principal = ?1",
+            "DELETE FROM plays WHERE principal = ?1",
             "DELETE FROM continue_hidden_ids WHERE principal = ?1",
             "DELETE FROM continue_hidden WHERE principal = ?1",
             "DELETE FROM track_overrides WHERE principal = ?1",

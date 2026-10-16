@@ -10,6 +10,31 @@
   again, so removing an app stops its new sign-ins; tokens already given
   keep working until the app is disconnected. Before, any app with an
   https or loopback redirect URI could register.
+- Play history (PX-52): the server keeps every play, tracks included,
+  one row each with when it started and ended, how long was actually
+  played (a seek adds nothing, and one report adds at most 30 s, so a
+  report after a long silence is not taken as play), whether it counts,
+  the device and the path (iroh or HTTP). A track counts at half its
+  length or 4 minutes, whichever comes first, by a play that started
+  before that point; a film or an episode when it is watched (its
+  credits, else 95%) by a play that started before that point, with at
+  least half of what the play covered actually played. So seeking to
+  the end is not a play, and neither is a track or a film stopped past
+  that point and resumed in a new playback a second one. Play history
+  never fails or holds up a playback request: plays are written in the
+  background, one that cannot be written is logged, and its progress
+  report and stop still answer. A track's
+  progress report is no longer refused as "no watch state"; tracks get
+  no resume point in Continue watching. Behind a new regular feature,
+  `spoolframe:play-history` (the protocol version is unchanged): a
+  client that lists it gets `play_count` and `last_played_at` in the
+  playback state of an item's details and its children, and may ask
+  `RecentlyPlayed { kinds, offset, limit }`, the user's items by their
+  latest play, newest first. A portable user's plays go when they leave
+  the server. SDK: `Features::play_history`,
+  `Session::recently_played`, and `PlaybackState::play_count` and
+  `last_played_at`. Migration 0033 adds the `plays` and `play_ids`
+  tables.
 - Fix (SDK): an address where a saved server was once reached, now
   answered by a server of another key, no longer stops every dial. Iroh
   settles the handshake on the first answer, so the other server's key

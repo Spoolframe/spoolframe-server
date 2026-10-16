@@ -26,6 +26,7 @@ mod link_meter;
 pub mod pairing;
 mod pairing_relay;
 mod playlists;
+mod plays;
 pub mod portable;
 mod portable_sign_in;
 mod reachability;

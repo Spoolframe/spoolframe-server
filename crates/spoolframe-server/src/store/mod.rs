@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod passkeys;
 pub mod pins;
 pub mod playlists;
+pub mod plays;
 pub mod portable;
 pub mod sessions;
 pub mod ties;
@@ -33,6 +34,23 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 
 /// The database file's name inside the state directory.
 pub const DB_FILE: &str = "spoolframe.db";
+
+/// Push `values` to `query` as a parenthesised list of binds, for an `IN`.
+/// The list must not be empty: SQLite reads `IN ()` as false, but a
+/// caller that has nothing to ask for should not ask.
+pub(crate) fn push_in_list<'t, T>(
+    query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    values: impl IntoIterator<Item = T>,
+) where
+    T: sqlx::Encode<'t, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    query.push("(");
+    let mut list = query.separated(", ");
+    for value in values {
+        list.push_bind(value);
+    }
+    query.push(")");
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
