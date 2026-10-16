@@ -417,7 +417,7 @@ async fn every_call_is_counted_and_logged() {
     }
 }
 
-const PLAYLIST_TOOLS: [&str; 9] = [
+const PLAYLIST_TOOLS: [&str; 11] = [
     "list_playlists",
     "get_playlist",
     "create_playlist",
@@ -426,6 +426,8 @@ const PLAYLIST_TOOLS: [&str; 9] = [
     "move_in_playlist",
     "pin_playlist",
     "unpin_playlist",
+    "like",
+    "unlike",
     "set_watched",
 ];
 
@@ -497,7 +499,7 @@ async fn a_playlist_of_every_heist_episode_is_made_through_search_and_add_to_pla
         principal: alice,
         admin: false,
     };
-    let (theirs, _) = server.playlists.list(&actor).await.unwrap();
+    let (theirs, _) = server.playlists.list(&actor, true).await.unwrap();
     assert_eq!(theirs.len(), 1);
     assert_eq!(theirs[0].name, "Heists");
 }
@@ -523,7 +525,15 @@ async fn without_the_scope_the_playlist_tools_are_absent_and_refused() {
         admin: false,
     };
     // Nothing was made, for anyone.
-    assert!(server.playlists.list(&actor).await.unwrap().0.is_empty());
+    assert!(
+        server
+            .playlists
+            .list(&actor, true)
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
 }
 
 /// With playlists:read alone an app reads playlists and changes none:
@@ -569,9 +579,60 @@ async fn with_playlists_read_the_playlists_are_read_and_not_changed() {
         .await
         .unwrap_err();
     assert!(refused.contains("playlists:write"), "{refused}");
-    let (mine, _) = server.playlists.list(&actor).await.unwrap();
+    let (mine, _) = server.playlists.list(&actor, true).await.unwrap();
     assert_eq!(mine.len(), 1);
     assert_eq!(mine[0].id, made.id);
+}
+
+/// PX-43: an agent likes an album for the user and takes a track out
+/// again; Liked and All come first among their playlists, and an item
+/// says whether it is liked. Only tracks and albums are liked.
+#[tokio::test]
+async fn like_and_unlike_change_the_user_s_liked() {
+    let (server, addr) = beside("mcp-like").await;
+    server.catalog.serve_music();
+    user(&server, "alice", Role::Consumer).await;
+    let mcp = Mcp::connect(addr, "alice", &["library:read", "playlists:write"]).await;
+    let liked = mcp
+        .call("like", json!({ "items": ["plex:album:31"] }))
+        .await
+        .unwrap();
+    assert_eq!(liked["builtin"], "liked");
+    let album = mcp
+        .call("get_item", json!({ "id": "plex:album:31" }))
+        .await
+        .unwrap();
+    assert_eq!(album["liked"], "all");
+    assert_eq!(album["playlists"][0]["id"], liked["id"]);
+    mcp.call("unlike", json!({ "items": ["plex:track:33"] }))
+        .await
+        .unwrap();
+    let album = mcp
+        .call("get_item", json!({ "id": "plex:album:31" }))
+        .await
+        .unwrap();
+    assert_eq!(album["liked"], "some");
+    assert_eq!(album["likedTracks"], json!(["plex:track:32"]));
+
+    let listed = mcp.call("list_playlists", json!({})).await.unwrap();
+    let builtins: Vec<&Value> = listed["playlists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| &p["builtin"])
+        .collect();
+    assert_eq!(builtins, [&json!("liked"), &json!("all")]);
+    let page = mcp
+        .call("get_playlist", json!({ "playlist": liked["id"] }))
+        .await
+        .unwrap();
+    assert_eq!(page["entries"][0]["liked"], true);
+
+    let refused = mcp
+        .call("like", json!({ "items": ["plex:movie:1"] }))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("only a track or an album"), "{refused}");
 }
 
 #[tokio::test]

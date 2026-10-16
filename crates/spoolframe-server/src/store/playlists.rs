@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use spoolframe_policy::playlists::{self as policy, Since, Step};
-use spoolframe_protocol::playlists::{EntryId, Kinds, PlaySettings, Repeat};
+use spoolframe_protocol::playlists::{Builtin, EntryId, Kinds, PlaySettings, Repeat};
 use sqlx::{QueryBuilder, Sqlite};
 
 use super::{Store, StoreError, decode_error};
@@ -45,6 +45,8 @@ pub struct PlaylistRow {
     pub created_at: i64,
     pub updated_at: i64,
     pub shares: Vec<ShareRow>,
+    /// Liked or All (PX-43); `None` for one a user made.
+    pub builtin: Option<Builtin>,
 }
 
 impl PlaylistRow {
@@ -217,7 +219,44 @@ fn kinds_of(bits: i64) -> Kinds {
     }
 }
 
-type PlaylistTuple = (String, String, String, i64, bool, i64, i64, i64);
+type PlaylistTuple = (
+    String,
+    String,
+    String,
+    i64,
+    bool,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+);
+
+fn builtin_text(builtin: Builtin) -> &'static str {
+    match builtin {
+        Builtin::Liked => "liked",
+        Builtin::All => "all",
+        // Never made: the service makes Liked and All only.
+        Builtin::Unknown => "unknown",
+    }
+}
+
+fn builtin_of(text: &str) -> Builtin {
+    match text {
+        "liked" => Builtin::Liked,
+        "all" => Builtin::All,
+        _ => Builtin::Unknown,
+    }
+}
+
+/// What a built-in playlist is called when made; clients name it by its
+/// `builtin` in their own language.
+fn builtin_name(builtin: Builtin) -> &'static str {
+    match builtin {
+        Builtin::Liked => "Liked",
+        Builtin::All => "All",
+        Builtin::Unknown => "Built-in",
+    }
+}
 
 type PlaceTuple = (Option<i64>, bool, String, bool, Option<String>);
 
@@ -230,11 +269,11 @@ type EntryTuple = (
     Option<String>,
 );
 
-const PLAYLIST_COLUMNS: &str =
-    "p.id, p.owner, p.name, p.kinds, p.server_wide, p.revision, p.created_at, p.updated_at";
+const PLAYLIST_COLUMNS: &str = "p.id, p.owner, p.name, p.kinds, p.server_wide, p.revision, \
+     p.created_at, p.updated_at, p.builtin";
 
 fn playlist_of(row: PlaylistTuple, shares: Vec<ShareRow>) -> PlaylistRow {
-    let (id, owner, name, kinds, server_wide, revision, created_at, updated_at) = row;
+    let (id, owner, name, kinds, server_wide, revision, created_at, updated_at, builtin) = row;
     PlaylistRow {
         id,
         owner,
@@ -245,6 +284,7 @@ fn playlist_of(row: PlaylistTuple, shares: Vec<ShareRow>) -> PlaylistRow {
         created_at,
         updated_at,
         shares,
+        builtin: builtin.as_deref().map(builtin_of),
     }
 }
 
@@ -283,7 +323,57 @@ impl Store {
             created_at: now,
             updated_at: now,
             shares: new.shares.clone(),
+            builtin: None,
         })
+    }
+
+    /// `owner`'s built-in playlist `builtin` (PX-43), made now if it is
+    /// not yet: personal, music only.
+    pub async fn builtin_playlist(
+        &self,
+        owner: &str,
+        builtin: Builtin,
+    ) -> Result<PlaylistRow, StoreError> {
+        let now = self.now();
+        let tracks = Kinds {
+            tracks: true,
+            ..Kinds::default()
+        };
+        sqlx::query(
+            "INSERT INTO playlists (id, owner, name, kinds, builtin, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+             ON CONFLICT (owner, builtin) WHERE builtin IS NOT NULL DO NOTHING",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(owner)
+        .bind(builtin_name(builtin))
+        .bind(kinds_bits(tracks))
+        .bind(builtin_text(builtin))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        let row: PlaylistTuple = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PLAYLIST_COLUMNS} FROM playlists p WHERE p.owner = ?1 AND p.builtin = ?2"
+        )))
+        .bind(owner)
+        .bind(builtin_text(builtin))
+        .fetch_one(&self.pool)
+        .await?;
+        // Never shared.
+        Ok(playlist_of(row, Vec::new()))
+    }
+
+    /// The items in `owner`'s Liked (PX-43), by `MediaId`; none before
+    /// they first like something.
+    pub async fn liked_media(&self, owner: &str) -> Result<HashSet<String>, StoreError> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT e.media_id FROM playlist_entries e JOIN playlists p ON p.id = e.playlist_id \
+             WHERE p.owner = ?1 AND p.builtin = 'liked'",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().collect())
     }
 
     /// One playlist, whoever may see it.

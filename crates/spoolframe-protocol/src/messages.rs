@@ -782,6 +782,23 @@ pub enum Request {
     /// Forget the notes `ListPlaylists` gave: a client showed them.
     /// `Done`. Notes are per user, not per device.
     DismissPinNotes,
+    /// Like tracks or albums (PX-43): their tracks go to the top of the
+    /// session user's Liked, in the order given, an album's in disc and
+    /// track order; a track liked already stays where it is. An album
+    /// likes the tracks it has now: one added to it later is not liked.
+    /// `PlaylistInfo`, Liked as it is now. 1 to 100 items; anything but
+    /// a track or an album is `KindNotAllowed`, an item not here
+    /// `NotFound`. Liked again, nothing changes. Only from a client that
+    /// listed `spoolframe:liked`; from any other, `Unsupported`.
+    Like {
+        items: Vec<MediaId>,
+    },
+    /// Take tracks, or every track of albums, out of the session user's
+    /// Liked (PX-43): `PlaylistInfo`, Liked as it is now. As `Like`
+    /// takes them; one not liked is no change.
+    Unlike {
+        items: Vec<MediaId>,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -1155,6 +1172,17 @@ pub enum Reply {
         // compat(v1): required at the protocol reset
         #[serde(default, skip_serializing_if = "Option::is_none")]
         playlists: Option<Vec<PlaylistRef>>,
+        /// Its heart (PX-43): a track's `all` or `none`; an album's
+        /// `all`, `some` or `none` by the tracks it has now. `None` for
+        /// any other item, and for a client without `spoolframe:liked`.
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        liked: Option<crate::playlists::Liked>,
+        /// An album's tracks among `children` that are liked (PX-43),
+        /// for their hearts. `None` as `liked` is.
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        liked_children: Option<Vec<MediaId>>,
     },
     Search(SearchResults),
     Tracks(MediaTracks),

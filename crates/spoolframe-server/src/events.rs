@@ -190,33 +190,45 @@ impl Addresses {
 
 /// The users each connection that listed `spoolframe:playlists` has
 /// made requests as, by its stable id: who to tell of playlist changes
-/// (PX-40). A connection carries any number of sessions; each one used is
-/// noted, and all go when it closes.
+/// (PX-40), and whether it listed `spoolframe:liked` too (PX-43): one
+/// that did not is not told of Liked and All, which it does not list. A
+/// connection carries any number of sessions; each one used is noted,
+/// and all go when it closes.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PlaylistListeners(Arc<Mutex<HashMap<usize, HashSet<Principal>>>>);
+pub(crate) struct PlaylistListeners(Arc<Mutex<HashMap<usize, Listener>>>);
+
+#[derive(Debug, Default)]
+struct Listener {
+    who: HashSet<Principal>,
+    liked: bool,
+}
 
 impl PlaylistListeners {
-    pub(crate) fn note(&self, id: usize, principal: Principal) {
-        self.0.lock().entry(id).or_default().insert(principal);
+    pub(crate) fn note(&self, id: usize, principal: Principal, liked: bool) {
+        let mut all = self.0.lock();
+        let listener = all.entry(id).or_default();
+        listener.who.insert(principal);
+        listener.liked = liked;
     }
 
     pub(crate) fn remove(&self, id: usize) {
         self.0.lock().remove(&id);
     }
 
-    fn each(&self) -> Vec<(usize, Vec<Principal>)> {
+    fn each(&self) -> Vec<(usize, Vec<Principal>, bool)> {
         self.0
             .lock()
             .iter()
-            .map(|(id, who)| (*id, who.iter().copied().collect()))
+            .map(|(id, l)| (*id, l.who.iter().copied().collect(), l.liked))
             .collect()
     }
 }
 
 /// The event `news` is for a connection whose users are `who`, if any: a
 /// playlist one of them sees now changed; one some saw is gone to all of
-/// them; the pins of one of them changed.
-fn playlist_event(news: &PlaylistNews, who: &[Principal]) -> Option<Event> {
+/// them; the pins of one of them changed. A built-in playlist's news is
+/// only for a connection that takes them (`liked`).
+fn playlist_event(news: &PlaylistNews, who: &[Principal], liked: bool) -> Option<Event> {
     match news {
         PlaylistNews::Playlist {
             id,
@@ -224,6 +236,12 @@ fn playlist_event(news: &PlaylistNews, who: &[Principal]) -> Option<Event> {
             before,
             after,
         } => {
+            let builtin = [before, after]
+                .iter()
+                .any(|seen| seen.as_ref().is_some_and(|s| s.builtin));
+            if builtin && !liked {
+                return None;
+            }
             let sees = |seen: &Option<crate::playlists::Seen>| {
                 seen.as_ref()
                     .is_some_and(|seen| who.iter().any(|p| seen.sees(*p)))
@@ -260,8 +278,8 @@ pub(crate) async fn tell_playlist_news(
             }
             Err(RecvError::Closed) => return,
         };
-        for (id, who) in listeners.each() {
-            if let Some(event) = playlist_event(&told, &who) {
+        for (id, who, liked) in listeners.each() {
+            if let Some(event) = playlist_event(&told, &who, liked) {
                 streams.send(id, event);
             }
         }
@@ -303,24 +321,50 @@ mod tests {
             after: Some(personal),
         };
         assert_eq!(
-            playlist_event(&unshared, &[alice]),
+            playlist_event(&unshared, &[alice], false),
             Some(Event::PlaylistChanged {
                 id: "p".into(),
                 revision: 4
             })
         );
         assert_eq!(
-            playlist_event(&unshared, &[bob]),
+            playlist_event(&unshared, &[bob], false),
             Some(Event::PlaylistGone { id: "p".into() })
         );
-        assert_eq!(playlist_event(&unshared, &[carol]), None);
+        assert_eq!(playlist_event(&unshared, &[carol], false), None);
         // A connection Bob and Alice both use sees it still.
         assert!(matches!(
-            playlist_event(&unshared, &[bob, alice]),
+            playlist_event(&unshared, &[bob, alice], false),
             Some(Event::PlaylistChanged { .. })
         ));
         let pins = PlaylistNews::Pins { principal: bob };
-        assert_eq!(playlist_event(&pins, &[bob]), Some(Event::PinsChanged));
-        assert_eq!(playlist_event(&pins, &[alice]), None);
+        assert_eq!(
+            playlist_event(&pins, &[bob], false),
+            Some(Event::PinsChanged)
+        );
+        assert_eq!(playlist_event(&pins, &[alice], false), None);
+    }
+
+    /// PX-43: a connection that did not list `spoolframe:liked` is not
+    /// told of Liked or All, which it never lists.
+    #[test]
+    fn a_builtin_s_change_is_told_only_to_who_takes_builtins() {
+        let alice = principal(1);
+        let mut liked = crate::playlists::Seen::for_tests(alice, false, &[]);
+        liked.builtin = true;
+        let changed = PlaylistNews::Playlist {
+            id: "liked".into(),
+            revision: 2,
+            before: Some(liked.clone()),
+            after: Some(liked),
+        };
+        assert_eq!(playlist_event(&changed, &[alice], false), None);
+        assert_eq!(
+            playlist_event(&changed, &[alice], true),
+            Some(Event::PlaylistChanged {
+                id: "liked".into(),
+                revision: 2
+            })
+        );
     }
 }

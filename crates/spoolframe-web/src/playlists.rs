@@ -313,6 +313,7 @@ mod tests {
             can_edit,
             can_manage: can_edit,
             revision: 0,
+            builtin: None,
         }
     }
 
@@ -500,6 +501,7 @@ mod tests {
                 entry,
                 item: film.clone(),
                 unavailable: false,
+                liked: false,
             })
             .collect()
     }

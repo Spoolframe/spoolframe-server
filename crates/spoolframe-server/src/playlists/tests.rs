@@ -385,11 +385,11 @@ async fn sharing_gives_read_or_edit_and_a_third_user_sees_nothing() {
         h.playlists.get(&h.admin, &list, 0, 10).await,
         Err(PlaylistsError::NotFound)
     ));
-    let (bobs, _) = h.playlists.list(&h.bob).await.unwrap();
+    let (bobs, _) = h.playlists.list(&h.bob, true).await.unwrap();
     assert_eq!(bobs[0].owner_kind, PlaylistOwnerKind::SharedWithMe);
     // Who else it is shared with is not Bob's to know.
     assert_eq!(bobs[0].visibility, Visibility::Shared { with: vec![] });
-    let (alices, _) = h.playlists.list(&h.alice).await.unwrap();
+    let (alices, _) = h.playlists.list(&h.alice, true).await.unwrap();
     assert_eq!(alices[0].owner_kind, PlaylistOwnerKind::Mine);
     assert!(matches!(&alices[0].visibility, Visibility::Shared { with } if with.len() == 2));
 }
@@ -410,7 +410,7 @@ async fn a_server_wide_playlist_is_made_by_an_admin_seen_by_all_and_edited_by_ad
         admin: false,
     };
     for who in [&h.alice, &h.bob, &guest] {
-        let (seen, _) = h.playlists.list(who).await.unwrap();
+        let (seen, _) = h.playlists.list(who, true).await.unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].owner_kind, PlaylistOwnerKind::ServerWide);
         assert!(!seen[0].can_edit);
@@ -484,30 +484,48 @@ async fn an_item_s_screen_lists_the_playlists_its_viewer_sees_holding_it() {
             refs.into_iter().map(|r| r.id).collect::<Vec<_>>()
         };
         assert_eq!(
-            names(h.playlists.holding(&h.alice, screen, &[]).await.unwrap()),
+            names(
+                h.playlists
+                    .holding(&h.alice, screen, &[], true)
+                    .await
+                    .unwrap()
+            ),
             std::slice::from_ref(&heists),
             "{screen:?}"
         );
         assert_eq!(
-            names(h.playlists.holding(&h.bob, screen, &[]).await.unwrap()),
+            names(
+                h.playlists
+                    .holding(&h.bob, screen, &[], true)
+                    .await
+                    .unwrap()
+            ),
             std::slice::from_ref(&heists)
         );
         assert!(
             h.playlists
-                .holding(&h.carol, screen, &[])
+                .holding(&h.carol, screen, &[], true)
                 .await
                 .unwrap()
                 .is_empty()
         );
     }
-    let for_carol = h.playlists.holding(&h.carol, &show, &[]).await.unwrap();
+    let for_carol = h
+        .playlists
+        .holding(&h.carol, &show, &[], true)
+        .await
+        .unwrap();
     assert_eq!(for_carol.len(), 1);
     assert_eq!(
         (for_carol[0].id.as_str(), for_carol[0].owner_kind),
         (everyone.as_str(), PlaylistOwnerKind::ServerWide)
     );
     assert_eq!(
-        h.playlists.holding(&h.bob, &show, &[]).await.unwrap().len(),
+        h.playlists
+            .holding(&h.bob, &show, &[], true)
+            .await
+            .unwrap()
+            .len(),
         2
     );
 }
@@ -606,11 +624,11 @@ async fn unsharing_a_pinned_playlist_tells_who_lost_it_and_leaves_a_note() {
             principal: h.bob.principal
         }
     );
-    let (lists, notes) = h.playlists.list(&h.bob).await.unwrap();
+    let (lists, notes) = h.playlists.list(&h.bob, true).await.unwrap();
     assert!(lists.is_empty());
     assert_eq!(notes[0].reason, PinNoteReason::Unshared);
     h.playlists.dismiss_pin_notes(&h.bob).await.unwrap();
-    assert!(h.playlists.list(&h.bob).await.unwrap().1.is_empty());
+    assert!(h.playlists.list(&h.bob, true).await.unwrap().1.is_empty());
 }
 
 #[tokio::test]
@@ -622,7 +640,7 @@ async fn a_playlist_one_does_not_see_cannot_be_pinned() {
         Err(PlaylistsError::NotFound)
     ));
     h.playlists.pin(&h.alice, &list, 0).await.unwrap();
-    let (lists, _) = h.playlists.list(&h.alice).await.unwrap();
+    let (lists, _) = h.playlists.list(&h.alice, true).await.unwrap();
     assert_eq!(lists[0].pinned, Some(0));
 }
 
@@ -852,7 +870,7 @@ async fn an_import_makes_a_playlist_of_what_is_here_and_reports_the_rest() {
         .await
         .unwrap();
     assert_eq!((none, count), (None, 2));
-    assert!(h.playlists.list(&h.alice).await.unwrap().0.is_empty());
+    assert!(h.playlists.list(&h.alice, true).await.unwrap().0.is_empty());
     let (made, count, left_out) = h
         .playlists
         .import(&h.alice, "From Plex", &items, false)

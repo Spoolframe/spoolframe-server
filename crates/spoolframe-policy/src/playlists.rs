@@ -1,11 +1,13 @@
 //! Playlist rules (PX-40): who may do what with a playlist, and how an
-//! edit made on an old revision is redone on the newer one.
+//! edit made on an old revision is redone on the newer one. And the
+//! built-in Liked and All (PX-43): what they allow, and how a heart reads.
 //!
 //! Pure: the server's store gathers the facts, these judge them.
 
 use std::collections::HashSet;
 
-use spoolframe_protocol::playlists::EntryId;
+use spoolframe_protocol::playlists::{Builtin, EntryId, Liked, PlaylistEdit};
+use spoolframe_types::MediaKind;
 
 /// What one viewer may do with one playlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -189,6 +191,69 @@ pub fn shuffled(entries: &[EntryId], seed: u64) -> Vec<EntryId> {
     order
 }
 
+/// What a viewer may do with a built-in playlist, given what its
+/// standing gives (`access`, always `Own` for its owner): nobody manages
+/// one, as nobody renames, re-kinds, shares or deletes it; Liked's owner
+/// changes its entries; All is read-only, its entries being the library.
+pub fn builtin_access(builtin: Builtin, access: Access) -> Access {
+    match builtin {
+        Builtin::Liked => access.min(Access::Edit),
+        Builtin::All | Builtin::Unknown => access.min(Access::Read),
+    }
+}
+
+/// Whether `edit` may be made through `EditPlaylist` on `builtin`. Liked
+/// is reordered and pruned there; a track gets in by being liked, so it
+/// goes to the top and is there once.
+pub fn builtin_edit(builtin: Builtin, edit: &PlaylistEdit) -> bool {
+    match builtin {
+        Builtin::Liked => matches!(
+            edit,
+            PlaylistEdit::Remove { .. } | PlaylistEdit::Move { .. }
+        ),
+        Builtin::All | Builtin::Unknown => false,
+    }
+}
+
+/// Whether an item of `kind` is liked or unliked: a track, or an album
+/// for each of its tracks. Not an artist: a heart on an artist would read
+/// as following them.
+pub fn likeable(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Track | MediaKind::Album)
+}
+
+/// An album's heart, from how many tracks it has now and how many of
+/// them are liked. An album with no tracks is not liked.
+pub fn album_liked(tracks: usize, liked: usize) -> Liked {
+    match liked {
+        0 => Liked::None,
+        n if n >= tracks => Liked::All,
+        _ => Liked::Some,
+    }
+}
+
+/// The least entry id of All. All's entries are not stored, so they get
+/// no AUTOINCREMENT id; each is named by its track's id instead (see
+/// [`all_entry`]), in the range from here to `i64::MAX`, which the store's
+/// ids, counted up from 1, never reach. An id there is never mistaken for
+/// a stored entry.
+pub const ALL_ENTRIES: EntryId = 1 << 62;
+
+/// The entry id of `media_id`'s track in All: FNV-1a of the id, in
+/// [`ALL_ENTRIES`]..=`i64::MAX`. The same for the same track whatever
+/// else the library holds, so a place and a shuffled round kept by entry
+/// id stay right after a scan adds tracks; a track whose key changes (a
+/// Plex rebuild) is a new entry, and a place on it starts over. 62 bits:
+/// two tracks of one library sharing one is not a worry.
+pub fn all_entry(media_id: &str) -> EntryId {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in media_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    ALL_ENTRIES | (hash & (ALL_ENTRIES - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +435,72 @@ mod tests {
         assert_eq!(candidates(&order, Some(2), true), [2, 3, 4]);
         // An entry taken out since: from the start.
         assert_eq!(candidates(&order, Some(9), false), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn liked_is_edited_by_its_owner_and_never_managed() {
+        assert_eq!(builtin_access(Builtin::Liked, Access::Own), Access::Edit);
+        assert!(!builtin_access(Builtin::Liked, Access::Own).can_manage());
+        // Nobody else sees it at all.
+        assert_eq!(builtin_access(Builtin::Liked, Access::None), Access::None);
+    }
+
+    #[test]
+    fn all_is_read_only_to_its_owner() {
+        let all = builtin_access(Builtin::All, Access::Own);
+        assert_eq!(all, Access::Read);
+        assert!(!all.can_edit());
+        assert_eq!(builtin_access(Builtin::Unknown, Access::Own), Access::Read);
+    }
+
+    #[test]
+    fn liked_is_reordered_and_pruned_but_not_added_to_by_an_edit() {
+        let moved = PlaylistEdit::Move {
+            entry: 1,
+            before: None,
+        };
+        let removed = PlaylistEdit::Remove { entry: 1 };
+        assert!(builtin_edit(Builtin::Liked, &moved));
+        assert!(builtin_edit(Builtin::Liked, &removed));
+        assert!(!builtin_edit(Builtin::Liked, &add("plex:track:1")));
+        assert!(!builtin_edit(Builtin::All, &moved));
+    }
+
+    #[test]
+    fn only_tracks_and_albums_are_liked() {
+        assert!(likeable(MediaKind::Track));
+        assert!(likeable(MediaKind::Album));
+        for kind in [
+            MediaKind::Artist,
+            MediaKind::Movie,
+            MediaKind::Episode,
+            MediaKind::Season,
+            MediaKind::Show,
+        ] {
+            assert!(!likeable(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn an_album_s_heart_is_full_half_or_empty() {
+        assert_eq!(album_liked(12, 12), Liked::All);
+        assert_eq!(album_liked(12, 11), Liked::Some);
+        assert_eq!(album_liked(12, 0), Liked::None);
+        // A track added later: 12 liked of 13 is half.
+        assert_eq!(album_liked(13, 12), Liked::Some);
+        assert_eq!(album_liked(0, 0), Liked::None);
+    }
+
+    #[test]
+    fn an_all_entry_is_its_track_s_and_never_a_stored_one() {
+        let a = all_entry("plex:track:32");
+        assert_eq!(a, all_entry("plex:track:32"));
+        assert_ne!(a, all_entry("plex:track:33"));
+        for id in ["plex:track:1", "", "plex:track:99999999"] {
+            let entry = all_entry(id);
+            assert!(entry >= ALL_ENTRIES, "{id}");
+            assert!(i64::try_from(entry).is_ok(), "{id}: kept as SQLite's i64");
+        }
     }
 
     #[test]

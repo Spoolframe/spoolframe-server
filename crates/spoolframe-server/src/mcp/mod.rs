@@ -173,7 +173,9 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
             tool: schema::<NoArgs>(tool(
                 "list_playlists",
                 "The playlists the user sees: their own, those shared with them and the \
-                 server-wide ones, with whether they may change each and where it is pinned.",
+                 server-wide ones, with whether they may change each and where it is pinned. \
+                 First, while there is music, the built-in Liked (the tracks the user liked; \
+                 changed by like and unlike) and All (every track; read-only).",
             ))
             .annotate(reads()),
         },
@@ -240,6 +242,32 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
                 "Take a playlist out of the user's Pinned.",
             ))
             .annotate(writes().idempotent(true)),
+        },
+        Entry {
+            scope: Scope::PlaylistsWrite,
+            tool: schema::<LikeArgs>(tool(
+                "like",
+                "Like tracks or albums: their tracks go to the top of the user's Liked \
+                 playlist, an album's in order; one liked already stays where it is. Only \
+                 tracks and albums are liked.",
+            ))
+            .annotate(writes().idempotent(true)),
+        },
+        Entry {
+            scope: Scope::PlaylistsWrite,
+            tool: schema::<LikeArgs>(tool(
+                "unlike",
+                "Take tracks, or every track of albums, out of the user's Liked playlist.",
+            ))
+            // As remove_from_playlist: liked again, a track goes to the
+            // top, not back where it was.
+            .annotate(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .idempotent(true)
+                    .open_world(false),
+            ),
         },
         Entry {
             scope: Scope::PlaylistsWrite,
@@ -420,6 +448,13 @@ struct MoveArgs {
     entry: u64,
     /// The entry to put it before; at the end if left out.
     before: Option<u64>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct LikeArgs {
+    /// The tracks' or albums' ids; at most 100.
+    items: Vec<String>,
 }
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
@@ -688,6 +723,21 @@ impl McpServer {
                     .await?;
                 Ok(json!({ "pinned": false }))
             }
+            "like" | "unlike" => {
+                let a: LikeArgs = args(arguments)?;
+                let items = a
+                    .items
+                    .iter()
+                    .map(|id| media_id(id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let library = self.library()?;
+                let liked = if name == "like" {
+                    library.playlists.like(&caller.actor(), &items).await?
+                } else {
+                    library.playlists.unlike(&caller.actor(), &items).await?
+                };
+                Ok(playlist_json(&liked))
+            }
             "set_watched" => {
                 let a: SetWatchedArgs = args(arguments)?;
                 let library = self.library()?;
@@ -789,12 +839,18 @@ impl McpServer {
         library.watch.fill(caller.principal(), &mut items).await?;
         let playlists = library
             .playlists
-            .holding(&caller.actor(), &found.item, &found.children)
+            .holding(&caller.actor(), &found.item, &found.children, true)
+            .await?;
+        let (liked, liked_children) = library
+            .playlists
+            .liked(&caller.actor(), &found.item, &found.children)
             .await?;
         Ok(json!({
             "item": item_detail(&found.item),
             "children": items_json(&found.children),
             "playlists": playlists.iter().map(|p| json!({ "id": p.id, "name": p.name })).collect::<Vec<_>>(),
+            "liked": liked,
+            "likedTracks": liked_children,
         }))
     }
 
@@ -830,7 +886,7 @@ impl McpServer {
 impl McpServer {
     async fn list_playlists(&self, caller: &McpCaller) -> ToolResult {
         let library = self.library()?;
-        let (playlists, _) = library.playlists.list(&caller.actor()).await?;
+        let (playlists, _) = library.playlists.list(&caller.actor(), true).await?;
         Ok(json!({ "playlists": playlists.iter().map(playlist_json).collect::<Vec<_>>() }))
     }
 
@@ -848,6 +904,7 @@ impl McpServer {
                 "entry": e.entry,
                 "item": item_json(&e.item),
                 "unavailable": e.unavailable,
+                "liked": e.liked,
             })).collect::<Vec<_>>(),
             "offset": page.offset,
             "total": page.total,
@@ -995,6 +1052,7 @@ fn playlist_json(p: &PlaylistSummary) -> Value {
         "canEdit": p.can_edit,
         "canManage": p.can_manage,
         "pinned": p.pinned,
+        "builtin": p.builtin,
     })
 }
 
@@ -1175,10 +1233,11 @@ mod tests {
             "end_session",
             "stop_playback",
             "remove_from_playlist",
+            "unlike",
         ] {
             assert_eq!(annotations(name).destructive_hint, Some(true), "{name}");
         }
-        for name in ["create_playlist", "add_to_playlist", "set_watched"] {
+        for name in ["create_playlist", "add_to_playlist", "set_watched", "like"] {
             assert_eq!(annotations(name).destructive_hint, Some(false), "{name}");
         }
         for name in ["search", "list_users", "read_logs", "list_playlists"] {

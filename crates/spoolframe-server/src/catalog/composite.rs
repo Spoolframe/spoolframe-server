@@ -309,6 +309,17 @@ impl Catalog for Composite {
         Ok(episodes.into_iter().map(|i| ids::item(server, i)).collect())
     }
 
+    async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
+        let (server, local) = ids::library_local(library);
+        let tracks = self
+            .source(server, library)?
+            .catalog
+            .tracks(&local)
+            .await
+            .map_err(|e| named(e, &local, library))?;
+        Ok(tracks.into_iter().map(|i| ids::item(server, i)).collect())
+    }
+
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
         let (server, local) = ids::media_local(id);
         self.source(server, id)?

@@ -155,6 +155,13 @@ pub struct ItemDetail {
     /// The playlists the user sees that hold it (PX-40). Empty when none,
     /// or the server has no playlists.
     pub playlists: Vec<spoolframe_protocol::playlists::PlaylistRef>,
+    /// Its heart (PX-43): a track's `All` or `None`, an album's `All`,
+    /// `Some` or `None`. `None` for anything else, or when the server has
+    /// no Liked.
+    pub liked: Option<spoolframe_protocol::playlists::Liked>,
+    /// An album's tracks among `children` that are liked (PX-43). Empty
+    /// otherwise.
+    pub liked_children: Vec<MediaId>,
 }
 
 /// How the server would play an item.
@@ -750,11 +757,15 @@ impl Session {
                 children,
                 markers,
                 playlists,
+                liked,
+                liked_children,
             } => Ok(ItemDetail {
                 item,
                 children,
                 markers,
                 playlists: playlists.unwrap_or_default(),
+                liked,
+                liked_children: liked_children.unwrap_or_default(),
             }),
             other => Err(unexpected(other)),
         }

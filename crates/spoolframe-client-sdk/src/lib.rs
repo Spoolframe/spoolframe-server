@@ -71,9 +71,9 @@ pub use session::{
     PlaybackOptions, PlaybackQuality, ProfileSignIn, SavedProfile, Session, SignInMethod, Subtitle,
 };
 pub use spoolframe_protocol::playlists::{
-    EntryId, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings, PlaylistEdit, PlaylistEntry,
-    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare, PlaylistSummary,
-    PlexImport, PlexImported, PlexUnmapped, Repeat, Visibility,
+    Builtin, EntryId, ItemKind, Kinds, Liked, PinNote, PinNoteReason, PlaySettings, PlaylistEdit,
+    PlaylistEntry, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare,
+    PlaylistSummary, PlexImport, PlexImported, PlexUnmapped, Repeat, Visibility,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{

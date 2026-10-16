@@ -170,6 +170,11 @@ impl Catalog for LiveCatalog {
             .await
     }
 
+    /// Not kept: All (PX-43) shows a newly scanned album at once.
+    async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
+        self.current()?.tracks(library).await
+    }
+
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
         self.replies
             .read(

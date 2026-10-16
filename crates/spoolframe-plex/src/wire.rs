@@ -159,6 +159,12 @@ pub struct Metadata {
     pub media: Vec<Media>,
     /// Plex's own stable id, `plex://movie/…`.
     pub guid: Option<String>,
+    /// The token's account's stars, 0 to 10 (PX-43: a track rated is
+    /// liked on import), and when it was last rated (Unix s).
+    #[serde(default, deserialize_with = "lenient")]
+    pub user_rating: Option<f64>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub last_rated_at: Option<i64>,
     /// A playlist's: `video`, `audio` or `photo` (PX-40).
     pub playlist_type: Option<String>,
     /// A playlist made by rules rather than by hand (PX-40).

@@ -544,3 +544,53 @@ async fn a_place_and_its_settings_are_kept_per_user_and_playlist() {
         Some(ended)
     );
 }
+
+/// PX-43: each user has one Liked and one All, however often they are
+/// asked for, and only Liked's entries count as liked.
+#[tokio::test]
+async fn a_user_s_builtin_playlists_are_made_once() {
+    let store = store("playlists-builtin").await;
+    let liked = store.builtin_playlist(ALICE, Builtin::Liked).await.unwrap();
+    assert_eq!(liked.builtin, Some(Builtin::Liked));
+    assert_eq!(liked.name, "Liked");
+    assert!(liked.kinds.tracks && !liked.kinds.movies && !liked.kinds.episodes);
+    let again = store.builtin_playlist(ALICE, Builtin::Liked).await.unwrap();
+    assert_eq!(again.id, liked.id);
+    let all = store.builtin_playlist(ALICE, Builtin::All).await.unwrap();
+    assert_ne!(all.id, liked.id);
+    let bobs = store.builtin_playlist(BOB, Builtin::Liked).await.unwrap();
+    assert_ne!(bobs.id, liked.id);
+
+    let mut track = episode(1);
+    track.media_id = "plex:track:7".into();
+    store
+        .edit_playlist(
+            &liked.id,
+            liked.revision,
+            vec![EntryEdit::Add {
+                entries: vec![track],
+                before: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let other = playlist(&store, ALICE, Vec::new()).await;
+    store
+        .edit_playlist(
+            &other.id,
+            other.revision,
+            vec![EntryEdit::Add {
+                entries: vec![episode(2)],
+                before: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let liked_now = store.liked_media(ALICE).await.unwrap();
+    assert_eq!(liked_now.into_iter().collect::<Vec<_>>(), ["plex:track:7"]);
+    assert!(store.liked_media(BOB).await.unwrap().is_empty());
+    assert_eq!(
+        store.playlist(&all.id).await.unwrap().unwrap().builtin,
+        Some(Builtin::All)
+    );
+}

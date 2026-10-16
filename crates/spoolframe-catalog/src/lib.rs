@@ -160,6 +160,47 @@ pub trait Catalog: Send + Sync {
         Ok(episodes)
     }
 
+    /// Every track of music library `library`, in no order promised:
+    /// what the built-in All playlist (PX-43) is made of. Walks its
+    /// artists' albums by default; a backend that can list a library's
+    /// tracks at once does so, a page of requests rather than one per
+    /// album.
+    async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
+        const PAGE: u32 = 200;
+        let mut artists = Vec::new();
+        loop {
+            let page = self
+                .items(
+                    library,
+                    Page {
+                        offset: artists.len() as u32,
+                        limit: PAGE,
+                    },
+                )
+                .await?;
+            let got = page.items.len();
+            artists.extend(page.items);
+            if got == 0 || artists.len() >= page.total as usize {
+                break;
+            }
+        }
+        let mut tracks = Vec::new();
+        for artist in artists.iter().filter(|a| matches!(a, Item::Artist(_))) {
+            for album in self.item(artist.id()).await?.children {
+                if let Item::Album(album) = album {
+                    tracks.extend(
+                        self.item(&album.id)
+                            .await?
+                            .children
+                            .into_iter()
+                            .filter(|t| matches!(t, Item::Track(_))),
+                    );
+                }
+            }
+        }
+        Ok(tracks)
+    }
+
     /// The stable identities of the item now under `id`, as
     /// [`ItemWithChildren::external_ids`], without its children or
     /// markers: the cheapest way to ask what a key holds. `NotFound` when

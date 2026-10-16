@@ -2436,3 +2436,31 @@ async fn two_devices_see_each_other_s_playlist_changes() {
     laptop.close().await;
     server.stop().await;
 }
+
+/// PX-43: the SDK lists `spoolframe:liked`, so a session has Liked and
+/// All, first; `like` and `unlike` change Liked, and an album's details
+/// carry its heart and its liked tracks.
+#[tokio::test]
+async fn the_sdk_likes_an_album_and_reads_its_hearts() {
+    use spoolframe_client_sdk::{Builtin, Liked};
+    use spoolframe_types::{MediaId, MediaKind, Namespace};
+    let (server, phone, _) = ready("liked-sdk").await;
+    server.catalog.serve_music();
+    let session = alice(&server, &phone).await;
+    assert!(session.features().liked);
+    let album = MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap();
+    let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
+    let liked = session.like(std::slice::from_ref(&album)).await.unwrap();
+    assert_eq!(liked.builtin, Some(Builtin::Liked));
+    let listed = session.playlists().await.unwrap().playlists;
+    assert_eq!(listed[0].builtin, Some(Builtin::Liked));
+    assert_eq!(listed[1].builtin, Some(Builtin::All));
+    let detail = session.item(&album).await.unwrap();
+    assert_eq!(detail.liked, Some(Liked::All));
+    assert_eq!(detail.liked_children.len(), 2);
+    session.unlike(std::slice::from_ref(&track)).await.unwrap();
+    let detail = session.item(&album).await.unwrap();
+    assert_eq!(detail.liked, Some(Liked::Some));
+    phone.close().await;
+    server.stop().await;
+}

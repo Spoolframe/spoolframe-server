@@ -1818,9 +1818,41 @@ impl ClientProtocol {
         // PX-40: a connection that takes playlist events is told of the
         // changes to what each user it acts as sees.
         let playlists_listed = features::has(&hello.features, features::PLAYLISTS);
+        // PX-43: Liked and All, and hearts, only for a client that knows
+        // them; one that does not would offer to rename or delete them.
+        let liked_listed = playlists_listed && features::has(&hello.features, features::LIKED);
         if playlists_listed {
             self.playlist_listeners
-                .note(connection.stable_id(), principal);
+                .note(connection.stable_id(), principal, liked_listed);
+        }
+        if !liked_listed {
+            match &request {
+                Request::Like { .. } | Request::Unlike { .. } => {
+                    return Err(Error::Unsupported {
+                        request: format!("a like without {}", features::LIKED),
+                    });
+                }
+                // Liked and All are not there for it.
+                Request::GetPlaylist { id, .. }
+                | Request::UpdatePlaylist { id, .. }
+                | Request::EditPlaylist { id, .. }
+                | Request::DeletePlaylist { id }
+                | Request::PinPlaylist { id, .. }
+                | Request::UnpinPlaylist { id }
+                | Request::PlayPlaylist { id, .. }
+                | Request::NextInPlaylist { id, .. }
+                    if self
+                        .services
+                        .playlists
+                        .builtin_of(id)
+                        .await
+                        .map_err(playlists_error)?
+                        .is_some() =>
+                {
+                    return Err(playlists_error(crate::playlists::PlaylistsError::NotFound));
+                }
+                _ => {}
+            }
         }
         // A request about a playback says which in its span, and links to
         // the playback's start.
@@ -2358,25 +2390,37 @@ impl ClientProtocol {
                     Some(
                         self.services
                             .playlists
-                            .holding(&actor, &found.item, &found.children)
+                            .holding(&actor, &found.item, &found.children, liked_listed)
                             .await
                             .map_err(playlists_error)?,
                     )
                 } else {
                     None
                 };
+                // PX-43: the hearts, for a client that takes them.
+                let (liked, liked_children) = if liked_listed {
+                    self.services
+                        .playlists
+                        .liked(&actor, &found.item, &found.children)
+                        .await
+                        .map_err(playlists_error)?
+                } else {
+                    (None, None)
+                };
                 Ok(Reply::Item {
                     item: found.item,
                     children: found.children,
                     markers: found.markers,
                     playlists,
+                    liked,
+                    liked_children,
                 })
             }
             Request::ListPlaylists => {
                 let (playlists, pin_notes) = self
                     .services
                     .playlists
-                    .list(&actor)
+                    .list(&actor, liked_listed)
                     .await
                     .map_err(playlists_error)?;
                 Ok(Reply::Playlists {
@@ -2389,7 +2433,12 @@ impl ClientProtocol {
                 .playlists
                 .get(&actor, &id, offset, limit)
                 .await
-                .map(Reply::Playlist)
+                .map(|mut page| {
+                    if !liked_listed {
+                        page.entries.iter_mut().for_each(|e| e.liked = false);
+                    }
+                    Reply::Playlist(page)
+                })
                 .map_err(playlists_error),
             Request::CreatePlaylist {
                 name,
@@ -2474,14 +2523,14 @@ impl ClientProtocol {
                     },
                 )
                 .await
-                .map(|next| next.map_or(Reply::PlaylistFinished, Reply::PlaylistItem))
+                .map(|next| playing(next, liked_listed))
                 .map_err(playlists_error),
             Request::NextInPlaylist { id, after } => self
                 .services
                 .playlists
                 .next(&actor, &id, after)
                 .await
-                .map(|next| next.map_or(Reply::PlaylistFinished, Reply::PlaylistItem))
+                .map(|next| playing(next, liked_listed))
                 .map_err(playlists_error),
             Request::ImportPlexPlaylists { dry_run } => {
                 let user = local(&who)?;
@@ -2518,6 +2567,20 @@ impl ClientProtocol {
                 .dismiss_pin_notes(&actor)
                 .await
                 .map(|()| Reply::Done)
+                .map_err(playlists_error),
+            Request::Like { items } => self
+                .services
+                .playlists
+                .like(&actor, &items)
+                .await
+                .map(Reply::PlaylistInfo)
+                .map_err(playlists_error),
+            Request::Unlike { items } => self
+                .services
+                .playlists
+                .unlike(&actor, &items)
+                .await
+                .map(Reply::PlaylistInfo)
                 .map_err(playlists_error),
             Request::Search(mut search) => {
                 search.limit = search.limit.min(MAX_PAGE);
@@ -5847,6 +5910,18 @@ pub(crate) fn unserved(e: &CatalogError) -> bool {
     )
 }
 
+/// What plays next, as a client is told it: its heart only for one that
+/// takes hearts (PX-43).
+fn playing(next: Option<spoolframe_protocol::playlists::PlaylistNext>, liked: bool) -> Reply {
+    match next {
+        Some(mut next) => {
+            next.liked &= liked;
+            Reply::PlaylistItem(next)
+        }
+        None => Reply::PlaylistFinished,
+    }
+}
+
 /// A playlist failure as the client sees it (PX-40).
 fn playlists_error(e: crate::playlists::PlaylistsError) -> Error {
     use crate::playlists::PlaylistsError;
@@ -5859,7 +5934,9 @@ fn playlists_error(e: crate::playlists::PlaylistsError) -> Error {
         },
         PlaylistsError::ReadOnly => Error::PlaylistReadOnly,
         PlaylistsError::AdminRequired => Error::AdminRequired,
-        PlaylistsError::KindNotAllowed(kind) => Error::KindNotAllowed { kind: kind.into() },
+        PlaylistsError::KindNotAllowed(kind) | PlaylistsError::NotLikeable(kind) => {
+            Error::KindNotAllowed { kind: kind.into() }
+        }
         PlaylistsError::InvalidInput(message) => Error::InvalidInput { message },
         PlaylistsError::Conflict { revision } => Error::PlaylistConflict { revision },
         PlaylistsError::Catalog(e) => catalog_error(e),

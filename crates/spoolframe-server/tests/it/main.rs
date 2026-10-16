@@ -31,6 +31,7 @@ mod lan;
 mod leave;
 mod libraries;
 mod license_boundary;
+mod liked;
 mod mcp;
 mod metrics;
 mod not_set_up;

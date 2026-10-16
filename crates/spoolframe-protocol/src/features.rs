@@ -22,8 +22,19 @@
 /// `PlaylistGone` and `PinsChanged` events.
 pub const PLAYLISTS: &str = "spoolframe:playlists";
 
+/// Liked and All (PX-43), on top of [`PLAYLISTS`]: the `Like` and
+/// `Unlike` requests; `Item`'s `liked` and `liked_children`, and the
+/// `liked` of a playlist's entries and of the entry playing; a playlist
+/// summary's and reference's `builtin`; and the built-in Liked and All
+/// playlists themselves. A session whose client did not list it is sent
+/// none of these, and is never shown Liked or All, as it would not know
+/// them for built-ins and would offer to rename or delete them. The first
+/// feature added instead of a protocol version: an app built before it
+/// keeps working against a server that has it.
+pub const LIKED: &str = "spoolframe:liked";
+
 /// Every regular feature this build knows.
-pub const ALL: &[&str] = &[PLAYLISTS];
+pub const ALL: &[&str] = &[PLAYLISTS, LIKED];
 
 /// The ones that change what a client can do before it has a session:
 /// what the answer to `Hello` lists. None yet.
@@ -59,5 +70,11 @@ mod tests {
     fn playlists_are_not_pre_auth() {
         assert!(ALL.contains(&PLAYLISTS));
         assert!(!PRE_AUTH.contains(&PLAYLISTS));
+    }
+
+    #[test]
+    fn liked_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&LIKED));
+        assert!(!PRE_AUTH.contains(&LIKED));
     }
 }

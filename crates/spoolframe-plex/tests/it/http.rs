@@ -1313,3 +1313,55 @@ async fn an_account_s_playlists_and_their_items_are_read_with_what_does_not_map(
         spoolframe_plex::playlists::PlexPlaylistItem::Unmapped { title, .. } if title == "A trailer"
     ));
 }
+
+/// PX-43's All: a music section's tracks are one listing of its leaves,
+/// page by page, not a request per album.
+#[tokio::test]
+async fn a_music_library_s_tracks_are_one_listing() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/sections/12/all"))
+        .and(query_param("type", "10"))
+        .respond_with(json("section-leaves-track"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let music = LibraryId::new(Namespace::Plex, "12").unwrap();
+    let tracks = catalog(&server).tracks(&music).await.unwrap();
+    let keys: Vec<&str> = tracks.iter().map(|t| t.id().key()).collect();
+    assert_eq!(keys, ["228207", "228208"]);
+    assert!(tracks.iter().all(|t| matches!(t, Item::Track(_))));
+    let unserved = catalog(&server)
+        .serving(Some(["2".to_owned()].into()))
+        .tracks(&music)
+        .await
+        .unwrap_err();
+    assert!(matches!(unserved, CatalogError::NotServed(_)), "{unserved}");
+}
+
+/// PX-43's import: the tracks the account rated, asked of each music
+/// section by `userRating>>=0`, the last rated first; one Plex sends
+/// unrated anyway is left out.
+#[tokio::test]
+async fn the_rated_tracks_are_the_last_rated_first() {
+    let server = MockServer::start().await;
+    serve(&server, "/library/sections", "sections").await;
+    let track = |key: &str, rating: f64, at: i64| {
+        serde_json::json!({ "ratingKey": key, "type": "track", "title": key,
+            "parentRatingKey": "40", "grandparentRatingKey": "39",
+            "userRating": rating, "lastRatedAt": at })
+    };
+    Mock::given(path("/library/sections/12/all"))
+        .and(query_param("type", "10"))
+        .and(query_param("userRating>>", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": { "totalSize": 3, "Metadata": [
+                track("41", 10.0, 100), track("42", 0.0, 300), track("43", 4.0, 200),
+            ] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let rated = catalog(&server).rated_tracks().await.unwrap();
+    let keys: Vec<&str> = rated.iter().map(|t| t.id().key()).collect();
+    assert_eq!(keys, ["43", "41"]);
+}

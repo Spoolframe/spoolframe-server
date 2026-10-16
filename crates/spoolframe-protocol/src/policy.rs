@@ -86,7 +86,11 @@ pub fn retry_safe(request: &Request) -> bool {
         // PX-40: reads. A read may drop entries whose items left the
         // library, which a second read would drop too.
         | Request::ListPlaylists
-        | Request::GetPlaylist { .. } => true,
+        | Request::GetPlaylist { .. }
+        // PX-43: liking what is liked, or unliking what is not, changes
+        // nothing.
+        | Request::Like { .. }
+        | Request::Unlike { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

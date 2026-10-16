@@ -41,7 +41,8 @@ must be updated together. The changes per revision are in
   [idle playbacks](#paused-playback-and-the-idle-limit)
 - [Home rows and "Remove"](#home-rows-and-remove)
 - [Leaving a server](#leaving-a-server)
-- [Features](#features) and [playlists](#playlists)
+- [Features](#features), [playlists](#playlists) and
+  [Liked and All](#liked-and-all)
 - [Portable identities](#portable-identities)
 
 ## Basics
@@ -1409,6 +1410,11 @@ when empty, so an older peer sends and reads what it did before.
 Regular features differ from experimental ones (PX-49,
 `Hello.experimental`): a build that has one always lists it.
 
+New wire capability comes as a regular feature, not a new protocol
+version: an app built before a feature keeps working against a server
+that has it, and is sent nothing of it. `spoolframe:liked` (PX-43) is
+the first added so.
+
 ## Playlists
 
 Feature `spoolframe:playlists` (PX-40). A playlist is a name, an owner,
@@ -1598,6 +1604,63 @@ says which the session's server has (from `WhoAmI`), and
 `PlaylistConflict { revision }`. `Client::playlist_events()` gives every
 `PlaylistEvent { server, change }` the servers tell, `change` one of
 `Changed { id, revision }`, `Gone { id }` and `PinsChanged`.
+
+## Liked and All
+
+Feature `spoolframe:liked` (PX-43), on top of `spoolframe:playlists`.
+Every user has two built-in music playlists, made the first time they
+are needed, and listed first by `ListPlaylists`, Liked then All, while
+a music library is served. Each `PlaylistSummary` (and each item's
+`PlaylistRef`) says which with `builtin: liked | all`; one a user made
+has none.
+
+- Liked holds the tracks the user liked, newest first. Its owner moves
+  and removes its entries with `EditPlaylist`; an `Add` there is
+  `InvalidInput`, as a track gets in by being liked.
+- All is every track the user may see, worked out from the library at
+  each read and play, never stored: a newly scanned album is in it at
+  once. It is read-only (`PlaylistReadOnly`). Its entry ids are its
+  tracks' (the same for the same track, at 2^62 and above), so a place
+  and a shuffled round survive a scan; its `playable` is its `total`, as
+  its files are looked at only as they are listed and played.
+- Neither is renamed, re-kinded, shared or deleted (`can_manage` is
+  false: `PlaylistReadOnly`). Both play, pin and resume as any playlist.
+
+| Request | Reply |
+|---|---|
+| `Like { items }` | `PlaylistInfo` (Liked) |
+| `Unlike { items }` | `PlaylistInfo` (Liked) |
+
+`items` are 1 to 100 track or album ids; anything else is
+`KindNotAllowed { kind }`. `Like` puts each track not liked yet at the
+top of Liked, an album's tracks in disc and track order; `Unlike` takes
+a track out, or every track of an album, those it has now and those
+liked from it before. Both are sent again on a new connection: liking
+what is liked, or unliking what is not, changes nothing.
+
+`Item` carries `liked` for a track (`all` or `none`) or an album
+(`all`, `some` or `none`, by the tracks it has now, so a track added to
+a liked album later makes its heart half), and for an album
+`liked_children`, its tracks that are liked. A playlist's entries and
+the entry playing (`PlaylistNext`) carry `liked: true` for a liked
+track. Liked is among an album's or artist's `playlists` when it holds
+one of its tracks; All never is.
+
+A session whose client did not list `spoolframe:liked` gets none of
+this: no `liked` fields, no `builtin`, neither playlist in
+`ListPlaylists`, an item's playlists, or events; asking for either by id
+is `NotFound`, and `Like` or `Unlike` is `Unsupported`. An older app
+would not know them for built-ins and would offer to rename or delete
+them.
+
+The SDK: `Features::liked` gates `Session::like` and `Session::unlike`
+(both answer Liked's `PlaylistSummary`); `ItemDetail::liked` and
+`ItemDetail::liked_children` carry the hearts.
+
+Plex's import (`ImportPlexPlaylists`) likes the tracks the user rated in
+Plex, the last rated first, instead of making a playlist of them: in
+`PlexImport` they are a `PlexImported` named "Liked", `entries` the
+tracks newly liked.
 
 ## Portable identities
 

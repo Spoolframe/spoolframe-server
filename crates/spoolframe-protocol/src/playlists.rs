@@ -159,6 +159,37 @@ pub enum PlaylistOwnerKind {
     Unknown,
 }
 
+/// A built-in playlist (PX-43): every user has one of each, made by the
+/// server, never renamed, re-kinded, shared or deleted. Music only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Builtin {
+    /// The tracks the user liked (`Like`), newest first unless they
+    /// moved them. Its entries change by `Like` and `Unlike`, and by
+    /// `EditPlaylist`'s removes and moves; an add there is refused.
+    Liked,
+    /// Every track the user may see, worked out when read or played, so
+    /// a newly scanned album is in it at once. Read-only.
+    All,
+    /// One this build does not know: shown as any read-only playlist.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A heart (PX-43): whether an item is in the user's Liked. A track's is
+/// `All` or `None`; an album's is `All` when every track it has now is
+/// liked, `Some` when some are, `None` when none are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Liked {
+    All,
+    Some,
+    None,
+    /// One this build does not know: shown as `None`.
+    #[serde(other)]
+    Unknown,
+}
+
 /// A playlist as one user sees it, without its entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaylistSummary {
@@ -177,6 +208,12 @@ pub struct PlaylistSummary {
     /// Its place in their Pinned (0 first), or `None` when not pinned.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub pinned: Option<u32>,
+    /// Which built-in playlist it is (PX-43), or `None` for one a user
+    /// made: what a client lists Liked and All first by, and hides
+    /// rename, share and delete for.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<Builtin>,
 }
 
 /// A playlist holding an item, as the item's details list it.
@@ -185,6 +222,11 @@ pub struct PlaylistRef {
     pub id: String,
     pub name: String,
     pub owner_kind: PlaylistOwnerKind,
+    /// As [`PlaylistSummary::builtin`]. All is never listed here: it
+    /// holds every track.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<Builtin>,
 }
 
 /// One entry of a playlist, with its item as the catalog has it now and
@@ -196,6 +238,11 @@ pub struct PlaylistEntry {
     /// Still in the library, but its file cannot be read now (a drive
     /// offline, a file moved): shown, counted, skipped when playing.
     pub unavailable: bool,
+    /// A track in the user's Liked (PX-43): its heart. Sent only when
+    /// true, and only to a client that listed `spoolframe:liked`.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub liked: bool,
 }
 
 /// One page of a playlist's entries (`GetPlaylist`). Items the user may
@@ -209,6 +256,8 @@ pub struct PlaylistPage {
     /// How many entries the whole list has.
     pub total: u32,
     /// How many of them can be played now: `total` less the unavailable.
+    /// All's (PX-43) is `total`: its files are looked at only as they
+    /// are listed and played, not all at every read.
     pub playable: u32,
     /// The user's place: the entry playing or last played, which
     /// `PlayPlaylist` without `from` goes on from; `None` to start at the
@@ -253,13 +302,21 @@ pub struct PlaylistNext {
     pub entry: EntryId,
     pub item: spoolframe_types::Item,
     pub markers: Vec<spoolframe_types::Marker>,
+    /// A track in the user's Liked (PX-43): the now-playing heart. Sent
+    /// only when true, and only to a client that listed
+    /// `spoolframe:liked`.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub liked: bool,
 }
 
 /// What importing the user's Plex playlists made, or would make
 /// (`ImportPlexPlaylists`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlexImport {
-    /// One per Plex playlist with at least one item found here.
+    /// One per Plex playlist with at least one item found here; and one
+    /// named "Liked" for the tracks rated in Plex that were liked here
+    /// (PX-43), its `entries` those newly liked.
     pub made: Vec<PlexImported>,
     /// The items, or whole playlists, not found here, and why.
     pub unmapped: Vec<PlexUnmapped>,
@@ -339,6 +396,33 @@ mod tests {
         assert!(EPISODES.widen_only(more));
         assert!(EPISODES.widen_only(EPISODES));
         assert!(!more.widen_only(EPISODES));
+    }
+
+    #[test]
+    fn a_builtin_or_heart_of_a_newer_build_reads_as_unknown() {
+        let builtin: Builtin = serde_json::from_str(r#""recent""#).unwrap();
+        assert_eq!(builtin, Builtin::Unknown);
+        let liked: Liked = serde_json::from_str(r#""most""#).unwrap();
+        assert_eq!(liked, Liked::Unknown);
+        assert_eq!(serde_json::to_string(&Liked::Some).unwrap(), r#""some""#);
+    }
+
+    #[test]
+    fn an_older_server_s_summary_is_no_builtin() {
+        let json = serde_json::json!({
+            "id": "x", "name": "Heists",
+            "kinds": { "movies": false, "episodes": true, "tracks": false },
+            "owner_kind": "mine", "visibility": { "type": "personal" },
+            "can_edit": true, "can_manage": true, "revision": 1, "pinned": null,
+        });
+        let summary: PlaylistSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(summary.builtin, None);
+        assert!(
+            serde_json::to_value(&summary)
+                .unwrap()
+                .get("builtin")
+                .is_none()
+        );
     }
 
     #[test]

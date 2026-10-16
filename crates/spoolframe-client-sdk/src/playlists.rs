@@ -7,13 +7,19 @@
 //! [`SdkError::Unsupported`] and nothing is sent. Changes made elsewhere
 //! (another device, another user) come as [`PlaylistEvent`]s from
 //! [`crate::Client::playlist_events`].
+//!
+//! Liked and All (PX-43, feature `spoolframe:liked`): hearts on tracks and
+//! albums, and the two built-in playlists, listed first, each summary's
+//! `builtin` saying which. A server without the feature lists neither and
+//! [`Session::like`] is [`SdkError::Unsupported`].
 
-use spoolframe_protocol::features::PLAYLISTS;
+use spoolframe_protocol::features::{LIKED, PLAYLISTS};
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
     PlaylistSummary, Visibility,
 };
 use spoolframe_protocol::{Reply, Request};
+use spoolframe_types::MediaId;
 
 use crate::{SdkError, Session};
 
@@ -23,6 +29,8 @@ use crate::{SdkError, Session};
 pub struct Features {
     /// Playlists (PX-40).
     pub playlists: bool,
+    /// Liked and All, and hearts (PX-43).
+    pub liked: bool,
 }
 
 impl Features {
@@ -31,6 +39,8 @@ impl Features {
     pub(crate) fn of(names: &[String]) -> Self {
         Self {
             playlists: spoolframe_protocol::features::has(names, PLAYLISTS),
+            liked: spoolframe_protocol::features::has(names, PLAYLISTS)
+                && spoolframe_protocol::features::has(names, LIKED),
         }
     }
 }
@@ -260,6 +270,44 @@ impl Session {
 }
 
 impl Session {
+    /// Send `request` if the server has Liked (PX-43).
+    async fn liked_call(&self, request: Request) -> Result<Reply, SdkError> {
+        if !self.features.liked {
+            return Err(SdkError::Unsupported {
+                feature: LIKED.into(),
+            });
+        }
+        self.call(request).await
+    }
+
+    /// Like tracks or albums: their tracks not liked yet go to the top of
+    /// the user's Liked, an album's in order. Liked as it is after. Only
+    /// tracks and albums ([`SdkError::KindNotAllowed`] otherwise); 1 to
+    /// 100 at a time.
+    pub async fn like(&self, items: &[MediaId]) -> Result<PlaylistSummary, SdkError> {
+        let request = Request::Like {
+            items: items.to_vec(),
+        };
+        match self.liked_call(request).await? {
+            Reply::PlaylistInfo(liked) => Ok(liked),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Take tracks, or every track of albums, out of the user's Liked.
+    /// Liked as it is after.
+    pub async fn unlike(&self, items: &[MediaId]) -> Result<PlaylistSummary, SdkError> {
+        let request = Request::Unlike {
+            items: items.to_vec(),
+        };
+        match self.liked_call(request).await? {
+            Reply::PlaylistInfo(liked) => Ok(liked),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+impl Session {
     /// Import the user's Plex playlists once (each video or music
     /// playlist of their linked account becomes a personal one here), or
     /// with `dry_run` say what would be made. Imported twice, made twice.
@@ -292,6 +340,10 @@ mod tests {
     #[test]
     fn a_server_s_list_names_the_features_this_sdk_uses() {
         assert!(Features::of(&[PLAYLISTS.to_owned()]).playlists);
+        assert!(!Features::of(&[PLAYLISTS.to_owned()]).liked);
+        assert!(Features::of(&[PLAYLISTS.to_owned(), LIKED.to_owned()]).liked);
+        // Liked is a part of playlists: without them, none.
+        assert!(!Features::of(&[LIKED.to_owned()]).liked);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }

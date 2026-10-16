@@ -12,18 +12,30 @@
 //! item left the library. An item in a library not served now is hidden,
 //! never dropped, as watch state is kept (P3-11). A catalog that cannot
 //! be asked drops nothing.
+//!
+//! Every user has two built-in music playlists (PX-43), made the first
+//! time they are needed: Liked, the tracks they liked, kept as any
+//! playlist's entries are; and All, every track they may see, whose
+//! entries are never kept but worked out from the catalog at each read
+//! and play, so a newly scanned album is in it at once. All has a row all
+//! the same, for the user's place, settings and pin. Neither is renamed,
+//! shared or deleted, and All is not edited: `spoolframe_policy`'s
+//! `builtin_*`. They are listed only while a music library is served, and
+//! only to callers that take them (a client listing `spoolframe:liked`).
 
 use std::sync::Arc;
 
 use futures_util::{StreamExt, TryStreamExt, stream};
 use spoolframe_catalog::{Catalog, CatalogError, ItemWithChildren};
 use spoolframe_policy::playlists::{self as policy, Access, Standing};
-use spoolframe_protocol::playlists::{EntryId, PlaySettings, PlaylistNext, Repeat};
+use std::collections::HashSet;
+
+use spoolframe_protocol::playlists::{Builtin, EntryId, Liked, PlaySettings, PlaylistNext, Repeat};
 use spoolframe_protocol::playlists::{
     Kinds, PinNote, PinNoteReason, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage,
     PlaylistRef, PlaylistShare, PlaylistSummary, Visibility,
 };
-use spoolframe_types::{Item, Marker, MediaId, MediaKind};
+use spoolframe_types::{Item, LibraryKind, Marker, MediaId, MediaKind};
 
 use crate::principal::{Actor, Principal};
 use crate::store::playlists::PlaceRow;
@@ -44,6 +56,12 @@ pub const MAX_EDITS: usize = 100;
 pub const MAX_PAGE: u32 = 200;
 /// The most catalog lookups one call has in flight at once, as Home's.
 const CATALOG_FETCHES: usize = 8;
+/// The kinds Liked and All hold.
+const TRACKS: Kinds = Kinds {
+    movies: false,
+    episodes: false,
+    tracks: true,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlaylistsError {
@@ -63,6 +81,9 @@ pub enum PlaylistsError {
     /// The playlist's kinds do not take an item of this kind.
     #[error("this playlist does not take a {0:?}")]
     KindNotAllowed(MediaKind),
+    /// Only a track or an album is liked (PX-43).
+    #[error("only a track or an album can be liked, not a {0:?}")]
+    NotLikeable(MediaKind),
     #[error("{0}")]
     InvalidInput(String),
     /// The edit was made on a revision someone else's change has
@@ -120,6 +141,8 @@ pub struct Seen {
     owner: String,
     server_wide: bool,
     shares: Vec<String>,
+    /// Liked or All (PX-43): told only to who takes built-ins.
+    pub builtin: bool,
 }
 
 impl Seen {
@@ -128,6 +151,7 @@ impl Seen {
             owner: row.owner.clone(),
             server_wide: row.server_wide,
             shares: row.shares.iter().map(|s| s.principal.clone()).collect(),
+            builtin: row.builtin.is_some(),
         }
     }
 
@@ -138,6 +162,7 @@ impl Seen {
             owner: owner.to_string(),
             server_wide,
             shares: shares.iter().map(ToString::to_string).collect(),
+            builtin: false,
         }
     }
 
@@ -253,12 +278,16 @@ impl Playlists {
     /// What `actor` may do with `row`.
     fn access(actor: &Actor, row: &PlaylistRow) -> Access {
         let principal = actor.principal.to_string();
-        policy::access(Standing {
+        let access = policy::access(Standing {
             owner: row.owner == principal,
             admin: actor.admin,
             server_wide: row.server_wide,
             share: row.share_of(&principal),
-        })
+        });
+        match row.builtin {
+            Some(builtin) => policy::builtin_access(builtin, access),
+            None => access,
+        }
     }
 
     /// Playlist `id`, if `actor` sees it, with what they may do.
@@ -315,6 +344,7 @@ impl Playlists {
             can_manage: access.can_manage(),
             revision: row.revision,
             pinned,
+            builtin: row.builtin,
         }
     }
 
@@ -326,12 +356,33 @@ impl Playlists {
 
     /// Every playlist `actor` sees, and the notes of pinned ones that left
     /// their Pinned.
+    /// With `builtins`, Liked and All first, made now if they are not
+    /// yet, while a music library is served; without, they are left out,
+    /// for a client that would not know them for what they are.
     pub async fn list(
         &self,
         actor: &Actor,
+        builtins: bool,
     ) -> Result<(Vec<PlaylistSummary>, Vec<PinNote>), PlaylistsError> {
         let principal = actor.principal.to_string();
-        let rows = self.store.playlists_seen_by(&principal).await?;
+        let builtins = builtins && self.serves_music().await;
+        if builtins {
+            for builtin in [Builtin::Liked, Builtin::All] {
+                self.store.builtin_playlist(&principal, builtin).await?;
+            }
+        }
+        let mut rows = self.store.playlists_seen_by(&principal).await?;
+        if !builtins {
+            rows.retain(|row| row.builtin.is_none());
+        }
+        // Liked, then All, then the rest as they were: first among the
+        // music playlists. Stable.
+        rows.sort_by_key(|row| match row.builtin {
+            Some(Builtin::Liked) => 0,
+            Some(Builtin::All) => 1,
+            Some(Builtin::Unknown) => 2,
+            None => 3,
+        });
         let pins = self.store.pins(&principal).await?;
         let summaries = rows
             .iter()
@@ -367,14 +418,35 @@ impl Playlists {
         limit: u32,
     ) -> Result<PlaylistPage, PlaylistsError> {
         let (row, _) = self.seen(actor, id).await?;
-        let mut entries = self.entries(actor, &row).await?;
-        let total = entries.len() as u32;
-        let playable = entries.iter().filter(|e| !e.unavailable).count() as u32;
-        let start = (offset as usize).min(entries.len());
-        let end = start
-            .saturating_add(limit.min(MAX_PAGE) as usize)
-            .min(entries.len());
-        let mut page: Vec<PlaylistEntry> = entries.drain(start..end).collect();
+        let principal = actor.principal.to_string();
+        let (mut page, start, total, playable) = if row.builtin == Some(Builtin::All) {
+            let tracks = self.all_tracks(actor).await?;
+            let (start, end) = cut(tracks.len(), offset, limit);
+            let mut page = Vec::with_capacity(end - start);
+            for item in &tracks[start..end] {
+                page.push(PlaylistEntry {
+                    entry: policy::all_entry(&item.id().to_string()),
+                    unavailable: self.unavailable(item.id()).await?,
+                    item: item.clone(),
+                    liked: false,
+                });
+            }
+            // Its files are looked at as they are listed and played, not
+            // the whole library's at every read.
+            let total = tracks.len() as u32;
+            (page, start, total, total)
+        } else {
+            let mut entries = self.entries(actor, &row).await?;
+            let total = entries.len() as u32;
+            let playable = entries.iter().filter(|e| !e.unavailable).count() as u32;
+            let (start, end) = cut(entries.len(), offset, limit);
+            (entries.drain(start..end).collect(), start, total, playable)
+        };
+        let liked = self.store.liked_media(&principal).await?;
+        for entry in &mut page {
+            entry.liked = matches!(entry.item, Item::Track(_))
+                && liked.contains(&entry.item.id().to_string());
+        }
         let mut items: Vec<&mut Item> = page.iter_mut().map(|e| &mut e.item).collect();
         self.watch.fill(actor.principal, &mut items).await?;
         // Its revision may have moved while entries were dropped or
@@ -386,7 +458,7 @@ impl Playlists {
             .ok_or(PlaylistsError::NotFound)?;
         let place = self
             .store
-            .playlist_place(&actor.principal.to_string(), id)
+            .playlist_place(&principal, id)
             .await?
             .unwrap_or_default();
         Ok(PlaylistPage {
@@ -398,6 +470,83 @@ impl Playlists {
             place: place.entry,
             settings: place.settings,
         })
+    }
+
+    /// Whether a music library is served: Liked and All are listed only
+    /// then. A catalog that cannot be asked now hides nothing; one not
+    /// set up has none.
+    async fn serves_music(&self) -> bool {
+        match self.catalog.libraries().await {
+            Ok(libraries) => libraries.iter().any(|l| l.kind == LibraryKind::Music),
+            Err(CatalogError::NotSetUp) => false,
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot list the libraries; listing Liked and All");
+                true
+            }
+        }
+    }
+
+    /// Every track `actor` may see in the music libraries served: All's
+    /// entries (PX-43), by artist, album, disc and track.
+    async fn all_tracks(&self, actor: &Actor) -> Result<Vec<Item>, PlaylistsError> {
+        let mut tracks = Vec::new();
+        for library in self.catalog.libraries().await? {
+            if library.kind != LibraryKind::Music {
+                continue;
+            }
+            match self.catalog.tracks(&library.id).await {
+                Ok(found) => tracks.extend(found),
+                // Taken out of the config since it was listed.
+                Err(CatalogError::NotServed(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut seen = HashSet::new();
+        tracks.retain(|t| {
+            matches!(t, Item::Track(_))
+                && self.visibility.may_see(actor, t)
+                && seen.insert(t.id().clone())
+        });
+        tracks.sort_by_cached_key(|t| match t {
+            Item::Track(t) => (
+                t.artist_name.as_deref().unwrap_or_default().to_lowercase(),
+                t.album_title.as_deref().unwrap_or_default().to_lowercase(),
+                t.album_id.to_string(),
+                t.disc.unwrap_or(1),
+                t.track.unwrap_or(u32::MAX),
+                t.title.to_lowercase(),
+            ),
+            _ => Default::default(),
+        });
+        Ok(tracks)
+    }
+
+    /// The entries `row` plays, in order: its own, or All's worked out
+    /// now, each named by [`policy::all_entry`].
+    async fn order_of(
+        &self,
+        actor: &Actor,
+        row: &PlaylistRow,
+    ) -> Result<Vec<EntryRow>, PlaylistsError> {
+        if row.builtin != Some(Builtin::All) {
+            return Ok(self.store.playlist_entries(&row.id).await?);
+        }
+        Ok(self
+            .all_tracks(actor)
+            .await?
+            .iter()
+            .map(|track| {
+                let entry = new_entry(track, Vec::new());
+                EntryRow {
+                    entry_id: policy::all_entry(&entry.media_id),
+                    media_id: entry.media_id,
+                    kind: entry.kind,
+                    show_id: entry.show_id,
+                    album_id: entry.album_id,
+                    artist_id: entry.artist_id,
+                }
+            })
+            .collect())
     }
 
     /// Every entry of `row` that `actor` may see, in order, each with its
@@ -448,6 +597,8 @@ impl Playlists {
                     entry: entry.entry_id,
                     item,
                     unavailable,
+                    // Filled by the caller, for the page only.
+                    liked: false,
                 });
             }
         }
@@ -471,6 +622,13 @@ impl Playlists {
                 item: found.item,
                 markers: found.markers,
             }),
+            // All's entries are worked out from the catalog and keep no
+            // stable ids to follow.
+            Err(CatalogError::NotFound(_) | CatalogError::ForeignId(_))
+                if entry.entry_id >= policy::ALL_ENTRIES =>
+            {
+                Ok(Resolved::Gone)
+            }
             Err(CatalogError::NotFound(_) | CatalogError::ForeignId(_)) => {
                 let ids = self.store.playlist_entry_ids(entry.entry_id).await?;
                 let Some(to) = self.catalog.find_external(id.kind(), &ids).await? else {
@@ -675,6 +833,13 @@ impl Playlists {
                 "an edit carries 1 to {MAX_EDITS} changes"
             )));
         }
+        if let Some(builtin) = row.builtin
+            && edits.iter().any(|e| !policy::builtin_edit(builtin, e))
+        {
+            return Err(PlaylistsError::InvalidInput(
+                "a track goes into Liked by liking it; here it is only moved or removed".into(),
+            ));
+        }
         let mut resolved = Vec::with_capacity(edits.len());
         for edit in edits {
             resolved.push(match edit {
@@ -852,13 +1017,8 @@ impl Playlists {
         let (row, _) = self.seen(actor, id).await?;
         let principal = actor.principal.to_string();
         let kept = self.store.playlist_place(&principal, id).await?;
-        let order: Vec<EntryId> = self
-            .store
-            .playlist_entries(id)
-            .await?
-            .iter()
-            .map(|e| e.entry_id)
-            .collect();
+        let entries = self.order_of(actor, &row).await?;
+        let order: Vec<EntryId> = entries.iter().map(|e| e.entry_id).collect();
         let shuffling_already = kept.as_ref().is_some_and(|k| k.settings.shuffle);
         let mut place = PlaceRow {
             settings,
@@ -878,7 +1038,7 @@ impl Playlists {
             Some(from) => Some(Start::At(from)),
             None => place.entry.map(Start::Resume),
         };
-        self.go_on(actor, &row, place, start).await
+        self.go_on(actor, &row, place, start, entries).await
     }
 
     /// What plays in playlist `id` after entry `after` ended or was
@@ -895,21 +1055,22 @@ impl Playlists {
             .playlist_place(&actor.principal.to_string(), id)
             .await?
             .unwrap_or_default();
-        self.go_on(actor, &row, place, Some(Start::After(after)))
+        let entries = self.order_of(actor, &row).await?;
+        self.go_on(actor, &row, place, Some(Start::After(after)), entries)
             .await
     }
 
-    /// Find what plays from `start` by `place`'s settings and round, keep
-    /// it as the place, and give it.
+    /// Find what plays from `start` among `entries` by `place`'s settings
+    /// and round, keep it as the place, and give it.
     async fn go_on(
         &self,
         actor: &Actor,
         row: &PlaylistRow,
         mut place: PlaceRow,
         start: Option<Start>,
+        entries: Vec<EntryRow>,
     ) -> Result<Option<PlaylistNext>, PlaylistsError> {
         let principal = actor.principal.to_string();
-        let entries = self.store.playlist_entries(&row.id).await?;
         let settings = place.settings;
         let order: Vec<EntryId> = match &place.round {
             // The round's entries still there, then any added since.
@@ -1021,6 +1182,8 @@ impl Playlists {
                     self.told_playlist(&row.id, revision, Some(Seen::of(row)), Some(Seen::of(row)));
                     (item, markers)
                 }
+                // All's are not stored: nothing to drop.
+                Resolved::Gone if row.builtin == Some(Builtin::All) => continue,
                 Resolved::Gone => {
                     if let Some(revision) = self
                         .store
@@ -1046,10 +1209,17 @@ impl Playlists {
             if settings.skip_watched && watched(&item) && regardless != Some(*entry_id) {
                 continue;
             }
+            let liked = matches!(item, Item::Track(_))
+                && self
+                    .store
+                    .liked_media(&actor.principal.to_string())
+                    .await?
+                    .contains(&item.id().to_string());
             return Ok(Some(PlaylistNext {
                 entry: *entry_id,
                 item,
                 markers,
+                liked,
             }));
         }
         Ok(None)
@@ -1143,11 +1313,15 @@ impl Playlists {
     /// the item's details have them): a movie, episode or track itself; a
     /// season's episodes; any of a show's episodes, an album's or an
     /// artist's tracks.
+    ///
+    /// Liked is among them with `builtins`; All never is, as it holds
+    /// every track and saying so tells nothing.
     pub async fn holding(
         &self,
         actor: &Actor,
         item: &Item,
         children: &[Item],
+        builtins: bool,
     ) -> Result<Vec<PlaylistRef>, PlaylistsError> {
         let id = item.id().to_string();
         let (by, values) = match item {
@@ -1166,16 +1340,299 @@ impl Playlists {
             .await?;
         Ok(rows
             .iter()
+            .filter(|row| builtins || row.builtin.is_none())
             .map(|row| {
                 let summary = Self::summary(actor, row, None);
                 PlaylistRef {
                     id: summary.id,
                     name: summary.name,
                     owner_kind: summary.owner_kind,
+                    builtin: summary.builtin,
                 }
             })
             .collect())
     }
+}
+
+/// How many times an unlike is made again on a Liked another device of
+/// the user's changed meanwhile.
+const UNLIKE_TRIES: usize = 3;
+
+/// Liked (PX-43): hearts on tracks and albums.
+impl Playlists {
+    /// Which built-in playlist `id` is, if it is one: what a client that
+    /// does not take them is refused by.
+    pub async fn builtin_of(&self, id: &str) -> Result<Option<Builtin>, PlaylistsError> {
+        Ok(self.store.playlist(id).await?.and_then(|row| row.builtin))
+    }
+
+    /// `items`, if they may be liked or unliked: 1 to [`MAX_EDITS`]
+    /// tracks or albums.
+    fn likeable(items: &[MediaId]) -> Result<(), PlaylistsError> {
+        if items.is_empty() || items.len() > MAX_EDITS {
+            return Err(PlaylistsError::InvalidInput(format!(
+                "1 to {MAX_EDITS} items are liked or unliked at a time"
+            )));
+        }
+        match items.iter().find(|id| !policy::likeable(id.kind())) {
+            Some(id) => Err(PlaylistsError::NotLikeable(id.kind())),
+            None => Ok(()),
+        }
+    }
+
+    /// Playlist `id` as `actor` sees it now.
+    async fn summary_now(
+        &self,
+        actor: &Actor,
+        id: &str,
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        let row = self
+            .store
+            .playlist(id)
+            .await?
+            .ok_or(PlaylistsError::NotFound)?;
+        Ok(Self::summary(actor, &row, self.pinned(actor, id).await?))
+    }
+
+    /// Put `entries` at the top of Liked `row`, newest first: its new
+    /// revision.
+    async fn to_top(
+        &self,
+        row: &PlaylistRow,
+        entries: Vec<NewEntry>,
+    ) -> Result<u64, PlaylistsError> {
+        let top = self
+            .store
+            .playlist_entries(&row.id)
+            .await?
+            .first()
+            .map(|e| e.entry_id);
+        let revision = self
+            .store
+            .edit_playlist(
+                &row.id,
+                row.revision,
+                vec![EntryEdit::Add {
+                    entries,
+                    before: top,
+                }],
+            )
+            .await?;
+        self.told_playlist(&row.id, revision, Some(Seen::of(row)), Some(Seen::of(row)));
+        Ok(revision)
+    }
+
+    /// Like `items`, tracks or albums: their tracks not liked yet go to
+    /// the top of `actor`'s Liked, in the order given, an album's in disc
+    /// and track order. Liked as it is after.
+    pub async fn like(
+        &self,
+        actor: &Actor,
+        items: &[MediaId],
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        Self::likeable(items)?;
+        let row = self
+            .store
+            .builtin_playlist(&actor.principal.to_string(), Builtin::Liked)
+            .await?;
+        let mut held: HashSet<String> = self
+            .store
+            .playlist_entries(&row.id)
+            .await?
+            .into_iter()
+            .map(|e| e.media_id)
+            .collect();
+        let mut new = Vec::new();
+        for item in items {
+            for entry in self.adding(actor, TRACKS, item).await? {
+                if held.insert(entry.media_id.clone()) {
+                    new.push(entry);
+                }
+            }
+        }
+        if !new.is_empty() {
+            self.to_top(&row, new).await?;
+        }
+        self.summary_now(actor, &row.id).await
+    }
+
+    /// Take `items` out of `actor`'s Liked: a track itself; an album each
+    /// of its tracks, those it has now and those liked from it before.
+    /// Liked as it is after.
+    pub async fn unlike(
+        &self,
+        actor: &Actor,
+        items: &[MediaId],
+    ) -> Result<PlaylistSummary, PlaylistsError> {
+        Self::likeable(items)?;
+        let mut tracks: HashSet<String> = HashSet::new();
+        let mut albums: HashSet<String> = HashSet::new();
+        for item in items {
+            if item.kind() == MediaKind::Track {
+                tracks.insert(item.to_string());
+                continue;
+            }
+            albums.insert(item.to_string());
+            match self.catalog.item(item).await {
+                Ok(found) => tracks.extend(
+                    found
+                        .children
+                        .iter()
+                        .filter(|c| matches!(c, Item::Track(_)))
+                        .map(|c| c.id().to_string()),
+                ),
+                // Gone from the library: its tracks go by their album.
+                Err(e) if crate::client::unserved(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let principal = actor.principal.to_string();
+        let liked = self
+            .store
+            .builtin_playlist(&principal, Builtin::Liked)
+            .await?;
+        for _ in 0..UNLIKE_TRIES {
+            let row = self
+                .store
+                .playlist(&liked.id)
+                .await?
+                .ok_or(PlaylistsError::NotFound)?;
+            let removes: Vec<EntryEdit> = self
+                .store
+                .playlist_entries(&row.id)
+                .await?
+                .into_iter()
+                .filter(|e| {
+                    tracks.contains(&e.media_id)
+                        || e.album_id.as_ref().is_some_and(|a| albums.contains(a))
+                })
+                .map(|e| EntryEdit::Remove(e.entry_id))
+                .collect();
+            if removes.is_empty() {
+                return self.summary_now(actor, &row.id).await;
+            }
+            match self
+                .store
+                .edit_playlist(&row.id, row.revision, removes)
+                .await
+            {
+                Ok(revision) => {
+                    self.told_playlist(
+                        &row.id,
+                        revision,
+                        Some(Seen::of(&row)),
+                        Some(Seen::of(&row)),
+                    );
+                    return self.summary_now(actor, &row.id).await;
+                }
+                // Another device removed one meanwhile: again, on the new
+                // revision.
+                Err(PlaylistError::Conflict) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let now = self
+            .store
+            .playlist(&liked.id)
+            .await?
+            .map_or(0, |r| r.revision);
+        Err(PlaylistsError::Conflict { revision: now })
+    }
+
+    /// `item`'s heart for `actor`, and which of `children` (its details',
+    /// as the catalog has them now) are liked: a track's `All` or `None`;
+    /// an album's by the tracks it has now that `actor` may see, so a
+    /// track added to it later makes a full heart half. `None` for
+    /// anything else.
+    pub async fn liked(
+        &self,
+        actor: &Actor,
+        item: &Item,
+        children: &[Item],
+    ) -> Result<(Option<Liked>, Option<Vec<MediaId>>), PlaylistsError> {
+        if !matches!(item, Item::Track(_) | Item::Album(_)) {
+            return Ok((None, None));
+        }
+        let liked = self.store.liked_media(&actor.principal.to_string()).await?;
+        if let Item::Track(track) = item {
+            let heart = if liked.contains(&track.id.to_string()) {
+                Liked::All
+            } else {
+                Liked::None
+            };
+            return Ok((Some(heart), None));
+        }
+        let tracks: Vec<&MediaId> = children
+            .iter()
+            .filter(|c| matches!(c, Item::Track(_)) && self.visibility.may_see(actor, c))
+            .map(Item::id)
+            .collect();
+        let hearted: Vec<MediaId> = tracks
+            .iter()
+            .filter(|id| liked.contains(&id.to_string()))
+            .map(|id| (*id).clone())
+            .collect();
+        Ok((
+            Some(policy::album_liked(tracks.len(), hearted.len())),
+            Some(hearted),
+        ))
+    }
+
+    /// Like `items`, tracks rated in Plex, for `actor`: a Plex import's
+    /// (PX-43), into Liked rather than a playlist of its own, the first
+    /// of them at the top. Those liked already are left where they are;
+    /// those the catalog does not serve, or that `actor` may not see, are
+    /// left out, with why. With `dry_run` nothing is liked. Liked's id
+    /// (`None` on a dry run or when nothing is new), how many were newly
+    /// liked, and what was left out.
+    pub async fn import_liked(
+        &self,
+        actor: &Actor,
+        items: &[(MediaId, String)],
+        dry_run: bool,
+    ) -> Result<(Option<String>, u32, Vec<(String, String)>), PlaylistsError> {
+        let principal = actor.principal.to_string();
+        let mut held = self.store.liked_media(&principal).await?;
+        let mut entries = Vec::new();
+        let mut left_out = Vec::new();
+        for (id, title) in items {
+            if id.kind() != MediaKind::Track {
+                left_out.push((title.clone(), "not a track".into()));
+                continue;
+            }
+            match self.catalog.item(id).await {
+                Ok(found) if self.visibility.may_see(actor, &found.item) => {
+                    let entry = new_entry(&found.item, found.external_ids);
+                    if held.insert(entry.media_id.clone()) {
+                        entries.push(entry);
+                    }
+                }
+                Ok(_) => left_out.push((title.clone(), "not in this server's libraries".into())),
+                Err(e) if crate::client::unserved(&e) => {
+                    left_out.push((title.clone(), "not in this server's libraries".into()));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let count = entries.len() as u32;
+        if entries.is_empty() || dry_run {
+            return Ok((None, count, left_out));
+        }
+        let row = self
+            .store
+            .builtin_playlist(&principal, Builtin::Liked)
+            .await?;
+        self.to_top(&row, entries).await?;
+        Ok((Some(row.id), count, left_out))
+    }
+}
+
+/// Where page `offset`, at most `limit` ([`MAX_PAGE`]), of `len` entries
+/// starts and ends.
+fn cut(len: usize, offset: u32, limit: u32) -> (usize, usize) {
+    let start = (offset as usize).min(len);
+    let end = start.saturating_add(limit.min(MAX_PAGE) as usize).min(len);
+    (start, end)
 }
 
 /// Where playing starts.
@@ -1277,3 +1734,6 @@ pub mod plex_import;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod builtin_tests;

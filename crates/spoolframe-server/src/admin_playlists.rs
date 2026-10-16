@@ -10,12 +10,13 @@
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::types::ErrorObjectOwned;
 use spoolframe_admin_api::{
-    NewPlaylist, PlaylistChanges, PlaylistDetail, PlaylistEditOp, PlaylistEntryInfo, PlaylistInfo,
-    PlaylistKinds, PlaylistOwner, PlaylistShare, PlaylistSharing, PlexPlaylistImport,
-    PlexPlaylistMade, PlexPlaylistUnmapped, ShareableUser, error_code,
+    NewPlaylist, PlaylistBuiltin, PlaylistChanges, PlaylistDetail, PlaylistEditOp,
+    PlaylistEntryInfo, PlaylistInfo, PlaylistKinds, PlaylistOwner, PlaylistShare, PlaylistSharing,
+    PlexPlaylistImport, PlexPlaylistMade, PlexPlaylistUnmapped, ShareableUser, error_code,
 };
 use spoolframe_protocol::playlists::{
-    Kinds, PlaylistEdit, PlaylistOwnerKind, PlaylistShare as WireShare, PlaylistSummary, Visibility,
+    Builtin, Kinds, PlaylistEdit, PlaylistOwnerKind, PlaylistShare as WireShare, PlaylistSummary,
+    Visibility,
 };
 use spoolframe_types::MediaId;
 
@@ -42,12 +43,21 @@ impl AdminApi {
     pub(super) async fn my_playlists(&self, user: ApiSessionUser) -> RpcResult<Vec<PlaylistInfo>> {
         let (mut list, _notes) = self
             .playlists_service()?
-            .list(&actor(&user))
+            .list(&actor(&user), true)
             .await
             .map_err(playlists_error)?;
         // Pin notes are the apps' to show (Pinned is theirs): the web UI
         // leaves them, so dismissing them here never hides one from an app.
-        list.sort_by_cached_key(|p| p.name.to_lowercase());
+        // Liked and All first (PX-43), then by name.
+        list.sort_by_cached_key(|p| {
+            let builtin = match p.builtin {
+                Some(Builtin::Liked) => 0,
+                Some(Builtin::All) => 1,
+                Some(Builtin::Unknown) => 2,
+                None => 3,
+            };
+            (builtin, p.name.to_lowercase())
+        });
         Ok(list.iter().map(info).collect())
     }
 
@@ -72,6 +82,7 @@ impl AdminApi {
                     entry: e.entry,
                     item: e.item,
                     unavailable: e.unavailable,
+                    liked: e.liked,
                 })
                 .collect(),
             offset: page.offset,
@@ -132,6 +143,26 @@ impl AdminApi {
             .edit(&actor(&user), id, revision, edits)
             .await
             .map_err(playlists_error)
+    }
+
+    /// Like `items` (`like`) or unlike them (PX-43): Liked after.
+    pub(super) async fn like_items(
+        &self,
+        user: ApiSessionUser,
+        items: Vec<String>,
+        like: bool,
+    ) -> RpcResult<PlaylistInfo> {
+        let items = items
+            .iter()
+            .map(|id| item_id(id))
+            .collect::<RpcResult<Vec<MediaId>>>()?;
+        let playlists = self.playlists_service()?;
+        let liked = if like {
+            playlists.like(&actor(&user), &items).await
+        } else {
+            playlists.unlike(&actor(&user), &items).await
+        };
+        Ok(info(&liked.map_err(playlists_error)?))
     }
 
     pub(super) async fn delete_playlist(&self, user: ApiSessionUser, id: &str) -> RpcResult<()> {
@@ -256,16 +287,21 @@ fn visibility(sharing: PlaylistSharing) -> Visibility {
 fn edit(op: PlaylistEditOp) -> RpcResult<PlaylistEdit> {
     Ok(match op {
         PlaylistEditOp::Add { id, before } => PlaylistEdit::Add {
-            id: id.parse::<MediaId>().map_err(|_| {
-                error(
-                    error_code::INVALID_INPUT,
-                    format!("{id:?} is not an item id"),
-                )
-            })?,
+            id: item_id(&id)?,
             before,
         },
         PlaylistEditOp::Remove { entry } => PlaylistEdit::Remove { entry },
         PlaylistEditOp::Move { entry, before } => PlaylistEdit::Move { entry, before },
+    })
+}
+
+/// `id` as an item's id.
+fn item_id(id: &str) -> RpcResult<MediaId> {
+    id.parse::<MediaId>().map_err(|_| {
+        error(
+            error_code::INVALID_INPUT,
+            format!("{id:?} is not an item id"),
+        )
     })
 }
 
@@ -302,6 +338,11 @@ fn info(p: &PlaylistSummary) -> PlaylistInfo {
         can_edit: p.can_edit,
         can_manage: p.can_manage,
         revision: p.revision,
+        builtin: p.builtin.and_then(|b| match b {
+            Builtin::Liked => Some(PlaylistBuiltin::Liked),
+            Builtin::All => Some(PlaylistBuiltin::All),
+            Builtin::Unknown => None,
+        }),
     }
 }
 
@@ -318,6 +359,7 @@ fn playlists_error(e: PlaylistsError) -> ErrorObjectOwned {
             error_code::KIND_NOT_ALLOWED,
             format!("this playlist does not take {}", kind_name(kind)),
         ),
+        PlaylistsError::NotLikeable(_) => error(error_code::KIND_NOT_ALLOWED, e.to_string()),
         PlaylistsError::Conflict { revision } => ErrorObjectOwned::owned(
             error_code::PLAYLIST_CONFLICT,
             e.to_string(),

@@ -55,6 +55,9 @@ pub struct FakeCatalog {
     rekeyed: Mutex<Vec<(MediaId, MediaId)>>,
     /// Items still in the library whose file cannot be read.
     unreadable: Mutex<Vec<MediaId>>,
+    /// Whether its music is a library of its own (PX-43): the artist,
+    /// albums and tracks are items either way.
+    music: Mutex<bool>,
 }
 
 /// What a key holds after the catalog gave its item a new one. A key the
@@ -83,7 +86,14 @@ impl FakeCatalog {
             removed: Mutex::default(),
             rekeyed: Mutex::default(),
             unreadable: Mutex::default(),
+            music: Mutex::default(),
         }
+    }
+
+    /// Serve its music as a second library, `plex:library:2`, holding
+    /// [`artist`]: what makes Liked and All listed (PX-43).
+    pub fn serve_music(&self) {
+        *self.music.lock() = true;
     }
 
     /// Take `id` out of the library: it is not found from now on, under
@@ -397,13 +407,33 @@ pub fn library() -> Library {
     }
 }
 
+/// The music library [`FakeCatalog::serve_music`] adds.
+pub fn music_library() -> Library {
+    Library {
+        id: LibraryId::new(Namespace::Plex, "2").unwrap(),
+        title: "Music".into(),
+        kind: LibraryKind::Music,
+    }
+}
+
 #[async_trait]
 impl Catalog for FakeCatalog {
     async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
+        if *self.music.lock() {
+            return Ok(vec![library(), music_library()]);
+        }
         Ok(vec![library()])
     }
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
+        if library.key() == "2" && *self.music.lock() {
+            let items = if page.offset == 0 && page.limit > 0 {
+                vec![artist()]
+            } else {
+                Vec::new()
+            };
+            return Ok(ItemPage { items, total: 1 });
+        }
         if library.key() != "1" {
             return Err(CatalogError::NotFound(library.to_string()));
         }

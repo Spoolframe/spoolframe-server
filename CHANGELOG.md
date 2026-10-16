@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Liked and All, built-in music playlists (PX-43). Every user has two,
+  made the first time they are needed and listed first among their
+  playlists while a music library is served: Liked, the tracks they
+  liked, newest first (they may reorder it); and All, every track they
+  may see, worked out from the library at each read, so a newly scanned
+  album is in it at once. Both play as any playlist does (in order,
+  shuffled, repeated, resumed, skipping played); neither is renamed,
+  shared or deleted, and All is not edited. A heart likes a track, or
+  every track of an album not liked yet; unliking an album takes all of
+  its tracks out. An album's heart is full when every track it has now is
+  liked, half when some are, empty when none: a track added to it later
+  is not liked by itself. Liked shows on album and artist screens as any
+  playlist holding a track does; All does not, as it holds every track.
+  The Plex import likes the tracks the user rated in Plex, the last rated
+  first, instead of making a playlist of them. Client protocol, behind
+  the new regular feature `spoolframe:liked` (the protocol version is
+  unchanged: an app without the feature sees neither playlist nor a
+  heart, and its `Like` is refused): `Like { items }` and
+  `Unlike { items }` (tracks or albums; anything else is
+  `KindNotAllowed`), answered with Liked's `PlaylistInfo`; `Item`'s
+  `liked` (`all`, `some` or `none`) and `liked_children`; `builtin`
+  (`liked` or `all`) on playlist summaries and on an item's playlists;
+  `liked` on a playlist's entries and on the entry playing. SDK:
+  `Features::liked`, `Session::like`, `Session::unlike`,
+  `ItemDetail::liked`, `ItemDetail::liked_children`, and the `Builtin`
+  and `Liked` types. Admin API: `me.like`, `me.unlike`, `builtin` on a
+  playlist, `liked` on an entry, and the hearts in `admin.catalogItem`'s
+  client reply. MCP: the `like` and `unlike` tools (`playlists:write`);
+  `list_playlists` lists the built-ins, `get_item` says what is liked.
+
 ## 0.10.0 (2026-10-16)
 
 - Playlists in the web UI (PX-40). A consumer gets a Playlists tab beside

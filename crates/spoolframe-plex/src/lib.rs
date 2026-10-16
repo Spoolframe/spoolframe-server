@@ -783,6 +783,22 @@ impl Catalog for PlexCatalog {
             .collect())
     }
 
+    /// One listing of the section's tracks (`type=10`), page by page,
+    /// where walking its albums is a request each (PX-43).
+    async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
+        let key = plex_key(library.namespace(), library.key(), library)?;
+        if !self.serves(Some(&SectionKey(key.to_owned()))) {
+            return Err(CatalogError::NotServed(library.to_string()));
+        }
+        let listed = self.listed(key, "10", &[]).await?;
+        let call = Call::get(format!("/library/sections/{key}/all")).about(library);
+        Ok(self
+            .items_of(&call, &listed)?
+            .into_iter()
+            .filter(|i| matches!(i, Item::Track(_)))
+            .collect())
+    }
+
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
         let key = plex_key(id.namespace(), id.key(), id)?;
         let call = Call::get(format!("/library/metadata/{key}")).about(id);

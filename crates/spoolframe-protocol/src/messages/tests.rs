@@ -490,6 +490,8 @@ fn every_reply_round_trips() {
             children: Vec::new(),
             markers: markers(),
             playlists: None,
+            liked: None,
+            liked_children: None,
         },
         Reply::Item {
             item: movie(),
@@ -499,7 +501,10 @@ fn every_reply_round_trips() {
                 id: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
                 name: "Heists".into(),
                 owner_kind: crate::playlists::PlaylistOwnerKind::SharedWithMe,
+                builtin: None,
             }]),
+            liked: None,
+            liked_children: None,
         },
         Reply::Search(search_results()),
         Reply::Tracks(MediaTracks::default()),
@@ -1606,6 +1611,8 @@ fn an_older_client_reads_an_item_that_has_markers() {
         children: Vec::new(),
         markers: markers(),
         playlists: None,
+        liked: None,
+        liked_children: None,
     })
     .unwrap();
     let before_markers::Reply::Item { item, children } = codec::decode(&bytes).unwrap() else {
@@ -1871,6 +1878,8 @@ fn a_reply_missing_a_field_is_refused() {
             children: Vec::new(),
             markers: Vec::new(),
             playlists: None,
+            liked: None,
+            liked_children: None,
         },
         &["markers"],
     );
@@ -2610,6 +2619,7 @@ mod playlists {
             can_manage: true,
             revision: 7,
             pinned: Some(0),
+            builtin: None,
         }
     }
 
@@ -2668,6 +2678,12 @@ mod playlists {
             Request::ImportPlexPlaylists { dry_run: true },
             Request::UnpinPlaylist { id },
             Request::DismissPinNotes,
+            Request::Like {
+                items: vec![movie().id().clone()],
+            },
+            Request::Unlike {
+                items: vec![movie().id().clone()],
+            },
         ] {
             assert!(!request.is_pre_auth(), "{request:?}");
             round_trip(RequestEnvelope {
@@ -2690,6 +2706,7 @@ mod playlists {
                     entry: 3,
                     item: movie(),
                     unavailable: true,
+                    liked: false,
                 }],
                 offset: 0,
                 total: 18,
@@ -2705,6 +2722,7 @@ mod playlists {
                 entry: 3,
                 item: movie(),
                 markers: markers(),
+                liked: true,
             }),
             Reply::PlaylistFinished,
             Reply::PlexImport(crate::playlists::PlexImport {
@@ -2764,6 +2782,49 @@ mod playlists {
             id: "x".into(),
             position: 0,
         }));
+        // Liking twice is liking once.
+        assert!(retry_safe(&Request::Like { items: Vec::new() }));
+        assert!(retry_safe(&Request::Unlike { items: Vec::new() }));
+    }
+
+    /// PX-43: a built-in playlist says which it is, an album says how
+    /// much of it is liked and which of its tracks, and an entry or the
+    /// one playing has its heart.
+    #[test]
+    fn likes_and_builtins_round_trip() {
+        let album: MediaId = "plex:album:31".parse().unwrap();
+        let track: MediaId = "plex:track:32".parse().unwrap();
+        let liked = PlaylistSummary {
+            name: "Liked".into(),
+            builtin: Some(crate::playlists::Builtin::Liked),
+            ..summary()
+        };
+        round_trip(Response::Ok(Reply::PlaylistInfo(liked)));
+        round_trip(Response::Ok(Reply::Playlists {
+            playlists: vec![PlaylistSummary {
+                builtin: Some(crate::playlists::Builtin::All),
+                ..summary()
+            }],
+            pin_notes: Vec::new(),
+        }));
+        let item = Reply::Item {
+            item: movie(),
+            children: Vec::new(),
+            markers: Vec::new(),
+            playlists: Some(Vec::new()),
+            liked: Some(crate::playlists::Liked::Some),
+            liked_children: Some(vec![track.clone()]),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["liked"], "some");
+        assert_eq!(json["liked_children"][0], "plex:track:32");
+        round_trip(Response::Ok(item));
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: Request::Like {
+                items: vec![album, track],
+            },
+        });
     }
 
     /// A client without the feature never gets `playlists`; one with it
@@ -2775,6 +2836,8 @@ mod playlists {
             children: Vec::new(),
             markers: Vec::new(),
             playlists: None,
+            liked: None,
+            liked_children: None,
         };
         let json = serde_json::to_value(&without).unwrap();
         assert!(json.get("playlists").is_none(), "{json}");

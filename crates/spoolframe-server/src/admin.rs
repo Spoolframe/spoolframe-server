@@ -2707,6 +2707,16 @@ impl MeApiServer for AdminApi {
         let (_, user) = self.caller(ext).await?;
         self.import_plex_playlists(user, dry_run).await
     }
+
+    async fn like(&self, ext: &Extensions, items: Vec<String>) -> RpcResult<PlaylistInfo> {
+        let (_, user) = self.caller(ext).await?;
+        self.like_items(user, items, true).await
+    }
+
+    async fn unlike(&self, ext: &Extensions, items: Vec<String>) -> RpcResult<PlaylistInfo> {
+        let (_, user) = self.caller(ext).await?;
+        self.like_items(user, items, false).await
+    }
 }
 
 #[async_trait]

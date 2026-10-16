@@ -3,6 +3,11 @@
 //! personal playlist of theirs, its items mapped to this server's. What
 //! does not map is reported. Nothing is synced afterwards: the playlist
 //! is ours only. A smart playlist is imported as what it holds now.
+//!
+//! The tracks the user rated in Plex, with any number of stars, are
+//! liked here (PX-43): Plex's rating is what its apps' heart sets, so
+//! they go into Liked, the last rated at the top, not into a playlist of
+//! their own. Imported twice, they are liked once.
 
 use spoolframe_plex::playlists::PlexPlaylistItem;
 use spoolframe_protocol::playlists::{PlexImport, PlexImported, PlexUnmapped};
@@ -33,6 +38,9 @@ impl From<SyncError> for ImportError {
     }
 }
 
+/// What the report calls Liked: its rated tracks' "playlist".
+const LIKED: &str = "Liked";
+
 /// What a Plex item is called, for the report.
 fn title(item: &Item) -> String {
     match item {
@@ -57,7 +65,20 @@ pub async fn import(
 ) -> Result<PlexImport, ImportError> {
     let (views, mut notes) = sync.user_views(user).await?;
     let (mut made, mut unmapped) = (Vec::new(), Vec::new());
+    let mut rated: Vec<(MediaId, String)> = Vec::new();
     for (server, plex) in views {
+        match plex.rated_tracks().await {
+            Ok(tracks) => rated.extend(tracks.iter().map(|track| {
+                let id = crate::catalog::ids::media(&server, track.id().clone());
+                (id, title(track))
+            })),
+            Err(e) => {
+                tracing::warn!(server, error = %e, "cannot read a Plex account's rated tracks");
+                notes.push(format!(
+                    "the rated tracks on Plex server {server} could not be read"
+                ));
+            }
+        }
         let lists = match plex.playlists().await {
             Ok(lists) => lists,
             Err(e) => {
@@ -113,6 +134,21 @@ pub async fn import(
             }
             made.push(PlexImported {
                 name: list.title.clone(),
+                playlist_id,
+                entries: count,
+            });
+        }
+    }
+    if !rated.is_empty() {
+        let (playlist_id, count, left_out) = playlists.import_liked(actor, &rated, dry_run).await?;
+        unmapped.extend(left_out.into_iter().map(|(title, reason)| PlexUnmapped {
+            playlist: LIKED.into(),
+            title: Some(title),
+            reason,
+        }));
+        if count > 0 {
+            made.push(PlexImported {
+                name: LIKED.into(),
                 playlist_id,
                 entries: count,
             });

@@ -479,3 +479,199 @@ async fn a_plex_import_dry_run_says_what_it_would_make_and_the_import_makes_it()
         .collect();
     assert_eq!(holding, ["Films for all"]);
 }
+
+/// PX-43 in the web UI: `me.like` fills the caller's Liked, which with
+/// All comes first in `me.playlists`, marked built-in, and is neither
+/// renamed nor deleted; All is not edited. One user's likes are not
+/// another's.
+#[tokio::test]
+async fn liked_and_all_are_listed_first_and_me_like_fills_liked() {
+    use spoolframe_admin_api::PlaylistBuiltin;
+    let f = four("web-playlists-liked").await;
+    f.server.catalog.serve_music();
+    f.alice
+        .playlist_create(new("Aardvarks", EPISODES, PlaylistSharing::Personal))
+        .await
+        .unwrap();
+    let liked = f.alice.like(vec!["plex:album:31".into()]).await.unwrap();
+    assert_eq!(liked.builtin, Some(PlaylistBuiltin::Liked));
+    let list = f.alice.playlists().await.unwrap();
+    let builtins: Vec<_> = list.iter().map(|p| p.builtin).collect();
+    assert_eq!(
+        builtins,
+        [
+            Some(PlaylistBuiltin::Liked),
+            Some(PlaylistBuiltin::All),
+            None
+        ]
+    );
+    let page = f.alice.playlist(liked.id.clone(), 0, 10).await.unwrap();
+    assert_eq!(page.entries.len(), 2);
+    assert!(page.entries.iter().all(|e| e.liked));
+    assert_eq!(
+        items(
+            &f.bob,
+            &named(&f.bob.playlists().await.unwrap(), "Liked")
+                .unwrap()
+                .id
+        )
+        .await
+        .len(),
+        0
+    );
+
+    let rename = f
+        .alice
+        .playlist_update(
+            liked.id.clone(),
+            PlaylistChanges {
+                name: Some("Loved".into()),
+                ..PlaylistChanges::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(rename), error_code::PLAYLIST_READ_ONLY);
+    let all = &list[1];
+    let delete = f.alice.playlist_delete(all.id.clone()).await.unwrap_err();
+    assert_eq!(code(delete), error_code::PLAYLIST_READ_ONLY);
+    let edit = f
+        .alice
+        .playlist_edit(
+            all.id.clone(),
+            all.revision,
+            vec![PlaylistEditOp::Remove { entry: 1 }],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(edit), error_code::PLAYLIST_READ_ONLY);
+    assert_eq!(items(&f.alice, &all.id).await.len(), 3);
+    let film = f.alice.like(vec!["plex:movie:1".into()]).await.unwrap_err();
+    assert_eq!(code(film), error_code::KIND_NOT_ALLOWED);
+}
+
+/// Alice's rated tracks on the stand-in Plex server's music section (4):
+/// 41, rated first, and 42, rated since; 44, not rated; 95, which Plex
+/// no longer has.
+async fn mount_plex_music(pms: &wiremock::MockServer) {
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+    let track = |key: &str, rating: f64, rated_at: i64| {
+        json!({ "ratingKey": key, "type": "track", "title": format!("Track {key}"),
+                "parentRatingKey": "40", "grandparentRatingKey": "39",
+                "parentTitle": "Discovery", "grandparentTitle": "Daft Punk",
+                "index": 1, "parentIndex": 1, "librarySectionID": 4,
+                "userRating": rating, "lastRatedAt": rated_at,
+                "Media": [{ "Part": [{ "file": format!("/data/music/{key}.flac"), "size": 1 }] }] })
+    };
+    Mock::given(method("GET"))
+        .and(path("/library/sections"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "MediaContainer": {
+            "Directory": [
+                { "key": "1", "type": "movie", "title": "Movies" },
+                { "key": "4", "type": "artist", "title": "Music" },
+            ],
+        } })),
+        )
+        .with_priority(1)
+        .mount(pms)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/4/all"))
+        .and(query_param("type", "10"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "MediaContainer": {
+            "totalSize": 4,
+            "Metadata": [
+                track("41", 10.0, 100),
+                track("42", 8.0, 200),
+                track("44", 0.0, 0),
+                track("95", 6.0, 50),
+            ],
+        } })),
+        )
+        .with_priority(1)
+        .mount(pms)
+        .await;
+    for key in ["41", "42"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/library/metadata/{key}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "MediaContainer": { "Metadata": [track(key, 0.0, 0)] } }),
+                ),
+            )
+            .with_priority(1)
+            .mount(pms)
+            .await;
+    }
+}
+
+/// PX-43: the import likes the tracks rated in Plex, the last rated
+/// first, rather than making a playlist of them; a dry run likes none.
+#[tokio::test]
+async fn a_plex_import_likes_the_rated_tracks() {
+    use crate::plex_link::{link, mount_pin, reaching, root_and_alice};
+    use crate::plex_sync::{library, mount_resources, tower};
+    use spoolframe_admin_api::{PlaylistBuiltin, PlexPlaylistMade};
+
+    let pms = tower(&[(Some("alice-on-tower"), &[])]).await;
+    mount_plex_playlists(&pms).await;
+    mount_plex_music(&pms).await;
+    let tv = wiremock::MockServer::start().await;
+    mount_pin(&tv, 77, "tok-alice", "alice").await;
+    mount_resources(&tv, &pms, &[("tok-alice", "alice-on-tower")]).await;
+    let file = format!(
+        "plex {{ url = \"{}\"; }} libraries [ {} {{ name = \"Music\"; kind = \"music\"; plex {{ server = \"plex\"; section = \"4\"; }} }} ]",
+        pms.uri(),
+        library("Movies", "1", "both")
+    );
+    let dir = crate::admin::state_dir("web-playlists-plex-liked").await;
+    let (addr, _store) =
+        crate::settings::serve_syncing_with(dir.as_ref(), &file, reaching(&tv), false, true).await;
+    let (root, alice) = root_and_alice(addr).await;
+    link(&alice).await;
+
+    let dry = alice.playlist_plex_import(true).await.unwrap();
+    let liked = dry.made.iter().find(|m| m.name == "Liked");
+    assert_eq!(
+        liked,
+        Some(&PlexPlaylistMade {
+            name: "Liked".into(),
+            playlist_id: None,
+            entries: 2,
+        }),
+        "{dry:?}"
+    );
+    assert!(
+        dry.unmapped
+            .iter()
+            .any(|u| u.playlist == "Liked" && u.title.as_deref() == Some("Track 95")),
+        "{:?}",
+        dry.unmapped
+    );
+
+    let done = alice.playlist_plex_import(false).await.unwrap();
+    let id = done
+        .made
+        .iter()
+        .find(|m| m.name == "Liked")
+        .and_then(|m| m.playlist_id.clone())
+        .expect("Liked filled");
+    let list = alice.playlists().await.unwrap();
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].builtin, Some(PlaylistBuiltin::Liked));
+    assert_eq!(items(&alice, &id).await, ["plex:track:42", "plex:track:41"]);
+    // The Heists playlist is made as before.
+    assert!(named(&list, "Heists").is_some());
+
+    // An item's page shows the caller's own heart: root liked nothing.
+    use spoolframe_admin_api::AdminApiClient;
+    let track = root.catalog_item("plex:track:41".into()).await.unwrap();
+    assert_eq!(track.reply["liked"], "none");
+    root.like(vec!["plex:track:41".into()]).await.unwrap();
+    let track = root.catalog_item("plex:track:41".into()).await.unwrap();
+    assert_eq!(track.reply["liked"], "all");
+}

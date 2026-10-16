@@ -89,10 +89,22 @@ impl PlexCatalog {
         plex_type: &str,
         filter: (&str, &str),
     ) -> Result<Vec<Metadata>, CatalogError> {
+        self.listed(section, plex_type, &[filter]).await
+    }
+
+    /// A section's items of `plex_type` (`10`: tracks) that pass
+    /// `filters`, page by page.
+    pub(crate) async fn listed(
+        &self,
+        section: &str,
+        plex_type: &str,
+        filters: &[(&str, &str)],
+    ) -> Result<Vec<Metadata>, CatalogError> {
         let mut all = Vec::new();
         loop {
             let mut call = Call::get(format!("/library/sections/{section}/all"));
-            call.query = vec![("type", plex_type), ("includeGuids", "1"), filter];
+            call.query = vec![("type", plex_type), ("includeGuids", "1")];
+            call.query.extend_from_slice(filters);
             call.headers = vec![
                 ("X-Plex-Container-Start", all.len().to_string()),
                 ("X-Plex-Container-Size", PAGE.to_string()),

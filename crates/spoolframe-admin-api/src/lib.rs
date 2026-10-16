@@ -2045,7 +2045,10 @@ pub struct CatalogItem {
     pub server_name: String,
     /// Exactly what `spoolframe/client/1` answers `Item` with, as JSON:
     /// `{"type": "item", "item": …, "children": […], "markers": […]}`,
-    /// with the caller's own playback state.
+    /// with the caller's own playback state, the playlists holding it,
+    /// and its hearts (PX-43): a track's or album's `liked` (`"all"`,
+    /// `"some"`, `"none"`) and an album's `liked_children`, its tracks
+    /// liked.
     pub reply: serde_json::Value,
     pub matched: bool,
     pub guid: Option<String>,
@@ -3048,6 +3051,19 @@ pub enum PlaylistOwner {
     ServerWide,
 }
 
+/// A built-in playlist (PX-43): every user's own, never renamed, shared
+/// or deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaylistBuiltin {
+    /// The tracks the caller liked (`me.like`), newest first unless
+    /// moved; entries are moved and removed, never added, by
+    /// `me.playlistEdit`.
+    Liked,
+    /// Every track the caller may see, worked out at each read. Read-only.
+    All,
+}
+
 /// A playlist as the caller sees it, without its entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3064,6 +3080,9 @@ pub struct PlaylistInfo {
     pub can_manage: bool,
     /// What `me.playlistEdit` names; raised by every change.
     pub revision: u64,
+    /// Which built-in playlist it is (PX-43); `None` for one a user made.
+    #[serde(default)]
+    pub builtin: Option<PlaylistBuiltin>,
 }
 
 /// One entry of a playlist: its item as the catalog has it now, with the
@@ -3077,6 +3096,9 @@ pub struct PlaylistEntryInfo {
     pub item: Item,
     /// Still in the library, but its file cannot be read now.
     pub unavailable: bool,
+    /// A track in the caller's Liked (PX-43): its heart.
+    #[serde(default)]
+    pub liked: bool,
 }
 
 /// A playlist and one page of its entries (`me.playlist`).
@@ -3526,6 +3548,18 @@ pub trait MeApi {
         &self,
         dry_run: bool,
     ) -> jsonrpsee::core::RpcResult<PlexPlaylistImport>;
+
+    /// Like tracks or albums (PX-43), by MediaId: their tracks not liked
+    /// yet go to the top of the caller's Liked, an album's in disc and
+    /// track order. Liked as it is after. 1 to 100 items;
+    /// `KIND_NOT_ALLOWED` for anything but a track or an album.
+    #[method(name = "like", with_extensions)]
+    async fn like(&self, items: Vec<String>) -> jsonrpsee::core::RpcResult<PlaylistInfo>;
+
+    /// Take tracks, or every track of albums, out of the caller's Liked
+    /// (PX-43). Liked as it is after.
+    #[method(name = "unlike", with_extensions)]
+    async fn unlike(&self, items: Vec<String>) -> jsonrpsee::core::RpcResult<PlaylistInfo>;
 }
 
 /// Other users and the server: admins only.
