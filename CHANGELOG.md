@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- MCP has its own Settings tab, Settings › MCP, out of Remote access:
+  the `mcp.enabled` switch (unchanged, still live) and, while it is on,
+  this server's MCP address and the commands that add it to Claude Code
+  (`claude mcp add --transport http spoolframe <URL>`, then `/mcp` to
+  sign in) and to Codex (`codex mcp add spoolframe --url <URL>`, then
+  `codex mcp login spoolframe`), each with a Copy button, and which
+  scopes the agent asks for. The plain-HTTP and public-address notices
+  come with it.
+
 - The web UI's pages are up to 1600px wide, where they stopped at 1200px
   and left a wide empty strip on a large window. The GPU card's and the
   Logs page's longer notes keep to a readable width.

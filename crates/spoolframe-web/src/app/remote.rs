@@ -5,6 +5,10 @@
 //! "From outside your home?", in the Access step's apps card
 //! (WebWizardRemoteChoices). The form's logic is `crate::remote`, tested
 //! on the host.
+//!
+//! And Settings › MCP (PX-42), its own tab: the `mcp.enabled` switch and
+//! how to add the server to an agent. It was a card of Remote access; it
+//! stays in this file for the switch, notice and save parts it shares.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{AdminApiClient, MappingStatus, ServerStatus, Settings};
@@ -198,14 +202,6 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
                 key: "{g}",
                 settings: loaded.clone(),
                 advanced,
-                on_done,
-                on_reload: move |_| generation += 1,
-            }
-        }
-        for g in [generation()] {
-            McpFields {
-                key: "{g}",
-                settings: loaded.clone(),
                 on_done,
                 on_reload: move |_| generation += 1,
             }
@@ -792,8 +788,53 @@ fn UplinkFields(
     }
 }
 
+/// Settings › MCP.
+#[component]
+pub fn McpForm(on_done: EventHandler<()>) -> Element {
+    let mut generation = use_signal(|| 0u32);
+    let settings = use_resource(move || async move {
+        let _ = generation();
+        load_settings().await
+    });
+    let current = settings.read().clone();
+    if let Some(wait) = loading(&current) {
+        return wait;
+    }
+    let Some(Ok(loaded)) = current else {
+        return rsx! {};
+    };
+    rsx! {
+        div { class: "flex flex-col gap-1.5",
+            h2 { class: "m-0 text-[22px] font-semibold", "MCP" }
+            p { class: "m-0 text-sm text-ctp-subtext0",
+                "An MCP server for AI agents such as Claude Code and Codex, which act for the user who connects them."
+            }
+        }
+        for g in [generation()] {
+            McpFields {
+                key: "{g}",
+                settings: loaded.clone(),
+                on_done,
+                on_reload: move |_| generation += 1,
+            }
+        }
+    }
+}
+
+/// One command to copy, with its Copy button.
+#[component]
+fn Command(text: String) -> Element {
+    rsx! {
+        div { class: "flex items-start gap-2.5",
+            code { class: "mono-value cat-break min-w-0 flex-grow text-xs", "{text}" }
+            super::admin::CopyButton { text: text.clone() }
+        }
+    }
+}
+
 /// `mcp.enabled` (PX-42): an MCP server at `/mcp`, for AI agents such
-/// as Claude, which sign users in through OAuth. Off by default.
+/// as Claude, which sign users in through OAuth. Off by default. While
+/// it is on (as saved), how to add it to Claude Code and Codex.
 #[component]
 fn McpFields(
     settings: Settings,
@@ -812,6 +853,11 @@ fn McpFields(
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_default();
     let address = crate::connect::mcp_url(public_url.as_deref(), &origin);
+    let claude = crate::connect::claude_code_add(&address);
+    let [codex, codex_login] = crate::connect::codex_add(&address);
+    // The commands only once it is on, as saved: an agent added before
+    // would find no server.
+    let saved_on = flag(&settings, KEY);
     let s = settings.clone();
     let on_save = use_callback(move |()| {
         let s = s.clone();
@@ -837,10 +883,10 @@ fn McpFields(
                 }
                 Note { settings: settings.clone(), setting: KEY, on_changed: move |_| on_reload.call(()) }
             }
-            if on() {
+            if saved_on {
                 div { class: "wan-part",
                     span { class: "text-[13px] text-ctp-subtext0", "Connect an agent by this address:" }
-                    span { class: "mono-value text-xs", "{address}" }
+                    Command { text: address.clone() }
                     if public_url.is_none() {
                         Notice {
                             "Over the Internet an agent needs the web UI's public address, with HTTPS (admin.public_url). Without one, only an agent that reaches this server at its own address can connect."
@@ -849,6 +895,30 @@ fn McpFields(
                         Notice {
                             "This page is plain HTTP across the network: an agent's sign-in here crosses it in clear."
                         }
+                    }
+                }
+                div { class: "wan-part",
+                    span { class: "text-sm font-semibold", "Claude Code" }
+                    Command { text: claude }
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "Then run /mcp in Claude Code and choose spoolframe: it opens this server's sign-in in your browser."
+                    }
+                }
+                div { class: "wan-part",
+                    span { class: "text-sm font-semibold", "Codex" }
+                    Command { text: codex }
+                    Command { text: codex_login }
+                    span { class: "text-[13px] text-ctp-subtext0", "The second signs in, in your browser." }
+                }
+                div { class: "wan-part",
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "The agent asks for library:read, playlists:read, playlists:write and, for an admin, admin. You choose which it gets on the consent page, and disconnect it in My profile."
+                    }
+                }
+            } else {
+                div { class: "wan-part",
+                    span { class: "text-[13px] text-ctp-subtext0",
+                        "Turn MCP on and save to get the commands that add this server to Claude Code or Codex."
                     }
                 }
             }

@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use super::Route;
 use super::admin::{Said, Toast, say};
 use super::experimental::ExperimentalForm;
-use super::remote::RemoteAccessForm;
+use super::remote::{McpForm, RemoteAccessForm};
 use super::restart::PendingRestart;
 use super::sso::SsoForm;
 use super::telemetry::TelemetryForm;
@@ -25,6 +25,7 @@ const TABS: &[(&str, &str)] = &[
     ("playback", "Playback"),
     ("access", "Access"),
     ("remote", "Remote access"),
+    ("mcp", "MCP"),
     ("security", "Security"),
     ("sso", "Sign-in providers"),
     ("telemetry", "Telemetry"),
@@ -151,6 +152,14 @@ pub fn Settings(tab: String) -> Element {
                 div { class: "flex max-w-[820px] flex-col gap-[18px]",
                     for n in [saved()] {
                         RemoteAccessForm { key: "{n}", on_done }
+                    }
+                }
+            } else if tab == "mcp" {
+                // `mcp.enabled` and how to add the server to an agent
+                // (PX-42), out of Remote access.
+                div { class: "flex max-w-[820px] flex-col gap-[18px]",
+                    for n in [saved()] {
+                        McpForm { key: "{n}", on_done }
                     }
                 }
             } else if tab == "sso" {

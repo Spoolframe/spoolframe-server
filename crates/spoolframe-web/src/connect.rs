@@ -1,7 +1,8 @@
 //! What the pages about connected apps say (PX-42), apart from the
 //! pages: the consent page's words for each scope, which of them are
-//! granted, the address an MCP client is given in Settings › Remote
-//! access, and Connected apps' and the audit list's lines.
+//! granted, the address an MCP client is given in Settings › MCP and the
+//! commands that add it to Claude Code and Codex, and Connected apps' and
+//! the audit list's lines.
 
 /// What a scope lets an app do, as consent words it: a title and a line.
 /// `None` for one this page does not know, which it never offers.
@@ -42,6 +43,24 @@ pub fn granted(offered: &[String], unticked: &[String]) -> Vec<String> {
 pub fn mcp_url(public_url: Option<&str>, page_origin: &str) -> String {
     let base = public_url.unwrap_or(page_origin).trim_end_matches('/');
     format!("{base}/mcp")
+}
+
+/// The name the commands below give this server in the agent's list.
+pub const MCP_NAME: &str = "spoolframe";
+
+/// The command that adds the MCP server at `url` to Claude Code. `/mcp`
+/// in Claude Code then signs in (OAuth, in the browser).
+pub fn claude_code_add(url: &str) -> String {
+    format!("claude mcp add --transport http {MCP_NAME} {url}")
+}
+
+/// The commands that add the MCP server at `url` to Codex and sign in to
+/// it, in that order.
+pub fn codex_add(url: &str) -> [String; 2] {
+    [
+        format!("codex mcp add {MCP_NAME} --url {url}"),
+        format!("codex mcp login {MCP_NAME}"),
+    ]
 }
 
 /// Where a sign-in on the consent page comes back to: the same request.
@@ -119,6 +138,22 @@ mod tests {
         assert_eq!(
             mcp_url(None, "http://10.0.0.5:7421"),
             "http://10.0.0.5:7421/mcp"
+        );
+    }
+
+    #[test]
+    fn the_agents_are_given_the_mcp_address() {
+        let url = mcp_url(Some("https://media.example.org"), "http://10.0.0.5:7421");
+        assert_eq!(
+            claude_code_add(&url),
+            "claude mcp add --transport http spoolframe https://media.example.org/mcp"
+        );
+        assert_eq!(
+            codex_add(&url),
+            [
+                "codex mcp add spoolframe --url https://media.example.org/mcp".to_owned(),
+                "codex mcp login spoolframe".to_owned(),
+            ]
         );
     }
 

@@ -128,7 +128,7 @@ after a change: bundle, reload.
 ### MCP (AI agents)
 
 The server has an MCP server at `/mcp` on the admin listener (PX-42), off
-until `mcp.enabled` is on (Settings › Remote access, or the config file).
+until `mcp.enabled` is on (Settings › MCP, or the config file).
 To connect Claude, add a custom connector with the web UI's address and
 `/mcp`, e.g. `https://media.example.org/mcp`: Claude registers itself,
 opens the server's sign-in and consent page, and gets a token for the
