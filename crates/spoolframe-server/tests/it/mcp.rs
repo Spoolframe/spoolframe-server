@@ -467,10 +467,14 @@ async fn every_call_is_counted_and_logged() {
     }
 }
 
-const PLAYLIST_TOOLS: [&str; 11] = [
+const PLAYLIST_TOOLS: [&str; 15] = [
     "list_playlists",
     "get_playlist",
     "create_playlist",
+    "rename_playlist",
+    "list_share_candidates",
+    "share_playlist",
+    "delete_playlist",
     "add_to_playlist",
     "remove_from_playlist",
     "move_in_playlist",
@@ -1046,6 +1050,35 @@ async fn playlists_write_alone_does_not_edit_a_server_wide_playlist() {
     assert!(page["entries"].as_array().unwrap().is_empty(), "{page}");
 }
 
+/// The scope, not ownership, lets an agent near what every user sees: the
+/// admin who made a server-wide playlist, through an app granted only
+/// playlists:write, neither edits nor deletes it.
+#[tokio::test]
+async fn its_owner_without_the_admin_scope_does_not_change_a_server_wide_playlist() {
+    let (server, addr) = beside("mcp-server-wide-owner").await;
+    user(&server, "carol", Role::Admin).await;
+    let id = movie_night(addr, "carol").await;
+    let mcp = Mcp::connect(addr, "carol", &["playlists:write"]).await;
+    let added = mcp
+        .call(
+            "add_to_playlist",
+            json!({ "playlist": id, "items": ["plex:movie:1"] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(added.contains("admin scope"), "{added}");
+    let deleted = mcp
+        .call("delete_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap_err();
+    assert!(deleted.contains("admin scope"), "{deleted}");
+    let page = mcp
+        .call("get_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert!(page["entries"].as_array().unwrap().is_empty(), "{page}");
+}
+
 /// With the admin scope, an edit of a server-wide playlist is made, and
 /// kept in the audit list as the making is.
 #[tokio::test]
@@ -1076,4 +1109,289 @@ async fn an_admin_scoped_edit_of_a_server_wide_playlist_is_audited() {
         (edit.target.as_deref(), edit.outcome.as_str()),
         (Some(id.as_str()), "ok")
     );
+}
+
+/// A personal playlist `name` of alice's, made by her agent: its id.
+async fn alices(mcp: &Mcp, name: &str) -> String {
+    let made = mcp
+        .call("create_playlist", json!({ "name": name }))
+        .await
+        .unwrap();
+    made["id"].as_str().unwrap().to_owned()
+}
+
+/// The ids of the playlists `mcp`'s user sees.
+async fn seen_playlists(mcp: &Mcp) -> Vec<String> {
+    let listed = mcp.call("list_playlists", json!({})).await.unwrap();
+    ids(&listed["playlists"])
+}
+
+/// With playlists:write every playlist tool is listed, deleting and
+/// sharing among them.
+#[tokio::test]
+async fn playlists_write_lists_every_playlist_tool() {
+    let (server, addr) = beside("mcp-playlist-tools").await;
+    user(&server, "alice", Role::Consumer).await;
+    let mcp = Mcp::connect(addr, "alice", &["playlists:write"]).await;
+    let tools = mcp.tools().await;
+    for tool in PLAYLIST_TOOLS {
+        assert!(tools.contains(&tool.to_owned()), "{tool}: {tools:?}");
+    }
+}
+
+/// An agent deletes a playlist it made for the user: it is gone from
+/// their playlists.
+#[tokio::test]
+async fn the_owner_s_agent_deletes_their_playlist() {
+    let (server, addr) = beside("mcp-delete").await;
+    user(&server, "alice", Role::Consumer).await;
+    let mcp = Mcp::connect(addr, "alice", &["playlists:write"]).await;
+    let id = alices(&mcp, "Heists").await;
+    let deleted = mcp
+        .call("delete_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert_eq!(deleted["deleted"], id.as_str());
+    assert!(!seen_playlists(&mcp).await.contains(&id));
+    let again = mcp
+        .call("get_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap_err();
+    assert!(again.contains("no such playlist"), "{again}");
+}
+
+/// Someone a playlist is shared with, even as an editor, does not delete
+/// it, nor share it on, nor ask whom it can be shared with.
+#[tokio::test]
+async fn another_user_s_agent_neither_deletes_nor_shares_a_playlist() {
+    let (server, addr) = beside("mcp-delete-not-mine").await;
+    user(&server, "alice", Role::Consumer).await;
+    let bob = user(&server, "bob", Role::Consumer).await;
+    let alice = Mcp::connect(addr, "alice", &["playlists:write"]).await;
+    let id = alices(&alice, "Heists").await;
+    alice
+        .call(
+            "share_playlist",
+            json!({
+                "playlist": id,
+                "visibility": { "shared": [{ "user": bob.to_string(), "can_edit": true }] },
+            }),
+        )
+        .await
+        .unwrap();
+    let bobs = Mcp::connect(addr, "bob", &["playlists:write"]).await;
+    assert!(seen_playlists(&bobs).await.contains(&id));
+
+    let refused = bobs
+        .call("delete_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("cannot change"), "{refused}");
+    let refused = bobs
+        .call(
+            "share_playlist",
+            json!({ "playlist": id, "visibility": "personal" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("cannot change"), "{refused}");
+    let refused = bobs
+        .call("list_share_candidates", json!({ "playlist": id }))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("cannot change"), "{refused}");
+    // Still hers, still shared with him.
+    assert!(seen_playlists(&alice).await.contains(&id));
+    assert!(seen_playlists(&bobs).await.contains(&id));
+}
+
+/// Liked and All are the server's to keep: deleting one is refused.
+#[tokio::test]
+async fn a_built_in_playlist_is_not_deleted() {
+    let (server, addr) = beside("mcp-delete-builtin").await;
+    server.catalog.serve_music();
+    user(&server, "alice", Role::Consumer).await;
+    let mcp = Mcp::connect(addr, "alice", &["playlists:write"]).await;
+    let listed = mcp.call("list_playlists", json!({})).await.unwrap();
+    let builtins = ids(&listed["playlists"]);
+    assert_eq!(builtins.len(), 2, "{listed}");
+    for id in &builtins {
+        let refused = mcp
+            .call("delete_playlist", json!({ "playlist": id }))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("cannot change"), "{id}: {refused}");
+    }
+    assert_eq!(seen_playlists(&mcp).await, builtins);
+}
+
+/// An admin's agent with the admin scope deletes another admin's
+/// server-wide playlist, and the deleting is kept in the audit list;
+/// with playlists:write alone it is refused.
+#[tokio::test]
+async fn deleting_a_server_wide_playlist_needs_the_admin_scope_and_is_audited() {
+    let (server, addr) = beside("mcp-delete-server-wide").await;
+    user(&server, "root", Role::Admin).await;
+    user(&server, "carol", Role::Admin).await;
+    let id = movie_night(addr, "carol").await;
+
+    let without = Mcp::connect(addr, "root", &["playlists:write"]).await;
+    let refused = without
+        .call("delete_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("admin scope"), "{refused}");
+    assert!(seen_playlists(&without).await.contains(&id));
+
+    let with = Mcp::connect(addr, "root", &["playlists:write", "admin"]).await;
+    with.call("delete_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert!(!seen_playlists(&with).await.contains(&id));
+    let (events, _) = server.store.audit_page(0, 10).await.unwrap();
+    let deleted = events
+        .iter()
+        .find(|e| e.action == "delete_playlist")
+        .expect("the deleting is in the audit list");
+    assert_eq!(
+        (deleted.target.as_deref(), deleted.outcome.as_str()),
+        (Some(id.as_str()), "ok")
+    );
+}
+
+/// The ticket's own: an agent finds bob among whom a playlist can be
+/// shared with and shares it with him; his playlists list it, until it
+/// is made personal again.
+#[tokio::test]
+async fn a_playlist_is_shared_with_a_candidate_and_made_personal_again() {
+    let (server, addr) = beside("mcp-share").await;
+    user(&server, "alice", Role::Consumer).await;
+    let bob = user(&server, "bob", Role::Consumer).await;
+    user(&server, "carol", Role::Consumer).await;
+    let alice = Mcp::connect(addr, "alice", &["playlists:write"]).await;
+    let id = alices(&alice, "Heists").await;
+
+    let found = alice
+        .call(
+            "list_share_candidates",
+            json!({ "playlist": id, "query": "BO" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["total"], 1, "{found}");
+    let candidate = &found["candidates"][0];
+    assert_eq!(candidate["id"], bob.to_string());
+    assert_eq!(candidate["username"], "bob");
+    assert_eq!(candidate["displayName"], "bob");
+    assert_eq!(candidate["kind"], "local");
+    // Everyone but her, when no query narrows it.
+    let everyone = alice
+        .call("list_share_candidates", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert_eq!(everyone["total"], 2, "{everyone}");
+
+    let shared = alice
+        .call(
+            "share_playlist",
+            json!({
+                "playlist": id,
+                "visibility": { "shared": [{ "user": candidate["id"], "can_edit": false }] },
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        shared["visibility"]["shared"][0]["user"],
+        bob.to_string(),
+        "{shared}"
+    );
+    let bobs = Mcp::connect(addr, "bob", &["playlists:read"]).await;
+    assert!(seen_playlists(&bobs).await.contains(&id));
+    let carols = Mcp::connect(addr, "carol", &["playlists:read"]).await;
+    assert!(!seen_playlists(&carols).await.contains(&id));
+
+    let personal = alice
+        .call(
+            "share_playlist",
+            json!({ "playlist": id, "visibility": "personal" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(personal["visibility"], "personal");
+    assert!(!seen_playlists(&bobs).await.contains(&id));
+}
+
+/// Making a playlist server-wide is what every user sees: refused with
+/// playlists:write alone, as making one is; with the admin scope it is
+/// made, bob sees it, and it is kept in the audit list.
+#[tokio::test]
+async fn sharing_a_playlist_server_wide_needs_the_admin_scope() {
+    let (server, addr) = beside("mcp-share-server-wide").await;
+    user(&server, "root", Role::Admin).await;
+    user(&server, "bob", Role::Consumer).await;
+    let without = Mcp::connect(addr, "root", &["playlists:write"]).await;
+    let id = alices(&without, "Movie night").await;
+    let refused = without
+        .call(
+            "share_playlist",
+            json!({ "playlist": id, "visibility": "server_wide" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("admin scope"), "{refused}");
+    let bobs = Mcp::connect(addr, "bob", &["playlists:read"]).await;
+    assert!(!seen_playlists(&bobs).await.contains(&id));
+
+    let with = Mcp::connect(addr, "root", &["playlists:write", "admin"]).await;
+    let shared = with
+        .call(
+            "share_playlist",
+            json!({ "playlist": id, "visibility": "server_wide" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["visibility"], "server_wide");
+    assert!(seen_playlists(&bobs).await.contains(&id));
+    let (events, _) = server.store.audit_page(0, 10).await.unwrap();
+    let audited = events
+        .iter()
+        .find(|e| e.action == "share_playlist")
+        .expect("the sharing is in the audit list");
+    assert_eq!(
+        (audited.target.as_deref(), audited.outcome.as_str()),
+        (Some(id.as_str()), "ok")
+    );
+
+    // Server-wide now, it is changed back only with the admin scope too.
+    let refused = without
+        .call(
+            "share_playlist",
+            json!({ "playlist": id, "visibility": "personal" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("admin scope"), "{refused}");
+    assert!(seen_playlists(&bobs).await.contains(&id));
+}
+
+#[tokio::test]
+async fn the_owner_s_agent_renames_their_playlist() {
+    let (server, addr) = beside("mcp-rename").await;
+    user(&server, "alice", Role::Consumer).await;
+    let mcp = Mcp::connect(addr, "alice", &["playlists:write"]).await;
+    let id = alices(&mcp, "Heists").await;
+    let renamed = mcp
+        .call(
+            "rename_playlist",
+            json!({ "playlist": id, "name": "Capers" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed["name"], "Capers");
+    let page = mcp
+        .call("get_playlist", json!({ "playlist": id }))
+        .await
+        .unwrap();
+    assert_eq!(page["playlist"]["name"], "Capers");
 }

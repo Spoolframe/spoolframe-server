@@ -33,7 +33,9 @@ use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_types::{Item, MediaId, SearchScope};
 
 use jsonrpsee::types::ErrorObjectOwned;
-use spoolframe_protocol::playlists::{Kinds, PlaylistEdit, PlaylistSummary, Visibility};
+use spoolframe_protocol::playlists::{
+    Kinds, PlaylistEdit, PlaylistShare, PlaylistSummary, Visibility,
+};
 
 use crate::admin::AdminApi;
 use crate::oauth::Scope;
@@ -204,9 +206,51 @@ static TOOLS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
                 "create_playlist",
                 "Make a playlist, empty: its id, for add_to_playlist. The user's own, or with \
                  server_wide, one every user of the server sees, which only an admin's \
-                 connection granted the admin scope may make.",
+                 connection granted the admin scope may make. share_playlist shares it \
+                 afterwards.",
             ))
             .annotate(writes()),
+        },
+        Entry {
+            scope: Scope::PlaylistsWrite,
+            tool: schema::<RenameArgs>(tool(
+                "rename_playlist",
+                "Rename a playlist the user manages (canManage in list_playlists).",
+            ))
+            .annotate(writes().idempotent(true)),
+        },
+        Entry {
+            scope: Scope::PlaylistsWrite,
+            tool: schema::<ShareCandidatesArgs>(tool(
+                "list_share_candidates",
+                "Whom a playlist the user manages can be shared with: the server's other \
+                 users, a page at a time, optionally only those whose name or username holds \
+                 a query. Each one's id is what share_playlist takes.",
+            ))
+            .annotate(reads()),
+        },
+        Entry {
+            scope: Scope::PlaylistsWrite,
+            tool: schema::<ShareArgs>(tool(
+                "share_playlist",
+                "Set who sees a playlist the user manages, replacing who saw it before: \
+                 \"personal\" (the user alone), {\"shared\": [{\"user\": id, \"can_edit\": \
+                 bool}]} (the user and those listed; ids come from list_share_candidates, and \
+                 can_edit lets them add, remove and move entries), or \"server_wide\" (every \
+                 user). Making a playlist server-wide, or changing one that is, needs the \
+                 admin scope. list_playlists gives each playlist's visibility in this form.",
+            ))
+            .annotate(writes().idempotent(true)),
+        },
+        Entry {
+            scope: Scope::PlaylistsWrite,
+            tool: schema::<PlaylistArgs>(tool(
+                "delete_playlist",
+                "Delete a playlist and its entries, for everyone who sees it. The user's \
+                 own, or with the admin scope a server-wide one. Liked and All cannot be \
+                 deleted.",
+            ))
+            .annotate(destroys()),
         },
         Entry {
             scope: Scope::PlaylistsWrite,
@@ -433,6 +477,78 @@ struct CreatePlaylistArgs {
     /// edited by admins, rather than the user's own. Needs the admin
     /// scope; false if left out.
     server_wide: Option<bool>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RenameArgs {
+    /// The playlist's id.
+    playlist: String,
+    /// Its new name, up to 100 characters.
+    name: String,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ShareCandidatesArgs {
+    /// The playlist's id: one the user manages.
+    playlist: String,
+    /// Only those whose display name or username holds this, in any
+    /// case; everyone if left out.
+    query: Option<String>,
+    /// Where the page starts; 0 if left out.
+    offset: Option<u32>,
+    /// How many; 20 if left out, at most 100.
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ShareArgs {
+    /// The playlist's id: one the user manages.
+    playlist: String,
+    /// Who sees it from now on.
+    visibility: VisibilityArg,
+}
+
+/// Who sees a playlist: "personal", {"shared": [...]} or "server_wide".
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "snake_case")]
+enum VisibilityArg {
+    /// The user alone.
+    Personal,
+    /// The user and these users; anyone not listed stops seeing it.
+    Shared(Vec<ShareArg>),
+    /// Every user of the server, portable guests included, edited by
+    /// admins. Needs the admin scope.
+    ServerWide,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ShareArg {
+    /// Their id, from list_share_candidates.
+    user: String,
+    /// They may add, remove and move its entries, never rename, share or
+    /// delete it; false if left out.
+    #[serde(default)]
+    can_edit: bool,
+}
+
+impl From<VisibilityArg> for Visibility {
+    fn from(v: VisibilityArg) -> Self {
+        match v {
+            VisibilityArg::Personal => Visibility::Personal,
+            VisibilityArg::Shared(with) => Visibility::Shared {
+                with: with
+                    .into_iter()
+                    .map(|s| PlaylistShare::new(s.user, s.can_edit))
+                    .collect(),
+            },
+            VisibilityArg::ServerWide => Visibility::ServerWide,
+        }
+    }
 }
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
@@ -726,6 +842,26 @@ impl McpServer {
             "add_to_playlist" => self.add_to_playlist(caller, args(arguments)?).await,
             "remove_from_playlist" => self.remove_from_playlist(caller, args(arguments)?).await,
             "move_in_playlist" => self.move_in_playlist(caller, args(arguments)?).await,
+            "rename_playlist" => {
+                let a: RenameArgs = args(arguments)?;
+                let update = crate::playlists::PlaylistUpdate {
+                    name: Some(a.name),
+                    ..Default::default()
+                };
+                self.update(caller, "rename_playlist", &a.playlist, update)
+                    .await
+            }
+            "list_share_candidates" => self.list_share_candidates(caller, args(arguments)?).await,
+            "share_playlist" => {
+                let a: ShareArgs = args(arguments)?;
+                let update = crate::playlists::PlaylistUpdate {
+                    visibility: Some(a.visibility.into()),
+                    ..Default::default()
+                };
+                self.update(caller, "share_playlist", &a.playlist, update)
+                    .await
+            }
+            "delete_playlist" => self.delete_playlist(caller, args(arguments)?).await,
             "pin_playlist" => {
                 let a: PlaylistArgs = args(arguments)?;
                 let library = self.library()?;
@@ -982,11 +1118,7 @@ impl McpServer {
         // playlists:write alone, and kept in the audit list as the admin
         // tools' calls are.
         if !caller.may(Scope::Admin) {
-            return Err(ToolError(
-                "a server-wide playlist needs the admin scope, which this connection was not \
-                 granted"
-                    .into(),
-            ));
+            return Err(needs_admin_scope());
         }
         let made = library
             .playlists
@@ -999,10 +1131,108 @@ impl McpServer {
         Ok(playlist_json(&made?))
     }
 
+    /// Rename playlist `id` or change who sees it, as `tool`. A
+    /// server-wide one, or making one so, is what every user sees: as
+    /// for its making, only with the admin scope, and kept in the audit
+    /// list. Its owner without the admin scope is refused too, though the
+    /// service would let them: the scope is what lets an agent near it.
+    async fn update(
+        &self,
+        caller: &McpCaller,
+        tool: &str,
+        id: &str,
+        update: crate::playlists::PlaylistUpdate,
+    ) -> ToolResult {
+        let library = self.library()?;
+        let actor = caller.actor();
+        let now = library.playlists.get(&actor, id, 0, 1).await?.playlist;
+        let server_wide = now.visibility == Visibility::ServerWide
+            || update.visibility == Some(Visibility::ServerWide);
+        if !server_wide {
+            let updated = library.playlists.update(&actor, id, update).await?;
+            return Ok(playlist_json(&updated));
+        }
+        if !caller.may(Scope::Admin) {
+            return Err(needs_admin_scope());
+        }
+        let updated = library
+            .playlists
+            .update(&actor, id, update)
+            .await
+            .map_err(ToolError::from);
+        self.audit_result(caller, tool, Some(id), &updated).await;
+        Ok(playlist_json(&updated?))
+    }
+
+    async fn list_share_candidates(
+        &self,
+        caller: &McpCaller,
+        a: ShareCandidatesArgs,
+    ) -> ToolResult {
+        let library = self.library()?;
+        let (offset, limit) = PageArgs {
+            offset: a.offset,
+            limit: a.limit,
+        }
+        .page();
+        let page = library
+            .playlists
+            .share_candidates(
+                &caller.actor(),
+                &a.playlist,
+                a.query.as_deref().unwrap_or(""),
+                offset,
+                limit,
+            )
+            .await?;
+        let candidates: Vec<Value> = page
+            .candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.user_id,
+                    "displayName": c.display_name,
+                    "username": c.username,
+                    "kind": c.kind,
+                })
+            })
+            .collect();
+        Ok(json!({ "candidates": candidates, "offset": page.offset, "total": page.total }))
+    }
+
+    /// Delete playlist `id`, as the service lets the caller. A
+    /// server-wide one only with the admin scope, its owner's too, and kept
+    /// in the audit list, as every change to one is.
+    async fn delete_playlist(&self, caller: &McpCaller, a: PlaylistArgs) -> ToolResult {
+        let library = self.library()?;
+        let actor = caller.actor();
+        let now = library
+            .playlists
+            .get(&actor, &a.playlist, 0, 1)
+            .await?
+            .playlist;
+        let server_wide = now.visibility == Visibility::ServerWide;
+        if server_wide && !caller.may(Scope::Admin) {
+            return Err(needs_admin_scope());
+        }
+        let deleted = library
+            .playlists
+            .delete(&actor, &a.playlist)
+            .await
+            .map_err(ToolError::from);
+        if server_wide {
+            self.audit_result(caller, "delete_playlist", Some(&a.playlist), &deleted)
+                .await;
+        }
+        deleted?;
+        Ok(json!({ "deleted": a.playlist }))
+    }
+
     /// Make `edits` on playlist `id` at its revision now, again on a newer
     /// one if someone else's change overtook it: the playlist's revision
-    /// after. `tool` names the call: an edit of a server-wide playlist
-    /// with an admin's rights is kept in the audit list, as its making is.
+    /// after. `tool` names the call. A server-wide playlist is edited only
+    /// with the admin scope, its owner's too, and the edit is kept in the
+    /// audit list, as its making is.
     async fn edit(
         &self,
         caller: &McpCaller,
@@ -1014,8 +1244,10 @@ impl McpServer {
         if edits.is_empty() || edits.len() > MAX_EDITS {
             return Err(ToolError(format!("between 1 and {MAX_EDITS} at a time")));
         }
-        let (edited, audited) = edit_retrying(library, &caller.actor(), id, edits).await?;
-        if audited {
+        let may_admin = caller.may(Scope::Admin);
+        let (edited, server_wide) =
+            edit_retrying(library, &caller.actor(), may_admin, id, edits).await?;
+        if server_wide && may_admin {
             self.audit_result(caller, tool, Some(id), &edited).await;
         }
         Ok(json!({ "revision": edited? }))
@@ -1109,13 +1341,35 @@ impl McpServer {
     }
 }
 
-/// A playlist as the tools give it.
+/// Why a tool would not touch what every user sees.
+fn needs_admin_scope() -> ToolError {
+    ToolError::new(
+        "a server-wide playlist needs the admin scope, which this connection was not granted",
+    )
+}
+
+/// A playlist as the tools give it. Its visibility is in the form
+/// share_playlist takes; its shares are listed only to whoever manages
+/// it, as the service gives them.
 fn playlist_json(p: &PlaylistSummary) -> Value {
+    let visibility = match &p.visibility {
+        Visibility::Personal => json!("personal"),
+        Visibility::ServerWide => json!("server_wide"),
+        Visibility::Shared { with } => json!({
+            "shared": with.iter().map(|s| json!({
+                "user": s.user_id,
+                "can_edit": s.can_edit,
+                "displayName": s.display_name,
+            })).collect::<Vec<_>>(),
+        }),
+        Visibility::Unknown => Value::Null,
+    };
     json!({
         "id": p.id,
         "name": p.name,
         "kinds": p.kinds,
         "owner": p.owner_kind,
+        "visibility": visibility,
         "canEdit": p.can_edit,
         "canManage": p.can_manage,
         "pinned": p.pinned,
@@ -1124,31 +1378,36 @@ fn playlist_json(p: &PlaylistSummary) -> Value {
 }
 
 /// Make `edits` on playlist `id` at its revision now, again on a newer one
-/// if someone else's change overtook it: how it went, and whether it was a
-/// server-wide playlist edited with an admin's rights. A playlist that
-/// cannot be read is the call's error, as it is not edited.
+/// if someone else's change overtook it: how it went, and whether the
+/// playlist is server-wide. A server-wide one is not edited without the
+/// admin scope (`may_admin`). A playlist that cannot be read is the call's
+/// error, as it is not edited.
 async fn edit_retrying(
     library: &Library,
     actor: &Actor,
+    may_admin: bool,
     id: &str,
     edits: Vec<PlaylistEdit>,
 ) -> Result<(Result<u64, ToolError>, bool), ToolError> {
-    let mut as_admin = false;
+    let mut server_wide = false;
     for _ in 0..EDIT_TRIES {
         let playlist = library.playlists.get(actor, id, 0, 1).await?.playlist;
-        as_admin = actor.admin && playlist.visibility == Visibility::ServerWide;
+        server_wide = playlist.visibility == Visibility::ServerWide;
+        if server_wide && !may_admin {
+            return Err(needs_admin_scope());
+        }
         match library
             .playlists
             .edit(actor, id, playlist.revision, edits.clone())
             .await
         {
             Err(crate::playlists::PlaylistsError::Conflict { .. }) => continue,
-            done => return Ok((done.map_err(ToolError::from), as_admin)),
+            done => return Ok((done.map_err(ToolError::from), server_wide)),
         }
     }
     let kept_changing =
         ToolError::new("the playlist kept changing under this edit; look at it again and retry");
-    Ok((Err(kept_changing), as_admin))
+    Ok((Err(kept_changing), server_wide))
 }
 
 /// What an admin tool acts on, from its arguments, for the audit list.
@@ -1341,15 +1600,51 @@ mod tests {
             "stop_playback",
             "remove_from_playlist",
             "unlike",
+            "delete_playlist",
         ] {
             assert_eq!(annotations(name).destructive_hint, Some(true), "{name}");
         }
-        for name in ["create_playlist", "add_to_playlist", "set_watched", "like"] {
+        for name in [
+            "create_playlist",
+            "add_to_playlist",
+            "set_watched",
+            "like",
+            "rename_playlist",
+            "share_playlist",
+        ] {
             assert_eq!(annotations(name).destructive_hint, Some(false), "{name}");
         }
-        for name in ["search", "list_users", "read_logs", "list_playlists"] {
+        for name in [
+            "search",
+            "list_users",
+            "read_logs",
+            "list_playlists",
+            "list_share_candidates",
+        ] {
             assert_eq!(annotations(name).read_only_hint, Some(true), "{name}");
         }
+    }
+
+    /// share_playlist's visibility, in the three forms its description
+    /// gives an agent.
+    #[test]
+    fn a_visibility_is_a_word_or_the_users_shared_with() {
+        let parse =
+            |v: Value| -> Visibility { serde_json::from_value::<VisibilityArg>(v).unwrap().into() };
+        assert_eq!(parse(json!("personal")), Visibility::Personal);
+        assert_eq!(parse(json!("server_wide")), Visibility::ServerWide);
+        assert_eq!(
+            parse(
+                json!({ "shared": [{ "user": "local:1", "can_edit": true }, { "user": "local:2" }] })
+            ),
+            Visibility::Shared {
+                with: vec![
+                    PlaylistShare::new("local:1", true),
+                    PlaylistShare::new("local:2", false)
+                ]
+            }
+        );
+        assert!(serde_json::from_value::<VisibilityArg>(json!("everyone")).is_err());
     }
 
     #[test]

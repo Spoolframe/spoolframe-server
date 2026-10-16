@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- MCP: an agent deletes, shares and renames playlists. `delete_playlist`
+  deletes one (marked destructive, so the client asks first): the
+  user's own, or with the admin scope a server-wide one; Liked and All
+  are refused. `share_playlist` sets who sees one the user manages:
+  `"personal"`, `{"shared": [{"user", "can_edit"}]}` with ids from the
+  new `list_share_candidates`, or `"server_wide"`. Making a playlist
+  server-wide, or any change to one that is (entries, name, sharing,
+  deleting), needs the admin scope, its owner's agent's too, as
+  `create_playlist` does, and is kept in the audit list.
+  `rename_playlist` renames one. All four are
+  under `playlists:write`; `list_playlists` and the others now give a
+  playlist's `visibility` in the form `share_playlist` takes. Before,
+  an agent that made a playlist could not remove it or show it to
+  anyone.
 - Settings › MCP lists the apps allowed to sign in
   (`mcp.allowed_redirects`), each a name and a pattern of the redirect
   URIs it returns to: Claude Code, Claude (claude.ai and desktop) and

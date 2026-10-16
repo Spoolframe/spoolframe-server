@@ -20,7 +20,7 @@ pub fn scope_words(scope: &str) -> Option<(&'static str, &'static str)> {
         )),
         "playlists:write" => Some((
             "Change your playlists and watched marks",
-            "Make playlists, add, move and remove what is in them, pin them, and mark items watched or unwatched.",
+            "Make, rename, share and delete playlists, add, move and remove what is in them, pin them, and mark items watched or unwatched.",
         )),
         "admin" => Some((
             "Manage the server as an admin",
