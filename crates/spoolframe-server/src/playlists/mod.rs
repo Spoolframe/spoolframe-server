@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use spoolframe_protocol::playlists::{Builtin, EntryId, Liked, PlaySettings, PlaylistNext, Repeat};
 use spoolframe_protocol::playlists::{
     Kinds, PinNote, PinNoteReason, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage,
-    PlaylistRef, PlaylistShare, PlaylistSummary, Visibility,
+    PlaylistRef, PlaylistShare, PlaylistSummary, ShareCandidatePage, Visibility,
 };
 use spoolframe_types::{Item, LibraryKind, Marker, MediaId, MediaKind};
 
@@ -45,6 +45,7 @@ use crate::store::playlists::{
 };
 use crate::store::{Store, StoreError};
 use crate::watch::Watch;
+use people::Names;
 
 /// The longest name a playlist takes, in characters.
 pub const MAX_NAME: usize = 100;
@@ -304,7 +305,13 @@ impl Playlists {
         Ok((row, access))
     }
 
-    fn summary(actor: &Actor, row: &PlaylistRow, pinned: Option<u32>) -> PlaylistSummary {
+    /// `row` as `actor` sees it, its owner and shares named by `names`.
+    fn summary(
+        actor: &Actor,
+        row: &PlaylistRow,
+        pinned: Option<u32>,
+        names: &Names,
+    ) -> PlaylistSummary {
         let access = Self::access(actor, row);
         let principal = actor.principal.to_string();
         let owner_kind = if row.server_wide {
@@ -325,8 +332,9 @@ impl Playlists {
                     row.shares
                         .iter()
                         .map(|s| PlaylistShare {
-                            user_id: s.principal.clone(),
-                            can_edit: s.can_edit,
+                            display_name: names.of_principal(&s.principal),
+                            kind: s.principal.parse().ok().map(people::kind_of),
+                            ..PlaylistShare::new(s.principal.clone(), s.can_edit)
                         })
                         .collect()
                 } else {
@@ -345,6 +353,7 @@ impl Playlists {
             revision: row.revision,
             pinned,
             builtin: row.builtin,
+            owner_name: names.of_principal(&row.owner),
         }
     }
 
@@ -384,11 +393,12 @@ impl Playlists {
             None => 3,
         });
         let pins = self.store.pins(&principal).await?;
+        let names = Names::of(&self.store).await?;
         let summaries = rows
             .iter()
             .map(|row| {
                 let pinned = pins.iter().position(|p| *p == row.id).map(|n| n as u32);
-                Self::summary(actor, row, pinned)
+                Self::summary(actor, row, pinned, &names)
             })
             .collect();
         let notes = self
@@ -462,7 +472,12 @@ impl Playlists {
             .await?
             .unwrap_or_default();
         Ok(PlaylistPage {
-            playlist: Self::summary(actor, &row, self.pinned(actor, id).await?),
+            playlist: Self::summary(
+                actor,
+                &row,
+                self.pinned(actor, id).await?,
+                &Names::of(&self.store).await?,
+            ),
             entries: page,
             offset: start as u32,
             total,
@@ -690,7 +705,12 @@ impl Playlists {
             })
             .await?;
         self.told_playlist(&row.id, row.revision, None, Some(Seen::of(&row)));
-        Ok(Self::summary(actor, &row, None))
+        Ok(Self::summary(
+            actor,
+            &row,
+            None,
+            &Names::of(&self.store).await?,
+        ))
     }
 
     /// `visibility` as rows: whether server-wide, and the shares. Only an
@@ -811,7 +831,12 @@ impl Playlists {
                 self.tell(PlaylistNews::Pins { principal });
             }
         }
-        Ok(Self::summary(actor, &after, self.pinned(actor, id).await?))
+        Ok(Self::summary(
+            actor,
+            &after,
+            self.pinned(actor, id).await?,
+            &Names::of(&self.store).await?,
+        ))
     }
 
     /// Apply `edits`, made on `revision`, to playlist `id`'s entries: its
@@ -1342,7 +1367,8 @@ impl Playlists {
             .iter()
             .filter(|row| builtins || row.builtin.is_none())
             .map(|row| {
-                let summary = Self::summary(actor, row, None);
+                // A reference names no one.
+                let summary = Self::summary(actor, row, None, &Names::default());
                 PlaylistRef {
                     id: summary.id,
                     name: summary.name,
@@ -1351,6 +1377,44 @@ impl Playlists {
                 }
             })
             .collect())
+    }
+}
+
+/// Sharing by name (`spoolframe:playlist-sharing`).
+impl Playlists {
+    /// Whom playlist `id` can be shared with, those whose name holds
+    /// `query` (empty: everyone), a page from `offset` of at most `limit`
+    /// ([`MAX_PAGE`]), and how many match in all. Only whoever manages
+    /// it asks: anyone else who sees it is [`PlaylistsError::ReadOnly`],
+    /// as for a rename. The caller is never among them.
+    pub async fn share_candidates(
+        &self,
+        actor: &Actor,
+        id: &str,
+        query: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ShareCandidatePage, PlaylistsError> {
+        let (_, access) = self.seen(actor, id).await?;
+        if !access.can_manage() {
+            return Err(PlaylistsError::ReadOnly);
+        }
+        let found = people::matching(
+            people::share_candidates(&self.store, actor.principal).await?,
+            query,
+        );
+        let total = u32::try_from(found.len()).unwrap_or(u32::MAX);
+        let candidates = found
+            .iter()
+            .skip(offset as usize)
+            .take(limit.min(MAX_PAGE) as usize)
+            .map(people::Person::candidate)
+            .collect();
+        Ok(ShareCandidatePage {
+            candidates,
+            offset,
+            total,
+        })
     }
 }
 
@@ -1391,7 +1455,12 @@ impl Playlists {
             .playlist(id)
             .await?
             .ok_or(PlaylistsError::NotFound)?;
-        Ok(Self::summary(actor, &row, self.pinned(actor, id).await?))
+        Ok(Self::summary(
+            actor,
+            &row,
+            self.pinned(actor, id).await?,
+            &Names::of(&self.store).await?,
+        ))
     }
 
     /// Put `entries` at the top of Liked `row`, newest first: its new
@@ -1730,6 +1799,7 @@ fn new_entry(item: &Item, external_ids: Vec<String>) -> NewEntry {
     }
 }
 
+pub mod people;
 pub mod plex_import;
 
 #[cfg(test)]

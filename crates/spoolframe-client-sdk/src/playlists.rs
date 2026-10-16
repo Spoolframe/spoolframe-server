@@ -12,11 +12,18 @@
 //! albums, and the two built-in playlists, listed first, each summary's
 //! `builtin` saying which. A server without the feature lists neither and
 //! [`Session::like`] is [`SdkError::Unsupported`].
+//!
+//! Sharing by name (feature `spoolframe:playlist-sharing`): whom a
+//! playlist can be shared with ([`Session::share_candidates`]), and the
+//! names of a playlist's owner (`PlaylistSummary::owner_name`) and of who
+//! it is shared with (`PlaylistShare::display_name`, `kind`). A server
+//! without the feature sends no names, and the call is
+//! [`SdkError::Unsupported`].
 
-use spoolframe_protocol::features::{LAST_VIEWED, LIKED, PLAYLISTS};
+use spoolframe_protocol::features::{LAST_VIEWED, LIKED, PLAYLIST_SHARING, PLAYLISTS};
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
-    PlaylistSummary, Visibility,
+    PlaylistSummary, ShareCandidatePage, Visibility,
 };
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::MediaId;
@@ -34,6 +41,9 @@ pub struct Features {
     /// When each item was last viewed: `PlaybackState::last_viewed_at` on
     /// Home's rows and an item's details. Data only, nothing to call.
     pub last_viewed: bool,
+    /// Sharing by name: [`Session::share_candidates`], and the names of a
+    /// playlist's owner and of who it is shared with.
+    pub playlist_sharing: bool,
 }
 
 impl Features {
@@ -45,6 +55,8 @@ impl Features {
             liked: spoolframe_protocol::features::has(names, PLAYLISTS)
                 && spoolframe_protocol::features::has(names, LIKED),
             last_viewed: spoolframe_protocol::features::has(names, LAST_VIEWED),
+            playlist_sharing: spoolframe_protocol::features::has(names, PLAYLISTS)
+                && spoolframe_protocol::features::has(names, PLAYLIST_SHARING),
         }
     }
 }
@@ -312,6 +324,38 @@ impl Session {
 }
 
 impl Session {
+    /// Whom playlist `id` can be shared with, a page from `offset` of at
+    /// most `limit` (200), by display name, and how many match in all:
+    /// every enabled account and granted portable user but the session
+    /// user. With a `query`, only those whose display name or username
+    /// holds it, in any case; empty, everyone. Only whoever manages the
+    /// playlist may ask ([`SdkError::PlaylistReadOnly`] otherwise).
+    pub async fn share_candidates(
+        &self,
+        id: &str,
+        query: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ShareCandidatePage, SdkError> {
+        if !self.features.playlist_sharing {
+            return Err(SdkError::Unsupported {
+                feature: PLAYLIST_SHARING.into(),
+            });
+        }
+        let request = Request::ListShareCandidates {
+            id: id.into(),
+            query: query.into(),
+            offset,
+            limit,
+        };
+        match self.call(request).await? {
+            Reply::ShareCandidates(page) => Ok(page),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+impl Session {
     /// Import the user's Plex playlists once (each video or music
     /// playlist of their linked account becomes a personal one here), or
     /// with `dry_run` say what would be made. Imported twice, made twice.
@@ -349,6 +393,10 @@ mod tests {
         // Liked is a part of playlists: without them, none.
         assert!(!Features::of(&[LIKED.to_owned()]).liked);
         assert!(Features::of(&[LAST_VIEWED.to_owned()]).last_viewed);
+        assert!(
+            Features::of(&[PLAYLISTS.to_owned(), PLAYLIST_SHARING.to_owned()]).playlist_sharing
+        );
+        assert!(!Features::of(&[PLAYLIST_SHARING.to_owned()]).playlist_sharing);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }

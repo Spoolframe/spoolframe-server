@@ -1819,6 +1819,15 @@ impl ClientProtocol {
         let liked_listed = playlists_listed && features::has(&hello.features, features::LIKED);
         // When each item was last viewed, only for a client that takes it.
         let last_viewed_listed = features::has(&hello.features, features::LAST_VIEWED);
+        // Sharing by name: whom to share with, and the names of owners and
+        // shares, only for a client that takes them.
+        let sharing_listed =
+            playlists_listed && features::has(&hello.features, features::PLAYLIST_SHARING);
+        if !sharing_listed && matches!(request, Request::ListShareCandidates { .. }) {
+            return Err(Error::Unsupported {
+                request: format!("share candidates without {}", features::PLAYLIST_SHARING),
+            });
+        }
         if playlists_listed {
             self.playlist_listeners
                 .note(connection.stable_id(), principal, liked_listed);
@@ -1839,6 +1848,7 @@ impl ClientProtocol {
                 | Request::UnpinPlaylist { id }
                 | Request::PlayPlaylist { id, .. }
                 | Request::NextInPlaylist { id, .. }
+                | Request::ListShareCandidates { id, .. }
                     if self
                         .services
                         .playlists
@@ -2433,7 +2443,10 @@ impl ClientProtocol {
                     .await
                     .map_err(playlists_error)?;
                 Ok(Reply::Playlists {
-                    playlists,
+                    playlists: playlists
+                        .into_iter()
+                        .map(|p| named(p, sharing_listed))
+                        .collect(),
                     pin_notes,
                 })
             }
@@ -2446,6 +2459,7 @@ impl ClientProtocol {
                     if !liked_listed {
                         page.entries.iter_mut().for_each(|e| e.liked = false);
                     }
+                    page.playlist = named(page.playlist, sharing_listed);
                     Reply::Playlist(page)
                 })
                 .map_err(playlists_error),
@@ -2458,7 +2472,7 @@ impl ClientProtocol {
                 .playlists
                 .create(&actor, &name, kinds, visibility)
                 .await
-                .map(Reply::PlaylistInfo)
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
                 .map_err(playlists_error),
             Request::UpdatePlaylist {
                 id,
@@ -2478,7 +2492,7 @@ impl ClientProtocol {
                     },
                 )
                 .await
-                .map(Reply::PlaylistInfo)
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
                 .map_err(playlists_error),
             Request::EditPlaylist {
                 id,
@@ -2582,14 +2596,26 @@ impl ClientProtocol {
                 .playlists
                 .like(&actor, &items)
                 .await
-                .map(Reply::PlaylistInfo)
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
                 .map_err(playlists_error),
             Request::Unlike { items } => self
                 .services
                 .playlists
                 .unlike(&actor, &items)
                 .await
-                .map(Reply::PlaylistInfo)
+                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed)))
+                .map_err(playlists_error),
+            Request::ListShareCandidates {
+                id,
+                query,
+                offset,
+                limit,
+            } => self
+                .services
+                .playlists
+                .share_candidates(&actor, &id, &query, offset, limit)
+                .await
+                .map(Reply::ShareCandidates)
                 .map_err(playlists_error),
             Request::Search(mut search) => {
                 search.limit = search.limit.min(MAX_PAGE);
@@ -5943,6 +5969,25 @@ fn playing(next: Option<spoolframe_protocol::playlists::PlaylistNext>, liked: bo
         }
         None => Reply::PlaylistFinished,
     }
+}
+
+/// `summary` as a session sees it: without its owner's and shares'
+/// names unless its client listed `spoolframe:playlist-sharing`.
+fn named(
+    mut summary: spoolframe_protocol::playlists::PlaylistSummary,
+    sharing: bool,
+) -> spoolframe_protocol::playlists::PlaylistSummary {
+    if !sharing {
+        summary.owner_name = None;
+        if let spoolframe_protocol::playlists::Visibility::Shared { with } = &mut summary.visibility
+        {
+            for share in with {
+                share.display_name = None;
+                share.kind = None;
+            }
+        }
+    }
+    summary
 }
 
 /// A playlist failure as the client sees it (PX-40).

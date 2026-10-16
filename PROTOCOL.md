@@ -41,8 +41,8 @@ must be updated together. The changes per revision are in
   [idle playbacks](#paused-playback-and-the-idle-limit)
 - [Home rows and "Remove"](#home-rows-and-remove)
 - [Leaving a server](#leaving-a-server)
-- [Features](#features), [playlists](#playlists) and
-  [Liked and All](#liked-and-all)
+- [Features](#features), [playlists](#playlists),
+  [sharing by name](#sharing-by-name) and [Liked and All](#liked-and-all)
 - [Portable identities](#portable-identities)
 
 ## Basics
@@ -1604,6 +1604,40 @@ says which the session's server has (from `WhoAmI`), and
 `PlaylistConflict { revision }`. `Client::playlist_events()` gives every
 `PlaylistEvent { server, change }` the servers tell, `change` one of
 `Changed { id, revision }`, `Gone { id }` and `PinsChanged`.
+
+## Sharing by name
+
+Feature `spoolframe:playlist-sharing`, on top of `spoolframe:playlists`.
+It lets an app share a playlist by picking a person, not by typing a
+user id, and show who it is shared with and whose it is.
+
+- `ListShareCandidates { id, query, offset, limit }` answers
+  `ShareCandidates(ShareCandidatePage { candidates, offset, total })`:
+  a page of at most 200 of whom playlist `id` can be shared with,
+  ordered by display name in any case. Each is `ShareCandidate {
+  user_id, display_name, username, kind }`: `user_id` as
+  `PlaylistShare::user_id` takes it, `username` an account's (left out
+  for a portable user), `kind` `local` or `portable`. They are every
+  enabled account here and every portable user granted access, but the
+  session user. A `query` keeps those whose display name or username
+  holds it, in any case; an empty one keeps everyone. `total` counts
+  every match. Only whoever manages the playlist asks: anyone else who
+  sees it gets `PlaylistReadOnly`, one who does not `NotFound`.
+- Each `PlaylistShare` a manager is shown carries `display_name` and
+  `kind`. Someone no longer here (a deleted account, a revoked grant)
+  is listed by `user_id` alone. A disabled account is still named.
+- `PlaylistSummary` carries `owner_name`, what its owner is shown as,
+  so a row can say whose it is; `None` for an owner no longer here.
+
+A request reads only `user_id` and `can_edit` of a share; the names are
+the server's to say. A session whose client did not list the feature is
+sent none of these fields, and its `ListShareCandidates` is
+`Unsupported`.
+
+SDK: `Features::playlist_sharing`; `Session::share_candidates(id, query,
+offset, limit)` returns the `ShareCandidatePage` (`SdkError::Unsupported`
+without the feature, `PlaylistReadOnly` for a non-manager);
+`PlaylistShare::new(user_id, can_edit)` makes a share to send.
 
 ## When an item was last viewed
 

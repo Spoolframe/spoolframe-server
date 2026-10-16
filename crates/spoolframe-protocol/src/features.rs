@@ -42,8 +42,16 @@ pub const LIKED: &str = "spoolframe:liked";
 /// wrong. A session whose client did not list it is never sent the field.
 pub const LAST_VIEWED: &str = "spoolframe:last-viewed";
 
+/// Sharing a playlist by name, on top of [`PLAYLISTS`]: the
+/// `ListShareCandidates` request, whom its manager may share it with, by
+/// name; and the `display_name` and `kind` of each user a playlist is
+/// shared with, and a summary's `owner_name`. A session whose client did
+/// not list it is sent none of these fields, and its `ListShareCandidates`
+/// is `Unsupported`.
+pub const PLAYLIST_SHARING: &str = "spoolframe:playlist-sharing";
+
 /// Every regular feature this build knows.
-pub const ALL: &[&str] = &[PLAYLISTS, LIKED, LAST_VIEWED];
+pub const ALL: &[&str] = &[PLAYLISTS, LIKED, LAST_VIEWED, PLAYLIST_SHARING];
 
 /// The ones that change what a client can do before it has a session:
 /// what the answer to `Hello` lists. None yet.
@@ -85,6 +93,12 @@ mod tests {
     fn last_viewed_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&LAST_VIEWED));
         assert!(!PRE_AUTH.contains(&LAST_VIEWED));
+    }
+
+    #[test]
+    fn playlist_sharing_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&PLAYLIST_SHARING));
+        assert!(!PRE_AUTH.contains(&PLAYLIST_SHARING));
     }
 
     #[test]

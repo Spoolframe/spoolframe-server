@@ -99,10 +99,7 @@ fn add(item: MediaId) -> PlaylistEdit {
 }
 
 fn share(actor: &Actor, can_edit: bool) -> PlaylistShare {
-    PlaylistShare {
-        user_id: actor.principal.to_string(),
-        can_edit,
-    }
+    PlaylistShare::new(actor.principal.to_string(), can_edit)
 }
 
 impl Harness {
@@ -426,10 +423,7 @@ async fn a_server_wide_playlist_is_made_by_an_admin_seen_by_all_and_edited_by_ad
 #[tokio::test]
 async fn sharing_with_someone_who_is_not_a_user_is_refused() {
     let h = harness("share-stranger").await;
-    let stranger = PlaylistShare {
-        user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
-        can_edit: false,
-    };
+    let stranger = PlaylistShare::new("local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c", false);
     let refused = h
         .playlists
         .create(

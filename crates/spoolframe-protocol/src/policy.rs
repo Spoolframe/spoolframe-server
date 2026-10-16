@@ -90,7 +90,9 @@ pub fn retry_safe(request: &Request) -> bool {
         // PX-43: liking what is liked, or unliking what is not, changes
         // nothing.
         | Request::Like { .. }
-        | Request::Unlike { .. } => true,
+        | Request::Unlike { .. }
+        // A read.
+        | Request::ListShareCandidates { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

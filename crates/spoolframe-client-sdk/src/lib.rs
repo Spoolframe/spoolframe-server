@@ -73,7 +73,8 @@ pub use session::{
 pub use spoolframe_protocol::playlists::{
     Builtin, EntryId, ItemKind, Kinds, Liked, PinNote, PinNoteReason, PlaySettings, PlaylistEdit,
     PlaylistEntry, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare,
-    PlaylistSummary, PlexImport, PlexImported, PlexUnmapped, Repeat, Visibility,
+    PlaylistSummary, PlexImport, PlexImported, PlexUnmapped, Repeat, ShareCandidate,
+    ShareCandidatePage, UserKind, Visibility,
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{

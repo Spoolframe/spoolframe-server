@@ -21,6 +21,7 @@ use spoolframe_protocol::playlists::{
 use spoolframe_types::MediaId;
 
 use super::{AdminApi, error, internal};
+use crate::playlists::people;
 use crate::playlists::plex_import::{self, ImportError};
 use crate::playlists::{PlaylistUpdate, Playlists, PlaylistsError};
 use crate::principal::{Actor, Principal};
@@ -172,36 +173,22 @@ impl AdminApi {
             .map_err(playlists_error)
     }
 
-    /// Every enabled local user but `user`, and every portable user with a
-    /// live grant, by the name they are shown as.
+    /// Whom `user` can share a playlist with: the same list the client
+    /// protocol's `ListShareCandidates` pages through, all of it.
     pub(super) async fn share_candidates(
         &self,
         user: ApiSessionUser,
     ) -> RpcResult<Vec<ShareableUser>> {
-        let store = self.auth.store();
-        let mut candidates: Vec<ShareableUser> = store
-            .list_users()
-            .await?
+        let candidates = people::share_candidates(self.auth.store(), actor(&user).principal)
+            .await
+            .map_err(playlists_error)?;
+        Ok(candidates
             .into_iter()
-            .filter(|u| u.id != user.user && u.disabled_at.is_none())
-            .map(|u| ShareableUser {
-                user_id: Principal::LocalUser(u.id).to_string(),
-                display_name: u.display_name.unwrap_or(u.username),
+            .map(|c| ShareableUser {
+                user_id: c.principal.to_string(),
+                display_name: c.display_name,
             })
-            .collect();
-        candidates.extend(
-            store
-                .grants()
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .map(|g| ShareableUser {
-                    user_id: Principal::PortableUser(g.portable).to_string(),
-                    display_name: g.shown_name(),
-                }),
-        );
-        candidates.sort_by_cached_key(|c| c.display_name.to_lowercase());
-        Ok(candidates)
+            .collect())
     }
 
     pub(super) async fn import_plex_playlists(
@@ -275,10 +262,7 @@ fn visibility(sharing: PlaylistSharing) -> Visibility {
         PlaylistSharing::Shared { with } => Visibility::Shared {
             with: with
                 .into_iter()
-                .map(|s| WireShare {
-                    user_id: s.user_id,
-                    can_edit: s.can_edit,
-                })
+                .map(|s| WireShare::new(s.user_id, s.can_edit))
                 .collect(),
         },
     }

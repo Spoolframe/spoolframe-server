@@ -799,6 +799,21 @@ pub enum Request {
     Unlike {
         items: Vec<MediaId>,
     },
+    /// Whom playlist `id` can be shared with: `ShareCandidates`, a page
+    /// from `offset`, at most `limit` (200), by display name. Every
+    /// enabled account here and every portable user granted access, but
+    /// the session user; with a `query`, only those whose display name or
+    /// username holds it, in any case (empty: everyone). Only whoever
+    /// manages the playlist asks: anyone else who sees it gets
+    /// `PlaylistReadOnly`, one who does not `NotFound`. Only from a client
+    /// that listed `spoolframe:playlist-sharing`; from any other,
+    /// `Unsupported`.
+    ListShareCandidates {
+        id: String,
+        query: String,
+        offset: u32,
+        limit: u32,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -1347,6 +1362,8 @@ pub enum Reply {
     PlaylistFinished,
     /// What importing Plex playlists made, or would (`ImportPlexPlaylists`).
     PlexImport(crate::playlists::PlexImport),
+    /// Whom a playlist can be shared with (`ListShareCandidates`).
+    ShareCandidates(crate::playlists::ShareCandidatePage),
 }
 
 /// Which HLS playlist (P2-05).

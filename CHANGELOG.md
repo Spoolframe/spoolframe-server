@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Playlists are shared by name. Behind a new regular feature,
+  `spoolframe:playlist-sharing` (the protocol version is unchanged):
+  `ListShareCandidates { id, query, offset, limit }` answers a page of
+  whom a playlist's manager can share it with (every enabled account and
+  granted portable user but themselves, by display name, filtered by a
+  case-insensitive `query` on the name or username), each with its
+  `user_id`, `display_name`, `username` and `kind` (local or portable);
+  anyone else gets `PlaylistReadOnly`. A playlist's shares carry the
+  person's `display_name` and `kind`, and its summary its `owner_name`.
+  A client without the feature gets no names and `Unsupported` for the
+  request. SDK: `Features::playlist_sharing`,
+  `Session::share_candidates`, `PlaylistShare::new`. The admin API's
+  `me.playlistShareCandidates` reads the same list.
+
 - MCP has its own Settings tab, Settings › MCP, out of Remote access:
   the `mcp.enabled` switch (unchanged, still live) and, while it is on,
   this server's MCP address and the commands that add it to Claude Code

@@ -142,6 +142,71 @@ pub struct PlaylistShare {
     /// They may add, remove and move its entries; never rename it, change
     /// its kinds or sharing, or delete it.
     pub can_edit: bool,
+    /// What they are shown as, for a client that listed
+    /// `spoolframe:playlist-sharing`; `None` for someone no longer here
+    /// (shown by `user_id`). Read by no request: a share is named by
+    /// `user_id` alone.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Whose account they are, for a client that listed
+    /// `spoolframe:playlist-sharing`. Read by no request.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<UserKind>,
+}
+
+impl PlaylistShare {
+    /// A share with `user_id`, as a request names it: no name, no kind.
+    pub fn new(user_id: impl Into<String>, can_edit: bool) -> Self {
+        Self {
+            user_id: user_id.into(),
+            can_edit,
+            display_name: None,
+            kind: None,
+        }
+    }
+}
+
+/// Whose account a user is (`spoolframe:playlist-sharing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserKind {
+    /// An account on this server: `local:<uuid>`.
+    Local,
+    /// A portable user granted access here: `portable:` and 64 hex
+    /// digits.
+    Portable,
+    /// One this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Someone a playlist can be shared with (`ListShareCandidates`): an
+/// enabled account here, or a portable user granted access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCandidate {
+    /// As [`PlaylistShare::user_id`] takes it.
+    pub user_id: String,
+    /// What they are shown as: an account's display name, else its
+    /// username; a portable user's name, else their fingerprint.
+    pub display_name: String,
+    /// An account's username; `None` for a portable user, who has none
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    pub kind: UserKind,
+}
+
+/// One page of whom a playlist can be shared with
+/// (`ListShareCandidates`), by display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCandidatePage {
+    pub candidates: Vec<ShareCandidate>,
+    /// Where `candidates` start in the whole list.
+    pub offset: u32,
+    /// How many match in all.
+    pub total: u32,
 }
 
 /// How a playlist stands to whoever asks: what a client lists its
@@ -214,6 +279,12 @@ pub struct PlaylistSummary {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<Builtin>,
+    /// What its owner is shown as, for a client that listed
+    /// `spoolframe:playlist-sharing`: what a row says "Alice's" by. `None`
+    /// for an owner no longer here.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
 }
 
 /// A playlist holding an item, as the item's details list it.
@@ -423,6 +494,18 @@ mod tests {
                 .get("builtin")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn an_older_server_s_share_has_no_name_and_a_request_s_share_sends_none() {
+        let share: PlaylistShare =
+            serde_json::from_str(r#"{"user_id":"local:x","can_edit":true}"#).unwrap();
+        assert_eq!(share, PlaylistShare::new("local:x", true));
+        let sent = serde_json::to_value(PlaylistShare::new("local:x", false)).unwrap();
+        assert!(sent.get("display_name").is_none());
+        assert!(sent.get("kind").is_none());
+        let kind: UserKind = serde_json::from_str(r#""federated""#).unwrap();
+        assert_eq!(kind, UserKind::Unknown);
     }
 
     #[test]

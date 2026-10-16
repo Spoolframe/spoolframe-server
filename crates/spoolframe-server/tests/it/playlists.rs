@@ -135,10 +135,7 @@ async fn a_playlist_is_made_filled_read_and_refused_over_the_wire() {
     let alice = tv.login("alice", "correct horse").await;
     let bob = tv.login("bob", "correct horse").await;
     let carol = tv.login("carol", "correct horse").await;
-    let shares = vec![PlaylistShare {
-        user_id: user_id(&tv, &bob).await,
-        can_edit: false,
-    }];
+    let shares = vec![PlaylistShare::new(user_id(&tv, &bob).await, false)];
     let made = create(&tv, &alice, EPISODES, Visibility::Shared { with: shares }).await;
 
     // An episodes playlist takes no film.
@@ -292,10 +289,7 @@ async fn a_pin_shows_on_another_device_and_an_unshare_takes_it_away_with_a_note(
     // an app makes when it shows its playlists.
     list(&laptop, &bob_on_laptop).await;
     let shared = Visibility::Shared {
-        with: vec![PlaylistShare {
-            user_id: bob_id,
-            can_edit: true,
-        }],
+        with: vec![PlaylistShare::new(bob_id, true)],
     };
     let first = create(&tv, &alice, EPISODES, shared.clone()).await;
     let second = create(&tv, &alice, EPISODES, shared).await;

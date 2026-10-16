@@ -2594,7 +2594,8 @@ mod playlists {
     use super::*;
     use crate::playlists::{
         ItemKind, Kinds, PinNote, PinNoteReason, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind,
-        PlaylistPage, PlaylistShare, PlaylistSummary, Visibility,
+        PlaylistPage, PlaylistShare, PlaylistSummary, ShareCandidate, ShareCandidatePage, UserKind,
+        Visibility,
     };
 
     const EPISODES: Kinds = Kinds {
@@ -2610,16 +2611,17 @@ mod playlists {
             kinds: EPISODES,
             owner_kind: PlaylistOwnerKind::Mine,
             visibility: Visibility::Shared {
-                with: vec![PlaylistShare {
-                    user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4d".into(),
-                    can_edit: true,
-                }],
+                with: vec![PlaylistShare::new(
+                    "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4d",
+                    true,
+                )],
             },
             can_edit: true,
             can_manage: true,
             revision: 7,
             pinned: Some(0),
             builtin: None,
+            owner_name: None,
         }
     }
 
@@ -2846,6 +2848,73 @@ mod playlists {
                 items: vec![album, track],
             },
         });
+    }
+
+    /// `spoolframe:playlist-sharing`: whom a playlist can be shared
+    /// with, a page at a time; and the names of who it is shared with
+    /// and of its owner, left out when not given.
+    #[test]
+    fn share_candidates_and_names_round_trip() {
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: Request::ListShareCandidates {
+                id: "x".into(),
+                query: "ali".into(),
+                offset: 0,
+                limit: 50,
+            },
+        });
+        assert!(crate::policy::retry_safe(&Request::ListShareCandidates {
+            id: "x".into(),
+            query: String::new(),
+            offset: 0,
+            limit: 50,
+        }));
+        let page = Reply::ShareCandidates(ShareCandidatePage {
+            candidates: vec![
+                ShareCandidate {
+                    user_id: "local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4d".into(),
+                    display_name: "Alice".into(),
+                    username: Some("alice".into()),
+                    kind: UserKind::Local,
+                },
+                ShareCandidate {
+                    user_id: format!("portable:{}", "ab".repeat(32)),
+                    display_name: "Bob".into(),
+                    username: None,
+                    kind: UserKind::Portable,
+                },
+            ],
+            offset: 0,
+            total: 2,
+        });
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["type"], "share_candidates");
+        assert_eq!(json["candidates"][0]["kind"], "local");
+        assert!(json["candidates"][1].get("username").is_none(), "{json}");
+        round_trip(Response::Ok(page));
+        let named = PlaylistSummary {
+            visibility: Visibility::Shared {
+                with: vec![PlaylistShare {
+                    display_name: Some("Alice".into()),
+                    kind: Some(UserKind::Local),
+                    ..PlaylistShare::new("local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4d", true)
+                }],
+            },
+            owner_name: Some("Carol".into()),
+            ..summary()
+        };
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json["owner_name"], "Carol");
+        assert_eq!(json["visibility"]["with"][0]["display_name"], "Alice");
+        assert_eq!(json["visibility"]["with"][0]["kind"], "local");
+        round_trip(Response::Ok(Reply::PlaylistInfo(named)));
+        let json = serde_json::to_value(summary()).unwrap();
+        assert!(json.get("owner_name").is_none(), "{json}");
+        assert!(
+            json["visibility"]["with"][0].get("display_name").is_none(),
+            "{json}"
+        );
     }
 
     /// A client without the feature never gets `playlists`; one with it
