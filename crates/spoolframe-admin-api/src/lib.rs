@@ -2666,6 +2666,8 @@ pub enum KeyframesRead {
     Index { ms: u64 },
     /// Every packet of the file.
     Scan { ms: u64 },
+    /// An earlier scan of the file, kept on disk.
+    Stored { ms: u64 },
 }
 
 /// When a playback's first segment was ready (PX-24).

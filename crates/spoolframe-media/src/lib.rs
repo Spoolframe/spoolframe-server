@@ -16,6 +16,7 @@ mod external;
 pub mod gpus;
 pub mod harden;
 pub mod keyframe_index;
+mod keyframe_store;
 pub mod ocr;
 pub mod pgs;
 mod probe;
@@ -24,7 +25,8 @@ pub mod roles;
 pub mod sandbox;
 pub mod vobsub;
 
-pub use probe::{KeyframeTimes, KeyframesFrom, ProbeError, Prober};
+pub use keyframe_store::KeyframeStore;
+pub use probe::{Ahead, KeyframeTimes, KeyframesFrom, ProbeError, Prober};
 
 pub use descriptor::{
     AudioStream, DolbyVision, DvBase, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource,

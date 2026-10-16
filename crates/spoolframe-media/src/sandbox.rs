@@ -909,6 +909,30 @@ impl std::ops::DerefMut for Command {
     }
 }
 
+/// Run `command` at the lowest CPU and I/O priority there is (nice 19,
+/// the idle I/O class): work done ahead of any play, which a playback, or
+/// its conversion, never waits on.
+pub fn low_priority(command: &mut tokio::process::Command) {
+    // SAFETY: only setpriority(2) and ioprio_set(2), both async-signal-safe
+    // syscalls, run between fork and exec; neither allocates or takes a
+    // lock. Set there, before exec, every thread the program starts
+    // inherits them. A failure (a kernel without ioprio) leaves the
+    // default, and the program still runs.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+            libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IOPRIO_IDLE);
+            Ok(())
+        });
+    }
+}
+
+/// `ioprio_set(2)`: the calling process.
+pub const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+/// The idle class (3), in the class bits: I/O only when no one else
+/// wants the disk.
+const IOPRIO_IDLE: libc::c_int = 3 << 13;
+
 #[cfg(target_env = "gnu")]
 type Resource = libc::__rlimit_resource_t;
 #[cfg(not(target_env = "gnu"))]

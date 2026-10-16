@@ -23,6 +23,7 @@ mod gpu_pick;
 mod harden;
 mod http_playback;
 mod hwdec;
+mod index_ahead;
 mod invite_admin;
 mod invites;
 mod lan;

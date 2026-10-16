@@ -503,6 +503,14 @@ experimental {
   # them through system memory. Tried at start, and its own used where
   # that fails, as it does with Mesa's RADV today. NVIDIA always shares.
   libplacebo_shared_on_amd = false;
+  # Read the keyframes of each film and episode whose file has no index
+  # (a transport stream, .ts or .m2ts) ahead of any play, and keep them in
+  # the cache: the first HLS playback of one with its video copied reads
+  # the whole file first, minutes for a large remux. The newest first,
+  # then the rest of the libraries; one file at a time, at the lowest CPU
+  # and I/O priority, started only while nothing converts. What a play
+  # reads is kept too, on or off. Applies at once.
+  index_ahead = false;
 }
 
 # HTTP playback (PX-49): a playback's HLS, or its file, over plain HTTP on

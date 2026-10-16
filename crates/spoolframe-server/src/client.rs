@@ -4697,6 +4697,7 @@ impl ProtocolHandler for ClientProtocol {
     /// closes the connections.
     async fn shutdown(&self) {
         self.services.previews.stop();
+        self.services.index_ahead.stop();
         let notices = self
             .addresses
             .streams

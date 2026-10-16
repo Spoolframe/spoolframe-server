@@ -133,6 +133,29 @@
   where each run starts. A track that starts on time is copied as
   before.
 
+- Keyframes read ahead (`experimental.index_ahead`, off by default, a
+  switch in Settings › Experimental, applied at once). A film in a
+  transport stream (`.ts`, `.m2ts`) has no index of its keyframes, so
+  its first HLS playback with the video copied read the whole file
+  first: 155 s for a 58 GB remux, past the 135 s an app waits. With the
+  switch on, the server reads each film and episode whose file has no
+  index it can use before anyone plays it: the newest first, then every
+  library, again when the catalog changes; one file at a time, at the
+  lowest CPU and I/O priority, started only while nothing converts. A
+  play of a file being read waits for that read. Files with an index
+  are not read.
+
+- Keyframe lists that took a whole file's read are kept in
+  `state_dir/cache/keyframes`, one per media path, with the file's size
+  and modification time: a restart no longer reads the file again, and
+  a changed file is read again. A play's own read is kept too, switch or
+  not; before, they were kept in memory only. Playback debug and the
+  "playback start timed" line say `stored` for a list read from there.
+  New metrics: `spoolframe_index_ahead_queued`,
+  `spoolframe_index_ahead_files_total{outcome="scanned"|"failed"}`,
+  `spoolframe_index_ahead_read_bytes_total` and
+  `spoolframe_index_ahead_seconds_total`.
+
 - Server › Settings › Experimental: every experimental switch in one
   tab, shown whether or not the advanced settings are. HTTP playback for
   AirPlay (PX-49), until now the config file's and the CLI's only, is a

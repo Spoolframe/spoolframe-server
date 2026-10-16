@@ -446,6 +446,8 @@ pub struct ServerOptions {
     pub uplink: spoolframe_server::uplink::UplinkSettings,
     /// `http_playback` (PX-49): off unless a test is about it.
     pub http_playback: spoolframe_server::http_playback::Settings,
+    /// `experimental.index_ahead`: off unless a test is about it.
+    pub index_ahead: bool,
 }
 
 impl Default for ServerOptions {
@@ -492,6 +494,7 @@ impl Default for ServerOptions {
             finders: offline_finders(),
             uplink: Default::default(),
             http_playback: Default::default(),
+            index_ahead: false,
         }
     }
 }
@@ -676,7 +679,11 @@ impl TestServer {
         };
         let sandbox = media_sandbox(&dir);
         let ffprobe = tool(&ffprobe, &sandbox);
-        let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
+        let keyframes =
+            spoolframe_media::KeyframeStore::open(&dir.join("cache").join("keyframes")).unwrap();
+        let prober = Arc::new(
+            Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT).with_keyframe_store(keyframes),
+        );
         let jobs = Jobs::new(
             JobLimits {
                 budget: options.budget,
@@ -735,6 +742,16 @@ impl TestServer {
             previews.watch_catalog(live.changes());
         }
         spoolframe_server::previews::ahead::spawn(&previews, catalog.clone(), None, store.clone());
+        let index_ahead = spoolframe_server::index_ahead::IndexAhead::start(
+            spoolframe_server::index_ahead::IndexAheadSources {
+                catalog: catalog.clone(),
+                episodes: None,
+                prober: prober.clone(),
+                encoding: jobs.encoding(),
+                changes: options.catalog.as_ref().map(|live| live.changes()),
+            },
+            options.index_ahead,
+        );
         let auth = Auth::with_failure_window(store.clone(), options.failure_window)
             .with_sign_in_lifetime(options.sign_in_lifetime)
             .with_stranger_attempts(options.stranger_attempts);
@@ -774,6 +791,7 @@ impl TestServer {
             jobs: jobs.clone(),
             subtitles: Arc::new(subtitles),
             previews,
+            index_ahead,
             app_passkeys: Arc::new(
                 spoolframe_server::app_passkeys::AppPasskeys::with_lifetime(
                     server_id.clone(),

@@ -26,6 +26,7 @@ use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::connected::Connected;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
+use spoolframe_server::index_ahead::{IndexAhead, IndexAheadSources};
 use spoolframe_server::logs::{self, LogRing, RingLayer};
 use spoolframe_server::metrics::Metrics;
 use spoolframe_server::network::{Server, ServerName, Services};
@@ -822,7 +823,18 @@ async fn run(
         std::env::current_exe().context("cannot find the server's own binary")?,
         sandbox.clone(),
     );
-    let prober = Arc::new(Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT));
+    // Keyframe lists that took a whole file's read, kept across restarts
+    // whether or not they are read ahead.
+    let keyframes_dir = state_dir.join("cache").join("keyframes");
+    let keyframes = spoolframe_media::KeyframeStore::open(&keyframes_dir).with_context(|| {
+        format!(
+            "cannot prepare the keyframe cache {}",
+            keyframes_dir.display()
+        )
+    })?;
+    let prober = Arc::new(
+        Prober::new(ffprobe.clone(), Prober::DEFAULT_TIMEOUT).with_keyframe_store(keyframes),
+    );
     reload::config_warnings(config);
     let transcoding = Arc::new(
         Transcoding::new(
@@ -917,6 +929,16 @@ async fn run(
         catalog.clone(),
         Some(live.clone()),
         store.clone(),
+    );
+    let index_ahead = IndexAhead::start(
+        IndexAheadSources {
+            catalog: catalog.clone(),
+            episodes: Some(live.clone()),
+            prober: prober.clone(),
+            encoding: jobs.encoding(),
+            changes: Some(live.changes()),
+        },
+        config.experimental.index_ahead(),
     );
     let auth = Auth::new(store).with_trust_idle(config.auth.trust_idle()?);
     let watch = Arc::new(Watch::new(
@@ -1060,6 +1082,7 @@ async fn run(
             watch: Some(watch.clone()),
             jobs: Some(jobs.clone()),
             previews: Some(previews.clone()),
+            index_ahead: Some(index_ahead.clone()),
             artwork: Some(artwork_cache.clone()),
             oidc: Some(oidc.clone()),
             metrics: Some(metrics.clone()),
@@ -1162,6 +1185,7 @@ async fn run(
             jobs: jobs.clone(),
             subtitles,
             previews,
+            index_ahead,
             metrics,
             wan: spoolframe_server::wan::Finders::system(),
             uplink: uplink.clone(),

@@ -722,6 +722,9 @@ fn start(t: &StartTimes) -> api::PlaybackStart {
             Some((took, KeyframesFrom::Scan)) => api::KeyframesRead::Scan {
                 ms: took.as_millis() as u64,
             },
+            Some((took, KeyframesFrom::Stored)) => api::KeyframesRead::Stored {
+                ms: took.as_millis() as u64,
+            },
         },
         first_segment: match t.first_segment {
             FirstSegment::Direct => api::FirstSegment::NotApplicable,

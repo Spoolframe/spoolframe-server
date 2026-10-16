@@ -48,6 +48,8 @@ pub struct Live {
     pub jobs: Option<Arc<Jobs>>,
     /// `previews.*`.
     pub previews: Option<Arc<Previews>>,
+    /// `experimental.index_ahead`.
+    pub index_ahead: Option<Arc<crate::index_ahead::IndexAhead>>,
     /// `artwork.memory_mb`.
     pub artwork: Option<Arc<crate::artwork::ArtworkCache>>,
     /// `auth.oidc` (P3-04).
@@ -555,6 +557,9 @@ impl RuntimeSettings {
         if let (Some(previews), Ok(settings)) = (&live.previews, config.previews.settings()) {
             previews.set_settings(settings);
         }
+        if let Some(ahead) = &live.index_ahead {
+            ahead.set_on(config.experimental.index_ahead());
+        }
         if let Some(artwork) = &live.artwork {
             artwork.set_memory_limit(config.artwork.tiers().memory);
         }
@@ -803,6 +808,40 @@ mod tests {
         assert_eq!(now.when, When::Never);
         assert_eq!(now.interval, std::time::Duration::from_secs(4));
         assert_eq!(now.workers, 3);
+    }
+
+    /// Keyframes read ahead are turned on and off at once.
+    #[tokio::test]
+    async fn index_ahead_is_turned_on_and_off_at_once() {
+        use crate::index_ahead::{IndexAhead, IndexAheadSources};
+        let (mut settings, _dir) = settings(None).await;
+        let ahead = IndexAhead::start(
+            IndexAheadSources {
+                catalog: Arc::new(LiveCatalog::default()),
+                episodes: None,
+                prober: Arc::new(spoolframe_media::Prober::new(
+                    spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
+                    spoolframe_media::Prober::DEFAULT_TIMEOUT,
+                )),
+                encoding: Default::default(),
+                changes: None,
+            },
+            false,
+        );
+        settings.live.index_ahead = Some(ahead.clone());
+        let entry = settings
+            .set("experimental.index_ahead", &serde_json::json!(true), "root")
+            .unwrap();
+        assert!(!entry.restart_pending);
+        assert!(ahead.on());
+        settings
+            .set(
+                "experimental.index_ahead",
+                &serde_json::json!(false),
+                "root",
+            )
+            .unwrap();
+        assert!(!ahead.on());
     }
 
     /// A token file the server cannot read refuses the change that names

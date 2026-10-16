@@ -248,6 +248,7 @@ struct Sources {
     jobs: Option<Arc<Jobs>>,
     artwork: Option<Arc<ArtworkCache>>,
     previews: Option<Arc<Previews>>,
+    index_ahead: Option<Arc<crate::index_ahead::IndexAhead>>,
     subtitles: Option<Arc<Subtitles>>,
     plex_sync: Option<Arc<WatchSync>>,
     catalog: Option<Arc<LiveCatalog>>,
@@ -403,6 +404,7 @@ impl Metrics {
         sources.jobs = Some(services.jobs.clone());
         sources.artwork = Some(services.artwork.clone());
         sources.previews = Some(services.previews.clone());
+        sources.index_ahead = Some(services.index_ahead.clone());
         sources.subtitles = Some(services.subtitles.clone());
         if let Some(sync) = &services.plex_sync {
             sync.record_into(self.histograms.clone());
@@ -1119,6 +1121,40 @@ impl Metrics {
                 Sample::labelled(&[("outcome", "failed")], previews.failed as f64),
             ],
         });
+        // Off or not there yet, with nothing in them: a family the OTLP
+        // export starts with has its samples then, or it is not exported.
+        let ahead = sources
+            .index_ahead
+            .as_ref()
+            .map(|a| a.counts())
+            .unwrap_or_default();
+        families.push(Family::single(
+            "spoolframe_index_ahead_queued",
+            "Films and episodes waiting to have their keyframes read ahead.",
+            Kind::Gauge,
+            ahead.queued as f64,
+        ));
+        families.push(Family {
+            name: "spoolframe_index_ahead_files_total",
+            help: "Files whose every packet was read ahead for their keyframes, and ones that could not be.",
+            kind: Kind::Counter,
+            samples: vec![
+                Sample::labelled(&[("outcome", "scanned")], ahead.scanned as f64),
+                Sample::labelled(&[("outcome", "failed")], ahead.failed as f64),
+            ],
+        });
+        families.push(Family::single(
+            "spoolframe_index_ahead_read_bytes_total",
+            "Bytes of files read ahead for their keyframes.",
+            Kind::Counter,
+            ahead.read_bytes as f64,
+        ));
+        families.push(Family::single(
+            "spoolframe_index_ahead_seconds_total",
+            "Seconds spent reading files ahead for their keyframes.",
+            Kind::Counter,
+            ahead.read_seconds,
+        ));
         let ocr = sources
             .subtitles
             .as_ref()

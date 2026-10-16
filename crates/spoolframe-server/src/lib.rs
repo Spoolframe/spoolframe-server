@@ -25,6 +25,7 @@ pub mod http_playback;
 pub mod hybrid;
 pub mod identity;
 mod ifaddrs;
+pub mod index_ahead;
 pub mod invites;
 mod keyed_locks;
 pub mod libraries;

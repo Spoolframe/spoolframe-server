@@ -531,6 +531,8 @@ pub struct Services {
     pub subtitles: Arc<Subtitles>,
     /// Frame previews for scrubbing (P3-13).
     pub previews: Arc<crate::previews::Previews>,
+    /// Keyframes read ahead of any play (`experimental.index_ahead`).
+    pub index_ahead: Arc<crate::index_ahead::IndexAhead>,
     /// The apps' passkeys (P3-19).
     pub app_passkeys: Arc<crate::app_passkeys::AppPasskeys>,
     /// The web UI's origin (`admin.public_url`), where a browser approves

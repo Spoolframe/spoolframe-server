@@ -6931,6 +6931,7 @@ name = "spoolframe-media"
 version = "0.9.1"
 dependencies = [
  "async-trait",
+ "blake3",
  "easy-ffprobe",
  "landlock",
  "libc",

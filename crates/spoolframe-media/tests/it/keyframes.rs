@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use spoolframe_media::keyframe_index::{self, IndexKind};
 use spoolframe_media::sandbox::Tool;
-use spoolframe_media::{KeyframesFrom, Prober};
+use spoolframe_media::{Ahead, KeyframeStore, KeyframesFrom, Prober};
 
 async fn scratch(test: &str) -> spoolframe_test_dir::TestDir {
     spoolframe_test_dir::TestDir::new(&format!("spoolframe-keyframes-{test}")).await
@@ -285,13 +285,158 @@ async fn two_callers_at_once_share_one_scan() {
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .unwrap();
-    // No index the reader follows: every packet is read.
-    let film = dir.join("film.ts");
-    std::fs::write(&film, b"not a container with an index").unwrap();
+    // No index the reader follows: every packet is read. In a directory
+    // of its own: the stand-in's log, made beside it, would change the
+    // directory's time, and so its stamp, between the two callers.
+    let film = transport_stream(dir);
     let prober = Prober::new(Tool::unconfined(&ffprobe), Duration::from_secs(30));
     let (a, b) = tokio::join!(prober.keyframes(&film), prober.keyframes(&film));
     assert_eq!(a.unwrap().times_ms, [0, 2000]);
     assert_eq!(b.unwrap().times_ms, [0, 2000]);
     let ran = std::fs::read_to_string(&scans).unwrap();
     assert_eq!(ran.lines().count(), 1, "{ran}");
+}
+
+/// A stand-in ffprobe in `dir` that adds a line to `dir/scans` each run,
+/// the niceness it ran at, takes half a second, and lists keyframes at 0
+/// and 2 s.
+fn counting_ffprobe(dir: &Path) -> PathBuf {
+    let ffprobe = dir.join("ffprobe");
+    std::fs::write(
+        &ffprobe,
+        format!(
+            "#!/bin/sh\nnice >> '{}'\nsleep 0.5\necho 0.000000,K__\necho 2.000000,K__\n",
+            dir.join("scans").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &ffprobe,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    ffprobe
+}
+
+/// The niceness of each stand-in ffprobe run so far.
+fn scans(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("scans"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A prober running the stand-in, keeping its scans in `dir/keyframes`:
+/// another one made on the same directory is the server after a restart.
+fn kept(dir: &Path) -> Prober {
+    Prober::new(
+        Tool::unconfined(dir.join("ffprobe")),
+        Duration::from_secs(30),
+    )
+    .with_keyframe_store(KeyframeStore::open(&dir.join("keyframes")).unwrap())
+}
+
+/// A file with no index the reader follows, as a transport stream is, in
+/// `dir/films`.
+fn transport_stream(dir: &Path) -> PathBuf {
+    let films = dir.join("films");
+    std::fs::create_dir_all(&films).unwrap();
+    let film = films.join("film.ts");
+    std::fs::write(&film, b"not a container with an index").unwrap();
+    film
+}
+
+/// A scan reads the whole file: tens of GB for a remux in a transport
+/// stream. It is kept on disk, so a restart does not read it again.
+#[tokio::test]
+async fn a_scan_is_kept_and_used_after_a_restart() {
+    let tmp = scratch("kept").await;
+    let dir = tmp.as_ref();
+    counting_ffprobe(dir);
+    let film = transport_stream(dir);
+    let (times, from) = kept(dir).keyframes_from(&film).await.unwrap();
+    assert!(matches!(from, KeyframesFrom::Scan { .. }), "{from:?}");
+    let (again, from) = kept(dir).keyframes_from(&film).await.unwrap();
+    assert_eq!(from, KeyframesFrom::Stored);
+    assert_eq!(again, times);
+    assert_eq!(scans(dir).len(), 1);
+}
+
+/// What is kept is the file as it was: one changed since (its size or
+/// modification time) is scanned again.
+#[tokio::test]
+async fn a_changed_file_is_scanned_again() {
+    let tmp = scratch("changed").await;
+    let dir = tmp.as_ref();
+    counting_ffprobe(dir);
+    let film = transport_stream(dir);
+    kept(dir).keyframes_from(&film).await.unwrap();
+    std::fs::write(&film, b"another film, of another length").unwrap();
+    let (_, from) = kept(dir).keyframes_from(&film).await.unwrap();
+    assert!(matches!(from, KeyframesFrom::Scan { .. }), "{from:?}");
+    assert_eq!(scans(dir).len(), 2);
+    let (_, from) = kept(dir).keyframes_from(&film).await.unwrap();
+    assert_eq!(from, KeyframesFrom::Stored);
+}
+
+/// A play that starts while its film is being read ahead waits for that
+/// read, and does not start a second. The read ahead runs at the lowest
+/// priority, a play's own at the server's.
+#[tokio::test]
+async fn a_play_during_a_read_ahead_waits_for_it() {
+    let tmp = scratch("joined").await;
+    let dir = tmp.as_ref();
+    counting_ffprobe(dir);
+    let film = transport_stream(dir);
+    let prober = kept(dir);
+    let (ahead, played) = tokio::join!(prober.keyframes_ahead(&film), async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        prober.keyframes_from(&film).await
+    });
+    assert!(matches!(ahead.unwrap(), Ahead::Scanned { .. }));
+    let (times, from) = played.unwrap();
+    assert_eq!(times.times_ms, [0, 2000]);
+    assert_eq!(from, KeyframesFrom::Stored);
+    assert_eq!(scans(dir), ["19"]);
+
+    let other = dir.join("films").join("other.ts");
+    std::fs::write(&other, b"another film with no index").unwrap();
+    prober.keyframes_from(&other).await.unwrap();
+    // The test's own niceness, whatever it runs at.
+    assert_ne!(scans(dir)[1], "19");
+}
+
+/// Read ahead, a film whose index the reader follows is not scanned: a
+/// play reads the index in moments.
+#[tokio::test]
+async fn a_film_with_an_index_is_not_scanned_ahead() {
+    let tmp = scratch("indexed-ahead").await;
+    let dir = tmp.as_ref();
+    let path = film(dir, "film.mkv", &[]);
+    let prober = Prober::new(Tool::unconfined("ffprobe"), Duration::from_secs(30))
+        .with_keyframe_store(KeyframeStore::open(&dir.join("keyframes")).unwrap());
+    assert_eq!(prober.keyframes_ahead(&path).await.unwrap(), Ahead::Indexed);
+    assert_eq!(std::fs::read_dir(dir.join("keyframes")).unwrap().count(), 0);
+}
+
+/// A transport stream ffmpeg writes is scanned ahead, and a play then
+/// gets every packet's keyframes from what was kept.
+#[tokio::test]
+async fn a_transport_stream_is_scanned_ahead() {
+    let tmp = scratch("ts-ahead").await;
+    let dir = tmp.as_ref();
+    let path = film(dir, "film.ts", &[]);
+    let store = dir.join("keyframes");
+    let prober = || {
+        Prober::new(Tool::unconfined("ffprobe"), Duration::from_secs(30))
+            .with_keyframe_store(KeyframeStore::open(&store).unwrap())
+    };
+    let ahead = prober().keyframes_ahead(&path).await.unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(ahead, Ahead::Scanned { bytes: size });
+    let (times, from) = prober().keyframes_from(&path).await.unwrap();
+    assert_eq!(from, KeyframesFrom::Stored);
+    assert_eq!(times, prober().scan_keyframes(&path).await.unwrap());
+    assert_eq!(prober().keyframes_ahead(&path).await.unwrap(), Ahead::Known);
 }

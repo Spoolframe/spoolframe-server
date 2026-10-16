@@ -265,6 +265,12 @@ pub struct ExperimentalConfig {
     /// used where that fails, as it does on RADV today. Off if left out.
     #[ucl(default)]
     pub libplacebo_shared_on_amd: Option<bool>,
+    /// Read ahead of any play the keyframes of each film and episode
+    /// whose file has no index (a transport stream): one file at a time,
+    /// at the lowest priority, while nothing converts, and kept on disk
+    /// ([`crate::index_ahead`]). Off if left out.
+    #[ucl(default)]
+    pub index_ahead: Option<bool>,
 }
 
 impl ExperimentalConfig {
@@ -273,12 +279,20 @@ impl ExperimentalConfig {
         self.libplacebo_shared_on_amd.unwrap_or(false)
     }
 
+    /// `index_ahead`.
+    pub fn index_ahead(&self) -> bool {
+        self.index_ahead.unwrap_or(false)
+    }
+
     /// The switches turned on, by key, as the start's log names them.
     pub fn on(&self) -> Vec<&'static str> {
-        [(
-            "experimental.libplacebo_shared_on_amd",
-            self.libplacebo_shared_on_amd(),
-        )]
+        [
+            (
+                "experimental.libplacebo_shared_on_amd",
+                self.libplacebo_shared_on_amd(),
+            ),
+            ("experimental.index_ahead", self.index_ahead()),
+        ]
         .into_iter()
         .filter_map(|(key, on)| on.then_some(key))
         .collect()
@@ -3163,6 +3177,18 @@ mod tests {
         assert!(
             plex(r#"plex { url = "http://nas:32400"; } experimental { shared = true; }"#).is_err()
         );
+    }
+
+    /// Keyframes read ahead: off if left out, and named for the start's
+    /// log when on.
+    #[test]
+    fn index_ahead_is_off_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert!(!config.experimental.index_ahead());
+        let on = plex(r#"plex { url = "http://nas:32400"; } experimental { index_ahead = true; }"#)
+            .unwrap();
+        assert!(on.experimental.index_ahead());
+        assert_eq!(on.experimental.on(), ["experimental.index_ahead"]);
     }
 
     /// Review 2026-10-11 M2: how long a copied video's HLS segments are,

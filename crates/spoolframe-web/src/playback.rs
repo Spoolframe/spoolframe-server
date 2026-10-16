@@ -233,6 +233,7 @@ pub fn start_parts(start: &PlaybackStart) -> [(&'static str, String, String); 3]
         KeyframesRead::None => ("—".to_owned(), "none needed".to_owned()),
         KeyframesRead::Index { ms } => (ms_text(ms), "from the file's index".to_owned()),
         KeyframesRead::Scan { ms } => (ms_text(ms), "read the whole file".to_owned()),
+        KeyframesRead::Stored { ms } => (ms_text(ms), "kept from an earlier read".to_owned()),
     };
     let (first, note) = match start.first_segment {
         FirstSegment::NotApplicable => ("n/a".to_owned(), "direct play has none".to_owned()),

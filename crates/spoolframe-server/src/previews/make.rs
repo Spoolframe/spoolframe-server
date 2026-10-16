@@ -16,7 +16,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use spoolframe_media::encoders::{Hardware, hwaccel_args};
-use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool};
+use spoolframe_media::sandbox::{GpuUse, Jail, Limits, Tool, low_priority};
 
 use super::sheets::TILE_WIDTH;
 use crate::encode::args::TONE_MAP;
@@ -104,28 +104,6 @@ pub fn tile_args(source: &Source, hardware: bool, at: Duration, out: &Path) -> V
     args.push(out.display().to_string());
     args
 }
-
-/// Run `command` at the lowest CPU and I/O priority there is.
-pub fn low_priority(command: &mut tokio::process::Command) {
-    // SAFETY: only setpriority(2) and ioprio_set(2), both async-signal-safe
-    // syscalls, run between fork and exec; neither allocates or takes a
-    // lock. Set there, before exec, every thread ffmpeg starts inherits
-    // them. A failure (a kernel without ioprio) leaves the default, and
-    // the tile is still made.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
-            libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IOPRIO_IDLE);
-            Ok(())
-        });
-    }
-}
-
-/// `ioprio_set(2)`: the calling process.
-const IOPRIO_WHO_PROCESS: libc::c_int = 1;
-/// The idle class (3), in the class bits: I/O only when no one else
-/// wants the disk.
-const IOPRIO_IDLE: libc::c_int = 3 << 13;
 
 /// What makes one tile: ffmpeg ([`Ffmpeg`]), or a stand-in in tests.
 #[async_trait::async_trait]
@@ -287,6 +265,7 @@ async fn tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_media::sandbox::IOPRIO_WHO_PROCESS;
 
     fn source(hdr: bool, hardware: Option<Hardware>) -> Source {
         Source {

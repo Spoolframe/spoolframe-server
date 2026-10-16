@@ -143,6 +143,7 @@ pub const SETTINGS: &[Setting] = &[
     live("telemetry.otlp.logs"),
     // Detection reads it, at start.
     restart("experimental.libplacebo_shared_on_amd"),
+    live("experimental.index_ahead"),
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),
     restart("http_playback.address"),

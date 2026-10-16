@@ -243,6 +243,8 @@ pub enum KeyframesFrom {
     Index,
     /// Every packet of the file.
     Scan,
+    /// An earlier scan of the file, kept on disk.
+    Stored,
 }
 
 impl KeyframesFrom {
@@ -250,6 +252,7 @@ impl KeyframesFrom {
         match from {
             spoolframe_media::KeyframesFrom::Index(_) => KeyframesFrom::Index,
             spoolframe_media::KeyframesFrom::Scan { .. } => KeyframesFrom::Scan,
+            spoolframe_media::KeyframesFrom::Stored => KeyframesFrom::Stored,
         }
     }
 }
@@ -293,6 +296,7 @@ impl StartTimes {
                 match from {
                     KeyframesFrom::Index => "index",
                     KeyframesFrom::Scan => "scan",
+                    KeyframesFrom::Stored => "stored",
                 },
             ),
             None => ("none".to_owned(), "none"),

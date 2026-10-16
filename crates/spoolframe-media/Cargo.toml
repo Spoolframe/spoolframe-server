@@ -10,6 +10,8 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
+# Names a kept keyframe list by its media path (keyframe_store.rs).
+blake3 = { workspace = true }
 easy-ffprobe = { workspace = true }
 # What the tools it runs may reach (sandbox.rs): Landlock's file and
 # network rules, made before the fork and applied after it.

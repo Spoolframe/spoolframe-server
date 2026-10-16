@@ -1,7 +1,8 @@
 //! Server › Settings › Experimental: every switch that may change or go
 //! away in one place. HTTP playback for AirPlay (PX-49), which was the
-//! config file's and the CLI's only, and libplacebo's shared Vulkan
-//! device on AMD (PGPU-04), which was at the foot of Playback.
+//! config file's and the CLI's only, libplacebo's shared Vulkan device on
+//! AMD (PGPU-04), which was at the foot of Playback, and keyframes read
+//! ahead of any play (`experimental.index_ahead`).
 
 use dioxus::prelude::*;
 use serde_json::json;
@@ -50,6 +51,7 @@ fn ExperimentalFields(
     let port = use_signal(|| listen.port_text());
     let address = use_signal(|| text(&settings, "http_playback.address"));
     let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
+    let mut index_ahead = use_signal(|| flag(&settings, "experimental.index_ahead"));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     // `http_playback.*` is sensitive: from an old session, "Confirm it's
@@ -73,6 +75,7 @@ fn ExperimentalFields(
                 "experimental.libplacebo_shared_on_amd",
                 Some(json!(shared_on_amd())),
             ),
+            ("experimental.index_ahead", Some(json!(index_ahead()))),
         ];
         busy.set(true);
         spawn(async move {
@@ -145,6 +148,24 @@ fn ExperimentalFields(
                 }
             }
             Note { settings: settings.clone(), setting: "experimental.libplacebo_shared_on_amd", on_changed: move |_| on_reload.call(()) }
+        }
+        div { class: "flex flex-col gap-2",
+            h2 { "Keyframes read ahead" }
+            div { class: "flex items-start gap-3",
+                button {
+                    class: "switch mt-0.5",
+                    role: "switch",
+                    aria_checked: "{index_ahead()}",
+                    aria_label: "Read keyframes ahead of any play",
+                    disabled: locked(&settings, "experimental.index_ahead"),
+                    onclick: move |_| index_ahead.toggle(),
+                }
+                span { class: "choice-what",
+                    b { "Read keyframes ahead of any play" }
+                    "A film in a transport stream (.ts, .m2ts) has no index of its keyframes, so its first playback with the video copied reads the whole file first: minutes for a large remux, longer than an app waits. With this on, the server reads such files before anyone plays them, the newest first, one at a time, at the lowest priority, while nothing converts, and keeps what it read."
+                }
+            }
+            Note { settings: settings.clone(), setting: "experimental.index_ahead", on_changed: move |_| on_reload.call(()) }
         }
         if let Some(text) = error() {
             Alert { text }

@@ -11,6 +11,7 @@ use easy_ffprobe::FfProbe;
 use crate::descriptor::{MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream};
 use crate::external;
 use crate::keyframe_index::{self, IndexKind};
+use crate::keyframe_store::{KeyframeStore, Made};
 use crate::ocr::{self, OcrError};
 use crate::roles;
 use crate::sandbox::{Jail, Limits, Tool};
@@ -74,6 +75,9 @@ pub struct Prober {
     /// later caller waits on: one read of a file at a time, not one per
     /// caller (review 2026-10-11 M33). A scan reads the whole file.
     reading: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// Where the lists that took a scan are kept across restarts; none
+    /// without [`Prober::with_keyframe_store`].
+    store: Option<KeyframeStore>,
 }
 
 /// A file's keyframe times, shared.
@@ -191,6 +195,21 @@ pub enum KeyframesFrom {
     Index(IndexKind),
     /// Every packet of the file, and why not the index.
     Scan { why: String },
+    /// A scan of the file as it is now, kept on disk
+    /// ([`Prober::with_keyframe_store`]).
+    Stored,
+}
+
+/// What [`Prober::keyframes_ahead`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ahead {
+    /// Nothing: the file's keyframes are in memory or kept already.
+    Known,
+    /// Nothing: the file has an index the reader follows, which a play
+    /// reads in moments.
+    Indexed,
+    /// Every packet was read, `bytes` of file, and the list kept.
+    Scanned { bytes: u64 },
 }
 
 /// The intervals between indexed keyframes that are read to check an
@@ -229,7 +248,15 @@ impl Prober {
             cache: Mutex::new(Lru::new(MAX_DESCRIPTORS)),
             keyframes: Mutex::new(Lru::new(MAX_KEYFRAME_LISTS)),
             reading: Mutex::new(HashMap::new()),
+            store: None,
         }
+    }
+
+    /// Keep each list that took a scan in `store`, and look there before
+    /// reading a file: a restart does not read a whole file again.
+    pub fn with_keyframe_store(mut self, store: KeyframeStore) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// The descriptor of the media file at `path`, with the subtitle files
@@ -324,7 +351,8 @@ impl Prober {
     /// reading the packets of a few intervals between its entries, finds
     /// a keyframe at each entry and none between; otherwise, and for a
     /// file with no index the reader follows, every packet is read
-    /// ([`Prober::scan_keyframes`]).
+    /// ([`Prober::scan_keyframes`]). A scan is kept in the keyframe store,
+    /// where one is, and taken from there while the file is unchanged.
     pub async fn keyframes_from(
         &self,
         path: &Path,
@@ -343,6 +371,44 @@ impl Prober {
         self.read_keyframes(path, stamp).await
     }
 
+    /// Read `path`'s keyframes ahead of any play, if a play would read
+    /// every packet: at the lowest CPU and I/O priority, kept in the
+    /// keyframe store rather than in memory. A play of the file that
+    /// starts meanwhile waits for this read and takes what it kept, as a
+    /// second start of a film waits for the first's.
+    ///
+    /// The file's index is read but not checked against its packets: a
+    /// play does that in seconds, and scans only if it fails.
+    pub async fn keyframes_ahead(&self, path: &Path) -> Result<Ahead, ProbeError> {
+        let stamp = self.stamp_or_forget(path).await?;
+        if self.keyframes_cached(path, stamp).is_some() {
+            return Ok(Ahead::Known);
+        }
+        let turn = Turn::take(self, path);
+        let _mine = turn.gate.lock().await;
+        if self.keyframes_cached(path, stamp).is_some() || self.is_stored(path, stamp).await {
+            return Ok(Ahead::Known);
+        }
+        if read_index(path).await.is_ok() {
+            return Ok(Ahead::Indexed);
+        }
+        let times = self.scan(path, true).await?;
+        if !self.keep(path, stamp, &times).await {
+            // Nowhere to keep it but memory.
+            self.keyframes.lock().insert(
+                path.to_owned(),
+                (
+                    stamp,
+                    times,
+                    KeyframesFrom::Scan {
+                        why: "read ahead".into(),
+                    },
+                ),
+            );
+        }
+        Ok(Ahead::Scanned { bytes: stamp.size })
+    }
+
     /// `path`'s stamp; one that cannot be had (the file is gone or
     /// renamed) drops what is remembered of it.
     async fn stamp_or_forget(&self, path: &Path) -> Result<Stamp, ProbeError> {
@@ -350,8 +416,56 @@ impl Prober {
         if stamped.is_err() {
             self.cache.lock().remove(path);
             self.keyframes.lock().remove(path);
+            if let Some(store) = self.store.clone() {
+                let path = path.to_owned();
+                let _ = tokio::task::spawn_blocking(move || store.forget(&path)).await;
+            }
         }
         stamped
+    }
+
+    /// The list kept for `path` as `stamp` says it is, read on a blocking
+    /// thread.
+    async fn stored(&self, path: &Path, stamp: Stamp) -> Option<KeyframeTimes> {
+        let store = self.store.clone()?;
+        let made = Made::of(stamp.size, stamp.modified)?;
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || store.get(&path, made))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Whether a list is kept for `path` as `stamp` says it is.
+    async fn is_stored(&self, path: &Path, stamp: Stamp) -> bool {
+        let (Some(store), Some(made)) = (self.store.clone(), Made::of(stamp.size, stamp.modified))
+        else {
+            return false;
+        };
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || store.has(&path, made))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Keep `times` for `path` as `stamp` says it is: whether it was.
+    async fn keep(&self, path: &Path, stamp: Stamp, times: &Keyframes) -> bool {
+        let (Some(store), Some(made)) = (self.store.clone(), Made::of(stamp.size, stamp.modified))
+        else {
+            return false;
+        };
+        let (owned, times) = (path.to_owned(), times.clone());
+        let kept = tokio::task::spawn_blocking(move || store.put(&owned, made, &times))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|kept| kept);
+        match kept {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot keep the keyframes read");
+                false
+            }
+        }
     }
 
     fn keyframes_cached(&self, path: &Path, stamp: Stamp) -> Option<(Keyframes, KeyframesFrom)> {
@@ -368,6 +482,14 @@ impl Prober {
         path: &Path,
         stamp: Stamp,
     ) -> Result<(Keyframes, KeyframesFrom), ProbeError> {
+        if let Some(times) = self.stored(path, stamp).await {
+            let times = Arc::new(times);
+            self.keyframes.lock().insert(
+                path.to_owned(),
+                (stamp, times.clone(), KeyframesFrom::Stored),
+            );
+            return Ok((times, KeyframesFrom::Stored));
+        }
         let indexed = match read_index(path).await {
             Ok(indexed) => self
                 .check_index(path, &indexed.times_ms)
@@ -385,10 +507,9 @@ impl Prober {
             ),
             Err(why) => {
                 tracing::debug!(path = %path.display(), %why, "keyframes from every packet");
-                (
-                    self.scan_keyframes(path).await?,
-                    KeyframesFrom::Scan { why },
-                )
+                let times = self.scan(path, false).await?;
+                self.keep(path, stamp, &times).await;
+                (times, KeyframesFrom::Scan { why })
             }
         };
         self.keyframes
@@ -458,7 +579,15 @@ impl Prober {
     /// The keyframes from every packet of the file, read without
     /// decoding: all of the file is read. Not cached.
     pub async fn scan_keyframes(&self, path: &Path) -> Result<Keyframes, ProbeError> {
+        self.scan(path, false).await
+    }
+
+    /// [`Prober::scan_keyframes`], at the lowest priority if `low`.
+    async fn scan(&self, path: &Path, low: bool) -> Result<Keyframes, ProbeError> {
         let mut cmd = self.command(path).await?;
+        if low {
+            crate::sandbox::low_priority(&mut cmd);
+        }
         keyframe_listing(&mut cmd, path, None);
         let output = self
             .output(cmd, path, MAX_KEYFRAME_LISTING, KEYFRAME_TIMEOUT)
