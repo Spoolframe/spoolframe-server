@@ -728,6 +728,24 @@ spoolframe://invite?server=3f9a…a0f1&name=Home%20Media&addr=203.0.113.24:41641
 | `kind` | `portable-account`: the code grants a portable identity access rather than making an account. Absent, it makes an account. A hint. |
 | `cap` | The code, 12 characters from `ABCDEFGHJKMNPQRSTVWXYZ23456789`, shown in groups of four. |
 
+Sent as text, the same invite has an https form (PX-45), which messages
+make tappable and the apps open as a universal link: the same parameters
+after `https://spoolframe.app/i#` (`Invite::share_link`; `Invite::link`
+is the `spoolframe://` form):
+
+```text
+https://spoolframe.app/i#server=3f9a…a0f1&name=Home%20Media&addr=203.0.113.24:41641&relay=https://relay.home-media.example&exp=1792003200&role=consumer&cap=QW7K-2MFP-XR4T
+```
+
+The invite is the fragment, which a browser never sends, so
+spoolframe.app never sees a code, an address or a key. QR codes stay
+`spoolframe://`: they are scanned in the same room. `parse_link` reads
+both forms. It reads the https one only as `https`, the host
+`spoolframe.app` alone (scheme and host in any case; no user, port or
+trailing dot), the path `/i` or `/i/`, no query, and the invite after
+`#`; anything else is not an invite. Pairing and device sign-in links
+have no https form.
+
 Values are percent-encoded where they would break the link (`&`, `=`,
 `#`, `%`, `+`, spaces, anything outside ASCII); `:` and `/` are written
 as they are. A reader ignores a parameter it does not know, and a hint
@@ -819,9 +837,11 @@ lists and revokes the other's.
 ```
 
 Each `null` is the default (one use, 7 days, `consumer`). The answer is
-`invite_created { invite, code, link }`: the code (`QW7K-2MFP-XR4T`) and
-the link with it, shown this once, and `invite`, as `list_invites` lists
-it:
+`invite_created { invite, code, link, share_link }`: the code
+(`QW7K-2MFP-XR4T`) and the link with it in both forms (`link`, the
+`spoolframe://` one for a QR code; `share_link`, the https one to send,
+absent from a server before PX-45), shown this once, and `invite`, as
+`list_invites` lists it:
 
 ```json
 {"id": "0192…", "kind": "create-user", "note": "Mum", "role": "consumer",
@@ -871,8 +891,9 @@ link as the user pasted or opened it:
   `UsernameTaken`, `InvalidInput` and `RateLimited`.
 
 An admin's `Session` makes them: `create_invite(InviteSpec) ->
-MintedInvite` (its `link` and `copy_string` are the same link, the one
-the web UI copies), `invites() -> Vec<InviteSummary>` (`used` is
+MintedInvite` (`link` is the `spoolframe://` form, for its QR code;
+`share_link` the https one, for the share sheet; `copy_string` is
+`share_link`, as the web UI copies it), `invites() -> Vec<InviteSummary>` (`used` is
 `uses - uses_left`; `created_from`'s `Device` says `this_device`) and
 `revoke_invite(id)`. Their refusals are `AdminRequired`,
 `NotForPortableUsers`, `RecentSignInRequired` (confirm, then ask again),

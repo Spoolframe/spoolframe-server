@@ -709,6 +709,11 @@ async fn invites_from_the_cli() {
             .unwrap_or_else(|| panic!("no {label:?} in {made}"))
             .to_owned()
     };
+    // PX-45: the https form, as it is sent.
+    assert!(
+        line("link").starts_with("https://spoolframe.app/i#"),
+        "{made}"
+    );
     let link = spoolframe_protocol::invite::parse_link(&line("link"))
         .unwrap_or_else(|| panic!("not a link: {made}"));
     assert_eq!(link.name.as_deref(), Some("CLI Invites"));
@@ -747,10 +752,13 @@ async fn invites_from_the_cli() {
     let listed = stdout(cli(&config, &["invite", "list"], "", &admin));
     assert!(!listed.contains("Mum's iPad"), "{listed}");
 
-    let server = spoolframe_protocol::invite::parse_link(
-        stdout(cli(&config, &["invite", "link"], "", &admin)).trim(),
-    )
-    .expect("the server's link");
+    let printed = stdout(cli(&config, &["invite", "link"], "", &admin));
+    assert!(
+        printed.trim().starts_with("https://spoolframe.app/i#"),
+        "{printed}"
+    );
+    let server =
+        spoolframe_protocol::invite::parse_link(printed.trim()).expect("the server's link");
     assert_eq!((server.server, server.code), (link.server, None));
 
     running.stop();

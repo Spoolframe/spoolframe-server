@@ -7,7 +7,7 @@
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
-    AdminApiClient, InviteCreated, InviteEntry, InviteKind, PortableGrant, Role,
+    AdminApiClient, InviteCreated, InviteEntry, InviteKind, PortableGrant, Role, ServerLink,
 };
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -33,7 +33,7 @@ async fn grants() -> Result<Vec<PortableGrant>, ApiError> {
     client.grant_list().await.map_err(rpc::error)
 }
 
-async fn server_link() -> Result<String, ApiError> {
+async fn server_link() -> Result<ServerLink, ApiError> {
     let client = rpc::client().await?;
     client.invite_link().await.map_err(rpc::error)
 }
@@ -75,7 +75,7 @@ pub fn Invites() -> Element {
     let mut creating = use_signal(|| false);
     let mut made = use_signal(|| None::<InviteCreated>);
     let mut revoking = use_signal(|| None::<InviteEntry>);
-    let mut showing = use_signal(|| None::<String>);
+    let mut showing = use_signal(|| None::<ServerLink>);
     let now = now();
     let current = list.read().clone();
     rsx! {
@@ -127,7 +127,7 @@ pub fn Invites() -> Element {
             p { class: "m-0 -mt-2.5 mx-1 hidden text-[13px] text-ctp-subtext0 md:block",
                 "Used-up and expired invites drop off this list. Revoking stops the unused codes; accounts already made stay."
             }
-            ServerLink { on_show: move |link: String| showing.set(Some(link)) }
+            ShareServer { on_show: move |link: ServerLink| showing.set(Some(link)) }
             Guests { toast }
         }
         if creating() {
@@ -157,7 +157,7 @@ pub fn Invites() -> Element {
             }
         }
         if let Some(link) = showing() {
-            LinkDialog { link, on_done: move |_| showing.set(None) }
+            LinkDialog { link: link.link, share_link: link.share_link, on_done: move |_| showing.set(None) }
         }
         Toast { said: toast }
     }
@@ -269,9 +269,10 @@ fn InviteCard(invite: InviteEntry, now: i64, on_revoke: EventHandler<InviteEntry
 }
 
 /// "Share the server without an account": the server's link, which has
-/// no code, never expires and needs no confirming.
+/// no code, never expires and needs no confirming. Copy copies its https
+/// form; Show QR shows the `spoolframe://` one.
 #[component]
-fn ServerLink(on_show: EventHandler<String>) -> Element {
+fn ShareServer(on_show: EventHandler<ServerLink>) -> Element {
     let link = use_resource(server_link);
     let mut copied = use_signal(|| false);
     let current = link.read().clone();
@@ -304,7 +305,7 @@ fn ServerLink(on_show: EventHandler<String>) -> Element {
                         button {
                             class: "btn",
                             onclick: {
-                                let link = link.clone();
+                                let link = link.share_link.clone();
                                 move |_| {
                                     copy(&link);
                                     copied.set(true);
@@ -606,12 +607,14 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
 
 /// WebInviteResult: the code, shown this once, its QR code and its link,
 /// and what the invite does. On a phone (WebInvitesPhone 4) the link goes
-/// out through the share sheet.
+/// out through the share sheet. The QR code is the `spoolframe://` link,
+/// scanned in the same room; what is shown, copied and shared is the
+/// https one (PX-45), which a message makes tappable.
 #[component]
 fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
     let mut copied = use_signal(|| false);
     let invite = &created.invite;
-    let link = created.link.clone();
+    let link = created.share_link.clone();
     let can_share = share_sheet().is_some();
     let copy_link = {
         let link = link.clone();
@@ -629,7 +632,7 @@ fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
                 }
                 div { class: "flex flex-col items-center gap-6 md:flex-row md:items-start",
                     div { class: "flex flex-col items-center gap-2.5",
-                        QrCard { data: link.clone(), px: 204 }
+                        QrCard { data: created.link.clone(), px: 204 }
                         span { class: "hidden text-xs text-ctp-subtext0 md:inline", "Scan with the Spoolframe app" }
                     }
                     div { class: "flex w-full min-w-0 flex-1 flex-col gap-3.5",
@@ -694,9 +697,10 @@ fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
     }
 }
 
-/// The server's link without a code, as a QR code ("Show QR").
+/// The server's link without a code, as a QR code ("Show QR"): `link`,
+/// the `spoolframe://` form; the https `share_link` is shown and copied.
 #[component]
-fn LinkDialog(link: String, on_done: EventHandler<()>) -> Element {
+fn LinkDialog(link: String, share_link: String, on_done: EventHandler<()>) -> Element {
     let mut copied = use_signal(|| false);
     rsx! {
         div { class: "scrim scrim-sheet",
@@ -709,12 +713,12 @@ fn LinkDialog(link: String, on_done: EventHandler<()>) -> Element {
                     QrCard { data: link.clone(), px: 204 }
                 }
                 p { "Scan it with the Spoolframe app, or send the link. It finds and saves this server; the person signs in with an account they already have." }
-                div { class: "invite-link", "{link}" }
+                div { class: "invite-link", "{share_link}" }
                 div { class: "dialog-actions",
                     button {
                         class: "btn-dialog btn-dialog-outline",
                         onclick: {
-                            let link = link.clone();
+                            let link = share_link.clone();
                             move |_| {
                                 copy(&link);
                                 copied.set(true);

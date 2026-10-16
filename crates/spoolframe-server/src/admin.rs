@@ -36,7 +36,9 @@ use spoolframe_admin_api::{
     AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
 };
 use spoolframe_admin_api::{ConfigReload, UplinkMeasurement};
-use spoolframe_admin_api::{InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant};
+use spoolframe_admin_api::{
+    InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant, ServerLink,
+};
 use spoolframe_admin_api::{LookupStatus, MappingStatus};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_plex::check::Scope;
@@ -3246,10 +3248,11 @@ impl AdminApiServer for AdminApi {
                 }
                 crate::invites::CreateError::Invite(e) => e.into(),
             })?;
-        let link = created.link(server);
+        let invite = created.invite(server);
         Ok(InviteCreated {
             code: created.code.shown(),
-            link,
+            link: invite.link(),
+            share_link: invite.share_link(),
             invite: invite_entry(created.record),
         })
     }
@@ -3300,10 +3303,13 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
-    async fn invite_link(&self, ext: &Extensions) -> RpcResult<String> {
+    async fn invite_link(&self, ext: &Extensions) -> RpcResult<ServerLink> {
         self.admin(ext).await?;
         match self.status.invite().await {
-            Some(link) => Ok(link.link()),
+            Some(invite) => Ok(ServerLink {
+                link: invite.link(),
+                share_link: invite.share_link(),
+            }),
             None => Err(error(
                 error_code::NOT_CONFIGURED,
                 "the server's endpoint is starting; try again in a moment",

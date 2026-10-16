@@ -3204,10 +3204,11 @@ impl ClientProtocol {
                     Some(self.addresses.told.clone()),
                 )
                 .await;
-                let link = created.link(server);
+                let invite = created.invite(server);
                 Ok(Reply::InviteCreated(InviteCreated {
                     code: created.code.shown(),
-                    link,
+                    link: invite.link(),
+                    share_link: invite.share_link(),
                     invite: invite_summary(created.record),
                 }))
             }

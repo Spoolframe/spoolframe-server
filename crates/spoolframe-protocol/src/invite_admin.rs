@@ -117,10 +117,15 @@ pub struct InviteCreated {
     pub invite: InviteSummary,
     /// As people read and type it: `QW7K-2MFP-XR4T`.
     pub code: String,
-    /// The invite link ([`crate::invite`]), the code in it: what the QR
-    /// code shows and what is pasted into "Add a server", as the web UI
-    /// copies it.
+    /// The invite link ([`crate::invite`]), the code in it: the
+    /// `spoolframe://` form, what the QR code shows.
     pub link: String,
+    /// The same invite as an https link on spoolframe.app
+    /// ([`crate::invite::Invite::share_link`], PX-45): what the share
+    /// sheet sends and Copy copies. Empty from a server before it.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub share_link: String,
 }
 
 impl fmt::Debug for InviteCreated {
@@ -130,6 +135,7 @@ impl fmt::Debug for InviteCreated {
             .field("invite", &self.invite)
             .field("code", &"<redacted>")
             .field("link", &"<redacted>")
+            .field("share_link", &"<redacted>")
             .finish()
     }
 }
@@ -162,9 +168,8 @@ mod tests {
         assert_eq!(serde_json::from_str::<InviteOrigin>(&json).unwrap(), origin);
     }
 
-    #[test]
-    fn the_code_and_link_stay_out_of_debug() {
-        let created = InviteCreated {
+    fn created() -> InviteCreated {
+        InviteCreated {
             invite: InviteSummary {
                 id: "id".into(),
                 kind: InviteKind::CreateUser,
@@ -182,8 +187,29 @@ mod tests {
             },
             code: "QW7K-2MFP-XR4T".into(),
             link: "spoolframe://invite?server=x&cap=QW7K2MFPXR4T".into(),
-        };
-        let shown = format!("{created:?}");
+            share_link: "https://spoolframe.app/i#server=x&cap=QW7K2MFPXR4T".into(),
+        }
+    }
+
+    #[test]
+    fn the_code_and_link_stay_out_of_debug() {
+        let shown = format!("{:?}", created());
         assert!(!shown.contains("QW7K"), "{shown}");
+    }
+
+    /// PX-45: a server before share links sends none; it reads as empty,
+    /// and the SDK makes it from `link`.
+    #[test]
+    fn a_created_invite_without_a_share_link_reads_as_empty() {
+        let mut sent = serde_json::to_value(created()).unwrap();
+        sent.as_object_mut().unwrap().remove("share_link").unwrap();
+        let read: InviteCreated = serde_json::from_value(sent).unwrap();
+        assert_eq!(
+            read,
+            InviteCreated {
+                share_link: String::new(),
+                ..created()
+            }
+        );
     }
 }

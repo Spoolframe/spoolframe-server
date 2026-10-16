@@ -61,8 +61,12 @@ pub struct MintedInvite {
     pub code: String,
     /// `spoolframe://invite?…` with the code: what the QR code shows.
     pub link: String,
-    /// What to copy and send, for "Add a server" on the other device: the
-    /// link, as the web UI copies it.
+    /// The same invite as `https://spoolframe.app/i#…` (PX-45), the
+    /// invite in its fragment: what the share sheet sends. The apps open
+    /// it as a universal link, and every `parse_link` reads it.
+    pub share_link: String,
+    /// What to copy and send, for "Add a server" on the other device:
+    /// [`Self::share_link`], as the web UI copies it.
     pub copy_string: String,
     pub expires_at: SystemTime,
     /// How many times it may be redeemed.
@@ -80,6 +84,16 @@ impl std::fmt::Debug for MintedInvite {
             .field("uses", &self.uses)
             .finish()
     }
+}
+
+/// `created`'s https link; made from its `link` when the server is from
+/// before PX-45 and sends none.
+fn share_link(created: &wire::InviteCreated) -> String {
+    if !created.share_link.is_empty() {
+        return created.share_link.clone();
+    }
+    spoolframe_protocol::invite::parse_link(&created.link)
+        .map_or_else(|| created.link.clone(), |invite| invite.share_link())
 }
 
 /// Who made an invite.
@@ -156,10 +170,11 @@ impl Session {
         });
         match self.call(request).await? {
             Reply::InviteCreated(created) => Ok(MintedInvite {
+                share_link: share_link(&created),
+                copy_string: share_link(&created),
                 id: created.invite.id,
                 kind: kind_of(created.invite.kind),
                 code: created.code,
-                copy_string: created.link.clone(),
                 link: created.link,
                 expires_at: time(created.invite.expires_at),
                 uses: created.invite.uses,
@@ -304,6 +319,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// PX-45: a server before share links sends none, and the SDK makes
+    /// it from the link; one that sends it is taken as it is.
+    #[test]
+    fn a_share_link_is_made_from_the_link_when_the_server_sends_none() {
+        let server = "ab".repeat(32);
+        let mut created = wire::InviteCreated {
+            invite: listed(wire::InviteOrigin::WebAdmin),
+            code: "QW7K-2MFP-XR4T".into(),
+            link: format!("spoolframe://invite?server={server}&cap=QW7K-2MFP-XR4T"),
+            share_link: String::new(),
+        };
+        assert_eq!(
+            share_link(&created),
+            format!("https://spoolframe.app/i#server={server}&cap=QW7K-2MFP-XR4T")
+        );
+        created.share_link = "https://spoolframe.app/i#as-sent".into();
+        assert_eq!(share_link(&created), "https://spoolframe.app/i#as-sent");
     }
 
     #[test]

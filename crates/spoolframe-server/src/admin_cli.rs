@@ -748,7 +748,8 @@ async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
                 .map_err(api_error)?;
             println!("{}", invite_line(&made.invite));
             println!("code  {}", made.code);
-            println!("link  {}", made.link);
+            // The https form (PX-45): text is sent, not scanned.
+            println!("link  {}", made.share_link);
             eprintln!(
                 "The code is shown only this once: the server keeps only its hash. \
                  Lost it? Revoke the invite and make another."
@@ -768,7 +769,7 @@ async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
             println!("revoked invite {id}; the accounts it made stay");
         }
         InviteCommand::Link => {
-            println!("{}", api.invite_link().await.map_err(api_error)?);
+            println!("{}", api.invite_link().await.map_err(api_error)?.share_link);
         }
     }
     Ok(())

@@ -208,6 +208,7 @@ async fn the_link_carries_the_key_the_hints_and_the_code_and_the_list_never_the_
         })
         .await;
     let link = parse_link(&created.link).expect("an invite link");
+    assert_eq!(parse_link(&created.share_link).as_ref(), Some(&link));
     assert_eq!(link.server, invites.server.server.id().to_string());
     assert_eq!(link.name.as_deref(), Some("Home Media"));
     let told = invites.server.server.told();
@@ -249,7 +250,15 @@ async fn the_link_carries_the_key_the_hints_and_the_code_and_the_list_never_the_
 #[tokio::test]
 async fn the_server_link_finds_the_server_and_has_no_code() {
     let invites = Invites::start("invite-server-link").await;
-    let link = parse_link(&invites.root.invite_link().await.unwrap()).expect("an invite link");
+    let both = invites.root.invite_link().await.unwrap();
+    let link = parse_link(&both.link).expect("an invite link");
+    // PX-45: the https form, sent as text, is the same link.
+    assert!(both.link.starts_with("spoolframe://invite?"), "{both:?}");
+    assert!(
+        both.share_link.starts_with("https://spoolframe.app/i#"),
+        "{both:?}"
+    );
+    assert_eq!(parse_link(&both.share_link).as_ref(), Some(&link));
     assert_eq!(link.server, invites.server.server.id().to_string());
     assert_eq!(link.name.as_deref(), Some("Home Media"));
     assert_eq!((link.code, link.expires_at, link.role), (None, None, None));
@@ -997,8 +1006,10 @@ mod sdk {
         let created = invites.create(create_user()).await;
         let id = invites.server.server.id().to_string();
         let client = new_device().await;
+        // As a message carries it: the https form (PX-45).
+        let link = &created.share_link;
 
-        let info = client.read_invite(&created.link).await.unwrap();
+        let info = client.read_invite(link).await.unwrap();
         assert_eq!(info.endpoint_id, id);
         assert_eq!(
             info.fingerprint,
@@ -1012,7 +1023,7 @@ mod sdk {
 
         // "Is this the server you were invited to?": who answers, before
         // anything is saved.
-        let entry = client.connect_invite(&created.link).await.unwrap();
+        let entry = client.connect_invite(link).await.unwrap();
         assert_eq!(entry.name, "Home Media");
         assert_eq!(
             entry.server_id.as_deref(),
@@ -1021,7 +1032,7 @@ mod sdk {
         assert!(!entry.pinned, "{entry:?}");
 
         let session = client
-            .redeem_invite(&created.link, "mum", Some("Mum"), PASSWORD)
+            .redeem_invite(link, "mum", Some("Mum"), PASSWORD)
             .await
             .unwrap();
         assert_eq!(session.user().username, "mum");
@@ -1046,6 +1057,37 @@ mod sdk {
 
         // The user is kept: the app opened again finds the profile.
         assert_eq!(client.profiles(&id).await.unwrap().len(), 1);
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// A `spoolframe://` link as one was written before PX-45, by hand
+    /// here, as a QR code printed then holds it, still redeems.
+    #[tokio::test]
+    async fn a_spoolframe_link_from_before_share_links_still_redeems() {
+        let invites = invites("sdk-invite-old-link").await;
+        let created = invites.create(create_user()).await;
+        let told = invites.server.server.told();
+        let addrs = tokio::task::spawn_blocking(move || told.addrs())
+            .await
+            .unwrap();
+        let mut link = format!(
+            "spoolframe://invite?server={}&name=Home%20Media",
+            invites.server.server.id()
+        );
+        for addr in addrs {
+            link.push_str(&format!("&addr={addr}"));
+        }
+        link.push_str(&format!(
+            "&exp={}&role=consumer&cap={}",
+            created.invite.expires_at, created.code
+        ));
+        let client = new_device().await;
+        let session = client
+            .redeem_invite(&link, "mum", None, PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(session.user().username, "mum");
         client.close().await;
         invites.server.stop().await;
     }
@@ -1171,7 +1213,7 @@ mod sdk {
         // The TV knows the server (a link with no code), and offers.
         let tv = new_device().await;
         tv.portable().set_allow_guests(true).await.unwrap();
-        let find = invites.root.invite_link().await.unwrap();
+        let find = invites.root.invite_link().await.unwrap().link;
         tv.save_invite_server(&find).await.unwrap();
         let offered = tv
             .offer_relay_pairing(&server, "Living room TV")
@@ -1296,7 +1338,7 @@ mod sdk {
 
         let invites = invites("sdk-p7-08-webauthn").await;
         let server = invites.server.server.id().to_string();
-        let find = invites.root.invite_link().await.unwrap();
+        let find = invites.root.invite_link().await.unwrap().link;
         let new_invite = || {
             invites.create(NewInvite {
                 kind: spoolframe_admin_api::InviteKind::PortableAccount,
@@ -1412,7 +1454,7 @@ mod sdk {
         // Signing in again carries the state that adds the key.
         phone.sign_in_portable(&server, identity).await.unwrap();
 
-        let find = invites.root.invite_link().await.unwrap();
+        let find = invites.root.invite_link().await.unwrap().link;
         let fresh = new_device().await;
         fresh.save_invite_server(&find).await.unwrap();
         let record = fresh
@@ -1446,7 +1488,8 @@ mod sdk {
             .server
             .add_user("alice", "battery staple", None)
             .await;
-        let link = invites.root.invite_link().await.unwrap();
+        // As sent: the https form (PX-45).
+        let link = invites.root.invite_link().await.unwrap().share_link;
         let client = new_device().await;
         let info = client.read_invite(&link).await.unwrap();
         assert!(!info.has_code, "{info:?}");
@@ -1550,7 +1593,7 @@ mod sdk {
     #[tokio::test]
     async fn an_invite_for_a_saved_server_adds_its_hints() {
         let invites = invites("sdk-invite-hints").await;
-        let link = invites.root.invite_link().await.unwrap();
+        let link = invites.root.invite_link().await.unwrap().link;
         let client = new_device().await;
         let first = client.save_invite_server(&link).await.unwrap();
         let mut hinted = spoolframe_protocol::invite::parse_link(&link).unwrap();
@@ -1575,11 +1618,11 @@ mod sdk {
         assert_eq!(first.server.name.get(), second.server.name.get());
         let client = new_device().await;
         client
-            .save_invite_server(&first.root.invite_link().await.unwrap())
+            .save_invite_server(&first.root.invite_link().await.unwrap().link)
             .await
             .unwrap();
         client
-            .save_invite_server(&second.root.invite_link().await.unwrap())
+            .save_invite_server(&second.root.invite_link().await.unwrap().link)
             .await
             .unwrap();
         let saved: Vec<_> = client

@@ -115,9 +115,9 @@ pub struct Created {
 }
 
 impl Created {
-    /// The invite link: `server`'s ([`server_link`]) with the code, its
-    /// expiry, and what redeeming it does.
-    pub fn link(&self, mut server: Invite) -> String {
+    /// The invite its links are made of: `server`'s ([`server_link`])
+    /// with the code, its expiry, and what redeeming it does.
+    pub fn invite(&self, mut server: Invite) -> Invite {
         server.code = Some(self.code.as_str().to_owned());
         server.expires_at = u64::try_from(self.record.expires_at).ok();
         if self.record.kind == InviteKind::PortableAccount {
@@ -125,7 +125,7 @@ impl Created {
         } else {
             server.role = Some(self.record.role);
         }
-        server.link()
+        server
     }
 }
 

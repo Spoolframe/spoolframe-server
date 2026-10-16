@@ -2215,9 +2215,25 @@ async fn an_admin_makes_and_revokes_an_invite_in_the_app() {
     let made = alice.create_invite(spec.clone()).await.unwrap();
     assert_eq!(made.kind, InviteKind::CreateUser);
     assert_eq!(made.uses, 4);
-    assert_eq!(made.copy_string, made.link);
-    let read = client.read_invite(&made.link).await.unwrap();
-    assert!(read.has_code);
+    // PX-45: the share sheet's and Copy's link is the https form of the
+    // QR code's, and reads as the same invite.
+    assert!(
+        made.link.starts_with("spoolframe://invite?"),
+        "{}",
+        made.link
+    );
+    assert!(
+        made.share_link.starts_with("https://spoolframe.app/i#"),
+        "{}",
+        made.share_link
+    );
+    assert_eq!(made.copy_string, made.share_link);
+    let parse = spoolframe_protocol::invite::parse_link;
+    assert_eq!(parse(&made.share_link), parse(&made.link));
+    for link in [&made.link, &made.share_link] {
+        let read = client.read_invite(link).await.unwrap();
+        assert!(read.has_code);
+    }
 
     let listed = alice.invites().await.unwrap();
     assert_eq!(listed.len(), 1);

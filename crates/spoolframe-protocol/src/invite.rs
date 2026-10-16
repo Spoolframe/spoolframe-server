@@ -5,6 +5,13 @@
 //!
 //! `spoolframe://invite?server=<endpoint id>&name=<name>&addr=<ip:port>&relay=<url>&exp=<unix seconds>&role=<consumer|admin>&cap=<code>`
 //!
+//! Sent as text it has an https form (PX-45), which Messages and Mail make
+//! tappable and the apps open as a universal link, with the same query
+//! after `#`: `https://spoolframe.app/i#server=…&cap=…`. A browser never
+//! sends a fragment, so the site never sees a code, an address or a
+//! server's key. A QR code stays `spoolframe://`: it is scanned in the
+//! same room and never needs the site. [`parse_link`] reads both.
+//!
 //! - `server`, the hex `EndpointId`, is the only parameter a link must
 //!   have. A client pins it as it is: the link came from the server's
 //!   admin, so there is nothing to trust on first use.
@@ -53,6 +60,11 @@ pub const MAX_HINTS: usize = 32;
 pub const MAX_LINK: usize = 4096;
 
 const LINK_PREFIX: &str = "spoolframe://invite?";
+/// The https form's site, and the page whose fragment holds the invite.
+/// Permanent: every shipped app's associated domains name it, and every
+/// invite sent.
+const SHARE_HOST: &str = "spoolframe.app";
+const SHARE_PREFIX: &str = "https://spoolframe.app/i#";
 
 /// `input` as a code (`QW7K2MFPXR4T`), whatever case, dashes or spaces it
 /// was typed with; `None` if it cannot be one.
@@ -128,9 +140,21 @@ impl fmt::Debug for Invite {
 }
 
 impl Invite {
-    /// The link: what the QR code carries and what is pasted.
+    /// The `spoolframe://` link: what the QR code carries.
     pub fn link(&self) -> String {
-        let mut link = format!("{LINK_PREFIX}server={}", self.server);
+        format!("{LINK_PREFIX}{}", self.query())
+    }
+
+    /// The https link (PX-45): what is sent as text and copied. The invite
+    /// is its fragment, never its path or query, so a browser that opens
+    /// it sends none of it to the site.
+    pub fn share_link(&self) -> String {
+        format!("{SHARE_PREFIX}{}", self.query())
+    }
+
+    /// The parameters both links carry.
+    fn query(&self) -> String {
+        let mut link = format!("server={}", self.server);
         let mut add = |key: &str, value: &str| {
             link.push('&');
             link.push_str(key);
@@ -165,15 +189,18 @@ impl Invite {
     }
 }
 
-/// The invite `text` holds; `None` if it is not an invite link: another
-/// scheme, no `server`, a `server` that is not a key, or a `cap` that is
-/// not a code (a damaged link, not one without a code).
+/// The invite `text` holds, in either form; `None` if it is not an
+/// invite link: another scheme or site, no `server`, a `server` that is
+/// not a key, or a `cap` that is not a code (a damaged link, not one
+/// without a code).
 pub fn parse_link(text: &str) -> Option<Invite> {
     let text = text.trim();
     if text.len() > MAX_LINK {
         return None;
     }
-    let query = text.strip_prefix(LINK_PREFIX)?;
+    let query = text
+        .strip_prefix(LINK_PREFIX)
+        .or_else(|| share_query(text))?;
     let mut server = None;
     let mut invite = Invite::default();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -223,6 +250,27 @@ pub fn parse_link(text: &str) -> Option<Invite> {
     }
     invite.server = server.to_ascii_lowercase();
     Some(invite)
+}
+
+/// The fragment of `text` if it is the https form: `https`, the host
+/// `spoolframe.app` and nothing else in the authority (no user, port or
+/// trailing dot), the path `/i` or `/i/`, no query, then `#`. Scheme and
+/// host in any case, as URLs allow; the path as it is. Anything else is
+/// not an invite, so a link to another site never reads as one.
+fn share_query(text: &str) -> Option<&str> {
+    let scheme = text.get(..8)?;
+    if !scheme.eq_ignore_ascii_case("https://") {
+        return None;
+    }
+    let rest = &text[8..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if !rest[..end].eq_ignore_ascii_case(SHARE_HOST) {
+        return None;
+    }
+    let after = &rest[end..];
+    after
+        .strip_prefix("/i#")
+        .or_else(|| after.strip_prefix("/i/#"))
 }
 
 /// Whether `value` may be a relay's URL: `https://` or `http://` and a
@@ -329,6 +377,107 @@ mod tests {
     #[test]
     fn a_link_reads_back() {
         assert_eq!(parse_link(&invite().link()), Some(invite()));
+    }
+
+    #[test]
+    fn a_share_link_is_the_query_after_the_site_s_fragment() {
+        assert_eq!(
+            invite().share_link(),
+            format!(
+                "https://spoolframe.app/i#server={SERVER}&name=Home%20Media\
+                 &addr=203.0.113.24:41641&relay=https://relay.home-media.example\
+                 &exp=1792003200&role=consumer&cap=QW7K-2MFP-XR4T"
+            )
+        );
+    }
+
+    #[test]
+    fn a_share_link_reads_back_as_the_same_invite() {
+        assert_eq!(parse_link(&invite().share_link()), Some(invite()));
+        let only = Invite {
+            server: SERVER.into(),
+            ..Invite::default()
+        };
+        assert_eq!(parse_link(&only.share_link()), Some(only));
+    }
+
+    /// The code, the key and the hints are all in the fragment: a browser
+    /// asks the site for `/i` and nothing else.
+    #[test]
+    fn nothing_of_the_invite_is_in_the_share_link_s_path_or_query() {
+        let link = invite().share_link();
+        let (before, fragment) = link.split_once('#').unwrap();
+        assert_eq!(before, "https://spoolframe.app/i");
+        for part in ["QW7K", SERVER, "203.0.113.24", "Home"] {
+            assert!(fragment.contains(part), "{part} in {fragment}");
+        }
+        // Not even an escaped `#` could end the fragment early.
+        let odd = Invite {
+            name: Some("#cap=AAAA?x/y".into()),
+            ..invite()
+        };
+        let link = odd.share_link();
+        assert_eq!(link.matches('#').count(), 1, "{link}");
+        assert_eq!(parse_link(&link), Some(odd));
+    }
+
+    /// A link written before PX-45, as a QR code made then carries it.
+    #[test]
+    fn a_spoolframe_link_from_before_share_links_still_reads() {
+        let old = format!(
+            "spoolframe://invite?server={SERVER}&name=Home%20Media\
+             &addr=203.0.113.24:41641&relay=https://relay.home-media.example\
+             &exp=1792003200&role=consumer&cap=QW7K-2MFP-XR4T"
+        );
+        assert_eq!(parse_link(&old), Some(invite()));
+    }
+
+    #[test]
+    fn a_share_link_is_read_with_a_trailing_slash_and_in_any_case_of_host() {
+        let query = invite().link().replace(LINK_PREFIX, "");
+        for text in [
+            format!("https://spoolframe.app/i/#{query}"),
+            format!("HTTPS://SpoolFrame.App/i#{query}"),
+            format!("  https://spoolframe.app/i#{query}\n"),
+        ] {
+            assert_eq!(parse_link(&text), Some(invite()), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_share_link_on_another_site_or_shape_is_not_an_invite() {
+        let query = invite().link().replace(LINK_PREFIX, "");
+        for text in [
+            // Another host, or one made to look like it.
+            format!("https://example.com/i#{query}"),
+            format!("https://spoolframe.app.example.com/i#{query}"),
+            format!("https://www.spoolframe.app/i#{query}"),
+            format!("https://spoolframe.app./i#{query}"),
+            format!("https://spoolframe.apps/i#{query}"),
+            format!("https://spoo1frame.app/i#{query}"),
+            format!("https://xn--spoolframe-xyz.app/i#{query}"),
+            // The userinfo trick, both ways round, and a port.
+            format!("https://spoolframe.app@example.com/i#{query}"),
+            format!("https://user@spoolframe.app/i#{query}"),
+            format!("https://spoolframe.app:443/i#{query}"),
+            // Not https.
+            format!("http://spoolframe.app/i#{query}"),
+            format!("spoolframe.app/i#{query}"),
+            format!("//spoolframe.app/i#{query}"),
+            // In the query, which a browser would send the site.
+            format!("https://spoolframe.app/i?{query}"),
+            format!("https://spoolframe.app/i?x=1#{query}"),
+            // Another path.
+            format!("https://spoolframe.app/I#{query}"),
+            format!("https://spoolframe.app/invite#{query}"),
+            format!("https://spoolframe.app/i/x#{query}"),
+            format!("https://spoolframe.app/#{query}"),
+            format!("https://spoolframe.app#{query}"),
+            // An empty fragment.
+            "https://spoolframe.app/i#".to_owned(),
+        ] {
+            assert_eq!(parse_link(&text), None, "{text}");
+        }
     }
 
     /// P7-05: a portable-account invite says so; one that does not is an

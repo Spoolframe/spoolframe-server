@@ -290,8 +290,21 @@ pub struct InviteCreated {
     /// As shown: `QW7K-2MFP-XR4T`.
     pub code: String,
     /// The link that carries it, the server's key and where to find it:
-    /// what the QR code shows and what is sent.
+    /// the `spoolframe://` form, what the QR code shows.
     pub link: String,
+    /// The same as an https link on spoolframe.app (PX-45), the invite in
+    /// its fragment: what is copied and sent.
+    pub share_link: String,
+}
+
+/// The server's link without a code (`inviteLink`), in both forms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerLink {
+    /// `spoolframe://invite?…`: what the QR code shows.
+    pub link: String,
+    /// `https://spoolframe.app/i#…` (PX-45): what is copied and sent.
+    pub share_link: String,
 }
 
 impl fmt::Debug for InviteCreated {
@@ -300,6 +313,7 @@ impl fmt::Debug for InviteCreated {
             .field("invite", &self.invite)
             .field("code", &"<redacted>")
             .field("link", &"<redacted>")
+            .field("share_link", &"<redacted>")
             .finish()
     }
 }
@@ -3790,11 +3804,12 @@ pub trait AdminApi {
     #[method(name = "inviteRevoke", with_extensions)]
     async fn invite_revoke(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 
-    /// The server's link without a code: it finds and saves the server,
-    /// and the person signs in with an account they have. It never
-    /// expires. `NOT_CONFIGURED` while the endpoint is starting.
+    /// The server's link without a code, in both forms: it finds and
+    /// saves the server, and the person signs in with an account they
+    /// have. It never expires. `NOT_CONFIGURED` while the endpoint is
+    /// starting.
     #[method(name = "inviteLink", with_extensions)]
-    async fn invite_link(&self) -> jsonrpsee::core::RpcResult<String>;
+    async fn invite_link(&self) -> jsonrpsee::core::RpcResult<ServerLink>;
 
     /// The portable users granted access here (P7-06), oldest first.
     #[method(name = "grantList", with_extensions)]

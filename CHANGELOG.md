@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Invites are sent as https links on spoolframe.app (PX-45), which
+  Messages, Mail and chat apps make tappable and the apps open as a
+  universal link: `https://spoolframe.app/i#<the spoolframe:// link's
+  query>`. The invite is the fragment, which a browser never sends, so
+  the site never sees a code, an address or a server's key. The web
+  UI's invite and server-link dialogs show, copy and share it, and
+  `invite create` and `invite link` print it; QR codes stay
+  `spoolframe://`, as do pairing and device sign-in links. In the
+  protocol and SDK: `Invite::share_link()` makes it, beside `link()`;
+  `invite::parse_link` reads both forms, the https one only on
+  `spoolframe.app` itself at `/i` or `/i/` with the invite after `#`
+  (not a query, another host, a lookalike, a user or a port), and every
+  `spoolframe://` link made before still reads. `InviteCreated` (the
+  `create_invite` reply) has `share_link`, absent from an older server;
+  the SDK's `MintedInvite` has `share_link` too, made from `link` when
+  the server sends none, and its `copy_string` is now `share_link`
+  rather than `link`. The admin API's `inviteCreate` answers with
+  `shareLink` beside `link`, and `inviteLink` with
+  `{ link, shareLink }` rather than a string.
+
 - Fixed: AirPlay failed from a phone that reached the server over IPv6
   with `http_playback.listen` on `0.0.0.0`. Its URL named the IPv6
   address the phone came in on, where the port does not listen, so the
