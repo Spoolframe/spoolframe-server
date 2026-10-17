@@ -20,8 +20,8 @@ pub use spoolframe_types::{
     APP_RP_DOMAIN, Album, Artist, Artwork, ArtworkKind, AudioRole, BitmapPreference, Episode, Item,
     LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState, QuotaOf, Role, SdhPreference,
     Season, Show, SubtitleDownload, SubtitleDownloaded, SubtitleMode, SubtitleOrigin,
-    SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSourceState, SubtitleSourceStatus,
-    SubtitleTrack, Track, TrackPreferences,
+    SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSource, SubtitleSourceState,
+    SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.

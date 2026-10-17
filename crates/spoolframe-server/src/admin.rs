@@ -4342,7 +4342,11 @@ fn download_error(e: crate::subtitle_downloads::DownloadError) -> ErrorObjectOwn
             format!("{source} asks to wait before the next request"),
             Some(serde_json::json!({ "retryAfterMs": retry_after_ms })),
         ),
-        e @ DownloadError::Site { .. } => error(error_code::UNAVAILABLE, e.to_string()),
+        DownloadError::Site { site, error: e } => {
+            // The site's own words in the log only (`SiteError::user_message`).
+            tracing::warn!(%site, error = %e, "a subtitle search or download failed");
+            error(error_code::UNAVAILABLE, e.user_message(site))
+        }
         DownloadError::Catalog(e) => catalog::catalog_error(e),
         DownloadError::Unavailable(why) => error(error_code::UNAVAILABLE, why),
         DownloadError::Io(why) => {

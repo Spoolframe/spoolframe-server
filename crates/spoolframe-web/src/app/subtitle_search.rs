@@ -7,7 +7,8 @@
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
-    AdminApiClient, Settings, SubtitleResult, SubtitleSearch, SubtitleSyncState, SubtitleTimingInfo,
+    AdminApiClient, Settings, SubtitleResult, SubtitleSearch, SubtitleSource, SubtitleSyncState,
+    SubtitleTimingInfo,
 };
 
 use super::admin::{Said, Toast, say, sleep};
@@ -16,9 +17,8 @@ use super::wizard::{Footer, Mode, Note, entry, load_settings, loading, locked, s
 use super::{icons, rpc};
 use crate::logic::ApiError;
 use crate::subtitle_search::{
-    LIMIT, OLD_LIMIT, SOURCES, details, downloaded_by, downloaded_line, downloads, languages_value,
-    limit_changes, marks, refusal, secret_reference, source_lines, source_name, sources_on,
-    sources_value,
+    LIMIT, details, downloaded_by, downloaded_line, downloads, languages_value, limit_value, marks,
+    refusal, secret_reference, source_lines, sources_on, sources_value,
 };
 use crate::subtitle_timing::{any_syncing, sync_text};
 
@@ -333,8 +333,7 @@ fn SubtitleSiteFields(
     let subdl_key_set = entry(s, SUBDL_KEY).is_some_and(|e| e.set);
     let sources_before = sources_on(value(s, SOURCES_KEY));
     let sources_setting = value(s, SOURCES_KEY).cloned();
-    let old_limit_set = entry(s, OLD_LIMIT).is_some_and(|e| e.set);
-    let mut sources = use_signal(|| sources_before);
+    let mut sources = use_signal(|| sources_before.clone());
     let username = use_signal(|| text(s, USERNAME));
     let password = use_signal(String::new);
     let list = |key| {
@@ -346,14 +345,7 @@ fn SubtitleSiteFields(
     let languages = use_signal(|| list(LANGUAGES));
     let subdl_key = use_signal(String::new);
     let subdl_languages = use_signal(|| list(SUBDL_LANGUAGES));
-    let limit = use_signal(|| {
-        let now = text(s, LIMIT);
-        if now.is_empty() {
-            text(s, OLD_LIMIT)
-        } else {
-            now
-        }
-    });
+    let limit = use_signal(|| text(s, LIMIT));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     // The keys and the account are sensitive: from an old session,
@@ -366,7 +358,8 @@ fn SubtitleSiteFields(
             let mut changes = Vec::new();
             // Only when a box changed: the order the admin gave is kept,
             // and an unset list keeps following the default.
-            if let Some(list) = sources_value(sources_setting.as_ref(), sources_before, sources()) {
+            if let Some(list) = sources_value(sources_setting.as_ref(), &sources_before, &sources())
+            {
                 changes.push((SOURCES_KEY, Some(list)));
             }
             // A secret's field left empty keeps the one set.
@@ -383,7 +376,7 @@ fn SubtitleSiteFields(
             changes.push((USERNAME, super::wizard::typed(&username())));
             changes.push((LANGUAGES, languages_value(&languages())));
             changes.push((SUBDL_LANGUAGES, languages_value(&subdl_languages())));
-            changes.extend(limit_changes(&limit(), old_limit_set)?);
+            changes.push((LIMIT, limit_value(&limit())?));
             Ok(changes)
         })();
         let changes = match changes {
@@ -440,15 +433,21 @@ fn SubtitleSiteFields(
         }
         fieldset { class: "flex flex-col gap-1.5 border-0 p-0 m-0",
             legend { class: "mb-1 text-sm font-semibold", "Sites searched" }
-            for (at, id) in SOURCES.iter().enumerate() {
-                label { key: "{id}", class: "flex items-center gap-2 text-sm",
+            for site in SubtitleSource::ALL {
+                label { key: "{site.id()}", class: "flex items-center gap-2 text-sm",
                     input {
                         r#type: "checkbox",
-                        checked: sources()[at],
+                        checked: sources().contains(&site),
                         disabled: locked(s, SOURCES_KEY),
-                        onchange: move |e| sources.write()[at] = e.checked(),
+                        onchange: move |e| {
+                            if e.checked() {
+                                sources.write().insert(site);
+                            } else {
+                                sources.write().remove(&site);
+                            }
+                        },
                     }
-                    "{source_name(id)}"
+                    "{site.name()}"
                 }
             }
             span { class: "text-xs text-ctp-subtext0", "Both at once, as one list. Viewers do not choose." }

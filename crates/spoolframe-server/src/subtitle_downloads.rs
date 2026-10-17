@@ -69,73 +69,64 @@ pub struct Settings {
 
 /// One site, as the server uses it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SiteSettings {
-    OpenSubtitles {
-        account: opensubtitles::Account,
-        /// Searched when no language is asked for: `en`, `pt-br`.
-        languages: Vec<String>,
-    },
-    SubDl {
-        account: subdl::Account,
-        languages: Vec<String>,
-    },
+pub struct SiteSettings {
+    /// Searched when no language is asked for: `en`, `pt-br`.
+    pub languages: Vec<String>,
+    pub kind: SiteKind,
+}
+
+/// Which site, with the server's key and account for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteKind {
+    OpenSubtitles(opensubtitles::Account),
+    SubDl(subdl::Account),
 }
 
 impl SiteSettings {
     pub fn source(&self) -> Source {
-        match self {
-            SiteSettings::OpenSubtitles { .. } => Source::OpenSubtitles,
-            SiteSettings::SubDl { .. } => Source::SubDl,
-        }
-    }
-
-    pub fn languages(&self) -> &[String] {
-        match self {
-            SiteSettings::OpenSubtitles { languages, .. }
-            | SiteSettings::SubDl { languages, .. } => languages,
-        }
-    }
-
-    /// Whether `other` is the same site with the same key and account.
-    fn same_account(&self, other: &SiteSettings) -> bool {
-        match (self, other) {
-            (
-                SiteSettings::OpenSubtitles { account: a, .. },
-                SiteSettings::OpenSubtitles { account: b, .. },
-            ) => a == b,
-            (SiteSettings::SubDl { account: a, .. }, SiteSettings::SubDl { account: b, .. }) => {
-                a == b
-            }
-            _ => false,
+        match self.kind {
+            SiteKind::OpenSubtitles(_) => Source::OpenSubtitles,
+            SiteKind::SubDl(_) => Source::SubDl,
         }
     }
 }
 
-/// A site's client, kept while its account is the same: a sign-in's
-/// token and the pacing of calls go with it.
-#[derive(Debug, Clone)]
-enum Site {
-    OpenSubtitles(Arc<opensubtitles::Site>),
-    SubDl(Arc<subdl::Site>),
+/// A site's client, kept while its key and account are the same: a
+/// sign-in's token and the pacing of calls go with it.
+#[derive(Debug)]
+struct Site {
+    client: Client,
+    /// One download at a time: a result asked for twice at once is
+    /// downloaded once, and the site's quota is counted in order. Another
+    /// site's downloads do not wait for it.
+    downloading: tokio::sync::Mutex<()>,
+}
+
+#[derive(Debug)]
+enum Client {
+    OpenSubtitles(opensubtitles::Site),
+    SubDl(subdl::Site),
 }
 
 impl Site {
-    fn of(settings: &SiteSettings) -> Site {
-        match settings {
-            SiteSettings::OpenSubtitles { account, .. } => {
-                Site::OpenSubtitles(Arc::new(opensubtitles::Site::new(account.clone())))
+    fn of(kind: &SiteKind) -> Arc<Site> {
+        let client = match kind {
+            SiteKind::OpenSubtitles(account) => {
+                Client::OpenSubtitles(opensubtitles::Site::new(account.clone()))
             }
-            SiteSettings::SubDl { account, .. } => {
-                Site::SubDl(Arc::new(subdl::Site::new(account.clone())))
-            }
-        }
+            SiteKind::SubDl(account) => Client::SubDl(subdl::Site::new(account.clone())),
+        };
+        Arc::new(Site {
+            client,
+            downloading: tokio::sync::Mutex::new(()),
+        })
     }
 }
 
 /// The sites in use, each with the settings it came from.
 #[derive(Debug, Clone, Default)]
 struct Live {
-    sites: Vec<(Site, SiteSettings)>,
+    sites: Vec<(Arc<Site>, SiteSettings)>,
     daily_limit_per_user: u32,
 }
 
@@ -205,31 +196,23 @@ struct Offer {
     source: Source,
     /// The site's id of it: `5338574`, `3172974-3188291`.
     site_id: String,
+    /// What the site downloads it by: OpenSubtitles' file id (its
+    /// `site_id`), SubDL's path on its download host.
+    fetch: String,
+    /// Of a season's pack, the episode's file is taken.
+    episode: Option<(u32, u32)>,
     release: String,
     language: String,
     format: Option<String>,
     fps: Option<f64>,
-    downloads: u64,
-    /// 0 to 10; 0 while unrated.
-    rating: f64,
+    /// `None` from a site that does not count them (SubDL).
+    downloads: Option<u64>,
+    /// 0 to 10; `None` from a site that does not rate (SubDL), 0 while
+    /// unrated.
+    rating: Option<f64>,
     hearing_impaired: bool,
     origin: SubtitleOrigin,
     hash_match: bool,
-    fetch: Fetch,
-}
-
-/// How an offer's file is downloaded.
-#[derive(Debug, Clone)]
-enum Fetch {
-    /// By the site's file id, as SRT when the site's file is in a format
-    /// the server does not read.
-    OpenSubtitles { file_id: u64, as_srt: bool },
-    /// By its path on SubDL's download host; of a season's pack, the
-    /// episode's file.
-    SubDl {
-        path: String,
-        episode: Option<(u32, u32)>,
-    },
 }
 
 impl Offer {
@@ -238,12 +221,14 @@ impl Offer {
         Offer {
             source: Source::OpenSubtitles,
             site_id: found.file_id.to_string(),
+            fetch: found.file_id.to_string(),
+            episode: None,
             release: found.release.clone(),
             language: found.language.clone(),
             format: format.map(str::to_owned),
             fps: found.fps,
-            downloads: found.downloads,
-            rating: found.rating,
+            downloads: Some(found.downloads),
+            rating: Some(found.rating),
             hearing_impaired: found.hearing_impaired,
             origin: if found.ai_translated {
                 SubtitleOrigin::Ai
@@ -253,12 +238,6 @@ impl Offer {
                 SubtitleOrigin::Human
             },
             hash_match: found.hash_match,
-            fetch: Fetch::OpenSubtitles {
-                file_id: found.file_id,
-                // A format the server reads is taken as it is; any other
-                // is asked for as SRT, which the site converts it to.
-                as_srt: !format.is_some_and(|f| matches!(f, "srt" | "ass" | "ssa" | "vtt")),
-            },
         }
     }
 
@@ -266,20 +245,18 @@ impl Offer {
         Offer {
             source: Source::SubDl,
             site_id: found.id.clone(),
+            fetch: found.path.clone(),
+            episode,
             release: found.release.clone(),
             language: found.language.clone(),
             format: found.format.clone(),
             fps: found.fps,
-            downloads: 0,
-            rating: 0.0,
+            downloads: None,
+            rating: None,
             // SubDL's own flag says yes to everything (`subdl::Query`).
             hearing_impaired: false,
             origin: SubtitleOrigin::Human,
             hash_match: false,
-            fetch: Fetch::SubDl {
-                path: found.path.clone(),
-                episode,
-            },
         }
     }
 
@@ -297,22 +274,39 @@ struct Kept {
 }
 
 /// A search's key: the site, the item, the languages.
-type SearchKey = (Source, String, String);
-
-/// What a site's search found.
-type Found = Arc<Vec<Offer>>;
+type SearchKey = (Source, String, Vec<String>);
 
 /// What the sites are asked about an item, read from the catalog once
-/// per search.
+/// per search, when a site is asked.
 #[derive(Debug)]
 struct Subject {
     item: Item,
     media: PathBuf,
     imdb: Option<u64>,
     tmdb: Option<u64>,
-    /// An episode's show's.
-    show_imdb: Option<u64>,
-    show_tmdb: Option<u64>,
+    /// An episode's show's IMDb and TMDB ids, read when a site needs them:
+    /// SubDL always (it lists a show's subtitles), OpenSubtitles when the
+    /// episode has none of its own.
+    show: tokio::sync::OnceCell<(Option<u64>, Option<u64>)>,
+}
+
+/// An episode's show's ids, from the catalog; none for a film, and none
+/// when the catalog cannot say.
+async fn show_ids(subject: &Subject, catalog: &dyn Catalog) -> (Option<u64>, Option<u64>) {
+    let Item::Episode(episode) = &subject.item else {
+        return (None, None);
+    };
+    *subject
+        .show
+        .get_or_init(|| async {
+            site_ids(
+                &catalog
+                    .external_ids(&episode.show_id)
+                    .await
+                    .unwrap_or_default(),
+            )
+        })
+        .await
 }
 
 pub struct SubtitleDownloads {
@@ -326,10 +320,6 @@ pub struct SubtitleDownloads {
     searches: Mutex<HashMap<SearchKey, Kept>>,
     /// Each media file's hash, by its path, size and modification time.
     hashes: Mutex<HashMap<PathBuf, Hashed>>,
-    /// One download at a time per site: a result (one site's) asked for
-    /// twice at once is downloaded once, and a site's quota is counted in
-    /// order; a slow download from one site does not hold up the other's.
-    downloading: HashMap<Source, tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for SubtitleDownloads {
@@ -360,10 +350,6 @@ impl SubtitleDownloads {
             live: Mutex::new(Live::default()),
             searches: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
-            downloading: Source::ALL
-                .into_iter()
-                .map(|s| (s, tokio::sync::Mutex::new(())))
-                .collect(),
         };
         this.configure(settings);
         Ok(this)
@@ -387,9 +373,9 @@ impl SubtitleDownloads {
                 let kept = live
                     .sites
                     .iter()
-                    .find(|(_, had)| had.same_account(&wanted))
+                    .find(|(_, had)| had.kind == wanted.kind)
                     .map(|(site, _)| site.clone());
-                (kept.unwrap_or_else(|| Site::of(&wanted)), wanted)
+                (kept.unwrap_or_else(|| Site::of(&wanted.kind)), wanted)
             })
             .collect();
         *live = Live {
@@ -458,58 +444,31 @@ impl SubtitleDownloads {
     ) -> Result<SubtitleSearch, DownloadError> {
         let live = self.live()?;
         let asked = language.map(language_code).transpose()?;
-        // Each site's search, and what of it is kept from the last day.
-        let wanted: Vec<(&Site, Source, SearchKey, Option<Found>)> = live
-            .sites
-            .iter()
-            .map(|(site, settings)| {
-                let languages = match &asked {
-                    Some(language) => language.clone(),
-                    None => settings.languages().join(","),
-                };
-                let key = (settings.source(), id.to_string(), languages);
-                let kept = self.kept(&key);
-                (site, settings.source(), key, kept)
-            })
-            .collect();
-        // The catalog and the file are read only when a site is asked.
-        let asked_of = |source| {
-            wanted
-                .iter()
-                .any(|(_, s, _, kept)| *s == source && kept.is_none())
-        };
-        let subject = if wanted.iter().any(|(_, _, _, kept)| kept.is_none()) {
-            Some(
-                self.subject(id, asked_of(Source::OpenSubtitles), asked_of(Source::SubDl))
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let hash = match &subject {
-            Some(subject)
-                if wanted.iter().any(|(_, source, _, kept)| {
-                    *source == Source::OpenSubtitles && kept.is_none()
-                }) =>
-            {
-                self.hash(&subject.media).await
-            }
-            _ => None,
-        };
-        let searches = wanted.into_iter().map(|(site, source, key, kept)| {
-            let subject = subject.as_ref();
-            let hash = hash.clone();
+        // The item is read, and the file hashed, only when a site is asked
+        // (not all it found is kept from the last day).
+        let subject = tokio::sync::OnceCell::new();
+        let searches = live.sites.iter().map(|(site, settings)| {
+            let languages = match &asked {
+                Some(language) => vec![language.clone()],
+                None => settings.languages.clone(),
+            };
+            let key = (settings.source(), id.to_string(), languages);
+            let subject = &subject;
             async move {
-                let found = match (kept, subject) {
-                    (Some(found), _) => Ok(found),
-                    (None, Some(subject)) => self.site_search(site, subject, hash, key).await,
-                    // Not so: the item is read whenever a site is asked.
-                    (None, None) => Err(SiteError::Unreachable("the item was not read".into())),
+                let found = match self.kept(&key) {
+                    Some(found) => Ok(found),
+                    None => {
+                        let subject = subject.get_or_try_init(|| self.subject(id)).await?;
+                        self.site_search(site, subject, key).await
+                    }
                 };
-                (source, found)
+                Ok::<_, DownloadError>((settings.source(), found))
             }
         });
-        let answers = futures_util::future::join_all(searches).await;
+        let answers = futures_util::future::join_all(searches)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         let mut sources = Vec::new();
         let mut offers = Vec::new();
         let mut first_failure = None;
@@ -538,7 +497,7 @@ impl SubtitleDownloads {
                             }
                         }
                         other => SubtitleSourceState::Failed {
-                            message: failed_message(source, other),
+                            message: other.user_message(source),
                         },
                     };
                     first_failure.get_or_insert(DownloadError::of_site(source, error));
@@ -580,17 +539,11 @@ impl SubtitleDownloads {
         order(&mut results);
         let languages = match asked {
             Some(language) => vec![language],
-            None => {
-                let mut all: Vec<String> = Vec::new();
-                for (_, settings) in &live.sites {
-                    for language in settings.languages() {
-                        if !all.contains(language) {
-                            all.push(language.clone());
-                        }
-                    }
-                }
-                all
-            }
+            None => dedupe(
+                live.sites
+                    .iter()
+                    .flat_map(|(_, settings)| settings.languages.iter().cloned()),
+            ),
         };
         Ok(SubtitleSearch {
             languages,
@@ -604,23 +557,31 @@ impl SubtitleDownloads {
         &self,
         site: &Site,
         subject: &Subject,
-        hash: Option<String>,
         key: SearchKey,
     ) -> Result<Arc<Vec<Offer>>, SiteError> {
-        let languages: Vec<String> = key.2.split(',').map(str::to_owned).collect();
-        let found: Vec<Offer> = match site {
-            Site::OpenSubtitles(site) => site
-                .search(&opensubtitles_query(subject, hash, &languages))
-                .await?
-                .iter()
-                .map(Offer::of_opensubtitles)
-                .collect(),
-            Site::SubDl(site) => {
+        let languages = &key.2;
+        let found: Vec<Offer> = match &site.client {
+            Client::OpenSubtitles(site) => {
+                let hash = self.hash(&subject.media).await;
+                let (show_imdb, show_tmdb) = if subject.imdb.is_none() && subject.tmdb.is_none() {
+                    show_ids(subject, self.catalog.as_ref()).await
+                } else {
+                    (None, None)
+                };
+                let query = opensubtitles_query(subject, hash, show_imdb, show_tmdb, languages);
+                site.search(&query)
+                    .await?
+                    .iter()
+                    .map(Offer::of_opensubtitles)
+                    .collect()
+            }
+            Client::SubDl(site) => {
                 let episode = match &subject.item {
                     Item::Episode(e) => Some((e.season, e.episode)),
                     _ => None,
                 };
-                site.search(&subdl_query(subject, &languages))
+                let (show_imdb, show_tmdb) = show_ids(subject, self.catalog.as_ref()).await;
+                site.search(&subdl_query(subject, show_imdb, show_tmdb, languages))
                     .await?
                     .iter()
                     .map(|f| Offer::of_subdl(f, episode))
@@ -669,44 +630,24 @@ impl SubtitleDownloads {
             .find_map(|(_, k)| k.found.iter().find(|f| f.site_id == site_id).cloned())
     }
 
-    /// Item `id` as the sites are asked about it: its ids, an episode's
-    /// show's, and its media file.
-    ///
-    /// An episode's show's ids are asked for only when a site needs them:
-    /// SubDL always (it lists a show's subtitles), OpenSubtitles when
-    /// the episode has none of its own.
-    async fn subject(
-        &self,
-        id: &MediaId,
-        opensubtitles: bool,
-        subdl: bool,
-    ) -> Result<Subject, DownloadError> {
-        let found = self.catalog.item(id).await?;
+    /// Item `id` as the sites are asked about it: its ids and its media
+    /// file; an episode's show's ids are read later, by a site that needs
+    /// them.
+    async fn subject(&self, id: &MediaId) -> Result<Subject, DownloadError> {
+        let (found, media) = tokio::join!(self.catalog.item(id), self.catalog.media_path(id));
+        let found = found?;
         if !matches!(found.item, Item::Movie(_) | Item::Episode(_)) {
             return Err(DownloadError::InvalidInput(
                 "only a film or an episode has subtitles to find".into(),
             ));
         }
-        let media = self.catalog.media_path(id).await?;
         let (imdb, tmdb) = site_ids(&found.external_ids);
-        let wants_show = subdl || (opensubtitles && imdb.is_none() && tmdb.is_none());
-        let (show_imdb, show_tmdb) = match &found.item {
-            Item::Episode(episode) if wants_show => site_ids(
-                &self
-                    .catalog
-                    .external_ids(&episode.show_id)
-                    .await
-                    .unwrap_or_default(),
-            ),
-            _ => (None, None),
-        };
         Ok(Subject {
             item: found.item,
-            media,
+            media: media?,
             imdb,
             tmdb,
-            show_imdb,
-            show_tmdb,
+            show: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -746,7 +687,7 @@ impl SubtitleDownloads {
         who: &Asker,
     ) -> Result<SubtitleDownloaded, DownloadError> {
         let live = self.live()?;
-        let not_offered = DownloadError::NotFound("a search result for this item; search again");
+        let not_offered = || DownloadError::NotFound("a search result for this item; search again");
         let (source, site_id) = result
             .split_once(':')
             .and_then(|(source, site_id)| Some((Source::of(source)?, site_id)))
@@ -761,9 +702,9 @@ impl SubtitleDownloads {
             .iter()
             .find(|(_, settings)| settings.source() == source)
         else {
-            return Err(not_offered);
+            return Err(not_offered());
         };
-        let _one = self.downloading[&source].lock().await;
+        let _one = site.downloading.lock().await;
         let principal = who.actor.principal.to_string();
         let limit = live.daily_limit_per_user;
         if let Some(row) = self
@@ -774,7 +715,7 @@ impl SubtitleDownloads {
             let user_remaining = self.user_remaining(&principal, limit).await?;
             return self.answer(&row, who, None, user_remaining).await;
         }
-        let offer = self.offered(id, source, site_id).ok_or(not_offered)?;
+        let offer = self.offered(id, source, site_id).ok_or_else(not_offered)?;
         if !self.store.may_download_subtitles(&principal).await? {
             return Err(DownloadError::NotAllowed(
                 "an admin turned subtitle downloads off for you",
@@ -789,29 +730,43 @@ impl SubtitleDownloads {
             });
         }
         let media = self.catalog.media_path(id).await?;
-        let (bytes, account_remaining) = match (site, &offer.fetch) {
-            (Site::OpenSubtitles(site), Fetch::OpenSubtitles { file_id, as_srt }) => {
+        let (got, account_remaining) = match &site.client {
+            Client::OpenSubtitles(site) => {
+                let file_id = offer.fetch.parse().map_err(|_| not_offered())?;
+                // A format the server reads is taken as it is; any other is
+                // asked for as SRT, which the site converts it to.
+                let as_srt = !offer
+                    .format
+                    .as_deref()
+                    .is_some_and(|f| matches!(f, "srt" | "ass" | "ssa" | "vtt"));
                 let got = site
-                    .download(*file_id, as_srt.then_some("srt"))
+                    .download(file_id, as_srt.then_some("srt"))
                     .await
                     .map_err(|e| DownloadError::of_site(source, e))?;
                 (got.bytes, got.remaining)
             }
-            (Site::SubDl(site), Fetch::SubDl { path, episode }) => {
+            Client::SubDl(site) => {
                 let got = site
-                    .download(path)
+                    .download(&offer.fetch)
                     .await
                     .map_err(|e| DownloadError::of_site(source, e))?;
-                let file = if subtitle_file::is_archive(&got) {
-                    subtitle_file::unpack(&got, *episode).map_err(not_kept)?
-                } else {
-                    got
-                };
-                (file, None)
+                (got, None)
             }
-            _ => return Err(DownloadError::NotFound("a search result for this item")),
         };
-        let kept = subtitle_file::keep(&bytes).map_err(not_kept)?;
+        // SubDL's file may be an archive: the episode's (or the one)
+        // subtitle in it is taken.
+        let from_archive = matches!(site.client, Client::SubDl(_));
+        let episode = offer.episode;
+        let kept = tokio::task::spawn_blocking(move || {
+            if from_archive && subtitle_file::is_archive(&got) {
+                subtitle_file::keep(&subtitle_file::unpack(&got, episode)?)
+            } else {
+                subtitle_file::keep(&got)
+            }
+        })
+        .await
+        .map_err(|e| DownloadError::Io(format!("cannot read the downloaded file: {e}")))?
+        .map_err(not_kept)?;
         let row = DownloadRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
             media_id: id.to_string(),
@@ -1014,26 +969,11 @@ impl SubtitleDownloads {
             codec: codec.into(),
             kind: SubtitleKind::Text,
             language: Some(primary_language(&row.language)),
-            title: Some(source_name(&row.source).into()),
+            title: Some(Source::name_of(&row.source).into()),
             forced: false,
             default: false,
             role,
         }
-    }
-}
-
-/// What a user is told of a site's part of a search that failed: by the
-/// kind of failure only, as `client::download_error` tells a failed
-/// download. What the site said (a refusal's text, a parse error) is
-/// logged, not sent: it may name the account, or be anything at all.
-fn failed_message(site: Source, error: &SiteError) -> String {
-    match error {
-        SiteError::Refused { .. } => format!("{site} refused the server's request"),
-        SiteError::Unreadable(_) => format!("{site} answered with something unreadable"),
-        SiteError::TooLarge(_) => format!("{site} sent more than the server takes"),
-        SiteError::Unreachable(_) => format!("{site} cannot be reached"),
-        SiteError::RateLimited { .. } => format!("{site} asks to wait"),
-        SiteError::QuotaExhausted { .. } => format!("{site} has nothing left today"),
     }
 }
 
@@ -1042,18 +982,15 @@ fn not_kept(e: FileError) -> DownloadError {
     DownloadError::InvalidInput(format!("the downloaded file was not kept: {e}"))
 }
 
-/// The name of the site a row's `source` names; the id itself for one
-/// this build does not know.
-pub fn source_name(source: &str) -> &str {
-    Source::of(source).map_or(source, |s| s.name())
-}
-
 /// What OpenSubtitles is asked for an item: the file's hash, and the
-/// item's IMDb or TMDB id (an episode's own, else its show's with the
-/// season and episode), or its title and year when it has neither.
+/// item's IMDb or TMDB id (an episode's own, else its show's,
+/// `show_imdb` and `show_tmdb`, with the season and episode), or its
+/// title and year when it has neither.
 fn opensubtitles_query(
     subject: &Subject,
     hash: Option<String>,
+    show_imdb: Option<u64>,
+    show_tmdb: Option<u64>,
     languages: &[String],
 ) -> opensubtitles::Query {
     let mut query = opensubtitles::Query {
@@ -1076,7 +1013,6 @@ fn opensubtitles_query(
                 query.imdb_id = imdb;
                 query.tmdb_id = tmdb.filter(|_| imdb.is_none());
             } else {
-                let (show_imdb, show_tmdb) = (subject.show_imdb, subject.show_tmdb);
                 query.season_number = Some(episode.season);
                 query.episode_number = Some(episode.episode);
                 query.parent_imdb_id = show_imdb;
@@ -1092,15 +1028,16 @@ fn opensubtitles_query(
 }
 
 /// What SubDL is asked for an item: a film's IMDb or TMDB id, else its
-/// title and year; an episode's show's (SubDL lists a show's subtitles,
-/// not an episode's), else its title, with the season and episode.
-fn subdl_query(subject: &Subject, languages: &[String]) -> subdl::Query {
-    let mut codes: Vec<String> = Vec::new();
-    for code in languages.iter().map(|l| subdl::code_of(l)) {
-        if !codes.contains(&code) {
-            codes.push(code);
-        }
-    }
+/// title and year; an episode's show's, `show_imdb` and `show_tmdb`
+/// (SubDL lists a show's subtitles, not an episode's), else its title,
+/// with the season and episode.
+fn subdl_query(
+    subject: &Subject,
+    show_imdb: Option<u64>,
+    show_tmdb: Option<u64>,
+    languages: &[String],
+) -> subdl::Query {
+    let codes = dedupe(languages.iter().map(|l| subdl::code_of(l)));
     let mut query = subdl::Query {
         languages: codes.join(","),
         ..subdl::Query::default()
@@ -1120,9 +1057,9 @@ fn subdl_query(subject: &Subject, languages: &[String]) -> subdl::Query {
             query.kind = "tv";
             query.season_number = Some(episode.season);
             query.episode_number = Some(episode.episode);
-            query.imdb_id = subject.show_imdb.map(imdb);
-            query.tmdb_id = subject.show_tmdb.filter(|_| subject.show_imdb.is_none());
-            if subject.show_imdb.is_none() && subject.show_tmdb.is_none() {
+            query.imdb_id = show_imdb.map(imdb);
+            query.tmdb_id = show_tmdb.filter(|_| show_imdb.is_none());
+            if show_imdb.is_none() && show_tmdb.is_none() {
                 query.film_name = episode.show_title.clone();
             }
         }
@@ -1168,8 +1105,11 @@ fn result(offer: &Offer, rejected: bool, downloaded: bool) -> SubtitleResult {
         fps_milli: offer
             .fps
             .map(|f| (f * 1000.0).round().clamp(0.0, 1e6) as u32),
-        downloads: offer.downloads,
-        rating: (offer.rating > 0.0).then(|| (offer.rating * 10.0).round() as u8),
+        downloads: offer.downloads.unwrap_or(0),
+        rating: offer
+            .rating
+            .filter(|r| *r > 0.0)
+            .map(|r| (r * 10.0).round() as u8),
         hearing_impaired: offer.hearing_impaired,
         origin: offer.origin,
         hash_match: offer.hash_match,
@@ -1193,6 +1133,17 @@ fn order(results: &mut [SubtitleResult]) {
             std::cmp::Reverse(r.downloads),
         )
     });
+}
+
+/// `items` with each kept once, in their order.
+fn dedupe(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for item in items {
+        if !kept.contains(&item) {
+            kept.push(item);
+        }
+    }
+    kept
 }
 
 /// The format a site's file name says: its extension, if it is one a

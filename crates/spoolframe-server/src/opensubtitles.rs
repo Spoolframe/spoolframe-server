@@ -81,7 +81,7 @@ pub fn builtin_key() -> String {
         .collect();
     String::from_utf8(key).expect("the built-in key is ASCII")
 }
-use crate::subtitle_site::{Pacer, read_capped, retry_after};
+use crate::subtitle_site::{Pacer, client, endpoint, read_capped, refused, retry_after};
 
 /// What a search asks for. Every part left out is not sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -233,32 +233,14 @@ pub struct Site {
 impl Site {
     pub fn new(account: Account) -> Self {
         let api_host = account.api_url.host_str().map(str::to_owned);
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("Spoolframe v", env!("CARGO_PKG_VERSION")))
-            .timeout(CALL_TIMEOUT)
-            // A redirect only to the site itself: the download's file is
-            // served from one of its hosts.
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 3 {
-                    attempt.error("too many redirects")
-                } else if site_host(attempt.url(), api_host.as_deref()) {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
-            .build()
-            .expect("a client with rustls and no proxy settings builds");
+        // The download's file is served from one of the site's hosts.
+        let http = client(CALL_TIMEOUT, move |url| site_host(url, api_host.as_deref()));
         Self {
             account,
             http,
             pacer: Pacer::new(MIN_INTERVAL),
             session: tokio::sync::Mutex::new(None),
         }
-    }
-
-    pub fn account(&self) -> &Account {
-        &self.account
     }
 
     /// The subtitles `query` finds: the first page, the site's best.
@@ -376,10 +358,7 @@ impl Site {
                 resets_at: refusal.reset_time_utc.as_deref().and_then(utc_seconds),
             },
             500.. => SiteError::Unreachable(format!("{status}")),
-            code => SiteError::Refused {
-                status: code,
-                message: message.chars().take(200).collect(),
-            },
+            code => refused(code, &message),
         })
     }
 
@@ -401,16 +380,6 @@ impl Site {
         self.pacer.turn().await?;
         crate::subtitle_site::send(request).await
     }
-}
-
-/// `path` under the API at `base`.
-fn endpoint(base: &url::Url, path: &str) -> url::Url {
-    let mut url = base.clone();
-    url.path_segments_mut()
-        .expect("an http(s) URL has a path")
-        .pop_if_empty()
-        .push(path);
-    url
 }
 
 /// Whether `url` is on the site: the API's own host, or one of

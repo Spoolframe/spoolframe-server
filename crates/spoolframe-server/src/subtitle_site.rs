@@ -5,45 +5,8 @@
 
 use std::time::{Duration, Instant};
 
-/// A subtitle site the server searches and downloads from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Source {
-    OpenSubtitles,
-    SubDl,
-}
-
-impl Source {
-    /// Every site, in the order the server asks them unless the admin
-    /// set another.
-    pub const ALL: [Source; 2] = [Source::OpenSubtitles, Source::SubDl];
-
-    /// Its id, on the wire, in the database and in `subtitles.sources`.
-    pub fn id(self) -> &'static str {
-        match self {
-            Source::OpenSubtitles => "opensubtitles",
-            Source::SubDl => "subdl",
-        }
-    }
-
-    /// Its name, to show: a downloaded track's title.
-    pub fn name(self) -> &'static str {
-        match self {
-            Source::OpenSubtitles => "OpenSubtitles",
-            Source::SubDl => "SubDL",
-        }
-    }
-
-    /// The site `id` names, if one.
-    pub fn of(id: &str) -> Option<Source> {
-        Source::ALL.into_iter().find(|s| s.id() == id)
-    }
-}
-
-impl std::fmt::Display for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
+/// A subtitle site, as the server calls it.
+pub use spoolframe_types::SubtitleSource as Source;
 
 /// Why a call to a site failed. Which site is the caller's to say: each
 /// message reads after its name, "SubDL cannot be reached: …".
@@ -68,6 +31,68 @@ pub enum SiteError {
     /// The file is larger than the server takes.
     #[error("sent a file larger than {0} bytes")]
     TooLarge(usize),
+}
+
+/// The most of a site's own words a refusal keeps, in characters.
+const MAX_MESSAGE: usize = 200;
+
+/// A refusal with `status` and what the site said of it, cut short.
+pub fn refused(status: u16, message: &str) -> SiteError {
+    SiteError::Refused {
+        status,
+        message: message.chars().take(MAX_MESSAGE).collect(),
+    }
+}
+
+impl SiteError {
+    /// What a user (an admin too) is told of it, `site` named: never the
+    /// site's own words (a refusal's text, what made an answer
+    /// unreadable), which may name the account or be anything at all.
+    /// Those are the caller's to log.
+    pub fn user_message(&self, site: Source) -> String {
+        match self {
+            SiteError::Refused { .. } => format!("{site} refused the server's request"),
+            SiteError::Unreadable(_) => format!("{site} answered with something unreadable"),
+            // The server's own words.
+            SiteError::Unreachable(_)
+            | SiteError::RateLimited { .. }
+            | SiteError::QuotaExhausted { .. }
+            | SiteError::TooLarge(_) => format!("{site} {self}"),
+        }
+    }
+}
+
+/// A client for one site's calls, taking `timeout` each, that follows a
+/// redirect only to a host `is_site` says is the site's own (at most
+/// three): a key in a header or the query must not be sent elsewhere.
+pub fn client(
+    timeout: Duration,
+    is_site: impl Fn(&url::Url) -> bool + Send + Sync + 'static,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("Spoolframe v", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 3 {
+                attempt.error("too many redirects")
+            } else if is_site(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .expect("a client with rustls and no proxy settings builds")
+}
+
+/// `path` under the API at `base`.
+pub fn endpoint(base: &url::Url, path: &str) -> url::Url {
+    let mut url = base.clone();
+    url.path_segments_mut()
+        .expect("an http(s) URL has a path")
+        .pop_if_empty()
+        .push(path);
+    url
 }
 
 /// Calls to one site in turn: `interval` apart, and none while it said
@@ -175,13 +200,27 @@ pub async fn read_capped(
 mod tests {
     use super::*;
 
+    /// A user is told the server's own words of a failure, never the
+    /// site's: a refusal may name the account.
     #[test]
-    fn a_source_is_named_by_its_id() {
-        for source in Source::ALL {
-            assert_eq!(Source::of(source.id()), Some(source));
-        }
-        assert_eq!(Source::of("subdl"), Some(Source::SubDl));
-        assert_eq!(Source::of("SubDL"), None);
-        assert_eq!(Source::SubDl.name(), "SubDL");
+    fn a_user_is_told_of_a_failure_in_the_server_s_words() {
+        let site = Source::SubDl;
+        let said = |e: SiteError| e.user_message(site);
+        assert_eq!(
+            said(refused(403, "key of account 48151623 is suspended")),
+            "SubDL refused the server's request"
+        );
+        assert_eq!(
+            said(SiteError::Unreadable("expected `,` near 48151623".into())),
+            "SubDL answered with something unreadable"
+        );
+        assert_eq!(
+            said(SiteError::Unreachable("it took too long".into())),
+            "SubDL cannot be reached: it took too long"
+        );
+        let SiteError::Refused { message, .. } = refused(400, &"x".repeat(500)) else {
+            unreachable!()
+        };
+        assert_eq!(message.len(), MAX_MESSAGE);
     }
 }

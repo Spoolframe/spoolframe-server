@@ -118,6 +118,55 @@ pub struct SubtitleTrack {
     pub download: Option<SubtitleDownload>,
 }
 
+/// A subtitle site the server searches and downloads from (PX-02). On
+/// the wire, in the database and in `subtitles.sources` it is its
+/// [`id`](SubtitleSource::id), a string: a client shows a site this build
+/// does not know as that id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SubtitleSource {
+    OpenSubtitles,
+    SubDl,
+}
+
+impl SubtitleSource {
+    /// Every site, in the order the server asks them unless the admin
+    /// set another.
+    pub const ALL: [SubtitleSource; 2] = [SubtitleSource::OpenSubtitles, SubtitleSource::SubDl];
+
+    /// Its id: `opensubtitles`, `subdl`.
+    pub fn id(self) -> &'static str {
+        match self {
+            SubtitleSource::OpenSubtitles => "opensubtitles",
+            SubtitleSource::SubDl => "subdl",
+        }
+    }
+
+    /// Its name, to show.
+    pub fn name(self) -> &'static str {
+        match self {
+            SubtitleSource::OpenSubtitles => "OpenSubtitles",
+            SubtitleSource::SubDl => "SubDL",
+        }
+    }
+
+    /// The site `id` names, if one.
+    pub fn of(id: &str) -> Option<SubtitleSource> {
+        SubtitleSource::ALL.into_iter().find(|s| s.id() == id)
+    }
+
+    /// The name of the site `id` names; the id itself for one this build
+    /// does not know.
+    pub fn name_of(id: &str) -> &str {
+        SubtitleSource::of(id).map_or(id, |s| s.name())
+    }
+}
+
+impl std::fmt::Display for SubtitleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// A subtitle track downloaded from a subtitle site (PX-02), for everyone
 /// on the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +275,7 @@ impl TryFrom<SubtitleResultWire> for SubtitleResult {
     fn try_from(w: SubtitleResultWire) -> Result<Self, Self::Error> {
         let id = match (w.id, w.file_id) {
             (Some(id), _) => id,
-            (None, Some(n)) => format!("opensubtitles:{n}"),
+            (None, Some(n)) => format!("{}:{n}", SubtitleSource::OpenSubtitles.id()),
             (None, None) => return Err("a subtitle result has neither `id` nor `file_id`"),
         };
         Ok(SubtitleResult {
@@ -293,7 +342,7 @@ pub enum SubtitleSourceState {
 }
 
 fn opensubtitles() -> String {
-    "opensubtitles".into()
+    SubtitleSource::OpenSubtitles.id().into()
 }
 
 /// A subtitle downloaded (PX-02): the item's new track, at once, and the
@@ -469,6 +518,16 @@ mod tests {
     /// OpenSubtitles' `file_id`, no `id`, no `source`. It is
     /// OpenSubtitles' `opensubtitles:<file_id>`; a search names no sites'
     /// states. One with neither id is refused.
+    #[test]
+    fn a_source_is_named_by_its_id() {
+        for source in SubtitleSource::ALL {
+            assert_eq!(SubtitleSource::of(source.id()), Some(source));
+        }
+        assert_eq!(SubtitleSource::of("SubDL"), None);
+        assert_eq!(SubtitleSource::name_of("subdl"), "SubDL");
+        assert_eq!(SubtitleSource::name_of("podnapisi"), "podnapisi");
+    }
+
     #[test]
     fn a_result_from_a_server_before_subdl_is_opensubtitles() {
         let search: SubtitleSearch = serde_json::from_value(serde_json::json!({

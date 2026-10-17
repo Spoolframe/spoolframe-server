@@ -104,22 +104,61 @@ pub struct Layers {
     locked: bool,
     runtime_path: PathBuf,
     runtime: Table,
-    /// Settings no longer read that a layer still had ([`IGNORED`]), each
-    /// with where: taken out as the layers were read.
-    ignored: Vec<(&'static str, &'static str)>,
+    /// A warning each retired setting ([`RETIRED`]) a layer still had,
+    /// with where: taken out (or moved) as the layers were read.
+    retired: Vec<String>,
 }
 
-/// Settings the server no longer reads, taken out of every layer as it
-/// is read: never expanded (an `${SF_ENV_…}` whose variable is gone must
-/// not stop the server), never shown, and gone from the runtime layer the
-/// next time it is written. The server warns of each at start.
-// compat(PX-02): `opensubtitles.api_key` was a setting until the key was
-// built in; Fulcrum's runtime layer has one. Drop the entry once no
-// runtime layer from 0.12.0's prereleases is left.
-pub const IGNORED: [(&str, &str); 1] = [(
-    "opensubtitles.api_key",
-    "opensubtitles.api_key is no longer read; the built-in key is used",
-)];
+/// What became of a setting the server no longer reads under its name.
+#[derive(Debug, Clone, Copy)]
+pub enum Retired {
+    /// Read as this setting now: its value moves there, unless the same
+    /// layer sets that too.
+    Renamed(&'static str),
+    /// No longer read at all, and why.
+    Dropped(&'static str),
+}
+
+/// Settings retired, taken out of every layer as it is read: never
+/// expanded (an `${SF_ENV_…}` whose variable is gone must not stop the
+/// server), never shown, and gone from the runtime layer the next time it
+/// is written. The server warns of each at start. (PGPU-05's
+/// [`DEPRECATED`] keys are still read as they are, so they are not here.)
+// compat(PX-02): both were settings in 0.12.0's prereleases only;
+// Fulcrum's runtime layer has them. Drop the entries once no runtime
+// layer from those prereleases is left.
+pub const RETIRED: [(&str, Retired); 2] = [
+    (
+        "opensubtitles.api_key",
+        Retired::Dropped("the built-in key is used"),
+    ),
+    (
+        "opensubtitles.daily_limit_per_user",
+        Retired::Renamed("subtitles.daily_limit_per_user"),
+    ),
+];
+
+/// Take [`RETIRED`] settings out of `table`, the layer `place` names,
+/// moving a renamed one's value to its new key; a warning each in
+/// `notes`.
+fn strip_retired(table: &mut Table, place: &str, notes: &mut Vec<String>) {
+    for (key, retired) in RETIRED {
+        let Some(value) = tree::get(table, key).cloned() else {
+            continue;
+        };
+        tree::remove(table, key);
+        notes.push(match retired {
+            Retired::Dropped(why) => format!("{key} is no longer read; {why} ({place})"),
+            Retired::Renamed(new) if tree::get(table, new).is_some() => {
+                format!("{key} is no longer read; {new} is set beside it ({place})")
+            }
+            Retired::Renamed(new) => {
+                tree::set(table, new, value);
+                format!("{key} is now {new} ({place})")
+            }
+        });
+    }
+}
 
 /// Why a setting could not be changed.
 #[derive(Debug, thiserror::Error)]
@@ -316,16 +355,12 @@ impl Layers {
         runtime_path: PathBuf,
     ) -> Result<Self, ConfigError> {
         let defaults = tree::parse(DEFAULTS).expect("the built-in defaults parse");
-        let mut ignored = Vec::new();
+        let mut retired = Vec::new();
         let (file, locked) = match file {
             None => (None, false),
             Some((path, text)) => {
                 let (mut table, locked) = layer(text, path, true)?;
-                for (key, _) in IGNORED {
-                    if tree::remove(&mut table, key) {
-                        ignored.push((key, "config file"));
-                    }
-                }
+                strip_retired(&mut table, "config file", &mut retired);
                 (Some((path.to_owned(), table)), locked.unwrap_or(false))
             }
         };
@@ -346,18 +381,14 @@ impl Layers {
             }
         };
         let mut runtime = runtime;
-        for (key, _) in IGNORED {
-            if tree::remove(&mut runtime, key) {
-                ignored.push((key, "runtime settings"));
-            }
-        }
+        strip_retired(&mut runtime, "runtime settings", &mut retired);
         Ok(Self {
             defaults,
             file,
             locked,
             runtime_path,
             runtime,
-            ignored,
+            retired,
         })
     }
 
@@ -656,19 +687,10 @@ impl Layers {
         std::fs::rename(&partial, &self.runtime_path)
     }
 
-    /// A line each setting no longer read ([`IGNORED`]) a layer had,
-    /// with where; the server warns of each at start.
-    pub fn ignored(&self) -> Vec<String> {
-        self.ignored
-            .iter()
-            .map(|(key, place)| {
-                let why = IGNORED
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map_or("it is no longer read", |(_, why)| why);
-                format!("{why} ({place})")
-            })
-            .collect()
+    /// A line each retired setting ([`RETIRED`]) a layer had, with
+    /// where; the server warns of each at start.
+    pub fn retired(&self) -> &[String] {
+        &self.retired
     }
 
     /// A line each deprecated setting (PGPU-05) a layer sets (the
@@ -1215,8 +1237,10 @@ mod tests {
             (name == "SF_ENV_PX02_KEY").then(|| "abc".to_owned())
         })
         .unwrap();
-        let Some(crate::subtitle_downloads::SiteSettings::SubDl { account, .. }) =
-            config.subdl.settings().unwrap()
+        let Some(crate::subtitle_downloads::SiteSettings {
+            kind: crate::subtitle_downloads::SiteKind::SubDl(account),
+            ..
+        }) = config.subdl.settings().unwrap()
         else {
             panic!("SubDL is on")
         };
@@ -1250,7 +1274,7 @@ mod tests {
             Some(&["de".to_owned()][..])
         );
         assert_eq!(
-            loaded.ignored(),
+            loaded.retired(),
             [
                 "opensubtitles.api_key is no longer read; the built-in key is used (config file)",
                 "opensubtitles.api_key is no longer read; the built-in key is used (runtime settings)",
@@ -1274,6 +1298,53 @@ mod tests {
         assert!(!written.contains("api_key"), "{written}");
         assert!(!written.contains("PX02_GONE"), "{written}");
         assert!(written.contains("\"de\""), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PX-02: `opensubtitles.daily_limit_per_user`, in 0.12.0's
+    /// prereleases, is read as `subtitles.daily_limit_per_user` and
+    /// written back under that name; beside the new one it is dropped.
+    #[test]
+    fn the_old_daily_limit_is_read_as_the_new_one() {
+        let dir =
+            std::env::temp_dir().join(format!("spoolframe-px02-old-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime_path = dir.join(RUNTIME_FILE);
+        let loaded = Layers::from_texts(
+            Some((
+                Path::new("/etc/spoolframe.ucl"),
+                r#"opensubtitles { daily_limit_per_user = 9; }
+                   subtitles { daily_limit_per_user = 5; }"#,
+            )),
+            Some(
+                r#"schema = "spoolframe.server.v1";
+                   opensubtitles { daily_limit_per_user = 3; }"#,
+            ),
+            runtime_path.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded
+                .config()
+                .unwrap()
+                .subtitle_downloads()
+                .unwrap()
+                .daily_limit_per_user,
+            3
+        );
+        assert_eq!(
+            loaded.retired(),
+            [
+                "opensubtitles.daily_limit_per_user is no longer read; \
+                 subtitles.daily_limit_per_user is set beside it (config file)",
+                "opensubtitles.daily_limit_per_user is now subtitles.daily_limit_per_user \
+                 (runtime settings)",
+            ]
+        );
+        loaded.write_runtime().unwrap();
+        let written = std::fs::read_to_string(&runtime_path).unwrap();
+        assert!(!written.contains("opensubtitles"), "{written}");
+        assert!(written.contains("daily_limit_per_user = 3"), "{written}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

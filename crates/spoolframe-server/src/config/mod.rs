@@ -192,10 +192,6 @@ pub struct OpenSubtitlesConfig {
     /// left out.
     #[ucl(default)]
     pub languages: Option<Vec<String>>,
-    /// What `subtitles.daily_limit_per_user` was before SubDL: read
-    /// when that is left out.
-    #[ucl(default)]
-    pub daily_limit_per_user: Option<u32>,
     /// Where the API is; the site's own if left out. For tests, in the
     /// config file only: not a setting the web UI changes.
     #[ucl(default)]
@@ -209,7 +205,6 @@ impl std::fmt::Debug for OpenSubtitlesConfig {
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "(set)"))
             .field("languages", &self.languages)
-            .field("daily_limit_per_user", &self.daily_limit_per_user)
             .field("api_url", &self.api_url)
             .finish()
     }
@@ -228,16 +223,18 @@ impl OpenSubtitlesConfig {
                 });
             }
         };
-        Ok(crate::subtitle_downloads::SiteSettings::OpenSubtitles {
-            account: crate::opensubtitles::Account {
-                api_url: site_url(
-                    "opensubtitles.api_url",
-                    self.api_url.as_deref(),
-                    crate::opensubtitles::API_URL,
-                )?,
-                username,
-                password,
-            },
+        Ok(crate::subtitle_downloads::SiteSettings {
+            kind: crate::subtitle_downloads::SiteKind::OpenSubtitles(
+                crate::opensubtitles::Account {
+                    api_url: site_url(
+                        "opensubtitles.api_url",
+                        self.api_url.as_deref(),
+                        crate::opensubtitles::API_URL,
+                    )?,
+                    username,
+                    password,
+                },
+            ),
             languages: site_languages("opensubtitles.languages", self.languages.as_deref())?,
         })
     }
@@ -283,8 +280,8 @@ impl SubdlConfig {
         let Some(api_key) = trimmed(&self.api_key) else {
             return Ok(None);
         };
-        Ok(Some(crate::subtitle_downloads::SiteSettings::SubDl {
-            account: crate::subdl::Account {
+        Ok(Some(crate::subtitle_downloads::SiteSettings {
+            kind: crate::subtitle_downloads::SiteKind::SubDl(crate::subdl::Account {
                 api_url: site_url(
                     "subdl.api_url",
                     self.api_url.as_deref(),
@@ -296,7 +293,7 @@ impl SubdlConfig {
                     crate::subdl::DOWNLOAD_URL,
                 )?,
                 api_key: api_key.to_owned(),
-            },
+            }),
             languages: site_languages("subdl.languages", self.languages.as_deref())?,
         }))
     }
@@ -373,11 +370,7 @@ impl ServerConfig {
             .collect();
         Ok(crate::subtitle_downloads::Settings {
             sites,
-            daily_limit_per_user: self
-                .subtitles
-                .daily_limit_per_user
-                .or(self.opensubtitles.daily_limit_per_user)
-                .unwrap_or(0),
+            daily_limit_per_user: self.subtitles.daily_limit_per_user.unwrap_or(0),
         })
     }
 }
@@ -2948,8 +2941,12 @@ mod tests {
     #[test]
     fn opensubtitles_is_on_with_nothing_set() {
         let none = ServerConfig::parse(r#"schema = "spoolframe.server.v1";"#).unwrap();
-        let [crate::subtitle_downloads::SiteSettings::OpenSubtitles { account, languages }] =
-            &sites(&none)[..]
+        let [
+            crate::subtitle_downloads::SiteSettings {
+                languages,
+                kind: crate::subtitle_downloads::SiteKind::OpenSubtitles(account),
+            },
+        ] = &sites(&none)[..]
         else {
             panic!("{:?}", sites(&none))
         };
@@ -2968,21 +2965,16 @@ mod tests {
         );
     }
 
-    /// The languages are a site's own; the limit is every site's, and
-    /// `opensubtitles.daily_limit_per_user`, where it was before SubDL,
-    /// still counts when `subtitles` does not set it.
+    /// The languages are a site's own; the limit is every site's.
     #[test]
-    fn opensubtitles_takes_languages_and_a_limit() {
-        let config =
-            opensubtitles(r#"languages = ["en", "pt-BR"]; daily_limit_per_user = 3;"#).unwrap();
-        assert_eq!(sites(&config)[0].languages(), ["en", "pt-br"]);
-        assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 3);
+    fn opensubtitles_takes_languages_and_the_limit_is_every_site_s() {
         let config = ServerConfig::parse(
             r#"schema = "spoolframe.server.v1";
-               opensubtitles { daily_limit_per_user = 3; }
+               opensubtitles { languages = ["en", "pt-BR"]; }
                subtitles { daily_limit_per_user = 5; }"#,
         )
         .unwrap();
+        assert_eq!(sites(&config)[0].languages, ["en", "pt-br"]);
         assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 5);
     }
 
@@ -3018,8 +3010,10 @@ mod tests {
             |config: &ServerConfig| sites(config).iter().map(|s| s.source()).collect::<Vec<_>>();
         let both = parse("").unwrap();
         assert_eq!(order(&both), [Source::OpenSubtitles, Source::SubDl]);
-        let crate::subtitle_downloads::SiteSettings::SubDl { account, languages } =
-            &sites(&both)[1]
+        let crate::subtitle_downloads::SiteSettings {
+            languages,
+            kind: crate::subtitle_downloads::SiteKind::SubDl(account),
+        } = &sites(&both)[1]
         else {
             panic!()
         };

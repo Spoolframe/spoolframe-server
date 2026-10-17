@@ -6301,19 +6301,15 @@ fn download_error(e: crate::subtitle_downloads::DownloadError) -> Error {
             error: SiteError::RateLimited { retry_after_ms },
             ..
         } => Error::RateLimited { retry_after_ms },
-        DownloadError::Site {
-            site: source,
-            error: e @ SiteError::Refused { .. },
-        } => {
-            tracing::warn!(%source, error = %e, "a subtitle site refused the server; check its API key and account");
-            Error::Unavailable {
-                message: format!("{source} refused the server's request"),
+        DownloadError::Site { site, error } => {
+            // The site's own words in the log only (`SiteError::user_message`).
+            if matches!(error, SiteError::Refused { .. }) {
+                tracing::warn!(%site, %error, "a subtitle site refused the server; check its API key and account");
+            } else {
+                tracing::warn!(%site, %error, "a subtitle search or download failed");
             }
-        }
-        e @ DownloadError::Site { .. } => {
-            tracing::warn!(error = %e, "a subtitle search or download failed");
             Error::Unavailable {
-                message: e.to_string(),
+                message: error.user_message(site),
             }
         }
         DownloadError::Catalog(e) => catalog_error(e),

@@ -18,7 +18,7 @@ use spoolframe_protocol::{
     Selection, SessionId,
 };
 use spoolframe_server::opensubtitles::Account;
-use spoolframe_server::subtitle_downloads::{Settings, SiteSettings};
+use spoolframe_server::subtitle_downloads::{Settings, SiteKind, SiteSettings};
 use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, MediaTracks, QuotaOf, SubtitleDownloaded,
     SubtitleFormat, SubtitleSearch, VideoCodec,
@@ -90,13 +90,13 @@ async fn site() -> MockServer {
 
 fn settings(site: &MockServer, limit: u32) -> Settings {
     Settings {
-        sites: vec![SiteSettings::OpenSubtitles {
-            account: Account {
+        sites: vec![SiteSettings {
+            languages: vec!["en".into()],
+            kind: SiteKind::OpenSubtitles(Account {
                 api_url: url::Url::parse(&format!("{}/api/v1", site.uri())).unwrap(),
                 username: None,
                 password: None,
-            },
-            languages: vec!["en".into()],
+            }),
         }],
         daily_limit_per_user: limit,
     }
@@ -716,13 +716,13 @@ async fn with_subdl(site: &MockServer) -> Settings {
         .mount(site)
         .await;
     let mut sites = settings(site, 0);
-    sites.sites.push(SiteSettings::SubDl {
-        account: spoolframe_server::subdl::Account {
+    sites.sites.push(SiteSettings {
+        languages: vec!["en".into()],
+        kind: SiteKind::SubDl(spoolframe_server::subdl::Account {
             api_url: url::Url::parse(&format!("{}/subdl/api/v1", site.uri())).unwrap(),
             download_url: url::Url::parse(&site.uri()).unwrap(),
             api_key: "subdl-key".into(),
-        },
-        languages: vec!["en".into()],
+        }),
     });
     sites
 }

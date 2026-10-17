@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::subtitle_site::{Pacer, SiteError, read_capped, retry_after};
+use crate::subtitle_site::{Pacer, SiteError, client, endpoint, read_capped, refused, retry_after};
 
 /// The API, as it is reached.
 pub const API_URL: &str = "https://api.subdl.com/api/v1";
@@ -149,33 +149,16 @@ impl Site {
             account.api_url.host_str().map(str::to_owned),
             account.download_url.host_str().map(str::to_owned),
         ];
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("Spoolframe v", env!("CARGO_PKG_VERSION")))
-            .timeout(CALL_TIMEOUT)
-            // A redirect only to SubDL itself.
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                let host = attempt.url().host_str();
-                if attempt.previous().len() >= 3 {
-                    attempt.error("too many redirects")
-                } else if hosts.iter().flatten().any(|h| Some(h.as_str()) == host)
-                    || host.is_some_and(|h| h == "subdl.com" || h.ends_with(".subdl.com"))
-                {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
-            .build()
-            .expect("a client with rustls and no proxy settings builds");
+        let http = client(CALL_TIMEOUT, move |url| {
+            let host = url.host_str();
+            hosts.iter().flatten().any(|h| Some(h.as_str()) == host)
+                || host.is_some_and(|h| h == "subdl.com" || h.ends_with(".subdl.com"))
+        });
         Self {
             account,
             http,
             pacer: Pacer::new(MIN_INTERVAL),
         }
-    }
-
-    pub fn account(&self) -> &Account {
-        &self.account
     }
 
     /// The subtitles `query` finds: SubDL's first page.
@@ -185,14 +168,7 @@ impl Site {
             .append_pair("api_key", &self.account.api_key)
             .extend_pairs(query.pairs());
         let response = self.send(self.http.get(url)).await?;
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = retry_after(&response);
-            let body = read_capped(response, MAX_JSON).await.unwrap_or_default();
-            return Err(self.refusal(status.as_u16(), retry_after, &body));
-        }
-        let body = read_capped(response, MAX_JSON).await?;
-        read_search(&body)
+        read_search(&read_capped(response, MAX_JSON).await?)
     }
 
     /// The file at `path` (a [`Found::path`]): an archive or a subtitle,
@@ -209,47 +185,30 @@ impl Site {
             .get(url)
             .header("x-api-key", &self.account.api_key);
         let response = self.send(request).await?;
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = retry_after(&response);
-            let body = read_capped(response, MAX_JSON).await.unwrap_or_default();
-            return Err(self.refusal(status.as_u16(), retry_after, &body));
-        }
         read_capped(response, spoolframe_media::subtitle_file::MAX_ARCHIVE_BYTES).await
     }
 
-    /// A refusal, by its status and what its body says.
-    fn refusal(&self, status: u16, retry_after: Option<u64>, body: &[u8]) -> SiteError {
-        let message = serde_json::from_slice::<SearchAnswer>(body)
+    /// `request` sent in its turn, and its answer when it is a success:
+    /// otherwise the refusal, by its status and what its body says.
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, SiteError> {
+        self.pacer.turn().await?;
+        let response = crate::subtitle_site::send(request).await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let retry_after = retry_after(&response);
+        let body = read_capped(response, MAX_JSON).await.unwrap_or_default();
+        let message = serde_json::from_slice::<SearchAnswer>(&body)
             .ok()
             .and_then(|a| a.error)
             .unwrap_or_default();
-        match status {
-            429 if says_quota(&message) => SiteError::QuotaExhausted { resets_at: None },
-            429 => self.pacer.told_to_wait(retry_after),
+        Err(match status.as_u16() {
+            429 if !says_quota(&message) => self.pacer.told_to_wait(retry_after),
             500.. => SiteError::Unreachable(format!("{status}")),
-            _ if says_quota(&message) => SiteError::QuotaExhausted { resets_at: None },
-            code => SiteError::Refused {
-                status: code,
-                message: message.chars().take(200).collect(),
-            },
-        }
+            code => classify(code, &message),
+        })
     }
-
-    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, SiteError> {
-        self.pacer.turn().await?;
-        crate::subtitle_site::send(request).await
-    }
-}
-
-/// `path` under the API at `base`.
-fn endpoint(base: &url::Url, path: &str) -> url::Url {
-    let mut url = base.clone();
-    url.path_segments_mut()
-        .expect("an http(s) URL has a path")
-        .pop_if_empty()
-        .push(path);
-    url
 }
 
 /// Whether SubDL's words say a quota or a limit is used up.
@@ -258,6 +217,16 @@ fn says_quota(message: &str) -> bool {
     ["limit", "quota", "exceeded"]
         .iter()
         .any(|w| message.contains(w))
+}
+
+/// A refusal with `status` (not a 5xx, nor a 429 to wait out) and
+/// SubDL's `message`: a used-up quota when its words say so.
+fn classify(status: u16, message: &str) -> SiteError {
+    if says_quota(message) {
+        SiteError::QuotaExhausted { resets_at: None }
+    } else {
+        refused(status, message)
+    }
 }
 
 /// SubDL's words for a search that found nothing, as its API answers
@@ -276,13 +245,7 @@ fn read_search(body: &[u8]) -> Result<Vec<Found>, SiteError> {
         if message.trim().eq_ignore_ascii_case(NOTHING_FOUND) {
             return Ok(Vec::new());
         }
-        if says_quota(&message) {
-            return Err(SiteError::QuotaExhausted { resets_at: None });
-        }
-        return Err(SiteError::Refused {
-            status: 200,
-            message: message.chars().take(200).collect(),
-        });
+        return Err(classify(200, &message));
     }
     let mut found = Vec::new();
     for entry in answer.subtitles {

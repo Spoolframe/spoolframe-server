@@ -172,9 +172,6 @@ pub const SETTINGS: &[Setting] = &[
     live("opensubtitles.username"),
     write_only(OPENSUBTITLES_PASSWORD),
     live("opensubtitles.languages"),
-    // Before SubDL, the limit was OpenSubtitles' own; read when
-    // `subtitles.daily_limit_per_user` is left out.
-    live("opensubtitles.daily_limit_per_user"),
     write_only(SUBDL_API_KEY),
     live("subdl.languages"),
     live("subtitles.sources"),

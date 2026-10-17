@@ -73,11 +73,12 @@
   as any download, and synced. SubDL's hearing-impaired flag is not
   used: it is set on nearly every file. A site that fails is said in
   the server's own words, its own text only logged. A download from
-  one site no longer waits for one from the other. A download stays, for everyone, when its site is turned off
-  (out of `subtitles.sources`, or its key taken out). The daily limit
-  per user is every site's,
-  `subtitles.daily_limit_per_user` (`opensubtitles.daily_limit_per_user`
-  is still read when it is unset). SDK: `Session::download_subtitle`
+  one site no longer waits for one from the other. A download stays,
+  for everyone, when its site is turned off (out of `subtitles.sources`,
+  or its key taken out). The daily limit per user is every site's,
+  `subtitles.daily_limit_per_user`; `opensubtitles.daily_limit_per_user`,
+  where a prerelease kept it, is read as it, with a warning, and written
+  back under the new name. SDK: `Session::download_subtitle`
   takes the result's id. Admin API: `admin.subtitleDownload` takes
   `result`; `QUOTA_EXHAUSTED`'s data has `site`. CLI: `spoolframe-server
   subtitle download <id> <result>`, and the search lists a site that

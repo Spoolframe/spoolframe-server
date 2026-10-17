@@ -3,32 +3,23 @@
 //! site's part of a search went, what a download or a refusal says, and
 //! the settings' fields, testable on the host.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 use spoolframe_admin_api::{
-    SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleSearch, SubtitleSourceState,
-    SubtitleTimingInfo, error_code,
+    SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleSearch, SubtitleSource,
+    SubtitleSourceState, SubtitleTimingInfo, error_code,
 };
 
 use crate::logic::{ApiError, thousands};
 
-/// The site ids the server knows, in the order Settings › Subtitles
-/// lists them.
-pub const SOURCES: [&str; 2] = ["opensubtitles", "subdl"];
-
-/// A site's name, by its id: `subdl` is SubDL. One this build does not
-/// know is shown as its id.
-pub fn source_name(id: &str) -> &str {
-    match id {
-        "opensubtitles" => "OpenSubtitles",
-        "subdl" => "SubDL",
-        other => other,
-    }
-}
-
 /// What a result is marked with, each with its pill's tone: its site,
 /// found by the hash, then what a viewer weighs.
 pub fn marks(r: &SubtitleResult) -> Vec<(String, &'static str)> {
-    let mut marks = vec![(source_name(&r.source).to_owned(), "pill pill-source")];
+    let mut marks = vec![(
+        SubtitleSource::name_of(&r.source).to_owned(),
+        "pill pill-source",
+    )];
     let mut mark = |text: &str, tone| marks.push((text.to_owned(), tone));
     if r.hash_match {
         mark("Made for this file", "pill pill-trusted");
@@ -58,7 +49,7 @@ pub fn source_lines(found: &SubtitleSearch, now: i64) -> Vec<String> {
         .sources
         .iter()
         .filter_map(|status| {
-            let name = source_name(&status.source);
+            let name = SubtitleSource::name_of(&status.source);
             Some(match &status.state {
                 SubtitleSourceState::Found { .. } => return None,
                 SubtitleSourceState::QuotaExhausted {
@@ -141,7 +132,7 @@ pub fn refusal(e: &ApiError, now: i64) -> String {
                 (Some("user"), _) => "You have no subtitle downloads left today".to_owned(),
                 (_, Some(site)) => format!(
                     "The server's {} account has no downloads left today",
-                    source_name(site)
+                    SubtitleSource::name_of(site)
                 ),
                 _ => "The server's subtitle account has no downloads left today".to_owned(),
             };
@@ -195,64 +186,59 @@ pub fn downloaded_by(t: &SubtitleTimingInfo) -> String {
     line
 }
 
+/// The sites ticked: the setting's, or every one when it is not set, as
+/// the server reads it.
+pub type Ticked = BTreeSet<SubtitleSource>;
+
+/// Which sites `subtitles.sources` names; every one when it is not set.
+pub fn sources_on(setting: Option<&Value>) -> Ticked {
+    match setting.and_then(Value::as_array) {
+        None => SubtitleSource::ALL.into(),
+        Some(list) => list
+            .iter()
+            .filter_map(|v| SubtitleSource::of(v.as_str()?))
+            .collect(),
+    }
+}
+
 /// `subtitles.sources` once the boxes ticked when the form opened,
-/// `before`, are `now` (`on[i]` for [`SOURCES`]`[i]`): `None` when they
-/// did not change, so the setting is left as it is (unset, it follows the
-/// server's default). Changed, the sites keep the order `setting` gives
-/// them, the order they are asked in; one newly ticked comes last.
-pub fn sources_value(setting: Option<&Value>, before: [bool; 2], now: [bool; 2]) -> Option<Value> {
+/// `before`, are `now`: `None` when they did not change, so the setting
+/// is left as it is (unset, it follows the server's default). Changed,
+/// the sites keep the order `setting` gives them, the order they are
+/// asked in; one newly ticked comes last.
+pub fn sources_value(setting: Option<&Value>, before: &Ticked, now: &Ticked) -> Option<Value> {
     if before == now {
         return None;
     }
-    let ticked = |id: &str| SOURCES.iter().zip(now).any(|(s, on)| *s == id && on);
-    let mut order: Vec<&str> = match setting.and_then(Value::as_array) {
-        Some(list) => list.iter().filter_map(Value::as_str).collect(),
-        None => SOURCES.to_vec(),
+    let mut order: Vec<SubtitleSource> = match setting.and_then(Value::as_array) {
+        Some(list) => list
+            .iter()
+            .filter_map(|v| SubtitleSource::of(v.as_str()?))
+            .collect(),
+        None => SubtitleSource::ALL.to_vec(),
     };
-    order.retain(|id| ticked(id));
-    for id in SOURCES {
-        if ticked(id) && !order.contains(&id) {
-            order.push(id);
+    order.retain(|s| now.contains(s));
+    for s in now {
+        if !order.contains(s) {
+            order.push(*s);
         }
     }
-    Some(json!(order))
+    Some(json!(order.iter().map(|s| s.id()).collect::<Vec<_>>()))
 }
 
 /// The daily limit, every site's.
 pub const LIMIT: &str = "subtitles.daily_limit_per_user";
 
-/// Where the limit was before SubDL; the server reads it while
-/// [`LIMIT`] is unset.
-pub const OLD_LIMIT: &str = "opensubtitles.daily_limit_per_user";
-
-/// What saving the daily limit changes: [`LIMIT`] as typed, and
-/// [`OLD_LIMIT`] taken out (from the runtime settings, what the form can
-/// change), so it no longer stands in for it. Cleared while the old key
-/// is still set, the limit is written as 0 (none): the old key would
-/// otherwise be read in its place.
-pub fn limit_changes(
-    typed: &str,
-    old_key_set: bool,
-) -> Result<Vec<(&'static str, Option<Value>)>, String> {
+/// The daily limit as typed: a whole number, or nothing (none).
+pub fn limit_value(typed: &str) -> Result<Option<Value>, String> {
     let typed = typed.trim();
-    let limit = if typed.is_empty() {
-        old_key_set.then(|| json!(0))
-    } else {
-        let n: u32 = typed
-            .parse()
-            .map_err(|_| "The daily limit is a whole number.".to_owned())?;
-        Some(json!(n))
-    };
-    Ok(vec![(LIMIT, limit), (OLD_LIMIT, None)])
-}
-
-/// Which of [`SOURCES`] `subtitles.sources` names; every one when it is
-/// not set, as the server reads it.
-pub fn sources_on(setting: Option<&Value>) -> [bool; 2] {
-    match setting.and_then(Value::as_array) {
-        None => [true; 2],
-        Some(list) => SOURCES.map(|id| list.iter().any(|v| v.as_str() == Some(id))),
+    if typed.is_empty() {
+        return Ok(None);
     }
+    let n: u32 = typed
+        .parse()
+        .map_err(|_| "The daily limit is a whole number.".to_owned())?;
+    Ok(Some(json!(n)))
 }
 
 /// The languages field as the setting: `en, pt-BR` is `["en", "pt-BR"]`;
@@ -403,24 +389,11 @@ mod tests {
         );
     }
 
-    /// The limit is written to its own key and the old one taken out, so
-    /// the old one never stands in for it again; cleared while the old
-    /// one is set, it is written as none (0).
     #[test]
-    fn saving_the_limit_takes_the_old_key_out() {
-        assert_eq!(
-            limit_changes("3", true),
-            Ok(vec![(LIMIT, Some(json!(3))), (OLD_LIMIT, None)])
-        );
-        assert_eq!(
-            limit_changes(" ", true),
-            Ok(vec![(LIMIT, Some(json!(0))), (OLD_LIMIT, None)])
-        );
-        assert_eq!(
-            limit_changes("", false),
-            Ok(vec![(LIMIT, None), (OLD_LIMIT, None)])
-        );
-        assert!(limit_changes("three", false).is_err());
+    fn the_limit_is_a_whole_number_or_none() {
+        assert_eq!(limit_value(" 3 "), Ok(Some(json!(3))));
+        assert_eq!(limit_value(" "), Ok(None));
+        assert!(limit_value("three").is_err());
     }
 
     /// A site that failed or ran out is said by name; one that answered
@@ -464,28 +437,30 @@ mod tests {
     /// the admin set; a site ticked anew comes last. Unset, both are on.
     #[test]
     fn the_sites_ticked_are_the_setting_in_the_admin_s_order() {
-        let both = [true, true];
-        assert_eq!(sources_value(None, both, both), None);
+        use SubtitleSource::{OpenSubtitles, SubDl};
+        let ticked = |sites: &[SubtitleSource]| sites.iter().copied().collect::<Ticked>();
+        let both = ticked(&[OpenSubtitles, SubDl]);
+        assert_eq!(sources_value(None, &both, &both), None);
         let subdl_first = json!(["subdl", "opensubtitles"]);
-        assert_eq!(sources_value(Some(&subdl_first), both, both), None);
+        assert_eq!(sources_value(Some(&subdl_first), &both, &both), None);
         assert_eq!(
-            sources_value(None, both, [true, false]),
+            sources_value(None, &both, &ticked(&[OpenSubtitles])),
             Some(json!(["opensubtitles"]))
         );
         assert_eq!(
-            sources_value(Some(&subdl_first), both, [false, true]),
+            sources_value(Some(&subdl_first), &both, &ticked(&[SubDl])),
             Some(json!(["subdl"]))
         );
         // OpenSubtitles ticked again: after SubDL, which was alone.
         let subdl_only = json!(["subdl"]);
         assert_eq!(
-            sources_value(Some(&subdl_only), [false, true], both),
+            sources_value(Some(&subdl_only), &ticked(&[SubDl]), &both),
             Some(json!(["subdl", "opensubtitles"]))
         );
-        assert_eq!(sources_value(None, both, [false, false]), Some(json!([])));
-        assert_eq!(sources_on(None), [true, true]);
-        assert_eq!(sources_on(Some(&json!(["subdl"]))), [false, true]);
-        assert_eq!(sources_on(Some(&json!([]))), [false, false]);
+        assert_eq!(sources_value(None, &both, &ticked(&[])), Some(json!([])));
+        assert_eq!(sources_on(None), both);
+        assert_eq!(sources_on(Some(&json!(["subdl"]))), ticked(&[SubDl]));
+        assert_eq!(sources_on(Some(&json!([]))), ticked(&[]));
     }
 
     #[test]

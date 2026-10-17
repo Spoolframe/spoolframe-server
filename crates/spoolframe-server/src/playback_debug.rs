@@ -96,10 +96,10 @@ fn timing_info(
         // A download's file is named by an id; what it is is its release.
         (_, Some(download)) if !download.release.is_empty() => format!(
             "{} · {}",
-            crate::subtitle_downloads::source_name(&download.source),
+            crate::subtitle_site::Source::name_of(&download.source),
             download.release
         ),
-        (_, Some(download)) => crate::subtitle_downloads::source_name(&download.source).to_owned(),
+        (_, Some(download)) => crate::subtitle_site::Source::name_of(&download.source).to_owned(),
         (source, None) => match source {
             spoolframe_media::SubtitleSource::External { path } => path
                 .file_name()

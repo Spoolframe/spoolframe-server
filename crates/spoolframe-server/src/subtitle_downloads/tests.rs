@@ -58,25 +58,25 @@ struct Fixture {
 
 /// OpenSubtitles at `site`'s `/api/v1`.
 fn opensubtitles_at(site: &MockServer) -> SiteSettings {
-    SiteSettings::OpenSubtitles {
-        account: opensubtitles::Account {
+    SiteSettings {
+        languages: vec!["en".into()],
+        kind: SiteKind::OpenSubtitles(opensubtitles::Account {
             api_url: url::Url::parse(&format!("{}/api/v1", site.uri())).unwrap(),
             username: None,
             password: None,
-        },
-        languages: vec!["en".into()],
+        }),
     }
 }
 
 /// SubDL at `site`'s `/subdl/api/v1`, its files at `/subtitle/…`.
 fn subdl_at(site: &MockServer) -> SiteSettings {
-    SiteSettings::SubDl {
-        account: subdl::Account {
+    SiteSettings {
+        languages: vec!["en".into()],
+        kind: SiteKind::SubDl(subdl::Account {
             api_url: url::Url::parse(&format!("{}/subdl/api/v1", site.uri())).unwrap(),
             download_url: url::Url::parse(&site.uri()).unwrap(),
             api_key: "subdl-key".into(),
-        },
-        languages: vec!["en".into()],
+        }),
     }
 }
 
@@ -624,7 +624,7 @@ async fn without_a_site_nothing_is_asked() {
 async fn an_unreachable_site_fails_the_search_cleanly() {
     let f = fixture("offline", 0).await;
     let mut settings = settings(&f.site, 0);
-    let SiteSettings::OpenSubtitles { account, .. } = &mut settings.sites[0] else {
+    let SiteKind::OpenSubtitles(account) = &mut settings.sites[0].kind else {
         unreachable!()
     };
     account.api_url = crate::opensubtitles::tests::nothing_listens();
@@ -772,7 +772,7 @@ async fn one_site_failing_leaves_the_other_s_results() {
 
     // Both down: the first site's error.
     let mut settings = both(&f.site);
-    let SiteSettings::OpenSubtitles { account, .. } = &mut settings.sites[0] else {
+    let SiteKind::OpenSubtitles(account) = &mut settings.sites[0].kind else {
         unreachable!()
     };
     account.api_url = crate::opensubtitles::tests::nothing_listens();
