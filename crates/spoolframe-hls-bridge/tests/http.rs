@@ -807,6 +807,65 @@ async fn the_playback_log_and_replan_are_the_tokens_own() {
     assert!(!bridge.replanned("nope"));
 }
 
+/// Planned again (Fulcrum, 2026-10-17: a ladder became one 480p encode
+/// while AVPlayer was still on the ladder's playlist): the old token
+/// answers 410 for every HLS resource, never the new plan's playlists or
+/// segments, and the new plan's token plays.
+#[tokio::test]
+async fn a_replanned_stream_s_old_url_is_gone_and_the_new_one_plays() {
+    let (bridge, addr) = bridge().await;
+    let old = Src::new(b"");
+    old.playlist(
+        ManifestKind::Multivariant,
+        0,
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv0/media.m3u8\n",
+    );
+    old.opens(
+        0,
+        1,
+        vec![
+            Ok(Answer::whole(b"ladder", 1)),
+            Ok(Answer::whole(b"one encode", 1)),
+        ],
+    );
+    let token = hls(&bridge, &old);
+    let before = get(addr, &format!("/{token}/v0/seg1.m4s")).await;
+    assert_eq!(
+        (before.status, before.text()),
+        (StatusCode::OK, "ladder".into())
+    );
+
+    old.0.replanned.store(true, Ordering::Relaxed);
+    for name in [
+        "master.m3u8",
+        "v0/media.m3u8",
+        "v0/init.mp4",
+        "v0/seg1.m4s",
+        "v1/seg1.m4s",
+        "subs1.vtt",
+    ] {
+        assert_eq!(
+            get(addr, &format!("/{token}/{name}")).await.status,
+            StatusCode::GONE,
+            "{name}"
+        );
+    }
+    let notes = bridge.notes(&token);
+    assert!(
+        notes.iter().any(|n| n.contains("after a re-plan")),
+        "{notes:?}"
+    );
+
+    let new = Src::new(b"");
+    new.opens(0, 1, vec![Ok(Answer::whole(b"one encode", 1))]);
+    let renewed = hls(&bridge, &new);
+    let after = get(addr, &format!("/{renewed}/seg1.m4s")).await;
+    assert_eq!(
+        (after.status, after.text()),
+        (StatusCode::OK, "one encode".into())
+    );
+}
+
 #[tokio::test]
 async fn the_same_bridge_serves_again_on_a_new_listener() {
     let bridge = Bridge::new();

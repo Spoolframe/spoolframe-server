@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- SDK HLS bridge: a playback planned again since its URL was served
+  (`Bridge::replanned`) answers 410 Gone for every HLS resource at the
+  old URL, so a player still on the old plan's playlist never gets the
+  new plan's playlists or segments; the app plays the new plan from
+  the new URL it serves it under, as before.
+
 - HLS: a read of a rung the playback's plan does not have is
   `NotFound`, as its media playlist already was, not `PlaybackFailed`
   ("no rung 1 in this playback"). A ladder planned again as one encode

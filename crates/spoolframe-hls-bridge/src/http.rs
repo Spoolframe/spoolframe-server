@@ -88,6 +88,14 @@ pub(crate) async fn answer<S: Source, B>(bridge: Bridge<S>, request: Request<B>)
     stream.asked();
     if let Some(hook) = &bridge.on_request { hook(token); }
     let log = bridge.options.log;
+    // Planned again since it was served (a quality change, an Auto
+    // re-plan): the app serves the new plan under a new token, and this
+    // one's player is on the old plan's playlist. None of the new plan's
+    // playlists or segments may go to it, with other cuts or rungs.
+    if matches!(stream.kind, Kind::Hls { .. }) && stream.playback.replanned() {
+        note(&stream, format!("bridge: {name} asked after a re-plan"));
+        return Ok(status(StatusCode::GONE));
+    }
     let answer = async { match (&stream.kind, name) {
         (Kind::Direct { size, mime }, "file") => direct(stream.clone(), *size, mime, range, head),
         // A media segment streams as the server sends it (PX-46): AVPlayer
