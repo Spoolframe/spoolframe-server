@@ -346,6 +346,22 @@ pub enum SdkError {
     /// (PX-53). Nothing changed.
     #[error("the picture cannot be read")]
     ImageUnreadable,
+    /// The subtitle downloads of `whose` are used up for today (PX-02):
+    /// the server's account at subtitle site `site` (`opensubtitles`,
+    /// `subdl`, as `SubtitleResult::source`), or the user's own daily
+    /// limit (no `site`). `resets_at` (Unix seconds) is when more may be
+    /// downloaded, when the server knows. Nothing was downloaded;
+    /// searching still works.
+    #[error("no subtitle downloads left today")]
+    QuotaExhausted {
+        whose: crate::types::QuotaOf,
+        site: Option<String>,
+        resets_at: Option<i64>,
+    },
+    /// The server has no subtitle site set up (PX-02): hide "Find
+    /// subtitles". Nothing was asked of any site.
+    #[error("this server has no subtitle source set up")]
+    NoSubtitleSource,
     /// Pairing this device with a portable identity, or a phone with a
     /// device, did not happen (P7-03); [`PairingError`] says why.
     #[error(transparent)]
@@ -427,6 +443,16 @@ impl SdkError {
                 max_pixels,
             },
             ServerError::ImageUnreadable => SdkError::ImageUnreadable,
+            ServerError::QuotaExhausted {
+                whose,
+                resets_at,
+                site,
+            } => SdkError::QuotaExhausted {
+                whose,
+                site,
+                resets_at,
+            },
+            ServerError::NoSubtitleSource => SdkError::NoSubtitleSource,
             other => SdkError::Server(other.to_string()),
         }
     }
@@ -435,6 +461,45 @@ impl SdkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PX-02's refusals reach an app with their fields, not as a
+    /// server message to match on.
+    #[test]
+    fn a_used_up_subtitle_quota_keeps_whose_where_and_when() {
+        use crate::types::QuotaOf;
+        assert_eq!(
+            SdkError::from_server(ServerError::QuotaExhausted {
+                whose: QuotaOf::Account,
+                resets_at: Some(1_760_000_000),
+                site: Some("subdl".into()),
+            }),
+            SdkError::QuotaExhausted {
+                whose: QuotaOf::Account,
+                site: Some("subdl".into()),
+                resets_at: Some(1_760_000_000),
+            }
+        );
+        assert_eq!(
+            SdkError::from_server(ServerError::QuotaExhausted {
+                whose: QuotaOf::User,
+                resets_at: None,
+                site: None,
+            }),
+            SdkError::QuotaExhausted {
+                whose: QuotaOf::User,
+                site: None,
+                resets_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_server_without_a_subtitle_site_is_told_apart() {
+        assert_eq!(
+            SdkError::from_server(ServerError::NoSubtitleSource),
+            SdkError::NoSubtitleSource
+        );
+    }
 
     #[test]
     fn a_session_signed_in_too_long_ago_is_told_apart() {

@@ -8,6 +8,18 @@
   relative path, was read from the link's own directory, and every play
   with it failed at its first segment ("Error opening input files").
 
+- SDK: a used-up subtitle quota and a server without a subtitle site
+  are errors of their own, `SdkError::QuotaExhausted { whose, site,
+  resets_at }` (`whose` the protocol's `QuotaOf`; `site` the site's id,
+  `None` for the user's own daily limit; `resets_at` Unix seconds, when
+  known) and `SdkError::NoSubtitleSource`. In 0.12.0 both reached an
+  app as `SdkError::Server(message)`, its fields lost, and an app told
+  them apart by the message's words: match the variants instead. An
+  app that matches `SdkError` exhaustively needs the two arms. Every
+  other error the protocol has for an app already had its variant;
+  only the connection's own (`Malformed`, `HandshakeRequired`,
+  `ReplyTooLarge`, `Unsupported`) and `Internal` are still `Server`.
+
 ## 0.12.0 (2026-10-16)
 
 - SDK HLS bridge: a playback planned again since its URL was served
