@@ -72,3 +72,21 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     app::launch();
 }
+
+#[cfg(test)]
+mod tests {
+    /// The page dx builds the bundle's `index.html` from (the crate's
+    /// `index.html`): dx's own template, with what keeps a browser's
+    /// night mode off the already-dark pages, in the page itself, where
+    /// Dark Reader (Firefox for iOS's Night Mode) reads it as it loads.
+    #[test]
+    fn the_page_tells_night_modes_it_is_dark_already() {
+        let page = include_str!("../index.html");
+        let head = &page[..page.find("</head>").expect("a head")];
+        assert!(head.contains(r#"<meta name="color-scheme" content="light dark">"#));
+        assert!(head.contains(r#"<meta name="darkreader-lock">"#));
+        // dx's template otherwise: its title, and the app's root.
+        assert!(head.contains("<title>{app_title}</title>"));
+        assert!(page.contains(r#"<div id="main"></div>"#));
+    }
+}

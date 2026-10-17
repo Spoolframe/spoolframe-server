@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The web UI's pages say they are dark already (`color-scheme` and
+  `darkreader-lock` in the page itself), so a browser's night mode
+  leaves them as drawn: Firefox for iOS's Night Mode (Dark Reader)
+  repainted them.
+
 - A show's playlists are among its seasons, with their covers. An
   item's list of the playlists holding it now carries each one's
   picture, `PlaylistRef::artwork` (an uploaded cover, else its mosaic,

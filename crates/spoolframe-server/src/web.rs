@@ -117,3 +117,33 @@ mod tests {
         assert!(!web.takes_upgrade("/jsonrpc"));
     }
 }
+
+#[cfg(all(test, feature = "embed-web"))]
+mod embedded_tests {
+    use super::*;
+
+    /// The page served at `/` and at any route is the bundle's
+    /// `index.html`, which keeps a browser's night mode (Dark Reader,
+    /// Firefox for iOS) off the already-dark pages: in the page itself,
+    /// as Dark Reader decides as it loads.
+    #[tokio::test]
+    async fn the_served_page_tells_night_modes_it_is_dark_already() {
+        for path in ["/", "/admin"] {
+            let response = bundled(path);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let page = String::from_utf8(body.to_vec()).unwrap();
+            let head = &page[..page.find("</head>").expect("a head")];
+            assert!(
+                head.contains(r#"<meta name="color-scheme" content="light dark">"#),
+                "{path}: {head}"
+            );
+            assert!(
+                head.contains(r#"<meta name="darkreader-lock">"#),
+                "{path}: {head}"
+            );
+            assert!(head.contains("<title>Spoolframe</title>"), "{path}: {head}");
+        }
+    }
+}
