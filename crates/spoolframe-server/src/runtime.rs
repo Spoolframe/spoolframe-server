@@ -283,7 +283,6 @@ impl RuntimeSettings {
                 apply,
                 restart_pending: false,
                 running: None,
-                deprecated: None,
             };
         }
         let value = tree::get(merged, setting.key);
@@ -301,7 +300,6 @@ impl RuntimeSettings {
                 apply,
                 restart_pending: false,
                 running: None,
-                deprecated: None,
             };
         }
         let running = tree::get(&self.started, setting.key);
@@ -322,9 +320,6 @@ impl RuntimeSettings {
             running: restart_pending
                 .then(|| running.map(|v| layers::shown(setting.key, v).to_json()))
                 .flatten(),
-            deprecated: layers::DEPRECATED
-                .contains(&setting.key)
-                .then(|| layers.gpus_instead()),
         }
     }
 
@@ -364,14 +359,6 @@ impl RuntimeSettings {
         };
         self.change(key, by, |layers| Ok(layers.with_set(key, value)?))?;
         tracing::info!(by, key, value = shown, "setting changed");
-        if layers::DEPRECATED.contains(&key) {
-            tracing::warn!(
-                by,
-                key,
-                "{key} is deprecated: use {}",
-                self.layers().gpus_instead()
-            );
-        }
         Ok(self.entry_for(key).expect("a known setting"))
     }
 

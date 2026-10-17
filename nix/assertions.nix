@@ -226,6 +226,18 @@ in
     == ''
       services.spoolframe.transcode.hardware and vaapiDevice are deprecated and will be removed:
       use services.spoolframe.transcode.gpus = [ { api = "nvenc"; pick = "all"; } { api = "vaapi"; device = "/dev/dri/renderD128"; } ];'');
+  assert check "the old setting is written as the gpus it means" (let
+    text = rendered {
+      transcode = {
+        hardware = ["nvenc" "vaapi"];
+        vaapiDevice = "/dev/dri/renderD128";
+      };
+    };
+  in
+    lib.hasInfix ''gpus = [{"api":"nvenc","pick":"all"},{"api":"vaapi","device":"/dev/dri/renderD128"}];'' text
+    && !lib.hasInfix "hardware =" text
+    && !lib.hasInfix "vaapi_device =" text);
+  assert check "hardware none is written as no GPU" (lib.hasInfix "gpus = [];" (rendered {transcode.hardware = "none";}));
   assert check "the old setting keeps its one render node" (deviceAllow {
       hardware = ["vaapi"];
       vaapiDevice = "/dev/dri/renderD128";

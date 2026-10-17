@@ -354,7 +354,7 @@ pub enum Share {
 /// The one GPU family `spec`'s video encode runs on (PGPU-02), and so its
 /// encoder and decoder: of the families that encode the output codec,
 /// the one that does the most of the job ([`Share`]), the first in
-/// `transcode.hardware`'s order among equals (detection lists each
+/// detection's family order among equals (detection lists each
 /// codec's encoders in that order). With none, software, decoding on the
 /// first family that decodes the source (detection lists each sample's
 /// decoders in that order). A family never decodes for another's
@@ -4220,7 +4220,7 @@ mod tests {
     // PGPU-02: one GPU per job, the one that does the most of it.
 
     /// A host with a GTX 1060 and an AMD GPU, as detection finds it for
-    /// `transcode.hardware = ["nvenc", "vaapi"]`: NVENC encodes H.264 and
+    /// NVENC then VA-API (`HardwarePolicy::Ordered`): NVENC encodes H.264 and
     /// HEVC, VA-API H.264, HEVC and AV1; NVDEC decodes H.264, 8- and
     /// 10-bit HEVC and VP9, no AV1; VA-API decodes H.264, HEVC and AV1.
     /// Each codec's encoders, and each sample's decoders, in the policy's
@@ -4527,7 +4527,7 @@ mod tests {
         assert_eq!(picked(&spec), (s("libsvtav1"), Some(Hardware::Vaapi)));
     }
 
-    /// `transcode.hardware = "none"`: detection finds software encoders
+    /// `HardwarePolicy::None`: detection finds software encoders
     /// and no GPU decoders, so all of it is software.
     #[test]
     fn hardware_none_is_software_throughout() {

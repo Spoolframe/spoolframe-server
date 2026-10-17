@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use spoolframe_admin_api::SyncDirection;
-use spoolframe_media::encoders::{Hardware, HardwarePolicy, ToneMapSetting, TranscodeSettings};
+use spoolframe_media::encoders::{Hardware, ToneMapSetting, TranscodeSettings};
 use spoolframe_media::gpus::{GpuEntry, Pick, Which};
 use spoolframe_media::sandbox::Mode as SandboxMode;
 use spoolframe_plex::{PathMap, PathMapping};
@@ -1138,26 +1138,9 @@ pub struct TranscodeConfig {
     /// `best`, `dgpu`, `igpu`; `all` if left out) or `device` (a CUDA
     /// index for NVIDIA, a render node for VA-API and QSV), and
     /// `max_jobs`, GPU video encodes at once on each of its cards. Left
-    /// out, every card of every API, NVIDIA first. Not with `hardware`.
+    /// out, every card of every API, NVIDIA first.
     #[ucl(default)]
     pub gpus: Option<Vec<GpuConfig>>,
-    /// Deprecated (PGPU-05): `gpus` says more. Still read, as the `gpus`
-    /// it means: each family every card of it, VA-API on `vaapi_device`
-    /// alone when that is set.
-    ///
-    /// `"auto"` (every family that works), `"none"` for software only, or
-    /// a list of families in order of preference: `["nvenc", "vaapi"]`.
-    /// Each video encode runs on one family (PGPU-02): the one that does
-    /// the most of it, decoding the source, then running its filters
-    /// (tone map, picture burn-in, scale) on the GPU too, the order
-    /// deciding between equals. So on a GTX 1060 beside an AMD GPU, an
-    /// AV1 film, which Pascal cannot decode, encodes on the AMD one,
-    /// and a film both decode on NVIDIA unless the AMD GPU also runs its
-    /// filters; a codec neither encodes, in software.
-    #[ucl(default, map = "hardware_setting")]
-    pub hardware: Option<HardwareSetting>,
-    #[ucl(default)]
-    pub vaapi_device: Option<PathBuf>,
     /// The encode budget, in software video encodes; 2 if left out. A
     /// GPU video encode weighs half of one, or a quarter when decoded and
     /// scaled on the GPU too; an audio-only encode a quarter; a remux
@@ -1318,54 +1301,6 @@ impl GpuConfig {
     }
 }
 
-/// `transcode.hardware` as written: a word, or a list of families.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HardwareSetting {
-    /// `"auto"`, `"none"`, or one family alone.
-    Word(String),
-    List(Vec<String>),
-}
-
-fn hardware_setting(
-    object: uclicious::ObjectRef,
-) -> Result<Option<HardwareSetting>, uclicious::ObjectError> {
-    if object.is_array() {
-        let list: Vec<String> = uclicious::FromObject::try_from(object)?;
-        return Ok(Some(HardwareSetting::List(list)));
-    }
-    let word: String = uclicious::FromObject::try_from(object)?;
-    Ok(Some(HardwareSetting::Word(word)))
-}
-
-/// `transcode.hardware`'s families, in order; each at most once.
-/// `transcode.hardware`'s key, for its messages.
-const HARDWARE: &str = "transcode.hardware";
-
-fn hardware_order(names: &[&str]) -> Result<HardwarePolicy, ConfigError> {
-    let invalid = |message: String| ConfigError::Invalid {
-        key: HARDWARE,
-        message,
-    };
-    let mut order = Vec::new();
-    for &name in names {
-        let family = match name {
-            "vaapi" => Hardware::Vaapi,
-            "nvenc" => Hardware::Nvenc,
-            "qsv" => Hardware::Qsv,
-            other => {
-                return Err(invalid(format!(
-                    "{other:?}: expected \"auto\", \"none\", or a list of vaapi, nvenc and qsv"
-                )));
-            }
-        };
-        if order.contains(&family) {
-            return Err(invalid(format!("{name:?} is listed twice")));
-        }
-        order.push(family);
-    }
-    Ok(HardwarePolicy::Ordered(order))
-}
-
 /// `transcode.video_codecs`' key, for its messages.
 const VIDEO_CODECS: &str = "transcode.video_codecs";
 
@@ -1480,60 +1415,31 @@ impl TranscodeConfig {
         })
     }
 
-    /// The GPUs to use (PGPU-05): `gpus`, or what the deprecated
-    /// `hardware` and `vaapi_device` mean, or every card of every API.
-    /// Both is an error: which would win is a guess.
+    /// The GPUs to use (PGPU-05): `gpus`, or every card of every API.
     pub fn gpus(&self) -> Result<Vec<GpuEntry>, ConfigError> {
-        let old = self.hardware.is_some() || self.vaapi_device.is_some();
         match &self.gpus {
-            Some(_) if old => Err(ConfigError::Invalid {
-                key: GPUS,
-                message: "set gpus, or the older hardware and vaapi_device, not both: gpus \
-                          says everything they did"
-                    .into(),
-            }),
             Some(entries) => entries
                 .iter()
                 .enumerate()
                 .map(|(n, entry)| entry.entry(n))
                 .collect(),
-            None => {
-                // Only `hardware` is read here; the experimental switches
-                // do not change which cards an entry takes.
-                let settings = self.settings(&ExperimentalConfig::default())?;
-                Ok(GpuEntry::from_hardware(
-                    &settings.hardware,
-                    self.vaapi_device.as_deref(),
-                ))
-            }
+            None => Ok(GpuEntry::defaults()),
         }
     }
 
-    /// How encoders are detected; `experimental` says whether
-    /// libplacebo tries ffmpeg's Vulkan device on AMD.
+    /// What encoder detection starts from: the tone map, and whether
+    /// libplacebo tries ffmpeg's Vulkan device on AMD. Each card's test
+    /// sets its own API and node over it ([`Card::settings`]).
+    ///
+    /// [`Card::settings`]: spoolframe_media::gpus::Card::settings
     pub fn settings(
         &self,
         experimental: &ExperimentalConfig,
     ) -> Result<TranscodeSettings, ConfigError> {
-        const EXAMPLE: &str = r#"["nvenc", "vaapi"]"#;
-        let hardware = match &self.hardware {
-            None => HardwarePolicy::Auto,
-            Some(HardwareSetting::Word(word)) => match word.trim() {
-                "auto" => HardwarePolicy::Auto,
-                "none" => HardwarePolicy::None,
-                // One family alone; the old comma string is refused here.
-                _ => hardware_order(&one_each(HARDWARE, std::slice::from_ref(word), EXAMPLE)?)?,
-            },
-            Some(HardwareSetting::List(list)) => {
-                hardware_order(&one_each(HARDWARE, list, EXAMPLE)?)?
-            }
-        };
-        let defaults = TranscodeSettings::default();
         Ok(TranscodeSettings {
-            hardware,
-            vaapi_device: self.vaapi_device.clone().unwrap_or(defaults.vaapi_device),
             tone_map: self.tone_map()?,
             libplacebo_shared_on_amd: experimental.libplacebo_shared_on_amd(),
+            ..TranscodeSettings::default()
         })
     }
 }
@@ -3689,58 +3595,6 @@ mod tests {
         assert_eq!((limits.max_remux, limits.max_gpu_jobs), (8, 1));
     }
 
-    #[test]
-    fn a_hardware_family_is_read_and_a_bad_one_refused() {
-        let config = plex(
-            r#"plex { url = "http://nas:32400"; } transcode { hardware = "none"; vaapi_device = "/dev/dri/renderD129"; }"#,
-        )
-        .unwrap();
-        let settings = config.transcode.settings(&config.experimental).unwrap();
-        assert_eq!(settings.hardware, HardwarePolicy::None);
-        assert_eq!(settings.vaapi_device, PathBuf::from("/dev/dri/renderD129"));
-        let ordered = plex(
-            r#"plex { url = "http://nas:32400"; } transcode { hardware = ["nvenc", "vaapi"]; }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            ordered
-                .transcode
-                .settings(&ordered.experimental)
-                .unwrap()
-                .hardware,
-            HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi])
-        );
-        // One family alone may be a plain string.
-        let one = plex(r#"plex { url = "http://nas:32400"; } transcode { hardware = "vaapi"; }"#)
-            .unwrap();
-        assert_eq!(
-            one.transcode.settings(&one.experimental).unwrap().hardware,
-            HardwarePolicy::Ordered(vec![Hardware::Vaapi])
-        );
-        for refused in [
-            r#""cuda""#,
-            r#"["cuda"]"#,
-            r#"["auto"]"#,
-            r#"["vaapi", "vaapi"]"#,
-            // The comma-separated string it was before it took a list.
-            r#""nvenc, vaapi""#,
-        ] {
-            let config = plex(&format!(
-                r#"plex {{ url = "http://nas:32400"; }} transcode {{ hardware = {refused}; }}"#
-            ));
-            assert!(
-                matches!(
-                    config,
-                    Err(ConfigError::Invalid {
-                        key: "transcode.hardware",
-                        ..
-                    })
-                ),
-                "{refused}: {config:?}"
-            );
-        }
-    }
-
     /// PGPU-05: `transcode.gpus` as written, each entry an API and a
     /// pick, a device, or neither (every card).
     #[test]
@@ -3810,60 +3664,6 @@ mod tests {
     fn gpus_default_to_every_card_of_every_api() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert_eq!(config.transcode.gpus().unwrap(), GpuEntry::defaults());
-    }
-
-    /// The deprecated `hardware` and `vaapi_device` keep working, as the
-    /// `gpus` they mean.
-    #[test]
-    fn the_old_hardware_setting_is_read_as_gpus() {
-        let gpus = |transcode: &str| {
-            plex(&format!(
-                r#"plex {{ url = "http://nas:32400"; }} transcode {{ {transcode} }}"#
-            ))
-            .unwrap()
-            .transcode
-            .gpus()
-            .unwrap()
-        };
-        assert_eq!(
-            gpus(r#"hardware = ["nvenc", "vaapi"];"#),
-            [
-                GpuEntry::all(Hardware::Nvenc),
-                GpuEntry::all(Hardware::Vaapi)
-            ]
-        );
-        assert_eq!(
-            gpus(r#"hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD129";"#),
-            [
-                GpuEntry::all(Hardware::Nvenc),
-                GpuEntry {
-                    api: Hardware::Vaapi,
-                    which: Which::Device("/dev/dri/renderD129".into()),
-                    max_jobs: None,
-                },
-            ]
-        );
-        assert!(gpus(r#"hardware = "none";"#).is_empty());
-        assert_eq!(gpus(r#"hardware = "auto";"#), GpuEntry::defaults());
-    }
-
-    #[test]
-    fn gpus_and_hardware_together_are_refused() {
-        for old in [
-            r#"hardware = ["vaapi"];"#,
-            r#"vaapi_device = "/dev/dri/renderD128";"#,
-        ] {
-            let config = plex(&format!(
-                r#"plex {{ url = "http://nas:32400"; }} transcode {{ gpus = [ {{ api = "vaapi"; }} ]; {old} }}"#
-            ));
-            assert!(
-                matches!(
-                    &config,
-                    Err(ConfigError::Invalid { key: "transcode.gpus", message }) if message.contains("not both")
-                ),
-                "{old}: {config:?}"
-            );
-        }
     }
 
     #[test]

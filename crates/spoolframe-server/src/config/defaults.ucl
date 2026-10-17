@@ -364,13 +364,6 @@ transcode {
   #   { api = "qsv"; pick = "all"; },
   # ];
   # [] is no GPU: software only.
-  #
-  # Deprecated, and not with gpus: hardware ("auto", "none", or families
-  # in order: ["nvenc", "vaapi"]) and vaapi_device (VA-API's one render
-  # node) are read as the gpus they mean: each family every card of it,
-  # VA-API on vaapi_device alone when that is set.
-  # hardware = "auto";
-  # vaapi_device = "/dev/dri/renderD128";
   # The encode budget: how many software video encodes (libx264) run at
   # once. Lighter conversions take less of it: a GPU video encode half of
   # one, or a quarter when it is decoded and scaled on the GPU too with

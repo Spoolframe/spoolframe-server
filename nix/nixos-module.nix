@@ -8,9 +8,10 @@
   cfg = config.services.spoolframe;
 
   # The GPUs the server may use (PGPU-05): transcode.gpus, or what the
-  # deprecated hardware and vaapiDevice mean, as the server reads them
-  # (each family every card of it, VA-API and QSV on vaapiDevice alone
-  # when that is set), or every card of every API.
+  # deprecated hardware and vaapiDevice meant (each family every card of
+  # it, VA-API and QSV on vaapiDevice alone when that is set), or every
+  # card of every API. The server stopped reading hardware and
+  # vaapi_device in 0.12.0, so this module writes them as gpus.
   oldFamilies =
     if cfg.transcode.hardware == null || cfg.transcode.hardware == "auto"
     then ["nvenc" "vaapi" "qsv"]
@@ -176,9 +177,7 @@
       ${lib.optionalString cfg.admin.notProxied "not_proxied = true;"}
     }
     transcode {
-      ${lib.optionalString (cfg.transcode.gpus != null) "gpus = ${quote (map gpuEntry cfg.transcode.gpus)};"}
-      ${lib.optionalString (cfg.transcode.hardware != null) "hardware = ${quote cfg.transcode.hardware};"}
-      ${lib.optionalString (cfg.transcode.vaapiDevice != null) "vaapi_device = ${quote cfg.transcode.vaapiDevice};"}
+      ${lib.optionalString (cfg.transcode.gpus != null || oldSet) "gpus = ${quote (map gpuEntry gpus)};"}
       scratch_dir = "/var/cache/spoolframe/transcode";
       ${lib.optionalString (cfg.transcode.toneMap != null) "tone_map = ${quote cfg.transcode.toneMap};"}
       ${lib.optionalString (cfg.transcode.videoCodecs != null) "video_codecs = [${lib.concatMapStringsSep ", " quote cfg.transcode.videoCodecs}];"}
@@ -778,9 +777,10 @@ in {
         example = ["nvenc" "vaapi"];
         description = ''
           Deprecated, to be removed in a later release: use
-          {option}`services.spoolframe.transcode.gpus`. Still read, as the
-          gpus it means: each family named every card of it, in that
-          order (`auto` every API, `none` none), VA-API and QSV on
+          {option}`services.spoolframe.transcode.gpus`. The server no
+          longer reads it (0.12.0); this module writes the gpus it means:
+          each family named every card of it, in that order (`auto` every
+          API, `none` none), VA-API and QSV on
           {option}`services.spoolframe.transcode.vaapiDevice` alone when
           that is set. Not with gpus.
         '';
@@ -793,7 +793,8 @@ in {
         description = ''
           Deprecated, to be removed in a later release: use a
           {option}`services.spoolframe.transcode.gpus` entry with
-          `device`. The one render node VA-API encodes on. Not with gpus.
+          `device`. The one render node VA-API encodes on, written as
+          the gpus it means. Not with gpus.
         '';
       };
 
@@ -945,7 +946,7 @@ in {
         assertion = cfg.wan == null || cfg.wan.mappedPort == null || !(cfg.wan.mappedPort.publicIp == "lookup" && cfg.wan.mappedPort.lookupVia == null);
         message = ''services.spoolframe.wan.mappedPort.publicIp is "lookup", but wan.mappedPort.lookupVia = null forbids looking the address up: set publicIp to this network's public address, or lookupVia to "wtfismyip".'';
       }
-      # The server refuses both at load (PGPU-05).
+      # Which would win is a guess (PGPU-05).
       {
         assertion = cfg.transcode.gpus == null || !oldSet;
         message = "services.spoolframe.transcode.gpus is set, and so is the deprecated transcode.hardware or vaapiDevice: gpus says everything they did, so set gpus alone.";
@@ -982,7 +983,7 @@ in {
     ];
 
     warnings =
-      # PGPU-05: still read, as the gpus they mean.
+      # PGPU-05: written as the gpus they mean.
       lib.optional oldSet ''
         services.spoolframe.transcode.hardware and vaapiDevice are deprecated and will be removed:
         use services.spoolframe.transcode.gpus = [ ${lib.concatMapStringsSep " " gpuNix oldGpus} ];''

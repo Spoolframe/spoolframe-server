@@ -1,6 +1,5 @@
 //! One GPU per job (PGPU-02), end to end on a host with an NVIDIA and an
-//! AMD GPU: real detection of both under `transcode.hardware = ["nvenc",
-//! "vaapi"]`, where [`placement`] puts each job, and 20 s of it run
+//! AMD GPU: real detection of both, NVENC first then VA-API, where [`placement`] puts each job, and 20 s of it run
 //! confined as the server runs it, with each GPU's peak use while it ran.
 //! Ignored: needs both GPUs. On one (fulcrum's GTX 1060 + Radeon 890M):
 //!

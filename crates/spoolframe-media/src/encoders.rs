@@ -45,7 +45,7 @@ impl Hardware {
         }
     }
 
-    /// Its name in `transcode.hardware` and in ffmpeg's encoder names:
+    /// Its name in `transcode.gpus`' `api` and in ffmpeg's encoder names:
     /// `vaapi`, `nvenc`, `qsv`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -56,8 +56,8 @@ impl Hardware {
     }
 }
 
-/// Which hardware encoders to try, and in which order
-/// (`transcode { hardware = …; }`).
+/// Which hardware encoders to try, and in which order: detection tests
+/// each card with its own API alone (`gpus::Card::settings`).
 ///
 /// Detection lists each codec's working encoders in this order, and the
 /// server runs each video encode on the family that does the most of it
@@ -975,8 +975,8 @@ async fn gpu_filter(
 
 /// Logs a test that failed at debug, with what ffmpeg said last, and
 /// keeps a GPU family's in `failures` for the summary the server logs
-/// after detection (`transcode`): one line per family named in
-/// `transcode.hardware`, rather than a warning per codec it lacks.
+/// after detection (`transcode`): one line per family tested, rather
+/// than a warning per codec it lacks.
 fn failed(
     failures: &mut Vec<FailedTest>,
     hardware: Option<Hardware>,

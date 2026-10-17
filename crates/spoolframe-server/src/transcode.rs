@@ -370,8 +370,8 @@ fn log_missing(entries: &[GpuEntry], missed: &Missing) -> String {
 }
 
 /// A card none of whose encoders works: no encode goes to it. A warning
-/// when the operator asked for its API (entries of their own, as a family
-/// named in `transcode.hardware` was), with the first failed test and
+/// when the operator asked for its API (`transcode.gpus` entries of
+/// their own), with the first failed test and
 /// what ffmpeg said; under the default entries only a line.
 fn log_no_encoder(entries: &[GpuEntry], found: &Found, quiet: bool) {
     let card = &found.card;
@@ -589,7 +589,7 @@ mod tests {
     use std::sync::Arc;
 
     use spoolframe_admin_api::{LogLevel, LogQuery};
-    use spoolframe_media::encoders::{Hardware, HardwarePolicy};
+    use spoolframe_media::encoders::Hardware;
     use spoolframe_media::gpus::{Class, Kind, NvidiaCard, Pick, Which};
     use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -735,19 +735,18 @@ mod tests {
         (ring, transcoding.detected())
     }
 
-    async fn detect_with(name: &str, hardware: HardwarePolicy, script: &str) -> Arc<LogRing> {
-        let entries = GpuEntry::from_hardware(&hardware, None);
+    async fn detect_with(name: &str, entries: Vec<GpuEntry>, script: &str) -> Arc<LogRing> {
         detect_on(name, entries, vec![geforce()], script).await.0
     }
 
-    /// NVENC named in transcode.hardware, its card there, no encoder of it
+    /// NVENC named in transcode.gpus, its card there, no encoder of it
     /// working: one warning, with what its first failed test's ffmpeg
     /// said last.
     #[tokio::test]
     async fn a_named_family_s_failed_test_is_a_warning_with_ffmpeg_s_last_words() {
         let ring = detect_with(
             "spoolframe-transcode-named",
-            HardwarePolicy::Ordered(vec![Hardware::Nvenc]),
+            vec![GpuEntry::all(Hardware::Nvenc)],
             NO_CUDA,
         )
         .await;
@@ -767,7 +766,7 @@ mod tests {
     /// only for debugging: most hosts lack some API.
     #[tokio::test]
     async fn a_default_card_s_failed_test_is_no_warning() {
-        let ring = detect_with("spoolframe-transcode-auto", HardwarePolicy::Auto, NO_CUDA).await;
+        let ring = detect_with("spoolframe-transcode-auto", GpuEntry::defaults(), NO_CUDA).await;
         assert_eq!(lines(&ring, LogLevel::Warn, ""), Vec::<String>::new());
         let debug = about_cuda(&ring, LogLevel::Debug);
         assert_eq!(debug.len(), 1, "{debug:?}");
@@ -786,7 +785,7 @@ mod tests {
     async fn a_named_family_lacking_a_codec_says_so_once_not_as_a_warning() {
         let ring = detect_with(
             "spoolframe-transcode-lacks",
-            HardwarePolicy::Ordered(vec![Hardware::Nvenc]),
+            vec![GpuEntry::all(Hardware::Nvenc)],
             PASCAL,
         )
         .await;
@@ -810,7 +809,7 @@ mod tests {
     async fn a_default_card_lacking_a_codec_says_so_once() {
         let ring = detect_with(
             "spoolframe-transcode-lacks-auto",
-            HardwarePolicy::Auto,
+            GpuEntry::defaults(),
             PASCAL,
         )
         .await;

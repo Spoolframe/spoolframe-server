@@ -862,7 +862,6 @@ mod tests {
             apply: spoolframe_admin_api::SettingApply::Restart,
             restart_pending: false,
             running: None,
-            deprecated: None,
         }
     }
 

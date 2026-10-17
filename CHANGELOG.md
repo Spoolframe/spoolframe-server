@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Breaking (config): `transcode.hardware` and `transcode.vaapi_device`,
+  deprecated since PGPU-05, are no longer read. A config file or
+  runtime layer that still has them loads, with a warning for each,
+  and the runtime layer drops them the next time it is written. Set
+  `transcode.gpus` instead: `hardware = ["nvenc", "vaapi"]` with
+  `vaapi_device = "/dev/dri/renderD128"` is `transcode.gpus = [{ api =
+  "nvenc"; pick = "all"; }, { api = "vaapi"; device =
+  "/dev/dri/renderD128"; }]`. A `vaapi_device` alone is a `{ api =
+  "vaapi"; device = …; }` entry. `hardware = "none"` is `gpus = []`.
+  `"auto"`, or nothing set, is `gpus` left unset. The settings API's
+  `SettingEntry` has no `deprecated` field now, and the web UI's
+  Playback step no longer shows the old choice or its Convert button.
+  The NixOS options `transcode.hardware` and `transcode.vaapiDevice`
+  stay deprecated: the module writes them as the `gpus` they mean.
+
 - HLS: every variant says `CLOSED-CAPTIONS=NONE`, and the SDK's HLS
   bridge adds it to a master with a subtitle menu (an older server's).
   AVPlayer lists CEA-608 captions in a copied video as one more

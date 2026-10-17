@@ -86,51 +86,6 @@ impl GpuEntry {
             .collect()
     }
 
-    /// The entries the old `transcode.hardware` and `vaapi_device` mean:
-    /// each family every card of its API, in the order named, but VA-API
-    /// (and QSV, which goes through VA-API's render node) on
-    /// `vaapi_device` alone when that was set. `auto` is the default list;
-    /// `none` no GPU.
-    pub fn from_hardware(policy: &HardwarePolicy, vaapi_device: Option<&Path>) -> Vec<GpuEntry> {
-        let families = match policy {
-            HardwarePolicy::Auto => GpuEntry::defaults().into_iter().map(|e| e.api).collect(),
-            HardwarePolicy::Ordered(order) => order.clone(),
-            HardwarePolicy::None => Vec::new(),
-        };
-        families
-            .into_iter()
-            .map(|api| match (api, vaapi_device) {
-                (Hardware::Vaapi | Hardware::Qsv, Some(node)) => GpuEntry {
-                    api,
-                    which: Which::Device(node.display().to_string()),
-                    max_jobs: None,
-                },
-                _ => GpuEntry::all(api),
-            })
-            .collect()
-    }
-
-    /// The entry as `transcode.gpus` writes it: `{ api = "vaapi"; pick =
-    /// "all"; }`.
-    pub fn ucl(&self) -> String {
-        let which = match &self.which {
-            Which::Pick(pick) => format!("pick = \"{}\";", pick.as_str()),
-            Which::Device(device) => format!("device = {device:?};"),
-        };
-        let max = self
-            .max_jobs
-            .map(|n| format!(" max_jobs = {n};"))
-            .unwrap_or_default();
-        format!("{{ api = \"{}\"; {which}{max} }}", self.api.as_str())
-    }
-
-    /// `entries` as `transcode.gpus = …` takes them: what to write in
-    /// place of the deprecated `hardware` and `vaapi_device`.
-    pub fn ucl_list(entries: &[GpuEntry]) -> String {
-        let each: Vec<String> = entries.iter().map(GpuEntry::ucl).collect();
-        format!("[{}]", each.join(", "))
-    }
-
     /// For the log: `vaapi pick=dgpu`, `nvenc device=1 max_jobs=2`.
     pub fn describe(&self) -> String {
         let mut text = match &self.which {
@@ -943,55 +898,6 @@ mod tests {
     }
 
     #[test]
-    fn a_named_family_is_every_card_of_it_in_the_order_named() {
-        let entries = GpuEntry::from_hardware(
-            &HardwarePolicy::Ordered(vec![Hardware::Vaapi, Hardware::Nvenc]),
-            None,
-        );
-        assert_eq!(
-            entries,
-            [
-                GpuEntry::all(Hardware::Vaapi),
-                GpuEntry::all(Hardware::Nvenc)
-            ]
-        );
-    }
-
-    #[test]
-    fn vaapi_device_is_the_one_vaapi_card() {
-        let node = Path::new("/dev/dri/renderD129");
-        let entries = GpuEntry::from_hardware(
-            &HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi]),
-            Some(node),
-        );
-        assert_eq!(entries[0], GpuEntry::all(Hardware::Nvenc));
-        assert_eq!(
-            entries[1].which,
-            Which::Device("/dev/dri/renderD129".into())
-        );
-        // `auto` with a render node set: that node for VA-API and QSV.
-        let auto = GpuEntry::from_hardware(&HardwarePolicy::Auto, Some(node));
-        let devices: Vec<&Which> = auto.iter().map(|e| &e.which).collect();
-        assert_eq!(
-            devices,
-            [
-                &Which::Pick(Pick::All),
-                &Which::Device("/dev/dri/renderD129".into()),
-                &Which::Device("/dev/dri/renderD129".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn none_is_no_gpu_and_auto_the_default() {
-        assert!(GpuEntry::from_hardware(&HardwarePolicy::None, None).is_empty());
-        assert_eq!(
-            GpuEntry::from_hardware(&HardwarePolicy::Auto, None),
-            GpuEntry::defaults()
-        );
-    }
-
-    #[test]
     fn an_entry_describes_itself_as_written() {
         let entry = GpuEntry {
             api: Hardware::Nvenc,
@@ -1006,27 +912,6 @@ mod tests {
             }
             .describe(),
             "vaapi pick=dgpu"
-        );
-    }
-
-    #[test]
-    fn entries_are_written_as_gpus_takes_them() {
-        let entries = GpuEntry::from_hardware(
-            &HardwarePolicy::Ordered(vec![Hardware::Nvenc, Hardware::Vaapi]),
-            Some(Path::new("/dev/dri/renderD128")),
-        );
-        assert_eq!(
-            GpuEntry::ucl_list(&entries),
-            r#"[{ api = "nvenc"; pick = "all"; }, { api = "vaapi"; device = "/dev/dri/renderD128"; }]"#
-        );
-        assert_eq!(GpuEntry::ucl_list(&[]), "[]");
-        let limited = GpuEntry {
-            max_jobs: Some(1),
-            ..GpuEntry::all(Hardware::Qsv)
-        };
-        assert_eq!(
-            limited.ucl(),
-            r#"{ api = "qsv"; pick = "all"; max_jobs = 1; }"#
         );
     }
 

@@ -118,7 +118,6 @@ mod tests {
             apply: SettingApply::Restart,
             restart_pending,
             running: None,
-            deprecated: None,
         }
     }
 

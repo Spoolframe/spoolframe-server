@@ -126,8 +126,6 @@ pub const SETTINGS: &[Setting] = &[
     restart("media.tesseract"),
     restart("media.sandbox"),
     restart("transcode.gpus"),
-    restart("transcode.hardware"),
-    restart("transcode.vaapi_device"),
     live("transcode.max_jobs"),
     live("transcode.max_remux"),
     live("transcode.max_gpu_jobs"),

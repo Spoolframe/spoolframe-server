@@ -84,43 +84,35 @@ pub fn saved_before(at: Step) -> String {
     }
 }
 
-/// `transcode.hardware`, as the Playback step offers it.
+/// Which GPUs `transcode.gpus` says to use, as the Done card sums it
+/// up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hardware {
+    /// Not set: every card of every API.
     Auto,
+    /// `[]`: no GPU.
     Software,
-    /// Families in order, as typed: `nvenc, vaapi`.
+    /// The entries' APIs in order, each once: `nvenc, vaapi`.
     Ordered(String),
 }
 
 impl Hardware {
-    /// From the setting: `"auto"`, `"none"`, or a list of families (one
-    /// family alone may be a string). Nothing set is auto.
-    pub fn from_setting(value: Option<&serde_json::Value>) -> Self {
+    /// From `transcode.gpus`: nothing set is every card, an empty list
+    /// none, else its APIs in order.
+    pub fn from_gpus(value: Option<&serde_json::Value>) -> Self {
         use serde_json::Value;
         match value {
-            None | Some(Value::Null) => Hardware::Auto,
-            Some(Value::String(word)) => match word.trim() {
-                "auto" | "" => Hardware::Auto,
-                "none" => Hardware::Software,
-                family => Hardware::Ordered(family.to_owned()),
-            },
-            Some(Value::Array(list)) => Hardware::Ordered(
-                list.iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
-            Some(_) => Hardware::Auto,
-        }
-    }
-
-    /// The setting: a word, or the typed order as a list.
-    pub fn setting(&self) -> serde_json::Value {
-        match self {
-            Hardware::Auto => "auto".into(),
-            Hardware::Software => "none".into(),
-            Hardware::Ordered(list) => crate::logic::entries(list).into(),
+            Some(Value::Array(list)) if list.is_empty() => Hardware::Software,
+            Some(Value::Array(list)) => {
+                let mut apis: Vec<&str> = Vec::new();
+                for api in list.iter().filter_map(|e| e.get("api")?.as_str()) {
+                    if !apis.contains(&api) {
+                        apis.push(api);
+                    }
+                }
+                Hardware::Ordered(apis.join(", "))
+            }
+            _ => Hardware::Auto,
         }
     }
 }
@@ -783,38 +775,6 @@ impl Default for GpuRow {
     }
 }
 
-/// The `transcode.gpus` rows the deprecated `transcode.hardware` and
-/// `vaapi_device` mean, as the server reads them: each family every card
-/// of it, VA-API (and QSV) on `vaapi_device` alone when that is set;
-/// `auto` (or nothing) every API, NVIDIA first; `none` no row at all.
-pub fn gpus_from_hardware(
-    hardware: Option<&serde_json::Value>,
-    vaapi_device: Option<&serde_json::Value>,
-) -> Vec<GpuRow> {
-    let families: Vec<String> = match Hardware::from_setting(hardware) {
-        Hardware::Auto => GPU_APIS.iter().map(|(api, _)| (*api).to_owned()).collect(),
-        Hardware::Software => Vec::new(),
-        Hardware::Ordered(list) => crate::logic::entries(&list),
-    };
-    let node = vaapi_device
-        .and_then(serde_json::Value::as_str)
-        .filter(|n| !n.trim().is_empty());
-    families
-        .into_iter()
-        .map(|api| {
-            let mut row = GpuRow {
-                api,
-                ..GpuRow::new()
-            };
-            if let ("vaapi" | "qsv", Some(node)) = (row.api.as_str(), node) {
-                row.pick = "device".into();
-                row.device = node.to_owned();
-            }
-            row
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,26 +837,6 @@ mod tests {
             ..GpuRow::new()
         };
         assert!(GpuRow::setting(&[zero]).is_err());
-    }
-
-    /// What Convert writes: the server's own reading of the old setting.
-    #[test]
-    fn the_old_hardware_setting_converts_as_the_server_reads_it() {
-        let rows = gpus_from_hardware(
-            Some(&json!(["nvenc", "vaapi"])),
-            Some(&json!("/dev/dri/renderD129")),
-        );
-        assert_eq!(
-            GpuRow::setting(&rows).unwrap(),
-            json!([
-                { "api": "nvenc", "pick": "all" },
-                { "api": "vaapi", "device": "/dev/dri/renderD129" },
-            ])
-        );
-        assert!(gpus_from_hardware(Some(&json!("none")), None).is_empty());
-        let auto = gpus_from_hardware(Some(&json!("auto")), None);
-        let apis: Vec<&str> = auto.iter().map(|r| r.api.as_str()).collect();
-        assert_eq!(apis, ["nvenc", "vaapi", "qsv"]);
     }
 
     #[test]
@@ -1056,20 +996,20 @@ mod tests {
         assert_eq!(STEPS.len(), 7);
     }
 
+    /// The Done card reads `transcode.gpus` as the server does: unset
+    /// every card, `[]` none, else its APIs in order.
     #[test]
-    fn hardware_goes_both_ways() {
-        for (setting, choice) in [
-            (json!("auto"), Hardware::Auto),
-            (json!("none"), Hardware::Software),
-            (
-                json!(["nvenc", "vaapi"]),
-                Hardware::Ordered("nvenc, vaapi".into()),
-            ),
-        ] {
-            assert_eq!(Hardware::from_setting(Some(&setting)), choice);
-            assert_eq!(choice.setting(), setting);
-        }
-        assert_eq!(Hardware::from_setting(None), Hardware::Auto);
+    fn hardware_is_read_from_the_gpus() {
+        assert_eq!(Hardware::from_gpus(None), Hardware::Auto);
+        assert_eq!(Hardware::from_gpus(Some(&json!([]))), Hardware::Software);
+        assert_eq!(
+            Hardware::from_gpus(Some(&json!([
+                { "api": "nvenc", "pick": "all" },
+                { "api": "vaapi", "device": "/dev/dri/renderD128" },
+                { "api": "nvenc", "device": 1 },
+            ]))),
+            Hardware::Ordered("nvenc, vaapi".into())
+        );
     }
 
     #[test]

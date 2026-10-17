@@ -81,17 +81,14 @@ pub fn config_warnings(config: &ServerConfig) {
 }
 
 /// What the layers earn, logged at start and on each reload: the
-/// runtime settings a locked file overrides, and each deprecated key a
-/// layer sets (PGPU-05: still read, as the `gpus` they mean).
+/// runtime settings a locked file overrides, and each retired key a
+/// layer still has.
 pub fn shadowed_warnings(layers: &Layers) {
     for key in layers.shadowed() {
         tracing::warn!(
             key,
             "the locked config file sets this; the runtime settings' value is not used"
         );
-    }
-    for deprecated in layers.deprecations() {
-        tracing::warn!("{deprecated}");
     }
     for retired in layers.retired() {
         tracing::warn!("{retired}");
@@ -418,15 +415,15 @@ mod tests {
         );
     }
 
-    /// PGPU-05's deprecated keys are warned of again on each reload, as
-    /// at start, through the same hook: once a reload.
+    /// A retired key (PGPU-05's `transcode.hardware`) is warned of again
+    /// on each reload, as at start, through the same hook: once a reload.
     #[tokio::test]
-    async fn a_deprecated_key_is_warned_of_on_each_reload() {
+    async fn a_retired_gpu_key_is_warned_of_on_each_reload() {
         use crate::logs::{LogRing, RingLayer};
         use spoolframe_admin_api::{LogLevel, LogQuery};
         use tracing_subscriber::layer::SubscriberExt as _;
         let (settings, _dir, _file) = started(
-            "spoolframe-reload-deprecated",
+            "spoolframe-reload-retired",
             r#"transcode { hardware = "auto"; }"#,
         )
         .await;
@@ -437,7 +434,7 @@ mod tests {
         let warned = || {
             ring.page(&LogQuery {
                 level: Some(LogLevel::Warn),
-                text: Some("transcode.hardware is deprecated".into()),
+                text: Some("transcode.hardware is no longer read".into()),
                 ..LogQuery::default()
             })
             .lines

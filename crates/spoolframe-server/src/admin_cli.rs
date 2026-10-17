@@ -1224,9 +1224,6 @@ pub async fn config_change(listen: SocketAddr, key: &str, value: Option<&str>) -
     if entry.restart_pending {
         println!("applies after a restart");
     }
-    if let Some(instead) = &entry.deprecated {
-        println!("{} is deprecated: use {instead}", entry.key);
-    }
     Ok(())
 }
 

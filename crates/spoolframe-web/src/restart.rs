@@ -79,7 +79,6 @@ mod tests {
             apply,
             restart_pending,
             running: None,
-            deprecated: None,
         }
     }
 

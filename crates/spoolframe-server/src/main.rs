@@ -603,7 +603,7 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
         config = ?locations.config,
         "config loaded"
     );
-    // The locked file's shadows and the deprecated keys (PGPU-05), as a
+    // The locked file's shadows and the retired keys, as a
     // reload logs them again.
     reload::shadowed_warnings(&layers);
 

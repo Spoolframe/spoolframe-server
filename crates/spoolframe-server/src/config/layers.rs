@@ -122,12 +122,14 @@ pub enum Retired {
 /// Settings retired, taken out of every layer as it is read: never
 /// expanded (an `${SF_ENV_…}` whose variable is gone must not stop the
 /// server), never shown, and gone from the runtime layer the next time it
-/// is written. The server warns of each at start. (PGPU-05's
-/// [`DEPRECATED`] keys are still read as they are, so they are not here.)
-// compat(PX-02): both were settings in 0.12.0's prereleases only;
-// Fulcrum's runtime layer has them. Drop the entries once no runtime
-// layer from those prereleases is left.
-pub const RETIRED: [(&str, Retired); 2] = [
+/// is written. The server warns of each at start.
+// compat(PX-02): the opensubtitles keys were settings in 0.12.0's
+// prereleases only; Fulcrum's runtime layer has them. Drop those entries
+// once no runtime layer from those prereleases is left.
+// compat(PGPU-05): transcode.hardware and vaapi_device were released
+// settings (0.x), deprecated for transcode.gpus and dropped in 0.12.0.
+// Keep them here while layers written before 0.12.0 may be read.
+pub const RETIRED: [(&str, Retired); 4] = [
     (
         "opensubtitles.api_key",
         Retired::Dropped("the built-in key is used"),
@@ -135,6 +137,11 @@ pub const RETIRED: [(&str, Retired); 2] = [
     (
         "opensubtitles.daily_limit_per_user",
         Retired::Renamed("subtitles.daily_limit_per_user"),
+    ),
+    ("transcode.hardware", Retired::Dropped("use transcode.gpus")),
+    (
+        "transcode.vaapi_device",
+        Retired::Dropped("use transcode.gpus"),
     ),
 ];
 
@@ -693,37 +700,6 @@ impl Layers {
         &self.retired
     }
 
-    /// A line each deprecated setting (PGPU-05) a layer sets (the
-    /// defaults set none): which, where, and the `transcode.gpus` to
-    /// write in its place, exactly what the server reads it as.
-    pub fn deprecations(&self) -> Vec<String> {
-        let instead = self.gpus_instead();
-        DEPRECATED
-            .iter()
-            .filter_map(|key| {
-                let place = match self.origin(key).layer? {
-                    Layer::Default => return None,
-                    Layer::File => "config file",
-                    Layer::Runtime => "runtime settings",
-                };
-                Some(format!("{key} is deprecated ({place}): use {instead}"))
-            })
-            .collect()
-    }
-
-    /// `transcode.gpus = [ … ]`: what these layers' transcode settings
-    /// mean, as `transcode.gpus` says it; the key alone when they do not
-    /// parse.
-    pub fn gpus_instead(&self) -> String {
-        match self.config().and_then(|c| c.transcode.gpus()) {
-            Ok(entries) => format!(
-                "transcode.gpus = {}",
-                spoolframe_media::gpus::GpuEntry::ucl_list(&entries)
-            ),
-            Err(_) => "transcode.gpus".into(),
-        }
-    }
-
     /// `config show`: every setting, its value and where it comes from.
     /// Secrets only as set or not set.
     pub fn show(&self, secrets: &Secrets) -> String {
@@ -766,16 +742,9 @@ impl Layers {
             };
             let _ = writeln!(out, "{} = {value};  # {origin}", setting.key);
         }
-        for deprecated in self.deprecations() {
-            let _ = writeln!(out, "# {deprecated}");
-        }
         out
     }
 }
-
-/// Settings still read but deprecated (PGPU-05): `transcode.gpus` says
-/// what they did and more. To be removed in a later release.
-pub const DEPRECATED: [&str; 2] = ["transcode.hardware", "transcode.vaapi_device"];
 
 /// Where a value comes from, in words.
 fn describe(origin: &Origin) -> String {
@@ -917,79 +886,56 @@ mod tests {
         )
     }
 
-    /// PGPU-05: the old GPU settings, set in a layer, are a warning each,
-    /// naming the `gpus` to write instead.
+    /// PGPU-05: `transcode.hardware` and `vaapi_device`, dropped in
+    /// 0.12.0, no longer stop a layer from loading: each is a warning,
+    /// not a setting, and gone once the runtime layer is written.
     #[test]
-    fn the_old_gpu_settings_are_deprecated_where_they_are_set() {
-        let file = layers(
+    fn the_old_gpu_settings_are_dropped_with_a_warning() {
+        let dir =
+            std::env::temp_dir().join(format!("spoolframe-pgpu05-old-gpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime_path = dir.join(RUNTIME_FILE);
+        let loaded = Layers::from_texts(
+            Some((
+                Path::new("/etc/spoolframe.ucl"),
+                r#"transcode { hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD129"; }"#,
+            )),
             Some(
-                r#"schema = "spoolframe.server.v1"; transcode { hardware = ["nvenc", "vaapi"]; }"#,
+                r#"schema = "spoolframe.server.v1";
+                   transcode { hardware = "none"; vaapi_device = "/dev/dri/renderD128"; max_jobs = 3; }"#,
             ),
-            Some(r#"transcode { vaapi_device = "/dev/dri/renderD128"; }"#),
+            runtime_path.clone(),
         )
         .unwrap();
-        let instead = r#"use transcode.gpus = [{ api = "nvenc"; pick = "all"; }, { api = "vaapi"; device = "/dev/dri/renderD128"; }]"#;
+        let config = loaded.config().unwrap();
+        assert_eq!(config.transcode.max_jobs, Some(3));
         assert_eq!(
-            file.deprecations(),
+            config.transcode.gpus().unwrap(),
+            ServerConfig::parse(&format!("schema = {:?};", ServerConfig::SCHEMA))
+                .unwrap()
+                .transcode
+                .gpus()
+                .unwrap()
+        );
+        assert_eq!(
+            loaded.retired(),
             [
-                format!("transcode.hardware is deprecated (config file): {instead}"),
-                format!("transcode.vaapi_device is deprecated (runtime settings): {instead}"),
+                "transcode.hardware is no longer read; use transcode.gpus (config file)",
+                "transcode.vaapi_device is no longer read; use transcode.gpus (config file)",
+                "transcode.hardware is no longer read; use transcode.gpus (runtime settings)",
+                "transcode.vaapi_device is no longer read; use transcode.gpus (runtime settings)",
             ]
         );
-        assert!(
-            file.show(&Secrets::new(Path::new("/nonexistent")))
-                .contains(&format!(
-                    "# transcode.hardware is deprecated (config file): {instead}"
-                ))
-        );
-    }
-
-    #[test]
-    fn gpus_or_nothing_is_no_deprecation() {
-        assert!(layers(None, None).unwrap().deprecations().is_empty());
-        let gpus = layers(
-            None,
-            Some(r#"transcode { gpus = [ { api = "vaapi"; pick = "dgpu"; } ]; }"#),
-        )
-        .unwrap();
-        assert!(gpus.deprecations().is_empty());
-    }
-
-    /// What the warning says to write reads as exactly what the old
-    /// settings were read as.
-    #[test]
-    fn the_suggested_gpus_are_what_the_old_settings_meant() {
-        for old in [
-            r#"hardware = ["nvenc", "vaapi"]; vaapi_device = "/dev/dri/renderD129";"#,
-            r#"hardware = "auto";"#,
-            r#"hardware = "none";"#,
-            r#"hardware = "qsv";"#,
-            r#"vaapi_device = "/dev/dri/by-path/pci-0000:03:00.0-render";"#,
-        ] {
-            let before = layers(
-                Some(&format!(
-                    r#"schema = "spoolframe.server.v1"; transcode {{ {old} }}"#
-                )),
-                None,
-            )
-            .unwrap();
-            let meant = before.config().unwrap().transcode.gpus().unwrap();
-            let instead = before.gpus_instead();
-            let written = instead.strip_prefix("transcode.gpus = ").unwrap();
-            let after = layers(
-                Some(&format!(
-                    r#"schema = "spoolframe.server.v1"; transcode {{ gpus = {written}; }}"#
-                )),
-                None,
-            )
-            .unwrap();
-            assert_eq!(
-                after.config().unwrap().transcode.gpus().unwrap(),
-                meant,
-                "{old}"
-            );
-            assert!(after.deprecations().is_empty());
-        }
+        assert!(matches!(
+            loaded.with_set("transcode.hardware", Value::String("none".into())),
+            Err(SettingError::Unknown(_))
+        ));
+        loaded.write_runtime().unwrap();
+        let written = std::fs::read_to_string(&runtime_path).unwrap();
+        assert!(!written.contains("hardware"), "{written}");
+        assert!(!written.contains("vaapi_device"), "{written}");
+        assert!(written.contains("max_jobs = 3"), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1030,11 +976,8 @@ mod tests {
             bare.media.sandbox().unwrap()
         );
         assert_eq!(
-            documented
-                .transcode
-                .settings(&documented.experimental)
-                .unwrap(),
-            bare.transcode.settings(&bare.experimental).unwrap()
+            documented.transcode.gpus().unwrap(),
+            bare.transcode.gpus().unwrap()
         );
         assert_eq!(
             documented.transcode.limits(dir).unwrap(),

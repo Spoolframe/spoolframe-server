@@ -1549,15 +1549,6 @@ fn PlaybackFields(
     on_done: EventHandler<()>,
     on_reload: EventHandler<()>,
 ) -> Element {
-    let mut hardware =
-        use_signal(|| Hardware::from_setting(value(&settings, "transcode.hardware")));
-    let mut order =
-        use_signal(
-            || match Hardware::from_setting(value(&settings, "transcode.hardware")) {
-                Hardware::Ordered(list) => list,
-                _ => "nvenc, vaapi".to_owned(),
-            },
-        );
     let jobs = use_signal(|| text(&settings, "transcode.max_jobs"));
     let scratch = use_signal(|| {
         text(&settings, "transcode.scratch_limit_mb")
@@ -1602,22 +1593,7 @@ fn PlaybackFields(
     });
     // PGPU-06: Settings only, as the tone map.
     let codec_rows = use_signal(|| setup::codec_rows(value(&settings, "transcode.video_codecs")));
-    // PGPU-05: `transcode.gpus`, advanced; the deprecated `hardware` and
-    // `vaapi_device` shown only while a layer of the operator's sets one.
-    let set_by = |key: &str| entry(&settings, key).and_then(|e| e.layer);
-    let old_keys = ["transcode.hardware", "transcode.vaapi_device"];
-    let old_set = old_keys
-        .iter()
-        .any(|k| matches!(set_by(k), Some(SettingLayer::File | SettingLayer::Runtime)));
-    // Converting unsets them in the runtime layer: one in the config file
-    // stays, and gpus beside it is refused.
-    let old_in_file = old_keys
-        .iter()
-        .any(|k| set_by(k) == Some(SettingLayer::File));
-    let instead = old_keys
-        .iter()
-        .find_map(|k| entry(&settings, k).and_then(|e| e.deprecated.clone()));
-    let gpus_shown = advanced && !old_set;
+    // PGPU-05: `transcode.gpus`, among the advanced settings.
     let gpus_locked = locked(&settings, "transcode.gpus");
     let mut gpu_rows = use_signal(|| setup::GpuRow::rows(value(&settings, "transcode.gpus")));
     let mut no_gpu = use_signal(
@@ -1634,10 +1610,6 @@ fn PlaybackFields(
                 typed => Some(json!(
                     setup::mib(typed).ok_or("Scratch space is a number of GiB.")?
                 )),
-            };
-            let chosen = match hardware() {
-                Hardware::Ordered(_) => Hardware::Ordered(order()),
-                other => other,
             };
             let mut changes = vec![
                 ("transcode.max_jobs", number("Encode budget", &jobs())?),
@@ -1658,11 +1630,7 @@ fn PlaybackFields(
                     Some(setup::codecs_setting(&codec_rows())),
                 ));
             }
-            // Deprecated: saved only while it is set and shown.
-            if old_set {
-                changes.push(("transcode.hardware", Some(chosen.setting())));
-            }
-            if gpus_shown {
+            if advanced {
                 let gpus = match (no_gpu(), gpu_rows().is_empty()) {
                     (true, _) => Some(json!([])),
                     (false, true) => None,
@@ -1758,36 +1726,6 @@ fn PlaybackFields(
         .map(|s| setup::tone_maps_line(&s.transcoding.gpu_tone_maps));
     let tone_map_locked = locked(&settings, "transcode.tone_map");
     let gpu_encodes = setup::gpu_encoders_by_codec(&encoders);
-    let hw_locked = locked(&settings, "transcode.hardware");
-    let s = settings.clone();
-    let convert = move |_| {
-        let s = s.clone();
-        let rows = setup::gpus_from_hardware(
-            value(&s, "transcode.hardware"),
-            value(&s, "transcode.vaapi_device"),
-        );
-        busy.set(true);
-        spawn(async move {
-            // The old ones out first: gpus beside them is refused.
-            let changes = match setup::GpuRow::setting(&rows) {
-                Ok(gpus) => vec![
-                    ("transcode.hardware", None),
-                    ("transcode.vaapi_device", None),
-                    ("transcode.gpus", Some(gpus)),
-                ],
-                Err(why) => {
-                    error.set(Some(why));
-                    busy.set(false);
-                    return;
-                }
-            };
-            match save(&s, changes).await {
-                Ok(()) => on_reload.call(()),
-                Err(e) => error.set(Some(e.explain())),
-            }
-            busy.set(false);
-        });
-    };
     // Worked out from the server's CPUs, so the server says it.
     let workers_default = match status.as_ref().map(|s| s.preview_workers_default) {
         Some(d) => format!("Default {} ({})", d.count, d.counted.label()),
@@ -1830,67 +1768,7 @@ fn PlaybackFields(
                 }
             }
         }
-        if old_set {
-        div { class: "flex flex-col gap-2",
-            h2 { class: "flex items-center gap-2",
-                "Hardware"
-                span { class: "state state-warn", "Deprecated" }
-            }
-            span { class: "text-xs text-ctp-subtext0",
-                "transcode.hardware and vaapi_device are deprecated and will be removed: GPUs, among the advanced settings, say which cards to use. "
-                if let Some(instead) = &instead {
-                    "In their place: "
-                    span { class: "mono-value", "{instead}" }
-                }
-            }
-            if !old_in_file && !hw_locked {
-                button {
-                    class: "btn-dialog btn-dialog-grey self-start",
-                    r#type: "button",
-                    disabled: busy(),
-                    onclick: convert,
-                    "Convert to GPUs"
-                }
-            }
-            button {
-                class: choice(hardware() == Hardware::Auto),
-                disabled: hw_locked,
-                onclick: move |_| hardware.set(Hardware::Auto),
-                span { class: "radio" }
-                span { class: "choice-what",
-                    b { "Automatic" }
-                    {match best {
-                        Some(name) => format!("Uses the best encoder found. Here: {name}."),
-                        None => "Uses the best encoder found. Here: software.".to_owned(),
-                    }}
-                }
-            }
-            button {
-                class: choice(hardware() == Hardware::Software),
-                disabled: hw_locked,
-                onclick: move |_| hardware.set(Hardware::Software),
-                span { class: "radio" }
-                span { class: "choice-what", b { "Software only" } "Never use the GPU" }
-            }
-            div {
-                class: choice(matches!(hardware(), Hardware::Ordered(_))),
-                onclick: move |_| if !hw_locked { hardware.set(Hardware::Ordered(order())) },
-                span { class: "radio" }
-                span { class: "choice-what", b { "In this order" } "Try each family in turn, then software" }
-                input {
-                    value: "{order}",
-                    disabled: hw_locked,
-                    aria_label: "Encoder families in order",
-                    oninput: move |e| {
-                        order.set(e.value());
-                        hardware.set(Hardware::Ordered(e.value()));
-                    },
-                }
-            }
-            Note { settings: settings.clone(), setting: "transcode.hardware", on_changed: move |_| on_reload.call(()) }
-        }
-        }
-        if gpus_shown {
+        if advanced {
             div { class: "flex flex-col gap-2",
                 h2 { "GPUs" }
                 span { class: "text-xs text-ctp-subtext0",
@@ -2757,7 +2635,7 @@ pub fn DoneCard() -> Element {
         .as_ref()
         .map(|s| {
             setup::playback_summary(
-                &Hardware::from_setting(value(s, "transcode.hardware")),
+                &Hardware::from_gpus(value(s, "transcode.gpus")),
                 encoders.as_deref(),
                 text(s, "transcode.max_jobs").parse().unwrap_or(2),
             )
