@@ -402,6 +402,7 @@ impl MediaDescriptor {
                     external: matches!(s.source, SubtitleSource::External { .. }),
                     role: s.role,
                     timing: None,
+                    download: None,
                 })
                 .collect(),
         }

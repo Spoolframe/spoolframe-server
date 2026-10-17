@@ -30,7 +30,8 @@
 //! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLISTS, SUBTITLE_SYNC,
+    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLISTS, SUBTITLE_SEARCH,
+    SUBTITLE_SYNC,
 };
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
@@ -72,6 +73,11 @@ pub struct Features {
     /// [`Session::set_subtitle_offset`], and
     /// [`crate::Client::subtitle_timing_events`].
     pub subtitle_sync: bool,
+    /// Subtitles from OpenSubtitles on demand (PX-02):
+    /// [`Session::search_subtitles`], [`Session::download_subtitle`],
+    /// [`Session::remove_subtitle_download`], and `SubtitleTrack::download`
+    /// on an item's tracks.
+    pub subtitle_search: bool,
 }
 
 impl Features {
@@ -85,6 +91,7 @@ impl Features {
             (self.play_history, PLAY_HISTORY),
             (self.playlist_art, PLAYLIST_ART),
             (self.subtitle_sync, SUBTITLE_SYNC),
+            (self.subtitle_search, SUBTITLE_SEARCH),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -109,6 +116,7 @@ impl Features {
             play_history: self.play_history && other.play_history,
             playlist_art: self.playlist_art && other.playlist_art,
             subtitle_sync: self.subtitle_sync && other.subtitle_sync,
+            subtitle_search: self.subtitle_search && other.subtitle_search,
         }
         .needing_playlists()
     }
@@ -125,6 +133,7 @@ impl Features {
             play_history: has(PLAY_HISTORY),
             playlist_art: has(PLAYLIST_ART),
             subtitle_sync: has(SUBTITLE_SYNC),
+            subtitle_search: has(SUBTITLE_SEARCH),
         }
         .needing_playlists()
     }

@@ -1593,9 +1593,12 @@ fn recent(user: &ApiSessionUser, now: i64) -> RpcResult<()> {
 /// plain HTTP, and `address` is the host in every URL apps are given,
 /// each carrying a playback's token, so whoever names it is sent them.
 /// And MCP (`mcp.*`, PX-42): it opens an authorization server through
-/// which apps get tokens that act for users.
+/// which apps get tokens that act for users. And OpenSubtitles
+/// (`opensubtitles.*`, PX-02): the key and the account the server signs in
+/// with, each a reference to one of its environment variables.
 fn sensitive_setting(key: &str) -> bool {
     key.starts_with("admin.")
+        || key.starts_with("opensubtitles.")
         || key.starts_with("mcp.")
         || key.starts_with("http_playback.")
         || key.starts_with("auth.")
@@ -4131,10 +4134,10 @@ impl AdminApiServer for AdminApi {
         ext: &Extensions,
         id: String,
     ) -> RpcResult<Vec<spoolframe_admin_api::SubtitleTimingInfo>> {
-        self.admin(ext).await?;
+        let admin = self.admin(ext).await?;
         let id = catalog::media_id(&id)?;
         self.playback_debug()?
-            .subtitle_timings(&id)
+            .subtitle_timings(&id, &admin_actor(&admin))
             .await
             .map_err(debug_error)
     }
@@ -4177,10 +4180,7 @@ impl AdminApiServer for AdminApi {
         let admin = self.admin(ext).await?;
         let id = catalog::media_id(&id)?;
         // Recorded with the track: who set it, by the name users see.
-        let name = match self.auth.store().user_by_id(admin.user).await {
-            Ok(Some(user)) => user.display_name.unwrap_or(user.username),
-            _ => admin.user.to_string(),
-        };
+        let name = self.shown_name(&admin).await;
         let change = crate::playback_debug::Retime::Offset {
             offset_ms,
             by: crate::principal::Principal::LocalUser(admin.user).to_string(),
@@ -4190,6 +4190,85 @@ impl AdminApiServer for AdminApi {
             .retime(&id, track, change)
             .await
             .map_err(debug_error)
+    }
+
+    async fn subtitle_search(
+        &self,
+        ext: &Extensions,
+        id: String,
+        language: Option<String>,
+    ) -> RpcResult<spoolframe_types::SubtitleSearch> {
+        self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?
+            .subtitle_downloads
+            .search(&id, language.as_deref())
+            .await
+            .map_err(download_error)
+    }
+
+    async fn subtitle_download(
+        &self,
+        ext: &Extensions,
+        id: String,
+        file_id: u64,
+    ) -> RpcResult<spoolframe_types::SubtitleDownloaded> {
+        let admin = self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        let asker = crate::subtitle_downloads::Asker {
+            actor: admin_actor(&admin),
+            name: self.shown_name(&admin).await,
+        };
+        self.playback_debug()?
+            .subtitle_downloads
+            .download(&id, file_id, &asker)
+            .await
+            .map_err(download_error)
+    }
+
+    async fn subtitle_remove(
+        &self,
+        ext: &Extensions,
+        id: String,
+        download: String,
+    ) -> RpcResult<()> {
+        let admin = self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?
+            .subtitle_downloads
+            .remove(&id, &download, &admin_actor(&admin))
+            .await
+            .map_err(download_error)
+    }
+
+    async fn user_subtitle_downloads(&self, ext: &Extensions, username: String) -> RpcResult<bool> {
+        self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        let principal = crate::principal::Principal::LocalUser(user.id).to_string();
+        self.auth
+            .store()
+            .may_download_subtitles(&principal)
+            .await
+            .map_err(internal)
+    }
+
+    async fn user_set_subtitle_downloads(
+        &self,
+        ext: &Extensions,
+        username: String,
+        allowed: bool,
+    ) -> RpcResult<()> {
+        let admin = self.admin(ext).await?;
+        let user = self.record(&username).await?;
+        let principal = crate::principal::Principal::LocalUser(user.id).to_string();
+        let by = crate::principal::Principal::LocalUser(admin.user).to_string();
+        self.auth
+            .store()
+            .set_may_download_subtitles(&principal, allowed, &by)
+            .await
+            .map_err(internal)?;
+        tracing::info!(%username, allowed, "subtitle downloads changed by an admin");
+        Ok(())
     }
 
     async fn catalog_plan_for(
@@ -4204,6 +4283,57 @@ impl AdminApiServer for AdminApi {
             .plan_for(&id, &request)
             .await
             .map_err(debug_error)
+    }
+}
+
+/// An admin caller's rights, as the services that judge access take them.
+fn admin_actor(admin: &ApiSessionUser) -> crate::principal::Actor {
+    crate::principal::Actor {
+        principal: crate::principal::Principal::LocalUser(admin.user),
+        admin: true,
+    }
+}
+
+/// A subtitle search, download or removal refused (PX-02).
+fn download_error(e: crate::subtitle_downloads::DownloadError) -> ErrorObjectOwned {
+    use crate::opensubtitles::SiteError;
+    use crate::subtitle_downloads::DownloadError;
+    match e {
+        DownloadError::NoSource => error(
+            error_code::NOT_CONFIGURED,
+            "OpenSubtitles is not set up: give it an API key in Settings › Subtitles",
+        ),
+        DownloadError::NotFound(what) => {
+            error(error_code::INVALID_INPUT, format!("{what} not found"))
+        }
+        DownloadError::NotAllowed(why) => error(error_code::NOT_ALLOWED, why),
+        DownloadError::QuotaExhausted { whose, resets_at } => ErrorObjectOwned::owned(
+            error_code::QUOTA_EXHAUSTED,
+            match whose {
+                spoolframe_types::QuotaOf::User => "you have no subtitle downloads left today",
+                _ => "the server's OpenSubtitles account has no downloads left today",
+            },
+            Some(serde_json::json!({ "whose": whose, "resetsAt": resets_at })),
+        ),
+        DownloadError::InvalidInput(why) => error(error_code::INVALID_INPUT, why),
+        DownloadError::Site(SiteError::RateLimited { retry_after_ms }) => ErrorObjectOwned::owned(
+            error_code::RATE_LIMITED,
+            "OpenSubtitles asks to wait before the next request",
+            Some(serde_json::json!({ "retryAfterMs": retry_after_ms })),
+        ),
+        DownloadError::Site(SiteError::QuotaExhausted { resets_at }) => ErrorObjectOwned::owned(
+            error_code::QUOTA_EXHAUSTED,
+            "the server's OpenSubtitles account has no downloads left today",
+            Some(serde_json::json!({ "whose": "account", "resetsAt": resets_at })),
+        ),
+        DownloadError::Site(e) => error(error_code::UNAVAILABLE, e.to_string()),
+        DownloadError::Catalog(e) => catalog::catalog_error(e),
+        DownloadError::Unavailable(why) => error(error_code::UNAVAILABLE, why),
+        DownloadError::Io(why) => {
+            tracing::warn!(error = %why, "a downloaded subtitle could not be kept or removed");
+            internal(why)
+        }
+        DownloadError::Store(e) => internal(e),
     }
 }
 
@@ -4274,6 +4404,15 @@ fn setup_state((done, finished): (Vec<String>, bool)) -> SetupState {
 }
 
 impl AdminApi {
+    /// The name users see for admin `admin`: their display name, else
+    /// their username.
+    async fn shown_name(&self, admin: &ApiSessionUser) -> String {
+        match self.auth.store().user_by_id(admin.user).await {
+            Ok(Some(user)) => user.display_name.unwrap_or(user.username),
+            _ => admin.user.to_string(),
+        }
+    }
+
     /// The token the caller's own linked Plex account has for the server
     /// at `url`, if it reaches it (P3-12): plex.tv hands out one per
     /// server. `None` without a link, or when plex.tv cannot be asked.

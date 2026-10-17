@@ -1999,6 +1999,20 @@ impl ClientProtocol {
             }
             _ => {}
         }
+        // PX-02: subtitle downloads, only for a client that takes them.
+        let subtitle_search_listed = features::has(&hello.features, features::SUBTITLE_SEARCH);
+        if !subtitle_search_listed
+            && matches!(
+                request,
+                Request::SearchSubtitles { .. }
+                    | Request::DownloadSubtitle { .. }
+                    | Request::RemoveSubtitleDownload { .. }
+            )
+        {
+            return Err(Error::Unsupported {
+                request: format!("subtitle downloads without {}", features::SUBTITLE_SEARCH),
+            });
+        }
         if !liked_listed {
             match &request {
                 Request::Like { .. } | Request::Unlike { .. } => {
@@ -2951,8 +2965,45 @@ impl ClientProtocol {
                         track.timing = timing;
                     }
                 }
+                if subtitle_search_listed {
+                    let downloads = self
+                        .services
+                        .subtitle_downloads
+                        .downloads(&id, &descriptor, &who.actor())
+                        .await
+                        .map_err(internal)?;
+                    for (track, download) in tracks.subtitles.iter_mut().zip(downloads) {
+                        track.download = download;
+                    }
+                }
                 Ok(Reply::Tracks(tracks))
             }
+            Request::SearchSubtitles { id, language } => self
+                .services
+                .subtitle_downloads
+                .search(&id, language.as_deref())
+                .await
+                .map(Reply::SubtitleResults)
+                .map_err(download_error),
+            Request::DownloadSubtitle { id, file_id } => {
+                let asker = crate::subtitle_downloads::Asker {
+                    actor: who.actor(),
+                    name: who.display_name().to_owned(),
+                };
+                self.services
+                    .subtitle_downloads
+                    .download(&id, file_id, &asker)
+                    .await
+                    .map(Reply::SubtitleDownloaded)
+                    .map_err(download_error)
+            }
+            Request::RemoveSubtitleDownload { id, download } => self
+                .services
+                .subtitle_downloads
+                .remove(&id, &download, &who.actor())
+                .await
+                .map(|()| Reply::Done)
+                .map_err(download_error),
             Request::SyncSubtitle { id, track } => {
                 let track = self.subtitle_track(&id, track).await?;
                 let timings = &self.services.subtitle_timings;
@@ -4783,12 +4834,19 @@ impl ClientProtocol {
                     None => 0,
                 };
                 let transcoding = &self.services.transcoding;
+                // A subtitle file carried into the conversion is carried as
+                // it is served: synced or offset (PX-03), a download synced
+                // (PX-02).
+                let carried = match subtitle {
+                    Some(ConvertedSubtitle { index, .. }) => self.served(descriptor, *index).await,
+                    None => descriptor.clone(),
+                };
                 let conversion = Conversion::start(
                     self.services.jobs.clone(),
                     ConversionSource {
                         handle: &handle.0,
                         path,
-                        descriptor: descriptor.clone(),
+                        descriptor: carried,
                         plan,
                         gpus: transcoding.detected(),
                         keyframes,
@@ -4836,6 +4894,25 @@ impl ClientProtocol {
             }
         })?;
         Ok((path, descriptor))
+    }
+
+    /// `descriptor` with its subtitle `index`, when a file, as what it is
+    /// served as (PX-03): its synced or offset copy, when it has one.
+    async fn served(&self, descriptor: &Arc<MediaDescriptor>, index: u32) -> Arc<MediaDescriptor> {
+        let Some(SubtitleStream {
+            source: SubtitleSource::External { path },
+            ..
+        }) = descriptor.subtitles.get(index as usize)
+        else {
+            return descriptor.clone();
+        };
+        let resolved = self.services.subtitle_timings.resolve(path).await;
+        if &resolved == path {
+            return descriptor.clone();
+        }
+        let mut served = (**descriptor).clone();
+        served.subtitles[index as usize].source = SubtitleSource::External { path: resolved };
+        Arc::new(served)
     }
 
     /// Subtitle `track` of item `id`, to retime (PX-03).
@@ -6200,6 +6277,49 @@ fn conversion_error(e: JobError) -> Error {
 
 /// The text a reading made: waits for it a while, then tells the client to
 /// ask again.
+/// A subtitle search, download or removal refused, as the client sees it
+/// (PX-02). The site's own words go to the log: they may name the
+/// account.
+fn download_error(e: crate::subtitle_downloads::DownloadError) -> Error {
+    use crate::opensubtitles::SiteError;
+    use crate::subtitle_downloads::DownloadError;
+    match e {
+        DownloadError::NoSource => Error::NoSubtitleSource,
+        DownloadError::NotFound(what) => Error::NotFound { what: what.into() },
+        DownloadError::NotAllowed(_) => Error::NotAllowed,
+        DownloadError::QuotaExhausted { whose, resets_at } => {
+            Error::QuotaExhausted { whose, resets_at }
+        }
+        DownloadError::InvalidInput(message) => Error::InvalidInput { message },
+        DownloadError::Site(SiteError::RateLimited { retry_after_ms }) => {
+            Error::RateLimited { retry_after_ms }
+        }
+        DownloadError::Site(SiteError::QuotaExhausted { resets_at }) => Error::QuotaExhausted {
+            whose: spoolframe_types::QuotaOf::Account,
+            resets_at,
+        },
+        DownloadError::Site(e @ SiteError::Refused { .. }) => {
+            tracing::warn!(error = %e, "OpenSubtitles refused the server; check its API key and account");
+            Error::Unavailable {
+                message: "OpenSubtitles refused the server's request".into(),
+            }
+        }
+        DownloadError::Site(e) => {
+            tracing::warn!(error = %e, "a subtitle search or download failed");
+            Error::Unavailable {
+                message: e.to_string(),
+            }
+        }
+        DownloadError::Catalog(e) => catalog_error(e),
+        DownloadError::Unavailable(message) => Error::Unavailable { message },
+        DownloadError::Io(message) => {
+            tracing::warn!(error = %message, "a downloaded subtitle could not be kept or removed");
+            Error::Internal
+        }
+        DownloadError::Store(e) => internal(e),
+    }
+}
+
 /// A subtitle timing refusal as the client sees it (PX-03).
 fn timing_error(e: crate::subtitle_sync::TimingError) -> Error {
     use crate::subtitle_sync::TimingError;

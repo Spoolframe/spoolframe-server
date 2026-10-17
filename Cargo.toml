@@ -207,6 +207,11 @@ alass-core = "2.0"
 # Rust, no dependencies. In place of webrtc-vad, which alass-cli uses and
 # which builds WebRTC's C.
 earshot = "1.2"
+# A downloaded subtitle made UTF-8 (PX-02): many are CP-1251, CP-1252 and
+# the like. chardetng guesses the encoding of a file with no BOM that is
+# not UTF-8; encoding_rs (already in the tree) decodes it. Pure Rust.
+chardetng = "0.1"
+encoding_rs = "0.8"
 
 # Logging
 tracing = "0.1"

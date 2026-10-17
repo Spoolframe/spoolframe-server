@@ -309,6 +309,11 @@ fn Overview(seen: ItemView, item: Item, library: String) -> Element {
                 }
             }
             div { class: "flex flex-col gap-4",
+                // Its subtitles from OpenSubtitles (PX-02): a film's or an
+                // episode's, the items with a file.
+                if matches!(kind, CatalogKind::Movie | CatalogKind::Episode) {
+                    super::subtitle_search::SubtitlesCard { id: item.id().to_string() }
+                }
                 // The playlists holding it (PX-40), as clients list them.
                 super::playlists::HeldInCard { held: crate::playlists::held_in(&seen.reply) }
                 section { class: "card",

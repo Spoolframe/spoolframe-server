@@ -124,6 +124,7 @@ mod tests {
             offset_ms: 0,
             offset_by: None,
             offset_at: None,
+            download: None,
         };
         assert!(!any_syncing(std::slice::from_ref(&t)));
         assert_eq!(offset_by(&t), None);

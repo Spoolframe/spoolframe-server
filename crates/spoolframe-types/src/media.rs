@@ -109,6 +109,119 @@ pub struct SubtitleTrack {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<SubtitleTiming>,
+    /// Where a track someone downloaded came from (PX-02): its source,
+    /// who downloaded it and when. Sent only to a client that listed the
+    /// `spoolframe:subtitle-search` feature; `None` for every track that
+    /// was not downloaded, which is every track for any other client.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<SubtitleDownload>,
+}
+
+/// A subtitle track downloaded from a subtitle site (PX-02), for everyone
+/// on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleDownload {
+    /// The download's own id: what `RemoveSubtitleDownload` names.
+    pub id: String,
+    /// Where it came from, to show: `OpenSubtitles`.
+    pub source: String,
+    /// The release it was made for, as the site names it.
+    pub release: String,
+    /// Who downloaded it, by display name.
+    pub by: String,
+    /// When, Unix seconds.
+    pub at: i64,
+    /// It was found by the file's hash: made for this very release, so
+    /// it was not synced.
+    pub hash_match: bool,
+    pub origin: SubtitleOrigin,
+    /// Whether the session's user may remove it: the one who downloaded
+    /// it, or an admin.
+    pub can_remove: bool,
+}
+
+/// Who made a subtitle (PX-02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtitleOrigin {
+    /// Machine-translated from another language's subtitle.
+    MachineTranslated,
+    /// Made by an AI, from the speech.
+    Ai,
+    /// A person. Also any origin this build does not know. (Last, as
+    /// serde wants of `other`.)
+    #[default]
+    #[serde(other)]
+    Human,
+}
+
+/// One subtitle a search found (PX-02), to download by its `file_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleResult {
+    /// What `DownloadSubtitle` names.
+    pub file_id: u64,
+    /// The release it was made for, as its uploader named it.
+    pub release: String,
+    /// Its language, as the site says it: `en`, `pt-BR`.
+    pub language: String,
+    /// `srt`, `ass`, `vtt`, or what the site says.
+    pub format: Option<String>,
+    /// The frame rate it was made for, in thousandths: 23 976.
+    pub fps_milli: Option<u32>,
+    /// How many times it was downloaded on the site.
+    pub downloads: u64,
+    /// Its rating on the site, 0 to 100 (tenths of its 0 to 10); `None`
+    /// while unrated.
+    pub rating: Option<u8>,
+    pub hearing_impaired: bool,
+    pub origin: SubtitleOrigin,
+    /// Found by the file's hash: made for this very release, and played
+    /// as it is, not synced.
+    pub hash_match: bool,
+    /// Downloaded before and removed as bad: listed last.
+    pub rejected: bool,
+    /// Downloaded already: a download gives the same track.
+    pub downloaded: bool,
+}
+
+/// What a subtitle search found for an item (PX-02), best first: hash
+/// matches, then the rest by rating and downloads; machine-translated and
+/// AI-made after people's; rejected ones last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleSearch {
+    /// The languages searched.
+    pub languages: Vec<String>,
+    pub results: Vec<SubtitleResult>,
+}
+
+/// A subtitle downloaded (PX-02): the item's new track, at once, and the
+/// downloads left today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleDownloaded {
+    /// Its place in the item's `Tracks`' `subtitles`.
+    pub track: u32,
+    pub subtitle: SubtitleTrack,
+    /// The server's account's downloads left today, when the site says.
+    #[serde(deserialize_with = "crate::required::option")]
+    pub account_remaining: Option<u32>,
+    /// The user's own, when the admin set a limit per user.
+    #[serde(deserialize_with = "crate::required::option")]
+    pub user_remaining: Option<u32>,
+}
+
+/// Whose downloads ran out (PX-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaOf {
+    /// The server's account at the site: no one can download until it
+    /// resets.
+    Account,
+    /// The user's own daily limit on this server.
+    User,
+    /// One this build does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How an external text subtitle is timed (PX-03): synced to the file or
@@ -200,6 +313,7 @@ mod tests {
             external: false,
             role: SubtitleRole::Sdh,
             timing: None,
+            download: None,
         };
         crate::test_support::assert_each_required(&subtitle, &["role"]);
     }
@@ -213,7 +327,55 @@ mod tests {
             external: true,
             role: SubtitleRole::Full,
             timing,
+            download: None,
         }
+    }
+
+    /// PX-02: a downloaded track says so, and where from; any other track
+    /// leaves the field out, as a client from before it reads it.
+    #[test]
+    fn a_track_s_download_is_sent_only_for_a_downloaded_one() {
+        let json = serde_json::to_value(sidecar(None)).unwrap();
+        assert!(json.get("download").is_none(), "{json}");
+        let mut track = sidecar(None);
+        track.download = Some(SubtitleDownload {
+            id: "d1".into(),
+            source: "OpenSubtitles".into(),
+            release: "Film.2019.1080p".into(),
+            by: "Alice".into(),
+            at: 1_760_000_000,
+            hash_match: false,
+            origin: SubtitleOrigin::MachineTranslated,
+            can_remove: true,
+        });
+        let json = serde_json::to_value(&track).unwrap();
+        assert_eq!(json["download"]["origin"], "machine_translated");
+        assert_eq!(
+            serde_json::from_value::<SubtitleTrack>(json).unwrap(),
+            track
+        );
+    }
+
+    #[test]
+    fn an_origin_or_quota_this_build_does_not_know_still_decodes() {
+        let origin: SubtitleOrigin = serde_json::from_value(serde_json::json!("dubbed")).unwrap();
+        assert_eq!(origin, SubtitleOrigin::Human);
+        let whose: QuotaOf = serde_json::from_value(serde_json::json!("household")).unwrap();
+        assert_eq!(whose, QuotaOf::Unknown);
+    }
+
+    #[test]
+    fn a_download_s_remaining_counts_left_out_are_refused() {
+        let downloaded = SubtitleDownloaded {
+            track: 3,
+            subtitle: sidecar(None),
+            account_remaining: None,
+            user_remaining: None,
+        };
+        crate::test_support::assert_each_required(
+            &downloaded,
+            &["account_remaining", "user_remaining"],
+        );
     }
 
     /// PX-03: a track's timing is left out when there is none, so a
@@ -289,6 +451,7 @@ mod tests {
                 external: true,
                 role: SubtitleRole::Forced,
                 timing: None,
+                download: None,
             }],
         };
         let json = serde_json::to_value(&tracks).unwrap();

@@ -126,6 +126,38 @@ async fn an_sdh_subtitle_file_gets_the_sdh_role() {
     assert_eq!(last.language.as_deref(), Some("en"));
 }
 
+/// PX-02: a downloaded subtitle, a file of the server's own, is listed
+/// after the file's own subtitles without being probed, until it is taken
+/// away; the file's own keep their places.
+#[tokio::test]
+async fn an_added_subtitle_comes_after_the_file_s_own_until_taken_away() {
+    let (_tmp, dir) = scratch("added").await;
+    let movie = media(&dir);
+    let prober = prober(ffprobe_with_fixtures(&dir));
+    let own = prober.describe(&movie).await.unwrap().subtitles.clone();
+    let downloaded = spoolframe_media::SubtitleStream {
+        source: SubtitleSource::External {
+            path: PathBuf::from("/state/subtitles/downloaded/d1.srt"),
+        },
+        codec: "subrip".into(),
+        kind: spoolframe_media::SubtitleKind::Text,
+        language: Some("en".into()),
+        title: Some("English (OpenSubtitles)".into()),
+        forced: false,
+        default: false,
+        role: spoolframe_types::SubtitleRole::Full,
+    };
+    prober.set_added_subtitles(&movie, vec![downloaded.clone()]);
+    let with = prober.describe(&movie).await.unwrap();
+    assert_eq!(with.subtitles[..own.len()], own[..]);
+    assert_eq!(with.subtitles.last(), Some(&downloaded));
+    assert_eq!(with.subtitles.len(), own.len() + 1);
+    prober.set_added_subtitles(&movie, Vec::new());
+    assert_eq!(prober.describe(&movie).await.unwrap().subtitles, own);
+    // Probed once: the added file never was.
+    assert_eq!(calls(&dir), 1);
+}
+
 #[tokio::test]
 async fn an_unchanged_file_is_probed_once() {
     let (_tmp, dir) = scratch("cache-hit").await;

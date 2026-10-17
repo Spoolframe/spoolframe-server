@@ -25,7 +25,7 @@ use crate::support::{
 
 /// An admin API beside `server`, on the auth it shares: its root admin,
 /// and alice, a consumer, whose password is "battery staple".
-async fn admin_beside(server: &TestServer) -> (WsClient, WsClient) {
+pub(crate) async fn admin_beside(server: &TestServer) -> (WsClient, WsClient) {
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {

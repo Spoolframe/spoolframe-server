@@ -40,6 +40,7 @@ use spoolframe_server::plex_sync::{StartedAfter, WatchSync};
 use spoolframe_server::previews::{self, PreviewSources, Previews};
 use spoolframe_server::runtime::{self, Live, RuntimeSettings, reload};
 use spoolframe_server::store::Store;
+use spoolframe_server::subtitle_downloads::SubtitleDownloads;
 use spoolframe_server::subtitle_sync::{FfmpegSpeech, SubtitleTimings};
 use spoolframe_server::subtitles::Subtitles;
 use spoolframe_server::telemetry::{self, OtelLayer, Swap, Telemetry};
@@ -876,19 +877,23 @@ async fn run(
     );
     transcode::spawn_detection(transcoding.clone());
     let limits = config.transcode.limits(state_dir)?;
-    let jobs = Arc::new(Jobs::new(limits.clone(), ffmpeg.clone()).with_context(|| {
-        format!(
-            "cannot prepare the scratch directory {}",
-            limits.scratch_dir.display()
-        )
-    })?);
+    let sync_settings = config.subtitles.sync_settings(state_dir)?;
+    let jobs = Arc::new(
+        Jobs::new(limits.clone(), ffmpeg.clone())
+            .with_context(|| {
+                format!(
+                    "cannot prepare the scratch directory {}",
+                    limits.scratch_dir.display()
+                )
+            })?
+            .with_own_subtitles(sync_settings.dir.clone()),
+    );
     let ocr_settings = config.subtitles.ocr_settings(state_dir)?;
     let ocr = if ocr_settings.enabled {
         Ocr::detect(&Tool::new(config.media.tesseract(), sandbox.clone())).await
     } else {
         Ocr::disabled()
     };
-    let sync_settings = config.subtitles.sync_settings(state_dir)?;
     let subtitles = Arc::new(
         Subtitles::new(ocr, ffmpeg.clone(), ffprobe, decoder.clone(), &ocr_settings)
             .with_context(|| {
@@ -983,6 +988,29 @@ async fn run(
             )
         })?,
     );
+    // Subtitles from OpenSubtitles on demand (PX-02): each file gets back
+    // what was downloaded for it.
+    let subtitle_downloads = Arc::new(
+        SubtitleDownloads::new(
+            store.clone(),
+            catalog.clone(),
+            prober.clone(),
+            subtitle_timings.clone(),
+            sync_settings.dir.join("downloaded"),
+            config.opensubtitles.settings()?,
+        )
+        .with_context(|| {
+            format!(
+                "cannot prepare the downloaded subtitles in {}",
+                sync_settings.dir.display()
+            )
+        })?,
+    );
+    match subtitle_downloads.restore().await {
+        Ok(0) => {}
+        Ok(kept) => tracing::info!(kept, "downloaded subtitles restored"),
+        Err(e) => tracing::warn!(error = %e, "cannot restore the downloaded subtitles"),
+    }
     store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(
@@ -1157,6 +1185,7 @@ async fn run(
             telemetry: Some(telemetry.clone()),
             transcoding: Some(transcoding.clone()),
             mcp: mcp.clone(),
+            subtitle_downloads: Some(subtitle_downloads.clone()),
         },
         restart_mode,
     ));
@@ -1214,6 +1243,7 @@ async fn run(
                 transcoding: transcoding.clone(),
                 subtitles: subtitles.clone(),
                 subtitle_timings: subtitle_timings.clone(),
+                subtitle_downloads: subtitle_downloads.clone(),
                 previews: previews.clone(),
                 jobs: Some(jobs.clone()),
             })),
@@ -1263,6 +1293,7 @@ async fn run(
             jobs: jobs.clone(),
             subtitles,
             subtitle_timings: subtitle_timings.clone(),
+            subtitle_downloads,
             previews,
             index_ahead,
             metrics,

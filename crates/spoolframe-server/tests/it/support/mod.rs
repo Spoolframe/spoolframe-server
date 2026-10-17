@@ -70,6 +70,7 @@ pub async fn sdk_client(
             play_history: true,
             playlist_art: true,
             subtitle_sync: true,
+            subtitle_search: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };
@@ -468,6 +469,8 @@ pub struct ServerOptions {
     /// The speech a subtitle sync finds in the film's audio (PX-03), from
     /// a stand-in; `None`: real ffmpeg decodes it.
     pub speech: Option<Vec<spoolframe_media::subsync::Span>>,
+    /// OpenSubtitles (PX-02), a stand-in on loopback; off by default.
+    pub opensubtitles: Option<spoolframe_server::subtitle_downloads::SiteSettings>,
 }
 
 /// Speech found by a stand-in: always `0`.
@@ -531,6 +534,7 @@ impl Default for ServerOptions {
             http_playback: Default::default(),
             index_ahead: false,
             speech: None,
+            opensubtitles: None,
         }
     }
 }
@@ -746,7 +750,8 @@ impl TestServer {
             },
             tool(&options.ffmpeg, &sandbox),
         )
-        .unwrap();
+        .unwrap()
+        .with_own_subtitles(dir.join("subtitles"));
         let jobs = Arc::new(jobs);
         let ocr = if options.ocr {
             Ocr::detect(&tool(&options.tesseract, &sandbox)).await
@@ -820,6 +825,36 @@ impl TestServer {
             )
             .with_covers(covers),
         );
+        let subtitle_timings = Arc::new(
+            spoolframe_server::subtitle_sync::SubtitleTimings::new(
+                store.clone(),
+                tool(Path::new("ffmpeg"), &sandbox),
+                match &options.speech {
+                    Some(spans) => Arc::new(FixedSpeech(spans.clone())),
+                    None => Arc::new(spoolframe_server::subtitle_sync::FfmpegSpeech(tool(
+                        Path::new("ffmpeg"),
+                        &sandbox,
+                    ))),
+                },
+                &spoolframe_server::subtitle_sync::SyncSettings {
+                    at_once: 1,
+                    dir: dir.join("subtitles"),
+                    speech_dir: dir.join("cache").join("subtitle-speech"),
+                },
+            )
+            .unwrap(),
+        );
+        let subtitle_downloads = Arc::new(
+            spoolframe_server::subtitle_downloads::SubtitleDownloads::new(
+                store.clone(),
+                catalog.clone(),
+                prober.clone(),
+                subtitle_timings.clone(),
+                dir.join("subtitles").join("downloaded"),
+                options.opensubtitles.clone(),
+            )
+            .unwrap(),
+        );
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -839,25 +874,8 @@ impl TestServer {
             transcoding: transcoding(),
             jobs: jobs.clone(),
             subtitles: Arc::new(subtitles.with_own_dir(dir.join("subtitles"))),
-            subtitle_timings: Arc::new(
-                spoolframe_server::subtitle_sync::SubtitleTimings::new(
-                    store.clone(),
-                    tool(Path::new("ffmpeg"), &sandbox),
-                    match &options.speech {
-                        Some(spans) => Arc::new(FixedSpeech(spans.clone())),
-                        None => Arc::new(spoolframe_server::subtitle_sync::FfmpegSpeech(tool(
-                            Path::new("ffmpeg"),
-                            &sandbox,
-                        ))),
-                    },
-                    &spoolframe_server::subtitle_sync::SyncSettings {
-                        at_once: 1,
-                        dir: dir.join("subtitles"),
-                        speech_dir: dir.join("cache").join("subtitle-speech"),
-                    },
-                )
-                .unwrap(),
-            ),
+            subtitle_timings: subtitle_timings.clone(),
+            subtitle_downloads: subtitle_downloads.clone(),
             previews,
             index_ahead,
             app_passkeys: Arc::new(
@@ -883,6 +901,7 @@ impl TestServer {
             transcoding: services.transcoding.clone(),
             subtitles: services.subtitles.clone(),
             subtitle_timings: services.subtitle_timings.clone(),
+            subtitle_downloads: services.subtitle_downloads.clone(),
             previews: services.previews.clone(),
             jobs: Some(jobs.clone()),
         });

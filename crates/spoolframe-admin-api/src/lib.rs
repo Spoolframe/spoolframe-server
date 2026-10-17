@@ -18,8 +18,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 pub use spoolframe_types::{
     APP_RP_DOMAIN, Album, Artist, Artwork, ArtworkKind, AudioRole, BitmapPreference, Episode, Item,
-    LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState, Role, SdhPreference, Season,
-    Show, SubtitleMode, SubtitleRole, Track, TrackPreferences,
+    LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState, QuotaOf, Role, SdhPreference,
+    Season, Show, SubtitleDownload, SubtitleDownloaded, SubtitleMode, SubtitleOrigin,
+    SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleTrack, Track, TrackPreferences,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
@@ -223,6 +224,10 @@ pub mod error_code {
     /// Not a JPEG, PNG, WebP or HEIC picture the server can decode
     /// (PX-53).
     pub const IMAGE_UNREADABLE: i32 = -32035;
+    /// No subtitle downloads left today (PX-02): `data` has `whose`
+    /// (`account`, the server's OpenSubtitles account, or `user`, the
+    /// caller's own daily limit) and `resetsAt`, Unix seconds, when known.
+    pub const QUOTA_EXHAUSTED: i32 = -32036;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -3055,6 +3060,10 @@ pub struct SubtitleTimingInfo {
     pub offset_by: Option<String>,
     /// When, Unix seconds.
     pub offset_at: Option<i64>,
+    /// Where a downloaded track came from (PX-02); `None` for a file
+    /// beside the media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<spoolframe_types::SubtitleDownload>,
 }
 
 /// Where a subtitle's sync is (PX-03).
@@ -4308,6 +4317,54 @@ pub trait AdminApi {
         track: u32,
         offset_ms: i64,
     ) -> jsonrpsee::core::RpcResult<SubtitleTimingInfo>;
+
+    /// Search OpenSubtitles for item `id`'s subtitles in `language` (`en`,
+    /// `pt-BR`), or in the languages set (PX-02): best first, as the
+    /// client protocol's `SearchSubtitles`. Kept a day per item and
+    /// language. `NOT_CONFIGURED` without OpenSubtitles set up;
+    /// `UNAVAILABLE` when it cannot be reached; `RATE_LIMITED` when it
+    /// asks to wait.
+    #[method(name = "subtitleSearch", with_extensions)]
+    async fn subtitle_search(
+        &self,
+        id: String,
+        language: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<spoolframe_types::SubtitleSearch>;
+
+    /// Download result `file_id` of a search for item `id` (PX-02): a
+    /// track of the item for everyone, at once, synced in the background
+    /// when it was not found by the file's hash. The same result again is
+    /// the same track. `INVALID_INPUT` for a result no search of the item
+    /// listed lately (search again) or a file that is no subtitle;
+    /// `QUOTA_EXHAUSTED`; `NOT_ALLOWED` for a caller whose downloads were
+    /// turned off.
+    #[method(name = "subtitleDownload", with_extensions)]
+    async fn subtitle_download(
+        &self,
+        id: String,
+        file_id: u64,
+    ) -> jsonrpsee::core::RpcResult<spoolframe_types::SubtitleDownloaded>;
+
+    /// Remove item `id`'s downloaded subtitle `download`, for everyone
+    /// (PX-02): its files go, and its result is listed last, marked, in
+    /// the item's searches. Removing one already gone does nothing.
+    #[method(name = "subtitleRemove", with_extensions)]
+    async fn subtitle_remove(&self, id: String, download: String)
+    -> jsonrpsee::core::RpcResult<()>;
+
+    /// Whether user `username` may download subtitles (PX-02): everyone
+    /// may unless an admin turned it off.
+    #[method(name = "userSubtitleDownloads", with_extensions)]
+    async fn user_subtitle_downloads(&self, username: String) -> jsonrpsee::core::RpcResult<bool>;
+
+    /// Let user `username` download subtitles, or not (PX-02). Searching
+    /// stays theirs either way.
+    #[method(name = "userSetSubtitleDownloads", with_extensions)]
+    async fn user_set_subtitle_downloads(
+        &self,
+        username: String,
+        allowed: bool,
+    ) -> jsonrpsee::core::RpcResult<()>;
 
     /// Make an invite (P6-01): its code, shown this once, and its link.
     /// Needs a recent sign-in: the code makes an account

@@ -181,6 +181,7 @@ mod tests {
             external: false,
             role,
             timing: None,
+            download: None,
         }
     }
 

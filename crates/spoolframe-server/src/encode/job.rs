@@ -448,6 +448,10 @@ pub struct Jobs {
     decode_failures: Arc<DecodeFailures>,
     /// What [`Jobs::first_note`] was told.
     notes: parking_lot::Mutex<HashSet<&'static str>>,
+    /// The server's own subtitles (`state_dir/subtitles`: PX-03's served
+    /// files, PX-02's downloads), in the hidden state directory: a job
+    /// takes a copy of one, as no run may open it as an input.
+    own_subtitles: Option<PathBuf>,
 }
 
 /// Films whose GPU decode failed, for as long as the server runs: few,
@@ -580,7 +584,21 @@ impl Jobs {
             limits: parking_lot::RwLock::new(limits),
             dir,
             ffmpeg,
+            own_subtitles: None,
         })
+    }
+
+    /// The server's own subtitles are under `dir` (PX-02).
+    pub fn with_own_subtitles(mut self, dir: PathBuf) -> Self {
+        self.own_subtitles = Some(dir);
+        self
+    }
+
+    /// Whether `path` is one of the server's own subtitles.
+    pub(crate) fn is_own_subtitle(&self, path: &Path) -> bool {
+        self.own_subtitles
+            .as_deref()
+            .is_some_and(|dir| path.starts_with(dir))
     }
 
     /// Whether decoding (or filtering) `file` on the GPU failed since the

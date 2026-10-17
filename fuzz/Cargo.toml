@@ -125,3 +125,10 @@ bench = false
 spoolframe-media = { path = "../crates/spoolframe-media", features = ["fixtures"] }
 spoolframe-types = { path = "../crates/spoolframe-types" }
 tokio = { version = "1", features = ["rt", "macros"] }
+
+[[bin]]
+name = "subtitle_download"
+path = "fuzz_targets/subtitle_download.rs"
+test = false
+doc = false
+bench = false

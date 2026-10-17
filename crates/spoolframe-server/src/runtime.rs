@@ -68,6 +68,8 @@ pub struct Live {
     pub uplink: Option<Arc<crate::uplink::Uplink>>,
     /// `mcp.enabled` (PX-42).
     pub mcp: crate::oauth::McpSwitch,
+    /// `opensubtitles.*` (PX-02).
+    pub subtitle_downloads: Option<Arc<crate::subtitle_downloads::SubtitleDownloads>>,
 }
 
 /// Why a change was not made.
@@ -562,6 +564,11 @@ impl RuntimeSettings {
         }
         if let (Some(jobs), Ok(limits)) = (&live.jobs, config.transcode.limits(&self.state_dir)) {
             jobs.set_limits(limits);
+        }
+        if let (Some(downloads), Ok(settings)) =
+            (&live.subtitle_downloads, config.opensubtitles.settings())
+        {
+            downloads.configure(settings);
         }
         if let (Some(uplink), Ok(settings)) = (&live.uplink, config.network.uplink()) {
             uplink.set_settings(settings);

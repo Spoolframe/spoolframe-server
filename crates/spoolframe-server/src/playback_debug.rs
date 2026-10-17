@@ -43,6 +43,8 @@ pub struct PlaybackDebug {
     /// External text subtitles' sync and offset (PX-03), which an admin
     /// sees and changes on an item's page.
     pub subtitle_timings: Arc<crate::subtitle_sync::SubtitleTimings>,
+    /// Subtitles downloaded on demand (PX-02).
+    pub subtitle_downloads: Arc<crate::subtitle_downloads::SubtitleDownloads>,
     pub previews: Arc<Previews>,
     /// For `transcode.gpu_filters`, which decides where a plan's video
     /// encode runs (PGPU-02); none in tests that run no encode.
@@ -87,13 +89,21 @@ fn timing_info(
     track: u32,
     stream: &spoolframe_media::SubtitleStream,
     timing: spoolframe_types::SubtitleTiming,
+    download: Option<spoolframe_types::SubtitleDownload>,
 ) -> api::SubtitleTimingInfo {
     use spoolframe_types::SubtitleSync;
-    let label = match &stream.source {
-        spoolframe_media::SubtitleSource::External { path } => path
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
-        spoolframe_media::SubtitleSource::Embedded { index } => format!("stream {index}"),
+    let label = match (&stream.source, &download) {
+        // A download's file is named by an id; what it is is its release.
+        (_, Some(download)) if !download.release.is_empty() => {
+            format!("{} · {}", download.source, download.release)
+        }
+        (_, Some(download)) => download.source.clone(),
+        (source, None) => match source {
+            spoolframe_media::SubtitleSource::External { path } => path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            spoolframe_media::SubtitleSource::Embedded { index } => format!("stream {index}"),
+        },
     };
     let sync = match timing.sync {
         SubtitleSync::Syncing => api::SubtitleSyncState::Syncing,
@@ -119,6 +129,7 @@ fn timing_info(
         offset_ms: timing.offset_ms,
         offset_by: timing.offset_by,
         offset_at: timing.offset_at,
+        download,
     }
 }
 
@@ -956,19 +967,28 @@ impl PlaybackDebug {
     }
 
     /// Item `id`'s external text subtitles and how each is timed (PX-03).
+    /// A downloaded one (PX-02) says where from, and whether `actor` may
+    /// remove it.
     pub async fn subtitle_timings(
         &self,
         id: &MediaId,
+        actor: &crate::principal::Actor,
     ) -> Result<Vec<api::SubtitleTimingInfo>, DebugError> {
         let (_, descriptor) = self.describe(id).await?;
         let timings = self.subtitle_timings.timings(&descriptor).await;
+        let downloads = self
+            .subtitle_downloads
+            .downloads(id, &descriptor, actor)
+            .await
+            .map_err(|e| DebugError::Unreadable(e.to_string()))?;
         Ok(descriptor
             .subtitles
             .iter()
             .zip(timings)
+            .zip(downloads)
             .enumerate()
-            .filter_map(|(track, (stream, timing))| {
-                Some(timing_info(track as u32, stream, timing?))
+            .filter_map(|(track, ((stream, timing), download))| {
+                Some(timing_info(track as u32, stream, timing?, download))
             })
             .collect())
     }
@@ -1003,7 +1023,7 @@ impl PlaybackDebug {
                 name,
             } => timings.set_offset(target, offset_ms, &by, &name).await?,
         };
-        Ok(timing_info(track, &stream, timing))
+        Ok(timing_info(track, &stream, timing, None))
     }
 
     /// The plan the server would make for item `id` on `request`'s

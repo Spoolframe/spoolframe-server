@@ -132,6 +132,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget subtitle file `sidecar`'s row: the file is gone (PX-02, a
+    /// download removed).
+    pub async fn delete_subtitle_timing(&self, sidecar: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM subtitle_timings WHERE sidecar = ?1")
+            .bind(sidecar)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Syncs a stopped server left running end as failed, served as they
     /// were: how many.
     pub async fn end_interrupted_subtitle_syncs(&self) -> Result<u64, StoreError> {

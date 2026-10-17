@@ -35,6 +35,7 @@ mod relay_policy;
 mod servers;
 mod session;
 pub mod storage;
+mod subtitle_search;
 mod subtitle_sync;
 
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};

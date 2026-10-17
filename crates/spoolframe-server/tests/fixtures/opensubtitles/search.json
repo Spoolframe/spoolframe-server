@@ -1,0 +1,88 @@
+{
+  "total_pages": 1,
+  "total_count": 4,
+  "per_page": 60,
+  "page": 1,
+  "data": [
+    {
+      "id": "9000001",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "9000001",
+        "language": "en",
+        "download_count": 120,
+        "new_download_count": 3,
+        "hearing_impaired": false,
+        "hd": true,
+        "fps": 23.976,
+        "votes": 2,
+        "ratings": 6.0,
+        "from_trusted": false,
+        "foreign_parts_only": false,
+        "upload_date": "2020-01-02T03:04:05Z",
+        "ai_translated": false,
+        "nb_cd": 1,
+        "slug": "film-2019",
+        "machine_translated": false,
+        "release": "Film.2019.1080p.BluRay.x264-GRP",
+        "comments": "",
+        "legacy_subtitle_id": null,
+        "uploader": { "uploader_id": 1, "name": "someone", "rank": "Trusted" },
+        "feature_details": {
+          "feature_id": 1, "feature_type": "Movie", "year": 2019, "title": "Film",
+          "movie_name": "2019 - Film", "imdb_id": 1234567, "tmdb_id": 7654
+        },
+        "url": "https://www.opensubtitles.com/en/subtitles/legacy/9000001",
+        "related_links": [],
+        "files": [ { "file_id": 101, "cd_number": 1, "file_name": "Film.2019.1080p.BluRay.x264-GRP.srt" } ],
+        "moviehash_match": true
+      }
+    },
+    {
+      "id": "9000002",
+      "type": "subtitle",
+      "attributes": {
+        "language": "en",
+        "download_count": 90000,
+        "hearing_impaired": true,
+        "fps": 25.0,
+        "ratings": 9.1,
+        "ai_translated": false,
+        "machine_translated": false,
+        "release": "Film.2019.720p.WEB-DL",
+        "files": [ { "file_id": 102, "cd_number": 1, "file_name": "Film.2019.720p.WEB-DL.ass" } ]
+      }
+    },
+    {
+      "id": "9000003",
+      "type": "subtitle",
+      "attributes": {
+        "language": "en",
+        "download_count": 500000,
+        "hearing_impaired": false,
+        "fps": null,
+        "ratings": 10.0,
+        "ai_translated": false,
+        "machine_translated": true,
+        "release": "Film.2019.machine",
+        "files": [ { "file_id": 103, "cd_number": 1, "file_name": "Film.machine.srt" } ]
+      }
+    },
+    {
+      "id": "9000004",
+      "type": "subtitle",
+      "attributes": {
+        "language": "en",
+        "download_count": 10,
+        "hearing_impaired": false,
+        "fps": 23.976,
+        "ratings": 0.0,
+        "ai_translated": true,
+        "machine_translated": false,
+        "release": "Film.2019.ai",
+        "files": [ { "file_id": 104, "cd_number": 1, "file_name": "Film.ai.srt" } ],
+        "moviehash_match": false
+      }
+    }
+  ]
+}

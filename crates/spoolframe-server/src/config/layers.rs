@@ -120,6 +120,13 @@ pub enum SettingError {
          instead (kept apart from the settings)"
     )]
     PlainSecret { provider: String },
+    /// OpenSubtitles' key or password for the runtime layer that is the
+    /// secret itself (PX-02), as [`SettingError::PlainSecret`].
+    #[error(
+        "{key} must be an environment variable, ${{SF_ENV_<NAME>}}: the runtime settings \
+         are plain text, shown by config show and copied with the state directory"
+    )]
+    PlainKey { key: &'static str },
     /// The provided file sets it, and is locked.
     #[error("{key} is set by the server's config file ({path}), which is locked")]
     Locked { key: String, path: PathBuf },
@@ -489,6 +496,16 @@ impl Layers {
     fn check(&self) -> Result<ServerConfig, SettingError> {
         if let Some(provider) = plain_client_secret(&self.runtime) {
             return Err(SettingError::PlainSecret { provider });
+        }
+        for key in [
+            settings::OPENSUBTITLES_API_KEY,
+            settings::OPENSUBTITLES_PASSWORD,
+        ] {
+            if let Some(Value::String(s)) = tree::get(&self.runtime, key)
+                && !tree::is_env_reference(s)
+            {
+                return Err(SettingError::PlainKey { key });
+            }
         }
         ServerConfig::from_table(&self.merged()).map_err(SettingError::Invalid)
     }
@@ -1117,6 +1134,57 @@ mod tests {
             unset.to_string(),
             "auth.oidc.client_secret names ${SF_ENV_PX22_NEVER_SET}, but the server has no \
              environment variable SF_ENV_PX22_NEVER_SET"
+        );
+    }
+
+    /// PX-02: OpenSubtitles' key and password, as an OIDC secret.
+    #[test]
+    fn the_runtime_layer_takes_an_opensubtitles_key_only_as_an_sf_env_reference() {
+        let layers = layers(None, None).unwrap();
+        for key in [
+            settings::OPENSUBTITLES_API_KEY,
+            settings::OPENSUBTITLES_PASSWORD,
+        ] {
+            let refused = layers
+                .with_set(key, Value::String("hunter2".into()))
+                .unwrap_err();
+            assert!(
+                matches!(refused, SettingError::PlainKey { key: refused } if refused == key),
+                "{refused}"
+            );
+        }
+        // A reference passes, and is checked as any value: this variable
+        // is not set, so the change is refused naming it.
+        let unset = layers
+            .with_set(
+                settings::OPENSUBTITLES_API_KEY,
+                Value::String("${SF_ENV_PX02_NEVER_SET}".into()),
+            )
+            .unwrap_err();
+        assert!(
+            unset.to_string().contains("SF_ENV_PX02_NEVER_SET"),
+            "{unset}"
+        );
+        // Expanded, it is the key.
+        let mut table = layers.merged();
+        tree::set(
+            &mut table,
+            settings::OPENSUBTITLES_API_KEY,
+            Value::String("${SF_ENV_PX02_KEY}".into()),
+        );
+        let config = ServerConfig::from_table_with_env(&table, &|name| {
+            (name == "SF_ENV_PX02_KEY").then(|| "abc".to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            config
+                .opensubtitles
+                .settings()
+                .unwrap()
+                .unwrap()
+                .account
+                .api_key,
+            "abc"
         );
     }
 

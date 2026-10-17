@@ -868,6 +868,45 @@ pub enum Request {
         track: u32,
         offset_ms: i64,
     },
+    /// Search the subtitle site for item `id`'s subtitles in `language`
+    /// (an ISO 639-1 code such as `en`, or `pt-BR`), or, with none, in the
+    /// languages the server offers first (PX-02). `SubtitleResults`, best
+    /// first: those found by the file's hash (made for this release), then
+    /// the rest by rating and downloads, machine-translated and AI-made
+    /// after people's, ones removed before as bad last. Kept a day per item
+    /// and language. Anyone who can play the item may. `NoSubtitleSource`
+    /// when the server has none set up; `Unavailable` when the site cannot
+    /// be reached; `RateLimited` when it asks to wait. Only from a client
+    /// that listed `spoolframe:subtitle-search`; from any other,
+    /// `Unsupported`.
+    SearchSubtitles {
+        id: MediaId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    /// Download result `file_id` of a search for item `id` (PX-02): the
+    /// item gains an external subtitle track for everyone, usable at once
+    /// (`SubtitleDownloaded`). One not found by the file's hash is synced
+    /// in the background (`spoolframe:subtitle-sync`). The same result
+    /// downloaded again gives the same track, at no cost. `NotFound` for a
+    /// `file_id` no search of the item listed lately (search again);
+    /// `NotAllowed` for a user the admin took downloads from;
+    /// `QuotaExhausted` when the server's account or the user's own daily
+    /// limit is used up; `InvalidInput` for a file that is not a subtitle
+    /// the server reads. Otherwise as `SearchSubtitles`.
+    DownloadSubtitle {
+        id: MediaId,
+        file_id: u64,
+    },
+    /// Remove item `id`'s downloaded subtitle `download`
+    /// (`SubtitleDownload::id`), for everyone (PX-02): its files go, and
+    /// the result is listed last in the item's searches, marked rejected.
+    /// The one who downloaded it, or an admin, may: `NotAllowed` for
+    /// anyone else. `Done`; a download already removed is `Done` too.
+    RemoveSubtitleDownload {
+        id: MediaId,
+        download: String,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -1408,6 +1447,10 @@ pub enum Reply {
     /// A subtitle track's timing after `SyncSubtitle`,
     /// `UseOriginalSubtitleTiming` or `SetSubtitleOffset` (PX-03).
     SubtitleTiming(spoolframe_types::SubtitleTiming),
+    /// What `SearchSubtitles` found (PX-02).
+    SubtitleResults(spoolframe_types::SubtitleSearch),
+    /// The track `DownloadSubtitle` added (PX-02).
+    SubtitleDownloaded(spoolframe_types::SubtitleDownloaded),
     /// The playlist's revision after `EditPlaylist`.
     PlaylistEdited {
         revision: u64,
@@ -1884,6 +1927,21 @@ pub enum Error {
     /// one that hit the decoder's limits (PX-53). Nothing was changed.
     #[error("the picture cannot be read: a JPEG, PNG, WebP or HEIC is taken")]
     ImageUnreadable,
+    /// The downloads of `whose` are used up for today (PX-02): the
+    /// server's account at the subtitle site, or the user's own daily
+    /// limit on this server. `resets_at` (Unix seconds) is when more may
+    /// be downloaded, when known. Nothing was downloaded; searching still
+    /// works.
+    #[error("no subtitle downloads left today ({whose:?})")]
+    QuotaExhausted {
+        whose: spoolframe_types::QuotaOf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<i64>,
+    },
+    /// The server has no subtitle site set up (PX-02): hide "Find
+    /// subtitles". Nothing was asked of any site.
+    #[error("this server has no subtitle source set up")]
+    NoSubtitleSource,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

@@ -24,6 +24,7 @@ const ALL: Features = Features {
     play_history: true,
     playlist_art: true,
     subtitle_sync: true,
+    subtitle_search: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.
@@ -175,6 +176,37 @@ async fn an_app_not_listing_subtitle_sync_does_not_retime_a_track() {
     );
     assert!(stub.requests_of("sync_subtitle").is_empty());
     assert!(stub.requests_of("set_subtitle_offset").is_empty());
+}
+
+/// PX-02: an app that did not list subtitle search cannot search, download
+/// or remove, even on a server that has it: the SDK refuses, and sends
+/// nothing.
+#[tokio::test]
+async fn an_app_not_listing_subtitle_search_does_not_download() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    let (_client, session) = alice_listing(&stub, Features::default()).await;
+    let unsupported = SdkError::Unsupported {
+        feature: spoolframe_protocol::features::SUBTITLE_SEARCH.into(),
+    };
+    let id: spoolframe_client_sdk::types::MediaId = "plex:movie:1".parse().unwrap();
+    assert_eq!(
+        session.search_subtitles(&id, None).await.unwrap_err(),
+        unsupported
+    );
+    assert_eq!(
+        session.download_subtitle(&id, 101).await.unwrap_err(),
+        unsupported
+    );
+    assert_eq!(
+        session
+            .remove_subtitle_download(&id, "d1")
+            .await
+            .unwrap_err(),
+        unsupported
+    );
+    assert!(stub.requests_of("search_subtitles").is_empty());
+    assert!(stub.requests_of("download_subtitle").is_empty());
 }
 
 /// An app that did not list Liked cannot like, even on a server that has

@@ -222,7 +222,9 @@ impl SubtitleTimings {
     /// file when it has a timing, whether the playback began before the
     /// timing or after (then `path` already is that file).
     pub async fn resolve(&self, path: &Path) -> PathBuf {
-        if path.starts_with(&self.dir) {
+        // A served file is right in the directory; a downloaded subtitle
+        // (PX-02) is in one under it, and is served as any other.
+        if path.parent() == Some(self.dir.as_path()) {
             return path.to_owned();
         }
         self.serving(path).await.unwrap_or_else(|| path.to_owned())
@@ -344,6 +346,30 @@ impl SubtitleTimings {
         let timing = self.timing_of(&sidecar).await;
         self.tell(&track, timing.clone());
         Ok(timing)
+    }
+
+    /// Forget subtitle file `sidecar`'s timing and its files: it is gone
+    /// (PX-02, a download removed). A sync of it still running fails.
+    pub async fn forget(&self, sidecar: &Path) -> Result<(), TimingError> {
+        let _writing = self.writing.lock().await;
+        let key = path_text(sidecar);
+        for file in [
+            self.served_path(sidecar, &key),
+            self.synced_path(sidecar, &key),
+        ] {
+            match tokio::fs::remove_file(&file).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(TimingError::Io(format!(
+                        "cannot remove {}: {e}",
+                        file.display()
+                    )));
+                }
+            }
+        }
+        self.store.delete_subtitle_timing(&key).await?;
+        Ok(())
     }
 
     fn tell(&self, track: &TrackRef, timing: SubtitleTiming) {

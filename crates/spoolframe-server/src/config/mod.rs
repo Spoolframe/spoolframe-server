@@ -162,6 +162,115 @@ pub struct ServerConfig {
     /// unless `enabled`.
     #[ucl(default)]
     pub mcp: McpConfig,
+    /// Subtitles from OpenSubtitles on demand (PX-02): off without an
+    /// API key.
+    #[ucl(default)]
+    pub opensubtitles: OpenSubtitlesConfig,
+}
+
+/// `opensubtitles { api_key = "${SF_ENV_…}"; username; password;
+/// languages = ["en"]; daily_limit_per_user = 0; }` (PX-02). Off without
+/// `api_key`. The key and the password are secrets: in the runtime layer
+/// each must be a `${SF_ENV_…}` reference, never the secret itself. A
+/// live setting.
+#[derive(Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct OpenSubtitlesConfig {
+    /// The API key registered for the app at opensubtitles.com.
+    #[ucl(default)]
+    pub api_key: Option<String>,
+    /// The account downloads count against; without one, the site counts
+    /// them by the server's address, a handful a day.
+    #[ucl(default)]
+    pub username: Option<String>,
+    #[ucl(default)]
+    pub password: Option<String>,
+    /// Searched when no language is asked for, in order; `["en"]` if
+    /// left out.
+    #[ucl(default)]
+    pub languages: Option<Vec<String>>,
+    /// A user's downloads a day; 0 or left out for no limit.
+    #[ucl(default)]
+    pub daily_limit_per_user: Option<u32>,
+    /// Where the API is; the site's own if left out. For tests, in the
+    /// config file only: not a setting the web UI changes.
+    #[ucl(default)]
+    pub api_url: Option<String>,
+}
+
+impl std::fmt::Debug for OpenSubtitlesConfig {
+    /// Whether the secrets are set, never what they are.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenSubtitlesConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "(set)"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "(set)"))
+            .field("languages", &self.languages)
+            .field("daily_limit_per_user", &self.daily_limit_per_user)
+            .field("api_url", &self.api_url)
+            .finish()
+    }
+}
+
+impl OpenSubtitlesConfig {
+    /// The site as the server uses it; `None` without an API key.
+    pub fn settings(&self) -> Result<Option<crate::subtitle_downloads::SiteSettings>, ConfigError> {
+        fn set(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        }
+        let Some(api_key) = set(&self.api_key) else {
+            return Ok(None);
+        };
+        let (username, password) = match (set(&self.username), set(&self.password)) {
+            (Some(u), Some(p)) => (Some(u.to_owned()), Some(p.to_owned())),
+            (None, None) => (None, None),
+            _ => {
+                return Err(ConfigError::Invalid {
+                    key: "opensubtitles.username",
+                    message: "set both the username and the password, or neither".into(),
+                });
+            }
+        };
+        let languages = match &self.languages {
+            None => vec!["en".to_owned()],
+            Some(list) if list.is_empty() => {
+                return Err(ConfigError::Invalid {
+                    key: "opensubtitles.languages",
+                    message: "name at least one language, such as [\"en\"]".into(),
+                });
+            }
+            Some(list) => list
+                .iter()
+                .map(|l| {
+                    crate::subtitle_downloads::language_code(l).map_err(|e| ConfigError::Invalid {
+                        key: "opensubtitles.languages",
+                        message: e.to_string(),
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        let api_url = self
+            .api_url
+            .as_deref()
+            .unwrap_or(crate::opensubtitles::API_URL);
+        let api_url = Url::parse(api_url)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+            .ok_or_else(|| ConfigError::Invalid {
+                key: "opensubtitles.api_url",
+                message: format!("{api_url:?} is not an http(s) URL"),
+            })?;
+        Ok(Some(crate::subtitle_downloads::SiteSettings {
+            account: crate::opensubtitles::Account {
+                api_url,
+                api_key: api_key.to_owned(),
+                username,
+                password,
+            },
+            languages,
+            daily_limit_per_user: self.daily_limit_per_user.unwrap_or(0),
+        }))
+    }
 }
 
 /// `mcp { enabled = true; }` (PX-42): an MCP server at `/mcp` on the
@@ -2597,6 +2706,7 @@ impl ServerConfig {
         parsed.telemetry.otlp.settings()?;
         parsed.http_playback.settings()?;
         parsed.mcp.allowed_redirects()?;
+        parsed.opensubtitles.settings()?;
         Ok(parsed)
     }
 
@@ -2701,6 +2811,58 @@ mod tests {
     #[test]
     fn the_plex_section_is_optional() {
         assert!(plex("").unwrap().plex.is_none());
+    }
+
+    fn opensubtitles(block: &str) -> Result<ServerConfig, ConfigError> {
+        ServerConfig::parse(&format!(
+            r#"schema = "spoolframe.server.v1"; opensubtitles {{ {block} }}"#
+        ))
+    }
+
+    /// PX-02: off without a key; with one, English and no limit unless
+    /// set; the secrets never printed.
+    #[test]
+    fn opensubtitles_is_off_without_a_key() {
+        let none = ServerConfig::parse(r#"schema = "spoolframe.server.v1";"#).unwrap();
+        assert_eq!(none.opensubtitles.settings().unwrap(), None);
+        let config =
+            opensubtitles(r#"api_key = "k3y"; username = "u"; password = "p4ss";"#).unwrap();
+        let settings = config.opensubtitles.settings().unwrap().unwrap();
+        assert_eq!(settings.languages, ["en"]);
+        assert_eq!(settings.daily_limit_per_user, 0);
+        assert_eq!(
+            settings.account.api_url.as_str(),
+            "https://api.opensubtitles.com/api/v1"
+        );
+        assert_eq!(settings.account.username.as_deref(), Some("u"));
+        let shown = format!("{:?} {settings:?}", config.opensubtitles);
+        assert!(!shown.contains("k3y") && !shown.contains("p4ss"), "{shown}");
+    }
+
+    #[test]
+    fn opensubtitles_takes_languages_and_a_limit() {
+        let config = opensubtitles(
+            r#"api_key = "k"; languages = ["en", "pt-BR"]; daily_limit_per_user = 3;"#,
+        )
+        .unwrap();
+        let settings = config.opensubtitles.settings().unwrap().unwrap();
+        assert_eq!(settings.languages, ["en", "pt-br"]);
+        assert_eq!(settings.daily_limit_per_user, 3);
+    }
+
+    #[test]
+    fn opensubtitles_refuses_half_an_account_or_a_bad_language() {
+        for block in [
+            r#"api_key = "k"; username = "u";"#,
+            r#"api_key = "k"; languages = [];"#,
+            r#"api_key = "k"; languages = ["english!"];"#,
+            r#"api_key = "k"; api_url = "ftp://example";"#,
+        ] {
+            assert!(
+                matches!(opensubtitles(block), Err(ConfigError::Invalid { .. })),
+                "{block}"
+            );
+        }
     }
 
     #[test]

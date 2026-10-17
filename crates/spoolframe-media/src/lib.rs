@@ -25,6 +25,7 @@ mod record;
 pub mod roles;
 pub mod sandbox;
 pub mod subsync;
+pub mod subtitle_file;
 pub mod vobsub;
 
 pub use keyframe_store::KeyframeStore;

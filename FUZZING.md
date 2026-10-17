@@ -29,6 +29,7 @@ the dev shell to fuzz.
 | `keyframe_index` | a media file's own keyframe index: Matroska `Cues`, MP4 `stss` (PX-25) | `spoolframe-media` `keyframe_index.rs` |
 | `picture_header` | an uploaded playlist cover's header: its format (JPEG, PNG, WebP, HEIC) and size, read before anything is decoded (PX-53) | `spoolframe-media` `picture.rs` |
 | `subtitle_text` | a text subtitle (SRT, WebVTT, ASS) whose cue times are read and rewritten to sync it; the first byte picks the format (PX-03) | `spoolframe-media` `subsync/text.rs` |
+| `subtitle_download` | a subtitle downloaded from OpenSubtitles, in any encoding, made UTF-8 and its cues read before it is kept (PX-02) | `spoolframe-media` `subtitle_file.rs` |
 
 The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
 in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
@@ -58,6 +59,12 @@ decoded by ffmpeg, confined, which this target does not reach.
 to a library folder made, when someone syncs it: only its timestamps are
 parsed, as bytes. It also checks that a retimed file reads back with as many
 cues, so a rewrite never breaks a cue's timing line.
+
+`subtitle_download` runs in the server process on a file a subtitle site
+sent: its encoding guessed and decoded (`chardetng`, `encoding_rs`), its
+format read from its text, its cues read. It checks that what is kept is
+UTF-8 and reads back with as many cues. The site's JSON is read by serde
+into typed structs, not by a parser of the server's own.
 
 ## Running
 

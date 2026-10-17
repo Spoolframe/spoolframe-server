@@ -117,6 +117,8 @@ spoolframe-probe = { workspace = true }
 webauthn-authenticator-rs = { workspace = true }
 # The stand-in OpenID Connect provider's token times (P3-04).
 chrono = { workspace = true }
+# A CP-1251 subtitle for the download tests (PX-02).
+encoding_rs = { workspace = true }
 # PGS tracks for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }
 # A self-signed certificate for the own relay's TLS from files (P6-04).

@@ -3142,3 +3142,91 @@ fn subtitle_timing_round_trips() {
         timing,
     });
 }
+
+/// `spoolframe:subtitle-search` (PX-02): the three requests, their replies
+/// and the two errors round-trip in CBOR; each is retried safely, and the
+/// two that ask the site wait for it.
+#[test]
+fn subtitle_search_round_trips() {
+    use spoolframe_types::{
+        QuotaOf, SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch,
+        SubtitleTrack,
+    };
+    let id = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+    for (request, wait) in [
+        (
+            Request::SearchSubtitles {
+                id: id.clone(),
+                language: Some("pt-BR".into()),
+            },
+            crate::policy::wait::SUBTITLE_SITE,
+        ),
+        (
+            Request::SearchSubtitles {
+                id: id.clone(),
+                language: None,
+            },
+            crate::policy::wait::SUBTITLE_SITE,
+        ),
+        (
+            Request::DownloadSubtitle {
+                id: id.clone(),
+                file_id: 1_234_567,
+            },
+            crate::policy::wait::SUBTITLE_SITE,
+        ),
+        (
+            Request::RemoveSubtitleDownload {
+                id: id.clone(),
+                download: "d1".into(),
+            },
+            Duration::ZERO,
+        ),
+    ] {
+        assert!(crate::policy::retry_safe(&request));
+        assert_eq!(crate::policy::server_wait(&request), wait);
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request,
+        });
+    }
+    round_trip(Response::Ok(Reply::SubtitleResults(SubtitleSearch {
+        languages: vec!["en".into()],
+        results: vec![SubtitleResult {
+            file_id: 1_234_567,
+            release: "Film.2019.1080p.BluRay".into(),
+            language: "en".into(),
+            format: Some("srt".into()),
+            fps_milli: Some(23_976),
+            downloads: 5_000,
+            rating: Some(87),
+            hearing_impaired: true,
+            origin: SubtitleOrigin::Ai,
+            hash_match: true,
+            rejected: false,
+            downloaded: false,
+        }],
+    })));
+    round_trip(Response::Ok(Reply::SubtitleDownloaded(
+        SubtitleDownloaded {
+            track: 3,
+            subtitle: SubtitleTrack {
+                language: Some("eng".into()),
+                title: Some("English (OpenSubtitles)".into()),
+                forced: false,
+                default: false,
+                external: true,
+                role: SubtitleRole::Full,
+                timing: None,
+                download: None,
+            },
+            account_remaining: Some(19),
+            user_remaining: None,
+        },
+    )));
+    round_trip(Response::Err(Error::QuotaExhausted {
+        whose: QuotaOf::Account,
+        resets_at: Some(1_760_000_000),
+    }));
+    round_trip(Response::Err(Error::NoSubtitleSource));
+}

@@ -960,6 +960,16 @@
     background: color-mix(in srgb, var(--ctp-teal) 18%, transparent);
     color: var(--ctp-teal);
   }
+  /* A subtitle search result's warnings (PX-02): machine-made, removed
+     before. */
+  .pill-warn {
+    background: color-mix(in srgb, var(--ctp-yellow) 18%, transparent);
+    color: var(--ctp-yellow);
+  }
+  .pill-bad {
+    background: color-mix(in srgb, var(--ctp-red) 16%, transparent);
+    color: var(--ctp-red);
+  }
   /* How many identities open the account (P7-09), by its name. */
   .pill-tie {
     display: inline-flex;

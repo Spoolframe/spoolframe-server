@@ -45,6 +45,22 @@ const fn restart(key: &'static str) -> Setting {
 /// in `secrets/plex-token` under the state directory.
 pub const PLEX_TOKEN: &str = "plex.token";
 
+/// OpenSubtitles' API key (PX-02).
+pub const OPENSUBTITLES_API_KEY: &str = "opensubtitles.api_key";
+
+/// OpenSubtitles' account password (PX-02).
+pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles.password";
+
+/// A live setting whose value is never shown: only whether it is set.
+const fn write_only(key: &'static str) -> Setting {
+    Setting {
+        key,
+        apply: Apply::Live,
+        secret: false,
+        write_only: true,
+    }
+}
+
 /// Every setting, in the order `config show` lists them.
 pub const SETTINGS: &[Setting] = &[
     live("name"),
@@ -150,6 +166,16 @@ pub const SETTINGS: &[Setting] = &[
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),
     restart("http_playback.address"),
+    // PX-02. The key and the password are `${SF_ENV_…}` references, never
+    // shown: the runtime layer refuses the secret itself.
+    write_only(OPENSUBTITLES_API_KEY),
+    live("opensubtitles.username"),
+    write_only(OPENSUBTITLES_PASSWORD),
+    live("opensubtitles.languages"),
+    live("opensubtitles.daily_limit_per_user"),
+    // Not `opensubtitles.api_url`: in the config file only (tests). Set at
+    // run time, it would send the key, which may name any `SF_ENV_`
+    // variable, wherever an admin pointed it.
 ];
 
 /// The setting called `key`, if there is one.

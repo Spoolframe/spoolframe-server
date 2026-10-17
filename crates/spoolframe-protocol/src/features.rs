@@ -77,6 +77,16 @@ pub const PLAYLIST_ART: &str = "spoolframe:playlist-art";
 /// sent none of these, and the requests are `Unsupported`.
 pub const SUBTITLE_SYNC: &str = "spoolframe:subtitle-sync";
 
+/// Subtitles from OpenSubtitles on demand (PX-02): the `SearchSubtitles`
+/// request (`SubtitleResults`), `DownloadSubtitle` (`SubtitleDownloaded`:
+/// the item's new track, for everyone on the server) and
+/// `RemoveSubtitleDownload`; `SubtitleTrack::download` on `Tracks`; and
+/// the `QuotaExhausted` and `NoSubtitleSource` errors. A server without
+/// OpenSubtitles set up still has the feature, and answers each request
+/// `NoSubtitleSource`. A session whose client did not list it is sent no
+/// `download`, and the requests are `Unsupported`.
+pub const SUBTITLE_SEARCH: &str = "spoolframe:subtitle-search";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,
@@ -86,6 +96,7 @@ pub const ALL: &[&str] = &[
     PLAY_HISTORY,
     PLAYLIST_ART,
     SUBTITLE_SYNC,
+    SUBTITLE_SEARCH,
 ];
 
 /// The ones that change what a client can do before it has a session:
@@ -152,6 +163,12 @@ mod tests {
     fn subtitle_sync_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&SUBTITLE_SYNC));
         assert!(!PRE_AUTH.contains(&SUBTITLE_SYNC));
+    }
+
+    #[test]
+    fn subtitle_search_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&SUBTITLE_SEARCH));
+        assert!(!PRE_AUTH.contains(&SUBTITLE_SEARCH));
     }
 
     #[test]

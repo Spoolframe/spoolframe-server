@@ -60,6 +60,9 @@ pub struct FakeCatalog {
     music: Mutex<bool>,
     /// Whether its films, episodes and tracks have posters (PX-53).
     posters: Mutex<bool>,
+    /// Agents' ids an item has besides its `test://` one (PX-02:
+    /// `imdb://tt…`).
+    more_ids: Mutex<HashMap<MediaId, Vec<String>>>,
 }
 
 /// What a key holds after the catalog gave its item a new one. A key the
@@ -90,7 +93,23 @@ impl FakeCatalog {
             unreadable: Mutex::default(),
             music: Mutex::default(),
             posters: Mutex::default(),
+            more_ids: Mutex::default(),
         }
+    }
+
+    /// Give item `id` these agents' ids too (`imdb://tt0078748`).
+    pub fn give_ids(&self, id: &MediaId, ids: &[&str]) {
+        self.more_ids
+            .lock()
+            .insert(id.clone(), ids.iter().map(|s| (*s).to_owned()).collect());
+    }
+
+    fn ids_of(&self, item: &Item) -> Vec<String> {
+        let mut ids = external_ids(item);
+        if let Some(more) = self.more_ids.lock().get(item.id()) {
+            ids.extend(more.iter().cloned());
+        }
+        ids
     }
 
     /// Give each film, episode and track a poster, as a PMS does: a
@@ -499,7 +518,7 @@ impl Catalog for FakeCatalog {
                     Vec::new()
                 };
                 ItemWithChildren {
-                    external_ids: external_ids(&item),
+                    external_ids: self.ids_of(&item),
                     item,
                     children,
                     markers,
@@ -518,7 +537,7 @@ impl Catalog for FakeCatalog {
             None => {}
         }
         self.current(id)
-            .map(|(item, _)| external_ids(&item))
+            .map(|(item, _)| self.ids_of(&item))
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
     }
 

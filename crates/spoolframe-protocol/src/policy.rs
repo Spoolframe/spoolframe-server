@@ -21,6 +21,10 @@ pub mod wait {
     /// bounds only at 10 minutes. Two minutes is longer than a player
     /// should spin; past it the user is better told.
     pub const PLAYBACK: Duration = Duration::from_secs(120);
+    /// A request the server answers from a subtitle site (PX-02): a
+    /// search, or a sign-in, a download and the file. Each call to the
+    /// site has 10 seconds.
+    pub const SUBTITLE_SITE: Duration = Duration::from_secs(30);
 }
 
 /// How long the server may hold `request` before it answers.
@@ -35,6 +39,7 @@ pub fn server_wait(request: &Request) -> Duration {
         | Request::SyncSubtitle { .. }
         | Request::UseOriginalSubtitleTiming { .. }
         | Request::SetSubtitleOffset { .. } => wait::PROBE,
+        Request::SearchSubtitles { .. } | Request::DownloadSubtitle { .. } => wait::SUBTITLE_SITE,
         Request::StartPlayback { .. }
         | Request::ChangeSubtitle { .. }
         | Request::ChangeQuality { .. } => wait::PLAYBACK,
@@ -105,7 +110,13 @@ pub fn retry_safe(request: &Request) -> bool {
         // offset set twice is set once.
         | Request::SyncSubtitle { .. }
         | Request::UseOriginalSubtitleTiming { .. }
-        | Request::SetSubtitleOffset { .. } => true,
+        | Request::SetSubtitleOffset { .. }
+        // PX-02: a search is a read; the same result is never downloaded
+        // twice (the second gets the first's track); a download removed
+        // twice is removed once.
+        | Request::SearchSubtitles { .. }
+        | Request::DownloadSubtitle { .. }
+        | Request::RemoveSubtitleDownload { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

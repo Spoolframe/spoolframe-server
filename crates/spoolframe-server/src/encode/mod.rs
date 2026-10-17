@@ -287,7 +287,17 @@ impl Conversion {
                     ..
                 }) => {
                     let link = dir.join("sidecar");
-                    std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
+                    // One of the server's own (a download, PX-02) is in the
+                    // hidden state directory, which no run may open as an
+                    // input: the run reads a copy in its own directory.
+                    let target = if jobs.is_own_subtitle(path) {
+                        let copy = dir.join("own-sidecar");
+                        std::fs::copy(path, &copy).map_err(prepare)?;
+                        copy
+                    } else {
+                        path.clone()
+                    };
+                    std::os::unix::fs::symlink(&target, &link).map_err(prepare)?;
                     Some(link)
                 }
                 _ => None,

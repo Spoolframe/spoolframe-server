@@ -51,6 +51,13 @@ pub enum UserCommand {
     /// Make a user an admin or a consumer. The last enabled admin stays
     /// one.
     Role { username: String, role: Role },
+    /// Whether a user may download subtitles from OpenSubtitles (PX-02):
+    /// `on` or `off`; without one, says which. Searching stays theirs.
+    SubtitleDownloads {
+        username: String,
+        #[arg(value_parser = ["on", "off"])]
+        set: Option<String>,
+    },
     /// A user's profile PIN (P2-08).
     Pin {
         #[command(subcommand)]
@@ -181,6 +188,25 @@ pub enum SubtitleCommand {
         track: u32,
         #[arg(allow_hyphen_values = true)]
         offset_ms: i64,
+    },
+    /// Search OpenSubtitles for an item's subtitles (PX-02), best first.
+    Search {
+        id: String,
+        /// `en`, `pt-BR`; the languages set if left out.
+        #[arg(long)]
+        language: Option<String>,
+    },
+    /// Download a result of `search`: a track of the item for everyone.
+    Download {
+        id: String,
+        /// The result's file id, as `search` lists it.
+        file_id: u64,
+    },
+    /// Remove a downloaded subtitle, for everyone.
+    Remove {
+        id: String,
+        /// The download's id, as `list` shows it.
+        download: String,
     },
 }
 
@@ -616,6 +642,23 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
                 .map_err(api_error)?;
             println!("added {} ({})", user.username, user.role);
         }
+        UserCommand::SubtitleDownloads { username, set } => {
+            let allowed = match set.as_deref() {
+                Some(set) => {
+                    let allowed = set == "on";
+                    api.user_set_subtitle_downloads(username.clone(), allowed)
+                        .await
+                        .map_err(api_error)?;
+                    allowed
+                }
+                None => api
+                    .user_subtitle_downloads(username.clone())
+                    .await
+                    .map_err(api_error)?,
+            };
+            let state = if allowed { "on" } else { "off" };
+            println!("subtitle downloads are {state} for {username}");
+        }
         UserCommand::Role { username, role } => {
             let user = api.user_set_role(username, role).await.map_err(api_error)?;
             println!("{} is now {}", user.username, user.role);
@@ -915,6 +958,38 @@ pub async fn subtitle(listen: SocketAddr, command: SubtitleCommand) -> Result<()
 
 async fn run_subtitle(api: &WsClient, command: SubtitleCommand) -> Result<()> {
     let timings = match command {
+        SubtitleCommand::Search { id, language } => {
+            let found = api.subtitle_search(id, language).await.map_err(api_error)?;
+            if found.results.is_empty() {
+                println!("nothing found in {}", found.languages.join(", "));
+            }
+            for result in &found.results {
+                println!("{}", result_line(result));
+            }
+            return Ok(());
+        }
+        SubtitleCommand::Download { id, file_id } => {
+            let got = api
+                .subtitle_download(id, file_id)
+                .await
+                .map_err(api_error)?;
+            let mut line = format!("downloaded as subtitle {}", got.track);
+            if let Some(left) = got.account_remaining {
+                line.push_str(&format!("; the account has {left} download(s) left today"));
+            }
+            if let Some(left) = got.user_remaining {
+                line.push_str(&format!("; you have {left} left today"));
+            }
+            println!("{line}");
+            return Ok(());
+        }
+        SubtitleCommand::Remove { id, download } => {
+            api.subtitle_remove(id, download.clone())
+                .await
+                .map_err(api_error)?;
+            println!("removed {download}");
+            return Ok(());
+        }
         SubtitleCommand::List { id } => {
             let timings = api.subtitle_timings(id).await.map_err(api_error)?;
             if timings.is_empty() {
@@ -947,6 +1022,42 @@ async fn run_subtitle(api: &WsClient, command: SubtitleCommand) -> Result<()> {
 }
 
 /// `0  Film.en.srt  synced (-3200 ms, x1.0427, 1 split, score 87)  offset +1500 ms by Alice`.
+/// One search result as `subtitle search` lists it (PX-02).
+fn result_line(r: &spoolframe_types::SubtitleResult) -> String {
+    use spoolframe_types::SubtitleOrigin;
+    let mut marks = Vec::new();
+    if r.hash_match {
+        marks.push("hash match");
+    }
+    if r.hearing_impaired {
+        marks.push("SDH");
+    }
+    match r.origin {
+        SubtitleOrigin::MachineTranslated => marks.push("machine-translated"),
+        SubtitleOrigin::Ai => marks.push("AI-made"),
+        SubtitleOrigin::Human => {}
+    }
+    if r.downloaded {
+        marks.push("downloaded");
+    }
+    if r.rejected {
+        marks.push("removed before");
+    }
+    let rating = r.rating.map_or_else(
+        || "unrated".to_owned(),
+        |r| format!("{}.{}/10", r / 10, r % 10),
+    );
+    let marks = if marks.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", marks.join(", "))
+    };
+    format!(
+        "{}  {}  {}  {rating}, {} downloads{marks}",
+        r.file_id, r.language, r.release, r.downloads
+    )
+}
+
 fn timing_line(t: &spoolframe_admin_api::SubtitleTimingInfo) -> String {
     use spoolframe_admin_api::SubtitleSyncState as S;
     let sync = match &t.sync {
@@ -969,7 +1080,11 @@ fn timing_line(t: &spoolframe_admin_api::SubtitleTimingInfo) -> String {
         (ms, Some(by)) => format!("  offset {ms:+} ms by {by}"),
         (ms, None) => format!("  offset {ms:+} ms"),
     };
-    format!("{}  {}  {sync}{offset}", t.track, t.label)
+    let download = match &t.download {
+        Some(d) => format!("  downloaded by {} (id {})", d.by, d.id),
+        None => String::new(),
+    };
+    format!("{}  {}  {sync}{offset}{download}", t.track, t.label)
 }
 
 /// List or revoke portable users' grants (P7-06), logged in as an admin.
@@ -1192,6 +1307,7 @@ mod tests {
             offset_ms: 1_500,
             offset_by: Some("Alice".into()),
             offset_at: Some(1),
+            download: None,
         };
         assert_eq!(
             timing_line(&synced),
@@ -1205,6 +1321,29 @@ mod tests {
         assert_eq!(
             timing_line(&uncertain),
             "2  Film.en.srt  sync uncertain (score 9); original timing"
+        );
+    }
+
+    /// PX-02: a result says what it is made for and what marks it.
+    #[test]
+    fn a_search_result_line_says_its_marks() {
+        let result = spoolframe_types::SubtitleResult {
+            file_id: 101,
+            release: "Film.2019.1080p".into(),
+            language: "en".into(),
+            format: Some("srt".into()),
+            fps_milli: None,
+            downloads: 120,
+            rating: Some(87),
+            hearing_impaired: false,
+            origin: spoolframe_types::SubtitleOrigin::MachineTranslated,
+            hash_match: true,
+            rejected: true,
+            downloaded: false,
+        };
+        assert_eq!(
+            result_line(&result),
+            "101  en  Film.2019.1080p  8.7/10, 120 downloads  [hash match, machine-translated, removed before]"
         );
     }
 

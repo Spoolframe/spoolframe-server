@@ -78,6 +78,10 @@ pub struct Prober {
     /// Where the lists that took a scan are kept across restarts; none
     /// without [`Prober::with_keyframe_store`].
     store: Option<KeyframeStore>,
+    /// Subtitle files of the server's own a media file has besides those
+    /// beside it (PX-02's downloads), by the media file's path: put after
+    /// its own, so their places do not move the file's.
+    added: Mutex<HashMap<PathBuf, Vec<SubtitleStream>>>,
 }
 
 /// A file's keyframe times, shared.
@@ -249,6 +253,7 @@ impl Prober {
             keyframes: Mutex::new(Lru::new(MAX_KEYFRAME_LISTS)),
             reading: Mutex::new(HashMap::new()),
             store: None,
+            added: Mutex::new(HashMap::new()),
         }
     }
 
@@ -262,6 +267,37 @@ impl Prober {
     /// The descriptor of the media file at `path`, with the subtitle files
     /// beside it.
     pub async fn describe(&self, path: &Path) -> Result<Arc<MediaDescriptor>, ProbeError> {
+        let found = self.describe_file(path).await?;
+        Ok(self.with_added(path, found))
+    }
+
+    /// Give the media file at `path` these subtitle files of the server's
+    /// own (PX-02), after its own, in place of any it had: what
+    /// [`Prober::describe`] lists from now on. None takes them away. They
+    /// are not probed (ffprobe may not open a file of the server's own):
+    /// each comes as its caller made it.
+    pub fn set_added_subtitles(&self, path: &Path, subtitles: Vec<SubtitleStream>) {
+        let mut added = self.added.lock();
+        if subtitles.is_empty() {
+            added.remove(path);
+        } else {
+            added.insert(path.to_owned(), subtitles);
+        }
+    }
+
+    fn with_added(&self, path: &Path, found: Arc<MediaDescriptor>) -> Arc<MediaDescriptor> {
+        let added = self.added.lock();
+        match added.get(path) {
+            None => found,
+            Some(subtitles) => {
+                let mut descriptor = (*found).clone();
+                descriptor.subtitles.extend(subtitles.iter().cloned());
+                Arc::new(descriptor)
+            }
+        }
+    }
+
+    async fn describe_file(&self, path: &Path) -> Result<Arc<MediaDescriptor>, ProbeError> {
         let stamp = self.stamp_or_forget(path).await?;
         if let Some(hit) = self.cached(path, stamp) {
             return Ok(hit);

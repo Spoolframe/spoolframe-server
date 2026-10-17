@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- Subtitles from OpenSubtitles on demand (PX-02, the server and the web
+  UI). On a film's or an episode's page, "Find subtitles…" searches
+  opensubtitles.com by the file's hash and the item's IMDb or TMDB id
+  (or its title), best first: found by the hash, then by rating and
+  downloads, machine-translated and AI-made last, each marked. A
+  download is made UTF-8 (CP-1251 and the like detected), checked, kept
+  in `state_dir/subtitles/downloaded`, and is at once an external
+  subtitle of the item for every user, after the file's own; one not
+  found by the hash is synced (PX-03). Its downloader or an admin
+  removes it, and its result is then listed last, marked. The server
+  asks only when someone does, with one account: `opensubtitles {
+  api_key; username; password; languages; daily_limit_per_user; }`, set
+  in Settings › Subtitles; the key and the password are
+  `${SF_ENV_…}` references. Searches are kept a day per item and
+  language; calls are spaced out and a "wait" from the site is obeyed;
+  a used-up quota is said as the account's or the user's own. An admin
+  may turn downloads off per user. Behind a new regular feature,
+  `spoolframe:subtitle-search` (the protocol version is unchanged): the
+  `SearchSubtitles`, `DownloadSubtitle` and `RemoveSubtitleDownload`
+  requests, `SubtitleTrack::download`, and the `QuotaExhausted` and
+  `NoSubtitleSource` errors. SDK: `Features::subtitle_search`,
+  `Session::search_subtitles`, `Session::download_subtitle`,
+  `Session::remove_subtitle_download`. Admin API: `admin.subtitleSearch`,
+  `admin.subtitleDownload`, `admin.subtitleRemove`,
+  `admin.userSubtitleDownloads`, `admin.userSetSubtitleDownloads`, and
+  `download` on `admin.subtitleTimings`' rows; CLI: `spoolframe-server
+  subtitle search|download|remove` and `spoolframe-server user
+  subtitle-downloads <name> [on|off]`. A subtitle of the server's own
+  carried into a converted file is copied into the conversion's
+  directory, and a synced or offset one is carried as it is served.
+  Migration 0036 adds `subtitle_downloads`, `subtitle_download_log`,
+  `subtitle_rejections` and `subtitle_download_denied`. New
+  dependencies: `chardetng` (Apache-2.0 or MIT) and `encoding_rs`
+  (already in the tree), both pure Rust. A new fuzz target,
+  `subtitle_download`, checks a downloaded file as the server does.
+
 - Subtitle sync and offset (PX-03). A subtitle file beside a film (SRT,
   WebVTT, ASS) that was made for another release can be synced to the
   file, for every user who plays it: its cues are aligned with alass's
