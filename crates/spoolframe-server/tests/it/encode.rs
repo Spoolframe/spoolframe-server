@@ -1048,9 +1048,34 @@ async fn hls_plays_whole_in_a_scratch_space_smaller_than_the_film() {
     server.stop().await;
 }
 
+/// A stand-in for ffmpeg, in `dir`, whose first run (epoch 0) reads only
+/// the film's first 8 s, ending at segment 4; every later run is ffmpeg's
+/// own. A segment restarts the encode only if it is far past what the
+/// running one has written, and at full speed the first run writes a 30 s
+/// film in some 400 ms, before the throttle's first look (ffmpeg reports
+/// its progress every 500 ms): a test whose first read came later than
+/// that, on a loaded machine, found the segment written and no restart.
+/// Cut short, the first run never gets there.
+fn first_run_cut_short(dir: &Path) -> PathBuf {
+    let ffmpeg = dir.join("short-first-ffmpeg");
+    crate::support::write_script(
+        &ffmpeg,
+        "#!/bin/sh\nfor out; do :; done\n\
+         case \"$out\" in */0/*) exec ffmpeg -t 8 \"$@\" ;; esac\n\
+         exec ffmpeg \"$@\"\n",
+    );
+    ffmpeg
+}
+
 #[tokio::test]
 async fn asking_for_a_late_segment_first_restarts_the_encode_there() {
-    let (server, client, session) = hls_ready("hls-jump", hls_capabilities()).await;
+    let dir = fresh_dir("hls-jump").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let options = ServerOptions {
+        ffmpeg: first_run_cut_short(&dir),
+        ..ServerOptions::default()
+    };
+    let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
     let handle = started(&client, &session, None).await;
     // The last segment, before anything else: far past what is written.
     let last = segment(&client, &session, &handle, 15).await;
@@ -1403,24 +1428,14 @@ async fn hls_of_an_encoded_video_started_in_its_head_stores_the_film_s_own_time(
 /// A far seek starts a new run in a new epoch, with an `init.mp4` of its
 /// own: that one stores the film's time too.
 ///
-/// A segment restarts the encode only if it is far past what the running
-/// one has written, and at full speed the first run can write the whole
-/// film before segment 14 is asked for. So the first run (epoch 0) reads
-/// only the film's first 8 s: it ends at segment 4, and segment 14 is
+/// The first run is cut short ([`first_run_cut_short`]), so segment 14 is
 /// always far past it. The run that restarts there reads the whole film.
 #[tokio::test]
 async fn hls_restarted_far_ahead_stores_the_film_s_own_time() {
     let dir = fresh_dir("hls-times-restart").await;
     std::fs::create_dir_all(&dir).unwrap();
-    let ffmpeg = dir.join("short-first-ffmpeg");
-    crate::support::write_script(
-        &ffmpeg,
-        "#!/bin/sh\nfor out; do :; done\n\
-         case \"$out\" in */0/*) exec ffmpeg -t 8 \"$@\" ;; esac\n\
-         exec ffmpeg \"$@\"\n",
-    );
     let options = ServerOptions {
-        ffmpeg,
+        ffmpeg: first_run_cut_short(&dir),
         ..ServerOptions::default()
     };
     let (server, client, session) = hls_ready_with(dir, hls_capabilities(), options).await;
