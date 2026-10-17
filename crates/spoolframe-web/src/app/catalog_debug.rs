@@ -40,6 +40,7 @@ pub(super) fn DebugTab(id: String) -> Element {
                     PlanForCard { id: id.clone(), debug: debug.clone(), probe: probe.clone() }
                 }
                 Caches { debug: debug.clone() }
+                super::subtitle_timing::SubtitleTimingCard { id: id.clone() }
             }
         },
     }

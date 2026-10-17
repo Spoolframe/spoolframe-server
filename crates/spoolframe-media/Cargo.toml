@@ -9,9 +9,12 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]
+# Subtitle sync (subsync.rs): the aligner, and speech found in the audio.
+alass-core = { workspace = true }
 async-trait = { workspace = true }
 # Names a kept keyframe list by its media path (keyframe_store.rs).
 blake3 = { workspace = true }
+earshot = { workspace = true }
 easy-ffprobe = { workspace = true }
 # What the tools it runs may reach (sandbox.rs): Landlock's file and
 # network rules, made before the fork and applied after it.

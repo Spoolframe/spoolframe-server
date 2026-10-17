@@ -529,6 +529,8 @@ pub struct Services {
     pub jobs: Arc<Jobs>,
     /// Bitmap subtitles read as text (P2-07).
     pub subtitles: Arc<Subtitles>,
+    /// External text subtitles synced and offset (PX-03).
+    pub subtitle_timings: Arc<crate::subtitle_sync::SubtitleTimings>,
     /// Frame previews for scrubbing (P3-13).
     pub previews: Arc<crate::previews::Previews>,
     /// Keyframes read ahead of any play (`experimental.index_ahead`).

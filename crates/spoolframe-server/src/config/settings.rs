@@ -125,6 +125,7 @@ pub const SETTINGS: &[Setting] = &[
     restart("subtitles.ocr"),
     restart("subtitles.ocr_threads"),
     restart("subtitles.cache_dir"),
+    restart("subtitles.sync_at_once"),
     live("previews.when"),
     live("previews.interval_secs"),
     // The disk tier is laid out at start (crate::hybrid).

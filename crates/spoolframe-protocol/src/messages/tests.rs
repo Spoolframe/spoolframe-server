@@ -3098,3 +3098,47 @@ mod play_history {
         assert_eq!(read, movie());
     }
 }
+
+/// `spoolframe:subtitle-sync` (PX-03): the three requests, their reply and
+/// the event round-trip in CBOR; each is retried safely and may probe.
+#[test]
+fn subtitle_timing_round_trips() {
+    let id = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+    let timing = spoolframe_types::SubtitleTiming {
+        sync: spoolframe_types::SubtitleSync::Uncertain { score: 12 },
+        offset_ms: -1_500,
+        offset_by: Some("Alice".into()),
+        offset_at: Some(1_760_000_000),
+    };
+    for request in [
+        Request::SyncSubtitle {
+            id: id.clone(),
+            track: 2,
+        },
+        Request::UseOriginalSubtitleTiming {
+            id: id.clone(),
+            track: 2,
+        },
+        Request::SetSubtitleOffset {
+            id: id.clone(),
+            track: 2,
+            offset_ms: -1_500,
+        },
+    ] {
+        assert!(crate::policy::retry_safe(&request));
+        assert_eq!(
+            crate::policy::server_wait(&request),
+            crate::policy::wait::PROBE
+        );
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request,
+        });
+    }
+    round_trip(Response::Ok(Reply::SubtitleTiming(timing.clone())));
+    round_trip(Event::SubtitleTimingChanged {
+        id,
+        track: 2,
+        timing,
+    });
+}

@@ -29,7 +29,10 @@ pub use codec::{
 };
 pub use date::{CalendarDate, DateError};
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace, PersonId};
-pub use media::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack, VideoTrack};
+pub use media::{
+    AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleSync, SubtitleTiming, SubtitleTrack,
+    VideoTrack,
+};
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, CastMember, Episode, Item, Library, LibraryKind, Marker,
     MarkerKind, Movie, PlaybackState, Season, Show, Track,

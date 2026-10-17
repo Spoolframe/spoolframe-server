@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Subtitle sync and offset (PX-03). A subtitle file beside a film (SRT,
+  WebVTT, ASS) that was made for another release can be synced to the
+  file, for every user who plays it: its cues are aligned with alass's
+  algorithm to a text subtitle inside the file, in any language, else to
+  the speech in its default audio, which fixes a shift, a frame-rate
+  stretch (23.976 against 25) and cut scenes at once. Syncs run in the
+  background, one at a time (`subtitles.sync_at_once`), with ffmpeg's
+  decode of the audio and the alignment at idle priority; the speech
+  found is kept per file and audio track, so a second subtitle of the
+  same film syncs at once. A sync that scores too low is not used: the
+  track keeps its timing and says it is uncertain. The file itself is
+  never written: the synced copy and the one served (synced or original,
+  with the offset) are kept in `state_dir/subtitles`, and "Use original
+  timing" serves the original again. A manual offset is set on the track
+  for everyone, on top of its timing, with who set it and when. A
+  playback reading the track is told and reads it again, without a
+  restart. Behind a new regular feature, `spoolframe:subtitle-sync` (the
+  protocol version is unchanged): `SubtitleTrack::timing` on `Tracks`,
+  the `SyncSubtitle`, `UseOriginalSubtitleTiming` and `SetSubtitleOffset`
+  requests answered `SubtitleTiming`, and the `SubtitleTimingChanged`
+  event. SDK: `Features::subtitle_sync`, `Session::sync_subtitle`,
+  `Session::use_original_subtitle_timing`, `Session::set_subtitle_offset`
+  and `Client::subtitle_timing_events`. Admin API:
+  `admin.subtitleTimings`, `admin.subtitleSync`,
+  `admin.subtitleUseOriginal` and `admin.subtitleSetOffset`; CLI:
+  `spoolframe-server subtitle list|sync|original|offset`. The web UI
+  shows an item's subtitle files on its Debug tab, with Sync, Use
+  original timing and the offset. Migration 0035 adds
+  `subtitle_timings`. New dependencies: `alass-core` (GPL-3.0, allowed
+  for it alone) and `earshot` (MIT or Apache-2.0), both pure Rust. A new
+  fuzz target, `subtitle_text`, reads and rewrites a subtitle's times as
+  the server does.
+
 - An item's playlists (`Item`'s `playlists`, each a `PlaylistRef`) now
   say whose each is, `owner_name`, for a client that listed
   `spoolframe:playlist-sharing`, as a playlist's summary does. Without

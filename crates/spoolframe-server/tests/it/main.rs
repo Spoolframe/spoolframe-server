@@ -71,6 +71,7 @@ mod sessions;
 mod settings;
 mod sso;
 mod subtitle_decoder;
+mod subtitle_sync;
 mod subtitles;
 mod telemetry;
 mod throughput;

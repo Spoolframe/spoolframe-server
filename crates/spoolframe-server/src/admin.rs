@@ -4126,6 +4126,72 @@ impl AdminApiServer for AdminApi {
         self.playback_debug()?.item(&id).await.map_err(debug_error)
     }
 
+    async fn subtitle_timings(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<Vec<spoolframe_admin_api::SubtitleTimingInfo>> {
+        self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?
+            .subtitle_timings(&id)
+            .await
+            .map_err(debug_error)
+    }
+
+    async fn subtitle_sync(
+        &self,
+        ext: &Extensions,
+        id: String,
+        track: u32,
+    ) -> RpcResult<spoolframe_admin_api::SubtitleTimingInfo> {
+        self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?
+            .retime(&id, track, crate::playback_debug::Retime::Sync)
+            .await
+            .map_err(debug_error)
+    }
+
+    async fn subtitle_use_original(
+        &self,
+        ext: &Extensions,
+        id: String,
+        track: u32,
+    ) -> RpcResult<spoolframe_admin_api::SubtitleTimingInfo> {
+        self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        self.playback_debug()?
+            .retime(&id, track, crate::playback_debug::Retime::UseOriginal)
+            .await
+            .map_err(debug_error)
+    }
+
+    async fn subtitle_set_offset(
+        &self,
+        ext: &Extensions,
+        id: String,
+        track: u32,
+        offset_ms: i64,
+    ) -> RpcResult<spoolframe_admin_api::SubtitleTimingInfo> {
+        let admin = self.admin(ext).await?;
+        let id = catalog::media_id(&id)?;
+        // Recorded with the track: who set it, by the name users see.
+        let name = match self.auth.store().user_by_id(admin.user).await {
+            Ok(Some(user)) => user.display_name.unwrap_or(user.username),
+            _ => admin.user.to_string(),
+        };
+        let change = crate::playback_debug::Retime::Offset {
+            offset_ms,
+            by: crate::principal::Principal::LocalUser(admin.user).to_string(),
+            name,
+        };
+        self.playback_debug()?
+            .retime(&id, track, change)
+            .await
+            .map_err(debug_error)
+    }
+
     async fn catalog_plan_for(
         &self,
         ext: &Extensions,
@@ -4175,6 +4241,16 @@ fn debug_error(e: crate::playback_debug::DebugError) -> ErrorObjectOwned {
         DebugError::Catalog(e) => catalog::catalog_error(e),
         DebugError::Unreadable(why) => error(error_code::UNAVAILABLE, why),
         DebugError::NoSuchDevice(why) => error(error_code::NO_SUCH_DEVICE, why),
+        DebugError::Timing(e) => {
+            use crate::subtitle_sync::TimingError;
+            match e {
+                TimingError::NoSuchTrack(_)
+                | TimingError::NotExternalText
+                | TimingError::OffsetTooLarge => error(error_code::INVALID_INPUT, e.to_string()),
+                TimingError::Io(why) => error(error_code::UNAVAILABLE, why),
+                TimingError::Store(e) => internal(e),
+            }
+        }
     }
 }
 

@@ -837,6 +837,37 @@ pub enum Request {
     RemovePlaylistArt {
         id: String,
     },
+    /// Sync item `id`'s subtitle `track` (its place in `Tracks`'
+    /// `subtitles`) to the file (PX-03), in the background: an external
+    /// text subtitle (SRT, WebVTT, ASS) only. `SubtitleTiming`, its state
+    /// `Syncing` (a track already syncing is left to it); the outcome comes
+    /// as `SubtitleTimingChanged`, or in `Tracks` asked again. The track
+    /// is served as it was until the sync is done, then synced; a sync
+    /// that scores too low is not used (`Uncertain`). Anyone who can play
+    /// the item may. Another track is `InvalidInput`, a track the item
+    /// does not have `NotFound`. Only from a client that listed
+    /// `spoolframe:subtitle-sync`; from any other, `Unsupported`.
+    SyncSubtitle {
+        id: MediaId,
+        track: u32,
+    },
+    /// Serve item `id`'s subtitle `track` with its original timing again,
+    /// for everyone (PX-03): the sync is set aside, the offset kept.
+    /// `SubtitleTiming`. As `SyncSubtitle` for who may and which tracks.
+    UseOriginalSubtitleTiming {
+        id: MediaId,
+        track: u32,
+    },
+    /// Move item `id`'s subtitle `track` by `offset_ms` (positive: later)
+    /// on top of its timing, for everyone (PX-03); 0 resets it. At most
+    /// ten minutes either way (`InvalidInput`). The track records who set
+    /// it and when. `SubtitleTiming`. As `SyncSubtitle` for who may and
+    /// which tracks.
+    SetSubtitleOffset {
+        id: MediaId,
+        track: u32,
+        offset_ms: i64,
+    },
 
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
@@ -1374,6 +1405,9 @@ pub enum Reply {
     Playlist(PlaylistPage),
     /// A playlist as it is now (`CreatePlaylist`, `UpdatePlaylist`).
     PlaylistInfo(PlaylistSummary),
+    /// A subtitle track's timing after `SyncSubtitle`,
+    /// `UseOriginalSubtitleTiming` or `SetSubtitleOffset` (PX-03).
+    SubtitleTiming(spoolframe_types::SubtitleTiming),
     /// The playlist's revision after `EditPlaylist`.
     PlaylistEdited {
         revision: u64,
@@ -1907,6 +1941,17 @@ pub enum Event {
     /// The user's Pinned, or its notes, changed on another device or by
     /// another user's change: `ListPlaylists` again.
     PinsChanged,
+    /// Item `id`'s subtitle `track` is timed anew (PX-03): synced, its
+    /// sync done or set aside, or its offset changed, by anyone. What it
+    /// is served with changed: a player showing it reads it again (a
+    /// `ReadSubtitle` in progress answers `SubtitleChanged`), with no
+    /// restart. Only to a client that listed `spoolframe:subtitle-sync`,
+    /// on a connection that asked for the item's `Tracks` or plays it.
+    SubtitleTimingChanged {
+        id: MediaId,
+        track: u32,
+        timing: spoolframe_types::SubtitleTiming,
+    },
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,

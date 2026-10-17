@@ -638,3 +638,76 @@ async fn an_item_s_debug_shows_its_probe_and_its_caches() {
     assert!(debug.devices.iter().any(|d| d.id == "profile:apple-tv"));
     server.stop().await;
 }
+
+/// PX-03 from the admin API: an item's subtitle files and their timing,
+/// an offset an admin sets (recorded as theirs) and takes back, and the
+/// refusals, each with its code; a consumer may do none of it here.
+#[tokio::test]
+async fn an_admin_sees_and_offsets_an_item_s_subtitle_files() {
+    let server = TestServer::start_with(
+        fresh_dir("subtitle-timings").await,
+        ServerOptions {
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    server.generate_media(5, "libx264", "aac");
+    std::fs::write(
+        server.media.with_extension("en.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+    )
+    .unwrap();
+    let (root, alice) = admin_beside(&server).await;
+    let id = movie().id().to_string();
+    let timings = root.subtitle_timings(id.clone()).await.unwrap();
+    assert_eq!(timings.len(), 1);
+    assert_eq!(timings[0].label, "movie.en.srt");
+    assert_eq!(
+        timings[0].sync,
+        spoolframe_admin_api::SubtitleSyncState::Original
+    );
+    let set = root
+        .subtitle_set_offset(id.clone(), timings[0].track, -700)
+        .await
+        .unwrap();
+    assert_eq!(
+        (set.offset_ms, set.offset_by.as_deref()),
+        (-700, Some("root"))
+    );
+    assert_eq!(
+        root.subtitle_timings(id.clone()).await.unwrap()[0].offset_ms,
+        -700
+    );
+    let back = root
+        .subtitle_use_original(id.clone(), timings[0].track)
+        .await
+        .unwrap();
+    assert_eq!(back.offset_ms, -700, "the offset stays");
+    assert_eq!(
+        code(root.subtitle_sync(id.clone(), 7).await.unwrap_err()),
+        error_code::INVALID_INPUT
+    );
+    assert_eq!(
+        code(
+            root.subtitle_set_offset(id.clone(), 0, 11 * 60 * 1000)
+                .await
+                .unwrap_err()
+        ),
+        error_code::INVALID_INPUT
+    );
+    assert_eq!(
+        code(
+            alice
+                .subtitle_set_offset(id.clone(), 0, 100)
+                .await
+                .unwrap_err()
+        ),
+        error_code::FORBIDDEN
+    );
+    assert_eq!(
+        code(alice.subtitle_timings(id).await.unwrap_err()),
+        error_code::FORBIDDEN
+    );
+    server.stop().await;
+}

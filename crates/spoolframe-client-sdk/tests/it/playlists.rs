@@ -23,6 +23,7 @@ const ALL: Features = Features {
     playlist_sharing: true,
     play_history: true,
     playlist_art: true,
+    subtitle_sync: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.
@@ -140,6 +141,40 @@ async fn an_app_not_listing_playlist_art_does_not_send_a_cover() {
         unsupported
     );
     assert!(stub.requests_of("remove_playlist_art").is_empty());
+}
+
+/// PX-03: an app that did not list subtitle sync cannot sync, set back or
+/// offset a track, even on a server that has it: the SDK refuses, and
+/// sends nothing.
+#[tokio::test]
+async fn an_app_not_listing_subtitle_sync_does_not_retime_a_track() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    let (_client, session) = alice_listing(&stub, Features::default()).await;
+    let unsupported = SdkError::Unsupported {
+        feature: spoolframe_protocol::features::SUBTITLE_SYNC.into(),
+    };
+    let id: spoolframe_client_sdk::types::MediaId = "plex:movie:1".parse().unwrap();
+    assert_eq!(
+        session.sync_subtitle(&id, 0).await.unwrap_err(),
+        unsupported
+    );
+    assert_eq!(
+        session
+            .use_original_subtitle_timing(&id, 0)
+            .await
+            .unwrap_err(),
+        unsupported
+    );
+    assert_eq!(
+        session
+            .set_subtitle_offset(&id, 0, 1_500)
+            .await
+            .unwrap_err(),
+        unsupported
+    );
+    assert!(stub.requests_of("sync_subtitle").is_empty());
+    assert!(stub.requests_of("set_subtitle_offset").is_empty());
 }
 
 /// An app that did not list Liked cannot like, even on a server that has

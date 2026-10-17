@@ -206,6 +206,8 @@ pub(crate) struct Inner {
     pub(crate) shares: tokio::sync::broadcast::Sender<crate::PlaybackShare>,
     /// Playlist changes the servers told (PX-40).
     pub(crate) playlist_events: tokio::sync::broadcast::Sender<crate::PlaylistEvent>,
+    /// Subtitle timing changes the servers told (PX-03).
+    pub(crate) subtitle_events: tokio::sync::broadcast::Sender<crate::SubtitleTimingEvent>,
 }
 
 impl std::fmt::Debug for Client {
@@ -341,6 +343,7 @@ impl Client {
                 refusals: Arc::default(),
                 shares: tokio::sync::broadcast::channel(16).0,
                 playlist_events: tokio::sync::broadcast::channel(64).0,
+                subtitle_events: tokio::sync::broadcast::channel(64).0,
             }),
         };
         // Where saved servers publish (P6-05): looked up there from the
@@ -457,6 +460,16 @@ impl Client {
     /// connecting.
     pub fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<crate::PlaylistEvent> {
         self.inner.playlist_events.subscribe()
+    }
+
+    /// Every subtitle timing change a server this device is connected to
+    /// tells it of (PX-03): a track of an item this device asked the
+    /// tracks of, or plays, synced, set back to its original timing, or
+    /// offset, by anyone. A player showing the track reads it again.
+    pub fn subtitle_timing_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::SubtitleTimingEvent> {
+        self.inner.subtitle_events.subscribe()
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:

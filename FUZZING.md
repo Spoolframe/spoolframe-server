@@ -28,6 +28,7 @@ the dev shell to fuzz.
 | `ffprobe_json` | ffprobe's JSON for a file, made into a `MediaDescriptor` | the vendored `easy-ffprobe` model, `spoolframe-media` `descriptor.rs` |
 | `keyframe_index` | a media file's own keyframe index: Matroska `Cues`, MP4 `stss` (PX-25) | `spoolframe-media` `keyframe_index.rs` |
 | `picture_header` | an uploaded playlist cover's header: its format (JPEG, PNG, WebP, HEIC) and size, read before anything is decoded (PX-53) | `spoolframe-media` `picture.rs` |
+| `subtitle_text` | a text subtitle (SRT, WebVTT, ASS) whose cue times are read and rewritten to sync it; the first byte picks the format (PX-03) | `spoolframe-media` `subsync/text.rs` |
 
 The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
 in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
@@ -52,6 +53,11 @@ keyframes with ffprobe, confined), never a panic.
 it walks JPEG markers, PNG's `IHDR`, WebP's first chunk and HEIF's boxes
 without allocating from a length the file states. The picture itself is
 decoded by ffmpeg, confined, which this target does not reach.
+
+`subtitle_text` runs in the server process on a sidecar anyone who can write
+to a library folder made, when someone syncs it: only its timestamps are
+parsed, as bytes. It also checks that a retimed file reads back with as many
+cues, so a rewrite never breaks a cue's timing line.
 
 ## Running
 

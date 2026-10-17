@@ -156,6 +156,34 @@ pub enum PlaylistCommand {
     RemoveArt { id: String },
 }
 
+/// External text subtitles' sync and offset (PX-03), as an admin: the
+/// same for every user who plays the item.
+#[derive(Debug, Subcommand)]
+pub enum SubtitleCommand {
+    /// An item's subtitle files and how each is timed.
+    List {
+        /// The item's id, as `plex:movie:123`.
+        id: String,
+    },
+    /// Sync a subtitle file to the item's file, in the background; `list`
+    /// says when it is done.
+    Sync {
+        id: String,
+        /// The track, as `list` numbers it.
+        track: u32,
+    },
+    /// Serve a subtitle with its original timing again; its offset stays.
+    Original { id: String, track: u32 },
+    /// Move a subtitle by an offset, in milliseconds (positive: later);
+    /// 0 resets it.
+    Offset {
+        id: String,
+        track: u32,
+        #[arg(allow_hyphen_values = true)]
+        offset_ms: i64,
+    },
+}
+
 /// `12h` or `7d` as seconds.
 fn expiry(text: &str) -> Result<u64, String> {
     let (number, unit) = text.split_at(text.len().saturating_sub(1));
@@ -870,6 +898,80 @@ async fn run_playlist(
     Ok(())
 }
 
+/// See or change subtitles' timing (PX-03), logged in as an admin.
+pub async fn subtitle(listen: SocketAddr, command: SubtitleCommand) -> Result<()> {
+    let login = connect(listen, None)
+        .await?
+        .login(admin_credentials()?)
+        .await
+        .map_err(api_error)?;
+    let api = connect(listen, Some(&login.token)).await?;
+    let result = run_subtitle(&api, command).await;
+    if let Err(e) = api.logout().await {
+        tracing::debug!(error = %e, "logout");
+    }
+    result
+}
+
+async fn run_subtitle(api: &WsClient, command: SubtitleCommand) -> Result<()> {
+    let timings = match command {
+        SubtitleCommand::List { id } => {
+            let timings = api.subtitle_timings(id).await.map_err(api_error)?;
+            if timings.is_empty() {
+                println!("the item has no subtitle file to sync");
+            }
+            timings
+        }
+        SubtitleCommand::Sync { id, track } => {
+            vec![api.subtitle_sync(id, track).await.map_err(api_error)?]
+        }
+        SubtitleCommand::Original { id, track } => vec![
+            api.subtitle_use_original(id, track)
+                .await
+                .map_err(api_error)?,
+        ],
+        SubtitleCommand::Offset {
+            id,
+            track,
+            offset_ms,
+        } => vec![
+            api.subtitle_set_offset(id, track, offset_ms)
+                .await
+                .map_err(api_error)?,
+        ],
+    };
+    for timing in &timings {
+        println!("{}", timing_line(timing));
+    }
+    Ok(())
+}
+
+/// `0  Film.en.srt  synced (-3200 ms, x1.0427, 1 split, score 87)  offset +1500 ms by Alice`.
+fn timing_line(t: &spoolframe_admin_api::SubtitleTimingInfo) -> String {
+    use spoolframe_admin_api::SubtitleSyncState as S;
+    let sync = match &t.sync {
+        S::Original => "original timing".to_owned(),
+        S::Syncing => "syncing".to_owned(),
+        S::Synced {
+            offset_ms,
+            factor,
+            splits,
+            score,
+        } => format!(
+            "synced ({offset_ms:+} ms, x{factor:.4}, {splits} split{}, score {score})",
+            if *splits == 1 { "" } else { "s" }
+        ),
+        S::Uncertain { score } => format!("sync uncertain (score {score}); original timing"),
+        S::Failed { reason } => format!("sync failed: {reason}"),
+    };
+    let offset = match (t.offset_ms, &t.offset_by) {
+        (0, _) => String::new(),
+        (ms, Some(by)) => format!("  offset {ms:+} ms by {by}"),
+        (ms, None) => format!("  offset {ms:+} ms"),
+    };
+    format!("{}  {}  {sync}{offset}", t.track, t.label)
+}
+
 /// List or revoke portable users' grants (P7-06), logged in as an admin.
 pub async fn grant(listen: SocketAddr, command: GrantCommand) -> Result<()> {
     let login = connect(listen, None)
@@ -1073,6 +1175,38 @@ fn gpu_tone_maps(t: &spoolframe_admin_api::TranscodingStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PX-03: a subtitle's line says its sync and who offset it.
+    #[test]
+    fn a_subtitle_line_says_its_sync_and_offset() {
+        use spoolframe_admin_api::{SubtitleSyncState, SubtitleTimingInfo};
+        let synced = SubtitleTimingInfo {
+            track: 2,
+            label: "Film.en.srt".into(),
+            sync: SubtitleSyncState::Synced {
+                offset_ms: -3_200,
+                factor: 25.0 / 23.976,
+                splits: 1,
+                score: 87,
+            },
+            offset_ms: 1_500,
+            offset_by: Some("Alice".into()),
+            offset_at: Some(1),
+        };
+        assert_eq!(
+            timing_line(&synced),
+            "2  Film.en.srt  synced (-3200 ms, x1.0427, 1 split, score 87)  offset +1500 ms by Alice"
+        );
+        let uncertain = SubtitleTimingInfo {
+            sync: SubtitleSyncState::Uncertain { score: 9 },
+            offset_ms: 0,
+            ..synced
+        };
+        assert_eq!(
+            timing_line(&uncertain),
+            "2  Film.en.srt  sync uncertain (score 9); original timing"
+        );
+    }
 
     #[test]
     fn the_status_says_which_tone_maps_each_gpu_runs() {

@@ -101,6 +101,64 @@ pub struct SubtitleTrack {
     pub external: bool,
     /// What the track is for, whatever its title says (P1-20).
     pub role: SubtitleRole,
+    /// How the track is timed (PX-03): an external text track's sync and
+    /// offset, the same for every user. Sent only to a client that listed
+    /// the `spoolframe:subtitle-sync` feature, and only for an external
+    /// text track (SRT, WebVTT, ASS); `None` for every other track, whose
+    /// timing is the file's.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SubtitleTiming>,
+}
+
+/// How an external text subtitle is timed (PX-03): synced to the file or
+/// as it came, and moved by a manual offset on top. Set for everyone who
+/// plays the item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleTiming {
+    pub sync: SubtitleSync,
+    /// Added to every cue, ms, on top of the synced or original timing:
+    /// positive shows the text later. What the track is served with
+    /// already has it: a client does not add it again.
+    pub offset_ms: i64,
+    /// Who set the offset last, by display name; `None` while no one has.
+    #[serde(deserialize_with = "crate::required::option")]
+    pub offset_by: Option<String>,
+    /// When, Unix seconds.
+    #[serde(deserialize_with = "crate::required::option")]
+    pub offset_at: Option<i64>,
+}
+
+/// Where a subtitle's sync is (PX-03).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SubtitleSync {
+    /// Its own timing, as the file has it: never synced, or put back
+    /// with "Use original timing".
+    Original,
+    /// Being synced, or waiting its turn; it is served as it was until
+    /// the sync is done.
+    Syncing,
+    /// Synced, and served synced.
+    Synced {
+        /// The shift of most of its cues, ms.
+        offset_ms: i64,
+        /// The frame-rate ratio its times were multiplied by, in
+        /// millionths: 1 000 000 for none, 1 042 709 for 23.976 to 25.
+        factor_ppm: u32,
+        /// Where scenes were cut or added: the places its shift changes.
+        splits: u32,
+        /// How well it fell on the file, 0 to 100.
+        score: u8,
+    },
+    /// A sync scored too low to trust: it may be another film's subtitle.
+    /// Served with its original timing.
+    Uncertain { score: u8 },
+    /// The sync could not be made; served as it was.
+    Failed { reason: String },
+    /// A state this build does not know: show the track as it is.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a subtitle track is for.
@@ -141,8 +199,65 @@ mod tests {
             default: false,
             external: false,
             role: SubtitleRole::Sdh,
+            timing: None,
         };
         crate::test_support::assert_each_required(&subtitle, &["role"]);
+    }
+
+    fn sidecar(timing: Option<SubtitleTiming>) -> SubtitleTrack {
+        SubtitleTrack {
+            language: Some("eng".into()),
+            title: None,
+            forced: false,
+            default: false,
+            external: true,
+            role: SubtitleRole::Full,
+            timing,
+        }
+    }
+
+    /// PX-03: a track's timing is left out when there is none, so a
+    /// client from before it reads the track as it did; one sent reads
+    /// back as it was, its state by name.
+    #[test]
+    fn a_track_s_timing_is_sent_only_when_there_is_one() {
+        let json = serde_json::to_value(sidecar(None)).unwrap();
+        assert!(json.get("timing").is_none(), "{json}");
+        let timing = SubtitleTiming {
+            sync: SubtitleSync::Synced {
+                offset_ms: -3_200,
+                factor_ppm: 1_042_709,
+                splits: 1,
+                score: 87,
+            },
+            offset_ms: 1_500,
+            offset_by: Some("Alice".into()),
+            offset_at: Some(1_760_000_000),
+        };
+        let json = serde_json::to_value(sidecar(Some(timing.clone()))).unwrap();
+        assert_eq!(json["timing"]["sync"]["state"], "synced");
+        assert_eq!(
+            serde_json::from_value::<SubtitleTrack>(json).unwrap(),
+            sidecar(Some(timing))
+        );
+    }
+
+    #[test]
+    fn a_sync_state_this_build_does_not_know_is_unknown() {
+        let sync: SubtitleSync =
+            serde_json::from_value(serde_json::json!({ "state": "transcribing" })).unwrap();
+        assert_eq!(sync, SubtitleSync::Unknown);
+    }
+
+    #[test]
+    fn a_timing_s_offset_author_left_out_is_refused() {
+        let timing = SubtitleTiming {
+            sync: SubtitleSync::Original,
+            offset_ms: 0,
+            offset_by: None,
+            offset_at: None,
+        };
+        crate::test_support::assert_each_required(&timing, &["offset_by", "offset_at"]);
     }
 
     #[test]
@@ -173,6 +288,7 @@ mod tests {
                 default: false,
                 external: true,
                 role: SubtitleRole::Forced,
+                timing: None,
             }],
         };
         let json = serde_json::to_value(&tracks).unwrap();

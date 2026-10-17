@@ -40,6 +40,9 @@ pub struct PlaybackDebug {
     pub prober: Arc<Prober>,
     pub transcoding: Arc<Transcoding>,
     pub subtitles: Arc<Subtitles>,
+    /// External text subtitles' sync and offset (PX-03), which an admin
+    /// sees and changes on an item's page.
+    pub subtitle_timings: Arc<crate::subtitle_sync::SubtitleTimings>,
     pub previews: Arc<Previews>,
     /// For `transcode.gpu_filters`, which decides where a plan's video
     /// encode runs (PGPU-02); none in tests that run no encode.
@@ -61,6 +64,62 @@ pub enum DebugError {
     Unreadable(String),
     #[error("{0}")]
     NoSuchDevice(String),
+    /// A subtitle timing change refused (PX-03).
+    #[error(transparent)]
+    Timing(#[from] crate::subtitle_sync::TimingError),
+}
+
+/// A change to a subtitle's timing an admin makes (PX-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retime {
+    Sync,
+    UseOriginal,
+    /// The offset, ms, and the admin's principal and display name.
+    Offset {
+        offset_ms: i64,
+        by: String,
+        name: String,
+    },
+}
+
+/// A subtitle's timing as the admin API shows it (PX-03).
+fn timing_info(
+    track: u32,
+    stream: &spoolframe_media::SubtitleStream,
+    timing: spoolframe_types::SubtitleTiming,
+) -> api::SubtitleTimingInfo {
+    use spoolframe_types::SubtitleSync;
+    let label = match &stream.source {
+        spoolframe_media::SubtitleSource::External { path } => path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        spoolframe_media::SubtitleSource::Embedded { index } => format!("stream {index}"),
+    };
+    let sync = match timing.sync {
+        SubtitleSync::Syncing => api::SubtitleSyncState::Syncing,
+        SubtitleSync::Synced {
+            offset_ms,
+            factor_ppm,
+            splits,
+            score,
+        } => api::SubtitleSyncState::Synced {
+            offset_ms,
+            factor: f64::from(factor_ppm) / 1e6,
+            splits,
+            score,
+        },
+        SubtitleSync::Uncertain { score } => api::SubtitleSyncState::Uncertain { score },
+        SubtitleSync::Failed { reason } => api::SubtitleSyncState::Failed { reason },
+        SubtitleSync::Original | SubtitleSync::Unknown => api::SubtitleSyncState::Original,
+    };
+    api::SubtitleTimingInfo {
+        track,
+        label,
+        sync,
+        offset_ms: timing.offset_ms,
+        offset_by: timing.offset_by,
+        offset_at: timing.offset_at,
+    }
 }
 
 /// A stored capability profile for "Plan for…" (P3-15): what a kind of
@@ -894,6 +953,57 @@ impl PlaybackDebug {
             .await
             .map_err(|e| DebugError::Unreadable(e.to_string()))?;
         Ok((path, descriptor))
+    }
+
+    /// Item `id`'s external text subtitles and how each is timed (PX-03).
+    pub async fn subtitle_timings(
+        &self,
+        id: &MediaId,
+    ) -> Result<Vec<api::SubtitleTimingInfo>, DebugError> {
+        let (_, descriptor) = self.describe(id).await?;
+        let timings = self.subtitle_timings.timings(&descriptor).await;
+        Ok(descriptor
+            .subtitles
+            .iter()
+            .zip(timings)
+            .enumerate()
+            .filter_map(|(track, (stream, timing))| {
+                Some(timing_info(track as u32, stream, timing?))
+            })
+            .collect())
+    }
+
+    /// Item `id`'s subtitle `track` retimed by `change` (PX-03): its
+    /// timing after.
+    pub async fn retime(
+        &self,
+        id: &MediaId,
+        track: u32,
+        change: Retime,
+    ) -> Result<api::SubtitleTimingInfo, DebugError> {
+        let (media, descriptor) = self.describe(id).await?;
+        let stream = descriptor
+            .subtitles
+            .get(track as usize)
+            .cloned()
+            .ok_or(crate::subtitle_sync::TimingError::NoSuchTrack(track))?;
+        let target = crate::subtitle_sync::TrackRef {
+            id: id.clone(),
+            media,
+            descriptor,
+            index: track,
+        };
+        let timings = &self.subtitle_timings;
+        let timing = match change {
+            Retime::Sync => timings.sync(target).await?,
+            Retime::UseOriginal => timings.use_original(target).await?,
+            Retime::Offset {
+                offset_ms,
+                by,
+                name,
+            } => timings.set_offset(target, offset_ms, &by, &name).await?,
+        };
+        Ok(timing_info(track, &stream, timing))
     }
 
     /// The plan the server would make for item `id` on `request`'s

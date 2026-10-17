@@ -30,7 +30,7 @@
 //! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLISTS,
+    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLISTS, SUBTITLE_SYNC,
 };
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
@@ -66,6 +66,12 @@ pub struct Features {
     /// Playlist covers (PX-53): a summary's `artwork` and `custom_art`,
     /// [`Session::set_playlist_art`] and [`Session::remove_playlist_art`].
     pub playlist_art: bool,
+    /// Subtitle sync and offset (PX-03): `SubtitleTrack::timing` on an
+    /// item's tracks, [`Session::sync_subtitle`],
+    /// [`Session::use_original_subtitle_timing`],
+    /// [`Session::set_subtitle_offset`], and
+    /// [`crate::Client::subtitle_timing_events`].
+    pub subtitle_sync: bool,
 }
 
 impl Features {
@@ -78,6 +84,7 @@ impl Features {
             (self.playlist_sharing, PLAYLIST_SHARING),
             (self.play_history, PLAY_HISTORY),
             (self.playlist_art, PLAYLIST_ART),
+            (self.subtitle_sync, SUBTITLE_SYNC),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -101,6 +108,7 @@ impl Features {
             playlist_sharing: self.playlist_sharing && other.playlist_sharing,
             play_history: self.play_history && other.play_history,
             playlist_art: self.playlist_art && other.playlist_art,
+            subtitle_sync: self.subtitle_sync && other.subtitle_sync,
         }
         .needing_playlists()
     }
@@ -116,6 +124,7 @@ impl Features {
             playlist_sharing: has(PLAYLIST_SHARING),
             play_history: has(PLAY_HISTORY),
             playlist_art: has(PLAYLIST_ART),
+            subtitle_sync: has(SUBTITLE_SYNC),
         }
         .needing_playlists()
     }

@@ -30,7 +30,11 @@ pub fn server_wait(request: &Request) -> Duration {
         Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. } => wait::READ,
         Request::Tracks { .. }
         | Request::PlaybackPlan { .. }
-        | Request::SetTrackOverride { .. } => wait::PROBE,
+        | Request::SetTrackOverride { .. }
+        // PX-03: each probes the file to find the track.
+        | Request::SyncSubtitle { .. }
+        | Request::UseOriginalSubtitleTiming { .. }
+        | Request::SetSubtitleOffset { .. } => wait::PROBE,
         Request::StartPlayback { .. }
         | Request::ChangeSubtitle { .. }
         | Request::ChangeQuality { .. } => wait::PLAYBACK,
@@ -96,7 +100,12 @@ pub fn retry_safe(request: &Request) -> bool {
         // PX-52: a read.
         | Request::RecentlyPlayed { .. }
         // Taken away twice is taken away once (PX-53).
-        | Request::RemovePlaylistArt { .. } => true,
+        | Request::RemovePlaylistArt { .. }
+        // PX-03: a second sync joins the first; original timing or an
+        // offset set twice is set once.
+        | Request::SyncSubtitle { .. }
+        | Request::UseOriginalSubtitleTiming { .. }
+        | Request::SetSubtitleOffset { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

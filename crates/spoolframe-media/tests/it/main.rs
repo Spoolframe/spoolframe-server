@@ -11,4 +11,5 @@ mod prober;
 mod records;
 mod samples;
 mod sandbox;
+mod subsync;
 mod vobsub;

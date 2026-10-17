@@ -35,6 +35,7 @@ mod relay_policy;
 mod servers;
 mod session;
 pub mod storage;
+mod subtitle_sync;
 
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
@@ -65,6 +66,7 @@ pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
     Reachability, SavedAddr,
 };
+pub use subtitle_sync::SubtitleTimingEvent;
 // Playlists' wire types (PX-40), as the calls take and return them.
 pub use servers::ServerEntry;
 pub use session::{

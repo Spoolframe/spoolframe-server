@@ -55,6 +55,8 @@ mod setup;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod sso;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod subtitle_timing;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod telemetry;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod trust;

@@ -44,7 +44,7 @@ async fn version_names_the_binary_and_its_version() {
         rest,
         [
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
-            "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed, spoolframe:playlist-sharing, spoolframe:play-history, spoolframe:playlist-art",
+            "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed, spoolframe:playlist-sharing, spoolframe:play-history, spoolframe:playlist-art, spoolframe:subtitle-sync",
             "pre-auth features: none",
             "experimental features (each on by its setting): http-playback",
         ]

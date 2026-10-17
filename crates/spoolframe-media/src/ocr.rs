@@ -265,7 +265,16 @@ pub async fn extract_sup(
     index: u32,
     out: &Path,
 ) -> Result<(), OcrError> {
-    copy_stream(ffmpeg, input, index, &["-c", "copy", "-f", "sup"], out).await
+    let jail = Jail::new(Limits::PASS).input(input);
+    copy_stream(
+        ffmpeg,
+        jail,
+        input,
+        index,
+        &["-c", "copy", "-f", "sup"],
+        out,
+    )
+    .await
 }
 
 /// Subtitle stream `index` (ffprobe's stream index) of `input` as its
@@ -414,24 +423,55 @@ pub async fn convert_text(
     to: SubtitleFormat,
     out: &Path,
 ) -> Result<(), OcrError> {
-    let (codec, format) = match to {
-        SubtitleFormat::WebVtt => ("webvtt", "webvtt"),
-        _ => ("srt", "srt"),
-    };
-    copy_stream(ffmpeg, input, index, &["-c:s", codec, "-f", format], out).await
+    let (codec, format) = text_codec(to);
+    let jail = Jail::new(Limits::PASS).input(input);
+    copy_stream(
+        ffmpeg,
+        jail,
+        input,
+        index,
+        &["-c:s", codec, "-f", format],
+        out,
+    )
+    .await
 }
 
-/// Subtitle stream `index` of `input` written to `out` by ffmpeg, with
-/// `codec_args` saying how: what [`extract_sup`] and [`convert_text`]
-/// both run.
+/// [`convert_text`] of a subtitle file of the server's own, in its
+/// hidden state directory, which a run may not open as an input: a synced
+/// subtitle (PX-03). The run may read the file's directory instead.
+pub async fn convert_own_text(
+    ffmpeg: &Tool,
+    input: &Path,
+    to: SubtitleFormat,
+    out: &Path,
+) -> Result<(), OcrError> {
+    let (codec, format) = text_codec(to);
+    let jail = match input.parent() {
+        Some(dir) => Jail::new(Limits::PASS).reads(dir),
+        None => Jail::new(Limits::PASS),
+    };
+    copy_stream(ffmpeg, jail, input, 0, &["-c:s", codec, "-f", format], out).await
+}
+
+fn text_codec(to: SubtitleFormat) -> (&'static str, &'static str) {
+    match to {
+        SubtitleFormat::WebVtt => ("webvtt", "webvtt"),
+        _ => ("srt", "srt"),
+    }
+}
+
+/// Subtitle stream `index` of `input` written to `out` by ffmpeg in
+/// `jail`, with `codec_args` saying how: what [`extract_sup`] and
+/// [`convert_text`] both run.
 async fn copy_stream(
     ffmpeg: &Tool,
+    jail: Jail,
     input: &Path,
     index: u32,
     codec_args: &[&str],
     out: &Path,
 ) -> Result<(), OcrError> {
-    let mut command = spawnable(ffmpeg, writing(Jail::new(Limits::PASS).input(input), out)).await?;
+    let mut command = spawnable(ffmpeg, writing(jail, out)).await?;
     command
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(input)

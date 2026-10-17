@@ -23,7 +23,7 @@ cd "$(dirname "$0")/.."
 
 seconds=${1:-60}
 shift || true
-all=(protocol_frame protocol_cbor invite_link webauthn pgs dvb vobsub bif plex_json ffprobe_json keyframe_index picture_header)
+all=(protocol_frame protocol_cbor invite_link webauthn pgs dvb vobsub bif plex_json ffprobe_json keyframe_index picture_header subtitle_text)
 targets=("${@:-${all[@]}}")
 
 # Read-only seed directories for a target, beyond fuzz/seeds/TARGET.

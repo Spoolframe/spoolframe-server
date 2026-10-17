@@ -3039,6 +3039,48 @@ pub struct SubtitleCache {
     pub state: CacheState,
 }
 
+/// An external text subtitle's timing (PX-03): its sync, and the manual
+/// offset on top, the same for every user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleTimingInfo {
+    /// Its place in the item's subtitles, as clients number them.
+    pub track: u32,
+    /// `Film.en.srt`: the file's name.
+    pub label: String,
+    pub sync: SubtitleSyncState,
+    /// Added to every cue, ms; positive shows the text later.
+    pub offset_ms: i64,
+    /// Who set the offset last, by display name.
+    pub offset_by: Option<String>,
+    /// When, Unix seconds.
+    pub offset_at: Option<i64>,
+}
+
+/// Where a subtitle's sync is (PX-03).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum SubtitleSyncState {
+    /// As the file has it: never synced, or put back.
+    Original,
+    /// Being synced, or waiting its turn; served as it was meanwhile.
+    Syncing,
+    #[serde(rename_all = "camelCase")]
+    Synced {
+        offset_ms: i64,
+        /// The frame-rate ratio: 1 for none, 1.0427 for 23.976 to 25.
+        factor: f64,
+        splits: u32,
+        /// 0 to 100.
+        score: u8,
+    },
+    /// Scored too low to trust: served with its original timing.
+    #[serde(rename_all = "camelCase")]
+    Uncertain { score: u8 },
+    #[serde(rename_all = "camelCase")]
+    Failed { reason: String },
+}
+
 /// An item's frame previews (P3-13), as the cache has them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
@@ -4226,6 +4268,46 @@ pub trait AdminApi {
     /// the caches have them. Looking starts nothing.
     #[method(name = "catalogDebug", with_extensions)]
     async fn catalog_debug(&self, id: String) -> jsonrpsee::core::RpcResult<ItemDebug>;
+
+    /// An item's external text subtitles (SRT, WebVTT, ASS beside its
+    /// file) and how each is timed (PX-03). `UNAVAILABLE` when the file
+    /// cannot be read.
+    #[method(name = "subtitleTimings", with_extensions)]
+    async fn subtitle_timings(
+        &self,
+        id: String,
+    ) -> jsonrpsee::core::RpcResult<Vec<SubtitleTimingInfo>>;
+
+    /// Sync item `id`'s subtitle `track` to its file, in the background
+    /// (PX-03): `syncing` now; `subtitleTimings` says when it is done. It
+    /// is served as it was until then. `INVALID_INPUT` for a track that is
+    /// not an external text subtitle, or one the item does not have.
+    #[method(name = "subtitleSync", with_extensions)]
+    async fn subtitle_sync(
+        &self,
+        id: String,
+        track: u32,
+    ) -> jsonrpsee::core::RpcResult<SubtitleTimingInfo>;
+
+    /// Serve item `id`'s subtitle `track` with its original timing again,
+    /// for everyone (PX-03); its offset stays.
+    #[method(name = "subtitleUseOriginal", with_extensions)]
+    async fn subtitle_use_original(
+        &self,
+        id: String,
+        track: u32,
+    ) -> jsonrpsee::core::RpcResult<SubtitleTimingInfo>;
+
+    /// Move item `id`'s subtitle `track` by `offset_ms` on top of its
+    /// timing, for everyone (PX-03), as set by the caller; 0 resets it. At
+    /// most ten minutes either way (`INVALID_INPUT`).
+    #[method(name = "subtitleSetOffset", with_extensions)]
+    async fn subtitle_set_offset(
+        &self,
+        id: String,
+        track: u32,
+        offset_ms: i64,
+    ) -> jsonrpsee::core::RpcResult<SubtitleTimingInfo>;
 
     /// Make an invite (P6-01): its code, shown this once, and its link.
     /// Needs a recent sign-in: the code makes an account

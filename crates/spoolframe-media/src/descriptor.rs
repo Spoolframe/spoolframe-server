@@ -401,6 +401,7 @@ impl MediaDescriptor {
                     default: s.default,
                     external: matches!(s.source, SubtitleSource::External { .. }),
                     role: s.role,
+                    timing: None,
                 })
                 .collect(),
         }

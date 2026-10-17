@@ -67,6 +67,16 @@ pub const PLAY_HISTORY: &str = "spoolframe:play-history";
 /// `Unsupported`.
 pub const PLAYLIST_ART: &str = "spoolframe:playlist-art";
 
+/// Subtitle sync and offset (PX-03): an external text subtitle (SRT,
+/// WebVTT, ASS beside the film) synced to the file, or moved by a manual
+/// offset, for everyone who plays the item. `SubtitleTrack::timing` on
+/// `Tracks`; the `SyncSubtitle`, `UseOriginalSubtitleTiming` and
+/// `SetSubtitleOffset` requests, each answered `SubtitleTiming`; and the
+/// `SubtitleTimingChanged` event, to a connection that asked for the
+/// item's tracks or plays it. A session whose client did not list it is
+/// sent none of these, and the requests are `Unsupported`.
+pub const SUBTITLE_SYNC: &str = "spoolframe:subtitle-sync";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,
@@ -75,6 +85,7 @@ pub const ALL: &[&str] = &[
     PLAYLIST_SHARING,
     PLAY_HISTORY,
     PLAYLIST_ART,
+    SUBTITLE_SYNC,
 ];
 
 /// The ones that change what a client can do before it has a session:
@@ -135,6 +146,12 @@ mod tests {
     fn playlist_art_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&PLAYLIST_ART));
         assert!(!PRE_AUTH.contains(&PLAYLIST_ART));
+    }
+
+    #[test]
+    fn subtitle_sync_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&SUBTITLE_SYNC));
+        assert!(!PRE_AUTH.contains(&SUBTITLE_SYNC));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::announce::Told;
 use crate::network::Connections;
 use crate::playlists::PlaylistNews;
 use crate::principal::Principal;
+use spoolframe_types::MediaId;
 
 /// One connection's events stream, and the turn to write on it.
 pub(crate) type EventStream = Arc<tokio::sync::Mutex<SendStream>>;
@@ -286,9 +287,99 @@ pub(crate) async fn tell_playlist_news(
     }
 }
 
+/// The items each connection that listed `spoolframe:subtitle-sync` asked
+/// the tracks of or plays, by its stable id (PX-03): who to tell when one
+/// of their subtitles is timed anew. The items it asked about, it may
+/// see. At most [`MAX_WATCHED`] a connection, the oldest let go.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SubtitleListeners(Arc<Mutex<HashMap<usize, Vec<MediaId>>>>);
+
+/// The most items one connection is told of: a few screens of a browse.
+const MAX_WATCHED: usize = 64;
+
+impl SubtitleListeners {
+    pub(crate) fn note(&self, id: usize, item: &MediaId) {
+        let mut all = self.0.lock();
+        let items = all.entry(id).or_default();
+        items.retain(|i| i != item);
+        if items.len() == MAX_WATCHED {
+            items.remove(0);
+        }
+        items.push(item.clone());
+    }
+
+    pub(crate) fn remove(&self, id: usize) {
+        self.0.lock().remove(&id);
+    }
+
+    /// The connections that asked about `item`.
+    fn of(&self, item: &MediaId) -> Vec<usize> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|(_, items)| items.contains(item))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+}
+
+/// Tell each connection that asked about an item of its subtitles' timing
+/// changes, as they are made, until the news ends.
+pub(crate) async fn tell_subtitle_news(
+    mut news: tokio::sync::broadcast::Receiver<crate::subtitle_sync::TimingNews>,
+    listeners: SubtitleListeners,
+    streams: EventStreams,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let told = match news.recv().await {
+            Ok(told) => told,
+            Err(RecvError::Lagged(missed)) => {
+                tracing::debug!(missed, "subtitle timing changes went untold");
+                continue;
+            }
+            Err(RecvError::Closed) => return,
+        };
+        for id in listeners.of(&told.id) {
+            streams.send(
+                id,
+                Event::SubtitleTimingChanged {
+                    id: told.id.clone(),
+                    track: told.track,
+                    timing: told.timing.clone(),
+                },
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(n: u32) -> MediaId {
+        format!("plex:movie:{n}").parse().unwrap()
+    }
+
+    /// PX-03: a connection is told of the items it asked about, the last
+    /// [`MAX_WATCHED`] of them; one that closed, of none.
+    #[test]
+    fn subtitle_listeners_hear_of_the_items_they_asked_about() {
+        let listeners = SubtitleListeners::default();
+        listeners.note(1, &item(1));
+        listeners.note(2, &item(1));
+        listeners.note(2, &item(2));
+        assert_eq!(listeners.of(&item(2)), [2]);
+        let mut both = listeners.of(&item(1));
+        both.sort();
+        assert_eq!(both, [1, 2]);
+        for n in 10..10 + MAX_WATCHED as u32 {
+            listeners.note(1, &item(n));
+        }
+        assert!(listeners.of(&item(1)) == [2], "the oldest is let go");
+        listeners.remove(2);
+        assert!(listeners.of(&item(2)).is_empty());
+    }
 
     /// A stream with [`MAX_WAITING`] events waiting takes no more until
     /// one is written.

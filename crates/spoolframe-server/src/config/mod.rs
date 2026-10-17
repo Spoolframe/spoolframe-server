@@ -31,6 +31,7 @@ use crate::admission::Admission;
 use crate::encode::JobLimits;
 use crate::network::{EndpointOptions, Pkarr, Relay};
 use crate::previews::{PreviewSettings, When};
+use crate::subtitle_sync::SyncSettings;
 use crate::subtitles::OcrSettings;
 use crate::watch::WatchRules;
 use std::time::Duration;
@@ -785,9 +786,31 @@ pub struct SubtitlesConfig {
     /// Where the text is kept; `state_dir/cache/subtitles` if left out.
     #[ucl(default)]
     pub cache_dir: Option<PathBuf>,
+    /// Subtitle syncs that run at once (PX-03); 1 if left out.
+    #[ucl(default)]
+    pub sync_at_once: Option<u32>,
 }
 
 impl SubtitlesConfig {
+    /// Subtitle sync's settings (PX-03): its files in `state_dir`.
+    pub fn sync_settings(&self, state_dir: &Path) -> Result<SyncSettings, ConfigError> {
+        let at_once = match self.sync_at_once {
+            Some(0) => {
+                return Err(ConfigError::Invalid {
+                    key: "subtitles.sync_at_once",
+                    message: "0 would never sync anything; use at least 1".into(),
+                });
+            }
+            Some(n) => n as usize,
+            None => 1,
+        };
+        Ok(SyncSettings {
+            at_once,
+            dir: state_dir.join("subtitles"),
+            speech_dir: state_dir.join("cache").join("subtitle-speech"),
+        })
+    }
+
     pub fn ocr_settings(&self, state_dir: &Path) -> Result<OcrSettings, ConfigError> {
         let threads = match self.ocr_threads {
             Some(0) => {
@@ -2780,6 +2803,36 @@ mod tests {
         assert!(ocr.threads >= 1);
         assert_eq!(ocr.cache_dir, PathBuf::from("/var/lib/sf/cache/subtitles"));
         assert_eq!(config.media.tesseract(), PathBuf::from("tesseract"));
+    }
+
+    #[test]
+    fn subtitle_syncs_run_one_at_a_time_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        let sync = config
+            .subtitles
+            .sync_settings(Path::new("/var/lib/sf"))
+            .unwrap();
+        assert_eq!(sync.at_once, 1);
+        assert_eq!(sync.dir, PathBuf::from("/var/lib/sf/subtitles"));
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } subtitles { sync_at_once = 2; }"#).unwrap();
+        assert_eq!(
+            config
+                .subtitles
+                .sync_settings(Path::new("/s"))
+                .unwrap()
+                .at_once,
+            2
+        );
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } subtitles { sync_at_once = 0; }"#).unwrap();
+        assert!(matches!(
+            config.subtitles.sync_settings(Path::new("/s")),
+            Err(ConfigError::Invalid {
+                key: "subtitles.sync_at_once",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -180,6 +180,7 @@ mod tests {
             default: false,
             external: false,
             role,
+            timing: None,
         }
     }
 

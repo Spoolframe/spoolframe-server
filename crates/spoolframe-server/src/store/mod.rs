@@ -15,6 +15,7 @@ pub mod playlists;
 pub mod plays;
 pub mod portable;
 pub mod sessions;
+pub mod subtitle_timings;
 pub mod ties;
 pub mod tracks;
 pub mod trust;

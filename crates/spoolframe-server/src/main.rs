@@ -40,6 +40,7 @@ use spoolframe_server::plex_sync::{StartedAfter, WatchSync};
 use spoolframe_server::previews::{self, PreviewSources, Previews};
 use spoolframe_server::runtime::{self, Live, RuntimeSettings, reload};
 use spoolframe_server::store::Store;
+use spoolframe_server::subtitle_sync::{FfmpegSpeech, SubtitleTimings};
 use spoolframe_server::subtitles::Subtitles;
 use spoolframe_server::telemetry::{self, OtelLayer, Swap, Telemetry};
 use spoolframe_server::transcode::{self, Transcoding};
@@ -136,7 +137,7 @@ unsafe impl std::alloc::GlobalAlloc for Allocator {
     }
 }
 
-use admin_cli::{GrantCommand, InviteCommand, PlaylistCommand, UserCommand};
+use admin_cli::{GrantCommand, InviteCommand, PlaylistCommand, SubtitleCommand, UserCommand};
 
 /// How many items per library the startup check samples.
 const STARTUP_SAMPLE: u32 = 5;
@@ -243,6 +244,13 @@ enum Command {
     Playlist {
         #[command(subcommand)]
         command: PlaylistCommand,
+    },
+    /// See an item's subtitle files and sync or offset one (PX-03), for
+    /// every user, through the running server's admin API, logged in as
+    /// an admin.
+    Subtitle {
+        #[command(subcommand)]
+        command: SubtitleCommand,
     },
     /// The server's settings, and the layers they come from.
     Config {
@@ -644,6 +652,9 @@ async fn serve(cli: Cli, hardened: harden::Filter) -> Result<Option<RestartMode>
         Some(Command::Playlist { command }) => {
             admin_cli::playlist(config.admin.listen()?, command).await
         }
+        Some(Command::Subtitle { command }) => {
+            admin_cli::subtitle(config.admin.listen()?, command).await
+        }
         Some(Command::Status) => admin_cli::status(config.admin.listen()?).await,
         Some(Command::Id) => {
             let key = identity::load_or_create(state_dir)?;
@@ -877,15 +888,17 @@ async fn run(
     } else {
         Ocr::disabled()
     };
+    let sync_settings = config.subtitles.sync_settings(state_dir)?;
     let subtitles = Arc::new(
-        Subtitles::new(ocr, ffmpeg.clone(), ffprobe, decoder.clone(), &ocr_settings).with_context(
-            || {
+        Subtitles::new(ocr, ffmpeg.clone(), ffprobe, decoder.clone(), &ocr_settings)
+            .with_context(|| {
                 format!(
                     "cannot prepare the subtitle cache {}",
                     ocr_settings.cache_dir.display()
                 )
-            },
-        )?,
+            })?
+            // Synced subtitles (PX-03) are converted from there.
+            .with_own_dir(sync_settings.dir.clone()),
     );
     if ocr_settings.enabled {
         check_decoder(
@@ -949,6 +962,27 @@ async fn run(
     let store = Store::open(state_dir).await?;
     // Closed last, as the server stops.
     let database = store.clone();
+    // Subtitle sync and offset (PX-03). A sync a stopped server left
+    // running is failed; it is served as it was.
+    match store.end_interrupted_subtitle_syncs().await {
+        Ok(0) => {}
+        Ok(ended) => tracing::info!(ended, "subtitle syncs the server stopped during failed"),
+        Err(e) => tracing::warn!(error = %e, "cannot end the subtitle syncs left running"),
+    }
+    let subtitle_timings = Arc::new(
+        SubtitleTimings::new(
+            store.clone(),
+            ffmpeg.clone(),
+            Arc::new(FfmpegSpeech(ffmpeg.clone())),
+            &sync_settings,
+        )
+        .with_context(|| {
+            format!(
+                "cannot prepare the synced subtitles in {}",
+                sync_settings.dir.display()
+            )
+        })?,
+    );
     store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(
@@ -1179,6 +1213,7 @@ async fn run(
                 prober: prober.clone(),
                 transcoding: transcoding.clone(),
                 subtitles: subtitles.clone(),
+                subtitle_timings: subtitle_timings.clone(),
                 previews: previews.clone(),
                 jobs: Some(jobs.clone()),
             })),
@@ -1227,6 +1262,7 @@ async fn run(
             transcoding,
             jobs: jobs.clone(),
             subtitles,
+            subtitle_timings: subtitle_timings.clone(),
             previews,
             index_ahead,
             metrics,

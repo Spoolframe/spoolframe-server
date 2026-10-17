@@ -29,6 +29,7 @@ mod restart;
 mod rpc;
 mod settings;
 mod sso;
+mod subtitle_timing;
 mod telemetry;
 mod webauthn;
 mod wizard;

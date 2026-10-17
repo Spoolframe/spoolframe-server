@@ -724,6 +724,21 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 });
             }
         }
+        // PX-03: for whoever shows or plays the track.
+        Event::SubtitleTimingChanged {
+            id: item,
+            track,
+            timing,
+        } => {
+            if let Some(inner) = client.upgrade() {
+                let _ = inner.subtitle_events.send(crate::SubtitleTimingEvent {
+                    server: id.to_string(),
+                    id: item,
+                    track,
+                    timing,
+                });
+            }
+        }
         Event::Unknown => {}
     }
     std::ops::ControlFlow::Continue(())

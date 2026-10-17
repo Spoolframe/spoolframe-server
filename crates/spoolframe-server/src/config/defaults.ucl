@@ -434,6 +434,9 @@ subtitles {
   # Where the text is kept; the state directory's cache/subtitles if left
   # out.
   # cache_dir = "/var/cache/spoolframe/subtitles";
+  # Subtitle syncs that run at once (PX-03); the rest wait their turn.
+  # Each decodes a film's audio at idle priority, on one thread.
+  sync_at_once = 1;
 }
 
 # Frame previews for scrubbing: a picture every interval_secs of each film

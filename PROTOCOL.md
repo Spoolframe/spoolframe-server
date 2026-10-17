@@ -1873,6 +1873,75 @@ max_pixels }`, `ImageUnreadable`) and answers the new `ArtworkId`;
 `Session::remove_playlist_art(id)` answers the `PlaylistSummary`. Both
 are `SdkError::Unsupported`, unsent, without the feature.
 
+## Subtitle sync and offset
+
+Feature `spoolframe:subtitle-sync` (PX-03). An external text subtitle
+(SRT, WebVTT, ASS or SSA beside the film) may be synced to the file, or
+moved by a manual offset, for every user who plays the item. Embedded
+tracks and picture subtitles (PGS, VobSub) are timed by the file and
+are neither.
+
+`Tracks` carries each such track's `timing`, a `SubtitleTiming`; every
+other track has none:
+
+- `sync`, tagged by `state`: `original` (as the file has it: never
+  synced, or put back), `syncing` (being synced or waiting its turn;
+  served as it was meanwhile), `synced { offset_ms, factor_ppm, splits,
+  score }` (served synced; `factor_ppm` is the frame-rate ratio in
+  millionths, 1 000 000 for none; `splits` the places a cut moved it;
+  `score` 0 to 100), `uncertain { score }` (the sync scored too low to
+  trust, so the original timing is kept: show "sync uncertain"),
+  `failed { reason }`, or `unknown` for a state this build does not
+  know;
+- `offset_ms`, added to every cue on top of the sync, positive later;
+- `offset_by` and `offset_at`: who set the offset last, by display
+  name, and when (Unix seconds); `null` while no one has.
+
+What the server serves already has the timing, whatever the delivery
+(`ReadSubtitle`, a subtitle converted or read as text, an HLS
+rendition): a client never adds `offset_ms` itself.
+
+| Request | Reply |
+|---|---|
+| `SyncSubtitle { id, track }` | `SubtitleTiming`, `syncing` |
+| `UseOriginalSubtitleTiming { id, track }` | `SubtitleTiming` |
+| `SetSubtitleOffset { id, track, offset_ms }` | `SubtitleTiming` |
+
+`track` is the subtitle's place in `Tracks`' `subtitles`. Anyone who can
+play the item may make each change. A track that is not an external
+text subtitle, or an offset of more than ten minutes either way, is
+`InvalidInput`; a track the item does not have is `NotFound`. All three
+may be sent again on a new connection.
+
+A sync runs in the background, one at a time on a server by default
+(`subtitles.sync_at_once`), its work at idle priority. It aligns the
+subtitle's cues to a text subtitle inside the file, in any language,
+else to the speech in the file's default audio track, and fixes a shift,
+a frame-rate stretch (23.976 against 25, say) and cut scenes together.
+A sync of a track already syncing joins it. "Use original timing" sets
+the sync aside for everyone and keeps the offset; `SetSubtitleOffset`
+with 0 resets the offset.
+
+`SubtitleTimingChanged { id, track, timing }` tells a connection that
+asked for the item's `Tracks`, or played it, of every change to a
+track's timing, by anyone, the sync's end included. A player showing
+the track reads it again from offset 0: a `ReadSubtitle` with the
+`version` of the file before answers `SubtitleChanged`. A playback goes
+on as it is, and a direct playback's `ReadSubtitle` gives the new timing
+whenever the playback began. A playback that converts the subtitle (to
+WebVTT, or into its HLS rendition) has its text made when it starts: it
+gets the new timing with `ChangeSubtitle` to the same track.
+
+A session whose client did not list the feature is sent no `timing` and
+no event, and the requests are `Unsupported`.
+
+The SDK: `Features::subtitle_sync`; `Session::sync_subtitle(id,
+track)`, `Session::use_original_subtitle_timing(id, track)` and
+`Session::set_subtitle_offset(id, track, offset_ms)`, each answering the
+`SubtitleTiming`; `Client::subtitle_timing_events()`, a
+`SubtitleTimingEvent { server, id, track, timing }` per event. The calls
+are `SdkError::Unsupported`, unsent, without the feature.
+
 ## Portable identities
 
 A portable user (§42–§49) is an Ed25519 root key the user holds on their

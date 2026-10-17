@@ -113,6 +113,10 @@ pub struct Subtitles {
     ocr_pending: std::sync::atomic::AtomicU64,
     ocr_done: Counter,
     ocr_failed: Counter,
+    /// Where the server keeps subtitle files of its own (PX-03's synced
+    /// ones), in its hidden state directory: read by ffmpeg through the
+    /// directory, as no file there may be an input.
+    own_dir: Option<PathBuf>,
 }
 
 /// Text recognition's work now, and since the server started (P3-14).
@@ -169,7 +173,14 @@ impl Subtitles {
             ocr_pending: Default::default(),
             ocr_done: Counter::default(),
             ocr_failed: Counter::default(),
+            own_dir: None,
         })
+    }
+
+    /// Subtitle files under `dir` are the server's own (PX-03).
+    pub fn with_own_dir(mut self, dir: PathBuf) -> Self {
+        self.own_dir = Some(dir);
+        self
     }
 
     /// Text recognition's work (P3-14).
@@ -385,9 +396,18 @@ impl Job {
                     .expect("never closed");
                 let _ = state.send(TextState::Reading { done_percent: 0 });
                 let (input, index) = self.track_input().await?;
-                ocr::convert_text(&self.subtitles.ffmpeg, input, index, self.to, &partial)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let own = self
+                    .subtitles
+                    .own_dir
+                    .as_deref()
+                    .is_some_and(|dir| input.starts_with(dir));
+                let ffmpeg = &self.subtitles.ffmpeg;
+                if own {
+                    ocr::convert_own_text(ffmpeg, input, self.to, &partial).await
+                } else {
+                    ocr::convert_text(ffmpeg, input, index, self.to, &partial).await
+                }
+                .map_err(|e| e.to_string())?;
             }
         }
         // Written aside, then moved in: a half-written file in the cache

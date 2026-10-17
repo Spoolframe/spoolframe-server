@@ -58,6 +58,7 @@ pub mod relay_nat;
 pub mod runtime;
 pub mod search;
 pub mod store;
+pub mod subtitle_sync;
 pub mod subtitles;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]

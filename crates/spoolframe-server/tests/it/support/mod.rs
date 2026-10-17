@@ -69,6 +69,7 @@ pub async fn sdk_client(
             playlist_sharing: true,
             play_history: true,
             playlist_art: true,
+            subtitle_sync: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };
@@ -88,7 +89,9 @@ pub fn transcoding() -> Arc<Transcoding> {
 /// The media tools' sandbox for a server on `dir`, as the server's own
 /// (PX-11 finding 34), but for what it hides: the tests' films are in the
 /// state directory, so the database, the key and the secrets beside them
-/// are hidden rather than the whole of it.
+/// are hidden rather than the whole of it; and the synced subtitles
+/// (PX-03), which ffmpeg reads through their directory, as it must where
+/// the whole state directory is hidden.
 pub fn media_sandbox(dir: &Path) -> Sandbox {
     Sandbox::new(
         Mode::Required,
@@ -96,6 +99,7 @@ pub fn media_sandbox(dir: &Path) -> Sandbox {
             dir.join("spoolframe.db"),
             dir.join("endpoint.key"),
             dir.join("secrets"),
+            dir.join("subtitles"),
         ],
         GpuDevices::default(),
     )
@@ -461,6 +465,23 @@ pub struct ServerOptions {
     pub http_playback: spoolframe_server::http_playback::Settings,
     /// `experimental.index_ahead`: off unless a test is about it.
     pub index_ahead: bool,
+    /// The speech a subtitle sync finds in the film's audio (PX-03), from
+    /// a stand-in; `None`: real ffmpeg decodes it.
+    pub speech: Option<Vec<spoolframe_media::subsync::Span>>,
+}
+
+/// Speech found by a stand-in: always `0`.
+struct FixedSpeech(Vec<spoolframe_media::subsync::Span>);
+
+#[async_trait::async_trait]
+impl spoolframe_server::subtitle_sync::SpeechSource for FixedSpeech {
+    async fn speech(
+        &self,
+        _media: &Path,
+        _audio_index: u32,
+    ) -> Result<Vec<spoolframe_media::subsync::Span>, spoolframe_media::subsync::SyncError> {
+        Ok(self.0.clone())
+    }
 }
 
 impl Default for ServerOptions {
@@ -509,6 +530,7 @@ impl Default for ServerOptions {
             uplink: Default::default(),
             http_playback: Default::default(),
             index_ahead: false,
+            speech: None,
         }
     }
 }
@@ -816,7 +838,26 @@ impl TestServer {
             ),
             transcoding: transcoding(),
             jobs: jobs.clone(),
-            subtitles: Arc::new(subtitles),
+            subtitles: Arc::new(subtitles.with_own_dir(dir.join("subtitles"))),
+            subtitle_timings: Arc::new(
+                spoolframe_server::subtitle_sync::SubtitleTimings::new(
+                    store.clone(),
+                    tool(Path::new("ffmpeg"), &sandbox),
+                    match &options.speech {
+                        Some(spans) => Arc::new(FixedSpeech(spans.clone())),
+                        None => Arc::new(spoolframe_server::subtitle_sync::FfmpegSpeech(tool(
+                            Path::new("ffmpeg"),
+                            &sandbox,
+                        ))),
+                    },
+                    &spoolframe_server::subtitle_sync::SyncSettings {
+                        at_once: 1,
+                        dir: dir.join("subtitles"),
+                        speech_dir: dir.join("cache").join("subtitle-speech"),
+                    },
+                )
+                .unwrap(),
+            ),
             previews,
             index_ahead,
             app_passkeys: Arc::new(
@@ -841,6 +882,7 @@ impl TestServer {
             prober: services.prober.clone(),
             transcoding: services.transcoding.clone(),
             subtitles: services.subtitles.clone(),
+            subtitle_timings: services.subtitle_timings.clone(),
             previews: services.previews.clone(),
             jobs: Some(jobs.clone()),
         });

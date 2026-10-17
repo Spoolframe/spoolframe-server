@@ -198,6 +198,15 @@ libc = "0.2"
 # filter, set in the child between fork and exec.
 landlock = "0.4"
 seccompiler = "0.5"
+# Subtitle sync (PX-03): alass's aligner, the algorithm alass-cli runs,
+# with no dependencies of its own. GPL-3.0, which the server's AGPL-3.0
+# may be combined with (deny.toml's exception is for it alone).
+alass-core = "2.0"
+# Speech in a film's audio, the reference a subtitle is synced to when the
+# file has no text subtitle of its own (PX-03): a small network in pure
+# Rust, no dependencies. In place of webrtc-vad, which alass-cli uses and
+# which builds WebRTC's C.
+earshot = "1.2"
 
 # Logging
 tracing = "0.1"
@@ -256,6 +265,16 @@ cargo_metadata = "0.23"
 # without fat LTO's link time and memory. Line tables only: panic
 # backtraces and Pyroscope profiles keep file and line, without the full
 # debug info's size.
+# Subtitle sync's aligner and voice detector (PX-03) are number crunching
+# that runs ten times slower unoptimized: a dev server's sync, and the
+# tests that align whole generated films, take seconds with this rather
+# than minutes. Small crates, so it costs the debug build little.
+[profile.dev.package.alass-core]
+opt-level = 3
+
+[profile.dev.package.earshot]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 debug = "line-tables-only"

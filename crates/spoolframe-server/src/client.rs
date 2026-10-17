@@ -102,6 +102,9 @@ pub(crate) struct ClientProtocol {
     http_playback: Option<Arc<crate::http_playback::HttpPlayback>>,
     /// Who each connection that takes playlist events acts as (PX-40).
     playlist_listeners: crate::events::PlaylistListeners,
+    /// The items each connection that takes subtitle timing events asked
+    /// about (PX-03).
+    subtitle_listeners: crate::events::SubtitleListeners,
 }
 
 /// What one connection has said so far.
@@ -489,6 +492,12 @@ impl ClientProtocol {
             playlist_listeners.clone(),
             addresses.streams.clone(),
         ));
+        let subtitle_listeners = crate::events::SubtitleListeners::default();
+        tokio::spawn(crate::events::tell_subtitle_news(
+            services.subtitle_timings.changes(),
+            subtitle_listeners.clone(),
+            addresses.streams.clone(),
+        ));
         Self {
             id: endpoint.id(),
             connections,
@@ -503,6 +512,7 @@ impl ClientProtocol {
             pairing_relay,
             http_playback,
             playlist_listeners,
+            subtitle_listeners,
         }
     }
 
@@ -1965,6 +1975,30 @@ impl ClientProtocol {
             self.playlist_listeners
                 .note(connection.stable_id(), principal, liked_listed);
         }
+        // PX-03: subtitle timing, only for a client that takes it; it is
+        // told of the items whose tracks it asks for or plays.
+        let subtitle_sync_listed = features::has(&hello.features, features::SUBTITLE_SYNC);
+        match &request {
+            Request::SyncSubtitle { .. }
+            | Request::UseOriginalSubtitleTiming { .. }
+            | Request::SetSubtitleOffset { .. }
+                if !subtitle_sync_listed =>
+            {
+                return Err(Error::Unsupported {
+                    request: format!("subtitle timing without {}", features::SUBTITLE_SYNC),
+                });
+            }
+            Request::Tracks { id }
+            | Request::StartPlayback { id, .. }
+            | Request::SyncSubtitle { id, .. }
+            | Request::UseOriginalSubtitleTiming { id, .. }
+            | Request::SetSubtitleOffset { id, .. }
+                if subtitle_sync_listed =>
+            {
+                self.subtitle_listeners.note(connection.stable_id(), id);
+            }
+            _ => {}
+        }
         if !liked_listed {
             match &request {
                 Request::Like { .. } | Request::Unlike { .. } => {
@@ -2910,7 +2944,45 @@ impl ClientProtocol {
             }
             Request::Tracks { id } => {
                 let (_, descriptor) = self.describe(&id).await?;
-                Ok(Reply::Tracks(descriptor.tracks()))
+                let mut tracks = descriptor.tracks();
+                if subtitle_sync_listed {
+                    let timings = self.services.subtitle_timings.timings(&descriptor).await;
+                    for (track, timing) in tracks.subtitles.iter_mut().zip(timings) {
+                        track.timing = timing;
+                    }
+                }
+                Ok(Reply::Tracks(tracks))
+            }
+            Request::SyncSubtitle { id, track } => {
+                let track = self.subtitle_track(&id, track).await?;
+                let timings = &self.services.subtitle_timings;
+                timings
+                    .sync(track)
+                    .await
+                    .map(Reply::SubtitleTiming)
+                    .map_err(timing_error)
+            }
+            Request::UseOriginalSubtitleTiming { id, track } => {
+                let track = self.subtitle_track(&id, track).await?;
+                self.services
+                    .subtitle_timings
+                    .use_original(track)
+                    .await
+                    .map(Reply::SubtitleTiming)
+                    .map_err(timing_error)
+            }
+            Request::SetSubtitleOffset {
+                id,
+                track,
+                offset_ms,
+            } => {
+                let track = self.subtitle_track(&id, track).await?;
+                self.services
+                    .subtitle_timings
+                    .set_offset(track, offset_ms, &principal.to_string(), who.display_name())
+                    .await
+                    .map(Reply::SubtitleTiming)
+                    .map_err(timing_error)
             }
             Request::GetPreviews { id } => {
                 match self
@@ -3424,7 +3496,11 @@ impl ClientProtocol {
                             what: "an external subtitle in this playback".into(),
                         });
                     }
-                    Some(Sidecar::File { path, format }) => (path, format),
+                    // A playback that began before the track was synced
+                    // or offset (PX-03) reads what it is served as now.
+                    Some(Sidecar::File { path, format }) => {
+                        (self.services.subtitle_timings.resolve(&path).await, format)
+                    }
                     Some(Sidecar::Made { state, format }) => (read_text(state).await?, format),
                 };
                 let (bytes, total, version) = read_subtitle(&path, offset, version).await?;
@@ -4477,6 +4553,20 @@ impl ClientProtocol {
         stream: &SubtitleStream,
         to: SubtitleFormat,
     ) -> Sidecar {
+        // A synced or offset subtitle (PX-03) is made from what it is
+        // served as.
+        let served;
+        let stream = match &stream.source {
+            SubtitleSource::External { path } => {
+                let resolved = self.services.subtitle_timings.resolve(path).await;
+                served = SubtitleStream {
+                    source: SubtitleSource::External { path: resolved },
+                    ..stream.clone()
+                };
+                &served
+            }
+            SubtitleSource::Embedded { .. } => stream,
+        };
         let state = self
             .services
             .subtitles
@@ -4559,7 +4649,9 @@ impl ClientProtocol {
                             Some(self.read_as_text(path, stream, planned.format).await)
                         } else if let SubtitleSource::External { path } = &stream.source {
                             Some(Sidecar::File {
-                                path: path.clone(),
+                                // Synced or offset (PX-03), what it is
+                                // served as.
+                                path: self.services.subtitle_timings.resolve(path).await,
                                 format: planned.format,
                             })
                         } else {
@@ -4744,6 +4836,21 @@ impl ClientProtocol {
             }
         })?;
         Ok((path, descriptor))
+    }
+
+    /// Subtitle `track` of item `id`, to retime (PX-03).
+    async fn subtitle_track(
+        &self,
+        id: &MediaId,
+        track: u32,
+    ) -> Result<crate::subtitle_sync::TrackRef, Error> {
+        let (media, descriptor) = self.describe(id).await?;
+        Ok(crate::subtitle_sync::TrackRef {
+            id: id.clone(),
+            media,
+            descriptor,
+            index: track,
+        })
     }
 
     /// The tracks to plan with: the client's, or, when it sent none, the
@@ -4963,6 +5070,7 @@ impl ProtocolHandler for ClientProtocol {
         state.count_link(&connection, false);
         self.addresses.streams.remove(id);
         self.playlist_listeners.remove(id);
+        self.subtitle_listeners.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
         self.services.playbacks.connection_closed(state.number);
@@ -6092,6 +6200,27 @@ fn conversion_error(e: JobError) -> Error {
 
 /// The text a reading made: waits for it a while, then tells the client to
 /// ask again.
+/// A subtitle timing refusal as the client sees it (PX-03).
+fn timing_error(e: crate::subtitle_sync::TimingError) -> Error {
+    use crate::subtitle_sync::TimingError;
+    match e {
+        TimingError::NoSuchTrack(_) => Error::NotFound {
+            what: "a subtitle track of this item".into(),
+        },
+        TimingError::NotExternalText | TimingError::OffsetTooLarge => Error::InvalidInput {
+            message: e.to_string(),
+        },
+        // Its paths go to the log, not to the client.
+        TimingError::Io(message) => {
+            tracing::warn!(error = %message, "a subtitle's timing could not be changed");
+            Error::Unavailable {
+                message: "the subtitle could not be read or written".into(),
+            }
+        }
+        TimingError::Store(e) => internal(e),
+    }
+}
+
 async fn read_text(mut state: watch::Receiver<TextState>) -> Result<PathBuf, Error> {
     let _ = tokio::time::timeout(READ_WAIT, state.wait_for(TextState::finished)).await;
     let now = state.borrow().clone();
