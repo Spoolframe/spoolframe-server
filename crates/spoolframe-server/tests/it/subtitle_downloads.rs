@@ -693,31 +693,30 @@ async fn an_app_finds_downloads_and_removes_through_the_sdk() {
     server.stop().await;
 }
 
-/// Both sites on: one search over the wire lists both sites' results and
-/// how each went; a SubDL result, zipped, is downloaded from SubDL and is
-/// a track named for it, its download saying so.
-#[tokio::test]
-async fn both_sites_answer_one_search_and_a_subdl_result_is_a_track() {
+/// `site` answering as SubDL too: its recorded search at
+/// `/subdl/api/v1`, and result 3172974-3188291 as a zip of the CP-1251
+/// SRT. The settings with both sites.
+async fn with_subdl(site: &MockServer) -> Settings {
     use std::io::Write;
-    let site = site().await;
     Mock::given(method("GET"))
         .and(path("/subdl/api/v1/subtitles"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(include_str!("../fixtures/subdl/search.json")),
         )
-        .mount(&site)
+        .mount(site)
         .await;
+    let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode(RUSSIAN);
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     zip.start_file("Film.2019.srt", zip::write::SimpleFileOptions::default())
         .unwrap();
-    zip.write_all(RUSSIAN.as_bytes()).unwrap();
+    zip.write_all(&cp1251).unwrap();
     Mock::given(method("GET"))
         .and(path("/subtitle/3172974-3188291.zip"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(zip.finish().unwrap().into_inner()))
-        .mount(&site)
+        .mount(site)
         .await;
-    let mut sites = settings(&site, 0);
+    let mut sites = settings(site, 0);
     sites.sites.push(SiteSettings::SubDl {
         account: spoolframe_server::subdl::Account {
             api_url: url::Url::parse(&format!("{}/subdl/api/v1", site.uri())).unwrap(),
@@ -726,6 +725,81 @@ async fn both_sites_answer_one_search_and_a_subdl_result_is_a_track() {
         },
         languages: vec!["en".into()],
     });
+    sites
+}
+
+/// A download stays when its site is turned off, live: dropped from
+/// `subtitles.sources` or its key taken out. Each site's track is still
+/// listed with its source, plays, and its downloader may still remove it.
+#[tokio::test]
+async fn downloads_stay_when_their_site_is_turned_off() {
+    let site = site().await;
+    let sites = with_subdl(&site).await;
+    let server = ready("subdl-kept", sites.clone()).await;
+    let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
+    let (bob, bob_session) = app(&server, "bob", &[SUBTITLE_SEARCH]).await;
+    search(&alice, &session).await.unwrap();
+    let from_os = download(&alice, &session, "opensubtitles:101")
+        .await
+        .unwrap();
+    let from_subdl = download(&alice, &session, "subdl:3172974-3188291")
+        .await
+        .unwrap();
+
+    // SubDL out of `subtitles.sources`, then no site at all.
+    let downloads = &server.debug.subtitle_downloads;
+    downloads.configure(Settings {
+        sites: vec![sites.sites[0].clone()],
+        daily_limit_per_user: 0,
+    });
+    downloads.configure(Settings::default());
+    assert_eq!(search(&alice, &session).await, Err(Error::NoSubtitleSource));
+
+    let seen = tracks(&bob, &bob_session).await;
+    for (got, source) in [(&from_os, "opensubtitles"), (&from_subdl, "subdl")] {
+        let track = &seen.subtitles[got.track as usize];
+        let download = track.download.clone().expect("still a download");
+        assert_eq!(download.source, source);
+        assert!(!download.can_remove, "Bob did not download it");
+        let handle = play(&bob, &bob_session, got.track).await;
+        match bob
+            .call(
+                Some(&bob_session),
+                Request::ReadSubtitle {
+                    handle,
+                    offset: 0,
+                    version: None,
+                },
+            )
+            .await
+        {
+            Response::Ok(Reply::SubtitleChunk { bytes, .. }) => {
+                assert_eq!(String::from_utf8(bytes).unwrap(), RUSSIAN);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let mine = tracks(&alice, &session).await;
+    let subdl_download = mine.subtitles[from_subdl.track as usize]
+        .download
+        .clone()
+        .unwrap();
+    assert!(subdl_download.can_remove);
+    assert_eq!(
+        remove(&alice, &session, &subdl_download.id).await,
+        Response::Ok(Reply::Done)
+    );
+    assert_eq!(tracks(&alice, &session).await.subtitles.len(), 1);
+    server.stop().await;
+}
+
+/// Both sites on: one search over the wire lists both sites' results and
+/// how each went; a SubDL result, zipped, is downloaded from SubDL and is
+/// a track named for it, its download saying so.
+#[tokio::test]
+async fn both_sites_answer_one_search_and_a_subdl_result_is_a_track() {
+    let site = site().await;
+    let sites = with_subdl(&site).await;
     let server = ready("subdl-both", sites).await;
     let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
 

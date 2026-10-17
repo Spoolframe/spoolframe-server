@@ -64,7 +64,9 @@
   zip archive: it is opened in memory with a pure-Rust reader, its size,
   entries and names checked, and its one SRT, WebVTT or ASS taken (a
   season pack's, the episode's), then checked as any download, and
-  synced. The daily limit per user is every site's,
+  synced. A download stays, for everyone, when its site is turned off
+  (out of `subtitles.sources`, or its key taken out). The daily limit
+  per user is every site's,
   `subtitles.daily_limit_per_user` (`opensubtitles.daily_limit_per_user`
   is still read when it is unset). SDK: `Session::download_subtitle`
   takes the result's id. Admin API: `admin.subtitleDownload` takes

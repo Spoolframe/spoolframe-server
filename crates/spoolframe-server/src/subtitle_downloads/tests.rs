@@ -972,3 +972,57 @@ async fn an_episode_is_asked_of_subdl_by_its_show_and_taken_from_a_pack() {
     assert_eq!(kept.len(), 1);
     assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), RUSSIAN);
 }
+
+/// Turned off, live (out of the sources, or every site gone), a site's
+/// downloads stay: the tracks, their source, and who may remove them.
+#[tokio::test]
+async fn downloads_stay_when_their_site_is_turned_off() {
+    let f = fixture_with("kept", both).await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
+    f.subdl_serves(
+        "/subtitle/3172974-3188291.zip",
+        zipped(&[("Film.srt", RUSSIAN.as_bytes())]),
+    )
+    .await;
+    let own = f.subtitles().await.len();
+    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
+    let subdl = f
+        .downloads
+        .download(&film(), "subdl:3172974-3188291", &alice())
+        .await
+        .unwrap();
+    f.downloads.configure(Settings {
+        sites: vec![opensubtitles_at(&f.site)],
+        daily_limit_per_user: 0,
+    });
+    f.downloads.configure(Settings::default());
+
+    assert_eq!(f.subtitles().await.len(), own + 2);
+    let descriptor = f.prober.describe(&f.media).await.unwrap();
+    let seen = f
+        .downloads
+        .downloads(&film(), &descriptor, &alice().actor)
+        .await
+        .unwrap();
+    let sources: Vec<(&str, bool)> = seen[own..]
+        .iter()
+        .map(|d| {
+            d.as_ref()
+                .map(|d| (d.source.as_str(), d.can_remove))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(sources, [("opensubtitles", true), ("subdl", true)]);
+    let id = subdl.subtitle.download.unwrap().id;
+    f.downloads
+        .remove(&film(), &id, &alice().actor)
+        .await
+        .unwrap();
+    assert_eq!(f.subtitles().await.len(), own + 1);
+}
