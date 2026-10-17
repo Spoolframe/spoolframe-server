@@ -88,7 +88,19 @@ async fn clip(
     sandbox: &Sandbox,
     pixel_format: &str,
 ) -> (PathBuf, Arc<MediaDescriptor>) {
-    let film = dir.join(format!("clip-{pixel_format}.mkv"));
+    clip_of(dir, sandbox, pixel_format, "1280x720", 3).await
+}
+
+/// [`clip`] at `size`, `secs` long.
+async fn clip_of(
+    dir: &Path,
+    sandbox: &Sandbox,
+    pixel_format: &str,
+    size: &str,
+    secs: u32,
+) -> (PathBuf, Arc<MediaDescriptor>) {
+    let film = dir.join(format!("clip-{pixel_format}-{size}.mkv"));
+    let source = format!("testsrc2=size={size}:rate=24:duration={secs}");
     let made = run(
         "ffmpeg",
         &[
@@ -99,7 +111,7 @@ async fn clip(
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=1280x720:rate=24:duration=3",
+            &source,
             // Tagged, as films are: tone mapping needs to know the
             // transfer it starts from.
             "-vf",
@@ -244,6 +256,41 @@ async fn an_encode_makes_output_that_decodes_whichever_way_it_decodes() {
         let (frames, height) = decoded(&out).unwrap();
         assert_eq!((frames, height), (72, 480), "{name}");
     }
+}
+
+/// 2160p to 528 lines decoded and scaled on the GPU: past 4× on a side,
+/// which AMD's VPE (Mesa radeonsi 26.1.8) crashed on in one
+/// `scale_vaapi`, so it is scaled in two. Any render node runs it; only
+/// such a GPU crashed without the steps.
+#[tokio::test]
+async fn a_scale_past_4x_on_the_gpu_finishes() {
+    let dir = fresh_dir("vaapi-scale-4x").await;
+    let Some(gpu) = gpu_or_skip("vaapi-scale-4x", &dir).await else {
+        return;
+    };
+    let (film, descriptor) = clip_of(&dir, &gpu.sandbox, "yuv420p", "3840x2160", 1).await;
+    let out = dir.join("out-528.mkv");
+    let mut spec = spec(&film, &descriptor, &gpu, true, false, &out);
+    spec.video = Some(ConvertedVideo::Encode {
+        codec: VideoCodec::H264,
+        height: 528,
+        max_bitrate: Some(2_000_000),
+        tone_map: false,
+    });
+    if decode(&spec) != Decode::Gpu {
+        eprintln!("vaapi-scale-4x: skipped: this GPU does not decode 2160p H.264");
+        return;
+    }
+    let args = ffmpeg_args(&spec).unwrap();
+    let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+    assert_eq!(graph.matches("scale_vaapi").count(), 2, "{graph}");
+    let ran = confined(&gpu, &film, &dir, &args).await;
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert_eq!(decoded(&out).unwrap(), (24, 528));
 }
 
 /// A stream the driver refuses fails on the GPU path before its first

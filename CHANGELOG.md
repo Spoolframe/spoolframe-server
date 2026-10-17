@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A VA-API scale that shrinks a side more than 4× is made in steps,
+  the picture halved until the last is within 4×. AMD's VPE (Mesa
+  radeonsi 26.1.8, Radeon 890M) crashed ffmpeg on a single one: a
+  2160p film's 960×528 rung (4.09×) never played.
+
 - Breaking (config): `transcode.hardware` and `transcode.vaapi_device`,
   deprecated since PGPU-05, are no longer read. A config file or
   runtime layer that still has them loads, with a warning for each,

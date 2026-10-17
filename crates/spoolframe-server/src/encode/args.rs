@@ -973,6 +973,29 @@ fn scaled(width: u32, height: u32, to: u32) -> (u32, u32) {
     ((half * 2) as u32, to)
 }
 
+/// The most one `scale_vaapi` shrinks a side by. AMD's VPE (Mesa
+/// radeonsi 26.1.8 on a Radeon 890M, ffmpeg 9.0.1) crashes in
+/// `si_vpe_set_plane_info` on any step past it: 2160p to 528 lines
+/// (4.09×) did 20 times in 20; to 540 (4×), and 2160p to 1056 then to
+/// 528, never. Every VA-API scale keeps to it: a step more costs little.
+const VAAPI_MAX_DOWNSCALE: u32 = 4;
+
+/// The `scale_vaapi` steps a VA-API scale from `from` to `to` takes
+/// first, so none shrinks a side past [`VAAPI_MAX_DOWNSCALE`]: the
+/// picture halved, to even sizes, until `to` is within it. None for a
+/// scale within it.
+fn vaapi_steps(from: (u32, u32), to: (u32, u32)) -> Vec<String> {
+    let (mut w, mut h) = from;
+    let mut steps = Vec::new();
+    while to.0 > 0 && to.1 > 0 && (w > to.0 * VAAPI_MAX_DOWNSCALE || h > to.1 * VAAPI_MAX_DOWNSCALE)
+    {
+        w = (w / 2) & !1;
+        h = (h / 2) & !1;
+        steps.push(format!("scale_vaapi=w={w}:h={h}"));
+    }
+    steps
+}
+
 /// The picture an AV1 encode on VA-API writes, when the size `scaled`
 /// gives is not one it can: a width of 64s and a height of 16s. AMD's
 /// encoder (radeonsi) codes any other size padded out to them, and says
@@ -1143,6 +1166,8 @@ fn gpu_graph(
     let mut chain = Vec::new();
     let mut options = Vec::new();
     if height < stream.height {
+        let to = scaled(stream.width, stream.height, height);
+        chain.extend(vaapi_steps((stream.width, stream.height), to));
         options.push(format!("w=-2:h={height}"));
     }
     // An encode that keeps HDR (PGPU-06) keeps the decode's 10 bits.
@@ -1563,7 +1588,9 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
                 let graph = match whole {
                     Some((w, h)) => {
                         let graph = graph.strip_suffix("[v]").unwrap_or(&graph);
-                        format!("{graph},scale_vaapi=w={w}:h={h}[v]")
+                        let mut steps = vaapi_steps((stream.width, stream.height), (w, h));
+                        steps.push(format!("scale_vaapi=w={w}:h={h}"));
+                        format!("{graph},{}[v]", steps.join(","))
                     }
                     None => graph,
                 };
@@ -2923,6 +2950,57 @@ mod tests {
             after(&ffmpeg_args(&smaller).unwrap(), "-filter_complex"),
             "[0:0]scale_vaapi=w=-2:h=720[v]"
         );
+    }
+
+    /// AMD's VPE crashes on a `scale_vaapi` that shrinks a side more
+    /// than 4×: 2160p to 528 lines is halved first, then scaled; to 540
+    /// or 1080 lines is one step.
+    #[test]
+    fn a_vaapi_scale_past_4x_is_halved_first() {
+        let enc = with_decoders(true);
+        let film = film();
+        let graph = |height| {
+            let spec = spec(&film, &enc, plain_h264(height), COPY_DTS, None, hls());
+            assert_eq!(decode(&spec), Decode::Gpu);
+            after(&ffmpeg_args(&spec).unwrap(), "-filter_complex").to_owned()
+        };
+        assert_eq!(
+            graph(528),
+            "[0:0]scale_vaapi=w=1920:h=1080,scale_vaapi=w=-2:h=528:format=nv12[v]"
+        );
+        assert_eq!(graph(540), "[0:0]scale_vaapi=w=-2:h=540:format=nv12[v]");
+        assert_eq!(graph(1080), "[0:0]scale_vaapi=w=-2:h=1080:format=nv12[v]");
+    }
+
+    #[test]
+    fn no_vaapi_step_shrinks_a_side_past_4x() {
+        let size = |step: &str| {
+            let (w, h) = step
+                .strip_prefix("scale_vaapi=w=")
+                .and_then(|r| r.split_once(":h="))
+                .unwrap();
+            (w.parse::<u32>().unwrap(), h.parse::<u32>().unwrap())
+        };
+        for (from, to) in [
+            ((3840, 2160), (960, 528)),
+            ((3840, 2160), (640, 352)),
+            ((7680, 4320), (426, 240)),
+            ((3840, 1600), (1280, 528)),
+        ] {
+            let mut sizes = vec![from];
+            sizes.extend(vaapi_steps(from, to).iter().map(|s| size(s)));
+            sizes.push(to);
+            for pair in sizes.windows(2) {
+                let ((w0, h0), (w1, h1)) = (pair[0], pair[1]);
+                assert!(
+                    w0 <= w1 * 4 && h0 <= h1 * 4,
+                    "{from:?} to {to:?}: {sizes:?}"
+                );
+                assert!(w1 % 2 == 0 && h1 % 2 == 0, "{sizes:?}");
+            }
+        }
+        assert!(vaapi_steps((3840, 2160), (960, 540)).is_empty());
+        assert!(vaapi_steps((1920, 1080), (1280, 720)).is_empty());
     }
 
     /// Tone mapping and burn-in run on the CPU: the frames come back to
