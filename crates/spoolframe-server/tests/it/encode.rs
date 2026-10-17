@@ -3094,6 +3094,59 @@ async fn another_rung_s_segment_moves_the_encode_and_keeps_the_first_s() {
     server.stop().await;
 }
 
+/// A ladder planned again as one encode for a low bitrate (Fulcrum,
+/// 2026-10-17): a player still on the ladder's playlist asks for rung 1's
+/// init. That rung is gone, not the conversion failed: `NotFound`, as its
+/// media playlist is, and the new plan plays on.
+#[tokio::test]
+async fn a_rung_of_a_ladder_planned_again_as_one_encode_is_not_found() {
+    let (server, client, session) = ladder_ready("ladder-replanned").await;
+    let (handle, plan) = start_for(&client, &session, on_link(5_000_000)).await;
+    let start = rungs_of(&plan)
+        .iter()
+        .position(|r| r.max_bitrate <= 3_750_000)
+        .unwrap() as u32;
+    assert!(start > 1, "{plan:?}");
+    rung_segment(&client, &session, &handle, 1, start).await;
+    let (plan, epoch) = change_quality(
+        &client,
+        &session,
+        &handle,
+        Quality::Bitrate {
+            max_bitrate: 1_000_000,
+        },
+    )
+    .await;
+    assert!(rungs_of(&plan).is_empty(), "{plan:?}");
+    for n in [0, 1] {
+        let (response, _) = client
+            .media(MediaRead {
+                session: session.clone(),
+                handle: handle.clone(),
+                offset: 0,
+                length: MAX_READ,
+                epoch,
+                segment: Some(n),
+                variant: 1,
+            })
+            .await;
+        assert!(
+            matches!(
+                &response,
+                MediaReadResponse::Err(spoolframe_protocol::Error::NotFound { what })
+                    if what.contains("rung 1")
+            ),
+            "segment {n}: {response:?}"
+        );
+    }
+    assert_eq!(
+        rung_segment(&client, &session, &handle, 1, 0).await,
+        b"seg1"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 /// A rung that is not in the ladder is no segment.
 #[tokio::test]
 async fn a_rung_past_the_ladder_is_refused() {

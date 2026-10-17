@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- HLS: a read of a rung the playback's plan does not have is
+  `NotFound`, as its media playlist already was, not `PlaybackFailed`
+  ("no rung 1 in this playback"). A ladder planned again as one encode
+  (`ChangeQuality` to 1 Mbit/s) met a player still on the ladder's
+  playlist asking for rung 1's init: the read was answered as if the
+  conversion had failed.
+
 - A VA-API scale that shrinks a side more than 4× is made in steps,
   the picture halved until the last is within 4×. AMD's VPE (Mesa
   radeonsi 26.1.8, Radeon 890M) crashed ffmpeg on a single one: a

@@ -6004,6 +6004,15 @@ async fn segment_range(
             what: format!("segment {n}"),
         });
     }
+    // Not a failure of the conversion: a rung of a plan replaced since (a
+    // ladder planned again as one encode, by `ChangeQuality` or Auto),
+    // asked for by a player still on that plan's playlist; or no rung at
+    // all. Its media playlist is not found either.
+    if !conversion.has_rung(read.variant) {
+        return Err(Error::NotFound {
+            what: format!("rung {} of this playback's plan", read.variant),
+        });
+    }
     let job = if n == 0 {
         match conversion
             .init_for(read.variant)

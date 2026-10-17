@@ -483,6 +483,12 @@ impl Conversion {
         self.ladder.len().max(1) as u32
     }
 
+    /// Whether `rung` is one of this conversion's: one a player may ask
+    /// for its playlist, init and segments.
+    pub fn has_rung(&self, rung: u32) -> bool {
+        rung < self.rungs()
+    }
+
     /// For HLS, the segments.
     pub fn segments(&self) -> Option<&Segments> {
         self.segments.as_ref()

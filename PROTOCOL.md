@@ -1176,8 +1176,11 @@ The multivariant playlist of a ladder lists one variant per rung at
 the link chose first. Under `v{n}/` are that rung's `init.mp4` and
 `seg{k}.m4s`, on the same segment grid as every other rung.
 `GetManifest` and `MediaRead` carry `variant`: that `n` (0 for one
-encode, and for anything that is not a segment or a media playlist). One
-encode runs at a time: a read of another rung's segment moves it there,
+encode, and for anything that is not a segment or a media playlist). A
+`variant` the plan has no rung for is `NotFound`, for its playlist, init
+and segments alike: a player still on the playlist of a plan replaced
+since (a ladder planned again as one encode) is reading a stale one and
+should take the new plan's. One encode runs at a time: a read of another rung's segment moves it there,
 and the rung it left keeps what it wrote, readable.
 
 A rung's `video` is its own converted video where it is not the plan's
