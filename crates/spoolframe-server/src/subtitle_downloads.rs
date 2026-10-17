@@ -272,7 +272,8 @@ impl Offer {
             fps: found.fps,
             downloads: 0,
             rating: 0.0,
-            hearing_impaired: found.hearing_impaired,
+            // SubDL's own flag says yes to everything (`subdl::Query`).
+            hearing_impaired: false,
             origin: SubtitleOrigin::Human,
             hash_match: false,
             fetch: Fetch::SubDl {
@@ -325,9 +326,10 @@ pub struct SubtitleDownloads {
     searches: Mutex<HashMap<SearchKey, Kept>>,
     /// Each media file's hash, by its path, size and modification time.
     hashes: Mutex<HashMap<PathBuf, Hashed>>,
-    /// One download at a time: a result asked for twice at once is
-    /// downloaded once, and a site's quota counted in order.
-    downloading: tokio::sync::Mutex<()>,
+    /// One download at a time per site: a result (one site's) asked for
+    /// twice at once is downloaded once, and a site's quota is counted in
+    /// order; a slow download from one site does not hold up the other's.
+    downloading: HashMap<Source, tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for SubtitleDownloads {
@@ -358,7 +360,10 @@ impl SubtitleDownloads {
             live: Mutex::new(Live::default()),
             searches: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
-            downloading: tokio::sync::Mutex::new(()),
+            downloading: Source::ALL
+                .into_iter()
+                .map(|s| (s, tokio::sync::Mutex::new(())))
+                .collect(),
         };
         this.configure(settings);
         Ok(this)
@@ -468,8 +473,16 @@ impl SubtitleDownloads {
             })
             .collect();
         // The catalog and the file are read only when a site is asked.
+        let asked_of = |source| {
+            wanted
+                .iter()
+                .any(|(_, s, _, kept)| *s == source && kept.is_none())
+        };
         let subject = if wanted.iter().any(|(_, _, _, kept)| kept.is_none()) {
-            Some(self.subject(id).await?)
+            Some(
+                self.subject(id, asked_of(Source::OpenSubtitles), asked_of(Source::SubDl))
+                    .await?,
+            )
         } else {
             None
         };
@@ -510,6 +523,8 @@ impl SubtitleDownloads {
                     state
                 }
                 Err(error) => {
+                    // Its own words stay in the log: they may name the
+                    // key's account, or be anything a site sends.
                     tracing::info!(%id, %source, %error, "a subtitle site's search failed");
                     let state = match &error {
                         SiteError::QuotaExhausted { resets_at } => {
@@ -523,7 +538,7 @@ impl SubtitleDownloads {
                             }
                         }
                         other => SubtitleSourceState::Failed {
-                            message: format!("{source} {other}"),
+                            message: failed_message(source, other),
                         },
                     };
                     first_failure.get_or_insert(DownloadError::of_site(source, error));
@@ -542,17 +557,12 @@ impl SubtitleDownloads {
         {
             return Err(failure);
         }
-        let mut rejected = HashSet::new();
-        for (_, settings) in &live.sites {
-            let source = settings.source();
-            for site_id in self
-                .store
-                .subtitle_rejections(&id.to_string(), source.id())
-                .await?
-            {
-                rejected.insert((source.id().to_owned(), site_id));
-            }
-        }
+        let rejected: HashSet<(String, String)> = self
+            .store
+            .subtitle_rejections(&id.to_string())
+            .await?
+            .into_iter()
+            .collect();
         let downloaded: HashSet<(String, String)> = self
             .store
             .subtitle_downloads(&id.to_string())
@@ -661,7 +671,16 @@ impl SubtitleDownloads {
 
     /// Item `id` as the sites are asked about it: its ids, an episode's
     /// show's, and its media file.
-    async fn subject(&self, id: &MediaId) -> Result<Subject, DownloadError> {
+    ///
+    /// An episode's show's ids are asked for only when a site needs them:
+    /// SubDL always (it lists a show's subtitles), OpenSubtitles when
+    /// the episode has none of its own.
+    async fn subject(
+        &self,
+        id: &MediaId,
+        opensubtitles: bool,
+        subdl: bool,
+    ) -> Result<Subject, DownloadError> {
         let found = self.catalog.item(id).await?;
         if !matches!(found.item, Item::Movie(_) | Item::Episode(_)) {
             return Err(DownloadError::InvalidInput(
@@ -670,8 +689,9 @@ impl SubtitleDownloads {
         }
         let media = self.catalog.media_path(id).await?;
         let (imdb, tmdb) = site_ids(&found.external_ids);
+        let wants_show = subdl || (opensubtitles && imdb.is_none() && tmdb.is_none());
         let (show_imdb, show_tmdb) = match &found.item {
-            Item::Episode(episode) => site_ids(
+            Item::Episode(episode) if wants_show => site_ids(
                 &self
                     .catalog
                     .external_ids(&episode.show_id)
@@ -743,7 +763,7 @@ impl SubtitleDownloads {
         else {
             return Err(not_offered);
         };
-        let _one = self.downloading.lock().await;
+        let _one = self.downloading[&source].lock().await;
         let principal = who.actor.principal.to_string();
         let limit = live.daily_limit_per_user;
         if let Some(row) = self
@@ -999,6 +1019,21 @@ impl SubtitleDownloads {
             default: false,
             role,
         }
+    }
+}
+
+/// What a user is told of a site's part of a search that failed: by the
+/// kind of failure only, as `client::download_error` tells a failed
+/// download. What the site said (a refusal's text, a parse error) is
+/// logged, not sent: it may name the account, or be anything at all.
+fn failed_message(site: Source, error: &SiteError) -> String {
+    match error {
+        SiteError::Refused { .. } => format!("{site} refused the server's request"),
+        SiteError::Unreadable(_) => format!("{site} answered with something unreadable"),
+        SiteError::TooLarge(_) => format!("{site} sent more than the server takes"),
+        SiteError::Unreachable(_) => format!("{site} cannot be reached"),
+        SiteError::RateLimited { .. } => format!("{site} asks to wait"),
+        SiteError::QuotaExhausted { .. } => format!("{site} has nothing left today"),
     }
 }
 

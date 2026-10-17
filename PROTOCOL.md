@@ -1973,7 +1973,8 @@ is kept a day per item and language: asking again costs nothing.
 `sources`, how each site's part went, in the order the server asks
 them: `{ "source": "subdl", "state": "found", "found": 12 }`, or
 `quota_exhausted` (`resets_at?`), `rate_limited` (`retry_after_ms`),
-`failed` (`message`, to show). A site that failed or ran out leaves the
+`failed` (`message`, to show: the server's own words for what went
+wrong, never the site's). A site that failed or ran out leaves the
 other's results; only when every site failed is the search an error,
 the first site's.
 
@@ -1990,7 +1991,8 @@ its `source` (`opensubtitles` or `subdl`: show "OpenSubtitles" or
 (`srt`, `ass`, `vtt`, when the site says), `fps_milli` (23 976 for
 23.976 fps), `downloads` (0 from SubDL), `rating` (0 to 100, tenths of
 the site's 0 to 10; `null` while unrated, and always from SubDL),
-`hearing_impaired`, and `downloaded` (downloading it again gives the
+`hearing_impaired` (always `false` from SubDL, whose own flag is set on
+nearly every file), and `downloaded` (downloading it again gives the
 same track).
 
 `DownloadSubtitle` names a `result` a search of the same item listed in
@@ -1998,7 +2000,8 @@ the last day, and downloads it from its site; another, or one of a site
 since turned off, is `NotFound` (search again), and one that is no
 result's id at all `InvalidInput`. SubDL sends a zip archive: the
 server takes its one SRT, WebVTT or ASS file out (a season pack's, the
-episode's). The file is made UTF-8 (its encoding detected: many are
+episode's, by its name: `S01E05`, `1x05`, `E05`, `- 05`; a pack with
+several files and none named for the episode is `InvalidInput`). The file is made UTF-8 (its encoding detected: many are
 CP-1251 or CP-1252) and checked to be SRT, WebVTT or ASS; another is
 `InvalidInput`. `SubtitleDownloaded` has the new track's place in
 `Tracks`' `subtitles` (`track`), the track itself (`subtitle`), and the

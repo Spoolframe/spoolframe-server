@@ -159,6 +159,7 @@ pub enum SubtitleOrigin {
 
 /// One subtitle a search found (PX-02), to download by its `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SubtitleResultWire")]
 pub struct SubtitleResult {
     /// What `DownloadSubtitle` names: the site's id and its file's,
     /// `opensubtitles:5338574`, `subdl:3172974-3188291`. Opaque to a
@@ -192,6 +193,58 @@ pub struct SubtitleResult {
     pub rejected: bool,
     /// Downloaded already: a download gives the same track.
     pub downloaded: bool,
+}
+
+/// [`SubtitleResult`] as it is read: from a server before SubDL too,
+/// which named a result by OpenSubtitles' `file_id`, a number, and had no
+/// `id` nor `source`. Such a result is OpenSubtitles' `opensubtitles:<n>`.
+// compat(v1): `id` required, `file_id` gone, at the protocol reset
+#[derive(Deserialize)]
+struct SubtitleResultWire {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    file_id: Option<u64>,
+    #[serde(default = "opensubtitles")]
+    source: String,
+    release: String,
+    language: String,
+    format: Option<String>,
+    fps_milli: Option<u32>,
+    downloads: u64,
+    rating: Option<u8>,
+    hearing_impaired: bool,
+    origin: SubtitleOrigin,
+    hash_match: bool,
+    rejected: bool,
+    downloaded: bool,
+}
+
+impl TryFrom<SubtitleResultWire> for SubtitleResult {
+    type Error = &'static str;
+
+    fn try_from(w: SubtitleResultWire) -> Result<Self, Self::Error> {
+        let id = match (w.id, w.file_id) {
+            (Some(id), _) => id,
+            (None, Some(n)) => format!("opensubtitles:{n}"),
+            (None, None) => return Err("a subtitle result has neither `id` nor `file_id`"),
+        };
+        Ok(SubtitleResult {
+            id,
+            source: w.source,
+            release: w.release,
+            language: w.language,
+            format: w.format,
+            fps_milli: w.fps_milli,
+            downloads: w.downloads,
+            rating: w.rating,
+            hearing_impaired: w.hearing_impaired,
+            origin: w.origin,
+            hash_match: w.hash_match,
+            rejected: w.rejected,
+            downloaded: w.downloaded,
+        })
+    }
 }
 
 /// What a subtitle search found for an item (PX-02), best first: hash
@@ -412,22 +465,39 @@ mod tests {
         assert_eq!(whose, QuotaOf::Unknown);
     }
 
-    /// A result from a server before SubDL names no site: it is
-    /// OpenSubtitles'; a search names no sites' states.
+    /// A result from a server before SubDL, as it sent one: named by
+    /// OpenSubtitles' `file_id`, no `id`, no `source`. It is
+    /// OpenSubtitles' `opensubtitles:<file_id>`; a search names no sites'
+    /// states. One with neither id is refused.
     #[test]
-    fn a_result_without_a_source_is_opensubtitles() {
+    fn a_result_from_a_server_before_subdl_is_opensubtitles() {
         let search: SubtitleSearch = serde_json::from_value(serde_json::json!({
             "languages": ["en"],
             "results": [{
-                "id": "opensubtitles:7", "release": "R", "language": "en",
+                "file_id": 7, "release": "R", "language": "en",
                 "format": null, "fps_milli": null, "downloads": 1,
                 "rating": null, "hearing_impaired": false, "origin": "human",
                 "hash_match": false, "rejected": false, "downloaded": false,
             }],
         }))
         .unwrap();
+        assert_eq!(search.results[0].id, "opensubtitles:7");
         assert_eq!(search.results[0].source, "opensubtitles");
         assert!(search.sources.is_empty());
+        // Written again, it is the new shape, and reads back the same.
+        let again = serde_json::to_value(&search.results[0]).unwrap();
+        assert!(again.get("file_id").is_none(), "{again}");
+        assert_eq!(
+            serde_json::from_value::<SubtitleResult>(again).unwrap(),
+            search.results[0]
+        );
+        let neither = serde_json::json!({
+            "release": "R", "language": "en", "format": null, "fps_milli": null,
+            "downloads": 1, "rating": null, "hearing_impaired": false,
+            "origin": "human", "hash_match": false, "rejected": false,
+            "downloaded": false,
+        });
+        assert!(serde_json::from_value::<SubtitleResult>(neither).is_err());
     }
 
     #[test]

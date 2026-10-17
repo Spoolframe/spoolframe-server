@@ -1025,3 +1025,94 @@ async fn downloads_stay_when_their_site_is_turned_off() {
         .unwrap();
     assert_eq!(f.subtitles().await.len(), own + 1);
 }
+
+/// A site's part of a search that failed says only how, as a failed
+/// download does: what the site said stays in the log.
+#[tokio::test]
+async fn a_failed_site_s_own_words_are_not_sent_to_users() {
+    let f = fixture_with("redacted", both).await;
+    f.answers_search().await;
+    Mock::given(method("GET"))
+        .and(path("/subdl/api/v1/subtitles"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "status": false, "error": "key of account 48151623 is suspended",
+        })))
+        .mount(&f.site)
+        .await;
+    let found = f.downloads.search(&film(), None).await.unwrap();
+    assert_eq!(
+        found.sources[1].state,
+        SubtitleSourceState::Failed {
+            message: "SubDL refused the server's request".into()
+        }
+    );
+}
+
+/// One site's slow download does not hold up the other's.
+#[tokio::test]
+async fn a_slow_download_from_one_site_does_not_hold_up_the_other() {
+    let f = fixture_with("apart", both).await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
+    Mock::given(method("GET"))
+        .and(path("/subtitle/3172974-3188291.zip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(zipped(&[("Film.srt", RUSSIAN.as_bytes())]))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&f.site)
+        .await;
+    f.downloads.search(&film(), None).await.unwrap();
+    let (id, alice) = (film(), alice());
+    let slow = f.downloads.download(&id, "subdl:3172974-3188291", &alice);
+    let quick = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        f.downloads
+            .download(&film(), "opensubtitles:101", &bob())
+            .await
+            .unwrap();
+        started.elapsed()
+    };
+    let (slow, quick) = tokio::join!(slow, quick);
+    slow.unwrap();
+    assert!(quick < Duration::from_secs(2), "waited {quick:?} for SubDL");
+}
+
+/// An episode with ids of its own, searched on OpenSubtitles alone, does
+/// not need its show's: they are not asked for. SubDL, which lists a
+/// show's subtitles, does need them.
+#[tokio::test]
+async fn a_show_s_ids_are_asked_for_only_when_a_site_needs_them() {
+    let show = MediaId::new(Namespace::Plex, MediaKind::Show, "10").unwrap();
+    let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "15").unwrap();
+    let f = fixture("show-ids", 0).await;
+    crate::test_support::write_episode(&f.media, "15");
+    f.catalog.give_ids(&episode, &["imdb://tt2193022"]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/subtitles"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":[]}"#))
+        .mount(&f.site)
+        .await;
+    f.catalog.take_calls(&show);
+    f.downloads.search(&episode, None).await.unwrap();
+    assert!(
+        !f.catalog.take_calls(&show).contains(&"external_ids"),
+        "OpenSubtitles alone, by the episode's own id"
+    );
+    f.downloads.configure(Settings {
+        sites: vec![subdl_at(&f.site)],
+        daily_limit_per_user: 0,
+    });
+    Mock::given(method("GET"))
+        .and(path("/subdl/api/v1/subtitles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": false, "error": "can't find movie or tv",
+        })))
+        .mount(&f.site)
+        .await;
+    f.downloads.search(&episode, None).await.unwrap();
+    assert!(f.catalog.take_calls(&show).contains(&"external_ids"));
+}

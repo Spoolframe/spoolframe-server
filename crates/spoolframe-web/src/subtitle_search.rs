@@ -195,17 +195,55 @@ pub fn downloaded_by(t: &SubtitleTimingInfo) -> String {
     line
 }
 
-/// `subtitles.sources` with the sites ticked: `on[i]` for [`SOURCES`]`[i]`,
-/// in that order.
-pub fn sources_value(on: [bool; 2]) -> Value {
-    json!(
-        SOURCES
-            .iter()
-            .zip(on)
-            .filter(|(_, on)| *on)
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>()
-    )
+/// `subtitles.sources` once the boxes ticked when the form opened,
+/// `before`, are `now` (`on[i]` for [`SOURCES`]`[i]`): `None` when they
+/// did not change, so the setting is left as it is (unset, it follows the
+/// server's default). Changed, the sites keep the order `setting` gives
+/// them, the order they are asked in; one newly ticked comes last.
+pub fn sources_value(setting: Option<&Value>, before: [bool; 2], now: [bool; 2]) -> Option<Value> {
+    if before == now {
+        return None;
+    }
+    let ticked = |id: &str| SOURCES.iter().zip(now).any(|(s, on)| *s == id && on);
+    let mut order: Vec<&str> = match setting.and_then(Value::as_array) {
+        Some(list) => list.iter().filter_map(Value::as_str).collect(),
+        None => SOURCES.to_vec(),
+    };
+    order.retain(|id| ticked(id));
+    for id in SOURCES {
+        if ticked(id) && !order.contains(&id) {
+            order.push(id);
+        }
+    }
+    Some(json!(order))
+}
+
+/// The daily limit, every site's.
+pub const LIMIT: &str = "subtitles.daily_limit_per_user";
+
+/// Where the limit was before SubDL; the server reads it while
+/// [`LIMIT`] is unset.
+pub const OLD_LIMIT: &str = "opensubtitles.daily_limit_per_user";
+
+/// What saving the daily limit changes: [`LIMIT`] as typed, and
+/// [`OLD_LIMIT`] taken out (from the runtime settings, what the form can
+/// change), so it no longer stands in for it. Cleared while the old key
+/// is still set, the limit is written as 0 (none): the old key would
+/// otherwise be read in its place.
+pub fn limit_changes(
+    typed: &str,
+    old_key_set: bool,
+) -> Result<Vec<(&'static str, Option<Value>)>, String> {
+    let typed = typed.trim();
+    let limit = if typed.is_empty() {
+        old_key_set.then(|| json!(0))
+    } else {
+        let n: u32 = typed
+            .parse()
+            .map_err(|_| "The daily limit is a whole number.".to_owned())?;
+        Some(json!(n))
+    };
+    Ok(vec![(LIMIT, limit), (OLD_LIMIT, None)])
 }
 
 /// Which of [`SOURCES`] `subtitles.sources` names; every one when it is
@@ -226,8 +264,9 @@ pub fn languages_value(typed: &str) -> Option<Value> {
 
 /// Whether a secret field holds a reference the server reads its secret
 /// from, `${SF_ENV_NAME}`, as the server takes it at run time; the
-/// field's error otherwise.
-pub fn secret_reference(label: &str, typed: &str) -> Result<Option<Value>, String> {
+/// field's error otherwise, naming `example` (`SF_ENV_SUBDL_KEY`) as the
+/// field's own placeholder does.
+pub fn secret_reference(label: &str, typed: &str, example: &str) -> Result<Option<Value>, String> {
     let typed = typed.trim();
     if typed.is_empty() {
         return Ok(None);
@@ -244,7 +283,7 @@ pub fn secret_reference(label: &str, typed: &str) -> Result<Option<Value>, Strin
         }
         _ => Err(format!(
             "{label}: name the server's environment variable that holds it, as \
-             ${{SF_ENV_SUBTITLES_KEY}}, not the secret itself."
+             ${{{example}}}, not the secret itself."
         )),
     }
 }
@@ -364,6 +403,26 @@ mod tests {
         );
     }
 
+    /// The limit is written to its own key and the old one taken out, so
+    /// the old one never stands in for it again; cleared while the old
+    /// one is set, it is written as none (0).
+    #[test]
+    fn saving_the_limit_takes_the_old_key_out() {
+        assert_eq!(
+            limit_changes("3", true),
+            Ok(vec![(LIMIT, Some(json!(3))), (OLD_LIMIT, None)])
+        );
+        assert_eq!(
+            limit_changes(" ", true),
+            Ok(vec![(LIMIT, Some(json!(0))), (OLD_LIMIT, None)])
+        );
+        assert_eq!(
+            limit_changes("", false),
+            Ok(vec![(LIMIT, None), (OLD_LIMIT, None)])
+        );
+        assert!(limit_changes("three", false).is_err());
+    }
+
     /// A site that failed or ran out is said by name; one that answered
     /// is not.
     #[test]
@@ -401,15 +460,29 @@ mod tests {
         );
     }
 
-    /// The sites ticked are the setting; unset, both are on.
+    /// The sites are written only when a box changed, keeping the order
+    /// the admin set; a site ticked anew comes last. Unset, both are on.
     #[test]
-    fn the_sites_ticked_are_the_setting() {
-        assert_eq!(sources_value([true, false]), json!(["opensubtitles"]));
+    fn the_sites_ticked_are_the_setting_in_the_admin_s_order() {
+        let both = [true, true];
+        assert_eq!(sources_value(None, both, both), None);
+        let subdl_first = json!(["subdl", "opensubtitles"]);
+        assert_eq!(sources_value(Some(&subdl_first), both, both), None);
         assert_eq!(
-            sources_value([true, true]),
-            json!(["opensubtitles", "subdl"])
+            sources_value(None, both, [true, false]),
+            Some(json!(["opensubtitles"]))
         );
-        assert_eq!(sources_value([false, false]), json!([]));
+        assert_eq!(
+            sources_value(Some(&subdl_first), both, [false, true]),
+            Some(json!(["subdl"]))
+        );
+        // OpenSubtitles ticked again: after SubDL, which was alone.
+        let subdl_only = json!(["subdl"]);
+        assert_eq!(
+            sources_value(Some(&subdl_only), [false, true], both),
+            Some(json!(["subdl", "opensubtitles"]))
+        );
+        assert_eq!(sources_value(None, both, [false, false]), Some(json!([])));
         assert_eq!(sources_on(None), [true, true]);
         assert_eq!(sources_on(Some(&json!(["subdl"]))), [false, true]);
         assert_eq!(sources_on(Some(&json!([]))), [false, false]);
@@ -417,13 +490,17 @@ mod tests {
 
     #[test]
     fn a_secret_field_takes_only_a_reference() {
-        assert_eq!(secret_reference("API key", " "), Ok(None));
-        assert_eq!(
-            secret_reference("API key", "${SF_ENV_OS_KEY}"),
-            Ok(Some(json!("${SF_ENV_OS_KEY}")))
+        let key = |typed| secret_reference("SubDL's API key", typed, "SF_ENV_SUBDL_KEY");
+        assert_eq!(key(" "), Ok(None));
+        assert_eq!(key("${SF_ENV_OS_KEY}"), Ok(Some(json!("${SF_ENV_OS_KEY}"))));
+        assert!(key("abc123").unwrap_err().contains("${SF_ENV_SUBDL_KEY}"));
+        assert!(key("${HOME}").is_err());
+        let password = secret_reference("Password", "hunter2", "SF_ENV_OPENSUBTITLES_PASSWORD");
+        assert!(
+            password
+                .unwrap_err()
+                .contains("${SF_ENV_OPENSUBTITLES_PASSWORD}")
         );
-        assert!(secret_reference("API key", "abc123").is_err());
-        assert!(secret_reference("API key", "${HOME}").is_err());
         assert_eq!(languages_value("en, pt-BR"), Some(json!(["en", "pt-BR"])));
         assert_eq!(languages_value(""), None);
     }

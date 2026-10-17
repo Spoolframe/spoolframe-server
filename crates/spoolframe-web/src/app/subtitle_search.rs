@@ -12,14 +12,13 @@ use spoolframe_admin_api::{
 
 use super::admin::{Said, Toast, say, sleep};
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::wizard::{
-    Footer, Mode, Note, entry, load_settings, loading, locked, number, save, text, value,
-};
+use super::wizard::{Footer, Mode, Note, entry, load_settings, loading, locked, save, text, value};
 use super::{icons, rpc};
 use crate::logic::ApiError;
 use crate::subtitle_search::{
-    SOURCES, details, downloaded_by, downloaded_line, downloads, languages_value, marks, refusal,
-    secret_reference, source_lines, source_name, sources_on, sources_value,
+    LIMIT, OLD_LIMIT, SOURCES, details, downloaded_by, downloaded_line, downloads, languages_value,
+    limit_changes, marks, refusal, secret_reference, source_lines, source_name, sources_on,
+    sources_value,
 };
 use crate::subtitle_timing::{any_syncing, sync_text};
 
@@ -317,9 +316,6 @@ pub fn SubtitleSitesForm(on_done: EventHandler<()>) -> Element {
 }
 
 const SOURCES_KEY: &str = "subtitles.sources";
-const LIMIT: &str = "subtitles.daily_limit_per_user";
-/// Where the limit was before SubDL: shown while the new one is unset.
-const OLD_LIMIT: &str = "opensubtitles.daily_limit_per_user";
 const USERNAME: &str = "opensubtitles.username";
 const PASSWORD: &str = "opensubtitles.password";
 const LANGUAGES: &str = "opensubtitles.languages";
@@ -335,7 +331,10 @@ fn SubtitleSiteFields(
     let s = &settings;
     let password_set = entry(s, PASSWORD).is_some_and(|e| e.set);
     let subdl_key_set = entry(s, SUBDL_KEY).is_some_and(|e| e.set);
-    let mut sources = use_signal(|| sources_on(value(s, SOURCES_KEY)));
+    let sources_before = sources_on(value(s, SOURCES_KEY));
+    let sources_setting = value(s, SOURCES_KEY).cloned();
+    let old_limit_set = entry(s, OLD_LIMIT).is_some_and(|e| e.set);
+    let mut sources = use_signal(|| sources_before);
     let username = use_signal(|| text(s, USERNAME));
     let password = use_signal(String::new);
     let list = |key| {
@@ -364,18 +363,27 @@ fn SubtitleSiteFields(
     let on_save = use_callback(move |()| {
         let s = saved.clone();
         let changes = (|| -> Result<Vec<(&'static str, Option<serde_json::Value>)>, String> {
-            let mut changes = vec![(SOURCES_KEY, Some(sources_value(sources())))];
+            let mut changes = Vec::new();
+            // Only when a box changed: the order the admin gave is kept,
+            // and an unset list keeps following the default.
+            if let Some(list) = sources_value(sources_setting.as_ref(), sources_before, sources()) {
+                changes.push((SOURCES_KEY, Some(list)));
+            }
             // A secret's field left empty keeps the one set.
-            if let Some(pw) = secret_reference("Password", &password())? {
+            if let Some(pw) =
+                secret_reference("Password", &password(), "SF_ENV_OPENSUBTITLES_PASSWORD")?
+            {
                 changes.push((PASSWORD, Some(pw)));
             }
-            if let Some(key) = secret_reference("SubDL's API key", &subdl_key())? {
+            if let Some(key) =
+                secret_reference("SubDL's API key", &subdl_key(), "SF_ENV_SUBDL_KEY")?
+            {
                 changes.push((SUBDL_KEY, Some(key)));
             }
             changes.push((USERNAME, super::wizard::typed(&username())));
             changes.push((LANGUAGES, languages_value(&languages())));
             changes.push((SUBDL_LANGUAGES, languages_value(&subdl_languages())));
-            changes.push((LIMIT, number("The daily limit", &limit())?));
+            changes.extend(limit_changes(&limit(), old_limit_set)?);
             Ok(changes)
         })();
         let changes = match changes {

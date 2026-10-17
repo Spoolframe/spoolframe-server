@@ -37,7 +37,6 @@ async fn a_search_reads_each_result_without_the_key_in_its_link() {
         .and(query_param("imdb_id", "tt1234567"))
         .and(query_param("type", "movie"))
         .and(query_param("languages", "EN,BR_PT"))
-        .and(query_param("hi", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_string(SEARCH))
         .expect(1)
         .mount(&server)
@@ -52,7 +51,6 @@ async fn a_search_reads_each_result_without_the_key_in_its_link() {
     assert_eq!(found[0].format, None);
     assert_eq!(found[0].fps, Some(23.976));
     assert_eq!(found[0].release, "Film.2019.1080p.BluRay.x264-GRP");
-    assert!(!found[0].hearing_impaired && found[1].hearing_impaired);
     assert_eq!(found[2].language, "pt-br");
     assert_eq!(found[2].format.as_deref(), Some("srt"));
     assert!(
@@ -61,13 +59,22 @@ async fn a_search_reads_each_result_without_the_key_in_its_link() {
     );
 }
 
+/// SubDL's own words for nothing found are no result; any other
+/// `status: false`, even one that says "not found", is a refusal.
 #[tokio::test]
 async fn nothing_found_is_no_result_and_a_used_up_key_is_said() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(query_param("imdb_id", "tt1234567"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": false, "error": "Can't find movie or tv",
+            "status": false, "error": "can't find movie or tv",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(query_param("imdb_id", "tt7654321"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": false, "error": "API key not found",
         })))
         .mount(&server)
         .await;
@@ -80,6 +87,14 @@ async fn nothing_found_is_no_result_and_a_used_up_key_is_said() {
         .await;
     let site = Site::new(account(&server));
     assert_eq!(site.search(&film()).await.unwrap(), Vec::new());
+    let bad_key = Query {
+        imdb_id: Some("tt7654321".into()),
+        ..film()
+    };
+    assert!(matches!(
+        site.search(&bad_key).await,
+        Err(SiteError::Refused { status: 200, .. })
+    ));
     let by_name = Query {
         film_name: Some("film".into()),
         kind: "movie",

@@ -54,6 +54,10 @@ pub enum FileError {
     /// A readable archive with no SRT, WebVTT or ASS file in it.
     #[error("the archive has no subtitle the server reads (SRT, WebVTT or ASS)")]
     NoSubtitleInArchive,
+    /// An archive of several subtitles (a season's pack) none of whose
+    /// names says the episode asked for.
+    #[error("the archive has several subtitles and none of their names says this episode")]
+    EpisodeNotInArchive,
 }
 
 impl Kept {
@@ -114,9 +118,11 @@ pub fn is_archive(bytes: &[u8]) -> bool {
 }
 
 /// The subtitle in the zip archive `bytes`, as it is in it (for [`keep`]
-/// to check): its one SRT, WebVTT or ASS file; of several, the one whose
-/// name says episode `episode` (season, episode: `S01E02`, `1x02`) when
-/// one does, else the largest. Nothing is written anywhere: an entry is
+/// to check): its one SRT, WebVTT or ASS file. Of several, for a film,
+/// the largest (two discs, an SDH beside it); for episode `episode`
+/// (season, episode), the one whose name says it ([`episode_match`]),
+/// the largest of those that say it as well; and none when no name does:
+/// another episode's lines would be every user's. Nothing is written anywhere: an entry is
 /// only read, by its place, so its name cannot lead out of anywhere; an
 /// archive with a name that would is refused all the same, as made to
 /// harm. Entries in `__MACOSX/` are Finder's, not files.
@@ -154,14 +160,25 @@ pub fn unpack(bytes: &[u8], episode: Option<(u32, u32)>) -> Result<Vec<u8>, File
     if let Some((season, number)) = episode
         && subtitles.len() > 1
     {
-        let of_it: Vec<_> = subtitles
+        let matched: Vec<(u8, (usize, String, u64))> = subtitles
             .iter()
-            .filter(|(_, name, _)| names_episode(name, season, number))
-            .cloned()
+            .filter_map(|entry| Some((episode_match(&entry.1, season, number)?, entry.clone())))
             .collect();
-        if !of_it.is_empty() {
-            subtitles = of_it;
+        let best = matched
+            .iter()
+            .map(|(tier, _)| *tier)
+            .min()
+            .ok_or(FileError::EpisodeNotInArchive)?;
+        let of_it: Vec<_> = matched
+            .into_iter()
+            .filter(|(tier, _)| *tier == best)
+            .map(|(_, entry)| entry)
+            .collect();
+        // A bare `105` is taken only when one name has it.
+        if best == 4 && of_it.len() > 1 {
+            return Err(FileError::EpisodeNotInArchive);
         }
+        subtitles = of_it;
     }
     // The largest; of equal ones, the first by name.
     let (at, _, _) = subtitles
@@ -201,50 +218,83 @@ fn is_subtitle_name(name: &str) -> bool {
     })
 }
 
-/// Whether `name` says season `season`'s episode `number`: `S01E02`,
-/// `s1e2`, `1x02`, the numbers not part of larger ones.
-fn names_episode(name: &str, season: u32, number: u32) -> bool {
+/// How surely `name` says season `season`'s episode `number`, the
+/// numbers never part of larger ones; `None` when it does not:
+/// 1, `S01E05`, `s1e5`, `1x05`; 2, `E05`, `EP05`, `Episode 5`; 3, a
+/// two-digit `05` on its own (`Show - 05`, `Show_05`), or any number
+/// after `- `; 4, `105`, three digits on their own, season then episode.
+pub fn episode_match(name: &str, season: u32, number: u32) -> Option<u8> {
     let name = name.to_ascii_lowercase();
-    let bytes = name.as_bytes();
-    let digits_at = |from: usize| -> (u32, usize) {
+    let b = name.as_bytes();
+    // The number at `from` (at most 4 digits) and where it ends.
+    let digits = |from: usize| -> (u32, usize) {
         let mut end = from;
         let mut value: u32 = 0;
-        while end < bytes.len() && bytes[end].is_ascii_digit() && end - from < 4 {
-            value = value * 10 + u32::from(bytes[end] - b'0');
+        while end < b.len() && b[end].is_ascii_digit() && end - from < 4 {
+            value = value * 10 + u32::from(b[end] - b'0');
             end += 1;
         }
         (value, end)
     };
-    for at in 0..bytes.len() {
-        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
-        // `s01e02`
-        if before_ok && bytes[at] == b's' {
-            let (s, end) = digits_at(at + 1);
-            if end > at + 1 && bytes.get(end) == Some(&b'e') {
-                let (e, stop) = digits_at(end + 1);
-                if stop > end + 1
-                    && !bytes.get(stop).is_some_and(u8::is_ascii_digit)
-                    && (s, e) == (season, number)
-                {
-                    return true;
+    let alnum = |at: usize| b.get(at).is_some_and(u8::is_ascii_alphanumeric);
+    let digit = |at: usize| b.get(at).is_some_and(u8::is_ascii_digit);
+    let mut best: Option<u8> = None;
+    let mut found = |tier: u8| best = Some(best.map_or(tier, |b| b.min(tier)));
+    for at in 0..b.len() {
+        let starts = at == 0 || !alnum(at - 1);
+        if !starts {
+            continue;
+        }
+        // `s01e05`
+        if b[at] == b's' {
+            let (s, end) = digits(at + 1);
+            if end > at + 1 && b.get(end) == Some(&b'e') {
+                let (e, stop) = digits(end + 1);
+                if stop > end + 1 && !digit(stop) && (s, e) == (season, number) {
+                    found(1);
                 }
             }
         }
-        // `1x02`
-        if before_ok && bytes[at].is_ascii_digit() {
-            let (s, end) = digits_at(at);
-            if bytes.get(end) == Some(&b'x') {
-                let (e, stop) = digits_at(end + 1);
-                if stop > end + 1
-                    && !bytes.get(stop).is_some_and(u8::is_ascii_digit)
-                    && (s, e) == (season, number)
-                {
-                    return true;
+        if b[at].is_ascii_digit() {
+            let (s, end) = digits(at);
+            // `1x05`
+            if b.get(end) == Some(&b'x') {
+                let (e, stop) = digits(end + 1);
+                if stop > end + 1 && !digit(stop) && (s, e) == (season, number) {
+                    found(1);
+                }
+            } else if !alnum(end) {
+                let len = end - at;
+                let after_dash = at >= 2 && &b[at - 2..at] == b"- ";
+                // `05`, or `- 5`
+                if (len == 2 || after_dash) && s == number {
+                    found(3);
+                }
+                // `105`
+                if len == 3 && season < 10 && s == season * 100 + number {
+                    found(4);
                 }
             }
+        }
+        // `e05`, `ep05`, `episode 5`, `episode.05`
+        for word in ["episode", "ep", "e"] {
+            let Some(rest) = name[at..].strip_prefix(word) else {
+                continue;
+            };
+            let from = b.len() - rest.len();
+            let from = if word == "episode" && matches!(b.get(from), Some(b' ' | b'.' | b'_')) {
+                from + 1
+            } else {
+                from
+            };
+            let (e, stop) = digits(from);
+            if stop > from && !digit(stop) && e == number {
+                found(2);
+            }
+            break;
         }
     }
-    false
+    best
 }
 
 /// The text of `bytes`, without a byte order mark, and the encoding it was
@@ -348,9 +398,10 @@ mod tests {
     }
 
     /// Of a season's pack, the episode's; of several for a film (two
-    /// discs, an SDH), the largest.
+    /// discs, an SDH), the largest; of a pack none of whose names says
+    /// the episode, none: another episode's lines must not be kept.
     #[test]
-    fn of_several_the_episode_s_or_the_largest() {
+    fn of_several_the_episode_s_or_for_a_film_the_largest() {
         let one = SRT.as_bytes();
         let longer = [SRT, SRT].concat();
         let pack = zipped(&[
@@ -368,14 +419,67 @@ mod tests {
             .unwrap(),
             one
         );
-        // An episode the pack does not have: the largest, as for a film.
-        assert_eq!(unpack(&pack, Some((2, 1))).unwrap(), longer.as_bytes());
+        // An episode the pack does not have: refused.
+        assert_eq!(
+            unpack(&pack, Some((2, 1))),
+            Err(FileError::EpisodeNotInArchive)
+        );
+        // A film: the largest.
         assert_eq!(unpack(&pack, None).unwrap(), longer.as_bytes());
-        assert!(names_episode("Show.S01E02.srt", 1, 2));
-        assert!(!names_episode("Show.S01E021.srt", 1, 2));
-        assert!(!names_episode("Show.S01E12.srt", 1, 2));
-        assert!(names_episode("Cars 2x02.srt", 2, 2));
-        assert!(!names_episode("Cars2x02.srt", 2, 2));
+        // One subtitle alone is taken, whatever its name says.
+        assert_eq!(
+            unpack(&zipped(&[("Show.S01E09.srt", one)]), Some((1, 2))).unwrap(),
+            one
+        );
+    }
+
+    #[test]
+    fn an_episode_is_read_from_the_names_packs_use() {
+        for name in [
+            "Show.S01E05.srt",
+            "show s1e5.srt",
+            "Show.1x05.srt",
+            "Show.E05.srt",
+            "Show EP05.srt",
+            "Show Episode 5.srt",
+            "Show - 05.srt",
+            "Show_05.srt",
+            "Show - 5.srt",
+            "Show.105.srt",
+        ] {
+            assert!(episode_match(name, 1, 5).is_some(), "{name}");
+        }
+        for name in [
+            "Show.S01E15.srt",
+            "Show.S02E05.srt",
+            "Show.S01E051.srt",
+            "Cars2x05.srt",
+            "Show.720p.x265.srt",
+            "Show.DD5.1.srt",
+            "Show.1080p.srt",
+            "Show.2019.srt",
+            "Show.E15.srt",
+        ] {
+            assert_eq!(episode_match(name, 1, 5), None, "{name}");
+        }
+        // The surer form wins.
+        assert_eq!(episode_match("Show.S01E05.srt", 1, 5), Some(1));
+        assert_eq!(episode_match("Show - 05.srt", 1, 5), Some(3));
+        let pack = zipped(&[
+            ("Show - 05.srt", SRT.as_bytes()),
+            ("Show.S01E05.srt", [SRT, SRT].concat().as_bytes()),
+            ("Show - 06.srt", SRT.as_bytes()),
+        ]);
+        assert_eq!(
+            unpack(&pack, Some((1, 5))).unwrap(),
+            [SRT, SRT].concat().as_bytes()
+        );
+        // `105` only when one name has it.
+        let ambiguous = zipped(&[("A.105.srt", SRT.as_bytes()), ("B.105.srt", SRT.as_bytes())]);
+        assert_eq!(
+            unpack(&ambiguous, Some((1, 5))),
+            Err(FileError::EpisodeNotInArchive)
+        );
     }
 
     #[test]

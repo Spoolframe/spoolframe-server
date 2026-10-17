@@ -210,23 +210,21 @@ impl Store {
         Ok(Some(removed))
     }
 
-    /// The site's file ids removed as bad for item `media_id`.
+    /// The results removed as bad for item `media_id`, every site's:
+    /// (site, the site's file id).
     pub async fn subtitle_rejections(
         &self,
         media_id: &str,
-        source: &str,
-    ) -> Result<Vec<String>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT file_id FROM subtitle_rejections WHERE media_id = ?1 AND source = ?2",
-        )
-        .bind(media_id)
-        .bind(source)
-        .fetch_all(&self.pool)
-        .await?;
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let rows =
+            sqlx::query("SELECT source, file_id FROM subtitle_rejections WHERE media_id = ?1")
+                .bind(media_id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows
             .iter()
-            .map(|r| r.try_get::<String, _>("file_id"))
-            .collect::<Result<_, _>>()?)
+            .map(|r| Ok((r.try_get("source")?, r.try_get("file_id")?)))
+            .collect::<Result<_, sqlx::Error>>()?)
     }
 
     /// When each of `principal`'s downloads of the last day was made,
@@ -300,6 +298,18 @@ mod tests {
     use super::super::tests::test_store;
     use super::*;
 
+    /// Item 1's rejected file ids at `source`.
+    async fn rejected(store: &Store, source: &str) -> Vec<String> {
+        store
+            .subtitle_rejections("plex:movie:1")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(s, _)| s == source)
+            .map(|(_, id)| id)
+            .collect()
+    }
+
     fn download(id: &str, file_id: &str, by: &str, at: i64) -> DownloadRow {
         DownloadRow {
             id: id.into(),
@@ -372,13 +382,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert_eq!(
-            store
-                .subtitle_rejections("plex:movie:1", "opensubtitles")
-                .await
-                .unwrap(),
-            ["7"]
-        );
+        assert_eq!(rejected(&store, "opensubtitles").await, ["7"]);
         assert_eq!(
             store.subtitle_downloads_today("local:1").await.unwrap(),
             [now]
@@ -387,13 +391,7 @@ mod tests {
             .put_subtitle_download(&download("d3", "7", "local:2", now))
             .await
             .unwrap();
-        assert!(
-            store
-                .subtitle_rejections("plex:movie:1", "opensubtitles")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(rejected(&store, "opensubtitles").await.is_empty());
     }
 
     /// SubDL's ids are text; one site's id is not another's.
@@ -419,20 +417,8 @@ mod tests {
             .remove_subtitle_download("d1", "local:1")
             .await
             .unwrap();
-        assert_eq!(
-            store
-                .subtitle_rejections("plex:movie:1", "subdl")
-                .await
-                .unwrap(),
-            ["3172974-3188291"]
-        );
-        assert!(
-            store
-                .subtitle_rejections("plex:movie:1", "opensubtitles")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(rejected(&store, "subdl").await, ["3172974-3188291"]);
+        assert!(rejected(&store, "opensubtitles").await.is_empty());
     }
 
     /// Migration 0037 keeps the downloads and rejections 0036 made, their
@@ -481,13 +467,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("b", "5338574"), ("a", "42")]
         );
-        assert_eq!(
-            store
-                .subtitle_rejections("plex:movie:1", "opensubtitles")
-                .await
-                .unwrap(),
-            ["7"]
-        );
+        assert_eq!(rejected(&store, "opensubtitles").await, ["7"]);
     }
 
     #[tokio::test]

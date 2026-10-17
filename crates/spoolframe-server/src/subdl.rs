@@ -90,8 +90,10 @@ impl Query {
         put("episode_number", self.episode_number.map(|n| n.to_string()));
         put("languages", Some(self.languages.clone()));
         pairs.push(("subs_per_page", PER_PAGE.to_string()));
-        // Each result's hearing-impaired flag, which is left out without.
-        pairs.push(("hi", "1".into()));
+        // Not `hi=1`: the flag it adds was true for every one of thirty
+        // real results for one film. A track marked SDH is chosen, or
+        // passed over, by each user's SDH preference: a flag that says
+        // yes to everything would mark them all.
         pairs.push(("client", "custom_integration".into()));
         pairs
     }
@@ -112,7 +114,6 @@ pub struct Found {
     /// for an archive.
     pub format: Option<String>,
     pub fps: Option<f64>,
-    pub hearing_impaired: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,7 +132,6 @@ struct Entry {
     release_name: Option<String>,
     language: Option<String>,
     url: Option<String>,
-    hi: Option<bool>,
     fps: Option<serde_json::Value>,
 }
 
@@ -260,15 +260,20 @@ fn says_quota(message: &str) -> bool {
         .any(|w| message.contains(w))
 }
 
-/// The search answer's subtitles. `status: false` with SubDL's "can't
-/// find" is no result; with anything else, a refusal.
+/// SubDL's words for a search that found nothing, as its API answers
+/// (`{"status": false, "error": "can't find movie or tv"}`, HTTP 200).
+const NOTHING_FOUND: &str = "can't find movie or tv";
+
+/// The search answer's subtitles. `status: false` with SubDL's
+/// [`NOTHING_FOUND`] is no result (and kept a day, as any answer); with
+/// anything else, a refusal, which is not kept: a key SubDL no longer
+/// takes must not pass for a day of nothing found.
 fn read_search(body: &[u8]) -> Result<Vec<Found>, SiteError> {
     let answer: SearchAnswer =
         serde_json::from_slice(body).map_err(|e| SiteError::Unreadable(e.to_string()))?;
     if !answer.status {
         let message = answer.error.unwrap_or_default();
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("find") || lower.contains("not found") {
+        if message.trim().eq_ignore_ascii_case(NOTHING_FOUND) {
             return Ok(Vec::new());
         }
         if says_quota(&message) {
@@ -317,7 +322,6 @@ fn read_search(body: &[u8]) -> Result<Vec<Found>, SiteError> {
                     _ => None,
                 })
                 .filter(|f: &f64| f.is_finite() && *f > 0.0 && *f < 1000.0),
-            hearing_impaired: entry.hi.unwrap_or(false),
         });
     }
     Ok(found)

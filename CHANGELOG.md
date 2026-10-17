@@ -68,8 +68,12 @@
   says which site's account ran out (`site`). SubDL's file comes as a
   zip archive: it is opened in memory with a pure-Rust reader, its size,
   entries and names checked, and its one SRT, WebVTT or ASS taken (a
-  season pack's, the episode's), then checked as any download, and
-  synced. A download stays, for everyone, when its site is turned off
+  season pack's, the episode's, by its name; a pack with none named
+  for it is refused rather than its largest file taken), then checked
+  as any download, and synced. SubDL's hearing-impaired flag is not
+  used: it is set on nearly every file. A site that fails is said in
+  the server's own words, its own text only logged. A download from
+  one site no longer waits for one from the other. A download stays, for everyone, when its site is turned off
   (out of `subtitles.sources`, or its key taken out). The daily limit
   per user is every site's,
   `subtitles.daily_limit_per_user` (`opensubtitles.daily_limit_per_user`
