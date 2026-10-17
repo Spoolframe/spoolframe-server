@@ -45,9 +45,6 @@ const fn restart(key: &'static str) -> Setting {
 /// in `secrets/plex-token` under the state directory.
 pub const PLEX_TOKEN: &str = "plex.token";
 
-/// OpenSubtitles' API key (PX-02).
-pub const OPENSUBTITLES_API_KEY: &str = "opensubtitles.api_key";
-
 /// OpenSubtitles' account password (PX-02).
 pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles.password";
 
@@ -169,9 +166,9 @@ pub const SETTINGS: &[Setting] = &[
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),
     restart("http_playback.address"),
-    // PX-02. The key and the password are `${SF_ENV_…}` references, never
-    // shown: the runtime layer refuses the secret itself.
-    write_only(OPENSUBTITLES_API_KEY),
+    // PX-02. OpenSubtitles' API key is built in: not a setting. The
+    // password and SubDL's key are `${SF_ENV_…}` references, never shown:
+    // the runtime layer refuses the secret itself.
     live("opensubtitles.username"),
     write_only(OPENSUBTITLES_PASSWORD),
     live("opensubtitles.languages"),

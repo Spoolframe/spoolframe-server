@@ -11,7 +11,6 @@ const SEARCH: &str = include_str!("../../tests/fixtures/opensubtitles/search.jso
 fn account(server: &MockServer, login: bool) -> Account {
     Account {
         api_url: url::Url::parse(&format!("{}/api/v1", server.uri())).unwrap(),
-        api_key: "test-key".into(),
         username: login.then(|| "alice".into()),
         password: login.then(|| "pw".into()),
     }
@@ -22,7 +21,8 @@ async fn a_search_sends_the_key_and_its_query_in_order_and_reads_each_file() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/subtitles"))
-        .and(header("Api-Key", "test-key"))
+        // The built-in key, on every request.
+        .and(header("Api-Key", builtin_key().as_str()))
         .and(query_param("moviehash", "00000000000200ff"))
         .and(query_param("imdb_id", "1234567"))
         .and(query_param("languages", "en,pt-br"))
@@ -268,7 +268,6 @@ pub(crate) fn nothing_listens() -> url::Url {
 async fn an_unreachable_site_is_said_so() {
     let site = Site::new(Account {
         api_url: nothing_listens(),
-        api_key: "test-key".into(),
         username: None,
         password: None,
     });
@@ -322,10 +321,20 @@ fn only_the_site_s_own_api_hosts_are_moved_to() {
 fn an_account_s_secrets_are_never_printed() {
     let account = Account {
         api_url: url::Url::parse(API_URL).unwrap(),
-        api_key: "s3cret-key".into(),
         username: Some("alice".into()),
         password: Some("s3cret-pw".into()),
     };
     let shown = format!("{account:?}");
     assert!(!shown.contains("s3cret"), "{shown}");
+}
+
+/// The built-in key decodes to the shape OpenSubtitles' keys have: 32
+/// letters and digits. Its value is not asserted: no test holds it.
+#[test]
+fn the_built_in_key_decodes_to_a_key() {
+    let key = builtin_key();
+    assert_eq!(key.len(), 32);
+    assert!(key.bytes().all(|b| b.is_ascii_alphanumeric()));
+    // Not the scrambled bytes read as text.
+    assert_ne!(key.as_bytes(), SCRAMBLED_KEY);
 }

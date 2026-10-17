@@ -1605,3 +1605,42 @@ async fn sighup_reloads_the_config_file() {
     assert!(detected >= 2, "{}", running.log());
     running.stop_cleanly();
 }
+
+/// PX-02: a runtime layer from before OpenSubtitles' key was built in
+/// names `opensubtitles.api_key` as a variable the server no longer has.
+/// The server starts all the same, says once that the key is no longer
+/// read, and never shows it.
+#[tokio::test]
+async fn an_old_opensubtitles_key_in_the_runtime_layer_does_not_stop_the_server() {
+    let (_tmp, config) = config_with_state("old-opensubtitles-key", &closed_port_url()).await;
+    let state = config.with_file_name("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("runtime.ucl"),
+        r#"schema = "spoolframe.server.v1";
+           opensubtitles { api_key = "${SF_ENV_PX02_NEVER_SET}"; languages = ["de"]; }"#,
+    )
+    .unwrap();
+    let (running, log) = Running::start(&config);
+    assert!(log.contains("admin API listening"), "{log}");
+    assert_eq!(
+        log.matches("opensubtitles.api_key is no longer read; the built-in key is used")
+            .count(),
+        1,
+        "{log}"
+    );
+    running.stop_cleanly();
+    let shown = String::from_utf8(
+        server_with(&config)
+            .args(["config", "show"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(!shown.contains("opensubtitles.api_key"), "{shown}");
+    assert!(
+        shown.contains(r#"opensubtitles.languages = ["de"];"#),
+        "{shown}"
+    );
+}

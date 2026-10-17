@@ -1947,11 +1947,12 @@ are `SdkError::Unsupported`, unsent, without the feature.
 Feature `spoolframe:subtitle-search` (PX-02). The server searches the
 subtitle sites its admin turned on, OpenSubtitles (opensubtitles.com),
 SubDL (subdl.com) or both, for an item's subtitles and downloads one,
-only when someone asks, with its own key for each. Viewers do not pick
-the site: the admin does, per server. A download becomes an external
-text track of the item for every user on the server. A server with no
-site set up still has the feature and answers each request
-`NoSubtitleSource`: hide "Find subtitles…".
+only when someone asks (OpenSubtitles with Spoolframe's built-in key,
+SubDL with the admin's). Viewers do not pick the site: the admin does,
+per server. A download becomes an external text track of the item for
+every user on the server, and stays when its site is later turned off.
+A server with no site turned on still has the feature and answers each
+request `NoSubtitleSource`: hide "Find subtitles…".
 
 | Request | Reply |
 |---|---|
@@ -2024,7 +2025,7 @@ is then listed last in the item's searches, `rejected`. The user who
 downloaded it or an admin may: anyone else gets `NotAllowed`. A download
 already removed is `Done`.
 
-Errors: `NoSubtitleSource` (no site set up); `QuotaExhausted { whose,
+Errors: `NoSubtitleSource` (no site turned on); `QuotaExhausted { whose,
 resets_at?, site? }`, `whose` being `account` (the server's account at
 site `site`, `opensubtitles` or `subdl`) or `user` (the user's own
 daily limit, no `site`), `resets_at` when more may be downloaded, Unix

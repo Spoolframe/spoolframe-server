@@ -286,9 +286,10 @@ fn ResultRow(
 }
 
 /// Settings › Subtitles: which subtitle sites are searched, the daily
-/// limit per user, and each site's key and languages (OpenSubtitles' its
-/// account too). A key and a password are the names of the server's
-/// environment variables that hold them, never the secrets.
+/// limit per user, OpenSubtitles' account and languages (its API key is
+/// built in), and SubDL's key and languages. A key and a password are the
+/// names of the server's environment variables that hold them, never the
+/// secrets.
 #[component]
 pub fn SubtitleSitesForm(on_done: EventHandler<()>) -> Element {
     let mut generation = use_signal(|| 0u32);
@@ -319,7 +320,6 @@ const SOURCES_KEY: &str = "subtitles.sources";
 const LIMIT: &str = "subtitles.daily_limit_per_user";
 /// Where the limit was before SubDL: shown while the new one is unset.
 const OLD_LIMIT: &str = "opensubtitles.daily_limit_per_user";
-const API_KEY: &str = "opensubtitles.api_key";
 const USERNAME: &str = "opensubtitles.username";
 const PASSWORD: &str = "opensubtitles.password";
 const LANGUAGES: &str = "opensubtitles.languages";
@@ -333,11 +333,9 @@ fn SubtitleSiteFields(
     on_reload: EventHandler<()>,
 ) -> Element {
     let s = &settings;
-    let key_set = entry(s, API_KEY).is_some_and(|e| e.set);
     let password_set = entry(s, PASSWORD).is_some_and(|e| e.set);
     let subdl_key_set = entry(s, SUBDL_KEY).is_some_and(|e| e.set);
     let mut sources = use_signal(|| sources_on(value(s, SOURCES_KEY)));
-    let api_key = use_signal(String::new);
     let username = use_signal(|| text(s, USERNAME));
     let password = use_signal(String::new);
     let list = |key| {
@@ -368,9 +366,6 @@ fn SubtitleSiteFields(
         let changes = (|| -> Result<Vec<(&'static str, Option<serde_json::Value>)>, String> {
             let mut changes = vec![(SOURCES_KEY, Some(sources_value(sources())))];
             // A secret's field left empty keeps the one set.
-            if let Some(key) = secret_reference("OpenSubtitles' API key", &api_key())? {
-                changes.push((API_KEY, Some(key)));
-            }
             if let Some(pw) = secret_reference("Password", &password())? {
                 changes.push((PASSWORD, Some(pw)));
             }
@@ -420,11 +415,6 @@ fn SubtitleSiteFields(
         });
     };
     let set_hint = "Set. Type another to replace it.";
-    let key_hint = if key_set {
-        set_hint
-    } else {
-        "${SF_ENV_OPENSUBTITLES_KEY}"
-    };
     let password_hint = if password_set {
         set_hint
     } else {
@@ -438,7 +428,7 @@ fn SubtitleSiteFields(
     rsx! {
         p { class: "m-0 text-sm text-ctp-subtext0",
             "Subtitles are searched and downloaded from OpenSubtitles, SubDL or both only when someone asks, on an item's page or in an app, and kept for everyone. "
-            "Searching sends each site the item's IDs, and OpenSubtitles the file's hash. A site without its API key is off."
+            "Searching sends each site the item's IDs, and OpenSubtitles the file's hash. OpenSubtitles works with Spoolframe's built-in key; SubDL needs its own."
         }
         fieldset { class: "flex flex-col gap-1.5 border-0 p-0 m-0",
             legend { class: "mb-1 text-sm font-semibold", "Sites searched" }
@@ -463,14 +453,8 @@ fn SubtitleSiteFields(
         }
         h3 { class: "m-0 text-sm font-semibold", "OpenSubtitles" }
         div { class: "flex flex-col gap-1.5",
-            super::Field { label: "API key", value: api_key, placeholder: key_hint, disabled: locked(s, API_KEY) }
-            span { class: "text-xs text-ctp-subtext0",
-                "The server's environment variable that holds the key, as ${{SF_ENV_NAME}}, never the key itself: the settings are kept as plain text. "
-                if key_set {
-                    button { class: "btn-plain", onclick: move |_| forget(API_KEY), "Take it out" }
-                }
-            }
-            Note { settings: settings.clone(), setting: API_KEY, on_changed: move |_| on_reload.call(()) }
+            span { class: "text-sm", "API key" }
+            span { class: "text-xs text-ctp-subtext0", "Built-in key: Spoolframe's own, nothing to set." }
         }
         div { class: "flex flex-col gap-1.5",
             super::Field { label: "Account", value: username, placeholder: "Your username at opensubtitles.com", disabled: locked(s, USERNAME) }
@@ -495,7 +479,7 @@ fn SubtitleSiteFields(
         div { class: "flex flex-col gap-1.5",
             super::Field { label: "API key", value: subdl_key, placeholder: subdl_hint, disabled: locked(s, SUBDL_KEY) }
             span { class: "text-xs text-ctp-subtext0",
-                "From your account's panel at subdl.com, as an environment variable of the server, ${{SF_ENV_NAME}}. "
+                "From your account's panel at subdl.com: the server's environment variable that holds it, as ${{SF_ENV_NAME}}, never the key itself, as the settings are kept as plain text. "
                 if subdl_key_set {
                     button { class: "btn-plain", onclick: move |_| forget(SUBDL_KEY), "Take it out" }
                 }

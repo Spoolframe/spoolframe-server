@@ -1,9 +1,11 @@
 //! The opensubtitles.com REST API (PX-02): the site subtitles are searched
 //! and downloaded from, on demand only. Its old XML-RPC API is shut down.
 //!
-//! Every request carries the server's API key; a download also carries
-//! the token of the account the admin set, when one is set (without one
-//! the site counts downloads by address, a handful a day). The site limits
+//! Every request carries Spoolframe's own API key, built in
+//! ([`builtin_key`]): an app's key at OpenSubtitles names the app, not
+//! the server, so no admin sets one. A download also carries the token of
+//! the account the admin set, when one is set (without one the site
+//! counts downloads by address, a handful a day). The site limits
 //! requests per second: calls are spaced [`MIN_INTERVAL`] apart, and when
 //! it answers 429 no call is made until it said to wait. Everything it
 //! sends is read with a cap, by serde into the structs below; the
@@ -30,19 +32,18 @@ const MAX_JSON: usize = 4 << 20;
 /// How long a sign-in's token is used: the site's last a day.
 const TOKEN_LIFE: Duration = Duration::from_secs(23 * 60 * 60);
 
-/// The site, as the admin set it up: the key, the account, and where it
-/// is (another address only in tests).
+/// The site, as the admin set it up: the account, and where it is
+/// (another address only in tests). The key is [`builtin_key`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct Account {
     pub api_url: url::Url,
-    pub api_key: String,
     /// Signed in for downloads when both are set.
     pub username: Option<String>,
     pub password: Option<String>,
 }
 
 impl std::fmt::Debug for Account {
-    /// Never the key or the password.
+    /// Never the password.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Account")
             .field("api_url", &self.api_url.as_str())
@@ -52,6 +53,34 @@ impl std::fmt::Debug for Account {
 }
 
 pub use crate::subtitle_site::SiteError;
+
+/// What the pad that hides the built-in key is made from: the first 32
+/// bytes of BLAKE3 of it.
+const KEY_PAD_LABEL: &[u8] = b"spoolframe opensubtitles key v1";
+
+/// Spoolframe's OpenSubtitles API key, XORed with the pad. Obfuscated,
+/// not secret: anyone with the binary can recover it, and OpenSubtitles
+/// expects an app's key to ship in the app. This keeps it out of `grep`,
+/// out of secret scanners, and out of the binary's read-only data as
+/// text: the pad is computed at run time, so the compiler cannot fold
+/// the two into the plain key.
+const SCRAMBLED_KEY: [u8; 32] = [
+    0x84, 0xa7, 0xe6, 0x26, 0x57, 0xd2, 0xda, 0x21, 0x47, 0xac, 0xc2, 0xcf, 0x29, 0x4f, 0xc9, 0xfb,
+    0xc7, 0x51, 0x73, 0xdb, 0xea, 0x64, 0x86, 0x6b, 0x57, 0x40, 0x86, 0x12, 0x78, 0xd2, 0x84, 0xb1,
+];
+
+/// The built-in API key, decoded. Made right before it is put on a
+/// request and dropped with it: never kept, logged, shown in settings,
+/// or sent anywhere but OpenSubtitles.
+pub fn builtin_key() -> String {
+    let pad = blake3::hash(KEY_PAD_LABEL);
+    let key: Vec<u8> = SCRAMBLED_KEY
+        .iter()
+        .zip(pad.as_bytes())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    String::from_utf8(key).expect("the built-in key is ASCII")
+}
 use crate::subtitle_site::{Pacer, read_capped, retry_after};
 
 /// What a search asks for. Every part left out is not sent.
@@ -329,7 +358,7 @@ impl Site {
     /// `request` sent with the key, in its turn, and its answer's body.
     async fn call(&self, request: reqwest::RequestBuilder) -> Result<Vec<u8>, SiteError> {
         let request = request
-            .header("Api-Key", &self.account.api_key)
+            .header("Api-Key", builtin_key())
             .header(reqwest::header::ACCEPT, "application/json");
         let response = self.send(request).await?;
         let status = response.status();

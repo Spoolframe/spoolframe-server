@@ -150,9 +150,9 @@ pub fn refusal(e: &ApiError, now: i64) -> String {
                 _ => format!("{who}."),
             }
         }
-        error_code::NOT_CONFIGURED => "No subtitle site is set up: give OpenSubtitles or SubDL an \
-                                        API key in Settings › Subtitles."
-            .into(),
+        error_code::NOT_CONFIGURED => {
+            "No subtitle site is turned on: pick one in Settings › Subtitles.".into()
+        }
         error_code::NOT_ALLOWED => "An admin turned subtitle downloads off for this user.".into(),
         error_code::RATE_LIMITED => "The subtitle site asks to wait a moment; try again.".into(),
         _ => e.explain(),

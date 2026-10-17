@@ -21,10 +21,10 @@
   subtitle of the item for every user, after the file's own; one not
   found by the hash is synced (PX-03). Its downloader or an admin
   removes it, and its result is then listed last, marked. The server
-  asks only when someone does, with one account: `opensubtitles {
-  api_key; username; password; languages; daily_limit_per_user; }`, set
-  in Settings › Subtitles; the key and the password are
-  `${SF_ENV_…}` references. Searches are kept a day per item and
+  asks only when someone does, with Spoolframe's own API key, built in,
+  and the admin's account if one is set: `opensubtitles { username;
+  password; languages; }`, set in Settings › Subtitles; the password is
+  a `${SF_ENV_…}` reference. OpenSubtitles works with nothing set up. Searches are kept a day per item and
   language; calls are spaced out and a "wait" from the site is obeyed;
   a used-up quota is said as the account's or the user's own. An admin
   may turn downloads off per user. Behind a new regular feature,
@@ -50,8 +50,8 @@
 - SubDL as a second subtitle site (PX-02), beside OpenSubtitles. The
   admin picks the sites in Settings › Subtitles: OpenSubtitles, SubDL or
   both (`subtitles.sources = ["opensubtitles", "subdl"]`, both if left
-  out; a site without its key is off). `subdl { api_key; languages; }`,
-  the key a `${SF_ENV_…}` reference as OpenSubtitles' is. With both on,
+  out; SubDL is off without its key). `subdl { api_key; languages; }`,
+  the key a `${SF_ENV_…}` reference. With both on,
   one search asks both at once and lists their results as one, each
   marked with its site (`SubtitleResult::source`); a site that fails or
   is out of quota leaves the other's results, and
@@ -75,6 +75,19 @@
   failed. Migration 0037 keeps a site's file id as text. New dependency:
   `zip` (MIT), read only, deflate by the tree's `flate2`. A new fuzz
   target, `subtitle_archive`, opens an archive as the server does.
+
+- OpenSubtitles' API key is built in (PX-02): an app's key names the
+  app, so it is Spoolframe's, not each server's. `opensubtitles.api_key`
+  is no longer a setting; OpenSubtitles is on whenever
+  `subtitles.sources` lists it, and the account (`username`, `password`)
+  stays the admin's to set. A config file or runtime layer that still
+  has `opensubtitles.api_key` loads as before: the key is taken out
+  unread (an `${SF_ENV_…}` variable no longer set does not stop the
+  server), the server warns once that it is no longer read, and it is
+  gone from the runtime layer when settings are next written. The key is
+  kept in the source XORed with a pad made at run time: obfuscated, not
+  secret, so it is not found by `grep` or secret scanners; it is never
+  logged, shown in settings, or sent anywhere but OpenSubtitles.
 
 - Subtitle sync and offset (PX-03). A subtitle file beside a film (SRT,
   WebVTT, ASS) that was made for another release can be synced to the

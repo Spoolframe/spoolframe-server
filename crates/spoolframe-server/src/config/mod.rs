@@ -171,17 +171,17 @@ pub struct ServerConfig {
     pub subdl: SubdlConfig,
 }
 
-/// `opensubtitles { api_key = "${SF_ENV_…}"; username; password;
-/// languages = ["en"]; }` (PX-02). Off without `api_key`, or when
-/// `subtitles.sources` leaves it out. The key and the password are
-/// secrets: in the runtime layer each must be a `${SF_ENV_…}` reference,
-/// never the secret itself. A live setting.
+/// `opensubtitles { username; password = "${SF_ENV_…}"; languages =
+/// ["en"]; }` (PX-02), all optional. OpenSubtitles is on whenever
+/// `subtitles.sources` lists it: its API key is Spoolframe's own, built
+/// in ([`crate::opensubtitles::builtin_key`]), so there is none to set.
+/// An `api_key` a layer still has from before is taken out as the layers
+/// are read (`config::layers`), never expanded. The password is a secret:
+/// in the runtime layer it must be a `${SF_ENV_…}` reference, never the
+/// secret itself. A live setting.
 #[derive(Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct OpenSubtitlesConfig {
-    /// The API key registered for the app at opensubtitles.com.
-    #[ucl(default)]
-    pub api_key: Option<String>,
     /// The account downloads count against; without one, the site counts
     /// them by the server's address, a handful a day.
     #[ucl(default)]
@@ -203,10 +203,9 @@ pub struct OpenSubtitlesConfig {
 }
 
 impl std::fmt::Debug for OpenSubtitlesConfig {
-    /// Whether the secrets are set, never what they are.
+    /// Whether the password is set, never what it is.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenSubtitlesConfig")
-            .field("api_key", &self.api_key.as_ref().map(|_| "(set)"))
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "(set)"))
             .field("languages", &self.languages)
@@ -217,11 +216,8 @@ impl std::fmt::Debug for OpenSubtitlesConfig {
 }
 
 impl OpenSubtitlesConfig {
-    /// The site as the server uses it; `None` without an API key.
-    pub fn settings(&self) -> Result<Option<crate::subtitle_downloads::SiteSettings>, ConfigError> {
-        let Some(api_key) = trimmed(&self.api_key) else {
-            return Ok(None);
-        };
+    /// The site as the server uses it.
+    pub fn settings(&self) -> Result<crate::subtitle_downloads::SiteSettings, ConfigError> {
         let (username, password) = match (trimmed(&self.username), trimmed(&self.password)) {
             (Some(u), Some(p)) => (Some(u.to_owned()), Some(p.to_owned())),
             (None, None) => (None, None),
@@ -232,21 +228,18 @@ impl OpenSubtitlesConfig {
                 });
             }
         };
-        Ok(Some(
-            crate::subtitle_downloads::SiteSettings::OpenSubtitles {
-                account: crate::opensubtitles::Account {
-                    api_url: site_url(
-                        "opensubtitles.api_url",
-                        self.api_url.as_deref(),
-                        crate::opensubtitles::API_URL,
-                    )?,
-                    api_key: api_key.to_owned(),
-                    username,
-                    password,
-                },
-                languages: site_languages("opensubtitles.languages", self.languages.as_deref())?,
+        Ok(crate::subtitle_downloads::SiteSettings::OpenSubtitles {
+            account: crate::opensubtitles::Account {
+                api_url: site_url(
+                    "opensubtitles.api_url",
+                    self.api_url.as_deref(),
+                    crate::opensubtitles::API_URL,
+                )?,
+                username,
+                password,
             },
-        ))
+            languages: site_languages("opensubtitles.languages", self.languages.as_deref())?,
+        })
     }
 }
 
@@ -348,7 +341,7 @@ fn site_languages(key: &'static str, list: Option<&[String]>) -> Result<Vec<Stri
 
 impl ServerConfig {
     /// The subtitle sites as the server uses them (PX-02): those
-    /// `subtitles.sources` names, in its order, that have a key.
+    /// `subtitles.sources` names, in its order; SubDL only with its key.
     pub fn subtitle_downloads(&self) -> Result<crate::subtitle_downloads::Settings, ConfigError> {
         use crate::subtitle_site::Source;
         let order: Vec<Source> = match &self.subtitles.sources {
@@ -374,7 +367,7 @@ impl ServerConfig {
         let sites = order
             .into_iter()
             .filter_map(|source| match source {
-                Source::OpenSubtitles => opensubtitles.clone(),
+                Source::OpenSubtitles => Some(opensubtitles.clone()),
                 Source::SubDl => subdl.clone(),
             })
             .collect();
@@ -1016,9 +1009,9 @@ pub struct SubtitlesConfig {
     #[ucl(default)]
     pub sync_at_once: Option<u32>,
     /// The subtitle sites searched and downloaded from (PX-02), in the
-    /// order they are asked: `opensubtitles`, `subdl`. Both if left out;
-    /// a site without its API key is off whatever this says. A live
-    /// setting.
+    /// order they are asked: `opensubtitles`, `subdl`. Both if left out:
+    /// OpenSubtitles needs nothing set; SubDL is off without its API key
+    /// whatever this says. A live setting.
     #[ucl(default)]
     pub sources: Option<Vec<String>>,
     /// A user's subtitle downloads a day, from every site (PX-02); 0 or
@@ -2950,28 +2943,29 @@ mod tests {
         config.subtitle_downloads().unwrap().sites
     }
 
-    /// PX-02: off without a key; with one, English and no limit unless
-    /// set; the secrets never printed.
+    /// PX-02: OpenSubtitles is on with nothing set, with its built-in
+    /// key; English and no limit unless set; the password never printed.
     #[test]
-    fn opensubtitles_is_off_without_a_key() {
+    fn opensubtitles_is_on_with_nothing_set() {
         let none = ServerConfig::parse(r#"schema = "spoolframe.server.v1";"#).unwrap();
-        assert_eq!(none.subtitle_downloads().unwrap(), Default::default());
-        let config =
-            opensubtitles(r#"api_key = "k3y"; username = "u"; password = "p4ss";"#).unwrap();
         let [crate::subtitle_downloads::SiteSettings::OpenSubtitles { account, languages }] =
-            &sites(&config)[..]
+            &sites(&none)[..]
         else {
-            panic!("{:?}", sites(&config))
+            panic!("{:?}", sites(&none))
         };
         assert_eq!(languages, &["en"]);
-        assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 0);
+        assert_eq!(none.subtitle_downloads().unwrap().daily_limit_per_user, 0);
         assert_eq!(
             account.api_url.as_str(),
             "https://api.opensubtitles.com/api/v1"
         );
-        assert_eq!(account.username.as_deref(), Some("u"));
+        assert_eq!(account.username, None);
+        let config = opensubtitles(r#"username = "u"; password = "p4ss";"#).unwrap();
         let shown = format!("{:?} {:?}", config.opensubtitles, sites(&config));
-        assert!(!shown.contains("k3y") && !shown.contains("p4ss"), "{shown}");
+        assert!(
+            shown.contains("\"u\"") && !shown.contains("p4ss"),
+            "{shown}"
+        );
     }
 
     /// The languages are a site's own; the limit is every site's, and
@@ -2979,15 +2973,13 @@ mod tests {
     /// still counts when `subtitles` does not set it.
     #[test]
     fn opensubtitles_takes_languages_and_a_limit() {
-        let config = opensubtitles(
-            r#"api_key = "k"; languages = ["en", "pt-BR"]; daily_limit_per_user = 3;"#,
-        )
-        .unwrap();
+        let config =
+            opensubtitles(r#"languages = ["en", "pt-BR"]; daily_limit_per_user = 3;"#).unwrap();
         assert_eq!(sites(&config)[0].languages(), ["en", "pt-br"]);
         assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 3);
         let config = ServerConfig::parse(
             r#"schema = "spoolframe.server.v1";
-               opensubtitles { api_key = "k"; daily_limit_per_user = 3; }
+               opensubtitles { daily_limit_per_user = 3; }
                subtitles { daily_limit_per_user = 5; }"#,
         )
         .unwrap();
@@ -2997,10 +2989,10 @@ mod tests {
     #[test]
     fn opensubtitles_refuses_half_an_account_or_a_bad_language() {
         for block in [
-            r#"api_key = "k"; username = "u";"#,
-            r#"api_key = "k"; languages = [];"#,
-            r#"api_key = "k"; languages = ["english!"];"#,
-            r#"api_key = "k"; api_url = "ftp://example";"#,
+            r#"username = "u";"#,
+            r#"languages = [];"#,
+            r#"languages = ["english!"];"#,
+            r#"api_url = "ftp://example";"#,
         ] {
             assert!(
                 matches!(opensubtitles(block), Err(ConfigError::Invalid { .. })),
@@ -3009,16 +3001,15 @@ mod tests {
         }
     }
 
-    /// SubDL beside OpenSubtitles: each on with its key, asked in the
-    /// order `subtitles.sources` gives, or left out by it; its key never
-    /// printed.
+    /// SubDL beside OpenSubtitles: SubDL on with its key, each asked in
+    /// the order `subtitles.sources` gives, or left out by it; SubDL's
+    /// key never printed.
     #[test]
     fn the_admin_picks_the_subtitle_sites_and_their_order() {
         use crate::subtitle_site::Source;
         let parse = |rest: &str| {
             ServerConfig::parse(&format!(
                 r#"schema = "spoolframe.server.v1";
-                   opensubtitles {{ api_key = "os-k3y"; }}
                    subdl {{ api_key = "subdl-k3y"; languages = ["en", "pt-BR"]; }}
                    {rest}"#
             ))
@@ -3045,9 +3036,9 @@ mod tests {
         assert_eq!(order(&subdl_only), [Source::SubDl]);
         let none = parse(r#"subtitles { sources = []; }"#).unwrap();
         assert!(order(&none).is_empty());
-        // Named but without its key: off.
+        // SubDL named but without its key: off.
         let keyless = ServerConfig::parse(
-            r#"schema = "spoolframe.server.v1"; opensubtitles { api_key = "k"; }
+            r#"schema = "spoolframe.server.v1";
                subtitles { sources = ["subdl", "opensubtitles"]; }"#,
         )
         .unwrap();

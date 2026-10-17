@@ -104,7 +104,22 @@ pub struct Layers {
     locked: bool,
     runtime_path: PathBuf,
     runtime: Table,
+    /// Settings no longer read that a layer still had ([`IGNORED`]), each
+    /// with where: taken out as the layers were read.
+    ignored: Vec<(&'static str, &'static str)>,
 }
+
+/// Settings the server no longer reads, taken out of every layer as it
+/// is read: never expanded (an `${SF_ENV_…}` whose variable is gone must
+/// not stop the server), never shown, and gone from the runtime layer the
+/// next time it is written. The server warns of each at start.
+// compat(PX-02): `opensubtitles.api_key` was a setting until the key was
+// built in; Fulcrum's runtime layer has one. Drop the entry once no
+// runtime layer from 0.12.0's prereleases is left.
+pub const IGNORED: [(&str, &str); 1] = [(
+    "opensubtitles.api_key",
+    "opensubtitles.api_key is no longer read; the built-in key is used",
+)];
 
 /// Why a setting could not be changed.
 #[derive(Debug, thiserror::Error)]
@@ -301,10 +316,16 @@ impl Layers {
         runtime_path: PathBuf,
     ) -> Result<Self, ConfigError> {
         let defaults = tree::parse(DEFAULTS).expect("the built-in defaults parse");
+        let mut ignored = Vec::new();
         let (file, locked) = match file {
             None => (None, false),
             Some((path, text)) => {
-                let (table, locked) = layer(text, path, true)?;
+                let (mut table, locked) = layer(text, path, true)?;
+                for (key, _) in IGNORED {
+                    if tree::remove(&mut table, key) {
+                        ignored.push((key, "config file"));
+                    }
+                }
                 (Some((path.to_owned(), table)), locked.unwrap_or(false))
             }
         };
@@ -324,12 +345,19 @@ impl Layers {
                 table
             }
         };
+        let mut runtime = runtime;
+        for (key, _) in IGNORED {
+            if tree::remove(&mut runtime, key) {
+                ignored.push((key, "runtime settings"));
+            }
+        }
         Ok(Self {
             defaults,
             file,
             locked,
             runtime_path,
             runtime,
+            ignored,
         })
     }
 
@@ -498,11 +526,7 @@ impl Layers {
         if let Some(provider) = plain_client_secret(&self.runtime) {
             return Err(SettingError::PlainSecret { provider });
         }
-        for key in [
-            settings::OPENSUBTITLES_API_KEY,
-            settings::OPENSUBTITLES_PASSWORD,
-            settings::SUBDL_API_KEY,
-        ] {
+        for key in [settings::OPENSUBTITLES_PASSWORD, settings::SUBDL_API_KEY] {
             if let Some(Value::String(s)) = tree::get(&self.runtime, key)
                 && !tree::is_env_reference(s)
             {
@@ -630,6 +654,21 @@ impl Layers {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&partial, &self.runtime_path)
+    }
+
+    /// A line each setting no longer read ([`IGNORED`]) a layer had,
+    /// with where; the server warns of each at start.
+    pub fn ignored(&self) -> Vec<String> {
+        self.ignored
+            .iter()
+            .map(|(key, place)| {
+                let why = IGNORED
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map_or("it is no longer read", |(_, why)| why);
+                format!("{why} ({place})")
+            })
+            .collect()
     }
 
     /// A line each deprecated setting (PGPU-05) a layer sets (the
@@ -1139,16 +1178,12 @@ mod tests {
         );
     }
 
-    /// PX-02: OpenSubtitles' key and password, and SubDL's key, as an
-    /// OIDC secret.
+    /// PX-02: OpenSubtitles' password and SubDL's key, as an OIDC
+    /// secret.
     #[test]
-    fn the_runtime_layer_takes_an_opensubtitles_key_only_as_an_sf_env_reference() {
+    fn the_runtime_layer_takes_a_subtitle_site_secret_only_as_an_sf_env_reference() {
         let layers = layers(None, None).unwrap();
-        for key in [
-            settings::OPENSUBTITLES_API_KEY,
-            settings::OPENSUBTITLES_PASSWORD,
-            settings::SUBDL_API_KEY,
-        ] {
+        for key in [settings::OPENSUBTITLES_PASSWORD, settings::SUBDL_API_KEY] {
             let refused = layers
                 .with_set(key, Value::String("hunter2".into()))
                 .unwrap_err();
@@ -1161,7 +1196,7 @@ mod tests {
         // is not set, so the change is refused naming it.
         let unset = layers
             .with_set(
-                settings::OPENSUBTITLES_API_KEY,
+                settings::SUBDL_API_KEY,
                 Value::String("${SF_ENV_PX02_NEVER_SET}".into()),
             )
             .unwrap_err();
@@ -1173,19 +1208,73 @@ mod tests {
         let mut table = layers.merged();
         tree::set(
             &mut table,
-            settings::OPENSUBTITLES_API_KEY,
+            settings::SUBDL_API_KEY,
             Value::String("${SF_ENV_PX02_KEY}".into()),
         );
         let config = ServerConfig::from_table_with_env(&table, &|name| {
             (name == "SF_ENV_PX02_KEY").then(|| "abc".to_owned())
         })
         .unwrap();
-        let Some(crate::subtitle_downloads::SiteSettings::OpenSubtitles { account, .. }) =
-            config.opensubtitles.settings().unwrap()
+        let Some(crate::subtitle_downloads::SiteSettings::SubDl { account, .. }) =
+            config.subdl.settings().unwrap()
         else {
-            panic!("OpenSubtitles is on")
+            panic!("SubDL is on")
         };
         assert_eq!(account.api_key, "abc");
+    }
+
+    /// PX-02: a runtime layer (or file) from before the key was built in
+    /// still loads, though its `opensubtitles.api_key` names a variable
+    /// the server no longer has: the key is taken out unread, said once,
+    /// not shown, not a setting, and gone once the layer is written.
+    #[test]
+    fn an_old_opensubtitles_key_is_ignored_and_dropped() {
+        let dir =
+            std::env::temp_dir().join(format!("spoolframe-px02-old-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime_path = dir.join(RUNTIME_FILE);
+        let old = r#"schema = "spoolframe.server.v1";
+            opensubtitles { api_key = "${SF_ENV_PX02_GONE}"; languages = ["de"]; }"#;
+        let loaded = Layers::from_texts(
+            Some((
+                Path::new("/etc/spoolframe.ucl"),
+                r#"opensubtitles { api_key = "literal"; }"#,
+            )),
+            Some(old),
+            runtime_path.clone(),
+        )
+        .unwrap();
+        let config = loaded.config().unwrap();
+        assert_eq!(
+            config.opensubtitles.languages.as_deref(),
+            Some(&["de".to_owned()][..])
+        );
+        assert_eq!(
+            loaded.ignored(),
+            [
+                "opensubtitles.api_key is no longer read; the built-in key is used (config file)",
+                "opensubtitles.api_key is no longer read; the built-in key is used (runtime settings)",
+            ]
+        );
+        let shown = loaded.show(&Secrets::new(&dir));
+        assert!(
+            !shown.contains("opensubtitles.api_key") && !shown.contains("literal"),
+            "{shown}"
+        );
+        assert!(matches!(
+            loaded.with_set("opensubtitles.api_key", Value::String("${SF_ENV_X}".into())),
+            Err(SettingError::Unknown(_))
+        ));
+        // Any change writes the layer back without it.
+        let changed = loaded
+            .with_set("subtitles.daily_limit_per_user", Value::Int(2))
+            .unwrap();
+        changed.write_runtime().unwrap();
+        let written = std::fs::read_to_string(&runtime_path).unwrap();
+        assert!(!written.contains("api_key"), "{written}");
+        assert!(!written.contains("PX02_GONE"), "{written}");
+        assert!(written.contains("\"de\""), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

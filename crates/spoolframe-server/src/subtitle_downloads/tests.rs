@@ -61,7 +61,6 @@ fn opensubtitles_at(site: &MockServer) -> SiteSettings {
     SiteSettings::OpenSubtitles {
         account: opensubtitles::Account {
             api_url: url::Url::parse(&format!("{}/api/v1", site.uri())).unwrap(),
-            api_key: "test-key".into(),
             username: None,
             password: None,
         },

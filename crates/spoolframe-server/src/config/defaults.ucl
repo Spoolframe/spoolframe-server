@@ -438,20 +438,20 @@ subtitles {
   # Each decodes a film's audio at idle priority, on one thread.
   sync_at_once = 1;
   # The subtitle sites searched on demand, in order: OpenSubtitles,
-  # SubDL, or both, at once, as one list. A site without its API key
-  # (below) is off whatever this says.
+  # SubDL, or both, at once, as one list. OpenSubtitles needs nothing
+  # set; SubDL is off without its API key (below) whatever this says.
   # sources = ["opensubtitles", "subdl"];
   # A user's subtitle downloads a day, from every site; 0: no limit.
   # daily_limit_per_user = 0;
 }
 
 # Subtitles from OpenSubtitles (opensubtitles.com) on demand: searched
-# and downloaded only when someone asks, kept for everyone. Off without
-# an API key. Searching sends OpenSubtitles the file's hash and the item's
-# IDs. The key and the password are secrets: name the environment
-# variables that hold them, ${SF_ENV_<NAME>}, as the web UI does.
+# and downloaded only when someone asks, kept for everyone. On while
+# subtitles.sources lists it, with Spoolframe's built-in API key: there
+# is no key to set. Searching sends OpenSubtitles the file's hash and the
+# item's IDs. The password is a secret: name the environment variable
+# that holds it, ${SF_ENV_<NAME>}, as the web UI does.
 # opensubtitles {
-#   api_key = "${SF_ENV_OPENSUBTITLES_KEY}";
 #   # The account downloads count against; without one, a handful a day
 #   # for the server's address.
 #   username = "me";

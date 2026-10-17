@@ -4305,8 +4305,8 @@ fn download_error(e: crate::subtitle_downloads::DownloadError) -> ErrorObjectOwn
     match e {
         DownloadError::NoSource => error(
             error_code::NOT_CONFIGURED,
-            "no subtitle site is set up: give OpenSubtitles or SubDL an API key in \
-             Settings › Subtitles",
+            "no subtitle site is turned on: pick one in Settings › Subtitles (SubDL also \
+             needs its API key)",
         ),
         DownloadError::NotFound(what) => {
             error(error_code::INVALID_INPUT, format!("{what} not found"))

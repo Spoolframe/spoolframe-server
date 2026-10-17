@@ -93,6 +93,9 @@ pub fn shadowed_warnings(layers: &Layers) {
     for deprecated in layers.deprecations() {
         tracing::warn!("{deprecated}");
     }
+    for ignored in layers.ignored() {
+        tracing::warn!("{ignored}");
+    }
 }
 
 impl RuntimeSettings {
