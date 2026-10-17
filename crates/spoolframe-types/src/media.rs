@@ -124,7 +124,8 @@ pub struct SubtitleTrack {
 pub struct SubtitleDownload {
     /// The download's own id: what `RemoveSubtitleDownload` names.
     pub id: String,
-    /// Where it came from, to show: `OpenSubtitles`.
+    /// The site it came from, by id: `opensubtitles` (OpenSubtitles) or
+    /// `subdl` (SubDL), as [`SubtitleResult::source`].
     pub source: String,
     /// The release it was made for, as the site names it.
     pub release: String,
@@ -156,11 +157,18 @@ pub enum SubtitleOrigin {
     Human,
 }
 
-/// One subtitle a search found (PX-02), to download by its `file_id`.
+/// One subtitle a search found (PX-02), to download by its `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleResult {
-    /// What `DownloadSubtitle` names.
-    pub file_id: u64,
+    /// What `DownloadSubtitle` names: the site's id and its file's,
+    /// `opensubtitles:5338574`, `subdl:3172974-3188291`. Opaque to a
+    /// client.
+    pub id: String,
+    /// The site it was found on: `opensubtitles` (OpenSubtitles) or
+    /// `subdl` (SubDL); a client shows another as it is.
+    // compat(v1): required at the protocol reset
+    #[serde(default = "opensubtitles")]
+    pub source: String,
     /// The release it was made for, as its uploader named it.
     pub release: String,
     /// Its language, as the site says it: `en`, `pt-BR`.
@@ -169,7 +177,8 @@ pub struct SubtitleResult {
     pub format: Option<String>,
     /// The frame rate it was made for, in thousandths: 23 976.
     pub fps_milli: Option<u32>,
-    /// How many times it was downloaded on the site.
+    /// How many times it was downloaded on the site; 0 where the site
+    /// does not say (SubDL).
     pub downloads: u64,
     /// Its rating on the site, 0 to 100 (tenths of its 0 to 10); `None`
     /// while unrated.
@@ -187,12 +196,51 @@ pub struct SubtitleResult {
 
 /// What a subtitle search found for an item (PX-02), best first: hash
 /// matches, then the rest by rating and downloads; machine-translated and
-/// AI-made after people's; rejected ones last.
+/// AI-made after people's; rejected ones last. Every site the server
+/// searches is asked at once, and their results are one list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleSearch {
     /// The languages searched.
     pub languages: Vec<String>,
     pub results: Vec<SubtitleResult>,
+    /// How each site's search went, in the order the server asks them:
+    /// one that failed or is out of quota leaves the others' results.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub sources: Vec<SubtitleSourceStatus>,
+}
+
+/// How one site's part of a search went (PX-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleSourceStatus {
+    /// `opensubtitles` or `subdl`, as [`SubtitleResult::source`].
+    pub source: String,
+    /// Flattened: `{"source": "subdl", "state": "found", "found": 12}`.
+    #[serde(flatten)]
+    pub state: SubtitleSourceState,
+}
+
+/// Whether a site answered a search (PX-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SubtitleSourceState {
+    /// It answered, with `found` of the results.
+    Found { found: u32 },
+    /// Its quota is used up until `resets_at` (Unix seconds), when it
+    /// says.
+    QuotaExhausted { resets_at: Option<i64> },
+    /// It asked to wait this long before the next request.
+    RateLimited { retry_after_ms: u64 },
+    /// It could not be reached or refused the request: `message` says
+    /// why, to show.
+    Failed { message: String },
+    /// One this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+fn opensubtitles() -> String {
+    "opensubtitles".into()
 }
 
 /// A subtitle downloaded (PX-02): the item's new track, at once, and the
@@ -340,7 +388,7 @@ mod tests {
         let mut track = sidecar(None);
         track.download = Some(SubtitleDownload {
             id: "d1".into(),
-            source: "OpenSubtitles".into(),
+            source: "opensubtitles".into(),
             release: "Film.2019.1080p".into(),
             by: "Alice".into(),
             at: 1_760_000_000,
@@ -362,6 +410,24 @@ mod tests {
         assert_eq!(origin, SubtitleOrigin::Human);
         let whose: QuotaOf = serde_json::from_value(serde_json::json!("household")).unwrap();
         assert_eq!(whose, QuotaOf::Unknown);
+    }
+
+    /// A result from a server before SubDL names no site: it is
+    /// OpenSubtitles'; a search names no sites' states.
+    #[test]
+    fn a_result_without_a_source_is_opensubtitles() {
+        let search: SubtitleSearch = serde_json::from_value(serde_json::json!({
+            "languages": ["en"],
+            "results": [{
+                "id": "opensubtitles:7", "release": "R", "language": "en",
+                "format": null, "fps_milli": null, "downloads": 1,
+                "rating": null, "hearing_impaired": false, "origin": "human",
+                "hash_match": false, "rejected": false, "downloaded": false,
+            }],
+        }))
+        .unwrap();
+        assert_eq!(search.results[0].source, "opensubtitles");
+        assert!(search.sources.is_empty());
     }
 
     #[test]

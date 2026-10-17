@@ -195,7 +195,10 @@ async fn an_app_not_listing_subtitle_search_does_not_download() {
         unsupported
     );
     assert_eq!(
-        session.download_subtitle(&id, 101).await.unwrap_err(),
+        session
+            .download_subtitle(&id, "opensubtitles:101")
+            .await
+            .unwrap_err(),
         unsupported
     );
     assert_eq!(

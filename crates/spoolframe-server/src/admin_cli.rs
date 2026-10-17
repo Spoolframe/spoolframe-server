@@ -199,8 +199,9 @@ pub enum SubtitleCommand {
     /// Download a result of `search`: a track of the item for everyone.
     Download {
         id: String,
-        /// The result's file id, as `search` lists it.
-        file_id: u64,
+        /// The result's id, as `search` lists it: `opensubtitles:5338574`,
+        /// `subdl:3172974-3188291`.
+        result: String,
     },
     /// Remove a downloaded subtitle, for everyone.
     Remove {
@@ -966,13 +967,15 @@ async fn run_subtitle(api: &WsClient, command: SubtitleCommand) -> Result<()> {
             for result in &found.results {
                 println!("{}", result_line(result));
             }
+            for status in &found.sources {
+                if let Some(line) = source_line(status) {
+                    eprintln!("{line}");
+                }
+            }
             return Ok(());
         }
-        SubtitleCommand::Download { id, file_id } => {
-            let got = api
-                .subtitle_download(id, file_id)
-                .await
-                .map_err(api_error)?;
+        SubtitleCommand::Download { id, result } => {
+            let got = api.subtitle_download(id, result).await.map_err(api_error)?;
             let mut line = format!("downloaded as subtitle {}", got.track);
             if let Some(left) = got.account_remaining {
                 line.push_str(&format!("; the account has {left} download(s) left today"));
@@ -1054,8 +1057,24 @@ fn result_line(r: &spoolframe_types::SubtitleResult) -> String {
     };
     format!(
         "{}  {}  {}  {rating}, {} downloads{marks}",
-        r.file_id, r.language, r.release, r.downloads
+        r.id, r.language, r.release, r.downloads
     )
+}
+
+/// What a site's part of a search says when it found nothing it could:
+/// `subdl: out of downloads`. `None` for one that answered.
+fn source_line(status: &spoolframe_types::SubtitleSourceStatus) -> Option<String> {
+    use spoolframe_types::SubtitleSourceState as S;
+    let why = match &status.state {
+        S::Found { .. } => return None,
+        S::QuotaExhausted { .. } => "its account has no downloads or searches left today".into(),
+        S::RateLimited { retry_after_ms } => {
+            format!("asks to wait {} s", retry_after_ms.div_ceil(1000))
+        }
+        S::Failed { message } => message.clone(),
+        S::Unknown => "did not answer as this build knows".into(),
+    };
+    Some(format!("{}: {why}", status.source))
 }
 
 fn timing_line(t: &spoolframe_admin_api::SubtitleTimingInfo) -> String {
@@ -1328,7 +1347,8 @@ mod tests {
     #[test]
     fn a_search_result_line_says_its_marks() {
         let result = spoolframe_types::SubtitleResult {
-            file_id: 101,
+            id: "opensubtitles:101".into(),
+            source: "opensubtitles".into(),
             release: "Film.2019.1080p".into(),
             language: "en".into(),
             format: Some("srt".into()),
@@ -1343,7 +1363,32 @@ mod tests {
         };
         assert_eq!(
             result_line(&result),
-            "101  en  Film.2019.1080p  8.7/10, 120 downloads  [hash match, machine-translated, removed before]"
+            "opensubtitles:101  en  Film.2019.1080p  8.7/10, 120 downloads  [hash match, machine-translated, removed before]"
+        );
+    }
+
+    /// A site that failed says so; one that answered says nothing.
+    #[test]
+    fn a_failed_site_s_part_of_a_search_is_said() {
+        use spoolframe_types::{SubtitleSourceState as S, SubtitleSourceStatus};
+        let status = |state| SubtitleSourceStatus {
+            source: "subdl".into(),
+            state,
+        };
+        assert_eq!(source_line(&status(S::Found { found: 3 })), None);
+        assert_eq!(
+            source_line(&status(S::RateLimited {
+                retry_after_ms: 1_500
+            }))
+            .as_deref(),
+            Some("subdl: asks to wait 2 s")
+        );
+        assert_eq!(
+            source_line(&status(S::Failed {
+                message: "SubDL cannot be reached: no connection".into()
+            }))
+            .as_deref(),
+            Some("subdl: SubDL cannot be reached: no connection")
         );
     }
 

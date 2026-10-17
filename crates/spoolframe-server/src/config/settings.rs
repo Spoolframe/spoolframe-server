@@ -51,6 +51,9 @@ pub const OPENSUBTITLES_API_KEY: &str = "opensubtitles.api_key";
 /// OpenSubtitles' account password (PX-02).
 pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles.password";
 
+/// SubDL's API key (PX-02).
+pub const SUBDL_API_KEY: &str = "subdl.api_key";
+
 /// A live setting whose value is never shown: only whether it is set.
 const fn write_only(key: &'static str) -> Setting {
     Setting {
@@ -172,9 +175,16 @@ pub const SETTINGS: &[Setting] = &[
     live("opensubtitles.username"),
     write_only(OPENSUBTITLES_PASSWORD),
     live("opensubtitles.languages"),
+    // Before SubDL, the limit was OpenSubtitles' own; read when
+    // `subtitles.daily_limit_per_user` is left out.
     live("opensubtitles.daily_limit_per_user"),
-    // Not `opensubtitles.api_url`: in the config file only (tests). Set at
-    // run time, it would send the key, which may name any `SF_ENV_`
+    write_only(SUBDL_API_KEY),
+    live("subdl.languages"),
+    live("subtitles.sources"),
+    live("subtitles.daily_limit_per_user"),
+    // Not `opensubtitles.api_url` nor `subdl.api_url` or
+    // `subdl.download_url`: in the config file only (tests). Set at run
+    // time, they would send the key, which may name any `SF_ENV_`
     // variable, wherever an admin pointed it.
 ];
 

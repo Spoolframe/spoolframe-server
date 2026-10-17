@@ -166,13 +166,16 @@ pub struct ServerConfig {
     /// API key.
     #[ucl(default)]
     pub opensubtitles: OpenSubtitlesConfig,
+    /// Subtitles from SubDL on demand (PX-02): off without an API key.
+    #[ucl(default)]
+    pub subdl: SubdlConfig,
 }
 
 /// `opensubtitles { api_key = "${SF_ENV_…}"; username; password;
-/// languages = ["en"]; daily_limit_per_user = 0; }` (PX-02). Off without
-/// `api_key`. The key and the password are secrets: in the runtime layer
-/// each must be a `${SF_ENV_…}` reference, never the secret itself. A
-/// live setting.
+/// languages = ["en"]; }` (PX-02). Off without `api_key`, or when
+/// `subtitles.sources` leaves it out. The key and the password are
+/// secrets: in the runtime layer each must be a `${SF_ENV_…}` reference,
+/// never the secret itself. A live setting.
 #[derive(Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct OpenSubtitlesConfig {
@@ -189,7 +192,8 @@ pub struct OpenSubtitlesConfig {
     /// left out.
     #[ucl(default)]
     pub languages: Option<Vec<String>>,
-    /// A user's downloads a day; 0 or left out for no limit.
+    /// What `subtitles.daily_limit_per_user` was before SubDL: read
+    /// when that is left out.
     #[ucl(default)]
     pub daily_limit_per_user: Option<u32>,
     /// Where the API is; the site's own if left out. For tests, in the
@@ -215,13 +219,10 @@ impl std::fmt::Debug for OpenSubtitlesConfig {
 impl OpenSubtitlesConfig {
     /// The site as the server uses it; `None` without an API key.
     pub fn settings(&self) -> Result<Option<crate::subtitle_downloads::SiteSettings>, ConfigError> {
-        fn set(v: &Option<String>) -> Option<&str> {
-            v.as_deref().map(str::trim).filter(|v| !v.is_empty())
-        }
-        let Some(api_key) = set(&self.api_key) else {
+        let Some(api_key) = trimmed(&self.api_key) else {
             return Ok(None);
         };
-        let (username, password) = match (set(&self.username), set(&self.password)) {
+        let (username, password) = match (trimmed(&self.username), trimmed(&self.password)) {
             (Some(u), Some(p)) => (Some(u.to_owned()), Some(p.to_owned())),
             (None, None) => (None, None),
             _ => {
@@ -231,45 +232,160 @@ impl OpenSubtitlesConfig {
                 });
             }
         };
-        let languages = match &self.languages {
-            None => vec!["en".to_owned()],
-            Some(list) if list.is_empty() => {
-                return Err(ConfigError::Invalid {
-                    key: "opensubtitles.languages",
-                    message: "name at least one language, such as [\"en\"]".into(),
-                });
-            }
-            Some(list) => list
-                .iter()
-                .map(|l| {
-                    crate::subtitle_downloads::language_code(l).map_err(|e| ConfigError::Invalid {
-                        key: "opensubtitles.languages",
-                        message: e.to_string(),
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        let api_url = self
-            .api_url
-            .as_deref()
-            .unwrap_or(crate::opensubtitles::API_URL);
-        let api_url = Url::parse(api_url)
-            .ok()
-            .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
-            .ok_or_else(|| ConfigError::Invalid {
-                key: "opensubtitles.api_url",
-                message: format!("{api_url:?} is not an http(s) URL"),
-            })?;
-        Ok(Some(crate::subtitle_downloads::SiteSettings {
-            account: crate::opensubtitles::Account {
-                api_url,
-                api_key: api_key.to_owned(),
-                username,
-                password,
+        Ok(Some(
+            crate::subtitle_downloads::SiteSettings::OpenSubtitles {
+                account: crate::opensubtitles::Account {
+                    api_url: site_url(
+                        "opensubtitles.api_url",
+                        self.api_url.as_deref(),
+                        crate::opensubtitles::API_URL,
+                    )?,
+                    api_key: api_key.to_owned(),
+                    username,
+                    password,
+                },
+                languages: site_languages("opensubtitles.languages", self.languages.as_deref())?,
             },
-            languages,
-            daily_limit_per_user: self.daily_limit_per_user.unwrap_or(0),
+        ))
+    }
+}
+
+/// `subdl { api_key = "${SF_ENV_…}"; languages = ["en"]; }` (PX-02). Off
+/// without `api_key`, or when `subtitles.sources` leaves it out. The key
+/// is a secret, as OpenSubtitles' is. A live setting.
+#[derive(Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct SubdlConfig {
+    /// The API key from the SubDL account's panel.
+    #[ucl(default)]
+    pub api_key: Option<String>,
+    /// Searched when no language is asked for, in order; `["en"]` if
+    /// left out.
+    #[ucl(default)]
+    pub languages: Option<Vec<String>>,
+    /// Where the API and the files are; SubDL's own if left out. For
+    /// tests, in the config file only: as a setting, an admin could send
+    /// the key anywhere.
+    #[ucl(default)]
+    pub api_url: Option<String>,
+    #[ucl(default)]
+    pub download_url: Option<String>,
+}
+
+impl std::fmt::Debug for SubdlConfig {
+    /// Whether the key is set, never what it is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubdlConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "(set)"))
+            .field("languages", &self.languages)
+            .field("api_url", &self.api_url)
+            .field("download_url", &self.download_url)
+            .finish()
+    }
+}
+
+impl SubdlConfig {
+    /// The site as the server uses it; `None` without an API key.
+    pub fn settings(&self) -> Result<Option<crate::subtitle_downloads::SiteSettings>, ConfigError> {
+        let Some(api_key) = trimmed(&self.api_key) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::subtitle_downloads::SiteSettings::SubDl {
+            account: crate::subdl::Account {
+                api_url: site_url(
+                    "subdl.api_url",
+                    self.api_url.as_deref(),
+                    crate::subdl::API_URL,
+                )?,
+                download_url: site_url(
+                    "subdl.download_url",
+                    self.download_url.as_deref(),
+                    crate::subdl::DOWNLOAD_URL,
+                )?,
+                api_key: api_key.to_owned(),
+            },
+            languages: site_languages("subdl.languages", self.languages.as_deref())?,
         }))
+    }
+}
+
+/// `value` trimmed, if anything is left of it.
+fn trimmed(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// A subtitle site's URL, `default` if left out.
+fn site_url(key: &'static str, value: Option<&str>, default: &str) -> Result<Url, ConfigError> {
+    let text = value.unwrap_or(default);
+    Url::parse(text)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+        .ok_or_else(|| ConfigError::Invalid {
+            key,
+            message: format!("{text:?} is not an http(s) URL"),
+        })
+}
+
+/// A subtitle site's languages, `["en"]` if left out.
+fn site_languages(key: &'static str, list: Option<&[String]>) -> Result<Vec<String>, ConfigError> {
+    match list {
+        None => Ok(vec!["en".to_owned()]),
+        Some([]) => Err(ConfigError::Invalid {
+            key,
+            message: "name at least one language, such as [\"en\"]".into(),
+        }),
+        Some(list) => list
+            .iter()
+            .map(|l| {
+                crate::subtitle_downloads::language_code(l).map_err(|e| ConfigError::Invalid {
+                    key,
+                    message: e.to_string(),
+                })
+            })
+            .collect(),
+    }
+}
+
+impl ServerConfig {
+    /// The subtitle sites as the server uses them (PX-02): those
+    /// `subtitles.sources` names, in its order, that have a key.
+    pub fn subtitle_downloads(&self) -> Result<crate::subtitle_downloads::Settings, ConfigError> {
+        use crate::subtitle_site::Source;
+        let order: Vec<Source> = match &self.subtitles.sources {
+            None => Source::ALL.to_vec(),
+            Some(names) => {
+                let mut order = Vec::new();
+                for name in names {
+                    let source = Source::of(name.trim()).ok_or_else(|| ConfigError::Invalid {
+                        key: "subtitles.sources",
+                        message: format!(
+                            "{name:?} is not a subtitle site; name opensubtitles or subdl"
+                        ),
+                    })?;
+                    if !order.contains(&source) {
+                        order.push(source);
+                    }
+                }
+                order
+            }
+        };
+        let opensubtitles = self.opensubtitles.settings()?;
+        let subdl = self.subdl.settings()?;
+        let sites = order
+            .into_iter()
+            .filter_map(|source| match source {
+                Source::OpenSubtitles => opensubtitles.clone(),
+                Source::SubDl => subdl.clone(),
+            })
+            .collect();
+        Ok(crate::subtitle_downloads::Settings {
+            sites,
+            daily_limit_per_user: self
+                .subtitles
+                .daily_limit_per_user
+                .or(self.opensubtitles.daily_limit_per_user)
+                .unwrap_or(0),
+        })
     }
 }
 
@@ -880,7 +996,8 @@ impl MediaConfig {
     }
 }
 
-/// `subtitles { ocr = true; ocr_threads = 4; cache_dir = "…"; }`, all
+/// `subtitles { ocr = true; ocr_threads = 4; cache_dir = "…";
+/// sources = ["opensubtitles", "subdl"]; daily_limit_per_user = 0; }`, all
 /// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -898,6 +1015,16 @@ pub struct SubtitlesConfig {
     /// Subtitle syncs that run at once (PX-03); 1 if left out.
     #[ucl(default)]
     pub sync_at_once: Option<u32>,
+    /// The subtitle sites searched and downloaded from (PX-02), in the
+    /// order they are asked: `opensubtitles`, `subdl`. Both if left out;
+    /// a site without its API key is off whatever this says. A live
+    /// setting.
+    #[ucl(default)]
+    pub sources: Option<Vec<String>>,
+    /// A user's subtitle downloads a day, from every site (PX-02); 0 or
+    /// left out for no limit. A live setting.
+    #[ucl(default)]
+    pub daily_limit_per_user: Option<u32>,
 }
 
 impl SubtitlesConfig {
@@ -2706,7 +2833,7 @@ impl ServerConfig {
         parsed.telemetry.otlp.settings()?;
         parsed.http_playback.settings()?;
         parsed.mcp.allowed_redirects()?;
-        parsed.opensubtitles.settings()?;
+        parsed.subtitle_downloads()?;
         Ok(parsed)
     }
 
@@ -2819,35 +2946,52 @@ mod tests {
         ))
     }
 
+    fn sites(config: &ServerConfig) -> Vec<crate::subtitle_downloads::SiteSettings> {
+        config.subtitle_downloads().unwrap().sites
+    }
+
     /// PX-02: off without a key; with one, English and no limit unless
     /// set; the secrets never printed.
     #[test]
     fn opensubtitles_is_off_without_a_key() {
         let none = ServerConfig::parse(r#"schema = "spoolframe.server.v1";"#).unwrap();
-        assert_eq!(none.opensubtitles.settings().unwrap(), None);
+        assert_eq!(none.subtitle_downloads().unwrap(), Default::default());
         let config =
             opensubtitles(r#"api_key = "k3y"; username = "u"; password = "p4ss";"#).unwrap();
-        let settings = config.opensubtitles.settings().unwrap().unwrap();
-        assert_eq!(settings.languages, ["en"]);
-        assert_eq!(settings.daily_limit_per_user, 0);
+        let [crate::subtitle_downloads::SiteSettings::OpenSubtitles { account, languages }] =
+            &sites(&config)[..]
+        else {
+            panic!("{:?}", sites(&config))
+        };
+        assert_eq!(languages, &["en"]);
+        assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 0);
         assert_eq!(
-            settings.account.api_url.as_str(),
+            account.api_url.as_str(),
             "https://api.opensubtitles.com/api/v1"
         );
-        assert_eq!(settings.account.username.as_deref(), Some("u"));
-        let shown = format!("{:?} {settings:?}", config.opensubtitles);
+        assert_eq!(account.username.as_deref(), Some("u"));
+        let shown = format!("{:?} {:?}", config.opensubtitles, sites(&config));
         assert!(!shown.contains("k3y") && !shown.contains("p4ss"), "{shown}");
     }
 
+    /// The languages are a site's own; the limit is every site's, and
+    /// `opensubtitles.daily_limit_per_user`, where it was before SubDL,
+    /// still counts when `subtitles` does not set it.
     #[test]
     fn opensubtitles_takes_languages_and_a_limit() {
         let config = opensubtitles(
             r#"api_key = "k"; languages = ["en", "pt-BR"]; daily_limit_per_user = 3;"#,
         )
         .unwrap();
-        let settings = config.opensubtitles.settings().unwrap().unwrap();
-        assert_eq!(settings.languages, ["en", "pt-br"]);
-        assert_eq!(settings.daily_limit_per_user, 3);
+        assert_eq!(sites(&config)[0].languages(), ["en", "pt-br"]);
+        assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 3);
+        let config = ServerConfig::parse(
+            r#"schema = "spoolframe.server.v1";
+               opensubtitles { api_key = "k"; daily_limit_per_user = 3; }
+               subtitles { daily_limit_per_user = 5; }"#,
+        )
+        .unwrap();
+        assert_eq!(config.subtitle_downloads().unwrap().daily_limit_per_user, 5);
     }
 
     #[test]
@@ -2863,6 +3007,68 @@ mod tests {
                 "{block}"
             );
         }
+    }
+
+    /// SubDL beside OpenSubtitles: each on with its key, asked in the
+    /// order `subtitles.sources` gives, or left out by it; its key never
+    /// printed.
+    #[test]
+    fn the_admin_picks_the_subtitle_sites_and_their_order() {
+        use crate::subtitle_site::Source;
+        let parse = |rest: &str| {
+            ServerConfig::parse(&format!(
+                r#"schema = "spoolframe.server.v1";
+                   opensubtitles {{ api_key = "os-k3y"; }}
+                   subdl {{ api_key = "subdl-k3y"; languages = ["en", "pt-BR"]; }}
+                   {rest}"#
+            ))
+        };
+        let order =
+            |config: &ServerConfig| sites(config).iter().map(|s| s.source()).collect::<Vec<_>>();
+        let both = parse("").unwrap();
+        assert_eq!(order(&both), [Source::OpenSubtitles, Source::SubDl]);
+        let crate::subtitle_downloads::SiteSettings::SubDl { account, languages } =
+            &sites(&both)[1]
+        else {
+            panic!()
+        };
+        assert_eq!(account.api_url.as_str(), "https://api.subdl.com/api/v1");
+        assert_eq!(account.download_url.as_str(), "https://dl.subdl.com/");
+        assert_eq!(languages, &["en", "pt-br"]);
+        let shown = format!("{:?} {:?}", both.subdl, sites(&both));
+        assert!(!shown.contains("subdl-k3y"), "{shown}");
+
+        let subdl_first =
+            parse(r#"subtitles { sources = ["subdl", "opensubtitles", "subdl"]; }"#).unwrap();
+        assert_eq!(order(&subdl_first), [Source::SubDl, Source::OpenSubtitles]);
+        let subdl_only = parse(r#"subtitles { sources = ["subdl"]; }"#).unwrap();
+        assert_eq!(order(&subdl_only), [Source::SubDl]);
+        let none = parse(r#"subtitles { sources = []; }"#).unwrap();
+        assert!(order(&none).is_empty());
+        // Named but without its key: off.
+        let keyless = ServerConfig::parse(
+            r#"schema = "spoolframe.server.v1"; opensubtitles { api_key = "k"; }
+               subtitles { sources = ["subdl", "opensubtitles"]; }"#,
+        )
+        .unwrap();
+        assert_eq!(order(&keyless), [Source::OpenSubtitles]);
+        assert!(matches!(
+            parse(r#"subtitles { sources = ["podnapisi"]; }"#),
+            Err(ConfigError::Invalid {
+                key: "subtitles.sources",
+                ..
+            })
+        ));
+        assert!(matches!(
+            ServerConfig::parse(
+                r#"schema = "spoolframe.server.v1";
+                   subdl { api_key = "k"; download_url = "file:///etc"; }"#
+            ),
+            Err(ConfigError::Invalid {
+                key: "subdl.download_url",
+                ..
+            })
+        ));
     }
 
     #[test]

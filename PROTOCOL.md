@@ -1942,80 +1942,103 @@ track)`, `Session::use_original_subtitle_timing(id, track)` and
 `SubtitleTimingEvent { server, id, track, timing }` per event. The calls
 are `SdkError::Unsupported`, unsent, without the feature.
 
-## Subtitles from OpenSubtitles
+## Subtitles from OpenSubtitles and SubDL
 
-Feature `spoolframe:subtitle-search` (PX-02). The server searches
-OpenSubtitles (opensubtitles.com) for an item's subtitles and downloads
-one, only when someone asks, with its own API key and account. A
-download becomes an external text track of the item for every user on
-the server. A server whose admin set no API key still has the feature
-and answers each request `NoSubtitleSource`: hide "Find subtitles…".
+Feature `spoolframe:subtitle-search` (PX-02). The server searches the
+subtitle sites its admin turned on, OpenSubtitles (opensubtitles.com),
+SubDL (subdl.com) or both, for an item's subtitles and downloads one,
+only when someone asks, with its own key for each. Viewers do not pick
+the site: the admin does, per server. A download becomes an external
+text track of the item for every user on the server. A server with no
+site set up still has the feature and answers each request
+`NoSubtitleSource`: hide "Find subtitles…".
 
 | Request | Reply |
 |---|---|
 | `SearchSubtitles { id, language? }` | `SubtitleResults` (`SubtitleSearch`) |
-| `DownloadSubtitle { id, file_id }` | `SubtitleDownloaded` |
+| `DownloadSubtitle { id, result }` | `SubtitleDownloaded` |
 | `RemoveSubtitleDownload { id, download }` | `Done` |
 
 `SearchSubtitles` takes `language`, an ISO 639-1 code (`en`) or one with
-a region (`pt-BR`); left out, the server searches the languages its
-admin set first. It searches by the file's OpenSubtitles hash and the
-item's IMDb or TMDB id (an episode's own, else its show's with the
-season and episode), or its title and year when it has neither, and
-keeps the answer a day per item and language: asking again costs
-nothing. `SubtitleSearch` has the `languages` searched and the
-`results`, best first: those found by the file's hash (`hash_match`:
-made for this release), then the rest by rating and downloads;
-machine-translated and AI-made ones (`origin`: `human`,
-`machine_translated`, `ai`) after people's; ones removed before as bad
-(`rejected`) last. Each `SubtitleResult` has the `file_id` to download,
-its `release`, `language`, `format` (`srt`, `ass`, `vtt`, when the site
-says), `fps_milli` (23 976 for 23.976 fps), `downloads`, `rating` (0 to
-100, tenths of the site's 0 to 10; `null` while unrated),
+a region (`pt-BR`); left out, the server searches each site's languages
+its admin set. With both sites on, both are asked at once and their
+results are one list. OpenSubtitles is searched by the file's
+OpenSubtitles hash and the item's IMDb or TMDB id (an episode's own,
+else its show's with the season and episode), or its title and year when
+it has neither; SubDL by a film's IMDb or TMDB id, or an episode's
+show's with the season and episode, else the title. Each site's answer
+is kept a day per item and language: asking again costs nothing.
+`SubtitleSearch` has the `languages` searched, the `results`, and
+`sources`, how each site's part went, in the order the server asks
+them: `{ "source": "subdl", "state": "found", "found": 12 }`, or
+`quota_exhausted` (`resets_at?`), `rate_limited` (`retry_after_ms`),
+`failed` (`message`, to show). A site that failed or ran out leaves the
+other's results; only when every site failed is the search an error,
+the first site's.
+
+The `results` come best first: those found by the file's hash
+(`hash_match`: made for this release; only OpenSubtitles finds by it),
+then the rest by rating and downloads; machine-translated and AI-made
+ones (`origin`: `human`, `machine_translated`, `ai`) after people's;
+ones removed before as bad (`rejected`) last. SubDL gives no rating nor
+download count: its results come after rated or downloaded ones, in
+SubDL's own order. Each `SubtitleResult` has the `id` to download,
+opaque to a client (`opensubtitles:5338574`, `subdl:3172974-3188291`),
+its `source` (`opensubtitles` or `subdl`: show "OpenSubtitles" or
+"SubDL", and another as it is), its `release`, `language`, `format`
+(`srt`, `ass`, `vtt`, when the site says), `fps_milli` (23 976 for
+23.976 fps), `downloads` (0 from SubDL), `rating` (0 to 100, tenths of
+the site's 0 to 10; `null` while unrated, and always from SubDL),
 `hearing_impaired`, and `downloaded` (downloading it again gives the
 same track).
 
-`DownloadSubtitle` names a `file_id` a search of the same item listed
-in the last day; another is `NotFound` (search again). The file is made
-UTF-8 (its encoding detected: many are CP-1251 or CP-1252) and checked
-to be SRT, WebVTT or ASS; another is `InvalidInput`. `SubtitleDownloaded`
-has the new track's place in `Tracks`' `subtitles` (`track`), the track
-itself (`subtitle`), and the downloads left today: `account_remaining`,
-the server's account's, when the site says, and `user_remaining`, the
-user's own under the admin's daily limit, `null` without one. The track
-is usable at once, delivered as any external subtitle (`ReadSubtitle`,
-WebVTT, the HLS rendition). One not found by the file's hash is synced
-in the background (`spoolframe:subtitle-sync`: `timing` says `syncing`,
-then `synced` or `uncertain`), and a player showing it gets the synced
+`DownloadSubtitle` names a `result` a search of the same item listed in
+the last day, and downloads it from its site; another, or one of a site
+since turned off, is `NotFound` (search again), and one that is no
+result's id at all `InvalidInput`. SubDL sends a zip archive: the
+server takes its one SRT, WebVTT or ASS file out (a season pack's, the
+episode's). The file is made UTF-8 (its encoding detected: many are
+CP-1251 or CP-1252) and checked to be SRT, WebVTT or ASS; another is
+`InvalidInput`. `SubtitleDownloaded` has the new track's place in
+`Tracks`' `subtitles` (`track`), the track itself (`subtitle`), and the
+downloads left today: `account_remaining`, the server's account's at the
+site, when the site says (OpenSubtitles does, SubDL does not), and
+`user_remaining`, the user's own under the admin's daily limit, over
+every site, `null` without one. The track is usable at once, delivered
+as any external subtitle (`ReadSubtitle`, WebVTT, the HLS rendition).
+One not found by the file's hash (every SubDL one) is synced in the
+background (`spoolframe:subtitle-sync`: `timing` says `syncing`, then
+`synced` or `uncertain`), and a player showing it gets the synced
 timing without a restart. The same result is never downloaded twice:
 asking again answers the same track, at no cost.
 
 A downloaded track has `download` on `Tracks`, a `SubtitleDownload`:
-its `id` (what `RemoveSubtitleDownload` names), `source`
-(`OpenSubtitles`), `release`, who downloaded it (`by`, a display name)
-and when (`at`, Unix seconds), `hash_match`, `origin`, and `can_remove`,
-whether the session's user may remove it. Clients label it, as "English
-(OpenSubtitles)".
+its `id` (what `RemoveSubtitleDownload` names), `source` (the site's
+id, `opensubtitles` or `subdl`), `release`, who downloaded it (`by`, a
+display name) and when (`at`, Unix seconds), `hash_match`, `origin`,
+and `can_remove`, whether the session's user may remove it. Its `title`
+is the site's name. Clients label it, as "English (SubDL)".
 
 `RemoveSubtitleDownload` takes the track away for everyone; its result
 is then listed last in the item's searches, `rejected`. The user who
 downloaded it or an admin may: anyone else gets `NotAllowed`. A download
 already removed is `Done`.
 
-Errors: `NoSubtitleSource` (no API key set); `QuotaExhausted { whose,
-resets_at? }`, `whose` being `account` (the server's account at the
-site) or `user` (the user's own daily limit), `resets_at` when more may
-be downloaded, Unix seconds; `NotAllowed` for a user an admin took
-downloading from (they may still search); `RateLimited { retry_after_ms
-}` when the site asks to wait; `Unavailable` when it cannot be reached.
-Searching and downloading may be sent again on a new connection.
+Errors: `NoSubtitleSource` (no site set up); `QuotaExhausted { whose,
+resets_at?, site? }`, `whose` being `account` (the server's account at
+site `site`, `opensubtitles` or `subdl`) or `user` (the user's own
+daily limit, no `site`), `resets_at` when more may be downloaded, Unix
+seconds; `NotAllowed` for a user an admin took downloading from (they
+may still search); `RateLimited { retry_after_ms }` when the site asks
+to wait; `Unavailable` when it cannot be reached. Searching and
+downloading may be sent again on a new connection.
 
 A session whose client did not list the feature is sent no `download`
 (a downloaded track is an external subtitle like any other), and the
 requests are `Unsupported`.
 
 The SDK: `Features::subtitle_search`; `Session::search_subtitles(id,
-language)`, `Session::download_subtitle(id, file_id)` and
+language)`, `Session::download_subtitle(id, result)` and
 `Session::remove_subtitle_download(id, download)`. The calls are
 `SdkError::Unsupported`, unsent, without the feature.
 

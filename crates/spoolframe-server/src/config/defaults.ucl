@@ -437,6 +437,12 @@ subtitles {
   # Subtitle syncs that run at once (PX-03); the rest wait their turn.
   # Each decodes a film's audio at idle priority, on one thread.
   sync_at_once = 1;
+  # The subtitle sites searched on demand, in order: OpenSubtitles,
+  # SubDL, or both, at once, as one list. A site without its API key
+  # (below) is off whatever this says.
+  # sources = ["opensubtitles", "subdl"];
+  # A user's subtitle downloads a day, from every site; 0: no limit.
+  # daily_limit_per_user = 0;
 }
 
 # Subtitles from OpenSubtitles (opensubtitles.com) on demand: searched
@@ -452,8 +458,16 @@ subtitles {
 #   password = "${SF_ENV_OPENSUBTITLES_PASSWORD}";
 #   # Searched first, in order.
 #   languages = ["en"];
-#   # A user's downloads a day; 0: no limit.
-#   daily_limit_per_user = 0;
+# }
+
+# Subtitles from SubDL (subdl.com) on demand, as from OpenSubtitles. Off
+# without an API key, from the account's panel at subdl.com. Searching
+# sends SubDL the item's IDs, or its title. The key is a secret, named as
+# OpenSubtitles' is.
+# subdl {
+#   api_key = "${SF_ENV_SUBDL_KEY}";
+#   # Searched first, in order.
+#   languages = ["en"];
 # }
 
 # Frame previews for scrubbing: a picture every interval_secs of each film

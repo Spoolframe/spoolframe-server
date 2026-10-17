@@ -3,7 +3,9 @@
 //! API.
 
 use spoolframe_media::sandbox::Tool;
-use spoolframe_types::{MediaKind, Namespace, SubtitleSync};
+use spoolframe_types::{
+    MediaKind, Namespace, SubtitleSourceState, SubtitleSourceStatus, SubtitleSync,
+};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -15,6 +17,7 @@ use crate::subtitle_sync::{FfmpegSpeech, SyncSettings};
 use crate::test_support::{FakeCatalog, fake_ffprobe, movie};
 
 const SEARCH: &str = include_str!("../../tests/fixtures/opensubtitles/search.json");
+const SUBDL_SEARCH: &str = crate::subdl::tests::SEARCH;
 
 /// An SRT in CP-1251, as many old Russian subtitles are.
 const RUSSIAN: &str = "1\r\n00:00:01,000 --> 00:00:02,500\r\nПривет, мир\r\n\r\n\
@@ -53,20 +56,43 @@ struct Fixture {
     _tmp: spoolframe_test_dir::TestDir,
 }
 
-fn settings(site: &MockServer, limit: u32) -> SiteSettings {
-    SiteSettings {
-        account: Account {
+/// OpenSubtitles at `site`'s `/api/v1`.
+fn opensubtitles_at(site: &MockServer) -> SiteSettings {
+    SiteSettings::OpenSubtitles {
+        account: opensubtitles::Account {
             api_url: url::Url::parse(&format!("{}/api/v1", site.uri())).unwrap(),
             api_key: "test-key".into(),
             username: None,
             password: None,
         },
         languages: vec!["en".into()],
+    }
+}
+
+/// SubDL at `site`'s `/subdl/api/v1`, its files at `/subtitle/…`.
+fn subdl_at(site: &MockServer) -> SiteSettings {
+    SiteSettings::SubDl {
+        account: subdl::Account {
+            api_url: url::Url::parse(&format!("{}/subdl/api/v1", site.uri())).unwrap(),
+            download_url: url::Url::parse(&site.uri()).unwrap(),
+            api_key: "subdl-key".into(),
+        },
+        languages: vec!["en".into()],
+    }
+}
+
+fn settings(site: &MockServer, limit: u32) -> Settings {
+    Settings {
+        sites: vec![opensubtitles_at(site)],
         daily_limit_per_user: limit,
     }
 }
 
 async fn fixture(test: &str, limit: u32) -> Fixture {
+    fixture_with(test, |site| settings(site, limit)).await
+}
+
+async fn fixture_with(test: &str, settings: impl FnOnce(&MockServer) -> Settings) -> Fixture {
     let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-subdl-{test}")).await;
     let dir = tmp.path().to_path_buf();
     let store = test_store(&format!("subdl-{test}")).await;
@@ -99,7 +125,7 @@ async fn fixture(test: &str, limit: u32) -> Fixture {
         prober.clone(),
         timings.clone(),
         dir.join("state").join("subtitles").join("downloaded"),
-        Some(settings(&site, limit)),
+        settings(&site),
     )
     .unwrap();
     Fixture {
@@ -145,6 +171,23 @@ impl Fixture {
             .await;
     }
 
+    async fn subdl_answers_search(&self) {
+        Mock::given(method("GET"))
+            .and(path("/subdl/api/v1/subtitles"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SUBDL_SEARCH))
+            .mount(&self.site)
+            .await;
+    }
+
+    /// Serves SubDL's file at `path` as `bytes`.
+    async fn subdl_serves(&self, file: &str, bytes: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(file))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&self.site)
+            .await;
+    }
+
     async fn subtitles(&self) -> Vec<SubtitleStream> {
         self.prober
             .describe(&self.media)
@@ -177,8 +220,24 @@ async fn results_come_hash_matches_first_and_machine_made_last() {
     f.answers_search().await;
     let found = f.downloads.search(&film(), None).await.unwrap();
     assert_eq!(found.languages, ["en"]);
-    let ids: Vec<u64> = found.results.iter().map(|r| r.file_id).collect();
-    assert_eq!(ids, [101, 102, 103, 104]);
+    let ids: Vec<&str> = found.results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "opensubtitles:101",
+            "opensubtitles:102",
+            "opensubtitles:103",
+            "opensubtitles:104"
+        ]
+    );
+    assert!(found.results.iter().all(|r| r.source == "opensubtitles"));
+    assert_eq!(
+        found.sources,
+        [SubtitleSourceStatus {
+            source: "opensubtitles".into(),
+            state: SubtitleSourceState::Found { found: 4 },
+        }]
+    );
     assert!(found.results[0].hash_match);
     assert_eq!(found.results[1].rating, Some(91));
     assert_eq!(found.results[1].format.as_deref(), Some("ass"));
@@ -276,7 +335,11 @@ async fn a_download_is_a_track_at_once_and_only_once() {
     f.serves(103, cp1251.into_owned(), 19).await;
     let own = f.subtitles().await.len();
     f.downloads.search(&film(), None).await.unwrap();
-    let got = f.downloads.download(&film(), 103, &alice()).await.unwrap();
+    let got = f
+        .downloads
+        .download(&film(), "opensubtitles:103", &alice())
+        .await
+        .unwrap();
     assert_eq!(got.track as usize, own);
     assert_eq!(got.account_remaining, Some(19));
     assert_eq!(got.user_remaining, None);
@@ -305,7 +368,11 @@ async fn a_download_is_a_track_at_once_and_only_once() {
         .await
         .unwrap();
     assert!(seen[own].as_ref().is_some_and(|d| !d.can_remove));
-    let again = f.downloads.download(&film(), 103, &bob()).await.unwrap();
+    let again = f
+        .downloads
+        .download(&film(), "opensubtitles:103", &bob())
+        .await
+        .unwrap();
     assert_eq!(again.track, got.track);
     assert_eq!(f.site_calls("/api/v1/download").await, 1);
     let searched = f.downloads.search(&film(), None).await.unwrap();
@@ -313,7 +380,7 @@ async fn a_download_is_a_track_at_once_and_only_once() {
         searched
             .results
             .iter()
-            .any(|r| r.file_id == 103 && r.downloaded)
+            .any(|r| r.id == "opensubtitles:103" && r.downloaded)
     );
 }
 
@@ -325,8 +392,16 @@ async fn only_a_download_not_matched_by_hash_is_synced() {
     f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
     f.serves(102, RUSSIAN.as_bytes().to_vec(), 4).await;
     f.downloads.search(&film(), None).await.unwrap();
-    let matched = f.downloads.download(&film(), 101, &alice()).await.unwrap();
-    let other = f.downloads.download(&film(), 102, &alice()).await.unwrap();
+    let matched = f
+        .downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
+    let other = f
+        .downloads
+        .download(&film(), "opensubtitles:102", &alice())
+        .await
+        .unwrap();
     let descriptor = f.prober.describe(&f.media).await.unwrap();
     let timings = f.timings.timings(&descriptor).await;
     assert_eq!(
@@ -344,7 +419,9 @@ async fn only_a_download_not_matched_by_hash_is_synced() {
 async fn a_result_no_search_offered_is_not_downloaded() {
     let f = fixture("unoffered", 0).await;
     assert!(matches!(
-        f.downloads.download(&film(), 101, &alice()).await,
+        f.downloads
+            .download(&film(), "opensubtitles:101", &alice())
+            .await,
         Err(DownloadError::NotFound(_))
     ));
     assert_eq!(f.site_calls("/api/v1/download").await, 0);
@@ -360,18 +437,32 @@ async fn a_user_s_daily_limit_holds() {
         f.serves(id, RUSSIAN.as_bytes().to_vec(), 10).await;
     }
     f.downloads.search(&film(), None).await.unwrap();
-    let first = f.downloads.download(&film(), 101, &alice()).await.unwrap();
+    let first = f
+        .downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
     assert_eq!(first.user_remaining, Some(1));
-    f.downloads.download(&film(), 102, &alice()).await.unwrap();
-    let third = f.downloads.download(&film(), 103, &alice()).await;
+    f.downloads
+        .download(&film(), "opensubtitles:102", &alice())
+        .await
+        .unwrap();
+    let third = f
+        .downloads
+        .download(&film(), "opensubtitles:103", &alice())
+        .await;
     assert!(matches!(
         third,
         Err(DownloadError::QuotaExhausted {
             whose: QuotaOf::User,
-            resets_at: Some(_)
+            resets_at: Some(_),
+            site: None,
         })
     ));
-    f.downloads.download(&film(), 103, &bob()).await.unwrap();
+    f.downloads
+        .download(&film(), "opensubtitles:103", &bob())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -389,10 +480,13 @@ async fn an_exhausted_account_is_said_so() {
         .await;
     f.downloads.search(&film(), None).await.unwrap();
     assert!(matches!(
-        f.downloads.download(&film(), 101, &alice()).await,
+        f.downloads
+            .download(&film(), "opensubtitles:101", &alice())
+            .await,
         Err(DownloadError::QuotaExhausted {
             whose: QuotaOf::Account,
-            resets_at: Some(1_893_456_000)
+            resets_at: Some(1_893_456_000),
+            site: Some(Source::OpenSubtitles),
         })
     ));
 }
@@ -409,7 +503,9 @@ async fn a_user_without_the_permission_searches_but_does_not_download() {
         .unwrap();
     f.downloads.search(&film(), None).await.unwrap();
     assert!(matches!(
-        f.downloads.download(&film(), 101, &alice()).await,
+        f.downloads
+            .download(&film(), "opensubtitles:101", &alice())
+            .await,
         Err(DownloadError::NotAllowed(_))
     ));
 }
@@ -424,8 +520,16 @@ async fn a_download_is_removed_by_its_downloader_or_an_admin_only() {
     f.serves(102, RUSSIAN.as_bytes().to_vec(), 4).await;
     let own = f.subtitles().await.len();
     f.downloads.search(&film(), None).await.unwrap();
-    let first = f.downloads.download(&film(), 101, &alice()).await.unwrap();
-    let second = f.downloads.download(&film(), 102, &alice()).await.unwrap();
+    let first = f
+        .downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
+    let second = f
+        .downloads
+        .download(&film(), "opensubtitles:102", &alice())
+        .await
+        .unwrap();
     let first_id = first.subtitle.download.unwrap().id;
     let second_id = second.subtitle.download.unwrap().id;
 
@@ -450,7 +554,10 @@ async fn a_download_is_removed_by_its_downloader_or_an_admin_only() {
     );
     let searched = f.downloads.search(&film(), None).await.unwrap();
     let last = searched.results.last().unwrap();
-    assert_eq!((last.file_id, last.rejected), (101, true));
+    assert_eq!(
+        (last.id.as_str(), last.rejected),
+        ("opensubtitles:101", true)
+    );
 
     f.downloads
         .remove(&film(), &second_id, &root().actor)
@@ -468,7 +575,10 @@ async fn a_restart_restores_the_tracks() {
     f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
     let own = f.subtitles().await.len();
     f.downloads.search(&film(), None).await.unwrap();
-    f.downloads.download(&film(), 101, &alice()).await.unwrap();
+    f.downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
     let stray = f.downloads.dir().join("cut-short.partial");
     std::fs::write(&stray, b"half").unwrap();
 
@@ -482,7 +592,7 @@ async fn a_restart_restores_the_tracks() {
         prober.clone(),
         f.timings.clone(),
         f.downloads.dir().to_owned(),
-        None,
+        Settings::default(),
     )
     .unwrap();
     assert_eq!(restarted.restore().await.unwrap(), 1);
@@ -496,14 +606,16 @@ async fn a_restart_restores_the_tracks() {
 #[tokio::test]
 async fn without_a_site_nothing_is_asked() {
     let f = fixture("off", 0).await;
-    f.downloads.configure(None);
+    f.downloads.configure(Settings::default());
     assert!(!f.downloads.is_on());
     assert!(matches!(
         f.downloads.search(&film(), None).await,
         Err(DownloadError::NoSource)
     ));
     assert!(matches!(
-        f.downloads.download(&film(), 101, &alice()).await,
+        f.downloads
+            .download(&film(), "opensubtitles:101", &alice())
+            .await,
         Err(DownloadError::NoSource)
     ));
 }
@@ -513,11 +625,17 @@ async fn without_a_site_nothing_is_asked() {
 async fn an_unreachable_site_fails_the_search_cleanly() {
     let f = fixture("offline", 0).await;
     let mut settings = settings(&f.site, 0);
-    settings.account.api_url = crate::opensubtitles::tests::nothing_listens();
-    f.downloads.configure(Some(settings));
+    let SiteSettings::OpenSubtitles { account, .. } = &mut settings.sites[0] else {
+        unreachable!()
+    };
+    account.api_url = crate::opensubtitles::tests::nothing_listens();
+    f.downloads.configure(settings);
     assert!(matches!(
         f.downloads.search(&film(), None).await,
-        Err(DownloadError::Site(SiteError::Unreachable(_)))
+        Err(DownloadError::Site {
+            site: Source::OpenSubtitles,
+            error: SiteError::Unreachable(_)
+        })
     ));
 }
 
@@ -526,4 +644,331 @@ fn an_item_s_site_ids_are_read() {
     let ids = ["plex://movie/5d77", "imdb://tt0078748", "tmdb://348"].map(String::from);
     assert_eq!(site_ids(&ids), (Some(78_748), Some(348)));
     assert_eq!(site_ids(&["imdb://ttx".into()]), (None, None));
+}
+
+/// A zip of `entries` (name, bytes), as SubDL sends a subtitle.
+fn zipped(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+fn both(site: &MockServer) -> Settings {
+    Settings {
+        sites: vec![opensubtitles_at(site), subdl_at(site)],
+        daily_limit_per_user: 0,
+    }
+}
+
+/// With both on, one search asks both and lists what both found, each
+/// named by its site: OpenSubtitles' rated and downloaded ones first,
+/// then SubDL's, which gives neither, in its own order.
+#[tokio::test]
+async fn both_sites_are_searched_and_their_results_are_one_list() {
+    let f = fixture_with("both", both).await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    let found = f.downloads.search(&film(), None).await.unwrap();
+    let ids: Vec<&str> = found.results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "opensubtitles:101",
+            "opensubtitles:102",
+            "subdl:3172974-3188291",
+            "subdl:2978466-2972819",
+            "subdl:504692-1185",
+            "opensubtitles:103",
+            "opensubtitles:104",
+        ]
+    );
+    let subdl = &found.results[2];
+    assert_eq!(subdl.source, "subdl");
+    assert_eq!(
+        (subdl.downloads, subdl.rating, subdl.hash_match),
+        (0, None, false)
+    );
+    assert_eq!(subdl.fps_milli, Some(23_976));
+    assert_eq!(
+        found.sources,
+        [
+            SubtitleSourceStatus {
+                source: "opensubtitles".into(),
+                state: SubtitleSourceState::Found { found: 4 },
+            },
+            SubtitleSourceStatus {
+                source: "subdl".into(),
+                state: SubtitleSourceState::Found { found: 3 },
+            },
+        ]
+    );
+    // Each site was asked once, SubDL with its key and the film's title
+    // (it has no id), in SubDL's code.
+    assert_eq!(f.site_calls("/api/v1/subtitles").await, 1);
+    let asked = f.site.received_requests().await.unwrap();
+    let subdl_asked = asked
+        .iter()
+        .find(|r| r.url.path() == "/subdl/api/v1/subtitles")
+        .unwrap();
+    let pairs: HashMap<_, _> = subdl_asked.url.query_pairs().into_owned().collect();
+    assert_eq!(pairs["api_key"], "subdl-key");
+    assert_eq!(pairs["film_name"], "Alien");
+    assert_eq!(pairs["type"], "movie");
+    assert_eq!(pairs["languages"], "EN");
+    // Kept a day, as OpenSubtitles' are.
+    f.downloads.search(&film(), None).await.unwrap();
+    assert_eq!(f.site.received_requests().await.unwrap().len(), 2);
+}
+
+/// One site down or out of quota leaves the other's results, and says
+/// so; both down, the search fails with the first one's error.
+#[tokio::test]
+async fn one_site_failing_leaves_the_other_s_results() {
+    let f = fixture_with("one-down", both).await;
+    f.answers_search().await;
+    Mock::given(method("GET"))
+        .and(path("/subdl/api/v1/subtitles"))
+        .and(query_param("languages", "EN"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&f.site)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/subdl/api/v1/subtitles"))
+        .and(query_param("languages", "FR"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "status": false, "error": "Daily request limit exceeded",
+        })))
+        .mount(&f.site)
+        .await;
+    let found = f.downloads.search(&film(), None).await.unwrap();
+    assert_eq!(found.results.len(), 4);
+    assert!(found.results.iter().all(|r| r.source == "opensubtitles"));
+    assert!(matches!(
+        &found.sources[1],
+        SubtitleSourceStatus { source, state: SubtitleSourceState::Failed { message } }
+            if source == "subdl" && message.starts_with("SubDL cannot be reached")
+    ));
+    let french = f.downloads.search(&film(), Some("fr")).await.unwrap();
+    assert_eq!(
+        french.sources[1].state,
+        SubtitleSourceState::QuotaExhausted { resets_at: None }
+    );
+    // A failure is not kept: the next search asks SubDL again.
+    f.downloads.search(&film(), None).await.unwrap();
+    let subdl_calls = f
+        .site
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/subdl/api/v1/subtitles")
+        .count();
+    assert_eq!(subdl_calls, 3);
+
+    // Both down: the first site's error.
+    let mut settings = both(&f.site);
+    let SiteSettings::OpenSubtitles { account, .. } = &mut settings.sites[0] else {
+        unreachable!()
+    };
+    account.api_url = crate::opensubtitles::tests::nothing_listens();
+    f.downloads.configure(settings);
+    assert!(matches!(
+        f.downloads.search(&film(), Some("de")).await,
+        Err(DownloadError::Site {
+            site: Source::OpenSubtitles,
+            error: SiteError::Unreachable(_)
+        })
+    ));
+}
+
+/// A SubDL result is downloaded from SubDL: its zip opened, the CP-1251
+/// SRT in it kept as UTF-8, a track titled "SubDL" at once, and synced,
+/// as nothing SubDL has is matched by the file's hash.
+#[tokio::test]
+async fn a_subdl_download_comes_out_of_its_archive_and_is_synced() {
+    let f = fixture_with("subdl", both).await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode(RUSSIAN);
+    f.subdl_serves(
+        "/subtitle/3172974-3188291.zip",
+        zipped(&[("Film.nfo", b"made by someone"), ("Film.2019.srt", &cp1251)]),
+    )
+    .await;
+    let own = f.subtitles().await.len();
+    f.downloads.search(&film(), None).await.unwrap();
+    let got = f
+        .downloads
+        .download(&film(), "subdl:3172974-3188291", &alice())
+        .await
+        .unwrap();
+    assert_eq!(got.track as usize, own);
+    assert_eq!(got.account_remaining, None);
+    let download = got.subtitle.download.clone().unwrap();
+    assert_eq!(download.source, "subdl");
+    assert_eq!(download.release, "Film.2019.1080p.BluRay.x264-GRP");
+    assert_eq!(got.subtitle.title.as_deref(), Some("SubDL"));
+    let subtitles = f.subtitles().await;
+    let SubtitleSource::External { path } = &subtitles[own].source else {
+        panic!("not a file");
+    };
+    assert_eq!(
+        std::str::from_utf8(&std::fs::read(path).unwrap()).unwrap(),
+        RUSSIAN
+    );
+    let descriptor = f.prober.describe(&f.media).await.unwrap();
+    let timings = f.timings.timings(&descriptor).await;
+    assert_ne!(
+        timings[got.track as usize].as_ref().unwrap().sync,
+        SubtitleSync::Original
+    );
+    // The key went in a header; the file's URL has no query.
+    let fetched = f
+        .site
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/subtitle/3172974-3188291.zip")
+        .unwrap();
+    assert_eq!(fetched.url.query(), None);
+    assert_eq!(
+        fetched.headers.get("x-api-key").unwrap().to_str().unwrap(),
+        "subdl-key"
+    );
+    // Searched again, it is marked downloaded; the same id from the
+    // other site is another result.
+    let again = f.downloads.search(&film(), None).await.unwrap();
+    assert!(
+        again
+            .results
+            .iter()
+            .any(|r| r.id == "subdl:3172974-3188291" && r.downloaded)
+    );
+    assert!(
+        !again
+            .results
+            .iter()
+            .any(|r| r.source == "opensubtitles" && r.downloaded)
+    );
+}
+
+/// An archive that climbs out of itself, or holds no subtitle, is not
+/// kept, and nothing of it is written.
+#[tokio::test]
+async fn a_bad_subdl_archive_is_refused() {
+    let f = fixture_with("subdl-bad", both).await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    f.subdl_serves(
+        "/subtitle/3172974-3188291.zip",
+        zipped(&[("../../../etc/cron.d/x.srt", RUSSIAN.as_bytes())]),
+    )
+    .await;
+    f.subdl_serves(
+        "/subtitle/2978466-2972819.zip",
+        zipped(&[("Film.sub", b"{1}{2}Hello")]),
+    )
+    .await;
+    f.downloads.search(&film(), None).await.unwrap();
+    for result in ["subdl:3172974-3188291", "subdl:2978466-2972819"] {
+        assert!(
+            matches!(
+                f.downloads.download(&film(), result, &alice()).await,
+                Err(DownloadError::InvalidInput(_))
+            ),
+            "{result}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(f.downloads.dir()).unwrap().count(), 0);
+    assert!(
+        f.store
+            .subtitle_downloads(&film().to_string())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// SubDL alone: OpenSubtitles is never asked, nor the file hashed for it.
+/// A result's id names its site: one of a site that is off, or of none,
+/// is not downloaded.
+#[tokio::test]
+async fn subdl_alone_asks_only_subdl() {
+    let f = fixture_with("subdl-alone", |site| Settings {
+        sites: vec![subdl_at(site)],
+        daily_limit_per_user: 0,
+    })
+    .await;
+    f.subdl_answers_search().await;
+    let found = f.downloads.search(&film(), None).await.unwrap();
+    assert_eq!(found.results.len(), 3);
+    assert_eq!(f.site_calls("/api/v1/subtitles").await, 0);
+    assert!(matches!(
+        f.downloads
+            .download(&film(), "opensubtitles:101", &alice())
+            .await,
+        Err(DownloadError::NotFound(_))
+    ));
+    for bad in ["101", "podnapisi:1", "subdl:"] {
+        assert!(
+            matches!(
+                f.downloads.download(&film(), bad, &alice()).await,
+                Err(DownloadError::InvalidInput(_))
+            ),
+            "{bad}"
+        );
+    }
+}
+
+/// An episode is asked of SubDL by its show's id, as SubDL lists a
+/// show's subtitles, with its numbers; of a season's pack, the episode's
+/// file is the one kept.
+#[tokio::test]
+async fn an_episode_is_asked_of_subdl_by_its_show_and_taken_from_a_pack() {
+    let f = fixture_with("subdl-episode", |site| Settings {
+        sites: vec![subdl_at(site)],
+        daily_limit_per_user: 0,
+    })
+    .await;
+    let show = MediaId::new(Namespace::Plex, MediaKind::Show, "10").unwrap();
+    let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "15").unwrap();
+    crate::test_support::write_episode(&f.media, "15");
+    f.catalog.give_ids(&show, &["imdb://tt2193021"]);
+    Mock::given(method("GET"))
+        .and(path("/subdl/api/v1/subtitles"))
+        .and(query_param("imdb_id", "tt2193021"))
+        .and(query_param("type", "tv"))
+        .and(query_param("season_number", "2"))
+        .and(query_param("episode_number", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SUBDL_SEARCH))
+        .expect(1)
+        .mount(&f.site)
+        .await;
+    let other = "1\r\n00:00:01,000 --> 00:00:02,000\r\nWrong episode\r\n";
+    f.subdl_serves(
+        "/subtitle/3172974-3188291.zip",
+        zipped(&[
+            ("Show.S02E02.srt", [other, other, other].concat().as_bytes()),
+            ("Show.S02E01.srt", RUSSIAN.as_bytes()),
+        ]),
+    )
+    .await;
+    f.downloads.search(&episode, None).await.unwrap();
+    f.downloads
+        .download(&episode, "subdl:3172974-3188291", &alice())
+        .await
+        .unwrap();
+    let kept: Vec<_> = std::fs::read_dir(f.downloads.dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), RUSSIAN);
 }

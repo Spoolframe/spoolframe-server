@@ -20,7 +20,8 @@ pub use spoolframe_types::{
     APP_RP_DOMAIN, Album, Artist, Artwork, ArtworkKind, AudioRole, BitmapPreference, Episode, Item,
     LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState, QuotaOf, Role, SdhPreference,
     Season, Show, SubtitleDownload, SubtitleDownloaded, SubtitleMode, SubtitleOrigin,
-    SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleTrack, Track, TrackPreferences,
+    SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSourceState, SubtitleSourceStatus,
+    SubtitleTrack, Track, TrackPreferences,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
@@ -225,8 +226,9 @@ pub mod error_code {
     /// (PX-53).
     pub const IMAGE_UNREADABLE: i32 = -32035;
     /// No subtitle downloads left today (PX-02): `data` has `whose`
-    /// (`account`, the server's OpenSubtitles account, or `user`, the
-    /// caller's own daily limit) and `resetsAt`, Unix seconds, when known.
+    /// (`account`, the server's account at the subtitle site `site`,
+    /// `opensubtitles` or `subdl`; or `user`, the caller's own daily
+    /// limit, with no `site`) and `resetsAt`, Unix seconds, when known.
     pub const QUOTA_EXHAUSTED: i32 = -32036;
 }
 
@@ -4318,12 +4320,14 @@ pub trait AdminApi {
         offset_ms: i64,
     ) -> jsonrpsee::core::RpcResult<SubtitleTimingInfo>;
 
-    /// Search OpenSubtitles for item `id`'s subtitles in `language` (`en`,
-    /// `pt-BR`), or in the languages set (PX-02): best first, as the
-    /// client protocol's `SearchSubtitles`. Kept a day per item and
-    /// language. `NOT_CONFIGURED` without OpenSubtitles set up;
-    /// `UNAVAILABLE` when it cannot be reached; `RATE_LIMITED` when it
-    /// asks to wait.
+    /// Search the subtitle sites set up (OpenSubtitles, SubDL, or both,
+    /// at once) for item `id`'s subtitles in `language` (`en`, `pt-BR`),
+    /// or in each site's languages (PX-02): one list, best first, and how
+    /// each site's part went (`sources`), as the client protocol's
+    /// `SearchSubtitles`. Kept a day per site, item and language.
+    /// `NOT_CONFIGURED` without a site set up; when every site failed,
+    /// the first one's error: `UNAVAILABLE` when it cannot be reached,
+    /// `RATE_LIMITED` when it asks to wait, `QUOTA_EXHAUSTED`.
     #[method(name = "subtitleSearch", with_extensions)]
     async fn subtitle_search(
         &self,
@@ -4331,7 +4335,8 @@ pub trait AdminApi {
         language: Option<String>,
     ) -> jsonrpsee::core::RpcResult<spoolframe_types::SubtitleSearch>;
 
-    /// Download result `file_id` of a search for item `id` (PX-02): a
+    /// Download result `result` (`SubtitleResult::id`,
+    /// `subdl:3172974-3188291`) of a search for item `id` (PX-02): a
     /// track of the item for everyone, at once, synced in the background
     /// when it was not found by the file's hash. The same result again is
     /// the same track. `INVALID_INPUT` for a result no search of the item
@@ -4342,7 +4347,7 @@ pub trait AdminApi {
     async fn subtitle_download(
         &self,
         id: String,
-        file_id: u64,
+        result: String,
     ) -> jsonrpsee::core::RpcResult<spoolframe_types::SubtitleDownloaded>;
 
     /// Remove item `id`'s downloaded subtitle `download`, for everyone

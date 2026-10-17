@@ -1,0 +1,89 @@
+{
+  "status": true,
+  "results": [
+    {
+      "sd_id": 19681,
+      "name": "Film",
+      "type": "movie",
+      "imdb_id": "tt1234567",
+      "tmdb_id": 348,
+      "first_air_date": null,
+      "release_date": "2019-05-25T00:00:00.000Z",
+      "slug": "film",
+      "year": 2019
+    }
+  ],
+  "subtitles": [
+    {
+      "release_name": "Film.2019.1080p.BluRay.x264-GRP",
+      "name": "SUBDL::film-english-3188291.zip",
+      "lang": "english",
+      "author": "someone",
+      "url": "/subtitle/3172974-3188291.zip?api_key=subdl_FIXTUREKEY",
+      "subtitlePage": "/s/info/2jTMO6BuqY",
+      "season": 0,
+      "episode": null,
+      "language": "EN",
+      "framerate": 0,
+      "fps": "23.976",
+      "hi": false,
+      "releases": ["Film.2019.1080p.BluRay.x264-GRP"],
+      "episode_from": null,
+      "episode_end": 0,
+      "full_season": false
+    },
+    {
+      "release_name": "Film (Director's Cut)",
+      "name": "SUBDL::film-english-2972819.zip",
+      "lang": "english",
+      "author": "someone else",
+      "url": "/subtitle/2978466-2972819.zip?api_key=subdl_FIXTUREKEY",
+      "subtitlePage": "/s/info/uGESLfG3Tk",
+      "season": 0,
+      "episode": null,
+      "language": "EN",
+      "framerate": 0,
+      "fps": null,
+      "hi": true,
+      "episode_from": null,
+      "episode_end": 0,
+      "full_season": false
+    },
+    {
+      "release_name": "Film.2019.DVDRip",
+      "name": "SUBDL.com::_film_portuguese_1185.zip",
+      "lang": "brazillian portuguese",
+      "author": "a third",
+      "url": "/subtitle/504692-1185.srt?api_key=subdl_FIXTUREKEY",
+      "subtitlePage": "/s/info/abc",
+      "season": 0,
+      "episode": null,
+      "language": "BR_PT",
+      "framerate": 0,
+      "fps": null,
+      "hi": false,
+      "episode_from": null,
+      "episode_end": 0,
+      "full_season": false
+    },
+    {
+      "release_name": "Film.2019 from elsewhere",
+      "name": "elsewhere.zip",
+      "lang": "english",
+      "author": "nobody",
+      "url": "https://elsewhere.example/evil.zip",
+      "subtitlePage": "/s/info/x",
+      "season": 0,
+      "episode": null,
+      "language": "EN",
+      "framerate": 0,
+      "fps": null,
+      "hi": false,
+      "episode_from": null,
+      "episode_end": 0,
+      "full_season": false
+    }
+  ],
+  "totalPages": 1,
+  "currentPage": 1
+}

@@ -51,29 +51,8 @@ impl std::fmt::Debug for Account {
     }
 }
 
-/// Why a call to the site failed.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SiteError {
-    /// It could not be reached, took too long, or failed on its side.
-    #[error("OpenSubtitles cannot be reached: {0}")]
-    Unreachable(String),
-    /// It asked to wait this long before the next call.
-    #[error("OpenSubtitles asks to wait {retry_after_ms} ms")]
-    RateLimited { retry_after_ms: u64 },
-    /// The account's downloads are used up until `resets_at` (Unix
-    /// seconds), when the site says.
-    #[error("the OpenSubtitles account has no downloads left today")]
-    QuotaExhausted { resets_at: Option<i64> },
-    /// It refused the key, the account or the request: the admin's to fix.
-    #[error("OpenSubtitles refused the request ({status}): {message}")]
-    Refused { status: u16, message: String },
-    /// It answered with something that is not what it documents.
-    #[error("OpenSubtitles answered with something unreadable: {0}")]
-    Unreadable(String),
-    /// The file is larger than the server takes.
-    #[error("the subtitle file is larger than {0} bytes")]
-    TooLarge(usize),
-}
+pub use crate::subtitle_site::SiteError;
+use crate::subtitle_site::{Pacer, read_capped, retry_after};
 
 /// What a search asks for. Every part left out is not sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -218,10 +197,7 @@ struct Session {
 pub struct Site {
     account: Account,
     http: reqwest::Client,
-    /// When the last call was made, held while a call waits its turn.
-    last_call: tokio::sync::Mutex<Option<Instant>>,
-    /// No call until then: the site said to wait.
-    wait_until: parking_lot::Mutex<Option<Instant>>,
+    pacer: Pacer,
     session: tokio::sync::Mutex<Option<Session>>,
 }
 
@@ -247,8 +223,7 @@ impl Site {
         Self {
             account,
             http,
-            last_call: tokio::sync::Mutex::new(None),
-            wait_until: parking_lot::Mutex::new(None),
+            pacer: Pacer::new(MIN_INTERVAL),
             session: tokio::sync::Mutex::new(None),
         }
     }
@@ -361,22 +336,12 @@ impl Site {
         if status.is_success() {
             return read_capped(response, MAX_JSON).await;
         }
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok());
+        let retry_after = retry_after(&response);
         let body = read_capped(response, MAX_JSON).await.unwrap_or_default();
         let refusal: Refusal = serde_json::from_slice(&body).unwrap_or_default();
         let message = refusal.message.unwrap_or_default();
         Err(match status.as_u16() {
-            429 => {
-                let wait = Duration::from_secs(retry_after.unwrap_or(1).clamp(1, 3600));
-                *self.wait_until.lock() = Some(Instant::now() + wait);
-                SiteError::RateLimited {
-                    retry_after_ms: wait.as_millis() as u64,
-                }
-            }
+            429 => self.pacer.told_to_wait(retry_after),
             // The site's word for a download past the account's quota.
             406 => SiteError::QuotaExhausted {
                 resets_at: refusal.reset_time_utc.as_deref().and_then(utc_seconds),
@@ -404,38 +369,8 @@ impl Site {
     /// Send `request` when its turn comes: [`MIN_INTERVAL`] after the last,
     /// and not while the site said to wait.
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, SiteError> {
-        if let Some(until) = *self.wait_until.lock() {
-            let now = Instant::now();
-            if until > now {
-                return Err(SiteError::RateLimited {
-                    retry_after_ms: (until - now).as_millis() as u64,
-                });
-            }
-        }
-        {
-            let mut last = self.last_call.lock().await;
-            if let Some(at) = *last {
-                let next = at + MIN_INTERVAL;
-                if next > Instant::now() {
-                    tokio::time::sleep_until(next.into()).await;
-                }
-            }
-            *last = Some(Instant::now());
-        }
-        request.send().await.map_err(|e| {
-            // reqwest's error names the URL, which may carry the hash and
-            // the item's ids; the kind is enough.
-            let kind = if e.is_timeout() {
-                "it took too long"
-            } else if e.is_connect() {
-                "no connection"
-            } else if e.is_redirect() {
-                "it redirected away from the site"
-            } else {
-                "the request failed"
-            };
-            SiteError::Unreachable(kind.into())
-        })
+        self.pacer.turn().await?;
+        crate::subtitle_site::send(request).await
     }
 }
 
@@ -511,25 +446,6 @@ fn read_search(body: &[u8]) -> Result<Vec<Found>, SiteError> {
         }
     }
     Ok(found)
-}
-
-/// The body of `response`, refused past `max` bytes.
-async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, SiteError> {
-    if response.content_length().is_some_and(|n| n > max as u64) {
-        return Err(SiteError::TooLarge(max));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| SiteError::Unreachable("the answer broke off".into()))?
-    {
-        if body.len() + chunk.len() > max {
-            return Err(SiteError::TooLarge(max));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 /// `2022-04-08T13:03:16.000Z` (the site's UTC times) as Unix seconds.

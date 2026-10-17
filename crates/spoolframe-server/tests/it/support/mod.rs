@@ -470,7 +470,8 @@ pub struct ServerOptions {
     /// a stand-in; `None`: real ffmpeg decodes it.
     pub speech: Option<Vec<spoolframe_media::subsync::Span>>,
     /// OpenSubtitles (PX-02), a stand-in on loopback; off by default.
-    pub opensubtitles: Option<spoolframe_server::subtitle_downloads::SiteSettings>,
+    /// The subtitle sites (PX-02); none unless set.
+    pub subtitle_sites: spoolframe_server::subtitle_downloads::Settings,
 }
 
 /// Speech found by a stand-in: always `0`.
@@ -534,7 +535,7 @@ impl Default for ServerOptions {
             http_playback: Default::default(),
             index_ahead: false,
             speech: None,
-            opensubtitles: None,
+            subtitle_sites: Default::default(),
         }
     }
 }
@@ -851,7 +852,7 @@ impl TestServer {
                 prober.clone(),
                 subtitle_timings.clone(),
                 dir.join("subtitles").join("downloaded"),
-                options.opensubtitles.clone(),
+                options.subtitle_sites.clone(),
             )
             .unwrap(),
         );

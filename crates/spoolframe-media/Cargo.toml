@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 # A downloaded subtitle's encoding guessed and decoded (subtitle_file.rs).
 chardetng = { workspace = true }
 encoding_rs = { workspace = true }
+zip = { workspace = true }
 # Names a kept keyframe list by its media path (keyframe_store.rs).
 blake3 = { workspace = true }
 earshot = { workspace = true }

@@ -31,8 +31,8 @@ pub use date::{CalendarDate, DateError};
 pub use id::{ArtworkId, IdError, LibraryId, MediaId, MediaKind, Namespace, PersonId};
 pub use media::{
     AudioRole, AudioTrack, MediaTracks, QuotaOf, SubtitleDownload, SubtitleDownloaded,
-    SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSync, SubtitleTiming,
-    SubtitleTrack, VideoTrack,
+    SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSourceState,
+    SubtitleSourceStatus, SubtitleSync, SubtitleTiming, SubtitleTrack, VideoTrack,
 };
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, CastMember, Episode, Item, Library, LibraryKind, Marker,

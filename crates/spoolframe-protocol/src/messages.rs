@@ -868,15 +868,19 @@ pub enum Request {
         track: u32,
         offset_ms: i64,
     },
-    /// Search the subtitle site for item `id`'s subtitles in `language`
-    /// (an ISO 639-1 code such as `en`, or `pt-BR`), or, with none, in the
-    /// languages the server offers first (PX-02). `SubtitleResults`, best
+    /// Search the subtitle sites the admin turned on (OpenSubtitles,
+    /// SubDL, or both) for item `id`'s subtitles in `language` (an ISO
+    /// 639-1 code such as `en`, or `pt-BR`), or, with none, in the
+    /// languages the server offers first (PX-02). Both sites are asked at
+    /// once and their results are one list, `SubtitleResults`, best
     /// first: those found by the file's hash (made for this release), then
     /// the rest by rating and downloads, machine-translated and AI-made
-    /// after people's, ones removed before as bad last. Kept a day per item
-    /// and language. Anyone who can play the item may. `NoSubtitleSource`
-    /// when the server has none set up; `Unavailable` when the site cannot
-    /// be reached; `RateLimited` when it asks to wait. Only from a client
+    /// after people's, ones removed before as bad last; its `sources` say
+    /// how each site's part went. Kept a day per site, item and language.
+    /// Anyone who can play the item may. `NoSubtitleSource` when the
+    /// server has none set up. When every site failed, the first one's
+    /// error: `Unavailable` when it cannot be reached, `RateLimited` when
+    /// it asks to wait, `QuotaExhausted` when it is out. Only from a client
     /// that listed `spoolframe:subtitle-search`; from any other,
     /// `Unsupported`.
     SearchSubtitles {
@@ -884,19 +888,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
     },
-    /// Download result `file_id` of a search for item `id` (PX-02): the
+    /// Download result `result` (`SubtitleResult::id`) of a search for
+    /// item `id` (PX-02), from the site that found it: the
     /// item gains an external subtitle track for everyone, usable at once
     /// (`SubtitleDownloaded`). One not found by the file's hash is synced
     /// in the background (`spoolframe:subtitle-sync`). The same result
     /// downloaded again gives the same track, at no cost. `NotFound` for a
-    /// `file_id` no search of the item listed lately (search again);
+    /// `result` no search of the item listed lately (search again);
     /// `NotAllowed` for a user the admin took downloads from;
     /// `QuotaExhausted` when the server's account or the user's own daily
     /// limit is used up; `InvalidInput` for a file that is not a subtitle
     /// the server reads. Otherwise as `SearchSubtitles`.
     DownloadSubtitle {
         id: MediaId,
-        file_id: u64,
+        result: String,
     },
     /// Remove item `id`'s downloaded subtitle `download`
     /// (`SubtitleDownload::id`), for everyone (PX-02): its files go, and
@@ -1928,15 +1933,19 @@ pub enum Error {
     #[error("the picture cannot be read: a JPEG, PNG, WebP or HEIC is taken")]
     ImageUnreadable,
     /// The downloads of `whose` are used up for today (PX-02): the
-    /// server's account at the subtitle site, or the user's own daily
-    /// limit on this server. `resets_at` (Unix seconds) is when more may
-    /// be downloaded, when known. Nothing was downloaded; searching still
+    /// server's account at subtitle site `site` (`opensubtitles`,
+    /// `subdl`, as `SubtitleResult::source`), or the user's own daily
+    /// limit on this server (no `site`). `resets_at` (Unix seconds) is when more may be
+    /// downloaded, when known. Nothing was downloaded; searching still
     /// works.
     #[error("no subtitle downloads left today ({whose:?})")]
     QuotaExhausted {
         whose: spoolframe_types::QuotaOf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resets_at: Option<i64>,
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
     },
     /// The server has no subtitle site set up (PX-02): hide "Find
     /// subtitles". Nothing was asked of any site.

@@ -1,10 +1,11 @@
-//! Subtitles from OpenSubtitles on demand (PX-02) over a real Iroh
+//! Subtitles from OpenSubtitles and SubDL on demand (PX-02) over a real Iroh
 //! connection and the admin API, with real ffmpeg and ffprobe on a film,
 //! against a stand-in site on loopback answering as the real one does
 //! (never the real API): a search, a download that is every user's track
 //! at once and reads as UTF-8, who may remove it, the quotas, and a client
-//! without the feature sent none of it. The parts are tested in
-//! `subtitle_downloads::tests` and `opensubtitles::tests`.
+//! without the feature sent none of it; both sites at once. The parts are
+//! tested in `subtitle_downloads::tests`, `opensubtitles::tests` and
+//! `subdl::tests`.
 
 use crate::support;
 
@@ -17,7 +18,7 @@ use spoolframe_protocol::{
     Selection, SessionId,
 };
 use spoolframe_server::opensubtitles::Account;
-use spoolframe_server::subtitle_downloads::SiteSettings;
+use spoolframe_server::subtitle_downloads::{Settings, SiteSettings};
 use spoolframe_types::{
     AudioCodec, ClientCapabilities, Container, MediaTracks, QuotaOf, SubtitleDownloaded,
     SubtitleFormat, SubtitleSearch, VideoCodec,
@@ -87,20 +88,22 @@ async fn site() -> MockServer {
     site
 }
 
-fn settings(site: &MockServer, limit: u32) -> SiteSettings {
-    SiteSettings {
-        account: Account {
-            api_url: url::Url::parse(&format!("{}/api/v1", site.uri())).unwrap(),
-            api_key: "test-key".into(),
-            username: None,
-            password: None,
-        },
-        languages: vec!["en".into()],
+fn settings(site: &MockServer, limit: u32) -> Settings {
+    Settings {
+        sites: vec![SiteSettings::OpenSubtitles {
+            account: Account {
+                api_url: url::Url::parse(&format!("{}/api/v1", site.uri())).unwrap(),
+                api_key: "test-key".into(),
+                username: None,
+                password: None,
+            },
+            languages: vec!["en".into()],
+        }],
         daily_limit_per_user: limit,
     }
 }
 
-async fn ready(test: &str, site: Option<SiteSettings>) -> TestServer {
+async fn ready(test: &str, site: Settings) -> TestServer {
     let server = film(test, site).await;
     server
         .add_user("alice", "correct horse", Some("Alice"))
@@ -110,12 +113,12 @@ async fn ready(test: &str, site: Option<SiteSettings>) -> TestServer {
 }
 
 /// The server with its film, and no user yet.
-async fn film(test: &str, site: Option<SiteSettings>) -> TestServer {
+async fn film(test: &str, site: Settings) -> TestServer {
     let server = TestServer::start_with(
         fresh_dir(test).await,
         ServerOptions {
             real_media: true,
-            opensubtitles: site,
+            subtitle_sites: site,
             speech: Some(cues()),
             ..ServerOptions::default()
         },
@@ -177,14 +180,14 @@ async fn search(client: &TestClient, session: &SessionId) -> Result<SubtitleSear
 async fn download(
     client: &TestClient,
     session: &SessionId,
-    file_id: u64,
+    result: &str,
 ) -> Result<SubtitleDownloaded, Error> {
     match client
         .call(
             Some(session),
             Request::DownloadSubtitle {
                 id: movie().id().clone(),
-                file_id,
+                result: result.to_owned(),
             },
         )
         .await
@@ -251,14 +254,16 @@ async fn play(client: &TestClient, session: &SessionId, subtitle: u32) -> Playba
 #[tokio::test]
 async fn a_download_is_everyone_s_track_and_its_downloader_s_to_remove() {
     let site = site().await;
-    let server = ready("subdl-flow", Some(settings(&site, 0))).await;
+    let server = ready("subdl-flow", settings(&site, 0)).await;
     let (alice, alice_session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
     let (bob, bob_session) = app(&server, "bob", &[SUBTITLE_SEARCH]).await;
 
     let found = search(&alice, &alice_session).await.unwrap();
-    assert_eq!(found.results[0].file_id, 101);
+    assert_eq!(found.results[0].id, "opensubtitles:101");
     assert!(found.results[0].hash_match);
-    let got = download(&alice, &alice_session, 101).await.unwrap();
+    let got = download(&alice, &alice_session, "opensubtitles:101")
+        .await
+        .unwrap();
     assert_eq!(got.account_remaining, Some(17));
     let download_id = got.subtitle.download.clone().unwrap().id;
 
@@ -297,7 +302,10 @@ async fn a_download_is_everyone_s_track_and_its_downloader_s_to_remove() {
     assert!(tracks(&bob, &bob_session).await.subtitles.is_empty());
     let again = search(&bob, &bob_session).await.unwrap();
     let last = again.results.last().unwrap();
-    assert_eq!((last.file_id, last.rejected), (101, true));
+    assert_eq!(
+        (last.id.as_str(), last.rejected),
+        ("opensubtitles:101", true)
+    );
     server.stop().await;
 }
 
@@ -306,16 +314,19 @@ async fn a_download_is_everyone_s_track_and_its_downloader_s_to_remove() {
 #[tokio::test]
 async fn the_quotas_are_said_as_whose_they_are() {
     let site = site().await;
-    let server = ready("subdl-quota", Some(settings(&site, 1))).await;
+    let server = ready("subdl-quota", settings(&site, 1)).await;
     let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
     search(&alice, &session).await.unwrap();
-    let first = download(&alice, &session, 101).await.unwrap();
+    let first = download(&alice, &session, "opensubtitles:101")
+        .await
+        .unwrap();
     assert_eq!(first.user_remaining, Some(0));
     assert!(matches!(
-        download(&alice, &session, 102).await,
+        download(&alice, &session, "opensubtitles:102").await,
         Err(Error::QuotaExhausted {
             whose: QuotaOf::User,
-            resets_at: Some(_)
+            resets_at: Some(_),
+            site: None,
         })
     ));
 
@@ -331,10 +342,11 @@ async fn the_quotas_are_said_as_whose_they_are() {
         .await;
     let (bob, bob_session) = app(&server, "bob", &[SUBTITLE_SEARCH]).await;
     assert_eq!(
-        download(&bob, &bob_session, 102).await,
+        download(&bob, &bob_session, "opensubtitles:102").await,
         Err(Error::QuotaExhausted {
             whose: QuotaOf::Account,
-            resets_at: Some(1_893_456_000)
+            resets_at: Some(1_893_456_000),
+            site: Some("opensubtitles".into()),
         })
     );
     server.stop().await;
@@ -345,10 +357,12 @@ async fn the_quotas_are_said_as_whose_they_are() {
 #[tokio::test]
 async fn a_client_without_the_feature_is_sent_none_of_it() {
     let site = site().await;
-    let server = ready("subdl-old", Some(settings(&site, 0))).await;
+    let server = ready("subdl-old", settings(&site, 0)).await;
     let (alice, alice_session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
     search(&alice, &alice_session).await.unwrap();
-    download(&alice, &alice_session, 102).await.unwrap();
+    download(&alice, &alice_session, "opensubtitles:102")
+        .await
+        .unwrap();
     let (old, old_session) = app(&server, "bob", &[]).await;
     assert!(matches!(
         search(&old, &old_session).await,
@@ -363,7 +377,7 @@ async fn a_client_without_the_feature_is_sent_none_of_it() {
 
 #[tokio::test]
 async fn a_server_without_opensubtitles_says_so() {
-    let server = ready("subdl-off", None).await;
+    let server = ready("subdl-off", Settings::default()).await;
     let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
     assert_eq!(search(&alice, &session).await, Err(Error::NoSubtitleSource));
     server.stop().await;
@@ -375,13 +389,16 @@ async fn a_server_without_opensubtitles_says_so() {
 #[tokio::test]
 async fn the_admin_api_searches_downloads_and_turns_downloads_off() {
     let site = site().await;
-    let server = film("subdl-admin", Some(settings(&site, 0))).await;
+    let server = film("subdl-admin", settings(&site, 0)).await;
     let (root, _alice) = admin_beside(&server).await;
     server.add_user("bob", "correct horse", Some("Bob")).await;
     let id = movie().id().to_string();
     let found = root.subtitle_search(id.clone(), None).await.unwrap();
     assert_eq!(found.results.len(), 4);
-    let got = root.subtitle_download(id.clone(), 103).await.unwrap();
+    let got = root
+        .subtitle_download(id.clone(), "opensubtitles:103".into())
+        .await
+        .unwrap();
     let timings = root.subtitle_timings(id.clone()).await.unwrap();
     let row = timings
         .iter()
@@ -402,9 +419,16 @@ async fn the_admin_api_searches_downloads_and_turns_downloads_off() {
     assert!(!root.user_subtitle_downloads("bob".into()).await.unwrap());
     let (bob, session) = app(&server, "bob", &[SUBTITLE_SEARCH]).await;
     search(&bob, &session).await.unwrap();
-    assert_eq!(download(&bob, &session, 101).await, Err(Error::NotAllowed));
     assert_eq!(
-        code(root.subtitle_download(id, 999).await.unwrap_err()),
+        download(&bob, &session, "opensubtitles:101").await,
+        Err(Error::NotAllowed)
+    );
+    assert_eq!(
+        code(
+            root.subtitle_download(id, "opensubtitles:999".into())
+                .await
+                .unwrap_err()
+        ),
         error_code::INVALID_INPUT
     );
     server.stop().await;
@@ -469,10 +493,12 @@ fn on_the_lines(text: &str) {
 #[tokio::test]
 async fn a_download_not_matched_by_hash_plays_synced_once_synced() {
     let site = late_site().await;
-    let server = ready("subdl-synced", Some(settings(&site, 0))).await;
+    let server = ready("subdl-synced", settings(&site, 0)).await;
     let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH, SUBTITLE_SYNC]).await;
     search(&alice, &session).await.unwrap();
-    let got = download(&alice, &session, 102).await.unwrap();
+    let got = download(&alice, &session, "opensubtitles:102")
+        .await
+        .unwrap();
     let handle = play(&alice, &session, got.track).await;
     synced(&alice, &session, got.track).await;
     match alice
@@ -500,14 +526,16 @@ async fn a_download_not_matched_by_hash_plays_synced_once_synced() {
 #[tokio::test]
 async fn a_download_is_carried_into_a_converted_file() {
     let site = site().await;
-    let server = film("subdl-carried", Some(settings(&site, 0))).await;
+    let server = film("subdl-carried", settings(&site, 0)).await;
     server.generate_media(10, "libx264", "ac3");
     server
         .add_user("alice", "correct horse", Some("Alice"))
         .await;
     let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
     search(&alice, &session).await.unwrap();
-    let got = download(&alice, &session, 101).await.unwrap();
+    let got = download(&alice, &session, "opensubtitles:101")
+        .await
+        .unwrap();
     let handle = match alice
         .call(
             Some(&session),
@@ -564,14 +592,16 @@ async fn a_download_is_carried_into_a_converted_file() {
 #[tokio::test]
 async fn a_synced_download_is_carried_synced() {
     let site = late_site().await;
-    let server = film("subdl-carried-synced", Some(settings(&site, 0))).await;
+    let server = film("subdl-carried-synced", settings(&site, 0)).await;
     server.generate_media(10, "libx264", "ac3");
     server
         .add_user("alice", "correct horse", Some("Alice"))
         .await;
     let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH, SUBTITLE_SYNC]).await;
     search(&alice, &session).await.unwrap();
-    let got = download(&alice, &session, 102).await.unwrap();
+    let got = download(&alice, &session, "opensubtitles:102")
+        .await
+        .unwrap();
     synced(&alice, &session, got.track).await;
     let handle = play(&alice, &session, got.track).await;
     let mut bytes = Vec::new();
@@ -615,7 +645,7 @@ async fn a_synced_download_is_carried_synced() {
 #[tokio::test]
 async fn an_app_finds_downloads_and_removes_through_the_sdk() {
     let site = site().await;
-    let server = ready("subdl-sdk", Some(settings(&site, 0))).await;
+    let server = ready("subdl-sdk", settings(&site, 0)).await;
     let storage = std::sync::Arc::new(spoolframe_client_sdk::MemoryStorage::default());
     let client = support::sdk_client(
         storage,
@@ -645,7 +675,10 @@ async fn an_app_finds_downloads_and_removes_through_the_sdk() {
     let id = movie().id().clone();
     let found = alice.search_subtitles(&id, Some("en")).await.unwrap();
     assert_eq!(found.languages, ["en"]);
-    let got = alice.download_subtitle(&id, 104).await.unwrap();
+    let got = alice
+        .download_subtitle(&id, "opensubtitles:104")
+        .await
+        .unwrap();
     let tracks = alice.tracks(&id).await.unwrap();
     let download = tracks.subtitles[got.track as usize]
         .download
@@ -657,5 +690,81 @@ async fn an_app_finds_downloads_and_removes_through_the_sdk() {
         .await
         .unwrap();
     assert!(alice.tracks(&id).await.unwrap().subtitles.is_empty());
+    server.stop().await;
+}
+
+/// Both sites on: one search over the wire lists both sites' results and
+/// how each went; a SubDL result, zipped, is downloaded from SubDL and is
+/// a track named for it, its download saying so.
+#[tokio::test]
+async fn both_sites_answer_one_search_and_a_subdl_result_is_a_track() {
+    use std::io::Write;
+    let site = site().await;
+    Mock::given(method("GET"))
+        .and(path("/subdl/api/v1/subtitles"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("../fixtures/subdl/search.json")),
+        )
+        .mount(&site)
+        .await;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("Film.2019.srt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(RUSSIAN.as_bytes()).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/subtitle/3172974-3188291.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip.finish().unwrap().into_inner()))
+        .mount(&site)
+        .await;
+    let mut sites = settings(&site, 0);
+    sites.sites.push(SiteSettings::SubDl {
+        account: spoolframe_server::subdl::Account {
+            api_url: url::Url::parse(&format!("{}/subdl/api/v1", site.uri())).unwrap(),
+            download_url: url::Url::parse(&site.uri()).unwrap(),
+            api_key: "subdl-key".into(),
+        },
+        languages: vec!["en".into()],
+    });
+    let server = ready("subdl-both", sites).await;
+    let (alice, session) = app(&server, "alice", &[SUBTITLE_SEARCH]).await;
+
+    let found = search(&alice, &session).await.unwrap();
+    let sources: Vec<(&str, &spoolframe_types::SubtitleSourceState)> = found
+        .sources
+        .iter()
+        .map(|s| (s.source.as_str(), &s.state))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            (
+                "opensubtitles",
+                &spoolframe_types::SubtitleSourceState::Found { found: 4 }
+            ),
+            (
+                "subdl",
+                &spoolframe_types::SubtitleSourceState::Found { found: 3 }
+            ),
+        ]
+    );
+    assert_eq!(found.results.len(), 7);
+    assert!(
+        found
+            .results
+            .iter()
+            .any(|r| r.id == "subdl:3172974-3188291" && r.source == "subdl")
+    );
+
+    let got = download(&alice, &session, "subdl:3172974-3188291")
+        .await
+        .unwrap();
+    assert_eq!(got.account_remaining, None);
+    let track = &tracks(&alice, &session).await.subtitles[got.track as usize];
+    assert_eq!(track.title.as_deref(), Some("SubDL"));
+    assert_eq!(
+        track.download.as_ref().map(|d| d.source.as_str()),
+        Some("subdl")
+    );
     server.stop().await;
 }

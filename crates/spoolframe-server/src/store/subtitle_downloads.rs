@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use super::{Store, StoreError};
 
-/// One downloaded subtitle (migration 0036).
+/// One downloaded subtitle (migrations 0036 and 0037).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadRow {
     /// The server's own id: its file's name.
@@ -13,10 +13,10 @@ pub struct DownloadRow {
     pub media_id: String,
     /// The media file it was downloaded for.
     pub media_path: String,
-    /// `opensubtitles`.
+    /// `opensubtitles` or `subdl`: [`crate::subtitle_site::Source::id`].
     pub source: String,
-    /// The site's id of the file.
-    pub file_id: u64,
+    /// The site's id of the file: `5338574`, `3172974-3188291`.
+    pub file_id: String,
     pub language: String,
     pub release: String,
     /// `srt`, `ass` or `vtt`: its file's extension.
@@ -50,7 +50,7 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<DownloadRow, sqlx::Error> {
         media_id: r.try_get("media_id")?,
         media_path: r.try_get("media_path")?,
         source: r.try_get("source")?,
-        file_id: u64::try_from(r.try_get::<i64, _>("file_id")?).unwrap_or(0),
+        file_id: r.try_get("file_id")?,
         language: r.try_get("language")?,
         release: r.try_get("release")?,
         format: r.try_get("format")?,
@@ -114,7 +114,7 @@ impl Store {
         &self,
         media_id: &str,
         source: &str,
-        file_id: u64,
+        file_id: &str,
     ) -> Result<Option<DownloadRow>, StoreError> {
         let found = sqlx::query(concat!(
             "SELECT ",
@@ -124,7 +124,7 @@ impl Store {
         ))
         .bind(media_id)
         .bind(source)
-        .bind(file_id as i64)
+        .bind(file_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(found.as_ref().map(row).transpose()?)
@@ -144,7 +144,7 @@ impl Store {
         .bind(&download.media_id)
         .bind(&download.media_path)
         .bind(&download.source)
-        .bind(download.file_id as i64)
+        .bind(&download.file_id)
         .bind(&download.language)
         .bind(&download.release)
         .bind(&download.format)
@@ -166,7 +166,7 @@ impl Store {
         )
         .bind(&download.media_id)
         .bind(&download.source)
-        .bind(download.file_id as i64)
+        .bind(&download.file_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM subtitle_download_log WHERE at < ?1")
@@ -201,7 +201,7 @@ impl Store {
         )
         .bind(&removed.media_id)
         .bind(&removed.source)
-        .bind(removed.file_id as i64)
+        .bind(&removed.file_id)
         .bind(by)
         .bind(self.now())
         .execute(&mut *tx)
@@ -215,7 +215,7 @@ impl Store {
         &self,
         media_id: &str,
         source: &str,
-    ) -> Result<Vec<u64>, StoreError> {
+    ) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query(
             "SELECT file_id FROM subtitle_rejections WHERE media_id = ?1 AND source = ?2",
         )
@@ -225,7 +225,7 @@ impl Store {
         .await?;
         Ok(rows
             .iter()
-            .map(|r| r.try_get::<i64, _>("file_id").map(|id| id as u64))
+            .map(|r| r.try_get::<String, _>("file_id"))
             .collect::<Result<_, _>>()?)
     }
 
@@ -300,13 +300,13 @@ mod tests {
     use super::super::tests::test_store;
     use super::*;
 
-    fn download(id: &str, file_id: u64, by: &str, at: i64) -> DownloadRow {
+    fn download(id: &str, file_id: &str, by: &str, at: i64) -> DownloadRow {
         DownloadRow {
             id: id.into(),
             media_id: "plex:movie:1".into(),
             media_path: "/films/Film.mkv".into(),
             source: "opensubtitles".into(),
-            file_id,
+            file_id: file_id.into(),
             language: "en".into(),
             release: "Film.2019.1080p".into(),
             format: "srt".into(),
@@ -324,19 +324,19 @@ mod tests {
         let store = test_store("subtitle-downloads").await;
         let now = store.now();
         store
-            .put_subtitle_download(&download("d1", 7, "local:1", now))
+            .put_subtitle_download(&download("d1", "7", "local:1", now))
             .await
             .unwrap();
         assert_eq!(
             store
-                .subtitle_download_of("plex:movie:1", "opensubtitles", 7)
+                .subtitle_download_of("plex:movie:1", "opensubtitles", "7")
                 .await
                 .unwrap(),
-            Some(download("d1", 7, "local:1", now))
+            Some(download("d1", "7", "local:1", now))
         );
         assert_eq!(
             store
-                .subtitle_download_of("plex:movie:2", "opensubtitles", 7)
+                .subtitle_download_of("plex:movie:2", "opensubtitles", "7")
                 .await
                 .unwrap(),
             None
@@ -344,7 +344,7 @@ mod tests {
         // One result once per item.
         assert!(
             store
-                .put_subtitle_download(&download("d2", 7, "local:1", now))
+                .put_subtitle_download(&download("d2", "7", "local:1", now))
                 .await
                 .is_err()
         );
@@ -357,14 +357,14 @@ mod tests {
         let store = test_store("subtitle-downloads-removed").await;
         let now = store.now();
         store
-            .put_subtitle_download(&download("d1", 7, "local:1", now))
+            .put_subtitle_download(&download("d1", "7", "local:1", now))
             .await
             .unwrap();
         let removed = store
             .remove_subtitle_download("d1", "local:1")
             .await
             .unwrap();
-        assert_eq!(removed.map(|r| r.file_id), Some(7));
+        assert_eq!(removed.map(|r| r.file_id).as_deref(), Some("7"));
         assert_eq!(
             store
                 .remove_subtitle_download("d1", "local:1")
@@ -377,14 +377,14 @@ mod tests {
                 .subtitle_rejections("plex:movie:1", "opensubtitles")
                 .await
                 .unwrap(),
-            [7]
+            ["7"]
         );
         assert_eq!(
             store.subtitle_downloads_today("local:1").await.unwrap(),
             [now]
         );
         store
-            .put_subtitle_download(&download("d3", 7, "local:2", now))
+            .put_subtitle_download(&download("d3", "7", "local:2", now))
             .await
             .unwrap();
         assert!(
@@ -396,12 +396,106 @@ mod tests {
         );
     }
 
+    /// SubDL's ids are text; one site's id is not another's.
+    #[tokio::test]
+    async fn a_subdl_id_is_kept_as_it_is_and_apart_from_opensubtitles() {
+        let store = test_store("subtitle-downloads-subdl").await;
+        let now = store.now();
+        let mut subdl = download("d1", "3172974-3188291", "local:1", now);
+        subdl.source = "subdl".into();
+        store.put_subtitle_download(&subdl).await.unwrap();
+        store
+            .put_subtitle_download(&download("d2", "3172974-3188291", "local:1", now))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .subtitle_download_of("plex:movie:1", "subdl", "3172974-3188291")
+                .await
+                .unwrap(),
+            Some(subdl)
+        );
+        store
+            .remove_subtitle_download("d1", "local:1")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .subtitle_rejections("plex:movie:1", "subdl")
+                .await
+                .unwrap(),
+            ["3172974-3188291"]
+        );
+        assert!(
+            store
+                .subtitle_rejections("plex:movie:1", "opensubtitles")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Migration 0037 keeps the downloads and rejections 0036 made, their
+    /// OpenSubtitles ids as text, in their order.
+    #[tokio::test]
+    async fn the_migration_keeps_every_download_its_id_as_text() {
+        let dir = super::super::tests::state_dir("subtitle-ids-as-text").await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.as_ref().join(super::super::DB_FILE))
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = before
+            .iter()
+            .filter(|m| m.version < 37)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        before.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO subtitle_downloads (id, media_id, media_path, source, file_id, \
+               language, release, format, hearing_impaired, origin, hash_match, \
+               downloaded_by, downloaded_name, downloaded_at) VALUES \
+               ('b', 'plex:movie:1', '/f.mkv', 'opensubtitles', 5338574, 'en', 'R', 'srt', \
+                0, 'human', 0, 'local:1', 'Alice', 5), \
+               ('a', 'plex:movie:1', '/f.mkv', 'opensubtitles', 42, 'en', 'R', 'srt', \
+                0, 'human', 0, 'local:1', 'Alice', 5); \
+             INSERT INTO subtitle_rejections (media_id, source, file_id, rejected_by, \
+               rejected_at) VALUES ('plex:movie:1', 'opensubtitles', 7, 'local:1', 6);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        let kept = store.subtitle_downloads("plex:movie:1").await.unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|r| (r.id.as_str(), r.file_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("b", "5338574"), ("a", "42")]
+        );
+        assert_eq!(
+            store
+                .subtitle_rejections("plex:movie:1", "opensubtitles")
+                .await
+                .unwrap(),
+            ["7"]
+        );
+    }
+
     #[tokio::test]
     async fn a_day_later_a_download_no_longer_counts() {
         let store = test_store("subtitle-downloads-day").await;
         let now = store.now();
         store
-            .put_subtitle_download(&download("d1", 7, "local:1", now))
+            .put_subtitle_download(&download("d1", "7", "local:1", now))
             .await
             .unwrap();
         store

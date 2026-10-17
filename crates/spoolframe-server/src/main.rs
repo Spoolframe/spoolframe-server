@@ -988,8 +988,8 @@ async fn run(
             )
         })?,
     );
-    // Subtitles from OpenSubtitles on demand (PX-02): each file gets back
-    // what was downloaded for it.
+    // Subtitles from OpenSubtitles and SubDL on demand (PX-02): each file
+    // gets back what was downloaded for it.
     let subtitle_downloads = Arc::new(
         SubtitleDownloads::new(
             store.clone(),
@@ -997,7 +997,7 @@ async fn run(
             prober.clone(),
             subtitle_timings.clone(),
             sync_settings.dir.join("downloaded"),
-            config.opensubtitles.settings()?,
+            config.subtitle_downloads()?,
         )
         .with_context(|| {
             format!(

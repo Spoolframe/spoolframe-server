@@ -132,3 +132,10 @@ path = "fuzz_targets/subtitle_download.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "subtitle_archive"
+path = "fuzz_targets/subtitle_archive.rs"
+test = false
+doc = false
+bench = false

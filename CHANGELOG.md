@@ -47,6 +47,33 @@
   (already in the tree), both pure Rust. A new fuzz target,
   `subtitle_download`, checks a downloaded file as the server does.
 
+- SubDL as a second subtitle site (PX-02), beside OpenSubtitles. The
+  admin picks the sites in Settings › Subtitles: OpenSubtitles, SubDL or
+  both (`subtitles.sources = ["opensubtitles", "subdl"]`, both if left
+  out; a site without its key is off). `subdl { api_key; languages; }`,
+  the key a `${SF_ENV_…}` reference as OpenSubtitles' is. With both on,
+  one search asks both at once and lists their results as one, each
+  marked with its site (`SubtitleResult::source`); a site that fails or
+  is out of quota leaves the other's results, and
+  `SubtitleSearch::sources` says how each site's part went (`found`,
+  `quota_exhausted`, `rate_limited`, `failed`). A result is named by its
+  site and the site's id, `SubtitleResult::id` (`opensubtitles:5338574`,
+  `subdl:3172974-3188291`), which `DownloadSubtitle { id, result }`
+  takes; `SubtitleDownload::source` is the site's id. `QuotaExhausted`
+  says which site's account ran out (`site`). SubDL's file comes as a
+  zip archive: it is opened in memory with a pure-Rust reader, its size,
+  entries and names checked, and its one SRT, WebVTT or ASS taken (a
+  season pack's, the episode's), then checked as any download, and
+  synced. The daily limit per user is every site's,
+  `subtitles.daily_limit_per_user` (`opensubtitles.daily_limit_per_user`
+  is still read when it is unset). SDK: `Session::download_subtitle`
+  takes the result's id. Admin API: `admin.subtitleDownload` takes
+  `result`; `QUOTA_EXHAUSTED`'s data has `site`. CLI: `spoolframe-server
+  subtitle download <id> <result>`, and the search lists a site that
+  failed. Migration 0037 keeps a site's file id as text. New dependency:
+  `zip` (MIT), read only, deflate by the tree's `flate2`. A new fuzz
+  target, `subtitle_archive`, opens an archive as the server does.
+
 - Subtitle sync and offset (PX-03). A subtitle file beside a film (SRT,
   WebVTT, ASS) that was made for another release can be synced to the
   file, for every user who plays it: its cues are aligned with alass's

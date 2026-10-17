@@ -120,8 +120,9 @@ pub enum SettingError {
          instead (kept apart from the settings)"
     )]
     PlainSecret { provider: String },
-    /// OpenSubtitles' key or password for the runtime layer that is the
-    /// secret itself (PX-02), as [`SettingError::PlainSecret`].
+    /// OpenSubtitles' key or password, or SubDL's key, for the runtime
+    /// layer that is the secret itself (PX-02), as
+    /// [`SettingError::PlainSecret`].
     #[error(
         "{key} must be an environment variable, ${{SF_ENV_<NAME>}}: the runtime settings \
          are plain text, shown by config show and copied with the state directory"
@@ -500,6 +501,7 @@ impl Layers {
         for key in [
             settings::OPENSUBTITLES_API_KEY,
             settings::OPENSUBTITLES_PASSWORD,
+            settings::SUBDL_API_KEY,
         ] {
             if let Some(Value::String(s)) = tree::get(&self.runtime, key)
                 && !tree::is_env_reference(s)
@@ -1137,13 +1139,15 @@ mod tests {
         );
     }
 
-    /// PX-02: OpenSubtitles' key and password, as an OIDC secret.
+    /// PX-02: OpenSubtitles' key and password, and SubDL's key, as an
+    /// OIDC secret.
     #[test]
     fn the_runtime_layer_takes_an_opensubtitles_key_only_as_an_sf_env_reference() {
         let layers = layers(None, None).unwrap();
         for key in [
             settings::OPENSUBTITLES_API_KEY,
             settings::OPENSUBTITLES_PASSWORD,
+            settings::SUBDL_API_KEY,
         ] {
             let refused = layers
                 .with_set(key, Value::String("hunter2".into()))
@@ -1176,16 +1180,12 @@ mod tests {
             (name == "SF_ENV_PX02_KEY").then(|| "abc".to_owned())
         })
         .unwrap();
-        assert_eq!(
-            config
-                .opensubtitles
-                .settings()
-                .unwrap()
-                .unwrap()
-                .account
-                .api_key,
-            "abc"
-        );
+        let Some(crate::subtitle_downloads::SiteSettings::OpenSubtitles { account, .. }) =
+            config.opensubtitles.settings().unwrap()
+        else {
+            panic!("OpenSubtitles is on")
+        };
+        assert_eq!(account.api_key, "abc");
     }
 
     #[test]

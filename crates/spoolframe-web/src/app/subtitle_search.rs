@@ -1,8 +1,9 @@
-//! Subtitles from OpenSubtitles on demand (PX-02), the web UI's part of
-//! rollout stage 1: on a film's or an episode's page, its downloaded
-//! subtitles (who downloaded each, its sync, Remove) and "Find
-//! subtitles…" with the results; Settings › Subtitles, the key and the
-//! account; and on a user's page, whether they may download.
+//! Subtitles from OpenSubtitles and SubDL on demand (PX-02), the web UI's
+//! part of rollout stage 1: on a film's or an episode's page, its
+//! downloaded subtitles (who downloaded each, its sync, Remove) and "Find
+//! subtitles…" with the results, each marked with its site; Settings ›
+//! Subtitles, the sites searched and their keys; and on a user's page,
+//! whether they may download.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
@@ -17,8 +18,8 @@ use super::wizard::{
 use super::{icons, rpc};
 use crate::logic::ApiError;
 use crate::subtitle_search::{
-    details, downloaded_by, downloaded_line, downloads, languages_value, marks, refusal,
-    secret_reference,
+    SOURCES, details, downloaded_by, downloaded_line, downloads, languages_value, marks, refusal,
+    secret_reference, source_lines, source_name, sources_on, sources_value,
 };
 use crate::subtitle_timing::{any_syncing, sync_text};
 
@@ -63,7 +64,7 @@ pub(super) fn SubtitlesCard(id: String) -> Element {
         section { class: "card",
             div { class: "card-head",
                 h2 { "Subtitles" }
-                span { class: "text-xs text-ctp-subtext0", "From OpenSubtitles, for everyone" }
+                span { class: "text-xs text-ctp-subtext0", "From OpenSubtitles or SubDL, for everyone" }
             }
             div { class: "dbg-rows",
                 for row in rows.iter() {
@@ -182,7 +183,7 @@ fn Finder(id: String, toast: Signal<Option<Said>>, on_downloaded: EventHandler<(
     rsx! {
         div { class: "flex flex-col gap-3",
             p { class: "m-0 text-sm text-ctp-subtext0",
-                "Searching sends OpenSubtitles this file's hash and the item's IDs. A download counts against the server's account."
+                "Searching sends the subtitle sites set up the item's IDs, and OpenSubtitles this file's hash. A download counts against the server's account at its site."
             }
             div { class: "flex flex-wrap items-center gap-2",
                 label { class: "flex items-center gap-1 text-sm",
@@ -203,13 +204,16 @@ fn Finder(id: String, toast: Signal<Option<Said>>, on_downloaded: EventHandler<(
                 p { class: "m-0 text-sm text-ctp-red", "{why}" }
             }
             if let Some(found) = rows {
+                for line in source_lines(&found, super::now()) {
+                    p { key: "{line}", class: "m-0 text-sm text-ctp-yellow", "{line}" }
+                }
                 if found.results.is_empty() {
                     p { class: "m-0 text-sm text-ctp-subtext0", "Nothing found in {found.languages.join(\", \")}." }
                 }
                 div { class: "dbg-rows",
                     for result in found.results.iter() {
                         ResultRow {
-                            key: "{result.file_id}",
+                            key: "{result.id}",
                             id: id.clone(),
                             result: result.clone(),
                             toast,
@@ -233,15 +237,16 @@ fn ResultRow(
 ) -> Element {
     let mut busy = use_signal(|| false);
     let mut done = use_signal(|| result.downloaded);
-    let file_id = result.file_id;
+    let result_id = result.id.clone();
     let get = move |_| {
         let id = id.clone();
+        let result_id = result_id.clone();
         busy.set(true);
         spawn(async move {
             let got = async {
                 let client = rpc::client().await?;
                 client
-                    .subtitle_download(id, file_id)
+                    .subtitle_download(id, result_id)
                     .await
                     .map_err(rpc::error)
             };
@@ -280,11 +285,12 @@ fn ResultRow(
     }
 }
 
-/// Settings › Subtitles: OpenSubtitles' key, account, languages and the
-/// daily limit per user. The key and the password are the names of the
-/// server's environment variables that hold them, never the secrets.
+/// Settings › Subtitles: which subtitle sites are searched, the daily
+/// limit per user, and each site's key and languages (OpenSubtitles' its
+/// account too). A key and a password are the names of the server's
+/// environment variables that hold them, never the secrets.
 #[component]
-pub fn OpenSubtitlesForm(on_done: EventHandler<()>) -> Element {
+pub fn SubtitleSitesForm(on_done: EventHandler<()>) -> Element {
     let mut generation = use_signal(|| 0u32);
     let settings = use_resource(move || async move {
         let _ = generation();
@@ -299,7 +305,7 @@ pub fn OpenSubtitlesForm(on_done: EventHandler<()>) -> Element {
     };
     rsx! {
         for g in [generation()] {
-            OpenSubtitlesFields {
+            SubtitleSiteFields {
                 key: "{g}",
                 settings: loaded.clone(),
                 on_done,
@@ -309,14 +315,19 @@ pub fn OpenSubtitlesForm(on_done: EventHandler<()>) -> Element {
     }
 }
 
+const SOURCES_KEY: &str = "subtitles.sources";
+const LIMIT: &str = "subtitles.daily_limit_per_user";
+/// Where the limit was before SubDL: shown while the new one is unset.
+const OLD_LIMIT: &str = "opensubtitles.daily_limit_per_user";
 const API_KEY: &str = "opensubtitles.api_key";
 const USERNAME: &str = "opensubtitles.username";
 const PASSWORD: &str = "opensubtitles.password";
 const LANGUAGES: &str = "opensubtitles.languages";
-const LIMIT: &str = "opensubtitles.daily_limit_per_user";
+const SUBDL_KEY: &str = "subdl.api_key";
+const SUBDL_LANGUAGES: &str = "subdl.languages";
 
 #[component]
-fn OpenSubtitlesFields(
+fn SubtitleSiteFields(
     settings: Settings,
     on_done: EventHandler<()>,
     on_reload: EventHandler<()>,
@@ -324,35 +335,51 @@ fn OpenSubtitlesFields(
     let s = &settings;
     let key_set = entry(s, API_KEY).is_some_and(|e| e.set);
     let password_set = entry(s, PASSWORD).is_some_and(|e| e.set);
+    let subdl_key_set = entry(s, SUBDL_KEY).is_some_and(|e| e.set);
+    let mut sources = use_signal(|| sources_on(value(s, SOURCES_KEY)));
     let api_key = use_signal(String::new);
     let username = use_signal(|| text(s, USERNAME));
     let password = use_signal(String::new);
-    let languages = use_signal(|| {
-        value(s, LANGUAGES)
+    let list = |key| {
+        value(s, key)
             .map(super::wizard::strings)
             .unwrap_or_default()
             .join(", ")
+    };
+    let languages = use_signal(|| list(LANGUAGES));
+    let subdl_key = use_signal(String::new);
+    let subdl_languages = use_signal(|| list(SUBDL_LANGUAGES));
+    let limit = use_signal(|| {
+        let now = text(s, LIMIT);
+        if now.is_empty() {
+            text(s, OLD_LIMIT)
+        } else {
+            now
+        }
     });
-    let limit = use_signal(|| text(s, LIMIT));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
-    // The key and the account are sensitive: from an old session,
+    // The keys and the account are sensitive: from an old session,
     // "Confirm it's you" first, then the save again.
     let confirming = use_signal(|| None::<String>);
     let saved = settings.clone();
     let on_save = use_callback(move |()| {
         let s = saved.clone();
         let changes = (|| -> Result<Vec<(&'static str, Option<serde_json::Value>)>, String> {
-            let mut changes = Vec::new();
+            let mut changes = vec![(SOURCES_KEY, Some(sources_value(sources())))];
             // A secret's field left empty keeps the one set.
-            if let Some(key) = secret_reference("API key", &api_key())? {
+            if let Some(key) = secret_reference("OpenSubtitles' API key", &api_key())? {
                 changes.push((API_KEY, Some(key)));
             }
             if let Some(pw) = secret_reference("Password", &password())? {
                 changes.push((PASSWORD, Some(pw)));
             }
+            if let Some(key) = secret_reference("SubDL's API key", &subdl_key())? {
+                changes.push((SUBDL_KEY, Some(key)));
+            }
             changes.push((USERNAME, super::wizard::typed(&username())));
             changes.push((LANGUAGES, languages_value(&languages())));
+            changes.push((SUBDL_LANGUAGES, languages_value(&subdl_languages())));
             changes.push((LIMIT, number("The daily limit", &limit())?));
             Ok(changes)
         })();
@@ -370,7 +397,7 @@ fn OpenSubtitlesFields(
                     error.set(None);
                     on_done.call(());
                 }
-                Err(e) if asks_to_confirm(&e, confirming, "changing OpenSubtitles") => {}
+                Err(e) if asks_to_confirm(&e, confirming, "changing the subtitle sites") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
@@ -387,26 +414,54 @@ fn OpenSubtitlesFields(
             };
             match unset.await {
                 Ok(_) => on_reload.call(()),
-                Err(e) if asks_to_confirm(&e, confirming, "changing OpenSubtitles") => {}
+                Err(e) if asks_to_confirm(&e, confirming, "changing the subtitle sites") => {}
                 Err(e) => error.set(Some(e.explain())),
             }
         });
     };
+    let set_hint = "Set. Type another to replace it.";
     let key_hint = if key_set {
-        "Set. Type another to replace it."
+        set_hint
     } else {
         "${SF_ENV_OPENSUBTITLES_KEY}"
     };
     let password_hint = if password_set {
-        "Set. Type another to replace it."
+        set_hint
     } else {
         "${SF_ENV_OPENSUBTITLES_PASSWORD}"
     };
+    let subdl_hint = if subdl_key_set {
+        set_hint
+    } else {
+        "${SF_ENV_SUBDL_KEY}"
+    };
     rsx! {
         p { class: "m-0 text-sm text-ctp-subtext0",
-            "Subtitles are searched and downloaded from OpenSubtitles only when someone asks, on an item's page or in an app, and kept for everyone. "
-            "Searching sends OpenSubtitles the file's hash and the item's IDs. Without an API key it is off."
+            "Subtitles are searched and downloaded from OpenSubtitles, SubDL or both only when someone asks, on an item's page or in an app, and kept for everyone. "
+            "Searching sends each site the item's IDs, and OpenSubtitles the file's hash. A site without its API key is off."
         }
+        fieldset { class: "flex flex-col gap-1.5 border-0 p-0 m-0",
+            legend { class: "mb-1 text-sm font-semibold", "Sites searched" }
+            for (at, id) in SOURCES.iter().enumerate() {
+                label { key: "{id}", class: "flex items-center gap-2 text-sm",
+                    input {
+                        r#type: "checkbox",
+                        checked: sources()[at],
+                        disabled: locked(s, SOURCES_KEY),
+                        onchange: move |e| sources.write()[at] = e.checked(),
+                    }
+                    "{source_name(id)}"
+                }
+            }
+            span { class: "text-xs text-ctp-subtext0", "Both at once, as one list. Viewers do not choose." }
+            Note { settings: settings.clone(), setting: SOURCES_KEY, on_changed: move |_| on_reload.call(()) }
+        }
+        div { class: "flex flex-col gap-1.5",
+            super::Field { label: "Downloads a day per user", value: limit, kind: "number", placeholder: "0", disabled: locked(s, LIMIT) }
+            span { class: "text-xs text-ctp-subtext0", "From every site. 0 for no limit. An admin can turn downloads off for a user on their page." }
+            Note { settings: settings.clone(), setting: LIMIT, on_changed: move |_| on_reload.call(()) }
+        }
+        h3 { class: "m-0 text-sm font-semibold", "OpenSubtitles" }
         div { class: "flex flex-col gap-1.5",
             super::Field { label: "API key", value: api_key, placeholder: key_hint, disabled: locked(s, API_KEY) }
             span { class: "text-xs text-ctp-subtext0",
@@ -436,10 +491,20 @@ fn OpenSubtitlesFields(
             span { class: "text-xs text-ctp-subtext0", "Searched first, in order: en, pt-BR." }
             Note { settings: settings.clone(), setting: LANGUAGES, on_changed: move |_| on_reload.call(()) }
         }
+        h3 { class: "m-0 text-sm font-semibold", "SubDL" }
         div { class: "flex flex-col gap-1.5",
-            super::Field { label: "Downloads a day per user", value: limit, kind: "number", placeholder: "0", disabled: locked(s, LIMIT) }
-            span { class: "text-xs text-ctp-subtext0", "0 for no limit. An admin can turn downloads off for a user on their page." }
-            Note { settings: settings.clone(), setting: LIMIT, on_changed: move |_| on_reload.call(()) }
+            super::Field { label: "API key", value: subdl_key, placeholder: subdl_hint, disabled: locked(s, SUBDL_KEY) }
+            span { class: "text-xs text-ctp-subtext0",
+                "From your account's panel at subdl.com, as an environment variable of the server, ${{SF_ENV_NAME}}. "
+                if subdl_key_set {
+                    button { class: "btn-plain", onclick: move |_| forget(SUBDL_KEY), "Take it out" }
+                }
+            }
+            Note { settings: settings.clone(), setting: SUBDL_KEY, on_changed: move |_| on_reload.call(()) }
+        }
+        div { class: "flex flex-col gap-1.5",
+            super::Field { label: "Languages", value: subdl_languages, placeholder: "en", disabled: locked(s, SUBDL_LANGUAGES) }
+            Note { settings: settings.clone(), setting: SUBDL_LANGUAGES, on_changed: move |_| on_reload.call(()) }
         }
         if let Some(text) = error() {
             super::Alert { text }
@@ -501,7 +566,7 @@ pub(super) fn UserSubtitleDownloads(
                         aria_label: "May download subtitles",
                         onclick: flip,
                     }
-                    "May download subtitles from OpenSubtitles"
+                    "May download subtitles from the subtitle sites"
                 }
                 span { class: "note", "Searching stays theirs either way." }
             }

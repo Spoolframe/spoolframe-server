@@ -119,6 +119,8 @@ webauthn-authenticator-rs = { workspace = true }
 chrono = { workspace = true }
 # A CP-1251 subtitle for the download tests (PX-02).
 encoding_rs = { workspace = true }
+# SubDL's archives, made in tests (PX-02).
+zip = { workspace = true }
 # PGS tracks for the OCR tests.
 spoolframe-media = { workspace = true, features = ["fixtures"] }
 # A self-signed certificate for the own relay's TLS from files (P6-04).

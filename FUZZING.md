@@ -29,7 +29,8 @@ the dev shell to fuzz.
 | `keyframe_index` | a media file's own keyframe index: Matroska `Cues`, MP4 `stss` (PX-25) | `spoolframe-media` `keyframe_index.rs` |
 | `picture_header` | an uploaded playlist cover's header: its format (JPEG, PNG, WebP, HEIC) and size, read before anything is decoded (PX-53) | `spoolframe-media` `picture.rs` |
 | `subtitle_text` | a text subtitle (SRT, WebVTT, ASS) whose cue times are read and rewritten to sync it; the first byte picks the format (PX-03) | `spoolframe-media` `subsync/text.rs` |
-| `subtitle_download` | a subtitle downloaded from OpenSubtitles, in any encoding, made UTF-8 and its cues read before it is kept (PX-02) | `spoolframe-media` `subtitle_file.rs` |
+| `subtitle_download` | a subtitle downloaded from OpenSubtitles or SubDL, in any encoding, made UTF-8 and its cues read before it is kept (PX-02) | `spoolframe-media` `subtitle_file.rs` |
+| `subtitle_archive` | a zip archive SubDL sent, its one subtitle taken out with its size, entries and names checked (PX-02); the first byte picks the episode looked for | `spoolframe-media` `subtitle_file.rs` |
 
 The `dvb` and `vobsub` inputs are packets framed as `u16 LE length, u32 LE pts
 in ms, data`. A VobSub input starts with a `u16 LE` length and that much `.idx`
@@ -65,6 +66,15 @@ sent: its encoding guessed and decoded (`chardetng`, `encoding_rs`), its
 format read from its text, its cues read. It checks that what is kept is
 UTF-8 and reads back with as many cues. The site's JSON is read by serde
 into typed structs, not by a parser of the server's own.
+
+`subtitle_archive` runs on the zip archive SubDL sends a subtitle in. The
+archive is read by the `zip` crate (deflate by `flate2` and `zlib-rs`, no
+other method) in memory: at most 8 MB of it and 64 entries, an entry whose
+name is absolute or climbs out refuses the whole archive, only an SRT,
+WebVTT or ASS entry is taken, and it is read one byte past the 8 MB cap so
+a size the archive lies about cannot make it read more. It checks that
+what is taken out is within the cap, and that what is kept of it is
+UTF-8.
 
 ## Running
 

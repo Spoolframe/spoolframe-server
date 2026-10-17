@@ -3152,7 +3152,7 @@ fn subtitle_timing_round_trips() {
 fn subtitle_search_round_trips() {
     use spoolframe_types::{
         QuotaOf, SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch,
-        SubtitleTrack,
+        SubtitleSourceState, SubtitleSourceStatus, SubtitleTrack,
     };
     let id = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
     for (request, wait) in [
@@ -3173,7 +3173,7 @@ fn subtitle_search_round_trips() {
         (
             Request::DownloadSubtitle {
                 id: id.clone(),
-                file_id: 1_234_567,
+                result: "subdl:3172974-3188291".into(),
             },
             crate::policy::wait::SUBTITLE_SITE,
         ),
@@ -3195,7 +3195,8 @@ fn subtitle_search_round_trips() {
     round_trip(Response::Ok(Reply::SubtitleResults(SubtitleSearch {
         languages: vec!["en".into()],
         results: vec![SubtitleResult {
-            file_id: 1_234_567,
+            id: "opensubtitles:1234567".into(),
+            source: "opensubtitles".into(),
             release: "Film.2019.1080p.BluRay".into(),
             language: "en".into(),
             format: Some("srt".into()),
@@ -3208,7 +3209,46 @@ fn subtitle_search_round_trips() {
             rejected: false,
             downloaded: false,
         }],
+        sources: vec![
+            SubtitleSourceStatus {
+                source: "opensubtitles".into(),
+                state: SubtitleSourceState::Found { found: 1 },
+            },
+            SubtitleSourceStatus {
+                source: "subdl".into(),
+                state: SubtitleSourceState::QuotaExhausted { resets_at: None },
+            },
+            SubtitleSourceStatus {
+                source: "subdl".into(),
+                state: SubtitleSourceState::RateLimited {
+                    retry_after_ms: 1_000,
+                },
+            },
+            SubtitleSourceStatus {
+                source: "subdl".into(),
+                state: SubtitleSourceState::Failed {
+                    message: "SubDL cannot be reached".into(),
+                },
+            },
+        ],
     })));
+    // A site's state this build does not know reads as Unknown.
+    let later: SubtitleSourceStatus = serde_json::from_value(serde_json::json!({
+        "source": "subdl",
+        "state": "paused",
+        "until": 5,
+    }))
+    .unwrap();
+    assert_eq!(later.state, SubtitleSourceState::Unknown);
+    let found = serde_json::to_value(SubtitleSourceStatus {
+        source: "subdl".into(),
+        state: SubtitleSourceState::Found { found: 12 },
+    })
+    .unwrap();
+    assert_eq!(
+        found,
+        serde_json::json!({ "source": "subdl", "state": "found", "found": 12 })
+    );
     round_trip(Response::Ok(Reply::SubtitleDownloaded(
         SubtitleDownloaded {
             track: 3,
@@ -3229,6 +3269,12 @@ fn subtitle_search_round_trips() {
     round_trip(Response::Err(Error::QuotaExhausted {
         whose: QuotaOf::Account,
         resets_at: Some(1_760_000_000),
+        site: Some("subdl".into()),
+    }));
+    round_trip(Response::Err(Error::QuotaExhausted {
+        whose: QuotaOf::User,
+        resets_at: None,
+        site: None,
     }));
     round_trip(Response::Err(Error::NoSubtitleSource));
 }

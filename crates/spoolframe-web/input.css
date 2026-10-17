@@ -970,6 +970,12 @@
     background: color-mix(in srgb, var(--ctp-red) 16%, transparent);
     color: var(--ctp-red);
   }
+  /* The site a subtitle search result is from (PX-02): OpenSubtitles,
+     SubDL. */
+  .pill-source {
+    background: color-mix(in srgb, var(--ctp-blue) 16%, transparent);
+    color: var(--ctp-blue);
+  }
   /* How many identities open the account (P7-09), by its name. */
   .pill-tie {
     display: inline-flex;

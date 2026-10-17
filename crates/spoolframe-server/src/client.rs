@@ -2985,14 +2985,14 @@ impl ClientProtocol {
                 .await
                 .map(Reply::SubtitleResults)
                 .map_err(download_error),
-            Request::DownloadSubtitle { id, file_id } => {
+            Request::DownloadSubtitle { id, result } => {
                 let asker = crate::subtitle_downloads::Asker {
                     actor: who.actor(),
                     name: who.display_name().to_owned(),
                 };
                 self.services
                     .subtitle_downloads
-                    .download(&id, file_id, &asker)
+                    .download(&id, &result, &asker)
                     .await
                     .map(Reply::SubtitleDownloaded)
                     .map_err(download_error)
@@ -6281,30 +6281,36 @@ fn conversion_error(e: JobError) -> Error {
 /// (PX-02). The site's own words go to the log: they may name the
 /// account.
 fn download_error(e: crate::subtitle_downloads::DownloadError) -> Error {
-    use crate::opensubtitles::SiteError;
     use crate::subtitle_downloads::DownloadError;
+    use crate::subtitle_site::SiteError;
     match e {
         DownloadError::NoSource => Error::NoSubtitleSource,
         DownloadError::NotFound(what) => Error::NotFound { what: what.into() },
         DownloadError::NotAllowed(_) => Error::NotAllowed,
-        DownloadError::QuotaExhausted { whose, resets_at } => {
-            Error::QuotaExhausted { whose, resets_at }
-        }
-        DownloadError::InvalidInput(message) => Error::InvalidInput { message },
-        DownloadError::Site(SiteError::RateLimited { retry_after_ms }) => {
-            Error::RateLimited { retry_after_ms }
-        }
-        DownloadError::Site(SiteError::QuotaExhausted { resets_at }) => Error::QuotaExhausted {
-            whose: spoolframe_types::QuotaOf::Account,
+        DownloadError::QuotaExhausted {
+            whose,
             resets_at,
+            site,
+        } => Error::QuotaExhausted {
+            whose,
+            resets_at,
+            site: site.map(|s| s.id().into()),
         },
-        DownloadError::Site(e @ SiteError::Refused { .. }) => {
-            tracing::warn!(error = %e, "OpenSubtitles refused the server; check its API key and account");
+        DownloadError::InvalidInput(message) => Error::InvalidInput { message },
+        DownloadError::Site {
+            error: SiteError::RateLimited { retry_after_ms },
+            ..
+        } => Error::RateLimited { retry_after_ms },
+        DownloadError::Site {
+            site: source,
+            error: e @ SiteError::Refused { .. },
+        } => {
+            tracing::warn!(%source, error = %e, "a subtitle site refused the server; check its API key and account");
             Error::Unavailable {
-                message: "OpenSubtitles refused the server's request".into(),
+                message: format!("{source} refused the server's request"),
             }
         }
-        DownloadError::Site(e) => {
+        e @ DownloadError::Site { .. } => {
             tracing::warn!(error = %e, "a subtitle search or download failed");
             Error::Unavailable {
                 message: e.to_string(),

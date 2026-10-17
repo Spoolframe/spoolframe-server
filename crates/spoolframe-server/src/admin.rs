@@ -1593,12 +1593,16 @@ fn recent(user: &ApiSessionUser, now: i64) -> RpcResult<()> {
 /// plain HTTP, and `address` is the host in every URL apps are given,
 /// each carrying a playback's token, so whoever names it is sent them.
 /// And MCP (`mcp.*`, PX-42): it opens an authorization server through
-/// which apps get tokens that act for users. And OpenSubtitles
-/// (`opensubtitles.*`, PX-02): the key and the account the server signs in
-/// with, each a reference to one of its environment variables.
+/// which apps get tokens that act for users. And the subtitle sites
+/// (`opensubtitles.*`, `subdl.*`, `subtitles.sources`, PX-02): the keys
+/// and the account the server signs in with, each a reference to one of
+/// its environment variables, and which sites are sent the items'
+/// ids and file hashes.
 fn sensitive_setting(key: &str) -> bool {
     key.starts_with("admin.")
         || key.starts_with("opensubtitles.")
+        || key.starts_with("subdl.")
+        || key == "subtitles.sources"
         || key.starts_with("mcp.")
         || key.starts_with("http_playback.")
         || key.starts_with("auth.")
@@ -4211,7 +4215,7 @@ impl AdminApiServer for AdminApi {
         &self,
         ext: &Extensions,
         id: String,
-        file_id: u64,
+        result: String,
     ) -> RpcResult<spoolframe_types::SubtitleDownloaded> {
         let admin = self.admin(ext).await?;
         let id = catalog::media_id(&id)?;
@@ -4221,7 +4225,7 @@ impl AdminApiServer for AdminApi {
         };
         self.playback_debug()?
             .subtitle_downloads
-            .download(&id, file_id, &asker)
+            .download(&id, &result, &asker)
             .await
             .map_err(download_error)
     }
@@ -4296,37 +4300,49 @@ fn admin_actor(admin: &ApiSessionUser) -> crate::principal::Actor {
 
 /// A subtitle search, download or removal refused (PX-02).
 fn download_error(e: crate::subtitle_downloads::DownloadError) -> ErrorObjectOwned {
-    use crate::opensubtitles::SiteError;
     use crate::subtitle_downloads::DownloadError;
+    use crate::subtitle_site::SiteError;
     match e {
         DownloadError::NoSource => error(
             error_code::NOT_CONFIGURED,
-            "OpenSubtitles is not set up: give it an API key in Settings › Subtitles",
+            "no subtitle site is set up: give OpenSubtitles or SubDL an API key in \
+             Settings › Subtitles",
         ),
         DownloadError::NotFound(what) => {
             error(error_code::INVALID_INPUT, format!("{what} not found"))
         }
         DownloadError::NotAllowed(why) => error(error_code::NOT_ALLOWED, why),
-        DownloadError::QuotaExhausted { whose, resets_at } => ErrorObjectOwned::owned(
+        DownloadError::QuotaExhausted {
+            whose,
+            resets_at,
+            site,
+        } => ErrorObjectOwned::owned(
             error_code::QUOTA_EXHAUSTED,
-            match whose {
-                spoolframe_types::QuotaOf::User => "you have no subtitle downloads left today",
-                _ => "the server's OpenSubtitles account has no downloads left today",
+            match (whose, site) {
+                (spoolframe_types::QuotaOf::User, _) => {
+                    "you have no subtitle downloads left today".to_owned()
+                }
+                (_, Some(site)) => {
+                    format!("the server's {site} account has no downloads left today")
+                }
+                (_, None) => "the server's subtitle account has no downloads left today".to_owned(),
             },
-            Some(serde_json::json!({ "whose": whose, "resetsAt": resets_at })),
+            Some(serde_json::json!({
+                "whose": whose,
+                "resetsAt": resets_at,
+                "site": site.map(|s| s.id()),
+            })),
         ),
         DownloadError::InvalidInput(why) => error(error_code::INVALID_INPUT, why),
-        DownloadError::Site(SiteError::RateLimited { retry_after_ms }) => ErrorObjectOwned::owned(
+        DownloadError::Site {
+            site: source,
+            error: SiteError::RateLimited { retry_after_ms },
+        } => ErrorObjectOwned::owned(
             error_code::RATE_LIMITED,
-            "OpenSubtitles asks to wait before the next request",
+            format!("{source} asks to wait before the next request"),
             Some(serde_json::json!({ "retryAfterMs": retry_after_ms })),
         ),
-        DownloadError::Site(SiteError::QuotaExhausted { resets_at }) => ErrorObjectOwned::owned(
-            error_code::QUOTA_EXHAUSTED,
-            "the server's OpenSubtitles account has no downloads left today",
-            Some(serde_json::json!({ "whose": "account", "resetsAt": resets_at })),
-        ),
-        DownloadError::Site(e) => error(error_code::UNAVAILABLE, e.to_string()),
+        e @ DownloadError::Site { .. } => error(error_code::UNAVAILABLE, e.to_string()),
         DownloadError::Catalog(e) => catalog::catalog_error(e),
         DownloadError::Unavailable(why) => error(error_code::UNAVAILABLE, why),
         DownloadError::Io(why) => {

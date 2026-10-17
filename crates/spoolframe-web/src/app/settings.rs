@@ -10,7 +10,7 @@ use super::experimental::ExperimentalForm;
 use super::remote::{McpForm, RemoteAccessForm};
 use super::restart::PendingRestart;
 use super::sso::SsoForm;
-use super::subtitle_search::OpenSubtitlesForm;
+use super::subtitle_search::SubtitleSitesForm;
 use super::telemetry::TelemetryForm;
 use super::wizard::{
     AccessForm, MediaToolsForm, Mode, PathsForm, PlaybackForm, PlexForm, SecurityForm, ServerForm,
@@ -202,7 +202,7 @@ pub fn Settings(tab: String) -> Element {
                             "playback" => rsx! { PlaybackForm { key: "{n}", mode: Mode::Settings, on_done } },
                             "access" => rsx! { AccessForm { key: "{n}", mode: Mode::Settings, on_done } },
                             "experimental" => rsx! { ExperimentalForm { key: "{n}", on_done } },
-                            "subtitles" => rsx! { OpenSubtitlesForm { key: "{n}", on_done } },
+                            "subtitles" => rsx! { SubtitleSitesForm { key: "{n}", on_done } },
                             _ => rsx! { p { key: "{n}", "There is no such tab." } },
                         }
                     }
