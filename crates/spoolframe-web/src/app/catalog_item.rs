@@ -191,7 +191,7 @@ fn Page(
                 "files" => rsx! { Files { seen: seen.clone() } },
                 "artwork" => rsx! { ArtworkTab { id: id.clone(), server: seen.server_name.clone() } },
                 "markers" => rsx! { Markers { markers: markers.clone(), duration: duration_ms(&item), server: seen.server_name.clone() } },
-                "children" => rsx! { Children { library: library.clone(), seen: seen.clone(), client_children: client_children.clone() } },
+                "children" => rsx! { Children { library: library.clone(), seen: seen.clone(), client_children: client_children.clone(), kind } },
                 "debug" => rsx! { super::catalog_debug::DebugTab { id: id.clone() } },
                 _ => rsx! { Overview { seen: seen.clone(), item: item.clone(), library: library.clone() } },
             }
@@ -314,8 +314,11 @@ fn Overview(seen: ItemView, item: Item, library: String) -> Element {
                 if matches!(kind, CatalogKind::Movie | CatalogKind::Episode) {
                     super::subtitle_search::SubtitlesCard { id: item.id().to_string() }
                 }
-                // The playlists holding it (PX-40), as clients list them.
-                super::playlists::HeldInCard { held: crate::playlists::held_in(&seen.reply) }
+                // The playlists holding it (PX-40), as clients list them;
+                // a show's are among its seasons instead.
+                if !crate::playlists::held_as_seasons(kind) {
+                    super::playlists::HeldInCard { held: crate::playlists::held_in(&seen.reply) }
+                }
                 section { class: "card",
                     div { class: "card-head",
                         h2 { "External IDs" }
@@ -612,16 +615,49 @@ fn Markers(markers: Vec<Marker>, duration: Option<u64>, server: String) -> Eleme
     }
 }
 
+/// A playlist holding some of a show's episodes, as a row of its
+/// seasons: its cover, its name and whose it is, opening the playlist.
 #[component]
-fn Children(library: String, seen: ItemView, client_children: Vec<Item>) -> Element {
+fn HeldRow(held: crate::playlists::HeldIn) -> Element {
+    let line = crate::playlists::held_line(&held);
+    let src = crate::playlists::cover_src(&held.id, held.artwork.as_deref(), "thumb");
+    rsx! {
+        Link { class: "cat-child", to: Route::PlaylistView { id: held.id.clone() },
+            if held.artwork.is_some() {
+                img { class: "cat-thumb cat-thumb-cover", src, alt: "", loading: "lazy" }
+            } else {
+                span { class: "cat-thumb cat-thumb-none", title: "No cover", icons::Film { size: 12 } }
+            }
+            span { class: "flex min-w-0 flex-grow flex-col",
+                b { class: "text-sm", "{held.name}" }
+                span { class: "cat-quiet text-xs", "{line}" }
+            }
+            span { class: "text-ctp-subtext0", icons::ChevronRight { size: 16 } }
+        }
+    }
+}
+
+#[component]
+fn Children(
+    library: String,
+    seen: ItemView,
+    client_children: Vec<Item>,
+    kind: CatalogKind,
+) -> Element {
     let rows = seen.children.clone();
     let checked = matches!(seen.paths, PathsChecked::Checked { .. });
     // An album's tracks the caller liked (PX-43).
     let liked = crate::playlists::liked_children(&seen.reply);
+    // A show's playlists, after its seasons, as a season is shown.
+    let held = if crate::playlists::held_as_seasons(kind) {
+        crate::playlists::held_in(&seen.reply)
+    } else {
+        Vec::new()
+    };
     rsx! {
         section { class: "card",
             div { class: "card-body gap-0 py-0",
-                if rows.is_empty() {
+                if rows.is_empty() && held.is_empty() {
                     p { class: "py-4 text-sm text-ctp-subtext0", "It has none." }
                 }
                 for row in rows.iter().cloned() {
@@ -662,6 +698,9 @@ fn Children(library: String, seen: ItemView, client_children: Vec<Item>) -> Elem
                             }
                         }
                     }
+                }
+                for p in held {
+                    HeldRow { key: "{p.id}", held: p }
                 }
             }
         }

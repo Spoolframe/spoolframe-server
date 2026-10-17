@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A show's playlists are among its seasons, with their covers. An
+  item's list of the playlists holding it now carries each one's
+  picture, `PlaylistRef::artwork` (an uploaded cover, else its mosaic,
+  as `PlaylistSummary::artwork`), for a client that listed
+  `spoolframe:playlist-art`, so a client can show a show's playlists as
+  it shows seasons. The web UI does: on a show's page they are rows
+  after its seasons, each with its cover, its name and whose it is,
+  opening the playlist, in place of the Playlists card (a film's, an
+  album's and an artist's page keep the card).
 - Subtitles from OpenSubtitles on demand (PX-02, the server and the web
   UI). On a film's or an episode's page, "Find subtitles…" searches
   opensubtitles.com by the file's hash and the item's IMDb or TMDB id

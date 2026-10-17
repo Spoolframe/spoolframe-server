@@ -503,6 +503,7 @@ fn every_reply_round_trips() {
                 owner_kind: crate::playlists::PlaylistOwnerKind::SharedWithMe,
                 builtin: None,
                 owner_name: None,
+                artwork: None,
             }]),
             liked: None,
             liked_children: None,
@@ -2971,6 +2972,7 @@ mod playlists {
             owner_kind: PlaylistOwnerKind::SharedWithMe,
             builtin: None,
             owner_name: Some("Carol".into()),
+            artwork: None,
         };
         assert_eq!(serde_json::to_value(&held).unwrap()["owner_name"], "Carol");
         round_trip(held.clone());

@@ -3075,6 +3075,12 @@
     color: var(--ctp-overlay0);
     box-sizing: border-box;
   }
+  /* A playlist's square cover in a poster's place, as a show's seasons
+     list it: whole, not cut to the poster's shape. */
+  .cat-thumb-cover {
+    object-fit: contain;
+    background: transparent;
+  }
   .cat-thumb-head {
     width: 96px;
     height: 144px;

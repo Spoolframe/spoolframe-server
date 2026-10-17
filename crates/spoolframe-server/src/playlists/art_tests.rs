@@ -346,3 +346,45 @@ fn the_protocol_s_limits_are_the_decoder_s() {
         spoolframe_protocol::playlists::MAX_ART_PIXELS
     );
 }
+
+/// A film's page lists the playlists holding it with the pictures their
+/// own pages have: an editor's cover for every viewer, else its mosaic.
+#[tokio::test]
+async fn an_item_s_playlists_carry_their_covers() {
+    let h = harness("holding").await;
+    let film = id(MediaKind::Movie, "1");
+    let plain = h
+        .made(
+            &[film.clone(), id(MediaKind::Movie, "2")],
+            Visibility::Personal,
+        )
+        .await;
+    let covered = h.made(&[film], h.shared_with(&h.bob, false)).await;
+    let cover = h
+        .playlists
+        .set_art(&h.alice, &covered, &picture("tall.png"))
+        .await
+        .unwrap()
+        .artwork
+        .unwrap();
+    let art = |refs: Vec<spoolframe_protocol::playlists::PlaylistRef>| {
+        refs.into_iter()
+            .map(|r| (r.id, r.artwork))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let screen = crate::test_support::movie();
+    let alice = art(h
+        .playlists
+        .holding(&h.alice, &screen, &[], true)
+        .await
+        .unwrap());
+    assert_eq!(alice[&plain], Some(h.art(&h.alice, &plain).await));
+    assert_eq!(alice[&covered], Some(cover.clone()));
+    let bob = art(h
+        .playlists
+        .holding(&h.bob, &screen, &[], true)
+        .await
+        .unwrap());
+    assert_eq!(bob.len(), 1);
+    assert_eq!(bob[&covered], Some(cover));
+}

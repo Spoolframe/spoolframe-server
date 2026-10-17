@@ -2606,7 +2606,7 @@ impl ClientProtocol {
                             .await
                             .map_err(playlists_error)?
                             .into_iter()
-                            .map(|held| named_ref(held, sharing_listed))
+                            .map(|held| named_ref(held, sharing_listed, art_listed))
                             .collect(),
                     )
                 } else {
@@ -6433,14 +6433,19 @@ fn named(
 }
 
 /// An item's playlist reference as a session sees it: whose it is only
-/// for a client that listed `spoolframe:playlist-sharing`, as `named`
-/// does for a summary.
+/// for a client that listed `spoolframe:playlist-sharing`, its picture
+/// only for one that listed `spoolframe:playlist-art`, as `named` does
+/// for a summary.
 fn named_ref(
     mut held: spoolframe_protocol::playlists::PlaylistRef,
     sharing: bool,
+    art: bool,
 ) -> spoolframe_protocol::playlists::PlaylistRef {
     if !sharing {
         held.owner_name = None;
+    }
+    if !art {
+        held.artwork = None;
     }
     held
 }

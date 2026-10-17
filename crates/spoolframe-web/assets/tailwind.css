@@ -3792,6 +3792,10 @@
     color: var(--ctp-overlay0);
     box-sizing: border-box;
   }
+  .cat-thumb-cover {
+    object-fit: contain;
+    background: transparent;
+  }
   .cat-thumb-head {
     width: 96px;
     height: 144px;

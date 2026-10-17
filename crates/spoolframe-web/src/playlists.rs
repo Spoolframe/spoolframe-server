@@ -387,6 +387,31 @@ pub struct HeldIn {
     /// `liked` for Liked (PX-43).
     #[serde(default)]
     pub builtin: Option<String>,
+    /// Whose it is, for one shared with the caller.
+    #[serde(default)]
+    pub owner_name: Option<String>,
+    /// Its picture (PX-53): an uploaded cover, else its mosaic.
+    #[serde(default)]
+    pub artwork: Option<String>,
+}
+
+/// Whether an item's page lists the playlists holding it among its
+/// children, as a show's seasons are, rather than in a card of their
+/// own: a show's, whose playlists are runs of its episodes as a season
+/// is.
+pub fn held_as_seasons(kind: CatalogKind) -> bool {
+    kind == CatalogKind::Show
+}
+
+/// The line under a playlist's name where it is listed as a season is:
+/// whose it is.
+pub fn held_line(held: &HeldIn) -> String {
+    match (held.owner_kind.as_str(), &held.owner_name) {
+        ("mine", _) => "Your playlist".into(),
+        ("server_wide", _) => "Server-wide playlist".into(),
+        (_, Some(name)) => format!("{name}'s playlist"),
+        _ => "Shared playlist".into(),
+    }
 }
 
 /// The playlists an item's details (`CatalogItem::reply`) say hold it;
@@ -691,6 +716,42 @@ mod tests {
         assert_eq!(move_target(&list, 2, false, false), None);
     }
 
+    /// A show's page lists its playlists after its seasons, each with
+    /// its cover and a word on whose it is; any other item keeps the card.
+    #[test]
+    fn a_show_s_playlists_are_rows_after_its_seasons() {
+        let reply = serde_json::json!({
+            "type": "item",
+            "playlists": [
+                { "id": "p1", "name": "Heists", "owner_kind": "mine",
+                  "artwork": "image:playlist/0123456789abcdef0123456789abcdef" },
+                { "id": "p2", "name": "Crew picks", "owner_kind": "server_wide" },
+                { "id": "p3", "name": "Bob's", "owner_kind": "shared_with_me",
+                  "owner_name": "Bob" },
+            ],
+        });
+        let held = held_in(&reply);
+        assert_eq!(
+            held[0].artwork.as_deref(),
+            Some("image:playlist/0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(held[1].artwork, None);
+        assert_eq!(
+            held.iter().map(held_line).collect::<Vec<_>>(),
+            ["Your playlist", "Server-wide playlist", "Bob's playlist"]
+        );
+        assert!(held_as_seasons(CatalogKind::Show));
+        for kind in [
+            CatalogKind::Movie,
+            CatalogKind::Season,
+            CatalogKind::Episode,
+            CatalogKind::Album,
+            CatalogKind::Artist,
+        ] {
+            assert!(!held_as_seasons(kind), "{kind:?}");
+        }
+    }
+
     #[test]
     fn an_item_s_details_list_the_playlists_holding_it() {
         let reply = serde_json::json!({
@@ -704,6 +765,8 @@ mod tests {
                 name: "Heists".into(),
                 owner_kind: "mine".into(),
                 builtin: None,
+                owner_name: None,
+                artwork: None,
             }]
         );
         assert!(held_in(&serde_json::json!({ "type": "item" })).is_empty());

@@ -61,7 +61,7 @@ pub const PLAY_HISTORY: &str = "spoolframe:play-history";
 /// Playlist covers (PX-53), on top of [`PLAYLISTS`]: a summary's
 /// `artwork` (its uploaded cover, else a mosaic of its first four
 /// covers, else a placeholder; Liked's and All's fixed tiles) and
-/// `custom_art`; the `SetPlaylistArt` resource request, which uploads a
+/// `custom_art`; the same `artwork` on an item's `PlaylistRef`; the `SetPlaylistArt` resource request, which uploads a
 /// cover, and the `RemovePlaylistArt` request. A session whose client did
 /// not list it is sent neither field, and both requests are
 /// `Unsupported`.

@@ -1449,20 +1449,22 @@ impl Playlists {
         }
         // Read once for every reference: whose each is, as a summary says.
         let names = Names::of(&self.store).await?;
-        Ok(rows
-            .iter()
-            .filter(|row| builtins || row.builtin.is_none())
-            .map(|row| {
-                let summary = Self::summary(actor, row, None, &names);
-                PlaylistRef {
-                    id: summary.id,
-                    name: summary.name,
-                    owner_kind: summary.owner_kind,
-                    builtin: summary.builtin,
-                    owner_name: summary.owner_name,
-                }
-            })
-            .collect())
+        let mut held = Vec::with_capacity(rows.len());
+        for row in rows.iter().filter(|row| builtins || row.builtin.is_none()) {
+            // Its picture as its own page has it (PX-53); a mosaic is kept
+            // per revision and viewer, so a page opened again asks the
+            // catalog nothing.
+            let summary = self.summarized(actor, row, None, &names).await?;
+            held.push(PlaylistRef {
+                id: summary.id,
+                name: summary.name,
+                owner_kind: summary.owner_kind,
+                builtin: summary.builtin,
+                owner_name: summary.owner_name,
+                artwork: summary.artwork,
+            });
+        }
+        Ok(held)
     }
 }
 

@@ -320,7 +320,7 @@ async fn a_decompression_bomb_is_stopped_and_the_server_keeps_serving() {
 }
 
 /// A session that did not list `spoolframe:playlist-art` is sent no
-/// picture, and may neither upload nor remove one; one that did is sent
+/// picture, on a playlist or on an item's list of them, and may neither upload nor remove one; one that did is sent
 /// both fields. An uploaded cover is fetched only by who sees a playlist
 /// that has it.
 #[tokio::test]
@@ -350,6 +350,42 @@ async fn the_feature_gates_the_fields_and_the_requests() {
     let old = summary(without.call(Some(&alice_old), Request::ListPlaylists).await);
     assert_eq!(old.artwork, None);
     assert!(!old.custom_art);
+    // A film's page lists the playlist with its cover, to the same.
+    let film = media(MediaKind::Movie, "1");
+    assert!(matches!(
+        with.call(
+            Some(&alice),
+            Request::EditPlaylist {
+                id: playlist.clone(),
+                revision: new.revision,
+                edits: vec![PlaylistEdit::Add {
+                    id: film.clone(),
+                    before: None
+                }],
+            }
+        )
+        .await,
+        Response::Ok(_)
+    ));
+    let held = |reply: Response| match reply {
+        Response::Ok(Reply::Item {
+            playlists: Some(mut playlists),
+            ..
+        }) => playlists.remove(0),
+        other => panic!("{other:?}"),
+    };
+    let on_page = held(
+        with.call(Some(&alice), Request::Item { id: film.clone() })
+            .await,
+    );
+    assert_eq!(on_page.artwork.as_ref(), Some(&artwork));
+    let old_page = held(
+        without
+            .call(Some(&alice_old), Request::Item { id: film })
+            .await,
+    );
+    assert_eq!(old_page.id, playlist);
+    assert_eq!(old_page.artwork, None);
     assert!(matches!(
         refused(upload(&without, &alice_old, &playlist, photo.len() as u64, &photo).await),
         Error::Unsupported { .. }

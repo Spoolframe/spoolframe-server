@@ -329,6 +329,13 @@ pub struct PlaylistRef {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_name: Option<String>,
+    /// Its picture, as [`PlaylistSummary::artwork`]: an uploaded cover,
+    /// else the mosaic of its first four, so an item's page can show the
+    /// playlists holding it as it shows seasons. Only for a client that
+    /// listed `spoolframe:playlist-art`.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkId>,
 }
 
 /// One entry of a playlist, with its item as the catalog has it now and
