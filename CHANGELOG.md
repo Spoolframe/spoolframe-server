@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.0 (2026-10-16)
+
 - SDK HLS bridge: a playback planned again since its URL was served
   (`Bridge::replanned`) answers 410 Gone for every HLS resource at the
   old URL, so a player still on the old plan's playlist never gets the
