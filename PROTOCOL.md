@@ -1161,6 +1161,11 @@ nothing plays under is `CannotPlay`, and the playback goes on as it was.
 
 ### The ladder
 
+Every variant of a multivariant playlist says `CLOSED-CAPTIONS=NONE`:
+an HLS client's subtitle options are the `SUBTITLES` rendition's alone,
+one per track it lists, even when a copied video carries CEA-608
+captions (AVPlayer would otherwise offer those as one more).
+
 A converted plan has `ladder`: the encodes an HLS player switches
 between, highest first, each a `Rung { height, max_bitrate, video }`.
 It is empty for one encode, which is every plan except `auto` quality

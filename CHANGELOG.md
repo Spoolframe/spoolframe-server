@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- HLS: every variant says `CLOSED-CAPTIONS=NONE`, and the SDK's HLS
+  bridge adds it to a master with a subtitle menu (an older server's).
+  AVPlayer lists CEA-608 captions in a copied video as one more
+  subtitle option, which puts an app's menu (one entry per track) out of
+  step with the player's options, so the subtitle picked may not show.
+
 - The web UI's pages say they are dark already (`color-scheme` and
   `darkreader-lock` in the page itself), so a browser's night mode
   leaves them as drawn: Firefox for iOS's Night Mode (Dark Reader)

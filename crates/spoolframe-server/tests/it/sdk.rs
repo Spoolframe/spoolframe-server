@@ -2500,3 +2500,214 @@ async fn an_app_listing_no_feature_has_none() {
     client.close().await;
     server.stop().await;
 }
+
+/// The Apple app's path, end to end: the SDK's managed playback of an
+/// HLS conversion with a subtitle file beside the film picked (a
+/// download), served by the HLS bridge with the item's every subtitle as
+/// its menu. The master AVPlayer reads has one option per track, the
+/// picked one the server's rendition, and no closed captions.
+#[tokio::test]
+async fn the_bridge_master_of_an_external_pick_has_an_option_per_track() {
+    use spoolframe_client_sdk::types::SubtitleFormat;
+    use spoolframe_hls_bridge::{Bridge, Kind, MenuEntry, Stream};
+    let capabilities = ClientCapabilities {
+        subtitles: [SubtitleFormat::WebVtt].into(),
+        ..support::hls_capabilities()
+    };
+    let (server, client, alice) = converting("sdk-bridge-menu", capabilities, false).await;
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nOne\n\n";
+    server.add_text_track(SRT, "subrip");
+    std::fs::write(server.media.with_extension("en.srt"), SRT).unwrap();
+    let tracks = alice.tracks(movie().id()).await.unwrap();
+    assert_eq!(tracks.subtitles.len(), 2, "{tracks:?}");
+    let external = tracks.subtitles.iter().position(|s| s.external).unwrap() as u32;
+    let playback = alice
+        .open_playback(
+            movie().id(),
+            Some(Selection {
+                audio: Some(0),
+                subtitle: Some(external),
+            }),
+            PlaybackOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let bridge = Bridge::new();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = bridge.clone();
+    tokio::spawn(async move { serving.serve(listener).await });
+    let token = bridge.register(Stream::new(
+        AppSource(playback.clone()),
+        Kind::hls(),
+        Some(external),
+        Default::default(),
+    ));
+    let menu = tracks
+        .subtitles
+        .iter()
+        .enumerate()
+        .map(|(index, track)| MenuEntry {
+            index: index as u32,
+            name: track
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Track {index}")),
+            language: track.language.clone(),
+            forced: track.forced,
+        })
+        .collect();
+    assert!(bridge.set_menu(&token, menu));
+    let master = reqwest::get(format!("http://{addr}/{token}/master.m3u8"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let options: Vec<&str> = master
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-MEDIA:TYPE=SUBTITLES"))
+        .collect();
+    assert_eq!(options.len(), tracks.subtitles.len(), "{master}");
+    for (index, option) in options.iter().enumerate() {
+        let playing = index as u32 == external;
+        assert_eq!(option.contains("DEFAULT=YES"), playing, "{master}");
+        assert_eq!(
+            option.contains("URI=\"subtitles.m3u8\""),
+            playing,
+            "{master}"
+        );
+    }
+    assert!(
+        master
+            .lines()
+            .filter(|l| l.starts_with("#EXT-X-STREAM-INF:"))
+            .all(|l| l.contains("CLOSED-CAPTIONS=NONE")),
+        "{master}"
+    );
+    let cues = reqwest::get(format!("http://{addr}/{token}/subs1.vtt"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(cues.contains("One"), "{cues}");
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// The bridge's source over the SDK's managed playback, as the app's
+/// (`spoolframe_hls_bridge::SdkSource`) reads playlists and subtitle
+/// segments. Not that type itself: its `sdk` feature here would put the
+/// SDK, and the recovery phrase code, in the server's own build
+/// (`portable_root_boundary`). Media segments are not read through it.
+struct AppSource(spoolframe_client_sdk::ManagedPlayback);
+
+impl spoolframe_hls_bridge::Source for AppSource {
+    type Snapshot = spoolframe_client_sdk::Playback;
+    type Segment = NoSegment;
+
+    fn changes(&self) -> tokio::sync::watch::Receiver<Self::Snapshot> {
+        self.0.changes()
+    }
+
+    fn replanned(&self) -> bool {
+        false
+    }
+
+    async fn read(&self, _: u64, _: u64) -> Result<Vec<u8>, spoolframe_hls_bridge::Error> {
+        Err(not_read())
+    }
+
+    async fn manifest(
+        &self,
+        kind: spoolframe_hls_bridge::ManifestKind,
+        variant: u32,
+    ) -> Result<String, spoolframe_hls_bridge::Error> {
+        let kind = match kind {
+            spoolframe_hls_bridge::ManifestKind::Multivariant => ManifestKind::Multivariant,
+            spoolframe_hls_bridge::ManifestKind::Media => ManifestKind::Media,
+            spoolframe_hls_bridge::ManifestKind::Subtitles => ManifestKind::Subtitles,
+        };
+        self.0
+            .manifest(kind, variant)
+            .await
+            .map_err(|e| spoolframe_hls_bridge::Error::Other(e.to_string()))
+    }
+
+    async fn read_segment(
+        &self,
+        _: u32,
+        _: u32,
+        _: u64,
+        _: u64,
+    ) -> Result<spoolframe_hls_bridge::Chunk, spoolframe_hls_bridge::Error> {
+        Err(not_read())
+    }
+
+    async fn segment_stream(
+        &self,
+        _: u32,
+        _: u32,
+        _: u64,
+        _: u64,
+    ) -> Result<NoSegment, spoolframe_hls_bridge::Error> {
+        Err(not_read())
+    }
+
+    async fn read_subtitle_segment(
+        &self,
+        n: u32,
+    ) -> Result<spoolframe_hls_bridge::Subtitle, spoolframe_hls_bridge::Error> {
+        loop {
+            match self.0.read_subtitle_segment(n).await {
+                Ok(subtitle) => {
+                    return Ok(spoolframe_hls_bridge::Subtitle {
+                        bytes: subtitle.bytes,
+                    });
+                }
+                Err(SdkError::SubtitleNotReady { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(spoolframe_hls_bridge::Error::Other(e.to_string())),
+            }
+        }
+    }
+}
+
+fn not_read() -> spoolframe_hls_bridge::Error {
+    spoolframe_hls_bridge::Error::Other("media is not read in this test".into())
+}
+
+/// No media segment is read through [`AppSource`].
+struct NoSegment;
+
+impl spoolframe_hls_bridge::Segment for NoSegment {
+    fn sent(&self) -> u64 {
+        0
+    }
+
+    fn size(&self) -> u64 {
+        0
+    }
+
+    fn complete(&self) -> bool {
+        true
+    }
+
+    fn epoch(&self) -> u32 {
+        0
+    }
+
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, spoolframe_hls_bridge::Error> {
+        Ok(None)
+    }
+
+    async fn reopen(&self, _: u64) -> Result<Self, spoolframe_hls_bridge::Error> {
+        Err(not_read())
+    }
+}

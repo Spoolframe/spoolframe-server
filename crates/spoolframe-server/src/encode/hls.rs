@@ -503,8 +503,13 @@ fn stream_inf(
         }
         rate = rate.plus(audio_rate);
     }
+    // A copied video may carry CEA-608 captions in its SEI; unless the
+    // variant says it has none, AVPlayer offers them as one more subtitle
+    // option, beside the ones a client lists from `Tracks`, and the
+    // client's menu no longer matches its options. Its subtitles are the
+    // rendition's alone.
     let mut text = format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={},AVERAGE-BANDWIDTH={}",
+        "#EXT-X-STREAM-INF:BANDWIDTH={},AVERAGE-BANDWIDTH={},CLOSED-CAPTIONS=NONE",
         rate.peak, rate.average
     );
     // An empty CODECS is not valid HLS; none is.
@@ -997,7 +1002,7 @@ mod tests {
         assert_eq!(
             variant(&text),
             "#EXT-X-STREAM-INF:BANDWIDTH=90704000,AVERAGE-BANDWIDTH=60640000,\
-             CODECS=\"hvc1.2.4.L153.B0,ec-3\",\
+             CLOSED-CAPTIONS=NONE,CODECS=\"hvc1.2.4.L153.B0,ec-3\",\
              RESOLUTION=3840x1600,FRAME-RATE=23.976,VIDEO-RANGE=PQ"
         );
         assert!(

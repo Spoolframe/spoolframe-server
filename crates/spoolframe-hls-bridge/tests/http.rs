@@ -670,6 +670,18 @@ async fn the_master_playlist_names_the_subtitle_menu() {
     assert!(master.contains(
         "NAME=\"French 'CC'\",DEFAULT=NO,AUTOSELECT=NO,FORCED=YES,URI=\"subtitles-1.m3u8\",LANGUAGE=\"fr\""
     ), "{master}");
+    // An option per entry, in the menu's order, and no closed captions
+    // to make one more.
+    let options: Vec<&str> = master
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-MEDIA:TYPE=SUBTITLES"))
+        .collect();
+    assert_eq!(options.len(), 2, "{master}");
+    assert!(options[0].contains("NAME=\"English\""), "{master}");
+    assert!(
+        master.contains("SUBTITLES=\"subs\",CLOSED-CAPTIONS=NONE\nmedia.m3u8"),
+        "{master}"
+    );
     // The track not playing: no cues, as long as the media.
     let other = get(addr, &format!("/{token}/subtitles-1.m3u8"))
         .await
@@ -678,6 +690,66 @@ async fn the_master_playlist_names_the_subtitle_menu() {
     let empty = get(addr, &format!("/{token}/empty.vtt")).await;
     assert_eq!(empty.header(CONTENT_TYPE), Some("text/vtt"));
     assert!(empty.text().starts_with("WEBVTT"));
+}
+
+/// Thirteen tracks, the twelfth (a downloaded file) playing: thirteen
+/// options in the menu's order, the twelfth the server's rendition and the
+/// default, over a ladder of two variants; and no closed captions, which
+/// AVPlayer would list as a fourteenth.
+#[tokio::test]
+async fn a_menu_of_n_tracks_is_n_options_with_the_playing_one_in_its_place() {
+    let (bridge, addr) = bridge().await;
+    let source = Src::new(b"");
+    source.playlist(
+        ManifestKind::Multivariant,
+        0,
+        "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"OpenSubtitles\",\
+         DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI=\"subtitles.m3u8\",LANGUAGE=\"en\"\n\
+         #EXT-X-STREAM-INF:BANDWIDTH=2,SUBTITLES=\"subs\"\nv0/media.m3u8\n\
+         #EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES=\"subs\"\nv1/media.m3u8\n",
+    );
+    let token = bridge.register(Stream::new(
+        source.clone(),
+        Kind::hls(),
+        Some(11),
+        Default::default(),
+    ));
+    let menu = (0..13)
+        .map(|index| MenuEntry {
+            index,
+            name: format!("Track {index}"),
+            language: Some("en".into()),
+            forced: false,
+        })
+        .collect();
+    assert!(bridge.set_menu(&token, menu));
+    let master = get(addr, &format!("/{token}/master.m3u8")).await.text();
+    let options: Vec<&str> = master
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-MEDIA:TYPE=SUBTITLES"))
+        .collect();
+    assert_eq!(options.len(), 13, "{master}");
+    for (index, option) in options.iter().enumerate() {
+        assert!(
+            option.contains(&format!("NAME=\"Track {index}\",")),
+            "{option}"
+        );
+        let playing = index == 11;
+        assert_eq!(option.contains("DEFAULT=YES"), playing, "{option}");
+        assert_eq!(
+            option.contains("URI=\"subtitles.m3u8\""),
+            playing,
+            "{option}"
+        );
+    }
+    let variants: Vec<&str> = master
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-STREAM-INF:"))
+        .collect();
+    assert_eq!(variants.len(), 2, "{master}");
+    for variant in variants {
+        assert!(variant.ends_with(",CLOSED-CAPTIONS=NONE"), "{variant}");
+    }
 }
 
 #[tokio::test]

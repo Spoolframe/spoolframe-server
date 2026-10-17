@@ -3118,3 +3118,99 @@ async fn a_rung_past_the_ladder_is_refused() {
     client.close().await;
     server.stop().await;
 }
+
+/// A subtitle file beside the film (a download, PX-02) goes to an HLS
+/// client as an embedded track does: in the WebVTT rendition alone, the
+/// master naming it once, and no text track in the media segments. Every
+/// variant says it has no closed captions: AVPlayer lists any CEA-608
+/// captions a copied video carries as one more subtitle option, and the
+/// app's menu (from `Tracks`) then no longer lines up with its options.
+#[tokio::test]
+async fn an_hls_playback_of_an_external_subtitle_carries_it_in_the_rendition_alone() {
+    use spoolframe_protocol::Selection;
+    use spoolframe_types::SubtitleFormat;
+    let caps = ClientCapabilities {
+        subtitles: [SubtitleFormat::WebVtt].into(),
+        ..hls_capabilities()
+    };
+    let (server, client, session) = hls_ready("hls-external-subs", caps).await;
+    std::fs::write(
+        server.media.with_extension("en.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nOne\n\n\
+         2\n00:00:13,000 --> 00:00:14,500\nThirteen\n\n",
+    )
+    .unwrap();
+    let response = client
+        .call(
+            Some(&session),
+            Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: Some(Selection {
+                    audio: Some(0),
+                    subtitle: Some(0),
+                }),
+                start_ms: None,
+                bitmap: Default::default(),
+                quality: Default::default(),
+                display: None,
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) = response else {
+        panic!("no playback: {response:?}");
+    };
+    let multivariant = manifest(&client, &session, &handle, ManifestKind::Multivariant).await;
+    assert_eq!(
+        multivariant.matches("TYPE=SUBTITLES").count(),
+        1,
+        "{plan:?}\n{multivariant}"
+    );
+    let variants: Vec<&str> = multivariant
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-STREAM-INF:"))
+        .collect();
+    assert!(!variants.is_empty(), "{multivariant}");
+    for variant in variants {
+        assert!(variant.contains(",CLOSED-CAPTIONS=NONE"), "{variant}");
+    }
+
+    // The media segments: video and audio, no text track.
+    let mut media = segment(&client, &session, &handle, 0).await;
+    media.extend(segment(&client, &session, &handle, 1).await);
+    let file = server.media.with_extension("segments.mp4");
+    std::fs::write(&file, &media).unwrap();
+    let probed = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&file)
+        .output()
+        .expect("ffprobe runs");
+    let types = String::from_utf8_lossy(&probed.stdout);
+    assert_eq!(
+        types.lines().collect::<Vec<_>>(),
+        ["video", "audio"],
+        "{plan:?}"
+    );
+
+    // The rendition has the cues.
+    let subtitles = manifest(&client, &session, &handle, ManifestKind::Subtitles).await;
+    let at_13 = subtitle_segment(
+        &client,
+        &session,
+        &handle,
+        holding(&media_segments(&subtitles), 13.0),
+    )
+    .await;
+    assert!(
+        at_13.contains("00:00:13.000 --> 00:00:14.500\nThirteen"),
+        "{at_13}"
+    );
+    client.close().await;
+    server.stop().await;
+}

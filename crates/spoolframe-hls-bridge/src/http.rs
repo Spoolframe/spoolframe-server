@@ -271,7 +271,8 @@ async fn hls<S: Source>(stream: &Stream<S>, name: &str, options: &BridgeOptions)
 
 /// `master` with its subtitle rendition replaced by one per entry,
 /// `selected` the one the server plays: written once, before the first
-/// variant (a ladder has several; each names the group).
+/// variant (a ladder has several; each names the group, and none has
+/// closed captions).
 fn with_menu(master: &str, entries: &[MenuEntry], selected: Option<u32>) -> String {
     use std::fmt::Write;
     let yes = |b: bool| if b { "YES" } else { "NO" };
@@ -310,6 +311,12 @@ fn with_menu(master: &str, entries: &[MenuEntry], selected: Option<u32>) -> Stri
         out.push_str(line);
         if stream_inf && !line.contains("SUBTITLES=") {
             out.push_str(",SUBTITLES=\"subs\"");
+        }
+        // The menu is every option: CEA-608 captions in a copied video
+        // would be one more, and the entries' places would no longer be
+        // the options'. (A server from 0.12.0 says so itself.)
+        if stream_inf && !line.contains("CLOSED-CAPTIONS=") {
+            out.push_str(",CLOSED-CAPTIONS=NONE");
         }
         out.push('\n');
     }
