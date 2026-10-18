@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.1 (2026-10-17)
+
 - A relative state directory (`--state-dir .dev-state`) is made
   absolute at start, and a conversion's job links to absolute targets:
   a downloaded subtitle (PX-02), copied into the job and linked by a
