@@ -78,6 +78,16 @@ impl Locations {
             .or_else(|| root.then(|| PathBuf::from("/var/lib/spoolframe")))
             .or_else(|| var("HOME").map(|home| PathBuf::from(home).join(".local/state/spoolframe")))
             .ok_or(ConfigError::NoStateDir)?;
+        // Absolute, against the directory the server starts in: every path
+        // under it (the caches, a download, a job's links) is then right
+        // wherever it is used.
+        // A relative `--state-dir .dev-state` linked a job's subtitle to a
+        // relative target, which resolves from the link's directory.
+        let state_dir =
+            std::path::absolute(&state_dir).map_err(|source| ConfigError::StateDirUnresolved {
+                path: state_dir.clone(),
+                source,
+            })?;
         let config = config.or_else(|| var("SPOOLFRAME_CONFIG").map(PathBuf::from));
         Ok(Self { state_dir, config })
     }
@@ -866,6 +876,11 @@ mod tests {
             Locations::resolve(None, None, env(&[]), false),
             Err(ConfigError::NoStateDir)
         ));
+        // A relative one is the start directory's.
+        assert_eq!(
+            dir(Some(".dev-state"), &all, false),
+            std::env::current_dir().unwrap().join(".dev-state")
+        );
 
         let config = |flag: Option<&str>| {
             Locations::resolve(None, flag.map(PathBuf::from), env(&all), false)

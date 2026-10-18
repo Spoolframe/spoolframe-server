@@ -631,6 +631,30 @@ pub async fn fresh_dir(test: &str) -> StateDir {
     }
 }
 
+/// A new state directory named relative to the test's working directory,
+/// as `--state-dir .dev-state` names one, so every path the server makes
+/// under it is relative too: under cargo's `target/tmp`, reached as
+/// `../../target/tmp/…` from the crate, so a path resolved from somewhere
+/// else (a link's own directory) misses it. Kept, as [`fresh_dir`]'s are.
+pub async fn fresh_relative_dir(test: &str) -> StateDir {
+    let anchor = fresh_dir(test).await;
+    let name = anchor.path.file_name().unwrap();
+    let absolute = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::create_dir_all(&absolute).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let common = cwd.ancestors().find(|a| absolute.starts_with(a)).unwrap();
+    let up: PathBuf = cwd
+        .strip_prefix(common)
+        .unwrap()
+        .components()
+        .map(|_| "..")
+        .collect();
+    StateDir {
+        path: up.join(absolute.strip_prefix(common).unwrap()),
+        _tmp: anchor._tmp,
+    }
+}
+
 /// The module of the running test, so two modules may use the same
 /// `test` name. libtest names each test's thread by its path,
 /// `sessions::two_users`, and a `#[tokio::test]` body runs on that thread.

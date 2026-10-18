@@ -264,44 +264,49 @@ impl Conversion {
         let built = (|| -> Result<Arc<Self>, JobError> {
             // Plain names for ffmpeg's filters (see `args::filter_path`).
             let input = dir.join("input");
-            std::os::unix::fs::symlink(source.path, &input).map_err(prepare)?;
-            let sidecar = match subtitle
-                .and_then(|s| source.descriptor.subtitles.get(s.index as usize))
-            {
-                Some(spoolframe_media::SubtitleStream {
-                    source: spoolframe_media::SubtitleSource::External { path },
-                    codec,
-                    ..
-                }) if codecs::subtitle_format(codec) == SubtitleFormat::VobSub => {
-                    // VobSub is two files: the `.idx`, and the `.sub` with the
-                    // pictures, which ffmpeg finds by the `.idx`'s name. Both
-                    // are linked, under names that match.
-                    let link = dir.join("sidecar.idx");
-                    std::os::unix::fs::symlink(path, &link).map_err(prepare)?;
-                    std::os::unix::fs::symlink(path.with_extension("sub"), dir.join("sidecar.sub"))
+            // Every link's target absolute: a relative one resolves from
+            // the link's directory, not from where the server started.
+            let absolute = |path: &Path| std::path::absolute(path).map_err(prepare);
+            std::os::unix::fs::symlink(absolute(source.path)?, &input).map_err(prepare)?;
+            let sidecar =
+                match subtitle.and_then(|s| source.descriptor.subtitles.get(s.index as usize)) {
+                    Some(spoolframe_media::SubtitleStream {
+                        source: spoolframe_media::SubtitleSource::External { path },
+                        codec,
+                        ..
+                    }) if codecs::subtitle_format(codec) == SubtitleFormat::VobSub => {
+                        // VobSub is two files: the `.idx`, and the `.sub` with the
+                        // pictures, which ffmpeg finds by the `.idx`'s name. Both
+                        // are linked, under names that match.
+                        let link = dir.join("sidecar.idx");
+                        std::os::unix::fs::symlink(absolute(path)?, &link).map_err(prepare)?;
+                        std::os::unix::fs::symlink(
+                            absolute(&path.with_extension("sub"))?,
+                            dir.join("sidecar.sub"),
+                        )
                         .map_err(prepare)?;
-                    Some(link)
-                }
-                Some(spoolframe_media::SubtitleStream {
-                    source: spoolframe_media::SubtitleSource::External { path },
-                    ..
-                }) => {
-                    let link = dir.join("sidecar");
-                    // One of the server's own (a download, PX-02) is in the
-                    // hidden state directory, which no run may open as an
-                    // input: the run reads a copy in its own directory.
-                    let target = if jobs.is_own_subtitle(path) {
-                        let copy = dir.join("own-sidecar");
-                        std::fs::copy(path, &copy).map_err(prepare)?;
-                        copy
-                    } else {
-                        path.clone()
-                    };
-                    std::os::unix::fs::symlink(&target, &link).map_err(prepare)?;
-                    Some(link)
-                }
-                _ => None,
-            };
+                        Some(link)
+                    }
+                    Some(spoolframe_media::SubtitleStream {
+                        source: spoolframe_media::SubtitleSource::External { path },
+                        ..
+                    }) => {
+                        let link = dir.join("sidecar");
+                        // One of the server's own (a download, PX-02) is in the
+                        // hidden state directory, which no run may open as an
+                        // input: the run reads a copy in its own directory.
+                        let target = if jobs.is_own_subtitle(path) {
+                            let copy = dir.join("own-sidecar");
+                            std::fs::copy(path, &copy).map_err(prepare)?;
+                            copy
+                        } else {
+                            path.clone()
+                        };
+                        std::os::unix::fs::symlink(absolute(&target)?, &link).map_err(prepare)?;
+                        Some(link)
+                    }
+                    _ => None,
+                };
             let segments = match delivery {
                 Delivery::Hls => {
                     let total =

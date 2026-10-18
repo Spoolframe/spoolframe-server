@@ -92,6 +92,11 @@ pub enum ConfigError {
          (or XDG_STATE_HOME, or HOME)"
     )]
     NoStateDir,
+    #[error("cannot resolve the state directory {}: {source}", path.display())]
+    StateDirUnresolved {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// A parsed `spoolframe.server.v1` config.

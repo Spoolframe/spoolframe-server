@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A relative state directory (`--state-dir .dev-state`) is made
+  absolute at start, and a conversion's job links to absolute targets:
+  a downloaded subtitle (PX-02), copied into the job and linked by a
+  relative path, was read from the link's own directory, and every play
+  with it failed at its first segment ("Error opening input files").
+
 ## 0.12.0 (2026-10-16)
 
 - SDK HLS bridge: a playback planned again since its URL was served

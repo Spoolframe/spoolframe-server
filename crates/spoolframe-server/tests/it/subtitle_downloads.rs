@@ -113,8 +113,12 @@ async fn ready(test: &str, site: Settings) -> TestServer {
 
 /// The server with its film, and no user yet.
 async fn film(test: &str, site: Settings) -> TestServer {
+    film_in(fresh_dir(test).await, site).await
+}
+
+async fn film_in(dir: support::StateDir, site: Settings) -> TestServer {
     let server = TestServer::start_with(
-        fresh_dir(test).await,
+        dir,
         ServerOptions {
             real_media: true,
             subtitle_sites: site,
@@ -130,6 +134,27 @@ async fn film(test: &str, site: Settings) -> TestServer {
 /// A Linux app that plays SubRip and Matroska, directly or converted,
 /// listing `features`.
 async fn app(server: &TestServer, user: &str, features: &[&str]) -> (TestClient, SessionId) {
+    let capabilities = ClientCapabilities {
+        video: [VideoCodec::H264].into(),
+        audio: [AudioCodec::Aac].into(),
+        containers: [Container::Matroska].into(),
+        subtitles: [SubtitleFormat::Srt].into(),
+        delivery: vec![
+            spoolframe_types::Delivery::Range,
+            spoolframe_types::Delivery::Progressive,
+        ],
+        ..ClientCapabilities::default()
+    };
+    app_with(server, user, features, capabilities).await
+}
+
+/// An app with `capabilities`, listing `features`.
+async fn app_with(
+    server: &TestServer,
+    user: &str,
+    features: &[&str],
+    capabilities: ClientCapabilities,
+) -> (TestClient, SessionId) {
     let client = server.client().await;
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -137,17 +162,7 @@ async fn app(server: &TestServer, user: &str, features: &[&str]) -> (TestClient,
         client_version: "0".into(),
         platform: spoolframe_types::Platform::Linux,
         device_name: None,
-        capabilities: Some(ClientCapabilities {
-            video: [VideoCodec::H264].into(),
-            audio: [AudioCodec::Aac].into(),
-            containers: [Container::Matroska].into(),
-            subtitles: [SubtitleFormat::Srt].into(),
-            delivery: vec![
-                spoolframe_types::Delivery::Range,
-                spoolframe_types::Delivery::Progressive,
-            ],
-            ..ClientCapabilities::default()
-        }),
+        capabilities: Some(capabilities),
         experimental: Vec::new(),
         features: features.iter().map(|f| f.to_string()).collect(),
     };
@@ -636,6 +651,72 @@ async fn a_synced_download_is_carried_synced() {
         String::from_utf8_lossy(&text.stderr)
     );
     on_the_lines(&String::from_utf8(text.stdout).unwrap());
+    server.stop().await;
+}
+
+/// Nimble, 0.12.0, run with `--state-dir .dev-state`: a download synced,
+/// its offset set and set back, then played over HLS. The conversion
+/// copies the server's own file into its job and links to the copy; with
+/// a relative state directory the link's target was relative, read from
+/// the link's own directory, and ffmpeg found nothing ("Error opening
+/// input files"). Every play of the track failed from then on.
+#[tokio::test]
+async fn a_download_offset_and_reset_plays_over_hls_from_a_relative_state_dir() {
+    let site = late_site().await;
+    let dir = support::fresh_relative_dir("subdl-relative-hls").await;
+    assert!(dir.is_relative());
+    let server = film_in(dir, settings(&site, 0)).await;
+    server
+        .add_user("alice", "correct horse", Some("Alice"))
+        .await;
+    let capabilities = ClientCapabilities {
+        subtitles: [SubtitleFormat::WebVtt].into(),
+        ..support::hls_capabilities()
+    };
+    let (alice, session) = app_with(
+        &server,
+        "alice",
+        &[SUBTITLE_SEARCH, SUBTITLE_SYNC],
+        capabilities,
+    )
+    .await;
+    search(&alice, &session).await.unwrap();
+    let got = download(&alice, &session, "opensubtitles:102")
+        .await
+        .unwrap();
+    synced(&alice, &session, got.track).await;
+    for offset_ms in [500, 0] {
+        let set = alice
+            .call(
+                Some(&session),
+                Request::SetSubtitleOffset {
+                    id: movie().id().clone(),
+                    track: got.track,
+                    offset_ms,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&set, Response::Ok(Reply::SubtitleTiming(t)) if t.offset_ms == offset_ms),
+            "{set:?}"
+        );
+    }
+    let handle = play(&alice, &session, got.track).await;
+    let (response, bytes) = alice
+        .media(spoolframe_protocol::MediaRead {
+            session: session.clone(),
+            handle: handle.clone(),
+            offset: 0,
+            length: spoolframe_protocol::MAX_READ,
+            epoch: 0,
+            segment: Some(0),
+            variant: 0,
+        })
+        .await;
+    assert!(
+        matches!(response, spoolframe_protocol::MediaReadResponse::Ok(_)) && !bytes.is_empty(),
+        "{response:?}"
+    );
     server.stop().await;
 }
 
