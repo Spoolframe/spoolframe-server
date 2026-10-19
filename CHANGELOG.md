@@ -4,8 +4,8 @@
 
 - Optimized versions (PX-37): converted copies the server keeps and
   plays from. It keeps profiles (`Mobile`, `TV` and `Compact 4K` to
-  start with) and the copies made in them. A new `optimized { dir; max_size_mb; }`
-  section says where the copies are kept (`state_dir/optimized`) and
+  start with) and the copies made in them. A new
+  `optimized { dir; max_size_mb; }` section says where the copies are kept (`state_dir/optimized`) and
   the most they may take (100 GiB). A copy holds the video converted,
   every audio track (AAC, AC-3 and E-AC-3 as they are, the others in
   E-AC-3) and every subtitle and font in the file. The server makes
@@ -58,6 +58,11 @@
   The admin API has `optimizedOverview`, `optimizedProfilePut`,
   `optimizedProfileDelete`, `optimizedOutdatedDelete` and
   `optimizedCopyDelete` for it, for admins only.
+
+- Liked and All (PX-53) have new built-in covers: a heart and a ring,
+  pictures now, not drawn shapes. Their ids are `image:tile/liked/2`
+  and `image:tile/all/2`, so apps load the new ones, not their cached
+  copies.
 
 ## 0.12.1 (2026-10-17)
 

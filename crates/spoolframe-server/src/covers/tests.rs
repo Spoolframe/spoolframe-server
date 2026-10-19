@@ -153,7 +153,7 @@ fn ids_name_what_they_are_and_nothing_else() {
     for bad in [
         "image:playlist/../../etc/passwd",
         "image:playlist/0123",
-        "image:tile/liked/2",
+        "image:tile/liked/1",
         "plex:/library/metadata/1/thumb/1",
     ] {
         assert_eq!(local(&bad.parse().unwrap()), None, "{bad}");
@@ -196,7 +196,7 @@ fn a_mosaic_is_the_four_in_order() {
 
 #[test]
 fn each_tile_is_drawn_and_they_differ() {
-    let drawn: Vec<Vec<u8>> = [Tile::Liked, Tile::All, Tile::Empty]
+    let drawn: Vec<&[u8]> = [Tile::Liked, Tile::All, Tile::Empty]
         .into_iter()
         .map(|t| draw(t).unwrap())
         .collect();

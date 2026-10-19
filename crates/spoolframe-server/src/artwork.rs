@@ -378,11 +378,15 @@ impl ArtworkCache {
                 Ok(jpeg(made))
             }
             Some(Local::Tile(tile)) => {
-                let drawn = tokio::task::spawn_blocking(move || crate::covers::draw(tile))
-                    .await
-                    .map_err(|e| ArtworkError::Image(e.to_string()))?
-                    .map_err(ArtworkError::Image)?;
-                Ok(jpeg(drawn))
+                // Only the placeholder's first drawing blocks.
+                let drawn = match crate::covers::ready(tile) {
+                    Some(drawn) => drawn,
+                    None => tokio::task::spawn_blocking(move || crate::covers::draw(tile))
+                        .await
+                        .map_err(|e| ArtworkError::Image(e.to_string()))?
+                        .map_err(ArtworkError::Image)?,
+                };
+                Ok(jpeg(drawn.to_vec()))
             }
             None => Err(ArtworkError::Catalog(CatalogError::NotFound(
                 id.to_string(),

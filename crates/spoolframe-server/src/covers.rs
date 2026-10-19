@@ -14,12 +14,15 @@
 //!   is the cache's key and changes when any of the four does. Made on
 //!   demand from the four, each authorized as itself; never kept as a
 //!   playlist's cover.
-//! - `image:tile/liked/1`, `image:tile/all/1`, `image:tile/empty/1`:
-//!   Liked's and All's fixed tiles, and an empty playlist's placeholder,
-//!   drawn here. The number is the drawing's: a new one gets a new id.
+//! - `image:tile/liked/2`, `image:tile/all/2`, `image:tile/empty/1`:
+//!   Liked's and All's fixed tiles, pictures built into the server
+//!   (`assets/tiles`), and an empty playlist's placeholder, drawn here.
+//!   The number is the picture's: a new one gets a new id, so no app
+//!   keeps showing the old one from its cache.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -265,8 +268,8 @@ pub enum Tile {
 impl Tile {
     fn key(self) -> &'static str {
         match self {
-            Tile::Liked => "tile/liked/1",
-            Tile::All => "tile/all/1",
+            Tile::Liked => "tile/liked/2",
+            Tile::All => "tile/all/2",
             Tile::Empty => "tile/empty/1",
         }
     }
@@ -356,36 +359,40 @@ fn centre_square(picture: DynamicImage) -> DynamicImage {
 
 /// Catppuccin Mocha, as the web UI's dark look.
 mod mocha {
-    pub const BASE: [u8; 3] = [0x1e, 0x1e, 0x2e];
     pub const SURFACE0: [u8; 3] = [0x31, 0x32, 0x44];
     pub const OVERLAY0: [u8; 3] = [0x6c, 0x70, 0x86];
-    pub const RED: [u8; 3] = [0xf3, 0x8b, 0xa8];
-    pub const MAUVE: [u8; 3] = [0xcb, 0xa6, 0xf7];
-    pub const TEAL: [u8; 3] = [0x94, 0xe2, 0xd5];
-    pub const BLUE: [u8; 3] = [0x89, 0xb4, 0xfa];
 }
 
-/// Tile `tile`, drawn: a JPEG.
-pub fn draw(tile: Tile) -> Result<Vec<u8>, String> {
-    let picture = match tile {
-        Tile::Liked => drawn(gradient(mocha::RED, mocha::MAUVE), mocha::BASE, heart),
-        Tile::All => drawn(gradient(mocha::TEAL, mocha::BLUE), mocha::BASE, word_all),
-        Tile::Empty => drawn(|_, _| mocha::SURFACE0, mocha::OVERLAY0, lines),
-    };
-    jpeg(&picture)
+/// Liked's tile: a heart, 1024 px a side.
+const LIKED_TILE: &[u8] = include_bytes!("../assets/tiles/liked.jpg");
+
+/// All's tile: the word, 1024 px a side.
+const ALL_TILE: &[u8] = include_bytes!("../assets/tiles/all.jpg");
+
+/// The placeholder's JPEG, drawn once.
+static EMPTY_TILE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
+
+/// Tile `tile`'s JPEG if it needs no drawing: Liked's and All's built-in
+/// pictures, and the placeholder once drawn. Served as it is, off no
+/// blocking thread.
+pub fn ready(tile: Tile) -> Option<&'static [u8]> {
+    match tile {
+        Tile::Liked => Some(LIKED_TILE),
+        Tile::All => Some(ALL_TILE),
+        Tile::Empty => EMPTY_TILE.get()?.as_deref().ok(),
+    }
 }
 
-/// A diagonal from `from` (top left) to `to` (bottom right), at `(x, y)`
-/// in 0..1.
-fn gradient(from: [u8; 3], to: [u8; 3]) -> impl Fn(f32, f32) -> [u8; 3] {
-    move |x, y| {
-        let t = ((x + y) / 2.0).clamp(0.0, 1.0);
-        let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-        [
-            mix(from[0], to[0]),
-            mix(from[1], to[1]),
-            mix(from[2], to[2]),
-        ]
+/// Tile `tile`: a JPEG. Liked's and All's are the built-in pictures; the
+/// placeholder is drawn the first time, which blocks.
+pub fn draw(tile: Tile) -> Result<&'static [u8], String> {
+    match tile {
+        Tile::Liked => Ok(LIKED_TILE),
+        Tile::All => Ok(ALL_TILE),
+        Tile::Empty => EMPTY_TILE
+            .get_or_init(|| jpeg(&drawn(|_, _| mocha::SURFACE0, mocha::OVERLAY0, lines)))
+            .as_deref()
+            .map_err(Clone::clone),
     }
 }
 
@@ -416,41 +423,6 @@ fn drawn(
             mix(back[2], ink[2]),
         ])
     })
-}
-
-/// A heart in the middle half: `(x² + y² − 1)³ − x²y³ ≤ 0`.
-fn heart(x: f32, y: f32) -> bool {
-    let x = (x - 0.5) * 3.2;
-    let y = (0.47 - y) * 3.2;
-    (x * x + y * y - 1.0).powi(3) - x * x * y.powi(3) <= 0.0
-}
-
-/// "All", in a 5 × 7 grid a letter.
-fn word_all(x: f32, y: f32) -> bool {
-    const A: [&str; 7] = [
-        ".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#",
-    ];
-    const L: [&str; 7] = [
-        "##...", ".#...", ".#...", ".#...", ".#...", ".#...", "###..",
-    ];
-    // Three letters of five cells, one between each, in the middle.
-    let cell = 0.6 / 15.0;
-    let (left, top) = (0.5 - 7.5 * cell, 0.5 - 3.5 * cell);
-    let (cx, cy) = ((x - left) / cell, (y - top) / cell);
-    if cx < 0.0 || cy < 0.0 {
-        return false;
-    }
-    let (col, row) = (cx as usize, cy as usize);
-    if row >= 7 {
-        return false;
-    }
-    let (glyph, at) = match col {
-        0..=4 => (&A, col),
-        6..=8 => (&L, col - 6),
-        10..=12 => (&L, col - 10),
-        _ => return false,
-    };
-    glyph[row].as_bytes().get(at) == Some(&b'#')
 }
 
 /// Three lines, a list's: an empty playlist's placeholder.
