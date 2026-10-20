@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.0 (2026-10-20)
+
 - Optimized versions (PX-37): converted copies the server keeps and
   plays from. It keeps profiles (`Mobile`, `TV` and `Compact 4K` to
   start with) and the copies made in them. A new
