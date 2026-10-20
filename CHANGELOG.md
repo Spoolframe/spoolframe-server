@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.14.0 (2026-10-20)
+
 - The All playlist opens quickly on a large music library; before, a
   page of it could take longer than a client waits, and timed out. Its
   tracks are listed once a minute, not at each page and play, so a
