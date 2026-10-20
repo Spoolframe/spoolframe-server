@@ -587,9 +587,11 @@ async fn none_encoding(encoding: &Encoding) {
     .unwrap();
 }
 
-/// Waits up to 5 s for `ready`, checking every 20 ms.
+/// Waits for `ready`, checking every 20 ms. The 30 s only stops a test
+/// that would hang: what is waited for comes far sooner, even on a
+/// loaded machine.
 pub(crate) async fn eventually(ready: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while !ready() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -930,9 +932,10 @@ async fn dropping_a_job_kills_ffmpeg_and_removes_its_files() {
     let pid = job.pid();
     assert!(alive(pid));
     drop(job);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!alive(pid), "ffmpeg {pid} still runs");
-    assert!(!dir.exists());
+    // The kill and the cleanup run on their own task: waited for, not
+    // given a fixed time a loaded machine may not keep to.
+    eventually(|| !alive(pid)).await;
+    eventually(|| !dir.exists()).await;
 }
 
 #[tokio::test]

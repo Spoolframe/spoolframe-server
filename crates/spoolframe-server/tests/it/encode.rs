@@ -242,12 +242,19 @@ async fn four_audio_encodes_fill_a_budget_of_one_and_a_fifth_is_busy() {
     let (desktop, desktop_session) = &others[0];
     let mut handles = Vec::new();
     for _ in 0..2 {
-        handles.push(started(&tv, &session, None).await);
-        handles.push(started(desktop, desktop_session, None).await);
+        handles.push((&tv, &session, started(&tv, &session, None).await));
+        handles.push((
+            desktop,
+            desktop_session,
+            started(desktop, desktop_session, None).await,
+        ));
     }
-    for handle in &handles {
-        until("its ffmpeg runs", Duration::from_secs(10), || {
-            !ffmpeg_for(handle).is_empty()
+    // Its output, not its ffmpeg: the whole film's audio converts in
+    // about a second, and one the throttle does not hold back in time
+    // ends by itself, done, its playback and its place kept.
+    for (_, _, handle) in &handles {
+        until("its encode writes", Duration::from_secs(10), || {
+            output(&server, handle).exists()
         })
         .await;
     }
@@ -258,10 +265,12 @@ async fn four_audio_encodes_fill_a_budget_of_one_and_a_fifth_is_busy() {
         start(phone, phone_session, None).await,
         Response::Err(Error::Busy)
     ));
-    // The four play on.
-    for handle in &handles {
-        assert!(!ffmpeg_for(handle).is_empty());
+    // The four play on: each is read as before.
+    for (device, session, handle) in &handles {
+        let (response, _) = device.read_at(session, handle, 0, 0, 4096).await;
+        assert!(matches!(response, MediaReadResponse::Ok(_)), "{response:?}");
     }
+    drop(handles);
     tv.close().await;
     for (device, _) in others {
         device.close().await;
@@ -380,7 +389,9 @@ async fn a_revoked_session_s_hls_playback_ends_at_once() {
     tv.hello_with(None, Some(hls_capabilities())).await;
     let session = tv.login("alice", "correct horse").await;
     let handle = started(&tv, &session, None).await;
-    until("the encode is held back", Duration::from_secs(10), || {
+    // Only a hang guard: x264 has to get half a second ahead first, which
+    // a machine running many encodes at once may take a while to give it.
+    until("the encode is held back", Duration::from_secs(60), || {
         held_back(&handle)
     })
     .await;
@@ -389,9 +400,11 @@ async fn a_revoked_session_s_hls_playback_ends_at_once() {
         .revoke_session(&spoolframe_server::auth::SessionToken(session.0.clone()).hash())
         .await
         .unwrap();
+    // At once, not at the next recheck: well within playback::RECHECK
+    // (30 s), with room left for a loaded machine.
     until(
         "the revoked session's ffmpeg is gone",
-        Duration::from_secs(5),
+        Duration::from_secs(15),
         || ffmpeg_for(&handle).is_empty(),
     )
     .await;

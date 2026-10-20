@@ -1048,7 +1048,10 @@ async fn a_failed_site_s_own_words_are_not_sent_to_users() {
     );
 }
 
-/// One site's slow download does not hold up the other's.
+/// One site's slow download does not hold up the other's: the quick one
+/// ends while the slow one is still waiting for SubDL. Nothing is timed
+/// against the wall clock, so a loaded machine can't fail it; SubDL's
+/// answer is held long enough that it can only come after.
 #[tokio::test]
 async fn a_slow_download_from_one_site_does_not_hold_up_the_other() {
     let f = fixture_with("apart", both).await;
@@ -1060,25 +1063,41 @@ async fn a_slow_download_from_one_site_does_not_hold_up_the_other() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(zipped(&[("Film.srt", RUSSIAN.as_bytes())]))
-                .set_delay(Duration::from_secs(3)),
+                .set_delay(Duration::from_secs(120)),
         )
         .mount(&f.site)
         .await;
     f.downloads.search(&film(), None).await.unwrap();
     let (id, alice) = (film(), alice());
     let slow = f.downloads.download(&id, "subdl:3172974-3188291", &alice);
-    let quick = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let started = Instant::now();
-        f.downloads
-            .download(&film(), "opensubtitles:101", &bob())
-            .await
-            .unwrap();
-        started.elapsed()
+    tokio::pin!(slow);
+    // Bob asks only once Alice's download is at SubDL, waiting on it.
+    let at_subdl = async {
+        loop {
+            let asked = f.site.received_requests().await.unwrap_or_default();
+            if asked
+                .iter()
+                .any(|r| r.url.path() == "/subtitle/3172974-3188291.zip")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     };
-    let (slow, quick) = tokio::join!(slow, quick);
-    slow.unwrap();
-    assert!(quick < Duration::from_secs(2), "waited {quick:?} for SubDL");
+    tokio::select! {
+        done = &mut slow => panic!("SubDL's held answer came first: {done:?}"),
+        () = at_subdl => {}
+        () = tokio::time::sleep(Duration::from_secs(60)) => panic!("never reached SubDL"),
+    }
+    let bob = bob();
+    let quick = f.downloads.download(&id, "opensubtitles:101", &bob);
+    tokio::select! {
+        biased;
+        done = &mut slow => panic!("SubDL's held answer came first: {done:?}"),
+        quick = quick => {
+            quick.unwrap();
+        }
+    }
 }
 
 /// An episode with ids of its own, searched on OpenSubtitles alone, does

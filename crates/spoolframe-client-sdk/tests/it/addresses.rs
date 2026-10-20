@@ -76,6 +76,18 @@ async fn two_address_stub(key: &SecretKey) -> (Stub, SocketAddr, SocketAddr) {
     (stub, v4, v6)
 }
 
+/// Keep `addr`'s port from any other socket until dropped.
+fn hold(addr: SocketAddr) -> std::net::UdpSocket {
+    std::net::UdpSocket::bind(addr).expect("the freed port is free")
+}
+
+/// A stub for `key` at exactly `addr`.
+async fn start_at(key: &SecretKey, addr: SocketAddr) -> Stub {
+    let stub = Stub::start_on(key.clone(), &[addr]).await;
+    assert_eq!(stub.bound(), vec![addr], "the stub is at {addr}");
+    stub
+}
+
 /// Pin `stub`, given only `addr`, and wait until the client has seen the
 /// server at `also` too: iroh opens a path there on its own, once the
 /// server has told it its addresses.
@@ -133,18 +145,24 @@ async fn a_connection_over_one_address_keeps_the_others_to_dial_later() {
         let (stub, v4, v6) = two_address_stub(&key).await;
         pin_via(&storage, &stub, v4, v6).await;
         stub.stop().await;
+        // While no stub is at an address, a socket holds its port: the
+        // other tests bind ports of their own meanwhile, and one given
+        // this freed port would answer, or keep the next stub off it.
+        let held_v6 = hold(v6);
 
         // The server is reached over IPv4 alone, as a phone away from home
         // reaches it over one address.
-        let stub = Stub::start_on(key.clone(), &[v4]).await;
+        let stub = start_at(&key, v4).await;
         let client = open(&storage).await;
         client.connect(&id).await.unwrap();
         client.close().await;
         stub.stop().await;
+        let _held_v4 = hold(v4);
 
         // Then it answers only on IPv6, which no one gave this client:
         // it is dialled from what was saved.
-        let stub = Stub::start_on(key, &[v6]).await;
+        drop(held_v6);
+        let stub = start_at(&key, v6).await;
         let client = open(&storage).await;
         let entry = client
             .connect(&id)
@@ -628,7 +646,7 @@ async fn a_last_path_where_another_key_answers_now_is_let_go() {
 
         // The server is back where it advertises it is.
         drop(gone);
-        let server = Stub::start_on(key, &[away]).await;
+        let server = start_at(&key, away).await;
         let client = open(&storage).await;
         client
             .connect(&id)
