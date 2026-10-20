@@ -68,7 +68,12 @@ jobs:
       - name: kache flush
         if: always()
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: kache daemon stop || true
+        # As molds' ci:kache-flush: record this job's stats in the shared
+        # store's sessions.jsonl (the runner's kache_ci_* metrics), then
+        # drain queued uploads and stop the daemon.
+        run: |
+          kache stats --since 30d --record >/dev/null || true
+          kache daemon stop || true
 
   # The suite in two halves, one per job, in parallel: nextest's
   # `--partition count:N/2` (ci:test reads NEXTEST_PARTITION) deals the
@@ -120,7 +125,12 @@ jobs:
       - name: kache flush
         if: always()
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: kache daemon stop || true
+        # As molds' ci:kache-flush: record this job's stats in the shared
+        # store's sessions.jsonl (the runner's kache_ci_* metrics), then
+        # drain queued uploads and stop the daemon.
+        run: |
+          kache stats --since 30d --record >/dev/null || true
+          kache daemon stop || true
 
       - name: Publish JUnit results
         if: always()

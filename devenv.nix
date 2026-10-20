@@ -281,6 +281,16 @@ in {
         max_size_mb = 16384;
       }
 
+      # The rest of what grows under .dev-state, kept small for the same
+      # disk: live transcodes' scratch (20 GiB by default) and frame
+      # previews (4 GiB by default).
+      transcode {
+        scratch_limit_mb = 8192;
+      }
+      previews {
+        cache_mb = 2048;
+      }
+
       # HTTP playback (PX-49), for AirPlay tests from the apps.
       http_playback {
         listen = "[::]:7422";

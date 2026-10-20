@@ -58,4 +58,9 @@ jobs:
       - name: kache flush
         if: always()
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: kache daemon stop || true
+        # As molds' ci:kache-flush: record this job's stats in the shared
+        # store's sessions.jsonl (the runner's kache_ci_* metrics), then
+        # drain queued uploads and stop the daemon.
+        run: |
+          kache stats --since 30d --record >/dev/null || true
+          kache daemon stop || true
