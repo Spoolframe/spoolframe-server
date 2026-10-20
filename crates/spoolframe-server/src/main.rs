@@ -1235,6 +1235,7 @@ async fn run(
             catalog.clone(),
             watch.clone(),
         )
+        .with_catalog_changes(live.changes())
         .with_covers(covers),
     );
     // Covers whose playlists went while the server was down, or with a

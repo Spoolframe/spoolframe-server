@@ -170,7 +170,8 @@ impl Catalog for LiveCatalog {
             .await
     }
 
-    /// Not kept: All (PX-43) shows a newly scanned album at once.
+    /// Not kept here: All (PX-43) keeps its own list a while, as one
+    /// sorted list rather than each library's reply.
     async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
         self.current()?.tracks(library).await
     }

@@ -490,7 +490,8 @@ async fn one_user_s_likes_are_not_another_s() {
 }
 
 /// The ticket: All holds every track the user may see and none they may
-/// not, and a new album is in it after a scan with no edit.
+/// not, and a new album is in it after a scan with no edit, once its
+/// tracks were listed longer ago than they are kept for.
 #[tokio::test]
 async fn all_is_every_track_one_may_see_and_follows_a_scan() {
     let h = harness("all").await;
@@ -500,6 +501,10 @@ async fn all_is_every_track_one_may_see_and_follows_a_scan() {
     assert!(!bobs.contains(&"103".to_owned()));
 
     let new = h.music.add_album(3);
+    // Tokio's clock moved on, not slept through.
+    tokio::time::pause();
+    tokio::time::advance(ALL_KEPT_FOR).await;
+    tokio::time::resume();
     let all = h.builtin(&h.alice, Builtin::All).await;
     let page = h
         .playlists

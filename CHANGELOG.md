@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The All playlist opens quickly on a large music library; before, a
+  page of it could take longer than a client waits, and timed out. Its
+  tracks are listed once a minute, not at each page and play, so a
+  newly scanned album shows in All within a minute.
+
 ## 0.13.1 (2026-10-20)
 
 - Optimized versions (PX-37) are now off by default.
