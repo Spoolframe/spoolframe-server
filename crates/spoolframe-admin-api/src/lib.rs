@@ -24,6 +24,12 @@ pub use spoolframe_types::{
     SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
 };
 
+mod optimized;
+pub use optimized::{
+    OptimizedCopy, OptimizedCopyDeleted, OptimizedCopyState, OptimizedDeleted, OptimizedOverview,
+    OptimizedProfile, OptimizedProfileWritten, OptimizedProgress,
+};
+
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
 /// What makes an address a public one (`network.wan`, P6-02): one rule,
 /// so the web UI refuses a typed address with the words the server's
@@ -2735,6 +2741,24 @@ pub struct PlaybackMade {
     /// play, and until something is written.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub measured_bitrate: Option<u64>,
+    /// The optimized copy it plays from (PX-37), and which of its tracks;
+    /// `None` when it plays the film alone.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub copy: Option<PlaybackCopy>,
+}
+
+/// An optimized copy a playback plays from (PX-37): in the film's place,
+/// or for its audio alone, with the video encoded from the film.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackCopy {
+    pub id: String,
+    /// What it was made for: its profile's name, or `ahead`.
+    pub target: String,
+    /// The tracks played from it.
+    pub video: bool,
+    pub audio: bool,
+    pub subtitle: bool,
 }
 
 /// Where a playback's keyframes came from (PX-24, PX-25).
@@ -4430,6 +4454,43 @@ pub trait AdminApi {
         id: String,
         request: PlanFor,
     ) -> jsonrpsee::core::RpcResult<PlanView>;
+
+    /// Server › Optimized (PX-37): the pool's use against its budget, the
+    /// profiles, every copy, and the copy being made. `NOT_CONFIGURED`
+    /// on a server without the pool.
+    #[method(name = "optimizedOverview", with_extensions)]
+    async fn optimized_overview(&self) -> jsonrpsee::core::RpcResult<OptimizedOverview>;
+
+    /// Add `profile`, or change the one of its name (PX-37). A change to
+    /// its video outdates its copies: they are never used again, and
+    /// `optimizedOutdatedDelete` removes them now. `INVALID_INPUT`, saying
+    /// why, for a name, codec, height or bitrate out of range.
+    #[method(name = "optimizedProfilePut", with_extensions)]
+    async fn optimized_profile_put(
+        &self,
+        profile: OptimizedProfile,
+    ) -> jsonrpsee::core::RpcResult<OptimizedProfileWritten>;
+
+    /// Remove profile `name` (PX-37): its copies are outdated, and the
+    /// number of them returned. `INVALID_INPUT` for no such profile.
+    #[method(name = "optimizedProfileDelete", with_extensions)]
+    async fn optimized_profile_delete(&self, name: String) -> jsonrpsee::core::RpcResult<u64>;
+
+    /// Delete the outdated copies now (PX-37): profile `profile`'s, or
+    /// every one. A copy being read goes when its readers are done.
+    #[method(name = "optimizedOutdatedDelete", with_extensions)]
+    async fn optimized_outdated_delete(
+        &self,
+        profile: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<OptimizedDeleted>;
+
+    /// Delete copy `id` and its file (PX-37). One being read goes when
+    /// its readers are done, and one being made once its ffmpeg stops.
+    #[method(name = "optimizedCopyDelete", with_extensions)]
+    async fn optimized_copy_delete(
+        &self,
+        id: String,
+    ) -> jsonrpsee::core::RpcResult<OptimizedCopyDeleted>;
 }
 
 /// What was `serde(default)` before PX-15 is required: a server and a web

@@ -486,6 +486,18 @@ previews {
   # workers = 8;
 }
 
+# Optimized versions: converted copies the server keeps, for downloads and
+# for playback that would otherwise encode. Each copy is a whole film or
+# episode in one profile, with every audio and text track.
+optimized {
+  # Where the copies are kept; the state directory's optimized if left out.
+  # dir = "/srv/spoolframe/optimized";
+  # The most they may take, in MiB. Over it, copies of edited profiles go
+  # first, then binge-ahead ones, then the least recently used; one being
+  # read stays.
+  max_size_mb = 102400;
+}
+
 # The last log lines kept in memory for the web UI's Logs page, at the
 # level the server logs at: what the journal has, nothing more.
 logs {

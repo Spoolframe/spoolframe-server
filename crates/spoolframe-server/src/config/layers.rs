@@ -1006,6 +1006,10 @@ mod tests {
             documented.previews.settings().unwrap(),
             bare.previews.settings().unwrap()
         );
+        assert_eq!(
+            documented.optimized.settings(dir).unwrap(),
+            bare.optimized.settings(dir).unwrap()
+        );
         assert_eq!(documented.admin.metrics(), bare.admin.metrics());
         assert_eq!(
             documented.logs.buffer_lines().unwrap(),

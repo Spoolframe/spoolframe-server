@@ -13,7 +13,7 @@ use spoolframe_media::{KeyframeTimes, MediaDescriptor, Prober};
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::{AudioCodec, VideoCodec};
 
-use super::args::{EncodeSpec, Output, ffmpeg_args};
+use super::args::{EncodeSpec, Inputs, Output, ffmpeg_args};
 use super::hls::Segments;
 use super::job::listed_segments;
 use super::{header_first, keyframe_cuts, run_at};
@@ -174,8 +174,7 @@ fn run_as(
     let (start, from) = run_at(segments, n, Some(video));
     let encoders = Encoders::software_baseline();
     let spec = EncodeSpec {
-        input: film,
-        sidecar: None,
+        inputs: Inputs::film(film),
         descriptor,
         video: Some(video),
         audio: Some(AAC),

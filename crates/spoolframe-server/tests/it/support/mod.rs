@@ -700,6 +700,8 @@ pub struct TestServer {
     /// Its artwork cache: what an admin API beside it serves pictures
     /// from (PX-53).
     pub artwork: Arc<ArtworkCache>,
+    /// Its optimized copies (PX-37), in `optimized` in its directory.
+    pub optimized: Arc<spoolframe_server::optimized::Pool>,
 }
 
 impl TestServer {
@@ -880,6 +882,22 @@ impl TestServer {
             )
             .unwrap(),
         );
+        let optimized = Arc::new(
+            spoolframe_server::optimized::Pool::start(
+                spoolframe_server::optimized::PoolSources {
+                    store: store.clone(),
+                    jobs: jobs.clone(),
+                    transcoding: transcoding(),
+                    prober: prober.clone(),
+                },
+                &spoolframe_server::config::OptimizedSettings {
+                    dir: dir.join("optimized"),
+                    max_size_bytes: 1 << 30,
+                },
+            )
+            .await
+            .unwrap(),
+        );
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -901,6 +919,7 @@ impl TestServer {
             subtitles: Arc::new(subtitles.with_own_dir(dir.join("subtitles"))),
             subtitle_timings: subtitle_timings.clone(),
             subtitle_downloads: subtitle_downloads.clone(),
+            optimized: Some(optimized.clone()),
             previews,
             index_ahead,
             app_passkeys: Arc::new(
@@ -964,6 +983,7 @@ impl TestServer {
             watch,
             playlists,
             artwork,
+            optimized,
         }
     }
 

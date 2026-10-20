@@ -18,6 +18,7 @@ mod invites;
 mod libraries;
 mod licenses;
 mod logs;
+mod optimized;
 mod overview;
 mod playback;
 mod playlists;
@@ -49,6 +50,7 @@ use invites::Invites;
 use libraries::{AddLibrary, Libraries};
 use licenses::LicensesPage;
 use logs::LogsPage;
+use optimized::OptimizedPage;
 use overview::AdminHome;
 use playback::{PlaybackDetail, PlaybackPage};
 use playlists::{MyPlaylists, PlaylistView, ServerPlaylists};
@@ -127,6 +129,9 @@ enum Route {
             PlaybackPage {},
             #[route("/playback/:id")]
             PlaybackDetail { id: String },
+            // The optimized copies, their profiles and budget (PX-37).
+            #[route("/optimized")]
+            OptimizedPage {},
             #[route("/libraries")]
             Libraries {},
             // `back`: where Cancel and the back link go (the wizard's Plex
@@ -1436,6 +1441,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::LogsPage {} => "Logs",
         Route::AuditPageView {} => "Audit",
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
+        Route::OptimizedPage {} => "Optimized",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
         Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
         Route::ServerPlaylists {} => "Libraries",
@@ -1613,7 +1619,8 @@ fn users_links(route: &Route) -> Element {
 }
 
 /// Server's sub-pages in the sidebar, one step in: Activity (P3-14),
-/// Playback (P3-15), Logs (P3-14), Libraries (P3-11) and Settings.
+/// Playback (P3-15), Optimized (PX-37), Logs (P3-14), Libraries (P3-11)
+/// and Settings.
 fn server_links(route: &Route) -> Element {
     let pages = [
         (
@@ -1625,6 +1632,11 @@ fn server_links(route: &Route) -> Element {
             Route::PlaybackPage {},
             "Playback",
             matches!(route, Route::PlaybackPage {} | Route::PlaybackDetail { .. }),
+        ),
+        (
+            Route::OptimizedPage {},
+            "Optimized",
+            matches!(route, Route::OptimizedPage {}),
         ),
         (
             Route::LogsPage {},

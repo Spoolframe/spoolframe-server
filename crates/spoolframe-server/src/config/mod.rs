@@ -144,6 +144,9 @@ pub struct ServerConfig {
     /// Frame previews for scrubbing (P3-13).
     #[ucl(default)]
     pub previews: PreviewsConfig,
+    /// The pool of converted copies (PX-37).
+    #[ucl(default)]
+    pub optimized: OptimizedConfig,
     /// Ways to sign in besides the password and passkeys: SSO (P3-04).
     #[ucl(default)]
     pub auth: AuthConfig,
@@ -1126,6 +1129,51 @@ impl PreviewsConfig {
             cache_limit_bytes: self.cache_mb.unwrap_or(Self::DEFAULT_CACHE_MB) << 20,
             memory_limit_bytes: self.memory_mb.unwrap_or(Self::DEFAULT_MEMORY_MB) << 20,
             workers,
+        })
+    }
+}
+
+/// `optimized { dir = "…"; max_size_mb = 102400; }` (PX-37), all
+/// optional: where the pool of converted copies is kept, and the most it
+/// may hold.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct OptimizedConfig {
+    /// `state_dir/optimized` if left out.
+    #[ucl(default)]
+    pub dir: Option<PathBuf>,
+    /// In MiB; 102400 (100 GiB) if left out.
+    #[ucl(default)]
+    pub max_size_mb: Option<u64>,
+}
+
+/// The pool's place and size, read from [`OptimizedConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizedSettings {
+    pub dir: PathBuf,
+    pub max_size_bytes: u64,
+}
+
+impl OptimizedConfig {
+    /// A few films in each shipped profile: a 1080p film in `TV` is
+    /// about 10 GiB.
+    pub const DEFAULT_MAX_SIZE_MB: u64 = 100 * 1024;
+
+    /// The settings, with `state_dir` for the default directory.
+    pub fn settings(&self, state_dir: &Path) -> Result<OptimizedSettings, ConfigError> {
+        let max_size_mb = self.max_size_mb.unwrap_or(Self::DEFAULT_MAX_SIZE_MB);
+        if max_size_mb == 0 {
+            return Err(ConfigError::Invalid {
+                key: "optimized.max_size_mb",
+                message: "0 would keep no copy: every download would wait forever".into(),
+            });
+        }
+        Ok(OptimizedSettings {
+            dir: self
+                .dir
+                .clone()
+                .unwrap_or_else(|| state_dir.join("optimized")),
+            max_size_bytes: max_size_mb << 20,
         })
     }
 }
@@ -4753,6 +4801,42 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn the_optimized_pool_is_under_the_state_dir_unless_set() {
+        let default = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            default.optimized.settings(Path::new("/s")).unwrap().dir,
+            Path::new("/s/optimized")
+        );
+    }
+
+    #[test]
+    fn the_optimized_pool_size_is_read_in_mib() {
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } optimized { max_size_mb = 64; }"#).unwrap();
+        assert_eq!(
+            config
+                .optimized
+                .settings(Path::new("/s"))
+                .unwrap()
+                .max_size_bytes,
+            64 << 20
+        );
+    }
+
+    #[test]
+    fn an_optimized_pool_of_nothing_is_refused() {
+        let config =
+            plex(r#"plex { url = "http://nas:32400"; } optimized { max_size_mb = 0; }"#).unwrap();
+        assert!(matches!(
+            config.optimized.settings(Path::new("/s")),
+            Err(ConfigError::Invalid {
+                key: "optimized.max_size_mb",
+                ..
+            })
+        ));
     }
 
     #[test]

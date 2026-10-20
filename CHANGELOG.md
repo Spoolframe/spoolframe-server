@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+- Optimized versions (PX-37): converted copies the server keeps and
+  plays from. It keeps profiles (`Mobile`, `TV` and `Compact 4K` to
+  start with) and the copies made in them. A new `optimized { dir; max_size_mb; }`
+  section says where the copies are kept (`state_dir/optimized`) and
+  the most they may take (100 GiB). A copy holds the video converted,
+  every audio track (AAC, AC-3 and E-AC-3 as they are, the others in
+  E-AC-3) and every subtitle and font in the file. The server makes
+  copies one at a time with what the encode budget has spare, and a
+  live playback that finds the budget full takes the copy's place: the
+  copy starts over later. A copy a stopped server was making starts
+  over at the next start. Over `max_size_mb`, outdated copies go first,
+  then `ahead` ones, then the least recently used; a copy being read
+  stays. Downloads (PX-38) will ask for copies in a profile.
+
+  Playback uses the copies: a plan that would encode the video plays a
+  ready copy instead, directly or remuxed, when the copy fits. It
+  fits when its range is the plan's (SDR where the plan tone maps), it
+  is no shorter than the height next under the encode's (1080p: 720p),
+  and planned as the film it needs no video encode: the device decodes
+  it and takes its size, and its bitrate is under the quality and the
+  link. A seek in it answers at once. A copy of the file as it was
+  before it changed is not played. Where no copy fits but one holds the
+  picked audio already converted (a DTS track made E-AC-3), that track
+  is read from the copy beside a live encode of the film's video. An
+  `Auto` playback over HLS is still a ladder, which may take its audio
+  from a copy. Server › Playback shows the copy a playback plays from
+  and its tracks (`made.copy` in the admin API). Nothing changes on the
+  wire: the plan's track numbers are the film's.
+
+  Binge-ahead: while someone watches an episode whose playback encodes
+  its video (a remux or an audio-only conversion does not count), the
+  server makes a copy of the show's next episode with that playback's
+  plan (codec, height, bitrate, tone map), tagged `ahead`, so the next
+  episode looks the same and plays from the copy with no live encode.
+  It starts once the episode's encode has caught up (its read-ahead
+  full, or the episode encoded to its end), with what the encode budget
+  has spare; a live playback takes its place. `ahead` copies wait
+  behind every copy asked for in a profile. Each viewer has one: a
+  newer one replaces one not yet started. One not yet made for a show
+  its viewer has not played for a day is dropped (stopped, if being
+  made); one made stays until evicted. No copy is made after a show's
+  last episode, a special, or a film. An episode played from its
+  `ahead` copy asks at once for the next one, made like that copy, so
+  a whole binge plays from copies, one episode ahead; a playback from
+  a profile's copy asks for none.
+
+  A new Server › Optimized page shows the pool's space against its
+  budget, the copy being made with its progress and time left, and
+  every copy (its item, its profile or `ahead`, outdated or not, its
+  state, size and last use), each with Delete; a copy being read goes
+  when its reader is done. It adds, edits and removes profiles (codec,
+  height, bitrate in Mbit/s). An edit that changes a profile's video
+  says how many of its copies it outdated and offers "Delete them now".
+  The admin API has `optimizedOverview`, `optimizedProfilePut`,
+  `optimizedProfileDelete`, `optimizedOutdatedDelete` and
+  `optimizedCopyDelete` for it, for admins only.
+
 ## 0.12.1 (2026-10-17)
 
 - A relative state directory (`--state-dir .dev-state`) is made

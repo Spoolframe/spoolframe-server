@@ -33,6 +33,8 @@ mod logs;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod network;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod optimized;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod overview;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod playback;

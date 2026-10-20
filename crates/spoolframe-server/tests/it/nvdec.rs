@@ -28,7 +28,7 @@ use spoolframe_media::sandbox::{self, GpuUse, Jail, Limits, Mode, Sandbox, Tool}
 use spoolframe_protocol::ConvertedVideo;
 use spoolframe_server::encode::Decoder;
 use spoolframe_server::encode::args::{
-    Decode, EncodeSpec, Output, decode, ffmpeg_args, gpu_decoder, made,
+    Decode, EncodeSpec, Inputs, Output, decode, ffmpeg_args, gpu_decoder, made,
 };
 use spoolframe_types::VideoCodec;
 
@@ -190,8 +190,7 @@ async fn an_nvenc_encode_decodes_on_nvdec_and_scales_on_cuda() {
     for (i, way) in WAYS.iter().enumerate() {
         let out = dir.join(format!("out-{i}.mkv"));
         let spec = EncodeSpec {
-            input: &film,
-            sidecar: None,
+            inputs: Inputs::film(&film),
             descriptor: &descriptor,
             video: Some(ConvertedVideo::Encode {
                 codec: VideoCodec::H264,

@@ -31,7 +31,7 @@ use spoolframe_media::encoders::{
 use spoolframe_media::sandbox::{self, Jail, Limits, Mode, Sandbox, Tool};
 use spoolframe_protocol::ConvertedVideo;
 use spoolframe_server::encode::args::{
-    EncodeSpec, Output, ffmpeg_args, placement, tone_mapper, vulkan,
+    EncodeSpec, Inputs, Output, ffmpeg_args, placement, tone_mapper, vulkan,
 };
 use spoolframe_types::VideoCodec;
 
@@ -236,8 +236,7 @@ async fn each_tone_map_this_host_runs_makes_sdr_bt709() {
         let encoders = only(&found, method.family);
         let out = dir.join(format!("out-{i}.mkv"));
         let spec = EncodeSpec {
-            input: &film,
-            sidecar: None,
+            inputs: Inputs::film(&film),
             descriptor: &descriptor,
             video: Some(ConvertedVideo::Encode {
                 codec: VideoCodec::H264,

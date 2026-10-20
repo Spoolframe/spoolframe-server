@@ -62,6 +62,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         playback: None,
         mcp: Default::default(),
         library: None,
+        optimized: None,
     }
 }
 

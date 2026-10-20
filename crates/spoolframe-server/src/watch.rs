@@ -728,17 +728,11 @@ impl Watch {
             return Ok(None);
         }
         // All of them at once: one request to Plex, not one per season.
-        let mut episodes = match self.catalog.episodes(show).await {
-            Ok(episodes) => episodes,
+        let episodes = match self.catalog.episodes(show).await {
+            Ok(episodes) => show_run(episodes),
             Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        // Specials (season 0) are not part of the run.
-        episodes.retain(|e| matches!(e, Item::Episode(e) if e.season > 0));
-        episodes.sort_by_key(|e| match e {
-            Item::Episode(e) => (e.season, e.episode),
-            _ => (u32::MAX, u32::MAX),
-        });
         // The most recently watched, not the furthest: a rewatch (or a
         // show picked up again from the middle) goes on from where the
         // person is, as Plex's On Deck does. A season marked watched at
@@ -765,6 +759,18 @@ impl Watch {
             .is_some_and(|row| !row.watched && row.position_ms.is_some_and(|p| p >= min));
         Ok((!started).then_some(next))
     }
+}
+
+/// A show's run, of its `episodes` (the catalog's): specials (season 0)
+/// are not part of it, and the rest go by season and number. Next up and
+/// binge-ahead (PX-37) both go on along it.
+pub(crate) fn show_run(mut episodes: Vec<Item>) -> Vec<Item> {
+    episodes.retain(|e| matches!(e, Item::Episode(e) if e.season > 0));
+    episodes.sort_by_key(|e| match e {
+        Item::Episode(e) => (e.season, e.episode),
+        _ => (u32::MAX, u32::MAX),
+    });
+    episodes
 }
 
 #[cfg(test)]

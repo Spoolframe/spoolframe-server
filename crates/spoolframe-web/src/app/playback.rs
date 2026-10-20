@@ -18,7 +18,7 @@ use crate::activity::{since, updated_line};
 use crate::logic::ApiError;
 use crate::logs::hours_minutes;
 use crate::playback::{
-    ReadsChart, at, converted_percent, decoder_text, delivery, encoder_text, ended_text,
+    ReadsChart, at, converted_percent, copy_text, decoder_text, delivery, encoder_text, ended_text,
     filter_text, furthest, link_parts, made_line, out_text, output_text, plan_pill, reads_chart,
     start_parts, stream_name, tone_mapper_text, why_line,
 };
@@ -38,7 +38,7 @@ fn local_time(at: i64) -> String {
 
 /// A polled answer: the last one and when it came, why none did, and a
 /// clock ticking each second for "N s ago".
-type Polled<T> = (
+pub(super) type Polled<T> = (
     Signal<Option<(T, i64)>>,
     Signal<Option<ApiError>>,
     Signal<i64>,
@@ -46,7 +46,7 @@ type Polled<T> = (
 
 /// Ask every [`POLL_MS`] with `ask`, keeping the last answer and when it
 /// came, or why none did.
-fn use_polled<
+pub(super) fn use_polled<
     T: Clone + 'static,
     F: std::future::Future<Output = Result<T, ApiError>> + 'static,
 >(
@@ -469,6 +469,7 @@ fn Made(row: PlaybackRow) -> Element {
     let (tone_map, tone_map_tone) = filter_text(made.tone_map);
     let (burn_in, burn_in_tone) = filter_text(made.burn_in);
     let (output, output_note) = output_text(made, direct);
+    let (copy, copy_note) = copy_text(made);
     rsx! {
         section { class: "card",
             div { class: "card-head", h2 { "How it is made" } }
@@ -485,6 +486,7 @@ fn Made(row: PlaybackRow) -> Element {
                     Stat { label: "HDR tone mapping".to_owned(), value: tone_map.to_owned(), note: tone_mapper_text(made), tone: tone_map_tone.to_owned() }
                     Stat { label: "Subtitle burn-in".to_owned(), value: burn_in.to_owned(), note: String::new(), tone: burn_in_tone.to_owned() }
                     Stat { label: "Output".to_owned(), value: output, note: output_note, tone: String::new() }
+                    Stat { label: "Optimized copy".to_owned(), value: copy, note: copy_note, tone: String::new() }
                 }
             }
         }

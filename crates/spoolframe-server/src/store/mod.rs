@@ -9,6 +9,7 @@ pub mod grants;
 pub mod identities;
 pub mod invites;
 pub mod oauth;
+pub mod optimized;
 pub mod passkeys;
 pub mod pins;
 pub mod playlists;

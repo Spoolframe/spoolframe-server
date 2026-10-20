@@ -710,13 +710,27 @@ async fn a_playback_s_first_read_is_its_time_to_first_media() {
 /// An HLS conversion's reads say how long they waited for the encode, a
 /// read the encode is past 0; its first segment is its time to first
 /// media; a seek's run is a restart. Real ffmpeg.
+///
+/// The first read waits however late it comes: with no read-ahead the
+/// throttle holds the encode before its first segment until a reader asks
+/// for it. ffmpeg reads in real time, reporting often, so the throttle
+/// holds it well before the 2 s segment is cut; at full speed it could
+/// write the segment between two looks.
 #[tokio::test]
 async fn an_hls_conversion_s_waits_first_segment_and_seek_are_measured() {
+    let dir = fresh_dir("hls-quality").await;
+    std::fs::create_dir_all(&dir).unwrap();
+    let ffmpeg = dir.join("real-time-ffmpeg");
+    crate::support::write_script(
+        &ffmpeg,
+        "#!/bin/sh\nexec ffmpeg -stats_period 0.1 -readrate 1 \"$@\"\n",
+    );
     let server = TestServer::start_with(
-        fresh_dir("hls-quality").await,
+        dir,
         ServerOptions {
             real_media: true,
-            read_ahead: Duration::from_secs(2),
+            ffmpeg,
+            read_ahead: Duration::ZERO,
             ..ServerOptions::default()
         },
     )
@@ -739,7 +753,15 @@ async fn an_hls_conversion_s_waits_first_segment_and_seek_are_measured() {
         segment: Some(n),
         variant: 0,
     };
-    // The first waits for the encode; the same again does not.
+    // Held for its reader before its first segment, so the first read
+    // waits for the encode; the same again never does.
+    until("the encode is held for its reader", || {
+        let open = server.debug.list().open;
+        let conversion = open[0].conversion.as_ref().expect("a conversion");
+        assert_eq!(conversion.last_segment, None, "held only after segment 1");
+        conversion.paused
+    })
+    .await;
     for _ in 0..2 {
         let (read, bytes) = client.media(segment(1)).await;
         assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");

@@ -124,6 +124,14 @@ pub enum SandboxError {
         dir.display()
     )]
     Hidden { dir: PathBuf, error: std::io::Error },
+    /// A directory to show holds a hidden one: showing it would let the
+    /// media tools read the database, the key or the secrets.
+    #[error(
+        "{} may not be read by the media tools: it holds {}, which they are kept from",
+        shown.display(),
+        hidden.display()
+    )]
+    ShowsHidden { shown: PathBuf, hidden: PathBuf },
 }
 
 /// `dir` with every symlink in it followed, as the kernel names what is in
@@ -179,6 +187,10 @@ struct Inner {
     /// No input is read from in here: the state directory, with the
     /// database, the key and the secrets; systemd's credentials.
     hidden: Vec<PathBuf>,
+    /// Inputs may be read from in here, though it is inside a hidden one:
+    /// the copies of media the server made itself (PX-37), resolved as
+    /// `hidden` is.
+    shown: Vec<PathBuf>,
     /// The GPU device nodes this host has, by API; a run gets those of
     /// the GPU it uses.
     gpu: GpuDevices,
@@ -197,8 +209,34 @@ impl Sandbox {
             landlock: None,
             seccomp: None,
             hidden: Vec::new(),
+            shown: Vec::new(),
             gpu: GpuDevices::default(),
         }))
+    }
+
+    /// This sandbox, with inputs read from `dirs` though they are inside a
+    /// hidden directory: the optimized copies (PX-37), media the server
+    /// made, which playback reads as it reads a library's. A run still
+    /// reads the input's inode alone, and an input whose real path leads
+    /// out of `dirs` into a hidden one is refused. One that cannot be
+    /// resolved is kept as named: at worst its copies cannot be read. A
+    /// directory that is a hidden one, or holds one, is refused: it would
+    /// show the hidden one whole.
+    pub fn showing(self, dirs: Vec<PathBuf>) -> Result<Self, SandboxError> {
+        let mut inner = (*self.0).clone();
+        inner.shown = dirs
+            .into_iter()
+            .map(|dir| resolve_dir(&dir).unwrap_or(dir))
+            .collect();
+        for shown in &inner.shown {
+            if let Some(hidden) = inner.hidden.iter().find(|h| h.starts_with(shown)) {
+                return Err(SandboxError::ShowsHidden {
+                    shown: shown.clone(),
+                    hidden: hidden.clone(),
+                });
+            }
+        }
+        Ok(Self(Arc::new(inner)))
     }
 
     /// Confine as `mode` says, with this kernel's Landlock. Without it (or
@@ -244,6 +282,7 @@ impl Sandbox {
             landlock: None,
             seccomp: None,
             hidden,
+            shown: Vec::new(),
             gpu,
         };
         if mode == Mode::Off {
@@ -1401,7 +1440,8 @@ fn open_input(path: &Path, sandbox: &Inner, jail: &Jail) -> std::io::Result<Opti
         .chain(&jail.writes)
         .filter_map(|dir| std::fs::canonicalize(dir).ok())
         .any(|dir| real.starts_with(dir));
-    if !own && sandbox.hidden.iter().any(|dir| real.starts_with(dir)) {
+    let shown = sandbox.shown.iter().any(|dir| real.starts_with(dir));
+    if !own && !shown && sandbox.hidden.iter().any(|dir| real.starts_with(dir)) {
         return Err(refused(format!(
             "leads to {}, which a media tool may not read",
             real.display()
@@ -1708,6 +1748,60 @@ mod tests {
         assert!(hidden_from(&sandbox, &tmp.join("real/state/db")));
         assert!(hidden_from(&sandbox, &tmp.join("link/state/db")));
         assert!(!hidden_from(&sandbox, &tmp.join("real/movie.mkv")));
+    }
+
+    /// PX-37: a copy the server made, in a directory shown inside the
+    /// hidden state directory, is read as an input; the rest stays hidden.
+    #[tokio::test]
+    async fn a_shown_dir_inside_a_hidden_one_is_read() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-shown").await;
+        std::fs::create_dir_all(tmp.join("state/optimized")).unwrap();
+        std::fs::write(tmp.join("state/optimized/c1.mkv"), b"copy").unwrap();
+        let sandbox = hiding(Mode::Off, tmp.join("state"))
+            .unwrap()
+            .showing(vec![tmp.join("state/optimized")])
+            .unwrap();
+        assert!(!hidden_from(&sandbox, &tmp.join("state/optimized/c1.mkv")));
+    }
+
+    /// A link in the shown directory to a hidden file is refused: what
+    /// counts is where it leads.
+    #[tokio::test]
+    async fn a_link_out_of_a_shown_dir_into_a_hidden_one_is_refused() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-shown-link").await;
+        std::fs::create_dir_all(tmp.join("state/optimized")).unwrap();
+        std::fs::write(tmp.join("state/db"), b"secret").unwrap();
+        std::os::unix::fs::symlink(tmp.join("state/db"), tmp.join("state/optimized/c1.mkv"))
+            .unwrap();
+        let sandbox = hiding(Mode::Off, tmp.join("state"))
+            .unwrap()
+            .showing(vec![tmp.join("state/optimized")])
+            .unwrap();
+        assert!(hidden_from(&sandbox, &tmp.join("state/optimized/c1.mkv")));
+    }
+
+    /// Showing the hidden directory itself, or one above it, is refused:
+    /// it would show the database and the secrets.
+    #[tokio::test]
+    async fn showing_the_state_dir_itself_is_refused() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-show-state").await;
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        let sandbox = hiding(Mode::Off, tmp.join("state")).unwrap();
+        assert!(matches!(
+            sandbox.showing(vec![tmp.join("state")]),
+            Err(SandboxError::ShowsHidden { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn showing_a_dir_above_the_state_dir_is_refused() {
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-sandbox-show-above").await;
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        let sandbox = hiding(Mode::Off, tmp.join("state")).unwrap();
+        assert!(matches!(
+            sandbox.showing(vec![tmp.to_path_buf()]),
+            Err(SandboxError::ShowsHidden { .. })
+        ));
     }
 
     /// One not made yet is kept by where it will be: its nearest existing

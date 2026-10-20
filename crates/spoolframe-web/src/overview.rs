@@ -69,6 +69,7 @@ mod tests {
                 "height": 1080,
                 "targetBitrate": null,
                 "measuredBitrate": null,
+                "copy": null,
             },
             "start": {
                 "planMs": 12,

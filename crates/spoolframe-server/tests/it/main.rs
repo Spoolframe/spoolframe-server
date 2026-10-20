@@ -38,6 +38,8 @@ mod metrics;
 mod not_set_up;
 mod nvdec;
 mod oauth;
+mod optimized;
+mod optimized_admin;
 mod passkey_relay;
 mod passkey_setup;
 mod passkeys;

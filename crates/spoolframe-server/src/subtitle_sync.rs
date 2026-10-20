@@ -201,7 +201,7 @@ impl SubtitleTimings {
         let Some(row) = self.store.subtitle_timing(&path_text(sidecar)).await? else {
             return Ok(None);
         };
-        Ok(match stamp(sidecar).await {
+        Ok(match crate::files::stamp_text(sidecar).await {
             Ok(now) if now == row.stamp => Some(row),
             _ => None,
         })
@@ -267,7 +267,7 @@ impl SubtitleTimings {
     /// already syncing is left to it.
     pub async fn sync(self: &Arc<Self>, track: TrackRef) -> Result<SubtitleTiming, TimingError> {
         let (sidecar, format) = track.sidecar()?;
-        let stamp = stamp(&sidecar)
+        let stamp = crate::files::stamp_text(&sidecar)
             .await
             .map_err(|e| TimingError::Io(format!("the subtitle file cannot be read: {e}")))?;
         if !self.syncing.lock().insert(sidecar.clone()) {
@@ -391,7 +391,7 @@ impl SubtitleTimings {
         edit: impl FnOnce(&mut TimingRow) -> Result<(), TimingError>,
     ) -> Result<(), TimingError> {
         let _writing = self.writing.lock().await;
-        let stamp = stamp(sidecar)
+        let stamp = crate::files::stamp_text(sidecar)
             .await
             .map_err(|e| TimingError::Io(format!("the subtitle file cannot be read: {e}")))?;
         let mut row = self
@@ -562,7 +562,7 @@ impl SubtitleTimings {
     /// it ran (its row then no longer holds, and the outcome is of a file
     /// that is gone).
     async fn finish(&self, track: &TrackRef, sidecar: &Path, began: &str, outcome: Outcome) {
-        let changed = stamp(sidecar).await.ok().as_deref() != Some(began);
+        let changed = crate::files::stamp_text(sidecar).await.ok().as_deref() != Some(began);
         let written = if changed {
             Err(TimingError::Io(
                 "the subtitle file changed during the sync".into(),
@@ -672,12 +672,6 @@ fn format_of(sidecar: &Path) -> Option<TextFormat> {
         "ass" | "ssa" => Some(TextFormat::Ass),
         _ => None,
     }
-}
-
-/// A file's size and modification time, as a row keeps them.
-async fn stamp(path: &Path) -> std::io::Result<String> {
-    let (size, modified) = crate::files::stamp(path).await?;
-    Ok(format!("{size} {modified}"))
 }
 
 /// A subtitle file, never through a symlink, at most

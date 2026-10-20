@@ -96,6 +96,14 @@ pub async fn stamp(path: &Path) -> std::io::Result<(u64, u128)> {
     Ok((meta.len(), modified))
 }
 
+/// A file's size and modification time as one string, `"<size>
+/// <nanoseconds>"`: how a row keeps them, to tell the file as it was
+/// from the file now (PX-03's syncs, PX-37's copies).
+pub async fn stamp_text(path: &Path) -> std::io::Result<String> {
+    let (size, modified) = stamp(path).await?;
+    Ok(format!("{size} {modified}"))
+}
+
 /// A cache key's hash of `parts`, each ended by a NUL so no two lists of
 /// parts run together into one.
 pub fn hash_parts(parts: &[String]) -> blake3::Hash {

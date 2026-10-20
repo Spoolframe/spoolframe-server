@@ -24,7 +24,7 @@ use spoolframe_media::encoders::{
 };
 use spoolframe_media::sandbox::{self, Jail, Limits, Mode, Sandbox, Tool};
 use spoolframe_protocol::ConvertedVideo;
-use spoolframe_server::encode::args::{EncodeSpec, Output, ffmpeg_args, made, placement};
+use spoolframe_server::encode::args::{EncodeSpec, Inputs, Output, ffmpeg_args, made, placement};
 use spoolframe_types::VideoCodec;
 
 use crate::support::fresh_dir;
@@ -150,8 +150,7 @@ async fn each_job_runs_on_the_gpu_that_does_the_most_of_it() {
         for (m, out_height) in heights.into_iter().enumerate() {
             let out = dir.join(format!("out-{n}-{m}.mkv"));
             let spec = EncodeSpec {
-                input: film,
-                sidecar: None,
+                inputs: Inputs::film(film),
                 descriptor: &descriptor,
                 video: Some(ConvertedVideo::Encode {
                     codec: VideoCodec::H264,

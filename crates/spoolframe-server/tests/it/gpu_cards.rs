@@ -25,7 +25,7 @@ use spoolframe_media::gpus::{self, GpuEntry, HostRoots, Pick, Which};
 use spoolframe_media::sandbox::{GpuDevices, GpuUse, Jail, Limits, Mode, Sandbox, Tool};
 use spoolframe_protocol::ConvertedVideo;
 use spoolframe_server::encode::args::{
-    EncodeSpec, Output, ffmpeg_args, made, placement, tone_mapper, vulkan,
+    EncodeSpec, Inputs, Output, ffmpeg_args, made, placement, tone_mapper, vulkan,
 };
 use spoolframe_server::transcode::Transcoding;
 use spoolframe_types::VideoCodec;
@@ -128,8 +128,7 @@ async fn each_card_is_found_classified_and_encodes_confined() {
         let node = gpu.vaapi_device();
         let out = dir.join(format!("out-{n}.mkv"));
         let spec = EncodeSpec {
-            input: &film,
-            sidecar: None,
+            inputs: Inputs::film(&film),
             descriptor: &descriptor,
             video: Some(ConvertedVideo::Encode {
                 codec: VideoCodec::H264,
@@ -188,8 +187,7 @@ async fn each_card_is_found_classified_and_encodes_confined() {
         let node = gpu.vaapi_device();
         let out = dir.join(format!("hdr-{n}.mkv"));
         let spec = EncodeSpec {
-            input: &hdr,
-            sidecar: None,
+            inputs: Inputs::film(&hdr),
             descriptor: &hdr_descriptor,
             video: Some(ConvertedVideo::Encode {
                 codec: VideoCodec::H264,

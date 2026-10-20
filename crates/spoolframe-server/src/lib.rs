@@ -39,6 +39,7 @@ pub mod oauth;
 pub mod oidc;
 pub mod opensubtitles;
 mod operations;
+pub mod optimized;
 pub mod own_relay;
 pub mod pairing_relay;
 pub mod passkeys;

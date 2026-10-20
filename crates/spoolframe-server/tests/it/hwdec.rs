@@ -11,7 +11,7 @@ use spoolframe_media::encoders::{self, Encoders, FfmpegCommand, Hardware, Transc
 use spoolframe_media::sandbox::{self, GpuUse, Jail, Limits, Mode, Sandbox, Tool};
 use spoolframe_media::{MediaDescriptor, Prober};
 use spoolframe_protocol::ConvertedVideo;
-use spoolframe_server::encode::args::{Decode, EncodeSpec, Output, decode, ffmpeg_args};
+use spoolframe_server::encode::args::{Decode, EncodeSpec, Inputs, Output, decode, ffmpeg_args};
 use spoolframe_server::encode::job::{Fallback, Jobs, Run, Written};
 use spoolframe_server::encode::{JobLimits, Load, Units};
 use spoolframe_types::VideoCodec;
@@ -173,8 +173,7 @@ fn spec<'a>(
     out: &Path,
 ) -> EncodeSpec<'a> {
     EncodeSpec {
-        input: film,
-        sidecar: None,
+        inputs: Inputs::film(film),
         descriptor,
         video: Some(ConvertedVideo::Encode {
             codec: VideoCodec::H264,

@@ -742,6 +742,7 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
             height,
             target_bitrate: None,
             measured_bitrate: conversion.and_then(|c| c.output.bitrate()),
+            copy: copy_used(s),
         };
     };
     let (width, height) = made.size.unzip();
@@ -755,7 +756,19 @@ fn made(s: &Snapshot) -> api::PlaybackMade {
         height,
         target_bitrate: made.target_bitrate,
         measured_bitrate: conversion.and_then(|c| c.output.bitrate()),
+        copy: copy_used(s),
     }
+}
+
+/// The optimized copy `s` plays from, if any (PX-37).
+fn copy_used(s: &Snapshot) -> Option<api::PlaybackCopy> {
+    s.copy.as_ref().map(|c| api::PlaybackCopy {
+        id: c.id.clone(),
+        target: c.target.clone(),
+        video: c.tracks.video,
+        audio: c.tracks.audio,
+        subtitle: c.tracks.subtitle,
+    })
 }
 
 /// What decodes the video, as the admin API names it (PX-24).

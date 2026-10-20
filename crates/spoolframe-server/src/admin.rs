@@ -81,6 +81,8 @@ use spoolframe_plex::account::{PinState, PlexTv};
 
 #[path = "admin_catalog.rs"]
 mod catalog;
+#[path = "admin_optimized.rs"]
+mod optimized;
 #[path = "admin_playlists.rs"]
 mod playlists;
 
@@ -535,6 +537,9 @@ pub struct Admin {
     /// What MCP's library and playlist tools read (PX-42); `None` in
     /// tests without, where those tools say so.
     pub library: Option<crate::mcp::Library>,
+    /// The optimized copies (PX-37), for Server › Optimized; `None` in
+    /// tests without, where its methods are `NOT_CONFIGURED`.
+    pub optimized: Option<Arc<crate::optimized::Pool>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -660,6 +665,8 @@ pub async fn serve(
         playback: admin.playback,
         mcp: admin.mcp,
         library: admin.library,
+        optimized: admin.optimized,
+        optimized_titles: Arc::default(),
         checks,
         pins: Arc::default(),
         signed_in: Arc::default(),
@@ -695,6 +702,10 @@ pub(crate) struct AdminApi {
     oauth: Arc<crate::oauth::OAuth>,
     mcp: crate::oauth::McpSwitch,
     library: Option<crate::mcp::Library>,
+    optimized: Option<Arc<crate::optimized::Pool>>,
+    /// The optimized copies' items as the catalog named them, by media
+    /// id: only those still in the pool (PX-37).
+    optimized_titles: Arc<parking_lot::Mutex<optimized::Titles>>,
     /// Each library's last path check (P3-16).
     checks: Arc<PathChecks>,
     /// The plex.tv PINs this server began, so a check is only of those.
@@ -4288,6 +4299,47 @@ impl AdminApiServer for AdminApi {
             .await
             .map_err(debug_error)
     }
+
+    async fn optimized_overview(
+        &self,
+        ext: &Extensions,
+    ) -> RpcResult<spoolframe_admin_api::OptimizedOverview> {
+        self.admin(ext).await?;
+        self.optimized_view().await
+    }
+
+    async fn optimized_profile_put(
+        &self,
+        ext: &Extensions,
+        profile: spoolframe_admin_api::OptimizedProfile,
+    ) -> RpcResult<spoolframe_admin_api::OptimizedProfileWritten> {
+        let admin = self.admin(ext).await?;
+        self.put_optimized_profile(&admin, profile).await
+    }
+
+    async fn optimized_profile_delete(&self, ext: &Extensions, name: String) -> RpcResult<u64> {
+        let admin = self.admin(ext).await?;
+        self.delete_optimized_profile(&admin, &name).await
+    }
+
+    async fn optimized_outdated_delete(
+        &self,
+        ext: &Extensions,
+        profile: Option<String>,
+    ) -> RpcResult<spoolframe_admin_api::OptimizedDeleted> {
+        let admin = self.admin(ext).await?;
+        self.delete_outdated_copies(&admin, profile.as_deref())
+            .await
+    }
+
+    async fn optimized_copy_delete(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::OptimizedCopyDeleted> {
+        let admin = self.admin(ext).await?;
+        self.delete_optimized_copy(&admin, &id).await
+    }
 }
 
 /// An admin caller's rights, as the services that judge access take them.
@@ -4624,6 +4676,8 @@ mod tests {
             )),
             mcp: crate::oauth::McpSwitch::default(),
             library: None,
+            optimized: None,
+            optimized_titles: Arc::default(),
             auth,
             setup_code: None,
             status: Arc::new(StatusSource::new(

@@ -392,6 +392,10 @@ pub struct Playback {
     /// For a converted playback, its encode (P2-03). Ending the handle
     /// drops it, which stops ffmpeg and removes its files.
     pub conversion: Option<Arc<Conversion>>,
+    /// The film, or the optimized copy it plays or takes its audio from
+    /// (PX-37): a copy is lent until the playback ends, so it is not
+    /// evicted while played.
+    pub source: Source,
     /// The quality it is planned for (P6-06), again at a subtitle change.
     pub quality: Quality,
     /// What the screen showed when it was planned (PGPU-06): a re-plan
@@ -458,6 +462,12 @@ impl Playback {
         asked.or_else(|| self.display.clone())
     }
 
+    /// The file a direct play of it reads: its copy's, when the copy plays
+    /// in the film's place (PX-37), else the film.
+    pub fn read_path(&self) -> &std::path::Path {
+        self.source.read_path(&self.path)
+    }
+
     /// How it is served.
     pub fn plan(&self) -> Plan {
         match &self.conversion {
@@ -466,6 +476,126 @@ impl Playback {
             Some(_) => Plan::Remux,
         }
     }
+}
+
+/// What a playback reads (PX-37): the film, an optimized copy in its
+/// place, or the film with a copy's audio. Decided once, as it is
+/// planned; all else asks this.
+#[derive(Debug, Clone, Default)]
+pub enum Source {
+    #[default]
+    Film,
+    /// The copy plays in the film's place.
+    WholeCopy(CopyUse),
+    /// The film plays, its audio taken from the copy.
+    AudioFrom(CopyUse),
+}
+
+impl Source {
+    /// The file it reads, the film being at `film`.
+    pub fn read_path<'a>(&'a self, film: &'a std::path::Path) -> &'a std::path::Path {
+        match self {
+            Self::WholeCopy(copy) => copy.lease.path(),
+            Self::Film | Self::AudioFrom(_) => film,
+        }
+    }
+
+    /// The copy the audio alone is taken from, if that is all it gives.
+    pub fn audio_from(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::AudioFrom(copy) => Some(copy.lease.path()),
+            Self::Film | Self::WholeCopy(_) => None,
+        }
+    }
+
+    /// The copy lent, either way.
+    fn copy(&self) -> Option<&CopyUse> {
+        match self {
+            Self::Film => None,
+            Self::WholeCopy(copy) | Self::AudioFrom(copy) => Some(copy),
+        }
+    }
+
+    /// The copy's id, if a copy is lent.
+    pub fn copy_id(&self) -> Option<&str> {
+        self.copy().map(|copy| copy.lease.id())
+    }
+
+    /// The tracks it takes from its copy, if any.
+    pub fn tracks(&self) -> Option<CopyTracks> {
+        let copy = self.copy()?;
+        let whole = matches!(self, Self::WholeCopy(_));
+        Some(CopyTracks {
+            video: whole,
+            audio: copy.audio,
+            subtitle: whole && copy.embedded_subtitle,
+        })
+    }
+
+    /// Which copy it plays from and which of its tracks, as a snapshot
+    /// shows it.
+    pub fn used(&self) -> Option<CopyUsed> {
+        Some(CopyUsed {
+            id: self.copy_id()?.to_owned(),
+            target: self.copy()?.target.clone(),
+            tracks: self.tracks()?,
+        })
+    }
+}
+
+/// An optimized copy a playback plays from (PX-37), lent to it.
+#[derive(Debug, Clone)]
+pub struct CopyUse {
+    lease: Arc<crate::optimized::Lease>,
+    /// Its profile's name, or `ahead`.
+    target: String,
+    /// It has audio, which plays.
+    audio: bool,
+    /// The subtitle picked is one of its streams: played from it when
+    /// the copy plays whole.
+    embedded_subtitle: bool,
+}
+
+impl CopyUse {
+    /// `lease`d copy made for `target`, described as `descriptor`, with
+    /// `subtitle` picked.
+    pub fn new(
+        lease: crate::optimized::Lease,
+        target: &crate::store::optimized::CopyTarget,
+        descriptor: &spoolframe_media::MediaDescriptor,
+        subtitle: Option<u32>,
+    ) -> Self {
+        Self {
+            lease: Arc::new(lease),
+            target: match target {
+                crate::store::optimized::CopyTarget::Profile(name) => name.clone(),
+                crate::store::optimized::CopyTarget::Ahead => "ahead".to_owned(),
+            },
+            audio: !descriptor.audio.is_empty(),
+            embedded_subtitle: subtitle
+                .and_then(|s| descriptor.subtitles.get(s as usize))
+                .is_some_and(|t| {
+                    matches!(t.source, spoolframe_media::SubtitleSource::Embedded { .. })
+                }),
+        }
+    }
+}
+
+/// Which copy a playback plays from, and which of its tracks (PX-37).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyUsed {
+    pub id: String,
+    /// Its profile's name, or `ahead`.
+    pub target: String,
+    pub tracks: CopyTracks,
+}
+
+/// The tracks a playback takes from a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyTracks {
+    pub video: bool,
+    pub audio: bool,
+    pub subtitle: bool,
 }
 
 /// A playback to open.
@@ -485,6 +615,8 @@ pub struct Opened {
     pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
+    /// The film, or the optimized copy it plays from (PX-37).
+    pub source: Source,
     /// The quality the viewer chose (P6-06).
     pub quality: Quality,
     /// What the screen shows (PGPU-06), if the start said.
@@ -546,6 +678,7 @@ pub struct Changed {
     pub file: Option<FileId>,
     pub subtitle: Option<Sidecar>,
     pub conversion: Option<Arc<Conversion>>,
+    pub source: Source,
     pub quality: Quality,
     /// What the screen shows (PGPU-06): the change's, or the playback's.
     pub display: Option<DisplayCapabilities>,
@@ -712,6 +845,8 @@ pub struct Snapshot {
     /// The last [`READS_KEPT`], oldest first.
     pub reads: Vec<ReadPoint>,
     pub conversion: Option<ConversionSnapshot>,
+    /// The optimized copy it plays from (PX-37).
+    pub copy: Option<CopyUsed>,
     /// The file's picture, width × height.
     pub video_size: Option<(u32, u32)>,
     pub start: StartTimes,
@@ -822,6 +957,7 @@ impl Playback {
             last_read_at: trace.last_read,
             reads: trace.reads.iter().copied().collect(),
             conversion,
+            copy: self.source.used(),
             video_size: self.video_size,
             start: *self.start.lock(),
             link: self.link.lock().clone(),
@@ -1119,6 +1255,7 @@ impl Playbacks {
                 file: opened.file,
                 subtitle: opened.subtitle,
                 conversion: opened.conversion,
+                source: opened.source,
                 quality: opened.quality,
                 display: opened.display,
                 video_size: opened.video_size,
@@ -1166,6 +1303,9 @@ impl Playbacks {
         playback.subtitle = changed.subtitle;
         playback.quality = changed.quality;
         playback.display = changed.display;
+        // The copy it played is let go of once the new conversion runs:
+        // the old one, which may read it, is ended by then.
+        playback.source = changed.source;
         std::mem::replace(&mut playback.conversion, changed.conversion)
     }
 
@@ -1233,6 +1373,22 @@ impl Playbacks {
     /// the handle itself. Not a use of it.
     pub fn item(&self, handle: &PlaybackHandle) -> Option<MediaId> {
         self.lock().get(&handle.0).map(|p| p.item.clone())
+    }
+
+    /// What binge-ahead (PX-37) looks at of `handle`, if it is open. Not a
+    /// use of it.
+    pub fn binge_view(&self, handle: &PlaybackHandle) -> Option<crate::optimized::ahead::Seen> {
+        self.lock()
+            .get(&handle.0)
+            .map(|p| crate::optimized::ahead::Seen {
+                plan: p.planned.clone(),
+                caught_up: p.conversion.as_ref().is_some_and(|c| c.caught_up()),
+                signal: p.conversion.as_ref().map(|c| c.caught_up_signal()),
+                copy: match &p.source {
+                    Source::WholeCopy(copy) => Some(copy.lease.id().to_owned()),
+                    Source::Film | Source::AudioFrom(_) => None,
+                },
+            })
     }
 
     /// Mark `handle` used now, as a read that is still waiting for an
@@ -1911,6 +2067,7 @@ pub(crate) mod tests {
             file: None,
             subtitle: None,
             conversion: None,
+            source: Source::Film,
             quality: Quality::default(),
             video_size: None,
             start: Arc::new(Mutex::new(StartTimes {
@@ -1975,6 +2132,7 @@ pub(crate) mod tests {
                 file: None,
                 subtitle: None,
                 conversion: Some(new.clone()),
+                source: Source::Film,
                 quality: Quality::default(),
                 display: None,
             },
@@ -2064,6 +2222,7 @@ pub(crate) mod tests {
                 file: None,
                 subtitle: None,
                 conversion: None,
+                source: Source::Film,
                 quality: Quality::default(),
                 display: Some(sdr.clone()),
             },

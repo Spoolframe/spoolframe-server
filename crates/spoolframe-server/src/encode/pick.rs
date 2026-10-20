@@ -585,7 +585,7 @@ mod tests {
     use spoolframe_types::VideoCodec;
 
     use super::*;
-    use crate::encode::args::Output;
+    use crate::encode::args::{Inputs, Output};
     use crate::transcode::test_gpu;
 
     /// A card of `api` whose detection encodes `encodes` and decodes
@@ -650,8 +650,7 @@ mod tests {
     /// `film` encoded to H.264 at `height`.
     fn spec<'a>(film: &'a MediaDescriptor, height: u32, software: &'a Encoders) -> EncodeSpec<'a> {
         EncodeSpec {
-            input: Path::new("in"),
-            sidecar: None,
+            inputs: Inputs::film(Path::new("in")),
             descriptor: film,
             video: Some(ConvertedVideo::Encode {
                 codec: VideoCodec::H264,

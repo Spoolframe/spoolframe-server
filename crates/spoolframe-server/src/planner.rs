@@ -1137,20 +1137,29 @@ fn encode_audio(
         .ok_or_else(|| {
             format!("audio {index}: the server can encode no codec this client plays")
         })?;
-    // AC-3 tops out at 5.1; AAC and Opus beyond stereo stay at 5.1 too.
-    let channels = channels.min(6);
-    let bitrate = match (codec, channels > 2) {
+    let channels = channels.min(MAX_ENCODED_CHANNELS);
+    Ok(AudioAction::Encode {
+        codec,
+        channels,
+        bitrate: encoded_audio_bitrate(codec, channels),
+    })
+}
+
+/// The most channels an encoded track keeps: AC-3 tops out at 5.1; AAC
+/// and Opus beyond stereo stay at 5.1 too. A copy's converted tracks
+/// (PX-37) keep to it as a playback's do.
+pub(crate) const MAX_ENCODED_CHANNELS: u32 = 6;
+
+/// The bitrate an encoded track of `codec` with `channels` gets, bits per
+/// second.
+pub(crate) fn encoded_audio_bitrate(codec: AudioCodec, channels: u32) -> u64 {
+    match (codec, channels > 2) {
         (AudioCodec::Eac3 | AudioCodec::Ac3, true) => 640_000,
         (AudioCodec::Aac, true) => 384_000,
         (AudioCodec::Opus, true) => 256_000,
         (AudioCodec::Opus, false) => 128_000,
         _ => 192_000,
-    };
-    Ok(AudioAction::Encode {
-        codec,
-        channels,
-        bitrate,
-    })
+    }
 }
 
 /// What a plan does, in one word: the kind its log line

@@ -53,8 +53,8 @@ use crate::network::{Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
 use crate::playback::{
-    Changed, FileId, FirstSegment, KeyframesFrom, Opened, Playback, Playbacks, Refusal, Sidecar,
-    StartTimes, Using,
+    Changed, CopyUse, FileId, FirstSegment, KeyframesFrom, Opened, Playback, Playbacks, Refusal,
+    Sidecar, Source, StartTimes, Using,
 };
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
@@ -3159,15 +3159,18 @@ impl ClientProtocol {
                         .selection(principal, &id, &descriptor, selection)
                         .await?;
                     let bitmap = self.bitmap(principal, bitmap).await?;
-                    let plan = self.plan(
-                        state,
-                        &descriptor,
-                        caps.as_ref(),
-                        quality,
-                        share,
-                        selection,
-                        bitmap,
-                    );
+                    let planned = self
+                        .planned(
+                            state,
+                            (&path, &descriptor),
+                            caps.as_ref(),
+                            quality,
+                            share,
+                            selection,
+                            bitmap,
+                        )
+                        .await;
+                    let plan = planned.plan.clone();
                     let planned_in = requested.elapsed();
                     // The item's markers go with the playback (P2-10), so a
                     // player needs no second request for them.
@@ -3209,16 +3212,7 @@ impl ClientProtocol {
                     }
                     let start = start_ms.map(Duration::from_millis);
                     let prepared = match self
-                        .prepare(
-                            &handle,
-                            &id,
-                            (&path, &descriptor),
-                            &plan,
-                            quality,
-                            start,
-                            None,
-                            &trace,
-                        )
+                        .prepare(&handle, &id, &planned, &plan, quality, start, None, &trace)
                         .await
                     {
                         // No slot free, and the device holds one it does not
@@ -3234,14 +3228,7 @@ impl ClientProtocol {
                                 > 0 =>
                         {
                             self.prepare(
-                                &handle,
-                                &id,
-                                (&path, &descriptor),
-                                &plan,
-                                quality,
-                                start,
-                                None,
-                                &trace,
+                                &handle, &id, &planned, &plan, quality, start, None, &trace,
                             )
                             .await
                         }
@@ -3269,6 +3256,13 @@ impl ClientProtocol {
                         .playbacks
                         .progress_control(&session, &id)
                         .await;
+                    // An episode's next one may be made ahead (PX-37).
+                    let binge = match &found.item {
+                        spoolframe_types::Item::Episode(episode) => {
+                            Some(crate::optimized::ahead::Played::from(episode))
+                        }
+                        _ => None,
+                    };
                     let handle = self.services.playbacks.start(
                         handle,
                         Opened {
@@ -3287,7 +3281,12 @@ impl ClientProtocol {
                             conversion,
                             quality,
                             display,
-                            video_size: descriptor.video.as_ref().map(|v| (v.width, v.height)),
+                            video_size: planned
+                                .descriptor
+                                .video
+                                .as_ref()
+                                .map(|v| (v.width, v.height)),
+                            source: planned.source,
                             start: start_times.clone(),
                             requested,
                             connection: state.number,
@@ -3305,6 +3304,16 @@ impl ClientProtocol {
                     // follow once starts settle.
                     if let Some(admission) = admission {
                         admission.started(&handle.0, connection.stable_id());
+                    }
+                    if let (Some(pool), Some(episode)) = (&self.services.optimized, binge) {
+                        crate::optimized::ahead::spawn(
+                            pool,
+                            &self.services.playbacks,
+                            self.services.catalog.clone(),
+                            handle.clone(),
+                            principal.to_string(),
+                            episode,
+                        );
                     }
                     // What was decided, so a playback that then goes quiet
                     // can be read from the log; the endpoint as the
@@ -3377,20 +3386,23 @@ impl ClientProtocol {
                     subtitle,
                 };
                 let bitmap = self.bitmap(principal, bitmap).await?;
-                let plan = self.plan(
-                    state,
-                    &descriptor,
-                    caps.as_ref(),
-                    quality,
-                    share,
-                    selection,
-                    bitmap,
-                );
+                let planned = self
+                    .planned(
+                        state,
+                        (&path, &descriptor),
+                        caps.as_ref(),
+                        quality,
+                        share,
+                        selection,
+                        bitmap,
+                    )
+                    .await;
+                let plan = planned.plan.clone();
                 let (subtitle, (size, file), conversion, _) = self
                     .prepare(
                         &handle,
                         &playback.item,
-                        (&path, &descriptor),
+                        &planned,
                         &plan,
                         quality,
                         Some(Duration::from_millis(position_ms)),
@@ -3408,6 +3420,7 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
+                        source: planned.source,
                         quality: playback.quality,
                         display,
                     },
@@ -3432,17 +3445,23 @@ impl ClientProtocol {
                 // Its share now (PX-46): a re-plan after `PlaybackShare`
                 // takes the one the event told.
                 let share = self.services.uplink.share_of(&handle.0);
-                let plan = self.plan(
-                    state,
-                    &descriptor,
-                    caps.as_ref(),
-                    quality,
-                    share,
-                    selection,
-                    bitmap,
-                );
+                let planned = self
+                    .planned(
+                        state,
+                        (&path, &descriptor),
+                        caps.as_ref(),
+                        quality,
+                        share,
+                        selection,
+                        bitmap,
+                    )
+                    .await;
+                let plan = planned.plan.clone();
                 let epoch_now = playback.conversion.as_ref().map_or(0, |c| c.job().epoch);
-                if plan == playback.planned {
+                // The same plan of the same file: a copy's plan may read as
+                // the film's would (PX-37).
+                let same_copy = planned.source.copy_id() == playback.source.copy_id();
+                if plan == playback.planned && same_copy {
                     // The same plan: nothing to restart. The quality and
                     // the screen are kept for the next re-plan all the same.
                     self.services
@@ -3460,7 +3479,7 @@ impl ClientProtocol {
                     .prepare(
                         &handle,
                         &playback.item,
-                        (&path, &descriptor),
+                        &planned,
                         &plan,
                         quality,
                         Some(Duration::from_millis(position_ms)),
@@ -3478,6 +3497,7 @@ impl ClientProtocol {
                         file,
                         subtitle,
                         conversion,
+                        source: planned.source,
                         quality,
                         display,
                     },
@@ -4627,7 +4647,8 @@ impl ClientProtocol {
     }
 
     /// The plan for a playback on this connection: off the LAN or not as
-    /// its path is now, with the encoders and OCR as this server has them.
+    /// its path is now, with `encoders` ([`crate::encode::planning_encoders`])
+    /// and OCR as this server has them.
     #[expect(
         clippy::too_many_arguments,
         reason = "the call sites name each part; a struct would only repeat them"
@@ -4641,6 +4662,7 @@ impl ClientProtocol {
         share: Option<u64>,
         selection: Selection,
         bitmap: planner::Bitmap,
+        encoders: &spoolframe_media::encoders::Encoders,
     ) -> PlaybackPlan {
         planner::plan_for(
             descriptor,
@@ -4650,15 +4672,161 @@ impl ClientProtocol {
             !on_lan(&state.path()),
             selection,
             bitmap,
-            &crate::encode::planning_encoders(
-                &self.services.jobs,
-                &self.services.transcoding.detected(),
-            ),
+            encoders,
             self.services.subtitles.ocr(),
         )
     }
 
-    /// What `plan` needs to play as `handle`: the subtitle the client
+    /// [`Self::plan`] of `descriptor`, the film at `path`, or of an
+    /// optimized copy of it in its place, or with a copy's audio (PX-37,
+    /// [`crate::optimized::play`]): what plays, lent for the playback.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the call sites name each part; a struct would only repeat them"
+    )]
+    async fn planned(
+        &self,
+        state: &ConnectionState,
+        (path, descriptor): (&Path, &Arc<MediaDescriptor>),
+        caps: Option<&spoolframe_types::ClientCapabilities>,
+        quality: spoolframe_protocol::Quality,
+        share: Option<u64>,
+        selection: Selection,
+        bitmap: planner::Bitmap,
+    ) -> Planned {
+        // Once for the film and every copy planned in its place.
+        let encoders = crate::encode::planning_encoders(
+            &self.services.jobs,
+            &self.services.transcoding.detected(),
+        );
+        let plan = self.plan(
+            state, descriptor, caps, quality, share, selection, bitmap, &encoders,
+        );
+        let film = |plan| Planned {
+            plan,
+            film: path.to_path_buf(),
+            descriptor: descriptor.clone(),
+            source: Source::Film,
+        };
+        // Only a plan that encodes has anything to gain.
+        let Some(pool) = self
+            .services
+            .optimized
+            .as_ref()
+            .filter(|_| planner::Kind::of(&plan) == planner::Kind::Transcode)
+        else {
+            return film(plan);
+        };
+        let copies = self.ready_copies(pool, path, descriptor, &plan).await;
+        if copies.is_empty() {
+            return film(plan);
+        }
+        let described: Vec<&MediaDescriptor> = copies.iter().map(|(_, d)| &**d).collect();
+        let chosen = crate::optimized::play::choose(
+            descriptor,
+            &plan,
+            selection,
+            &described,
+            |d, selection| self.plan(state, d, caps, quality, share, selection, bitmap, &encoders),
+        );
+        let (at, chosen_plan, chosen_descriptor, source): (_, _, _, fn(CopyUse) -> Source) =
+            match chosen {
+                crate::optimized::play::Choice::Source => return film(plan),
+                crate::optimized::play::Choice::Copy {
+                    copy,
+                    plan,
+                    descriptor,
+                } => (copy, plan, descriptor, Source::WholeCopy),
+                crate::optimized::play::Choice::Audio {
+                    copy,
+                    plan,
+                    descriptor,
+                } => (copy, plan, descriptor, Source::AudioFrom),
+            };
+        let row = &copies[at].0;
+        // Gone since it was described (evicted, deleted): the film.
+        let lease = match pool.lease(&row.id).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return film(plan),
+            Err(e) => {
+                tracing::warn!(copy = row.id, error = %e, "cannot lend an optimized copy");
+                return film(plan);
+            }
+        };
+        let source = source(CopyUse::new(
+            lease,
+            &row.target,
+            &chosen_descriptor,
+            selection.subtitle,
+        ));
+        tracing::info!(
+            copy = row.id,
+            media = %path.display(),
+            whole = matches!(source, Source::WholeCopy(_)),
+            plan = planner::Kind::of(&chosen_plan).as_str(),
+            "a playback plays from an optimized copy"
+        );
+        Planned {
+            plan: chosen_plan,
+            film: path.to_path_buf(),
+            descriptor: Arc::new(chosen_descriptor),
+            source,
+        }
+    }
+
+    /// The ready copies of the film at `path` (described as `source`) made
+    /// from it as it is now that may play `plan` or lend it their audio
+    /// ([`crate::optimized::play::worth_describing`]), each with its file's
+    /// description, read at once. One that cannot be read is passed over,
+    /// and the film plays as planned.
+    async fn ready_copies(
+        &self,
+        pool: &crate::optimized::Pool,
+        path: &Path,
+        source: &MediaDescriptor,
+        plan: &PlaybackPlan,
+    ) -> Vec<(crate::store::optimized::CopyRow, Arc<MediaDescriptor>)> {
+        let rows = match self
+            .store()
+            .ready_optimized_copies(&path.to_string_lossy())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(media = %path.display(), error = %e, "cannot list the optimized copies");
+                return Vec::new();
+            }
+        };
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        // A copy of the file as it was is not the file now.
+        let Ok(stamp) = crate::files::stamp_text(path).await else {
+            return Vec::new();
+        };
+        let described = rows
+            .into_iter()
+            .filter(|r| {
+                r.source_stamp == stamp
+                    && crate::optimized::play::worth_describing(plan, source, &r.video)
+            })
+            .map(|row| async move {
+                match self.services.prober.describe(&pool.file(&row.id)).await {
+                    Ok(described) => Some((row, described)),
+                    Err(e) => {
+                        tracing::warn!(copy = row.id, error = %e, "cannot describe an optimized copy");
+                        None
+                    }
+                }
+            });
+        futures_util::future::join_all(described)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// What `plan` of `planned` needs to play as `handle`: the subtitle the client
     /// fetches beside it, the size of what it reads (0 while a conversion
     /// writes it) with the file read for direct play, the conversion,
     /// started at `start`, and how long its keyframes took to read and
@@ -4674,7 +4842,7 @@ impl ClientProtocol {
         &self,
         handle: &PlaybackHandle,
         id: &MediaId,
-        (path, descriptor): (&Path, &Arc<MediaDescriptor>),
+        planned: &Planned,
         plan: &PlaybackPlan,
         quality: spoolframe_protocol::Quality,
         start: Option<Duration>,
@@ -4689,6 +4857,8 @@ impl ClientProtocol {
         ),
         Error,
     > {
+        let (path, descriptor) = (planned.read_path(), &planned.descriptor);
+        let audio_from = planned.source.audio_from();
         Ok(match plan {
             PlaybackPlan::Direct { subtitle, .. } => {
                 let subtitle = match subtitle {
@@ -4718,7 +4888,10 @@ impl ClientProtocol {
                     }
                 })?;
                 let file = FileId::of(&metadata);
+                // The file it began with, if it reads the same one: a
+                // re-plan may move it to or from an optimized copy (PX-37).
                 if replaces
+                    .filter(|p| p.read_path() == path)
                     .and_then(|p| p.file)
                     .is_some_and(|began| began != file)
                 {
@@ -4808,7 +4981,7 @@ impl ClientProtocol {
                             Some(stream) => self
                                 .services
                                 .prober
-                                .first_packet_ms(path, stream.index)
+                                .first_packet_ms(audio_from.unwrap_or(path), stream.index)
                                 .await
                                 .inspect_err(|e| {
                                     tracing::warn!(%id, error = %e, "cannot read where the audio starts");
@@ -4846,6 +5019,7 @@ impl ClientProtocol {
                     ConversionSource {
                         handle: &handle.0,
                         path,
+                        audio_from,
                         descriptor: carried,
                         plan,
                         gpus: transcoding.detected(),
@@ -6201,6 +6375,22 @@ pub(crate) async fn subtitle_segment_of(
     Ok(hls::subtitle_segment(&vtt, start_ms, end_ms).into_bytes())
 }
 
+/// What a playback plays (PX-37): `plan`, of what `source` reads (the
+/// film at `film`, or a copy) described as `descriptor`.
+struct Planned {
+    plan: PlaybackPlan,
+    film: PathBuf,
+    descriptor: Arc<MediaDescriptor>,
+    source: Source,
+}
+
+impl Planned {
+    /// The file it reads.
+    fn read_path(&self) -> &Path {
+        self.source.read_path(&self.film)
+    }
+}
+
 /// A range of a direct playback's file: at most [`MAX_READ`] bytes from
 /// `read.offset`, from the file the playback started with or not at all
 /// (PX-09 B-1).
@@ -6262,7 +6452,7 @@ impl RangeOf {
             revision: playback.revision,
             conversion: playback.conversion.clone(),
             size: playback.size,
-            path: playback.path.clone(),
+            path: playback.read_path().to_path_buf(),
             file: playback.file,
         }
     }

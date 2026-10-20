@@ -218,6 +218,28 @@ pub fn output_text(made: &PlaybackMade, direct: bool) -> (String, String) {
     (value, note.join(" · "))
 }
 
+/// The optimized copy it plays from (PX-37), and which tracks:
+/// (`Mobile`, `video, audio from it`); (`None`, ``) for the film alone.
+pub fn copy_text(made: &PlaybackMade) -> (String, String) {
+    let Some(copy) = &made.copy else {
+        return ("None".to_owned(), String::new());
+    };
+    let tracks: Vec<&str> = [
+        (copy.video, "video"),
+        (copy.audio, "audio"),
+        (copy.subtitle, "subtitle"),
+    ]
+    .into_iter()
+    .filter_map(|(from, track)| from.then_some(track))
+    .collect();
+    let note = if tracks.is_empty() {
+        String::new()
+    } else {
+        format!("{} from it", tracks.join(", "))
+    };
+    (copy.target.clone(), note)
+}
+
 /// Milliseconds as a person reads a wait: `340 ms`, `1.2 s`.
 pub fn ms_text(ms: u64) -> String {
     if ms < 1000 {
@@ -523,7 +545,26 @@ mod tests {
             height: Some(1080),
             target_bitrate: None,
             measured_bitrate: None,
+            copy: None,
         }
+    }
+
+    #[test]
+    fn a_copy_s_audio_alone_is_named_with_its_profile() {
+        let made = PlaybackMade {
+            copy: Some(spoolframe_admin_api::PlaybackCopy {
+                id: "c1".into(),
+                target: "Mobile".into(),
+                video: false,
+                audio: true,
+                subtitle: false,
+            }),
+            ..made(VideoDecoder::Software, None)
+        };
+        assert_eq!(
+            copy_text(&made),
+            ("Mobile".to_owned(), "audio from it".to_owned())
+        );
     }
 
     #[test]
@@ -617,7 +658,7 @@ mod tests {
                 "decoder": { "kind": "software" },
                 "encoder": { "codec": "h264", "name": "h264_nvenc", "gpu": "nvidia" },
                 "toneMap": "cpu", "toneMapper": "cpu", "burnIn": "cpu", "width": 1920, "height": 1080,
-                "targetBitrate": 8000000, "measuredBitrate": 6200000
+                "targetBitrate": 8000000, "measuredBitrate": 6200000, "copy": null
             },
             "start": { "planMs": 12, "keyframes": { "from": "none" },
                        "firstSegment": { "state": "ready", "ms": 900 } }
