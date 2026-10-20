@@ -389,7 +389,7 @@ in {
       };
       # JUnit (nextest's ci profile) at target/nextest/ci/junit.xml and lcov
       # at target/lcov.info; the workflow publishes both. CI splits the
-      # suite over two jobs: NEXTEST_PARTITION (e.g. count:1/2) runs only
+      # suite over jobs: NEXTEST_PARTITION (e.g. count:1/3) runs only
       # that share of the tests, and each job's lcov covers only its share.
       # nextest has no environment variable for --partition, hence this one.
       # Unset, the whole suite runs, as it does on a workstation.
