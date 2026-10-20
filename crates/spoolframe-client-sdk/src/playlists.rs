@@ -215,6 +215,15 @@ impl Session {
         self.features
     }
 
+    /// Every regular feature the server listed when this session was made
+    /// or found (`LoggedIn`, `WhoAmI`), by name, in its order: those this
+    /// SDK knows and those it does not, whether the app listed them or
+    /// not. For showing what a server has against what the app has; what
+    /// the session may use is [`Session::features`].
+    pub fn server_features(&self) -> Vec<String> {
+        self.server_features.to_vec()
+    }
+
     /// Send `request` if the server has playlists.
     async fn playlist_call(&self, request: Request) -> Result<Reply, SdkError> {
         if !self.features.playlists {

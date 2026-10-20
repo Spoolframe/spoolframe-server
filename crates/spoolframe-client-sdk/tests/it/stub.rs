@@ -63,6 +63,8 @@ struct State {
     /// `LoggedIn` and `WhoAmI` list every regular feature (PX-16), as a
     /// server that has them all; otherwise none.
     all_features: AtomicBool,
+    /// Names `LoggedIn` and `WhoAmI` list after those.
+    more_features: Mutex<Vec<String>>,
 }
 
 pub struct Stub {
@@ -150,6 +152,12 @@ impl Stub {
     /// List every regular feature from now on, as a server that has them.
     pub fn have_all_features(&self) {
         self.state.all_features.store(true, Ordering::SeqCst);
+    }
+
+    /// List `names` too, after every regular feature if those are listed:
+    /// a newer server's features, unknown to this SDK.
+    pub fn also_list(&self, names: &[&str]) {
+        *self.state.more_features.lock() = names.iter().map(|n| n.to_string()).collect();
     }
 
     /// The regular features each `Hello` listed, in the order received.
@@ -510,11 +518,12 @@ fn answer(
         )
         .to_string()
     });
-    let features = if state.all_features.load(Ordering::SeqCst) {
+    let mut features = if state.all_features.load(Ordering::SeqCst) {
         spoolframe_protocol::features::names(spoolframe_protocol::features::ALL)
     } else {
         Vec::new()
     };
+    features.extend(state.more_features.lock().iter().cloned());
     let reply = match envelope.request {
         // What the server answers a Hello of another revision.
         Request::Hello(_) if state.refuse_hellos.load(Ordering::SeqCst) => {

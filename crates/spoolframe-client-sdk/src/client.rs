@@ -1287,6 +1287,7 @@ impl Client {
             remembered: Some(remembered),
             password_change_required: Arc::default(),
             features: self.inner.features.both(&features),
+            server_features: Arc::new(features),
         };
         self.inner.downloads.session_made(&session);
         Ok(session)
@@ -1354,6 +1355,7 @@ impl Client {
                         remembered: None,
                         password_change_required: Arc::default(),
                         features: self.inner.features.both(&features),
+                        server_features: Arc::new(features),
                     };
                     self.inner.downloads.session_made(&session);
                     profiles.push(session);

@@ -99,6 +99,31 @@ async fn by_default_an_app_lists_no_feature_and_has_none() {
     assert_eq!(found[0].features(), Features::default());
 }
 
+/// What the server has, by name, is there for the app whatever it listed
+/// and whatever this SDK knows: a newer server's feature too, in the
+/// server's order, on a session made and on one found again.
+#[tokio::test]
+async fn a_session_tells_every_feature_the_server_listed_by_name() {
+    let stub = Stub::start().await;
+    stub.have_all_features();
+    stub.also_list(&["vendor:telepathy"]);
+    let (client, session) = alice_listing(&stub, Features::default()).await;
+    let mut expected = spoolframe_protocol::features::names(spoolframe_protocol::features::ALL);
+    expected.push("vendor:telepathy".to_owned());
+    assert_eq!(session.server_features(), expected);
+    assert_eq!(session.features(), Features::default());
+    let found = client.profiles(&stub.id()).await.unwrap();
+    assert_eq!(found[0].server_features(), expected);
+}
+
+/// A server that lists none gives none.
+#[tokio::test]
+async fn a_server_with_no_feature_lists_none() {
+    let stub = Stub::start().await;
+    let (_client, session) = alice_listing(&stub, ALL).await;
+    assert!(session.server_features().is_empty());
+}
+
 /// An app that lists playlists and Liked is sent exactly those, and has
 /// only those of the server's.
 #[tokio::test]

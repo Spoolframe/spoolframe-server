@@ -471,6 +471,8 @@ pub struct Session {
     pub(crate) password_change_required: Arc<AtomicBool>,
     /// The regular features the server listed in this session's `WhoAmI`.
     pub(crate) features: crate::playlists::Features,
+    /// Every name in that list, known here or not.
+    pub(crate) server_features: Arc<Vec<String>>,
 }
 
 /// A [`Session`] without its client, for what the client itself keeps
@@ -483,6 +485,7 @@ pub(crate) struct SessionParts {
     user: UserSummary,
     can_leave: bool,
     features: crate::playlists::Features,
+    server_features: Arc<Vec<String>>,
 }
 
 impl SessionParts {
@@ -497,6 +500,7 @@ impl SessionParts {
             remembered: None,
             password_change_required: Arc::default(),
             features: self.features,
+            server_features: self.server_features,
         }
     }
 }
@@ -509,6 +513,7 @@ impl Session {
             user: self.user.clone(),
             can_leave: self.can_leave,
             features: self.features,
+            server_features: self.server_features.clone(),
         }
     }
 }

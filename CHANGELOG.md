@@ -49,6 +49,11 @@
   never a failed batch) takes in what a device watched offline:
   newest wins, the device's clock set right by the server's, watched
   judged by the server's rules and the item's credits.
+- The client SDK tells every regular feature a server listed:
+  `Session::server_features()`, the names from `LoggedIn` or `WhoAmI`,
+  including ones this SDK does not know and ones the app did not list,
+  for an app's per-server feature list. What the session may use is
+  still `Session::features()`.
 - The client SDK downloads (PX-38): `ClientOptions::downloads_dir` (none
   by default; `ClientOptions` is no longer `Copy`), `Features::downloads`
   (`spoolframe:downloads`), `Session::download_options`,
