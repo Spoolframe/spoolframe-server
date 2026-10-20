@@ -40,6 +40,19 @@ pub enum ResourceRequest {
         id: String,
         length: u64,
     },
+    /// Read download `id`'s file (PX-38, `spoolframe:downloads`): at most
+    /// `length` bytes from `offset`, and no more than [`crate::MAX_READ`].
+    /// Any offset may be asked, so a download broken off resumes where it
+    /// stopped. Answered `ready { length, download { size } }` with the
+    /// bytes; `length` is short only at the file's end. `NotFound` for an
+    /// id that is not the session user's; `DownloadNotReady` until its
+    /// state is `ready`. Not a playback: it takes no playback slot.
+    Download {
+        session: SessionId,
+        id: String,
+        offset: u64,
+        length: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +77,10 @@ pub enum ResourceMetadata {
     /// The cover `SetPlaylistArt` stored: the playlist's `artwork` now.
     PlaylistArt {
         artwork: ArtworkId,
+    },
+    /// A download's file (`Download`): its whole length.
+    Download {
+        size: u64,
     },
 }
 

@@ -751,6 +751,35 @@ async fn asked_ahead(media: &Path) -> NewCopy {
     }
 }
 
+/// An `ahead` copy a server with binge-ahead on left waiting.
+async fn left_ahead(s: &Setup) -> CopyRow {
+    let copy = s
+        .pool
+        .request_ahead("alice", "show", asked_ahead(&s.media).await)
+        .await
+        .unwrap();
+    s.pool.stop();
+    copy
+}
+
+/// PX-38: off, no binge-ahead copy is asked for, so one not yet made
+/// would only take the place of a download's.
+#[tokio::test]
+async fn with_binge_ahead_off_an_ahead_copy_left_waiting_is_dropped_at_start() {
+    let s = setup("ahead-off", "exit 1", 0, 1 << 30).await;
+    let copy = left_ahead(&s).await;
+    let _pool = restarted_as(&s, "ahead-off", false).await;
+    assert_eq!(s.state(&copy.id).await, None);
+}
+
+#[tokio::test]
+async fn with_binge_ahead_on_an_ahead_copy_left_waiting_waits_again() {
+    let s = setup("ahead-on", "exit 1", 0, 1 << 30).await;
+    let copy = left_ahead(&s).await;
+    let _pool = restarted_as(&s, "ahead-on", true).await;
+    assert_eq!(s.state(&copy.id).await, Some(CopyState::Waiting));
+}
+
 /// A stand-in ffmpeg that writes its part and runs on until killed.
 const RUNS_ON: &str = "for last; do :; done\necho partial > \"$last\"\nexec sleep 30";
 

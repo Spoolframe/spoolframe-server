@@ -473,6 +473,46 @@ pub struct Session {
     pub(crate) features: crate::playlists::Features,
 }
 
+/// A [`Session`] without its client, for what the client itself keeps
+/// (the download manager's sessions, PX-38): a session holds the client,
+/// so the client holding sessions would never be dropped.
+#[derive(Clone)]
+pub(crate) struct SessionParts {
+    server: EndpointId,
+    token: SessionId,
+    user: UserSummary,
+    can_leave: bool,
+    features: crate::playlists::Features,
+}
+
+impl SessionParts {
+    /// The session again, on `client`.
+    pub(crate) fn attach(self, client: Client) -> Session {
+        Session {
+            client,
+            server: self.server,
+            token: self.token,
+            user: self.user,
+            can_leave: self.can_leave,
+            remembered: None,
+            password_change_required: Arc::default(),
+            features: self.features,
+        }
+    }
+}
+
+impl Session {
+    pub(crate) fn parts(&self) -> SessionParts {
+        SessionParts {
+            server: self.server,
+            token: self.token.clone(),
+            user: self.user.clone(),
+            can_leave: self.can_leave,
+            features: self.features,
+        }
+    }
+}
+
 /// A profile explicitly selected by the application. All session operations
 /// remain available; choosing another profile relocks this one's PIN.
 #[derive(Debug, Clone)]

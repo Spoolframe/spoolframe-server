@@ -367,6 +367,14 @@ pub enum SdkError {
     #[error(transparent)]
     Pairing(#[from] PairingError),
     /// Any other error the server answered with.
+    /// A download's file was read before the server finished it (PX-38):
+    /// the download manager waits and asks again.
+    #[error("the download is not ready")]
+    DownloadNotReady,
+    /// The downloads directory ([`crate::ClientOptions::downloads_dir`])
+    /// could not be read or written, or none was set.
+    #[error("downloads: {0}")]
+    Downloads(String),
     #[error("server: {0}")]
     Server(String),
     /// The server's answer made no sense to this build.
@@ -453,6 +461,7 @@ impl SdkError {
                 resets_at,
             },
             ServerError::NoSubtitleSource => SdkError::NoSubtitleSource,
+            ServerError::DownloadNotReady => SdkError::DownloadNotReady,
             other => SdkError::Server(other.to_string()),
         }
     }

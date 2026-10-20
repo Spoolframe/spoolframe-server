@@ -55,45 +55,35 @@ impl Store {
     ) -> Result<(), StoreError> {
         let principal = principal.to_string();
         let mut tx = self.begin_write().await?;
-        sqlx::query(
-            "INSERT INTO watch_state \
-               (principal, media_id, show_id, position_ms, duration_ms, watched, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT (principal, media_id) DO UPDATE SET \
-               show_id = coalesce(excluded.show_id, watch_state.show_id), \
-               position_ms = excluded.position_ms, \
-               duration_ms = coalesce(excluded.duration_ms, watch_state.duration_ms), \
-               watched = excluded.watched, \
-               updated_at = excluded.updated_at",
+        write_watch(&mut tx, &principal, &update, updated_at).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Store::save_watch_at`], only if `updated_at` is newer than the
+    /// item's state as it is, if it has one (PX-38's offline watch: newest
+    /// wins, whichever device it came from): whether it was written.
+    pub async fn save_watch_if_newer(
+        &self,
+        principal: Principal,
+        update: WatchUpdate<'_>,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
+        let principal = principal.to_string();
+        let mut tx = self.begin_write().await?;
+        let stored: Option<i64> = sqlx::query_scalar(
+            "SELECT updated_at FROM watch_state WHERE principal = ?1 AND media_id = ?2",
         )
         .bind(&principal)
         .bind(update.media_id)
-        .bind(update.show_id)
-        .bind(update.position_ms)
-        .bind(update.duration_ms)
-        .bind(update.watched)
-        .bind(updated_at)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        for id in update.external_ids {
-            // An id names one item: if it was another row's, it is this
-            // one's now.
-            sqlx::query(
-                "INSERT INTO watch_state_ids (principal, media_id, external_id) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id",
-            )
-            .bind(&principal)
-            .bind(update.media_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        if stored.is_some_and(|stored| stored >= updated_at) {
+            return Ok(false);
         }
-        if update.unhide {
-            clear_hidden(&mut *tx, &principal, update.media_id).await?;
-        }
+        write_watch(&mut tx, &principal, &update, updated_at).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Remove `media_id` (a movie or an episode: the card, never a show)
@@ -486,6 +476,53 @@ async fn clear_hidden<'e>(
     Ok(())
 }
 
+/// Write one item's state, with its external ids, in `tx`.
+async fn write_watch(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    principal: &str,
+    update: &WatchUpdate<'_>,
+    updated_at: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO watch_state \
+           (principal, media_id, show_id, position_ms, duration_ms, watched, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT (principal, media_id) DO UPDATE SET \
+           show_id = coalesce(excluded.show_id, watch_state.show_id), \
+           position_ms = excluded.position_ms, \
+           duration_ms = coalesce(excluded.duration_ms, watch_state.duration_ms), \
+           watched = excluded.watched, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(principal)
+    .bind(update.media_id)
+    .bind(update.show_id)
+    .bind(update.position_ms)
+    .bind(update.duration_ms)
+    .bind(update.watched)
+    .bind(updated_at)
+    .execute(&mut **tx)
+    .await?;
+    for id in update.external_ids {
+        // An id names one item: if it was another row's, it is this
+        // one's now.
+        sqlx::query(
+            "INSERT INTO watch_state_ids (principal, media_id, external_id) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id",
+        )
+        .bind(principal)
+        .bind(update.media_id)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if update.unhide {
+        clear_hidden(&mut **tx, principal, update.media_id).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{TestStore, test_store};
@@ -530,6 +567,43 @@ mod tests {
             watched: false,
             unhide: true,
         }
+    }
+
+    /// PX-38: a write as of a time no newer than the state's own is not
+    /// made; a newer one is.
+    #[tokio::test]
+    async fn a_write_if_newer_is_made_only_over_an_older_state() {
+        let store = store("if-newer").await;
+        let id = "plex:movie:1";
+        store
+            .save_watch_at(ALICE, at(id, 1_000, &[]), 200)
+            .await
+            .unwrap();
+        let older = store
+            .save_watch_if_newer(ALICE, at(id, 2_000, &[]), 200)
+            .await
+            .unwrap();
+        let newer = store
+            .save_watch_if_newer(ALICE, at(id, 3_000, &[]), 201)
+            .await
+            .unwrap();
+        let first = store
+            .save_watch_if_newer(ALICE, at("plex:movie:2", 4_000, &[]), 1)
+            .await
+            .unwrap();
+        let positions: Vec<_> = store
+            .watch_states(ALICE, &[id.to_owned(), "plex:movie:2".to_owned()])
+            .await
+            .unwrap()
+            .into_values()
+            .map(|row| row.position_ms)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            (older, newer, first, positions),
+            (false, true, true, vec![Some(3_000), Some(4_000)])
+        );
     }
 
     /// PX-42: the most recently changed first, a page at a time, the

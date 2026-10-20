@@ -95,6 +95,15 @@ pub const SUBTITLE_SEARCH: &str = "spoolframe:subtitle-search";
 /// for both.
 pub const PLAYLIST_UPCOMING: &str = "spoolframe:playlist-upcoming";
 
+/// Downloads for offline viewing (PX-38): the `DownloadOptions`,
+/// `PrepareDownload`, `DownloadStatus` and `CancelDownload` requests, the
+/// `Download` resource read and the `DownloadChanged` event (see
+/// [`crate::downloads`]). Only an iPhone, iPad, Mac or Linux client
+/// downloads: from any other platform the requests are `Unsupported`. A
+/// session whose client did not list it is sent no event, and the
+/// requests and the read are `Unsupported`.
+pub const DOWNLOADS: &str = "spoolframe:downloads";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,
@@ -106,6 +115,7 @@ pub const ALL: &[&str] = &[
     SUBTITLE_SYNC,
     SUBTITLE_SEARCH,
     PLAYLIST_UPCOMING,
+    DOWNLOADS,
 ];
 
 /// The ones that change what a client can do before it has a session:
@@ -184,6 +194,12 @@ mod tests {
     fn subtitle_search_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&SUBTITLE_SEARCH));
         assert!(!PRE_AUTH.contains(&SUBTITLE_SEARCH));
+    }
+
+    #[test]
+    fn downloads_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&DOWNLOADS));
+        assert!(!PRE_AUTH.contains(&DOWNLOADS));
     }
 
     #[test]

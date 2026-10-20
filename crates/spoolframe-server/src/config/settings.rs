@@ -150,6 +150,9 @@ pub const SETTINGS: &[Setting] = &[
     restart("optimized.binge_ahead"),
     restart("optimized.dir"),
     restart("optimized.max_size_mb"),
+    // The download area is laid out at start (PX-38).
+    restart("downloads.dir"),
+    restart("downloads.max_size_mb"),
     live("logs.buffer_lines"),
     live("telemetry.otlp.endpoint"),
     live("telemetry.otlp.protocol"),

@@ -61,3 +61,11 @@ dialled directly. The device has no relay of its own: none is contacted until a
 server is dialled through one. Off, the endpoint has no relay transport, and a
 server is reached only at its addresses. It is fixed for the life of a
 `Client`; an app whose user changes it opens a new one.
+
+Downloads (PX-38, feature `spoolframe:downloads`) need
+`ClientOptions::downloads_dir`. `Client::downloads().start(session, ...)`
+prepares one on the server; the client's download manager then moves it on
+while the client is open, one at a time, and `Client::close` stops it where it
+got to. `list` reads the disk alone. On iOS, call `run_until_done` from a
+background task, give the free space the system counts with `set_free_space`,
+and exclude the directory from backup.

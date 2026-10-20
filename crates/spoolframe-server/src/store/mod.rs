@@ -5,6 +5,7 @@
 //! API, so users, sessions and rate limits have a single owner.
 
 pub mod audit;
+pub mod downloads;
 pub mod grants;
 pub mod identities;
 pub mod invites;
@@ -368,6 +369,14 @@ impl Store {
         self.clock.unix_secs()
     }
 
+    /// When a device with no server did something at `at` by its own
+    /// clock, by this one: moved by how far the device's clock
+    /// (`device_now`, read as it sent `at`) is from now, and kept no later
+    /// than now (PX-38's offline watch, PX-51's plays and likes).
+    pub(crate) fn server_time_of(&self, at: i64, device_now: i64) -> i64 {
+        server_time_of(self.now(), at, device_now)
+    }
+
     /// A transaction that writes, begun IMMEDIATE: it takes SQLite's
     /// writer at once, waiting for it as any write does (busy_timeout).
     /// A deferred one that reads first holds a WAL snapshot, and if
@@ -396,6 +405,11 @@ impl Store {
 }
 
 /// Seconds since the Unix epoch: how the database stores times.
+/// [`Store::server_time_of`], as of `now`.
+fn server_time_of(now: i64, at: i64, device_now: i64) -> i64 {
+    now.saturating_sub(device_now.saturating_sub(at)).min(now)
+}
+
 pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -406,6 +420,20 @@ pub(crate) fn now() -> i64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A device clock 50 s ahead: what it did 30 s before it sent is 30 s
+    /// ago here; a time ahead of its own clock is now.
+    #[test]
+    fn a_device_s_time_is_moved_onto_the_server_s_clock() {
+        let now = 1_000_000;
+        assert_eq!(
+            (
+                server_time_of(now, now + 20, now + 50),
+                server_time_of(now, now + 60, now + 50)
+            ),
+            (now - 30, now)
+        );
+    }
 
     /// A fresh state directory for one test, under a random name, so
     /// tests running at once (in this run or another) never share one.

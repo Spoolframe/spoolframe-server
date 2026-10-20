@@ -6914,6 +6914,7 @@ dependencies = [
  "getrandom 0.4.3",
  "iroh",
  "iroh-mdns-address-lookup",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",

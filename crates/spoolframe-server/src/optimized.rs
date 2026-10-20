@@ -57,7 +57,8 @@ use spoolframe_media::{MediaDescriptor, Prober};
 
 use crate::config::OptimizedSettings;
 use crate::encode::job::{
-    JobError, Jobs, Yielding, exit_blames_gpu, jail, launch, out_time_us, signal,
+    JobError, Jobs, Yielding, drain_stderr, exit_blames_gpu, jail, keep, launch, out_time_us,
+    relink, remove_file, signal, stopped,
 };
 use crate::encode::track_run::{self, Attempt, TrackInput, TrackRun};
 use crate::store::optimized::{CopyRow, CopyState, CopyTarget, NewCopy, Recipe, TrackRow};
@@ -83,9 +84,6 @@ pub const UNPLAYED: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The directory in `optimized.dir` tracks are made in: emptied at start.
 pub const MAKING_DIR: &str = "making";
-
-/// How many of ffmpeg's last stderr lines a failure keeps.
-const STDERR_LINES: usize = 5;
 
 /// What the pool works with.
 #[derive(Clone)]
@@ -410,19 +408,11 @@ impl Pool {
     ) -> Result<Self, PoolError> {
         let dir = settings.dir.clone();
         let making = dir.join(MAKING_DIR);
-        let prepare = |dir: &Path| {
-            let dir = dir.to_path_buf();
-            move |source| PoolError::Dir { dir, source }
-        };
-        crate::files::private_dir(&dir).map_err(prepare(&dir))?;
-        match std::fs::remove_dir_all(&making) {
-            Ok(()) => {
-                tracing::info!(dir = %making.display(), "removed the tracks a stopped server was making")
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(prepare(&making)(e)),
+        if crate::files::fresh_making_dir(&dir, &making)
+            .map_err(|(dir, source)| PoolError::Dir { dir, source })?
+        {
+            tracing::info!(dir = %making.display(), "removed the tracks a stopped server was making");
         }
-        crate::files::private_dir(&making).map_err(prepare(&making))?;
         let store = sources.store;
         let requeued = store.requeue_interrupted_optimized_tracks().await?;
         if requeued > 0 {
@@ -480,6 +470,18 @@ impl Pool {
             ask: Notify::new(),
             stop: watch::Sender::new(false),
         });
+        // Off, none is asked for: the ones a server that had it on left
+        // unmade would only take the place of downloads' (PX-38). Made
+        // ones stay, played from, and first to be evicted.
+        if !settings.binge_ahead {
+            let dropped = inner.drop_unmade_ahead().await?;
+            if dropped > 0 {
+                tracing::info!(
+                    copies = dropped,
+                    "binge-ahead is off: the binge-ahead copies not yet made are dropped"
+                );
+            }
+        }
         // Before the worker starts: it sweeps again only once woken.
         inner.sweep_logged().await;
         tokio::spawn(inner.clone().work());
@@ -876,6 +878,19 @@ impl Inner {
         Ok(dropped)
     }
 
+    /// Drop every binge-ahead copy waiting or being made, with its tracks
+    /// no other copy uses: how many.
+    async fn drop_unmade_ahead(&self) -> Result<usize, StoreError> {
+        let mut dropped = 0;
+        for copy in self.store.ahead_optimized_copies().await? {
+            let pending = matches!(copy.state, CopyState::Waiting | CopyState::Making);
+            if pending && self.delete(&copy.id).await? != Deleted::NotFound {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// [`Pool::delete`]: a copy read is outdated, to go once its leases
     /// end; else its row goes now. Either way its tracks no other copy
     /// uses are outdated, and those neither read nor made go now.
@@ -1200,13 +1215,7 @@ impl Inner {
                     if *stop.borrow() {
                         return Ended::Stopped;
                     }
-                    // The rest of what it said, briefly.
-                    let rest = async {
-                        while let Ok(Some(line)) = err.next_line().await {
-                            keep(&mut last, line);
-                        }
-                    };
-                    let _ = tokio::time::timeout(Duration::from_secs(1), rest).await;
+                    drain_stderr(&mut err, &mut last).await;
                     return Ended::Exited { status, last };
                 }
                 line = out.next_line(), if out_open => match line {
@@ -1338,35 +1347,6 @@ fn reserve(recipe: &Recipe, descriptor: &MediaDescriptor, media: &Path) -> u64 {
             u64::try_from(bits / 8).unwrap_or(u64::MAX)
         }
         _ => std::fs::metadata(media).map_or(0, |m| m.len()),
-    }
-}
-
-/// Until the pool is stopped. (The guard `wait_for` gives back is not
-/// `Send`: it is dropped here, not held across the worker's awaits.)
-async fn stopped(stop: &mut watch::Receiver<bool>) {
-    let _ = stop.wait_for(|stopped| *stopped).await;
-}
-
-/// `line` kept as ffmpeg's last, with at most [`STDERR_LINES`] before it.
-fn keep(last: &mut VecDeque<String>, line: String) {
-    if last.len() == STDERR_LINES {
-        last.pop_front();
-    }
-    last.push_back(line);
-}
-
-/// `link` made to lead to `media`, whatever it led to before.
-fn relink(media: &Path, link: &Path) -> std::io::Result<()> {
-    remove_file(link);
-    std::os::unix::fs::symlink(std::path::absolute(media)?, link)
-}
-
-/// `path` removed; one already gone is fine.
-fn remove_file(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(path = %path.display(), error = %e, "cannot remove a track's file");
     }
 }
 

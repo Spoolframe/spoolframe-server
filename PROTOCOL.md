@@ -45,6 +45,7 @@ must be updated together. The changes per revision are in
   [sharing by name](#sharing-by-name), [Liked and All](#liked-and-all),
   [playlist covers](#playlist-covers) and
   [up next in a playlist](#up-next-in-a-playlist)
+- [Downloads](#downloads)
 - [Portable identities](#portable-identities)
 
 ## Basics
@@ -1110,6 +1111,7 @@ stream.
 | `subtitle { session, handle, revision, offset, version }` | a chunk of a whole-file subtitle | `subtitle { format, total, version, revision }` |
 | `subtitle_segment { session, handle, revision, segment }` | an HLS subtitle segment | `subtitle { … }` |
 | `set_playlist_art { session, id, length }` | an upload: `length` bytes of a picture follow the request | `playlist_art { artwork }`, no body |
+| `download { session, id, offset, length }` | a range of a download's file (see "Downloads") | `download { size }` |
 
 `ResourceResponse` is `ready { length, metadata }` or `error { error }`.
 
@@ -1132,7 +1134,7 @@ progressive output, `0` for an HLS init segment, and `n` for segment `n`.
 encode and for anything that is not a segment. The end of the file is
 `complete` and `offset + sent == size`.
 
-Media reads and subtitle segments are at most 16 MiB (`MAX_READ`);
+Media reads, download reads and subtitle segments are at most 16 MiB (`MAX_READ`);
 subtitle file chunks at most 512 KiB (`SUBTITLE_CHUNK`). Artwork
 requests state a maximum length; the SDK uses 64 MiB. The server bounds
 file copies by the announced length, even if a file grows while it is
@@ -2107,6 +2109,155 @@ The SDK: `Features::subtitle_search`; `Session::search_subtitles(id,
 language)`, `Session::download_subtitle(id, result)` and
 `Session::remove_subtitle_download(id, download)`. The calls are
 `SdkError::Unsupported`, unsent, without the feature.
+
+## Downloads
+
+Feature `spoolframe:downloads` (PX-38). A film or an episode is written
+as one file for the device to keep and play with no server: in original
+quality or in an optimized profile, with the tracks the user picks. An
+iPhone, iPad or Mac (`Hello.platform` `ios` or `macos`) gets MP4, its
+text subtitles as `mov_text`; the Linux app and the CLI (`linux`,
+`cli`) get Matroska. Any other platform (`tvos`, `web`, a platform the
+server does not know) gets `Unsupported` for every request and the
+read, saying why, as does a client that did not list the feature;
+such a client is sent no event. Anyone who can play the item may
+download it; nothing expires, and no admin lists who downloaded what.
+
+Tracks are named by their place in the item's `Tracks`: `audio[i]`,
+`subtitles[i]`. The video is always in the file.
+
+| Request | Reply |
+|---|---|
+| `DownloadOptions { id }` | `DownloadOptions { tracks, preferred, profiles, original, left_out }` |
+| `PrepareDownload { id, source, tracks }` | `Download(DownloadInfo)` |
+| `DownloadStatus { ids }` | `Downloads { downloads, gone }`: a `DownloadInfo` per id the user has, in order, and the others' ids |
+| `CancelDownload { id }` | `Done` |
+| `SyncOfflineWatch { device_now, entries }` | `OfflineWatchSynced { outcomes }` (see "Watching offline") |
+
+`DownloadOptions` is what to show before downloading:
+
+- `tracks`: the item's `Tracks`;
+- `preferred`: the choice to tick first, always `{ type: chosen, audio,
+  subtitles }`: the audio track playback would pick for the user, and
+  one more in another of their audio languages when the file has one;
+  every text subtitle in their subtitle languages (their audio
+  languages when they set none), and the subtitle playback would pick;
+- `profiles`: the optimized profiles' names, in the admin's order;
+- `original`: what original quality with every track would be, tagged
+  by `type`: `as_is` (the file itself, byte for byte), `remux` (another
+  container, or subtitles beside the file to carry; nothing
+  converted), or `convert { video, audio }` (the video converted when
+  `video`, and the audio tracks at the places in `audio`). For a choice
+  of tracks it is `convert` when the video is converted or a chosen
+  audio track is in `audio`, else `remux`: the file as it is goes only
+  with every track, and only when every subtitle goes into it as it is
+  (one left out, or read as text, makes it a `remux`);
+- `left_out`: the subtitles a download would leave out, each `{
+  subtitle, reason }`, `reason` said to the user as it is: picture
+  subtitles (PGS, VobSub) in an Apple file when the user's PX-13 choice
+  (`TrackPreferences.subtitles.bitmap`) is `pictures`, or when it is
+  `text` and the server cannot read their language; subtitles that no
+  file can carry (teletext, say). With `text`, picture subtitles are
+  read as text into `mov_text`. They are never burned in.
+
+`PrepareDownload`'s `source` is `{ type: original }` or `{ type:
+profile, name }`; its `tracks` `{ type: all }` or `{ type: chosen,
+audio, subtitles }` (order and repeats do not count). A source or
+choice of a type the server does not know, a track the item does not
+have, or an item that is not a film or an episode is `InvalidInput`; a
+profile not there `NotFound { what }`. The reply is the download now: a
+`DownloadInfo { id, state, file }`. The same user preparing the same
+item, source and tracks gets the same `id`, ready at once when its file
+is; two users' same request share one file. `file` is `{ container,
+tracks: { audio, subtitles } }`: `matroska` or `mp4`, and the tracks the
+file carries, by place, in the file's order after its video (a subtitle
+left out is not there).
+
+What the device cannot play is converted in the server's copy pool,
+which runs for downloads even with optimized versions off, and is kept
+there for the next download. On an iPhone, a film's HEVC HDR10 video is
+kept as it is and only its DTS becomes E-AC-3. A profile's download is
+made from that profile's copy, which is made first when there is none.
+
+A `DownloadState` is tagged by `type`:
+
+- `waiting`: for its conversion's turn, for room in the download area,
+  or for a place to write it;
+- `converting { done_percent, eta_secs }`: its conversion is made, or
+  its picture subtitles read as text; each `null` until known;
+- `writing { done_percent }`: its file is written;
+- `ready { size, sha256 }`: the file is whole, `size` bytes, with this
+  SHA-256 (64 hex digits);
+- `failed { reason }`: a conversion failed, the media file changed or
+  is gone, or the file was removed a day after its last read. A file
+  sent as it is is the media file itself: once that changes, the
+  download fails (when it is read, or at the server's start) rather
+  than send other bytes under its `size` and `sha256`.
+  `PrepareDownload` again tries again, under the same `id`;
+- `unknown`: a state this build does not know.
+
+`DownloadChanged { id, state }` tells each of the user's connections
+that listed the feature as the state moves: once per percent of
+progress or every 2 s, and at each change of `type`; no progress comes
+after `ready` or `failed`. A connection is told while a session of the
+user's on it is live: signed out there, or revoked, it is told no more. A conversion made
+for the download is told at least as `converting { done_percent: 100 }`
+however quickly it went. `DownloadStatus` asks for at most 500 ids.
+Each is answered alone: `downloads` holds those the user has, in the
+order asked, and `gone` (left out when empty) the ids they have not:
+never theirs, cancelled, or no longer kept. A device treats a gone
+download as cancelled on the server: preparing it again brings it
+back, under the same id when the request is the same.
+
+A ready file is read with the `download { session, id, offset,
+length }` resource request: the header `download { size }` and at most
+`length` (and 16 MiB) bytes from `offset`, fewer only at the end. Any
+offset may be read, so a download broken off resumes where it stopped,
+on a direct path or a relayed one. A read is not a playback: it takes no
+playback slot and no place in the WAN uplink budget, and is no play. A
+file being read is never removed; each read keeps it a day longer. An
+id that is not the user's is `NotFound`; one not ready yet
+`DownloadNotReady`.
+
+`CancelDownload` drops the user's download: its file goes once no
+download names it and no one reads it, and one being made stops. The
+device sends it too once the file is whole and its SHA-256 matches,
+which is how the server learns the download finished. An id that is not
+the user's, or was cancelled, is `NotFound`.
+
+### Watching offline
+
+A device plays a download with no server, and keeps where it got to.
+When it reaches the server again it sends what it kept:
+
+| Request | Reply |
+|---|---|
+| `SyncOfflineWatch { device_now, entries }` | `OfflineWatchSynced { outcomes }`, one per entry, in order |
+
+Each entry is an `OfflineWatch { id, position_ms, watched, at }`: a film
+or an episode, where it stopped (`null` when only `watched` changed),
+`watched` (`true` or `false` when it was marked so, else `null`), and
+`at`, when, by the device's clock, in Unix seconds. `device_now` is the
+device's clock as it sends them. The server sets the device's clock
+right: an entry counts as of `server_now - (device_now - at)`, and no
+later than now. It is written only when that is newer than the item's
+state on the server, from any device: newest wins. With a position,
+watched is judged by the server's own rules (the credits' start, else a
+share of the length), as any progress is, or made so by `watched:
+true`; `watched` alone marks the item, its progress starting over. The
+progress throttle does not apply. A written entry counts as any progress
+does: Home, Next up, the Plex mirror.
+
+Each outcome is `applied` (written), `older` (the server's state is as
+new or newer: show it), `not_tracked` (not a film or an episode, or not
+on the server any more), or `unknown`. At most 500 entries; an entry
+with neither a position nor `watched` is `InvalidInput`. Sent again, an
+entry written once is `older`, so the request may be sent again on a new
+connection. As the other requests, it needs the feature and a platform
+that downloads.
+
+All five requests may be sent again on a new connection; a cancel sent
+again answers `NotFound`.
 
 ## Portable identities
 

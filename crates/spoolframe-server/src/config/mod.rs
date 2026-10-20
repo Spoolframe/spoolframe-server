@@ -147,6 +147,9 @@ pub struct ServerConfig {
     /// The pool of converted copies (PX-37).
     #[ucl(default)]
     pub optimized: OptimizedConfig,
+    /// The files written for downloads (PX-38).
+    #[ucl(default)]
+    pub downloads: DownloadsConfig,
     /// Ways to sign in besides the password and passkeys: SSO (P3-04).
     #[ucl(default)]
     pub auth: AuthConfig,
@@ -345,6 +348,75 @@ fn site_languages(key: &'static str, list: Option<&[String]>) -> Result<Vec<Stri
 }
 
 impl ServerConfig {
+    /// The pool's place and the download area's, with `state_dir` for
+    /// their defaults (review 2026-10-20, finding 1). Each removes files
+    /// in its directory and empties its `making/` at start, so neither
+    /// may be the other, and neither may be, hold or sit in a directory
+    /// the server keeps other files in (its caches, subtitle sync, the
+    /// transcode scratch, the subtitles' text) or one the media is read
+    /// from (a Plex path mapping's `to`). The download area may sit in
+    /// the pool (its default, `<optimized dir>/downloads`), not in the
+    /// pool's `making/`; the pool may not sit in the area.
+    pub fn areas(
+        &self,
+        state_dir: &Path,
+    ) -> Result<(OptimizedSettings, DownloadSettings), ConfigError> {
+        let pool = self.optimized.place(state_dir)?;
+        let area = self.downloads.place(state_dir, &pool.dir)?;
+        let refuse = |key: &'static str, dir: &Path, why: String| {
+            Err(ConfigError::Invalid {
+                key,
+                message: format!(
+                    "{} {why}: its files would be removed. Choose a directory of its own",
+                    dir.display()
+                ),
+            })
+        };
+        if area.dir == pool.dir {
+            return refuse("downloads.dir", &area.dir, "is optimized.dir".into());
+        }
+        if pool.dir.starts_with(&area.dir) {
+            return refuse("optimized.dir", &pool.dir, "is in downloads.dir".into());
+        }
+        if area
+            .dir
+            .starts_with(pool.dir.join(crate::optimized::MAKING_DIR))
+        {
+            return refuse(
+                "downloads.dir",
+                &area.dir,
+                "is in the optimized pool's making directory".into(),
+            );
+        }
+        let limits = self.transcode.limits(state_dir)?;
+        let ocr = self.subtitles.ocr_settings(state_dir)?;
+        let mut kept: Vec<(String, PathBuf)> = vec![
+            ("the server's caches".into(), state_dir.join("cache")),
+            ("subtitle sync's files".into(), state_dir.join("subtitles")),
+            ("transcode.scratch_dir".into(), limits.scratch_dir),
+            ("subtitles.cache_dir".into(), ocr.cache_dir),
+        ];
+        if let Some(plex) = &self.plex {
+            let servers = std::iter::once(&plex.path_mapping)
+                .chain(plex.servers.iter().map(|server| &server.path_mapping));
+            for mapping in servers.flatten() {
+                kept.push(("a Plex path mapping's media".into(), mapping.to.clone()));
+            }
+        }
+        for (key, dir) in [("optimized.dir", &pool.dir), ("downloads.dir", &area.dir)] {
+            for (what, other) in &kept {
+                if dir.starts_with(other) || other.starts_with(dir) {
+                    return refuse(
+                        key,
+                        dir,
+                        format!("is, holds or is in {what} ({})", other.display()),
+                    );
+                }
+            }
+        }
+        Ok((pool, area))
+    }
+
     /// The subtitle sites as the server uses them (PX-02): those
     /// `subtitles.sources` names, in its order; SubDL only with its key.
     pub fn subtitle_downloads(&self) -> Result<crate::subtitle_downloads::Settings, ConfigError> {
@@ -1209,6 +1281,68 @@ impl OptimizedConfig {
             dir,
             max_size_bytes: max_size_mb << 20,
             binge_ahead: self.binge_ahead(),
+        })
+    }
+}
+
+/// `downloads { dir = "…"; max_size_mb = 65536; }` (PX-38), both
+/// optional: where the files written for downloads are kept until the
+/// device has them, and the most they may take. Converted copies a
+/// download is written from stay in the pool, under
+/// `optimized.max_size_mb`.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct DownloadsConfig {
+    /// `<optimized dir>/downloads` if left out.
+    #[ucl(default)]
+    pub dir: Option<PathBuf>,
+    /// In MiB; 65536 (64 GiB) if left out.
+    #[ucl(default)]
+    pub max_size_mb: Option<u64>,
+}
+
+/// The download area's place and size, read from [`DownloadsConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadSettings {
+    pub dir: PathBuf,
+    pub max_size_bytes: u64,
+}
+
+impl DownloadsConfig {
+    /// A few films at once, as they are, while their devices fetch them.
+    pub const DEFAULT_MAX_SIZE_MB: u64 = 64 * 1024;
+
+    /// The area's place and size, `optimized_dir` (the pool's) holding
+    /// it unless `dir` says otherwise. A size of 0 and a directory that
+    /// is the state directory or holds it are refused.
+    pub fn place(
+        &self,
+        state_dir: &Path,
+        optimized_dir: &Path,
+    ) -> Result<DownloadSettings, ConfigError> {
+        let max_size_mb = self.max_size_mb.unwrap_or(Self::DEFAULT_MAX_SIZE_MB);
+        if max_size_mb == 0 {
+            return Err(ConfigError::Invalid {
+                key: "downloads.max_size_mb",
+                message: "0 would hold no file: every download would wait forever".into(),
+            });
+        }
+        let dir = self
+            .dir
+            .clone()
+            .unwrap_or_else(|| optimized_dir.join("downloads"));
+        if state_dir.starts_with(&dir) {
+            return Err(ConfigError::Invalid {
+                key: "downloads.dir",
+                message: format!(
+                    "{} is the state directory or holds it: choose a directory of its own",
+                    dir.display()
+                ),
+            });
+        }
+        Ok(DownloadSettings {
+            dir,
+            max_size_bytes: max_size_mb << 20,
         })
     }
 }
@@ -2809,7 +2943,7 @@ impl ServerConfig {
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
         parsed.previews.settings()?;
-        parsed.optimized.place(Path::new("/"))?;
+        parsed.areas(Path::new("/"))?;
         parsed.logs.buffer_lines()?;
         parsed.telemetry.otlp.settings()?;
         parsed.http_playback.settings()?;
@@ -4908,6 +5042,113 @@ mod tests {
                 "{config:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_download_area_is_in_the_pool_s_dir_with_64_gib_unless_set() {
+        let config = plex(PLEX).unwrap();
+        let area = config
+            .downloads
+            .place(Path::new("/s"), Path::new("/s/optimized"))
+            .unwrap();
+        assert_eq!(
+            (area.dir, area.max_size_bytes),
+            (PathBuf::from("/s/optimized/downloads"), 64 << 30)
+        );
+    }
+
+    #[test]
+    fn the_download_area_s_dir_and_size_are_read() {
+        let config = plex(&format!(
+            r#"{PLEX}downloads {{ dir = "/d"; max_size_mb = 16384; }}"#
+        ))
+        .unwrap();
+        let area = config
+            .downloads
+            .place(Path::new("/s"), Path::new("/s/optimized"))
+            .unwrap();
+        assert_eq!(
+            (area.dir, area.max_size_bytes),
+            (PathBuf::from("/d"), 16 << 30)
+        );
+    }
+
+    #[test]
+    fn a_download_area_of_nothing_is_refused() {
+        let config = plex(&format!("{PLEX}downloads {{ max_size_mb = 0; }}"));
+        assert!(
+            matches!(
+                config,
+                Err(ConfigError::Invalid {
+                    key: "downloads.max_size_mb",
+                    ..
+                })
+            ),
+            "{config:?}"
+        );
+    }
+
+    /// `optimized { … }` and `downloads { … }` beside a Plex server whose
+    /// films are read from /srv/media.
+    fn areas(optimized: &str, downloads: &str) -> Result<(), ConfigError> {
+        plex(&format!(
+            r#"plex {{ url = "http://nas:32400"; path_mapping [ {{ from = "/data"; to = "/srv/media"; }} ] }}
+            optimized {{ {optimized} }} downloads {{ {downloads} }}"#
+        ))?
+        .areas(Path::new("/var/lib/sf"))
+        .map(|_| ())
+    }
+
+    fn refused_for(result: Result<(), ConfigError>) -> Option<&'static str> {
+        match result {
+            Err(ConfigError::Invalid { key, .. }) => Some(key),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_default_areas_and_a_download_area_of_its_own_are_taken() {
+        assert_eq!(
+            [
+                areas("", ""),
+                areas(r#"dir = "/srv/copies";"#, r#"dir = "/srv/downloads";"#),
+                areas(
+                    r#"dir = "/srv/copies";"#,
+                    r#"dir = "/srv/copies/downloads";"#
+                ),
+            ]
+            .map(|r| r.is_ok()),
+            [true; 3]
+        );
+    }
+
+    /// Review 2026-10-20, finding 1: the sweeps would remove each other's
+    /// files, the media, or the server's own.
+    #[test]
+    fn a_download_area_that_overlaps_the_pool_the_media_or_the_caches_is_refused() {
+        let cases = [
+            (r#"dir = "/srv/x";"#, r#"dir = "/srv/x";"#),
+            (r#"dir = "/srv/x/copies";"#, r#"dir = "/srv/x";"#),
+            (r#"dir = "/srv/x";"#, r#"dir = "/srv/x/making";"#),
+            ("", r#"dir = "/srv/media";"#),
+            ("", r#"dir = "/srv/media/films";"#),
+            ("", r#"dir = "/srv";"#),
+            ("", r#"dir = "/var/lib/sf/cache/previews";"#),
+            (r#"dir = "/srv/media/.copies";"#, ""),
+        ];
+        assert_eq!(
+            cases.map(|(optimized, downloads)| refused_for(areas(optimized, downloads))),
+            [
+                Some("downloads.dir"),
+                Some("optimized.dir"),
+                Some("downloads.dir"),
+                Some("downloads.dir"),
+                Some("downloads.dir"),
+                Some("downloads.dir"),
+                Some("downloads.dir"),
+                Some("optimized.dir"),
+            ]
+        );
     }
 
     #[test]

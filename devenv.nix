@@ -292,6 +292,11 @@ in {
         cache_mb = 2048;
       }
 
+      # Downloads (PX-38): 16 GiB on nimble too, for the same reason.
+      downloads {
+        max_size_mb = 16384;
+      }
+
       # HTTP playback (PX-49), for AirPlay tests from the apps.
       http_playback {
         listen = "[::]:7422";

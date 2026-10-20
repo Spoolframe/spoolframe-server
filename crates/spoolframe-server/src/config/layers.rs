@@ -1037,6 +1037,10 @@ mod tests {
             documented.optimized.binge_ahead(),
             bare.optimized.binge_ahead()
         );
+        assert_eq!(
+            documented.downloads.place(dir, dir).unwrap(),
+            bare.downloads.place(dir, dir).unwrap()
+        );
         assert_eq!(documented.admin.metrics(), bare.admin.metrics());
         assert_eq!(
             documented.logs.buffer_lines().unwrap(),

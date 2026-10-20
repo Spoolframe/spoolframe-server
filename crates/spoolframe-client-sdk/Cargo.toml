@@ -23,6 +23,8 @@ zeroize = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
+# statvfs: the free space downloads have (PX-38).
+libc = { workspace = true }
 # soft-key: the software security key the SDK offers (P7-08).
 spoolframe-protocol = { workspace = true, features = ["soft-key"] }
 # The clientDataHash a security key root signs (P7-08).

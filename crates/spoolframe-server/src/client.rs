@@ -100,11 +100,16 @@ pub(crate) struct ClientProtocol {
     /// The HTTP playback port (PX-49), when it is on: what turns the
     /// `http-playback` experimental feature on.
     http_playback: Option<Arc<crate::http_playback::HttpPlayback>>,
-    /// Who each connection that takes playlist events acts as (PX-40).
+    /// Who each connection acts as, by session: what every feature's
+    /// listeners ask.
+    users: crate::connection_users::ConnectionUsers,
+    /// The connections that take playlist events (PX-40).
     playlist_listeners: crate::events::PlaylistListeners,
     /// The items each connection that takes subtitle timing events asked
     /// about (PX-03).
     subtitle_listeners: crate::events::SubtitleListeners,
+    /// The connections that take download events (PX-38).
+    download_listeners: crate::events::DownloadListeners,
 }
 
 /// What one connection has said so far.
@@ -407,7 +412,9 @@ struct Locks {
 
 enum ResourceBody {
     Bytes(Vec<u8>),
-    File(tokio::fs::File),
+    /// A file, and for a download's (PX-38) what keeps it there while it
+    /// is sent: the area removes no file being read.
+    File(tokio::fs::File, Option<crate::downloads::DownloadRead>),
 }
 
 impl Locks {
@@ -486,7 +493,8 @@ impl ClientProtocol {
         let pairing_relay = Arc::new(crate::pairing_relay::PairingRelay::new(
             services.auth.store().clock().clone(),
         ));
-        let playlist_listeners = crate::events::PlaylistListeners::default();
+        let users = crate::connection_users::ConnectionUsers::default();
+        let playlist_listeners = crate::events::PlaylistListeners::new(users.clone());
         tokio::spawn(crate::events::tell_playlist_news(
             services.playlists.news(),
             playlist_listeners.clone(),
@@ -497,6 +505,16 @@ impl ClientProtocol {
             services.subtitle_timings.changes(),
             subtitle_listeners.clone(),
             addresses.streams.clone(),
+        ));
+        let download_listeners = crate::events::DownloadListeners::new(users.clone());
+        tokio::spawn(crate::events::tell_download_news(
+            services.downloads.subscribe(),
+            download_listeners.clone(),
+            addresses.streams.clone(),
+        ));
+        tokio::spawn(crate::connection_users::forget_ended_sessions(
+            services.auth.clone(),
+            users.clone(),
         ));
         Self {
             id: endpoint.id(),
@@ -511,8 +529,10 @@ impl ClientProtocol {
             portable_sign_ins,
             pairing_relay,
             http_playback,
+            users,
             playlist_listeners,
             subtitle_listeners,
+            download_listeners,
         }
     }
 
@@ -1196,6 +1216,12 @@ impl ClientProtocol {
                 }
                 state.locks.lock().learn(&session, who.pin_required());
                 state.peer.note_signed_in(Some(&who.log_name()));
+                // Who the connection acts as, for every feature's events;
+                // not a session opened only to choose a new password.
+                if !who.password_change_only() {
+                    self.users
+                        .note(connection.stable_id(), &session, who.principal());
+                }
                 Ok((session, who))
             }
             Ok(None) => Err(Error::Unauthenticated),
@@ -1289,9 +1315,10 @@ impl ClientProtocol {
                         ResourceBody::Bytes(bytes) => {
                             send_unless_stalled(&mut send, &bytes, stall).await?;
                         }
-                        ResourceBody::File(file) => {
+                        ResourceBody::File(file, reading) => {
                             let copied =
                                 copy_unless_stalled(file.take(length), &mut send, stall).await?;
+                            drop(reading);
                             if media {
                                 self.services.metrics.media_reads.inc();
                                 self.services.metrics.media_read_bytes.add(copied);
@@ -1340,6 +1367,15 @@ impl ClientProtocol {
             return Err(Error::HandshakeRequired);
         };
         match request {
+            ResourceRequest::Download {
+                session,
+                id,
+                offset,
+                length,
+            } => {
+                self.read_download(connection, state, hello, session, &id, offset, length)
+                    .await
+            }
             ResourceRequest::SetPlaylistArt {
                 session,
                 id,
@@ -1397,7 +1433,7 @@ impl ClientProtocol {
                         revision,
                     },
                     reply.sent,
-                    ResourceBody::File(file),
+                    ResourceBody::File(file, None),
                 ))
             }
             request => {
@@ -1480,6 +1516,52 @@ impl ClientProtocol {
                 ))
             }
         }
+    }
+
+    /// A read of download `id`'s file (PX-38): at most `length` bytes
+    /// from `offset`, and at most [`MAX_READ`]. Not a playback: no
+    /// admission, no play. The file is held for the read.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_download(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        hello: &spoolframe_protocol::Hello,
+        session: SessionId,
+        id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
+        downloads_offered(hello)?;
+        let (session, who) = self
+            .authenticate_unrestricted(connection, state, Some(session))
+            .await?;
+        state.locks.lock().use_session(&session)?;
+        let read = self
+            .services
+            .downloads
+            .open_read(&who.principal(), id)
+            .await
+            .map_err(downloads_error)?;
+        let sent = length.min(MAX_READ).min(read.size.saturating_sub(offset));
+        self.services.downloads.sending(sent);
+        let unreadable = |e: std::io::Error| {
+            tracing::warn!(path = %read.path.display(), error = %e, "cannot read a download's file");
+            Error::Unavailable {
+                message: "the download's file could not be read".into(),
+            }
+        };
+        let mut file = tokio::fs::File::from_std(read.file.try_clone().map_err(unreadable)?);
+        if sent > 0 {
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(unreadable)?;
+        }
+        Ok((
+            ResourceMetadata::Download { size: read.size },
+            sent,
+            ResourceBody::File(file, Some(read)),
+        ))
     }
 
     /// `SetPlaylistArt` (PX-53): who may, and how large, are checked
@@ -1987,7 +2069,7 @@ impl ClientProtocol {
         }
         if playlists_listed {
             self.playlist_listeners
-                .note(connection.stable_id(), principal, liked_listed);
+                .note(connection.stable_id(), liked_listed);
         }
         // PX-03: subtitle timing, only for a client that takes it; it is
         // told of the items whose tracks it asks for or plays.
@@ -2012,6 +2094,21 @@ impl ClientProtocol {
                 self.subtitle_listeners.note(connection.stable_id(), id);
             }
             _ => {}
+        }
+        // PX-38: downloads, only for a client that takes them, on a
+        // platform that has them; it is told of its user's downloads.
+        if matches!(
+            request,
+            Request::DownloadOptions { .. }
+                | Request::PrepareDownload { .. }
+                | Request::DownloadStatus { .. }
+                | Request::CancelDownload { .. }
+                | Request::SyncOfflineWatch { .. }
+        ) {
+            downloads_offered(hello)?;
+        }
+        if features::has(&hello.features, features::DOWNLOADS) {
+            self.download_listeners.note(connection.stable_id());
         }
         // PX-02: subtitle downloads, only for a client that takes them.
         let subtitle_search_listed = features::has(&hello.features, features::SUBTITLE_SEARCH);
@@ -2459,6 +2556,9 @@ impl ClientProtocol {
                     .logout(&session.0)
                     .await
                     .map_err(internal)?;
+                // Told of the user's playlists and downloads no more, at
+                // once.
+                self.users.forget(&session.0);
                 Ok(Reply::LoggedOut)
             }
             Request::SetDeviceTrust {
@@ -3908,6 +4008,102 @@ impl ClientProtocol {
                     Err(e) => Err(internal(e)),
                 }
             }
+            Request::DownloadOptions { id } => self
+                .download_options(state, hello, principal, &id)
+                .await
+                .map(Reply::DownloadOptions),
+            Request::PrepareDownload { id, source, tracks } => self
+                .prepare_download(state, hello, principal, &id, source, tracks)
+                .await
+                .map(Reply::Download),
+            Request::DownloadStatus { ids } => {
+                if ids.len() > spoolframe_protocol::downloads::MAX_ASKED {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "at most {} downloads are asked about at once",
+                            spoolframe_protocol::downloads::MAX_ASKED
+                        ),
+                    });
+                }
+                // Each id answered alone: one not the user's (or no
+                // longer kept) is gone, and never fails the rest.
+                let statuses = self
+                    .services
+                    .downloads
+                    .statuses(&principal, &ids)
+                    .await
+                    .map_err(downloads_error)?;
+                let mut downloads = Vec::with_capacity(ids.len());
+                let mut gone = Vec::new();
+                for id in ids {
+                    match statuses.get(&id).cloned() {
+                        Some(status) => downloads.push(download_info(
+                            id,
+                            &status.state,
+                            status.class,
+                            status.carried,
+                        )),
+                        None => gone.push(id),
+                    }
+                }
+                Ok(Reply::Downloads { downloads, gone })
+            }
+            Request::CancelDownload { id } => {
+                if self
+                    .services
+                    .downloads
+                    .cancel(&principal, &id)
+                    .await
+                    .map_err(downloads_error)?
+                {
+                    Ok(Reply::Done)
+                } else {
+                    Err(no_such_download())
+                }
+            }
+            Request::SyncOfflineWatch {
+                device_now,
+                entries,
+            } => {
+                use spoolframe_protocol::downloads::MAX_ASKED;
+                if entries.len() > MAX_ASKED {
+                    return Err(Error::InvalidInput {
+                        message: format!("at most {MAX_ASKED} entries are synced at once"),
+                    });
+                }
+                if let Some(empty) = entries
+                    .iter()
+                    .find(|e| e.position_ms.is_none() && e.watched.is_none())
+                {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "the entry for {} has no position and no watched",
+                            empty.id
+                        ),
+                    });
+                }
+                let entries = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let offline = crate::watch::Offline {
+                            position: entry.position_ms.map(Duration::from_millis),
+                            watched: entry.watched,
+                            at: entry.at,
+                            device_now,
+                        };
+                        (entry.id, offline)
+                    })
+                    .collect();
+                let synced = self
+                    .services
+                    .watch
+                    .offline(principal, entries)
+                    .await
+                    .map_err(watch_error)?;
+                Ok(Reply::OfflineWatchSynced {
+                    outcomes: synced.into_iter().map(Into::into).collect(),
+                })
+            }
             Request::Hello(_)
             | Request::AuthMethods
             | Request::LoginPassword(_)
@@ -5127,6 +5323,142 @@ impl ClientProtocol {
         })
     }
 
+    /// What `principal`'s device may download of `id` (PX-38).
+    async fn download_options(
+        &self,
+        state: &ConnectionState,
+        hello: &spoolframe_protocol::Hello,
+        principal: Principal,
+        id: &MediaId,
+    ) -> Result<spoolframe_protocol::downloads::DownloadOptionsInfo, Error> {
+        use crate::downloads::plan::{self, Decision, Subtitle, Tracks};
+        use spoolframe_protocol::downloads::{
+            DownloadOptionsInfo, DownloadTracks, LeftOutSubtitle, OriginalDownload,
+        };
+        let class = downloads_offered(hello)?;
+        downloadable(id)?;
+        let (_, descriptor) = self.describe(id).await?;
+        let store = self.store();
+        let preferences = store.track_preferences(principal).await.map_err(internal)?;
+        let scope = self.override_scope(id).await?;
+        let override_ = store
+            .track_override(principal, &scope)
+            .await
+            .map_err(internal)?;
+        let preferred = DownloadTracks::from(plan::preferred(
+            &descriptor,
+            &preferences,
+            override_.as_ref(),
+        ));
+        let caps = capabilities(state, None).unwrap_or_else(|| class.capabilities());
+        let every: Vec<u32> = (0..descriptor.subtitles.len() as u32).collect();
+        let ways = plan::subtitles(
+            &descriptor,
+            class,
+            &every,
+            preferences.subtitles.bitmap,
+            self.services.subtitles.ocr(),
+        );
+        let decision = plan::original(&descriptor, class, &caps, &Tracks::All).map_err(|e| {
+            Error::InvalidInput {
+                message: e.to_string(),
+            }
+        })?;
+        // As the download would be: not as it is with a subtitle left out
+        // or read as text.
+        let original = match plan::settled(decision, &ways) {
+            Decision::AsIs => OriginalDownload::AsIs,
+            Decision::Remux => OriginalDownload::Remux,
+            Decision::Convert { video, audio, .. } => OriginalDownload::Convert {
+                video: !video.copied,
+                // Stream indexes, as the copy names them, to places.
+                audio: (0..descriptor.audio.len() as u32)
+                    .filter(|&at| audio.contains(&descriptor.audio[at as usize].index))
+                    .collect(),
+            },
+        };
+        let left_out = ways
+            .into_iter()
+            .filter_map(|(subtitle, way)| match way {
+                Subtitle::LeftOut(reason) => Some(LeftOutSubtitle { subtitle, reason }),
+                Subtitle::Written | Subtitle::ReadAsText => None,
+            })
+            .collect();
+        let profiles = store
+            .optimized_profiles()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        Ok(DownloadOptionsInfo {
+            tracks: descriptor.tracks(),
+            preferred,
+            profiles,
+            original,
+            left_out,
+        })
+    }
+
+    /// Prepare `principal`'s download of `id` (PX-38), with their PX-13
+    /// choice for picture subtitles.
+    async fn prepare_download(
+        &self,
+        state: &ConnectionState,
+        hello: &spoolframe_protocol::Hello,
+        principal: Principal,
+        id: &MediaId,
+        source: spoolframe_protocol::downloads::DownloadSource,
+        tracks: spoolframe_protocol::downloads::DownloadTracks,
+    ) -> Result<spoolframe_protocol::downloads::DownloadInfo, Error> {
+        use crate::downloads::plan::{Source, Tracks, UnknownTracks};
+        use spoolframe_protocol::downloads::DownloadSource;
+        let class = downloads_offered(hello)?;
+        let source = match source {
+            DownloadSource::Original => Source::Original,
+            DownloadSource::Profile { name } => Source::Profile(name),
+            DownloadSource::Unknown => {
+                return Err(Error::InvalidInput {
+                    message: "a download source this server does not know".into(),
+                });
+            }
+        };
+        let tracks = Tracks::try_from(tracks).map_err(|UnknownTracks| Error::InvalidInput {
+            message: "a choice of tracks this server does not know".into(),
+        })?;
+        downloadable(id)?;
+        let (path, descriptor) = self.describe(id).await?;
+        let preferences = self
+            .store()
+            .track_preferences(principal)
+            .await
+            .map_err(internal)?;
+        let caps = capabilities(state, None);
+        let media_id = id.to_string();
+        let prepared = self
+            .services
+            .downloads
+            .prepare(crate::downloads::PrepareRequest {
+                principal,
+                media_id: &media_id,
+                media: &path,
+                descriptor: &descriptor,
+                class,
+                capabilities: caps.as_ref(),
+                source,
+                tracks,
+                bitmap: preferences.subtitles.bitmap,
+            })
+            .await
+            .map_err(downloads_error)?;
+        Ok(download_info(
+            prepared.id,
+            &prepared.state,
+            Some(class),
+            Some(prepared.carried),
+        ))
+    }
+
     /// `id`'s media file and Spoolframe's description of it.
     async fn describe(&self, id: &MediaId) -> Result<(PathBuf, Arc<MediaDescriptor>), Error> {
         let path = self
@@ -5396,6 +5728,8 @@ impl ProtocolHandler for ClientProtocol {
         self.addresses.streams.remove(id);
         self.playlist_listeners.remove(id);
         self.subtitle_listeners.remove(id);
+        self.download_listeners.remove(id);
+        self.users.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
         self.services.playbacks.connection_closed(state.number);
@@ -5760,6 +6094,7 @@ impl Asked {
             Ok(ResourceRequest::SetPlaylistArt { session, .. }) => {
                 ("set_playlist_art", Some(session))
             }
+            Ok(ResourceRequest::Download { session, .. }) => ("download", Some(session)),
             Err(_) => ("resource", None),
         };
         Self {
@@ -5767,6 +6102,92 @@ impl Asked {
             session,
             ..Self::default()
         }
+    }
+}
+
+/// The class a client downloads for (PX-38), if it listed
+/// `spoolframe:downloads` and its platform has downloads; else
+/// `Unsupported`, saying which.
+fn downloads_offered(
+    hello: &spoolframe_protocol::Hello,
+) -> Result<crate::downloads::DeviceClass, Error> {
+    if !features::has(&hello.features, features::DOWNLOADS) {
+        return Err(Error::Unsupported {
+            request: format!("downloads without {}", features::DOWNLOADS),
+        });
+    }
+    crate::downloads::DeviceClass::of(hello.platform).ok_or_else(|| Error::Unsupported {
+        request: format!(
+            "downloads on {}: only an iPhone, iPad, Mac or Linux client downloads",
+            hello.platform.as_str()
+        ),
+    })
+}
+
+/// Only films and episodes are downloaded (PX-38): music is a later
+/// ticket's.
+fn downloadable(id: &MediaId) -> Result<(), Error> {
+    if crate::watch::tracked(id) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput {
+            message: "only films and episodes are downloaded".into(),
+        })
+    }
+}
+
+fn no_such_download() -> Error {
+    Error::NotFound {
+        what: "download".into(),
+    }
+}
+
+/// A download on the wire (PX-38).
+fn download_info(
+    id: String,
+    state: &crate::downloads::DownloadState,
+    class: Option<crate::downloads::DeviceClass>,
+    carried: Option<crate::downloads::Carried>,
+) -> spoolframe_protocol::downloads::DownloadInfo {
+    use spoolframe_protocol::downloads::{DownloadFile, DownloadInfo, FileTracks};
+    DownloadInfo {
+        id,
+        state: state.to_wire(),
+        file: class.zip(carried).map(|(class, carried)| DownloadFile {
+            container: class.container(),
+            tracks: FileTracks {
+                audio: carried.audio,
+                subtitles: carried.subtitles,
+            },
+        }),
+    }
+}
+
+/// A download's refusal on the wire (PX-38).
+fn downloads_error(e: crate::downloads::DownloadError) -> Error {
+    use crate::downloads::DownloadError;
+    match e {
+        DownloadError::Plan(e) => Error::InvalidInput {
+            message: e.to_string(),
+        },
+        DownloadError::NoProfile(name) => Error::NotFound {
+            what: format!("profile {name}"),
+        },
+        DownloadError::Media(e) => {
+            tracing::warn!(error = %e, "cannot read a download's media file");
+            Error::Unavailable {
+                message: "the media file could not be read".into(),
+            }
+        }
+        DownloadError::NotFound => no_such_download(),
+        DownloadError::NotReady => Error::DownloadNotReady,
+        DownloadError::Open(e) => {
+            tracing::warn!(error = %e, "cannot open a download's file");
+            Error::Unavailable {
+                message: "the download's file could not be read".into(),
+            }
+        }
+        DownloadError::Store(e) => internal(e),
     }
 }
 

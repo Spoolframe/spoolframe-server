@@ -3322,3 +3322,262 @@ mod playlist_upcoming {
         }));
     }
 }
+
+/// `spoolframe:downloads` (PX-38): the requests, replies, event and read
+/// of downloads, and what an older peer makes of a newer one's.
+mod downloads {
+    use super::*;
+    use crate::downloads::{
+        DownloadFile, DownloadInfo, DownloadOptionsInfo, DownloadSource, DownloadState,
+        DownloadTracks, FileTracks, LeftOutSubtitle, OriginalDownload,
+    };
+    use crate::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+
+    fn id() -> MediaId {
+        MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap()
+    }
+
+    fn requests() -> Vec<Request> {
+        vec![
+            Request::DownloadOptions { id: id() },
+            Request::PrepareDownload {
+                id: id(),
+                source: DownloadSource::Original,
+                tracks: DownloadTracks::All,
+            },
+            Request::PrepareDownload {
+                id: id(),
+                source: DownloadSource::Profile {
+                    name: "Mobile".into(),
+                },
+                tracks: DownloadTracks::Chosen {
+                    audio: vec![0],
+                    subtitles: vec![0, 1],
+                },
+            },
+            Request::DownloadStatus {
+                ids: vec!["ab".repeat(16)],
+            },
+            Request::CancelDownload {
+                id: "ab".repeat(16),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_requests_round_trip_and_are_safe_to_retry() {
+        for request in requests() {
+            assert!(crate::policy::retry_safe(&request), "{request:?}");
+            round_trip(RequestEnvelope {
+                session: Some(SessionId("s".into())),
+                request,
+            });
+        }
+    }
+
+    #[test]
+    fn the_requests_are_tagged_by_their_snake_case_names() {
+        let tags: Vec<_> = requests()
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap()["type"].clone())
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "download_options",
+                "prepare_download",
+                "prepare_download",
+                "download_status",
+                "cancel_download"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_source_and_tracks_are_tagged_by_type() {
+        let prepare = Request::PrepareDownload {
+            id: id(),
+            source: DownloadSource::Profile {
+                name: "Mobile".into(),
+            },
+            tracks: DownloadTracks::Chosen {
+                audio: vec![1],
+                subtitles: vec![],
+            },
+        };
+        let json = serde_json::to_value(&prepare).unwrap();
+        assert_eq!(
+            (json["source"].clone(), json["tracks"].clone()),
+            (
+                serde_json::json!({"type": "profile", "name": "Mobile"}),
+                serde_json::json!({"type": "chosen", "audio": [1], "subtitles": []})
+            )
+        );
+    }
+
+    fn ready() -> DownloadInfo {
+        DownloadInfo {
+            id: "ab".repeat(16),
+            state: DownloadState::Ready {
+                size: 5_731_000_000,
+                sha256: "cd".repeat(32),
+            },
+            file: Some(DownloadFile {
+                container: Container::Mp4,
+                tracks: FileTracks {
+                    audio: vec![0],
+                    subtitles: vec![0, 1],
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn the_replies_round_trip() {
+        for reply in [
+            Reply::DownloadOptions(DownloadOptionsInfo {
+                tracks: MediaTracks::default(),
+                preferred: DownloadTracks::Chosen {
+                    audio: vec![0, 2],
+                    subtitles: vec![1],
+                },
+                profiles: vec!["Mobile".into()],
+                original: OriginalDownload::Convert {
+                    video: false,
+                    audio: vec![1],
+                },
+                left_out: vec![LeftOutSubtitle {
+                    subtitle: 3,
+                    reason: "picture subtitles are not carried in an MP4 file".into(),
+                }],
+            }),
+            Reply::Download(ready()),
+            Reply::Downloads {
+                downloads: vec![
+                    ready(),
+                    DownloadInfo {
+                        id: "ef".repeat(16),
+                        state: DownloadState::Converting {
+                            done_percent: Some(42),
+                            eta_secs: Some(90),
+                        },
+                        file: None,
+                    },
+                ],
+                gone: vec!["01".repeat(16)],
+            },
+            Reply::Downloads {
+                downloads: Vec::new(),
+                gone: Vec::new(),
+            },
+        ] {
+            round_trip(Response::Ok(reply));
+        }
+        round_trip(Response::Err(Error::DownloadNotReady));
+    }
+
+    #[test]
+    fn every_state_round_trips_in_its_event() {
+        for state in [
+            DownloadState::Waiting,
+            DownloadState::Converting {
+                done_percent: None,
+                eta_secs: None,
+            },
+            DownloadState::Writing {
+                done_percent: Some(7),
+            },
+            DownloadState::Ready {
+                size: 1,
+                sha256: "00".repeat(32),
+            },
+            DownloadState::Failed {
+                reason: "the conversion failed".into(),
+            },
+        ] {
+            round_trip(Event::DownloadChanged {
+                id: "ab".repeat(16),
+                state,
+            });
+        }
+    }
+
+    #[test]
+    fn what_a_newer_peer_adds_decodes_as_unknown() {
+        let state: DownloadState = serde_json::from_str(r#"{"type": "paused"}"#).unwrap();
+        let source: DownloadSource = serde_json::from_str(r#"{"type": "remote"}"#).unwrap();
+        let tracks: DownloadTracks = serde_json::from_str(r#"{"type": "some"}"#).unwrap();
+        let original: OriginalDownload = serde_json::from_str(r#"{"type": "x"}"#).unwrap();
+        assert_eq!(
+            (state, source, tracks, original),
+            (
+                DownloadState::Unknown,
+                DownloadSource::Unknown,
+                DownloadTracks::Unknown,
+                OriginalDownload::Unknown
+            )
+        );
+    }
+
+    #[test]
+    fn an_offline_watch_sync_round_trips_and_is_safe_to_retry() {
+        use crate::downloads::{OfflineWatch, OfflineWatchOutcome};
+        let sync = Request::SyncOfflineWatch {
+            device_now: 1_790_003_600,
+            entries: vec![
+                OfflineWatch {
+                    id: id(),
+                    position_ms: Some(600_000),
+                    watched: None,
+                    at: 1_790_000_000,
+                },
+                OfflineWatch {
+                    id: id(),
+                    position_ms: None,
+                    watched: Some(true),
+                    at: 1_790_000_100,
+                },
+            ],
+        };
+        assert!(crate::policy::retry_safe(&sync));
+        assert_eq!(
+            serde_json::to_value(&sync).unwrap()["type"],
+            "sync_offline_watch"
+        );
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: sync,
+        });
+        round_trip(Response::Ok(Reply::OfflineWatchSynced {
+            outcomes: vec![
+                OfflineWatchOutcome::Applied,
+                OfflineWatchOutcome::Older,
+                OfflineWatchOutcome::NotTracked,
+            ],
+        }));
+        assert_eq!(
+            serde_json::from_str::<OfflineWatchOutcome>(r#""merged""#).unwrap(),
+            OfflineWatchOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn a_read_of_a_download_round_trips() {
+        round_trip(ResourceRequest::Download {
+            session: SessionId("s".into()),
+            id: "ab".repeat(16),
+            offset: 8 << 20,
+            length: 8 << 20,
+        });
+        round_trip(ResourceResponse::Ready {
+            length: 8 << 20,
+            metadata: ResourceMetadata::Download {
+                size: 5_731_000_000,
+            },
+        });
+        assert_eq!(
+            serde_json::to_value(ResourceMetadata::Download { size: 3 }).unwrap(),
+            serde_json::json!({"type": "download", "size": 3})
+        );
+    }
+}

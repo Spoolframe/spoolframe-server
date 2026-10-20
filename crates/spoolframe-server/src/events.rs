@@ -21,6 +21,7 @@ use spoolframe_protocol::Event;
 use spoolframe_protocol::codec::write_frame;
 
 use crate::announce::Told;
+use crate::connection_users::ConnectionUsers;
 use crate::network::Connections;
 use crate::playlists::PlaylistNews;
 use crate::principal::Principal;
@@ -189,38 +190,58 @@ impl Addresses {
     }
 }
 
-/// The users each connection that listed `spoolframe:playlists` has
-/// made requests as, by its stable id: who to tell of playlist changes
-/// (PX-40), and whether it listed `spoolframe:liked` too (PX-43): one
-/// that did not is not told of Liked and All, which it does not list. A
-/// connection carries any number of sessions; each one used is noted,
-/// and all go when it closes.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PlaylistListeners(Arc<Mutex<HashMap<usize, Listener>>>);
+/// The next of `news`, or `None` once it ends; news missed while the
+/// teller lagged is let go, as `what` went untold.
+async fn next_news<T: Clone>(
+    news: &mut tokio::sync::broadcast::Receiver<T>,
+    what: &str,
+) -> Option<T> {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match news.recv().await {
+            Ok(told) => return Some(told),
+            Err(RecvError::Lagged(missed)) => tracing::debug!(missed, "{what} went untold"),
+            Err(RecvError::Closed) => return None,
+        }
+    }
+}
 
-#[derive(Debug, Default)]
-struct Listener {
-    who: HashSet<Principal>,
-    liked: bool,
+/// The connections that listed `spoolframe:playlists`, by stable id: told
+/// of playlist changes (PX-40) to what each user they act as
+/// ([`ConnectionUsers`]) sees, and whether each listed `spoolframe:liked`
+/// too (PX-43): one that did not is not told of Liked and All, which it
+/// does not list.
+#[derive(Debug, Clone)]
+pub(crate) struct PlaylistListeners {
+    liked: Arc<Mutex<HashMap<usize, bool>>>,
+    users: ConnectionUsers,
 }
 
 impl PlaylistListeners {
-    pub(crate) fn note(&self, id: usize, principal: Principal, liked: bool) {
-        let mut all = self.0.lock();
-        let listener = all.entry(id).or_default();
-        listener.who.insert(principal);
-        listener.liked = liked;
+    pub(crate) fn new(users: ConnectionUsers) -> Self {
+        Self {
+            liked: Arc::default(),
+            users,
+        }
+    }
+
+    pub(crate) fn note(&self, id: usize, liked: bool) {
+        self.liked.lock().insert(id, liked);
     }
 
     pub(crate) fn remove(&self, id: usize) {
-        self.0.lock().remove(&id);
+        self.liked.lock().remove(&id);
     }
 
-    fn each(&self) -> Vec<(usize, Vec<Principal>, bool)> {
-        self.0
-            .lock()
-            .iter()
-            .map(|(id, l)| (*id, l.who.iter().copied().collect(), l.liked))
+    /// The event of `news` for each listening connection concerned.
+    fn events(&self, news: &PlaylistNews) -> Vec<(usize, Event)> {
+        let listening: Vec<(usize, bool)> =
+            self.liked.lock().iter().map(|(id, l)| (*id, *l)).collect();
+        listening
+            .into_iter()
+            .filter_map(|(id, liked)| {
+                playlist_event(news, &self.users.who(id), liked).map(|event| (id, event))
+            })
             .collect()
     }
 }
@@ -269,20 +290,9 @@ pub(crate) async fn tell_playlist_news(
     listeners: PlaylistListeners,
     streams: EventStreams,
 ) {
-    use tokio::sync::broadcast::error::RecvError;
-    loop {
-        let told = match news.recv().await {
-            Ok(told) => told,
-            Err(RecvError::Lagged(missed)) => {
-                tracing::debug!(missed, "playlist changes went untold");
-                continue;
-            }
-            Err(RecvError::Closed) => return,
-        };
-        for (id, who, liked) in listeners.each() {
-            if let Some(event) = playlist_event(&told, &who, liked) {
-                streams.send(id, event);
-            }
+    while let Some(told) = next_news(&mut news, "playlist changes").await {
+        for (id, event) in listeners.events(&told) {
+            streams.send(id, event);
         }
     }
 }
@@ -330,16 +340,7 @@ pub(crate) async fn tell_subtitle_news(
     listeners: SubtitleListeners,
     streams: EventStreams,
 ) {
-    use tokio::sync::broadcast::error::RecvError;
-    loop {
-        let told = match news.recv().await {
-            Ok(told) => told,
-            Err(RecvError::Lagged(missed)) => {
-                tracing::debug!(missed, "subtitle timing changes went untold");
-                continue;
-            }
-            Err(RecvError::Closed) => return,
-        };
+    while let Some(told) = next_news(&mut news, "subtitle timing changes").await {
         for id in listeners.of(&told.id) {
             streams.send(
                 id,
@@ -353,9 +354,122 @@ pub(crate) async fn tell_subtitle_news(
     }
 }
 
+/// The connections that listed `spoolframe:downloads`, by stable id:
+/// told when a download of a user they act as ([`ConnectionUsers`])
+/// moves (PX-38). Only their own: a download is its user's business.
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadListeners {
+    listed: Arc<Mutex<HashSet<usize>>>,
+    users: ConnectionUsers,
+}
+
+impl DownloadListeners {
+    pub(crate) fn new(users: ConnectionUsers) -> Self {
+        Self {
+            listed: Arc::default(),
+            users,
+        }
+    }
+
+    pub(crate) fn note(&self, id: usize) {
+        self.listed.lock().insert(id);
+    }
+
+    pub(crate) fn remove(&self, id: usize) {
+        self.listed.lock().remove(&id);
+    }
+
+    /// The listening connections that act as `principal`.
+    fn of(&self, principal: &Principal) -> Vec<usize> {
+        let mut ids = self.users.of(principal);
+        let listed = self.listed.lock();
+        ids.retain(|id| listed.contains(id));
+        ids
+    }
+}
+
+/// Tell each connection of a download's user of its moves, as the
+/// downloads tell them (a progress once per percent or every 2 s), until
+/// they end.
+pub(crate) async fn tell_download_news(
+    mut news: tokio::sync::broadcast::Receiver<crate::downloads::DownloadChange>,
+    listeners: DownloadListeners,
+    streams: EventStreams,
+) {
+    while let Some(told) = next_news(&mut news, "download changes").await {
+        let Ok(principal) = told.principal.parse::<Principal>() else {
+            continue;
+        };
+        let connections = listeners.of(&principal);
+        if connections.is_empty() {
+            continue;
+        }
+        let state = told.state.to_wire();
+        for id in connections {
+            streams.send(
+                id,
+                Event::DownloadChanged {
+                    id: told.id.clone(),
+                    state: state.clone(),
+                },
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_protocol::SessionId;
+
+    /// PX-38: a download's moves go to its user's connections that listed
+    /// downloads alone, and to none once they close.
+    #[test]
+    fn download_listeners_hear_of_their_own_user_s_downloads() {
+        let users = ConnectionUsers::default();
+        let listeners = DownloadListeners::new(users.clone());
+        let (alice, bob) = (principal(1), principal(2));
+        users.note(1, &session(1), alice);
+        users.note(2, &session(2), bob);
+        users.note(2, &session(3), alice);
+        users.note(3, &session(4), alice);
+        listeners.note(1);
+        listeners.note(2);
+        let mut of_alice = listeners.of(&alice);
+        of_alice.sort();
+        assert_eq!(of_alice, [1, 2], "3 did not list downloads");
+        listeners.remove(2);
+        assert!(listeners.of(&bob).is_empty());
+    }
+
+    /// Review 2026-10-20, finding 6: a connection that signed out as alice
+    /// and in as bob is told neither of alice's playlists nor her pins.
+    #[test]
+    fn a_connection_signed_out_of_a_user_is_told_none_of_their_playlists() {
+        let users = ConnectionUsers::default();
+        let listeners = PlaylistListeners::new(users.clone());
+        let (alice, bob) = (principal(1), principal(2));
+        users.note(1, &session(1), alice);
+        listeners.note(1, false);
+        users.forget(&session(1).0);
+        users.note(1, &session(2), bob);
+        let hers = crate::playlists::Seen::for_tests(alice, false, &[]);
+        let changed = PlaylistNews::Playlist {
+            id: "p".into(),
+            revision: 2,
+            before: Some(hers.clone()),
+            after: Some(hers),
+        };
+        let pins = PlaylistNews::Pins { principal: alice };
+        assert_eq!(
+            (listeners.events(&changed), listeners.events(&pins)),
+            (vec![], vec![])
+        );
+    }
+
+    fn session(n: u8) -> SessionId {
+        SessionId(format!("session-{n}"))
+    }
 
     fn item(n: u32) -> MediaId {
         format!("plex:movie:{n}").parse().unwrap()

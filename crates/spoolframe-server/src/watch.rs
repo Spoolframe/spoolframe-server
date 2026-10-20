@@ -65,6 +65,40 @@ pub struct Watch {
     changed: tokio::sync::broadcast::Sender<Principal>,
 }
 
+/// Where a device got to in an item while it had no server (PX-38).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offline {
+    /// Where it stopped, if it played.
+    pub position: Option<Duration>,
+    /// Marked watched (`true`) or unwatched (`false`) there.
+    pub watched: Option<bool>,
+    /// When, by the device's clock (Unix seconds).
+    pub at: i64,
+    /// The device's clock now, as it sent this (Unix seconds).
+    pub device_now: i64,
+}
+
+/// What became of an [`Offline`] state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Synced {
+    /// Written: newer than the server's.
+    Applied,
+    /// Not written: the server's is as new or newer.
+    Older,
+    /// Not written: the item has no watch state, or is not there.
+    NotTracked,
+}
+
+impl From<Synced> for spoolframe_protocol::downloads::OfflineWatchOutcome {
+    fn from(synced: Synced) -> Self {
+        match synced {
+            Synced::Applied => Self::Applied,
+            Synced::Older => Self::Older,
+            Synced::NotTracked => Self::NotTracked,
+        }
+    }
+}
+
 /// A progress write, for judging the reports the throttle skips.
 #[derive(Debug, Clone, Copy)]
 struct Written {
@@ -235,6 +269,86 @@ impl Watch {
         Ok(())
     }
 
+    /// Take in where `principal` got to in `id` on a device with no
+    /// server (PX-38): written only when newer than the state the server
+    /// has, newest winning whichever device it came from. The device's
+    /// clock is set right first: its `at` is moved by how far its clock
+    /// is from the server's, and kept no later than now. Watched is
+    /// judged by the rules from the position and the item's credits, as
+    /// any progress is, or marked as the device says; the throttle does
+    /// not apply. Written, it is told as any save is (PX-04's Plex
+    /// mirror). Each of `entries` in turn, the items fetched a few ahead:
+    /// a failure on one leaves those before it written and none after.
+    pub async fn offline(
+        &self,
+        principal: Principal,
+        entries: Vec<(MediaId, Offline)>,
+    ) -> Result<Vec<Synced>, WatchError> {
+        let mut fetched = stream::iter(entries)
+            .map(|(id, offline)| async move {
+                let found = if tracked(&id) {
+                    self.served_item(&id).await
+                } else {
+                    Ok(None)
+                };
+                (id, offline, found)
+            })
+            .buffered(CATALOG_FETCHES);
+        let mut synced = Vec::new();
+        while let Some((id, offline, found)) = fetched.next().await {
+            synced.push(match found? {
+                Some(found) => self.offline_one(principal, &id, &found, offline).await?,
+                None => Synced::NotTracked,
+            });
+        }
+        Ok(synced)
+    }
+
+    /// [`Watch::offline`] of `offline` in `id`, `found`.
+    async fn offline_one(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        found: &spoolframe_catalog::ItemWithChildren,
+        offline: Offline,
+    ) -> Result<Synced, WatchError> {
+        let at = self.store.server_time_of(offline.at, offline.device_now);
+        let duration = self.duration(id, &found.item).await;
+        let (position, watched) = match (offline.position, offline.watched) {
+            (Some(position), marked) => {
+                let credits = credits_to_end(&found.markers);
+                let judged = self.rules().is_watched(position, duration, credits);
+                (Some(position), judged || marked == Some(true))
+            }
+            // Marked, as `mark` does: its progress starts over.
+            (None, Some(marked)) => (None, marked),
+            // Nothing to write is newer than nothing.
+            (None, None) => return Ok(Synced::Older),
+        };
+        let written = self
+            .save_as_of(principal, id, found, position, duration, watched, Some(at))
+            .await?;
+        Ok(if written {
+            Synced::Applied
+        } else {
+            Synced::Older
+        })
+    }
+
+    /// Item `id`, or `None` when it is gone, another catalog's, or in a
+    /// library no longer served: an offline entry's answer alone
+    /// (`NotTracked`), never its batch's.
+    async fn served_item(
+        &self,
+        id: &MediaId,
+    ) -> Result<Option<spoolframe_catalog::ItemWithChildren>, WatchError> {
+        match self.catalog.item(id).await {
+            Ok(found) => Ok(Some(found)),
+            Err(e) if crate::client::unserved(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Remove the card `id`, a movie or an episode, from `principal`'s
     /// Continue watching or Next up (P1-22). Only that card: the show's
     /// other episodes stay. Its watch state does not change; the next one
@@ -342,6 +456,24 @@ impl Watch {
         duration: Option<Duration>,
         watched: bool,
     ) -> Result<(), WatchError> {
+        self.save_as_of(principal, id, found, position, duration, watched, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Watch::save`], now; or, with `at` (Unix seconds), as of then and
+    /// only when newer than the state there is: whether it was written.
+    #[allow(clippy::too_many_arguments)]
+    async fn save_as_of(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        found: &spoolframe_catalog::ItemWithChildren,
+        position: Option<Duration>,
+        duration: Option<Duration>,
+        watched: bool,
+        at: Option<i64>,
+    ) -> Result<bool, WatchError> {
         let media_id = id.to_string();
         // Bring over any state this item had under an earlier key first.
         self.relink(principal, id, &found.external_ids).await?;
@@ -349,25 +481,32 @@ impl Watch {
             Item::Episode(e) => Some(e.show_id.to_string()),
             _ => None,
         };
-        self.store
-            .save_watch(
-                principal,
-                WatchUpdate {
-                    media_id: &media_id,
-                    show_id: show_id.as_deref(),
-                    external_ids: &found.external_ids,
-                    position_ms: position.map(ms),
-                    duration_ms: duration.map(ms),
-                    watched,
-                    unhide: true,
-                },
-            )
-            .await?;
+        let update = WatchUpdate {
+            media_id: &media_id,
+            show_id: show_id.as_deref(),
+            external_ids: &found.external_ids,
+            position_ms: position.map(ms),
+            duration_ms: duration.map(ms),
+            watched,
+            unhide: true,
+        };
+        match at {
+            None => self.store.save_watch(principal, update).await?,
+            Some(at) => {
+                if !self
+                    .store
+                    .save_watch_if_newer(principal, update, at)
+                    .await?
+                {
+                    return Ok(false);
+                }
+            }
+        }
         // What is next up may have changed.
         self.next_up.lock().remove(&principal);
         // Nobody listening is fine: nothing syncs.
         let _ = self.changed.send(principal);
-        Ok(())
+        Ok(true)
     }
 
     /// The duration from the server's own probe, else the catalog's; never

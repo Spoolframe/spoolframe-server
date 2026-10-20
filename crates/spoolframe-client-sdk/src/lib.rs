@@ -17,6 +17,7 @@
 mod client;
 mod connection;
 mod discovery;
+mod downloads;
 mod error;
 mod experimental;
 mod invite_admin;
@@ -40,6 +41,11 @@ mod subtitle_sync;
 
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
 pub use connection::Timeouts;
+// Downloads for offline viewing (PX-38), and their wire types.
+pub use downloads::{
+    DownloadEvent, DownloadPhase, DownloadSpace, Downloads, LocalArtwork, LocalDownload,
+    LocalWatch, SyncedWatch,
+};
 pub use error::SdkError;
 pub use experimental::{Experimental, HttpPlayback, HttpPlaybackRefusal};
 pub use invite_admin::{
@@ -48,6 +54,10 @@ pub use invite_admin::{
 pub use invites::InviteInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
+pub use spoolframe_protocol::downloads::{
+    DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, FileTracks,
+    LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
+};
 // Pairing a guest onto this device by QR code (P7-03).
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 pub use spoolframe_protocol::invite::InviteLinkKind;

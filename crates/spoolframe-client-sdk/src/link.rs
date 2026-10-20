@@ -739,6 +739,12 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 });
             }
         }
+        // PX-38: the download manager asks again at once.
+        Event::DownloadChanged { id: download, .. } => {
+            if let Some(inner) = client.upgrade() {
+                inner.downloads.server_event(id, download);
+            }
+        }
         Event::Unknown => {}
     }
     std::ops::ControlFlow::Continue(())

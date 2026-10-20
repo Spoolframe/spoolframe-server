@@ -109,7 +109,7 @@ impl std::fmt::Debug for DeviceSignIn {
 
 /// How [`Client::open_with_options`] opens this device. The default is
 /// what [`Client::open`] does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientOptions {
     /// How long requests wait for answers.
     pub timeouts: Timeouts,
@@ -142,6 +142,12 @@ pub struct ClientOptions {
     /// knowing a feature does not turn it on. What a session has is
     /// [`crate::Session::features`].
     pub features: crate::Features,
+    /// Where downloads are kept (PX-38, [`Client::downloads`]); none by
+    /// default, and then nothing is downloaded. The client's download
+    /// manager runs with one. iOS: a directory in Application Support,
+    /// excluded from backup by the app; Linux:
+    /// `$XDG_DATA_HOME/spoolframe/downloads`.
+    pub downloads_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ClientOptions {
@@ -152,6 +158,7 @@ impl Default for ClientOptions {
             relays: true,
             experimental: crate::Experimental::default(),
             features: crate::Features::default(),
+            downloads_dir: None,
         }
     }
 }
@@ -208,6 +215,8 @@ pub(crate) struct Inner {
     pub(crate) playlist_events: tokio::sync::broadcast::Sender<crate::PlaylistEvent>,
     /// Subtitle timing changes the servers told (PX-03).
     pub(crate) subtitle_events: tokio::sync::broadcast::Sender<crate::SubtitleTimingEvent>,
+    /// This device's downloads and their manager (PX-38).
+    pub(crate) downloads: Arc<crate::downloads::Shared>,
 }
 
 impl std::fmt::Debug for Client {
@@ -257,6 +266,7 @@ impl Client {
             relays,
             experimental,
             features,
+            downloads_dir,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
         let reach = Arc::new(ReachLog::default());
@@ -344,6 +354,7 @@ impl Client {
                 shares: tokio::sync::broadcast::channel(16).0,
                 playlist_events: tokio::sync::broadcast::channel(64).0,
                 subtitle_events: tokio::sync::broadcast::channel(64).0,
+                downloads: crate::downloads::Shared::new(downloads_dir),
             }),
         };
         // Where saved servers publish (P6-05): looked up there from the
@@ -357,6 +368,7 @@ impl Client {
                 client.inner.relay_policy.choose(id, server.use_relays);
             }
         }
+        client.inner.downloads.start(Arc::downgrade(&client.inner));
         Ok(client)
     }
 
@@ -1266,7 +1278,7 @@ impl Client {
         }
         session::save(storage, &server, &stored).await?;
         drop(_saving);
-        Ok(Session {
+        let session = Session {
             client: self.clone(),
             server,
             token,
@@ -1275,7 +1287,9 @@ impl Client {
             remembered: Some(remembered),
             password_change_required: Arc::default(),
             features: self.inner.features.both(&features),
-        })
+        };
+        self.inner.downloads.session_made(&session);
+        Ok(session)
     }
 
     /// End `token` on `server` if a connection to it is open now, without
@@ -1330,16 +1344,20 @@ impl Client {
                     user,
                     can_leave,
                     features,
-                })) => profiles.push(Session {
-                    client: self.clone(),
-                    server,
-                    token,
-                    user,
-                    can_leave,
-                    remembered: None,
-                    password_change_required: Arc::default(),
-                    features: self.inner.features.both(&features),
-                }),
+                })) => {
+                    let session = Session {
+                        client: self.clone(),
+                        server,
+                        token,
+                        user,
+                        can_leave,
+                        remembered: None,
+                        password_change_required: Arc::default(),
+                        features: self.inner.features.both(&features),
+                    };
+                    self.inner.downloads.session_made(&session);
+                    profiles.push(session);
+                }
                 Response::Err(spoolframe_protocol::Error::Unauthenticated) => {
                     tracing::info!(
                         user = s.username,
@@ -2225,8 +2243,10 @@ impl Client {
         self.inner.endpoint.id()
     }
 
-    /// Close the endpoint and every connection on it.
+    /// Close the endpoint and every connection on it. The download
+    /// manager stops first, keeping where each transfer got to.
     pub async fn close(&self) {
+        self.inner.downloads.close().await;
         let links: Vec<_> = self
             .inner
             .links

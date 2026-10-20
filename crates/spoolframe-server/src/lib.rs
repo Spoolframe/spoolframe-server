@@ -16,6 +16,7 @@ mod client;
 pub mod clock;
 pub mod config;
 pub mod connected;
+mod connection_users;
 pub mod covers;
 pub mod device_sign_in;
 pub mod downloads;

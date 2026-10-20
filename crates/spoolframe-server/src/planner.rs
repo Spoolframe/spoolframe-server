@@ -529,6 +529,20 @@ fn hdr_shown(video: &VideoStream, caps: &ClientCapabilities) -> Showing {
     if base { Showing::Base } else { Showing::No }
 }
 
+/// Whether a client with `caps` plays `video` as it is, bitrate aside: a
+/// download in original quality (PX-38) keeps it then, at any bitrate, as
+/// it is read from a file on the device.
+pub(crate) fn plays_video(video: &VideoStream, caps: &ClientCapabilities) -> bool {
+    let codec = codecs::video_codec(&video.codec);
+    supported(&caps.video, codec, VideoCodec::Unknown) && over_limits(video, caps).is_empty()
+}
+
+/// Whether `video`, converted for a client with `caps`, is tone mapped:
+/// it shows the video's HDR neither as it is nor by its base layer.
+pub(crate) fn tone_maps(video: &VideoStream, caps: &ClientCapabilities) -> bool {
+    hdr_shown(video, caps) == Showing::No
+}
+
 fn mbits(bits: u64) -> String {
     format!("{:.1} Mbit/s", bits as f64 / 1e6)
 }

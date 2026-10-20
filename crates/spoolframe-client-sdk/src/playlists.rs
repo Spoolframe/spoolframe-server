@@ -30,8 +30,8 @@
 //! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLIST_UPCOMING, PLAYLISTS,
-    SUBTITLE_SEARCH, SUBTITLE_SYNC,
+    DOWNLOADS, LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLIST_UPCOMING,
+    PLAYLISTS, SUBTITLE_SEARCH, SUBTITLE_SYNC,
 };
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
@@ -82,6 +82,10 @@ pub struct Features {
     /// [`Session::upcoming_in_playlist`] and
     /// [`Session::set_playlist_settings`].
     pub playlist_upcoming: bool,
+    /// Downloads for offline viewing (PX-38): [`crate::Client::downloads`],
+    /// [`Session::download_options`] and [`crate::Client::download_events`].
+    /// Only an iPhone, iPad, Mac or Linux app downloads.
+    pub downloads: bool,
 }
 
 impl Features {
@@ -97,6 +101,7 @@ impl Features {
             (self.subtitle_sync, SUBTITLE_SYNC),
             (self.subtitle_search, SUBTITLE_SEARCH),
             (self.playlist_upcoming, PLAYLIST_UPCOMING),
+            (self.downloads, DOWNLOADS),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -123,6 +128,7 @@ impl Features {
             subtitle_sync: self.subtitle_sync && other.subtitle_sync,
             subtitle_search: self.subtitle_search && other.subtitle_search,
             playlist_upcoming: self.playlist_upcoming && other.playlist_upcoming,
+            downloads: self.downloads && other.downloads,
         }
         .needing_playlists()
     }
@@ -141,6 +147,7 @@ impl Features {
             subtitle_sync: has(SUBTITLE_SYNC),
             subtitle_search: has(SUBTITLE_SEARCH),
             playlist_upcoming: has(PLAYLIST_UPCOMING),
+            downloads: has(DOWNLOADS),
         }
         .needing_playlists()
     }
@@ -614,6 +621,9 @@ mod tests {
             Features::of(&[PLAYLISTS.to_owned(), PLAYLIST_UPCOMING.to_owned()]).playlist_upcoming
         );
         assert!(!Features::of(&[PLAYLIST_UPCOMING.to_owned()]).playlist_upcoming);
+        // Downloads stand alone too.
+        assert!(Features::of(&[DOWNLOADS.to_owned()]).downloads);
+        assert!(!Features::of(&[PLAYLISTS.to_owned()]).downloads);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }

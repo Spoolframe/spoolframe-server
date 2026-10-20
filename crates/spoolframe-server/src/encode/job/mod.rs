@@ -27,7 +27,10 @@ pub use self::budget::{BudgetUse, CardLimit, Load, Slot, Units};
 use self::budget::{Place, YieldEntry};
 pub use self::encode_job::{CaughtUp, EncodeJob};
 use self::process::DecodeFailures;
-pub(crate) use self::process::{exit_blames_gpu, jail, launch, out_time_us, signal};
+pub(crate) use self::process::{
+    drain_stderr, exit_blames_gpu, jail, keep, launch, link, out_time_us, relink, remove_file,
+    signal, stopped,
+};
 #[cfg(test)]
 pub(super) use self::supervisor::listed_segments;
 use self::supervisor::{RunSpan, Shared, Supervisor};
@@ -563,7 +566,6 @@ impl Jobs {
     /// a job's run, held until the slot is dropped: taken as a start takes
     /// one, from a yielding hold if none is free; `Busy` when there is
     /// none. Not counted as a refused start.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the copy pool (PX-37) uses it"))]
     pub(crate) fn hold(&self, load: Load, card: Option<CardLimit>) -> Result<Slot, JobError> {
         self.admit(load, card, None)
     }

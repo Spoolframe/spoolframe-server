@@ -38,7 +38,10 @@ pub fn server_wait(request: &Request) -> Duration {
         // PX-03: each probes the file to find the track.
         | Request::SyncSubtitle { .. }
         | Request::UseOriginalSubtitleTiming { .. }
-        | Request::SetSubtitleOffset { .. } => wait::PROBE,
+        | Request::SetSubtitleOffset { .. }
+        // PX-38: each probes the file to plan the download.
+        | Request::DownloadOptions { .. }
+        | Request::PrepareDownload { .. } => wait::PROBE,
         Request::SearchSubtitles { .. } | Request::DownloadSubtitle { .. } => wait::SUBTITLE_SITE,
         Request::StartPlayback { .. }
         | Request::ChangeSubtitle { .. }
@@ -120,7 +123,16 @@ pub fn retry_safe(request: &Request) -> bool {
         // twice is removed once.
         | Request::SearchSubtitles { .. }
         | Request::DownloadSubtitle { .. }
-        | Request::RemoveSubtitleDownload { .. } => true,
+        | Request::RemoveSubtitleDownload { .. }
+        // PX-38: reads; the same request prepared twice is one download,
+        // under one id; a download cancelled twice is cancelled once (the
+        // second says `NotFound`).
+        | Request::DownloadOptions { .. }
+        | Request::PrepareDownload { .. }
+        | Request::DownloadStatus { .. }
+        | Request::CancelDownload { .. }
+        // Newest wins: an entry written once is older the second time.
+        | Request::SyncOfflineWatch { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

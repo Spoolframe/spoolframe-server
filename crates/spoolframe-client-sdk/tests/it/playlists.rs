@@ -26,6 +26,7 @@ const ALL: Features = Features {
     subtitle_sync: true,
     subtitle_search: true,
     playlist_upcoming: true,
+    downloads: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.

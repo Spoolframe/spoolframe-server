@@ -486,9 +486,13 @@ previews {
   # workers = 8;
 }
 
-# Optimized versions: converted copies the server keeps, for downloads and
-# for playback that would otherwise encode. Each copy is a whole film or
-# episode in one profile, with every audio and text track.
+# Optimized versions: converted tracks the server keeps, for downloads and
+# for playback that would otherwise encode. A copy in a profile stores
+# only what it converts, each stream in a file of its own: the video, and
+# each audio track it converts. Tracks kept as they are, and subtitles,
+# are read from the film itself, and a copy is muxed from both when it is
+# played or downloaded. One converted track serves every copy that needs
+# it.
 #
 # The pool always runs: downloads, and an admin's on-demand requests
 # (Optimize… on a film, episode, season, show or library), make their
@@ -504,6 +508,18 @@ optimized {
   # first, then binge-ahead ones, then the least recently used; one being
   # read stays, and so does one a pinned on-demand request wants.
   max_size_mb = 102400;
+}
+
+# Downloads (PX-38): the files written for devices to fetch, each from
+# the film and any copy above, with only the tracks chosen. A file is
+# kept until every device that asked for it has it, or a day after it
+# was last read. Over max_size_mb a new file waits; one being read
+# stays. The copies stay in optimized's dir, under its max_size_mb.
+downloads {
+  # Where the files are kept; optimized's dir's downloads if left out.
+  # dir = "/srv/spoolframe/downloads";
+  # The most they may take, in MiB.
+  max_size_mb = 65536;
 }
 
 # The last log lines kept in memory for the web UI's Logs page, at the

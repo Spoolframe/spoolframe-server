@@ -1353,7 +1353,8 @@ pub const OWN_CREDENTIAL_RENEW: i64 = 30 * 24 * 3600;
 /// What [`Portable::issued`] calls the root's phone's own credential.
 pub const OWN_DEVICE_LABEL: &str = "This device";
 
-fn unix_now() -> i64 {
+/// Unix seconds, by this device's clock.
+pub(crate) fn unix_now() -> i64 {
     i64::try_from(now()).unwrap_or(i64::MAX)
 }
 

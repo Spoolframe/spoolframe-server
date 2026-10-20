@@ -24,7 +24,7 @@ use spoolframe_server::config::layers::{DEFAULTS, Layers, Locations};
 use spoolframe_server::config::secrets::Secrets;
 use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::connected::Connected;
-use spoolframe_server::downloads::Downloads;
+use spoolframe_server::downloads::{DownloadSources, Downloads};
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::index_ahead::{IndexAhead, IndexAheadSources};
@@ -1022,7 +1022,9 @@ async fn run(
     // plays from every copy made (the user's decision, 2026-10-20).
     // `optimized.binge_ahead` only says whether the next episode is made
     // ahead.
-    let place = config.optimized.place(state_dir)?;
+    // Neither the pool nor the download area may sit where the other, or
+    // the server's other files, or the media, would be swept.
+    let (place, area) = config.areas(state_dir)?;
     let pool = Arc::new(
         Pool::start(
             PoolSources {
@@ -1043,7 +1045,22 @@ async fn run(
             )
         })?,
     );
-    let downloads = Arc::new(Downloads::new(pool.clone()));
+    // Downloads (PX-38): what a stopped server was writing is removed, and
+    // its downloads fail; a ready file stays, under its id.
+    let downloads = Arc::new(
+        Downloads::start(
+            DownloadSources {
+                store: store.clone(),
+                pool: pool.clone(),
+                jobs: jobs.clone(),
+                subtitles: subtitles.clone(),
+                timings: subtitle_timings.clone(),
+            },
+            &area,
+        )
+        .await
+        .with_context(|| format!("cannot prepare the downloads in {}", area.dir.display()))?,
+    );
     store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(

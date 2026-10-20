@@ -72,6 +72,7 @@ pub async fn sdk_client(
             subtitle_sync: true,
             subtitle_search: true,
             playlist_upcoming: true,
+            downloads: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };
@@ -86,6 +87,15 @@ pub fn transcoding() -> Arc<Transcoding> {
         Vec::new(),
         std::env::temp_dir(),
     ))
+}
+
+/// Transcoding with the software encoders real ffmpeg has, as a server
+/// detects them, and no GPU.
+pub async fn detected_transcoding() -> Arc<Transcoding> {
+    let transcoding =
+        Transcoding::new(Tool::unconfined("ffmpeg"), Vec::new(), std::env::temp_dir());
+    transcoding.detect().await;
+    Arc::new(transcoding)
 }
 
 /// The media tools' sandbox for a server on `dir`, as the server's own
@@ -478,8 +488,14 @@ pub struct ServerOptions {
     /// it does; the server's own default is off. The pool runs, and
     /// playback plays from its copies, either way.
     pub binge_ahead: bool,
+    /// The download area's limit (PX-38), in bytes.
+    pub downloads_max_size: u64,
     /// The optimized pool's limit (PX-37), in bytes.
     pub optimized_max_size: u64,
+    /// The copy pool converts with the software encoders real ffmpeg
+    /// has, as a server detects them (E-AC-3 among them), not the
+    /// baseline's AAC alone.
+    pub detect_encoders: bool,
 }
 
 /// Speech found by a stand-in: always `0`.
@@ -545,7 +561,9 @@ impl Default for ServerOptions {
             speech: None,
             subtitle_sites: Default::default(),
             binge_ahead: true,
+            downloads_max_size: 1 << 30,
             optimized_max_size: 1 << 30,
+            detect_encoders: false,
         }
     }
 }
@@ -714,6 +732,8 @@ pub struct TestServer {
     /// directory: playback plays from it, downloads (PX-38) and on-demand
     /// requests make their copies in it.
     pub copies: Arc<spoolframe_server::optimized::Pool>,
+    /// Its downloads (PX-38), their area in `optimized/downloads`.
+    pub downloads: Arc<spoolframe_server::downloads::Downloads>,
 }
 
 impl TestServer {
@@ -904,7 +924,11 @@ impl TestServer {
                 spoolframe_server::optimized::PoolSources {
                     store: store.clone(),
                     jobs: jobs.clone(),
-                    transcoding: transcoding(),
+                    transcoding: if options.detect_encoders {
+                        detected_transcoding().await
+                    } else {
+                        transcoding()
+                    },
                     prober: prober.clone(),
                     catalog: catalog.clone(),
                     catalog_changes: options.catalog.as_ref().map(|live| live.changes()),
@@ -918,7 +942,24 @@ impl TestServer {
             .await
             .unwrap(),
         );
-
+        let subtitles = Arc::new(subtitles.with_own_dir(dir.join("subtitles")));
+        let downloads = Arc::new(
+            spoolframe_server::downloads::Downloads::start(
+                spoolframe_server::downloads::DownloadSources {
+                    store: store.clone(),
+                    pool: copies.clone(),
+                    jobs: jobs.clone(),
+                    subtitles: subtitles.clone(),
+                    timings: subtitle_timings.clone(),
+                },
+                &spoolframe_server::config::DownloadSettings {
+                    dir: dir.join("optimized").join("downloads"),
+                    max_size_bytes: options.downloads_max_size,
+                },
+            )
+            .await
+            .unwrap(),
+        );
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -937,12 +978,12 @@ impl TestServer {
             ),
             transcoding: transcoding(),
             jobs: jobs.clone(),
-            subtitles: Arc::new(subtitles.with_own_dir(dir.join("subtitles"))),
+            subtitles,
             subtitle_timings: subtitle_timings.clone(),
             subtitle_downloads: subtitle_downloads.clone(),
             optimized: Some(copies.clone()),
             binge_ahead: options.binge_ahead,
-            downloads: Arc::new(spoolframe_server::downloads::Downloads::new(copies.clone())),
+            downloads: downloads.clone(),
             previews,
             index_ahead,
             app_passkeys: Arc::new(
@@ -1007,6 +1048,7 @@ impl TestServer {
             playlists,
             artwork,
             copies,
+            downloads,
         }
     }
 

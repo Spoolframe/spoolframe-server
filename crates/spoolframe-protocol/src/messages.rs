@@ -938,6 +938,59 @@ pub enum Request {
         download: String,
     },
 
+    /// What the device may download of film or episode `id` (PX-38,
+    /// `spoolframe:downloads`): `DownloadOptions`, its tracks, the choice
+    /// to show first, the profiles, what original quality would be, and
+    /// the subtitles a download would leave out. Anyone who can play the
+    /// item may ask. Only from an iPhone, iPad, Mac or Linux client
+    /// (`Hello.platform`); from any other, and from a client that did not
+    /// list the feature, `Unsupported`.
+    DownloadOptions {
+        id: MediaId,
+    },
+    /// Prepare a download of film or episode `id` from `source` with
+    /// `tracks` (PX-38): `Download`, its id and state. The same user's
+    /// same request is the same id, ready at once when its file is; one
+    /// that failed is tried again. The file is made in the background;
+    /// `DownloadChanged` tells its state as it moves. A track the item
+    /// does not have, or a source or choice this build does not know, is
+    /// `InvalidInput`; a profile not there `NotFound`. As
+    /// `DownloadOptions` for who may and from where.
+    PrepareDownload {
+        id: MediaId,
+        source: crate::downloads::DownloadSource,
+        tracks: crate::downloads::DownloadTracks,
+    },
+    /// The session user's downloads `ids` (PX-38): `Downloads`, those
+    /// they have in order, and in `gone` each id they have not (never
+    /// theirs, cancelled, or no longer kept), so one such id never fails
+    /// the rest; at most [`crate::downloads::MAX_ASKED`] ids.
+    DownloadStatus {
+        ids: Vec<String>,
+    },
+    /// Cancel download `id` (PX-38), as the device also does once it has
+    /// the file whole and its SHA-256 checked: `Done`. Its file goes once
+    /// no download names it and no one reads it; one being made stops. An
+    /// id that is not the session user's, or was cancelled, is `NotFound`.
+    CancelDownload {
+        id: String,
+    },
+    /// Where the device got to in films and episodes while it had no
+    /// server (PX-38, `spoolframe:downloads`): `OfflineWatchSynced`, an
+    /// outcome per entry, in order. `device_now` is the device's clock
+    /// now, in Unix seconds: each entry's `at` is moved by the difference
+    /// to the server's clock, and kept no later than now. An entry is
+    /// written only when it is newer than what the server has (newest
+    /// wins, whichever device it came from); watched is judged by the
+    /// server's rules from the position and the item's credits, or taken
+    /// from `watched: true`. At most [`crate::downloads::MAX_ASKED`]
+    /// entries; one with neither a position nor `watched` is
+    /// `InvalidInput`. As `DownloadOptions` for from where.
+    SyncOfflineWatch {
+        device_now: i64,
+        entries: Vec<crate::downloads::OfflineWatch>,
+    },
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -1498,6 +1551,23 @@ pub enum Reply {
     PlexImport(crate::playlists::PlexImport),
     /// Whom a playlist can be shared with (`ListShareCandidates`).
     ShareCandidates(crate::playlists::ShareCandidatePage),
+    /// What the device may download of an item (`DownloadOptions`).
+    DownloadOptions(crate::downloads::DownloadOptionsInfo),
+    /// A download prepared (`PrepareDownload`).
+    Download(crate::downloads::DownloadInfo),
+    /// Downloads, in the order asked (`DownloadStatus`): each the user
+    /// has, and the ids asked for that they have not. A device treats a
+    /// gone download as cancelled: preparing it again brings it back.
+    Downloads {
+        downloads: Vec<crate::downloads::DownloadInfo>,
+        /// Left out when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gone: Vec<String>,
+    },
+    /// What became of each offline entry, in order (`SyncOfflineWatch`).
+    OfflineWatchSynced {
+        outcomes: Vec<crate::downloads::OfflineWatchOutcome>,
+    },
 }
 
 /// Which HLS playlist (P2-05).
@@ -1980,6 +2050,10 @@ pub enum Error {
     /// subtitles". Nothing was asked of any site.
     #[error("this server has no subtitle source set up")]
     NoSubtitleSource,
+    /// The download's file is not whole yet (PX-38): read it once its
+    /// state is `ready`. A download that failed is prepared again.
+    #[error("the download is not ready")]
+    DownloadNotReady,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.
@@ -2047,6 +2121,14 @@ pub enum Event {
         id: MediaId,
         track: u32,
         timing: spoolframe_types::SubtitleTiming,
+    },
+    /// Download `id`'s state moved (PX-38): `waiting`, then `converting`
+    /// (told once per percent or every 2 s), `writing`, and `ready` or
+    /// `failed`. Only to the connections of the user whose it is, that
+    /// listed `spoolframe:downloads`.
+    DownloadChanged {
+        id: String,
+        state: crate::downloads::DownloadState,
     },
     /// An event type this build does not know; ignore it.
     #[serde(other)]

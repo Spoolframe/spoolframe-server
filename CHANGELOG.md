@@ -12,6 +12,63 @@
   class (Apple or Linux): the video copied as it is where the class
   plays it, and only the audio the class cannot play converted. A
   `max_size_mb` of 0 is now always refused.
+  The server writes download files (not yet asked for by any client):
+  the film as it is when the device plays it and every track is
+  chosen, else a remux of only the chosen tracks, from the film and any
+  converted tracks, with chapters; MP4 with `mov_text` subtitles for
+  Apple, Matroska for Linux. Picture subtitles in an Apple file are
+  read as text when the viewer prefers text, else left out; never
+  burned in. Each file has a SHA-256; the same request from two users
+  is one file. Files are kept in `downloads.dir` (the optimized dir's
+  `downloads` by default) within `downloads.max_size_mb` (64 GiB), a
+  new one waiting when it is full, and go when every download of them
+  is cancelled or a day after their last read; only files named as the
+  area names them are ever removed. `downloads.dir` and `optimized.dir`
+  are refused when one is the other, the pool sits in the area, or
+  either is, holds or sits in the server's caches, subtitle sync's
+  files, the transcode scratch, the subtitles' text or a Plex path
+  mapping's media: their sweeps would remove files not theirs. A file
+  sent as it is whose media file changed fails, at its next read or at
+  start, rather than send other bytes. Which user prepared which file,
+  the tracks it carries and the media file's stamp are kept in the
+  database (migration 0040), so a restart writes no ready file again;
+  nothing lists it for an admin. With
+  binge-ahead off, binge-ahead copies left unmade are dropped at
+  start.
+  Clients ask for downloads with the `spoolframe:downloads` feature: the
+  `DownloadOptions`, `PrepareDownload`, `DownloadStatus` and
+  `CancelDownload` requests, the `DownloadChanged` event, the `download`
+  resource read (resumable from any byte, over relays too) and the
+  `DownloadNotReady` error. Only iPhone, iPad, Mac and Linux clients
+  download; a tvOS or web client, or one without the feature, is
+  refused. `DownloadStatus` answers each id alone: those the user has
+  in `downloads`, the others in `gone`. A connection is told of a
+  user's downloads only while a session of theirs on it is live.
+  `SyncOfflineWatch` (`OfflineWatchSynced`, an `applied`, `older` or
+  `not_tracked` per entry; an item no longer served is `not_tracked`,
+  never a failed batch) takes in what a device watched offline:
+  newest wins, the device's clock set right by the server's, watched
+  judged by the server's rules and the item's credits.
+- The client SDK downloads (PX-38): `ClientOptions::downloads_dir` (none
+  by default; `ClientOptions` is no longer `Copy`), `Features::downloads`
+  (`spoolframe:downloads`), `Session::download_options`,
+  `Client::downloads()` (`Downloads`: `start`, `pause`, `resume`,
+  `cancel`, `delete`, `retry`, `list`, `get`, `run_until_done`, `space`,
+  `set_free_space`, `record_position`, `set_watched`, `sync_watch`) and
+  `Client::download_events()` (`DownloadEvent::Changed` /
+  `Removed`). A download (`LocalDownload`: the item, an episode's show
+  and season, markers, artwork files, tracks, `phase` — `Preparing`,
+  `Transferring`, `Paused`, `Done`, `Failed` — and once done its
+  `file_path` and `file_url`) is kept in
+  `<dir>/<server>/<user>/<key>/` with its `manifest.json`, so `list`
+  needs no server. A manager task the client owns follows the server's
+  `DownloadChanged` events and `DownloadStatus`, reads the file in
+  8 MiB pieces, goes on from the last saved byte after a cut or a crash,
+  checks the SHA-256, and tells the server it finished. Where the user
+  got to offline is sent with `SyncOfflineWatch` when a session of
+  theirs is made or found, and with `sync_watch`. New errors:
+  `SdkError::DownloadNotReady` and `SdkError::Downloads`. The server
+  counts the bytes download reads send (`Downloads::sent`).
 - Optimized versions keep tracks, not whole files (PX-37). Each
   converted stream is a file of its own: one video file per video plan,
   one file per converted audio track. Tracks kept as they are, the

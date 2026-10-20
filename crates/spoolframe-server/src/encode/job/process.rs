@@ -2,9 +2,14 @@
 //! files removed, its progress lines read, and the GPU blamed or not
 //! for how it ended.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::io::{BufReader, Lines};
+use tokio::process::ChildStderr;
+use tokio::sync::watch;
 
 use spoolframe_media::sandbox::{Jail, Limits, Tool};
 
@@ -81,6 +86,58 @@ pub(crate) fn signal(pid: u32, sig: libc::c_int) {
         unsafe {
             libc::kill(-pid, sig);
         }
+    }
+}
+
+/// How many of ffmpeg's last stderr lines a failure keeps.
+pub(crate) const STDERR_LINES: usize = 5;
+
+/// `line` kept as ffmpeg's last, with at most [`STDERR_LINES`] before it.
+pub(crate) fn keep(last: &mut VecDeque<String>, line: String) {
+    if last.len() == STDERR_LINES {
+        last.pop_front();
+    }
+    last.push_back(line);
+}
+
+/// The rest of what an ended ffmpeg said on `err`, briefly: kept as
+/// [`keep`] does, for at most a second.
+pub(crate) async fn drain_stderr(
+    err: &mut Lines<BufReader<ChildStderr>>,
+    last: &mut VecDeque<String>,
+) {
+    let rest = async {
+        while let Ok(Some(line)) = err.next_line().await {
+            keep(last, line);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(1), rest).await;
+}
+
+/// Until `stop` says to stop (or its sender is gone). The guard
+/// `wait_for` gives back is not `Send`: it is dropped here, not held
+/// across the caller's awaits.
+pub(crate) async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// `link` made to lead to `target` (made absolute).
+pub(crate) fn link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(std::path::absolute(target)?, link)
+}
+
+/// `link` made to lead to `target`, whatever it led to before.
+pub(crate) fn relink(target: &Path, at: &Path) -> std::io::Result<()> {
+    remove_file(at);
+    link(target, at)
+}
+
+/// `path` removed; one already gone is fine.
+pub(crate) fn remove_file(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), error = %e, "cannot remove a file");
     }
 }
 

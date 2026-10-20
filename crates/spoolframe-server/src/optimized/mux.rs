@@ -1,9 +1,12 @@
 //! A copy read whole (PX-37's track store): its media file and its
 //! stored tracks muxed into one file, a remux with no encode. PX-38's
-//! download writer builds on this.
+//! download writer writes its files with it: Matroska for Linux, MP4 for
+//! Apple, with text subtitles as `mov_text` and subtitles from files of
+//! their own (beside the media file, or read from pictures as text).
 //!
 //! Input 0 is always the media file, then the stored video, then each
-//! stored audio track; every `-map` names its input by [`MuxInputs`],
+//! stored audio track, then each subtitle file; every `-map` names its
+//! input by [`MuxInputs`],
 //! which numbers them in that one place. The media file gives what a copy
 //! never stores: the tracks kept as they are, the subtitles, the
 //! chapters, the attachments and the metadata. A stored track's language,
@@ -13,10 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
-use spoolframe_media::{MediaDescriptor, SubtitleSource};
+use spoolframe_media::{MediaDescriptor, SubtitleKind, SubtitleSource};
 
 use super::CopyFiles;
-use crate::encode::args::{QUIET_ARGS, s};
+use crate::encode::args::{PROGRESS_ARGS, QUIET_ARGS, s};
 
 /// Text subtitles that are not text ffmpeg can write again: teletext
 /// decodes to pictures or needs a library builds often leave out, and
@@ -33,6 +36,9 @@ enum Read {
     Video,
     /// The stored audio track standing in for this source stream.
     Audio(u32),
+    /// The subtitle at this position in the descriptor, from a file of
+    /// its own.
+    Subtitle(u32),
 }
 
 /// A mux's inputs in their `-i` order, each with its number: the media
@@ -54,6 +60,14 @@ impl MuxInputs {
             inputs.push((Read::Audio(stream), path.clone()));
         }
         Self { inputs }
+    }
+
+    /// These inputs and the subtitle at `position` in the descriptor read
+    /// from `path`, a file of its own: one beside the media file, or text
+    /// read from its pictures. It stands in for the descriptor's own.
+    pub fn with_subtitle(mut self, position: u32, path: PathBuf) -> Self {
+        self.inputs.push((Read::Subtitle(position), path));
+        self
     }
 
     fn index(&self, read: &Read) -> Option<usize> {
@@ -101,23 +115,52 @@ pub struct MuxPicks {
 
 impl MuxPicks {
     /// Every track.
+    #[cfg(test)]
     pub const ALL: Self = Self {
         audio: None,
         subtitles: None,
     };
 }
 
-/// ffmpeg's arguments for a Matroska file of `descriptor`'s media file
-/// read through `inputs`, with `picks`' tracks, written to `out`. Every
-/// stream is copied; nothing is encoded. The output is bit-exact: the
-/// same inputs make the same bytes.
+/// The file a mux writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxFormat {
+    /// Every stream copied, the attachments (fonts) too.
+    Matroska,
+    /// For Apple's players: the moov first, text subtitles as `mov_text`,
+    /// no attachments (MP4 has none), and HEVC tagged `hvc1` (`hvc1`
+    /// true), the one tag AVPlayer plays.
+    Mp4 { hvc1: bool },
+}
+
+/// [`mux_args_as`], as Matroska.
+#[cfg(test)]
 pub fn mux_args(
     descriptor: &MediaDescriptor,
     inputs: &MuxInputs,
     picks: &MuxPicks,
     out: &Path,
 ) -> Vec<String> {
+    mux_args_as(descriptor, inputs, picks, MuxFormat::Matroska, out)
+}
+
+/// ffmpeg's arguments for a `format` file of `descriptor`'s media file
+/// read through `inputs`, with `picks`' tracks, written to `out`. Every
+/// stream is copied; nothing is encoded. The output is bit-exact: the
+/// same inputs make the same bytes. In MP4 text subtitles are written as
+/// `mov_text` and embedded picture subtitles are left out: one read as
+/// text comes from its own file ([`MuxInputs::with_subtitle`]).
+pub fn mux_args_as(
+    descriptor: &MediaDescriptor,
+    inputs: &MuxInputs,
+    picks: &MuxPicks,
+    format: MuxFormat,
+    out: &Path,
+) -> Vec<String> {
+    let mp4 = matches!(format, MuxFormat::Mp4 { .. });
     let mut args: Vec<String> = QUIET_ARGS.map(s).to_vec();
+    // A download's writer reads it (PX-38).
+    args.extend(PROGRESS_ARGS.map(s));
     args.extend(inputs.args());
     args.push(s("-copyts"));
     // Output streams so far: a stored track's language, title and flags
@@ -158,24 +201,61 @@ pub fn mux_args(
         at += 1;
     }
     for (position, track) in descriptor.subtitles.iter().enumerate() {
+        let position = position as u32;
+        let picked = match &picks.subtitles {
+            Some(p) => p.contains(&position),
+            None => !UNWRITABLE_TEXT.contains(&track.codec.as_str()),
+        };
+        if !picked {
+            continue;
+        }
+        // A file of its own stands in for it, named as the track is.
+        if let Some(input) = inputs.index(&Read::Subtitle(position)) {
+            args.extend([s("-map"), format!("{input}:0")]);
+            let tags = [("language", &track.language), ("title", &track.title)];
+            for (key, value) in tags {
+                if let Some(value) = value {
+                    args.extend([format!("-metadata:s:{at}"), format!("{key}={value}")]);
+                }
+            }
+            let disposition = match (track.forced, track.default) {
+                (true, true) => "default+forced",
+                (true, false) => "forced",
+                (false, true) => "default",
+                (false, false) => "0",
+            };
+            args.extend([format!("-disposition:{at}"), s(disposition)]);
+            at += 1;
+            continue;
+        }
         let SubtitleSource::Embedded { index } = track.source else {
             continue;
         };
-        let picked = match &picks.subtitles {
-            Some(p) => p.contains(&(position as u32)),
-            None => !UNWRITABLE_TEXT.contains(&track.codec.as_str()),
-        };
-        if picked {
-            args.extend([s("-map"), format!("0:{index}")]);
+        if mp4 && track.kind == SubtitleKind::Bitmap {
+            continue;
+        }
+        args.extend([s("-map"), format!("0:{index}")]);
+        at += 1;
+    }
+    if !mp4 {
+        // Fonts for ASS, and whatever else the file carries.
+        args.extend(["-map", "0:t?"].map(s));
+    }
+    args.extend(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"].map(s));
+    // Some records the muxers write only with it (a Dolby Vision
+    // configuration, PGPU-06).
+    args.extend(["-strict", "unofficial", "-fflags", "+bitexact"].map(s));
+    match format {
+        MuxFormat::Matroska => args.extend([s("-f"), s("matroska")]),
+        MuxFormat::Mp4 { hvc1 } => {
+            args.extend(["-c:s", "mov_text", "-movflags", "+faststart"].map(s));
+            if hvc1 {
+                args.extend(["-tag:v", "hvc1"].map(s));
+            }
+            args.extend([s("-f"), s("mp4")]);
         }
     }
-    // Fonts for ASS, and whatever else the file carries.
-    args.extend(["-map", "0:t?"].map(s));
-    args.extend(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"].map(s));
-    // Some records the Matroska muxer writes only with it (a Dolby
-    // Vision configuration, PGPU-06).
-    args.extend(["-strict", "unofficial", "-fflags", "+bitexact"].map(s));
-    args.extend([s("-f"), s("matroska"), s(out.display())]);
+    args.push(s(out.display()));
     args
 }
 
@@ -319,5 +399,57 @@ mod tests {
     #[test]
     fn nothing_is_encoded() {
         assert!(has(&args(&MuxPicks::ALL), &["-c", "copy"]));
+    }
+
+    fn mp4(picks: &MuxPicks, inputs: MuxInputs) -> Vec<String> {
+        let format = MuxFormat::Mp4 { hvc1: false };
+        mux_args_as(&film(), &inputs, picks, format, Path::new("/out.mp4"))
+    }
+
+    fn film_alone() -> MuxInputs {
+        MuxInputs::new(Path::new("/media/film.mkv"), &CopyFiles::default())
+    }
+
+    #[test]
+    fn an_mp4_writes_its_text_subtitles_as_mov_text_with_the_moov_first() {
+        let args = mp4(&MuxPicks::ALL, film_alone());
+        assert!(
+            has(&args, &["-c:s", "mov_text", "-movflags", "+faststart"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn an_mp4_carries_no_attachments() {
+        assert!(!has(&mp4(&MuxPicks::ALL, film_alone()), &["-map", "0:t?"]));
+    }
+
+    #[test]
+    fn a_subtitle_from_a_file_of_its_own_stands_in_for_the_track() {
+        let picks = MuxPicks {
+            audio: Some(Vec::new()),
+            subtitles: Some(vec![0]),
+        };
+        let inputs = film_alone().with_subtitle(0, "/run/sub-0.srt".into());
+        let args = mp4(&picks, inputs);
+        let maps: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:0", "1:0"]);
+    }
+
+    #[test]
+    fn an_mp4_tags_hevc_as_hvc1() {
+        let format = MuxFormat::Mp4 { hvc1: true };
+        let args = mux_args_as(
+            &film(),
+            &film_alone(),
+            &MuxPicks::ALL,
+            format,
+            Path::new("/out.mp4"),
+        );
+        assert!(has(&args, &["-tag:v", "hvc1"]));
     }
 }

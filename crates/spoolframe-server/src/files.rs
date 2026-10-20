@@ -17,6 +17,27 @@ pub fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// `dir` and its `making` directory, each private ([`private_dir`]), and
+/// `making` emptied of what a stopped server was writing there: whether
+/// it held anything. An error names the directory it is about.
+pub fn fresh_making_dir(
+    dir: &Path,
+    making: &Path,
+) -> Result<bool, (std::path::PathBuf, std::io::Error)> {
+    let at = |dir: &Path| {
+        let dir = dir.to_path_buf();
+        move |e| (dir, e)
+    };
+    private_dir(dir).map_err(at(dir))?;
+    let removed = match std::fs::remove_dir_all(making) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(at(making)(e)),
+    };
+    private_dir(making).map_err(at(making))?;
+    Ok(removed)
+}
+
 /// `path`, made empty if missing, as only the server's user may read or
 /// write it; one made open to everyone is closed.
 pub fn private_file(path: &Path) -> std::io::Result<()> {
