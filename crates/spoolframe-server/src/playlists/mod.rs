@@ -28,7 +28,7 @@ use std::sync::Arc;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use spoolframe_catalog::{Catalog, CatalogError, ItemWithChildren};
 use spoolframe_policy::playlists::{self as policy, Access, Standing};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use spoolframe_protocol::playlists::{Builtin, EntryId, Liked, PlaySettings, PlaylistNext, Repeat};
 use spoolframe_protocol::playlists::{
@@ -56,6 +56,8 @@ pub const MAX_SHARES: usize = 100;
 pub const MAX_EDITS: usize = 100;
 /// The most entries one page of a playlist lists.
 pub const MAX_PAGE: u32 = 200;
+/// The most entries one `UpcomingInPlaylist` lists.
+pub const MAX_UPCOMING: u32 = 100;
 /// The most catalog lookups one call has in flight at once, as Home's.
 const CATALOG_FETCHES: usize = 8;
 /// The kinds Liked and All hold.
@@ -280,7 +282,13 @@ pub struct Playlists {
     /// Uploaded covers (PX-53); without, uploads are `Unavailable`.
     covers: Option<Arc<Covers>>,
     mosaics: Mosaics,
+    /// Where shuffling draws from: the system's randomness, or a test's
+    /// named seeds.
+    seeds: Seeds,
 }
+
+/// A source of shuffle seeds.
+type Seeds = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl std::fmt::Debug for Playlists {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -308,7 +316,23 @@ impl Playlists {
             news: tokio::sync::broadcast::Sender::new(NEWS),
             covers: None,
             mosaics: Mosaics::default(),
+            seeds: Arc::new(|| {
+                use password_hash::rand_core::{OsRng, RngCore};
+                OsRng.next_u64()
+            }),
         }
+    }
+
+    /// Draw shuffle seeds from `seeds`, so a test knows its rounds.
+    #[cfg(test)]
+    pub(crate) fn with_seeds(mut self, seeds: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.seeds = Arc::new(seeds);
+        self
+    }
+
+    /// A new shuffle seed.
+    fn seed(&self) -> u64 {
+        (self.seeds)()
     }
 
     /// Keep uploaded covers in `covers` (PX-53).
@@ -1121,30 +1145,14 @@ impl Playlists {
         settings: PlaySettings,
     ) -> Result<Option<PlaylistNext>, PlaylistsError> {
         let (row, _) = self.seen(actor, id).await?;
-        let principal = actor.principal.to_string();
-        let kept = self.store.playlist_place(&principal, id).await?;
-        let entries = self.order_of(actor, &row).await?;
-        let order: Vec<EntryId> = entries.iter().map(|e| e.entry_id).collect();
-        let shuffling_already = kept.as_ref().is_some_and(|k| k.settings.shuffle);
-        let mut place = PlaceRow {
-            settings,
-            ..kept.unwrap_or_default()
-        };
-        // A new round when shuffling starts, or starts somewhere chosen:
-        // that entry first, then the rest shuffled.
-        place.round = match (settings.shuffle, from) {
-            (false, _) => None,
-            (true, Some(from)) => Some(round_from(&order, Some(from))),
-            (true, None) if !shuffling_already || place.round.is_none() => {
-                Some(round_from(&order, None))
-            }
-            (true, None) => place.round,
-        };
+        let (place, entries, _) = self
+            .place_with_round(actor, &row, Some((settings, from)))
+            .await?;
         let start = match from {
             Some(from) => Some(Start::At(from)),
             None => place.entry.map(Start::Resume),
         };
-        self.go_on(actor, &row, place, start, entries).await
+        self.go_on(actor, &row, place, start, &entries).await
     }
 
     /// What plays in playlist `id` after entry `after` ended or was
@@ -1156,14 +1164,130 @@ impl Playlists {
         after: EntryId,
     ) -> Result<Option<PlaylistNext>, PlaylistsError> {
         let (row, _) = self.seen(actor, id).await?;
-        let place = self
+        let (place, entries, _) = self.place_with_round(actor, &row, None).await?;
+        self.go_on(actor, &row, place, Some(Start::After(after)), &entries)
+            .await
+    }
+
+    /// Keep `settings` as how `actor` plays playlist `id`, playing nothing:
+    /// the place and the round stay. Shuffle turned on makes a new round,
+    /// starting at the place (the whole playlist ahead); turned off, the
+    /// playlist's order, from the place.
+    pub async fn set_settings(
+        &self,
+        actor: &Actor,
+        id: &str,
+        settings: PlaySettings,
+    ) -> Result<(), PlaylistsError> {
+        let (row, _) = self.seen(actor, id).await?;
+        let principal = actor.principal.to_string();
+        let mut place = self
             .store
-            .playlist_place(&actor.principal.to_string(), id)
+            .playlist_place(&principal, id)
             .await?
             .unwrap_or_default();
-        let entries = self.order_of(actor, &row).await?;
-        self.go_on(actor, &row, place, Some(Start::After(after)), entries)
-            .await
+        // The entries are read only for a new round: a repeat or
+        // skip-watched toggle on All must not walk the library. A kept
+        // round is brought up to date when it is next played or listed.
+        place.round = match round_turn(&place, settings, None) {
+            RoundTurn::Off => None,
+            RoundTurn::Kept => place.round,
+            RoundTurn::New { first } => {
+                let entries = self.order_of(actor, &row).await?;
+                let now: Vec<EntryId> = entries.iter().map(|e| e.entry_id).collect();
+                Some(round_from(&now, first, self.seed()))
+            }
+        };
+        place.settings = settings;
+        self.store
+            .set_playlist_place(&principal, &row.id, &place)
+            .await?;
+        Ok(())
+    }
+
+    /// The next `limit` ([`MAX_UPCOMING`]) entries `actor` plays in
+    /// playlist `id` after their place, each the one `next` would give
+    /// after the one before: the round's order when shuffling, else the
+    /// playlist's; from the start again with repeat all; the place's
+    /// entry alone with repeat one, which plays it again. With no place,
+    /// from the top. Unavailable entries are passed, and with
+    /// `skip_watched` watched ones, as playing passes them.
+    pub async fn upcoming(
+        &self,
+        actor: &Actor,
+        id: &str,
+        limit: u32,
+    ) -> Result<Vec<PlaylistEntry>, PlaylistsError> {
+        let (row, _) = self.seen(actor, id).await?;
+        let (place, entries, changed) = self.place_with_round(actor, &row, None).await?;
+        // The round as `next` will play it, kept so: an entry added since
+        // gets its place once.
+        if changed {
+            self.store
+                .set_playlist_place(&actor.principal.to_string(), &row.id, &place)
+                .await?;
+        }
+        let order = order_of_place(&place, &entries);
+        let settings = place.settings;
+        let mut lookup = Lookup::new(&row, &entries, settings);
+        let mut upcoming = Vec::new();
+        let mut after = place.entry;
+        let limit = limit.min(MAX_UPCOMING) as usize;
+        while upcoming.len() < limit {
+            // As `go_on` tries them.
+            let tries = policy::next_from(&order, after, settings.repeat);
+            let Some(next) = self.play_on(actor, &mut lookup, &order, &tries).await? else {
+                break;
+            };
+            after = Some(next.entry);
+            upcoming.push(PlaylistEntry {
+                entry: next.entry,
+                item: next.item,
+                unavailable: false,
+                liked: next.liked,
+            });
+            if settings.repeat == Repeat::One {
+                // `next` gives it again, and again.
+                break;
+            }
+        }
+        Ok(upcoming)
+    }
+
+    /// `actor`'s place in `row` and `row`'s entries now, the place's round
+    /// as playing keeps it, and whether the place differs from the one
+    /// stored (none stored reads as the default).
+    /// With `chosen` settings and the entry picked, if any, those become
+    /// the place's. The round is brought up to date with the entries:
+    /// those taken out leave it, and those added since go among the ones
+    /// not played yet, so what is listed as coming up is what plays.
+    async fn place_with_round(
+        &self,
+        actor: &Actor,
+        row: &PlaylistRow,
+        chosen: Option<(PlaySettings, Option<EntryId>)>,
+    ) -> Result<(PlaceRow, Vec<EntryRow>, bool), PlaylistsError> {
+        let kept = self
+            .store
+            .playlist_place(&actor.principal.to_string(), &row.id)
+            .await?;
+        let entries = self.order_of(actor, row).await?;
+        let now: Vec<EntryId> = entries.iter().map(|e| e.entry_id).collect();
+        let kept = kept.unwrap_or_default();
+        let mut place = kept.clone();
+        if let Some((settings, from)) = chosen {
+            place.round = match round_turn(&place, settings, from) {
+                RoundTurn::Off => None,
+                RoundTurn::Kept => place.round,
+                RoundTurn::New { first } => Some(round_from(&now, first, self.seed())),
+            };
+            place.settings = settings;
+        }
+        if let Some(round) = &place.round {
+            place.round = Some(policy::reconciled(round, &now, place.entry, self.seed()));
+        }
+        let changed = place != kept;
+        Ok((place, entries, changed))
     }
 
     /// Find what plays from `start` among `entries` by `place`'s settings
@@ -1174,161 +1298,164 @@ impl Playlists {
         row: &PlaylistRow,
         mut place: PlaceRow,
         start: Option<Start>,
-        entries: Vec<EntryRow>,
+        entries: &[EntryRow],
     ) -> Result<Option<PlaylistNext>, PlaylistsError> {
-        let principal = actor.principal.to_string();
-        let settings = place.settings;
-        let order: Vec<EntryId> = match &place.round {
-            // The round's entries still there, then any added since.
-            Some(round) => {
-                let mut kept: Vec<EntryId> = round
-                    .iter()
-                    .copied()
-                    .filter(|e| entries.iter().any(|x| x.entry_id == *e))
-                    .collect();
-                kept.extend(
-                    entries
-                        .iter()
-                        .map(|e| e.entry_id)
-                        .filter(|e| !round.contains(e)),
-                );
-                kept
-            }
-            None => entries.iter().map(|e| e.entry_id).collect(),
-        };
-        let repeat_one = settings.repeat == Repeat::One;
+        let order = order_of_place(&place, entries);
+        let repeat = place.settings.repeat;
+        let mut lookup = Lookup::new(row, entries, place.settings);
         // The entries to try in turn, and the one among them that plays
         // even when watched: chosen, resumed, or repeated.
-        let (tried, regardless) = match start {
-            Some(Start::At(from)) => {
-                let mut tried = vec![from];
-                tried.extend(policy::candidates(&order, Some(from), false));
-                (tried, Some(from))
-            }
+        let tries = match start {
+            Some(Start::At(from)) => policy::again_from(&order, from, repeat),
             Some(Start::Resume(at)) => {
-                let finished = match entries.iter().find(|e| e.entry_id == at) {
+                let finished = match lookup.entries.get(&at) {
                     Some(entry) => self.watched(actor, entry).await?,
                     None => true,
                 };
                 if finished {
-                    (
-                        policy::candidates(&order, Some(at), repeat_one),
-                        repeat_one.then_some(at),
-                    )
+                    policy::next_from(&order, Some(at), repeat)
                 } else {
-                    let mut tried = vec![at];
-                    tried.extend(policy::candidates(&order, Some(at), false));
-                    (tried, Some(at))
+                    policy::again_from(&order, at, repeat)
                 }
             }
-            Some(Start::After(after)) => (
-                policy::candidates(&order, Some(after), repeat_one),
-                repeat_one.then_some(after),
-            ),
-            None => (order.clone(), None),
+            Some(Start::After(after)) => policy::next_from(&order, Some(after), repeat),
+            None => policy::next_from(&order, None, repeat),
         };
-        let mut found = self
-            .first_playable(actor, row, &entries, &tried, regardless, settings)
-            .await?;
-        if found.is_none() && settings.repeat == Repeat::All {
-            // A new round, from its start.
-            let round = settings.shuffle.then(|| round_from(&order, None));
-            let again = round.clone().unwrap_or_else(|| order.clone());
-            found = self
-                .first_playable(actor, row, &entries, &again, None, settings)
-                .await?;
-            place.round = round;
-        }
-        match &found {
-            Some(next) => place.entry = Some(next.entry),
-            None => {
-                // The end: the next play starts at the top.
-                place.entry = None;
-                place.round = None;
-            }
-        }
+        let found = self.play_on(actor, &mut lookup, &order, &tries).await?;
+        // At the end the next play starts at the top, of the same round.
+        place.entry = found.as_ref().map(|next| next.entry);
         self.store
-            .set_playlist_place(&principal, &row.id, &place)
+            .set_playlist_place(&actor.principal.to_string(), &row.id, &place)
             .await?;
         Ok(found)
     }
 
-    /// The first of `tried` that can be played: still in `entries`, its
-    /// item there, readable and seen by `actor`, and, with
-    /// `skip_watched`, not watched (unless it is `regardless`).
+    /// What plays by `tries` in `order`: the first of its entries that can
+    /// be played, else, with repeat all, the first of the same round again
+    /// from its start (shuffle was not turned off and on).
+    async fn play_on(
+        &self,
+        actor: &Actor,
+        lookup: &mut Lookup<'_>,
+        order: &[EntryId],
+        tries: &policy::Tries,
+    ) -> Result<Option<PlaylistNext>, PlaylistsError> {
+        let found = self
+            .first_playable(actor, lookup, &tries.tried, tries.regardless)
+            .await?;
+        if found.is_some() || !tries.wraps {
+            return Ok(found);
+        }
+        self.first_playable(actor, lookup, order, None).await
+    }
+
+    /// The first of `tried` that can be played ([`Self::playable`]) and,
+    /// with `skip_watched`, is not watched (unless it is `regardless`).
     async fn first_playable(
         &self,
         actor: &Actor,
-        row: &PlaylistRow,
-        entries: &[EntryRow],
+        lookup: &mut Lookup<'_>,
         tried: &[EntryId],
         regardless: Option<EntryId>,
-        settings: PlaySettings,
     ) -> Result<Option<PlaylistNext>, PlaylistsError> {
         for entry_id in tried {
-            let Some(entry) = entries.iter().find(|e| e.entry_id == *entry_id) else {
+            let Some(next) = self.playable(actor, lookup, *entry_id).await? else {
                 continue;
             };
-            let (mut item, markers) = match self.resolve(entry).await? {
-                Resolved::Here {
-                    item,
-                    markers,
-                    unavailable: false,
-                } => (item, markers),
-                Resolved::Moved {
-                    item,
-                    markers,
-                    unavailable: false,
-                    to,
-                } => {
-                    let revision = self
-                        .store
-                        .relink_playlist_entry(&row.id, entry.entry_id, &to.to_string())
-                        .await?;
-                    self.told_playlist(&row.id, revision, Some(Seen::of(row)), Some(Seen::of(row)));
-                    (item, markers)
-                }
-                // All's are not stored: nothing to drop.
-                Resolved::Gone if row.builtin == Some(Builtin::All) => continue,
-                Resolved::Gone => {
-                    if let Some(revision) = self
-                        .store
-                        .drop_playlist_entries(&row.id, &[entry.entry_id])
-                        .await?
-                    {
-                        self.told_playlist(
-                            &row.id,
-                            revision,
-                            Some(Seen::of(row)),
-                            Some(Seen::of(row)),
-                        );
-                    }
-                    continue;
-                }
-                // Unavailable, or in a library not served now.
-                _ => continue,
-            };
-            if !self.visibility.may_see(actor, &item) {
+            if lookup.settings.skip_watched && watched(&next.item) && regardless != Some(*entry_id)
+            {
                 continue;
             }
-            self.watch.fill(actor.principal, &mut [&mut item]).await?;
-            if settings.skip_watched && watched(&item) && regardless != Some(*entry_id) {
-                continue;
-            }
-            let liked = matches!(item, Item::Track(_))
-                && self
-                    .store
-                    .liked_media(&actor.principal.to_string())
-                    .await?
-                    .contains(&item.id().to_string());
-            return Ok(Some(PlaylistNext {
-                entry: *entry_id,
-                item,
-                markers,
-                liked,
-            }));
+            return Ok(Some(next));
         }
         Ok(None)
+    }
+
+    /// Entry `entry_id` as it plays, if it can: still among `lookup`'s
+    /// entries, its item there, readable and seen by `actor`. Each entry
+    /// is looked at once per `lookup`, so one gone or moved is dropped or
+    /// followed once.
+    async fn playable(
+        &self,
+        actor: &Actor,
+        lookup: &mut Lookup<'_>,
+        entry_id: EntryId,
+    ) -> Result<Option<PlaylistNext>, PlaylistsError> {
+        if let Some(known) = lookup.plays.get(&entry_id) {
+            return Ok(known.clone());
+        }
+        let found = self.look_at(actor, lookup, entry_id).await?;
+        lookup.plays.insert(entry_id, found.clone());
+        Ok(found)
+    }
+
+    /// [`Self::playable`], unremembered.
+    async fn look_at(
+        &self,
+        actor: &Actor,
+        lookup: &mut Lookup<'_>,
+        entry_id: EntryId,
+    ) -> Result<Option<PlaylistNext>, PlaylistsError> {
+        let row = lookup.row;
+        let Some(entry) = lookup.entries.get(&entry_id).copied() else {
+            return Ok(None);
+        };
+        let (mut item, markers) = match self.resolve(entry).await? {
+            Resolved::Here {
+                item,
+                markers,
+                unavailable: false,
+            } => (item, markers),
+            Resolved::Moved {
+                item,
+                markers,
+                unavailable: false,
+                to,
+            } => {
+                let revision = self
+                    .store
+                    .relink_playlist_entry(&row.id, entry.entry_id, &to.to_string())
+                    .await?;
+                self.told_playlist(&row.id, revision, Some(Seen::of(row)), Some(Seen::of(row)));
+                (item, markers)
+            }
+            // All's are not stored: nothing to drop.
+            Resolved::Gone if row.builtin == Some(Builtin::All) => return Ok(None),
+            Resolved::Gone => {
+                if let Some(revision) = self
+                    .store
+                    .drop_playlist_entries(&row.id, &[entry.entry_id])
+                    .await?
+                {
+                    self.told_playlist(&row.id, revision, Some(Seen::of(row)), Some(Seen::of(row)));
+                }
+                return Ok(None);
+            }
+            // Unavailable, or in a library not served now.
+            _ => return Ok(None),
+        };
+        if !self.visibility.may_see(actor, &item) {
+            return Ok(None);
+        }
+        self.watch.fill(actor.principal, &mut [&mut item]).await?;
+        let liked = match item {
+            Item::Track(_) => {
+                let liked = match &mut lookup.liked {
+                    Some(liked) => liked,
+                    none => {
+                        none.insert(self.store.liked_media(&actor.principal.to_string()).await?)
+                    }
+                };
+                liked.contains(&item.id().to_string())
+            }
+            _ => false,
+        };
+        Ok(Some(PlaylistNext {
+            entry: entry_id,
+            item,
+            markers,
+            liked,
+        }))
     }
 
     /// Whether `actor` has watched `entry`'s item. One no longer served
@@ -2014,6 +2141,40 @@ fn cut(len: usize, offset: u32, limit: u32) -> (usize, usize) {
     (start, end)
 }
 
+/// What one call has found of which of a playlist's entries play.
+struct Lookup<'a> {
+    row: &'a PlaylistRow,
+    /// The playlist's entries now, by id.
+    entries: HashMap<EntryId, &'a EntryRow>,
+    /// How they are played.
+    settings: PlaySettings,
+    /// The user's Liked, read when a track is first found.
+    liked: Option<HashSet<String>>,
+    /// Each entry looked at, as it plays (watched or not) if it can.
+    plays: HashMap<EntryId, Option<PlaylistNext>>,
+}
+
+impl<'a> Lookup<'a> {
+    fn new(row: &'a PlaylistRow, entries: &'a [EntryRow], settings: PlaySettings) -> Self {
+        Self {
+            row,
+            entries: entries.iter().map(|e| (e.entry_id, e)).collect(),
+            settings,
+            liked: None,
+            plays: HashMap::new(),
+        }
+    }
+}
+
+/// The order `place` plays `entries` in: its round when shuffling, else
+/// the playlist's.
+fn order_of_place(place: &PlaceRow, entries: &[EntryRow]) -> Vec<EntryId> {
+    match &place.round {
+        Some(round) => round.clone(),
+        None => entries.iter().map(|e| e.entry_id).collect(),
+    }
+}
+
 /// Where playing starts.
 #[derive(Debug, Clone, Copy)]
 enum Start {
@@ -2025,9 +2186,36 @@ enum Start {
     After(EntryId),
 }
 
-/// A shuffled round of `order`, with `first` at its start.
-fn round_from(order: &[EntryId], first: Option<EntryId>) -> Vec<EntryId> {
-    use password_hash::rand_core::{OsRng, RngCore};
+/// What becomes of a place's round when its settings are chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundTurn {
+    /// Shuffle is off: no round.
+    Off,
+    /// The round kept as it is.
+    Kept,
+    /// A new round, `first` at its start.
+    New { first: Option<EntryId> },
+}
+
+/// The round rule, for `kept` played with `settings`, `from` picked or
+/// not: one round per turn-on, kept until shuffle is turned off. A new
+/// one when shuffling starts (at the entry playing, so the rest of the
+/// playlist still plays) or when there is none, and when an entry is
+/// picked, that entry first. Otherwise the kept round.
+fn round_turn(kept: &PlaceRow, settings: PlaySettings, from: Option<EntryId>) -> RoundTurn {
+    match (settings.shuffle, from) {
+        (false, _) => RoundTurn::Off,
+        (true, Some(from)) => RoundTurn::New { first: Some(from) },
+        (true, None) if !kept.settings.shuffle || kept.round.is_none() => {
+            RoundTurn::New { first: kept.entry }
+        }
+        (true, None) => RoundTurn::Kept,
+    }
+}
+
+/// A shuffled round of `order` drawn from `seed`, with `first` at its
+/// start.
+fn round_from(order: &[EntryId], first: Option<EntryId>, seed: u64) -> Vec<EntryId> {
     let first = first.filter(|f| order.contains(f));
     let rest: Vec<EntryId> = order
         .iter()
@@ -2035,7 +2223,7 @@ fn round_from(order: &[EntryId], first: Option<EntryId>) -> Vec<EntryId> {
         .filter(|e| Some(*e) != first)
         .collect();
     let mut round: Vec<EntryId> = first.into_iter().collect();
-    round.extend(policy::shuffled(&rest, OsRng.next_u64()));
+    round.extend(policy::shuffled(&rest, seed));
     round
 }
 

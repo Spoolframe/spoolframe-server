@@ -64,6 +64,33 @@
   and `image:tile/all/2`, so apps load the new ones, not their cached
   copies.
 
+- Playlist shuffle is stable: the server shuffles a playlist once each
+  time shuffle is turned on, and keeps that order while shuffle stays
+  on. Repeat All plays the same shuffled order again, not a new one,
+  and so does playing the playlist again after its end. Turning
+  shuffle on part way through starts the shuffled order at the entry
+  playing, so the whole rest of the playlist is ahead (before, the
+  order was random and resuming in the middle of it ended the playlist
+  early). Picking an entry while shuffling still shuffles again, with
+  that entry first. An entry added while shuffling goes to a random
+  place among the entries not played yet, not always last. Turning
+  shuffle off goes back to the playlist's order from the entry
+  playing.
+
+- Up next in a playlist, and play settings saved alone, behind a new
+  regular feature, `spoolframe:playlist-upcoming` (the protocol
+  version is unchanged): `UpcomingInPlaylist { id, limit }` answers
+  `PlaylistUpcoming { entries }`, at most 100 entries, each the one
+  `NextInPlaylist` would give next, in the shuffled order while
+  shuffling and round again with Repeat All; and
+  `SetPlaylistSettings { id, shuffle, repeat, skip_watched }` answers
+  `Done`, saving how the user plays the playlist without playing it,
+  so a shuffle or repeat button keeps the place (shuffle turned on
+  shuffles from the entry playing). SDK: `Features::playlist_upcoming`,
+  `Session::upcoming_in_playlist` and `Session::set_playlist_settings`.
+  An app that builds `Features` with every field named needs the new
+  one.
+
 ## 0.12.1 (2026-10-17)
 
 - A relative state directory (`--state-dir .dev-state`) is made

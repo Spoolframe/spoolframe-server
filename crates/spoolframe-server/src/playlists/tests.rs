@@ -70,7 +70,11 @@ async fn harness(test: &str) -> Harness {
             admin: role == Role::Admin,
         });
     }
-    let playlists = Playlists::new(store, catalog.clone(), watch);
+    // Named seeds, one after another: each test's rounds are the same at
+    // every run.
+    let next_seed = std::sync::atomic::AtomicU64::new(1);
+    let playlists = Playlists::new(store, catalog.clone(), watch)
+        .with_seeds(move || next_seed.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     Harness {
         playlists,
         catalog,
@@ -813,6 +817,299 @@ async fn shuffle_and_repeat_give_every_entry_once_per_round() {
         round.sort();
         assert_eq!(round, ["12", "13", "15", "21"], "{played:?}");
     }
+}
+
+const SHUFFLED: PlaySettings = PlaySettings {
+    shuffle: true,
+    repeat: Repeat::Off,
+    skip_watched: false,
+};
+
+impl Harness {
+    /// The keys `who` plays in `list` from `first` on, by `next`, at most
+    /// `count` of them.
+    async fn playing_on(
+        &self,
+        who: &Actor,
+        list: &str,
+        first: Option<PlaylistNext>,
+        count: usize,
+    ) -> Vec<String> {
+        let mut played = Vec::new();
+        let mut now = first;
+        while let Some(playing) = now {
+            played.push(playing.item.id().key().to_owned());
+            if played.len() == count {
+                break;
+            }
+            now = self.playlists.next(who, list, playing.entry).await.unwrap();
+        }
+        played
+    }
+
+    /// The keys `who` plays in `list` from a play with `settings` on.
+    async fn played(
+        &self,
+        who: &Actor,
+        list: &str,
+        settings: PlaySettings,
+        count: usize,
+    ) -> Vec<String> {
+        let first = self
+            .playlists
+            .play(who, list, None, settings)
+            .await
+            .unwrap();
+        self.playing_on(who, list, first, count).await
+    }
+}
+
+/// The user's rule: one shuffle per turn-on, kept. Repeat All plays the
+/// same round again, not a new one.
+#[tokio::test]
+async fn repeat_all_replays_the_same_round_while_shuffling() {
+    let h = harness("play-shuffle-replay").await;
+    let list = heists(&h).await;
+    h.edit(&h.alice, &list, vec![add(episode("13"))]).await;
+    let looping = PlaySettings {
+        repeat: Repeat::All,
+        ..SHUFFLED
+    };
+    let played = h.played(&h.alice, &list, looping, 8).await;
+    assert_eq!(played[..4], played[4..], "{played:?}");
+}
+
+/// Listened through to the end and played again, the round is the same:
+/// shuffle was not turned off and on.
+#[tokio::test]
+async fn playing_again_after_the_end_keeps_the_round() {
+    let h = harness("play-shuffle-again").await;
+    let list = heists(&h).await;
+    h.edit(&h.alice, &list, vec![add(episode("13"))]).await;
+    let first = h.played(&h.alice, &list, SHUFFLED, 10).await;
+    let again = h.played(&h.alice, &list, SHUFFLED, 10).await;
+    assert_eq!(again, first);
+}
+
+/// An entry added while shuffling goes somewhere among those not played
+/// yet, not always last.
+#[tokio::test]
+async fn an_entry_added_while_shuffling_plays_before_the_round_ends() {
+    let h = harness("play-shuffle-added").await;
+    let list = heists(&h).await;
+    let first = h
+        .playlists
+        .play(&h.alice, &list, None, SHUFFLED)
+        .await
+        .unwrap();
+    h.edit(&h.alice, &list, vec![add(episode("13"))]).await;
+    let played = h.playing_on(&h.alice, &list, first, 10).await;
+    assert_ne!(played.last().map(String::as_str), Some("13"), "{played:?}");
+}
+
+/// Shuffle turned on part way through, with no entry picked, starts its
+/// round at the entry playing: every other entry is ahead, and plays once.
+#[tokio::test]
+async fn turning_shuffle_on_without_a_pick_puts_the_whole_playlist_ahead() {
+    let h = harness("play-shuffle-on").await;
+    let list = heists(&h).await;
+    h.edit(&h.alice, &list, vec![add(episode("13"))]).await;
+    h.playlists
+        .play(&h.alice, &list, None, settings())
+        .await
+        .unwrap();
+    let mut played = h.played(&h.alice, &list, SHUFFLED, 10).await;
+    played.sort();
+    assert_eq!(played, ["12", "13", "15", "21"]);
+}
+
+impl Harness {
+    /// The keys of what `who` has coming up in `list`.
+    async fn upcoming(&self, who: &Actor, list: &str, limit: u32) -> Vec<String> {
+        self.playlists
+            .upcoming(who, list, limit)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.item.id().key().to_owned())
+            .collect()
+    }
+
+    /// Play `list` with `settings`, give what plays, and four entries
+    /// in all: the heists and 13.
+    async fn playing_four(&self, settings: PlaySettings) -> (String, PlaylistNext) {
+        let list = heists(self).await;
+        self.edit(&self.alice, &list, vec![add(episode("13"))])
+            .await;
+        let first = self
+            .playlists
+            .play(&self.alice, &list, None, settings)
+            .await
+            .unwrap()
+            .expect("something to play");
+        (list, first)
+    }
+}
+
+/// What comes up is what `next` plays, one after another: the round's
+/// order while shuffling.
+#[tokio::test]
+async fn upcoming_is_what_next_plays_in_turn() {
+    let h = harness("upcoming-in-turn").await;
+    let (list, first) = h.playing_four(SHUFFLED).await;
+    let upcoming = h.upcoming(&h.alice, &list, 10).await;
+    let next = h
+        .playlists
+        .next(&h.alice, &list, first.entry)
+        .await
+        .unwrap();
+    let played = h.playing_on(&h.alice, &list, next, 10).await;
+    assert_eq!(upcoming, played);
+}
+
+/// With repeat all, it goes round to the round's start again.
+#[tokio::test]
+async fn upcoming_goes_round_with_repeat_all() {
+    let h = harness("upcoming-repeat-all").await;
+    let looping = PlaySettings {
+        repeat: Repeat::All,
+        ..SHUFFLED
+    };
+    let (list, first) = h.playing_four(looping).await;
+    let upcoming = h.upcoming(&h.alice, &list, 7).await;
+    let next = h
+        .playlists
+        .next(&h.alice, &list, first.entry)
+        .await
+        .unwrap();
+    let played = h.playing_on(&h.alice, &list, next, 7).await;
+    assert_eq!(upcoming, played);
+}
+
+/// With repeat one, what comes up is the entry playing, once.
+#[tokio::test]
+async fn upcoming_with_repeat_one_is_the_entry_playing() {
+    let h = harness("upcoming-repeat-one").await;
+    let one = PlaySettings {
+        repeat: Repeat::One,
+        ..settings()
+    };
+    let (list, first) = h.playing_four(one).await;
+    let upcoming = h.playlists.upcoming(&h.alice, &list, 10).await.unwrap();
+    let entries: Vec<EntryId> = upcoming.iter().map(|e| e.entry).collect();
+    assert_eq!(entries, [first.entry]);
+}
+
+#[tokio::test]
+async fn upcoming_without_a_place_is_the_playlist_from_the_top() {
+    let h = harness("upcoming-no-place").await;
+    let list = heists(&h).await;
+    assert_eq!(h.upcoming(&h.alice, &list, 10).await, ["15", "12", "21"]);
+}
+
+#[tokio::test]
+async fn upcoming_lists_at_most_its_limit() {
+    let h = harness("upcoming-limit").await;
+    let list = heists(&h).await;
+    assert_eq!(h.upcoming(&h.alice, &list, 2).await, ["15", "12"]);
+}
+
+#[tokio::test]
+async fn upcoming_of_a_playlist_one_does_not_see_is_not_found() {
+    let h = harness("upcoming-unseen").await;
+    let list = heists(&h).await;
+    let refused = h.playlists.upcoming(&h.bob, &list, 10).await;
+    assert!(
+        matches!(refused, Err(PlaylistsError::NotFound)),
+        "{refused:?}"
+    );
+}
+
+/// Saving settings while shuffling plays nothing and keeps the round and
+/// the place: what comes up is the same.
+#[tokio::test]
+async fn saving_settings_while_shuffling_keeps_the_round_and_the_place() {
+    let h = harness("settings-keep").await;
+    let (list, _) = h.playing_four(SHUFFLED).await;
+    let before = h.upcoming(&h.alice, &list, 10).await;
+    let skipping = PlaySettings {
+        skip_watched: true,
+        ..SHUFFLED
+    };
+    h.playlists
+        .set_settings(&h.alice, &list, skipping)
+        .await
+        .unwrap();
+    assert_eq!(h.upcoming(&h.alice, &list, 10).await, before);
+}
+
+/// A settings save that leaves shuffle on stores the round as it is,
+/// without reading the entries (on All, the library): an entry added since
+/// gets its place when the round is next played or listed.
+#[tokio::test]
+async fn saving_settings_with_shuffle_kept_leaves_the_round_as_it_is() {
+    let h = harness("settings-round-as-is").await;
+    let list = heists(&h).await;
+    h.playlists
+        .play(&h.alice, &list, None, SHUFFLED)
+        .await
+        .unwrap();
+    let principal = h.alice.principal.to_string();
+    let round = async || {
+        h.playlists
+            .store
+            .playlist_place(&principal, &list)
+            .await
+            .unwrap()
+            .expect("a place")
+            .round
+    };
+    let before = round().await;
+    h.edit(&h.alice, &list, vec![add(episode("13"))]).await;
+    let looping = PlaySettings {
+        repeat: Repeat::All,
+        ..SHUFFLED
+    };
+    h.playlists
+        .set_settings(&h.alice, &list, looping)
+        .await
+        .unwrap();
+    assert_eq!(round().await, before);
+}
+
+/// Shuffle turned on by a settings save shuffles from the entry playing:
+/// every other entry is ahead.
+#[tokio::test]
+async fn turning_shuffle_on_by_settings_puts_the_whole_playlist_ahead() {
+    let h = harness("settings-shuffle-on").await;
+    let (list, first) = h.playing_four(settings()).await;
+    h.playlists
+        .set_settings(&h.alice, &list, SHUFFLED)
+        .await
+        .unwrap();
+    let mut upcoming = h.upcoming(&h.alice, &list, 10).await;
+    upcoming.sort();
+    let mut others = vec!["12", "13", "15", "21"];
+    others.retain(|k| *k != first.item.id().key());
+    assert_eq!(upcoming, others);
+}
+
+/// Shuffle turned off by a settings save goes on in the playlist's order
+/// from the entry playing.
+#[tokio::test]
+async fn turning_shuffle_off_by_settings_goes_on_in_the_playlists_order() {
+    let h = harness("settings-shuffle-off").await;
+    let (list, first) = h.playing_four(SHUFFLED).await;
+    h.playlists
+        .set_settings(&h.alice, &list, settings())
+        .await
+        .unwrap();
+    let order = ["15", "12", "21", "13"];
+    let at = order
+        .iter()
+        .position(|k| *k == first.item.id().key())
+        .unwrap();
+    assert_eq!(h.upcoming(&h.alice, &list, 10).await, order[at + 1..]);
 }
 
 #[tokio::test]

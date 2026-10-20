@@ -104,6 +104,10 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ListShareCandidates { .. }
         // PX-52: a read.
         | Request::RecentlyPlayed { .. }
+        // A read; settings saved twice are saved once, and shuffle turned
+        // on twice shuffles once.
+        | Request::UpcomingInPlaylist { .. }
+        | Request::SetPlaylistSettings { .. }
         // Taken away twice is taken away once (PX-53).
         | Request::RemovePlaylistArt { .. }
         // PX-03: a second sync joins the first; original timing or an

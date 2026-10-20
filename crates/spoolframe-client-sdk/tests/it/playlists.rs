@@ -25,6 +25,7 @@ const ALL: Features = Features {
     playlist_art: true,
     subtitle_sync: true,
     subtitle_search: true,
+    playlist_upcoming: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.
@@ -142,6 +143,30 @@ async fn an_app_not_listing_playlist_art_does_not_send_a_cover() {
         unsupported
     );
     assert!(stub.requests_of("remove_playlist_art").is_empty());
+}
+
+/// A server without what comes up in a playlist is not asked for it, nor
+/// to save settings alone: the SDK refuses, and sends nothing.
+#[tokio::test]
+async fn a_server_without_playlist_upcoming_is_not_asked_for_it() {
+    let stub = Stub::start().await;
+    let (_client, session) = alice_listing(&stub, ALL).await;
+    let unsupported = SdkError::Unsupported {
+        feature: spoolframe_protocol::features::PLAYLIST_UPCOMING.into(),
+    };
+    assert_eq!(
+        session.upcoming_in_playlist("p", 10).await.unwrap_err(),
+        unsupported
+    );
+    assert_eq!(
+        session
+            .set_playlist_settings("p", spoolframe_client_sdk::PlaySettings::default())
+            .await
+            .unwrap_err(),
+        unsupported
+    );
+    assert!(stub.requests_of("upcoming_in_playlist").is_empty());
+    assert!(stub.requests_of("set_playlist_settings").is_empty());
 }
 
 /// PX-03: an app that did not list subtitle sync cannot sync, set back or

@@ -290,7 +290,8 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
             "spoolframe:play-history",
             "spoolframe:playlist-art",
             "spoolframe:subtitle-sync",
-            "spoolframe:subtitle-search"
+            "spoolframe:subtitle-search",
+            "spoolframe:playlist-upcoming"
         ]
     );
     assert!(status.pre_auth_features.is_empty());

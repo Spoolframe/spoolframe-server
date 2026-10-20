@@ -30,11 +30,11 @@
 //! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLISTS, SUBTITLE_SEARCH,
-    SUBTITLE_SYNC,
+    LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLIST_UPCOMING, PLAYLISTS,
+    SUBTITLE_SEARCH, SUBTITLE_SYNC,
 };
 use spoolframe_protocol::playlists::{
-    EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistNext, PlaylistPage,
+    EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
     PlaylistSummary, ShareCandidatePage, Visibility,
 };
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
@@ -78,6 +78,10 @@ pub struct Features {
     /// [`Session::remove_subtitle_download`], and `SubtitleTrack::download`
     /// on an item's tracks.
     pub subtitle_search: bool,
+    /// What comes up in a playlist, and its settings saved alone:
+    /// [`Session::upcoming_in_playlist`] and
+    /// [`Session::set_playlist_settings`].
+    pub playlist_upcoming: bool,
 }
 
 impl Features {
@@ -92,6 +96,7 @@ impl Features {
             (self.playlist_art, PLAYLIST_ART),
             (self.subtitle_sync, SUBTITLE_SYNC),
             (self.subtitle_search, SUBTITLE_SEARCH),
+            (self.playlist_upcoming, PLAYLIST_UPCOMING),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -117,6 +122,7 @@ impl Features {
             playlist_art: self.playlist_art && other.playlist_art,
             subtitle_sync: self.subtitle_sync && other.subtitle_sync,
             subtitle_search: self.subtitle_search && other.subtitle_search,
+            playlist_upcoming: self.playlist_upcoming && other.playlist_upcoming,
         }
         .needing_playlists()
     }
@@ -134,6 +140,7 @@ impl Features {
             playlist_art: has(PLAYLIST_ART),
             subtitle_sync: has(SUBTITLE_SYNC),
             subtitle_search: has(SUBTITLE_SEARCH),
+            playlist_upcoming: has(PLAYLIST_UPCOMING),
         }
         .needing_playlists()
     }
@@ -144,6 +151,7 @@ impl Features {
             liked: self.liked && self.playlists,
             playlist_sharing: self.playlist_sharing && self.playlists,
             playlist_art: self.playlist_art && self.playlists,
+            playlist_upcoming: self.playlist_upcoming && self.playlists,
             ..self
         }
     }
@@ -434,6 +442,61 @@ impl Session {
 }
 
 impl Session {
+    /// Send `request` if the server has what comes up in a playlist.
+    async fn upcoming_call(&self, request: Request) -> Result<Reply, SdkError> {
+        if !self.features.playlist_upcoming {
+            return Err(SdkError::Unsupported {
+                feature: PLAYLIST_UPCOMING.into(),
+            });
+        }
+        self.call(request).await
+    }
+
+    /// What plays next in a playlist, without playing it: at most `limit`
+    /// (100) entries after the user's place, each the one
+    /// [`Session::next_in_playlist`] would give after the one before. The
+    /// shuffled round's order while shuffling, else the playlist's; from
+    /// the start again with repeat all; with repeat one, the entry playing
+    /// alone. With no place, from the top. Unavailable entries, and with
+    /// `skip_watched` watched ones, are passed.
+    pub async fn upcoming_in_playlist(
+        &self,
+        id: &str,
+        limit: u32,
+    ) -> Result<Vec<PlaylistEntry>, SdkError> {
+        let request = Request::UpcomingInPlaylist {
+            id: id.into(),
+            limit,
+        };
+        match self.upcoming_call(request).await? {
+            Reply::PlaylistUpcoming { entries } => Ok(entries),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Keep `settings` as how the user plays a playlist, playing nothing:
+    /// the place and the shuffled round stay. Shuffle turned on shuffles
+    /// anew from the place, so the whole playlist is ahead; turned off, the
+    /// playlist's order from the place.
+    pub async fn set_playlist_settings(
+        &self,
+        id: &str,
+        settings: PlaySettings,
+    ) -> Result<(), SdkError> {
+        let request = Request::SetPlaylistSettings {
+            id: id.into(),
+            shuffle: settings.shuffle,
+            repeat: settings.repeat,
+            skip_watched: settings.skip_watched,
+        };
+        match self.upcoming_call(request).await? {
+            Reply::Done => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+impl Session {
     /// Send `request` if the server has Liked (PX-43).
     async fn liked_call(&self, request: Request) -> Result<Reply, SdkError> {
         if !self.features.liked {
@@ -547,6 +610,10 @@ mod tests {
         assert!(!Features::of(&[PLAYLIST_SHARING.to_owned()]).playlist_sharing);
         // Play history stands alone: no playlists needed.
         assert!(Features::of(&[PLAY_HISTORY.to_owned()]).play_history);
+        assert!(
+            Features::of(&[PLAYLISTS.to_owned(), PLAYLIST_UPCOMING.to_owned()]).playlist_upcoming
+        );
+        assert!(!Features::of(&[PLAYLIST_UPCOMING.to_owned()]).playlist_upcoming);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use spoolframe_protocol::playlists::{Builtin, EntryId, Liked, PlaylistEdit};
+use spoolframe_protocol::playlists::{Builtin, EntryId, Liked, PlaylistEdit, Repeat};
 use spoolframe_types::MediaKind;
 
 /// What one viewer may do with one playlist.
@@ -172,6 +172,44 @@ pub fn candidates(order: &[EntryId], after: Option<EntryId>, repeat_one: bool) -
     tried
 }
 
+/// What one step of playing on in `order` tries, as [`next_from`] and
+/// [`again_from`] give it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tries {
+    /// The entries to try, in turn: the first that can be played plays.
+    pub tried: Vec<EntryId>,
+    /// The one among them that plays even when watched.
+    pub regardless: Option<EntryId>,
+    /// Whether, none of them playing, the round is tried again from its
+    /// start: repeat all.
+    pub wraps: bool,
+}
+
+/// What plays after `after` in `order` with `repeat`: the [`candidates`];
+/// with repeat one, `after` again, even watched. After nothing, the round
+/// from its start. The one rule for what plays next, and so for what is
+/// listed as coming up.
+pub fn next_from(order: &[EntryId], after: Option<EntryId>, repeat: Repeat) -> Tries {
+    let repeat_one = repeat == Repeat::One;
+    Tries {
+        tried: candidates(order, after, repeat_one),
+        regardless: after.filter(|_| repeat_one),
+        wraps: repeat == Repeat::All,
+    }
+}
+
+/// What plays from `at` in `order` with `repeat`: `at` itself, even
+/// watched (chosen, or resumed unfinished), then the rest of the round.
+pub fn again_from(order: &[EntryId], at: EntryId, repeat: Repeat) -> Tries {
+    let mut tried = vec![at];
+    tried.extend(candidates(order, Some(at), false));
+    Tries {
+        tried,
+        regardless: Some(at),
+        wraps: repeat == Repeat::All,
+    }
+}
+
 /// `entries` in a shuffled order, the same for the same `seed`: one
 /// round, each entry once.
 pub fn shuffled(entries: &[EntryId], seed: u64) -> Vec<EntryId> {
@@ -180,15 +218,47 @@ pub fn shuffled(entries: &[EntryId], seed: u64) -> Vec<EntryId> {
     // Fisher–Yates, drawn from splitmix64: no generator to depend on, and
     // a test names its seed.
     for i in (1..order.len()).rev() {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let j = (z % (i as u64 + 1)) as usize;
+        let j = (splitmix(&mut state) % (i as u64 + 1)) as usize;
         order.swap(i, j);
     }
     order
+}
+
+/// A shuffled `round` brought up to date with `order`, the playlist's
+/// entries now, while `at` plays: an entry taken out leaves the round;
+/// each one added since goes to a place drawn from `seed` among those
+/// after `at`, the not yet played, so it plays this round and the round
+/// played so far stays as it was. With `at` not in the round (none
+/// playing, or taken out), the whole round is not yet played.
+pub fn reconciled(
+    round: &[EntryId],
+    order: &[EntryId],
+    at: Option<EntryId>,
+    seed: u64,
+) -> Vec<EntryId> {
+    let now: HashSet<EntryId> = order.iter().copied().collect();
+    let mut kept: Vec<EntryId> = round.iter().copied().filter(|e| now.contains(e)).collect();
+    let had: HashSet<EntryId> = kept.iter().copied().collect();
+    let played = at
+        .and_then(|at| kept.iter().position(|e| *e == at))
+        .map_or(0, |p| p + 1);
+    let mut state = seed;
+    for added in order.iter().copied().filter(|e| !had.contains(e)) {
+        // From just after `at` to the end, both ends included.
+        let places = (kept.len() - played) as u64 + 1;
+        let to = played + (splitmix(&mut state) % places) as usize;
+        kept.insert(to, added);
+    }
+    kept
+}
+
+/// The next draw of splitmix64 from `state`, moving it on.
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// What a viewer may do with a built-in playlist, given what its
@@ -438,6 +508,36 @@ mod tests {
     }
 
     #[test]
+    fn after_the_last_entry_only_repeat_all_starts_over() {
+        let order = [1, 2, 3];
+        let off = next_from(&order, Some(3), Repeat::Off);
+        assert!(off.tried.is_empty());
+        assert!(!off.wraps);
+        assert!(next_from(&order, Some(3), Repeat::All).wraps);
+    }
+
+    #[test]
+    fn repeat_one_plays_the_entry_again_even_watched() {
+        let step = next_from(&[1, 2, 3], Some(2), Repeat::One);
+        assert_eq!(step.tried, [2, 3]);
+        assert_eq!(step.regardless, Some(2));
+    }
+
+    #[test]
+    fn after_nothing_the_round_plays_from_its_start() {
+        let step = next_from(&[3, 1, 2], None, Repeat::One);
+        assert_eq!(step.tried, [3, 1, 2]);
+        assert_eq!(step.regardless, None);
+    }
+
+    #[test]
+    fn an_entry_chosen_plays_first_even_watched_then_the_rest() {
+        let step = again_from(&[1, 2, 3], 2, Repeat::Off);
+        assert_eq!(step.tried, [2, 3]);
+        assert_eq!(step.regardless, Some(2));
+    }
+
+    #[test]
     fn liked_is_edited_by_its_owner_and_never_managed() {
         assert_eq!(builtin_access(Builtin::Liked, Access::Own), Access::Edit);
         assert!(!builtin_access(Builtin::Liked, Access::Own).can_manage());
@@ -513,5 +613,28 @@ mod tests {
         assert_eq!(sorted, entries);
         assert_eq!(shuffled(&entries, 7), round);
         assert_ne!(shuffled(&entries, 8), round);
+    }
+
+    #[test]
+    fn an_entry_taken_out_leaves_the_round() {
+        assert_eq!(reconciled(&[3, 1, 4, 2], &[1, 2, 3], Some(1), 7), [3, 1, 2]);
+    }
+
+    #[test]
+    fn an_entry_added_goes_among_those_not_yet_played() {
+        let round: Vec<EntryId> = (1..=20).collect();
+        let order: Vec<EntryId> = (1..=40).collect();
+        let now = reconciled(&round, &order, Some(10), 7);
+        assert_eq!(now[..10], round[..10]);
+        let mut rest = now[10..].to_vec();
+        rest.sort();
+        assert_eq!(rest, (11..=40).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn added_entries_are_spread_through_the_rest_not_put_at_its_end() {
+        let round: Vec<EntryId> = (1..=20).collect();
+        let order: Vec<EntryId> = (1..=40).collect();
+        assert_ne!(reconciled(&round, &order, Some(10), 7)[20..], order[20..]);
     }
 }

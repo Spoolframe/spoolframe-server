@@ -769,6 +769,31 @@ pub enum Request {
         id: String,
         after: crate::playlists::EntryId,
     },
+    /// What plays next, without playing it (`spoolframe:playlist-upcoming`):
+    /// `PlaylistUpcoming`, at most `limit` (100) entries after the session
+    /// user's place, each the one `NextInPlaylist` would give after the
+    /// one before. The round's order while shuffling, else the playlist's;
+    /// from the start again with repeat all; with repeat one, the place's
+    /// entry alone. With no place, from the top. Unavailable entries, and
+    /// with `skip_watched` watched ones, are passed. Whoever sees the
+    /// playlist. Only from a client that listed the feature; from any
+    /// other, `Unsupported`.
+    UpcomingInPlaylist {
+        id: String,
+        limit: u32,
+    },
+    /// Keep how the session user plays a playlist, playing nothing
+    /// (`spoolframe:playlist-upcoming`): `Done`. The place and the shuffled
+    /// round stay. Shuffle turned on shuffles anew, from the place, so the
+    /// whole playlist is ahead; turned off, the playlist's order, from the
+    /// place. Whoever sees the playlist. Only from a client that listed
+    /// the feature; from any other, `Unsupported`.
+    SetPlaylistSettings {
+        id: String,
+        shuffle: bool,
+        repeat: crate::playlists::Repeat,
+        skip_watched: bool,
+    },
     /// Import the session user's Plex playlists, once (PX-40): each video
     /// or music playlist of their linked Plex account, on every Plex
     /// server here, becomes a personal playlist of theirs, its items
@@ -1465,6 +1490,10 @@ pub enum Reply {
     /// Nothing is left to play: the end, with repeat off, or no entry can
     /// be played. The user's place is cleared.
     PlaylistFinished,
+    /// What plays next in a playlist (`UpcomingInPlaylist`), in turn.
+    PlaylistUpcoming {
+        entries: Vec<crate::playlists::PlaylistEntry>,
+    },
     /// What importing Plex playlists made, or would (`ImportPlexPlaylists`).
     PlexImport(crate::playlists::PlexImport),
     /// Whom a playlist can be shared with (`ListShareCandidates`).

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use iroh::endpoint::RecvStream;
 use spoolframe_protocol::codec::read_frame;
-use spoolframe_protocol::features::PLAYLISTS;
+use spoolframe_protocol::features::{PLAYLIST_UPCOMING, PLAYLISTS};
 use spoolframe_protocol::playlists::{
     ItemKind, Kinds, PinNoteReason, PlaylistEdit, PlaylistOwnerKind, PlaylistShare,
     PlaylistSummary, Visibility,
@@ -446,4 +446,75 @@ async fn a_playlist_plays_over_the_wire_to_its_end() {
         tv.call(Some(&alice), next(second.entry)).await,
         Response::Ok(Reply::PlaylistFinished)
     );
+}
+
+/// `spoolframe:playlist-upcoming`: what comes up after the place, and the
+/// settings saved alone, which keep the place and change what comes up.
+#[tokio::test]
+async fn upcoming_and_settings_alone_reach_the_server_over_the_wire() {
+    let server = TestServer::start("playlists-upcoming").await;
+    server.add_user("alice", "correct horse", None).await;
+    let tv = server.client().await;
+    tv.hello_listing(&[PLAYLISTS, PLAYLIST_UPCOMING]).await;
+    server.write_media(1000);
+    for key in ["12", "13"] {
+        server.write_episode(key);
+    }
+    let alice = tv.login("alice", "correct horse").await;
+    let made = create(&tv, &alice, EPISODES, Visibility::Personal).await;
+    edit(&tv, &alice, &made.id, 0, vec![add(season("11"))]).await;
+    let play = Request::PlayPlaylist {
+        id: made.id.clone(),
+        from: None,
+        shuffle: false,
+        repeat: spoolframe_protocol::playlists::Repeat::Off,
+        skip_watched: false,
+    };
+    let Response::Ok(Reply::PlaylistItem(first)) = tv.call(Some(&alice), play).await else {
+        panic!("nothing to play");
+    };
+    let set = Request::SetPlaylistSettings {
+        id: made.id.clone(),
+        shuffle: false,
+        repeat: spoolframe_protocol::playlists::Repeat::All,
+        skip_watched: false,
+    };
+    assert_eq!(tv.call(Some(&alice), set).await, Response::Ok(Reply::Done));
+    let upcoming = Request::UpcomingInPlaylist {
+        id: made.id.clone(),
+        limit: 3,
+    };
+    let Response::Ok(Reply::PlaylistUpcoming { entries }) = tv.call(Some(&alice), upcoming).await
+    else {
+        panic!("no upcoming");
+    };
+    let keys: Vec<&str> = entries.iter().map(|e| e.item.id().key()).collect();
+    // After 12, which plays on: 13, then round again with repeat all.
+    assert_eq!(keys, ["13", "12", "13"], "after {:?}", first.item.id());
+}
+
+/// A client that did not list the feature gets neither request.
+#[tokio::test]
+async fn a_client_without_playlist_upcoming_is_refused_both_requests() {
+    let (_server, tv) = three_users("playlists-upcoming-unlisted").await;
+    let alice = tv.login("alice", "correct horse").await;
+    let made = create(&tv, &alice, EPISODES, Visibility::Personal).await;
+    for request in [
+        Request::UpcomingInPlaylist {
+            id: made.id.clone(),
+            limit: 3,
+        },
+        Request::SetPlaylistSettings {
+            id: made.id.clone(),
+            shuffle: true,
+            repeat: spoolframe_protocol::playlists::Repeat::Off,
+            skip_watched: false,
+        },
+    ] {
+        let answer = tv.call(Some(&alice), request).await;
+        assert!(
+            matches!(answer, Response::Err(Error::Unsupported { .. })),
+            "{answer:?}"
+        );
+    }
 }

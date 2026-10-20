@@ -3278,3 +3278,47 @@ fn subtitle_search_round_trips() {
     }));
     round_trip(Response::Err(Error::NoSubtitleSource));
 }
+
+/// `spoolframe:playlist-upcoming`: what comes up in a playlist, and its
+/// settings saved alone.
+mod playlist_upcoming {
+    use super::*;
+    use crate::playlists::{PlaylistEntry, Repeat};
+
+    #[test]
+    fn upcoming_and_settings_round_trip_and_are_safe_to_retry() {
+        let upcoming = Request::UpcomingInPlaylist {
+            id: "p".into(),
+            limit: 20,
+        };
+        let settings = Request::SetPlaylistSettings {
+            id: "p".into(),
+            shuffle: true,
+            repeat: Repeat::All,
+            skip_watched: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&upcoming).unwrap()["type"],
+            "upcoming_in_playlist"
+        );
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["type"],
+            "set_playlist_settings"
+        );
+        for request in [upcoming, settings] {
+            assert!(crate::policy::retry_safe(&request), "{request:?}");
+            round_trip(RequestEnvelope {
+                session: Some(SessionId("s".into())),
+                request,
+            });
+        }
+        round_trip(Response::Ok(Reply::PlaylistUpcoming {
+            entries: vec![PlaylistEntry {
+                entry: 3,
+                item: movie(),
+                unavailable: false,
+                liked: true,
+            }],
+        }));
+    }
+}

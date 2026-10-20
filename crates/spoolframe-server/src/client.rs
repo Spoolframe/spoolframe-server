@@ -1971,6 +1971,20 @@ impl ClientProtocol {
                 request: format!("playlist art without {}", features::PLAYLIST_ART),
             });
         }
+        // What comes up, and settings saved alone, only for a client that
+        // takes them.
+        let upcoming_listed =
+            playlists_listed && features::has(&hello.features, features::PLAYLIST_UPCOMING);
+        if !upcoming_listed
+            && matches!(
+                request,
+                Request::UpcomingInPlaylist { .. } | Request::SetPlaylistSettings { .. }
+            )
+        {
+            return Err(Error::Unsupported {
+                request: format!("playlist upcoming without {}", features::PLAYLIST_UPCOMING),
+            });
+        }
         if playlists_listed {
             self.playlist_listeners
                 .note(connection.stable_id(), principal, liked_listed);
@@ -2029,6 +2043,8 @@ impl ClientProtocol {
                 | Request::UnpinPlaylist { id }
                 | Request::PlayPlaylist { id, .. }
                 | Request::NextInPlaylist { id, .. }
+                | Request::UpcomingInPlaylist { id, .. }
+                | Request::SetPlaylistSettings { id, .. }
                 | Request::ListShareCandidates { id, .. }
                 | Request::RemovePlaylistArt { id }
                     if self
@@ -2757,6 +2773,38 @@ impl ClientProtocol {
                 .next(&actor, &id, after)
                 .await
                 .map(|next| playing(next, liked_listed))
+                .map_err(playlists_error),
+            Request::UpcomingInPlaylist { id, limit } => self
+                .services
+                .playlists
+                .upcoming(&actor, &id, limit)
+                .await
+                .map(|mut entries| {
+                    if !liked_listed {
+                        entries.iter_mut().for_each(|e| e.liked = false);
+                    }
+                    Reply::PlaylistUpcoming { entries }
+                })
+                .map_err(playlists_error),
+            Request::SetPlaylistSettings {
+                id,
+                shuffle,
+                repeat,
+                skip_watched,
+            } => self
+                .services
+                .playlists
+                .set_settings(
+                    &actor,
+                    &id,
+                    spoolframe_protocol::playlists::PlaySettings {
+                        shuffle,
+                        repeat,
+                        skip_watched,
+                    },
+                )
+                .await
+                .map(|()| Reply::Done)
                 .map_err(playlists_error),
             Request::ImportPlexPlaylists { dry_run } => {
                 let user = local(&who)?;

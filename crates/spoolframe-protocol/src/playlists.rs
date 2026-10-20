@@ -396,7 +396,8 @@ pub enum Repeat {
     Off,
     /// The same entry, over and over.
     One,
-    /// The whole playlist: a new round after the last entry.
+    /// The whole playlist again after the last entry; shuffled, the same
+    /// round again.
     All,
     /// A kind this build does not know: played as `Off`.
     #[serde(other)]

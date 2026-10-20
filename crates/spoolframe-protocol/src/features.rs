@@ -87,6 +87,14 @@ pub const SUBTITLE_SYNC: &str = "spoolframe:subtitle-sync";
 /// `download`, and the requests are `Unsupported`.
 pub const SUBTITLE_SEARCH: &str = "spoolframe:subtitle-search";
 
+/// What comes up in a playlist, and its settings saved alone, on top of
+/// [`PLAYLISTS`]: the `UpcomingInPlaylist` request (`PlaylistUpcoming`,
+/// the entries `NextInPlaylist` would give, in turn) and
+/// `SetPlaylistSettings` (shuffle, repeat and skip watched kept, playing
+/// nothing). A session whose client did not list it gets `Unsupported`
+/// for both.
+pub const PLAYLIST_UPCOMING: &str = "spoolframe:playlist-upcoming";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,
@@ -97,6 +105,7 @@ pub const ALL: &[&str] = &[
     PLAYLIST_ART,
     SUBTITLE_SYNC,
     SUBTITLE_SEARCH,
+    PLAYLIST_UPCOMING,
 ];
 
 /// The ones that change what a client can do before it has a session:
@@ -163,6 +172,12 @@ mod tests {
     fn subtitle_sync_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&SUBTITLE_SYNC));
         assert!(!PRE_AUTH.contains(&SUBTITLE_SYNC));
+    }
+
+    #[test]
+    fn playlist_upcoming_is_a_feature_and_not_pre_auth() {
+        assert!(ALL.contains(&PLAYLIST_UPCOMING));
+        assert!(!PRE_AUTH.contains(&PLAYLIST_UPCOMING));
     }
 
     #[test]

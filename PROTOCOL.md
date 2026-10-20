@@ -42,8 +42,9 @@ must be updated together. The changes per revision are in
 - [Home rows and "Remove"](#home-rows-and-remove)
 - [Leaving a server](#leaving-a-server)
 - [Features](#features), [playlists](#playlists),
-  [sharing by name](#sharing-by-name), [Liked and All](#liked-and-all)
-  and [playlist covers](#playlist-covers)
+  [sharing by name](#sharing-by-name), [Liked and All](#liked-and-all),
+  [playlist covers](#playlist-covers) and
+  [up next in a playlist](#up-next-in-a-playlist)
 - [Portable identities](#portable-identities)
 
 ## Basics
@@ -1559,13 +1560,22 @@ asks the server what comes next:
   credits for an episode (PX-06), or was skipped.
 - Unavailable entries are passed, and with `skip_watched` watched ones
   (not the one chosen with `from`, resumed, or repeated).
-- `repeat: one` plays the same entry again; `all` starts a new round
-  after the last. With `shuffle`, a round is a shuffled order of every
-  entry, each once; `from` starts a new round with that entry first.
-  Entries added during a round play at its end.
+- `repeat: one` plays the same entry again; `all` plays the playlist
+  again after the last entry.
+- With `shuffle`, a round is a shuffled order of every entry, each once.
+  The server shuffles once each time shuffle is turned on, and keeps
+  that round while it stays on: `repeat: all` plays the same round
+  again, and so does a play after the end. A round made when shuffle is
+  turned on starts at the entry that plays (the user's place, or the
+  top's first), so the whole playlist is ahead. Picking an entry
+  (`from`) while shuffling shuffles again, with that entry first.
+  Entries added during a round go to a random place among the entries
+  not played yet; entries taken out leave it. Shuffle turned off goes
+  back to the playlist's order, from the entry playing.
 - `PlaylistFinished` when nothing is left: the end with repeat off, or
   no entry that can be played. The place is cleared, so the next
-  `PlayPlaylist` starts at the top; the settings are kept.
+  `PlayPlaylist` starts at the top (of the same round, when shuffling);
+  the settings are kept.
 
 Both are mutations (they move the place), never sent again on a new
 connection.
@@ -1880,6 +1890,50 @@ bytes)` uploads (`SdkError::NotAllowed`, `ImageTooLarge { max_bytes,
 max_pixels }`, `ImageUnreadable`) and answers the new `ArtworkId`;
 `Session::remove_playlist_art(id)` answers the `PlaylistSummary`. Both
 are `SdkError::Unsupported`, unsent, without the feature.
+
+## Up next in a playlist
+
+Feature `spoolframe:playlist-upcoming`, on top of
+`spoolframe:playlists`. What plays next in a playlist, without playing
+it, and the play settings saved alone.
+
+| Request | Reply | Who |
+|---|---|---|
+| `UpcomingInPlaylist { id, limit }` | `PlaylistUpcoming { entries }` | who sees it |
+| `SetPlaylistSettings { id, shuffle, repeat, skip_watched }` | `Done` | who sees it |
+
+`UpcomingInPlaylist` lists at most `limit` entries (100 at most;
+`MAX_UPCOMING`) after the user's place, each a `PlaylistEntry` (its
+`unavailable` always false): the first is what `NextInPlaylist` after
+the place would give, and each one after is what it would give after the
+one before. So it follows the shuffled round while shuffling, else the
+playlist's order; it goes round from the start again with `repeat:
+all`, and stops at the end otherwise; with `repeat: one` it is the
+place's entry alone, which `NextInPlaylist` gives again and again.
+Unavailable entries are passed, and with `skip_watched` watched ones, as
+playing passes them. With no place (never played, or played to the end),
+it starts at the top: what `PlayPlaylist` without `from` would play
+first, and on from there. An entry added to the playlist while
+shuffling gets its place in the round the first time either request or
+playing sees it, so the list does not change between reads.
+
+`SetPlaylistSettings` keeps the settings as `PlayPlaylist` would, and
+plays nothing: the place stays, and so does the shuffled round while
+shuffle stays on. Shuffle turned on shuffles anew, starting at the place
+(or the top, with none), so the whole playlist is ahead; turned off, the
+playlist's order, from the place. A client uses it for its shuffle and
+repeat buttons, where `PlayPlaylist` would start playing.
+
+Both are sent again on a new connection: the first is a read, the
+second saves the same settings twice as once. A session whose client did
+not list the feature gets `Unsupported` for both. A client without it
+uses `PlayPlaylist` as before.
+
+The SDK: `Features::playlist_upcoming`;
+`Session::upcoming_in_playlist(id, limit)` answers the
+`Vec<PlaylistEntry>`, and `Session::set_playlist_settings(id,
+settings)` takes a `PlaySettings`. Both are `SdkError::Unsupported`,
+unsent, without the feature.
 
 ## Subtitle sync and offset
 
