@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.1 (2026-10-20)
+
 - Optimized versions (PX-37) are now off by default.
   `optimized { enabled = true; }` turns them on, and so does the setup
   wizard's Playback step or Settings › Playback (after a restart). With
