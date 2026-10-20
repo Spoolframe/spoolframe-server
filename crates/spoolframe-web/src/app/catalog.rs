@@ -279,6 +279,13 @@ pub fn CatalogLibrary(
                         "{header_line(&lib, now)}"
                     }
                 }
+                if lib.kind != LibraryKind::Music {
+                    super::optimized::OptimizeButton {
+                        kind: spoolframe_admin_api::OptimizedScopeKind::Library,
+                        id: lib.id.clone(),
+                        name: lib.name.clone(),
+                    }
+                }
                 span { class: "cat-readonly", icons::Eye { size: 13 } "Read-only · fix matches in Plex" }
             }
             div { class: "cat-tools",

@@ -3223,3 +3223,53 @@ fn audio_from_a_copy_comes_after_a_subtitle_file() {
     let args = ffmpeg_args(&spec).unwrap();
     assert!(has(&args, &["-map", "2:1", "-c:a", "copy"]), "{args:?}");
 }
+
+/// A copy's stored video and audio (PX-37's track store): the film first,
+/// then the video, then the audio, each mapped from its own input.
+#[test]
+fn a_stored_video_and_audio_are_mapped_from_their_own_inputs() {
+    let (mut film, enc) = (film_with_copy_audio(), encoders(false));
+    film.video.as_mut().unwrap().index = 0;
+    film.audio[0].index = 0;
+    let mut spec = spec(&film, &enc, COPY_HEVC, COPY_EAC3, None, progressive());
+    spec.inputs.video = Some(Path::new("/job/video"));
+    spec.inputs.audio = Some(Path::new("/job/audio"));
+    let args = ffmpeg_args(&spec).unwrap();
+    assert!(
+        has(&args, &["-i", "/job/video", "-i", "/job/audio"])
+            && has(&args, &["-map", "1:0", "-c:v", "copy"])
+            && has(&args, &["-map", "2:0", "-c:a", "copy"]),
+        "{args:?}"
+    );
+}
+
+/// A stored track keeps the film's times: every input keeps its own.
+#[test]
+fn a_run_reading_a_stored_track_keeps_every_input_s_times() {
+    let (film, enc) = (film_with_copy_audio(), encoders(false));
+    let mut spec = spec(
+        &film,
+        &enc,
+        TONE_MAPPED_H264,
+        COPY_EAC3,
+        None,
+        progressive(),
+    );
+    spec.inputs.audio = Some(Path::new("/job/audio"));
+    assert!(ffmpeg_args(&spec).unwrap().iter().any(|a| a == "-copyts"));
+}
+
+#[test]
+fn a_stored_video_is_never_encoded() {
+    let (film, enc) = (film_with_copy_audio(), encoders(false));
+    let mut spec = spec(
+        &film,
+        &enc,
+        TONE_MAPPED_H264,
+        COPY_EAC3,
+        None,
+        progressive(),
+    );
+    spec.inputs.video = Some(Path::new("/job/video"));
+    assert!(ffmpeg_args(&spec).is_err());
+}

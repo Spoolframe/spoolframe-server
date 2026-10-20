@@ -256,6 +256,12 @@ fn host_ipv6_is_gone() -> ConfigError {
     }
 }
 
+/// `optimized.enabled`, 0.13's switch, renamed `optimized.binge_ahead` in
+/// 0.14.0 with no alias (the user's decision, 2026-10-20): it turned
+/// playback from copies on too, which is now always on, so reading it as
+/// the new key would change what an admin set.
+const OPTIMIZED_ENABLED: &str = "optimized.enabled";
+
 /// A layer's document as a table: `schema` checked and taken out, and the
 /// keys only the provided file may have refused anywhere else. A gone key
 /// in the provided file (`written_by_hand`) is refused; in the runtime
@@ -281,6 +287,14 @@ fn layer(
         return Err(in_file(ConfigError::Invalid {
             key: "admin.allow_remote",
             message: "is gone: the admin listener takes any address now (P3-10); remove it".into(),
+        }));
+    }
+    if tree::get(&table, OPTIMIZED_ENABLED).is_some() {
+        return Err(in_file(ConfigError::Invalid {
+            key: OPTIMIZED_ENABLED,
+            message: "is now optimized.binge_ahead, and only turns binge-ahead on: playback \
+                      always plays from the copies there are. Rename it, or remove it"
+                .into(),
         }));
     }
     if tree::get(&table, HOST_IPV6).is_some() {
@@ -587,7 +601,7 @@ impl Layers {
         if let Some(state_dir) = self.runtime_path.parent() {
             config
                 .optimized
-                .settings(state_dir)
+                .place(state_dir)
                 .map_err(SettingError::Invalid)?;
         }
         Ok(config)
@@ -1016,14 +1030,12 @@ mod tests {
             bare.previews.settings().unwrap()
         );
         assert_eq!(
-            documented.optimized.settings(dir).unwrap(),
-            bare.optimized.settings(dir).unwrap()
+            documented.optimized.place(dir).unwrap(),
+            bare.optimized.place(dir).unwrap()
         );
-        // Off in both, so the settings above say nothing of the size.
-        assert!(!documented.optimized.enabled());
         assert_eq!(
-            documented.optimized.max_size_mb,
-            Some(crate::config::OptimizedConfig::DEFAULT_MAX_SIZE_MB)
+            documented.optimized.binge_ahead(),
+            bare.optimized.binge_ahead()
         );
         assert_eq!(documented.admin.metrics(), bare.admin.metrics());
         assert_eq!(
@@ -1436,6 +1448,25 @@ mod tests {
             "/etc/spoolframe.ucl: invalid config: admin.allow_remote: is gone: the admin \
              listener takes any address now (P3-10); remove it"
         );
+    }
+
+    #[test]
+    fn optimized_enabled_is_refused_naming_binge_ahead() {
+        let err = layers(Some("optimized { enabled = true; }"), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/etc/spoolframe.ucl: invalid config: optimized.enabled: is now \
+             optimized.binge_ahead, and only turns binge-ahead on: playback always plays from \
+             the copies there are. Rename it, or remove it"
+        );
+    }
+
+    /// 0.13.1's wizard saved it in the runtime layer: refused there too,
+    /// as the rename has no alias.
+    #[test]
+    fn optimized_enabled_the_wizard_saved_is_refused_too() {
+        let err = layers(None, Some("optimized { enabled = false; }")).unwrap_err();
+        assert!(err.to_string().contains("optimized.binge_ahead"), "{err}");
     }
 
     #[test]

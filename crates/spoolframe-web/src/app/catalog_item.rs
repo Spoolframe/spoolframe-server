@@ -165,6 +165,9 @@ fn Page(
                     super::playlists::HeartButton { id: id.clone(), heart, kind, title: title.clone(), word: true, on_changed: on_reload }
                 }
                 super::playlists::AddToPlaylist { item: item.clone() }
+                if let Some(scope) = crate::optimized::scope_of(kind) {
+                    super::optimized::OptimizeButton { kind: scope, id: id.clone(), name: title.clone() }
+                }
                 if let Some(link) = &seen.open_in_plex {
                     a { class: "btn shrink-0", href: "{link}", target: "_blank", rel: "noopener noreferrer",
                         icons::ExternalLink { size: 14 }

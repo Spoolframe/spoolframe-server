@@ -1133,18 +1133,21 @@ impl PreviewsConfig {
     }
 }
 
-/// `optimized { enabled = true; dir = "…"; max_size_mb = 102400; }`
-/// (PX-37), all optional: whether the server keeps converted copies at
-/// all (it does not unless told to), where the pool of them is kept, and
-/// the most it may hold.
+/// `optimized { binge_ahead = true; dir = "…"; max_size_mb = 102400; }`
+/// (PX-37), all optional: whether the server makes the next episode
+/// ahead while someone watches (it does not unless told to), where the
+/// pool of copies is kept, and the most it may hold. The pool always
+/// runs: downloads (PX-38) and the admin's on-demand requests make their
+/// copies in it, and playback plays from every copy it has made.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct OptimizedConfig {
-    /// Off if left out: the server keeps no copy and makes none, ahead or
-    /// on request. A pool fills its limit on its own while shows are
-    /// binged, so it is the admin's choice.
+    /// Off if left out: binge-ahead fills the pool on its own while
+    /// shows are binged, so it is the admin's choice. It is the only
+    /// switch (the user's decision, 2026-10-20): 0.13's `enabled` is
+    /// refused, naming this.
     #[ucl(default)]
-    pub enabled: Option<bool>,
+    pub binge_ahead: Option<bool>,
     /// `state_dir/optimized` if left out.
     #[ucl(default)]
     pub dir: Option<PathBuf>,
@@ -1153,11 +1156,15 @@ pub struct OptimizedConfig {
     pub max_size_mb: Option<u64>,
 }
 
-/// The pool's place and size, read from [`OptimizedConfig`].
+/// The pool's place and size, read from [`OptimizedConfig`], and
+/// whether the server makes the next episode ahead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptimizedSettings {
     pub dir: PathBuf,
     pub max_size_bytes: u64,
+    /// `optimized.binge_ahead`: off, the pool drops at start the
+    /// binge-ahead copies a server that had it on left unmade.
+    pub binge_ahead: bool,
 }
 
 impl OptimizedConfig {
@@ -1165,20 +1172,18 @@ impl OptimizedConfig {
     /// about 10 GiB.
     pub const DEFAULT_MAX_SIZE_MB: u64 = 100 * 1024;
 
-    /// Whether the pool is on.
-    pub fn enabled(&self) -> bool {
-        self.enabled.unwrap_or(false)
+    /// Whether the server makes the next episode ahead while someone
+    /// watches.
+    pub fn binge_ahead(&self) -> bool {
+        self.binge_ahead.unwrap_or(false)
     }
 
-    /// The settings, with `state_dir` for the default directory; `None`
-    /// unless the pool is on, so a caller cannot forget that it may be
-    /// off. When on, a size of 0 and a directory that is the state
-    /// directory or holds it are refused: the media sandbox hides the
-    /// state directory and would not show the copies in it.
-    pub fn settings(&self, state_dir: &Path) -> Result<Option<OptimizedSettings>, ConfigError> {
-        if !self.enabled() {
-            return Ok(None);
-        }
+    /// The pool's place and size, with `state_dir` for the default
+    /// directory. A size of 0 and a
+    /// directory that is the state directory or holds it are refused: the
+    /// media sandbox hides the state directory and would not show the
+    /// copies in it.
+    pub fn place(&self, state_dir: &Path) -> Result<OptimizedSettings, ConfigError> {
         let max_size_mb = self.max_size_mb.unwrap_or(Self::DEFAULT_MAX_SIZE_MB);
         if max_size_mb == 0 {
             return Err(ConfigError::Invalid {
@@ -1200,10 +1205,11 @@ impl OptimizedConfig {
                 ),
             });
         }
-        Ok(Some(OptimizedSettings {
+        Ok(OptimizedSettings {
             dir,
             max_size_bytes: max_size_mb << 20,
-        }))
+            binge_ahead: self.binge_ahead(),
+        })
     }
 }
 
@@ -2803,7 +2809,7 @@ impl ServerConfig {
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
         parsed.previews.settings()?;
-        parsed.optimized.settings(Path::new("/"))?;
+        parsed.optimized.place(Path::new("/"))?;
         parsed.logs.buffer_lines()?;
         parsed.telemetry.otlp.settings()?;
         parsed.http_playback.settings()?;
@@ -4837,59 +4843,78 @@ mod tests {
 
     fn on(optimized: &str) -> Result<ServerConfig, ConfigError> {
         plex(&format!(
-            "{PLEX}optimized {{ enabled = true; {optimized} }}"
+            "{PLEX}optimized {{ binge_ahead = true; {optimized} }}"
         ))
     }
 
     #[test]
-    fn the_optimized_pool_is_off_when_left_out() {
+    fn binge_ahead_is_off_when_left_out() {
         let default = plex(PLEX).unwrap();
-        assert_eq!(default.optimized.settings(Path::new("/s")).unwrap(), None);
+        assert!(!default.optimized.binge_ahead());
         // Its other keys alone do not turn it on.
         let sized = plex(&format!("{PLEX}optimized {{ max_size_mb = 64; }}")).unwrap();
-        assert_eq!(sized.optimized.settings(Path::new("/s")).unwrap(), None);
+        assert!(!sized.optimized.binge_ahead());
     }
 
     #[test]
-    fn the_optimized_pool_is_on_with_enabled_and_under_the_state_dir_unless_set() {
-        let settings = on("").unwrap().optimized.settings(Path::new("/s")).unwrap();
-        let settings = settings.expect("on");
+    fn binge_ahead_is_read() {
+        assert!(on("").unwrap().optimized.binge_ahead());
+    }
+
+    /// The pool serves downloads and on-demand requests with binge-ahead
+    /// off.
+    #[test]
+    fn the_optimized_pool_has_a_place_when_off() {
+        let default = plex(PLEX).unwrap();
+        let place = default.optimized.place(Path::new("/s")).unwrap();
+        assert_eq!(place.dir, Path::new("/s/optimized"));
+    }
+
+    #[test]
+    fn the_optimized_pool_is_under_the_state_dir_unless_set() {
+        let settings = on("").unwrap().optimized.place(Path::new("/s")).unwrap();
         assert_eq!(settings.dir, Path::new("/s/optimized"));
         assert_eq!(settings.max_size_bytes, 100 << 30);
         let elsewhere = on(r#"dir = "/srv/copies";"#)
             .unwrap()
             .optimized
-            .settings(Path::new("/s"))
-            .unwrap()
-            .expect("on");
+            .place(Path::new("/s"))
+            .unwrap();
         assert_eq!(elsewhere.dir, Path::new("/srv/copies"));
     }
 
     #[test]
     fn the_optimized_pool_size_is_read_in_mib() {
         let config = on("max_size_mb = 64;").unwrap();
-        let settings = config.optimized.settings(Path::new("/s")).unwrap();
-        assert_eq!(settings.unwrap().max_size_bytes, 64 << 20);
+        let settings = config.optimized.place(Path::new("/s")).unwrap();
+        assert_eq!(settings.max_size_bytes, 64 << 20);
     }
 
+    /// The pool always runs: its size counts with binge-ahead off.
     #[test]
-    fn an_optimized_pool_of_nothing_is_refused_when_on() {
-        assert!(matches!(
+    fn an_optimized_pool_of_nothing_is_refused_on_or_off() {
+        for config in [
             on("max_size_mb = 0;"),
-            Err(ConfigError::Invalid {
-                key: "optimized.max_size_mb",
-                ..
-            })
-        ));
-        // Off, the size is not looked at.
-        plex(&format!("{PLEX}optimized {{ max_size_mb = 0; }}")).unwrap();
+            plex(&format!("{PLEX}optimized {{ max_size_mb = 0; }}")),
+        ] {
+            assert!(
+                matches!(
+                    config,
+                    Err(ConfigError::Invalid {
+                        key: "optimized.max_size_mb",
+                        ..
+                    })
+                ),
+                "{config:?}"
+            );
+        }
     }
 
     #[test]
     fn an_optimized_dir_that_is_or_holds_the_state_dir_is_refused() {
         for dir in ["/var/lib/sf", "/var/lib", "/"] {
             let config = on(&format!(r#"dir = "{dir}";"#));
-            let err = config.and_then(|c| c.optimized.settings(Path::new("/var/lib/sf")));
+            let err = config.and_then(|c| c.optimized.place(Path::new("/var/lib/sf")));
             assert!(
                 matches!(
                     err,

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use spoolframe_media::encoders::Encoders;
 use spoolframe_media::ocr::Ocr;
-use spoolframe_media::{AudioStream, SubtitleKind, SubtitleStream};
+use spoolframe_media::{AudioStream, SubtitleKind, SubtitleSource, SubtitleStream};
 use spoolframe_protocol::{PlaybackPlan, Quality};
 use spoolframe_types::{
     AudioCodec, AudioRole, BitmapPreference, ClientCapabilities, Container, Delivery, HdrFormat,
@@ -87,17 +87,36 @@ fn film() -> MediaDescriptor {
     }
 }
 
-/// A copy of [`film`] `height` lines tall at `bit_rate`, as the copy's
-/// probe describes it: no file beside it.
-fn copy(height: u32, bit_rate: u64) -> MediaDescriptor {
+/// A stored video file `height` lines tall at `bit_rate`, as its probe
+/// describes it: stream 0, alone.
+fn video_file(height: u32, bit_rate: u64) -> MediaDescriptor {
     MediaDescriptor {
         container: "matroska,webm".into(),
         duration: Some(Duration::from_secs(7000)),
         bit_rate: Some(bit_rate),
         video: Some(video(0, "h264", height)),
-        audio: vec![audio(1, "ac3")],
-        subtitles: vec![subtitle(SubtitleSource::Embedded { index: 2 }, "subrip")],
+        audio: Vec::new(),
+        subtitles: Vec::new(),
     }
+}
+
+/// A stored audio track in `codec`, as its probe describes it.
+fn audio_file(codec: &str) -> MediaDescriptor {
+    MediaDescriptor {
+        video: None,
+        audio: vec![AudioStream {
+            language: None,
+            default: false,
+            ..audio(0, codec)
+        }],
+        ..video_file(0, 640_000)
+    }
+}
+
+/// A copy of [`film`] with its video stored `height` lines tall at
+/// `bit_rate`, as the planner sees it.
+fn copy(height: u32, bit_rate: u64) -> MediaDescriptor {
+    built(&film(), Some(&video_file(height, bit_rate)), &[]).unwrap()
 }
 
 fn caps() -> ClientCapabilities {
@@ -179,10 +198,10 @@ fn the_height_next_under_1080_is_720() {
 }
 
 #[test]
-fn a_copy_under_the_cap_plays_directly_in_place_of_an_encode() {
+fn a_copy_under_the_cap_is_remuxed_in_place_of_an_encode() {
     assert_eq!(
         played(&chosen(&[copy(1080, 4_500_000)])),
-        Some((0, Kind::Direct))
+        Some((0, Kind::Remux))
     );
 }
 
@@ -239,7 +258,7 @@ fn a_copy_well_under_the_encode_s_height_is_not_played() {
 #[test]
 fn of_the_copies_that_fit_the_tallest_plays() {
     let copies = [copy(720, 2_500_000), copy(1080, 4_500_000)];
-    assert_eq!(played(&chosen(&copies)), Some((1, Kind::Direct)));
+    assert_eq!(played(&chosen(&copies)), Some((1, Kind::Remux)));
 }
 
 /// A 2160p HDR10 HEVC film at 40 Mbit/s: an H.264 device gets it tone
@@ -273,7 +292,7 @@ fn a_tone_mapped_copy_plays_to_a_device_that_shows_no_hdr() {
         caps(),
         CAPPED,
     );
-    assert_eq!(played(&choice), Some((0, Kind::Direct)));
+    assert_eq!(played(&choice), Some((0, Kind::Remux)));
 }
 
 #[test]
@@ -281,61 +300,51 @@ fn auto_over_hls_stays_a_ladder() {
     let auto = Quality::Auto {
         link_bitrate: Some(6_000_000),
     };
-    let mut aac = copy(1080, 4_500_000);
-    aac.audio = vec![audio(1, "aac")];
     let mut film = film();
     film.audio = vec![audio(1, "aac")];
+    let aac = built(&film, Some(&video_file(1080, 4_500_000)), &[]).unwrap();
     let choice = chosen_with(&film, &[aac], Selection::default(), hls_caps(), auto);
     assert_eq!(choice, Choice::Source);
 }
 
 #[test]
-fn a_copy_whose_audio_is_in_another_language_does_not_line_up() {
-    let mut french = copy(1080, 4_500_000);
-    french.audio[0].language = Some("fre".into());
-    assert!(aligned(&film(), &french).is_none());
-}
-
-/// [`film`] with a teletext track first, which copies leave out.
-fn film_with_teletext() -> MediaDescriptor {
-    let mut film = film();
-    film.subtitles.insert(
-        0,
-        subtitle(SubtitleSource::Embedded { index: 3 }, "dvb_teletext"),
+fn a_copy_is_never_played_directly() {
+    let choice = chosen(&[copy(1080, 4_500_000)]);
+    assert!(
+        !matches!(
+            choice,
+            Choice::Copy {
+                plan: PlaybackPlan::Direct { .. },
+                ..
+            }
+        ),
+        "{choice:?}"
     );
-    film
 }
 
 #[test]
-fn a_picked_track_the_copy_left_out_plays_from_the_film() {
+fn a_stored_audio_track_stands_in_its_source_s_place_named_as_it() {
+    let copy = built(&film(), None, &[(1, &audio_file("eac3"))]).unwrap();
+    let track = &copy.audio[0];
+    assert_eq!(
+        (track.codec.as_str(), track.index, track.language.as_deref()),
+        ("eac3", 0, Some("eng"))
+    );
+}
+
+#[test]
+fn a_stored_track_for_a_stream_the_film_does_not_have_is_no_copy() {
+    assert!(built(&film(), None, &[(7, &audio_file("eac3"))]).is_none());
+}
+
+#[test]
+fn a_picked_embedded_subtitle_plays_from_the_film_beside_the_copy() {
     let picked = Selection {
         audio: None,
         subtitle: Some(0),
     };
-    let choice = chosen_with(
-        &film_with_teletext(),
-        &[copy(1080, 4_500_000)],
-        picked,
-        caps(),
-        CAPPED,
-    );
-    assert_eq!(choice, Choice::Source);
-}
-
-#[test]
-fn a_direct_copy_whose_picked_subtitle_moved_in_the_file_is_not_played() {
-    let picked = Selection {
-        audio: None,
-        subtitle: Some(1),
-    };
-    let choice = chosen_with(
-        &film_with_teletext(),
-        &[copy(1080, 4_500_000)],
-        picked,
-        caps(),
-        CAPPED,
-    );
-    assert_eq!(choice, Choice::Source);
+    let choice = chosen_with(&film(), &[copy(1080, 4_500_000)], picked, caps(), CAPPED);
+    assert_eq!(played(&choice), Some((0, Kind::Remux)));
 }
 
 #[test]
@@ -345,7 +354,7 @@ fn a_subtitle_file_beside_the_film_plays_beside_its_copy() {
         subtitle: Some(1),
     };
     let choice = chosen_with(&film(), &[copy(1080, 4_500_000)], picked, caps(), CAPPED);
-    assert_eq!(played(&choice), Some((0, Kind::Direct)));
+    assert_eq!(played(&choice), Some((0, Kind::Remux)));
 }
 
 /// [`film`] with DTS, which the device does not play.
@@ -357,9 +366,12 @@ fn dts_film() -> MediaDescriptor {
 
 /// A copy too short to stand in for the video, its DTS made AAC.
 fn short_aac_copy() -> MediaDescriptor {
-    let mut short = copy(240, 400_000);
-    short.audio = vec![audio(1, "aac")];
-    short
+    built(
+        &dts_film(),
+        Some(&video_file(240, 400_000)),
+        &[(1, &audio_file("aac"))],
+    )
+    .unwrap()
 }
 
 /// The audio a choice takes from a copy, and the plan's action for it.

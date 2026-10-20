@@ -533,9 +533,15 @@ pub struct Services {
     pub subtitle_timings: Arc<crate::subtitle_sync::SubtitleTimings>,
     /// Subtitles downloaded from OpenSubtitles on demand (PX-02).
     pub subtitle_downloads: Arc<crate::subtitle_downloads::SubtitleDownloads>,
-    /// The optimized copies (PX-37), which a playback may play in place of
-    /// an encode; `None` plays none.
+    /// The optimized copies (PX-37), which a playback plays in place of
+    /// an encode whenever one fits; `None` plays none. The server always
+    /// gives it.
     pub optimized: Option<Arc<crate::optimized::Pool>>,
+    /// `optimized.binge_ahead`: an episode's playback has the pool make
+    /// the next one ahead.
+    pub binge_ahead: bool,
+    /// Downloads (PX-38), with the pool they use.
+    pub downloads: Arc<crate::downloads::Downloads>,
     /// Frame previews for scrubbing (P3-13).
     pub previews: Arc<crate::previews::Previews>,
     /// Keyframes read ahead of any play (`experimental.index_ahead`).

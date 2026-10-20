@@ -1599,9 +1599,9 @@ fn PlaybackFields(
     let mut no_gpu = use_signal(
         || matches!(value(&settings, "transcode.gpus"), Some(Value::Array(list)) if list.is_empty()),
     );
-    // PX-37: off unless turned on; the limit in GiB and the directory
-    // matter only when on.
-    let mut optimized_on = use_signal(|| flag(&settings, "optimized.enabled"));
+    // PX-37: binge-ahead is off unless turned on; the limit in GiB and
+    // the directory apply either way.
+    let mut optimized_on = use_signal(|| flag(&settings, "optimized.binge_ahead"));
     let optimized_size = use_signal(|| {
         setup::optimized_size_text(text(&settings, "optimized.max_size_mb").parse().ok())
     });
@@ -2058,34 +2058,32 @@ fn PlaybackFields(
                     class: "switch mt-0.5",
                     role: "switch",
                     aria_checked: "{optimized_on()}",
-                    aria_label: "Keep optimized versions",
-                    disabled: locked(&settings, "optimized.enabled"),
+                    aria_label: "Make the next episode ahead while someone watches",
+                    disabled: locked(&settings, "optimized.binge_ahead"),
                     onclick: move |_| optimized_on.toggle(),
                 }
                 span { class: "choice-what",
-                    b { "Keep optimized versions" }
+                    b { "Make the next episode ahead while someone watches" }
                     "{setup::OPTIMIZED_NOTE} Off by default."
                 }
             }
-            Note { settings: settings.clone(), setting: "optimized.enabled", on_changed: move |_| on_reload.call(()) }
-            if optimized_on() {
-                div { class: "limits",
-                    div { class: "flex flex-col gap-1.5",
-                        Limit { label: "Most to keep", value: optimized_size, unit: "GiB", disabled: locked(&settings, "optimized.max_size_mb") }
-                        span { class: "text-xs text-ctp-subtext0", "Default 100 GiB · the least recently used go first" }
-                        Note { settings: settings.clone(), setting: "optimized.max_size_mb", on_changed: move |_| on_reload.call(()) }
-                    }
-                    label { class: "field",
-                        "Directory"
-                        input {
-                            placeholder: "the server's state directory, optimized",
-                            value: "{optimized_dir}",
-                            disabled: locked(&settings, "optimized.dir"),
-                            oninput: move |e| optimized_dir.set(e.value()),
-                        }
-                    }
-                    Note { settings: settings.clone(), setting: "optimized.dir", on_changed: move |_| on_reload.call(()) }
+            Note { settings: settings.clone(), setting: "optimized.binge_ahead", on_changed: move |_| on_reload.call(()) }
+            div { class: "limits",
+                div { class: "flex flex-col gap-1.5",
+                    Limit { label: "Most to keep", value: optimized_size, unit: "GiB", disabled: locked(&settings, "optimized.max_size_mb") }
+                    span { class: "text-xs text-ctp-subtext0", "Default 100 GiB · the least recently used go first" }
+                    Note { settings: settings.clone(), setting: "optimized.max_size_mb", on_changed: move |_| on_reload.call(()) }
                 }
+                label { class: "field",
+                    "Directory"
+                    input {
+                        placeholder: "the server's state directory, optimized",
+                        value: "{optimized_dir}",
+                        disabled: locked(&settings, "optimized.dir"),
+                        oninput: move |e| optimized_dir.set(e.value()),
+                    }
+                }
+                Note { settings: settings.clone(), setting: "optimized.dir", on_changed: move |_| on_reload.call(()) }
             }
         }
         if let Some(text) = error() {

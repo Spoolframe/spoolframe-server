@@ -490,15 +490,19 @@ previews {
 # for playback that would otherwise encode. Each copy is a whole film or
 # episode in one profile, with every audio and text track.
 #
-# Off by default: with it on, the server keeps up to max_size_mb of
-# converted copies, and makes them on its own while shows are binged.
+# The pool always runs: downloads, and an admin's on-demand requests
+# (Optimize… on a film, episode, season, show or library), make their
+# copies here, and playback plays from every copy made.
 optimized {
-  enabled = false;
+  # Make the next episode ahead while someone watches one that is
+  # converted, so it plays from a copy. Off by default: it fills the pool
+  # on its own while shows are binged.
+  binge_ahead = false;
   # Where the copies are kept; the state directory's optimized if left out.
   # dir = "/srv/spoolframe/optimized";
   # The most they may take, in MiB. Over it, copies of edited profiles go
   # first, then binge-ahead ones, then the least recently used; one being
-  # read stays.
+  # read stays, and so does one a pinned on-demand request wants.
   max_size_mb = 102400;
 }
 

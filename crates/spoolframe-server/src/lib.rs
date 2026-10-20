@@ -18,6 +18,7 @@ pub mod config;
 pub mod connected;
 pub mod covers;
 pub mod device_sign_in;
+pub mod downloads;
 pub mod encode;
 mod events;
 pub mod files;

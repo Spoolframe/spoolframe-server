@@ -274,10 +274,11 @@ in {
         not_proxied = true;
       }
 
-      # Optimized versions (PX-37), off by default. 16 GiB on nimble: its
-      # root disk is shared with the build dirs and has filled before.
+      # Optimized versions (PX-37): binge-ahead is off by default. 16 GiB
+      # on nimble: its root disk is shared with the build dirs and has
+      # filled before.
       optimized {
-        enabled = true;
+        binge_ahead = true;
         max_size_mb = 16384;
       }
 

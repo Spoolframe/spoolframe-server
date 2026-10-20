@@ -1,12 +1,12 @@
 //! What Server › Optimized (PX-37) asks of the pool: its place and
-//! budget, what the budget counts, who reads a copy, and "Delete them
-//! now" for outdated copies.
+//! budget, what the budget counts, who reads a copy or track, and
+//! "Delete them now" for outdated copies.
 
 use std::path::Path;
 
 use super::{Deleted, Pool};
 use crate::store::StoreError;
-use crate::store::optimized::{CopyRow, CopyTarget};
+use crate::store::optimized::CopyTarget;
 
 /// What [`Pool::delete_outdated`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,14 +28,15 @@ impl Pool {
         self.inner.max_size
     }
 
-    /// What the budget counts of `copies` (the store's rows): the copies
-    /// made, and the one being made at what it is written to or expected
-    /// to grow to, whichever is more, as the sweep counts them.
-    pub async fn used_bytes(&self, copies: &[CopyRow]) -> u64 {
-        self.inner.used_bytes(copies).await
+    /// What the budget counts: the tracks made, and the one being made at
+    /// what it is written to or expected to grow to, whichever is more, as
+    /// the sweep counts them.
+    pub async fn used_bytes(&self) -> Result<u64, StoreError> {
+        let tracks = self.inner.store.optimized_tracks().await?;
+        Ok(self.inner.used(&tracks).await)
     }
 
-    /// Whether copy `id` is lent to a reader now.
+    /// Whether copy or track `id` is lent to a reader now.
     pub fn is_read(&self, id: &str) -> bool {
         self.inner.state.lock().leases.contains_key(id)
     }
@@ -51,7 +52,7 @@ impl Pool {
             let wanted = match (&copy.target, profile) {
                 (_, None) => true,
                 (CopyTarget::Profile(name), Some(profile)) => name == profile,
-                (CopyTarget::Ahead, Some(_)) => false,
+                (CopyTarget::Ahead | CopyTarget::Original { .. }, Some(_)) => false,
             };
             if !copy.outdated || !wanted {
                 continue;

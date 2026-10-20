@@ -475,9 +475,10 @@ pub fn ocr_note(on: bool, found: bool) -> &'static str {
     }
 }
 
-/// What the Playback step says under "Optimized versions" (PX-37).
-pub const OPTIMIZED_NOTE: &str = "Converted copies the server keeps and plays from, made on its \
-     own while shows are binged, up to the limit.";
+/// What the Playback step says under "Make the next episode ahead" (PX-37).
+pub const OPTIMIZED_NOTE: &str = "While someone watches, the server converts the next episode \
+     too. Copies are kept within the optimized budget below, and playback always uses the \
+     copies that exist.";
 
 /// The size limit the field starts with, in GiB: the server's default.
 pub const OPTIMIZED_DEFAULT_GIB: &str = "100";
@@ -488,19 +489,15 @@ pub fn optimized_size_text(max_size_mb: Option<i64>) -> String {
     max_size_mb.map_or_else(|| OPTIMIZED_DEFAULT_GIB.to_owned(), gib)
 }
 
-/// The settings the "Optimized versions" choice saves: `optimized.enabled`
-/// always; with it on, the size limit and the directory too. A blank size
-/// or directory takes the runtime value out, so the server's default
-/// applies. Off, the size and the directory are left as they are.
+/// The settings the "Optimized versions" choice saves: `optimized.binge_ahead`,
+/// the size limit and the directory. A blank size or directory takes the
+/// runtime value out, so the server's default applies.
 pub fn optimized_changes(
     on: bool,
     size_gib: &str,
     dir: &str,
 ) -> Result<Vec<(&'static str, Option<serde_json::Value>)>, String> {
-    let mut changes = vec![("optimized.enabled", Some(serde_json::json!(on)))];
-    if !on {
-        return Ok(changes);
-    }
+    let mut changes = vec![("optimized.binge_ahead", Some(serde_json::json!(on)))];
     let size = match size_gib.trim() {
         "" => None,
         typed => Some(serde_json::json!(mib(typed).ok_or(
@@ -1101,12 +1098,16 @@ mod tests {
     }
 
     #[test]
-    fn optimized_versions_start_at_100_gib_and_save_only_the_switch_when_off() {
+    fn optimized_versions_start_at_100_gib_and_save_the_limit_with_binge_ahead_off() {
         assert_eq!(optimized_size_text(None), "100");
         assert_eq!(optimized_size_text(Some(16384)), "16");
         assert_eq!(
             optimized_changes(false, "7", "/srv/x").unwrap(),
-            vec![("optimized.enabled", Some(json!(false)))]
+            vec![
+                ("optimized.binge_ahead", Some(json!(false))),
+                ("optimized.max_size_mb", Some(json!(7168))),
+                ("optimized.dir", Some(json!("/srv/x"))),
+            ]
         );
     }
 
@@ -1115,7 +1116,7 @@ mod tests {
         assert_eq!(
             optimized_changes(true, " 16 ", " /srv/copies ").unwrap(),
             vec![
-                ("optimized.enabled", Some(json!(true))),
+                ("optimized.binge_ahead", Some(json!(true))),
                 ("optimized.max_size_mb", Some(json!(16384))),
                 ("optimized.dir", Some(json!("/srv/copies"))),
             ]
@@ -1124,7 +1125,7 @@ mod tests {
         assert_eq!(
             optimized_changes(true, "", "").unwrap(),
             vec![
-                ("optimized.enabled", Some(json!(true))),
+                ("optimized.binge_ahead", Some(json!(true))),
                 ("optimized.max_size_mb", None),
                 ("optimized.dir", None),
             ]
@@ -1137,8 +1138,8 @@ mod tests {
             assert!(optimized_changes(true, size, "").is_err(), "{size}");
         }
         assert!(optimized_changes(true, "10", "copies").is_err());
-        // Off, nothing typed is looked at.
-        assert!(optimized_changes(false, "0", "copies").is_ok());
+        // The pool always runs: binge-ahead off does not excuse them.
+        assert!(optimized_changes(false, "0", "copies").is_err());
     }
 
     #[test]

@@ -2,8 +2,6 @@
 //! handles, and how their output is read.
 
 pub mod args;
-pub(crate) mod copy_args;
-pub(crate) mod copy_run;
 pub mod hls;
 pub mod job;
 pub mod pick;
@@ -11,6 +9,8 @@ mod plan;
 mod run;
 #[cfg(test)]
 mod segment_muxer_tests;
+pub(crate) mod track_args;
+pub(crate) mod track_run;
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -93,7 +93,9 @@ pub struct Conversion {
     file: PathBuf,
     input: PathBuf,
     sidecar: Option<PathBuf>,
-    /// The link to the optimized copy its audio is taken from (PX-37).
+    /// The link to a copy's stored video it plays (PX-37).
+    video_from: Option<PathBuf>,
+    /// The link to a copy's stored audio track it plays (PX-37).
     audio_from: Option<PathBuf>,
     descriptor: Arc<MediaDescriptor>,
     pub delivery: Delivery,
@@ -218,8 +220,11 @@ const SEGMENTS_AHEAD: u32 = 3;
 pub struct ConversionSource<'a> {
     pub handle: &'a str,
     pub path: &'a Path,
-    /// An optimized copy the picked audio is taken from, as it is there
-    /// (PX-37): `descriptor`'s track for it is the copy's.
+    /// A copy's stored video (PX-37's track store), copied: `descriptor`'s
+    /// video is its.
+    pub video_from: Option<&'a Path>,
+    /// A copy's stored audio track the picked audio is, as it is there
+    /// (PX-37): `descriptor`'s track for it is its.
     pub audio_from: Option<&'a Path>,
     pub descriptor: Arc<MediaDescriptor>,
     pub plan: &'a PlaybackPlan,
@@ -318,14 +323,16 @@ impl Conversion {
                     }
                     _ => None,
                 };
-            let audio_from = match source.audio_from {
-                Some(copy) => {
-                    let link = dir.join("audio");
-                    std::os::unix::fs::symlink(absolute(copy)?, &link).map_err(prepare)?;
-                    Some(link)
+            let stored = |file: Option<&Path>, name: &str| match file {
+                Some(file) => {
+                    let link = dir.join(name);
+                    std::os::unix::fs::symlink(absolute(file)?, &link).map_err(prepare)?;
+                    Ok(Some(link))
                 }
-                None => None,
+                None => Ok(None),
             };
+            let video_from = stored(source.video_from, "video")?;
+            let audio_from = stored(source.audio_from, "audio")?;
             let segments = match delivery {
                 Delivery::Hls => {
                     let total =
@@ -393,6 +400,7 @@ impl Conversion {
                     inputs: Inputs {
                         film: &input,
                         sidecar: sidecar.as_deref(),
+                        video: video_from.as_deref(),
                         audio: audio_from.as_deref(),
                     },
                     descriptor: &source.descriptor,
@@ -417,6 +425,7 @@ impl Conversion {
                 Inputs {
                     film: &input,
                     sidecar: sidecar.as_deref(),
+                    video: video_from.as_deref(),
                     audio: audio_from.as_deref(),
                 },
                 &source.descriptor,
@@ -444,6 +453,7 @@ impl Conversion {
                 file: source.path.to_path_buf(),
                 input,
                 sidecar,
+                video_from,
                 audio_from,
                 descriptor: source.descriptor,
                 delivery: *delivery,
@@ -777,6 +787,7 @@ impl Conversion {
         Inputs {
             film: &self.input,
             sidecar: self.sidecar.as_deref(),
+            video: self.video_from.as_deref(),
             audio: self.audio_from.as_deref(),
         }
     }
@@ -1274,6 +1285,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,
@@ -1619,6 +1631,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,
@@ -1708,6 +1721,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,
@@ -1824,6 +1838,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,
@@ -1951,6 +1966,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,
@@ -2077,6 +2093,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,
@@ -2212,6 +2229,7 @@ pub(crate) mod tests {
                 trace: crate::playback::PlaybackTrace::untraced(),
                 handle: "h1",
                 path: &film,
+                video_from: None,
                 audio_from: None,
                 descriptor,
                 plan: &plan,

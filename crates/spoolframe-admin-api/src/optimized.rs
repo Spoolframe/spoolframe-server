@@ -1,5 +1,6 @@
 //! Server › Optimized (PX-37): the profiles copies are made in, the pool
-//! of copies against its budget, and the copy being made.
+//! of copies against its budget, the copy being made, and the on-demand
+//! requests an admin made for an item, a season, a show or a library.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,9 @@ pub struct OptimizedProfileWritten {
     /// Its copies now outdated, as its video changed: never played or
     /// downloaded again, and the first to go.
     pub outdated: u64,
+    /// The items of its on-demand requests queued again, to be made with
+    /// its new video.
+    pub requeued: u64,
 }
 
 /// Where a copy is in its making.
@@ -75,6 +79,31 @@ pub struct OptimizedCopy {
     pub last_used_at: i64,
     /// How far it is, for the one copy being made now.
     pub progress: Option<OptimizedProgress>,
+    /// The tracks it stores (the track store): each converted stream a
+    /// file of its own. Its other tracks are read from the media file.
+    /// Empty for a copy that converts nothing.
+    #[serde(default)]
+    pub tracks: Vec<OptimizedTrack>,
+    /// A pinned on-demand request wants it: it is never evicted.
+    pub pinned: bool,
+}
+
+/// One stored track of a copy: a converted stream in a file of its own,
+/// shared by every copy that needs it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizedTrack {
+    pub id: String,
+    /// `video` or `audio`.
+    pub kind: String,
+    /// What it is converted to: `h264 1080p 4000 kbit/s`, `eac3 6 ch
+    /// 640 kbit/s`.
+    pub label: String,
+    pub state: OptimizedCopyState,
+    /// Its file's size, once made.
+    pub size_bytes: Option<u64>,
+    /// Another copy is made with it too.
+    pub shared: bool,
 }
 
 /// How far the copy being made is.
@@ -101,8 +130,72 @@ pub struct OptimizedOverview {
     /// In the order the admin put them.
     pub profiles: Vec<OptimizedProfile>,
     /// In the order they would be evicted: outdated first, then `ahead`,
-    /// then the least recently used.
+    /// then the least recently used. Pinned ones are never evicted.
     pub copies: Vec<OptimizedCopy>,
+    /// The on-demand requests, newest first.
+    pub requests: Vec<OptimizedRequest>,
+}
+
+/// What an on-demand request covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OptimizedScopeKind {
+    /// One film or episode.
+    Item,
+    /// Every episode of a season.
+    Season,
+    /// Every episode of a show, specials too.
+    Show,
+    /// Every film of a film library, or every episode of a show library.
+    Library,
+}
+
+/// An item, season, show or library, by its id: a media id
+/// (`plex:movie:1`) or, for a library, a library id (`plex:1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizedScope {
+    pub kind: OptimizedScopeKind,
+    pub id: String,
+}
+
+/// What `optimizedRequestPut` asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizedRequestPut {
+    pub scope: OptimizedScope,
+    /// A profile's name.
+    pub profile: String,
+    /// Its copies are never evicted, and count against the budget until
+    /// the request is deleted or unpinned.
+    pub pinned: bool,
+}
+
+/// An on-demand request: a kept rule that makes a copy, in its profile,
+/// of each film or episode its scope holds, and of each one the scope
+/// gains later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizedRequest {
+    pub id: String,
+    pub scope: OptimizedScope,
+    /// The scope as the pages name it (`Alien`, `The Expanse · Season 1`,
+    /// `Movies`), when the catalog answered in time.
+    pub title: Option<String>,
+    pub profile: String,
+    pub pinned: bool,
+    /// The admin who asked, by username; `None` for one since removed.
+    pub created_by: Option<String>,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// The films and episodes it covers now.
+    pub items: u64,
+    /// Of those, the ones whose copy is made.
+    pub done: u64,
+    /// Of those, the ones whose copy could not be made.
+    pub failed: u64,
+    /// The made copies' tracks together.
+    pub size_bytes: u64,
 }
 
 /// What `optimizedOutdatedDelete` did.
@@ -142,9 +235,17 @@ mod tests {
             max_size_bytes: 2,
             profiles: Vec::new(),
             copies: Vec::new(),
+            requests: Vec::new(),
         };
         let json = serde_json::to_value(&overview).unwrap();
-        for field in ["dir", "usedBytes", "maxSizeBytes", "profiles", "copies"] {
+        for field in [
+            "dir",
+            "usedBytes",
+            "maxSizeBytes",
+            "profiles",
+            "copies",
+            "requests",
+        ] {
             let mut without = json.clone();
             without.as_object_mut().unwrap().remove(field);
             assert!(
@@ -165,6 +266,21 @@ mod tests {
         assert_eq!(
             serde_json::to_value(OptimizedCopyDeleted::NotFound).unwrap(),
             "notFound"
+        );
+    }
+
+    /// The web UI names a request's scope as the server reads it.
+    #[test]
+    fn a_scope_reads_as_its_kind_and_id() {
+        let scope: OptimizedScope =
+            serde_json::from_value(serde_json::json!({"kind": "season", "id": "plex:season:11"}))
+                .unwrap();
+        assert_eq!(
+            scope,
+            OptimizedScope {
+                kind: OptimizedScopeKind::Season,
+                id: "plex:season:11".into()
+            }
         );
     }
 }

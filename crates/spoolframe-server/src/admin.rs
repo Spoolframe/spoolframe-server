@@ -537,8 +537,9 @@ pub struct Admin {
     /// What MCP's library and playlist tools read (PX-42); `None` in
     /// tests without, where those tools say so.
     pub library: Option<crate::mcp::Library>,
-    /// The optimized copies (PX-37), for Server › Optimized; `None` in
-    /// tests without, where its methods are `NOT_CONFIGURED`.
+    /// The optimized copies (PX-37), for Server › Optimized and on-demand
+    /// requests: the pool, which always runs; `None` in tests without,
+    /// where its methods are `NOT_CONFIGURED`.
     pub optimized: Option<Arc<crate::optimized::Pool>>,
 }
 
@@ -4339,6 +4340,38 @@ impl AdminApiServer for AdminApi {
     ) -> RpcResult<spoolframe_admin_api::OptimizedCopyDeleted> {
         let admin = self.admin(ext).await?;
         self.delete_optimized_copy(&admin, &id).await
+    }
+
+    async fn optimized_request_put(
+        &self,
+        ext: &Extensions,
+        request: spoolframe_admin_api::OptimizedRequestPut,
+    ) -> RpcResult<spoolframe_admin_api::OptimizedRequest> {
+        let admin = self.admin(ext).await?;
+        self.put_optimized_request(&admin, request).await
+    }
+
+    async fn optimized_requests(
+        &self,
+        ext: &Extensions,
+    ) -> RpcResult<Vec<spoolframe_admin_api::OptimizedRequest>> {
+        self.admin(ext).await?;
+        self.optimized_request_views().await
+    }
+
+    async fn optimized_request_delete(&self, ext: &Extensions, id: String) -> RpcResult<bool> {
+        let admin = self.admin(ext).await?;
+        self.delete_optimized_request(&admin, &id).await
+    }
+
+    async fn optimized_request_pin(
+        &self,
+        ext: &Extensions,
+        id: String,
+        pinned: bool,
+    ) -> RpcResult<spoolframe_admin_api::OptimizedRequest> {
+        let admin = self.admin(ext).await?;
+        self.pin_optimized_request(&admin, &id, pinned).await
     }
 }
 

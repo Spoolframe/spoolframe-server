@@ -27,7 +27,8 @@ pub use spoolframe_types::{
 mod optimized;
 pub use optimized::{
     OptimizedCopy, OptimizedCopyDeleted, OptimizedCopyState, OptimizedDeleted, OptimizedOverview,
-    OptimizedProfile, OptimizedProfileWritten, OptimizedProgress,
+    OptimizedProfile, OptimizedProfileWritten, OptimizedProgress, OptimizedRequest,
+    OptimizedRequestPut, OptimizedScope, OptimizedScopeKind, OptimizedTrack,
 };
 
 /// JSON-RPC error codes the admin API returns, beside the standard ones.
@@ -4491,6 +4492,40 @@ pub trait AdminApi {
         &self,
         id: String,
     ) -> jsonrpsee::core::RpcResult<OptimizedCopyDeleted>;
+
+    /// Optimize `request.scope` in `request.profile` on demand (PX-37): a
+    /// kept rule, its films and episodes queued behind live playback and
+    /// downloads, and those its scope gains later too. The same scope and
+    /// profile again is the same request, its pin set as asked.
+    /// `INVALID_INPUT`, saying why, for no such profile, an id of another
+    /// kind, a music library, or a pinned request the budget cannot hold
+    /// beside the pinned ones; `UNAVAILABLE` when the catalog cannot say
+    /// what the scope holds.
+    #[method(name = "optimizedRequestPut", with_extensions)]
+    async fn optimized_request_put(
+        &self,
+        request: OptimizedRequestPut,
+    ) -> jsonrpsee::core::RpcResult<OptimizedRequest>;
+
+    /// The on-demand requests, newest first, with how far each is (PX-37).
+    #[method(name = "optimizedRequests", with_extensions)]
+    async fn optimized_requests(&self) -> jsonrpsee::core::RpcResult<Vec<OptimizedRequest>>;
+
+    /// Delete on-demand request `id` (PX-37): no new item is queued for
+    /// it, and its copies are no longer pinned by it; they stay, evicted
+    /// as any other copy. Whether it was there.
+    #[method(name = "optimizedRequestDelete", with_extensions)]
+    async fn optimized_request_delete(&self, id: String) -> jsonrpsee::core::RpcResult<bool>;
+
+    /// Pin or unpin on-demand request `id` (PX-37). `INVALID_INPUT` for
+    /// no such request, or a pin the budget cannot hold beside the
+    /// pinned ones.
+    #[method(name = "optimizedRequestPin", with_extensions)]
+    async fn optimized_request_pin(
+        &self,
+        id: String,
+        pinned: bool,
+    ) -> jsonrpsee::core::RpcResult<OptimizedRequest>;
 }
 
 /// What was `serde(default)` before PX-15 is required: a server and a web

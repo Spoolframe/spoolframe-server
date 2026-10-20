@@ -24,6 +24,7 @@ use spoolframe_server::config::layers::{DEFAULTS, Layers, Locations};
 use spoolframe_server::config::secrets::Secrets;
 use spoolframe_server::config::{ServerConfig, WatchSyncConfig};
 use spoolframe_server::connected::Connected;
+use spoolframe_server::downloads::Downloads;
 use spoolframe_server::encode::job::Jobs;
 use spoolframe_server::identity;
 use spoolframe_server::index_ahead::{IndexAhead, IndexAheadSources};
@@ -706,7 +707,7 @@ fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<Comp
 /// credentials, with no GPU's device nodes: a run on a GPU is given its
 /// one card's (PGPU-05, `Transcoding`). The optimized copies, which are
 /// in the state directory unless `optimized.dir` says otherwise, are read
-/// as media (PX-37), when they are on.
+/// as media (PX-37): the pool always runs.
 fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
     let mut hidden = vec![state_dir.to_path_buf()];
     hidden.extend(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from));
@@ -715,10 +716,7 @@ fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
         hidden,
         sandbox::GpuDevices::default(),
     )?;
-    Ok(match config.optimized.settings(state_dir)? {
-        Some(copies) => sandbox.showing(vec![copies.dir])?,
-        None => sandbox,
-    })
+    Ok(sandbox.showing(vec![config.optimized.place(state_dir)?.dir])?)
 }
 
 /// Shows the media tools confined here, in this service's own sandbox
@@ -1019,29 +1017,33 @@ async fn run(
         Err(e) => tracing::warn!(error = %e, "cannot restore the downloaded subtitles"),
     }
     // Optimized versions (PX-37): what a stopped server was making is made
-    // again, from the start.
-    // Off unless the config turns it on: no pool, no copies made.
-    let optimized = match config.optimized.settings(state_dir)? {
-        Some(settings) => Some(Arc::new(
-            Pool::start(
-                PoolSources {
-                    store: store.clone(),
-                    jobs: jobs.clone(),
-                    transcoding: transcoding.clone(),
-                    prober: prober.clone(),
-                },
-                &settings,
+    // again, from the start. The pool always runs: downloads (PX-38) and
+    // the admin's on-demand requests make their copies in it, and playback
+    // plays from every copy made (the user's decision, 2026-10-20).
+    // `optimized.binge_ahead` only says whether the next episode is made
+    // ahead.
+    let place = config.optimized.place(state_dir)?;
+    let pool = Arc::new(
+        Pool::start(
+            PoolSources {
+                store: store.clone(),
+                jobs: jobs.clone(),
+                transcoding: transcoding.clone(),
+                prober: prober.clone(),
+                catalog: catalog.clone(),
+                catalog_changes: Some(live.changes()),
+            },
+            &place,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "cannot prepare the optimized versions in {}",
+                place.dir.display()
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot prepare the optimized versions in {}",
-                    settings.dir.display()
-                )
-            })?,
-        )),
-        None => None,
-    };
+        })?,
+    );
+    let downloads = Arc::new(Downloads::new(pool.clone()));
     store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(
@@ -1285,7 +1287,7 @@ async fn run(
                 watch: watch.clone(),
                 playlists: playlists.clone(),
             }),
-            optimized: optimized.clone(),
+            optimized: Some(pool.clone()),
         },
         admin_origins,
         admin_proxies,
@@ -1327,7 +1329,9 @@ async fn run(
             subtitles,
             subtitle_timings: subtitle_timings.clone(),
             subtitle_downloads,
-            optimized: optimized.clone(),
+            optimized: Some(pool.clone()),
+            binge_ahead: config.optimized.binge_ahead(),
+            downloads,
             previews,
             index_ahead,
             metrics,
@@ -1382,9 +1386,7 @@ async fn run(
     // export can still send it.
     jobs.stop_all();
     // The copy being made, too: the next start makes it again.
-    if let Some(optimized) = &optimized {
-        optimized.stop();
-    }
+    pool.stop();
     within(SHUTDOWN_STEP, "the artwork cache", artwork_cache.close()).await;
     within(SHUTDOWN_STEP, "the previews cache", previews_cache.close()).await;
     // What is queued for the collector goes before the process does.

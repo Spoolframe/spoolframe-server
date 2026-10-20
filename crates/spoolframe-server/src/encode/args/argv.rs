@@ -21,14 +21,20 @@ pub fn ffmpeg_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
 /// What asks ffmpeg for its progress, on stdout, for the job to read.
 pub(crate) const PROGRESS_ARGS: [&str; 3] = ["-progress", "pipe:1", "-nostats"];
 
+/// What every run of ffmpeg starts with: no banner, no keyboard, an
+/// output there already overwritten, and only errors said.
+pub(crate) const QUIET_ARGS: [&str; 5] = ["-hide_banner", "-nostdin", "-y", "-loglevel", "error"];
+
+/// No version or random ids of ffmpeg's own in the output, so the same
+/// inputs make the same bytes.
+pub(crate) const BITEXACT_ARGS: [&str; 4] = ["-fflags", "+bitexact", "-flags", "+bitexact"];
+
 /// The first part of the arguments: ffmpeg's own options, the devices and
 /// decode, the inputs with their seeks, and the video's map, graph and
 /// encoder.
 pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, String> {
     let d = spec.descriptor;
-    let mut args: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-loglevel", "error"]
-        .map(s)
-        .to_vec();
+    let mut args: Vec<String> = QUIET_ARGS.map(s).to_vec();
 
     // The video encoder, if any: VA-API wants its device before the inputs.
     let encoder = match spec.video {
@@ -88,7 +94,8 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
         }
         args.extend([s("-i"), s(input.path.display())]);
     }
-    if spec.start.is_some() || input_index(spec, Input::Subtitle).is_some() {
+    if spec.start.is_some() || input_index(spec, Input::Subtitle).is_some() || spec.inputs.stored()
+    {
         // The film's own time, not 0, so the player shows where it is
         // and HLS segments line up with the playlist and the cues.
         // And for a subtitle file, burned in or kept as a stream: without
@@ -103,12 +110,17 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
     if spec.video.is_some() && d.video.is_none() {
         return Err(s("video: no such stream"));
     }
+    // A copy's stored video is copied as it is: an encode of it would be
+    // an encode of an encode.
+    if spec.inputs.video.is_some() && matches!(spec.video, Some(ConvertedVideo::Encode { .. })) {
+        return Err(s("video: a stored video is copied, not encoded"));
+    }
     if let (Some(video), Some(stream)) = (spec.video, &d.video) {
         match video {
             ConvertedVideo::Copy { .. } => {
                 args.extend([
                     s("-map"),
-                    format!("0:{}", stream.index),
+                    format!("{}:{}", video_input(spec), stream.index),
                     s("-c:v"),
                     s("copy"),
                 ]);
@@ -219,7 +231,9 @@ pub(crate) enum Input {
     Film,
     /// The subtitle file, burned in as pictures or kept as a stream.
     Subtitle,
-    /// The optimized copy the audio is taken from (PX-37).
+    /// An optimized copy's stored video (PX-37).
+    Video,
+    /// An optimized copy's stored audio track (PX-37).
     Audio,
 }
 
@@ -231,7 +245,7 @@ struct FfmpegInput {
 }
 
 /// ffmpeg's inputs in their `-i` order: the film, a subtitle file it
-/// reads ([`sidecar_input`]), then the copy the audio is taken from
+/// reads ([`sidecar_input`]), then a copy's stored video and audio track
 /// (PX-37), sought as the film is. Every input's number comes from this
 /// list ([`input_index`]), so a `-map` cannot name another's.
 fn ffmpeg_inputs(spec: &EncodeSpec<'_>) -> Vec<FfmpegInput> {
@@ -245,6 +259,13 @@ fn ffmpeg_inputs(spec: &EncodeSpec<'_>) -> Vec<FfmpegInput> {
             what: Input::Subtitle,
             path,
             sought,
+        });
+    }
+    if let Some(video) = spec.inputs.video {
+        inputs.push(FfmpegInput {
+            what: Input::Video,
+            path: video.to_path_buf(),
+            sought: true,
         });
     }
     if let Some(copy) = spec.inputs.audio {
@@ -295,10 +316,16 @@ fn sidecar_input(spec: &EncodeSpec<'_>) -> Option<(PathBuf, bool)> {
     }
 }
 
-/// The input the audio is read from: an optimized copy (PX-37), else
-/// the film, always ffmpeg's first.
+/// The input the audio is read from: a copy's stored track (PX-37),
+/// else the film, always ffmpeg's first.
 fn audio_input(spec: &EncodeSpec<'_>) -> usize {
     input_index(spec, Input::Audio).unwrap_or(0)
+}
+
+/// The input the video is read from: a copy's stored video (PX-37), else
+/// the film.
+fn video_input(spec: &EncodeSpec<'_>) -> usize {
+    input_index(spec, Input::Video).unwrap_or(0)
 }
 
 /// The rest, after [`input_video_args`]: the audio, a subtitle kept as a

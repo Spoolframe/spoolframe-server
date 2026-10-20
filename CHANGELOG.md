@@ -6,6 +6,52 @@
   page of it could take longer than a client waits, and timed out. Its
   tracks are listed once a minute, not at each page and play, so a
   newly scanned album shows in All within a minute.
+- Downloads groundwork (PX-38): the copy pool now always runs, for
+  downloads, and Server › Optimized always lists it. The
+  pool can make a download's copy in original quality for a device
+  class (Apple or Linux): the video copied as it is where the class
+  plays it, and only the audio the class cannot play converted. A
+  `max_size_mb` of 0 is now always refused.
+- Optimized versions keep tracks, not whole files (PX-37). Each
+  converted stream is a file of its own: one video file per video plan,
+  one file per converted audio track. Tracks kept as they are, the
+  subtitles, chapters and fonts are always read from the film. One
+  converted track serves every copy that needs it: a DTS track made
+  E-AC-3 for an Apple download is the same file `Mobile` plays, and a
+  4K film whose video is kept stores its audio alone. A copy is muxed
+  as it is read, which encodes nothing; it always plays remuxed, never
+  by range. Editing a profile outdates only its video file. The budget
+  and eviction (outdated first, then what only binge-ahead copies use,
+  then the least recently used) count track files; a track goes with
+  the copies made with it. Server › Optimized shows what each copy
+  stores and what it shares. **Upgrading drops the copies 0.13 made**:
+  they are a cache, and their files in `optimized.dir` are removed at
+  the first start; they are made again when asked for.
+- Optimize on demand (PX-37). An admin asks for a film, an episode, a
+  season, a show or a library to be optimized in a profile: Optimize…
+  on its page, or `optimizedRequestPut` in the admin API. Its tracks
+  are made in the pool behind live playback, downloads and binge-ahead,
+  and yield to live playback as every track does. A season, show or
+  library request is a kept rule: the episodes and films it gains later
+  are made too (looked for every hour and whenever the catalog
+  changes). A request is pinned or not: a pinned copy is never evicted
+  while its request stands, and a pin is refused, saying why, when the
+  pinned requests are expected to pass `optimized.max_size_mb`.
+  Deleting a request unpins its copies; they stay, evicted as any
+  other. Editing a profile's video makes its requests' copies again.
+  Server › Optimized lists the requests with how far each is, a pin
+  switch and Delete, and marks pinned copies. The admin API has
+  `optimizedRequestPut`, `optimizedRequests`, `optimizedRequestPin` and
+  `optimizedRequestDelete`; `optimizedOverview` lists `requests`, a copy
+  says whether it is `pinned`, and `optimizedProfilePut` says how many
+  items it `requeued`. The requests are kept in migration 0039.
+- **`optimized.enabled` is now `optimized.binge_ahead`**, with no
+  alias: a config or a runtime layer that still sets `enabled` is
+  refused at start, naming the new key. It only turns binge-ahead on
+  (off by default). Playback now always plays from the copies there
+  are, whatever it says, and the pool always runs. The setup wizard's
+  step says what it does: make the next episode ahead while someone
+  watches.
 
 ## 0.13.1 (2026-10-20)
 

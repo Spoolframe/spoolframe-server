@@ -3353,7 +3353,9 @@ impl ClientProtocol {
                     if let Some(admission) = admission {
                         admission.started(&handle.0, connection.stable_id());
                     }
-                    if let (Some(pool), Some(episode)) = (&self.services.optimized, binge) {
+                    if let (Some(pool), Some(episode), true) =
+                        (&self.services.optimized, binge, self.services.binge_ahead)
+                    {
                         crate::optimized::ahead::spawn(
                             pool,
                             &self.services.playbacks,
@@ -4769,7 +4771,7 @@ impl ClientProtocol {
         if copies.is_empty() {
             return film(plan);
         }
-        let described: Vec<&MediaDescriptor> = copies.iter().map(|(_, d)| &**d).collect();
+        let described: Vec<&MediaDescriptor> = copies.iter().map(|(_, d)| d).collect();
         let chosen = crate::optimized::play::choose(
             descriptor,
             &plan,
@@ -4777,20 +4779,19 @@ impl ClientProtocol {
             &described,
             |d, selection| self.plan(state, d, caps, quality, share, selection, bitmap, &encoders),
         );
-        let (at, chosen_plan, chosen_descriptor, source): (_, _, _, fn(CopyUse) -> Source) =
-            match chosen {
-                crate::optimized::play::Choice::Source => return film(plan),
-                crate::optimized::play::Choice::Copy {
-                    copy,
-                    plan,
-                    descriptor,
-                } => (copy, plan, descriptor, Source::WholeCopy),
-                crate::optimized::play::Choice::Audio {
-                    copy,
-                    plan,
-                    descriptor,
-                } => (copy, plan, descriptor, Source::AudioFrom),
-            };
+        let (at, chosen_plan, chosen_descriptor, whole) = match chosen {
+            crate::optimized::play::Choice::Source => return film(plan),
+            crate::optimized::play::Choice::Copy {
+                copy,
+                plan,
+                descriptor,
+            } => (copy, plan, descriptor, true),
+            crate::optimized::play::Choice::Audio {
+                copy,
+                plan,
+                descriptor,
+            } => (copy, plan, descriptor, false),
+        };
         let row = &copies[at].0;
         // Gone since it was described (evicted, deleted): the film.
         let lease = match pool.lease(&row.id).await {
@@ -4801,12 +4802,20 @@ impl ClientProtocol {
                 return film(plan);
             }
         };
-        let source = source(CopyUse::new(
-            lease,
-            &row.target,
-            &chosen_descriptor,
-            selection.subtitle,
-        ));
+        // The film's stream the picked audio is, which a stored track of
+        // the copy may stand in for.
+        let audio_stream = match &chosen_plan {
+            PlaybackPlan::Converted {
+                audio: Some(audio), ..
+            } => descriptor.audio.get(audio.index as usize).map(|t| t.index),
+            _ => None,
+        };
+        let used = CopyUse::new(lease, &row.target, whole, audio_stream);
+        let source = if whole {
+            Source::WholeCopy(used)
+        } else {
+            Source::AudioFrom(used)
+        };
         tracing::info!(
             copy = row.id,
             media = %path.display(),
@@ -4824,21 +4833,20 @@ impl ClientProtocol {
 
     /// The ready copies of the film at `path` (described as `source`) made
     /// from it as it is now that may play `plan` or lend it their audio
-    /// ([`crate::optimized::play::worth_describing`]), each with its file's
-    /// description, read at once. One that cannot be read is passed over,
-    /// and the film plays as planned.
+    /// ([`crate::optimized::play::worth_describing`]), each described as
+    /// the planner sees it: the film with its stored tracks in their
+    /// streams' places ([`crate::optimized::play::built`]), each track
+    /// read at once. One that cannot be read is passed over, and the film
+    /// plays as planned.
     async fn ready_copies(
         &self,
         pool: &crate::optimized::Pool,
         path: &Path,
         source: &MediaDescriptor,
         plan: &PlaybackPlan,
-    ) -> Vec<(crate::store::optimized::CopyRow, Arc<MediaDescriptor>)> {
-        let rows = match self
-            .store()
-            .ready_optimized_copies(&path.to_string_lossy())
-            .await
-        {
+    ) -> Vec<(crate::store::optimized::CopyRow, MediaDescriptor)> {
+        let store = self.store();
+        let rows = match store.ready_optimized_copies(&path.to_string_lossy()).await {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(media = %path.display(), error = %e, "cannot list the optimized copies");
@@ -4859,13 +4867,29 @@ impl ClientProtocol {
                     && crate::optimized::play::worth_describing(plan, source, &r.video)
             })
             .map(|row| async move {
-                match self.services.prober.describe(&pool.file(&row.id)).await {
-                    Ok(described) => Some((row, described)),
-                    Err(e) => {
-                        tracing::warn!(copy = row.id, error = %e, "cannot describe an optimized copy");
-                        None
+                let files = pool.files_of(&row.tracks);
+                let id = &row.id;
+                let describe = |file: PathBuf| async move {
+                    match self.services.prober.describe(&file).await {
+                        Ok(described) => Some(described),
+                        Err(e) => {
+                            tracing::warn!(copy = id, error = %e, "cannot describe an optimized copy's track");
+                            None
+                        }
                     }
+                };
+                let video = match files.video.clone() {
+                    Some(file) => Some(describe(file).await?),
+                    None => None,
+                };
+                let mut audio = Vec::new();
+                for (stream, file) in &files.audio {
+                    audio.push((*stream, describe(file.clone()).await?));
                 }
+                let audio: Vec<(u32, &MediaDescriptor)> =
+                    audio.iter().map(|(s, d)| (*s, &**d)).collect();
+                let built = crate::optimized::play::built(source, video.as_deref(), &audio)?;
+                Some((row, built))
             });
         futures_util::future::join_all(described)
             .await
@@ -4906,6 +4930,7 @@ impl ClientProtocol {
         Error,
     > {
         let (path, descriptor) = (planned.read_path(), &planned.descriptor);
+        let video_from = planned.source.video_from();
         let audio_from = planned.source.audio_from();
         Ok(match plan {
             PlaybackPlan::Direct { subtitle, .. } => {
@@ -5004,7 +5029,7 @@ impl ClientProtocol {
                         let (keyframes, from) = self
                             .services
                             .prober
-                            .keyframes_from(path)
+                            .keyframes_from(video_from.unwrap_or(path))
                             .await
                             .map_err(|e| {
                                 tracing::warn!(%id, error = %e, "cannot list keyframes");
@@ -5067,6 +5092,7 @@ impl ClientProtocol {
                     ConversionSource {
                         handle: &handle.0,
                         path,
+                        video_from,
                         audio_from,
                         descriptor: carried,
                         plan,

@@ -147,7 +147,7 @@ pub const SETTINGS: &[Setting] = &[
     live("previews.memory_mb"),
     live("previews.workers"),
     // The pool is built at start (PX-37).
-    restart("optimized.enabled"),
+    restart("optimized.binge_ahead"),
     restart("optimized.dir"),
     restart("optimized.max_size_mb"),
     live("logs.buffer_lines"),

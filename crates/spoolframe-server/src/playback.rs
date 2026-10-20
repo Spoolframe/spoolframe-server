@@ -480,32 +480,36 @@ impl Playback {
 
 /// What a playback reads (PX-37): the film, an optimized copy in its
 /// place, or the film with a copy's audio. Decided once, as it is
-/// planned; all else asks this.
+/// planned; all else asks this. A copy is the film and its stored tracks
+/// read together (the track store): direct play always reads the film.
 #[derive(Debug, Clone, Default)]
 pub enum Source {
     #[default]
     Film,
-    /// The copy plays in the film's place.
+    /// The copy plays in the film's place, remuxed.
     WholeCopy(CopyUse),
     /// The film plays, its audio taken from the copy.
     AudioFrom(CopyUse),
 }
 
 impl Source {
-    /// The file it reads, the film being at `film`.
+    /// The file it reads, the film being at `film`: always the film, as a
+    /// copy is never one file to read by range.
     pub fn read_path<'a>(&'a self, film: &'a std::path::Path) -> &'a std::path::Path {
+        film
+    }
+
+    /// The stored video it plays, if the copy gives it one.
+    pub fn video_from(&self) -> Option<&std::path::Path> {
         match self {
-            Self::WholeCopy(copy) => copy.lease.path(),
-            Self::Film | Self::AudioFrom(_) => film,
+            Self::WholeCopy(copy) => copy.video.as_deref(),
+            Self::Film | Self::AudioFrom(_) => None,
         }
     }
 
-    /// The copy the audio alone is taken from, if that is all it gives.
+    /// The stored audio track it plays, if the copy gives it one.
     pub fn audio_from(&self) -> Option<&std::path::Path> {
-        match self {
-            Self::AudioFrom(copy) => Some(copy.lease.path()),
-            Self::Film | Self::WholeCopy(_) => None,
-        }
+        self.copy().and_then(|copy| copy.audio.as_deref())
     }
 
     /// The copy lent, either way.
@@ -521,14 +525,13 @@ impl Source {
         self.copy().map(|copy| copy.lease.id())
     }
 
-    /// The tracks it takes from its copy, if any.
+    /// The tracks it takes from its copy, if any: its stored ones.
     pub fn tracks(&self) -> Option<CopyTracks> {
         let copy = self.copy()?;
-        let whole = matches!(self, Self::WholeCopy(_));
         Some(CopyTracks {
-            video: whole,
-            audio: copy.audio,
-            subtitle: whole && copy.embedded_subtitle,
+            video: self.video_from().is_some(),
+            audio: copy.audio.is_some(),
+            subtitle: false,
         })
     }
 
@@ -543,40 +546,35 @@ impl Source {
     }
 }
 
-/// An optimized copy a playback plays from (PX-37), lent to it.
+/// An optimized copy a playback plays from (PX-37), lent to it with
+/// every track it is made of.
 #[derive(Debug, Clone)]
 pub struct CopyUse {
     lease: Arc<crate::optimized::Lease>,
     /// Its profile's name, or `ahead`.
     target: String,
-    /// It has audio, which plays.
-    audio: bool,
-    /// The subtitle picked is one of its streams: played from it when
-    /// the copy plays whole.
-    embedded_subtitle: bool,
+    /// Its stored video, when it plays in the film's place with one.
+    video: Option<std::path::PathBuf>,
+    /// Its stored track for the picked audio, if that one is stored.
+    audio: Option<std::path::PathBuf>,
 }
 
 impl CopyUse {
-    /// `lease`d copy made for `target`, described as `descriptor`, with
-    /// `subtitle` picked.
+    /// `lease`d copy made for `target`, playing its stored video if
+    /// `whole`, and its stored track for the film's audio stream
+    /// `audio` (a stream index), if it has one.
     pub fn new(
         lease: crate::optimized::Lease,
         target: &crate::store::optimized::CopyTarget,
-        descriptor: &spoolframe_media::MediaDescriptor,
-        subtitle: Option<u32>,
+        whole: bool,
+        audio: Option<u32>,
     ) -> Self {
+        let files = lease.files();
         Self {
+            video: files.video.clone().filter(|_| whole),
+            audio: audio.and_then(|stream| files.audio.get(&stream).cloned()),
+            target: target.label(),
             lease: Arc::new(lease),
-            target: match target {
-                crate::store::optimized::CopyTarget::Profile(name) => name.clone(),
-                crate::store::optimized::CopyTarget::Ahead => "ahead".to_owned(),
-            },
-            audio: !descriptor.audio.is_empty(),
-            embedded_subtitle: subtitle
-                .and_then(|s| descriptor.subtitles.get(s as usize))
-                .is_some_and(|t| {
-                    matches!(t.source, spoolframe_media::SubtitleSource::Embedded { .. })
-                }),
         }
     }
 }

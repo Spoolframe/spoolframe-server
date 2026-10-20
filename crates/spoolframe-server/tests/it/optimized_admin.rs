@@ -10,11 +10,12 @@ use jsonrpsee::core::ClientError;
 use jsonrpsee::ws_client::WsClient;
 use spoolframe_admin_api::{
     AdminApiClient, MeApiClient, NewUser, OptimizedCopyDeleted, OptimizedCopyState,
-    OptimizedDeleted, OptimizedOverview, OptimizedProfile, OptimizedProfileWritten, Role,
-    error_code,
+    OptimizedDeleted, OptimizedOverview, OptimizedProfile, OptimizedProfileWritten,
+    OptimizedRequestPut, OptimizedScope, OptimizedScopeKind, Role, error_code,
 };
 use spoolframe_server::admin::{self, Admin, Origins, SetupCode, TrustedProxies};
-use spoolframe_server::store::optimized::{CopyRow, CopyTarget, CopyVideo, NewCopy};
+use spoolframe_server::downloads::DeviceClass;
+use spoolframe_server::store::optimized::{CopyRow, CopyTarget, CopyVideo, NewCopy, Recipe};
 use spoolframe_types::VideoCodec;
 
 use crate::admin::{CODE, admin, anonymous, code, creds, setup, with_token};
@@ -26,6 +27,7 @@ const MOBILE: CopyVideo = CopyVideo {
     height: 1080,
     max_bitrate: Some(4_000_000),
     tone_map: false,
+    copied: false,
 };
 
 /// A server, and an admin API beside it on its pool: root's client.
@@ -52,25 +54,36 @@ async fn beside(test: &str) -> (TestServer, WsClient, SocketAddr) {
     (server, with_token(addr, &root.token).await, addr)
 }
 
-/// The movie's file at `path`, made for `profile` and `size` bytes long.
+/// The movie's file at `path`, made for `profile`: its video track alone,
+/// `size` bytes long, a video of the profile's own (no two profiles'
+/// copies share a track).
 async fn made(server: &TestServer, path: &str, profile: &str, size: u64) -> CopyRow {
+    let video = CopyVideo {
+        height: 100 + profile.len() as u32,
+        ..MOBILE
+    };
     let (row, _) = server
         .store
-        .request_optimized_copy(&NewCopy {
-            media_id: movie().id().to_string(),
-            media_path: path.to_owned(),
-            source_stamp: "1000:1".into(),
-            target: CopyTarget::Profile(profile.to_owned()),
-            video: MOBILE,
-        })
+        .request_optimized_copy(
+            &NewCopy {
+                media_id: movie().id().to_string(),
+                media_path: path.to_owned(),
+                source_stamp: "1000:1".into(),
+                target: CopyTarget::Profile(profile.to_owned()),
+                video,
+            },
+            &[Recipe::Video(video)],
+        )
         .await
         .unwrap();
-    server
-        .store
-        .optimized_copy_ready(&row.id, size)
-        .await
-        .unwrap();
-    row
+    for track in server.store.optimized_copy_tracks(&row.id).await.unwrap() {
+        server
+            .store
+            .optimized_track_ready(&track.id, size)
+            .await
+            .unwrap();
+    }
+    server.store.optimized_copy(&row.id).await.unwrap().unwrap()
 }
 
 fn profile(name: &str, codec: &str, height: u32, max_bitrate: u64) -> OptimizedProfile {
@@ -172,13 +185,14 @@ async fn a_server_without_the_pool_says_so() {
     assert_eq!(code(err), error_code::NOT_CONFIGURED);
 }
 
-/// A server started with the pool off, as by default, has none to show.
+/// A server with binge-ahead off, as by default, still runs the
+/// pool for downloads (PX-38), and the page lists their copies.
 #[tokio::test]
-async fn a_server_started_with_the_pool_off_answers_not_configured() {
+async fn with_binge_ahead_off_the_overview_lists_a_download_s_copy() {
     let server = TestServer::start_with(
         crate::support::fresh_dir("opt-admin-off").await,
         crate::support::ServerOptions {
-            optimized: false,
+            binge_ahead: false,
             ..Default::default()
         },
     )
@@ -186,7 +200,8 @@ async fn a_server_started_with_the_pool_off_answers_not_configured() {
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
         Admin {
-            optimized: server.optimized.clone(),
+            // As the server wires it: the pool, always.
+            optimized: Some(server.pool().clone()),
             ..admin(server.auth.clone(), Some(SetupCode::new(CODE)))
         },
         Origins::default(),
@@ -201,8 +216,29 @@ async fn a_server_started_with_the_pool_off_answers_not_configured() {
         .await
         .unwrap();
     let root = with_token(addr, &root.token).await;
-    let err = root.optimized_overview().await.unwrap_err();
-    assert_eq!(code(err), error_code::NOT_CONFIGURED);
+    server
+        .store
+        .request_optimized_copy(
+            &NewCopy {
+                media_id: movie().id().to_string(),
+                media_path: "/media/alien.mkv".into(),
+                source_stamp: "1000:1".into(),
+                target: CopyTarget::Original {
+                    class: DeviceClass::Apple,
+                },
+                video: CopyVideo {
+                    copied: true,
+                    max_bitrate: None,
+                    ..MOBILE
+                },
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+    let overview = root.optimized_overview().await.unwrap();
+    let targets: Vec<_> = overview.copies.into_iter().map(|c| c.target).collect();
+    assert_eq!(targets, ["original (Apple)"]);
     server.stop().await;
 }
 
@@ -251,7 +287,8 @@ async fn a_new_profile_is_added_last() {
         written,
         OptimizedProfileWritten {
             created: true,
-            outdated: 0
+            outdated: 0,
+            requeued: 0
         }
     );
     let overview = root.optimized_overview().await.unwrap();
@@ -275,7 +312,8 @@ async fn editing_a_profile_s_video_outdates_its_copies() {
         written,
         OptimizedProfileWritten {
             created: false,
-            outdated: 1
+            outdated: 1,
+            requeued: 0
         }
     );
     let overview = root.optimized_overview().await.unwrap();
@@ -387,5 +425,190 @@ async fn delete_them_now_leaves_a_copy_being_read_to_its_reader() {
             vec![copy.id]
         )
     );
+    server.stop().await;
+}
+
+/// An on-demand request for the fake catalog's film in `profile`.
+fn for_the_film(profile: &str, pinned: bool) -> OptimizedRequestPut {
+    OptimizedRequestPut {
+        scope: OptimizedScope {
+            kind: OptimizedScopeKind::Item,
+            id: movie().id().to_string(),
+        },
+        profile: profile.into(),
+        pinned,
+    }
+}
+
+/// `Tiny`: about 97 MB for the film's 117 minutes, which a 1 GiB pool
+/// holds pinned.
+fn tiny() -> OptimizedProfile {
+    profile("Tiny", "h264", 144, 100_000)
+}
+
+#[tokio::test]
+async fn an_on_demand_request_reads_back_named_with_its_item_and_admin() {
+    let (server, root, _) = beside("opt-admin-request").await;
+    let put = root
+        .optimized_request_put(for_the_film("Mobile", false))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            put.scope.clone(),
+            put.title.as_deref(),
+            put.profile.as_str(),
+            put.pinned,
+            put.created_by.as_deref(),
+            put.items
+        ),
+        (
+            for_the_film("Mobile", false).scope,
+            Some("Alien"),
+            "Mobile",
+            false,
+            Some("root"),
+            1
+        )
+    );
+    let listed = root.optimized_requests().await.unwrap();
+    let overview = root.optimized_overview().await.unwrap();
+    assert_eq!(
+        (
+            listed.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            overview.requests.iter().map(|r| &r.id).collect::<Vec<_>>()
+        ),
+        (vec![&put.id], vec![&put.id])
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn the_same_scope_and_profile_again_is_the_same_request() {
+    let (server, root, _) = beside("opt-admin-request-again").await;
+    root.optimized_profile_put(tiny()).await.unwrap();
+    let first = root
+        .optimized_request_put(for_the_film("Tiny", false))
+        .await
+        .unwrap();
+    let again = root
+        .optimized_request_put(for_the_film("Tiny", true))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            again.id == first.id,
+            again.pinned,
+            root.optimized_requests().await.unwrap().len()
+        ),
+        (true, true, 1)
+    );
+    server.stop().await;
+}
+
+/// `Mobile`'s film is about 3.9 GB: the server's 1 GiB pool cannot hold
+/// it pinned, and says so.
+#[tokio::test]
+async fn a_pin_the_budget_cannot_hold_is_refused_saying_why() {
+    let (server, root, _) = beside("opt-admin-request-budget").await;
+    let (code, message) = refusal(
+        root.optimized_request_put(for_the_film("Mobile", true))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        code == error_code::INVALID_INPUT
+            && message.contains("pinned copies would not fit the budget")
+            && message.contains("optimized.max_size_mb"),
+        "{code} {message}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_request_is_pinned_and_unpinned() {
+    let (server, root, _) = beside("opt-admin-request-pin").await;
+    root.optimized_profile_put(tiny()).await.unwrap();
+    let put = root
+        .optimized_request_put(for_the_film("Tiny", false))
+        .await
+        .unwrap();
+    let pinned = root
+        .optimized_request_pin(put.id.clone(), true)
+        .await
+        .unwrap();
+    let unpinned = root.optimized_request_pin(put.id, false).await.unwrap();
+    assert_eq!((pinned.pinned, unpinned.pinned), (true, false));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_deleted_request_is_gone_and_a_second_delete_says_so() {
+    let (server, root, _) = beside("opt-admin-request-delete").await;
+    let put = root
+        .optimized_request_put(for_the_film("Mobile", false))
+        .await
+        .unwrap();
+    let first = root.optimized_request_delete(put.id.clone()).await.unwrap();
+    let second = root.optimized_request_delete(put.id).await.unwrap();
+    assert_eq!(
+        (
+            first,
+            second,
+            root.optimized_requests().await.unwrap().len()
+        ),
+        (true, false, 0)
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_scope_of_the_wrong_kind_is_refused() {
+    let (server, root, _) = beside("opt-admin-request-kind").await;
+    let request = OptimizedRequestPut {
+        scope: OptimizedScope {
+            kind: OptimizedScopeKind::Season,
+            id: movie().id().to_string(),
+        },
+        ..for_the_film("Mobile", false)
+    };
+    let (code, message) = refusal(root.optimized_request_put(request).await.unwrap_err());
+    assert_eq!(
+        (code, message),
+        (
+            error_code::INVALID_INPUT,
+            format!("{} is not a season", movie().id())
+        )
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_request_in_no_such_profile_is_refused() {
+    let (server, root, _) = beside("opt-admin-request-profile").await;
+    let (code, message) = refusal(
+        root.optimized_request_put(for_the_film("Nope", false))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(
+        (code, message.as_str()),
+        (error_code::INVALID_INPUT, "there is no profile Nope")
+    );
+    server.stop().await;
+}
+
+/// A change to a profile's video asks for its requests' items again.
+#[tokio::test]
+async fn editing_a_profile_s_video_requeues_its_requests_items() {
+    let (server, root, _) = beside("opt-admin-request-remake").await;
+    root.optimized_request_put(for_the_film("Mobile", false))
+        .await
+        .unwrap();
+    let written = root
+        .optimized_profile_put(profile("Mobile", "h264", 1080, 6_000_000))
+        .await
+        .unwrap();
+    assert_eq!(written.requeued, 1);
     server.stop().await;
 }

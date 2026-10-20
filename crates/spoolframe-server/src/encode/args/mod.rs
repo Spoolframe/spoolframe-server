@@ -241,9 +241,13 @@ pub struct Inputs<'a> {
     /// The selected external subtitle, if it is one; the descriptor's
     /// own path is not used, for the same reason.
     pub sidecar: Option<&'a Path>,
-    /// The optimized copy the picked audio is taken from (PX-37):
-    /// `descriptor`'s track at `audio`'s index is the copy's, with the
-    /// copy's stream index. `None`: the audio is the film's.
+    /// An optimized copy's stored video (PX-37's track store), copied:
+    /// `descriptor`'s video is its, stream 0 of its file. `None`: the
+    /// video is the film's.
+    pub video: Option<&'a Path>,
+    /// An optimized copy's stored audio track the picked audio is (PX-37):
+    /// `descriptor`'s track at `audio`'s index is its, stream 0 of its
+    /// file. `None`: the audio is the film's.
     pub audio: Option<&'a Path>,
 }
 
@@ -253,8 +257,16 @@ impl<'a> Inputs<'a> {
         Self {
             film,
             sidecar: None,
+            video: None,
             audio: None,
         }
+    }
+
+    /// Whether it reads a stored track, whose times are the film's own:
+    /// every input then keeps its own (`-copyts`), or ffmpeg would move
+    /// each input's to start at 0 and a late track would lose its lead.
+    pub fn stored(&self) -> bool {
+        self.video.is_some() || self.audio.is_some()
     }
 }
 

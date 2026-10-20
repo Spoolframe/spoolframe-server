@@ -51,6 +51,9 @@ pub struct FakeCatalog {
     calls: Mutex<Vec<(&'static str, MediaId)>>,
     /// Items taken out of the library: not found any more.
     removed: Mutex<Vec<MediaId>>,
+    /// Items the library has not gained yet: not found, and not among
+    /// their parent's children, until [`FakeCatalog::gain`].
+    ungained: Mutex<Vec<MediaId>>,
     /// Items given a new key (a rebuild): the old key, and the new one.
     rekeyed: Mutex<Vec<(MediaId, MediaId)>>,
     /// Items still in the library whose file cannot be read.
@@ -89,6 +92,7 @@ impl FakeCatalog {
             old_keys: Mutex::default(),
             calls: Mutex::default(),
             removed: Mutex::default(),
+            ungained: Mutex::default(),
             rekeyed: Mutex::default(),
             unreadable: Mutex::default(),
             music: Mutex::default(),
@@ -126,6 +130,17 @@ impl FakeCatalog {
         *self.music.lock() = true;
     }
 
+    /// Start without `id`, as a library that gains it later does: it is
+    /// neither found nor its parent's child until [`FakeCatalog::gain`].
+    pub fn not_yet(&self, id: &MediaId) {
+        self.ungained.lock().push(id.clone());
+    }
+
+    /// The library gains `id`, held back by [`FakeCatalog::not_yet`].
+    pub fn gain(&self, id: &MediaId) {
+        self.ungained.lock().retain(|u| u != id);
+    }
+
     /// Take `id` out of the library: it is not found from now on, under
     /// any key.
     pub fn remove(&self, id: &MediaId) {
@@ -150,10 +165,17 @@ impl FakeCatalog {
     /// What the fake's tree has under `id` now, with its children: none
     /// for a removed item or a key given away, the item for its new key.
     fn current(&self, id: &MediaId) -> Option<(Item, Vec<Item>)> {
-        if self.removed.lock().contains(id) || self.rekeyed.lock().iter().any(|(old, _)| old == id)
+        if self.removed.lock().contains(id)
+            || self.ungained.lock().contains(id)
+            || self.rekeyed.lock().iter().any(|(old, _)| old == id)
         {
             return None;
         }
+        let ungained = self.ungained.lock().clone();
+        let gained = |(item, mut children): (Item, Vec<Item>)| {
+            children.retain(|c| !ungained.contains(c.id()));
+            (item, children)
+        };
         let old = self
             .rekeyed
             .lock()
@@ -164,8 +186,12 @@ impl FakeCatalog {
             Some(old) => tree()
                 .into_iter()
                 .find(|(item, _)| *item.id() == old)
-                .map(|(item, children)| (with_id(item, id), children)),
-            None => tree().into_iter().find(|(item, _)| item.id() == id),
+                .map(|(item, children)| (with_id(item, id), children))
+                .map(gained),
+            None => tree()
+                .into_iter()
+                .find(|(item, _)| item.id() == id)
+                .map(gained),
         }
     }
 

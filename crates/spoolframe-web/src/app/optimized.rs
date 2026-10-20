@@ -1,12 +1,15 @@
 //! Server › Optimized (PX-37): the profiles copies are made in, with Add,
 //! Edit and Remove; the pool's use against its budget; the copy being
 //! made; and every copy, with Delete. Editing a profile's video outdates
-//! its copies, and the dialog offers "Delete them now". The admin API has
-//! no subscriptions, so the page asks again every few seconds.
+//! its copies, and the dialog offers "Delete them now". The on-demand
+//! requests an admin made are listed with a pin and Delete; the "Optimize…"
+//! button of the catalog pages is here too. The admin API has no
+//! subscriptions, so the page asks again every few seconds.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
     AdminApiClient, OptimizedCopy, OptimizedOverview, OptimizedProfile, OptimizedProgress,
+    OptimizedRequest, OptimizedRequestPut, OptimizedScope, OptimizedScopeKind,
 };
 
 use super::admin::{Said, Toast, say};
@@ -14,11 +17,13 @@ use super::catalog::Forbidden;
 use super::playback::use_polled;
 use super::{Alert, Field, icons, now, rpc};
 use crate::activity::updated_line;
+use crate::catalog::bytes;
 use crate::logic::{ApiError, ago};
 use crate::optimized::{
     CODECS, OFF_TEXT, codec_label, copies_of, copy_deleted_text, copy_name, eta_text, is_off,
     job_percent, mbit_field, outdated_deleted_text, outdated_message, parse_height, parse_mbit,
-    profile_line, size_text, state_text, usage,
+    pinned_text, profile_line, profile_saved_text, request_name, request_percent, request_progress,
+    requested_text, requeued_text, scope_label, size_text, state_text, tracks_text, usage,
 };
 
 async fn overview() -> Result<OptimizedOverview, ApiError> {
@@ -37,6 +42,8 @@ enum Open {
     Removing(OptimizedProfile),
     /// Delete this copy, asked first.
     Deleting(OptimizedCopy),
+    /// Delete this request, asked first.
+    DeletingRequest(OptimizedRequest),
 }
 
 #[component]
@@ -68,7 +75,7 @@ pub fn OptimizedPage() -> Element {
                 }
             }
             p { class: "m-0 max-w-[820px] text-sm text-ctp-subtext0 max-md:hidden",
-                "Converted copies the server keeps, so a film is converted once and played or downloaded from the copy after. Copies are made in a profile and shared by every user; binge-ahead's are marked ahead. Over the budget, outdated and ahead copies go first, then the least recently used. A copy being read stays."
+                "Converted copies the server keeps, so a film is converted once and played or downloaded from the copy after. Copies are made in a profile and shared by every user; binge-ahead's are marked ahead. Over the budget, outdated and ahead copies go first, then the least recently used. A copy being read or pinned stays."
             }
             if forbidden {
                 Forbidden {}
@@ -86,6 +93,7 @@ pub fn OptimizedPage() -> Element {
                     if let Some(copy) = view.copies.iter().find(|c| c.progress.is_some()) {
                         Making { copy: copy.clone() }
                     }
+                    Requests { view: view.clone(), open, toast }
                     Copies { view: view.clone(), open, toast }
                 },
             }
@@ -95,6 +103,7 @@ pub fn OptimizedPage() -> Element {
             Some(Open::Editing(profile)) => rsx! { ProfileDialog { editing: Some(profile), on_done } },
             Some(Open::Removing(profile)) => rsx! { RemoveDialog { profile, on_done } },
             Some(Open::Deleting(copy)) => rsx! { DeleteCopyDialog { copy, on_done } },
+            Some(Open::DeletingRequest(request)) => rsx! { DeleteRequestDialog { request, on_done } },
             None => rsx! {},
         }
         Toast { said: toast }
@@ -219,6 +228,123 @@ fn Making(copy: OptimizedCopy) -> Element {
     }
 }
 
+/// The on-demand requests: what an admin asked to be optimized, in which
+/// profile, how far it is, with a pin and Delete.
+#[component]
+fn Requests(
+    view: OptimizedOverview,
+    open: Signal<Option<Open>>,
+    toast: Signal<Option<Said>>,
+) -> Element {
+    let mut open = open;
+    let mut busy = use_signal(|| false);
+    let now = now();
+    rsx! {
+        section { class: "card",
+            div { class: "card-head",
+                h2 { "Requests" }
+                span { class: "text-[13px] text-ctp-subtext0", "asked for with Optimize… on a film, season, show or library page" }
+            }
+            if view.requests.is_empty() {
+                div { class: "card-body",
+                    p { class: "m-0 text-sm text-ctp-subtext0", "No requests. A season, show or library request is kept and follows the items it gains." }
+                }
+            } else {
+                div { class: "overflow-x-auto",
+                    table { class: "table",
+                        thead {
+                            tr {
+                                th { "Request" }
+                                th { "Profile" }
+                                th { "Progress" }
+                                th { "Size" }
+                                th { "Asked" }
+                                th {}
+                            }
+                        }
+                        tbody {
+                            for r in view.requests.iter().cloned() {
+                                {
+                                    let name = request_name(&r).to_owned();
+                                    let percent = request_percent(&r);
+                                    let tone = if r.failed > 0 { "act-yellow" } else { "act-teal" };
+                                    let by = r.created_by.clone().unwrap_or_else(|| "a removed admin".to_owned());
+                                    let pin = {
+                                        let id = r.id.clone();
+                                        let name = name.clone();
+                                        let pinned = r.pinned;
+                                        move |_| {
+                                            let id = id.clone();
+                                            let name = name.clone();
+                                            busy.set(true);
+                                            spawn(async move {
+                                                let done = async {
+                                                    let client = rpc::client().await?;
+                                                    client
+                                                        .optimized_request_pin(id, !pinned)
+                                                        .await
+                                                        .map_err(rpc::error)
+                                                };
+                                                match done.await {
+                                                    Ok(r) => say(toast, true, pinned_text(&name, r.pinned)),
+                                                    Err(e) => say(toast, false, e.explain()),
+                                                }
+                                                busy.set(false);
+                                            });
+                                        }
+                                    };
+                                    rsx! {
+                                        tr { key: "{r.id}",
+                                            td {
+                                                div { class: "who-name", title: "{r.scope.id}",
+                                                    b { "{name}" }
+                                                    span { "{scope_label(r.scope.kind)}" }
+                                                }
+                                            }
+                                            td { "{r.profile}" }
+                                            td {
+                                                div { class: "flex min-w-[140px] flex-col gap-1",
+                                                    div { class: "pb-bar max-w-none",
+                                                        span { class: "pb-bar-fill {tone}", style: "width: {percent}%" }
+                                                    }
+                                                    span { class: "text-xs text-ctp-subtext0", "{request_progress(&r)}" }
+                                                }
+                                            }
+                                            td { class: "whitespace-nowrap", "{bytes(r.size_bytes)}" }
+                                            td {
+                                                div { class: "flex flex-col whitespace-nowrap",
+                                                    span { "{by}" }
+                                                    span { class: "text-xs text-ctp-subtext0", "{ago(now, r.created_at)}" }
+                                                }
+                                            }
+                                            td {
+                                                span { class: "row-do justify-end",
+                                                    label { class: "flex items-center gap-1.5 text-sm",
+                                                        input { r#type: "checkbox", checked: r.pinned, disabled: busy(), onchange: pin }
+                                                        "Pinned"
+                                                    }
+                                                    button { class: "btn-delete", aria_label: "Delete the request for {name}",
+                                                        onclick: {
+                                                            let r = r.clone();
+                                                            move |_| open.set(Some(Open::DeletingRequest(r.clone())))
+                                                        },
+                                                        icons::Trash { size: 14 }
+                                                        "Delete"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn Copies(
     view: OptimizedOverview,
@@ -260,7 +386,7 @@ fn Copies(
             }
             if view.copies.is_empty() {
                 div { class: "card-body",
-                    p { class: "m-0 text-sm text-ctp-subtext0", "No copies yet. A download in a profile makes one, and so does binge-ahead." }
+                    p { class: "m-0 text-sm text-ctp-subtext0", "No copies yet. A download in a profile makes one, and so does an Optimize request or binge-ahead." }
                 }
             } else {
                 div { class: "overflow-x-auto",
@@ -294,6 +420,9 @@ fn Copies(
                                                     if c.outdated {
                                                         span { class: "pill pill-warn", "outdated" }
                                                     }
+                                                    if c.pinned {
+                                                        span { class: "pill", title: "Never evicted", "pinned" }
+                                                    }
                                                 }
                                             }
                                             td {
@@ -307,7 +436,12 @@ fn Copies(
                                                     }
                                                 }
                                             }
-                                            td { class: "whitespace-nowrap", "{size_text(&c)}" }
+                                            td {
+                                                div { class: "flex flex-col whitespace-nowrap",
+                                                    span { "{size_text(&c)}" }
+                                                    span { class: "text-xs text-ctp-subtext0", "{tracks_text(&c)}" }
+                                                }
+                                            }
                                             td { class: "whitespace-nowrap", "{ago(now, c.last_used_at)}" }
                                             td {
                                                 button { class: "btn-delete", aria_label: "Delete the copy of {name}",
@@ -357,8 +491,9 @@ fn ProfileDialog(
     });
     let mut failed = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
-    // After an edit that outdated copies: the profile's name and how many.
-    let mut outdated = use_signal(|| None::<(String, u64)>);
+    // After an edit that outdated copies: the profile's name, how many,
+    // and how many on-demand items it queued again.
+    let mut outdated = use_signal(|| None::<(String, u64, u64)>);
     let adding = editing.is_none();
     let submit = move |e: FormEvent| {
         e.prevent_default();
@@ -386,19 +521,21 @@ fn ProfileDialog(
                     .map_err(rpc::error)
             };
             match written.await {
-                Ok(w) if w.outdated > 0 => outdated.set(Some((profile.name, w.outdated))),
+                Ok(w) if w.outdated > 0 => {
+                    outdated.set(Some((profile.name, w.outdated, w.requeued)))
+                }
                 Ok(w) if w.created => {
                     on_done.call(Some(Ok(format!("Profile {} added", profile.name))))
                 }
-                Ok(_) => on_done.call(Some(Ok(format!("Profile {} saved", profile.name)))),
+                Ok(w) => on_done.call(Some(Ok(profile_saved_text(&profile.name, w.requeued)))),
                 Err(e) => failed.set(Some(e.explain())),
             }
             busy.set(false);
         });
     };
-    if let Some((profile, n)) = outdated() {
+    if let Some((profile, n, requeued)) = outdated() {
         return rsx! {
-            OutdatedDialog { profile, n, on_done }
+            OutdatedDialog { profile, n, requeued, on_done }
         };
     }
     rsx! {
@@ -493,10 +630,11 @@ fn DangerDialog(
 fn OutdatedDialog(
     profile: String,
     n: u64,
+    requeued: u64,
     on_done: EventHandler<Option<Result<String, String>>>,
 ) -> Element {
     let busy = use_signal(|| false);
-    let saved = format!("Profile {profile} saved");
+    let saved = profile_saved_text(&profile, requeued);
     let delete = {
         let profile = profile.clone();
         move |()| {
@@ -514,7 +652,11 @@ fn OutdatedDialog(
     rsx! {
         DangerDialog {
             title: "{profile} saved",
-            text: outdated_message(&profile, n).unwrap_or_default(),
+            text: [outdated_message(&profile, n), requeued_text(requeued).map(|t| format!("{t}."))]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" "),
             warning: true,
             cancel: "Keep them for now",
             confirm: "Delete them now",
@@ -595,6 +737,181 @@ fn DeleteCopyDialog(
             busy: busy(),
             on_cancel: move |()| on_done.call(None),
             on_confirm: go,
+        }
+    }
+}
+
+/// "Delete the request for The Expanse?", saying what happens to its
+/// copies.
+#[component]
+fn DeleteRequestDialog(
+    request: OptimizedRequest,
+    on_done: EventHandler<Option<Result<String, String>>>,
+) -> Element {
+    let busy = use_signal(|| false);
+    let name = request_name(&request).to_owned();
+    let id = request.id.clone();
+    let go = {
+        let name = name.clone();
+        move |()| {
+            let id = id.clone();
+            let name = name.clone();
+            act(busy, on_done, async move {
+                let client = rpc::client().await?;
+                let gone = client
+                    .optimized_request_delete(id)
+                    .await
+                    .map_err(rpc::error)?;
+                Ok(if gone {
+                    format!("Request for {name} deleted")
+                } else {
+                    "That request was gone already".to_owned()
+                })
+            });
+        }
+    };
+    let text = if request.pinned {
+        "Its copies stay, but are not pinned any more: they are evicted like the others. Items it would have gained are no longer made."
+    } else {
+        "Its copies stay and are evicted like the others. Items it would have gained are no longer made."
+    };
+    rsx! {
+        DangerDialog {
+            title: "Delete the request for {name}?",
+            text,
+            cancel: "Cancel",
+            confirm: "Delete",
+            busy: busy(),
+            on_cancel: move |()| on_done.call(None),
+            on_confirm: go,
+        }
+    }
+}
+
+/// "Optimize…" on the page of a film, episode, season, show or library:
+/// asks for `id`, a `kind`, to be made in a profile. `name` is what the
+/// confirmation calls it.
+#[component]
+pub(super) fn OptimizeButton(kind: OptimizedScopeKind, id: String, name: String) -> Element {
+    let mut open = use_signal(|| false);
+    let toast = use_signal(|| None::<Said>);
+    rsx! {
+        button { class: "btn shrink-0", onclick: move |_| open.set(true),
+            icons::Download { size: 14 }
+            "Optimize…"
+        }
+        if open() {
+            OptimizeDialog {
+                kind,
+                id,
+                name,
+                on_done: move |said: Option<String>| {
+                    open.set(false);
+                    if let Some(text) = said {
+                        say(toast, true, text);
+                    }
+                },
+            }
+        }
+        Toast { said: toast }
+    }
+}
+
+/// The Optimize dialog: a profile, whether to pin, and Optimize.
+#[component]
+fn OptimizeDialog(
+    kind: OptimizedScopeKind,
+    id: String,
+    name: String,
+    on_done: EventHandler<Option<String>>,
+) -> Element {
+    let profiles = use_resource(|| async { overview().await.map(|o| o.profiles) });
+    let mut chosen = use_signal(String::new);
+    let mut pinned = use_signal(|| false);
+    let mut failed = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let submit = {
+        let name = name.clone();
+        move |e: FormEvent| {
+            e.prevent_default();
+            let Some(Ok(list)) = profiles.read().clone() else {
+                return;
+            };
+            // The first profile is the select's, until the admin picks.
+            let Some(profile) = Some(chosen())
+                .filter(|c| !c.is_empty())
+                .or_else(|| list.first().map(|p| p.name.clone()))
+            else {
+                return;
+            };
+            let request = OptimizedRequestPut {
+                scope: OptimizedScope {
+                    kind,
+                    id: id.clone(),
+                },
+                profile,
+                pinned: pinned(),
+            };
+            let name = name.clone();
+            busy.set(true);
+            failed.set(None);
+            spawn(async move {
+                let put = async {
+                    let client = rpc::client().await?;
+                    client
+                        .optimized_request_put(request)
+                        .await
+                        .map_err(rpc::error)
+                };
+                match put.await {
+                    Ok(made) => on_done.call(Some(requested_text(&name, made.items))),
+                    Err(e) => failed.set(Some(e.explain())),
+                }
+                busy.set(false);
+            });
+        }
+    };
+    let loaded = profiles.read().clone();
+    rsx! {
+        div { class: "scrim",
+            form { class: "dialog w-[440px]", role: "dialog", onsubmit: submit,
+                div { class: "dialog-head",
+                    icons::Download { size: 22 }
+                    h1 { "Optimize {name}" }
+                }
+                match loaded {
+                    None => rsx! { p { "Loading…" } },
+                    Some(Err(e)) => rsx! { Alert { text: e.explain() } },
+                    Some(Ok(list)) if list.is_empty() => rsx! {
+                        p { "There is no profile yet. Add one in Server › Optimized first." }
+                    },
+                    Some(Ok(list)) => rsx! {
+                        p { class: "m-0 text-sm text-ctp-subtext0",
+                            "Makes a copy of each film or episode in the profile you pick. For a season, show or library the request is kept and follows new items."
+                        }
+                        label { class: "field",
+                            "Profile"
+                            select { onchange: move |e| chosen.set(e.value()),
+                                for p in list.iter() {
+                                    option { key: "{p.name}", value: "{p.name}", selected: chosen() == p.name, "{p.name} · {profile_line(p)}" }
+                                }
+                            }
+                        }
+                        label { class: "flex items-center gap-2 text-sm",
+                            input { r#type: "checkbox", checked: pinned(), onchange: move |e| pinned.set(e.checked()) }
+                            "Pin"
+                        }
+                        span { class: "hint", "Never evicted; counts against the budget." }
+                    },
+                }
+                if let Some(text) = failed() {
+                    Alert { text }
+                }
+                div { class: "dialog-actions",
+                    button { class: "btn-dialog btn-dialog-grey", r#type: "button", onclick: move |_| on_done.call(None), "Cancel" }
+                    button { class: "btn-dialog btn-dialog-primary", r#type: "submit", disabled: busy(), "Optimize" }
+                }
+            }
         }
     }
 }

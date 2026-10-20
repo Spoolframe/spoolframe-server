@@ -325,26 +325,26 @@ async fn a_restart_setting_is_saved_and_flagged() {
 /// `setting_set`: off until it is saved on, kept in the runtime layer, and
 /// applied at the next start.
 #[tokio::test]
-async fn optimized_versions_are_off_then_saved_on_through_the_wizard_s_method() {
+async fn binge_ahead_is_off_then_saved_on_through_the_wizard_s_method() {
     let (_addr, root, dir) = served("optimized-setting", "").await;
     let all = root.settings().await.unwrap();
     let listed = |all: &spoolframe_admin_api::Settings, key: &str| {
         all.entries.iter().find(|e| e.key == key).cloned().unwrap()
     };
     assert_eq!(
-        listed(&all, "optimized.enabled").value,
+        listed(&all, "optimized.binge_ahead").value,
         Some(json!(false)),
         "off by default"
     );
     for (key, value) in [
-        ("optimized.enabled", json!(true)),
+        ("optimized.binge_ahead", json!(true)),
         ("optimized.max_size_mb", json!(16384)),
     ] {
         let entry = root.setting_set(key.into(), value).await.unwrap();
         assert_eq!(entry.apply, SettingApply::Restart, "{key}");
     }
     let all = root.settings().await.unwrap();
-    let enabled = listed(&all, "optimized.enabled");
+    let enabled = listed(&all, "optimized.binge_ahead");
     assert_eq!(
         (enabled.value, enabled.layer, enabled.restart_pending),
         (Some(json!(true)), Some(SettingLayer::Runtime), true)
@@ -360,7 +360,8 @@ async fn optimized_versions_are_off_then_saved_on_through_the_wizard_s_method() 
     })
     .unwrap();
     let config = layers.config().unwrap();
-    let pool = config.optimized.settings(dir.as_ref()).unwrap().unwrap();
+    assert!(config.optimized.binge_ahead());
+    let pool = config.optimized.place(dir.as_ref()).unwrap();
     assert_eq!(pool.max_size_bytes, 16384 << 20);
 }
 
@@ -369,7 +370,7 @@ async fn optimized_versions_are_off_then_saved_on_through_the_wizard_s_method() 
 #[tokio::test]
 async fn optimized_versions_in_the_state_dir_or_above_it_are_refused() {
     let (_addr, root, dir) = served("optimized-setting-dir", "").await;
-    root.setting_set("optimized.enabled".into(), json!(true))
+    root.setting_set("optimized.binge_ahead".into(), json!(true))
         .await
         .unwrap();
     let state = dir.as_ref().to_str().unwrap().to_owned();
