@@ -10,6 +10,15 @@ use spoolframe_admin_api::{
 use crate::catalog::bytes;
 use crate::playback::bitrate_text;
 
+/// What the page says when the server has the pool off (it does unless
+/// the config or Settings › Playback turns it on).
+pub const OFF_TEXT: &str = "Optimized versions are off. Turn them on in Settings › Playback, or with `optimized { enabled = true; }` in the server's config; they keep up to `max_size_mb` of converted copies.";
+
+/// Whether the admin API's error `code` says the pool is off.
+pub fn is_off(code: i32) -> bool {
+    code == spoolframe_admin_api::error_code::NOT_CONFIGURED
+}
+
 /// The codecs a copy is made in, as the edit dialog offers them: the
 /// protocol's name and the page's.
 pub const CODECS: [(&str, &str); 3] = [("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")];
@@ -171,6 +180,14 @@ pub fn copy_deleted_text(deleted: OptimizedCopyDeleted) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_not_configured_means_the_pool_is_off() {
+        use spoolframe_admin_api::error_code;
+        assert!(is_off(error_code::NOT_CONFIGURED));
+        assert!(!is_off(error_code::FORBIDDEN));
+        assert!(OFF_TEXT.contains("optimized { enabled = true; }"));
+    }
 
     fn copy(title: Option<&str>, subtitle: Option<&str>) -> OptimizedCopy {
         OptimizedCopy {

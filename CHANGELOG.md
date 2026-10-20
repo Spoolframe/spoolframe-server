@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Optimized versions (PX-37) are now off by default.
+  `optimized { enabled = true; }` turns them on, and so does the setup
+  wizard's Playback step or Settings › Playback (after a restart). With
+  them off the server keeps no copies, makes none ahead, and the Server
+  › Optimized page says how to turn them on. A pool that is on cannot
+  have the state directory, or a directory that holds it, as its `dir`.
+
 ## 0.13.0 (2026-10-20)
 
 - Optimized versions (PX-37): converted copies the server keeps and

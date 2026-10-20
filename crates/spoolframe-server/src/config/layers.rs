@@ -581,7 +581,16 @@ impl Layers {
                 return Err(SettingError::PlainKey { key });
             }
         }
-        ServerConfig::from_table(&self.merged()).map_err(SettingError::Invalid)
+        let config = ServerConfig::from_table(&self.merged()).map_err(SettingError::Invalid)?;
+        // The runtime layer sits in the state directory: a pool that is
+        // that directory, or holds it, would stop the next start.
+        if let Some(state_dir) = self.runtime_path.parent() {
+            config
+                .optimized
+                .settings(state_dir)
+                .map_err(SettingError::Invalid)?;
+        }
+        Ok(config)
     }
 
     /// The layers with the wizard's progress in the runtime layer: not a
@@ -1009,6 +1018,12 @@ mod tests {
         assert_eq!(
             documented.optimized.settings(dir).unwrap(),
             bare.optimized.settings(dir).unwrap()
+        );
+        // Off in both, so the settings above say nothing of the size.
+        assert!(!documented.optimized.enabled());
+        assert_eq!(
+            documented.optimized.max_size_mb,
+            Some(crate::config::OptimizedConfig::DEFAULT_MAX_SIZE_MB)
         );
         assert_eq!(documented.admin.metrics(), bare.admin.metrics());
         assert_eq!(

@@ -1133,12 +1133,18 @@ impl PreviewsConfig {
     }
 }
 
-/// `optimized { dir = "…"; max_size_mb = 102400; }` (PX-37), all
-/// optional: where the pool of converted copies is kept, and the most it
-/// may hold.
+/// `optimized { enabled = true; dir = "…"; max_size_mb = 102400; }`
+/// (PX-37), all optional: whether the server keeps converted copies at
+/// all (it does not unless told to), where the pool of them is kept, and
+/// the most it may hold.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct OptimizedConfig {
+    /// Off if left out: the server keeps no copy and makes none, ahead or
+    /// on request. A pool fills its limit on its own while shows are
+    /// binged, so it is the admin's choice.
+    #[ucl(default)]
+    pub enabled: Option<bool>,
     /// `state_dir/optimized` if left out.
     #[ucl(default)]
     pub dir: Option<PathBuf>,
@@ -1159,8 +1165,20 @@ impl OptimizedConfig {
     /// about 10 GiB.
     pub const DEFAULT_MAX_SIZE_MB: u64 = 100 * 1024;
 
-    /// The settings, with `state_dir` for the default directory.
-    pub fn settings(&self, state_dir: &Path) -> Result<OptimizedSettings, ConfigError> {
+    /// Whether the pool is on.
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    /// The settings, with `state_dir` for the default directory; `None`
+    /// unless the pool is on, so a caller cannot forget that it may be
+    /// off. When on, a size of 0 and a directory that is the state
+    /// directory or holds it are refused: the media sandbox hides the
+    /// state directory and would not show the copies in it.
+    pub fn settings(&self, state_dir: &Path) -> Result<Option<OptimizedSettings>, ConfigError> {
+        if !self.enabled() {
+            return Ok(None);
+        }
         let max_size_mb = self.max_size_mb.unwrap_or(Self::DEFAULT_MAX_SIZE_MB);
         if max_size_mb == 0 {
             return Err(ConfigError::Invalid {
@@ -1168,13 +1186,24 @@ impl OptimizedConfig {
                 message: "0 would keep no copy: every download would wait forever".into(),
             });
         }
-        Ok(OptimizedSettings {
-            dir: self
-                .dir
-                .clone()
-                .unwrap_or_else(|| state_dir.join("optimized")),
+        let dir = self
+            .dir
+            .clone()
+            .unwrap_or_else(|| state_dir.join("optimized"));
+        if state_dir.starts_with(&dir) {
+            return Err(ConfigError::Invalid {
+                key: "optimized.dir",
+                message: format!(
+                    "{} is the state directory or holds it: the copies would show it whole \
+                     to ffmpeg. Choose a directory of its own",
+                    dir.display()
+                ),
+            });
+        }
+        Ok(Some(OptimizedSettings {
+            dir,
             max_size_bytes: max_size_mb << 20,
-        })
+        }))
     }
 }
 
@@ -2774,6 +2803,7 @@ impl ServerConfig {
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
         parsed.previews.settings()?;
+        parsed.optimized.settings(Path::new("/"))?;
         parsed.logs.buffer_lines()?;
         parsed.telemetry.otlp.settings()?;
         parsed.http_playback.settings()?;
@@ -4803,40 +4833,74 @@ mod tests {
         );
     }
 
+    const PLEX: &str = r#"plex { url = "http://nas:32400"; } "#;
+
+    fn on(optimized: &str) -> Result<ServerConfig, ConfigError> {
+        plex(&format!(
+            "{PLEX}optimized {{ enabled = true; {optimized} }}"
+        ))
+    }
+
     #[test]
-    fn the_optimized_pool_is_under_the_state_dir_unless_set() {
-        let default = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert_eq!(
-            default.optimized.settings(Path::new("/s")).unwrap().dir,
-            Path::new("/s/optimized")
-        );
+    fn the_optimized_pool_is_off_when_left_out() {
+        let default = plex(PLEX).unwrap();
+        assert_eq!(default.optimized.settings(Path::new("/s")).unwrap(), None);
+        // Its other keys alone do not turn it on.
+        let sized = plex(&format!("{PLEX}optimized {{ max_size_mb = 64; }}")).unwrap();
+        assert_eq!(sized.optimized.settings(Path::new("/s")).unwrap(), None);
+    }
+
+    #[test]
+    fn the_optimized_pool_is_on_with_enabled_and_under_the_state_dir_unless_set() {
+        let settings = on("").unwrap().optimized.settings(Path::new("/s")).unwrap();
+        let settings = settings.expect("on");
+        assert_eq!(settings.dir, Path::new("/s/optimized"));
+        assert_eq!(settings.max_size_bytes, 100 << 30);
+        let elsewhere = on(r#"dir = "/srv/copies";"#)
+            .unwrap()
+            .optimized
+            .settings(Path::new("/s"))
+            .unwrap()
+            .expect("on");
+        assert_eq!(elsewhere.dir, Path::new("/srv/copies"));
     }
 
     #[test]
     fn the_optimized_pool_size_is_read_in_mib() {
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } optimized { max_size_mb = 64; }"#).unwrap();
-        assert_eq!(
-            config
-                .optimized
-                .settings(Path::new("/s"))
-                .unwrap()
-                .max_size_bytes,
-            64 << 20
-        );
+        let config = on("max_size_mb = 64;").unwrap();
+        let settings = config.optimized.settings(Path::new("/s")).unwrap();
+        assert_eq!(settings.unwrap().max_size_bytes, 64 << 20);
     }
 
     #[test]
-    fn an_optimized_pool_of_nothing_is_refused() {
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } optimized { max_size_mb = 0; }"#).unwrap();
+    fn an_optimized_pool_of_nothing_is_refused_when_on() {
         assert!(matches!(
-            config.optimized.settings(Path::new("/s")),
+            on("max_size_mb = 0;"),
             Err(ConfigError::Invalid {
                 key: "optimized.max_size_mb",
                 ..
             })
         ));
+        // Off, the size is not looked at.
+        plex(&format!("{PLEX}optimized {{ max_size_mb = 0; }}")).unwrap();
+    }
+
+    #[test]
+    fn an_optimized_dir_that_is_or_holds_the_state_dir_is_refused() {
+        for dir in ["/var/lib/sf", "/var/lib", "/"] {
+            let config = on(&format!(r#"dir = "{dir}";"#));
+            let err = config.and_then(|c| c.optimized.settings(Path::new("/var/lib/sf")));
+            assert!(
+                matches!(
+                    err,
+                    Err(ConfigError::Invalid {
+                        key: "optimized.dir",
+                        ..
+                    })
+                ),
+                "{dir}: {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -274,6 +274,13 @@ in {
         not_proxied = true;
       }
 
+      # Optimized versions (PX-37), off by default. 16 GiB on nimble: its
+      # root disk is shared with the build dirs and has filled before.
+      optimized {
+        enabled = true;
+        max_size_mb = 16384;
+      }
+
       # HTTP playback (PX-49), for AirPlay tests from the apps.
       http_playback {
         listen = "[::]:7422";

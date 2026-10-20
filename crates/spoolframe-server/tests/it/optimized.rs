@@ -107,11 +107,11 @@ async fn made(server: &TestServer, video: CopyVideo) -> CopyRow {
         target: CopyTarget::Profile("Mobile".into()),
         video,
     };
-    let row = server.optimized.request(asked).await.unwrap();
+    let row = server.pool().request(asked).await.unwrap();
     let until = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let state = server
-            .optimized
+            .pool()
             .progress(&row.id)
             .await
             .unwrap()
@@ -209,7 +209,7 @@ async fn a_read_near_the_end_of_a_played_copy_is_the_copy_s_own_bytes() {
     let (server, client, session) = ready("optimized-seek", "ac3", true).await;
     let copy = made(&server, FITS).await;
     let (handle, _) = start(&client, &session).await;
-    let file = std::fs::read(server.optimized.file(&copy.id)).unwrap();
+    let file = std::fs::read(server.pool().file(&copy.id)).unwrap();
     let tail = file.len() as u64 - 4096;
     let bytes = read(&client, &session, &handle, tail, 4096).await;
     assert_eq!(bytes, file[tail as usize..]);
@@ -235,7 +235,7 @@ async fn a_copy_being_played_is_not_removed() {
     let copy = made(&server, FITS).await;
     let (_handle, _) = start(&client, &session).await;
     assert_eq!(
-        server.optimized.delete(&copy.id).await.unwrap(),
+        server.pool().delete(&copy.id).await.unwrap(),
         Deleted::Deferred
     );
     client.close().await;
@@ -264,6 +264,39 @@ async fn a_playback_s_start_counts_as_a_use_of_its_copy() {
         after.last_used_at > before.last_used_at,
         "{before:?} {after:?}"
     );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A server with the pool off (the server's own default) keeps no pool
+/// and no directory for copies, and a playback that would encode is a
+/// live encode of the film's video.
+#[tokio::test]
+async fn with_the_pool_off_a_playback_that_encodes_is_a_live_encode() {
+    let server = TestServer::start_with(
+        fresh_dir("optimized-off").await,
+        ServerOptions {
+            real_media: true,
+            optimized: false,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    write_film(&server, "ac3");
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, Some(device(false))).await;
+    let session = client.login("alice", "correct horse").await;
+    let (_, plan) = start(&client, &session).await;
+    let PlaybackPlan::Converted {
+        video: Some(spoolframe_protocol::ConvertedVideo::Encode { .. }),
+        ..
+    } = plan
+    else {
+        panic!("the film's video is not encoded live: {plan:?}");
+    };
+    assert!(server.optimized.is_none());
+    assert!(!server.dir.join("optimized").exists());
     client.close().await;
     server.stop().await;
 }

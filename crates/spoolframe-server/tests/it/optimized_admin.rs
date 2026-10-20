@@ -35,7 +35,7 @@ async fn beside(test: &str) -> (TestServer, WsClient, SocketAddr) {
         "127.0.0.1:0".parse().unwrap(),
         Admin {
             playback: Some(server.debug.clone()),
-            optimized: Some(server.optimized.clone()),
+            optimized: Some(server.pool().clone()),
             ..admin(server.auth.clone(), Some(SetupCode::new(CODE)))
         },
         Origins::default(),
@@ -172,6 +172,40 @@ async fn a_server_without_the_pool_says_so() {
     assert_eq!(code(err), error_code::NOT_CONFIGURED);
 }
 
+/// A server started with the pool off, as by default, has none to show.
+#[tokio::test]
+async fn a_server_started_with_the_pool_off_answers_not_configured() {
+    let server = TestServer::start_with(
+        crate::support::fresh_dir("opt-admin-off").await,
+        crate::support::ServerOptions {
+            optimized: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (addr, handle) = admin::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Admin {
+            optimized: server.optimized.clone(),
+            ..admin(server.auth.clone(), Some(SetupCode::new(CODE)))
+        },
+        Origins::default(),
+        TrustedProxies::default(),
+    )
+    .await
+    .unwrap();
+    std::mem::forget(handle);
+    let root = anonymous(addr)
+        .await
+        .setup(setup(CODE, "root", "correct horse"))
+        .await
+        .unwrap();
+    let root = with_token(addr, &root.token).await;
+    let err = root.optimized_overview().await.unwrap_err();
+    assert_eq!(code(err), error_code::NOT_CONFIGURED);
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_profile_out_of_range_is_refused_saying_why() {
     let (server, root, _) = beside("opt-admin-refused").await;
@@ -298,7 +332,7 @@ async fn delete_them_now_removes_only_that_profile_s_outdated_copies() {
 async fn a_copy_being_read_is_deleted_once_its_reader_is_done() {
     let (server, root, _) = beside("opt-admin-leased").await;
     let copy = made(&server, "/media/alien.mkv", "Mobile", 1000).await;
-    let lease = server.optimized.lease(&copy.id).await.unwrap().unwrap();
+    let lease = server.pool().lease(&copy.id).await.unwrap().unwrap();
     assert!(root.optimized_overview().await.unwrap().copies[0].reading);
     assert_eq!(
         root.optimized_copy_delete(copy.id.clone()).await.unwrap(),
@@ -338,7 +372,7 @@ async fn deleting_a_copy_not_read_removes_it_at_once() {
 async fn delete_them_now_leaves_a_copy_being_read_to_its_reader() {
     let (server, root, _) = beside("opt-admin-outdated-read").await;
     let copy = made(&server, "/media/alien.mkv", "Mobile", 1000).await;
-    let _lease = server.optimized.lease(&copy.id).await.unwrap().unwrap();
+    let _lease = server.pool().lease(&copy.id).await.unwrap().unwrap();
     root.optimized_profile_put(profile("Mobile", "h264", 720, 4_000_000))
         .await
         .unwrap();

@@ -16,9 +16,9 @@ use super::{Alert, Field, icons, now, rpc};
 use crate::activity::updated_line;
 use crate::logic::{ApiError, ago};
 use crate::optimized::{
-    CODECS, codec_label, copies_of, copy_deleted_text, copy_name, eta_text, job_percent,
-    mbit_field, outdated_deleted_text, outdated_message, parse_height, parse_mbit, profile_line,
-    size_text, state_text, usage,
+    CODECS, OFF_TEXT, codec_label, copies_of, copy_deleted_text, copy_name, eta_text, is_off,
+    job_percent, mbit_field, outdated_deleted_text, outdated_message, parse_height, parse_mbit,
+    profile_line, size_text, state_text, usage,
 };
 
 async fn overview() -> Result<OptimizedOverview, ApiError> {
@@ -49,6 +49,7 @@ pub fn OptimizedPage() -> Element {
     let forbidden = error()
         .as_ref()
         .is_some_and(|e| e.code == spoolframe_admin_api::error_code::FORBIDDEN);
+    let off = error().as_ref().is_some_and(|e| is_off(e.code));
     let on_done = move |said: Option<Result<String, String>>| {
         open.set(None);
         match said {
@@ -71,6 +72,8 @@ pub fn OptimizedPage() -> Element {
             }
             if forbidden {
                 Forbidden {}
+            } else if off {
+                p { class: "m-0 max-w-[820px] text-sm text-ctp-subtext0", "{OFF_TEXT}" }
             } else if let Some(e) = error() {
                 Alert { text: format!("Not updating: {}", e.explain()) }
             }

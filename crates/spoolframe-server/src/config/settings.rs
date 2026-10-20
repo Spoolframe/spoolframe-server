@@ -146,6 +146,10 @@ pub const SETTINGS: &[Setting] = &[
     restart("previews.cache_mb"),
     live("previews.memory_mb"),
     live("previews.workers"),
+    // The pool is built at start (PX-37).
+    restart("optimized.enabled"),
+    restart("optimized.dir"),
+    restart("optimized.max_size_mb"),
     live("logs.buffer_lines"),
     live("telemetry.otlp.endpoint"),
     live("telemetry.otlp.protocol"),

@@ -321,6 +321,77 @@ async fn a_restart_setting_is_saved_and_flagged() {
     assert!(listed.restart_pending);
 }
 
+/// The wizard's Playback step saves "Optimized versions" (PX-37) with
+/// `setting_set`: off until it is saved on, kept in the runtime layer, and
+/// applied at the next start.
+#[tokio::test]
+async fn optimized_versions_are_off_then_saved_on_through_the_wizard_s_method() {
+    let (_addr, root, dir) = served("optimized-setting", "").await;
+    let all = root.settings().await.unwrap();
+    let listed = |all: &spoolframe_admin_api::Settings, key: &str| {
+        all.entries.iter().find(|e| e.key == key).cloned().unwrap()
+    };
+    assert_eq!(
+        listed(&all, "optimized.enabled").value,
+        Some(json!(false)),
+        "off by default"
+    );
+    for (key, value) in [
+        ("optimized.enabled", json!(true)),
+        ("optimized.max_size_mb", json!(16384)),
+    ] {
+        let entry = root.setting_set(key.into(), value).await.unwrap();
+        assert_eq!(entry.apply, SettingApply::Restart, "{key}");
+    }
+    let all = root.settings().await.unwrap();
+    let enabled = listed(&all, "optimized.enabled");
+    assert_eq!(
+        (enabled.value, enabled.layer, enabled.restart_pending),
+        (Some(json!(true)), Some(SettingLayer::Runtime), true)
+    );
+    assert_eq!(
+        listed(&all, "optimized.max_size_mb").value,
+        Some(json!(16384))
+    );
+    // And it is what a start reads back from the runtime layer.
+    let layers = Layers::load(&Locations {
+        state_dir: dir.as_ref().to_owned(),
+        config: Some(dir.as_ref().join("server.ucl")),
+    })
+    .unwrap();
+    let config = layers.config().unwrap();
+    let pool = config.optimized.settings(dir.as_ref()).unwrap().unwrap();
+    assert_eq!(pool.max_size_bytes, 16384 << 20);
+}
+
+/// The directory of the copies may not be the state directory, nor hold
+/// it: the media sandbox would refuse to start.
+#[tokio::test]
+async fn optimized_versions_in_the_state_dir_or_above_it_are_refused() {
+    let (_addr, root, dir) = served("optimized-setting-dir", "").await;
+    root.setting_set("optimized.enabled".into(), json!(true))
+        .await
+        .unwrap();
+    let state = dir.as_ref().to_str().unwrap().to_owned();
+    let above = dir.as_ref().parent().unwrap().to_str().unwrap().to_owned();
+    for bad in [state, above] {
+        match root
+            .setting_set("optimized.dir".into(), json!(bad))
+            .await
+            .unwrap_err()
+        {
+            jsonrpsee::core::ClientError::Call(e) => {
+                assert_eq!(e.code(), error_code::INVALID_INPUT, "{bad}");
+                assert!(e.message().contains("optimized.dir"), "{}", e.message());
+            }
+            other => panic!("{other}"),
+        }
+    }
+    root.setting_set("optimized.dir".into(), json!("/srv/copies"))
+        .await
+        .unwrap();
+}
+
 /// Without a supervisor the server starts itself again in place, so a
 /// restart is offered, and said to be done that way.
 #[tokio::test]

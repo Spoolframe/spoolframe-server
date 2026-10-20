@@ -473,6 +473,9 @@ pub struct ServerOptions {
     /// OpenSubtitles (PX-02), a stand-in on loopback; off by default.
     /// The subtitle sites (PX-02); none unless set.
     pub subtitle_sites: spoolframe_server::subtitle_downloads::Settings,
+    /// Start the optimized copies' pool (PX-37). On for tests, which are
+    /// mostly about what it does; the server's own default is off.
+    pub optimized: bool,
 }
 
 /// Speech found by a stand-in: always `0`.
@@ -537,6 +540,7 @@ impl Default for ServerOptions {
             index_ahead: false,
             speech: None,
             subtitle_sites: Default::default(),
+            optimized: true,
         }
     }
 }
@@ -701,11 +705,19 @@ pub struct TestServer {
     /// Its artwork cache: what an admin API beside it serves pictures
     /// from (PX-53).
     pub artwork: Arc<ArtworkCache>,
-    /// Its optimized copies (PX-37), in `optimized` in its directory.
-    pub optimized: Arc<spoolframe_server::optimized::Pool>,
+    /// Its optimized copies (PX-37), in `optimized` in its directory:
+    /// there unless [`ServerOptions::optimized`] is off.
+    pub optimized: Option<Arc<spoolframe_server::optimized::Pool>>,
 }
 
 impl TestServer {
+    /// Its optimized copies' pool: for a test that started it.
+    pub fn pool(&self) -> &Arc<spoolframe_server::optimized::Pool> {
+        self.optimized
+            .as_ref()
+            .expect("the server was started with ServerOptions::optimized off")
+    }
+
     /// A fresh server whose state lives in a directory named for `test`.
     pub async fn start(test: &str) -> Self {
         Self::start_in(fresh_dir(test).await).await
@@ -883,22 +895,26 @@ impl TestServer {
             )
             .unwrap(),
         );
-        let optimized = Arc::new(
-            spoolframe_server::optimized::Pool::start(
-                spoolframe_server::optimized::PoolSources {
-                    store: store.clone(),
-                    jobs: jobs.clone(),
-                    transcoding: transcoding(),
-                    prober: prober.clone(),
-                },
-                &spoolframe_server::config::OptimizedSettings {
-                    dir: dir.join("optimized"),
-                    max_size_bytes: 1 << 30,
-                },
-            )
-            .await
-            .unwrap(),
-        );
+        let optimized = if options.optimized {
+            Some(Arc::new(
+                spoolframe_server::optimized::Pool::start(
+                    spoolframe_server::optimized::PoolSources {
+                        store: store.clone(),
+                        jobs: jobs.clone(),
+                        transcoding: transcoding(),
+                        prober: prober.clone(),
+                    },
+                    &spoolframe_server::config::OptimizedSettings {
+                        dir: dir.join("optimized"),
+                        max_size_bytes: 1 << 30,
+                    },
+                )
+                .await
+                .unwrap(),
+            ))
+        } else {
+            None
+        };
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -920,7 +936,7 @@ impl TestServer {
             subtitles: Arc::new(subtitles.with_own_dir(dir.join("subtitles"))),
             subtitle_timings: subtitle_timings.clone(),
             subtitle_downloads: subtitle_downloads.clone(),
-            optimized: Some(optimized.clone()),
+            optimized: optimized.clone(),
             previews,
             index_ahead,
             app_passkeys: Arc::new(

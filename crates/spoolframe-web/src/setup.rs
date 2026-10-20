@@ -475,6 +475,48 @@ pub fn ocr_note(on: bool, found: bool) -> &'static str {
     }
 }
 
+/// What the Playback step says under "Optimized versions" (PX-37).
+pub const OPTIMIZED_NOTE: &str = "Converted copies the server keeps and plays from, made on its \
+     own while shows are binged, up to the limit.";
+
+/// The size limit the field starts with, in GiB: the server's default.
+pub const OPTIMIZED_DEFAULT_GIB: &str = "100";
+
+/// The size field's text for the `optimized.max_size_mb` the server has:
+/// its default if none is set.
+pub fn optimized_size_text(max_size_mb: Option<i64>) -> String {
+    max_size_mb.map_or_else(|| OPTIMIZED_DEFAULT_GIB.to_owned(), gib)
+}
+
+/// The settings the "Optimized versions" choice saves: `optimized.enabled`
+/// always; with it on, the size limit and the directory too. A blank size
+/// or directory takes the runtime value out, so the server's default
+/// applies. Off, the size and the directory are left as they are.
+pub fn optimized_changes(
+    on: bool,
+    size_gib: &str,
+    dir: &str,
+) -> Result<Vec<(&'static str, Option<serde_json::Value>)>, String> {
+    let mut changes = vec![("optimized.enabled", Some(serde_json::json!(on)))];
+    if !on {
+        return Ok(changes);
+    }
+    let size = match size_gib.trim() {
+        "" => None,
+        typed => Some(serde_json::json!(mib(typed).ok_or(
+            "Optimized versions' limit is a number of GiB, more than 0."
+        )?)),
+    };
+    let dir = match dir.trim() {
+        "" => None,
+        typed if typed.starts_with('/') => Some(serde_json::json!(typed)),
+        _ => return Err("Optimized versions' directory is a full path, starting with /.".into()),
+    };
+    changes.push(("optimized.max_size_mb", size));
+    changes.push(("optimized.dir", dir));
+    Ok(changes)
+}
+
 /// What `transcode.gpu_filters` does, under its switch.
 pub const GPU_FILTERS_NOTE: &str = "Faster and uses less CPU, but colours or subtitle placement \
      may differ slightly; falls back to the CPU where the GPU can't.";
@@ -1056,6 +1098,47 @@ mod tests {
         );
         assert_eq!(decoders_line("Quick Sync", &found), None);
         assert_eq!(decoders_line("Software", &found), None);
+    }
+
+    #[test]
+    fn optimized_versions_start_at_100_gib_and_save_only_the_switch_when_off() {
+        assert_eq!(optimized_size_text(None), "100");
+        assert_eq!(optimized_size_text(Some(16384)), "16");
+        assert_eq!(
+            optimized_changes(false, "7", "/srv/x").unwrap(),
+            vec![("optimized.enabled", Some(json!(false)))]
+        );
+    }
+
+    #[test]
+    fn optimized_versions_on_save_the_limit_in_mib_and_the_directory() {
+        assert_eq!(
+            optimized_changes(true, " 16 ", " /srv/copies ").unwrap(),
+            vec![
+                ("optimized.enabled", Some(json!(true))),
+                ("optimized.max_size_mb", Some(json!(16384))),
+                ("optimized.dir", Some(json!("/srv/copies"))),
+            ]
+        );
+        // Blank: the server's defaults.
+        assert_eq!(
+            optimized_changes(true, "", "").unwrap(),
+            vec![
+                ("optimized.enabled", Some(json!(true))),
+                ("optimized.max_size_mb", None),
+                ("optimized.dir", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn optimized_versions_on_refuse_a_limit_of_nothing_and_a_relative_directory() {
+        for size in ["0", "-1", "lots"] {
+            assert!(optimized_changes(true, size, "").is_err(), "{size}");
+        }
+        assert!(optimized_changes(true, "10", "copies").is_err());
+        // Off, nothing typed is looked at.
+        assert!(optimized_changes(false, "0", "copies").is_ok());
     }
 
     #[test]

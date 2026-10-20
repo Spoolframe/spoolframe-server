@@ -706,17 +706,19 @@ fn plex(config: &ServerConfig, layers: &Layers, state_dir: &Path) -> Result<Comp
 /// credentials, with no GPU's device nodes: a run on a GPU is given its
 /// one card's (PGPU-05, `Transcoding`). The optimized copies, which are
 /// in the state directory unless `optimized.dir` says otherwise, are read
-/// as media (PX-37).
+/// as media (PX-37), when they are on.
 fn media_sandbox(config: &ServerConfig, state_dir: &Path) -> Result<Sandbox> {
     let mut hidden = vec![state_dir.to_path_buf()];
     hidden.extend(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from));
-    let copies = config.optimized.settings(state_dir)?.dir;
-    Ok(Sandbox::new(
+    let sandbox = Sandbox::new(
         config.media.sandbox()?,
         hidden,
         sandbox::GpuDevices::default(),
-    )?
-    .showing(vec![copies])?)
+    )?;
+    Ok(match config.optimized.settings(state_dir)? {
+        Some(copies) => sandbox.showing(vec![copies.dir])?,
+        None => sandbox,
+    })
 }
 
 /// Shows the media tools confined here, in this service's own sandbox
@@ -1018,25 +1020,28 @@ async fn run(
     }
     // Optimized versions (PX-37): what a stopped server was making is made
     // again, from the start.
-    let optimized_settings = config.optimized.settings(state_dir)?;
-    let optimized = Arc::new(
-        Pool::start(
-            PoolSources {
-                store: store.clone(),
-                jobs: jobs.clone(),
-                transcoding: transcoding.clone(),
-                prober: prober.clone(),
-            },
-            &optimized_settings,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "cannot prepare the optimized versions in {}",
-                optimized_settings.dir.display()
+    // Off unless the config turns it on: no pool, no copies made.
+    let optimized = match config.optimized.settings(state_dir)? {
+        Some(settings) => Some(Arc::new(
+            Pool::start(
+                PoolSources {
+                    store: store.clone(),
+                    jobs: jobs.clone(),
+                    transcoding: transcoding.clone(),
+                    prober: prober.clone(),
+                },
+                &settings,
             )
-        })?,
-    );
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot prepare the optimized versions in {}",
+                    settings.dir.display()
+                )
+            })?,
+        )),
+        None => None,
+    };
     store.spawn_session_purge();
     // Previews made ahead (P3-13) start with what is being watched.
     previews::ahead::spawn(
@@ -1279,7 +1284,7 @@ async fn run(
                 watch: watch.clone(),
                 playlists: playlists.clone(),
             }),
-            optimized: Some(optimized.clone()),
+            optimized: optimized.clone(),
         },
         admin_origins,
         admin_proxies,
@@ -1321,7 +1326,7 @@ async fn run(
             subtitles,
             subtitle_timings: subtitle_timings.clone(),
             subtitle_downloads,
-            optimized: Some(optimized.clone()),
+            optimized: optimized.clone(),
             previews,
             index_ahead,
             metrics,
@@ -1376,7 +1381,9 @@ async fn run(
     // export can still send it.
     jobs.stop_all();
     // The copy being made, too: the next start makes it again.
-    optimized.stop();
+    if let Some(optimized) = &optimized {
+        optimized.stop();
+    }
     within(SHUTDOWN_STEP, "the artwork cache", artwork_cache.close()).await;
     within(SHUTDOWN_STEP, "the previews cache", previews_cache.close()).await;
     // What is queued for the collector goes before the process does.
