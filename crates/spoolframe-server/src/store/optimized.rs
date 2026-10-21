@@ -875,6 +875,28 @@ impl Store {
     }
 
     /// Copy `id`, which the caller knows is there.
+    /// The live copy of `media_path` for `target` made with `video`, if
+    /// there is one: what a request for it would be given.
+    pub async fn live_optimized_copy(
+        &self,
+        media_path: &str,
+        target: &CopyTarget,
+        video: &CopyVideo,
+    ) -> Result<Option<CopyRow>, StoreError> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM optimized_copies \
+             WHERE media_path = ?1 AND target = ?2 AND outdated = 0",
+        )
+        .bind(media_path)
+        .bind(target_key(target, video))
+        .fetch_optional(&self.pool)
+        .await?;
+        match id {
+            Some(id) => self.optimized_copy(&id).await,
+            None => Ok(None),
+        }
+    }
+
     async fn copy_there(&self, id: &str) -> Result<CopyRow, StoreError> {
         self.optimized_copy(id)
             .await?

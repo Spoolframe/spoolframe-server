@@ -282,6 +282,27 @@ pub fn original(
     })
 }
 
+/// About how many bytes a download of `descriptor`'s file, `size` bytes,
+/// is with every track: its own size when its video is kept
+/// (`video_rate` `None`), else the video at `video_rate` (bits/s, at
+/// most the file's own video rate) and the rest of the file at the rest
+/// of its rate, over its length. `None` when the length is not known.
+pub fn estimate(descriptor: &MediaDescriptor, size: u64, video_rate: Option<u64>) -> Option<u64> {
+    let Some(rate) = video_rate else {
+        return Some(size);
+    };
+    let length = descriptor.duration?;
+    let source = descriptor.video.as_ref().and_then(|v| v.bit_rate);
+    // Audio and the rest: unknown, so left out, without the video's rate.
+    let rest = match (descriptor.bit_rate, source) {
+        (Some(all), Some(video)) => all.saturating_sub(video),
+        _ => 0,
+    };
+    let video = source.map_or(rate, |source| rate.min(source));
+    let bits = u128::from(video + rest) * length.as_millis() / 1000;
+    u64::try_from(bits / 8).ok()
+}
+
 /// Whether a device that plays `caps` plays `profile`'s copies: what
 /// download options list.
 pub fn plays(caps: &ClientCapabilities, profile: &Profile) -> bool {
@@ -687,6 +708,48 @@ mod tests {
                 audio: Vec::new(),
             }
         );
+    }
+
+    /// 100 s at 20 Mbit/s, 18 of them the video's.
+    fn rated_film() -> MediaDescriptor {
+        let mut film = h264_aac_mp4();
+        film.duration = Some(std::time::Duration::from_secs(100));
+        film.bit_rate = Some(20_000_000);
+        film.video.as_mut().unwrap().bit_rate = Some(18_000_000);
+        film
+    }
+
+    #[test]
+    fn a_kept_video_is_estimated_as_the_file_s_size() {
+        assert_eq!(
+            estimate(&rated_film(), 250_000_000, None),
+            Some(250_000_000)
+        );
+    }
+
+    #[test]
+    fn a_converted_video_is_estimated_at_its_rate_with_the_rest_of_the_file() {
+        // (4 + 2) Mbit/s over 100 s.
+        assert_eq!(
+            estimate(&rated_film(), 250_000_000, Some(4_000_000)),
+            Some(75_000_000)
+        );
+    }
+
+    #[test]
+    fn a_rate_over_the_file_s_own_video_rate_is_estimated_at_the_file_s() {
+        // (18 + 2) Mbit/s over 100 s: the encode cannot add detail.
+        assert_eq!(
+            estimate(&rated_film(), 250_000_000, Some(40_000_000)),
+            Some(250_000_000)
+        );
+    }
+
+    #[test]
+    fn a_film_of_unknown_length_has_no_estimate() {
+        let mut film = rated_film();
+        film.duration = None;
+        assert_eq!(estimate(&film, 250_000_000, Some(4_000_000)), None);
     }
 
     #[test]

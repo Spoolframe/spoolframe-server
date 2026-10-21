@@ -143,6 +143,38 @@ pub struct DownloadOptionsInfo {
     /// The subtitles this device's download would leave out, of all the
     /// item's, with why: leave them unticked.
     pub left_out: Vec<LeftOutSubtitle>,
+    /// About each option: `Original` first, then each of `profiles` in
+    /// its order. Films and episodes only; empty from a server before
+    /// 0.14.2.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub estimates: Vec<DownloadEstimate>,
+}
+
+/// About one download option (`DownloadOptions`): how large it is and
+/// whether it waits for a conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadEstimate {
+    pub source: DownloadSource,
+    /// About how many bytes the file is with every track: the item's
+    /// own size where nothing is converted, else the converted video's
+    /// rate and the rest of the file's over its length. `None` when the
+    /// server cannot tell (the file's length is not known).
+    pub size_bytes: Option<u64>,
+    pub readiness: DownloadReadiness,
+}
+
+/// Whether a download option waits for a conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadReadiness {
+    /// Nothing to convert, or the server already keeps the conversion:
+    /// the file is written at once.
+    Ready,
+    /// The server converts first: the download waits for it.
+    ConvertsFirst,
+    /// A kind this build does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Where a download is.

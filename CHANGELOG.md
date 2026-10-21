@@ -17,6 +17,17 @@
   none. Preparing a download in another profile is refused with
   `InvalidInput` ("this device does not play hevc"). Before, an HEVC
   file could be downloaded to a device that cannot play it.
+- `DownloadOptionsInfo` gains `estimates`, one per option, `Original`
+  first and then each profile in `profiles`' order:
+  - `size_bytes`: about how large the file is, with every track. It is
+    the item's own size when its video is kept, else the converted
+    video's rate (at most the file's own) plus the rest of the file's
+    rate, over its length. `None` when the length is not known.
+  - `readiness`: `ready` when nothing is converted or the server
+    already keeps the conversion, else `converts_first`.
+  Films and episodes only: a track's options have none. A server
+  before 0.14.2 sends none, and the field decodes as empty. The
+  protocol version is still 15.
 
 ## 0.14.1 (2026-10-21)
 

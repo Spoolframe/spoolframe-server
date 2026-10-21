@@ -5445,7 +5445,7 @@ impl ClientProtocol {
         };
         let class = downloads_offered(hello)?;
         let kind = downloadable(hello, id)?;
-        let (_, descriptor) = self.describe(id).await?;
+        let (path, descriptor) = self.describe(id).await?;
         if kind == Downloadable::Track {
             return music_download_options(&descriptor, class);
         }
@@ -5477,7 +5477,8 @@ impl ClientProtocol {
         })?;
         // As the download would be: not as it is with a subtitle left out
         // or read as text.
-        let original = match plan::settled(decision, &ways) {
+        let settled = plan::settled(decision, &ways);
+        let original = match settled.clone() {
             Decision::AsIs => OriginalDownload::AsIs,
             Decision::Remux => OriginalDownload::Remux,
             Decision::Convert { video, audio, .. } => OriginalDownload::Convert {
@@ -5495,20 +5496,26 @@ impl ClientProtocol {
                 Subtitle::Written | Subtitle::ReadAsText => None,
             })
             .collect();
-        let profiles = store
+        let played: Vec<_> = store
             .optimized_profiles()
             .await
             .map_err(internal)?
             .into_iter()
             .filter(|p| plan::plays(&caps, p))
-            .map(|p| p.name)
             .collect();
+        let estimates = self
+            .services
+            .downloads
+            .estimates(&path, &descriptor, settled, &played, &caps)
+            .await
+            .map_err(downloads_error)?;
         Ok(DownloadOptionsInfo {
             tracks: descriptor.tracks(),
             preferred,
-            profiles,
+            profiles: played.into_iter().map(|p| p.name).collect(),
             original,
             left_out,
+            estimates,
         })
     }
 
@@ -6322,6 +6329,8 @@ fn music_download_options(
             },
         },
         left_out: Vec::new(),
+        // Films and episodes only.
+        estimates: Vec::new(),
     })
 }
 

@@ -449,6 +449,7 @@ async fn the_options_offer_the_viewer_s_languages_the_profiles_and_what_original
         profiles,
         original,
         left_out,
+        ..
     })) = mac
         .call(
             Some(&session),
@@ -935,5 +936,69 @@ async fn a_profile_the_device_does_not_play_is_refused() {
         matches!(&answer, Response::Err(Error::InvalidInput { message }) if message.contains("hevc")),
         "{answer:?}"
     );
+    server.stop().await;
+}
+
+/// `DownloadOptions` from `client`.
+async fn options(client: &TestClient, session: &SessionId) -> DownloadOptionsInfo {
+    match client
+        .call(
+            Some(session),
+            Request::DownloadOptions {
+                id: movie().id().clone(),
+            },
+        )
+        .await
+    {
+        Response::Ok(Reply::DownloadOptions(options)) => options,
+        other => panic!("no options: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn each_option_is_estimated_original_first() {
+    use spoolframe_protocol::downloads::DownloadReadiness::{ConvertsFirst, Ready};
+    let server = server("downloads-wire-estimates", ServerOptions::default()).await;
+    write_film(&server);
+    let size = std::fs::metadata(&server.media).unwrap().len();
+    let (linux, session) = device(&server, Platform::Linux, "alice").await;
+    let estimates = options(&linux, &session).await.estimates;
+    let profile = |name: &str| DownloadSource::Profile { name: name.into() };
+    assert_eq!(
+        estimates
+            .iter()
+            .map(|e| (e.source.clone(), e.readiness))
+            .collect::<Vec<_>>(),
+        [
+            // Linux plays the H.264 film as it is: nothing to convert.
+            (DownloadSource::Original, Ready),
+            (profile("Mobile"), ConvertsFirst),
+            (profile("Mobile (H.264)"), ConvertsFirst),
+            (profile("TV"), ConvertsFirst),
+            (profile("Compact 4K"), ConvertsFirst),
+        ]
+    );
+    assert_eq!(estimates[0].size_bytes, Some(size));
+    assert!(
+        estimates[1..].iter().all(|e| e.size_bytes.is_some()),
+        "{estimates:?}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_profile_whose_copy_is_made_is_ready() {
+    use spoolframe_protocol::downloads::DownloadReadiness::Ready;
+    let server = server("downloads-wire-estimate-ready", ServerOptions::default()).await;
+    write_film(&server);
+    let (linux, session) = device(&server, Platform::Linux, "alice").await;
+    let h264 = DownloadSource::Profile {
+        name: "Mobile (H.264)".into(),
+    };
+    let info = prepared(&linux, &session, h264.clone(), first_audio()).await;
+    ready(&linux, &session, &info.id).await;
+    let estimates = options(&linux, &session).await.estimates;
+    let made = estimates.iter().find(|e| e.source == h264).unwrap();
+    assert_eq!(made.readiness, Ready, "{estimates:?}");
     server.stop().await;
 }

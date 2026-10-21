@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, watch};
 
 use spoolframe_media::{MediaDescriptor, SubtitleSource, codecs};
+use spoolframe_protocol::downloads::{DownloadEstimate, DownloadReadiness, DownloadSource};
 use spoolframe_types::{AudioCodec, BitmapPreference, ClientCapabilities, Container, Platform};
 
 use crate::config::DownloadSettings;
@@ -800,6 +801,66 @@ impl Downloads {
             job,
         )
         .await
+    }
+
+    /// About each option of a download of `media`, with every track:
+    /// original quality, which would be `original`, then each of
+    /// `profiles` in their order. The device plays every one of them, as
+    /// `caps` says; an option the plan refuses is left out.
+    pub async fn estimates(
+        &self,
+        media: &Path,
+        descriptor: &MediaDescriptor,
+        original: Decision,
+        profiles: &[crate::store::optimized::Profile],
+        caps: &ClientCapabilities,
+    ) -> Result<Vec<DownloadEstimate>, DownloadError> {
+        let size = tokio::fs::metadata(media)
+            .await
+            .map_err(DownloadError::Media)?
+            .len();
+        let stamp = crate::files::stamp_text(media)
+            .await
+            .map_err(DownloadError::Media)?;
+        let mut options = vec![(DownloadSource::Original, original)];
+        for profile in profiles {
+            if let Ok(decision) = plan::profile(descriptor, profile, caps, &Tracks::All) {
+                let source = DownloadSource::Profile {
+                    name: profile.name.clone(),
+                };
+                options.push((source, decision));
+            }
+        }
+        let mut estimates = Vec::with_capacity(options.len());
+        for (source, decision) in options {
+            let (rate, readiness) = match &decision {
+                Decision::AsIs | Decision::Remux => (None, DownloadReadiness::Ready),
+                Decision::Convert { target, video, .. } => {
+                    let source_rate = descriptor.video.as_ref().and_then(|v| v.bit_rate);
+                    let rate = (!video.copied)
+                        .then(|| video.max_bitrate.or(source_rate))
+                        .flatten();
+                    let made = self
+                        .inner
+                        .store
+                        .live_optimized_copy(&media.display().to_string(), target, video)
+                        .await?
+                        .is_some_and(|c| c.state == CopyState::Ready && c.source_stamp == stamp);
+                    let readiness = if made {
+                        DownloadReadiness::Ready
+                    } else {
+                        DownloadReadiness::ConvertsFirst
+                    };
+                    (rate, readiness)
+                }
+            };
+            estimates.push(DownloadEstimate {
+                source,
+                size_bytes: plan::estimate(descriptor, size, rate),
+                readiness,
+            });
+        }
+        Ok(estimates)
     }
 
     /// Keep `asked`, a download of `job`'s file, as the user's, and begin

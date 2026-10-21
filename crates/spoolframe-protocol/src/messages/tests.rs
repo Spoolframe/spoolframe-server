@@ -3341,10 +3341,37 @@ mod playlist_upcoming {
 mod downloads {
     use super::*;
     use crate::downloads::{
-        DownloadFile, DownloadInfo, DownloadOptionsInfo, DownloadSource, DownloadState,
-        DownloadTracks, FileTracks, LeftOutSubtitle, OriginalDownload,
+        DownloadEstimate, DownloadFile, DownloadInfo, DownloadOptionsInfo, DownloadReadiness,
+        DownloadSource, DownloadState, DownloadTracks, FileTracks, LeftOutSubtitle,
+        OriginalDownload,
     };
     use crate::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
+
+    /// A server before 0.14.2 sends no `estimates`: the reply still
+    /// decodes, with none.
+    #[test]
+    fn options_without_estimates_decode_with_none() {
+        let old = serde_json::json!({
+            "tracks": MediaTracks::default(),
+            "preferred": {"type": "chosen", "audio": [0], "subtitles": []},
+            "profiles": ["Mobile"],
+            "original": {"type": "as_is"},
+            "left_out": [],
+        });
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        let options: DownloadOptionsInfo = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(options.estimates, []);
+    }
+
+    /// A readiness a newer server names is `Unknown`, not an error.
+    #[test]
+    fn an_unknown_readiness_is_unknown() {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&"copying_now", &mut bytes).unwrap();
+        let readiness: DownloadReadiness = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(readiness, DownloadReadiness::Unknown);
+    }
 
     fn id() -> MediaId {
         MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap()
@@ -3463,6 +3490,20 @@ mod downloads {
                     subtitle: 3,
                     reason: "picture subtitles are not carried in an MP4 file".into(),
                 }],
+                estimates: vec![
+                    DownloadEstimate {
+                        source: DownloadSource::Original,
+                        size_bytes: Some(4_000_000_000),
+                        readiness: DownloadReadiness::ConvertsFirst,
+                    },
+                    DownloadEstimate {
+                        source: DownloadSource::Profile {
+                            name: "Mobile".into(),
+                        },
+                        size_bytes: None,
+                        readiness: DownloadReadiness::Ready,
+                    },
+                ],
             }),
             Reply::Download(ready()),
             Reply::Downloads {
