@@ -607,7 +607,7 @@ async fn a_download_in_a_profile_is_made_from_its_copy() {
         &linux,
         &session,
         DownloadSource::Profile {
-            name: "Mobile".into(),
+            name: "Mobile (H.264)".into(),
         },
         first_audio(),
     )
@@ -621,7 +621,9 @@ async fn a_download_in_a_profile_is_made_from_its_copy() {
         (
             probe(&file, "stream=codec_name"),
             copies.iter().any(|c| c.target
-                == spoolframe_server::store::optimized::CopyTarget::Profile("Mobile".into()))
+                == spoolframe_server::store::optimized::CopyTarget::Profile(
+                    "Mobile (H.264)".into()
+                ))
         ),
         (vec!["h264".to_owned(), "aac".to_owned()], true)
     );

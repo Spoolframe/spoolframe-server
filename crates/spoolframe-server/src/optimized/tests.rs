@@ -1230,9 +1230,10 @@ mod on_demand {
     #[tokio::test]
     async fn a_download_s_track_waits_before_an_on_demand_one() {
         let s = setup("on-demand-lane", "exit 1", 0, 1 << 30).await;
+        // Another codec than TV's: the two copies share no track.
         let request = s
             .pool
-            .put_request(asked(the_film(), "Mobile", false))
+            .put_request(asked(the_film(), "Mobile (H.264)", false))
             .await
             .unwrap();
         let on_demand = s.on_demand_copy(&request.row.id, movie().id(), None).await;

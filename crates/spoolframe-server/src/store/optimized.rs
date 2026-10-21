@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_server_ships_three_profiles() {
+    async fn the_server_ships_four_profiles() {
         let store = test_store("optimized-shipped").await;
         let names: Vec<_> = store
             .optimized_profiles()
@@ -1309,16 +1309,105 @@ mod tests {
             .into_iter()
             .map(|p| p.name)
             .collect();
-        assert_eq!(names, ["Mobile", "TV", "Compact 4K"]);
+        assert_eq!(names, ["Mobile", "Mobile (H.264)", "TV", "Compact 4K"]);
     }
 
     #[tokio::test]
-    async fn a_shipped_profile_is_what_the_ticket_names() {
+    async fn mobile_ships_as_hevc() {
         let store = test_store("optimized-shipped-mobile").await;
         assert_eq!(
             store.optimized_profile("Mobile").await.unwrap(),
-            Some(mobile())
+            Some(Profile {
+                video_codec: VideoCodec::Hevc,
+                ..mobile()
+            })
         );
+    }
+
+    #[tokio::test]
+    async fn mobile_h264_ships_as_mobile_was() {
+        let store = test_store("optimized-shipped-mobile-h264").await;
+        assert_eq!(
+            store.optimized_profile("Mobile (H.264)").await.unwrap(),
+            Some(Profile {
+                name: "Mobile (H.264)".into(),
+                ..mobile()
+            })
+        );
+    }
+
+    /// A server from before migration 0042: `Mobile`'s H.264 copies are
+    /// `Mobile (H.264)`'s after it, not made again.
+    #[tokio::test]
+    async fn the_migration_keeps_mobile_copies_as_mobile_h264() {
+        let pool = before_migration("optimized-mobile-migrated", 42).await;
+        sqlx::query(
+            "INSERT INTO optimized_copies (id, media_id, media_path, source_stamp, target, \
+             video_codec, height, max_bitrate, tone_map, requested_at, last_used_at) \
+             VALUES ('c1', 'plex:movie:1', '/films/Alien.mkv', '100 5', 'profile:Mobile', \
+             'h264', 1080, 4000000, 0, 1, 1)",
+        )
+        .execute(&pool.0)
+        .await
+        .unwrap();
+        let store = pool.open().await;
+        let target: String =
+            sqlx::query_scalar("SELECT target FROM optimized_copies WHERE id = 'c1'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(target, "profile:Mobile (H.264)");
+    }
+
+    /// An admin's own `Mobile` is theirs: migration 0042 leaves it.
+    #[tokio::test]
+    async fn the_migration_keeps_an_edited_mobile() {
+        let pool = before_migration("optimized-mobile-edited", 42).await;
+        sqlx::query("UPDATE optimized_profiles SET height = 720 WHERE name = 'Mobile'")
+            .execute(&pool.0)
+            .await
+            .unwrap();
+        let store = pool.open().await;
+        assert_eq!(
+            store.optimized_profile("Mobile").await.unwrap(),
+            Some(Profile {
+                height: 720,
+                ..mobile()
+            })
+        );
+    }
+
+    /// A database with every migration before `version`, to open as a
+    /// store once a test has put its rows in.
+    struct Before(sqlx::SqlitePool, spoolframe_test_dir::TestDir);
+
+    impl Before {
+        async fn open(self) -> Store {
+            self.0.close().await;
+            Store::open(self.1.as_ref()).await.unwrap()
+        }
+    }
+
+    async fn before_migration(test: &str, version: i64) -> Before {
+        let dir = super::super::tests::state_dir(test).await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.as_ref().join(super::super::DB_FILE))
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = before
+            .iter()
+            .filter(|m| m.version < version)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        before.run(&pool).await.unwrap();
+        Before(pool, dir)
     }
 
     #[tokio::test]
@@ -1416,7 +1505,8 @@ mod tests {
             .request_optimized_copy(&in_mobile(), &[])
             .await
             .unwrap();
-        let written = store.put_optimized_profile(&mobile()).await.unwrap();
+        let shipped = store.optimized_profile("Mobile").await.unwrap().unwrap();
+        let written = store.put_optimized_profile(&shipped).await.unwrap();
         assert_eq!(
             written,
             ProfileWritten {

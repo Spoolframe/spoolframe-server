@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The `Mobile` profile is now HEVC 1080p at 4 Mbit/s. At the same rate,
+  HEVC looks better than H.264, and the phones it is for decode it in
+  hardware. A new profile, `Mobile (H.264)`, is listed after it. It is
+  `Mobile` as it was, for devices that play H.264 only. On a server
+  where `Mobile` is still as shipped, its copies move to
+  `Mobile (H.264)` and are not made again, and on-demand requests for
+  `Mobile` ask for their items again, in HEVC. A `Mobile` the admin
+  edited is not changed. The server encodes HEVC only with a GPU or an
+  ffmpeg that has libx265: without one, a `Mobile` copy fails, as `TV`
+  and `Compact 4K` copies already do.
+
 ## 0.14.1 (2026-10-21)
 
 - SDK: a downloaded file belongs to the device, not to a user. Two

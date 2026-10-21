@@ -122,7 +122,7 @@ async fn the_overview_shows_the_budget_the_profiles_and_each_copy() {
             .iter()
             .map(|p| p.name.as_str())
             .collect::<Vec<_>>(),
-        ["Mobile", "TV", "Compact 4K"]
+        ["Mobile", "Mobile (H.264)", "TV", "Compact 4K"]
     );
     let shown = &overview.copies[0];
     assert_eq!(

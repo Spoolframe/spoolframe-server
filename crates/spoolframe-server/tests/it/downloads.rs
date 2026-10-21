@@ -461,7 +461,7 @@ async fn a_remade_stored_video_track_gives_a_new_content_key() {
         prepare(
             &server,
             DeviceClass::Apple,
-            Source::Profile("Mobile".into()),
+            Source::Profile("Mobile (H.264)".into()),
             first_audio(),
             BitmapPreference::Text,
         )
@@ -478,7 +478,7 @@ async fn a_remade_stored_video_track_gives_a_new_content_key() {
         .await
         .unwrap()
         .into_iter()
-        .find(|c| c.target == CopyTarget::Profile("Mobile".into()))
+        .find(|c| c.target == CopyTarget::Profile("Mobile (H.264)".into()))
         .unwrap();
     assert_eq!(server.pool().delete(&copy.id).await.unwrap(), Deleted::Now);
     let again = ask().await;
