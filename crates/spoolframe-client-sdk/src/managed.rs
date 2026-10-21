@@ -391,6 +391,8 @@ struct Inner {
     gone: watch::Sender<()>,
     /// What keeps a track's bytes as they are read (PX-51).
     keeper: std::sync::OnceLock<Arc<crate::downloads::Keeper>>,
+    /// The read ahead of a kept track's file was started.
+    reading_ahead: std::sync::atomic::AtomicBool,
 }
 
 /// A live playback with shared recovery, bounded progress reporting and cleanup.
@@ -602,6 +604,7 @@ impl ManagedPlayback {
             runtime: tokio::runtime::Handle::current(),
             gone: watch::Sender::new(()),
             keeper: std::sync::OnceLock::new(),
+            reading_ahead: std::sync::atomic::AtomicBool::new(false),
         });
         // A share of the server's uplink that moved (PX-46): a playback in
         // Auto plans itself again where the viewer is, as the viewer's own
@@ -789,18 +792,70 @@ impl ManagedPlayback {
     }
     /// Up to `length` bytes of a direct playback's file from `offset`. A
     /// playback the server ended is resumed and the read goes on.
+    ///
+    /// A track kept as it plays (PX-51) is read ahead, whole, from its
+    /// first read: the reads come from what is here once it is, and the
+    /// track is in the cache before it has played to its end.
     pub async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
-        let backend = &self.0.backend;
-        let bytes = self
-            .resuming(None, move |p| async move {
-                backend.read(&p.handle, offset, length).await
-            })
-            .await?;
-        if let Some(keeper) = self.0.keeper.get() {
-            let p = self.snapshot();
-            keeper.direct(&p.plan, p.size, offset, &bytes).await;
+        let Some(keeper) = self.0.keeper.get() else {
+            return self.read_remote(offset, length).await;
+        };
+        let size = self.snapshot().size;
+        if let Some(bytes) = keeper.local(size, offset, length).await {
+            return Ok(bytes);
         }
+        let bytes = self.read_remote(offset, length).await?;
+        let p = self.snapshot();
+        keeper.direct(&p.plan, p.size, offset, &bytes).await;
+        self.read_ahead();
         Ok(bytes)
+    }
+
+    async fn read_remote(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
+        let backend = &self.0.backend;
+        self.resuming(None, move |p| async move {
+            backend.read(&p.handle, offset, length).await
+        })
+        .await
+    }
+
+    /// Fetch what the keeper is missing of the file, a piece at a time,
+    /// once: until it is all here, the keeper gives up, a read fails, or
+    /// the playback goes. The task holds the playback only for a read.
+    fn read_ahead(&self) {
+        if self
+            .0
+            .reading_ahead
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(&self.0);
+        self.0.runtime.spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let playback = ManagedPlayback(inner);
+                let Some(keeper) = playback.0.keeper.get().cloned() else {
+                    return;
+                };
+                let Some((offset, length)) = keeper.gap().await else {
+                    return;
+                };
+                match playback.read_remote(offset, length).await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let p = playback.snapshot();
+                        keeper.direct(&p.plan, p.size, offset, &bytes).await;
+                    }
+                    Ok(_) => return,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "a track's read ahead stopped");
+                        return;
+                    }
+                }
+            }
+        });
     }
     /// A reader remains pinned to its handle and epoch snapshot. On a seek
     /// ([`SdkError::PlaybackRestarted`]) or a resume

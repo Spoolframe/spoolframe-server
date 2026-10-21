@@ -128,6 +128,20 @@ async fn play(session: &Session, key: &str, whole: bool) {
     playback.close().await.unwrap();
 }
 
+/// Whether `check` holds within `limit`, asked every 50 ms.
+async fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if check() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The tracks of `music`, by key, with their marks.
 fn marks(music: &OfflineMusic) -> Vec<(String, OfflineMark)> {
     let mut marks: Vec<(String, OfflineMark)> = music
@@ -220,10 +234,11 @@ async fn an_album_downloaded_plays_offline_with_its_art() {
     away.close().await;
 }
 
-/// A track played to its end is kept, marked as such, the file as it is;
-/// one skipped after its first bytes leaves nothing.
+/// A track played to its end is kept, marked as such, the file as it is.
+/// One skipped after its first bytes is kept only if its read ahead had
+/// brought it whole by then; it leaves no part either way.
 #[tokio::test]
-async fn a_track_played_to_the_end_is_kept_and_one_skipped_is_not() {
+async fn a_track_played_to_the_end_is_kept_and_one_skipped_leaves_no_part() {
     let server = music_server("sdk-music-kept").await;
     let dir = TestDir::new("spoolframe-sdk-music-kept").await;
     let storage = Arc::new(MemoryStorage::default());
@@ -231,25 +246,72 @@ async fn a_track_played_to_the_end_is_kept_and_one_skipped_is_not() {
     let session = alice(&server, &client).await;
     play(&session, "32", true).await;
     play(&session, "33", false).await;
-    let music = offline(&client, &server, &session.user().user_id);
-    let kept = &music.artists[0].albums[0].tracks[0];
-    let parts = std::fs::read_dir(dir.join("listening"))
-        .map(|d| d.count())
-        .unwrap_or(0);
+    let user_id = session.user().user_id.clone();
+    let listed = |music: &OfflineMusic| -> u64 {
+        music
+            .artists
+            .iter()
+            .flat_map(|a| &a.albums)
+            .flat_map(|a| &a.tracks)
+            .map(|t| t.size)
+            .sum()
+    };
+    // Behind the close, the skipped track's part goes, or it is kept
+    // whole if its read ahead had finished: settled once no part is left
+    // and the cache is what is listed.
+    let settled = eventually(Duration::from_secs(10), || {
+        let parts = std::fs::read_dir(dir.join("listening"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        parts == 0
+            && client.downloads().cache().used == listed(&offline(&client, &server, &user_id))
+    })
+    .await;
+    let music = offline(&client, &server, &user_id);
+    let whole = music
+        .artists
+        .iter()
+        .flat_map(|a| &a.albums)
+        .flat_map(|a| &a.tracks)
+        .all(|t| {
+            let key = t.item.id().key().to_owned();
+            std::fs::read(&t.file_path).unwrap() == source(&server, &key)
+        });
     assert_eq!(
-        (
-            marks(&music),
-            std::fs::read(&kept.file_path).unwrap() == source(&server, "32"),
-            parts,
-            client.downloads().cache().used,
-        ),
-        (
-            vec![("32".to_owned(), OfflineMark::Kept)],
-            true,
-            0,
-            kept.size,
-        )
+        (settled, marks(&music).first().cloned(), whole),
+        (true, Some(("32".to_owned(), OfflineMark::Kept)), true)
     );
+    client.close().await;
+    server.stop().await;
+}
+
+/// One read of a track played direct is enough: the rest is read ahead,
+/// and the track is in the cache, the file as it is, before the player
+/// has asked for it.
+#[tokio::test]
+async fn a_track_is_read_ahead_whole_from_its_first_read() {
+    let server = music_server("sdk-music-ahead").await;
+    let dir = TestDir::new("spoolframe-sdk-music-ahead").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let playback = session
+        .open_playback(&track_id("32"), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let size = playback.snapshot().size;
+    let first = playback.read(0, 4096.min(size)).await.unwrap();
+    let user_id = session.user().user_id.clone();
+    let kept = eventually(Duration::from_secs(30), || {
+        marks(&offline(&client, &server, &user_id)) == [("32".to_owned(), OfflineMark::Kept)]
+    })
+    .await;
+    // The rest of the file comes from what was kept.
+    let rest = playback.read(first.len() as u64, size).await.unwrap();
+    let mut read = first;
+    read.extend(rest);
+    assert_eq!((kept, read == source(&server, "32")), (true, true));
+    playback.close().await.unwrap();
     client.close().await;
     server.stop().await;
 }

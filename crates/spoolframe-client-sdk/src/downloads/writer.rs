@@ -80,6 +80,9 @@ impl BlockWriter {
         }
         self.file.seek(std::io::SeekFrom::Start(offset)).await?;
         self.file.write_all(bytes).await?;
+        // Done, not only handed to tokio's file: a read of the part may
+        // follow (a track read ahead, played from it).
+        self.file.flush().await?;
         self.unsynced += bytes.len() as u64;
         self.add(offset, end);
         Ok(())
@@ -121,6 +124,34 @@ impl BlockWriter {
         }
         self.size = size;
         Ok(())
+    }
+
+    /// Every byte of `[offset, offset + len)` is written.
+    pub fn has(&self, offset: u64, len: u64) -> bool {
+        let end = offset.saturating_add(len);
+        self.have.iter().any(|&(s, e)| s <= offset && end <= e)
+    }
+
+    /// The first range not written yet, at most `max` bytes of it; `None`
+    /// once complete, or while the size is not known.
+    pub fn first_gap(&self, max: u64) -> Option<(u64, u64)> {
+        if self.size == u64::MAX {
+            return None;
+        }
+        let mut at = 0;
+        for &(s, e) in &self.have {
+            if s > at {
+                break;
+            }
+            at = at.max(e);
+        }
+        let end = self
+            .have
+            .iter()
+            .map(|&(s, _)| s)
+            .find(|&s| s > at)
+            .unwrap_or(self.size);
+        (at < self.size).then(|| (at, (end - at).min(max)))
     }
 
     pub fn is_complete(&self) -> bool {
@@ -197,6 +228,27 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(dir.join("done")).unwrap(), film);
         assert!(!dir.join("part").exists());
+    }
+
+    /// What a read ahead fetches next: the first bytes missing, up to the
+    /// next written, at most so many at once.
+    #[tokio::test]
+    async fn the_first_gap_is_what_is_missing_from_the_start() {
+        let dir = dir("first-gap");
+        let mut writer = BlockWriter::open(&dir.join("part"), 100, 0).await.unwrap();
+        assert_eq!(writer.first_gap(30), Some((0, 30)));
+        writer.write_at(0, &[1; 10]).await.unwrap();
+        writer.write_at(50, &[1; 10]).await.unwrap();
+        assert_eq!(writer.first_gap(100), Some((10, 40)));
+        assert!(writer.has(52, 8) && !writer.has(55, 10));
+        writer.write_at(10, &[1; 40]).await.unwrap();
+        assert_eq!(writer.first_gap(100), Some((60, 40)));
+        writer.write_at(60, &[1; 40]).await.unwrap();
+        assert_eq!(writer.first_gap(100), None);
+        let stream = BlockWriter::open(&dir.join("stream"), u64::MAX, 0)
+            .await
+            .unwrap();
+        assert_eq!(stream.first_gap(100), None);
     }
 
     #[tokio::test]

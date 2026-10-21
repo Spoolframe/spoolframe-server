@@ -49,9 +49,14 @@ enum State {
         container: Container,
         epoch: u32,
     },
-    /// Kept, or given up on: nothing more is written.
+    /// Kept, here: reads are played from it.
+    Kept(std::path::PathBuf),
+    /// Given up on: nothing more is written.
     Over,
 }
+
+/// How much a read ahead asks for at once.
+const AHEAD: u64 = 1 << 20;
 
 impl Keeper {
     /// A keeper of `id` played in `session` with `options`, when it is a
@@ -100,6 +105,9 @@ impl Keeper {
         };
         let mut state = self.state.lock().await;
         if matches!(*state, State::Idle) {
+            if size == 0 {
+                return;
+            }
             *state = match self.open(size).await {
                 Some((writer, part)) => State::Direct {
                     writer,
@@ -174,6 +182,31 @@ impl Keeper {
         }
     }
 
+    /// `length` bytes at `offset` of a direct play's file, if they are
+    /// here: read ahead, or the track kept whole. A read past the end is
+    /// cut at it.
+    pub(crate) async fn local(&self, size: u64, offset: u64, length: u64) -> Option<Vec<u8>> {
+        let length = length.min(size.checked_sub(offset)?);
+        if length == 0 {
+            return None;
+        }
+        let path = match &*self.state.lock().await {
+            State::Direct { writer, part, .. } if writer.has(offset, length) => part.clone(),
+            State::Kept(path) => path.clone(),
+            _ => return None,
+        };
+        read_range(&path, offset, length).await.ok()
+    }
+
+    /// What a read ahead fetches next of a direct play's file: `None` once
+    /// it is all here, kept, given up on, or not a direct play.
+    pub(crate) async fn gap(&self) -> Option<(u64, u64)> {
+        match &*self.state.lock().await {
+            State::Direct { writer, .. } => writer.first_gap(AHEAD),
+            _ => None,
+        }
+    }
+
     async fn open(&self, size: u64) -> Option<(BlockWriter, std::path::PathBuf)> {
         let store = self.shared.store.as_ref()?;
         let part = self.part(store);
@@ -213,11 +246,17 @@ impl Keeper {
                 container,
                 ..
             } => (writer, part, container, false),
-            State::Idle | State::Over => return,
+            State::Idle | State::Kept(_) | State::Over => return,
         };
-        if let Err(e) = self.kept(writer, &part, container, direct).await {
-            tracing::info!(id = %self.id, error = %e, "a track played whole is not kept");
-            let _ = tokio::fs::remove_file(&part).await;
+        match self.kept(writer, &part, container, direct).await {
+            Ok(Some(media)) => *state = State::Kept(media),
+            Ok(None) => {
+                let _ = tokio::fs::remove_file(&part).await;
+            }
+            Err(e) => {
+                tracing::info!(id = %self.id, error = %e, "a track played whole is not kept");
+                let _ = tokio::fs::remove_file(&part).await;
+            }
         }
     }
 
@@ -227,7 +266,7 @@ impl Keeper {
         part: &std::path::Path,
         container: Container,
         direct: bool,
-    ) -> Result<(), crate::SdkError> {
+    ) -> Result<Option<std::path::PathBuf>, crate::SdkError> {
         let shared = &self.shared;
         let store = shared.store()?;
         let session = &self.session;
@@ -235,7 +274,7 @@ impl Keeper {
         let user = session.user().clone();
         // Downloaded or kept meanwhile: that stands for it.
         if shared.played(&server, &self.id).await {
-            return Ok(());
+            return Ok(None);
         }
         let size = {
             let mut writer = writer;
@@ -244,7 +283,7 @@ impl Keeper {
         };
         let detail = session.item(&self.id).await?;
         let Item::Track(track) = &detail.item else {
-            return Ok(());
+            return Ok(None);
         };
         let (album, artist) = tokio::join!(
             session.item(&track.album_id),
@@ -299,8 +338,19 @@ impl Keeper {
         }
         tracing::debug!(key, size, "a track played whole is kept");
         shared.emit(&m);
-        music::evict(shared, Some(&key)).await
+        music::evict(shared, Some(&key)).await?;
+        Ok(Some(media))
     }
+}
+
+/// `length` bytes of the file at `path` from `offset`.
+async fn read_range(path: &std::path::Path, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut bytes = vec![0; length as usize];
+    file.read_exact(&mut bytes).await?;
+    Ok(bytes)
 }
 
 impl Drop for Keeper {
