@@ -172,6 +172,9 @@
 - `spoolframe-probe`'s stranger-cap check tries a connection again when
   the server's BUSY close was lost and a stateless reset came instead,
   rather than failing a server that refused the connection as it should.
+- The client SDK's `Client::close` waits for the addresses its
+  connections reached to be saved, so one reached just before an app
+  closes is not lost.
 
 ## 0.13.1 (2026-10-20)
 

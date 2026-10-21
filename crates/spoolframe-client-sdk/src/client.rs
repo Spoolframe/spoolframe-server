@@ -197,6 +197,10 @@ pub(crate) struct Inner {
     lan_discovery: bool,
     /// Each server's connection and its state.
     links: Mutex<HashMap<EndpointId, Arc<Link>>>,
+    /// The tasks saving where each connection reached its server
+    /// ([`save_reached`]): [`Client::close`] lets them finish, so an
+    /// address reached just before the app closes is not lost.
+    saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
     pub(crate) saving: tokio::sync::Mutex<()>,
     revisions: Mutex<HashMap<PlaybackKey, RevisionState>>,
@@ -344,6 +348,7 @@ impl Client {
                 reach,
                 lan_discovery,
                 links: Mutex::default(),
+                saves: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
                 revisions: Mutex::default(),
                 progress_sequences: Mutex::default(),
@@ -1959,12 +1964,16 @@ impl Client {
             conn.conn.close(0u32.into(), b"not the server pinned");
             return Err(e);
         }
-        tokio::spawn(save_reached(
+        let save = tokio::spawn(save_reached(
             Arc::downgrade(&self.inner),
             id,
             reached,
             saving,
         ));
+        let mut saves = self.inner.saves.lock();
+        saves.retain(|s| !s.is_finished());
+        saves.push(save);
+        drop(saves);
         Ok(conn)
     }
 
@@ -2260,6 +2269,13 @@ impl Client {
             link.close();
         }
         self.inner.endpoint.close().await;
+        // Closed, each connection's last addresses reach its save task,
+        // which then ends: wait for them, not past SAVES_END.
+        let saves: Vec<_> = self.inner.saves.lock().drain(..).collect();
+        let all = futures_util::future::join_all(saves);
+        if tokio::time::timeout(SAVES_END, all).await.is_err() {
+            tracing::warn!("closed before every address reached was saved");
+        }
     }
 }
 
@@ -2275,6 +2291,9 @@ pub(crate) fn same_server<'a>(
         .iter()
         .find(|s| s.endpoint_id != id && s.server_id.as_deref() == Some(server_id))
 }
+
+/// How long [`Client::close`] waits for the addresses reached to be saved.
+const SAVES_END: Duration = Duration::from_secs(5);
 
 /// Save each address a connection to server `id` reaches from now on
 /// (`reached`), past those in `saved`, until the connection closes or the
