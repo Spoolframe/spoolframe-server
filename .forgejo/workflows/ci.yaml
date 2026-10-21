@@ -75,25 +75,16 @@ jobs:
           kache stats --since 30d --record >/dev/null || true
           kache daemon stop || true
 
-  # The suite in thirds: nextest's `--partition count:N/3` (ci:test reads
-  # NEXTEST_PARTITION) deals the tests out round-robin, so each third runs
-  # once and none twice. Every job builds the whole workspace. The first
-  # third runs alone and fills kache with that build; the other two start
-  # when it is done and take nearly every compile from kache, in parallel.
-  test-first:
-    name: "test (1/3)"
+  # The tests are built once, instrumented for coverage, into a nextest
+  # archive (ci:test-archive). Three jobs then each run a third of it at
+  # once (`--partition count:N/3`, round-robin, so each test runs once and
+  # none twice), from the archive, with no compiling. A workspace that
+  # does not build fails here, once.
+  build:
+    name: "build"
     runs-on: beefy
-    # The LAN tests (crates/spoolframe-server/tests/it/lan.rs) run in a
-    # private network namespace: `unshare` then `ip`. Under podman's default
-    # seccomp profile unshare(CLONE_NEWUSER) needs CAP_SYS_ADMIN, so the
-    # job's container gets it (as foundry's check job did). No `image:`:
-    # the `beefy` label's default image still applies.
-    container:
-      options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
     # Forgejo injects ACTIONS_ID_TOKEN_REQUEST_* only with this flag.
     enable-openid-connect: true
-    env:
-      NEXTEST_PARTITION: count:1/3
     steps:
       - uses: actions/checkout@v4
       # GitHub's API limit for Nix's github: inputs: a read-only GH_PAT
@@ -113,9 +104,17 @@ jobs:
           nix --version
           devenv --version
 
-      - name: ci:test
+      # What kache finds wrong with its setup on this runner (config, the
+      # shared store's reach), in the log. Diagnosis only: no --fix, and a
+      # problem it reports does not fail the build, which is still right
+      # without a cache.
+      - name: kache doctor
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: devenv --no-tui tasks run --profile ci ci:test
+        run: kache doctor || true
+
+      - name: ci:test-archive
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: devenv --no-tui tasks run --profile ci ci:test-archive
 
       # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,
       # and the job's container may go before it drains them.
@@ -129,43 +128,23 @@ jobs:
           kache stats --since 30d --record >/dev/null || true
           kache daemon stop || true
 
-      - name: Publish JUnit results
-        if: always()
-        uses: actions/action-junit-report@v4
-        with:
-          report_paths: target/nextest/ci/junit.xml
-          check_name: tests (1/3)
-          fail_on_failure: true
-          require_tests: false
-          comment: true
-          updateComment: true
-          detailed_summary: true
-
       # Pinned to v3 deliberately: v4's @actions/artifact v2 talks only to
-      # GitHub.com's backend and aborts against Forgejo. The coverage job
-      # below merges the thirds' lcov.
-      - name: Upload coverage + test artifacts
-        if: always()
+      # GitHub.com's backend and aborts against Forgejo.
+      - name: Upload the test archive
         uses: actions/upload-artifact@v3
         with:
-          name: tests-1
-          path: |
-            target/nextest/ci/junit.xml
-            target/lcov.info
-          if-no-files-found: ignore
-
+          name: test-archive
+          path: target/tests.tar.zst
+          retention-days: 1
 
   test:
     name: "test (${{ matrix.partition }}/3)"
-    # After the first third: its build has filled kache, so these two
-    # build from it. They run even when it failed, so every test still runs.
-    needs: [test-first]
-    if: ${{ !cancelled() }}
+    needs: [build]
     runs-on: beefy
     strategy:
       fail-fast: false
       matrix:
-        partition: [2, 3]
+        partition: [1, 2, 3]
     # The LAN tests (crates/spoolframe-server/tests/it/lan.rs) run in a
     # private network namespace: `unshare` then `ip`. Under podman's default
     # seccomp profile unshare(CLONE_NEWUSER) needs CAP_SYS_ADMIN, so the
@@ -173,8 +152,6 @@ jobs:
     # the `beefy` label's default image still applies.
     container:
       options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
-    # Forgejo injects ACTIONS_ID_TOKEN_REQUEST_* only with this flag.
-    enable-openid-connect: true
     env:
       NEXTEST_PARTITION: count:${{ matrix.partition }}/3
     steps:
@@ -196,21 +173,15 @@ jobs:
           nix --version
           devenv --version
 
-      - name: ci:test
-        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: devenv --no-tui tasks run --profile ci ci:test
+      - name: Download the test archive
+        uses: actions/download-artifact@v3
+        with:
+          name: test-archive
+          path: target
 
-      # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,
-      # and the job's container may go before it drains them.
-      - name: kache flush
-        if: always()
+      - name: ci:test-shard
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        # As molds' ci:kache-flush: record this job's stats in the shared
-        # store's sessions.jsonl (the runner's kache_ci_* metrics), then
-        # drain queued uploads and stop the daemon.
-        run: |
-          kache stats --since 30d --record >/dev/null || true
-          kache daemon stop || true
+        run: devenv --no-tui tasks run --profile ci ci:test-shard
 
       - name: Publish JUnit results
         if: always()
@@ -224,9 +195,7 @@ jobs:
           updateComment: true
           detailed_summary: true
 
-      # Pinned to v3 deliberately: v4's @actions/artifact v2 talks only to
-      # GitHub.com's backend and aborts against Forgejo. The coverage job
-      # below merges the thirds' lcov.
+      # v3, as above. The coverage job below merges the thirds' lcov.
       - name: Upload coverage + test artifacts
         if: always()
         uses: actions/upload-artifact@v3
@@ -244,7 +213,7 @@ jobs:
   # covered than is.
   coverage:
     name: "coverage"
-    needs: [test-first, test]
+    needs: [test]
     if: success() && github.event_name == 'pull_request'
     runs-on: beefy
     steps:

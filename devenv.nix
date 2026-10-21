@@ -411,6 +411,31 @@ in {
             --lcov --output-path target/lcov.info
         '';
       };
+      # CI builds the tests once, instrumented, into a nextest archive
+      # (ci:test-archive, about 420 MB), and three jobs each run a third of
+      # it from the archive with no compiling (ci:test-shard). A shard has
+      # only the archive and a checkout: --workspace-remap points the
+      # tests' paths at the checkout, and llvm-cov-target must exist before
+      # the archive is extracted into it.
+      "ci:test-archive" = {
+        description = "Build the instrumented tests into target/tests.tar.zst";
+        exec = "cargo llvm-cov nextest-archive --locked --archive-file target/tests.tar.zst";
+      };
+      "ci:test-shard" = {
+        description = "Run NEXTEST_PARTITION of target/tests.tar.zst (JUnit + lcov)";
+        exec = ''
+          mkdir -p target/llvm-cov-target
+          status=0
+          cargo llvm-cov nextest --archive-file target/tests.tar.zst \
+            --workspace-remap . --profile ci --no-tests=warn --no-report \
+            ''${NEXTEST_PARTITION:+--partition "$NEXTEST_PARTITION"} || status=$?
+          # The lcov of what ran, failed tests or not; the job fails after.
+          cargo llvm-cov report --nextest-archive-file target/tests.tar.zst \
+            --ignore-filename-regex '/\.cargo/(registry|git)/|/rustc/' \
+            --lcov --output-path target/lcov.info
+          exit "$status"
+        '';
+      };
       "ci:audit" = {
         description = "Audit dependencies for known vulnerabilities";
         exec = "cargo audit";
