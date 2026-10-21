@@ -145,6 +145,9 @@ pub enum PlanError {
     NoSubtitle(u32),
     #[error("the file has no video")]
     NoVideo,
+    /// The profile's video codec is not one the device plays.
+    #[error("this device does not play {0}")]
+    NotPlayed(VideoCodec),
 }
 
 impl DeviceClass {
@@ -279,14 +282,25 @@ pub fn original(
     })
 }
 
+/// Whether a device that plays `caps` plays `profile`'s copies: what
+/// download options list.
+pub fn plays(caps: &ClientCapabilities, profile: &Profile) -> bool {
+    caps.video.contains(&profile.video_codec)
+}
+
 /// How a download of `descriptor`'s file in `profile` is written, with
-/// `tracks`: always from the profile's copy.
+/// `tracks`: always from the profile's copy, refused when a device that
+/// plays `caps` would not play it.
 pub fn profile(
     descriptor: &MediaDescriptor,
     profile: &Profile,
+    caps: &ClientCapabilities,
     tracks: &Tracks,
 ) -> Result<Decision, PlanError> {
     check(descriptor, tracks)?;
+    if !plays(caps, profile) {
+        return Err(PlanError::NotPlayed(profile.video_codec));
+    }
     let video = descriptor.video.as_ref().ok_or(PlanError::NoVideo)?;
     let audio = tracks
         .audio(descriptor)
@@ -658,8 +672,9 @@ mod tests {
             height: 720,
             max_bitrate: 4_000_000,
         };
+        let caps = DeviceClass::Apple.capabilities();
         assert_eq!(
-            profile(&h264_aac_mp4(), &mobile, &Tracks::All).unwrap(),
+            profile(&h264_aac_mp4(), &mobile, &caps, &Tracks::All).unwrap(),
             Decision::Convert {
                 target: CopyTarget::Profile("Mobile".into()),
                 video: CopyVideo {
@@ -671,6 +686,24 @@ mod tests {
                 },
                 audio: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn a_profile_the_device_does_not_play_is_refused() {
+        let tv = Profile {
+            name: "TV".into(),
+            video_codec: VideoCodec::Hevc,
+            height: 1080,
+            max_bitrate: 12_000_000,
+        };
+        let caps = ClientCapabilities {
+            video: [VideoCodec::H264].into(),
+            ..DeviceClass::Apple.capabilities()
+        };
+        assert_eq!(
+            profile(&h264_aac_mp4(), &tv, &caps, &Tracks::All),
+            Err(PlanError::NotPlayed(VideoCodec::Hevc))
         );
     }
 

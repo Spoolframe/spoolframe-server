@@ -593,7 +593,7 @@ impl Downloads {
                     .optimized_profile(name)
                     .await?
                     .ok_or_else(|| DownloadError::NoProfile(name.clone()))?;
-                plan::profile(descriptor, &profile, &tracks)?
+                plan::profile(descriptor, &profile, caps, &tracks)?
             }
         };
         let stamp = crate::files::stamp_text(request.media)

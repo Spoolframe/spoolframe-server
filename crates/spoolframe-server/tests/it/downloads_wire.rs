@@ -871,3 +871,69 @@ async fn a_download_reads_whole_over_a_relay_alone() {
     server.stop().await;
     drop(relay);
 }
+
+/// A device that plays H.264 alone, as its `Hello` says.
+async fn h264_only(server: &TestServer) -> (TestClient, SessionId) {
+    let client = server.client().await;
+    let caps = spoolframe_types::ClientCapabilities {
+        video: [spoolframe_types::VideoCodec::H264].into(),
+        ..spoolframe_types::ClientCapabilities::default()
+    };
+    let hello = Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_name: "test".into(),
+        client_version: "0".into(),
+        platform: Platform::Linux,
+        device_name: None,
+        capabilities: Some(caps),
+        experimental: Vec::new(),
+        features: vec![DOWNLOADS.to_owned()],
+    };
+    assert!(matches!(
+        client.call(None, Request::Hello(hello)).await,
+        Response::Ok(Reply::ServerInfo(_))
+    ));
+    let session = client.login("alice", PASSWORD).await;
+    (client, session)
+}
+
+#[tokio::test]
+async fn a_device_is_offered_only_the_profiles_it_plays() {
+    let server = server("downloads-wire-plays", ServerOptions::default()).await;
+    write_film(&server);
+    let (client, session) = h264_only(&server).await;
+    let Response::Ok(Reply::DownloadOptions(options)) = client
+        .call(
+            Some(&session),
+            Request::DownloadOptions {
+                id: movie().id().clone(),
+            },
+        )
+        .await
+    else {
+        panic!("no options");
+    };
+    assert_eq!(options.profiles, ["Mobile (H.264)"]);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_profile_the_device_does_not_play_is_refused() {
+    let server = server("downloads-wire-not-played", ServerOptions::default()).await;
+    write_film(&server);
+    let (client, session) = h264_only(&server).await;
+    let answer = prepare(
+        &client,
+        &session,
+        DownloadSource::Profile {
+            name: "Mobile".into(),
+        },
+        first_audio(),
+    )
+    .await;
+    assert!(
+        matches!(&answer, Response::Err(Error::InvalidInput { message }) if message.contains("hevc")),
+        "{answer:?}"
+    );
+    server.stop().await;
+}

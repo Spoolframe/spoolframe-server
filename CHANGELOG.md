@@ -12,6 +12,11 @@
   edited is not changed. The server encodes HEVC only with a GPU or an
   ffmpeg that has libx265: without one, a `Mobile` copy fails, as `TV`
   and `Compact 4K` copies already do.
+- Download options list only the profiles whose video codec the device
+  plays, from its `Hello` capabilities, or from its class when it sent
+  none. Preparing a download in another profile is refused with
+  `InvalidInput` ("this device does not play hevc"). Before, an HEVC
+  file could be downloaded to a device that cannot play it.
 
 ## 0.14.1 (2026-10-21)
 

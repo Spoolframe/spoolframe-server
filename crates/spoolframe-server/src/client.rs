@@ -5500,6 +5500,7 @@ impl ClientProtocol {
             .await
             .map_err(internal)?
             .into_iter()
+            .filter(|p| plan::plays(&caps, p))
             .map(|p| p.name)
             .collect();
         Ok(DownloadOptionsInfo {
