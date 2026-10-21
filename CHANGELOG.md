@@ -169,6 +169,9 @@
   session, a password reset) keeps its new connection: signing a device
   out now closes only its signed-in connections, not one it opened since
   to sign in again.
+- `spoolframe-probe`'s stranger-cap check tries a connection again when
+  the server's BUSY close was lost and a stateless reset came instead,
+  rather than failing a server that refused the connection as it should.
 
 ## 0.13.1 (2026-10-20)
 

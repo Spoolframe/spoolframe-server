@@ -558,12 +558,21 @@ async fn until_limited(
 
 /// Check 4: stranger connections, one at a time and each with a `Hello`,
 /// until one is closed `BUSY` or `cap`+1 are held. All are closed after.
+/// How many times a stranger-cap slot is tried again after a stateless
+/// reset before the check fails.
+const MAX_RESETS: u32 = 3;
+
 async fn stranger_cap(probe: &Probe, config: &Config) -> Result<Outcome, Problem> {
     let mut f = Findings::default();
     let cap = config.expect.cap as usize;
     sleep(SETTLE).await;
     let mut held: Vec<Conn> = Vec::new();
     let mut busy_at = None;
+    // A refusal is one CONNECTION_CLOSE packet, and the server forgets the
+    // connection soon after. Lost (a full socket buffer, a lossy path),
+    // the probe's next packet meets a server that no longer knows it and
+    // is answered with a stateless reset: the slot is tried again.
+    let mut resets = 0;
     while held.len() <= cap {
         sleep(config.cap_pace).await;
         let conn = probe.connect().await?;
@@ -585,6 +594,7 @@ async fn stranger_cap(probe: &Probe, config: &Config) -> Result<Outcome, Problem
                     busy_at = Some(held.len() + 1);
                     break;
                 }
+                Ok(ConnectionError::Reset) if resets < MAX_RESETS => resets += 1,
                 other => {
                     return Err(Problem::Failed(format!(
                         "connection {}: {why}; closed {other:?}",
