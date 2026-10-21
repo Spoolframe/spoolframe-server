@@ -13,7 +13,7 @@ use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceR
 use spoolframe_protocol::{ArtworkSize, Reply, Request};
 use spoolframe_types::{ArtworkId, Item, MediaId};
 
-use super::store::{EntryKind, Manifest, Store, StoredArtwork, sha256_file};
+use super::store::{EntryKind, Hold, Manifest, Store, StoredArtwork, sha256_file};
 use super::writer::{BlockWriter, Unfinished};
 use super::{DownloadEvent, DownloadPhase, LocalWatch, Shared, SyncedWatch, disk, music, now};
 use crate::client::{Client, Inner, parse_id};
@@ -446,9 +446,13 @@ async fn preparing(shared: &Shared, session: &Session, m: Manifest) -> Result<St
     let id = info.id.clone();
     let m = shared
         .update(&m.key, |m| {
-            // Paused or removed while asking: as it is.
-            if matches!(m.phase, DownloadPhase::Preparing { .. }) {
+            // Paused or removed while asking, or handed to another user
+            // of the device (store::Store::release): as it is.
+            if matches!(m.phase, DownloadPhase::Preparing { .. })
+                && m.user_id == session.user().user_id
+            {
                 take(m, info);
+                m.username = session.user().username.clone();
                 m.note = None;
             }
             Ok(())
@@ -501,7 +505,7 @@ async fn transferring(
     // A track kept from listening that is this very file: moved here,
     // with nothing fetched.
     if m.kind == EntryKind::Track
-        && let Some(kept) = music::kept(store, &m.server, &m.user_id, m.item.id())
+        && let Some(kept) = music::kept(store, &m.server, m.item.id())
         && kept.size == Some(size)
         && let (Some(from), Some(to)) = (store.media(&kept), store.media(&m))
         && music::kept_is(&kept, &from, &sha256).await
@@ -524,6 +528,9 @@ async fn transferring(
                 shared
                     .update(&m.key, |m| {
                         m.last_played_at = kept.last_played_at.max(m.last_played_at);
+                        // Still the device's too: every profile plays it,
+                        // and it is cache again once the download goes.
+                        m.add_hold(&Hold::listening());
                         Ok(())
                     })
                     .await?;
@@ -716,7 +723,7 @@ async fn finish(
     // stands for it now.
     if m.kind == EntryKind::Track
         && let Some(store) = &shared.store
-        && let Some(kept) = music::kept(store, &m.server, &m.user_id, m.item.id())
+        && let Some(kept) = music::kept(store, &m.server, m.item.id())
         && kept.cached_only()
     {
         let removed = {
@@ -774,9 +781,9 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
     let mut sending = Vec::new();
     for m in store.scan() {
         if m.server == server
-            && m.user_id == user_id
-            && m.watch.pending
-            && let Some(entry) = m.watch.entry(&m.item)
+            && let Some(watch) = m.watches.get(&user_id)
+            && watch.pending
+            && let Some(entry) = watch.entry(&m.item)
         {
             sending.push((Some(m.key.clone()), entry));
         }
@@ -818,10 +825,11 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
                         .update(key, |m| {
                             // Watched again while this was on the way: that
                             // is sent next time.
-                            if m.watch.at == at {
-                                m.watch.pending = false;
+                            let watch = m.watch_mut(&user_id);
+                            if watch.at == at {
+                                watch.pending = false;
                                 if let Some(item) = &server_state {
-                                    m.watch = LocalWatch::of(item);
+                                    *watch = LocalWatch::of(item);
                                 }
                             }
                             Ok(())

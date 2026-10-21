@@ -13,6 +13,9 @@ default = []
 media-readers = []
 
 [dependencies]
+# The PIN checked offline (PX-60), hashed as the server hashes it.
+argon2 = { workspace = true }
+password-hash = { workspace = true }
 async-trait = { workspace = true }
 # The portable identity's root and its recovery phrase (P7-01).
 bip39 = { workspace = true }

@@ -971,11 +971,24 @@ impl Session {
     /// is ended ([`SdkError::SignInRequired`]) and the user signs in with
     /// their password. Switching to another profile and back locks it
     /// again.
+    ///
+    /// The PIN that unlocks it is kept here, hashed, to unlock its
+    /// downloads offline ([`crate::Downloads::unlock_offline`], PX-60),
+    /// and the profile is unlocked for them too if it is
+    /// [`crate::Downloads::set_profile`]'s.
     pub async fn unlock(&self, pin: &str) -> Result<(), SdkError> {
         self.done(Request::UnlockProfile {
             pin: pin.to_owned(),
         })
-        .await
+        .await?;
+        self.locks()
+            .unlocked_online(&self.server(), &self.user.user_id, pin)
+            .await;
+        Ok(())
+    }
+
+    fn locks(&self) -> &std::sync::Arc<crate::downloads::Locks> {
+        &self.client.inner.downloads.locks
     }
 
     /// Set or change this user's PIN: 4 to 8 digits. A user with none
@@ -999,20 +1012,34 @@ impl Session {
             pin: pin.to_owned(),
             proof,
         })
-        .await
+        .await?;
+        self.locks()
+            .pin_set(&self.server(), &self.user.user_id, pin)
+            .await;
+        Ok(())
     }
 
     /// Remove this user's PIN, and where it is asked for, with a
     /// [`PinProof`], checked as for [`Session::set_pin`].
     pub async fn clear_pin(&self, proof: PinProof) -> Result<(), SdkError> {
-        self.done(Request::ClearPin { proof }).await
+        self.done(Request::ClearPin { proof }).await?;
+        self.locks()
+            .pin_cleared(&self.server(), &self.user.user_id)
+            .await;
+        Ok(())
     }
 
     /// The devices this user has signed in from, with where the PIN is
     /// asked for.
     pub async fn devices(&self) -> Result<Vec<DeviceInfo>, SdkError> {
         match self.call(Request::ListDevices).await? {
-            Reply::Devices { devices } => Ok(devices),
+            Reply::Devices { devices } => {
+                if let Some(here) = devices.iter().find(|d| d.this_device) {
+                    self.locks()
+                        .seen(&self.server(), &self.user.user_id, here.pin_required);
+                }
+                Ok(devices)
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -1056,6 +1083,10 @@ impl Session {
             auto_login,
         })
         .await?;
+        if own && auto_login {
+            // Auto-login turns the PIN off for this profile here.
+            self.locks().seen(&self.server(), &self.user.user_id, false);
+        }
         if own && !trusted {
             self.client.end_session(self.server, &self.token).await?;
         }
@@ -1088,11 +1119,17 @@ impl Session {
         device: Option<&str>,
         required: bool,
     ) -> Result<(), SdkError> {
+        let own = device.is_none_or(|d| d == self.client.id());
         self.done(Request::SetPinRequired {
             device: device.map(str::to_owned),
             required,
         })
-        .await
+        .await?;
+        if own {
+            self.locks()
+                .seen(&self.server(), &self.user.user_id, required);
+        }
+        Ok(())
     }
 
     /// Begin making a passkey for this user in the app (P3-19): what the

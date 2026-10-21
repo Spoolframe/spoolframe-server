@@ -6906,6 +6906,7 @@ name = "spoolframe-client-sdk"
 version = "0.14.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "async-trait",
  "bip39",
  "blake3",
@@ -6916,6 +6917,7 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "libc",
  "parking_lot",
+ "password-hash",
  "serde",
  "serde_json",
  "sha2 0.10.9",

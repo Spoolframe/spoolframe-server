@@ -68,10 +68,7 @@ impl Keeper {
         }
         let shared = session.client.inner.downloads.clone();
         shared.store.as_ref()?;
-        if shared
-            .played(&session.server(), &session.user().user_id, id)
-            .await
-        {
+        if shared.played(&session.server(), id).await {
             return None;
         }
         Some(Arc::new(Self {
@@ -84,11 +81,7 @@ impl Keeper {
     }
 
     fn part(&self, store: &Store) -> std::path::PathBuf {
-        let key = kept_key(
-            &self.session.server(),
-            &self.session.user().user_id,
-            &self.id,
-        );
+        let key = kept_key(&self.session.server(), &self.id);
         // One playback's part: two playbacks of the same track do not
         // write over each other.
         let mut nonce = [0u8; 8];
@@ -241,7 +234,7 @@ impl Keeper {
         let server = session.server();
         let user = session.user().clone();
         // Downloaded or kept meanwhile: that stands for it.
-        if shared.played(&server, &user.user_id, &self.id).await {
+        if shared.played(&server, &self.id).await {
             return Ok(());
         }
         let size = {
@@ -258,7 +251,7 @@ impl Keeper {
             session.item(&track.artist_id)
         );
         let (album, artist) = (album.ok().map(|d| d.item), artist.ok().map(|d| d.item));
-        let key = kept_key(&server, &user.user_id, &self.id);
+        let key = kept_key(&server, &self.id);
         let mut m = Store::manifest(
             EntryKind::Track,
             key.clone(),

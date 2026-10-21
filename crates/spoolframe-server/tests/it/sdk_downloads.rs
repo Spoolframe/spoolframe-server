@@ -506,3 +506,87 @@ async fn a_deleted_download_leaves_nothing_on_the_device() {
     client.close().await;
     server.stop().await;
 }
+
+/// Two profiles download the same film: one file, each one's download.
+/// Each sees only theirs; the first one deleting it leaves it for the
+/// other.
+#[tokio::test]
+async fn two_profiles_share_one_file_and_each_sees_their_own() {
+    let server = server("sdk-downloads-shared", ServerOptions::default()).await;
+    server.add_user("bob", PASSWORD, None).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-shared").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let alice = alice(&server, &client).await;
+    let bob = client
+        .sign_in(&server.server.id().to_string(), "bob", PASSWORD, false)
+        .await
+        .unwrap();
+    let key = start(&client, &alice).await.key;
+    let file = settled(&client, &key).await.file_path.unwrap();
+    assert_eq!(start(&client, &bob).await.key, key);
+    let downloads = client.downloads();
+    let id = server.server.id().to_string();
+    downloads.set_profile(&id, &bob.user().user_id);
+    assert_eq!(downloads.list().len(), 1);
+    downloads.set_profile(&id, "local:someone-else");
+    assert!(downloads.list().is_empty());
+    assert!(downloads.get(&key).is_err());
+
+    downloads.set_profile(&id, &alice.user().user_id);
+    downloads.delete(&key).await.unwrap();
+    assert!(downloads.list().is_empty());
+    assert!(file.exists(), "bob's download went with alice's");
+    downloads.set_profile(&id, &bob.user().user_id);
+    let left = downloads.list();
+    assert_eq!(
+        (left.len(), left[0].phase.clone()),
+        (1, DownloadPhase::Done)
+    );
+    downloads.delete(&key).await.unwrap();
+    assert!(!file.exists());
+    client.close().await;
+    server.stop().await;
+}
+
+/// The PIN asked for on this device locks the profile's downloads with no
+/// server, as it locks the profile online, until its PIN is given (PX-60).
+#[tokio::test]
+async fn offline_a_profile_whose_pin_is_asked_here_opens_only_with_it() {
+    let server = server("sdk-downloads-locked", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-locked").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let first = alice(&server, &client).await;
+    first.set_pin("1234", None).await.unwrap();
+    first.set_pin_required(None, true).await.unwrap();
+    // Signed in again, the profile starts locked; its PIN opens it.
+    let session = alice(&server, &client).await;
+    session.unlock("1234").await.unwrap();
+    let key = start(&client, &session).await.key;
+    settled(&client, &key).await;
+    let user_id = session.user().user_id.clone();
+    client.close().await;
+    let id = server.server.id().to_string();
+    server.stop().await;
+
+    let offline = Client::open_with_options(storage.clone(), linux(), options(&dir, false))
+        .await
+        .unwrap();
+    let downloads = offline.downloads();
+    downloads.set_profile(&id, &user_id);
+    assert!(downloads.profile_locked());
+    assert!(downloads.list().is_empty());
+    assert!(matches!(
+        downloads.get(&key),
+        Err(spoolframe_client_sdk::SdkError::ProfileLocked)
+    ));
+    assert!(matches!(
+        downloads.unlock_offline("0000").await,
+        Err(spoolframe_client_sdk::SdkError::InvalidCredentials)
+    ));
+    downloads.unlock_offline("1234").await.unwrap();
+    assert_eq!(downloads.list().len(), 1);
+    assert!(downloads.get(&key).unwrap().file_path.is_some());
+    offline.close().await;
+}

@@ -1,8 +1,15 @@
 //! Downloads on disk (PX-38): one directory per stored file,
-//! `<dir>/<server>/<user>/<kind>/<key>/`, holding `manifest.json`, the
+//! `<dir>/<server>/%files/<kind>/<key>/`, holding `manifest.json`, the
 //! media (`media.part` while it arrives, then `media.mp4` or `media.mkv`)
 //! and the artwork (`art/*.jpg`). Everything about an entry is in its
 //! manifest, so the list needs no server.
+//!
+//! A file is the device's, not a user's: two profiles that download the
+//! same item share one file, each holding it ([`Hold::user`]), each with
+//! its own watch state. What is per user (offline watch of deleted
+//! downloads, music followed, plays not sent) is under
+//! `<dir>/<server>/<user>/`. 0.14.0 kept files per user, under
+//! `<dir>/<server>/<user>/<kind>/<key>/`: [`Store::open`] moves them.
 //!
 //! Entries are keyed by their item's kind ([`EntryKind`]): films and
 //! episodes now; music (PX-51) adds tracks beside them. A stored file is
@@ -16,7 +23,7 @@
 //! is not listed; neither is one of a newer version or a kind this build
 //! does not know, which is left as it is.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,8 +36,12 @@ use spoolframe_types::{ArtworkKind, Container, Item, Marker, MediaId, MediaTrack
 
 use super::{DownloadPhase, LocalWatch};
 
-/// This layout's version, in each manifest.
-const VERSION: u32 = 1;
+/// This layout's version, in each manifest: 2 since files are shared by
+/// the device's users.
+const VERSION: u32 = 2;
+/// The directory of a server's files, beside its users': `dir_name`
+/// never makes a name with a `%` not followed by two hex digits.
+const FILES: &str = "%files";
 const MANIFEST: &str = "manifest.json";
 const PART: &str = "media.part";
 const ART: &str = "art";
@@ -92,23 +103,35 @@ impl EntryKind {
 pub(crate) struct Hold {
     pub by: String,
     pub id: Option<String>,
+    /// Whose: the user whose download, album or playlist it is. `None`
+    /// for the device's own, the cache of what was kept from listening,
+    /// which every profile may play.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 impl Hold {
-    /// The user's download of the item itself.
-    pub fn download() -> Self {
+    /// `user_id`'s download of the item itself.
+    pub fn download(user_id: &str) -> Self {
         Self {
             by: "download".into(),
             id: None,
+            user: Some(user_id.to_owned()),
         }
     }
 
-    /// The cache of tracks kept from listening (PX-51).
+    /// The cache of tracks kept from listening (PX-51): the device's.
     pub fn listening() -> Self {
         Self {
             by: LISTENING.into(),
             id: None,
+            user: None,
         }
+    }
+
+    /// Held for `user_id`, or for the device (every profile).
+    pub fn is_for(&self, user_id: &str) -> bool {
+        self.user.as_deref().is_none_or(|u| u == user_id)
     }
 
     pub fn is_listening(&self) -> bool {
@@ -158,7 +181,12 @@ pub(crate) struct Manifest {
     /// How much of `media.part` is known to be on disk (synced).
     pub offset: u64,
     pub phase: DownloadPhase,
-    pub watch: LocalWatch,
+    /// Each user's watch state of it, by user id.
+    #[serde(default)]
+    pub watches: BTreeMap<String, LocalWatch>,
+    /// 0.14.0's one watch state, of `user_id`: read into `watches`.
+    #[serde(default, skip_serializing)]
+    watch: Option<LocalWatch>,
     /// Why it is not moving, while it waits to try again.
     pub note: Option<String>,
     /// Unix seconds, by this device's clock.
@@ -186,6 +214,43 @@ impl Manifest {
     pub fn cached_only(&self) -> bool {
         !self.holds.is_empty() && self.holds.iter().all(Hold::is_listening)
     }
+
+    /// Held by `user_id`, or for every profile (kept from listening).
+    pub fn is_for(&self, user_id: &str) -> bool {
+        self.holds.iter().any(|h| h.is_for(user_id))
+    }
+
+    /// Held by `user_id` themselves: a download of theirs.
+    pub fn held_by(&self, user_id: &str) -> bool {
+        self.holds
+            .iter()
+            .any(|h| h.user.as_deref() == Some(user_id))
+    }
+
+    /// `user_id`'s watch state of it: none yet for a user who has not
+    /// watched it here, or downloaded it (`item` is as another user saw
+    /// it).
+    pub fn watch_of(&self, user_id: &str) -> LocalWatch {
+        self.watches.get(user_id).cloned().unwrap_or_default()
+    }
+
+    /// `user_id`'s watch state, to change.
+    pub fn watch_mut(&mut self, user_id: &str) -> &mut LocalWatch {
+        self.watches.entry(user_id.to_owned()).or_default()
+    }
+
+    /// 0.14.0's manifest read: its one watch state is its user's.
+    fn upgrade(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            self.watches.entry(self.user_id.clone()).or_insert(watch);
+        }
+        for hold in &mut self.holds {
+            if hold.user.is_none() && !hold.is_listening() {
+                hold.user = Some(self.user_id.clone());
+            }
+        }
+        self.version = VERSION;
+    }
 }
 
 /// A picture kept with a download: `file` in its `art` directory.
@@ -197,12 +262,12 @@ pub(crate) struct StoredArtwork {
     pub file: String,
 }
 
-/// The key of a download: the same for the same server, user, kind,
-/// item, source and tracks, so starting one twice finds the first. Order
-/// and repeats of chosen tracks do not count, as on the server.
+/// The key of a download: the same for the same server, kind, item,
+/// source and tracks, whoever asks, so starting one twice, or as another
+/// profile, finds the first. Order and repeats of chosen tracks do not
+/// count, as on the server.
 pub(crate) fn key_of(
     server: &str,
-    user_id: &str,
     kind: EntryKind,
     id: &MediaId,
     source: &DownloadSource,
@@ -210,9 +275,8 @@ pub(crate) fn key_of(
 ) -> String {
     let tracks = tracks.normalized();
     key_hash(&[
-        "download:1",
+        "download:2",
         server,
-        user_id,
         kind.dir(),
         &id.to_string(),
         &serde_json::to_string(source).expect("a source serializes"),
@@ -231,10 +295,10 @@ pub(crate) fn key_hash(parts: &[&str]) -> String {
     hasher.finalize().to_hex()[..32].to_owned()
 }
 
-/// The key of the file of track `id` kept from listening: one per
-/// track, whatever was streamed.
-pub(crate) fn kept_key(server: &str, user_id: &str, id: &MediaId) -> String {
-    key_hash(&["listening:1", server, user_id, &id.to_string()])
+/// The key of the file of track `id` kept from listening: one per track
+/// and device, whatever was streamed and whoever played it.
+pub(crate) fn kept_key(server: &str, id: &MediaId) -> String {
+    key_hash(&["listening:2", server, &id.to_string()])
 }
 
 /// A user id as a directory name: every byte but ASCII letters, digits,
@@ -294,16 +358,89 @@ impl Store {
         &self.root
     }
 
+    /// Move 0.14.0's files, kept per user under
+    /// `<server>/<user>/<kind>/<key>/`, to where they are now, under the
+    /// key they have now: a file two users both had becomes one, held by
+    /// both, with each one's watch state. Run before anything else reads
+    /// the directory; one that cannot be moved is left where it was, and
+    /// logged.
+    pub fn migrate(&self) {
+        for server in read_dir(&self.root) {
+            for user in user_dirs(&server) {
+                for kind in read_dir(&user) {
+                    if !kind
+                        .file_name()
+                        .is_some_and(|n| ["film", "episode", "track"].iter().any(|k| n == *k))
+                    {
+                        continue;
+                    }
+                    for old in read_dir(&kind) {
+                        if let Err(e) = self.migrate_one(&old) {
+                            tracing::warn!(path = %old.display(), error = %e, "a 0.14.0 download cannot be moved; left where it was");
+                        }
+                    }
+                    let _ = std::fs::remove_dir(&kind);
+                }
+            }
+        }
+        *self.active.lock() = None;
+    }
+
+    /// Move one 0.14.0 file from `old`.
+    fn migrate_one(&self, old: &Path) -> std::io::Result<()> {
+        let Some(mut m) = read_manifest(&old.join(MANIFEST))? else {
+            return Ok(());
+        };
+        let id = m.item.id().clone();
+        // 0.14.0's key of a track kept from listening.
+        let kept = m.key == key_hash(&["listening:1", &m.server, &m.user_id, &id.to_string()]);
+        m.key = if kept {
+            kept_key(&m.server, &id)
+        } else {
+            key_of(&m.server, m.kind, &id, &m.source, &m.chosen)
+        };
+        let to = self.dir(&m);
+        match read_manifest(&to.join(MANIFEST))? {
+            None => {
+                std::fs::create_dir_all(to.parent().expect("a file's directory has a parent"))?;
+                std::fs::rename(old, &to)?;
+                self.write(&m)
+            }
+            Some(mut there) => {
+                // The same file twice: the one further along stays, held
+                // by both, and the other goes.
+                if further(&m, &there) {
+                    std::mem::swap(&mut m, &mut there);
+                    std::fs::remove_dir_all(&to)?;
+                    std::fs::rename(old, &to)?;
+                } else {
+                    std::fs::remove_dir_all(old)?;
+                }
+                for hold in &m.holds {
+                    there.add_hold(hold);
+                }
+                for (user_id, watch) in m.watches {
+                    there.watches.entry(user_id).or_insert(watch);
+                }
+                there.last_played_at = there.last_played_at.max(m.last_played_at);
+                self.write(&there)
+            }
+        }
+    }
+
     /// Where `server`'s downloads for `user_id` are.
     pub fn user_dir(&self, server: &str, user_id: &str) -> PathBuf {
         self.root.join(dir_name(server)).join(dir_name(user_id))
     }
 
+    /// Where `server`'s files are.
+    fn files_dir(&self, server: &str) -> PathBuf {
+        self.root.join(dir_name(server)).join(FILES)
+    }
+
     /// Where download `m` is.
     pub fn dir(&self, m: &Manifest) -> PathBuf {
-        self.user_dir(&m.server, &m.user_id)
-            .join(m.kind.dir())
-            .join(&m.key)
+        self.files_dir(&m.server).join(m.kind.dir()).join(&m.key)
     }
 
     pub fn part(&self, m: &Manifest) -> PathBuf {
@@ -390,7 +527,9 @@ impl Store {
             version: VERSION,
             kind,
             key,
-            holds: vec![Hold::download()],
+            holds: vec![Hold::download(&user_id)],
+            watches: BTreeMap::from([(user_id.clone(), watch)]),
+            watch: None,
             server,
             user_id,
             username,
@@ -410,7 +549,6 @@ impl Store {
             phase: DownloadPhase::Preparing {
                 server: spoolframe_protocol::downloads::DownloadState::Waiting,
             },
-            watch,
             note: None,
             created_at,
             album: None,
@@ -424,16 +562,14 @@ impl Store {
     pub fn scan(&self) -> Vec<Manifest> {
         let mut found = Vec::new();
         for server in read_dir(&self.root) {
-            for user in read_dir(&server) {
-                for kind in read_dir(&user) {
-                    for key in read_dir(&kind) {
-                        let path = key.join(MANIFEST);
-                        match read_manifest(&path) {
-                            Ok(Some(m)) => found.push(m),
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(path = %path.display(), error = %e, "a download's manifest cannot be read; left out")
-                            }
+            for kind in read_dir(&server.join(FILES)) {
+                for key in read_dir(&kind) {
+                    let path = key.join(MANIFEST);
+                    match read_manifest(&path) {
+                        Ok(Some(m)) => found.push(m),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "a download's manifest cannot be read; left out")
                         }
                     }
                 }
@@ -450,25 +586,23 @@ impl Store {
             return None;
         }
         for server in read_dir(&self.root) {
-            for user in read_dir(&server) {
-                for kind in read_dir(&user) {
-                    if let Ok(Some(m)) = read_manifest(&kind.join(key).join(MANIFEST)) {
-                        return Some(m);
-                    }
+            for kind in read_dir(&server.join(FILES)) {
+                if let Ok(Some(m)) = read_manifest(&kind.join(key).join(MANIFEST)) {
+                    return Some(m);
                 }
             }
         }
         None
     }
 
-    /// `server`'s `user_id`'s track `key`, if there is one: read from
-    /// where it would be, with no other directory looked in.
-    pub fn find_track(&self, server: &str, user_id: &str, key: &str) -> Option<Manifest> {
+    /// `server`'s track `key`, if there is one: read from where it would
+    /// be, with no other directory looked in.
+    pub fn find_track(&self, server: &str, key: &str) -> Option<Manifest> {
         if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let path = self
-            .user_dir(server, user_id)
+            .files_dir(server)
             .join(EntryKind::Track.dir())
             .join(key)
             .join(MANIFEST);
@@ -480,6 +614,20 @@ impl Store {
     /// manifest is written with the holds left.
     pub fn release(&self, m: &mut Manifest, hold: &Hold) -> std::io::Result<bool> {
         m.holds.retain(|h| h != hold);
+        // The user whose session fetches it let go, and others hold it
+        // still: one of them fetches what is left, from the start of
+        // their own preparation (the server's download is per user).
+        if !m.holds.is_empty()
+            && !m.held_by(&m.user_id)
+            && !matches!(m.phase, DownloadPhase::Done)
+            && let Some(next) = m.holds.iter().find_map(|h| h.user.clone())
+        {
+            m.user_id = next;
+            m.id = None;
+            m.phase = DownloadPhase::Preparing {
+                server: spoolframe_protocol::downloads::DownloadState::Waiting,
+            };
+        }
         if m.holds.is_empty() {
             self.remove(m)?;
             Ok(true)
@@ -492,13 +640,15 @@ impl Store {
     /// Take download `m` off the disk. Its offline watch entry, if not
     /// sent yet, is kept for the next sync.
     pub fn remove(&self, m: &Manifest) -> std::io::Result<()> {
-        if m.watch.pending
-            && let Some(entry) = m.watch.entry(&m.item)
-        {
-            let mut carried = self.carried(&m.server, &m.user_id);
-            carried.retain(|c| c.id != entry.id);
-            carried.push(entry);
-            self.set_carried(&m.server, &m.user_id, &carried)?;
+        for (user_id, watch) in &m.watches {
+            if watch.pending
+                && let Some(entry) = watch.entry(&m.item)
+            {
+                let mut carried = self.carried(&m.server, user_id);
+                carried.retain(|c| c.id != entry.id);
+                carried.push(entry);
+                self.set_carried(&m.server, user_id, &carried)?;
+            }
         }
         match std::fs::remove_dir_all(self.dir(m)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -541,12 +691,14 @@ impl Store {
     pub fn carried_users(&self) -> Vec<(String, String)> {
         let mut users = Vec::new();
         for m in self.scan() {
-            if m.watch.pending {
-                users.push((m.server.clone(), m.user_id.clone()));
+            for (user_id, watch) in &m.watches {
+                if watch.pending {
+                    users.push((m.server.clone(), user_id.clone()));
+                }
             }
         }
         for server in read_dir(&self.root) {
-            for user in read_dir(&server) {
+            for user in user_dirs(&server) {
                 let Ok(bytes) = std::fs::read(user.join(CARRIED)) else {
                     continue;
                 };
@@ -593,7 +745,7 @@ impl Store {
     pub fn users_with(&self, name: &str) -> Vec<(String, String)> {
         let mut users = Vec::new();
         for server in read_dir(&self.root) {
-            for user in read_dir(&server) {
+            for user in user_dirs(&server) {
                 if user.join(name).exists()
                     && let (Some(s), Some(u)) = (
                         server.file_name().and_then(|n| n.to_str()),
@@ -687,6 +839,20 @@ fn undo_dir_name(name: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// `a` is further along than `b`: finished, or with more on disk.
+fn further(a: &Manifest, b: &Manifest) -> bool {
+    let done = |m: &Manifest| matches!(m.phase, DownloadPhase::Done);
+    (done(a), a.offset) > (done(b), b.offset)
+}
+
+/// A server's users' directories: every one but its files'.
+fn user_dirs(server: &Path) -> Vec<PathBuf> {
+    read_dir(server)
+        .into_iter()
+        .filter(|d| d.file_name().is_none_or(|n| n != FILES))
+        .collect()
+}
+
 /// The directories in `dir`; none if it cannot be read.
 fn read_dir(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -720,7 +886,11 @@ fn read_manifest(path: &Path) -> std::io::Result<Option<Manifest>> {
         tracing::debug!(path = %path.display(), version, "an entry of a newer build; left as it is");
         return Ok(None);
     }
-    read.map(Some).map_err(std::io::Error::other)
+    let mut m = read.map_err(std::io::Error::other)?;
+    if m.version < VERSION {
+        m.upgrade();
+    }
+    Ok(Some(m))
 }
 
 /// `path`'s SHA-256, as 64 hex digits, read on a blocking thread: a film
@@ -809,7 +979,6 @@ mod tests {
         let key = |tracks| {
             key_of(
                 "s",
-                "u",
                 EntryKind::Film,
                 &id(),
                 &DownloadSource::Original,
@@ -822,21 +991,20 @@ mod tests {
     }
 
     #[test]
-    fn another_user_server_or_source_has_another_key() {
+    fn another_server_kind_or_source_has_another_key() {
         let all = DownloadTracks::All;
         let original = DownloadSource::Original;
         let film = EntryKind::Film;
-        let base = key_of("s", "u", film, &id(), &original, &all);
-        assert_ne!(base, key_of("s", "v", film, &id(), &original, &all));
-        assert_ne!(base, key_of("t", "u", film, &id(), &original, &all));
+        let base = key_of("s", film, &id(), &original, &all);
+        assert_ne!(base, key_of("t", film, &id(), &original, &all));
         assert_ne!(
             base,
-            key_of("s", "u", EntryKind::Episode, &id(), &original, &all)
+            key_of("s", EntryKind::Episode, &id(), &original, &all)
         );
         let mobile = DownloadSource::Profile {
             name: "Mobile".into(),
         };
-        assert_ne!(base, key_of("s", "u", film, &id(), &mobile, &all));
+        assert_ne!(base, key_of("s", film, &id(), &mobile, &all));
         assert_eq!(base.len(), 32);
     }
 
@@ -846,18 +1014,14 @@ mod tests {
     fn a_download_s_key_does_not_change() {
         let key = key_of(
             "s",
-            "u",
             EntryKind::Film,
             &id(),
             &DownloadSource::Original,
             &DownloadTracks::All,
         );
-        assert_eq!(key, "d36a1f2bce4c77f44634c05b7a6a0f7a");
+        assert_eq!(key, "ab616441e5cf44e6d44aea3cbbe01e32");
         let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
-        assert_eq!(
-            kept_key("s", "u", &track),
-            "ec58120f39c376f8cc3c3e42ff585e75"
-        );
+        assert_eq!(kept_key("s", &track), "5846f3e3807adad07ba3f7df6d6aeadc");
     }
 
     /// A track kept from listening and the same track downloaded are two
@@ -867,14 +1031,13 @@ mod tests {
         let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
         let downloaded = key_of(
             "s",
-            "u",
             EntryKind::Track,
             &track,
             &DownloadSource::Original,
             &DownloadTracks::All,
         );
-        assert_ne!(kept_key("s", "u", &track), downloaded);
-        assert_ne!(kept_key("s", "u", &track), kept_key("s", "v", &track));
+        assert_ne!(kept_key("s", &track), downloaded);
+        assert_ne!(kept_key("s", &track), kept_key("t", &track));
         assert_eq!(
             [
                 Container::Mp4,
@@ -889,8 +1052,10 @@ mod tests {
         assert_eq!(extension(EntryKind::Film, Container::Mp4), "mp4");
     }
 
+    /// A file is the server's on this device, not a user's: beside the
+    /// users' directories, under a name none of theirs can have.
     #[test]
-    fn a_download_lives_under_its_server_and_user() {
+    fn a_download_lives_under_its_server_s_files() {
         let store = store("layout");
         let m = manifest("ab12", 1);
         assert_eq!(
@@ -898,10 +1063,15 @@ mod tests {
             store
                 .root()
                 .join("server-key")
-                .join("local%3A0f3a")
+                .join("%files")
                 .join("film")
                 .join("ab12")
         );
+        assert_eq!(
+            store.user_dir("server-key", "local:0f3a"),
+            store.root().join("server-key").join("local%3A0f3a")
+        );
+        assert_ne!(dir_name("%files"), FILES);
         assert_eq!(undo_dir_name("local%3A0f3a").as_deref(), Some("local:0f3a"));
         assert_eq!(dir_name(".."), "%2E%2E");
     }
@@ -924,13 +1094,7 @@ mod tests {
         .unwrap();
         assert_eq!(store.scan(), vec![m.clone()]);
         // A directory with no manifest is a download that never started.
-        std::fs::create_dir_all(
-            store
-                .user_dir("server-key", "local:0f3a")
-                .join("film")
-                .join("cd34"),
-        )
-        .unwrap();
+        std::fs::create_dir_all(store.files_dir("server-key").join("film").join("cd34")).unwrap();
         assert_eq!(store.scan(), vec![m]);
     }
 
@@ -987,13 +1151,18 @@ mod tests {
         let album = Hold {
             by: "album".into(),
             id: Some("plex:album:3".into()),
+            user: Some("local:0f3a".into()),
         };
         let mut m = manifest("ab12", 1);
         m.add_hold(&album);
         m.add_hold(&album);
-        assert_eq!(m.holds, [Hold::download(), album.clone()]);
+        assert_eq!(m.holds, [Hold::download("local:0f3a"), album.clone()]);
         store.write(&m).unwrap();
-        assert!(!store.release(&mut m, &Hold::download()).unwrap());
+        assert!(
+            !store
+                .release(&mut m, &Hold::download("local:0f3a"))
+                .unwrap()
+        );
         assert_eq!(
             store.find("ab12").map(|m| m.holds),
             Some(vec![album.clone()])
@@ -1004,23 +1173,176 @@ mod tests {
     }
 
     /// A track is read from its own directory: the same one `find`
-    /// finds, and none of another user's.
+    /// finds, and none of another server's.
     #[test]
     fn a_track_is_found_where_it_is() {
         let store = store("track");
         let mut m = manifest("ab12", 1);
         m.kind = EntryKind::Track;
         store.write(&m).unwrap();
-        assert_eq!(
-            store.find_track("server-key", "local:0f3a", "ab12"),
-            store.find("ab12")
-        );
+        assert_eq!(store.find_track("server-key", "ab12"), store.find("ab12"));
         assert!(store.find("ab12").is_some());
-        assert_eq!(store.find_track("server-key", "other", "ab12"), None);
-        assert_eq!(
-            store.find_track("server-key", "local:0f3a", "../ab12"),
-            None
+        assert_eq!(store.find_track("other", "ab12"), None);
+        assert_eq!(store.find_track("server-key", "../ab12"), None);
+    }
+
+    /// The user fetching a file lets go of it while another still holds
+    /// it: the other fetches it, prepared again as theirs.
+    #[test]
+    fn a_file_another_user_holds_is_handed_to_them() {
+        let store = store("handoff");
+        let mut m = manifest("ab12", 1);
+        m.id = Some("alice's download".into());
+        m.phase = DownloadPhase::Transferring;
+        m.add_hold(&Hold::download("local:bob"));
+        store.write(&m).unwrap();
+        assert!(
+            !store
+                .release(&mut m, &Hold::download("local:0f3a"))
+                .unwrap()
         );
+        let m = store.find("ab12").unwrap();
+        assert_eq!(m.user_id, "local:bob");
+        assert_eq!(m.id, None);
+        assert!(matches!(m.phase, DownloadPhase::Preparing { .. }));
+    }
+
+    /// A finished file stays as it is when its fetcher lets go.
+    #[test]
+    fn a_finished_file_is_not_fetched_again_for_another_user() {
+        let store = store("handoff-done");
+        let mut m = manifest("ab12", 1);
+        m.phase = DownloadPhase::Done;
+        m.add_hold(&Hold::download("local:bob"));
+        store.write(&m).unwrap();
+        assert!(
+            !store
+                .release(&mut m, &Hold::download("local:0f3a"))
+                .unwrap()
+        );
+        let m = store.find("ab12").unwrap();
+        assert_eq!(m.phase, DownloadPhase::Done);
+        assert_eq!(m.user_id, "local:0f3a");
+    }
+
+    /// Who may see a file: whoever holds it, and every profile for one
+    /// kept from listening.
+    #[test]
+    fn a_file_is_each_holder_s_and_a_kept_one_everyone_s() {
+        let mut m = manifest("ab12", 1);
+        assert!(m.is_for("local:0f3a"));
+        assert!(!m.is_for("local:bob"));
+        m.add_hold(&Hold::listening());
+        assert!(m.is_for("local:bob"));
+        assert!(!m.held_by("local:bob"));
+    }
+
+    /// 0.14.0's layout: each user's files under their directory. Moved
+    /// under the new keys, the same film twice becomes one file held by
+    /// both with each one's watch state, a kept track moves, and what is
+    /// the user's own (their music, the watch of deleted downloads) stays.
+    #[test]
+    fn the_per_user_layout_of_0_14_0_is_moved_and_merged() {
+        let store = store("migrate");
+        let old = |user: &str, kind: &str, key: &str| {
+            store.user_dir("server-key", user).join(kind).join(key)
+        };
+        let write_old = |user: &str, m: serde_json::Value, done: bool| {
+            let dir = old(
+                user,
+                m["kind"].as_str().unwrap(),
+                m["key"].as_str().unwrap(),
+            );
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(MANIFEST), m.to_string()).unwrap();
+            if done {
+                std::fs::write(dir.join("media.mkv"), user).unwrap();
+            }
+        };
+        // As 0.14.0 wrote them: version 1, one `watch`, holds with no user.
+        let v1 = |user: &str, key: &str, position: u64, done: bool| {
+            let mut m = serde_json::to_value(manifest(key, 1)).unwrap();
+            m["version"] = 1.into();
+            m["user_id"] = user.into();
+            m["holds"] = serde_json::json!([{"by": "download", "id": null}]);
+            m.as_object_mut().unwrap().remove("watches");
+            m["watch"] = serde_json::to_value(LocalWatch {
+                position_ms: Some(position),
+                watched: None,
+                at: 5,
+                pending: true,
+            })
+            .unwrap();
+            if done {
+                m["phase"] = serde_json::to_value(DownloadPhase::Done).unwrap();
+                m["file"] = serde_json::json!(null);
+            }
+            m
+        };
+        write_old("local:0f3a", v1("local:0f3a", "aaaa", 10, true), true);
+        write_old("local:bob", v1("local:bob", "bbbb", 20, false), false);
+        let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
+        let old_kept = key_hash(&["listening:1", "server-key", "local:bob", &track.to_string()]);
+        let mut kept = v1("local:bob", &old_kept, 0, true);
+        kept["kind"] = "track".into();
+        kept["item"]["id"] = serde_json::to_value(&track).unwrap();
+        kept["holds"] = serde_json::json!([{"by": "listening", "id": null}]);
+        write_old("local:bob", kept, true);
+        let music = store.music_path("server-key", "local:bob");
+        std::fs::write(&music, "{}").unwrap();
+
+        store.migrate();
+
+        let key = key_of(
+            "server-key",
+            EntryKind::Film,
+            &id(),
+            &DownloadSource::Original,
+            &DownloadTracks::All,
+        );
+        let films: Vec<Manifest> = store
+            .scan()
+            .into_iter()
+            .filter(|m| m.kind == EntryKind::Film)
+            .collect();
+        assert_eq!(films.len(), 1);
+        let film = &films[0];
+        assert_eq!(film.key, key);
+        assert_eq!(film.version, VERSION);
+        assert_eq!(
+            film.holds,
+            [Hold::download("local:0f3a"), Hold::download("local:bob")]
+        );
+        assert_eq!(film.watch_of("local:0f3a").position_ms, Some(10));
+        assert_eq!(film.watch_of("local:bob").position_ms, Some(20));
+        // The finished one stayed, with its file.
+        assert_eq!(film.phase, DownloadPhase::Done);
+        assert_eq!(
+            std::fs::read_to_string(store.dir(film).join("media.mkv")).unwrap(),
+            "local:0f3a"
+        );
+        let moved = store
+            .find_track("server-key", &kept_key("server-key", &track))
+            .expect("the kept track moved");
+        assert!(moved.cached_only());
+        assert!(moved.is_for("local:0f3a"));
+        assert!(!old("local:0f3a", "film", "aaaa").exists());
+        assert!(
+            !store
+                .user_dir("server-key", "local:bob")
+                .join("film")
+                .exists()
+        );
+        assert!(
+            !store
+                .user_dir("server-key", "local:bob")
+                .join("track")
+                .exists()
+        );
+        assert!(music.exists());
+        // Run again: nothing more to do.
+        store.migrate();
+        assert_eq!(store.scan().len(), 2);
     }
 
     /// A newer build's entry (a kind this one does not know, or a later
@@ -1035,10 +1357,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         json["version"] = (VERSION + 1).into();
         std::fs::write(&path, json.to_string()).unwrap();
-        let photo = store
-            .user_dir("server-key", "local:0f3a")
-            .join("photo")
-            .join("cd34");
+        let photo = store.files_dir("server-key").join("photo").join("cd34");
         std::fs::create_dir_all(&photo).unwrap();
         std::fs::write(
             photo.join(MANIFEST),
@@ -1057,9 +1376,9 @@ mod tests {
         let store = store("unreadable");
         std::fs::create_dir_all(store.root()).unwrap();
         let path = store.root().join(MANIFEST);
-        std::fs::write(&path, r#"{"version":2,"kind":"film","holds":"new"}"#).unwrap();
+        std::fs::write(&path, r#"{"version":3,"kind":"film","holds":"new"}"#).unwrap();
         assert!(matches!(read_manifest(&path), Ok(None)));
-        std::fs::write(&path, r#"{"version":1,"kind":"film","holds":"new"}"#).unwrap();
+        std::fs::write(&path, r#"{"version":2,"kind":"film","holds":"new"}"#).unwrap();
         assert!(read_manifest(&path).is_err());
         std::fs::write(&path, b"{").unwrap();
         assert!(read_manifest(&path).is_err());
@@ -1069,7 +1388,7 @@ mod tests {
     fn a_deleted_download_s_unsent_watch_is_kept_for_the_next_sync() {
         let store = store("carried");
         let mut m = manifest("ab12", 1);
-        m.watch = LocalWatch {
+        *m.watch_mut("local:0f3a") = LocalWatch {
             position_ms: Some(90_000),
             watched: None,
             at: 1_700_000_000,
@@ -1100,8 +1419,8 @@ mod tests {
         );
         // A sent one is not kept.
         let mut sent = manifest("cd34", 2);
-        sent.watch.pending = false;
-        sent.watch.position_ms = Some(5);
+        sent.watch_mut("local:0f3a").pending = false;
+        sent.watch_mut("local:0f3a").position_ms = Some(5);
         store.write(&sent).unwrap();
         store.remove(&sent).unwrap();
         assert_eq!(store.carried("server-key", "local:0f3a").len(), 1);

@@ -154,15 +154,19 @@ pub enum MusicTarget {
 
 impl MusicTarget {
     /// The hold its tracks get.
-    fn hold(&self) -> Hold {
+    fn hold(&self, user_id: &str) -> Hold {
         let (by, id) = match self {
-            Self::Track { .. } => return Hold::download(),
+            Self::Track { .. } => return Hold::download(user_id),
             Self::Album { id } => ("album", Some(id.to_string())),
             Self::Artist { id } => ("artist", Some(id.to_string())),
             Self::Playlist { id } => ("playlist", Some(id.clone())),
             Self::Liked => ("liked", None),
         };
-        Hold { by: by.into(), id }
+        Hold {
+            by: by.into(),
+            id,
+            user: Some(user_id.to_owned()),
+        }
     }
 
     /// A track's, an album's or an artist's id, and the kind it must be.
@@ -416,9 +420,9 @@ impl Downloads {
             write_json(&path, &state).map_err(disk)?;
             stored
         };
-        let hold = target.hold();
+        let hold = target.hold(&user_id);
         let source = stored.quality.source();
-        self.release_tracks(&server, &user_id, &source, &dropped, &hold)
+        self.release_tracks(&server, &source, &dropped, &hold)
             .await?;
         for (id, item) in tracks {
             if let Err(e) =
@@ -450,10 +454,9 @@ impl Downloads {
         let source = stored.quality.source();
         self.release_tracks(
             &server,
-            &user_id,
             &source,
             &stored.tracks,
-            &stored.target.hold(),
+            &stored.target.hold(&user_id),
         )
         .await
     }
@@ -462,15 +465,14 @@ impl Downloads {
     async fn release_tracks(
         &self,
         server: &str,
-        user_id: &str,
         source: &DownloadSource,
         ids: &[MediaId],
         hold: &Hold,
     ) -> Result<(), SdkError> {
         let store = self.shared().store()?;
         for id in ids {
-            let key = track_key(server, user_id, id, source);
-            if let Some(m) = store.find_track(server, user_id, &key) {
+            let key = track_key(server, id, source);
+            if let Some(m) = store.find_track(server, &key) {
                 self.release(m, hold).await?;
             }
         }
@@ -485,7 +487,15 @@ impl Downloads {
             return Vec::new();
         };
         let mut all = Vec::new();
+        let active = shared.locks.active();
         for (server, user_id) in store.users_with(store::MUSIC_FILE) {
+            if active
+                .as_ref()
+                .is_some_and(|a| *a != (server.clone(), user_id.clone()))
+                || shared.locks.is_locked(&server, &user_id)
+            {
+                continue;
+            }
             let state: MusicState = read_json(&store.music_path(&server, &user_id));
             for stored in &state.downloads {
                 all.push(shared.music_view(store, &server, &user_id, stored));
@@ -503,7 +513,7 @@ impl Downloads {
             Some(store) => store
                 .scan()
                 .iter()
-                .filter(|m| m.kind == EntryKind::Track)
+                .filter(|m| m.kind == EntryKind::Track && shared.shown(m).is_ok())
                 .map(|m| shared.view(m))
                 .collect(),
             None => Vec::new(),
@@ -519,9 +529,12 @@ impl Downloads {
         let Some(store) = &shared.store else {
             return OfflineMusic::default();
         };
+        if shared.locks.is_locked(server, user_id) {
+            return OfflineMusic::default();
+        }
         let mut by_track: HashMap<MediaId, (Manifest, OfflineTrack)> = HashMap::new();
         for m in store.scan() {
-            if m.kind != EntryKind::Track || m.server != server || m.user_id != user_id {
+            if m.kind != EntryKind::Track || m.server != server || !m.is_for(user_id) {
                 continue;
             }
             let Some(track) = shared.offline_track(&m) else {
@@ -661,6 +674,11 @@ impl Downloads {
     pub async fn record_play(&self, key: &str, played: Duration) -> Result<(), SdkError> {
         let shared = self.shared();
         let store = shared.store()?;
+        let m = store
+            .find(key)
+            .ok_or_else(|| SdkError::NotFound(format!("track {key}")))?;
+        shared.shown(&m)?;
+        let user_id = shared.acting(&m);
         let m = shared
             .update(key, |m| {
                 if m.kind != EntryKind::Track {
@@ -676,7 +694,7 @@ impl Downloads {
             played_ms: played.as_millis() as u64,
         };
         shared
-            .pending(store, &m.server, &m.user_id, |p| p.plays.push(play))
+            .pending(store, &m.server, &user_id, |p| p.plays.push(play))
             .await
     }
 
@@ -689,13 +707,14 @@ impl Downloads {
             .find(key)
             .filter(|m| m.kind == EntryKind::Track)
             .ok_or_else(|| SdkError::NotFound(format!("track {key}")))?;
+        shared.shown(&m)?;
         let like = OfflineLike {
             track: m.item.id().clone(),
             liked,
             at: now(),
         };
         shared
-            .pending(store, &m.server, &m.user_id, |p| {
+            .pending(store, &m.server, &shared.acting(&m), |p| {
                 p.liked.retain(|l| l.track != like.track);
                 p.liked.push(like);
             })
@@ -841,8 +860,8 @@ async fn hold_track(
     let store = shared.store()?;
     let server = session.server();
     let user = session.user().clone();
-    let key = track_key(&server, &user.user_id, id, source);
-    if store.find_track(&server, &user.user_id, &key).is_some() {
+    let key = track_key(&server, id, source);
+    if store.find_track(&server, &key).is_some() {
         shared
             .update(&key, |m| {
                 m.add_hold(hold);
@@ -880,7 +899,7 @@ async fn hold_track(
     {
         let _writing = shared.manifests.lock().await;
         // Made meanwhile by another download: held by both.
-        if let Some(mut there) = store.find_track(&m.server, &m.user_id, &m.key) {
+        if let Some(mut there) = store.find_track(&m.server, &m.key) {
             there.add_hold(hold);
             store.write(&there).map_err(disk)?;
             m = there;
@@ -893,15 +912,8 @@ async fn hold_track(
 }
 
 /// The key of track `id` downloaded in `source`.
-fn track_key(server: &str, user_id: &str, id: &MediaId, source: &DownloadSource) -> String {
-    key_of(
-        server,
-        user_id,
-        EntryKind::Track,
-        id,
-        source,
-        &DownloadTracks::All,
-    )
+fn track_key(server: &str, id: &MediaId, source: &DownloadSource) -> String {
+    key_of(server, EntryKind::Track, id, source, &DownloadTracks::All)
 }
 
 /// The key of a music download: one per server, user and target.
@@ -1009,8 +1021,8 @@ impl Shared {
         let source = stored.quality.source();
         let (mut done, mut received, mut size) = (0, 0, 0);
         for id in &stored.tracks {
-            let key = track_key(server, user_id, id, &source);
-            if let Some(m) = store.find_track(server, user_id, &key) {
+            let key = track_key(server, id, &source);
+            if let Some(m) = store.find_track(server, &key) {
                 if m.phase == super::DownloadPhase::Done {
                     done += 1;
                 }
@@ -1068,19 +1080,19 @@ impl Shared {
         write_json(&path, &pending).map_err(disk)
     }
 
-    /// Track `id` of `server`'s `user_id` was just played, streamed: its
+    /// Track `id` of `server` was just played, streamed: its
     /// entries count it for the cache. Whether one is here whole,
     /// downloaded or kept already, so nothing more is to be kept of it.
-    pub(super) async fn played(&self, server: &str, user_id: &str, id: &MediaId) -> bool {
+    pub(super) async fn played(&self, server: &str, id: &MediaId) -> bool {
         let Some(store) = &self.store else {
             return false;
         };
         // Its entries: kept from listening, or downloaded in a quality.
-        let mut keys = vec![kept_key(server, user_id, id)];
-        keys.extend(MusicQuality::ALL.map(|q| track_key(server, user_id, id, &q.source())));
+        let mut keys = vec![kept_key(server, id)];
+        keys.extend(MusicQuality::ALL.map(|q| track_key(server, id, &q.source())));
         let mut whole = false;
         for key in keys {
-            let Some(m) = store.find_track(server, user_id, &key) else {
+            let Some(m) = store.find_track(server, &key) else {
                 continue;
             };
             whole |= m.phase == super::DownloadPhase::Done;
@@ -1389,7 +1401,7 @@ async fn follow(
     let user_id = session.user().user_id.clone();
     let before: HashSet<&MediaId> = stored.tracks.iter().collect();
     let now_held: HashSet<&MediaId> = tracks.iter().collect();
-    let hold = stored.target.hold();
+    let hold = stored.target.hold(&user_id);
     let source = stored.quality.source();
     for id in tracks.iter().filter(|id| !before.contains(id)) {
         if let Err(e) = hold_track(shared, session, id, None, &source, &hold, parents).await {
@@ -1406,7 +1418,7 @@ async fn follow(
         .cloned()
         .collect();
     downloads
-        .release_tracks(&server, &user_id, &source, &gone, &hold)
+        .release_tracks(&server, &source, &gone, &hold)
         .await?;
     {
         let _writing = shared.manifests.lock().await;
@@ -1433,9 +1445,9 @@ pub(super) async fn kept_is(m: &Manifest, path: &std::path::Path, sha256: &str) 
 }
 
 /// The entry of `id` kept from listening, if one is here whole.
-pub(super) fn kept(store: &Store, server: &str, user_id: &str, id: &MediaId) -> Option<Manifest> {
+pub(super) fn kept(store: &Store, server: &str, id: &MediaId) -> Option<Manifest> {
     store
-        .find_track(server, user_id, &kept_key(server, user_id, id))
+        .find_track(server, &kept_key(server, id))
         .filter(|m| m.phase == super::DownloadPhase::Done)
 }
 
@@ -1512,7 +1524,7 @@ mod tests {
         let (shared, store) = shared("evict", 150);
         entry(&store, "1", Hold::listening(), 100, 10);
         entry(&store, "2", Hold::listening(), 100, 20);
-        entry(&store, "3", Hold::download(), 1000, 1);
+        entry(&store, "3", Hold::download("user"), 1000, 1);
         evict(&shared, None).await.unwrap();
         assert_eq!(keys(&store), ["0002", "0003"]);
     }
@@ -1547,7 +1559,7 @@ mod tests {
             MusicTarget::Album {
                 id: MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap(),
             }
-            .hold(),
+            .hold("user"),
         );
         store.write(&m).unwrap();
         evict(&shared, None).await.unwrap();
@@ -1560,10 +1572,10 @@ mod tests {
     async fn a_track_played_marks_each_of_its_entries() {
         let (shared, store) = shared("played", 1);
         let id = MediaId::new(Namespace::Plex, MediaKind::Track, "7").unwrap();
-        let put = |key: String, user: &str, done: bool| {
-            let mut m = entry(&store, "7", Hold::download(), 10, 1);
+        let put = |key: String, server: &str, done: bool| {
+            let mut m = entry(&store, "7", Hold::download("user"), 10, 1);
             store.remove(&m).unwrap();
-            (m.key, m.user_id) = (key, user.into());
+            (m.key, m.server) = (key, server.into());
             if !done {
                 m.phase = super::super::DownloadPhase::Paused;
             }
@@ -1571,24 +1583,24 @@ mod tests {
             m.key
         };
         let aac = put(
-            track_key("server", "user", &id, &DownloadSource::Aac256),
-            "user",
+            track_key("server", &id, &DownloadSource::Aac256),
+            "server",
             false,
         );
-        let kept = put(kept_key("server", "user", &id), "user", true);
-        let other = put(kept_key("server", "other", &id), "other", true);
-        let before = shared.played("server", "user", &id).await;
-        let played = |key: &str, user: &str| {
+        let kept = put(kept_key("server", &id), "server", true);
+        let other = put(kept_key("other", &id), "other", true);
+        let before = shared.played("server", &id).await;
+        let played = |key: &str, server: &str| {
             store
-                .find_track("server", user, key)
+                .find_track(server, key)
                 .and_then(|m| m.last_played_at)
                 .is_some_and(|at| at > 1)
         };
         assert_eq!(
             (
                 before,
-                played(&aac, "user"),
-                played(&kept, "user"),
+                played(&aac, "server"),
+                played(&kept, "server"),
                 played(&other, "other")
             ),
             (true, true, true, false)
@@ -1656,14 +1668,14 @@ mod tests {
         let album =
             MediaId::new(spoolframe_types::Namespace::Plex, MediaKind::Album, "31").unwrap();
         let holds = [
-            MusicTarget::Album { id: album.clone() }.hold(),
-            MusicTarget::Playlist { id: "p".into() }.hold(),
-            MusicTarget::Liked.hold(),
+            MusicTarget::Album { id: album.clone() }.hold("u"),
+            MusicTarget::Playlist { id: "p".into() }.hold("u"),
+            MusicTarget::Liked.hold("u"),
             MusicTarget::Track {
                 id: MediaId::new(spoolframe_types::Namespace::Plex, MediaKind::Track, "32")
                     .unwrap(),
             }
-            .hold(),
+            .hold("u"),
         ];
         assert_eq!(
             holds.map(|h| (h.by, h.id)),

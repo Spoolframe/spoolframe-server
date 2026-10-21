@@ -35,8 +35,14 @@
 //! playlists and Liked, and `listening` for tracks kept as they play.
 //! On a mobile network ([`Downloads::set_network`]) nothing moves unless
 //! [`DownloadSettings::allow_cellular`].
+//!
+//! A file is the device's: two profiles that download the same item share
+//! it, each holding it. [`Downloads::set_profile`] says whose downloads
+//! the views show, and locks a profile whose PIN is asked for here until
+//! [`Downloads::unlock_offline`] (PX-60, the `lock` module).
 
 mod listening;
+mod lock;
 mod manager;
 mod music;
 mod space;
@@ -44,6 +50,7 @@ mod store;
 mod writer;
 
 pub(crate) use listening::Keeper;
+pub(crate) use lock::Locks;
 pub use music::{
     CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
     MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
@@ -168,6 +175,9 @@ pub struct LocalDownload {
     pub key: String,
     /// The server's key.
     pub server: String,
+    /// The user whose session fetches it. A file is shared by the
+    /// profiles that downloaded it: [`Downloads::set_profile`] shows each
+    /// only theirs.
     pub user_id: String,
     pub username: String,
     /// The film or episode, as the server had it when it was downloaded.
@@ -321,14 +331,19 @@ impl Downloads {
         let tracks = tracks.normalized();
         let server = session.server();
         let user = session.user().clone();
-        let key = store::key_of(&server, &user.user_id, kind, id, &source, &tracks);
+        let key = store::key_of(&server, kind, id, &source, &tracks);
         shared.session_made(session);
         if store.find(&key).is_some() {
-            // Held by something else so far, it is the user's download
-            // now too.
+            // Held by something else so far (another profile's download),
+            // it is the user's download now too, watched as they watched
+            // it.
+            let watch = session.item(id).await.ok().map(|d| LocalWatch::of(&d.item));
             let m = shared
                 .update(&key, |m| {
-                    m.add_hold(&Hold::download());
+                    m.add_hold(&Hold::download(&user.user_id));
+                    if let Some(watch) = watch {
+                        m.watches.entry(user.user_id.clone()).or_insert(watch);
+                    }
                     Ok(())
                 })
                 .await?;
@@ -366,6 +381,7 @@ impl Downloads {
     /// Stop moving download `key` until [`Downloads::resume`]. What
     /// arrived is kept.
     pub async fn pause(&self, key: &str) -> Result<LocalDownload, SdkError> {
+        self.find(key)?;
         let shared = self.shared();
         let m = shared
             .update(key, |m| {
@@ -410,6 +426,7 @@ impl Downloads {
         may: impl FnOnce(&DownloadPhase) -> bool,
         not: &str,
     ) -> Result<LocalDownload, SdkError> {
+        self.find(key)?;
         let shared = self.shared();
         let m = shared
             .update(key, |m| {
@@ -443,24 +460,32 @@ impl Downloads {
                 "download {key} is finished: delete it"
             )));
         }
-        self.release(m, &Hold::download()).await
+        let hold = Hold::download(&self.shared().acting(&m));
+        self.release(m, &hold).await
     }
 
     /// Take download `key` off this device, in any phase. One not
     /// finished is cancelled on the server, if it can be reached now. Its
     /// offline watch not sent yet is kept for the next sync. A file that
     /// something else still holds (a track in an album downloaded, or
-    /// kept from listening) stays, for it.
+    /// kept from listening, or another profile's download) stays, for it.
+    /// It is the active profile's download that goes
+    /// ([`Downloads::set_profile`]).
     pub async fn delete(&self, key: &str) -> Result<(), SdkError> {
         let m = self.find(key)?;
-        self.release(m, &Hold::download()).await
+        let hold = Hold::download(&self.shared().acting(&m));
+        self.release(m, &hold).await
     }
 
+    /// Download `key`, if the active profile may see it.
     fn find(&self, key: &str) -> Result<Manifest, SdkError> {
-        self.shared()
+        let shared = self.shared();
+        let m = shared
             .store()?
             .find(key)
-            .ok_or_else(|| SdkError::NotFound(format!("download {key}")))
+            .ok_or_else(|| SdkError::NotFound(format!("download {key}")))?;
+        shared.shown(&m)?;
+        Ok(m)
     }
 
     /// Let go of `hold` on `m`: with nothing left holding it, it is taken
@@ -505,17 +530,18 @@ impl Downloads {
         Ok(())
     }
 
-    /// Every film and episode downloaded on this device, oldest first,
-    /// from disk alone: no server is asked. None without a downloads
-    /// directory. Music is [`Downloads::music_downloads`] and
-    /// [`Downloads::music_tracks`].
+    /// Every film and episode downloaded on this device by the active
+    /// profile ([`Downloads::set_profile`]; every profile's without one),
+    /// oldest first, from disk alone: no server is asked. None for a
+    /// locked profile, and without a downloads directory. Music is
+    /// [`Downloads::music_downloads`] and [`Downloads::music_tracks`].
     pub fn list(&self) -> Vec<LocalDownload> {
         let shared = self.shared();
         match &shared.store {
             Some(store) => store
                 .scan()
                 .iter()
-                .filter(|m| m.kind != EntryKind::Track)
+                .filter(|m| m.kind != EntryKind::Track && shared.shown(m).is_ok())
                 .map(|m| shared.view(m))
                 .collect(),
             None => Vec::new(),
@@ -593,9 +619,10 @@ impl Downloads {
         watched: Option<bool>,
     ) -> Result<LocalDownload, SdkError> {
         let shared = self.shared();
+        let user_id = shared.acting(&self.find(key)?);
         let m = shared
             .update(key, |m| {
-                m.watch = LocalWatch {
+                *m.watch_mut(&user_id) = LocalWatch {
                     position_ms,
                     watched,
                     at: now(),
@@ -615,6 +642,67 @@ impl Downloads {
         session.downloads_offered()?;
         manager::sync(self.shared(), session).await
     }
+
+    /// The app shows `server`'s `user_id` (a [`LocalDownload::server`] and
+    /// a user id): from now on the views ([`Downloads::list`],
+    /// [`Downloads::music_tracks`], [`Downloads::music_downloads`], the
+    /// download events) are theirs, the watch state is theirs, and
+    /// [`Downloads::delete`] lets go of their download. Tracks kept from
+    /// listening are every profile's.
+    ///
+    /// A profile whose PIN is asked for on this device
+    /// ([`crate::Session::set_pin_required`], one setting per profile and
+    /// device) starts locked, as online: its views are empty and its
+    /// downloads [`SdkError::ProfileLocked`] until it is unlocked, online
+    /// ([`crate::Session::unlock`]) or not ([`Downloads::unlock_offline`],
+    /// [`Downloads::unlock_offline_by_owner`]). Choosing another profile
+    /// locks it again; choosing the same one again does not.
+    pub fn set_profile(&self, server: &str, user_id: &str) {
+        self.shared().locks.set_active(server, user_id);
+    }
+
+    /// No profile is shown: the views have every profile's downloads, as
+    /// before [`Downloads::set_profile`].
+    pub fn clear_profile(&self) {
+        self.shared().locks.clear_active();
+    }
+
+    /// The active profile is locked on this device: ask for its PIN, or
+    /// the owner's Face ID.
+    pub fn profile_locked(&self) -> bool {
+        self.shared()
+            .locks
+            .active()
+            .is_some_and(|(server, user_id)| self.shared().locks.is_locked(&server, &user_id))
+    }
+
+    /// Unlock the active profile with its PIN, with no server: checked
+    /// against the PIN that last unlocked it online on this device.
+    ///
+    /// - A wrong PIN is [`SdkError::InvalidCredentials`]; after 3 in a
+    ///   row each next one waits ([`SdkError::RateLimited`]), and after
+    ///   10 the profile stays locked offline until it is unlocked online
+    ///   ([`SdkError::SignInRequired`]).
+    /// - No PIN has unlocked it online here since 0.14.1:
+    ///   [`SdkError::NoOfflinePin`].
+    /// - No active profile: [`SdkError::InvalidInput`]. One not locked
+    ///   stays open.
+    ///
+    /// The server still has the profile locked until
+    /// [`crate::Session::unlock`]: the app may send the same PIN once it
+    /// is reached.
+    pub async fn unlock_offline(&self, pin: &str) -> Result<(), SdkError> {
+        self.shared().locks.unlock_offline(pin).await
+    }
+
+    /// Unlock the active profile with no server because the device's
+    /// owner proved it is them: on Apple, LocalAuthentication
+    /// (`deviceOwnerAuthentication`: Face ID, Touch ID or the passcode)
+    /// passed. The SDK takes the app's word. Refused like
+    /// [`Downloads::unlock_offline`] after 10 wrong PINs.
+    pub fn unlock_offline_by_owner(&self) -> Result<(), SdkError> {
+        self.shared().locks.unlock_by_owner()
+    }
 }
 
 /// A server's `DownloadChanged`, for the manager.
@@ -627,6 +715,8 @@ struct ServerChange {
 /// What the client keeps for its downloads, and the manager shares.
 pub(crate) struct Shared {
     store: Option<Store>,
+    /// The active profile and the profiles' locks (PX-60).
+    pub(crate) locks: Arc<lock::Locks>,
     /// Held across each read, change and write of a manifest.
     manifests: tokio::sync::Mutex<()>,
     /// Something for the manager to do.
@@ -674,7 +764,12 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn new(dir: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
-            store: dir.map(Store::new),
+            store: dir.map(|dir| {
+                let store = Store::new(dir);
+                store.migrate();
+                store
+            }),
+            locks: Arc::default(),
             manifests: tokio::sync::Mutex::default(),
             wake: Notify::new(),
             events: broadcast::channel(64).0,
@@ -742,6 +837,11 @@ impl Shared {
         if self.store.is_none() || !session.features.downloads {
             return;
         }
+        self.locks.session_locked(
+            &session.server(),
+            &session.user.user_id,
+            session.user.locked,
+        );
         let key = (session.server, session.user.user_id.clone());
         self.sessions.lock().insert(key.clone(), session.parts());
         self.sync_wanted.lock().insert(key);
@@ -792,8 +892,36 @@ impl Shared {
         Ok(m)
     }
 
+    /// Tell `m` changed, if the active profile may see it.
     fn emit(&self, m: &Manifest) {
-        let _ = self.events.send(DownloadEvent::Changed(self.view(m)));
+        if self.shown(m).is_ok() {
+            let _ = self.events.send(DownloadEvent::Changed(self.view(m)));
+        }
+    }
+
+    /// The user acting on `m`: the active profile, on its server; else
+    /// the one whose session fetches it.
+    fn acting(&self, m: &Manifest) -> String {
+        match self.locks.active() {
+            Some((server, user_id)) if server == m.server => user_id,
+            _ => m.user_id.clone(),
+        }
+    }
+
+    /// The active profile may see `m`: one of its own, or kept from
+    /// listening, on its server, with the profile not locked. Every one
+    /// with no active profile.
+    fn shown(&self, m: &Manifest) -> Result<(), SdkError> {
+        let Some((server, user_id)) = self.locks.active() else {
+            return Ok(());
+        };
+        if m.server != server || !m.is_for(&user_id) {
+            return Err(SdkError::NotFound(format!("download {}", m.key)));
+        }
+        if self.locks.is_locked(&server, &user_id) {
+            return Err(SdkError::ProfileLocked);
+        }
+        Ok(())
     }
 
     /// `m` as an app sees it.
@@ -834,7 +962,7 @@ impl Shared {
             size: m.size,
             file_path,
             file_url,
-            watch: m.watch.clone(),
+            watch: m.watch_of(&self.acting(m)),
             note: if m.phase.is_active() && self.network_held() {
                 Some(WAITING_FOR_NETWORK.to_owned())
             } else {

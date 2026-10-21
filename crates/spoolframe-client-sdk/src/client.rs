@@ -373,6 +373,12 @@ impl Client {
                 client.inner.relay_policy.choose(id, server.use_relays);
             }
         }
+        client
+            .inner
+            .downloads
+            .locks
+            .load(client.inner.storage.clone())
+            .await?;
         client.inner.downloads.start(Arc::downgrade(&client.inner));
         Ok(client)
     }
@@ -978,7 +984,18 @@ impl Client {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
         match self.call(server, None, Request::TrustedProfiles).await? {
-            Response::Ok(Reply::TrustedProfiles { profiles }) => Ok(profiles),
+            Response::Ok(Reply::TrustedProfiles { profiles }) => {
+                // Whether each asks for their PIN here: what locks them
+                // offline (PX-60).
+                for p in &profiles {
+                    self.inner.downloads.locks.seen(
+                        &server.to_string(),
+                        &p.user_id,
+                        p.pin_required,
+                    );
+                }
+                Ok(profiles)
+            }
             Response::Ok(other) => Err(SdkError::Protocol(format!(
                 "TrustedProfiles answered {other:?}"
             ))),

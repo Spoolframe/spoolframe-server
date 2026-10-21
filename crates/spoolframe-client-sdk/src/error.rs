@@ -174,6 +174,12 @@ pub enum SdkError {
     /// shown.
     #[error("this profile is locked; enter its PIN")]
     ProfileLocked,
+    /// Offline, this profile's PIN cannot be checked: no PIN has unlocked
+    /// it online on this device since 0.14.1 (PX-60). Offer the device
+    /// owner's unlock ([`crate::Downloads::unlock_offline_by_owner`]), or
+    /// unlock it online.
+    #[error("this profile's PIN cannot be checked offline here yet")]
+    NoOfflinePin,
     /// A value the call carried is not acceptable (a PIN that is not 4 to 8
     /// digits); the message says why.
     #[error("{0}")]

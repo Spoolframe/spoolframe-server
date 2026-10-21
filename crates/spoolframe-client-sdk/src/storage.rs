@@ -53,6 +53,10 @@ pub mod keys {
     /// (P8) later.
     pub const ALLOW_GUESTS: &str = "allow-guests";
 
+    /// Secret: each profile's lock offline (PX-60), JSON: whether its PIN
+    /// is asked for on this device, and a hash of the PIN to check.
+    pub const OFFLINE_LOCKS: &str = "offline-locks";
+
     /// Secret: the sessions on one server, JSON.
     pub fn sessions(server: &str) -> String {
         format!("sessions/{server}")
