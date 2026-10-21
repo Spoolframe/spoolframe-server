@@ -239,11 +239,13 @@ jobs:
 
   # One coverage report for the PR: each third's lcov covers only the
   # tests it ran, so they are merged (lcov -a sums the hits) before the
-  # report. `always()` so a failing test still gets its coverage reported.
+  # report. Only when every third passed: a failed or cancelled third's
+  # lcov is missing or partial, and a report built from it says less was
+  # covered than is.
   coverage:
     name: "coverage"
     needs: [test-first, test]
-    if: always() && github.event_name == 'pull_request'
+    if: success() && github.event_name == 'pull_request'
     runs-on: beefy
     steps:
       # genhtml reads the sources the lcov names.
@@ -263,10 +265,9 @@ jobs:
       - name: Download test artifacts
         uses: actions/download-artifact@v3
         with:
-          path: halves
+          path: thirds
 
-      # Only the halves that got as far as writing lcov: genhtml errors on
-      # no input and would hide the real failure.
+      # Only the thirds that wrote lcov: genhtml errors on no input.
       - name: Merge lcov
         id: merge
         shell: bash
@@ -276,7 +277,7 @@ jobs:
           echo "$LCOV_BIN" >> "$GITHUB_PATH"
           "$LCOV_BIN/genhtml" --version | head -1
           args=()
-          for f in halves/tests-*/lcov.info; do
+          for f in thirds/tests-*/lcov.info; do
             [ -s "$f" ] && args+=(-a "$f")
           done
           if [ "${#args[@]}" -eq 0 ]; then
