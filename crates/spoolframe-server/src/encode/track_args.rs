@@ -95,22 +95,32 @@ pub(crate) fn track_args(spec: &EncodeSpec<'_>, recipe: &Recipe) -> Result<Vec<S
         // and tone map as a single encode of that plan (PGPU-04).
         Recipe::Video(_) => input_video_args(spec)?,
         Recipe::Audio(audio) => {
-            let encoder = spec
-                .encoders
-                .audio_encoder(audio.codec)
-                .ok_or_else(|| format!("no encoder for {} on this machine", audio.codec))?;
+            let encoder = match audio.codec {
+                // A track's lossless copy (PX-51): ffmpeg's own encoders,
+                // in every build, and not ones playback picks from.
+                AudioCodec::Alac => s("alac"),
+                AudioCodec::Flac => s("flac"),
+                codec => spec
+                    .encoders
+                    .audio_encoder(codec)
+                    .ok_or_else(|| format!("no encoder for {codec} on this machine"))?
+                    .name
+                    .clone(),
+            };
             let mut args: Vec<String> = QUIET_ARGS.map(s).to_vec();
             args.extend([s("-i"), s(spec.inputs.film.display())]);
             args.extend([
                 s("-map"),
                 format!("0:{}", audio.stream),
                 s("-c:a"),
-                encoder.name.clone(),
+                encoder,
                 s("-ac"),
                 s(audio.channels),
-                s("-b:a"),
-                s(audio.bitrate),
             ]);
+            // Lossless has no rate to aim at.
+            if audio.bitrate > 0 {
+                args.extend([s("-b:a"), s(audio.bitrate)]);
+            }
             args
         }
     };
@@ -302,6 +312,20 @@ mod tests {
             &args(DTS_AS_EAC3),
             &["-map", "0:1", "-c:a", "eac3", "-ac", "6", "-b:a", "640000"]
         ));
+    }
+
+    #[test]
+    fn an_alac_track_is_encoded_by_ffmpeg_s_own_encoder_with_no_rate() {
+        let args = args(Recipe::Audio(AudioRecipe {
+            stream: 1,
+            codec: AudioCodec::Alac,
+            channels: 2,
+            bitrate: 0,
+        }));
+        assert!(
+            has(&args, &["-c:a", "alac", "-ac", "2"]) && !args.iter().any(|a| a == "-b:a"),
+            "{args:?}"
+        );
     }
 
     #[test]

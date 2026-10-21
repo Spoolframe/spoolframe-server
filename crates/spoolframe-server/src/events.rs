@@ -280,6 +280,8 @@ fn playlist_event(news: &PlaylistNews, who: &[Principal], liked: bool) -> Option
             }
         }
         PlaylistNews::Pins { principal } => who.contains(principal).then_some(Event::PinsChanged),
+        // For music downloads: [`tell_liked_news`].
+        PlaylistNews::Liked { .. } => None,
     }
 }
 
@@ -356,7 +358,9 @@ pub(crate) async fn tell_subtitle_news(
 
 /// The connections that listed `spoolframe:downloads`, by stable id:
 /// told when a download of a user they act as ([`ConnectionUsers`])
-/// moves (PX-38). Only their own: a download is its user's business.
+/// moves (PX-38). Only their own: a download is its user's business. The
+/// same, of the connections that listed `spoolframe:music-downloads`, is
+/// who is told of their user's likes (PX-51, [`tell_liked_news`]).
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadListeners {
     listed: Arc<Mutex<HashSet<usize>>>,
@@ -413,6 +417,24 @@ pub(crate) async fn tell_download_news(
                     state: state.clone(),
                 },
             );
+        }
+    }
+}
+
+/// Tell each connection of a user that listed `spoolframe:music-downloads`
+/// when they like or unlike a track (PX-51): a device that downloaded
+/// Liked asks what it holds now. Until the playlists' news ends.
+pub(crate) async fn tell_liked_news(
+    mut news: tokio::sync::broadcast::Receiver<PlaylistNews>,
+    listeners: DownloadListeners,
+    streams: EventStreams,
+) {
+    while let Some(told) = next_news(&mut news, "liked changes").await {
+        let PlaylistNews::Liked { principal } = told else {
+            continue;
+        };
+        for id in listeners.of(&principal) {
+            streams.send(id, Event::LikedChanged);
         }
     }
 }

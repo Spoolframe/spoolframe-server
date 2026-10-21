@@ -13,6 +13,7 @@ use super::{Store, StoreError};
 use crate::downloads::DeviceClass;
 
 pub mod requests;
+use crate::downloads::music::MusicQuality;
 
 /// A profile (migration 0038): what its copies' video is converted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +98,13 @@ pub enum CopyTarget {
     /// what the class cannot play is converted, its video copied when it
     /// plays it. Queued and evicted as a profile's copy is.
     Original { class: DeviceClass },
+    /// A track's download (PX-51) for a device class, in a quality: its
+    /// one audio track converted as [`crate::downloads::music`] says.
+    /// Queued and evicted as a profile's copy is.
+    Music {
+        class: DeviceClass,
+        quality: MusicQuality,
+    },
 }
 
 impl CopyTarget {
@@ -105,7 +113,7 @@ impl CopyTarget {
     pub fn keep_audio(&self) -> Option<BTreeSet<AudioCodec>> {
         match self {
             Self::Original { class } => Some(class.keep_audio()),
-            Self::Profile(_) | Self::Ahead => None,
+            Self::Profile(_) | Self::Ahead | Self::Music { .. } => None,
         }
     }
 
@@ -120,6 +128,16 @@ impl CopyTarget {
             Self::Original {
                 class: DeviceClass::Linux,
             } => "original (Linux)".to_owned(),
+            Self::Music { class, quality } => {
+                let class = match class {
+                    DeviceClass::Apple => "Apple",
+                    DeviceClass::Linux => "Linux",
+                };
+                match quality {
+                    MusicQuality::Original => format!("music (original, {class})"),
+                    MusicQuality::Aac256 => format!("music (AAC 256, {class})"),
+                }
+            }
         }
     }
 }
@@ -393,6 +411,10 @@ const AHEAD_PREFIX: &str = "ahead:";
 /// quality: its device class, then its video, after it.
 const ORIGINAL_PREFIX: &str = "original:";
 
+/// The `target` column's prefix for a track's download (PX-51): its
+/// device class, then its quality, after it.
+const MUSIC_PREFIX: &str = "music:";
+
 /// The `target` column: one string per target, so a media file has one
 /// live copy for each. An `ahead` copy is unique by its plan; an
 /// `original` one by its class and video, `copy` for the file's own, or
@@ -410,6 +432,9 @@ fn target_key(target: &CopyTarget, video: &CopyVideo) -> String {
             video.height,
             if video.tone_map { "sdr" } else { "hdr" }
         ),
+        CopyTarget::Music { class, quality } => {
+            format!("{MUSIC_PREFIX}{}:{}", class.as_str(), quality.as_str())
+        }
         CopyTarget::Profile(name) => format!("{PROFILE_PREFIX}{name}"),
         CopyTarget::Ahead => format!(
             "{AHEAD_PREFIX}{}:{}:{}:{}",
@@ -484,6 +509,13 @@ fn target_of(key: &str) -> Result<CopyTarget, sqlx::Error> {
         && let Some(class) = rest.split(':').next().and_then(DeviceClass::parse)
     {
         return Ok(CopyTarget::Original { class });
+    }
+    if let Some(rest) = key.strip_prefix(MUSIC_PREFIX)
+        && let Some((class, quality)) = rest.split_once(':')
+        && let (Some(class), Some(quality)) =
+            (DeviceClass::parse(class), MusicQuality::parse(quality))
+    {
+        return Ok(CopyTarget::Music { class, quality });
     }
     Err(decode_error("target", key))
 }
@@ -564,17 +596,22 @@ fn copy_row(r: &sqlx::sqlite::SqliteRow, tracks: Vec<TrackRow>) -> Result<CopyRo
         media_id: r.try_get("media_id")?,
         media_path: r.try_get("media_path")?,
         source_stamp: r.try_get("source_stamp")?,
-        target,
-        video: CopyVideo {
-            codec: codec(&r.try_get::<String, _>("video_codec")?)?,
-            height: u32::try_from(r.try_get::<i64, _>("height")?).unwrap_or(0),
-            max_bitrate: r
-                .try_get::<Option<i64>, _>("max_bitrate")?
-                .map(|b| unsigned("max_bitrate", b))
-                .transpose()?,
-            tone_map: r.try_get("tone_map")?,
-            copied: r.try_get("video_copied")?,
+        video: match target {
+            // A track's (PX-51) has no video: its row's says so as
+            // `unknown`, which no film's is.
+            CopyTarget::Music { .. } => crate::downloads::music::NO_VIDEO,
+            _ => CopyVideo {
+                codec: codec(&r.try_get::<String, _>("video_codec")?)?,
+                height: u32::try_from(r.try_get::<i64, _>("height")?).unwrap_or(0),
+                max_bitrate: r
+                    .try_get::<Option<i64>, _>("max_bitrate")?
+                    .map(|b| unsigned("max_bitrate", b))
+                    .transpose()?,
+                tone_map: r.try_get("tone_map")?,
+                copied: r.try_get("video_copied")?,
+            },
         },
+        target,
         keep_audio: keep_audio(r.try_get("keep_audio")?)?,
         state,
         size_bytes: ready.then(|| tracks.iter().filter_map(|t| t.size_bytes).sum()),
@@ -1797,6 +1834,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(key, "original:apple:copy");
+    }
+
+    #[tokio::test]
+    async fn a_track_s_copy_reads_back_with_its_class_and_quality() {
+        let store = test_store("optimized-music-round-trip").await;
+        let asked = NewCopy {
+            target: CopyTarget::Music {
+                class: DeviceClass::Linux,
+                quality: MusicQuality::Aac256,
+            },
+            video: crate::downloads::music::NO_VIDEO,
+            ..for_apple()
+        };
+        let (copy, _) = store.request_optimized_copy(&asked, &[]).await.unwrap();
+        let read = store.optimized_copy(&copy.id).await.unwrap().unwrap();
+        let key: String = sqlx::query_scalar("SELECT target FROM optimized_copies")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (read.target, read.video, key.as_str()),
+            (asked.target, asked.video, "music:linux:aac256")
+        );
     }
 
     #[tokio::test]

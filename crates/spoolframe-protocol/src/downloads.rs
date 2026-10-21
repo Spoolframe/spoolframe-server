@@ -12,6 +12,15 @@
 //! device cannot play converted. Apple devices (iOS, iPadOS, macOS) get
 //! MP4, Linux ones Matroska; tvOS and the web have none. Tracks are named
 //! by their place in the item's `Tracks`: `audio[i]`, `subtitles[i]`.
+//!
+//! With `spoolframe:music-downloads` too (PX-51), a download may be a
+//! track: in `original` quality, the file as it is when the device plays
+//! it, byte for byte; else, converted, lossless as ALAC (Apple) or FLAC
+//! (Linux) and lossy as AAC; or as AAC at 256 kbit/s (`aac256`). A
+//! converted track keeps its tags and its cover. What a device follows
+//! (an artist, a playlist, Liked) is asked with
+//! [`crate::Request::MusicDownloadChanges`], and what it played offline
+//! sent with [`crate::Request::SyncOfflinePlays`].
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{Container, MediaId, MediaTracks};
@@ -28,8 +37,13 @@ pub enum DownloadSource {
     /// it, at its resolution and with its HDR.
     Original,
     /// The copy in an optimized profile (PX-37), by name, as
-    /// `DownloadOptions::profiles` lists them.
+    /// `DownloadOptions::profiles` lists them. A film or an episode only.
     Profile { name: String },
+    /// A track as AAC at 256 kbit/s (PX-51, `spoolframe:music-downloads`),
+    /// smaller than the original: for a device short of space. A lossy
+    /// file at or under 256 kbit/s the device plays is sent as it is. A
+    /// track only.
+    Aac256,
     /// A source this build does not know, from a newer client: the server
     /// answers `InvalidInput`.
     #[serde(other)]
@@ -206,19 +220,91 @@ pub struct OfflineWatch {
     pub at: i64,
 }
 
-/// What became of one [`OfflineWatch`].
+/// What became of one [`OfflineWatch`], and of one [`OfflinePlay`] or
+/// [`OfflineLike`] (PX-51).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OfflineWatchOutcome {
-    /// Written: it was newer than what the server had.
+    /// Written: it was newer than what the server had. A play is always
+    /// written, once: sent again, it is `applied` and not counted twice.
     Applied,
     /// Not written: the server has a newer state for the item (from
     /// another device, say). Show the server's.
     Older,
     /// Not written: the item has no watch state (not a film or an
-    /// episode), or is not on the server any more.
+    /// episode; for a play or a like, not a track), or is not on the
+    /// server any more.
     NotTracked,
     /// An outcome this build does not know.
     #[serde(other)]
     Unknown,
+}
+
+/// The most artists and playlists one `MusicDownloadChanges` asks about,
+/// together.
+pub const MAX_FOLLOWED: usize = 100;
+
+/// What a device's music download follows (PX-51): it keeps every track
+/// of it, as it is now.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Followed {
+    /// Every track of every album of the artist, those it gains later
+    /// included.
+    Artist { id: MediaId },
+    /// The tracks of a playlist (PX-40), by its id; not All.
+    Playlist { id: String },
+    /// The tracks of the user's Liked (PX-43).
+    Liked,
+    /// One this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The tracks a followed thing holds, against the cursor asked with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FollowedTracks {
+    /// The same as at the cursor: nothing to do.
+    Unchanged,
+    /// Every track it holds now, in its order, each once: the device
+    /// fetches those it does not have, and deletes those it has that are
+    /// no longer here unless another download covers them. Sent with no
+    /// cursor, or when something changed since it.
+    Tracks { tracks: Vec<MediaId> },
+    /// Not on the server any more, or not the user's to see: the device
+    /// drops the download.
+    Gone,
+    /// One this build does not know: ask again with no cursor.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One followed thing's tracks (`MusicDownloadChanges`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowedChange {
+    pub followed: Followed,
+    pub tracks: FollowedTracks,
+}
+
+/// A track played on a device with no server (`SyncOfflinePlays`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflinePlay {
+    pub track: MediaId,
+    /// When the play ended, by the device's clock, in Unix seconds. With
+    /// `track`, what makes the play one: sent twice, it counts once.
+    pub at: i64,
+    /// How much of it was played: the server judges by its rules whether
+    /// it counts as a play.
+    pub played_ms: u64,
+}
+
+/// A track liked or unliked on a device with no server
+/// (`SyncOfflinePlays`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineLike {
+    pub track: MediaId,
+    pub liked: bool,
+    /// When, by the device's clock, in Unix seconds.
+    pub at: i64,
 }

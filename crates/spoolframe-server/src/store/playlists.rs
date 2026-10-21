@@ -381,6 +381,65 @@ impl Store {
         Ok(ids.into_iter().collect())
     }
 
+    /// When `owner` last liked or unliked track `media_id` (PX-51), Unix
+    /// seconds: as kept since migration 0041, else when it went into
+    /// their Liked; `None` for a track they never liked.
+    pub async fn liked_changed_at(
+        &self,
+        owner: &str,
+        media_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let noted: Option<i64> = sqlx::query_scalar(
+            "SELECT at FROM liked_changes WHERE principal = ?1 AND media_id = ?2",
+        )
+        .bind(owner)
+        .bind(media_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if noted.is_some() {
+            return Ok(noted);
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT max(e.added_at) FROM playlist_entries e \
+             JOIN playlists p ON p.id = e.playlist_id \
+             WHERE p.owner = ?1 AND p.builtin = 'liked' AND e.media_id = ?2",
+        )
+        .bind(owner)
+        .bind(media_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Note that `owner` liked (or unliked) tracks `media_ids` at `at`,
+    /// Unix seconds (PX-51).
+    pub async fn note_liked(
+        &self,
+        owner: &str,
+        media_ids: &[String],
+        liked: bool,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        if media_ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin_write().await?;
+        for media_id in media_ids {
+            sqlx::query(
+                "INSERT INTO liked_changes (principal, media_id, liked, at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (principal, media_id) DO UPDATE SET liked = excluded.liked, \
+                   at = excluded.at",
+            )
+            .bind(owner)
+            .bind(media_id)
+            .bind(liked)
+            .bind(at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// One playlist, whoever may see it.
     pub async fn playlist(&self, id: &str) -> Result<Option<PlaylistRow>, StoreError> {
         // Its columns are this module's constant, never input.

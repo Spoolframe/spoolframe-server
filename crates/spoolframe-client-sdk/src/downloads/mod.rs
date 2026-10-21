@@ -29,11 +29,26 @@
 //! sends it by itself when a session of that user on that server is made
 //! or found, and when it starts. The server decides what counts as
 //! watched; what is kept here is for showing.
+//!
+//! Music (PX-51, `spoolframe:music-downloads`) rides the same entries
+//! and manager: see the `music` module for downloads of albums, artists,
+//! playlists and Liked, and `listening` for tracks kept as they play.
+//! On a mobile network ([`Downloads::set_network`]) nothing moves unless
+//! [`DownloadSettings::allow_cellular`].
 
+mod listening;
 mod manager;
+mod music;
 mod space;
 mod store;
 mod writer;
+
+pub(crate) use listening::Keeper;
+pub use music::{
+    CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
+    MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
+    OfflinePlaylist, OfflineTrack, SyncedPlay,
+};
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -296,9 +311,13 @@ impl Downloads {
         let shared = self.shared();
         let store = shared.store()?;
         session.downloads_offered()?;
-        let kind = EntryKind::of(id).ok_or_else(|| {
-            SdkError::InvalidInput(format!("{id}: only films and episodes download"))
-        })?;
+        let kind = EntryKind::of(id)
+            .filter(|kind| *kind != EntryKind::Track)
+            .ok_or_else(|| {
+                SdkError::InvalidInput(format!(
+                    "{id}: only films and episodes download here; music with start_music"
+                ))
+            })?;
         let tracks = tracks.normalized();
         let server = session.server();
         let user = session.user().clone();
@@ -309,9 +328,7 @@ impl Downloads {
             // now too.
             let m = shared
                 .update(&key, |m| {
-                    if !m.holds.contains(&Hold::download()) {
-                        m.holds.push(Hold::download());
-                    }
+                    m.add_hold(&Hold::download());
                     Ok(())
                 })
                 .await?;
@@ -336,7 +353,7 @@ impl Downloads {
         m.markers = detail.markers;
         (m.show, m.season) = manager::parents(session, &detail.item).await;
         manager::take(&mut m, info);
-        m.artwork = manager::fetch_artwork(session, store, &m).await;
+        m.artwork = manager::fetch_artwork(session, store, &m, &mut HashMap::new()).await;
         {
             let _writing = shared.manifests.lock().await;
             store.write(&m).map_err(disk)?;
@@ -426,17 +443,17 @@ impl Downloads {
                 "download {key} is finished: delete it"
             )));
         }
-        self.remove(m).await
+        self.release(m, &Hold::download()).await
     }
 
     /// Take download `key` off this device, in any phase. One not
     /// finished is cancelled on the server, if it can be reached now. Its
     /// offline watch not sent yet is kept for the next sync. A file that
-    /// something else still holds (none does for a film or an episode)
-    /// stays, for it.
+    /// something else still holds (a track in an album downloaded, or
+    /// kept from listening) stays, for it.
     pub async fn delete(&self, key: &str) -> Result<(), SdkError> {
         let m = self.find(key)?;
-        self.remove(m).await
+        self.release(m, &Hold::download()).await
     }
 
     fn find(&self, key: &str) -> Result<Manifest, SdkError> {
@@ -446,10 +463,24 @@ impl Downloads {
             .ok_or_else(|| SdkError::NotFound(format!("download {key}")))
     }
 
-    async fn remove(&self, m: Manifest) -> Result<(), SdkError> {
+    /// Let go of `hold` on `m`: with nothing left holding it, it is taken
+    /// off this device, and one not finished is cancelled on the server
+    /// if it can be reached now.
+    async fn release(&self, m: Manifest, hold: &Hold) -> Result<(), SdkError> {
         let shared = self.shared();
         let store = shared.store()?;
         let key = m.key.clone();
+        if !m.holds.iter().all(|h| h == hold) {
+            // Something else holds it: only the hold goes, whatever the
+            // manager is doing with it.
+            shared
+                .update(&key, |m| {
+                    m.holds.retain(|h| h != hold);
+                    Ok(())
+                })
+                .await?;
+            return Ok(());
+        }
         shared.stop(&key);
         let claim = shared.claim(&key);
         let _claimed = claim.lock().await;
@@ -462,7 +493,7 @@ impl Downloads {
         let mut m = m;
         let removed = {
             let _writing = shared.manifests.lock().await;
-            store.release(&mut m, &Hold::download()).map_err(disk)?
+            store.release(&mut m, hold).map_err(disk)?
         };
         shared.stopping.lock().remove(&key);
         shared.retry_at.lock().remove(&key);
@@ -474,12 +505,19 @@ impl Downloads {
         Ok(())
     }
 
-    /// Every download on this device, oldest first, from disk alone: no
-    /// server is asked. None without a downloads directory.
+    /// Every film and episode downloaded on this device, oldest first,
+    /// from disk alone: no server is asked. None without a downloads
+    /// directory. Music is [`Downloads::music_downloads`] and
+    /// [`Downloads::music_tracks`].
     pub fn list(&self) -> Vec<LocalDownload> {
         let shared = self.shared();
         match &shared.store {
-            Some(store) => store.scan().iter().map(|m| shared.view(m)).collect(),
+            Some(store) => store
+                .scan()
+                .iter()
+                .filter(|m| m.kind != EntryKind::Track)
+                .map(|m| shared.view(m))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -612,8 +650,25 @@ pub(crate) struct Shared {
     sync_wanted: Mutex<HashSet<(EndpointId, String)>>,
     /// [`Downloads::set_free_space`].
     free_space: Mutex<Option<u64>>,
+    /// [`Downloads::settings`], once read.
+    settings: Mutex<Option<DownloadSettings>>,
+    /// [`Downloads::set_network`].
+    network: Mutex<NetworkKind>,
+    /// Followed music downloads to ask about again while connected
+    /// (PX-51).
+    follow_due: Mutex<music::FollowDue>,
+    /// Something for the follower to do.
+    follow_wake: Notify,
+    /// Pictures of tracks kept from listening: the next track of an album
+    /// links to its cover here instead of fetching it.
+    kept_art: Mutex<manager::KeptArt>,
+    /// Held while a user's followed downloads are brought up to date: two
+    /// at once would each compare with the same tracks kept.
+    following: tokio::sync::Mutex<()>,
     closed: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The follower ([`music::follow_while_connected`]).
+    follower: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Shared {
@@ -632,16 +687,28 @@ impl Shared {
             received: Mutex::default(),
             sync_wanted: Mutex::default(),
             free_space: Mutex::default(),
+            settings: Mutex::default(),
+            network: Mutex::default(),
+            follow_due: Mutex::default(),
+            follow_wake: Notify::new(),
+            kept_art: Mutex::default(),
+            following: tokio::sync::Mutex::default(),
             closed: watch::Sender::new(false),
             task: Mutex::default(),
+            follower: Mutex::default(),
         })
     }
 
-    /// Start the manager, with a downloads directory: it holds the client
-    /// only while it moves a download.
+    /// Start the manager and the follower, with a downloads directory:
+    /// each holds the client only while it moves a download or asks the
+    /// server.
     pub(crate) fn start(self: &Arc<Self>, client: std::sync::Weak<Inner>) {
         if self.store.is_some() {
-            *self.task.lock() = Some(tokio::spawn(manager::run(client, self.clone())));
+            *self.task.lock() = Some(tokio::spawn(manager::run(client.clone(), self.clone())));
+            *self.follower.lock() = Some(tokio::spawn(music::follow_while_connected(
+                client,
+                self.clone(),
+            )));
         }
     }
 
@@ -651,13 +718,15 @@ impl Shared {
         self.closed.send_replace(true);
         self.interrupt.send_modify(|n| *n += 1);
         self.wake.notify_one();
-        let task = self.task.lock().take();
-        if let Some(mut task) = task
-            && tokio::time::timeout(Duration::from_secs(5), &mut task)
+        self.follow_wake.notify_one();
+        let tasks = [self.task.lock().take(), self.follower.lock().take()];
+        for mut task in tasks.into_iter().flatten() {
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await
                 .is_err()
-        {
-            task.abort();
+            {
+                task.abort();
+            }
         }
     }
 
@@ -691,7 +760,7 @@ impl Shared {
     }
 
     fn should_stop(&self, key: &str) -> bool {
-        *self.closed.borrow() || self.stopping.lock().contains(key)
+        *self.closed.borrow() || self.stopping.lock().contains(key) || self.network_held()
     }
 
     fn claim(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -766,7 +835,11 @@ impl Shared {
             file_path,
             file_url,
             watch: m.watch.clone(),
-            note: m.note.clone(),
+            note: if m.phase.is_active() && self.network_held() {
+                Some(WAITING_FOR_NETWORK.to_owned())
+            } else {
+                m.note.clone()
+            },
             created_at: m.created_at,
         }
     }
@@ -791,6 +864,10 @@ impl Shared {
         space::available(store.root()).map_err(disk)
     }
 }
+
+/// The note of a download under way while the device is on a mobile
+/// network that downloads may not use.
+const WAITING_FOR_NETWORK: &str = "Waiting for Wi-Fi or a wired network";
 
 /// A file system error in the downloads directory.
 fn disk(e: std::io::Error) -> SdkError {

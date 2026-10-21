@@ -37,7 +37,7 @@ use spoolframe_protocol::{
     RedeemInvite, RedeemPortableInvite, Reply, Request, Response, ServerInfo, SessionId,
     SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply, is_app_rp_id,
 };
-use spoolframe_types::{ArtworkId, MediaId, Namespace, SubtitleFormat};
+use spoolframe_types::{ArtworkId, MediaId, MediaKind, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
@@ -110,6 +110,9 @@ pub(crate) struct ClientProtocol {
     subtitle_listeners: crate::events::SubtitleListeners,
     /// The connections that take download events (PX-38).
     download_listeners: crate::events::DownloadListeners,
+    /// The connections that listed music downloads (PX-51): told of
+    /// their users' likes.
+    music_listeners: crate::events::DownloadListeners,
 }
 
 /// What one connection has said so far.
@@ -512,6 +515,12 @@ impl ClientProtocol {
             download_listeners.clone(),
             addresses.streams.clone(),
         ));
+        let music_listeners = crate::events::DownloadListeners::new(users.clone());
+        tokio::spawn(crate::events::tell_liked_news(
+            services.playlists.news(),
+            music_listeners.clone(),
+            addresses.streams.clone(),
+        ));
         tokio::spawn(crate::connection_users::forget_ended_sessions(
             services.auth.clone(),
             users.clone(),
@@ -533,6 +542,7 @@ impl ClientProtocol {
             playlist_listeners,
             subtitle_listeners,
             download_listeners,
+            music_listeners,
         }
     }
 
@@ -2107,8 +2117,18 @@ impl ClientProtocol {
         ) {
             downloads_offered(hello)?;
         }
+        // PX-51: music offline, on top of downloads.
+        if matches!(
+            request,
+            Request::MusicDownloadChanges { .. } | Request::SyncOfflinePlays { .. }
+        ) {
+            music_offered(hello)?;
+        }
         if features::has(&hello.features, features::DOWNLOADS) {
             self.download_listeners.note(connection.stable_id());
+        }
+        if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
+            self.music_listeners.note(connection.stable_id());
         }
         // PX-02: subtitle downloads, only for a client that takes them.
         let subtitle_search_listed = features::has(&hello.features, features::SUBTITLE_SEARCH);
@@ -2556,8 +2576,8 @@ impl ClientProtocol {
                     .logout(&session.0)
                     .await
                     .map_err(internal)?;
-                // Told of the user's playlists and downloads no more, at
-                // once.
+                // Told of the user's playlists, downloads and likes no
+                // more, at once.
                 self.users.forget(&session.0);
                 Ok(Reply::LoggedOut)
             }
@@ -4104,6 +4124,94 @@ impl ClientProtocol {
                     outcomes: synced.into_iter().map(Into::into).collect(),
                 })
             }
+            Request::MusicDownloadChanges {
+                artists,
+                playlists,
+                liked,
+                since,
+            } => {
+                use crate::playlists::Followed;
+                use spoolframe_protocol::downloads::MAX_FOLLOWED;
+                if artists.len() + playlists.len() > MAX_FOLLOWED {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "at most {MAX_FOLLOWED} artists and playlists are asked about at once"
+                        ),
+                    });
+                }
+                if liked && !liked_listed {
+                    return Err(Error::Unsupported {
+                        request: format!("Liked without {}", features::LIKED),
+                    });
+                }
+                let followed: Vec<Followed> = artists
+                    .into_iter()
+                    .map(Followed::Artist)
+                    .chain(playlists.into_iter().map(Followed::Playlist))
+                    .chain(liked.then_some(Followed::Liked))
+                    .collect();
+                let (changes, cursor) = crate::downloads::followed::changes(
+                    &self.services.playlists,
+                    &actor,
+                    &followed,
+                    since.as_deref(),
+                )
+                .await
+                .map_err(playlists_error)?;
+                Ok(Reply::MusicDownloadChanges { changes, cursor })
+            }
+            Request::SyncOfflinePlays {
+                device_now,
+                plays,
+                liked,
+            } => {
+                use spoolframe_protocol::downloads::MAX_ASKED;
+                if plays.len() + liked.len() > MAX_ASKED {
+                    return Err(Error::InvalidInput {
+                        message: format!("at most {MAX_ASKED} plays and likes are synced at once"),
+                    });
+                }
+                if !liked.is_empty() && !liked_listed {
+                    return Err(Error::Unsupported {
+                        request: format!("Liked without {}", features::LIKED),
+                    });
+                }
+                let endpoint = connection.remote_id().to_string();
+                let mut played = Vec::with_capacity(plays.len());
+                for play in plays {
+                    let synced = self
+                        .services
+                        .watch
+                        .offline_play(
+                            principal,
+                            &play.track,
+                            crate::watch::OfflinePlay {
+                                at: play.at,
+                                device_now,
+                                played: Duration::from_millis(play.played_ms),
+                                endpoint_id: Some(&endpoint),
+                                device_name: hello.device_name.as_deref(),
+                            },
+                        )
+                        .await
+                        .map_err(watch_error)?;
+                    played.push(synced.into());
+                }
+                let mut likes = Vec::with_capacity(liked.len());
+                for like in liked {
+                    let synced = self
+                        .services
+                        .playlists
+                        .offline_like(&actor, &like.track, like.liked, like.at, device_now)
+                        .await
+                        .map_err(playlists_error)?;
+                    likes.push(synced.into());
+                }
+                Ok(Reply::OfflinePlaysSynced {
+                    plays: played,
+                    liked: likes,
+                })
+            }
             Request::Hello(_)
             | Request::AuthMethods
             | Request::LoginPassword(_)
@@ -5336,8 +5444,11 @@ impl ClientProtocol {
             DownloadOptionsInfo, DownloadTracks, LeftOutSubtitle, OriginalDownload,
         };
         let class = downloads_offered(hello)?;
-        downloadable(id)?;
+        let kind = downloadable(hello, id)?;
         let (_, descriptor) = self.describe(id).await?;
+        if kind == Downloadable::Track {
+            return music_download_options(&descriptor, class);
+        }
         let store = self.store();
         let preferences = store.track_preferences(principal).await.map_err(internal)?;
         let scope = self.override_scope(id).await?;
@@ -5414,9 +5525,19 @@ impl ClientProtocol {
         use crate::downloads::plan::{Source, Tracks, UnknownTracks};
         use spoolframe_protocol::downloads::DownloadSource;
         let class = downloads_offered(hello)?;
+        if downloadable(hello, id)? == Downloadable::Track {
+            return self
+                .prepare_track_download(principal, id, class, source)
+                .await;
+        }
         let source = match source {
             DownloadSource::Original => Source::Original,
             DownloadSource::Profile { name } => Source::Profile(name),
+            DownloadSource::Aac256 => {
+                return Err(Error::InvalidInput {
+                    message: "only a track is downloaded as AAC 256".into(),
+                });
+            }
             DownloadSource::Unknown => {
                 return Err(Error::InvalidInput {
                     message: "a download source this server does not know".into(),
@@ -5426,7 +5547,6 @@ impl ClientProtocol {
         let tracks = Tracks::try_from(tracks).map_err(|UnknownTracks| Error::InvalidInput {
             message: "a choice of tracks this server does not know".into(),
         })?;
-        downloadable(id)?;
         let (path, descriptor) = self.describe(id).await?;
         let preferences = self
             .store()
@@ -5449,14 +5569,50 @@ impl ClientProtocol {
                 tracks,
                 bitmap: preferences.subtitles.bitmap,
             })
-            .await
-            .map_err(downloads_error)?;
-        Ok(download_info(
-            prepared.id,
-            &prepared.state,
-            Some(class),
-            Some(prepared.carried),
-        ))
+            .await;
+        prepared_info(prepared, class)
+    }
+
+    /// Prepare `principal`'s download of track `id` from `source`
+    /// (PX-51).
+    async fn prepare_track_download(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        class: crate::downloads::DeviceClass,
+        source: spoolframe_protocol::downloads::DownloadSource,
+    ) -> Result<spoolframe_protocol::downloads::DownloadInfo, Error> {
+        use crate::downloads::music::MusicQuality;
+        use spoolframe_protocol::downloads::DownloadSource;
+        let quality = match source {
+            DownloadSource::Original => MusicQuality::Original,
+            DownloadSource::Aac256 => MusicQuality::Aac256,
+            DownloadSource::Profile { .. } => {
+                return Err(Error::InvalidInput {
+                    message: "a track is downloaded in original or aac256, not a profile".into(),
+                });
+            }
+            DownloadSource::Unknown => {
+                return Err(Error::InvalidInput {
+                    message: "a download source this server does not know".into(),
+                });
+            }
+        };
+        let (path, descriptor) = self.describe(id).await?;
+        let media_id = id.to_string();
+        let prepared = self
+            .services
+            .downloads
+            .prepare_music(crate::downloads::MusicRequest {
+                principal,
+                media_id: &media_id,
+                media: &path,
+                descriptor: &descriptor,
+                class,
+                quality,
+            })
+            .await;
+        prepared_info(prepared, class)
     }
 
     /// `id`'s media file and Spoolframe's description of it.
@@ -5729,6 +5885,7 @@ impl ProtocolHandler for ClientProtocol {
         self.playlist_listeners.remove(id);
         self.subtitle_listeners.remove(id);
         self.download_listeners.remove(id);
+        self.music_listeners.remove(id);
         self.users.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
@@ -6124,14 +6281,81 @@ fn downloads_offered(
     })
 }
 
-/// Only films and episodes are downloaded (PX-38): music is a later
-/// ticket's.
-fn downloadable(id: &MediaId) -> Result<(), Error> {
+/// What a `class` device may download of a track (PX-51): its one audio
+/// track, no profiles, and what original quality would be.
+fn music_download_options(
+    descriptor: &MediaDescriptor,
+    class: crate::downloads::DeviceClass,
+) -> Result<spoolframe_protocol::downloads::DownloadOptionsInfo, Error> {
+    use crate::downloads::music::{MusicQuality, plan};
+    use crate::downloads::plan::Decision;
+    use spoolframe_protocol::downloads::{DownloadOptionsInfo, DownloadTracks, OriginalDownload};
+    let planned =
+        plan(descriptor, class, MusicQuality::Original).map_err(|e| Error::InvalidInput {
+            message: e.to_string(),
+        })?;
+    Ok(DownloadOptionsInfo {
+        tracks: descriptor.tracks(),
+        preferred: DownloadTracks::Chosen {
+            audio: vec![0],
+            subtitles: Vec::new(),
+        },
+        profiles: Vec::new(),
+        original: match planned.decision {
+            Decision::AsIs => OriginalDownload::AsIs,
+            Decision::Remux => OriginalDownload::Remux,
+            Decision::Convert { .. } => OriginalDownload::Convert {
+                video: false,
+                audio: vec![0],
+            },
+        },
+        left_out: Vec::new(),
+    })
+}
+
+/// What a download of an item is: a film's or an episode's (PX-38), or
+/// a track's (PX-51).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Downloadable {
+    Film,
+    Track,
+}
+
+/// Films and episodes are downloaded (PX-38), and tracks for a client
+/// that listed `spoolframe:music-downloads` (PX-51); nothing else.
+fn downloadable(hello: &spoolframe_protocol::Hello, id: &MediaId) -> Result<Downloadable, Error> {
     if crate::watch::tracked(id) {
-        Ok(())
+        return Ok(Downloadable::Film);
+    }
+    if id.kind() != MediaKind::Track {
+        return Err(Error::InvalidInput {
+            message: "only films, episodes and tracks are downloaded".into(),
+        });
+    }
+    if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
+        Ok(Downloadable::Track)
     } else {
         Err(Error::InvalidInput {
-            message: "only films and episodes are downloaded".into(),
+            message: format!(
+                "a track is downloaded only with {}",
+                features::MUSIC_DOWNLOADS
+            ),
+        })
+    }
+}
+
+/// The class a client keeps music for (PX-51), if it listed
+/// `spoolframe:music-downloads` besides what [`downloads_offered`]
+/// needs; else `Unsupported`.
+fn music_offered(
+    hello: &spoolframe_protocol::Hello,
+) -> Result<crate::downloads::DeviceClass, Error> {
+    let class = downloads_offered(hello)?;
+    if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
+        Ok(class)
+    } else {
+        Err(Error::Unsupported {
+            request: format!("music downloads without {}", features::MUSIC_DOWNLOADS),
         })
     }
 }
@@ -6140,6 +6364,20 @@ fn no_such_download() -> Error {
     Error::NotFound {
         what: "download".into(),
     }
+}
+
+/// What a device is told of a download just prepared, as `class`'s.
+fn prepared_info(
+    prepared: Result<crate::downloads::Prepared, crate::downloads::DownloadError>,
+    class: crate::downloads::DeviceClass,
+) -> Result<spoolframe_protocol::downloads::DownloadInfo, Error> {
+    let prepared = prepared.map_err(downloads_error)?;
+    Ok(download_info(
+        prepared.id,
+        &prepared.state,
+        Some(class),
+        Some(prepared.carried),
+    ))
 }
 
 /// A download on the wire (PX-38).
@@ -6154,7 +6392,7 @@ fn download_info(
         id,
         state: state.to_wire(),
         file: class.zip(carried).map(|(class, carried)| DownloadFile {
-            container: class.container(),
+            container: carried.container.unwrap_or_else(|| class.container()),
             tracks: FileTracks {
                 audio: carried.audio,
                 subtitles: carried.subtitles,

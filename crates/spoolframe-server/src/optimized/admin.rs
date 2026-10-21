@@ -52,7 +52,10 @@ impl Pool {
             let wanted = match (&copy.target, profile) {
                 (_, None) => true,
                 (CopyTarget::Profile(name), Some(profile)) => name == profile,
-                (CopyTarget::Ahead | CopyTarget::Original { .. }, Some(_)) => false,
+                (
+                    CopyTarget::Ahead | CopyTarget::Original { .. } | CopyTarget::Music { .. },
+                    Some(_),
+                ) => false,
             };
             if !copy.outdated || !wanted {
                 continue;

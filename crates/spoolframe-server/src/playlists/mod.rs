@@ -60,7 +60,7 @@ pub const MAX_PAGE: u32 = 200;
 /// The most entries one `UpcomingInPlaylist` lists.
 pub const MAX_UPCOMING: u32 = 100;
 /// The most catalog lookups one call has in flight at once, as Home's.
-const CATALOG_FETCHES: usize = 8;
+pub(crate) const CATALOG_FETCHES: usize = 8;
 /// The kinds Liked and All hold.
 const TRACKS: Kinds = Kinds {
     movies: false,
@@ -222,6 +222,9 @@ pub enum PlaylistNews {
     },
     /// `principal`'s pins or pin notes changed.
     Pins { principal: Principal },
+    /// `principal` liked or unliked tracks (PX-51): for their devices
+    /// that downloaded Liked.
+    Liked { principal: Principal },
 }
 
 /// How many pieces of news a listener may fall behind by.
@@ -411,6 +414,21 @@ impl Playlists {
             before,
             after,
         });
+    }
+
+    /// Note that `principal` liked (or unliked) tracks `media_ids` now
+    /// (PX-51), and tell their devices: every like and unlike comes here.
+    async fn noted_liked(
+        &self,
+        principal: Principal,
+        media_ids: &[String],
+        liked: bool,
+    ) -> Result<(), PlaylistsError> {
+        self.store
+            .note_liked(&principal.to_string(), media_ids, liked, self.store.now())
+            .await?;
+        self.tell(PlaylistNews::Liked { principal });
+        Ok(())
     }
 
     /// What `actor` may do with `row`.
@@ -1164,11 +1182,16 @@ impl Playlists {
             })
             .collect();
         albums.sort_by(|a, b| (a.year, &a.title).cmp(&(b.year, &b.title)));
-        let mut tracks = Vec::new();
-        for album in albums {
-            tracks.extend(tracks_of(self.catalog.item(&album.id).await?.children));
-        }
-        Ok(tracks)
+        // A few at a time, in the albums' order.
+        let albums: Vec<ItemWithChildren> = stream::iter(albums)
+            .map(|album| async move { self.catalog.item(&album.id).await })
+            .buffered(CATALOG_FETCHES)
+            .try_collect()
+            .await?;
+        Ok(albums
+            .into_iter()
+            .flat_map(|album| tracks_of(album.children))
+            .collect())
     }
 
     /// Delete playlist `id`: its owner's, or any admin's for a server-wide
@@ -1732,6 +1755,143 @@ impl Playlists {
     }
 }
 
+/// What a device's music download follows (PX-51).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Followed {
+    Artist(MediaId),
+    /// A playlist, by id: not All.
+    Playlist(String),
+    Liked,
+}
+
+/// Music downloads (PX-51): what an artist, a playlist or Liked holds.
+impl Playlists {
+    /// The tracks `followed` holds now for `actor`, in its order, each
+    /// once: an artist's albums oldest first, each in disc and track
+    /// order; a playlist's or Liked's entries in theirs. Only tracks
+    /// `actor` may see. `None` when it is gone, or not `actor`'s to see.
+    /// An id that is not an artist is `InvalidInput`, and so is All, as
+    /// it is every track.
+    pub async fn followed_tracks(
+        &self,
+        actor: &Actor,
+        followed: &Followed,
+    ) -> Result<Option<Vec<MediaId>>, PlaylistsError> {
+        let tracks = match followed {
+            Followed::Artist(id) => {
+                if id.kind() != MediaKind::Artist {
+                    return Err(PlaylistsError::InvalidInput(format!(
+                        "{id} is not an artist"
+                    )));
+                }
+                let found = match self.catalog.item(id).await {
+                    Ok(found) => found,
+                    Err(e) if crate::client::unserved(&e) => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
+                if !self.visibility.may_see(actor, &found.item) {
+                    return Ok(None);
+                }
+                let mut tracks = self.artist_tracks(found).await?;
+                tracks.retain(|t| self.visibility.may_see(actor, t));
+                tracks
+            }
+            Followed::Playlist(id) => {
+                let row = match self.seen(actor, id).await {
+                    Ok((row, _)) => row,
+                    Err(PlaylistsError::NotFound) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                if row.builtin == Some(Builtin::All) {
+                    return Err(PlaylistsError::InvalidInput(
+                        "All is every track: follow its artists instead".into(),
+                    ));
+                }
+                self.entry_items(actor, &row).await?
+            }
+            Followed::Liked => {
+                let row = self
+                    .store
+                    .builtin_playlist(&actor.principal.to_string(), Builtin::Liked)
+                    .await?;
+                self.entry_items(actor, &row).await?
+            }
+        };
+        let mut seen = HashSet::new();
+        Ok(Some(
+            tracks
+                .into_iter()
+                .filter(|t| matches!(t, Item::Track(_)))
+                .map(|t| t.id().clone())
+                .filter(|id| seen.insert(id.clone()))
+                .collect(),
+        ))
+    }
+
+    /// Take in a like or an unlike of `track` made by `actor` on a device
+    /// with no server (PX-51): made only when newer than the track's last
+    /// change here, newest winning whichever device made it. The device's
+    /// clock is set right first, as for a watch state ([`Watch::offline`]):
+    /// `at` is moved by how far `device_now` is from the server's clock,
+    /// and kept no later than now. A track gone from the library is not
+    /// liked.
+    ///
+    /// [`Watch::offline`]: crate::watch::Watch::offline
+    pub async fn offline_like(
+        &self,
+        actor: &Actor,
+        track: &MediaId,
+        liked: bool,
+        at: i64,
+        device_now: i64,
+    ) -> Result<crate::watch::Synced, PlaylistsError> {
+        use crate::watch::Synced;
+        if track.kind() != MediaKind::Track {
+            return Ok(Synced::NotTracked);
+        }
+        let at = self.store.server_time_of(at, device_now);
+        let principal = actor.principal.to_string();
+        let media_id = track.to_string();
+        if self
+            .store
+            .liked_changed_at(&principal, &media_id)
+            .await?
+            .is_some_and(|last| last >= at)
+        {
+            return Ok(Synced::Older);
+        }
+        let made = if liked {
+            self.like(actor, std::slice::from_ref(track)).await
+        } else {
+            self.unlike(actor, std::slice::from_ref(track)).await
+        };
+        match made {
+            Ok(_) => {}
+            Err(PlaylistsError::NoItem(_)) => return Ok(Synced::NotTracked),
+            Err(e) => return Err(e),
+        }
+        // When it was made on the device, not when it got here.
+        self.store
+            .note_liked(&principal, &[media_id], liked, at)
+            .await?;
+        Ok(Synced::Applied)
+    }
+
+    /// The items of `row`'s entries `actor` sees, in order.
+    async fn entry_items(
+        &self,
+        actor: &Actor,
+        row: &PlaylistRow,
+    ) -> Result<Vec<Item>, PlaylistsError> {
+        Ok(self
+            .entries(actor, row)
+            .await?
+            .into_iter()
+            .map(|e| e.item)
+            .collect())
+    }
+}
+
 /// How many times an unlike is made again on a Liked another device of
 /// the user's changed meanwhile.
 const UNLIKE_TRIES: usize = 3;
@@ -1835,7 +1995,9 @@ impl Playlists {
             }
         }
         if !new.is_empty() {
+            let liked: Vec<String> = new.iter().map(|e| e.media_id.clone()).collect();
             self.to_top(&row, new).await?;
+            self.noted_liked(actor.principal, &liked, true).await?;
         }
         self.summary_now(actor, &row.id).await
     }
@@ -1881,7 +2043,7 @@ impl Playlists {
                 .playlist(&liked.id)
                 .await?
                 .ok_or(PlaylistsError::NotFound)?;
-            let removes: Vec<EntryEdit> = self
+            let removed: Vec<EntryRow> = self
                 .store
                 .playlist_entries(&row.id)
                 .await?
@@ -1890,11 +2052,14 @@ impl Playlists {
                     tracks.contains(&e.media_id)
                         || e.album_id.as_ref().is_some_and(|a| albums.contains(a))
                 })
-                .map(|e| EntryEdit::Remove(e.entry_id))
                 .collect();
-            if removes.is_empty() {
+            if removed.is_empty() {
                 return self.summary_now(actor, &row.id).await;
             }
+            let removes = removed
+                .iter()
+                .map(|e| EntryEdit::Remove(e.entry_id))
+                .collect();
             match self
                 .store
                 .edit_playlist(&row.id, row.revision, removes)
@@ -1907,6 +2072,8 @@ impl Playlists {
                         Some(Seen::of(&row)),
                         Some(Seen::of(&row)),
                     );
+                    let unliked: Vec<String> = removed.into_iter().map(|e| e.media_id).collect();
+                    self.noted_liked(actor.principal, &unliked, false).await?;
                     return self.summary_now(actor, &row.id).await;
                 }
                 // Another device removed one meanwhile: again, on the new

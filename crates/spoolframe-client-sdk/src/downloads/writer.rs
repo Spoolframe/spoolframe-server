@@ -109,6 +109,20 @@ impl BlockWriter {
         }
     }
 
+    /// The file is `size` bytes after all: a stream's size (a
+    /// conversion's output) is known only at its end, so its writer is
+    /// opened with [`u64::MAX`]. Less than what was written is refused.
+    pub fn set_size(&mut self, size: u64) -> std::io::Result<()> {
+        if self.have.last().is_some_and(|&(_, end)| end > size) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{size} bytes is less than was written"),
+            ));
+        }
+        self.size = size;
+        Ok(())
+    }
+
     pub fn is_complete(&self) -> bool {
         self.contiguous() == self.size
     }
@@ -217,6 +231,23 @@ mod tests {
         writer.write_at(0, b"abc").await.unwrap();
         writer.finish(&dir.join("done"), None).await.unwrap();
         assert_eq!(std::fs::read(dir.join("done")).unwrap(), b"abc");
+    }
+
+    /// A conversion's output, whose size is told at its end.
+    #[tokio::test]
+    async fn a_stream_of_unknown_size_is_complete_once_its_size_is_told() {
+        let dir = dir("stream");
+        let mut writer = BlockWriter::open(&dir.join("part"), u64::MAX, 0)
+            .await
+            .unwrap();
+        writer.write_at(0, b"abc").await.unwrap();
+        writer.write_at(3, b"de").await.unwrap();
+        assert!(!writer.is_complete());
+        assert!(writer.set_size(4).is_err());
+        writer.set_size(5).unwrap();
+        assert!(writer.is_complete());
+        writer.finish(&dir.join("done"), None).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("done")).unwrap(), b"abcde");
     }
 
     #[tokio::test]

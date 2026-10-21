@@ -1,6 +1,8 @@
 //! The download manager (PX-38): one task per client, moving one download
 //! at a time, oldest first, and sending offline watch entries.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -9,11 +11,11 @@ use spoolframe_protocol::downloads::{
 };
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::{ArtworkSize, Reply, Request};
-use spoolframe_types::{Item, MediaId};
+use spoolframe_types::{ArtworkId, Item, MediaId};
 
-use super::store::{Manifest, Store, StoredArtwork, sha256_file};
+use super::store::{EntryKind, Manifest, Store, StoredArtwork, sha256_file};
 use super::writer::{BlockWriter, Unfinished};
-use super::{DownloadPhase, LocalWatch, Shared, SyncedWatch, disk, now};
+use super::{DownloadEvent, DownloadPhase, LocalWatch, Shared, SyncedWatch, disk, music, now};
 use crate::client::{Client, Inner, parse_id};
 use crate::{SdkError, Session};
 
@@ -36,10 +38,19 @@ const LONGEST_WAIT: Duration = Duration::from_secs(5 * 60);
 /// do.
 pub(super) async fn run(client: Weak<Inner>, shared: Arc<Shared>) {
     if let Some(store) = &shared.store {
-        for (server, user) in store.carried_users() {
+        let mut users = store.carried_users();
+        users.extend(music::users_to_sync(store));
+        for (server, user) in users {
             if let Ok(server) = parse_id(&server) {
                 shared.sync_wanted.lock().insert((server, user));
             }
+        }
+        // Tracks being kept as they played when the client stopped: none
+        // is whole, and a part is not gone on with.
+        if let Err(e) = std::fs::remove_dir_all(store.listening_parts())
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "tracks part kept from listening not removed");
         }
     }
     loop {
@@ -57,6 +68,11 @@ pub(super) async fn run(client: Weak<Inner>, shared: Arc<Shared>) {
                 Ok(session) => {
                     if let Err(e) = sync(&shared, &session).await {
                         tracing::info!(%server, error = %e, "offline watch not sent; sent with the next session");
+                    }
+                    if session.music_offered().is_ok()
+                        && let Err(e) = music::sync(&shared, &session).await
+                    {
+                        tracing::info!(%server, error = %e, "music not synced; synced with the next session");
                     }
                 }
                 Err(e) => {
@@ -84,7 +100,7 @@ pub(super) async fn run(client: Weak<Inner>, shared: Arc<Shared>) {
     }
 }
 
-async fn sleep_until(until: Option<tokio::time::Instant>) {
+pub(super) async fn sleep_until(until: Option<tokio::time::Instant>) {
     match until {
         Some(until) => tokio::time::sleep_until(until).await,
         None => std::future::pending().await,
@@ -102,6 +118,10 @@ fn next(shared: &Shared) -> Next {
     let Some(store) = &shared.store else {
         return Next::Wait(None);
     };
+    // On a mobile network downloads may not use: until it changes.
+    if shared.network_held() {
+        return Next::Wait(None);
+    }
     let now = tokio::time::Instant::now();
     let mut soonest = None;
     for key in store.active() {
@@ -322,51 +342,89 @@ pub(super) async fn parents(session: &Session, item: &Item) -> (Option<Item>, Op
     )
 }
 
-/// The artwork of `m`'s item, show and season, kept in its `art`
-/// directory. A picture that cannot be fetched is left out.
+/// Pictures kept already, by artwork id: where one is on disk, for the
+/// next entry with it to link to instead of fetching it again.
+pub(super) type KeptArt = HashMap<ArtworkId, PathBuf>;
+
+/// The artwork of `m`'s item, show and season (a track's album and
+/// artist), kept in its `art` directory: linked to a copy in `kept_art`,
+/// else fetched. A picture that cannot be fetched is left out.
 pub(super) async fn fetch_artwork(
     session: &Session,
     store: &Store,
     m: &Manifest,
+    kept_art: &mut KeptArt,
 ) -> Vec<StoredArtwork> {
     let dir = store.art_dir(m);
     let mut kept = Vec::new();
-    for item in [Some(&m.item), m.show.as_ref(), m.season.as_ref()]
-        .into_iter()
-        .flatten()
+    let mut seen = std::collections::HashSet::new();
+    for item in [
+        Some(&m.item),
+        m.show.as_ref(),
+        m.season.as_ref(),
+        m.album.as_ref(),
+        m.artist.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         let artwork = match item {
             Item::Movie(i) => &i.artwork,
             Item::Episode(i) => &i.artwork,
             Item::Show(i) => &i.artwork,
             Item::Season(i) => &i.artwork,
-            _ => continue,
+            Item::Track(i) => &i.artwork,
+            Item::Album(i) => &i.artwork,
+            Item::Artist(i) => &i.artwork,
         };
         for art in artwork {
-            let bytes = match session.artwork(&art.id, ArtworkSize::Large).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::debug!(id = %art.id, error = %e, "artwork not kept with a download");
-                    continue;
-                }
-            };
+            // A track's poster is its album's cover: kept once.
+            if !seen.insert(art.id.clone()) {
+                continue;
+            }
             let file = format!(
                 "{}.jpg",
                 &blake3::hash(art.id.to_string().as_bytes()).to_hex()[..16]
             );
-            let written = std::fs::create_dir_all(&dir)
-                .and_then(|()| std::fs::write(dir.join(&file), &bytes));
-            match written {
-                Ok(()) => kept.push(StoredArtwork {
-                    item: item.id().clone(),
-                    kind: art.kind,
-                    file,
-                }),
-                Err(e) => tracing::warn!(error = %e, "artwork not kept with a download"),
+            let path = dir.join(&file);
+            if !kept_art.get(&art.id).is_some_and(|from| reuse(from, &path)) {
+                let bytes = match session.artwork(&art.id, ArtworkSize::Large).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::debug!(id = %art.id, error = %e, "artwork not kept with a download");
+                        continue;
+                    }
+                };
+                let written =
+                    std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes));
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, "artwork not kept with a download");
+                    continue;
+                }
             }
+            kept_art.insert(art.id.clone(), path);
+            kept.push(StoredArtwork {
+                item: item.id().clone(),
+                kind: art.kind,
+                file,
+            });
         }
     }
     kept
+}
+
+/// `to` is the picture at `from` too: a hard link to it, else a copy.
+/// False when `from` is gone (its entry removed): it is fetched again.
+fn reuse(from: &Path, to: &Path) -> bool {
+    if from == to {
+        return from.exists();
+    }
+    let Some(dir) = to.parent() else {
+        return false;
+    };
+    let _ = std::fs::remove_file(to);
+    std::fs::create_dir_all(dir).is_ok()
+        && (std::fs::hard_link(from, to).is_ok() || std::fs::copy(from, to).is_ok())
 }
 
 /// Prepare `m`'s download on the server, or ask how it goes, and wait
@@ -439,6 +497,40 @@ async fn transferring(
         && sha256_file(&media).await.map_err(disk)? == sha256
     {
         return finish(shared, session, &m, &id, size).await;
+    }
+    // A track kept from listening that is this very file: moved here,
+    // with nothing fetched.
+    if m.kind == EntryKind::Track
+        && let Some(kept) = music::kept(store, &m.server, &m.user_id, m.item.id())
+        && kept.size == Some(size)
+        && let (Some(from), Some(to)) = (store.media(&kept), store.media(&m))
+        && music::kept_is(&kept, &from, &sha256).await
+    {
+        let moved = {
+            let _writing = shared.manifests.lock().await;
+            std::fs::create_dir_all(store.dir(&m))
+                .and_then(|()| std::fs::rename(&from, &to))
+                .and_then(|()| store.remove(&kept))
+        };
+        match moved {
+            Ok(()) => {
+                tracing::debug!(
+                    key = m.key,
+                    "a kept track became a download, fetched from nothing"
+                );
+                let _ = shared.events.send(DownloadEvent::Removed {
+                    key: kept.key.clone(),
+                });
+                shared
+                    .update(&m.key, |m| {
+                        m.last_played_at = kept.last_played_at.max(m.last_played_at);
+                        Ok(())
+                    })
+                    .await?;
+                return finish(shared, session, &m, &id, size).await;
+            }
+            Err(e) => tracing::info!(error = %e, "a kept track not moved to its download; fetched"),
+        }
     }
     let part = store.part(&m);
     let mut writer = BlockWriter::open(&part, size, m.offset)
@@ -620,6 +712,21 @@ async fn finish(
             Ok(())
         })
         .await?;
+    // The same track kept from listening in another quality: the download
+    // stands for it now.
+    if m.kind == EntryKind::Track
+        && let Some(store) = &shared.store
+        && let Some(kept) = music::kept(store, &m.server, &m.user_id, m.item.id())
+        && kept.cached_only()
+    {
+        let removed = {
+            let _writing = shared.manifests.lock().await;
+            store.remove(&kept)
+        };
+        if removed.is_ok() {
+            let _ = shared.events.send(DownloadEvent::Removed { key: kept.key });
+        }
+    }
     Ok(Step::Stop)
 }
 
@@ -738,6 +845,30 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture kept already is linked, not fetched; one whose entry is
+    /// gone is fetched again.
+    #[test]
+    fn a_kept_picture_is_linked_while_it_is_there() {
+        let dir = std::env::temp_dir().join(format!("sf-sdk-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("a.jpg");
+        std::fs::write(&from, b"cover").unwrap();
+        let to = dir.join("b").join("art").join("a.jpg");
+        let linked = reuse(&from, &to);
+        let again = reuse(&from, &from);
+        std::fs::remove_file(&from).unwrap();
+        assert_eq!(
+            (
+                linked,
+                again,
+                std::fs::read(&to).unwrap(),
+                reuse(&from, &to)
+            ),
+            (true, true, b"cover".to_vec(), false)
+        );
+    }
 
     /// Review 2026-10-20, finding 8: a download the server has not comes
     /// back gone, and is prepared again, not taken for a broken reply.

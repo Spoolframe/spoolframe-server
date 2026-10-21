@@ -41,7 +41,9 @@ pub fn server_wait(request: &Request) -> Duration {
         | Request::SetSubtitleOffset { .. }
         // PX-38: each probes the file to plan the download.
         | Request::DownloadOptions { .. }
-        | Request::PrepareDownload { .. } => wait::PROBE,
+        | Request::PrepareDownload { .. }
+        // PX-51: an artist's albums are read one by one from the catalog.
+        | Request::MusicDownloadChanges { .. } => wait::PROBE,
         Request::SearchSubtitles { .. } | Request::DownloadSubtitle { .. } => wait::SUBTITLE_SITE,
         Request::StartPlayback { .. }
         | Request::ChangeSubtitle { .. }
@@ -132,7 +134,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::DownloadStatus { .. }
         | Request::CancelDownload { .. }
         // Newest wins: an entry written once is older the second time.
-        | Request::SyncOfflineWatch { .. } => true,
+        | Request::SyncOfflineWatch { .. }
+        // PX-51: a read; a play is recorded once by its track and time,
+        // and a like is newest-wins as a watch is.
+        | Request::MusicDownloadChanges { .. }
+        | Request::SyncOfflinePlays { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

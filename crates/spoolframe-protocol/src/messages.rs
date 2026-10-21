@@ -944,7 +944,9 @@ pub enum Request {
     /// the subtitles a download would leave out. Anyone who can play the
     /// item may ask. Only from an iPhone, iPad, Mac or Linux client
     /// (`Hello.platform`); from any other, and from a client that did not
-    /// list the feature, `Unsupported`.
+    /// list the feature, `Unsupported`. With `spoolframe:music-downloads`
+    /// too, `id` may be a track (PX-51): its one audio track, no
+    /// profiles, and what `original` would be.
     DownloadOptions {
         id: MediaId,
     },
@@ -955,7 +957,9 @@ pub enum Request {
     /// `DownloadChanged` tells its state as it moves. A track the item
     /// does not have, or a source or choice this build does not know, is
     /// `InvalidInput`; a profile not there `NotFound`. As
-    /// `DownloadOptions` for who may and from where.
+    /// `DownloadOptions` for who may and from where. A track (PX-51, with
+    /// `spoolframe:music-downloads`) takes `original` or `aac256`, and
+    /// `tracks` is not read; a film or an episode is refused `aac256`.
     PrepareDownload {
         id: MediaId,
         source: crate::downloads::DownloadSource,
@@ -989,6 +993,43 @@ pub enum Request {
     SyncOfflineWatch {
         device_now: i64,
         entries: Vec<crate::downloads::OfflineWatch>,
+    },
+    /// What the music downloads a device follows hold now (PX-51,
+    /// `spoolframe:music-downloads` with `spoolframe:downloads`):
+    /// `MusicDownloadChanges`, one change per artist, per playlist, then
+    /// Liked, in that order, and a cursor to ask with next time. With
+    /// `since`, the cursor of the last answer, each thing that holds the
+    /// same tracks is `unchanged`; else, and with no cursor, its tracks
+    /// now, in full, for the device to compare with what it keeps. A
+    /// cursor this server cannot read is no cursor. Asked each time the
+    /// device reaches the server. At most
+    /// [`crate::downloads::MAX_FOLLOWED`] artists and playlists together;
+    /// an id that is not an artist, or All, is `InvalidInput`; Liked
+    /// needs `spoolframe:liked` too (`Unsupported` without). Only the
+    /// tracks the user may see. As `DownloadOptions` for from where.
+    MusicDownloadChanges {
+        artists: Vec<MediaId>,
+        playlists: Vec<String>,
+        liked: bool,
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        since: Option<String>,
+    },
+    /// What the device played and liked while it had no server (PX-51,
+    /// `spoolframe:music-downloads`): `OfflinePlaysSynced`, an outcome per
+    /// play and per like, in order. `device_now` is the device's clock
+    /// now, in Unix seconds: each `at` is moved by the difference to the
+    /// server's clock, and kept no later than now. Each play of a track is
+    /// recorded once, counted as the server's rules say from
+    /// `played_ms`: it is in play counts and last played. A like or an
+    /// unlike is made only when newer than the track's last change on the
+    /// server (newest wins, whichever device made it); likes need
+    /// `spoolframe:liked` too (`Unsupported` without). At most
+    /// [`crate::downloads::MAX_ASKED`] plays and likes together. As
+    /// `DownloadOptions` for from where.
+    SyncOfflinePlays {
+        device_now: i64,
+        plays: Vec<crate::downloads::OfflinePlay>,
+        liked: Vec<crate::downloads::OfflineLike>,
     },
 
     /// A request type this build does not know; answered with
@@ -1568,6 +1609,18 @@ pub enum Reply {
     OfflineWatchSynced {
         outcomes: Vec<crate::downloads::OfflineWatchOutcome>,
     },
+    /// What each followed thing holds (`MusicDownloadChanges`), and the
+    /// cursor to ask with next.
+    MusicDownloadChanges {
+        changes: Vec<crate::downloads::FollowedChange>,
+        cursor: String,
+    },
+    /// What became of each offline play and like, in order
+    /// (`SyncOfflinePlays`).
+    OfflinePlaysSynced {
+        plays: Vec<crate::downloads::OfflineWatchOutcome>,
+        liked: Vec<crate::downloads::OfflineWatchOutcome>,
+    },
 }
 
 /// Which HLS playlist (P2-05).
@@ -2111,6 +2164,11 @@ pub enum Event {
     /// The user's Pinned, or its notes, changed on another device or by
     /// another user's change: `ListPlaylists` again.
     PinsChanged,
+    /// The user liked or unliked a track (PX-51), on any device: a device
+    /// that downloaded Liked asks what it holds now
+    /// (`MusicDownloadChanges`). Only to the user's own connections that
+    /// listed `spoolframe:music-downloads`.
+    LikedChanged,
     /// Item `id`'s subtitle `track` is timed anew (PX-03): synced, its
     /// sync done or set aside, or its offset changed, by anyone. What it
     /// is served with changed: a player showing it reads it again (a

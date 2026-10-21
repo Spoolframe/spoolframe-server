@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use spoolframe_policy::plays::{PlayKind, PlayProgress, counts};
 use spoolframe_protocol::playlists::Kinds;
-use spoolframe_types::{Item, MediaKind};
+use spoolframe_types::{Item, MediaId, MediaKind};
 
 use super::{Watch, WatchError, ms, playback_mut};
 use crate::playback::{Observer, Opened};
@@ -261,7 +261,86 @@ impl Observer for Plays {
     }
 }
 
+/// A track played on a device with no server (PX-51).
+#[derive(Debug, Clone, Copy)]
+pub struct OfflinePlay<'a> {
+    /// When it ended, by the device's clock (Unix seconds).
+    pub at: i64,
+    /// The device's clock now, as it sent this (Unix seconds).
+    pub device_now: i64,
+    pub played: Duration,
+    /// The device: its endpoint id, and the name it gave.
+    pub endpoint_id: Option<&'a str>,
+    pub device_name: Option<&'a str>,
+}
+
 impl Watch {
+    /// Record `principal`'s play of track `id` on a device with no server
+    /// (PX-51): a closed play, counted as the rules count a track's from
+    /// what was played of it, ending at `play.at` with the device's clock
+    /// set right as [`Watch::offline`] sets it. Recorded once per device
+    /// and device time: sent again, it is `Applied` and nothing more is
+    /// written. Anything but a track, or a track not on the server, is
+    /// `NotTracked`.
+    pub async fn offline_play(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        play: OfflinePlay<'_>,
+    ) -> Result<super::Synced, WatchError> {
+        use super::Synced;
+        if id.kind() != MediaKind::Track {
+            return Ok(Synced::NotTracked);
+        }
+        let Some(found) = self.served_item(id).await? else {
+            return Ok(Synced::NotTracked);
+        };
+        let Item::Track(track) = &found.item else {
+            return Ok(Synced::NotTracked);
+        };
+        let ended = self.store.server_time_of(play.at, play.device_now);
+        let played_secs = i64::try_from(play.played.as_secs()).unwrap_or(i64::MAX);
+        let duration = self.duration(id, &found.item).await;
+        let counted = counts(
+            &self.rules(),
+            PlayKind::Track,
+            &PlayProgress {
+                played: play.played,
+                from: Duration::ZERO,
+                position: play.played,
+                duration,
+                credits: None,
+            },
+        );
+        let media_id = id.to_string();
+        let album_id = track.album_id.to_string();
+        let artist_id = track.artist_id.to_string();
+        // What makes it one play: the device's own time of it, which a
+        // second send has unchanged (the clock fix may move).
+        let key = format!("offline:{}", play.at);
+        self.store
+            .record_offline_play(
+                principal,
+                NewPlay {
+                    media_id: &media_id,
+                    kind: PlayedKind::Track,
+                    show_id: None,
+                    album_id: Some(&album_id),
+                    artist_id: Some(&artist_id),
+                    external_ids: &found.external_ids,
+                    duration_ms: duration.map(ms),
+                    endpoint_id: play.endpoint_id,
+                    device_name: play.device_name,
+                    playback_id: Some(&key),
+                },
+                (ended.saturating_sub(played_secs), ended),
+                ms(play.played),
+                counted,
+            )
+            .await?;
+        Ok(Synced::Applied)
+    }
+
     /// Close the plays a server that stopped left open, as far as they
     /// had got: at start, before any playback.
     pub async fn close_open_plays(&self) -> Result<u64, WatchError> {

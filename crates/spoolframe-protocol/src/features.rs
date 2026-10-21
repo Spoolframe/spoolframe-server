@@ -104,6 +104,16 @@ pub const PLAYLIST_UPCOMING: &str = "spoolframe:playlist-upcoming";
 /// requests and the read are `Unsupported`.
 pub const DOWNLOADS: &str = "spoolframe:downloads";
 
+/// Music offline (PX-51), on top of [`DOWNLOADS`]: `PrepareDownload` and
+/// `DownloadOptions` take a track, with the `aac256` source besides
+/// `original`; the `MusicDownloadChanges` request (what an artist, a
+/// playlist or Liked a device keeps holds now) and `SyncOfflinePlays`
+/// (plays and Liked changes made with no server). A client must list
+/// both features: one without this one is refused a track
+/// (`InvalidInput`, as before) and the two requests (`Unsupported`), and
+/// an app without it keeps no music.
+pub const MUSIC_DOWNLOADS: &str = "spoolframe:music-downloads";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,
@@ -116,6 +126,7 @@ pub const ALL: &[&str] = &[
     SUBTITLE_SEARCH,
     PLAYLIST_UPCOMING,
     DOWNLOADS,
+    MUSIC_DOWNLOADS,
 ];
 
 /// The ones that change what a client can do before it has a session:

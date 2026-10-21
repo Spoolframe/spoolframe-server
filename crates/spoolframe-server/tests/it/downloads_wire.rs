@@ -23,10 +23,10 @@ use tokio::io::AsyncReadExt;
 use crate::downloads::write_film;
 use crate::support::{ServerOptions, TestClient, TestServer, fresh_dir, movie};
 
-const PASSWORD: &str = "correct horse";
+pub(crate) const PASSWORD: &str = "correct horse";
 
 /// A server with real ffmpeg and ffprobe, and the users alice and bob.
-async fn server(test: &str, options: ServerOptions) -> TestServer {
+pub(crate) async fn server(test: &str, options: ServerOptions) -> TestServer {
     let server = TestServer::start_with(
         fresh_dir(test).await,
         ServerOptions {
@@ -43,7 +43,7 @@ async fn server(test: &str, options: ServerOptions) -> TestServer {
 
 /// `Hello` from an app on `platform` listing `features`, saying nothing
 /// of what it plays.
-async fn hello(client: &TestClient, platform: Platform, features: &[&str]) {
+pub(crate) async fn hello(client: &TestClient, platform: Platform, features: &[&str]) {
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         client_name: "test".into(),
@@ -118,7 +118,7 @@ async fn prepared(
     }
 }
 
-async fn status(client: &TestClient, session: &SessionId, id: &str) -> Response {
+pub(crate) async fn status(client: &TestClient, session: &SessionId, id: &str) -> Response {
     client
         .call(
             Some(session),
@@ -130,7 +130,7 @@ async fn status(client: &TestClient, session: &SessionId, id: &str) -> Response 
 }
 
 /// Download `id` once it is ready or failed, for at most 60 s.
-async fn settled(client: &TestClient, session: &SessionId, id: &str) -> DownloadInfo {
+pub(crate) async fn settled(client: &TestClient, session: &SessionId, id: &str) -> DownloadInfo {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let info = match status(client, session, id).await {
@@ -149,7 +149,7 @@ async fn settled(client: &TestClient, session: &SessionId, id: &str) -> Download
 }
 
 /// Download `id`'s size and SHA-256, once ready.
-async fn ready(client: &TestClient, session: &SessionId, id: &str) -> (u64, String) {
+pub(crate) async fn ready(client: &TestClient, session: &SessionId, id: &str) -> (u64, String) {
     match settled(client, session, id).await.state {
         DownloadState::Ready { size, sha256 } => (size, sha256),
         other => panic!("the download failed: {other:?}"),
@@ -157,7 +157,7 @@ async fn ready(client: &TestClient, session: &SessionId, id: &str) -> (u64, Stri
 }
 
 /// One read of download `id`: the answer and the bytes after it.
-async fn read(
+pub(crate) async fn read(
     client: &TestClient,
     session: &SessionId,
     id: &str,
@@ -175,7 +175,7 @@ async fn read(
 }
 
 /// Download `id`'s file from `offset` to its end, `chunk` bytes a read.
-async fn read_from(
+pub(crate) async fn read_from(
     client: &TestClient,
     session: &SessionId,
     id: &str,
@@ -202,7 +202,7 @@ async fn read_from(
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     <sha2::Sha256 as sha2::Digest>::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -210,7 +210,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// What ffprobe says of `entries` in `file`, a line each.
-fn probe(file: &Path, entries: &str) -> Vec<String> {
+pub(crate) fn probe(file: &Path, entries: &str) -> Vec<String> {
     let out = std::process::Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", entries, "-of", "csv=p=0"])
         .arg(file)
@@ -249,7 +249,7 @@ fn video_hash(file: &Path) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-async fn events(client: &TestClient) -> RecvStream {
+pub(crate) async fn events(client: &TestClient) -> RecvStream {
     let mut events = tokio::time::timeout(Duration::from_secs(5), client.conn.accept_uni())
         .await
         .expect("no events stream within 5 s")
@@ -262,7 +262,7 @@ async fn events(client: &TestClient) -> RecvStream {
 /// or failed, for at most 60 s. Another download's are skipped: one the
 /// test settled before may still be told after this one's first, under
 /// load.
-async fn moves_until_settled(events: &mut RecvStream, id: &str) -> Vec<DownloadState> {
+pub(crate) async fn moves_until_settled(events: &mut RecvStream, id: &str) -> Vec<DownloadState> {
     let mut moves = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -288,7 +288,7 @@ async fn moves_until_settled(events: &mut RecvStream, id: &str) -> Vec<DownloadS
 }
 
 /// Each kind of state in `moves`, once, in order.
-fn kinds(moves: &[DownloadState]) -> Vec<&'static str> {
+pub(crate) fn kinds(moves: &[DownloadState]) -> Vec<&'static str> {
     let mut kinds: Vec<&'static str> = Vec::new();
     for state in moves {
         let kind = match state {
@@ -313,7 +313,7 @@ fn first_audio() -> DownloadTracks {
     }
 }
 
-fn unsupported(response: &Response) -> bool {
+pub(crate) fn unsupported(response: &Response) -> bool {
     matches!(response, Response::Err(Error::Unsupported { .. }))
 }
 

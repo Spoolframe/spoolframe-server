@@ -22,7 +22,7 @@ pub use spoolframe_policy::watch::WatchRules;
 use spoolframe_policy::watch::credits_to_end;
 
 mod plays;
-pub use plays::Plays;
+pub use plays::{OfflinePlay, Plays};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {

@@ -73,6 +73,7 @@ pub async fn sdk_client(
             subtitle_search: true,
             playlist_upcoming: true,
             downloads: true,
+            music_downloads: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };

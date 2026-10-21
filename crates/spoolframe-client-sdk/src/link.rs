@@ -33,6 +33,7 @@ use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use iroh::endpoint::RecvStream;
 use spoolframe_protocol::codec::read_frame;
+use spoolframe_protocol::downloads::Followed;
 use spoolframe_protocol::streams::uni;
 use spoolframe_protocol::{Event, ServerInfo, SessionId};
 use tokio::io::AsyncReadExt;
@@ -678,15 +679,30 @@ fn tell_playlists(client: &Weak<Inner>, id: EndpointId, change: crate::PlaylistC
     }
 }
 
+/// Tell the download manager that `followed` changed on server `id`.
+fn tell_music(client: &Weak<Inner>, id: EndpointId, followed: Followed) {
+    if let Some(inner) = client.upgrade() {
+        inner.downloads.followed_changed(id, followed);
+    }
+}
+
 /// Apply `event` from server `id`; `Break` on `ShuttingDown`.
 async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::ControlFlow<()> {
     match event {
         Event::ShuttingDown => return std::ops::ControlFlow::Break(()),
-        // PX-40: for whoever shows playlists.
+        // PX-40: for whoever shows playlists; PX-51: a playlist
+        // downloaded is asked about again.
         Event::PlaylistChanged {
             id: playlist,
             revision,
         } => {
+            tell_music(
+                client,
+                id,
+                Followed::Playlist {
+                    id: playlist.clone(),
+                },
+            );
             tell_playlists(
                 client,
                 id,
@@ -697,9 +713,18 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
             );
         }
         Event::PlaylistGone { id: playlist } => {
+            tell_music(
+                client,
+                id,
+                Followed::Playlist {
+                    id: playlist.clone(),
+                },
+            );
             tell_playlists(client, id, crate::PlaylistChange::Gone { id: playlist });
         }
         Event::PinsChanged => tell_playlists(client, id, crate::PlaylistChange::PinsChanged),
+        // PX-51: Liked downloaded is asked about again.
+        Event::LikedChanged => tell_music(client, id, Followed::Liked),
         Event::ServerAddresses {
             addrs,
             relays,

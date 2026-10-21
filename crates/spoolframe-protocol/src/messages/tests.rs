@@ -1192,6 +1192,19 @@ fn an_unknown_event_decodes_as_unknown() {
     assert_eq!(codec::decode::<Event>(&bytes).unwrap(), Event::Unknown);
 }
 
+/// PX-51: `LikedChanged` goes as `liked_changed`, with no fields; a peer
+/// without it reads it as any event it does not know.
+#[test]
+fn liked_changed_has_its_wire_name() {
+    round_trip(Event::LikedChanged);
+    let value: ciborium::Value =
+        ciborium::from_reader(codec::encode(&Event::LikedChanged).unwrap().as_slice()).unwrap();
+    assert_eq!(
+        value,
+        ciborium::Value::Map(vec![("type".into(), "liked_changed".into())])
+    );
+}
+
 #[test]
 fn a_field_added_by_a_newer_client_is_ignored() {
     let bytes = codec::encode(&newer::Hello {
@@ -3579,5 +3592,137 @@ mod downloads {
             serde_json::to_value(ResourceMetadata::Download { size: 3 }).unwrap(),
             serde_json::json!({"type": "download", "size": 3})
         );
+    }
+}
+
+mod music_downloads {
+    use super::*;
+    use crate::downloads::{
+        DownloadSource, DownloadTracks, Followed, FollowedChange, FollowedTracks, OfflineLike,
+        OfflinePlay, OfflineWatchOutcome,
+    };
+
+    fn track(key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, MediaKind::Track, key).unwrap()
+    }
+
+    fn artist() -> MediaId {
+        MediaId::new(Namespace::Plex, MediaKind::Artist, "30").unwrap()
+    }
+
+    #[test]
+    fn a_track_s_aac_256_source_is_tagged_by_type() {
+        let prepare = Request::PrepareDownload {
+            id: track("32"),
+            source: DownloadSource::Aac256,
+            tracks: DownloadTracks::All,
+        };
+        assert_eq!(
+            serde_json::to_value(&prepare).unwrap()["source"],
+            serde_json::json!({"type": "aac256"})
+        );
+        round_trip(prepare);
+    }
+
+    #[test]
+    fn a_changes_query_round_trips_and_is_safe_to_retry() {
+        let changes = Request::MusicDownloadChanges {
+            artists: vec![artist()],
+            playlists: vec!["0192".into()],
+            liked: true,
+            since: Some("cursor".into()),
+        };
+        assert!(crate::policy::retry_safe(&changes));
+        assert_eq!(
+            serde_json::to_value(&changes).unwrap()["type"],
+            "music_download_changes"
+        );
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: changes,
+        });
+    }
+
+    #[test]
+    fn a_changes_query_names_its_cursor_even_when_there_is_none() {
+        let without: Result<Request, _> = serde_json::from_value(serde_json::json!({
+            "type": "music_download_changes",
+            "artists": [],
+            "playlists": [],
+            "liked": true,
+        }));
+        assert!(without.is_err());
+    }
+
+    #[test]
+    fn each_followed_thing_s_change_round_trips() {
+        let reply = Reply::MusicDownloadChanges {
+            changes: vec![
+                FollowedChange {
+                    followed: Followed::Artist { id: artist() },
+                    tracks: FollowedTracks::Tracks {
+                        tracks: vec![track("32"), track("33")],
+                    },
+                },
+                FollowedChange {
+                    followed: Followed::Playlist { id: "0192".into() },
+                    tracks: FollowedTracks::Gone,
+                },
+                FollowedChange {
+                    followed: Followed::Liked,
+                    tracks: FollowedTracks::Unchanged,
+                },
+            ],
+            cursor: "next".into(),
+        };
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(
+            (
+                json["changes"][0]["followed"].clone(),
+                json["changes"][2].clone()
+            ),
+            (
+                serde_json::json!({"type": "artist", "id": artist()}),
+                serde_json::json!({"followed": {"type": "liked"}, "tracks": {"type": "unchanged"}})
+            )
+        );
+        round_trip(Response::Ok(reply));
+    }
+
+    #[test]
+    fn what_a_newer_peer_follows_decodes_as_unknown() {
+        let followed: Followed = serde_json::from_str(r#"{"type": "genre"}"#).unwrap();
+        let tracks: FollowedTracks = serde_json::from_str(r#"{"type": "diff"}"#).unwrap();
+        assert_eq!(
+            (followed, tracks),
+            (Followed::Unknown, FollowedTracks::Unknown)
+        );
+    }
+
+    #[test]
+    fn an_offline_plays_sync_round_trips_and_is_safe_to_retry() {
+        let sync = Request::SyncOfflinePlays {
+            device_now: 1_790_003_600,
+            plays: vec![OfflinePlay {
+                track: track("32"),
+                at: 1_790_000_000,
+                played_ms: 240_000,
+            }],
+            liked: vec![OfflineLike {
+                track: track("33"),
+                liked: false,
+                at: 1_790_000_100,
+            }],
+        };
+        assert!(crate::policy::retry_safe(&sync));
+        assert_eq!(
+            serde_json::to_value(&sync).unwrap()["type"],
+            "sync_offline_plays"
+        );
+        round_trip(sync);
+        round_trip(Response::Ok(Reply::OfflinePlaysSynced {
+            plays: vec![OfflineWatchOutcome::Applied],
+            liked: vec![OfflineWatchOutcome::Older],
+        }));
     }
 }

@@ -29,6 +29,11 @@
 //!
 //! The pool is always here, whatever `optimized.binge_ahead` says (the
 //! user's decision, 2026-10-20).
+//!
+//! A track is downloaded the same way (PX-51, [`Downloads::prepare_music`]):
+//! [`music`] says how its file is written, and the pool's copy for its
+//! class and quality converts its one audio track. What an artist, a
+//! playlist or Liked a device follows holds is [`followed`]'s.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -53,9 +58,12 @@ use crate::store::{Store, StoreError};
 use crate::subtitle_sync::SubtitleTimings;
 use crate::subtitles::{Subtitles, TextSource, TextState};
 
+pub mod followed;
+pub mod music;
 pub mod plan;
 mod write;
 
+use music::{MusicFormat, MusicQuality};
 use plan::{Decision, PlanError, Source, Subtitle, Tracks};
 use write::{Run, RunError, SubtitleFile};
 
@@ -200,6 +208,17 @@ pub struct PrepareRequest<'a> {
     pub bitmap: BitmapPreference,
 }
 
+/// A track's download asked for (PX-51).
+#[derive(Debug, Clone)]
+pub struct MusicRequest<'a> {
+    pub principal: Principal,
+    pub media_id: &'a str,
+    pub media: &'a Path,
+    pub descriptor: &'a MediaDescriptor,
+    pub class: DeviceClass,
+    pub quality: MusicQuality,
+}
+
 /// A download prepared.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prepared {
@@ -222,6 +241,10 @@ pub struct Prepared {
 pub struct Carried {
     pub audio: Vec<u32>,
     pub subtitles: Vec<u32>,
+    /// What the file is, when not the class's film container: a track's
+    /// (PX-51).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
 }
 
 /// A download as its user may know it.
@@ -383,12 +406,52 @@ struct Job {
     /// The copy was not ready when the download was asked for: it is
     /// converted for it, and says so however quickly that goes.
     converts: bool,
-    format: MuxFormat,
+    writes: Writes,
     picks: MuxPicks,
     /// The subtitles beside the file, by position.
     sidecars: Vec<SubtitleFile>,
     /// The picture subtitles to read as text, by position.
     ocr: Vec<u32>,
+}
+
+/// What a file is written as.
+#[derive(Debug, Clone, Copy)]
+enum Writes {
+    /// A film or an episode, with its tracks and subtitles.
+    Film(MuxFormat),
+    /// A track (PX-51), its tags and cover.
+    Track(MusicFormat),
+}
+
+impl Writes {
+    /// Every format a file is written as, once each.
+    fn all() -> impl Iterator<Item = Self> {
+        [MuxFormat::Matroska, MuxFormat::Mp4 { hvc1: false }]
+            .map(Self::Film)
+            .into_iter()
+            .chain(MusicFormat::ALL.map(Self::Track))
+    }
+
+    /// The file's extension: what the writer names it with and the sweep
+    /// knows it by.
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Film(MuxFormat::Matroska) => "mkv",
+            Self::Film(MuxFormat::Mp4 { .. }) => "mp4",
+            Self::Track(format) => format.extension(),
+        }
+    }
+}
+
+/// A download asked for, as [`Downloads::register`] keeps it.
+struct Asked<'a> {
+    principal: Principal,
+    media_id: &'a str,
+    /// As the database keeps it ([`RequestKey`], [`MusicKey`]).
+    request: String,
+    container: Container,
+    left_out: Vec<(u32, String)>,
+    carried: Carried,
 }
 
 /// The request as the database keeps it: the same one is the same id.
@@ -397,6 +460,13 @@ struct RequestKey<'a> {
     class: &'static str,
     source: &'a Source,
     tracks: &'a Tracks,
+}
+
+/// A track's request as the database keeps it (PX-51).
+#[derive(Serialize)]
+struct MusicKey {
+    class: &'static str,
+    music: MusicQuality,
 }
 
 impl Downloads {
@@ -581,29 +651,15 @@ impl Downloads {
         if !left_out.is_empty() {
             tracing::info!(media = %request.media.display(), left_out = ?left_out, "subtitles left out of a download");
         }
-        let mut converts = false;
-        let copy = match &decision {
-            Decision::Convert { target, video, .. } => {
-                let row = inner
-                    .pool
-                    .request(NewCopy {
-                        media_id: request.media_id.to_owned(),
-                        media_path: request.media.display().to_string(),
-                        source_stamp: stamp.clone(),
-                        target: target.clone(),
-                        video: *video,
-                    })
-                    .await?;
-                // Each stored track it reads, by id: one made again (its
-                // file evicted, say) is another file.
-                for track in inner.store.optimized_copy_tracks(&row.id).await? {
-                    parts.push(format!("track:{}", track.id));
-                }
-                converts = row.state != CopyState::Ready;
-                Some(row.id)
-            }
-            Decision::AsIs | Decision::Remux => None,
-        };
+        let (copy, converts) = self
+            .copy_for(
+                request.media_id,
+                request.media,
+                &stamp,
+                &decision,
+                &mut parts,
+            )
+            .await?;
         let format = match class {
             DeviceClass::Linux => MuxFormat::Matroska,
             DeviceClass::Apple => {
@@ -625,35 +681,23 @@ impl Downloads {
         let carried = Carried {
             audio: audio.clone(),
             subtitles: written.clone(),
+            container: None,
         };
-        let carried_text = serde_json::to_string(&carried).expect("tracks are JSON");
-        let principal = request.principal.to_string();
         let request_text = serde_json::to_string(&RequestKey {
             class: class.as_str(),
             source: &request.source,
             tracks: &tracks,
         })
         .expect("a request is JSON");
-        let row = inner
-            .store
-            .put_download(NewDownload {
-                principal: &principal,
-                media_id: request.media_id,
-                request: &request_text,
-                content_key: &content_key,
-                carried: &carried_text,
-                stamp: &stamp,
-            })
-            .await?;
         let job = Job {
-            key: content_key.clone(),
+            key: content_key,
             media: request.media.to_path_buf(),
             stamp,
             descriptor: descriptor.clone(),
             decision: decision.clone(),
             copy,
             converts,
-            format,
+            writes: Writes::Film(format),
             picks: MuxPicks {
                 audio: Some(audio),
                 subtitles: Some(written),
@@ -661,16 +705,151 @@ impl Downloads {
             sidecars,
             ocr,
         };
+        self.register(
+            Asked {
+                principal: request.principal,
+                media_id: request.media_id,
+                request: request_text,
+                container: class.container(),
+                left_out,
+                carried,
+            },
+            job,
+        )
+        .await
+    }
+
+    /// Prepare track `request` (PX-51), as [`Downloads::prepare`] does a
+    /// film: its one audio track, as [`music::plan`] says.
+    pub async fn prepare_music(
+        &self,
+        request: MusicRequest<'_>,
+    ) -> Result<Prepared, DownloadError> {
+        let class = request.class;
+        let planned = music::plan(request.descriptor, class, request.quality)?;
+        let stamp = crate::files::stamp_text(request.media)
+            .await
+            .map_err(DownloadError::Media)?;
+        let mut parts = vec![
+            "music-download:1".to_owned(),
+            request.media.display().to_string(),
+            stamp.clone(),
+            class.as_str().to_owned(),
+            request.quality.as_str().to_owned(),
+            format!("{:?}", planned.decision),
+            format!("{:?}", planned.format),
+        ];
+        let (copy, converts) = self
+            .copy_for(
+                request.media_id,
+                request.media,
+                &stamp,
+                &planned.decision,
+                &mut parts,
+            )
+            .await?;
+        let carried = Carried {
+            audio: vec![0],
+            subtitles: Vec::new(),
+            container: Some(planned.container),
+        };
+        let request_text = serde_json::to_string(&MusicKey {
+            class: class.as_str(),
+            music: request.quality,
+        })
+        .expect("a request is JSON");
+        let job = Job {
+            key: crate::files::hash_parts(&parts).to_hex().to_string(),
+            media: request.media.to_path_buf(),
+            stamp,
+            descriptor: request.descriptor.clone(),
+            decision: planned.decision,
+            copy,
+            converts,
+            // As it is, the file is the track's own: nothing written.
+            writes: Writes::Track(planned.format.unwrap_or(MusicFormat::Matroska)),
+            picks: MuxPicks {
+                audio: Some(vec![0]),
+                subtitles: Some(Vec::new()),
+            },
+            sidecars: Vec::new(),
+            ocr: Vec::new(),
+        };
+        self.register(
+            Asked {
+                principal: request.principal,
+                media_id: request.media_id,
+                request: request_text,
+                container: planned.container,
+                left_out: Vec::new(),
+                carried,
+            },
+            job,
+        )
+        .await
+    }
+
+    /// Keep `asked`, a download of `job`'s file, as the user's, and begin
+    /// the file: what [`Downloads::prepare`] and
+    /// [`Downloads::prepare_music`] end with.
+    async fn register(&self, asked: Asked<'_>, job: Job) -> Result<Prepared, DownloadError> {
+        let carried = serde_json::to_string(&asked.carried).expect("tracks are JSON");
+        let row = self
+            .inner
+            .store
+            .put_download(NewDownload {
+                principal: &asked.principal.to_string(),
+                media_id: asked.media_id,
+                request: &asked.request,
+                content_key: &job.key,
+                carried: &carried,
+                stamp: &job.stamp,
+            })
+            .await?;
+        let (content_key, decision) = (job.key.clone(), job.decision.clone());
         let state = self.begin(&row, job).await?;
         Ok(Prepared {
             id: row.id,
             content_key,
-            container: class.container(),
+            container: asked.container,
             decision,
-            left_out,
-            carried,
+            left_out: asked.left_out,
+            carried: asked.carried,
             state,
         })
+    }
+
+    /// The pool's copy a `decision` to convert reads, asked for now, and
+    /// whether it is not made yet; each stored track it reads, by id, goes
+    /// into the content key's `parts`: one made again (its file evicted,
+    /// say) is another file.
+    async fn copy_for(
+        &self,
+        media_id: &str,
+        media: &Path,
+        stamp: &str,
+        decision: &Decision,
+        parts: &mut Vec<String>,
+    ) -> Result<(Option<String>, bool), DownloadError> {
+        let Decision::Convert { target, video, .. } = decision else {
+            return Ok((None, false));
+        };
+        let inner = &self.inner;
+        let row = inner
+            .pool
+            .request(NewCopy {
+                media_id: media_id.to_owned(),
+                media_path: media.display().to_string(),
+                source_stamp: stamp.to_owned(),
+                target: target.clone(),
+                video: *video,
+            })
+            .await?;
+        for track in inner.store.optimized_copy_tracks(&row.id).await? {
+            parts.push(format!("track:{}", track.id));
+        }
+        let converts = row.state != CopyState::Ready;
+        Ok((Some(row.id), converts))
     }
 
     /// `row`'s file: ready already (its own, or another download's of the
@@ -1090,7 +1269,6 @@ impl Inner {
             stored: &stored,
             subtitles: &subtitles,
             picks: &job.picks,
-            format: job.format,
             max_size: self.max_size,
         };
         self.set(&job.key, DownloadState::Writing { progress: None })
@@ -1098,15 +1276,17 @@ impl Inner {
         tracing::info!(key = job.key, media = %job.media.display(), "writing a download's file");
         let key = job.key.clone();
         let progress = |fraction: Option<f64>| self.progress(&key, fraction);
-        write::write(&run, &part, progress, cancelled).await?;
+        match job.writes {
+            Writes::Film(format) => write::write(&run, format, &part, progress, cancelled).await?,
+            Writes::Track(format) => {
+                write::write_music(&run, format, &part, progress, cancelled).await?;
+            }
+        }
         drop(lease);
         let (sha256, size) = write::sha256(&part)
             .await
             .map_err(|e| Ended::Failed(format!("the file cannot be read back: {e}")))?;
-        let ext = match job.format {
-            MuxFormat::Matroska => "mkv",
-            MuxFormat::Mp4 { .. } => "mp4",
-        };
+        let ext = job.writes.extension();
         let file = self.dir.join(format!("{}.{ext}", job.key));
         std::fs::rename(&part, &file)
             .map_err(|e| Ended::Failed(format!("cannot keep the file: {e}")))?;
@@ -1604,12 +1784,14 @@ async fn unchanged(path: &Path, stamp: &str) -> bool {
 }
 
 /// The content key of a file the area wrote, from its name: 64 hex
-/// digits and an extension it writes. The sweep removes no other file:
-/// a file of someone else's in a directory chosen wrongly stays.
+/// digits and an extension it writes, a film's or a track's (PX-51). The
+/// sweep removes no other file: a file of someone else's in a directory
+/// chosen wrongly stays.
 fn written_key(name: &str) -> Option<&str> {
     let (key, extension) = name.split_once('.')?;
     let key_like = key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    (key_like && matches!(extension, "mp4" | "mkv")).then_some(key)
+    let written = Writes::all().any(|w| w.extension() == extension);
+    (key_like && written).then_some(key)
 }
 
 /// `wait`, unless `cancelled` says to stop first.
@@ -1809,10 +1991,11 @@ mod tests {
             format!("{}.mkv", "0123456789ABCDEF".repeat(4)),
             format!("{key}.nfo"),
             format!("{key}.mkv.part"),
+            format!("{key}.flac"),
         ];
         assert_eq!(
             names.map(|n| written_key(&n).is_some()),
-            [true, true, false, false, false, false]
+            [true, true, false, false, false, false, true]
         );
     }
 }

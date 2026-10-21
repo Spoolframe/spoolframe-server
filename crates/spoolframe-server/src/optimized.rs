@@ -794,6 +794,13 @@ impl Inner {
             .describe(Path::new(&copy.media_path))
             .await
             .map_err(|e| format!("the media file cannot be read: {e}"))?;
+        // A track's (PX-51): its one audio track, converted as its
+        // download's plan says. Asked for only when the plan converts.
+        if let CopyTarget::Music { class, quality } = copy.target {
+            return crate::downloads::music::recipe(&descriptor, class, quality)
+                .map(|audio| vec![Recipe::Audio(audio)])
+                .ok_or_else(|| "the track has no audio".to_owned());
+        }
         let detected = self.transcoding.detected();
         crate::encode::track_args::recipes(
             &descriptor,
@@ -1339,7 +1346,8 @@ impl Inner {
 fn reserve(recipe: &Recipe, descriptor: &MediaDescriptor, media: &Path) -> u64 {
     let rate = match recipe {
         Recipe::Video(video) => video.max_bitrate,
-        Recipe::Audio(audio) => Some(audio.bitrate),
+        // Lossless (PX-51) has no rate: about the file's own size.
+        Recipe::Audio(audio) => Some(audio.bitrate).filter(|&rate| rate > 0),
     };
     match (rate, descriptor.duration) {
         (Some(rate), Some(length)) => {

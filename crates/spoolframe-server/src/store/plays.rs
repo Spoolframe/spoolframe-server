@@ -93,6 +93,29 @@ pub struct PlaySummary {
     pub last: i64,
 }
 
+/// Note `play`'s external ids as its item's, for `principal`. An id names
+/// one item: if it was another key's, it is this one's now. One already
+/// this item's is left unwritten.
+async fn note_play_ids(
+    tx: &mut sqlx::SqliteConnection,
+    principal: &str,
+    play: &NewPlay<'_>,
+) -> Result<(), StoreError> {
+    for external in play.external_ids {
+        sqlx::query(
+            "INSERT INTO play_ids (principal, media_id, external_id) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id \
+             WHERE play_ids.media_id != excluded.media_id",
+        )
+        .bind(principal)
+        .bind(play.media_id)
+        .bind(external)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open a play for `principal`, now; its id.
     pub async fn open_play(
@@ -122,20 +145,7 @@ impl Store {
         .bind(play.playback_id)
         .fetch_one(&mut *tx)
         .await?;
-        for external in play.external_ids {
-            // An id names one item: if it was another key's, it is this
-            // one's now. One already this item's is left unwritten.
-            sqlx::query(
-                "INSERT INTO play_ids (principal, media_id, external_id) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id \
-                 WHERE play_ids.media_id != excluded.media_id",
-            )
-            .bind(&principal)
-            .bind(play.media_id)
-            .bind(external)
-            .execute(&mut *tx)
-            .await?;
-        }
+        note_play_ids(&mut tx, &principal, &play).await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -158,6 +168,62 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a play made on a device with no server (PX-51), closed as
+    /// it is, from `started_at` to `ended_at` (Unix seconds): its path is
+    /// `offline`. Recorded once: a play of the same item from the same
+    /// device with the same `play.playback_id` (the device's own time of
+    /// it) is there already, and this is `false`.
+    pub async fn record_offline_play(
+        &self,
+        principal: Principal,
+        play: NewPlay<'_>,
+        (started_at, ended_at): (i64, i64),
+        played_ms: i64,
+        counted: bool,
+    ) -> Result<bool, StoreError> {
+        let principal = principal.to_string();
+        let mut tx = self.begin_write().await?;
+        let there: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM plays WHERE principal = ?1 AND media_id = ?2 AND playback_id = ?3 \
+               AND endpoint_id IS ?4",
+        )
+        .bind(&principal)
+        .bind(play.media_id)
+        .bind(play.playback_id)
+        .bind(play.endpoint_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if there.is_some() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO plays \
+               (principal, media_id, kind, show_id, album_id, artist_id, started_at, ended_at, \
+                played_ms, duration_ms, counted, closed, endpoint_id, device_name, path, \
+                playback_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, 'offline', ?14)",
+        )
+        .bind(&principal)
+        .bind(play.media_id)
+        .bind(play.kind.as_str())
+        .bind(play.show_id)
+        .bind(play.album_id)
+        .bind(play.artist_id)
+        .bind(started_at)
+        .bind(ended_at)
+        .bind(played_ms)
+        .bind(play.duration_ms)
+        .bind(counted)
+        .bind(play.endpoint_id)
+        .bind(play.device_name)
+        .bind(play.playback_id)
+        .execute(&mut *tx)
+        .await?;
+        note_play_ids(&mut tx, &principal, &play).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Close every play still open: at start, those a server that stopped

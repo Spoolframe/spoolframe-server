@@ -49,6 +49,25 @@
   never a failed batch) takes in what a device watched offline:
   newest wins, the device's clock set right by the server's, watched
   judged by the server's rules and the item's credits.
+- Music offline (PX-51), with the `spoolframe:music-downloads` feature
+  on top of `spoolframe:downloads`: `PrepareDownload` and
+  `DownloadOptions` take a track. In `original` quality the file is sent
+  as it is when the device plays it (a FLAC byte for byte on Apple and
+  Linux), remuxed when only its container is the problem, else
+  converted in the copy pool: lossless as ALAC (Apple) or FLAC (Linux),
+  lossy as AAC 320. The new `aac256` source is AAC at 256 kbit/s (a
+  lossy file at about that rate or less is sent as it is). Converted
+  files keep their tags and cover, and a second device of the same
+  class encodes nothing. `MusicDownloadChanges` says what a followed
+  artist, playlist or Liked holds now, against a cursor (whole sets:
+  nothing logs what left them); the cursor keeps what was not asked
+  about, so an ask about one followed thing keeps the others'. `SyncOfflinePlays` records plays made
+  offline once each, counted by the server's rules, and Liked changes,
+  newest winning. Migration 0041 keeps when each track was last liked
+  or unliked. The new `LikedChanged` event (no fields) goes to the
+  user's own connections that listed the feature (while a session of
+  theirs on the connection is live) on every like and unlike, so a device that downloaded Liked asks again; a peer without
+  it ignores it as an unknown event.
 - The client SDK tells every regular feature a server listed:
   `Session::server_features()`, the names from `LoggedIn` or `WhoAmI`,
   including ones this SDK does not know and ones the app did not list,
@@ -74,6 +93,38 @@
   theirs is made or found, and with `sync_watch`. New errors:
   `SdkError::DownloadNotReady` and `SdkError::Downloads`. The server
   counts the bytes download reads send (`Downloads::sent`).
+- The client SDK's music offline (PX-51): `Features::music_downloads`
+  (`spoolframe:music-downloads`, which needs `downloads`).
+  `Downloads::start_music(session, MusicTarget)` downloads a `Track`,
+  an `Album`, an `Artist` (it follows new albums), a `Playlist` or
+  `Liked` (they stay in sync); `remove_music`, `music_downloads`
+  (`MusicDownload`: its tracks, how many are here, bytes) and
+  `music_tracks`. Each track is one file per quality, held by every
+  download covering it and deleted when none does. What followed
+  downloads hold is asked with `MusicDownloadChanges` each time a
+  session is made or found, and compared here. While connected, music
+  downloads follow edits too: a downloaded playlist's
+  `PlaylistChanged` or `PlaylistGone`, or `LikedChanged`, asks about it
+  2 s later (a burst of edits is one ask), and every followed download
+  is asked about every 15 minutes, for an artist's new albums. Every
+  ask, of one or of all, sends the cursor kept and keeps the one given,
+  so an unchanged set costs nothing after an ask about another. Tracks
+  played whole are kept from listening, as they were streamed (direct
+  reads or a progressive conversion; nothing of a track skipped), in a
+  cache under `DownloadSettings::cache_max_bytes` (2 GiB by default; the least
+  recently played go first; downloads never count) that `clear_cache`
+  empties; a kept track downloaded in the same quality moves to the
+  downloads with nothing fetched. `Downloads::settings` and
+  `set_settings` (`DownloadSettings`: `music_quality` —
+  `MusicQuality::Original` or `Aac256` — `allow_cellular`, off by
+  default, and the cache's cap), `set_network(NetworkKind::Unmetered |
+  Cellular)`: on cellular, unless allowed, every download waits and
+  goes on on Wi-Fi. `offline_music(server, user)` (`OfflineMusic`:
+  artists, albums and playlists made from what is on the device, each
+  `OfflineTrack` marked `OfflineMark::Download` or `Kept`) needs no
+  server. `record_play` and `record_like` keep what was played and liked
+  offline, sent with `SyncOfflinePlays` (also by `sync_music`). `list`
+  now lists films and episodes only.
 - Optimized versions keep tracks, not whole files (PX-37). Each
   converted stream is a file of its own: one video file per video plan,
   one file per converted audio track. Tracks kept as they are, the

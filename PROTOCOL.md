@@ -1631,6 +1631,16 @@ closes):
 - `PinsChanged`: the user's Pinned or its notes changed, here, on
   another device, or by another user's change. `ListPlaylists` again.
 
+With `spoolframe:music-downloads` (see "Music offline"), whether or not
+this feature is listed, a connection is also sent:
+
+- `LikedChanged` (no fields): the user liked or unliked a track, here
+  or on another device (PX-51). Only to the user's own connections,
+  while a session of theirs on the connection is live; a device that
+  downloaded Liked asks `MusicDownloadChanges` again. A
+  peer that does not know it reads it as an unknown event and ignores
+  it.
+
 An app that missed events (it was not connected) reads what it shows
 again on connecting.
 
@@ -2258,6 +2268,113 @@ that downloads.
 
 All five requests may be sent again on a new connection; a cancel sent
 again answers `NotFound`.
+
+### Music offline
+
+Feature `spoolframe:music-downloads` (PX-51), on top of
+`spoolframe:downloads`: a client lists both. A track is downloaded with
+the same requests as a film, and two more requests keep a device's
+music in step. A client without this feature is refused a track
+(`InvalidInput`) and the two requests (`Unsupported`), and keeps
+nothing from listening; the platforms are the downloads' own.
+
+| Request | Reply |
+|---|---|
+| `PrepareDownload { id: <track>, source, tracks }` | `Download(DownloadInfo)` |
+| `DownloadOptions { id: <track> }` | `DownloadOptions { … }` |
+| `MusicDownloadChanges { artists, playlists, liked, since }` | `MusicDownloadChanges { changes, cursor }` |
+| `SyncOfflinePlays { device_now, plays, liked }` | `OfflinePlaysSynced { plays, liked }` |
+
+A track's `source` is `{ type: original }` or `{ type: aac256 }`;
+`tracks` is not read, and a profile is `InvalidInput`, as `aac256` is
+for a film or an episode. In `original`:
+
+- the file as it is, byte for byte, when the device plays it so: on an
+  iPhone, iPad or Mac, AAC, ALAC, AC-3 and E-AC-3 in MP4, MP3 in MP3 or
+  MP4, FLAC in FLAC or MP4; on Linux, every codec the server names
+  (AAC, AC-3, E-AC-3, ALAC, FLAC, MP3, DTS, TrueHD, Opus, Vorbis, PCM)
+  in MP4, FLAC, MP3, Ogg or Matroska;
+- a codec the device plays in a container it does not is remuxed into
+  one it does (FLAC, MP3, MP4 as `.m4a`, Ogg, or Matroska as `.mka`),
+  nothing encoded;
+- else converted: lossless (APE, WavPack, TTA, WMA Lossless, DSD, PCM
+  on Apple, and the like) as ALAC in MP4 on Apple and as FLAC on Linux,
+  sample for sample; lossy (WMA, say, or Opus and Vorbis on Apple) as
+  AAC at 320 kbit/s in MP4.
+
+`aac256` is AAC at 256 kbit/s in MP4, unless the file is lossy at about
+256 kbit/s or less (its file's rate at most a tenth over): it is sent as
+`original` would send it, as encoding it again only loses more. A
+converted or remuxed file keeps the file's tags and its embedded cover
+(none in Ogg). Conversions are made in the copy pool, one per device
+class and quality, so a second device of the same class gets the same
+file with nothing encoded. The reply's `file` is `{ container, tracks:
+{ audio: [0], subtitles: [] } }`, `container` the file's: `mp4`,
+`flac`, `mp3`, `ogg` or `matroska`. States, events, the `download`
+read and `CancelDownload` are a film's.
+
+`DownloadOptions` for a track gives its `tracks`, `preferred` `{ type:
+chosen, audio: [0], subtitles: [] }`, no `profiles`, its `original`
+(`as_is`, `remux`, or `convert { video: false, audio: [0] }`), and no
+`left_out`.
+
+`MusicDownloadChanges` asks what each thing the device follows holds
+now: the `artists` (every album, those the library gains later
+included), the `playlists` (by id; not All, which is `InvalidInput`)
+and, with `liked`, the user's Liked (which needs `spoolframe:liked`
+too). The reply has one `FollowedChange { followed, tracks }` per
+artist, then per playlist, then Liked, in the order asked; `followed`
+is `{ type: artist, id }`, `{ type: playlist, id }` or `{ type: liked
+}`, and `tracks`:
+
+- `{ type: tracks, tracks }`: every track it holds now, each once, in
+  its order (an artist's albums oldest first, each in disc and track
+  order); the device fetches those it has not and deletes those it has
+  that are not here, unless another download covers them;
+- `{ type: unchanged }`: the same tracks as at `since`;
+- `{ type: gone }`: not on the server, or not the user's to see any
+  more: the device drops the download;
+- `unknown`: one this build does not know: ask again with no cursor.
+
+Nothing on the server records what a device follows, and neither the
+catalog nor the playlists keep a log of what left them, so a change is
+the whole set, not what was added and removed. `cursor` is opaque: send
+it as `since` next time (it carries a hash of each answer); with `since:
+null`, or a cursor the server cannot read, every thing is `tracks`. It
+keeps the hashes of things not asked about this time from `since`, and
+drops a gone one's: one cursor serves every ask, of all the device
+follows or of some, and an ask split in parts sends each part's cursor
+with the next.
+Only tracks the user may see are listed. An id that is not an artist is
+`InvalidInput`; at most 100 artists and playlists together. The device
+asks each time it reaches the server, and while connected: about a
+playlist it downloaded on its `PlaylistChanged` or `PlaylistGone`, about
+Liked on `LikedChanged` (both 2 s later, so a burst of edits is one
+ask), and about every one every 15 minutes, for an artist's new albums.
+
+`SyncOfflinePlays` sends what the device played and liked with no
+server. `device_now` sets its clock right as in "Watching offline":
+each `at` counts as of `server_now - (device_now - at)`, and no later
+than now.
+
+- Each play is an `OfflinePlay { track, at, played_ms }`: when it
+  ended, by the device's clock, and how much was played. It is recorded
+  as a play that ended then (path `offline`), counted by the server's
+  rules for a track from `played_ms`, so play counts, last played and
+  Recently played have it. A play is recorded once by its track, its
+  device and its `at`: sent again, it is `applied` and nothing more is
+  written.
+- Each like is an `OfflineLike { track, liked, at }`: a heart set
+  (`true`) or taken off (`false`) on the device. It is made only when
+  newer than the track's last like or unlike on the server, from any
+  device: newest wins. Likes need `spoolframe:liked` too
+  (`Unsupported` without).
+
+The outcomes, one per play and one per like, in order, are as
+`OfflineWatchSynced`'s: `applied`, `older` (a like the server has a
+newer change for: show the server's), `not_tracked` (not a track, or
+not on the server), or `unknown`. At most 500 plays and likes together.
+Both requests may be sent again on a new connection.
 
 ## Portable identities
 

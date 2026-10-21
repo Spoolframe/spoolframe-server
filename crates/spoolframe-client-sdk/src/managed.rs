@@ -389,6 +389,8 @@ struct Inner {
     /// follows the server's share events (B2). That task holds only a
     /// weak reference, so nothing else would wake it.
     gone: watch::Sender<()>,
+    /// What keeps a track's bytes as they are read (PX-51).
+    keeper: std::sync::OnceLock<Arc<crate::downloads::Keeper>>,
 }
 
 /// A live playback with shared recovery, bounded progress reporting and cleanup.
@@ -599,6 +601,7 @@ impl ManagedPlayback {
             notify: notify.clone(),
             runtime: tokio::runtime::Handle::current(),
             gone: watch::Sender::new(()),
+            keeper: std::sync::OnceLock::new(),
         });
         // A share of the server's uplink that moved (PX-46): a playback in
         // Auto plans itself again where the viewer is, as the viewer's own
@@ -788,10 +791,16 @@ impl ManagedPlayback {
     /// playback the server ended is resumed and the read goes on.
     pub async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
         let backend = &self.0.backend;
-        self.resuming(None, move |p| async move {
-            backend.read(&p.handle, offset, length).await
-        })
-        .await
+        let bytes = self
+            .resuming(None, move |p| async move {
+                backend.read(&p.handle, offset, length).await
+            })
+            .await?;
+        if let Some(keeper) = self.0.keeper.get() {
+            let p = self.snapshot();
+            keeper.direct(&p.plan, p.size, offset, &bytes).await;
+        }
+        Ok(bytes)
     }
     /// A reader remains pinned to its handle and epoch snapshot. On a seek
     /// ([`SdkError::PlaybackRestarted`]) or a resume
@@ -817,6 +826,12 @@ impl ManagedPlayback {
                 self.restart(&p.handle, Restart::Resume { at: None })
                     .await?;
                 Err(self.moved_on(source))
+            }
+            Ok(chunk) => {
+                if let Some(keeper) = self.0.keeper.get() {
+                    keeper.chunk(source, offset, &chunk).await;
+                }
+                Ok(chunk)
             }
             answer => answer,
         }
@@ -1583,7 +1598,14 @@ impl Session {
         selection: Option<Selection>,
         options: PlaybackOptions,
     ) -> Result<ManagedPlayback, SdkError> {
-        ManagedPlayback::open(Arc::new(self.clone()), item.clone(), selection, options).await
+        // A track is kept as it plays, with music downloads (PX-51).
+        let keeper = crate::downloads::Keeper::of(self, item, &options).await;
+        let playback =
+            ManagedPlayback::open(Arc::new(self.clone()), item.clone(), selection, options).await?;
+        if let Some(keeper) = keeper {
+            let _ = playback.0.keeper.set(keeper);
+        }
+        Ok(playback)
     }
 }
 

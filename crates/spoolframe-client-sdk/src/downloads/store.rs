@@ -32,13 +32,21 @@ use super::{DownloadPhase, LocalWatch};
 /// This layout's version, in each manifest.
 const VERSION: u32 = 1;
 const MANIFEST: &str = "manifest.json";
-/// Where a manifest is written before it is renamed over the old one.
-const MANIFEST_NEW: &str = "manifest.json.new";
 const PART: &str = "media.part";
 const ART: &str = "art";
 /// Offline watch entries of downloads deleted before they were sent,
 /// per server and user: sent with the rest on the next sync.
 const CARRIED: &str = "watch.json";
+/// What a user's music downloads follow on a server (PX-51).
+const MUSIC: &str = "music.json";
+/// Plays and likes made with no server, per server and user, not sent
+/// yet (PX-51).
+const OFFLINE_PLAYS: &str = "plays.json";
+/// This device's download settings (PX-51), at the top.
+const SETTINGS: &str = "settings.json";
+/// Tracks being kept as they play, at the top: none is whole, so all are
+/// removed at start.
+const LISTENING_PARTS: &str = "listening";
 
 /// What kind of item an entry stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -46,8 +54,9 @@ const CARRIED: &str = "watch.json";
 pub(crate) enum EntryKind {
     Film,
     Episode,
-    /// A kind a newer build stores (a track): never listed, moved or
-    /// removed here.
+    /// A track (PX-51): downloaded, or kept from listening.
+    Track,
+    /// A kind a newer build stores: never listed, moved or removed here.
     #[serde(other)]
     Unknown,
 }
@@ -58,6 +67,7 @@ impl EntryKind {
         match id.kind() {
             spoolframe_types::MediaKind::Movie => Some(Self::Film),
             spoolframe_types::MediaKind::Episode => Some(Self::Episode),
+            spoolframe_types::MediaKind::Track => Some(Self::Track),
             _ => None,
         }
     }
@@ -67,6 +77,7 @@ impl EntryKind {
         match self {
             Self::Film => "film",
             Self::Episode => "episode",
+            Self::Track => "track",
             Self::Unknown => "unknown",
         }
     }
@@ -91,7 +102,21 @@ impl Hold {
             id: None,
         }
     }
+
+    /// The cache of tracks kept from listening (PX-51).
+    pub fn listening() -> Self {
+        Self {
+            by: LISTENING.into(),
+            id: None,
+        }
+    }
+
+    pub fn is_listening(&self) -> bool {
+        self.by == LISTENING
+    }
 }
+
+const LISTENING: &str = "listening";
 
 /// What every manifest starts with: read first, so one this build cannot
 /// read is left alone rather than logged as broken.
@@ -138,6 +163,29 @@ pub(crate) struct Manifest {
     pub note: Option<String>,
     /// Unix seconds, by this device's clock.
     pub created_at: i64,
+    /// A track's album and artist, as the server had them (PX-51).
+    #[serde(default)]
+    pub album: Option<Item>,
+    #[serde(default)]
+    pub artist: Option<Item>,
+    /// When a track was last played here, Unix seconds by this device's
+    /// clock: the cache lets the least recently played go first.
+    #[serde(default)]
+    pub last_played_at: Option<i64>,
+}
+
+impl Manifest {
+    /// Held by `hold` too, once.
+    pub fn add_hold(&mut self, hold: &Hold) {
+        if !self.holds.contains(hold) {
+            self.holds.push(hold.clone());
+        }
+    }
+
+    /// Kept from listening only: in the cache, under its cap.
+    pub fn cached_only(&self) -> bool {
+        !self.holds.is_empty() && self.holds.iter().all(Hold::is_listening)
+    }
 }
 
 /// A picture kept with a download: `file` in its `art` directory.
@@ -183,6 +231,12 @@ pub(crate) fn key_hash(parts: &[&str]) -> String {
     hasher.finalize().to_hex()[..32].to_owned()
 }
 
+/// The key of the file of track `id` kept from listening: one per
+/// track, whatever was streamed.
+pub(crate) fn kept_key(server: &str, user_id: &str, id: &MediaId) -> String {
+    key_hash(&["listening:1", server, user_id, &id.to_string()])
+}
+
 /// A user id as a directory name: every byte but ASCII letters, digits,
 /// `.`, `_` and `-` as `%XX`, so `local:<uuid>` is one name on every
 /// file system and no id is another's.
@@ -202,10 +256,15 @@ fn dir_name(id: &str) -> String {
     name
 }
 
-/// The extension of a finished file in `container`.
-pub(crate) fn extension(container: Container) -> &'static str {
-    match container {
-        Container::Mp4 => "mp4",
+/// The extension of a finished file of `kind` in `container`.
+pub(crate) fn extension(kind: EntryKind, container: Container) -> &'static str {
+    match (kind, container) {
+        (EntryKind::Track, Container::Mp4) => "m4a",
+        (EntryKind::Track, Container::Flac) => "flac",
+        (EntryKind::Track, Container::Mp3) => "mp3",
+        (EntryKind::Track, Container::Ogg) => "ogg",
+        (EntryKind::Track, _) => "mka",
+        (_, Container::Mp4) => "mp4",
         _ => "mkv",
     }
 }
@@ -254,7 +313,10 @@ impl Store {
     /// The finished file, once the container is known.
     pub fn media(&self, m: &Manifest) -> Option<PathBuf> {
         let container = m.file.as_ref()?.container;
-        Some(self.dir(m).join(format!("media.{}", extension(container))))
+        Some(
+            self.dir(m)
+                .join(format!("media.{}", extension(m.kind, container))),
+        )
     }
 
     pub fn art_dir(&self, m: &Manifest) -> PathBuf {
@@ -263,13 +325,7 @@ impl Store {
 
     /// Write `m`, whole or not at all.
     pub fn write(&self, m: &Manifest) -> std::io::Result<()> {
-        let dir = self.dir(m);
-        std::fs::create_dir_all(&dir)?;
-        let new = dir.join(MANIFEST_NEW);
-        let mut file = std::fs::File::create(&new)?;
-        file.write_all(&serde_json::to_vec_pretty(m).map_err(std::io::Error::other)?)?;
-        file.sync_all()?;
-        std::fs::rename(&new, dir.join(MANIFEST))?;
+        write_json(&self.dir(m).join(MANIFEST), m)?;
         self.note(m, m.phase.is_active());
         Ok(())
     }
@@ -357,6 +413,9 @@ impl Store {
             watch,
             note: None,
             created_at,
+            album: None,
+            artist: None,
+            last_played_at: None,
         }
     }
 
@@ -400,6 +459,20 @@ impl Store {
             }
         }
         None
+    }
+
+    /// `server`'s `user_id`'s track `key`, if there is one: read from
+    /// where it would be, with no other directory looked in.
+    pub fn find_track(&self, server: &str, user_id: &str, key: &str) -> Option<Manifest> {
+        if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let path = self
+            .user_dir(server, user_id)
+            .join(EntryKind::Track.dir())
+            .join(key)
+            .join(MANIFEST);
+        read_manifest(&path).ok().flatten()
     }
 
     /// Let go of `hold` on `m`: with nothing left holding it, it is taken
@@ -453,20 +526,14 @@ impl Store {
         user_id: &str,
         entries: &[OfflineWatch],
     ) -> std::io::Result<()> {
-        let dir = self.user_dir(server, user_id);
-        let path = dir.join(CARRIED);
+        let path = self.user_dir(server, user_id).join(CARRIED);
         if entries.is_empty() {
             return match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
                 _ => Ok(()),
             };
         }
-        std::fs::create_dir_all(&dir)?;
-        let new = dir.join(format!("{CARRIED}.new"));
-        let mut file = std::fs::File::create(&new)?;
-        file.write_all(&serde_json::to_vec(entries).map_err(std::io::Error::other)?)?;
-        file.sync_all()?;
-        std::fs::rename(&new, path)
+        write_json_compact(&path, &entries)
     }
 
     /// The servers and users with offline watch entries of deleted
@@ -502,6 +569,45 @@ impl Store {
         users
     }
 
+    /// What `server`'s `user_id`'s music downloads follow.
+    pub fn music_path(&self, server: &str, user_id: &str) -> PathBuf {
+        self.user_dir(server, user_id).join(MUSIC)
+    }
+
+    /// `server`'s `user_id`'s plays and likes not sent yet.
+    pub fn offline_plays_path(&self, server: &str, user_id: &str) -> PathBuf {
+        self.user_dir(server, user_id).join(OFFLINE_PLAYS)
+    }
+
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join(SETTINGS)
+    }
+
+    /// Where tracks being kept as they play are written.
+    pub fn listening_parts(&self) -> PathBuf {
+        self.root.join(LISTENING_PARTS)
+    }
+
+    /// The servers and users with a file `name` (music, plays) of their
+    /// own.
+    pub fn users_with(&self, name: &str) -> Vec<(String, String)> {
+        let mut users = Vec::new();
+        for server in read_dir(&self.root) {
+            for user in read_dir(&server) {
+                if user.join(name).exists()
+                    && let (Some(s), Some(u)) = (
+                        server.file_name().and_then(|n| n.to_str()),
+                        user.file_name().and_then(|n| n.to_str()),
+                    )
+                    && let (Some(s), Some(u)) = (undo_dir_name(s), undo_dir_name(u))
+                {
+                    users.push((s, u));
+                }
+            }
+        }
+        users
+    }
+
     /// The bytes every download takes on disk.
     pub fn used(&self) -> u64 {
         fn walk(dir: &Path) -> u64 {
@@ -516,6 +622,51 @@ impl Store {
         }
         walk(&self.root)
     }
+}
+
+pub(crate) const MUSIC_FILE: &str = MUSIC;
+pub(crate) const OFFLINE_PLAYS_FILE: &str = OFFLINE_PLAYS;
+
+/// The JSON at `path`; the default if there is none, or it cannot be
+/// read (said so in the log).
+pub(crate) fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(path = %path.display(), error = %e, "a downloads file cannot be read; started over");
+            T::default()
+        }),
+        Err(_) => T::default(),
+    }
+}
+
+/// Write `value` to `path` as JSON, whole or not at all.
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    write_whole(
+        path,
+        &serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?,
+    )
+}
+
+/// [`write_json`] on one line, with no spaces.
+fn write_json_compact<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    write_whole(
+        path,
+        &serde_json::to_vec(value).map_err(std::io::Error::other)?,
+    )
+}
+
+/// Write `bytes` to `path` whole or not at all: to a file beside it,
+/// renamed over it.
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().expect("a file in a directory");
+    std::fs::create_dir_all(dir)?;
+    let mut new = path.as_os_str().to_owned();
+    new.push(".new");
+    let new = PathBuf::from(new);
+    let mut file = std::fs::File::create(&new)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&new, path)
 }
 
 /// [`dir_name`] undone; `None` for a name it would not make.
@@ -582,7 +733,7 @@ pub(crate) async fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// `path`'s SHA-256, as 64 hex digits.
-pub(crate) fn sha256_of(path: &Path) -> std::io::Result<String> {
+fn sha256_of(path: &Path) -> std::io::Result<String> {
     use sha2::Digest;
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
@@ -702,6 +853,40 @@ mod tests {
             &DownloadTracks::All,
         );
         assert_eq!(key, "d36a1f2bce4c77f44634c05b7a6a0f7a");
+        let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
+        assert_eq!(
+            kept_key("s", "u", &track),
+            "ec58120f39c376f8cc3c3e42ff585e75"
+        );
+    }
+
+    /// A track kept from listening and the same track downloaded are two
+    /// entries; each music container has the extension players expect.
+    #[test]
+    fn a_kept_track_has_a_key_of_its_own_and_music_its_own_extensions() {
+        let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
+        let downloaded = key_of(
+            "s",
+            "u",
+            EntryKind::Track,
+            &track,
+            &DownloadSource::Original,
+            &DownloadTracks::All,
+        );
+        assert_ne!(kept_key("s", "u", &track), downloaded);
+        assert_ne!(kept_key("s", "u", &track), kept_key("s", "v", &track));
+        assert_eq!(
+            [
+                Container::Mp4,
+                Container::Flac,
+                Container::Mp3,
+                Container::Ogg,
+                Container::Matroska
+            ]
+            .map(|c| extension(EntryKind::Track, c)),
+            ["m4a", "flac", "mp3", "ogg", "mka"]
+        );
+        assert_eq!(extension(EntryKind::Film, Container::Mp4), "mp4");
     }
 
     #[test]
@@ -727,9 +912,16 @@ mod tests {
         let m = manifest("ab12", 1);
         store.write(&m).unwrap();
         assert_eq!(store.find("ab12"), Some(m.clone()));
+        // Pretty, as builds before wrote it.
+        let written = std::fs::read(store.dir(&m).join(MANIFEST)).unwrap();
+        assert_eq!(written, serde_json::to_vec_pretty(&m).unwrap());
         // A crash while writing the next leaves its new file beside it:
         // the last one whole is what is read.
-        std::fs::write(store.dir(&m).join(MANIFEST_NEW), b"{\"version\":").unwrap();
+        std::fs::write(
+            store.dir(&m).join(format!("{MANIFEST}.new")),
+            b"{\"version\":",
+        )
+        .unwrap();
         assert_eq!(store.scan(), vec![m.clone()]);
         // A directory with no manifest is a download that never started.
         std::fs::create_dir_all(
@@ -797,7 +989,9 @@ mod tests {
             id: Some("plex:album:3".into()),
         };
         let mut m = manifest("ab12", 1);
-        m.holds.push(album.clone());
+        m.add_hold(&album);
+        m.add_hold(&album);
+        assert_eq!(m.holds, [Hold::download(), album.clone()]);
         store.write(&m).unwrap();
         assert!(!store.release(&mut m, &Hold::download()).unwrap());
         assert_eq!(
@@ -809,8 +1003,28 @@ mod tests {
         assert!(!store.dir(&m).exists());
     }
 
-    /// A newer build's entry (a track, or a later layout) is not listed,
-    /// and its directory is left as it is.
+    /// A track is read from its own directory: the same one `find`
+    /// finds, and none of another user's.
+    #[test]
+    fn a_track_is_found_where_it_is() {
+        let store = store("track");
+        let mut m = manifest("ab12", 1);
+        m.kind = EntryKind::Track;
+        store.write(&m).unwrap();
+        assert_eq!(
+            store.find_track("server-key", "local:0f3a", "ab12"),
+            store.find("ab12")
+        );
+        assert!(store.find("ab12").is_some());
+        assert_eq!(store.find_track("server-key", "other", "ab12"), None);
+        assert_eq!(
+            store.find_track("server-key", "local:0f3a", "../ab12"),
+            None
+        );
+    }
+
+    /// A newer build's entry (a kind this one does not know, or a later
+    /// layout) is not listed, and its directory is left as it is.
     #[test]
     fn an_entry_of_a_newer_build_is_left_alone() {
         let store = store("newer");
@@ -821,19 +1035,19 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         json["version"] = (VERSION + 1).into();
         std::fs::write(&path, json.to_string()).unwrap();
-        let track = store
+        let photo = store
             .user_dir("server-key", "local:0f3a")
-            .join("track")
+            .join("photo")
             .join("cd34");
-        std::fs::create_dir_all(&track).unwrap();
+        std::fs::create_dir_all(&photo).unwrap();
         std::fs::write(
-            track.join(MANIFEST),
-            r#"{"version":1,"kind":"track","whatever":true}"#,
+            photo.join(MANIFEST),
+            r#"{"version":1,"kind":"photo","whatever":true}"#,
         )
         .unwrap();
         assert!(store.scan().is_empty());
         assert_eq!(store.find("cd34"), None);
-        assert!(path.exists() && track.join(MANIFEST).exists());
+        assert!(path.exists() && photo.join(MANIFEST).exists());
     }
 
     /// A newer build's manifest this one cannot read whole is left alone;
@@ -864,6 +1078,13 @@ mod tests {
         store.write(&m).unwrap();
         store.remove(&m).unwrap();
         assert!(store.scan().is_empty());
+        // On one line, as builds before wrote it.
+        let written =
+            std::fs::read(store.user_dir("server-key", "local:0f3a").join(CARRIED)).unwrap();
+        assert_eq!(
+            written,
+            serde_json::to_vec(&store.carried("server-key", "local:0f3a")).unwrap()
+        );
         assert_eq!(
             store.carried("server-key", "local:0f3a"),
             vec![OfflineWatch {

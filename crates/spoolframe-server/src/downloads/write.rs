@@ -18,6 +18,8 @@ use tokio::sync::watch;
 
 use spoolframe_media::MediaDescriptor;
 
+use super::music::MusicFormat;
+use crate::encode::args::{BITEXACT_ARGS, PROGRESS_ARGS, QUIET_ARGS};
 use crate::encode::job::{
     Jobs, drain_stderr, jail, keep, launch, link, out_time_us, signal, stopped,
 };
@@ -48,7 +50,6 @@ pub(super) struct Run<'a> {
     pub stored: &'a CopyFiles,
     pub subtitles: &'a [SubtitleFile],
     pub picks: &'a MuxPicks,
-    pub format: MuxFormat,
     /// The most any file of the run may grow to.
     pub max_size: u64,
 }
@@ -62,32 +63,52 @@ pub(super) enum RunError {
     Failed(String),
 }
 
-/// Write `run` into `part`, telling `progress` the fraction of the film
-/// written, until it ends or `stop` says to stop.
+/// A run that cannot set up its inputs.
+fn prepare(e: std::io::Error) -> RunError {
+    RunError::Failed(format!("cannot prepare the file: {e}"))
+}
+
+/// `run`'s directory made, with its media file linked in: the link, and
+/// what the jail lets ffmpeg open as inputs, the real files the links
+/// lead to.
+fn begin(run: &Run<'_>) -> Result<(PathBuf, Vec<PathBuf>), RunError> {
+    std::fs::create_dir_all(run.dir).map_err(prepare)?;
+    let input = run.dir.join("input");
+    link(run.media, &input).map_err(prepare)?;
+    Ok((input, vec![run.media.to_path_buf()]))
+}
+
+/// `path` brought into the run as `at`: copied when it is the server's
+/// own (`own`), else linked, the file noted in `reads`.
+fn bring(path: &Path, at: &Path, own: bool, reads: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if own {
+        std::fs::copy(path, at)?;
+    } else {
+        link(path, at)?;
+        reads.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
+/// Write `run` into `part` as `format`, telling `progress` the fraction
+/// of the film written, until it ends or `stop` says to stop.
 pub(super) async fn write(
     run: &Run<'_>,
+    format: MuxFormat,
     part: &Path,
     progress: impl Fn(Option<f64>),
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), RunError> {
-    let prepare = |e: std::io::Error| RunError::Failed(format!("cannot prepare the file: {e}"));
-    std::fs::create_dir_all(run.dir).map_err(prepare)?;
-    // What the jail lets ffmpeg open as inputs: the real files the links
-    // lead to.
-    let mut reads = vec![run.media.to_path_buf()];
-    let input = run.dir.join("input");
-    link(run.media, &input).map_err(prepare)?;
+    let (input, mut reads) = begin(run)?;
     let mut files = CopyFiles::default();
     if let Some(video) = &run.stored.video {
         let at = run.dir.join("video.mkv");
-        link(video, &at).map_err(prepare)?;
-        reads.push(video.clone());
+        bring(video, &at, false, &mut reads).map_err(prepare)?;
         files.video = Some(at);
     }
     for (stream, audio) in &run.stored.audio {
         let at = run.dir.join(format!("audio-{stream}.mkv"));
-        link(audio, &at).map_err(prepare)?;
-        reads.push(audio.clone());
+        bring(audio, &at, false, &mut reads).map_err(prepare)?;
         files.audio.insert(*stream, at);
     }
     let mut inputs = MuxInputs::new(&input, &files);
@@ -97,29 +118,69 @@ pub(super) async fn write(
             .extension()
             .map_or_else(String::new, |e| format!(".{}", e.to_string_lossy()));
         let at = run.dir.join(format!("subtitle-{}{ext}", sub.position));
-        if sub.own {
-            std::fs::copy(&sub.path, &at).map_err(prepare)?;
-        } else {
-            link(&sub.path, &at).map_err(prepare)?;
-            reads.push(sub.path.clone());
-        }
+        bring(&sub.path, &at, sub.own, &mut reads).map_err(prepare)?;
         if sub.vobsub {
             // ffmpeg finds the pictures by the `.idx`'s name.
             let pictures = sub.path.with_extension("sub");
-            let beside = at.with_extension("sub");
-            if sub.own {
-                std::fs::copy(&pictures, &beside).map_err(prepare)?;
-            } else {
-                link(&pictures, &beside).map_err(prepare)?;
-                reads.push(pictures);
-            }
+            bring(&pictures, &at.with_extension("sub"), sub.own, &mut reads).map_err(prepare)?;
         }
         inputs = inputs.with_subtitle(sub.position, at);
     }
-    let args = mux_args_as(run.descriptor, &inputs, run.picks, run.format, part);
-    let jail = jail(run.max_size, run.dir, &[], &reads);
+    let args = mux_args_as(run.descriptor, &inputs, run.picks, format, part);
+    remux(run, &reads, &args, progress, stop).await
+}
+
+/// Write track `run` (PX-51) into `part` as `format`: its audio from the
+/// copy's stored track when it has one, else from the file, with the
+/// file's tags and its cover where `format` takes one. Nothing encoded.
+pub(super) async fn write_music(
+    run: &Run<'_>,
+    format: MusicFormat,
+    part: &Path,
+    progress: impl Fn(Option<f64>),
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), RunError> {
+    let (input, mut reads) = begin(run)?;
+    let mut args: Vec<String> = QUIET_ARGS.map(String::from).to_vec();
+    args.extend(PROGRESS_ARGS.map(String::from));
+    args.extend([String::from("-i"), input.display().to_string()]);
+    let stream = run.descriptor.audio.first().map_or(0, |a| a.index);
+    let audio = match run.stored.audio.get(&stream) {
+        Some(stored) => {
+            let at = run.dir.join(format!("audio-{stream}.mkv"));
+            bring(stored, &at, false, &mut reads).map_err(prepare)?;
+            args.extend([String::from("-i"), at.display().to_string()]);
+            "1:a:0".to_owned()
+        }
+        None => format!("0:{stream}"),
+    };
+    args.extend([String::from("-map"), audio]);
+    if format.takes_cover() {
+        // The cover is a picture stream of the file's, when it has one.
+        args.extend(["-map", "0:v?", "-disposition:v", "attached_pic"].map(String::from));
+    }
+    args.extend(["-c", "copy", "-map_metadata", "0"].map(String::from));
+    args.extend(BITEXACT_ARGS.map(String::from));
+    args.extend([
+        String::from("-f"),
+        format.muxer().to_owned(),
+        part.display().to_string(),
+    ]);
+    remux(run, &reads, &args, progress, stop).await
+}
+
+/// Run ffmpeg with `args` in `run`'s jail, reading `reads`, telling
+/// `progress` the fraction written, until it ends or `stop` says to stop.
+async fn remux(
+    run: &Run<'_>,
+    reads: &[PathBuf],
+    args: &[String],
+    progress: impl Fn(Option<f64>),
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), RunError> {
+    let jail = jail(run.max_size, run.dir, &[], reads);
     let ffmpeg = run.jobs.ffmpeg();
-    let mut child = launch(ffmpeg, &jail, &args).map_err(|e| {
+    let mut child = launch(ffmpeg, &jail, args).map_err(|e| {
         RunError::Failed(format!(
             "ffmpeg could not be run: {}: {e}",
             ffmpeg.program().display()

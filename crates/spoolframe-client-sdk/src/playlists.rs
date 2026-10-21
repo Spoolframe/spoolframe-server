@@ -30,8 +30,8 @@
 //! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    DOWNLOADS, LAST_VIEWED, LIKED, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING, PLAYLIST_UPCOMING,
-    PLAYLISTS, SUBTITLE_SEARCH, SUBTITLE_SYNC,
+    DOWNLOADS, LAST_VIEWED, LIKED, MUSIC_DOWNLOADS, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING,
+    PLAYLIST_UPCOMING, PLAYLISTS, SUBTITLE_SEARCH, SUBTITLE_SYNC,
 };
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
@@ -86,6 +86,11 @@ pub struct Features {
     /// [`Session::download_options`] and [`crate::Client::download_events`].
     /// Only an iPhone, iPad, Mac or Linux app downloads.
     pub downloads: bool,
+    /// Music offline (PX-51): tracks, albums, artists, playlists and
+    /// Liked downloaded ([`crate::Downloads::start_music`]), tracks kept
+    /// from listening, the offline library, and plays and likes made with
+    /// no server sent later. Needs `downloads` too.
+    pub music_downloads: bool,
 }
 
 impl Features {
@@ -102,6 +107,7 @@ impl Features {
             (self.subtitle_search, SUBTITLE_SEARCH),
             (self.playlist_upcoming, PLAYLIST_UPCOMING),
             (self.downloads, DOWNLOADS),
+            (self.music_downloads, MUSIC_DOWNLOADS),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -129,6 +135,7 @@ impl Features {
             subtitle_search: self.subtitle_search && other.subtitle_search,
             playlist_upcoming: self.playlist_upcoming && other.playlist_upcoming,
             downloads: self.downloads && other.downloads,
+            music_downloads: self.music_downloads && other.music_downloads,
         }
         .needing_playlists()
     }
@@ -148,13 +155,16 @@ impl Features {
             subtitle_search: has(SUBTITLE_SEARCH),
             playlist_upcoming: has(PLAYLIST_UPCOMING),
             downloads: has(DOWNLOADS),
+            music_downloads: has(MUSIC_DOWNLOADS),
         }
         .needing_playlists()
     }
 
-    /// Off what needs playlists, without them: Liked and sharing.
+    /// Off what needs playlists, without them: Liked and sharing; and
+    /// music downloads without downloads.
     fn needing_playlists(self) -> Self {
         Self {
+            music_downloads: self.music_downloads && self.downloads,
             liked: self.liked && self.playlists,
             playlist_sharing: self.playlist_sharing && self.playlists,
             playlist_art: self.playlist_art && self.playlists,
@@ -633,6 +643,9 @@ mod tests {
         // Downloads stand alone too.
         assert!(Features::of(&[DOWNLOADS.to_owned()]).downloads);
         assert!(!Features::of(&[PLAYLISTS.to_owned()]).downloads);
+        // Music downloads are downloads too: alone, none.
+        assert!(Features::of(&[DOWNLOADS.to_owned(), MUSIC_DOWNLOADS.to_owned()]).music_downloads);
+        assert!(!Features::of(&[MUSIC_DOWNLOADS.to_owned()]).music_downloads);
         assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
         assert_eq!(Features::of(&[]), Features::default());
     }
@@ -640,7 +653,10 @@ mod tests {
     #[test]
     fn an_app_lists_only_what_it_set_and_has_only_what_both_list() {
         assert!(Features::default().names().is_empty());
-        let all = spoolframe_protocol::features::names(spoolframe_protocol::features::ALL);
+        // Every feature but music downloads, which this SDK takes up with
+        // PX-51's SDK stage.
+        let all: Vec<String> =
+            spoolframe_protocol::features::names(spoolframe_protocol::features::ALL);
         let every = Features::of(&all);
         assert_eq!(every.names(), all);
         assert_eq!(Features::of(&every.names()), every);

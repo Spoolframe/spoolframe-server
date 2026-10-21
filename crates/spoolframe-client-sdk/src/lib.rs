@@ -46,6 +46,12 @@ pub use downloads::{
     DownloadEvent, DownloadPhase, DownloadSpace, Downloads, LocalArtwork, LocalDownload,
     LocalWatch, SyncedWatch,
 };
+// Music offline (PX-51), and its wire types.
+pub use downloads::{
+    CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
+    MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
+    OfflinePlaylist, OfflineTrack, SyncedPlay,
+};
 pub use error::SdkError;
 pub use experimental::{Experimental, HttpPlayback, HttpPlaybackRefusal};
 pub use invite_admin::{
