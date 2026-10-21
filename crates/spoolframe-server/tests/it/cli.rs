@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 
 fn server() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spoolframe-server"));
+    let mut cmd = Command::new(crate::support::server_binary());
     for var in [
         "SPOOLFRAME_CONFIG",
         "SPOOLFRAME_STATE_DIR",

@@ -130,10 +130,27 @@ pub fn tool(program: &Path, sandbox: &Sandbox) -> Tool {
     }
 }
 
+/// The server's binary. `CARGO_BIN_EXE_*` is where cargo built it, fixed
+/// at compile time; a test run from a nextest archive (CI builds the tests
+/// once, and each third runs them elsewhere) has it where nextest
+/// extracted it, which nextest says at run time.
+pub fn server_binary() -> std::path::PathBuf {
+    [
+        "NEXTEST_BIN_EXE_spoolframe-server",
+        "NEXTEST_BIN_EXE_spoolframe_server",
+    ]
+    .iter()
+    .find_map(std::env::var_os)
+    .map_or_else(
+        || env!("CARGO_BIN_EXE_spoolframe-server").into(),
+        std::path::PathBuf::from,
+    )
+}
+
 /// The server's own binary as its subtitle decoder (finding 45), confined
 /// in `sandbox` as the server confines it.
 pub fn decoder(sandbox: &Sandbox) -> Tool {
-    Tool::new(env!("CARGO_BIN_EXE_spoolframe-server"), sandbox.clone())
+    Tool::new(server_binary(), sandbox.clone())
 }
 
 /// A search of everything for `query`, up to 10 per group.
