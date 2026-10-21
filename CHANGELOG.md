@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## 0.14.1 (2026-10-21)
+
+- SDK: a downloaded file belongs to the device, not to a user. Two
+  profiles that download the same film, episode or track share one
+  file. Each profile holds it, with its own watch state, and it goes
+  when the last one lets go. Tracks kept from listening are one per
+  track and device, and every profile may play them. 0.14.0's per-user
+  downloads are moved when the client opens, and copies of the same
+  file are merged.
+- SDK: a profile whose PIN is asked for on this device stays locked
+  offline (PX-60). `Downloads::set_profile` says whose downloads the
+  views and events show. A locked profile shows none, and its
+  downloads are `SdkError::ProfileLocked`, until one of these unlocks
+  it:
+  - `Downloads::unlock_offline(pin)`, checked against the PIN that last
+    unlocked it online on this device;
+  - `Downloads::unlock_offline_by_owner()`, after the app checks the
+    device owner (Face ID, Touch ID, the passcode).
+  After 3 wrong PINs each next one waits. After 10, the profile stays
+  locked until it is unlocked online. The setting is per profile and
+  per device: a profile left open on its owner's phone stays open
+  offline. New error `SdkError::NoOfflinePin`.
+- SDK: a track played direct is read ahead whole from its first read,
+  so it is in the cache before it has played to its end. The player's
+  reads then come from what is on the device. A track skipped after it
+  arrived whole is kept.
+- SDK: `Downloads::space().used` counts the downloads' files. Before,
+  it was always 0.
+- SDK: a download the server is still converting no longer holds up
+  the ones behind it. An album started during an episode's conversion
+  downloads meanwhile, and its tracks download in the album's order.
+- Server: in an Apple download, a subtitle from OpenSubtitles (or any
+  subtitle file named with a two-letter language) now carries its
+  language. Before, MP4 dropped two-letter codes. The subtitle that
+  playback picks for the viewer is the file's only default track.
+  Before, the file kept its own default flags.
+
 ## 0.14.0 (2026-10-20)
 
 - The All playlist opens quickly on a large music library; before, a
