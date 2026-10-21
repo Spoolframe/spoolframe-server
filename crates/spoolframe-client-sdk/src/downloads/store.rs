@@ -191,6 +191,10 @@ pub(crate) struct Manifest {
     pub note: Option<String>,
     /// Unix seconds, by this device's clock.
     pub created_at: i64,
+    /// Its place among what was started with it, in the same second: an
+    /// album's tracks in the album's order. They move in that order.
+    #[serde(default)]
+    pub place: u32,
     /// A track's album and artist, as the server had them (PX-51).
     #[serde(default)]
     pub album: Option<Item>,
@@ -337,14 +341,14 @@ pub(crate) fn extension(kind: EntryKind, container: Container) -> &'static str {
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     root: PathBuf,
-    /// The downloads under way, as `(created_at, key)`: read from the
+    /// The downloads under way, as `(created_at, place, key)`: read from the
     /// disk at first use, then kept by each write and removal here, so
     /// the manager need not read every manifest to find the next.
     active: Arc<Mutex<Option<Active>>>,
 }
 
-/// Downloads by `(created_at, key)`: oldest first.
-type Active = BTreeSet<(i64, String)>;
+/// Downloads by `(created_at, place, key)`: oldest first.
+type Active = BTreeSet<(i64, u32, String)>;
 
 impl Store {
     pub fn new(root: PathBuf) -> Self {
@@ -476,10 +480,10 @@ impl Store {
             self.scan()
                 .into_iter()
                 .filter(|m| m.phase.is_active())
-                .map(|m| (m.created_at, m.key))
+                .map(|m| (m.created_at, m.place, m.key))
                 .collect()
         });
-        active.iter().map(|(_, key)| key.clone()).collect()
+        active.iter().map(|(_, _, key)| key.clone()).collect()
     }
 
     /// Download `key` was found not under way: changed or removed by
@@ -492,14 +496,14 @@ impl Store {
         if let Some(active) = active.as_mut()
             && !self.find(key).is_some_and(|m| m.phase.is_active())
         {
-            active.retain(|(_, k)| k != key);
+            active.retain(|(_, _, k)| k != key);
         }
     }
 
     /// `m` is under way, or no longer.
     fn note(&self, m: &Manifest, under_way: bool) {
         if let Some(active) = self.active.lock().as_mut() {
-            let entry = (m.created_at, m.key.clone());
+            let entry = (m.created_at, m.place, m.key.clone());
             if under_way {
                 active.insert(entry);
             } else {
@@ -551,6 +555,7 @@ impl Store {
             },
             note: None,
             created_at,
+            place: 0,
             album: None,
             artist: None,
             last_played_at: None,
@@ -575,7 +580,7 @@ impl Store {
                 }
             }
         }
-        found.sort_by(|a, b| (a.created_at, &a.key).cmp(&(b.created_at, &b.key)));
+        found.sort_by(|a, b| (a.created_at, a.place, &a.key).cmp(&(b.created_at, b.place, &b.key)));
         found
     }
 
@@ -762,11 +767,15 @@ impl Store {
 
     /// The bytes every download takes on disk.
     pub fn used(&self) -> u64 {
+        // Every entry, files too: `read_dir` gives directories alone.
         fn walk(dir: &Path) -> u64 {
-            read_dir(dir)
-                .into_iter()
-                .map(|path| match std::fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.is_dir() => walk(&path),
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .map(|e| match e.metadata() {
+                    Ok(meta) if meta.is_dir() => walk(&e.path()),
                     Ok(meta) => meta.len(),
                     Err(_) => 0,
                 })
@@ -1107,6 +1116,23 @@ mod tests {
         assert_eq!(keys, ["aa", "bb"]);
     }
 
+    /// An album's tracks, started in the same second, move in the album's
+    /// order, not their keys'.
+    #[test]
+    fn what_was_started_together_moves_in_its_own_order() {
+        let store = store("place");
+        let mut first = manifest("ff", 10);
+        let mut second = manifest("aa", 10);
+        (first.place, second.place) = (0, 1);
+        store.write(&second).unwrap();
+        store.write(&first).unwrap();
+        assert_eq!(store.active(), ["ff", "aa"]);
+        let fresh = Store::new(store.root().to_path_buf());
+        assert_eq!(fresh.active(), ["ff", "aa"]);
+        let keys: Vec<String> = store.scan().into_iter().map(|m| m.key).collect();
+        assert_eq!(keys, ["ff", "aa"]);
+    }
+
     /// What is under way is kept as each download is written and removed,
     /// and is what a fresh read of the disk finds.
     #[test]
@@ -1424,6 +1450,19 @@ mod tests {
         store.write(&sent).unwrap();
         store.remove(&sent).unwrap();
         assert_eq!(store.carried("server-key", "local:0f3a").len(), 1);
+    }
+
+    /// What the downloads take is every file's bytes, however deep.
+    #[test]
+    fn the_space_used_counts_every_file() {
+        let store = store("used");
+        let m = manifest("ab12", 1);
+        store.write(&m).unwrap();
+        let manifest_len = std::fs::metadata(store.dir(&m).join(MANIFEST))
+            .unwrap()
+            .len();
+        std::fs::write(store.dir(&m).join("media.mkv"), vec![0u8; 1000]).unwrap();
+        assert_eq!(store.used(), manifest_len + 1000);
     }
 
     #[tokio::test]

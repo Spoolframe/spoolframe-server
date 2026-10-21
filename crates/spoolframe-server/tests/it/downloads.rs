@@ -135,6 +135,7 @@ async fn prepare(
             source,
             tracks,
             bitmap,
+            default_subtitle: None,
         })
         .await
         .unwrap()
@@ -233,6 +234,63 @@ async fn an_apple_download_of_one_audio_and_two_subtitles_is_an_mp4_with_exactly
                 .map(String::from)
                 .to_vec(),
             ["und", "und", "eng", "fre"].map(String::from).to_vec()
+        )
+    );
+    server.stop().await;
+}
+
+/// sf-ios, 2026-10-21: a subtitle from OpenSubtitles (a file of its own,
+/// its language in two letters) says its language in the Apple file, and
+/// the viewer's pick is the one default track: not the file's own
+/// default.
+#[tokio::test]
+async fn an_apple_download_names_every_subtitle_s_language_and_marks_the_viewer_s_pick_default() {
+    let server = server("downloads-apple-pick", ServerOptions::default()).await;
+    write_film(&server);
+    let mut descriptor = describe(&server.media).await;
+    let srt = server.media.with_file_name("opensubtitles-en.srt");
+    std::fs::write(&srt, "1\n00:00:00,500 --> 00:00:01,500\nHello\n").unwrap();
+    descriptor.subtitles[0].default = true;
+    descriptor.subtitles.push(spoolframe_media::SubtitleStream {
+        source: spoolframe_media::SubtitleSource::External { path: srt },
+        language: Some("en".into()),
+        title: Some("OpenSubtitles".into()),
+        default: false,
+        ..descriptor.subtitles[0].clone()
+    });
+    let media_id = movie().id().to_string();
+    let prepared = server
+        .downloads
+        .prepare(PrepareRequest {
+            principal: alice(),
+            media_id: &media_id,
+            media: &server.media,
+            descriptor: &descriptor,
+            class: DeviceClass::Apple,
+            capabilities: None,
+            source: Source::Original,
+            tracks: Tracks::Chosen {
+                audio: vec![0],
+                subtitles: vec![0, 3],
+            },
+            bitmap: BitmapPreference::Text,
+            default_subtitle: Some(3),
+        })
+        .await
+        .unwrap();
+    let (file, _) = ready(&server, &prepared.id).await;
+    assert_eq!(
+        (
+            probe(&file, "stream=codec_name"),
+            probe(&file, "stream_tags=language"),
+            probe(&file, "stream_disposition=default"),
+        ),
+        (
+            ["h264", "aac", "mov_text", "mov_text"]
+                .map(String::from)
+                .to_vec(),
+            ["und", "und", "eng", "eng"].map(String::from).to_vec(),
+            ["1", "1", "0", "1"].map(String::from).to_vec(),
         )
     );
     server.stop().await;

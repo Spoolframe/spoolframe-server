@@ -5553,6 +5553,16 @@ impl ClientProtocol {
             .track_preferences(principal)
             .await
             .map_err(internal)?;
+        let scope = self.override_scope(id).await?;
+        let override_ = self
+            .store()
+            .track_override(principal, &scope)
+            .await
+            .map_err(internal)?;
+        let default_subtitle =
+            crate::tracks::choose(&descriptor.tracks(), &preferences, override_.as_ref())
+                .selection
+                .subtitle;
         let caps = capabilities(state, None);
         let media_id = id.to_string();
         let prepared = self
@@ -5568,6 +5578,7 @@ impl ClientProtocol {
                 source,
                 tracks,
                 bitmap: preferences.subtitles.bitmap,
+                default_subtitle,
             })
             .await;
         prepared_info(prepared, class)

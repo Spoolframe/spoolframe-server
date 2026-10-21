@@ -49,7 +49,7 @@ use spoolframe_types::{AudioCodec, BitmapPreference, ClientCapabilities, Contain
 
 use crate::config::DownloadSettings;
 use crate::encode::job::{JobError, Jobs, Load, remove_file, stopped};
-use crate::optimized::mux::{MuxFormat, MuxPicks};
+use crate::optimized::mux::{DefaultSubtitle, MuxFormat, MuxPicks};
 use crate::optimized::{CopyFiles, Pool};
 use crate::principal::Principal;
 use crate::store::downloads::{DownloadRow, NewDownload, Of, StoredState};
@@ -206,6 +206,9 @@ pub struct PrepareRequest<'a> {
     pub tracks: Tracks,
     /// The viewer's PX-13 choice for picture subtitles.
     pub bitmap: BitmapPreference,
+    /// The subtitle playback picks for the viewer, by its position in
+    /// the descriptor: the one the file marks default, if it carries it.
+    pub default_subtitle: Option<u32>,
 }
 
 /// A track's download asked for (PX-51).
@@ -677,6 +680,14 @@ impl Downloads {
                 }
             }
         };
+        // The viewer's pick is the file's default: two users who pick
+        // differently get two files.
+        let default_subtitle = request
+            .default_subtitle
+            .filter(|position| written.contains(position));
+        if let Some(position) = default_subtitle {
+            parts.push(format!("default-subtitle:{position}"));
+        }
         let content_key = crate::files::hash_parts(&parts).to_hex().to_string();
         let carried = Carried {
             audio: audio.clone(),
@@ -701,6 +712,7 @@ impl Downloads {
             picks: MuxPicks {
                 audio: Some(audio),
                 subtitles: Some(written),
+                default_subtitle: DefaultSubtitle::Only(default_subtitle),
             },
             sidecars,
             ocr,
@@ -771,6 +783,7 @@ impl Downloads {
             picks: MuxPicks {
                 audio: Some(vec![0]),
                 subtitles: Some(Vec::new()),
+                default_subtitle: DefaultSubtitle::Only(None),
             },
             sidecars: Vec::new(),
             ocr: Vec::new(),

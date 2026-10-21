@@ -111,6 +111,19 @@ pub struct MuxPicks {
     /// The embedded subtitles, by their position in the descriptor; every
     /// one ffmpeg can write when `None`.
     pub subtitles: Option<Vec<u32>>,
+    /// Which subtitle players show first.
+    pub default_subtitle: DefaultSubtitle,
+}
+
+/// Which subtitle of a mux is marked default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultSubtitle {
+    /// Each as the media file marks it.
+    AsTheFile,
+    /// This one alone, by its position in the descriptor (a download's:
+    /// the one playback picks for its viewer, PX-38); none for `None`.
+    /// Forced ones stay forced.
+    Only(Option<u32>),
 }
 
 impl MuxPicks {
@@ -119,7 +132,37 @@ impl MuxPicks {
     pub const ALL: Self = Self {
         audio: None,
         subtitles: None,
+        default_subtitle: DefaultSubtitle::AsTheFile,
     };
+}
+
+/// ffmpeg's `-disposition` of a track `forced`, and `default`.
+fn disposition(forced: bool, default: bool) -> &'static str {
+    match (forced, default) {
+        (true, true) => "default+forced",
+        (true, false) => "forced",
+        (false, true) => "default",
+        (false, false) => "0",
+    }
+}
+
+/// `-metadata:s:<at>` for a track's language and title. The language as
+/// ISO 639-2: a file beside the media is often named in two letters.
+fn tags(at: usize, language: &Option<String>, title: &Option<String>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(language) = language {
+        args.extend([
+            format!("-metadata:s:{at}"),
+            format!(
+                "language={}",
+                spoolframe_types::language::iso639_2(language)
+            ),
+        ]);
+    }
+    if let Some(title) = title {
+        args.extend([format!("-metadata:s:{at}"), format!("title={title}")]);
+    }
+    args
 }
 
 /// The file a mux writes.
@@ -187,12 +230,7 @@ pub fn mux_args_as(
         let (map, stored) = inputs.audio(track.index);
         args.extend([s("-map"), map]);
         if stored {
-            let tags = [("language", &track.language), ("title", &track.title)];
-            for (key, value) in tags {
-                if let Some(value) = value {
-                    args.extend([format!("-metadata:s:{at}"), format!("{key}={value}")]);
-                }
-            }
+            args.extend(tags(at, &track.language, &track.title));
             args.extend([
                 format!("-disposition:{at}"),
                 s(if track.default { "default" } else { "0" }),
@@ -209,22 +247,18 @@ pub fn mux_args_as(
         if !picked {
             continue;
         }
+        let default = match picks.default_subtitle {
+            DefaultSubtitle::AsTheFile => track.default,
+            DefaultSubtitle::Only(chosen) => chosen == Some(position),
+        };
         // A file of its own stands in for it, named as the track is.
         if let Some(input) = inputs.index(&Read::Subtitle(position)) {
             args.extend([s("-map"), format!("{input}:0")]);
-            let tags = [("language", &track.language), ("title", &track.title)];
-            for (key, value) in tags {
-                if let Some(value) = value {
-                    args.extend([format!("-metadata:s:{at}"), format!("{key}={value}")]);
-                }
-            }
-            let disposition = match (track.forced, track.default) {
-                (true, true) => "default+forced",
-                (true, false) => "forced",
-                (false, true) => "default",
-                (false, false) => "0",
-            };
-            args.extend([format!("-disposition:{at}"), s(disposition)]);
+            args.extend(tags(at, &track.language, &track.title));
+            args.extend([
+                format!("-disposition:{at}"),
+                s(disposition(track.forced, default)),
+            ]);
             at += 1;
             continue;
         }
@@ -235,6 +269,16 @@ pub fn mux_args_as(
             continue;
         }
         args.extend([s("-map"), format!("0:{index}")]);
+        if matches!(picks.default_subtitle, DefaultSubtitle::Only(_)) {
+            args.extend([
+                format!("-disposition:{at}"),
+                s(disposition(track.forced, default)),
+            ]);
+        }
+        if mp4 {
+            // As ISO 639-2, which the MP4 muxer alone writes.
+            args.extend(tags(at, &track.language, &None));
+        }
         at += 1;
     }
     if !mp4 {
@@ -386,6 +430,7 @@ mod tests {
         let picks = MuxPicks {
             audio: Some(vec![1]),
             subtitles: Some(Vec::new()),
+            default_subtitle: DefaultSubtitle::AsTheFile,
         };
         let args = args(&picks);
         let maps: Vec<&str> = args
@@ -429,6 +474,7 @@ mod tests {
         let picks = MuxPicks {
             audio: Some(Vec::new()),
             subtitles: Some(vec![0]),
+            default_subtitle: DefaultSubtitle::AsTheFile,
         };
         let inputs = film_alone().with_subtitle(0, "/run/sub-0.srt".into());
         let args = mp4(&picks, inputs);
@@ -438,6 +484,43 @@ mod tests {
             .map(|w| w[1].as_str())
             .collect();
         assert_eq!(maps, ["0:0", "1:0"]);
+    }
+
+    /// sf-ios, 2026-10-21: in an Apple download the OpenSubtitles track
+    /// (a file named `en`) had no language, and the file's Spanish was
+    /// marked default though the viewer's pick was the English.
+    #[test]
+    fn a_download_s_subtitles_say_their_language_in_three_letters_and_the_pick_is_default() {
+        let mut film = film();
+        film.subtitles[0].language = Some("spa".into());
+        film.subtitles[0].default = true;
+        film.subtitles.push(SubtitleStream {
+            source: SubtitleSource::External {
+                path: "/subs/1.srt".into(),
+            },
+            language: Some("en".into()),
+            title: Some("OpenSubtitles".into()),
+            ..film.subtitles[0].clone()
+        });
+        film.subtitles[2].default = false;
+        let picks = MuxPicks {
+            audio: Some(Vec::new()),
+            subtitles: Some(vec![0, 2]),
+            default_subtitle: DefaultSubtitle::Only(Some(2)),
+        };
+        let inputs = film_alone().with_subtitle(2, "/run/subtitle-2.srt".into());
+        let args = mux_args_as(
+            &film,
+            &inputs,
+            &picks,
+            MuxFormat::Mp4 { hvc1: false },
+            Path::new("/out.mp4"),
+        );
+        // Output streams: the video (0), the Spanish (1), the English (2).
+        assert!(has(&args, &["-disposition:1", "0"]), "{args:?}");
+        assert!(has(&args, &["-metadata:s:1", "language=spa"]), "{args:?}");
+        assert!(has(&args, &["-metadata:s:2", "language=eng"]), "{args:?}");
+        assert!(has(&args, &["-disposition:2", "default"]), "{args:?}");
     }
 
     #[test]

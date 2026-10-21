@@ -446,6 +446,7 @@ impl Downloads {
             .await?;
         shared.stopping.lock().remove(key);
         shared.retry_at.lock().remove(key);
+        shared.check_at.lock().remove(key);
         shared.wake.notify_one();
         Ok(shared.view(&m))
     }
@@ -522,6 +523,7 @@ impl Downloads {
         };
         shared.stopping.lock().remove(&key);
         shared.retry_at.lock().remove(&key);
+        shared.check_at.lock().remove(&key);
         if removed {
             let _ = shared.events.send(DownloadEvent::Removed { key });
         } else {
@@ -561,6 +563,7 @@ impl Downloads {
         let shared = self.shared();
         let store = shared.store()?;
         shared.retry_at.lock().clear();
+        shared.check_at.lock().clear();
         shared.wake.notify_one();
         let mut closed = shared.closed.subscribe();
         loop {
@@ -733,6 +736,9 @@ pub(crate) struct Shared {
     claims: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Downloads waiting to try again: when, and the wait after that.
     retry_at: Mutex<HashMap<String, (tokio::time::Instant, Duration)>>,
+    /// When each download the server is still making is asked about
+    /// again; a server event asks about them all at once.
+    check_at: Mutex<HashMap<String, tokio::time::Instant>>,
     /// Bytes on disk of the download being transferred, ahead of its
     /// manifest.
     received: Mutex<HashMap<String, u64>>,
@@ -779,6 +785,7 @@ impl Shared {
             interrupt: watch::Sender::new(0),
             claims: Mutex::default(),
             retry_at: Mutex::default(),
+            check_at: Mutex::default(),
             received: Mutex::default(),
             sync_wanted: Mutex::default(),
             free_space: Mutex::default(),

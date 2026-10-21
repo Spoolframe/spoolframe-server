@@ -35,8 +35,13 @@ const LONGEST_WAIT: Duration = Duration::from_secs(5 * 60);
 
 /// Until the client is closed or gone: send what is wanted of offline
 /// watch, then move the next download due, else wait for something to
-/// do.
+/// do. A download the server is still making is asked about again after
+/// [`POLL`] or when the server says it moved, and the ones behind it go
+/// on meanwhile: an episode converting for half an hour holds up no
+/// album.
 pub(super) async fn run(client: Weak<Inner>, shared: Arc<Shared>) {
+    // Before anything is prepared: an event sent meanwhile is not missed.
+    let mut server_events = shared.server_events.subscribe();
     if let Some(store) = &shared.store {
         let mut users = store.carried_users();
         users.extend(music::users_to_sync(store));
@@ -93,6 +98,13 @@ pub(super) async fn run(client: Weak<Inner>, shared: Arc<Shared>) {
                 tokio::select! {
                     () = shared.wake.notified() => {}
                     () = sleep_until(until) => {}
+                    change = server_events.recv() => {
+                        // A preparation moved (or events were missed): every
+                        // one being made is asked about now.
+                        if !matches!(change, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            shared.check_at.lock().clear();
+                        }
+                    }
                     _ = closed.wait_for(|closed| *closed) => return,
                 }
             }
@@ -128,11 +140,13 @@ fn next(shared: &Shared) -> Next {
         if shared.stopping.lock().contains(&key) {
             continue;
         }
-        match shared.retry_at.lock().get(&key) {
-            Some((at, _)) if *at > now => {
-                soonest = Some(soonest.map_or(*at, |s: tokio::time::Instant| s.min(*at)));
+        let retry = shared.retry_at.lock().get(&key).map(|(at, _)| *at);
+        let check = shared.check_at.lock().get(&key).copied();
+        match retry.into_iter().chain(check).filter(|at| *at > now).max() {
+            Some(at) => {
+                soonest = Some(soonest.map_or(at, |s: tokio::time::Instant| s.min(at)));
             }
-            _ => return Next::Drive(key),
+            None => return Next::Drive(key),
         }
     }
     Next::Wait(soonest)
@@ -174,6 +188,7 @@ async fn drive(client: &Client, shared: &Arc<Shared>, key: &str) {
         match step {
             Ok(Step::Continue) => {
                 shared.retry_at.lock().remove(key);
+                shared.check_at.lock().remove(key);
             }
             Ok(Step::Stop) => return,
             Err(e) => {
@@ -463,26 +478,19 @@ async fn preparing(shared: &Shared, session: &Session, m: Manifest) -> Result<St
         DownloadPhase::Preparing { .. } => {}
         _ => return Ok(Step::Stop),
     }
-    let mut interrupt = shared.interrupt.subscribe();
+    // Told it moved while asking: asked again at once.
     let server = session.server;
-    let told = async {
-        loop {
-            match events.recv().await {
-                Ok(change) if change.server == server && change.id == id => return,
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    std::future::pending::<()>().await
-                }
-            }
+    while let Ok(change) = events.try_recv() {
+        if change.server == server && change.id == id {
+            return Ok(Step::Continue);
         }
-    };
-    tokio::select! {
-        () = told => {}
-        () = tokio::time::sleep(POLL) => {}
-        _ = interrupt.changed() => {}
     }
-    Ok(Step::Continue)
+    // Still being made: the others go on until it is asked about again.
+    shared
+        .check_at
+        .lock()
+        .insert(m.key.clone(), tokio::time::Instant::now() + POLL);
+    Ok(Step::Stop)
 }
 
 /// Read `m`'s file from where it stopped, check it whole and keep it.
@@ -853,6 +861,63 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sf-ios, 2026-10-21: album tracks sat waiting behind an episode the
+    /// server took half an hour to convert. One still being made lets the
+    /// next go until it is asked about again.
+    #[tokio::test]
+    async fn a_download_the_server_is_still_making_lets_the_next_one_go() {
+        let dir = std::env::temp_dir().join(format!("sf-sdk-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Shared::new(Some(dir));
+        let store = shared.store().unwrap();
+        let film = Item::Movie(spoolframe_types::Movie {
+            id: MediaId::new(
+                spoolframe_types::Namespace::Plex,
+                spoolframe_types::MediaKind::Movie,
+                "1",
+            )
+            .unwrap(),
+            title: "Alien".into(),
+            year: None,
+            release_date: None,
+            summary: None,
+            content_rating: None,
+            duration: None,
+            cast: Vec::new(),
+            artwork: Vec::new(),
+            playback: spoolframe_types::PlaybackState::default(),
+        });
+        for (key, created_at) in [("aa", 1), ("bb", 2)] {
+            let m = Store::manifest(
+                EntryKind::Film,
+                key.into(),
+                "s".into(),
+                "u".into(),
+                "u".into(),
+                film.clone(),
+                spoolframe_types::MediaTracks::default(),
+                spoolframe_protocol::downloads::DownloadSource::Original,
+                spoolframe_protocol::downloads::DownloadTracks::All,
+                LocalWatch::default(),
+                created_at,
+            );
+            store.write(&m).unwrap();
+        }
+        let driven = |shared: &Shared| match next(shared) {
+            Next::Drive(key) => Some(key),
+            Next::Wait(_) => None,
+        };
+        assert_eq!(driven(&shared).as_deref(), Some("aa"));
+        let later = tokio::time::Instant::now() + POLL;
+        shared.check_at.lock().insert("aa".into(), later);
+        assert_eq!(driven(&shared).as_deref(), Some("bb"));
+        shared.check_at.lock().insert("bb".into(), later);
+        assert!(matches!(next(&shared), Next::Wait(Some(at)) if at == later));
+        // A server event asks about them all again.
+        shared.check_at.lock().clear();
+        assert_eq!(driven(&shared).as_deref(), Some("aa"));
+    }
 
     /// A picture kept already is linked, not fetched; one whose entry is
     /// gone is fetched again.

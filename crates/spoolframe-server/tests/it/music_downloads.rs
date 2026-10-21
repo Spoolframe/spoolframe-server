@@ -683,6 +683,9 @@ async fn a_play_made_offline_reaches_the_server_once_at_its_time() {
         played_ms: 240_000,
     };
     let first = sync(&laptop, &session, device_now, vec![play.clone()], vec![]).await;
+    // The server read its clock in between: a second may have ticked
+    // since `now`.
+    let after = server.clock.unix_secs();
     let again = sync(&laptop, &session, device_now + 5, vec![play], vec![]).await;
     let plays = server
         .store
@@ -695,19 +698,20 @@ async fn a_play_made_offline_reaches_the_server_once_at_its_time() {
             again.0,
             plays
                 .iter()
-                .map(|p| (p.media_id.clone(), p.ended_at, p.counted, p.path.clone()))
+                .map(|p| (p.media_id.clone(), p.counted, p.path.clone()))
                 .collect::<Vec<_>>(),
         ),
         (
             vec![OfflineWatchOutcome::Applied],
             vec![OfflineWatchOutcome::Applied],
-            vec![(
-                track_id("32").to_string(),
-                now - 3600,
-                true,
-                "offline".to_owned()
-            )],
+            vec![(track_id("32").to_string(), true, "offline".to_owned())],
         )
+    );
+    // An hour before the server's now, not the device's 100 s fast one.
+    let ended_at = plays[0].ended_at;
+    assert!(
+        (now - 3600..=after - 3600).contains(&ended_at),
+        "ended at {ended_at}, not an hour before {now}..={after}"
     );
     server.stop().await;
 }

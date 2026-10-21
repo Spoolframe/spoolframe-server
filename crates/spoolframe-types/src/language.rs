@@ -65,6 +65,19 @@ pub fn bcp47(code: &str) -> String {
     canonical(code)
 }
 
+/// A language code as ISO 639-2 writes it, three letters, the
+/// bibliographic code where there are two (`en` and `eng` are `eng`,
+/// `de` is `ger`): what MP4's language field holds, and ffmpeg's MP4
+/// muxer writes `und` for any other. A code not known stays as it is,
+/// lowercased.
+pub fn iso639_2(code: &str) -> String {
+    let code = code.to_ascii_lowercase();
+    ALIASES
+        .iter()
+        .find(|codes| codes.contains(&code.as_str()))
+        .map_or(code, |codes| codes[1].to_owned())
+}
+
 /// Whether two language codes name the same language.
 pub fn same_language(a: &str, b: &str) -> bool {
     canonical(a) == canonical(b)
@@ -86,6 +99,15 @@ mod tests {
     fn different_languages_differ() {
         assert!(!same_language("eng", "spa"));
         assert!(!same_language("nob", "nor"));
+    }
+
+    #[test]
+    fn a_code_in_iso_639_2_is_three_letters() {
+        assert_eq!(iso639_2("en"), "eng");
+        assert_eq!(iso639_2("DE"), "ger");
+        assert_eq!(iso639_2("deu"), "ger");
+        assert_eq!(iso639_2("spa"), "spa");
+        assert_eq!(iso639_2("tlh"), "tlh");
     }
 
     #[test]

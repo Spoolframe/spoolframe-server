@@ -424,9 +424,18 @@ impl Downloads {
         let source = stored.quality.source();
         self.release_tracks(&server, &source, &dropped, &hold)
             .await?;
-        for (id, item) in tracks {
-            if let Err(e) =
-                hold_track(shared, session, &id, item, &source, &hold, &mut parents).await
+        for (place, (id, item)) in (0..).zip(tracks) {
+            if let Err(e) = hold_track(
+                shared,
+                session,
+                &id,
+                item,
+                &source,
+                &hold,
+                place,
+                &mut parents,
+            )
+            .await
             {
                 tracing::info!(%id, error = %e, "a track of a music download is left out");
             }
@@ -845,9 +854,11 @@ impl Parents {
     }
 }
 
-/// Track `id` in `source` held by `hold`: added to its entry if there is
-/// one, else a new entry with its details (`item`, or fetched), its album
+/// Track `id` in `source` held by `hold`, at `place` in what holds it:
+/// added to its entry if there is one, else a new entry with its details
+/// (`item`, or fetched), its album
 /// and artist and their artwork, for the manager to prepare.
+#[allow(clippy::too_many_arguments)]
 async fn hold_track(
     shared: &Shared,
     session: &Session,
@@ -855,6 +866,7 @@ async fn hold_track(
     item: Option<Item>,
     source: &DownloadSource,
     hold: &Hold,
+    place: u32,
     parents: &mut Parents,
 ) -> Result<(), SdkError> {
     let store = shared.store()?;
@@ -893,6 +905,7 @@ async fn hold_track(
         now(),
     );
     m.holds = vec![hold.clone()];
+    m.place = place;
     m.album = album;
     m.artist = artist;
     m.artwork = manager::fetch_artwork(session, store, &m, &mut parents.art).await;
@@ -1403,8 +1416,12 @@ async fn follow(
     let now_held: HashSet<&MediaId> = tracks.iter().collect();
     let hold = stored.target.hold(&user_id);
     let source = stored.quality.source();
-    for id in tracks.iter().filter(|id| !before.contains(id)) {
-        if let Err(e) = hold_track(shared, session, id, None, &source, &hold, parents).await {
+    for (place, id) in (0..)
+        .zip(tracks.iter())
+        .filter(|(_, id)| !before.contains(id))
+    {
+        if let Err(e) = hold_track(shared, session, id, None, &source, &hold, place, parents).await
+        {
             tracing::info!(%id, error = %e, "a track a followed download gained is left out");
         }
     }
