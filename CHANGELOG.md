@@ -165,6 +165,10 @@
   are, whatever it says, and the pool always runs. The setup wizard's
   step says what it does: make the next episode ahead while someone
   watches.
+- A device that connects again right after being signed out (a revoked
+  session, a password reset) keeps its new connection: signing a device
+  out now closes only its signed-in connections, not one it opened since
+  to sign in again.
 
 ## 0.13.1 (2026-10-20)
 

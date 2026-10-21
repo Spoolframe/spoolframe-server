@@ -361,9 +361,17 @@ impl Connections {
         endpoints
     }
 
-    /// `endpoint` has no live session left: close its connections.
+    /// `endpoint` has no live session left: close its signed-in
+    /// connections. Only those: the check that found no session was made
+    /// a moment ago, and a connection the device opened since, not signed
+    /// in yet (as an app does once signed out, to sign in again), is not
+    /// one it ended.
     fn sign_out(&self, endpoint: &EndpointId) {
-        for peer in self.lock().values().filter(|p| &p.endpoint == endpoint) {
+        for peer in self
+            .lock()
+            .values()
+            .filter(|p| &p.endpoint == endpoint && p.known())
+        {
             peer.sign_out();
         }
     }
