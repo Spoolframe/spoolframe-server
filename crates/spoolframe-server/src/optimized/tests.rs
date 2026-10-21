@@ -1067,7 +1067,7 @@ mod on_demand {
         let s = setup("on-demand-pinned", "exit 1", 0, 250).await;
         let request = s
             .pool
-            .put_request(asked(the_film(), "Mobile", false))
+            .put_request(asked(the_film(), "Mobile (H.264)", false))
             .await
             .unwrap();
         let pinned = s.on_demand_copy(&request.row.id, movie().id(), None).await;
@@ -1096,7 +1096,7 @@ mod on_demand {
         let s = setup("on-demand-unpinned", "exit 1", 0, 150).await;
         let request = s
             .pool
-            .put_request(asked(the_film(), "Mobile", false))
+            .put_request(asked(the_film(), "Mobile (H.264)", false))
             .await
             .unwrap();
         let copy = s.on_demand_copy(&request.row.id, movie().id(), None).await;
@@ -1124,7 +1124,7 @@ mod on_demand {
         let s = setup("on-demand-over-budget", "exit 1", 0, 1 << 30).await;
         let refused = s
             .pool
-            .put_request(asked(the_film(), "Mobile", true))
+            .put_request(asked(the_film(), "Mobile (H.264)", true))
             .await
             .unwrap_err();
         assert!(
@@ -1141,7 +1141,7 @@ mod on_demand {
         let s = setup("on-demand-unpinned-big", "exit 1", 0, 1 << 30).await;
         let request = s
             .pool
-            .put_request(asked(the_film(), "Mobile", false))
+            .put_request(asked(the_film(), "Mobile (H.264)", false))
             .await
             .unwrap();
         assert_eq!(request.items, 1);
@@ -1153,7 +1153,7 @@ mod on_demand {
         let s = setup("on-demand-pin-later", "exit 1", 0, 1 << 30).await;
         let request = s
             .pool
-            .put_request(asked(the_film(), "Mobile", false))
+            .put_request(asked(the_film(), "Mobile (H.264)", false))
             .await
             .unwrap();
         let refused = s.pool.pin_request(&request.row.id, true).await;
@@ -1170,7 +1170,7 @@ mod on_demand {
         let s = setup("on-demand-remake", "exit 1", 0, 1 << 30).await;
         let request = s
             .pool
-            .put_request(asked(the_film(), "Mobile", false))
+            .put_request(asked(the_film(), "Mobile (H.264)", false))
             .await
             .unwrap();
         let old = s.on_demand_copy(&request.row.id, movie().id(), None).await;
@@ -1178,7 +1178,7 @@ mod on_demand {
         let written = s
             .store
             .put_optimized_profile(&Profile {
-                name: "Mobile".into(),
+                name: "Mobile (H.264)".into(),
                 video_codec: VideoCodec::H264,
                 height: 1080,
                 max_bitrate: 6_000_000,
@@ -1186,7 +1186,7 @@ mod on_demand {
             .await
             .unwrap();
         assert!(written.changed);
-        assert_eq!(s.pool.remake("Mobile").await.unwrap(), 1);
+        assert_eq!(s.pool.remake("Mobile (H.264)").await.unwrap(), 1);
         let new = s
             .on_demand_copy(&request.row.id, movie().id(), Some(&old.id))
             .await;
@@ -1213,7 +1213,7 @@ mod on_demand {
             .pool
             .put_request(asked(
                 Scope::Season(media(MediaKind::Season, "11")),
-                "Mobile",
+                "Mobile (H.264)",
                 false,
             ))
             .await
@@ -1257,7 +1257,7 @@ mod on_demand {
             .pool
             .put_request(asked(
                 Scope::Library(crate::test_support::music_library().id),
-                "Mobile",
+                "Mobile (H.264)",
                 false,
             ))
             .await;
