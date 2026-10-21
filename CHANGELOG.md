@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.14.2 (2026-10-21)
+
 - The `Mobile` profile is now HEVC 1080p at 4 Mbit/s. At the same rate,
   HEVC looks better than H.264, and the phones it is for decode it in
   hardware. A new profile, `Mobile (H.264)`, is listed after it. It is
