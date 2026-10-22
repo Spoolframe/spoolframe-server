@@ -36,8 +36,9 @@ use spoolframe_catalog::{Catalog, CatalogError};
 use spoolframe_media::subtitle_file::{self, FileError};
 use spoolframe_media::{MediaDescriptor, Prober, SubtitleKind, SubtitleSource, SubtitleStream};
 use spoolframe_types::{
-    Item, MediaId, QuotaOf, SubtitleDownload, SubtitleDownloaded, SubtitleOrigin, SubtitleResult,
-    SubtitleRole, SubtitleSearch, SubtitleSourceState, SubtitleSourceStatus,
+    ForcedPreference, Item, MediaId, QuotaOf, SdhPreference, SubtitleDownload, SubtitleDownloaded,
+    SubtitleOrigin, SubtitlePreferences, SubtitleResult, SubtitleRole, SubtitleSearch,
+    SubtitleSourceState, SubtitleSourceStatus,
 };
 
 use crate::principal::Actor;
@@ -441,12 +442,15 @@ impl SubtitleDownloads {
     }
 
     /// Search every site that is on for item `id`'s subtitles in
-    /// `language`, or in each site's languages, at once. When every site
-    /// failed, the first one's error.
+    /// `language`, or in each site's languages, at once, for `who`: the
+    /// results ordered, and some left out, by their SDH and forced
+    /// preferences ([`order`]). When every site failed, the first one's
+    /// error.
     pub async fn search(
         &self,
         id: &MediaId,
         language: Option<&str>,
+        who: &Actor,
     ) -> Result<SubtitleSearch, DownloadError> {
         let live = self.live()?;
         let asked = language.map(language_code).transpose()?;
@@ -542,7 +546,8 @@ impl SubtitleDownloads {
                 result(offer, rejected.contains(&key), downloaded.contains(&key))
             })
             .collect();
-        order(&mut results);
+        let wanted = self.store.track_preferences(who.principal).await?;
+        order(&mut results, &wanted.subtitles);
         let languages = match asked {
             Some(language) => vec![language],
             None => dedupe(
@@ -1125,17 +1130,46 @@ fn result(offer: &Offer, rejected: bool, downloaded: bool) -> SubtitleResult {
     }
 }
 
-/// Best first: removed ones last; machine-translated and AI-made after
-/// people's; found by the hash first; then by rating, then downloads. A
-/// site that gives neither (SubDL) ranks its results after those that
-/// were rated or downloaded, in its own order; the sort keeps the order
-/// the sites were asked in for the rest.
-fn order(results: &mut [SubtitleResult]) {
+/// Best first for a user who wants `wanted`: removed ones last;
+/// machine-translated and AI-made after people's; found by the hash
+/// first; then as their forced and SDH preferences say (forced first, as
+/// a forced subtitle is the further from the whole dialogue); then by
+/// rating, then downloads. A site that gives neither (SubDL) ranks its
+/// results after those that were rated or downloaded, in its own order;
+/// the sort keeps the order the sites were asked in for the rest.
+///
+/// "Only" and "Avoid" (only without) leave results out rather than order
+/// them, a hash match too. SubDL's results are never SDH nor forced.
+fn order(results: &mut Vec<SubtitleResult>, wanted: &SubtitlePreferences) {
+    results.retain(|r| {
+        let sdh = match wanted.sdh {
+            SdhPreference::Only => r.hearing_impaired,
+            SdhPreference::Avoid => !r.hearing_impaired,
+            SdhPreference::Prefer | SdhPreference::Accept => true,
+        };
+        let forced = match wanted.forced {
+            ForcedPreference::Only => r.forced,
+            ForcedPreference::Avoid => !r.forced,
+            ForcedPreference::Prefer | ForcedPreference::Accept => true,
+        };
+        sdh && forced
+    });
     results.sort_by_key(|r| {
+        // False sorts first: what the preference puts before the rest.
+        let sdh_later = match wanted.sdh {
+            SdhPreference::Prefer => !r.hearing_impaired,
+            _ => r.hearing_impaired,
+        };
+        let forced_later = match wanted.forced {
+            ForcedPreference::Prefer => !r.forced,
+            _ => r.forced,
+        };
         (
             r.rejected,
             r.origin != SubtitleOrigin::Human,
             !r.hash_match,
+            forced_later,
+            sdh_later,
             std::cmp::Reverse(r.rating.unwrap_or(0)),
             std::cmp::Reverse(r.downloads),
         )

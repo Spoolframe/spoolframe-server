@@ -7,8 +7,8 @@
 //! changes what was set.
 
 use spoolframe_admin_api::{
-    AudioPick, AudioRole, BitmapPreference, SdhPreference, SubtitleMode, SubtitlePick,
-    SubtitleRole, TrackOverrideEntry,
+    AudioPick, AudioRole, BitmapPreference, ForcedPreference, SdhPreference, SubtitleMode,
+    SubtitlePick, SubtitleRole, TrackOverrideEntry,
 };
 
 /// What stands for the item's original language in an audio list.
@@ -132,6 +132,16 @@ pub const SDH: &[(SdhPreference, &str)] = &[
     (SdhPreference::Accept, "When there are no others"),
     (SdhPreference::Prefer, "Before others"),
     (SdhPreference::Avoid, "Never"),
+    (SdhPreference::Only, "Only SDH"),
+];
+
+/// Forced subtitles (signs and foreign lines only) in a subtitle search,
+/// as the card names each choice: the same four as [`SDH`].
+pub const FORCED: &[(ForcedPreference, &str)] = &[
+    (ForcedPreference::Accept, "After others"),
+    (ForcedPreference::Prefer, "Before others"),
+    (ForcedPreference::Avoid, "Never"),
+    (ForcedPreference::Only, "Only forced"),
 ];
 
 /// How picture subtitles (PGS, VobSub, DVB) show, as the card names each
@@ -352,5 +362,8 @@ mod tests {
     fn modes_and_sdh_are_found_by_value() {
         assert_eq!(index_of(SUBTITLE_MODES, &SubtitleMode::Off), 3);
         assert_eq!(index_of(SDH, &SdhPreference::Prefer), 1);
+        assert_eq!(index_of(SDH, &SdhPreference::Only), 3);
+        assert_eq!(index_of(FORCED, &ForcedPreference::Only), 3);
+        assert_eq!(index_of(FORCED, &ForcedPreference::default()), 0);
     }
 }

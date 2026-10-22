@@ -217,7 +217,11 @@ fn film() -> MediaId {
 async fn results_come_hash_matches_first_and_machine_made_last() {
     let f = fixture("order", 0).await;
     f.answers_search().await;
-    let found = f.downloads.search(&film(), None).await.unwrap();
+    let found = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(found.languages, ["en"]);
     let ids: Vec<&str> = found.results.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(
@@ -252,11 +256,20 @@ async fn results_come_hash_matches_first_and_machine_made_last() {
 async fn a_search_is_kept_a_day() {
     let f = fixture("kept", 0).await;
     f.answers_search().await;
-    f.downloads.search(&film(), None).await.unwrap();
-    f.downloads.search(&film(), Some("EN")).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    f.downloads
+        .search(&film(), Some("EN"), &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(f.site_calls("/api/v1/subtitles").await, 1);
     f.store.clock().advance(SEARCH_LIFE);
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(f.site_calls("/api/v1/subtitles").await, 2);
 }
 
@@ -280,10 +293,16 @@ async fn a_film_is_searched_by_its_hash_and_id_or_title() {
         .expect(1)
         .mount(&f.site)
         .await;
-    f.downloads.search(&film(), Some("en")).await.unwrap();
+    f.downloads
+        .search(&film(), Some("en"), &alice().actor)
+        .await
+        .unwrap();
     f.catalog
         .give_ids(&film(), &["imdb://tt0078748", "tmdb://348"]);
-    f.downloads.search(&film(), Some("fr")).await.unwrap();
+    f.downloads
+        .search(&film(), Some("fr"), &alice().actor)
+        .await
+        .unwrap();
     let asked = f.site.received_requests().await.unwrap();
     let hash = opensubtitles::movie_hash(&f.media).unwrap().unwrap();
     for request in &asked {
@@ -312,14 +331,19 @@ async fn an_episode_is_searched_by_its_show_s_id_with_its_numbers() {
         .expect(1)
         .mount(&f.site)
         .await;
-    f.downloads.search(&episode, None).await.unwrap();
+    f.downloads
+        .search(&episode, None, &alice().actor)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn a_bad_language_is_refused_before_the_site_is_asked() {
     let f = fixture("language", 0).await;
     assert!(matches!(
-        f.downloads.search(&film(), Some("en&imdb_id=1")).await,
+        f.downloads
+            .search(&film(), Some("en&imdb_id=1"), &alice().actor)
+            .await,
         Err(DownloadError::InvalidInput(_))
     ));
     assert_eq!(f.site_calls("/api/v1/subtitles").await, 0);
@@ -335,7 +359,10 @@ async fn a_download_is_a_track_at_once_and_only_once() {
     let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode(RUSSIAN);
     f.serves(103, cp1251.into_owned(), 19).await;
     let own = f.subtitles().await.len();
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let got = f
         .downloads
         .download(&film(), "opensubtitles:103", &alice())
@@ -376,7 +403,11 @@ async fn a_download_is_a_track_at_once_and_only_once() {
         .unwrap();
     assert_eq!(again.track, got.track);
     assert_eq!(f.site_calls("/api/v1/download").await, 1);
-    let searched = f.downloads.search(&film(), None).await.unwrap();
+    let searched = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert!(
         searched
             .results
@@ -392,7 +423,10 @@ async fn only_a_download_not_matched_by_hash_is_synced() {
     f.answers_search().await;
     f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
     f.serves(102, RUSSIAN.as_bytes().to_vec(), 4).await;
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let matched = f
         .downloads
         .download(&film(), "opensubtitles:101", &alice())
@@ -437,7 +471,10 @@ async fn a_user_s_daily_limit_holds() {
     for id in [101, 102, 103, 104] {
         f.serves(id, RUSSIAN.as_bytes().to_vec(), 10).await;
     }
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let first = f
         .downloads
         .download(&film(), "opensubtitles:101", &alice())
@@ -479,7 +516,10 @@ async fn an_exhausted_account_is_said_so() {
         })))
         .mount(&f.site)
         .await;
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert!(matches!(
         f.downloads
             .download(&film(), "opensubtitles:101", &alice())
@@ -502,7 +542,10 @@ async fn a_user_without_the_permission_searches_but_does_not_download() {
         .set_may_download_subtitles(&principal, false, "local:root")
         .await
         .unwrap();
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert!(matches!(
         f.downloads
             .download(&film(), "opensubtitles:101", &alice())
@@ -520,7 +563,10 @@ async fn a_download_is_removed_by_its_downloader_or_an_admin_only() {
     f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
     f.serves(102, RUSSIAN.as_bytes().to_vec(), 4).await;
     let own = f.subtitles().await.len();
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let first = f
         .downloads
         .download(&film(), "opensubtitles:101", &alice())
@@ -553,7 +599,11 @@ async fn a_download_is_removed_by_its_downloader_or_an_admin_only() {
         std::fs::read_dir(f.downloads.dir()).unwrap().count() == 1,
         "the removed file is gone"
     );
-    let searched = f.downloads.search(&film(), None).await.unwrap();
+    let searched = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let last = searched.results.last().unwrap();
     assert_eq!(
         (last.id.as_str(), last.rejected),
@@ -575,7 +625,10 @@ async fn a_restart_restores_the_tracks() {
     f.answers_search().await;
     f.serves(101, RUSSIAN.as_bytes().to_vec(), 5).await;
     let own = f.subtitles().await.len();
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     f.downloads
         .download(&film(), "opensubtitles:101", &alice())
         .await
@@ -610,7 +663,7 @@ async fn without_a_site_nothing_is_asked() {
     f.downloads.configure(Settings::default());
     assert!(!f.downloads.is_on());
     assert!(matches!(
-        f.downloads.search(&film(), None).await,
+        f.downloads.search(&film(), None, &alice().actor).await,
         Err(DownloadError::NoSource)
     ));
     assert!(matches!(
@@ -632,12 +685,132 @@ async fn an_unreachable_site_fails_the_search_cleanly() {
     account.api_url = crate::opensubtitles::tests::nothing_listens();
     f.downloads.configure(settings);
     assert!(matches!(
-        f.downloads.search(&film(), None).await,
+        f.downloads.search(&film(), None, &alice().actor).await,
         Err(DownloadError::Site {
             site: Source::OpenSubtitles,
             error: SiteError::Unreachable(_)
         })
     ));
+}
+
+/// A result for [`order`]: human-made, unrejected, rated `rating`.
+fn ranked(id: &str, hash_match: bool, sdh: bool, forced: bool, rating: u8) -> SubtitleResult {
+    SubtitleResult {
+        id: id.into(),
+        source: "opensubtitles".into(),
+        release: String::new(),
+        language: "en".into(),
+        format: None,
+        fps_milli: None,
+        downloads: 0,
+        rating: Some(rating),
+        hearing_impaired: sdh,
+        forced,
+        origin: SubtitleOrigin::Human,
+        hash_match,
+        rejected: false,
+        downloaded: false,
+    }
+}
+
+/// `matched` (found by the hash, SDH), `sdh` (rated 90), `plain` (rated
+/// 10) and `forced` (rated 95), ordered for `sdh` and `forced`
+/// preferences: their ids.
+fn ordered(sdh: SdhPreference, forced: ForcedPreference) -> Vec<String> {
+    let mut results = vec![
+        ranked("sdh", false, true, false, 90),
+        ranked("plain", false, false, false, 10),
+        ranked("matched", true, true, false, 0),
+        ranked("forced", false, false, true, 95),
+    ];
+    let wanted = SubtitlePreferences {
+        sdh,
+        forced,
+        ..SubtitlePreferences::default()
+    };
+    order(&mut results, &wanted);
+    results.into_iter().map(|r| r.id).collect()
+}
+
+/// The defaults: after the hash match, the whole dialogue first, plain
+/// before SDH, and forced ones last, whatever their rating.
+#[test]
+fn by_default_plain_comes_before_sdh_and_forced_after_both() {
+    assert_eq!(
+        ordered(SdhPreference::Accept, ForcedPreference::Accept),
+        ["matched", "plain", "sdh", "forced"]
+    );
+}
+
+#[test]
+fn sdh_preferred_comes_first_after_the_hash_match() {
+    assert_eq!(
+        ordered(SdhPreference::Prefer, ForcedPreference::Accept),
+        ["matched", "sdh", "plain", "forced"]
+    );
+}
+
+/// "Only with" and "only without" filter: even a hash match goes.
+#[test]
+fn sdh_avoided_or_only_filters_the_results() {
+    assert_eq!(
+        ordered(SdhPreference::Avoid, ForcedPreference::Accept),
+        ["plain", "forced"]
+    );
+    assert_eq!(
+        ordered(SdhPreference::Only, ForcedPreference::Accept),
+        ["matched", "sdh"]
+    );
+}
+
+#[test]
+fn forced_preferred_comes_first_after_the_hash_match() {
+    assert_eq!(
+        ordered(SdhPreference::Accept, ForcedPreference::Prefer),
+        ["matched", "forced", "plain", "sdh"]
+    );
+}
+
+#[test]
+fn forced_avoided_or_only_filters_the_results() {
+    assert_eq!(
+        ordered(SdhPreference::Accept, ForcedPreference::Avoid),
+        ["matched", "plain", "sdh"]
+    );
+    assert_eq!(
+        ordered(SdhPreference::Accept, ForcedPreference::Only),
+        ["forced"]
+    );
+}
+
+/// The asker's own preferences order their search: Alice, who wants no
+/// SDH, is not offered OpenSubtitles' SDH result; Bob, with the
+/// defaults, is.
+#[tokio::test]
+async fn a_search_follows_the_asker_s_preferences() {
+    let f = fixture("preferences", 0).await;
+    f.answers_search().await;
+    let mut no_sdh = spoolframe_types::TrackPreferences::default();
+    no_sdh.subtitles.sdh = SdhPreference::Avoid;
+    f.store
+        .set_track_preferences(alice().actor.principal, &no_sdh)
+        .await
+        .unwrap();
+    let ids = |found: SubtitleSearch| -> Vec<String> {
+        found.results.into_iter().map(|r| r.id).collect()
+    };
+    let alice_s = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    assert!(!ids(alice_s).contains(&"opensubtitles:102".to_owned()));
+    let bob_s = f
+        .downloads
+        .search(&film(), None, &bob().actor)
+        .await
+        .unwrap();
+    assert!(ids(bob_s).contains(&"opensubtitles:102".to_owned()));
 }
 
 #[test]
@@ -668,28 +841,34 @@ fn both(site: &MockServer) -> Settings {
 }
 
 /// With both on, one search asks both and lists what both found, each
-/// named by its site: OpenSubtitles' rated and downloaded ones first,
-/// then SubDL's, which gives neither, in its own order.
+/// named by its site: the hash match first, then the plain ones,
+/// OpenSubtitles' rated and downloaded ones before SubDL's, which gives
+/// neither, in its own order; OpenSubtitles' SDH one after them, as a
+/// user with the default SDH preference wants.
 #[tokio::test]
 async fn both_sites_are_searched_and_their_results_are_one_list() {
     let f = fixture_with("both", both).await;
     f.answers_search().await;
     f.subdl_answers_search().await;
-    let found = f.downloads.search(&film(), None).await.unwrap();
+    let found = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let ids: Vec<&str> = found.results.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(
         ids,
         [
             "opensubtitles:101",
-            "opensubtitles:102",
             "subdl:3172974-3188291",
             "subdl:2978466-2972819",
             "subdl:504692-1185",
+            "opensubtitles:102",
             "opensubtitles:103",
             "opensubtitles:104",
         ]
     );
-    let subdl = &found.results[2];
+    let subdl = &found.results[1];
     assert_eq!(subdl.source, "subdl");
     // SubDL says nothing of foreign parts: none of its is forced.
     assert_eq!(
@@ -729,7 +908,10 @@ async fn both_sites_are_searched_and_their_results_are_one_list() {
     assert_eq!(pairs["type"], "movie");
     assert_eq!(pairs["languages"], "EN");
     // Kept a day, as OpenSubtitles' are.
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(f.site.received_requests().await.unwrap().len(), 2);
 }
 
@@ -753,7 +935,11 @@ async fn one_site_failing_leaves_the_other_s_results() {
         })))
         .mount(&f.site)
         .await;
-    let found = f.downloads.search(&film(), None).await.unwrap();
+    let found = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(found.results.len(), 4);
     assert!(found.results.iter().all(|r| r.source == "opensubtitles"));
     assert!(matches!(
@@ -761,13 +947,20 @@ async fn one_site_failing_leaves_the_other_s_results() {
         SubtitleSourceStatus { source, state: SubtitleSourceState::Failed { message } }
             if source == "subdl" && message.starts_with("SubDL cannot be reached")
     ));
-    let french = f.downloads.search(&film(), Some("fr")).await.unwrap();
+    let french = f
+        .downloads
+        .search(&film(), Some("fr"), &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(
         french.sources[1].state,
         SubtitleSourceState::QuotaExhausted { resets_at: None }
     );
     // A failure is not kept: the next search asks SubDL again.
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let subdl_calls = f
         .site
         .received_requests()
@@ -786,7 +979,9 @@ async fn one_site_failing_leaves_the_other_s_results() {
     account.api_url = crate::opensubtitles::tests::nothing_listens();
     f.downloads.configure(settings);
     assert!(matches!(
-        f.downloads.search(&film(), Some("de")).await,
+        f.downloads
+            .search(&film(), Some("de"), &alice().actor)
+            .await,
         Err(DownloadError::Site {
             site: Source::OpenSubtitles,
             error: SiteError::Unreachable(_)
@@ -809,7 +1004,10 @@ async fn a_subdl_download_comes_out_of_its_archive_and_is_synced() {
     )
     .await;
     let own = f.subtitles().await.len();
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let got = f
         .downloads
         .download(&film(), "subdl:3172974-3188291", &alice())
@@ -851,7 +1049,11 @@ async fn a_subdl_download_comes_out_of_its_archive_and_is_synced() {
     );
     // Searched again, it is marked downloaded; the same id from the
     // other site is another result.
-    let again = f.downloads.search(&film(), None).await.unwrap();
+    let again = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert!(
         again
             .results
@@ -883,7 +1085,10 @@ async fn a_bad_subdl_archive_is_refused() {
         zipped(&[("Film.sub", b"{1}{2}Hello")]),
     )
     .await;
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     for result in ["subdl:3172974-3188291", "subdl:2978466-2972819"] {
         assert!(
             matches!(
@@ -914,7 +1119,11 @@ async fn subdl_alone_asks_only_subdl() {
     })
     .await;
     f.subdl_answers_search().await;
-    let found = f.downloads.search(&film(), None).await.unwrap();
+    let found = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(found.results.len(), 3);
     assert_eq!(f.site_calls("/api/v1/subtitles").await, 0);
     assert!(matches!(
@@ -967,7 +1176,10 @@ async fn an_episode_is_asked_of_subdl_by_its_show_and_taken_from_a_pack() {
         ]),
     )
     .await;
-    f.downloads.search(&episode, None).await.unwrap();
+    f.downloads
+        .search(&episode, None, &alice().actor)
+        .await
+        .unwrap();
     f.downloads
         .download(&episode, "subdl:3172974-3188291", &alice())
         .await
@@ -994,7 +1206,10 @@ async fn downloads_stay_when_their_site_is_turned_off() {
     )
     .await;
     let own = f.subtitles().await.len();
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     f.downloads
         .download(&film(), "opensubtitles:101", &alice())
         .await
@@ -1047,7 +1262,11 @@ async fn a_failed_site_s_own_words_are_not_sent_to_users() {
         })))
         .mount(&f.site)
         .await;
-    let found = f.downloads.search(&film(), None).await.unwrap();
+    let found = f
+        .downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     assert_eq!(
         found.sources[1].state,
         SubtitleSourceState::Failed {
@@ -1075,7 +1294,10 @@ async fn a_slow_download_from_one_site_does_not_hold_up_the_other() {
         )
         .mount(&f.site)
         .await;
-    f.downloads.search(&film(), None).await.unwrap();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
     let (id, alice) = (film(), alice());
     let slow = f.downloads.download(&id, "subdl:3172974-3188291", &alice);
     tokio::pin!(slow);
@@ -1124,7 +1346,10 @@ async fn a_show_s_ids_are_asked_for_only_when_a_site_needs_them() {
         .mount(&f.site)
         .await;
     f.catalog.take_calls(&show);
-    f.downloads.search(&episode, None).await.unwrap();
+    f.downloads
+        .search(&episode, None, &alice().actor)
+        .await
+        .unwrap();
     assert!(
         !f.catalog.take_calls(&show).contains(&"external_ids"),
         "OpenSubtitles alone, by the episode's own id"
@@ -1140,6 +1365,9 @@ async fn a_show_s_ids_are_asked_for_only_when_a_site_needs_them() {
         })))
         .mount(&f.site)
         .await;
-    f.downloads.search(&episode, None).await.unwrap();
+    f.downloads
+        .search(&episode, None, &alice().actor)
+        .await
+        .unwrap();
     assert!(f.catalog.take_calls(&show).contains(&"external_ids"));
 }

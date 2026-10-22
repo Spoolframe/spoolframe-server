@@ -46,6 +46,12 @@ pub struct SubtitlePreferences {
     /// leaves it to the server. It has no effect on a server that does not
     /// read them as text.
     pub bitmap: BitmapPreference,
+    /// Forced subtitles (only the parts in another language) among a
+    /// subtitle search's results (PX-02). Playback follows `mode`.
+    // compat(v1): required at the protocol reset. Until then a peer from
+    // before it leaves it out, and it reads as the default.
+    #[serde(default)]
+    pub forced: ForcedPreference,
 }
 
 /// When subtitles are shown.
@@ -65,16 +71,40 @@ pub enum SubtitleMode {
     ForcedOnly,
 }
 
-/// What to do with subtitles for the deaf and hard of hearing.
+/// What to do with subtitles for the deaf and hard of hearing: in
+/// playback, which track is chosen; in a subtitle search (PX-02), the
+/// results' order, or which are listed at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SdhPreference {
     /// SDH before plain subtitles.
     Prefer,
-    /// Never SDH.
+    /// Never SDH: a search lists none.
     Avoid,
+    /// Only SDH: no subtitles where there is none, and a search lists no
+    /// plain ones. A build before it reads it as `Accept`.
+    Only,
     /// Plain subtitles first, SDH when there are none. Also any value this
     /// build does not know. (Last, as serde wants of `other`.)
+    #[default]
+    #[serde(other)]
+    Accept,
+}
+
+/// What to do with forced subtitles (only the parts in another language:
+/// signs, a foreign line) in a subtitle search's results (PX-02): the
+/// same four ways as [`SdhPreference`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedPreference {
+    /// Forced ones before the rest.
+    Prefer,
+    /// None forced.
+    Avoid,
+    /// Only forced ones.
+    Only,
+    /// The rest first, forced ones after. Also any value this build does
+    /// not know. (Last, as serde wants of `other`.)
     #[default]
     #[serde(other)]
     Accept,
@@ -142,7 +172,51 @@ mod tests {
         assert_eq!(p, TrackPreferences::default());
     }
 
+    #[test]
+    fn only_sdh_reads_and_an_unknown_sdh_preference_is_accept() {
+        let p: TrackPreferences =
+            serde_json::from_value(full(|j| j["subtitles"]["sdh"] = "only".into())).unwrap();
+        assert_eq!(p.subtitles.sdh, SdhPreference::Only);
+        let p: TrackPreferences =
+            serde_json::from_value(full(|j| j["subtitles"]["sdh"] = "sometimes".into())).unwrap();
+        assert_eq!(p.subtitles.sdh, SdhPreference::Accept);
+    }
+
+    #[test]
+    fn a_forced_preference_reads_by_name_and_an_unknown_one_is_accept() {
+        assert_eq!(
+            TrackPreferences::default().subtitles.forced,
+            ForcedPreference::Accept
+        );
+        for (name, wanted) in [
+            ("prefer", ForcedPreference::Prefer),
+            ("avoid", ForcedPreference::Avoid),
+            ("only", ForcedPreference::Only),
+            ("accept", ForcedPreference::Accept),
+            ("hologram", ForcedPreference::Accept),
+        ] {
+            let p: TrackPreferences =
+                serde_json::from_value(full(|j| j["subtitles"]["forced"] = name.into())).unwrap();
+            assert_eq!(p.subtitles.forced, wanted, "{name}");
+        }
+    }
+
+    /// A peer from before the forced preference leaves it out: the
+    /// preferences still read, with the default.
+    #[test]
+    fn preferences_without_the_forced_preference_read_with_the_default() {
+        let mut wanted = TrackPreferences::default();
+        wanted.subtitles.sdh = SdhPreference::Prefer;
+        let p: TrackPreferences = serde_json::from_value(full(|j| {
+            j["subtitles"]["sdh"] = "prefer".into();
+            j["subtitles"].as_object_mut().unwrap().remove("forced");
+        }))
+        .unwrap();
+        assert_eq!(p, wanted);
+    }
+
     /// Each field in turn, by its JSON path, left out of the defaults.
+    /// (Not `subtitles.forced`, which a peer before it leaves out.)
     #[test]
     fn preferences_missing_any_field_are_refused() {
         for (section, field) in [

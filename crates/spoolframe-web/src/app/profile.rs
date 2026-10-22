@@ -21,7 +21,7 @@ use crate::logic::{
     passkey_title, password_remove_error,
 };
 use crate::preferences::{
-    self, PICTURE_SUBTITLES, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of,
+    self, FORCED, PICTURE_SUBTITLES, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of,
     override_line, picture_row, subtitle_choices,
 };
 use crate::sso::Tone;
@@ -1769,6 +1769,7 @@ fn PreferenceRows(
     let subtitles = preferences::key(&preferences.subtitles.languages);
     let mode = index_of(SUBTITLE_MODES, &preferences.subtitles.mode);
     let sdh = index_of(SDH, &preferences.subtitles.sdh);
+    let forced = index_of(FORCED, &preferences.subtitles.forced);
     let pictures = picture_row(preferences.subtitles.bitmap, ocr_offered);
     let avoid = avoids_extras(&preferences.audio.avoid);
     let p = preferences.clone();
@@ -1815,6 +1816,14 @@ fn PreferenceRows(
         let mut p = p.clone();
         if let Some((sdh, _)) = e.value().parse().ok().and_then(|i: usize| SDH.get(i)) {
             p.subtitles.sdh = *sdh;
+        }
+        on_change.call(p);
+    };
+    let p = preferences.clone();
+    let set_forced = move |e: FormEvent| {
+        let mut p = p.clone();
+        if let Some((forced, _)) = e.value().parse().ok().and_then(|i: usize| FORCED.get(i)) {
+            p.subtitles.forced = *forced;
         }
         on_change.call(p);
     };
@@ -1887,6 +1896,19 @@ fn PreferenceRows(
                 select { class: "pref-select", aria_label: "Subtitles for the deaf", disabled: busy, onchange: set_sdh,
                     for (i, (_, label)) in SDH.iter().enumerate() {
                         option { value: "{i}", selected: i == sdh, "{label}" }
+                    }
+                }
+            }
+        }
+        div { class: "row",
+            span { class: "row-what",
+                b { "Forced subtitles in a search" }
+                span { class: "row-sub", "Signs and foreign lines only, when finding subtitles. Playback follows Subtitles." }
+            }
+            span { class: "row-do",
+                select { class: "pref-select", aria_label: "Forced subtitles in a search", disabled: busy, onchange: set_forced,
+                    for (i, (_, label)) in FORCED.iter().enumerate() {
+                        option { value: "{i}", selected: i == forced, "{label}" }
                     }
                 }
             }

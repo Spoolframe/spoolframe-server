@@ -275,6 +275,22 @@ mod tests {
         assert_eq!(pick(SdhPreference::Prefer), Some(1));
         assert_eq!(pick(SdhPreference::Accept), Some(0));
         assert_eq!(pick(SdhPreference::Avoid), Some(0));
+        assert_eq!(pick(SdhPreference::Only), Some(1));
+    }
+
+    /// Only SDH: where there is none, no subtitles rather than plain ones.
+    #[test]
+    fn only_sdh_shows_nothing_without_an_sdh_track() {
+        let tracks = MediaTracks {
+            subtitles: vec![subtitle("eng", SubtitleRole::Full)],
+            ..MediaTracks::default()
+        };
+        let chosen = choose(
+            &tracks,
+            &english(SubtitleMode::Always, SdhPreference::Only),
+            None,
+        );
+        assert_eq!(chosen.selection.subtitle, None);
     }
 
     /// The B99 file's container and picture, as a client's track list

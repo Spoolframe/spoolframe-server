@@ -17,11 +17,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 pub use spoolframe_types::{
-    APP_RP_DOMAIN, Album, Artist, Artwork, ArtworkKind, AudioRole, BitmapPreference, Episode, Item,
-    LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState, QuotaOf, Role, SdhPreference,
-    Season, Show, SubtitleDownload, SubtitleDownloaded, SubtitleMode, SubtitleOrigin,
-    SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSource, SubtitleSourceState,
-    SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
+    APP_RP_DOMAIN, Album, Artist, Artwork, ArtworkKind, AudioRole, BitmapPreference, Episode,
+    ForcedPreference, Item, LibraryKind, Marker, MarkerKind, Movie, Platform, PlaybackState,
+    QuotaOf, Role, SdhPreference, Season, Show, SubtitleDownload, SubtitleDownloaded, SubtitleMode,
+    SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSource,
+    SubtitleSourceState, SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
 };
 
 mod optimized;

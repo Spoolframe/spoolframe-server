@@ -4214,11 +4214,11 @@ impl AdminApiServer for AdminApi {
         id: String,
         language: Option<String>,
     ) -> RpcResult<spoolframe_types::SubtitleSearch> {
-        self.admin(ext).await?;
+        let admin = self.admin(ext).await?;
         let id = catalog::media_id(&id)?;
         self.playback_debug()?
             .subtitle_downloads
-            .search(&id, language.as_deref())
+            .search(&id, language.as_deref(), &admin_actor(&admin))
             .await
             .map_err(download_error)
     }

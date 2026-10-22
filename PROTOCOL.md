@@ -2110,7 +2110,8 @@ the first site's.
 
 The `results` come best first: those found by the file's hash
 (`hash_match`: made for this release; only OpenSubtitles finds by it),
-then the rest by rating and downloads; machine-translated and AI-made
+then as the asking user's `TrackPreferences` say, then the rest by
+rating and downloads; machine-translated and AI-made
 ones (`origin`: `human`, `machine_translated`, `ai`) after people's;
 ones removed before as bad (`rejected`) last. SubDL gives no rating nor
 download count: its results come after rated or downloaded ones, in
@@ -2126,6 +2127,19 @@ nearly every file), `forced` (only the parts in another language, signs
 and foreign lines: OpenSubtitles' `foreign_parts_only`; always `false`
 from SubDL, which does not say, and left out by a server before it),
 and `downloaded` (downloading it again gives the same track).
+
+The user's preferences order the results by `forced` first, then by
+`hearing_impaired`. `subtitles.forced` is one of `prefer` (forced ones
+first), `accept` (the default: forced ones after the rest), `avoid`
+(none forced listed) or `only` (only forced ones listed); it is
+optional on the wire, and a peer before it leaves it out. Playback
+does not use it: `subtitles.mode` says when forced subtitles show.
+`subtitles.sdh` works the same way for `hearing_impaired`: `prefer`,
+`accept` (the default: plain ones first), `avoid` (no SDH listed) and
+`only` (only SDH listed; in playback, no subtitles where there is no
+SDH track). A build before `only` reads it as `accept`. `avoid` and
+`only` leave out a hash match too, and every SubDL result is plain and
+not forced.
 
 `DownloadSubtitle` names a `result` a search of the same item listed in
 the last day, and downloads it from its site; another, or one of a site

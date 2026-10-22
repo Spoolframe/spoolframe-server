@@ -236,6 +236,7 @@ fn choose_subtitle(
                 SdhPreference::Prefer => &[SubtitleRole::Sdh, SubtitleRole::Full],
                 SdhPreference::Accept => &[SubtitleRole::Full, SubtitleRole::Sdh],
                 SdhPreference::Avoid => &[SubtitleRole::Full],
+                SdhPreference::Only => &[SubtitleRole::Sdh],
             };
             for language in &languages {
                 for role in order {

@@ -3161,7 +3161,7 @@ impl ClientProtocol {
             Request::SearchSubtitles { id, language } => self
                 .services
                 .subtitle_downloads
-                .search(&id, language.as_deref())
+                .search(&id, language.as_deref(), &who.actor())
                 .await
                 .map(Reply::SubtitleResults)
                 .map_err(download_error),
