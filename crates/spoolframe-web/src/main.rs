@@ -19,6 +19,8 @@ mod connect;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod experimental;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod federation;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod gpus;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod invites;

@@ -20,6 +20,7 @@ mod discovery;
 mod downloads;
 mod error;
 mod experimental;
+mod federation;
 mod invite_admin;
 mod invites;
 mod lan_servers;
@@ -66,6 +67,7 @@ pub use spoolframe_protocol::downloads::{
     DownloadFailure, DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState,
     DownloadTracks, FileTracks, LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
 };
+pub use spoolframe_protocol::federation::{PairingRefused, PeerServer};
 // Pairing a guest onto this device by QR code (P7-03).
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 pub use spoolframe_protocol::invite::InviteLinkKind;

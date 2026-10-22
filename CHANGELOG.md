@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- Experimental, and off by default: server-to-server pairing (P8-01),
+  the first part of federation. Not reviewed yet: pair only with servers
+  you run. `experimental { federation = true; }` (Settings ›
+  Experimental, applies after a restart) opens `spoolframe/federation/1`;
+  off, it closes at once as before, and a `federation` invite is
+  refused. An admin of one server makes a `federation` invite (no role,
+  one use by default; its link says `kind=federation`); an admin of the
+  other redeems it, in the web UI's new Users and devices › Federation
+  page or the admin API's `federation_redeem`, and both servers keep the
+  pair (migration 0047, `federation_peers`). The server whose invite it
+  was pins the other's key and server id together: the same key under
+  another server id is refused every time; a known server id from a new
+  key is held, with at most three others and never in place of one,
+  until an admin confirms or rejects that very key
+  (`federation_keyConfirm`, `federation_keyReject`, each naming the key;
+  `KEY_NOT_HELD`, a new error, when the held keys changed). A rejected
+  key is refused for a day; a server never pairs with its own server id.
+  Either side unpairs
+  (`federation_peerRevoke`) and tells the other, best effort. A stranger
+  on the ALPN reaches only `hello` and redeeming, shares the strangers'
+  cap and budget with devices that are not signed in, and every refused
+  ask counts as a wrong guess at an invite code. A paired server is a
+  `friend` on this server's own relays. New crate `spoolframe-federation`
+  (AGPL-3.0-or-later, not published). PROTOCOL.md's "Federation" has the
+  wire.
+- Client protocol, used only with an app that names the experimental
+  `federation` feature: `PairServer { link }` pairs the server by another
+  server's invite (an admin's, recently signed in, as `CreateInvite`),
+  answered `ServerPaired`, or `PairingRefused` (a new error) when the
+  other server refuses for a reason other than the invite's own; and
+  `CreateInvite` makes a `federation` invite. `LookupInvite` of a
+  `federation` invite says the inviting server's key fingerprint
+  (`fingerprint`, left out for other kinds). No `PROTOCOL_VERSION`
+  change. SDK: `Experimental.federation` (a new field: a struct literal
+  needs it), `Session::pair_server`, `SdkError::PairingRefused`, and
+  `InviteLinkKind::Federation`.
+- `spoolframe-server invite create --role` is optional: a consumer's if
+  left out, as the server's default was; a `federation` invite takes
+  none.
+
 - A download's status says its expected size. `DownloadStatus` answered
   without `expected_size`, so a client that only polled it never learned
   the size to show before the file was ready; only `PrepareDownload` said

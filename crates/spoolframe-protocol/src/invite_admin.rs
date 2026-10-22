@@ -23,7 +23,9 @@ pub enum InviteKind {
     CreateUser,
     /// Lets a portable identity watch here, with no account made (P7-05).
     PortableAccount,
-    /// Pairs another server with this one (P8-01): refused until then.
+    /// Pairs another server with this one (P8-01, experimental): made
+    /// only for a client that named the `federation` feature, on a
+    /// server that has it on.
     Federation,
     /// A kind this build does not know, from a newer server.
     #[serde(other)]

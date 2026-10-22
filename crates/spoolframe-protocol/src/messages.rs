@@ -639,8 +639,9 @@ pub enum Request {
     /// shown this once. An admin's only (`AdminRequired`), and only after
     /// they confirmed it is them recently (`RecentSignInRequired`: confirm
     /// with `ConfirmPassword` or a passkey, then ask again). A
-    /// `federation` invite is `InvalidInput` until P8 builds them, as are
-    /// fields out of their limits.
+    /// `federation` invite is `InvalidInput` unless this connection's
+    /// `Hello` named the experimental `federation` feature and the server
+    /// has it on (P8-01), as are fields out of their limits.
     CreateInvite(CreateInvite),
     /// The invites that can still be redeemed, newest first, made here or
     /// in the web UI: `Invites`. An admin's only; no confirmation needed.
@@ -667,6 +668,21 @@ pub enum Request {
     HttpPlaybackUrl {
         handle: PlaybackHandle,
     },
+
+    /// Experimental (`federation`, P8-01; see [`crate::federation`]): pair
+    /// this server with the one whose `federation` invite `link` is, as an
+    /// admin pasting it in the web UI would: `ServerPaired`. Unsupported
+    /// unless this connection's `Hello` named the feature and the
+    /// server's answer named it back. An admin's only (`AdminRequired`),
+    /// after a recent confirmation (`RecentSignInRequired`), as
+    /// `CreateInvite`. A link that is not one, has no code, or is this
+    /// server's own is `InvalidInput`; the other server's refusal of the
+    /// code is the invite's own error (`InviteInvalid`, `InviteExpired`,
+    /// `InviteExhausted`, `WrongInviteKind`, `RateLimited`), any other is
+    /// `PairingRefused`; the other server unreachable is `Unavailable`.
+    /// Look the code up on the other server first (`LookupInvite`): it
+    /// tells the kind, the inviter and the key's fingerprint.
+    PairServer(crate::federation::PairServer),
 
     /// Leave this server (PX-47): `Done`, and every session of the user
     /// here is ended, this one too. Needs a recent sign-in
@@ -1623,6 +1639,11 @@ pub enum Reply {
     HttpPlaybackRefused {
         reason: crate::experimental::HttpPlaybackRefusal,
     },
+    /// Experimental (`federation`, P8-01): the server paired
+    /// (`PairServer`).
+    ServerPaired {
+        server: crate::federation::PeerServer,
+    },
     /// The playlists the user sees (`ListPlaylists`, PX-40), oldest first,
     /// and the notes of pinned ones that left their Pinned.
     Playlists {
@@ -2187,6 +2208,12 @@ pub enum Error {
     /// state is `ready`. A download that failed is prepared again.
     #[error("the download is not ready")]
     DownloadNotReady,
+    /// Experimental (`federation`, P8-01): the other server did not pair
+    /// (`PairServer`), for `reason`. Nothing was kept.
+    #[error("the other server did not pair: {reason}")]
+    PairingRefused {
+        reason: crate::federation::PairingRefused,
+    },
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.

@@ -1,8 +1,9 @@
 //! Server › Settings › Experimental: every switch that may change or go
 //! away in one place. HTTP playback for AirPlay (PX-49), which was the
 //! config file's and the CLI's only, libplacebo's shared Vulkan device on
-//! AMD (PGPU-04), which was at the foot of Playback, and keyframes read
-//! ahead of any play (`experimental.index_ahead`).
+//! AMD (PGPU-04), which was at the foot of Playback, keyframes read
+//! ahead of any play (`experimental.index_ahead`), and pairing with other
+//! servers (`experimental.federation`, P8-01).
 
 use dioxus::prelude::*;
 use serde_json::json;
@@ -52,6 +53,7 @@ fn ExperimentalFields(
     let address = use_signal(|| text(&settings, "http_playback.address"));
     let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
     let mut index_ahead = use_signal(|| flag(&settings, "experimental.index_ahead"));
+    let mut federation = use_signal(|| flag(&settings, crate::federation::SETTING));
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     // `http_playback.*` is sensitive: from an old session, "Confirm it's
@@ -76,6 +78,7 @@ fn ExperimentalFields(
                 Some(json!(shared_on_amd())),
             ),
             ("experimental.index_ahead", Some(json!(index_ahead()))),
+            (crate::federation::SETTING, Some(json!(federation()))),
         ];
         busy.set(true);
         spawn(async move {
@@ -166,6 +169,24 @@ fn ExperimentalFields(
                 }
             }
             Note { settings: settings.clone(), setting: "experimental.index_ahead", on_changed: move |_| on_reload.call(()) }
+        }
+        div { class: "flex flex-col gap-2",
+            h2 { "Federation" }
+            div { class: "flex items-start gap-3",
+                button {
+                    class: "switch mt-0.5",
+                    role: "switch",
+                    aria_checked: "{federation()}",
+                    aria_label: "Pair with other servers",
+                    disabled: locked(&settings, crate::federation::SETTING),
+                    onclick: move |_| federation.toggle(),
+                }
+                span { class: "choice-what",
+                    b { "Pair with other servers" }
+                    "Another Spoolframe server pairs with this one by an invite of its own kind, made and redeemed under Users and devices › Federation. Not reviewed yet: pair only with servers you run. Applies after a restart."
+                }
+            }
+            Note { settings: settings.clone(), setting: crate::federation::SETTING, on_changed: move |_| on_reload.call(()) }
         }
         if let Some(text) = error() {
             Alert { text }

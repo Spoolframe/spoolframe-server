@@ -7,8 +7,8 @@
 //! that does not know one, or has it off, does not turn it on, and its
 //! calls answer as off without asking it.
 
-use spoolframe_protocol::experimental::HTTP_PLAYBACK;
 pub use spoolframe_protocol::experimental::HttpPlaybackRefusal;
+use spoolframe_protocol::experimental::{FEDERATION, HTTP_PLAYBACK};
 
 /// The experimental features an app asks for, or a server turned on. None
 /// by default.
@@ -18,6 +18,12 @@ pub struct Experimental {
     /// own port, for a player with no Iroh: an AirPlay receiver
     /// ([`crate::Session::http_playback_url`]).
     pub http_playback: bool,
+    /// Server-to-server federation (P8-01): pairing the server with
+    /// another by that one's invite ([`crate::Session::pair_server`]),
+    /// and making `federation` invites
+    /// ([`crate::InviteKind::Federation`]). An admin's, on a server with
+    /// `experimental.federation` on.
+    pub federation: bool,
 }
 
 impl Experimental {
@@ -27,6 +33,9 @@ impl Experimental {
         if self.http_playback {
             names.push(HTTP_PLAYBACK.to_owned());
         }
+        if self.federation {
+            names.push(FEDERATION.to_owned());
+        }
         names
     }
 
@@ -35,6 +44,7 @@ impl Experimental {
     pub(crate) fn of(names: &[String]) -> Self {
         Self {
             http_playback: names.iter().any(|n| n == HTTP_PLAYBACK),
+            federation: names.iter().any(|n| n == FEDERATION),
         }
     }
 }
@@ -62,8 +72,12 @@ mod tests {
         assert!(Experimental::default().names().is_empty());
         let asked = Experimental {
             http_playback: true,
+            federation: true,
         };
-        assert_eq!(asked.names(), vec![HTTP_PLAYBACK.to_owned()]);
+        assert_eq!(
+            asked.names(),
+            vec![HTTP_PLAYBACK.to_owned(), FEDERATION.to_owned()]
+        );
         assert_eq!(Experimental::of(&asked.names()), asked);
         assert_eq!(
             Experimental::of(&["teleport".to_owned()]),

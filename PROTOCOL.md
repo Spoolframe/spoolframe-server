@@ -924,8 +924,10 @@ portable guest `not_for_portable_users`. `create_invite` and
 `revoke_invite` also need a recent confirmation, as the web UI's admin
 changes do: `recent_sign_in_required` past it, and `confirm_password` or
 a passkey confirmation lets them through. A field out of its limits, and
-a `federation` invite, is `invalid_input`. Neither is retried on its own
-on a new connection: a second `create_invite` makes a second code.
+a `federation` invite unless the connection's `Hello` named the
+experimental `federation` feature and the server has it on, is
+`invalid_input`. Neither is retried on its own on a new connection: a
+second `create_invite` makes a second code.
 
 ### SDK
 
@@ -3101,4 +3103,29 @@ since they were listed) is `KEY_NOT_HELD`, and nothing changes.
 When SA has paired but SB cannot keep its side (its store fails), SB
 sends `unpaired` on the same connection, best effort, so SA does not
 keep a pair SB has not.
+
+### Pairing from an app
+
+An app that names the experimental `federation` feature in its `Hello`,
+on a server that names it back, may ask its server to pair with another
+by that one's invite, as the QR flow does: look the code up on the other
+server first (`lookup_invite`, which tells a `federation` invite's
+`fingerprint`), then
+
+```json
+{"type": "pair_server", "link": "spoolframe://invite?server=…&kind=federation&cap=…"}
+```
+
+answered `server_paired { server: {name, server_id, endpoint_id,
+fingerprint} }`, the other server as this one now keeps it. An admin's
+only (`admin_required`), after a recent confirmation
+(`recent_sign_in_required`). Without the feature it is `unsupported`. A
+link that is not one, has no code, or is the server's own is
+`invalid_input`; the other server unreachable is `unavailable`. The
+other server's refusal of the code is the invite's own error
+(`invite_invalid`, `invite_expired`, `invite_exhausted`,
+`wrong_invite_kind`, `rate_limited`); any other, and the two being
+paired already, is `pairing_refused { reason }` (`already_paired`,
+`key_held`, `key_refused`, `server_id_changed`, `same_server_id`). It is never retried on its own: a
+second try may meet a used-up invite.
 

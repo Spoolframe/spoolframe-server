@@ -173,6 +173,10 @@ pub enum PairingRefused {
     /// rejected it within the day, or as many new keys as are held for
     /// that server wait already.
     KeyRefused,
+    /// The other server holds this one's new key until its admin
+    /// confirms it: what a server tells its own admin (`PairServer`),
+    /// never sent on the ALPN, where the standing says it.
+    KeyHeld,
     /// A reason this build does not know.
     #[serde(other)]
     Unknown,
@@ -192,6 +196,7 @@ impl PairingRefused {
             PairingRefused::ServerIdChanged => "server_id_changed",
             PairingRefused::SameServerId => "same_server_id",
             PairingRefused::KeyRefused => "key_refused",
+            PairingRefused::KeyHeld => "key_held",
             PairingRefused::Unknown => "unknown",
         }
     }
@@ -217,6 +222,9 @@ impl fmt::Display for PairingRefused {
             PairingRefused::KeyRefused => {
                 f.write_str("that new key for a paired server is not held for its admin")
             }
+            PairingRefused::KeyHeld => f.write_str(
+                "the other server holds this server's new key until its admin confirms it",
+            ),
             PairingRefused::Unknown => f.write_str("refused for a reason this build does not know"),
         }
     }
@@ -227,6 +235,33 @@ impl fmt::Display for PairingRefused {
 /// told keeps its row until its admin revokes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unpaired {}
+
+/// An admin's `PairServer` (client protocol, P8-01): the other server's
+/// `federation` invite link, with its code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairServer {
+    pub link: String,
+}
+
+impl fmt::Debug for PairServer {
+    // The link carries the code: keep it out of logs.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PairServer { link: <redacted> }")
+    }
+}
+
+/// A server paired by `PairServer` (client protocol, P8-01), as the app
+/// shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerServer {
+    /// What it calls itself.
+    pub name: String,
+    pub server_id: String,
+    /// Its `EndpointId`, hex: the key pinned.
+    pub endpoint_id: String,
+    /// The key's fingerprint, as the other server's admin sees it.
+    pub fingerprint: String,
+}
 
 /// A request on `spoolframe/federation/1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +352,7 @@ mod tests {
             PairingRefused::ServerIdChanged,
             PairingRefused::SameServerId,
             PairingRefused::KeyRefused,
+            PairingRefused::KeyHeld,
         ] {
             round_trip(PeerReply::Refused { reason });
         }
@@ -338,6 +374,7 @@ mod tests {
             PairingRefused::ServerIdChanged,
             PairingRefused::SameServerId,
             PairingRefused::KeyRefused,
+            PairingRefused::KeyHeld,
             PairingRefused::Unknown,
         ] {
             let json = serde_json::to_value(reason).unwrap();
@@ -392,6 +429,28 @@ mod tests {
             panic!("not a redemption");
         };
         assert!(redeem.addrs.is_empty() && redeem.relays.is_empty());
+    }
+
+    /// The client protocol's request and reply (P8-01).
+    #[test]
+    fn pairing_from_an_app_goes_both_ways_and_keeps_the_link_out_of_debug() {
+        use crate::{Error, Reply, Request, Response};
+        let request = Request::PairServer(PairServer {
+            link: "spoolframe://invite?server=x&kind=federation&cap=QW7K-2MFP-XR4T".into(),
+        });
+        round_trip(request.clone());
+        assert!(!format!("{request:?}").contains("QW7K"));
+        round_trip(Response::Ok(Reply::ServerPaired {
+            server: PeerServer {
+                name: "Alice's server".into(),
+                server_id: "mzxw6ytbojtg633c".into(),
+                endpoint_id: "ab".repeat(32),
+                fingerprint: "PGJA-BHZ1-F68M-DFSE".into(),
+            },
+        }));
+        round_trip(Response::Err(Error::PairingRefused {
+            reason: PairingRefused::AlreadyPaired,
+        }));
     }
 
     #[test]

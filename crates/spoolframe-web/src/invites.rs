@@ -64,13 +64,15 @@ pub fn new_invite(form: &InviteForm) -> Result<NewInvite, String> {
             invite::MAX_NOTE_CHARS
         ));
     }
-    let portable = form.kind == InviteKind::PortableAccount;
+    // Only an invite that makes an account here takes a role: not a
+    // portable user's, nor a server's.
+    let takes_role = form.kind == InviteKind::CreateUser;
     Ok(NewInvite {
         kind: form.kind,
         note: (!note.is_empty()).then(|| note.to_owned()),
         uses: Some(uses),
         expires: Some(form.expires),
-        role: (!portable).then_some(form.role),
+        role: takes_role.then_some(form.role),
     })
 }
 

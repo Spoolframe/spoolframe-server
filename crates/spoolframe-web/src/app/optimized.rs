@@ -595,12 +595,13 @@ fn act(
 
 /// A dialog that asks before something that cannot be undone: `title`,
 /// `text`, and two buttons. `warning` heads it with a warning rather than
-/// a delete's red.
+/// a delete's red; `icon`, when given, replaces the head's icon.
 #[component]
-fn DangerDialog(
+pub(super) fn DangerDialog(
     title: String,
     text: String,
     #[props(default)] warning: bool,
+    #[props(default)] icon: Option<Element>,
     cancel: String,
     confirm: String,
     busy: bool,
@@ -611,7 +612,13 @@ fn DangerDialog(
         div { class: "scrim",
             section { class: "dialog w-[440px]", role: "dialog",
                 div { class: if warning { "dialog-head" } else { "dialog-head dialog-head-danger" },
-                    if warning { icons::Warning { size: 22 } } else { icons::Trash { size: 22 } }
+                    if let Some(icon) = icon {
+                        {icon}
+                    } else if warning {
+                        icons::Warning { size: 22 }
+                    } else {
+                        icons::Trash { size: 22 }
+                    }
                     h1 { "{title}" }
                 }
                 p { "{text}" }

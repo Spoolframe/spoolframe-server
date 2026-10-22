@@ -82,7 +82,7 @@ pub fn tie_line(now: i64, tie: &PortableTie) -> String {
 
 /// `at` by the day, seen at `now`: today, yesterday, so many days ago in
 /// the last month, else its date.
-fn days_ago(now: i64, at: i64) -> String {
+pub(crate) fn days_ago(now: i64, at: i64) -> String {
     match now.div_euclid(86_400) - at.div_euclid(86_400) {
         ..=0 => "today".into(),
         1 => "yesterday".into(),
@@ -92,7 +92,7 @@ fn days_ago(now: i64, at: i64) -> String {
 }
 
 /// "Oct 2" (UTC), with the year when it is not `now`'s: "Oct 2, 2025".
-fn short_date(now: i64, at: i64) -> String {
+pub(crate) fn short_date(now: i64, at: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];

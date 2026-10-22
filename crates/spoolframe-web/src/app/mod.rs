@@ -11,6 +11,7 @@ mod connect;
 mod connected;
 mod device;
 mod experimental;
+mod federation;
 mod gpus;
 mod http;
 mod icons;
@@ -46,6 +47,7 @@ use catalog_item::CatalogItem;
 use connect::Connect;
 use connected::AuditPageView;
 use device::DeviceApproval;
+use federation::Federation;
 use invites::Invites;
 use libraries::{AddLibrary, Libraries};
 use licenses::LicensesPage;
@@ -114,6 +116,10 @@ enum Route {
             // Invites (P6-01): under Users and devices in the sidebar.
             #[route("/invites")]
             Invites {},
+            // Federation (P8-01, experimental): under Users and devices,
+            // in the sidebar while the server has it on.
+            #[route("/federation")]
+            Federation {},
             #[route("/server")]
             Server {},
             // Server's sub-pages (P3-14): what it does now, and its log.
@@ -1437,6 +1443,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
         Route::Invites {} => "Invites",
+        Route::Federation {} => "Federation",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
         Route::AuditPageView {} => "Audit",
@@ -1456,6 +1463,10 @@ fn SignedIn(user: UserInfo) -> Element {
         _ => title.to_owned(),
     };
     let site = use_resource(site);
+    // Federation's page is in the sidebar while the server has it on
+    // (P8-01, experimental).
+    let federation = use_resource(move || async move { admin && federation_on().await });
+    let federation = federation.read().unwrap_or(false);
     let insecure = admin && site.read().as_ref().is_some_and(|s| s.insecure_cookies);
     // Plain HTTP across the network (PX-23) says more than insecure
     // cookies do, and takes that banner's place: turning them off there
@@ -1523,7 +1534,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "flex flex-col gap-0.5",
                     {link(Route::AdminHome {}, "Overview", false)}
                     {link(Route::Users {}, "Users and devices", false)}
-                    {users_links(&route)}
+                    {users_links(&route, federation)}
                     {link(Route::Server {}, "Server", false)}
                     {server_links(&route)}
                     {link(plex_page(), "Plex", false)}
@@ -1566,7 +1577,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
                     {link(Route::AdminHome {}, "Overview", false)}
                     {link(Route::Users {}, "Users and devices", false)}
-                    {users_links(&route)}
+                    {users_links(&route, federation)}
                     {link(Route::Server {}, "Server", false)}
                     {server_links(&route)}
                     {link(plex_page(), "Plex", false)}
@@ -1607,15 +1618,33 @@ fn plex_page() -> Route {
 
 /// Users and devices' sub-page in the sidebar, one step in: Invites
 /// (P6-01).
-fn users_links(route: &Route) -> Element {
-    let here = matches!(route, Route::Invites {});
+fn users_links(route: &Route, federation: bool) -> Element {
+    let class = |here: bool| {
+        if here {
+            "nav-link nav-link-here nav-sub"
+        } else {
+            "nav-link nav-sub"
+        }
+    };
     rsx! {
-        Link {
-            class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
-            to: Route::Invites {},
-            "Invites"
+        Link { class: class(matches!(route, Route::Invites {})), to: Route::Invites {}, "Invites" }
+        if federation {
+            Link { class: class(matches!(route, Route::Federation {})), to: Route::Federation {}, "Federation" }
         }
     }
+}
+
+/// Whether the server has federation on (P8-01), as its status names its
+/// experimental features; off when it cannot be told.
+async fn federation_on() -> bool {
+    use spoolframe_admin_api::AdminApiClient;
+    let Ok(client) = rpc::client().await else {
+        return false;
+    };
+    client
+        .server_status()
+        .await
+        .is_ok_and(|s| crate::federation::is_on(&s.experimental_features))
 }
 
 /// Server's sub-pages in the sidebar, one step in: Activity (P3-14),

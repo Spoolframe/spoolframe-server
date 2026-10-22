@@ -386,6 +386,12 @@ pub enum SdkError {
     /// could not be read or written, or none was set.
     #[error("downloads: {0}")]
     Downloads(String),
+    /// Experimental (`federation`, P8-01): the other server did not pair
+    /// ([`crate::Session::pair_server`]), for `reason`. Nothing was kept.
+    #[error("the other server did not pair: {reason}")]
+    PairingRefused {
+        reason: spoolframe_protocol::federation::PairingRefused,
+    },
     #[error("server: {0}")]
     Server(String),
     /// The server's answer made no sense to this build.
@@ -473,6 +479,7 @@ impl SdkError {
             },
             ServerError::NoSubtitleSource => SdkError::NoSubtitleSource,
             ServerError::DownloadNotReady => SdkError::DownloadNotReady,
+            ServerError::PairingRefused { reason } => SdkError::PairingRefused { reason },
             other => SdkError::Server(other.to_string()),
         }
     }

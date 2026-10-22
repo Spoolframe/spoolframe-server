@@ -203,6 +203,8 @@ pub fn retry_safe(request: &Request) -> bool {
         // (PX-44).
         | Request::CreateInvite(_)
         | Request::RevokeInvite { .. }
+        // A pairing takes the other server's use (P8-01).
+        | Request::PairServer(_)
         // Leaving ends every session; a second try finds none (PX-47).
         | Request::LeaveServer
         // PX-40: a second create is a second playlist; an edit's adds

@@ -82,7 +82,9 @@ pub struct InviteInfo {
     pub role: Option<Role>,
     /// What the code does, as the link says (P7-05): makes an account
     /// ([`Client::redeem_invite`]), or grants a portable identity access
-    /// ([`Client::redeem_invite_portable`]). A hint for which form to
+    /// ([`Client::redeem_invite_portable`]), or pairs another server
+    /// (P8-01: an admin of that server redeems it, with
+    /// [`crate::Session::pair_server`] there). A hint for which form to
     /// show; the server answers the other with
     /// [`SdkError::WrongInviteKind`].
     pub kind: InviteLinkKind,

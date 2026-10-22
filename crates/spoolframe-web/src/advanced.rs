@@ -185,6 +185,7 @@ mod tests {
             "http_playback.address",
             "experimental.libplacebo_shared_on_amd",
             "experimental.index_ahead",
+            "experimental.federation",
         ] {
             assert!(!is_advanced(key), "{key}");
         }

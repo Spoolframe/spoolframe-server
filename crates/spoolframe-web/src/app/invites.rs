@@ -166,7 +166,13 @@ pub fn Invites() -> Element {
 /// The role as the list's pill shows it; "Guest" for a portable guest's
 /// invite (P7-05), which makes no account.
 #[component]
-fn RolePill(role: Role, #[props(default)] guest: bool) -> Element {
+fn RolePill(role: Role, #[props(default)] guest: bool, #[props(default)] server: bool) -> Element {
+    // A server's pairing invite (P8-01) makes no account either.
+    if server {
+        return rsx! {
+            span { class: "pill", "Server" }
+        };
+    }
     if guest {
         return rsx! {
             span { class: "pill", "Guest" }
@@ -211,6 +217,7 @@ fn InviteTable(
                                 RolePill {
                                     role: invite.role,
                                     guest: invite.kind == InviteKind::PortableAccount,
+                                    server: invite.kind == InviteKind::Federation,
                                 }
                             }
                             td { "{uses_left(&invite)}" }
@@ -253,7 +260,7 @@ fn InviteCard(invite: InviteEntry, now: i64, on_revoke: EventHandler<InviteEntry
         div { class: "invite-card",
             div { class: "flex items-center gap-2",
                 b { class: "flex-grow", "{name(&invite)}" }
-                RolePill { role: invite.role, guest: invite.kind == InviteKind::PortableAccount }
+                RolePill { role: invite.role, guest: invite.kind == InviteKind::PortableAccount, server: invite.kind == InviteKind::Federation }
             }
             span { "{card_line(&invite, now)}" }
             button {
@@ -611,7 +618,7 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
 /// scanned in the same room; what is shown, copied and shared is the
 /// https one (PX-45), which a message makes tappable.
 #[component]
-fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
+pub(super) fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
     let mut copied = use_signal(|| false);
     let invite = &created.invite;
     let link = created.share_link.clone();
@@ -670,6 +677,8 @@ fn InviteResult(created: InviteCreated, on_done: EventHandler<()>) -> Element {
                         div { class: "flex flex-wrap gap-2",
                             if invite.kind == InviteKind::PortableAccount {
                                 span { class: "pill", "Guest with their own identity" }
+                            } else if invite.kind == InviteKind::Federation {
+                                span { class: "pill", "Pairs a server" }
                             } else {
                                 span { class: "pill", "{role_name(invite.role)}" }
                             }

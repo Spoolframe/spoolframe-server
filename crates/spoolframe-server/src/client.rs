@@ -547,6 +547,15 @@ impl ClientProtocol {
         }
     }
 
+    /// Federation (P8-01), if this server has it on and `hello` named it.
+    fn federation_for(&self, hello: &Hello) -> Option<&Arc<crate::federation::Federation>> {
+        let asked = hello
+            .experimental
+            .iter()
+            .any(|n| n == spoolframe_protocol::experimental::FEDERATION);
+        self.services.federation.as_ref().filter(|_| asked)
+    }
+
     /// The experimental features this server has on (PX-49).
     fn experimental_on(&self) -> Vec<&'static str> {
         crate::protocol_info::experimental_on(
@@ -3820,6 +3829,33 @@ impl ClientProtocol {
                     Err(reason) => refused(reason),
                 }
             }
+            // Experimental (P8-01): only when this connection's Hello named
+            // it and the server has it on; an admin's, as CreateInvite is.
+            Request::PairServer(pair) => {
+                let Some(federation) = self.federation_for(hello) else {
+                    return Err(Error::Unsupported {
+                        request: format!(
+                            "pair_server without {}",
+                            spoolframe_protocol::experimental::FEDERATION
+                        ),
+                    });
+                };
+                let user = admin(&who)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
+                let peer = federation
+                    .redeem_link(&pair.link, &user.username)
+                    .await
+                    .map_err(pair_error)?;
+                Ok(Reply::ServerPaired {
+                    server: spoolframe_protocol::federation::PeerServer {
+                        fingerprint: spoolframe_protocol::fingerprint::of_hex(&peer.endpoint_id)
+                            .unwrap_or_default(),
+                        name: peer.display_name,
+                        server_id: peer.server_id,
+                        endpoint_id: peer.endpoint_id,
+                    },
+                })
+            }
             Request::LookupDeviceSignIn { code } => {
                 let user = local(&who)?;
                 let (code, guess) = self.sign_in_code(connection, user, &code)?;
@@ -4002,10 +4038,17 @@ impl ClientProtocol {
                     expires_secs: create.expires_in_secs,
                     role: create.role,
                 };
-                let created =
-                    crate::invites::create(self.store(), request, &user.username, &origin, None)
-                        .await
-                        .map_err(create_invite_error)?;
+                // P8-01: a `federation` one only for a client that named
+                // the experimental feature, on a server that has it on.
+                let created = crate::invites::create(
+                    self.store(),
+                    request,
+                    &user.username,
+                    &origin,
+                    self.federation_for(hello).map(|f| &**f),
+                )
+                .await
+                .map_err(create_invite_error)?;
                 let server = crate::invites::server_link(
                     self.id.to_string(),
                     self.name.get(),
@@ -6760,6 +6803,39 @@ fn endpoint_binding(endpoint_id: &str, hello: &Hello) -> SessionBinding {
         endpoint_id: endpoint_id.to_owned(),
         device_name: hello.device_name.clone(),
         platform: hello.platform,
+    }
+}
+
+/// Why `PairServer` made no pair, for the client (P8-01): the other
+/// server's refusal of the code as the invite's own error.
+fn pair_error(e: crate::federation::PairError) -> Error {
+    use crate::federation::PairError;
+    use spoolframe_federation::DialError;
+    use spoolframe_protocol::federation::PairingRefused;
+    let message = e.to_string();
+    match e {
+        PairError::NotALink | PairError::NoCode | PairError::WrongKind | PairError::Itself => {
+            Error::InvalidInput { message }
+        }
+        PairError::Starting => Error::Unavailable { message },
+        PairError::AlreadyPaired => Error::PairingRefused {
+            reason: PairingRefused::AlreadyPaired,
+        },
+        PairError::KeyHeld => Error::PairingRefused {
+            reason: PairingRefused::KeyHeld,
+        },
+        PairError::Dial(DialError::Refused(reason)) => match reason {
+            PairingRefused::InviteInvalid => Error::InviteInvalid,
+            PairingRefused::InviteExpired => Error::InviteExpired,
+            PairingRefused::InviteExhausted => Error::InviteExhausted,
+            PairingRefused::WrongInviteKind => Error::WrongInviteKind,
+            PairingRefused::RateLimited { retry_after_secs } => {
+                rate_limited(Duration::from_secs(retry_after_secs))
+            }
+            reason => Error::PairingRefused { reason },
+        },
+        PairError::Dial(_) | PairError::Unexpected(_) => Error::Unavailable { message },
+        PairError::Store(e) => internal(e),
     }
 }
 

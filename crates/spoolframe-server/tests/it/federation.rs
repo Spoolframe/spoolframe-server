@@ -1037,3 +1037,207 @@ mod admin {
         sb.server.stop().await;
     }
 }
+
+// P8-01's client-protocol side: an admin's app pairs its server by SA's
+// invite, as the QR flow does, through the SDK; only an app that names
+// the experimental `federation` feature may.
+
+mod app {
+    use spoolframe_client_sdk::{
+        Client, ClientOptions, Device, Experimental, InviteKind as SdkKind, InviteOutcome,
+        InviteSpec, MemoryStorage, SdkError, Session,
+    };
+    use spoolframe_types::Role;
+
+    use super::*;
+    use crate::support::mkv_capabilities;
+
+    const PASSWORD: &str = "correct horse";
+
+    /// An app on loopback that asks for `experimental` (and lists invite
+    /// lookup), signed in to `server` as `username`.
+    async fn signed_in(
+        server: &TestServer,
+        username: &str,
+        experimental: Experimental,
+    ) -> (Client, Session) {
+        let options = ClientOptions {
+            lan_discovery: false,
+            experimental,
+            features: spoolframe_client_sdk::Features {
+                invite_lookup: true,
+                ..Default::default()
+            },
+            ..ClientOptions::default()
+        };
+        let device = Device {
+            name: "phone".into(),
+            client_name: "sdk-test".into(),
+            client_version: "0".into(),
+            platform: spoolframe_client_sdk::types::Platform::Ios,
+            capabilities: mkv_capabilities(),
+        };
+        let client = Client::open_with_options(Arc::new(MemoryStorage::default()), device, options)
+            .await
+            .unwrap();
+        let session = sign_in(&client, server, username).await;
+        (client, session)
+    }
+
+    async fn sign_in(client: &Client, server: &TestServer, username: &str) -> Session {
+        let port = server
+            .server
+            .addr()
+            .ip_addrs()
+            .find(|addr| addr.is_ipv4())
+            .expect("an IPv4 address")
+            .port();
+        let id = server.server.id().to_string();
+        client
+            .add_address(&id, vec![([127, 0, 0, 1], port).into()])
+            .unwrap();
+        client.connect(&id).await.unwrap();
+        client.pin(&id, true).await.unwrap();
+        client
+            .sign_in(&id, username, PASSWORD, false)
+            .await
+            .unwrap()
+    }
+
+    const FEDERATION: Experimental = Experimental {
+        http_playback: false,
+        federation: true,
+    };
+
+    async fn with_admin(test: &str, name: &str, admin: &str) -> TestServer {
+        let server = super::server(test, name).await;
+        server.add_user(admin, PASSWORD, None).await;
+        server.store.set_role(admin, Role::Admin).await.unwrap();
+        server.add_user("guest", PASSWORD, None).await;
+        server
+    }
+
+    fn federation_invite() -> InviteSpec {
+        InviteSpec {
+            kind: SdkKind::Federation,
+            note: None,
+            uses: None,
+            expires_in: None,
+            role: None,
+        }
+    }
+
+    /// The QR flow from the apps: SA's admin makes the invite in an app;
+    /// SB's admin's app looks it up on SA (its kind, SA's fingerprint and
+    /// who made it), then has SB redeem it.
+    #[tokio::test]
+    async fn an_admin_s_app_pairs_its_server_by_the_other_s_invite() {
+        let sa = with_admin("fed-app-sa", "Alice's server", "alice").await;
+        let sb = with_admin("fed-app-sb", "Bob's server", "bob").await;
+        let (_on_sa, alice) = signed_in(&sa, "alice", FEDERATION).await;
+        let minted = alice.create_invite(federation_invite()).await.unwrap();
+        assert_eq!(minted.kind, SdkKind::Federation);
+
+        let (phone, bob) = signed_in(&sb, "bob", FEDERATION).await;
+        let info = phone.read_invite(&minted.link).await.unwrap();
+        assert_eq!(info.kind, InviteLinkKind::Federation);
+        let sa_print = fingerprint::fingerprint(sa.server.id().as_bytes());
+        let looked = phone.look_up_invite(&minted.link).await.unwrap();
+        assert_eq!(looked.server.fingerprint, sa_print);
+        assert!(matches!(
+            looked.outcome,
+            InviteOutcome::Valid {
+                kind: SdkKind::Federation,
+                ..
+            }
+        ));
+
+        let paired = bob.pair_server(&minted.link).await.unwrap();
+        assert_eq!(paired.fingerprint, sa_print);
+        assert_eq!(paired.name, "Alice's server");
+        assert_eq!(paired.server_id, sa.server_id.as_str());
+        let on_sb = sb
+            .store
+            .live_peer_by_endpoint(&sa.server.id().to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_sb.paired_by, "bob");
+        assert!(matches!(
+            bob.pair_server(&minted.link).await,
+            Err(SdkError::PairingRefused {
+                reason: PairingRefused::AlreadyPaired
+            })
+        ));
+        sa.stop().await;
+        sb.stop().await;
+    }
+
+    /// Without the feature named, nothing of federation is offered: no
+    /// pairing (not even sent), no `federation` invite.
+    #[tokio::test]
+    async fn an_app_that_does_not_name_the_feature_gets_none_of_it() {
+        let sa = with_admin("fed-app-unnamed", "Alice's server", "alice").await;
+        let (_phone, alice) = signed_in(&sa, "alice", Experimental::default()).await;
+        assert!(!alice.experimental().federation);
+        assert!(matches!(
+            alice.create_invite(federation_invite()).await,
+            Err(SdkError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            alice.pair_server("spoolframe://invite?server=x").await,
+            Err(SdkError::Unsupported { .. })
+        ));
+        // Asked on the wire anyway, it is refused.
+        let device = sa.client().await;
+        device.hello().await;
+        let session = device.login("alice", PASSWORD).await;
+        assert!(matches!(
+            device
+                .call(
+                    Some(&session),
+                    Request::PairServer(spoolframe_protocol::federation::PairServer {
+                        link: "spoolframe://invite?server=x".into(),
+                    })
+                )
+                .await,
+            Response::Err(Error::Unsupported { .. })
+        ));
+        sa.stop().await;
+    }
+
+    /// A server with federation off names nothing back, so an app that
+    /// asks gets none of it either.
+    #[tokio::test]
+    async fn a_server_with_federation_off_does_not_turn_it_on() {
+        let sa = TestServer::start("fed-app-off").await;
+        sa.add_user("alice", PASSWORD, None).await;
+        sa.store.set_role("alice", Role::Admin).await.unwrap();
+        let (_phone, alice) = signed_in(&sa, "alice", FEDERATION).await;
+        assert!(!alice.experimental().federation);
+        assert!(matches!(
+            alice.create_invite(federation_invite()).await,
+            Err(SdkError::InvalidInput(_))
+        ));
+        sa.stop().await;
+    }
+
+    /// Admins only, as `CreateInvite`; and recently signed in.
+    #[tokio::test]
+    async fn only_a_recently_signed_in_admin_pairs() {
+        let sb = with_admin("fed-app-admin-only", "Bob's server", "bob").await;
+        let (_guest_phone, guest) = signed_in(&sb, "guest", FEDERATION).await;
+        assert!(matches!(
+            guest.pair_server("spoolframe://invite?server=x").await,
+            Err(SdkError::AdminRequired)
+        ));
+        let (_phone, bob) = signed_in(&sb, "bob", FEDERATION).await;
+        sb.clock
+            .advance(spoolframe_server::auth::RECENT_SIGN_IN + std::time::Duration::from_secs(1));
+        assert!(matches!(
+            bob.pair_server("spoolframe://invite?server=x").await,
+            Err(SdkError::RecentSignInRequired)
+        ));
+        sb.stop().await;
+    }
+}

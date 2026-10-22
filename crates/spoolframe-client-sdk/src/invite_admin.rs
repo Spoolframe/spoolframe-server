@@ -25,8 +25,10 @@ pub enum InviteKind {
     /// Lets someone with a portable identity watch, with no account made
     /// (P7-05).
     PortableAccount,
-    /// Pairs another server with this one (P8-01): the server refuses to
-    /// make one until then ([`SdkError::InvalidInput`]).
+    /// Pairs another server with this one (P8-01, experimental): made
+    /// only with [`crate::Experimental::federation`] on for the session
+    /// ([`SdkError::InvalidInput`] otherwise). That server's admin redeems
+    /// it ([`Session::pair_server`]).
     Federation,
     /// A kind this build does not know, from a newer server: listed, never
     /// made.
@@ -151,7 +153,8 @@ impl Session {
     /// Make an invite as the web UI's Invites page does. An admin's only,
     /// after a recent confirmation ([`Session::confirm_password`]).
     /// [`SdkError::InvalidInput`] for a field out of its limits, and for a
-    /// federation invite until P8 builds them.
+    /// federation invite unless the session has
+    /// [`crate::Experimental::federation`] on.
     pub async fn create_invite(&self, spec: InviteSpec) -> Result<MintedInvite, SdkError> {
         let kind = match spec.kind {
             InviteKind::CreateUser => wire::InviteKind::CreateUser,

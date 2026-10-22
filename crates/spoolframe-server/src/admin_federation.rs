@@ -90,8 +90,7 @@ fn pair_error(e: PairError) -> ErrorObjectOwned {
         }
         PairError::Starting => error(error_code::NOT_CONFIGURED, message),
         PairError::AlreadyPaired => refused(PairingRefused::AlreadyPaired.name(), message),
-        // `PairingRefused` has no name for it: never sent on the ALPN.
-        PairError::KeyHeld => refused("key_held", message),
+        PairError::KeyHeld => refused(PairingRefused::KeyHeld.name(), message),
         PairError::Dial(DialError::Refused(PairingRefused::RateLimited { retry_after_secs })) => {
             ErrorObjectOwned::owned(
                 error_code::RATE_LIMITED,
