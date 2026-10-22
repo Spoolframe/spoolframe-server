@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Security: dependencies with known advisories are updated. rustls
+  0.23.46 (RUSTSEC-2026-0346 to -0349: TLS secrets in `Debug` output,
+  data sent after an ECH rejection, a 1 GiB allocation before
+  authentication, a downgrade to classical key exchange), rustls-webpki
+  0.103.16 (RUSTSEC-2026-0382: distrusted intermediates accepted),
+  webpki-roots and webpki-root-certs 1.0.10 (RUSTSEC-2026-0381, -0383:
+  distrusted emSign roots), and zip 9 (RUSTSEC-2026-0367 to -0369, all in
+  `extract`, which the server never calls: it reads a subtitle archive's
+  entries itself). An archive entry whose name is not UTF-8 is now a bad
+  archive.
+
 ## 0.14.2 (2026-10-21)
 
 - The `Mobile` profile is now HEVC 1080p at 4 Mbit/s. At the same rate,

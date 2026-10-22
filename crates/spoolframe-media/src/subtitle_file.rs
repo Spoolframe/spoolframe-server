@@ -143,7 +143,8 @@ pub fn unpack(bytes: &[u8], episode: Option<(u32, u32)>) -> Result<Vec<u8>, File
     let mut subtitles: Vec<(usize, String, u64)> = Vec::new();
     for at in 0..archive.len() {
         let entry = archive.by_index_raw(at).map_err(bad)?;
-        let name = entry.name().replace('\\', "/");
+        // zip 9 refuses a name that is not valid UTF-8: a bad archive.
+        let name = entry.name().map_err(bad)?.replace('\\', "/");
         if entry.enclosed_name().is_none() || leads_out(&name) {
             return Err(FileError::BadArchive(
                 "an entry's name leads out of the archive".into(),

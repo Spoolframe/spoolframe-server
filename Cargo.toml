@@ -214,7 +214,7 @@ chardetng = "0.1"
 encoding_rs = "0.8"
 # SubDL's subtitles come zipped (PX-02): read only, deflate by the
 # flate2 and zlib-rs the tree already has; no other method, no encryption.
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Logging
 tracing = "0.1"
