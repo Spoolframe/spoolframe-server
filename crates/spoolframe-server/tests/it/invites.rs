@@ -1029,6 +1029,7 @@ mod lookup {
                 role: Role::Admin,
                 expires_at: created.invite.expires_at,
                 inviter: Some("Andrey".into()),
+                fingerprint: None,
             }
         );
         invites.server.stop().await;

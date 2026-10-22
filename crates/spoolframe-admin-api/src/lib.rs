@@ -24,6 +24,12 @@ pub use spoolframe_types::{
     SubtitleSourceState, SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
 };
 
+mod federation;
+#[cfg(feature = "client")]
+pub use federation::FederationApiClient;
+#[cfg(feature = "server")]
+pub use federation::FederationApiServer;
+pub use federation::{PeerEntry, PeerKey};
 mod optimized;
 pub use optimized::{
     OptimizedCopy, OptimizedCopyDeleted, OptimizedCopyState, OptimizedDeleted, OptimizedOverview,
@@ -237,6 +243,17 @@ pub mod error_code {
     /// `opensubtitles` or `subdl`; or `user`, the caller's own daily
     /// limit, with no `site`) and `resetsAt`, Unix seconds, when known.
     pub const QUOTA_EXHAUSTED: i32 = -32036;
+    /// No server paired with this one by that id (P8-01).
+    pub const NO_SUCH_PEER: i32 = -32037;
+    /// The other server refused to pair, or the two are paired already
+    /// (P8-01): `data` has `reason`, the protocol's refusal in snake_case,
+    /// or `already_paired`, or `key_held` while the other holds this
+    /// server's new key for its admin.
+    pub const PAIRING_REFUSED: i32 = -32038;
+    /// `keyConfirm` or `keyReject` named a key that is not held for that
+    /// server (P8-01): the held keys changed since they were listed.
+    /// Nothing changed; list them again.
+    pub const KEY_NOT_HELD: i32 = -32039;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -315,7 +332,8 @@ pub enum InviteKind {
     /// as themselves, signed in from their own phone, and no account is
     /// made. Its role is always the consumer's.
     PortableAccount,
-    /// Pairs another server with this one: refused until P8.
+    /// Pairs another server with this one (P8-01): made only while
+    /// `experimental.federation` is on.
     Federation,
 }
 
@@ -4468,10 +4486,11 @@ pub trait AdminApi {
     /// Make an invite (P6-01): its code, shown this once, and its link.
     /// Needs a recent sign-in: the code makes an account
     /// (`RECENT_SIGN_IN_REQUIRED`). `INVALID_INPUT`, saying why, for a
-    /// kind this server does not make yet (`federation` arrives with P8),
-    /// a `portable-account` invite with a role other than consumer, or a
-    /// note, a number of uses or a time that is out of range. `NOT_CONFIGURED` while the endpoint
-    /// is starting: the link needs its key.
+    /// `federation` invite while `experimental.federation` is off, or with
+    /// any role (P8-01: it pairs a server), a `portable-account` invite
+    /// with a role other than consumer, or a note, a number of uses or a
+    /// time that is out of range. `NOT_CONFIGURED` while the endpoint is
+    /// starting: the link needs its key.
     #[method(name = "inviteCreate", with_extensions)]
     async fn invite_create(&self, invite: NewInvite) -> jsonrpsee::core::RpcResult<InviteCreated>;
 

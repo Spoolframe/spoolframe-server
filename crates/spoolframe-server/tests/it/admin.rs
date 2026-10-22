@@ -65,6 +65,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         mcp: Default::default(),
         library: None,
         optimized: None,
+        federation: None,
     }
 }
 

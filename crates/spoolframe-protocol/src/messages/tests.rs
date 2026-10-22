@@ -2172,12 +2172,21 @@ fn every_lookup_outcome_round_trips() {
             role: spoolframe_types::Role::Admin,
             expires_at: 1_792_003_200,
             inviter: Some("Andrey".into()),
+            fingerprint: None,
         },
         Outcome::Valid {
             kind: InviteKind::PortableAccount,
             role: spoolframe_types::Role::Consumer,
             expires_at: 1_792_003_200,
             inviter: None,
+            fingerprint: None,
+        },
+        Outcome::Valid {
+            kind: InviteKind::Federation,
+            role: spoolframe_types::Role::Consumer,
+            expires_at: 1_792_003_200,
+            inviter: Some("Andrey".into()),
+            fingerprint: Some("PGJA-BHZ1-F68M-DFSE".into()),
         },
         Outcome::Expired { at: 1_792_003_200 },
         Outcome::Used,
@@ -2186,6 +2195,23 @@ fn every_lookup_outcome_round_trips() {
     ] {
         round_trip(Response::Ok(Reply::InviteLookup { outcome }));
     }
+}
+
+/// P8-01: a server from before federation sends no fingerprint, and an
+/// outcome without one is sent as it did.
+#[test]
+fn a_lookup_without_a_fingerprint_is_the_one_before_it() {
+    use crate::InviteLookupOutcome as Outcome;
+    let without = Outcome::Valid {
+        kind: crate::invite_admin::InviteKind::CreateUser,
+        role: spoolframe_types::Role::Consumer,
+        expires_at: 1,
+        inviter: None,
+        fingerprint: None,
+    };
+    let json = serde_json::to_value(&without).unwrap();
+    assert!(json.get("fingerprint").is_none(), "{json}");
+    assert_eq!(serde_json::from_value::<Outcome>(json).unwrap(), without);
 }
 
 /// A newer server may tell a code apart in a way this build does not

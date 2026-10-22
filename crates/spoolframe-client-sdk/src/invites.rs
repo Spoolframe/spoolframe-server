@@ -145,6 +145,7 @@ fn outcome_of(outcome: InviteLookupOutcome) -> InviteOutcome {
             role,
             expires_at,
             inviter,
+            ..
         } => InviteOutcome::Valid {
             kind: kind_of(kind),
             role,
@@ -644,6 +645,7 @@ mod tests {
                 role: Role::Consumer,
                 expires_at: 1_792_003_200,
                 inviter: Some("Andrey".into()),
+                fingerprint: None,
             }),
             InviteOutcome::Valid {
                 kind: InviteKind::PortableAccount,

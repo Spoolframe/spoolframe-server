@@ -111,13 +111,16 @@ pub enum InviteCommand {
         /// 30 days.
         #[arg(long, default_value = "7d", value_parser = expiry)]
         expires: u64,
-        /// The role its accounts get: `consumer` or `admin`.
-        #[arg(long, default_value = "consumer")]
-        role: Role,
-        /// `create-user` (an account here), or `portable-account` (P7-05:
+        /// The role its accounts get: `consumer` or `admin`; a consumer's
+        /// if left out. Only a `create-user` invite takes one; a
+        /// `portable-account` one only `consumer`, a `federation` one none.
+        #[arg(long)]
+        role: Option<Role>,
+        /// `create-user` (an account here), `portable-account` (P7-05:
         /// someone with their own portable identity watches as
-        /// themselves; the role is a consumer's). `federation` arrives
-        /// with P8.
+        /// themselves; the role is a consumer's), or `federation` (P8-01,
+        /// experimental: another server pairs with this one, while
+        /// `experimental.federation` is on).
         #[arg(long, default_value = "create-user", value_parser = invite_kind)]
         kind: InviteKind,
     },
@@ -835,7 +838,7 @@ async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
                     note,
                     uses: Some(uses),
                     expires: Some(expires),
-                    role: Some(role),
+                    role,
                 })
                 .await
                 .map_err(api_error)?;

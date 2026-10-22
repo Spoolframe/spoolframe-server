@@ -1219,6 +1219,12 @@ pub enum InviteLookupOutcome {
         /// have none, or when the server's CLI made it.
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         inviter: Option<String>,
+        /// A `federation` one's (P8-01): the fingerprint of the key this
+        /// server pairs with, for the admin about to redeem it on another
+        /// server to compare. Left out for every other kind, and by a
+        /// server before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
     },
     /// It expired at `at`, Unix seconds.
     Expired { at: i64 },

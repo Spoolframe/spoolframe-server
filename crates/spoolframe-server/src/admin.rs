@@ -81,6 +81,8 @@ use spoolframe_plex::account::{PinState, PlexTv};
 
 #[path = "admin_catalog.rs"]
 mod catalog;
+#[path = "admin_federation.rs"]
+mod federation;
 #[path = "admin_optimized.rs"]
 mod optimized;
 #[path = "admin_playlists.rs"]
@@ -541,6 +543,10 @@ pub struct Admin {
     /// requests: the pool, which always runs; `None` in tests without,
     /// where its methods are `NOT_CONFIGURED`.
     pub optimized: Option<Arc<crate::optimized::Pool>>,
+    /// Federation (P8-01), while `experimental.federation` is on: the
+    /// `federation_*` methods, and `federation` invites. `None` otherwise,
+    /// where those methods are `NOT_CONFIGURED`.
+    pub federation: Option<Arc<crate::federation::Federation>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -667,6 +673,7 @@ pub async fn serve(
         mcp: admin.mcp,
         library: admin.library,
         optimized: admin.optimized,
+        federation: admin.federation,
         optimized_titles: Arc::default(),
         checks,
         pins: Arc::default(),
@@ -677,6 +684,11 @@ pub async fn serve(
     methods
         .merge(MeApiServer::into_rpc(api.clone()))
         .expect("the me and admin namespaces never share a name");
+    methods
+        .merge(spoolframe_admin_api::FederationApiServer::into_rpc(
+            api.clone(),
+        ))
+        .expect("the federation namespace shares no name");
     crate::admin_http::serve(listen, api, methods.into(), origins, proxies).await
 }
 
@@ -704,6 +716,7 @@ pub(crate) struct AdminApi {
     mcp: crate::oauth::McpSwitch,
     library: Option<crate::mcp::Library>,
     optimized: Option<Arc<crate::optimized::Pool>>,
+    federation: Option<Arc<crate::federation::Federation>>,
     /// The optimized copies' items as the catalog named them, by media
     /// id: only those still in the pool (PX-37).
     optimized_titles: Arc<parking_lot::Mutex<optimized::Titles>>,
@@ -1340,6 +1353,26 @@ impl AdminApi {
             .user_by_id(user.user)
             .await?
             .ok_or_else(|| error(error_code::UNAUTHENTICATED, "session is not valid"))
+    }
+
+    /// Who a change by `caller` is by, as an invite or a pair keeps it,
+    /// and where it was made: the admin's username from the web UI's
+    /// pages, which send their origin; the CLI, which does not, as
+    /// [`spoolframe_admin_api::invite::MADE_BY_CLI`].
+    pub(crate) async fn maker(
+        &self,
+        ext: &Extensions,
+        caller: ApiSessionUser,
+    ) -> RpcResult<(String, crate::store::invites::InviteOrigin)> {
+        use crate::store::invites::InviteOrigin;
+        Ok(if ext.get::<PageOrigin>().is_some() {
+            (self.account(caller).await?.username, InviteOrigin::Web)
+        } else {
+            (
+                spoolframe_admin_api::invite::MADE_BY_CLI.to_owned(),
+                InviteOrigin::Cli,
+            )
+        })
     }
 
     /// A stored passkey as the API shows it.
@@ -3557,8 +3590,6 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn invite_create(&self, ext: &Extensions, invite: NewInvite) -> RpcResult<InviteCreated> {
-        use crate::store::invites::InviteOrigin;
-        use spoolframe_admin_api::invite::MADE_BY_CLI;
         let caller = self.recent_admin(ext).await?;
         let Some(server) = self.status.invite().await else {
             return Err(error(
@@ -3566,12 +3597,7 @@ impl AdminApiServer for AdminApi {
                 "the server's endpoint is starting; try again in a moment",
             ));
         };
-        // The browser's pages send their origin; the CLI does not.
-        let (created_by, origin) = if ext.get::<PageOrigin>().is_some() {
-            (self.account(caller).await?.username, InviteOrigin::Web)
-        } else {
-            (MADE_BY_CLI.to_owned(), InviteOrigin::Cli)
-        };
+        let (created_by, origin) = self.maker(ext, caller).await?;
         let request = crate::invites::InviteRequest {
             kind: store_invite_kind(invite.kind),
             note: invite.note.as_deref(),
@@ -3579,17 +3605,20 @@ impl AdminApiServer for AdminApi {
             expires_secs: invite.expires,
             role: invite.role,
         };
-        // The admin API's federation methods come with the next stage;
-        // until then a `federation` invite is refused here as before.
-        let created =
-            crate::invites::create(self.auth.store(), request, &created_by, &origin, None)
-                .await
-                .map_err(|e| match e {
-                    crate::invites::CreateError::Invalid(message) => {
-                        error(error_code::INVALID_INPUT, message)
-                    }
-                    crate::invites::CreateError::Invite(e) => e.into(),
-                })?;
+        let created = crate::invites::create(
+            self.auth.store(),
+            request,
+            &created_by,
+            &origin,
+            self.federation.as_deref(),
+        )
+        .await
+        .map_err(|e| match e {
+            crate::invites::CreateError::Invalid(message) => {
+                error(error_code::INVALID_INPUT, message)
+            }
+            crate::invites::CreateError::Invite(e) => e.into(),
+        })?;
         let invite = created.invite(server);
         Ok(InviteCreated {
             code: created.code.shown(),
@@ -4780,6 +4809,7 @@ mod tests {
             mcp: crate::oauth::McpSwitch::default(),
             library: None,
             optimized: None,
+            federation: None,
             optimized_titles: Arc::default(),
             auth,
             setup_code: None,

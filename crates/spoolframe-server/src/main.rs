@@ -1316,6 +1316,7 @@ async fn run(
                 playlists: playlists.clone(),
             }),
             optimized: Some(pool.clone()),
+            federation: federation.clone(),
         },
         admin_origins,
         admin_proxies,

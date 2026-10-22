@@ -792,6 +792,7 @@ impl Server {
                 options.own_relays.clone(),
                 endpoint.id(),
                 services.auth.clone(),
+                services.federation.clone(),
             )
         });
         // Bound before the client protocol answers anyone, so a Hello

@@ -34,6 +34,9 @@ pub struct RelayAccess {
     /// The server's own key: its relay must carry it too.
     server: EndpointId,
     auth: Auth,
+    /// Federation, while `experimental.federation` is on (P8-01): a live
+    /// pair's endpoint is a friend.
+    federation: Option<Arc<crate::federation::Federation>>,
     /// How many connections each relay holds now.
     open: Arc<parking_lot::Mutex<HashMap<EndpointId, usize>>>,
 }
@@ -58,11 +61,19 @@ impl Drop for Held {
 }
 
 impl RelayAccess {
-    pub fn new(relays: Vec<EndpointId>, server: EndpointId, auth: Auth) -> Self {
+    /// Answering `relays` for `server`, over `auth`'s store; servers
+    /// `federation` pairs with are friends, while there is one.
+    pub fn new(
+        relays: Vec<EndpointId>,
+        server: EndpointId,
+        auth: Auth,
+        federation: Option<Arc<crate::federation::Federation>>,
+    ) -> Self {
         Self {
             relays: Arc::new(relays),
             server,
             auth,
+            federation,
             open: Arc::default(),
         }
     }
@@ -86,8 +97,9 @@ impl RelayAccess {
     /// live session, or trusted for a user, are its owner's. A device that
     /// is no one's, with a live invite's token for it, is the tier of the
     /// invite's kind (P6-08, [`crate::invites::holder_tier`]); one with a
-    /// portable user's session (P7-06) a friend's; anyone else a stranger.
-    /// Servers paired with this one (P8) will be friends too.
+    /// portable user's session (P7-06) a friend's, as is a server paired
+    /// with this one while federation is on (P8-01); anyone else a
+    /// stranger.
     pub async fn tier(&self, endpoint: &str, invite: Option<&str>) -> Tier {
         if endpoint == self.server.to_string() {
             return Tier::Owner;
@@ -118,6 +130,16 @@ impl RelayAccess {
             Err(e) => {
                 tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
                 return Tier::Stranger;
+            }
+        }
+        if let Some(federation) = &self.federation {
+            match federation.is_paired(endpoint).await {
+                Ok(true) => return Tier::Friend,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
+                    return Tier::Stranger;
+                }
             }
         }
         let holder = match (invite, endpoint.parse::<EndpointId>()) {

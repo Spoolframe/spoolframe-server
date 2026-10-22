@@ -23,18 +23,18 @@ use std::sync::{Arc, OnceLock};
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use spoolframe_federation::{DialError, Dialed, FederationProtocol, Live, Peers, Strangers};
-use spoolframe_protocol::ServerId;
 use spoolframe_protocol::federation::{
     MAX_HINTS, PROTOCOL_VERSION, PairingRefused, PeerHello, RedeemPairing, Standing, server_name,
 };
 use spoolframe_protocol::invite::{InviteLinkKind, is_relay_url, parse_link};
+use spoolframe_protocol::{ServerId, close};
 
 use crate::announce::Told;
 use crate::auth::Auth;
 use crate::invites::RedeemError;
 use crate::network::{Connections, ServerName};
 use crate::store::StoreError;
-use crate::store::federation::{KeyHold, NewPeer, PairRedeemed, PeerError, PeerRecord};
+use crate::store::federation::{HeldKey, KeyHold, NewPeer, PairRedeemed, PeerError, PeerRecord};
 use crate::store::invites::{InviteKind, InviteState};
 
 /// This server's federation: its pairs, the handler that answers the
@@ -245,6 +245,146 @@ impl Federation {
             "paired with another server"
         );
         Ok(peer)
+    }
+}
+
+impl Federation {
+    /// Every pair, live or not, as the store keeps them.
+    pub async fn peers(&self) -> Result<Vec<PeerRecord>, StoreError> {
+        self.store().federation_peers().await
+    }
+
+    /// The new keys kept for pair `id`, held and rejected.
+    pub async fn held_keys(&self, id: &str) -> Result<Vec<HeldKey>, StoreError> {
+        self.store().held_peer_keys(id).await
+    }
+
+    /// Whether `endpoint_id` (hex) is a live pair's key.
+    pub async fn is_paired(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .store()
+            .live_peer_by_endpoint(endpoint_id)
+            .await?
+            .is_some())
+    }
+
+    /// Whether `endpoint_id` (hex) has a federation connection open now.
+    pub fn connected(&self, endpoint_id: &str) -> bool {
+        endpoint_id
+            .parse::<EndpointId>()
+            .is_ok_and(|endpoint| self.live.has(&endpoint))
+    }
+
+    /// Unpair `id` (P8-01): revoke this side's row, close the other's
+    /// connections, and tell it, best effort, so it revokes its own. The
+    /// row as it was; `None` for no live pair. The relay's tier falls
+    /// back once its cache of the answer expires.
+    pub async fn unpair(&self, id: &str, by: &str) -> Result<Option<PeerRecord>, StoreError> {
+        let Some(peer) = self.store().revoke_peer(id).await? else {
+            return Ok(None);
+        };
+        tracing::info!(
+            peer = %peer.endpoint_id,
+            server_id = %peer.server_id,
+            name = %peer.display_name,
+            by,
+            "unpaired from another server"
+        );
+        if let Ok(endpoint) = peer.endpoint_id.parse::<EndpointId>() {
+            self.live.close(&endpoint, close::UNPAIRED, "unpaired");
+            if let Some(attached) = self.attached.get() {
+                let addr = endpoint_addr(endpoint, parsed(&peer.addrs), &peer.relays);
+                tokio::spawn(tell_unpaired(attached.endpoint.clone(), addr, self.hello()));
+            }
+        }
+        Ok(Some(peer))
+    }
+
+    /// Confirm `endpoint_id`, a key held for pair `id`: the pin moves to
+    /// it, and the old key's connections are closed, with those of the
+    /// pair's other held keys.
+    pub async fn confirm_key(
+        &self,
+        id: &str,
+        endpoint_id: &str,
+        by: &str,
+    ) -> Result<PeerRecord, PeerError> {
+        let old = self
+            .store()
+            .federation_peer(id)
+            .await?
+            .ok_or_else(|| PeerError::NoSuchPeer(id.to_owned()))?;
+        let others = self.store().held_peer_keys(id).await?;
+        let peer = self.store().confirm_peer_key(id, endpoint_id).await?;
+        tracing::info!(
+            server_id = %peer.server_id,
+            name = %peer.display_name,
+            old = %old.endpoint_id,
+            new = %peer.endpoint_id,
+            by,
+            "a paired server's new key confirmed"
+        );
+        let gone = std::iter::once(old.endpoint_id.as_str()).chain(
+            others
+                .iter()
+                .map(|k| k.endpoint_id.as_str())
+                .filter(|k| *k != endpoint_id),
+        );
+        for key in gone {
+            if let Ok(endpoint) = key.parse::<EndpointId>() {
+                self.live
+                    .close(&endpoint, close::UNPAIRED, "the pair moved to a new key");
+            }
+        }
+        Ok(peer)
+    }
+
+    /// Reject `endpoint_id`, a key held for pair `id`: its connections
+    /// are closed, and it is refused, not held again, for a day.
+    pub async fn reject_key(
+        &self,
+        id: &str,
+        endpoint_id: &str,
+        by: &str,
+    ) -> Result<PeerRecord, PeerError> {
+        let peer = self.store().reject_peer_key(id, endpoint_id).await?;
+        tracing::info!(
+            server_id = %peer.server_id,
+            name = %peer.display_name,
+            rejected = %endpoint_id,
+            by,
+            "a key that said it is a paired server was rejected"
+        );
+        if let Ok(endpoint) = endpoint_id.parse::<EndpointId>() {
+            self.live.close(&endpoint, close::UNPAIRED, "key rejected");
+        }
+        Ok(peer)
+    }
+}
+
+/// Tell the server at `addr` that this one, saying `hello`, unpaired:
+/// once, and only logged however it goes.
+async fn tell_unpaired(endpoint: Endpoint, addr: EndpointAddr, hello: PeerHello) {
+    let peer = addr.id;
+    let told = async {
+        let (dialed, info) = Dialed::connect(&endpoint, addr, hello).await?;
+        let told = if info.standing == Standing::Paired {
+            dialed.unpaired().await
+        } else {
+            // It holds no pair with this server already.
+            Ok(())
+        };
+        dialed.close();
+        told
+    }
+    .await;
+    match told {
+        Ok(()) => tracing::info!(peer = %peer.fmt_short(), "the unpaired server was told"),
+        Err(e) => tracing::warn!(
+            peer = %peer.fmt_short(),
+            error = %e,
+            "the unpaired server could not be told: it keeps its side until its admin unpairs"
+        ),
     }
 }
 

@@ -4351,8 +4351,9 @@ impl ClientProtocol {
         let found = crate::invites::look_up(&self.services.auth, &endpoint_id, &lookup.code)
             .await
             .map_err(redeem_error)?;
+        let key = spoolframe_protocol::fingerprint::fingerprint(self.id.as_bytes());
         Ok(Reply::InviteLookup {
-            outcome: lookup_outcome(found),
+            outcome: lookup_outcome(found, key),
         })
     }
 
@@ -6600,9 +6601,13 @@ fn wire_kind(
     }
 }
 
-/// What a lookup found, for the client.
-fn lookup_outcome(found: crate::store::invites::InviteLookup) -> InviteLookupOutcome {
-    use crate::store::invites::InviteLookup as Found;
+/// What a lookup found, for the client; a `federation` invite's with
+/// `fingerprint`, this server's key's (P8-01).
+fn lookup_outcome(
+    found: crate::store::invites::InviteLookup,
+    fingerprint: String,
+) -> InviteLookupOutcome {
+    use crate::store::invites::{InviteKind, InviteLookup as Found};
     match found {
         Found::NoMatch => InviteLookupOutcome::NoMatch,
         Found::Revoked => InviteLookupOutcome::Revoked,
@@ -6618,6 +6623,7 @@ fn lookup_outcome(found: crate::store::invites::InviteLookup) -> InviteLookupOut
             role,
             expires_at,
             inviter,
+            fingerprint: (kind == InviteKind::Federation).then_some(fingerprint),
         },
     }
 }

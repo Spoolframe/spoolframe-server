@@ -831,7 +831,11 @@ The code is taken as `redeem_invite` takes it. The answer is
 ```
 
 `kind` says which redemption takes it (`create-user` or
-`portable-account`); `role` is `consumer` for a `portable-account` one.
+`portable-account`; `federation` is another server's to redeem, see
+"Federation"); `role` is `consumer` for any but a `create-user` one. A
+`federation` one also has `fingerprint`, the key the server pairs with,
+for the admin about to redeem it elsewhere to compare; other kinds leave
+it out.
 `inviter` is the display name of the admin who made it, `null` when they
 have none or the server's CLI made it: never a username, as the device
 has no session. An outcome a client does not know reads as `unknown`.
@@ -878,7 +882,8 @@ counted, and the invite keeps its use.
 `admin.inviteCreate` makes one with `kind: "portable-account"` and no
 role (`INVALID_INPUT` for a role other than `consumer`), as does
 `spoolframe-server invite create --kind portable-account`. `federation`
-invites are refused until federation exists.
+invites are made only while `experimental.federation` is on, with no
+role (see "Federation").
 
 ### Making invites in an app
 
@@ -1019,8 +1024,10 @@ token.
   tier of the invite's kind: `create-user` (an account here, of either
   role) is `owner`; `portable-account` and `federation` are `friend`.
   The kind alone decides it.
-- Anyone else is a `stranger`. Servers paired with this one will be
-  friends once federation exists.
+- A server paired with this one (P8-01, while `experimental.federation`
+  is on) is `friend`; unpaired, it falls back once the relay's cache of
+  the answer expires.
+- Anyone else is a `stranger`.
 
 ### The invite holder's token
 
@@ -3067,4 +3074,31 @@ is refused `key_refused` and never replaces one kept, so the key an
 admin is looking at cannot change under them. A key rejected by the
 admin is refused `key_refused` for a day; a held key not seen for a week
 is forgotten.
+
+### Pairing and unpairing
+
+An admin of SA makes a `federation` invite (`admin.inviteCreate`
+`kind: "federation"`, no role, one use by default); its link says
+`kind=federation` and no `role`. An admin of SB pastes it into SB's admin
+API, `federation.redeem { link }`: SB dials SA from its own endpoint,
+says `hello`, checks it is not paired with SA already (by key or server
+id), and redeems the code. Both keep a pair row: SA pins SB's endpoint
+and server id, paired by the invite's maker; SB keeps SA's as the link
+and `info` gave them, paired by the admin who redeemed.
+
+The admin API's `federation` methods (`peerList`, `redeem`,
+`peerRevoke`, `keyConfirm`, `keyReject`) are admins', and all but
+`peerList` need a recent sign-in; they are `NOT_CONFIGURED` while the
+switch is off. `peerRevoke` revokes this side's row (kept, unpaired),
+closes the other's connections with `UNPAIRED`, and dials it once to
+send `unpaired`. A pair's `heldKeys` lists the new keys kept for it,
+each with its fingerprint; `keyConfirm { id, endpointId }` moves the pair
+to that key and forgets the pair's other held keys, and
+`keyReject { id, endpointId }` refuses that key for a day. Both name the
+key the admin saw: one that is not held for the pair (the keys changed
+since they were listed) is `KEY_NOT_HELD`, and nothing changes.
+
+When SA has paired but SB cannot keep its side (its store fails), SB
+sends `unpaired` on the same connection, best effort, so SA does not
+keep a pair SB has not.
 
