@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use super::{Store, StoreError};
 
-/// One downloaded subtitle (migrations 0036 and 0037).
+/// One downloaded subtitle (migrations 0036, 0037 and 0045).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadRow {
     /// The server's own id: its file's name.
@@ -22,6 +22,9 @@ pub struct DownloadRow {
     /// `srt`, `ass` or `vtt`: its file's extension.
     pub format: String,
     pub hearing_impaired: bool,
+    /// A forced track: foreign parts and signs only. False in a row from
+    /// before 0045.
+    pub forced: bool,
     /// `human`, `machine_translated` or `ai`.
     pub origin: String,
     pub hash_match: bool,
@@ -52,7 +55,7 @@ pub const DAY_SECS: i64 = 24 * 60 * 60;
 macro_rules! columns {
     () => {
         "id, media_id, media_path, source, file_id, language, release, format, \
-         hearing_impaired, origin, hash_match, downloaded_by, downloaded_name, downloaded_at"
+         hearing_impaired, forced, origin, hash_match, downloaded_by, downloaded_name, downloaded_at"
     };
 }
 
@@ -67,6 +70,7 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<DownloadRow, sqlx::Error> {
         release: r.try_get("release")?,
         format: r.try_get("format")?,
         hearing_impaired: r.try_get("hearing_impaired")?,
+        forced: r.try_get("forced")?,
         origin: r.try_get("origin")?,
         hash_match: r.try_get("hash_match")?,
         downloaded_by: r.try_get("downloaded_by")?,
@@ -150,7 +154,7 @@ impl Store {
         sqlx::query(concat!(
             "INSERT INTO subtitle_downloads (",
             columns!(),
-            ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
         ))
         .bind(&download.id)
         .bind(&download.media_id)
@@ -161,6 +165,7 @@ impl Store {
         .bind(&download.release)
         .bind(&download.format)
         .bind(download.hearing_impaired)
+        .bind(download.forced)
         .bind(&download.origin)
         .bind(download.hash_match)
         .bind(&download.downloaded_by)
@@ -362,6 +367,7 @@ mod tests {
             release: "Film.2019.1080p".into(),
             format: "srt".into(),
             hearing_impaired: false,
+            forced: false,
             origin: "human".into(),
             hash_match: false,
             downloaded_by: by.into(),
@@ -508,6 +514,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("b", "5338574"), ("a", "42")]
         );
+        // Rows from before 0045 played as full tracks, and still do.
+        assert!(kept.iter().all(|r| !r.forced));
         assert_eq!(rejected(&store, "opensubtitles").await, ["7"]);
     }
 

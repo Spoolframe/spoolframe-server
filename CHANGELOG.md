@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A forced subtitle downloaded from a subtitle site is a forced track. It
+  played as the whole dialogue before, as the download did not keep
+  that it is forced. Downloads from before stay full tracks.
+
 ## 0.14.4 (2026-10-21)
 
 - Invite lookup before joining. `LookupInvite` is a new pre-auth request,

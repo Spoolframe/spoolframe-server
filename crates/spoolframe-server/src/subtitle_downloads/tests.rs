@@ -417,6 +417,36 @@ async fn a_download_is_a_track_at_once_and_only_once() {
     );
 }
 
+/// A forced result stays forced once downloaded: the track plays as
+/// foreign parts only, not as the whole dialogue.
+#[tokio::test]
+async fn a_forced_download_is_a_forced_track() {
+    let f = fixture("forced", 0).await;
+    f.answers_search().await;
+    f.serves(104, RUSSIAN.as_bytes().to_vec(), 19).await;
+    f.serves(103, RUSSIAN.as_bytes().to_vec(), 18).await;
+    let own = f.subtitles().await.len();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let forced = f
+        .downloads
+        .download(&film(), "opensubtitles:104", &alice())
+        .await
+        .unwrap();
+    let plain = f
+        .downloads
+        .download(&film(), "opensubtitles:103", &alice())
+        .await
+        .unwrap();
+    let subtitles = f.subtitles().await;
+    assert!(subtitles[forced.track as usize].forced);
+    assert_eq!(subtitles[forced.track as usize].role, SubtitleRole::Forced);
+    assert!(!subtitles[plain.track as usize].forced);
+    assert!(forced.track as usize >= own && plain.track as usize >= own);
+}
+
 /// One not found by the hash is synced; one found by it is not.
 #[tokio::test]
 async fn only_a_download_not_matched_by_hash_is_synced() {

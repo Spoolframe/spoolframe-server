@@ -853,6 +853,7 @@ impl SubtitleDownloads {
             release: offer.release.chars().take(300).collect(),
             format: kept.extension().into(),
             hearing_impaired: offer.hearing_impaired,
+            forced: offer.forced,
             origin: origin_text(offer.origin).into(),
             hash_match: offer.hash_match,
             downloaded_by: principal.clone(),
@@ -1082,7 +1083,9 @@ impl SubtitleDownloads {
             "vtt" => "webvtt",
             _ => "subrip",
         };
-        let role = if row.hearing_impaired {
+        let role = if row.forced {
+            SubtitleRole::Forced
+        } else if row.hearing_impaired {
             SubtitleRole::Sdh
         } else {
             SubtitleRole::Full
@@ -1095,7 +1098,7 @@ impl SubtitleDownloads {
             kind: SubtitleKind::Text,
             language: Some(primary_language(&row.language)),
             title: Some(Source::name_of(&row.source).into()),
-            forced: false,
+            forced: row.forced,
             default: false,
             role,
         }
