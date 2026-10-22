@@ -146,6 +146,15 @@ pub enum Request {
     /// is not signed in draws on the sign-in budget all such devices share,
     /// as `LoginPassword` does.
     RedeemInvite(RedeemInvite),
+    /// What an invite's code is, before joining with it: `InviteLookup`,
+    /// for the "Got an invite?" screen. Nothing is used up. The code is
+    /// taken as `RedeemInvite` takes it, and counted as it counts one: a
+    /// code no invite has (or that cannot be one) is `no_match`, a wrong
+    /// guess (then `RateLimited`); a revoked, expired or used-up one is
+    /// not counted. On the strangers' budget, as redeeming is. Only for a
+    /// client that listed `spoolframe:invite-lookup`
+    /// ([`crate::features::INVITE_LOOKUP`]); `Unsupported` otherwise.
+    LookupInvite(LookupInvite),
     /// Begin signing in as a portable user with a device credential
     /// (P7-06): `PortableSignInBegun`, a nonce for the device key to sign
     /// over ([`crate::portable::device_proof_message`] of this server's
@@ -1054,6 +1063,7 @@ impl Request {
                 | Request::TrustedProfiles
                 | Request::ResumeProfile { .. }
                 | Request::RedeemInvite(_)
+                | Request::LookupInvite(_)
                 | Request::BeginPortableSignIn
                 | Request::FinishPortableSignIn(_)
                 | Request::RedeemPortableInvite(_)
@@ -1176,6 +1186,51 @@ impl fmt::Debug for RedeemInvite {
             .field("password", &"<redacted>")
             .finish()
     }
+}
+
+/// An invite's code to look up (`LookupInvite`): as `RedeemInvite` takes
+/// it, in any case, with dashes or spaces.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookupInvite {
+    pub code: String,
+}
+
+impl fmt::Debug for LookupInvite {
+    // The code is a capability until it is used up: keep it out of logs.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LookupInvite { code: <redacted> }")
+    }
+}
+
+/// What an invite's code is (`InviteLookup`). Looking never uses it up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InviteLookupOutcome {
+    /// It can be redeemed now: `kind` says how (`RedeemInvite` or
+    /// `RedeemPortableInvite`), and a `create-user` one makes an account
+    /// with `role`.
+    Valid {
+        kind: crate::invite_admin::InviteKind,
+        /// `consumer` for a `portable-account` one.
+        role: Role,
+        /// Unix seconds.
+        expires_at: i64,
+        /// The display name of the admin who made it; `None` when they
+        /// have none, or when the server's CLI made it.
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        inviter: Option<String>,
+    },
+    /// It expired at `at`, Unix seconds.
+    Expired { at: i64 },
+    /// Every use it had is used.
+    Used,
+    /// An admin revoked it.
+    Revoked,
+    /// No invite has this code: counted as a wrong guess.
+    NoMatch,
+    /// An outcome this build does not know, from a newer server.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The most identity states a portable sign-in carries.
@@ -1382,6 +1437,10 @@ pub enum Reply {
     },
     /// Not approved yet: `AwaitDeviceSignIn` again.
     DeviceSignInPending,
+    /// What an invite's code is (`LookupInvite`).
+    InviteLookup {
+        outcome: InviteLookupOutcome,
+    },
     /// The device a sign-in code belongs to.
     DeviceSignInRequest(DeviceSignInRequest),
     Libraries {

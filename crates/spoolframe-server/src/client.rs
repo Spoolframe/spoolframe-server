@@ -986,7 +986,8 @@ impl ClientProtocol {
                     request: "subtitle bytes require a resource stream".into(),
                 })
             }
-            Request::Unknown => Err(Error::Unsupported {
+            // Not served yet: answered as an older server answers it.
+            Request::Unknown | Request::LookupInvite(_) => Err(Error::Unsupported {
                 request: name.to_owned(),
             }),
             Request::AuthMethods => Ok(Reply::AuthMethods {
@@ -4223,6 +4224,7 @@ impl ClientProtocol {
             | Request::TrustedProfiles
             | Request::ResumeProfile { .. }
             | Request::RedeemInvite(_)
+            | Request::LookupInvite(_)
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)
             | Request::RedeemPortableInvite(_)

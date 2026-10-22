@@ -114,6 +114,13 @@ pub const DOWNLOADS: &str = "spoolframe:downloads";
 /// an app without it keeps no music.
 pub const MUSIC_DOWNLOADS: &str = "spoolframe:music-downloads";
 
+/// Looking an invite up before joining with it: the `LookupInvite`
+/// request (`InviteLookup`), which says what a code is without using it
+/// up, for the "Got an invite?" screen. Pre-auth: a device with no
+/// session asks, so the answer to `Hello` lists it. A device whose `Hello`
+/// did not list it gets `Unsupported`.
+pub const INVITE_LOOKUP: &str = "spoolframe:invite-lookup";
+
 /// Every regular feature this build knows.
 pub const ALL: &[&str] = &[
     PLAYLISTS,

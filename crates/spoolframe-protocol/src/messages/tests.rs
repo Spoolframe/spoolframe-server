@@ -2123,6 +2123,101 @@ fn a_redemption_keeps_its_code_and_password_out_of_debug_output() {
     assert!(shown.contains("mum"), "{shown}");
 }
 
+fn look_up() -> crate::LookupInvite {
+    crate::LookupInvite {
+        code: "qw7k-2mfp-xr4t".into(),
+    }
+}
+
+/// Looking an invite up is done before joining, by a device with no
+/// session: pre-auth, as redeeming it is.
+#[test]
+fn looking_up_an_invite_round_trips_and_is_pre_auth() {
+    let envelope = RequestEnvelope {
+        session: None,
+        request: Request::LookupInvite(look_up()),
+    };
+    round_trip(envelope.clone());
+    assert!(Request::LookupInvite(look_up()).is_pre_auth());
+    let bytes = codec::encode(&envelope).unwrap();
+    assert_eq!(
+        codec::request_type(&bytes).as_deref(),
+        Some("lookup_invite")
+    );
+    assert_each_required(&Request::LookupInvite(look_up()), &["code"]);
+}
+
+/// A wrong code counts toward the guess limit, so a lookup is not sent
+/// twice on its own.
+#[test]
+fn a_lookup_is_not_retried() {
+    assert!(!crate::policy::retry_safe(
+        &Request::LookupInvite(look_up())
+    ));
+}
+
+#[test]
+fn a_lookup_keeps_its_code_out_of_debug_output() {
+    let shown = format!("{:?}", Request::LookupInvite(look_up()));
+    assert!(!shown.to_ascii_uppercase().contains("QW7K"), "{shown}");
+}
+
+#[test]
+fn every_lookup_outcome_round_trips() {
+    use crate::InviteLookupOutcome as Outcome;
+    use crate::invite_admin::InviteKind;
+    for outcome in [
+        Outcome::Valid {
+            kind: InviteKind::CreateUser,
+            role: spoolframe_types::Role::Admin,
+            expires_at: 1_792_003_200,
+            inviter: Some("Andrey".into()),
+        },
+        Outcome::Valid {
+            kind: InviteKind::PortableAccount,
+            role: spoolframe_types::Role::Consumer,
+            expires_at: 1_792_003_200,
+            inviter: None,
+        },
+        Outcome::Expired { at: 1_792_003_200 },
+        Outcome::Used,
+        Outcome::Revoked,
+        Outcome::NoMatch,
+    ] {
+        round_trip(Response::Ok(Reply::InviteLookup { outcome }));
+    }
+}
+
+/// A newer server may tell a code apart in a way this build does not
+/// know: the reply still reads, as `Unknown`.
+#[test]
+fn a_lookup_outcome_from_a_newer_server_reads_as_unknown() {
+    #[derive(Serialize)]
+    struct Newer {
+        r#type: &'static str,
+        outcome: Outcome,
+    }
+    #[derive(Serialize)]
+    struct Outcome {
+        r#type: &'static str,
+        until: i64,
+    }
+    let bytes = codec::encode(&Newer {
+        r#type: "invite_lookup",
+        outcome: Outcome {
+            r#type: "paused",
+            until: 1,
+        },
+    })
+    .unwrap();
+    assert_eq!(
+        codec::decode::<Reply>(&bytes).unwrap(),
+        Reply::InviteLookup {
+            outcome: crate::InviteLookupOutcome::Unknown
+        }
+    );
+}
+
 #[test]
 fn the_invite_errors_round_trip() {
     for error in [

@@ -185,6 +185,7 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::FinishConfirmPasskey(_)
         // Looking up a wrong code consumes a failure-limit attempt too.
         | Request::LookupDeviceSignIn { .. }
+        | Request::LookupInvite(_)
         | Request::ApproveDeviceSignIn { .. }
         | Request::DenyDeviceSignIn { .. }
         | Request::UpdatePlaybackProgress { .. }
