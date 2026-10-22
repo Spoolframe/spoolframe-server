@@ -234,6 +234,11 @@ pub struct SubtitleResult {
     /// while unrated.
     pub rating: Option<u8>,
     pub hearing_impaired: bool,
+    /// Only the parts in another language than the rest (signs, a
+    /// foreign line): a forced subtitle, not the whole dialogue. False
+    /// where the site does not say (SubDL), and from a server before it.
+    #[serde(default)]
+    pub forced: bool,
     pub origin: SubtitleOrigin,
     /// Found by the file's hash: made for this very release, and played
     /// as it is, not synced.
@@ -263,6 +268,8 @@ struct SubtitleResultWire {
     downloads: u64,
     rating: Option<u8>,
     hearing_impaired: bool,
+    #[serde(default)]
+    forced: bool,
     origin: SubtitleOrigin,
     hash_match: bool,
     rejected: bool,
@@ -288,6 +295,7 @@ impl TryFrom<SubtitleResultWire> for SubtitleResult {
             downloads: w.downloads,
             rating: w.rating,
             hearing_impaired: w.hearing_impaired,
+            forced: w.forced,
             origin: w.origin,
             hash_match: w.hash_match,
             rejected: w.rejected,
@@ -542,6 +550,7 @@ mod tests {
         .unwrap();
         assert_eq!(search.results[0].id, "opensubtitles:7");
         assert_eq!(search.results[0].source, "opensubtitles");
+        assert!(!search.results[0].forced);
         assert!(search.sources.is_empty());
         // Written again, it is the new shape, and reads back the same.
         let again = serde_json::to_value(&search.results[0]).unwrap();

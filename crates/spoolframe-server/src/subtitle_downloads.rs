@@ -211,6 +211,9 @@ struct Offer {
     /// unrated.
     rating: Option<f64>,
     hearing_impaired: bool,
+    /// Only the parts in another language (OpenSubtitles'
+    /// `foreign_parts_only`).
+    forced: bool,
     origin: SubtitleOrigin,
     hash_match: bool,
 }
@@ -230,6 +233,7 @@ impl Offer {
             downloads: Some(found.downloads),
             rating: Some(found.rating),
             hearing_impaired: found.hearing_impaired,
+            forced: found.forced,
             origin: if found.ai_translated {
                 SubtitleOrigin::Ai
             } else if found.machine_translated {
@@ -255,6 +259,8 @@ impl Offer {
             rating: None,
             // SubDL's own flag says yes to everything (`subdl::Query`).
             hearing_impaired: false,
+            // SubDL's answer has no word for foreign parts only.
+            forced: false,
             origin: SubtitleOrigin::Human,
             hash_match: false,
         }
@@ -1111,6 +1117,7 @@ fn result(offer: &Offer, rejected: bool, downloaded: bool) -> SubtitleResult {
             .filter(|r| *r > 0.0)
             .map(|r| (r * 10.0).round() as u8),
         hearing_impaired: offer.hearing_impaired,
+        forced: offer.forced,
         origin: offer.origin,
         hash_match: offer.hash_match,
         rejected,

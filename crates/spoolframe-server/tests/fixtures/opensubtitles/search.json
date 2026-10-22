@@ -79,6 +79,7 @@
         "ratings": 0.0,
         "ai_translated": true,
         "machine_translated": false,
+        "foreign_parts_only": true,
         "release": "Film.2019.ai",
         "files": [ { "file_id": 104, "cd_number": 1, "file_name": "Film.ai.srt" } ],
         "moviehash_match": false

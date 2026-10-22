@@ -3351,6 +3351,7 @@ fn subtitle_search_round_trips() {
             downloads: 5_000,
             rating: Some(87),
             hearing_impaired: true,
+            forced: true,
             origin: SubtitleOrigin::Ai,
             hash_match: true,
             rejected: false,

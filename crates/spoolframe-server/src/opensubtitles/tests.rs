@@ -53,6 +53,8 @@ async fn a_search_sends_the_key_and_its_query_in_order_and_reads_each_file() {
     assert!(found[1].hearing_impaired);
     assert!(found[2].machine_translated && found[2].fps.is_none());
     assert!(found[3].ai_translated);
+    // `foreign_parts_only`: the parts in another language alone.
+    assert!(found[3].forced && !found[0].forced);
     // The query string is in key order, as the site wants it.
     let asked = &server.received_requests().await.unwrap()[0];
     let keys: Vec<String> = asked

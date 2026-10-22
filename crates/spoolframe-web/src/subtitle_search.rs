@@ -27,6 +27,9 @@ pub fn marks(r: &SubtitleResult) -> Vec<(String, &'static str)> {
     if r.hearing_impaired {
         mark("SDH", "pill");
     }
+    if r.forced {
+        mark("Forced", "pill");
+    }
     match r.origin {
         SubtitleOrigin::MachineTranslated => mark("Machine-translated", "pill pill-warn"),
         SubtitleOrigin::Ai => mark("AI-made", "pill pill-warn"),
@@ -289,6 +292,7 @@ mod tests {
             downloads: 12_345,
             rating: Some(87),
             hearing_impaired: true,
+            forced: false,
             origin: SubtitleOrigin::Human,
             hash_match: true,
             rejected: false,
@@ -315,6 +319,7 @@ mod tests {
             origin: SubtitleOrigin::MachineTranslated,
             hash_match: false,
             hearing_impaired: false,
+            forced: true,
             rejected: true,
             rating: None,
             fps_milli: Some(25_000),
@@ -326,7 +331,7 @@ mod tests {
                 .iter()
                 .map(|(t, _)| t.as_str())
                 .collect::<Vec<_>>(),
-            ["SubDL", "Machine-translated", "Removed before"]
+            ["SubDL", "Forced", "Machine-translated", "Removed before"]
         );
         assert_eq!(
             details(&machine),

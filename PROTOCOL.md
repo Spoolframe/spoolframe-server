@@ -2122,8 +2122,10 @@ its `source` (`opensubtitles` or `subdl`: show "OpenSubtitles" or
 23.976 fps), `downloads` (0 from SubDL), `rating` (0 to 100, tenths of
 the site's 0 to 10; `null` while unrated, and always from SubDL),
 `hearing_impaired` (always `false` from SubDL, whose own flag is set on
-nearly every file), and `downloaded` (downloading it again gives the
-same track).
+nearly every file), `forced` (only the parts in another language, signs
+and foreign lines: OpenSubtitles' `foreign_parts_only`; always `false`
+from SubDL, which does not say, and left out by a server before it),
+and `downloaded` (downloading it again gives the same track).
 
 `DownloadSubtitle` names a `result` a search of the same item listed in
 the last day, and downloads it from its site; another, or one of a site

@@ -1035,6 +1035,9 @@ fn result_line(r: &spoolframe_types::SubtitleResult) -> String {
     if r.hearing_impaired {
         marks.push("SDH");
     }
+    if r.forced {
+        marks.push("forced");
+    }
     match r.origin {
         SubtitleOrigin::MachineTranslated => marks.push("machine-translated"),
         SubtitleOrigin::Ai => marks.push("AI-made"),
@@ -1353,6 +1356,7 @@ mod tests {
             downloads: 120,
             rating: Some(87),
             hearing_impaired: false,
+            forced: true,
             origin: spoolframe_types::SubtitleOrigin::MachineTranslated,
             hash_match: true,
             rejected: true,
@@ -1360,7 +1364,7 @@ mod tests {
         };
         assert_eq!(
             result_line(&result),
-            "opensubtitles:101  en  Film.2019.1080p  8.7/10, 120 downloads  [hash match, machine-translated, removed before]"
+            "opensubtitles:101  en  Film.2019.1080p  8.7/10, 120 downloads  [hash match, forced, machine-translated, removed before]"
         );
     }
 

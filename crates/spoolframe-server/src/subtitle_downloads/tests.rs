@@ -243,6 +243,8 @@ async fn results_come_hash_matches_first_and_machine_made_last() {
     assert_eq!(found.results[2].origin, SubtitleOrigin::MachineTranslated);
     assert_eq!(found.results[3].origin, SubtitleOrigin::Ai);
     assert_eq!(found.results[0].fps_milli, Some(23_976));
+    assert!(found.results[3].forced);
+    assert!(!found.results[0].forced);
 }
 
 /// Opening the menu twice asks the site once; a day later, again.
@@ -689,9 +691,15 @@ async fn both_sites_are_searched_and_their_results_are_one_list() {
     );
     let subdl = &found.results[2];
     assert_eq!(subdl.source, "subdl");
+    // SubDL says nothing of foreign parts: none of its is forced.
     assert_eq!(
-        (subdl.downloads, subdl.rating, subdl.hash_match),
-        (0, None, false)
+        (
+            subdl.downloads,
+            subdl.rating,
+            subdl.hash_match,
+            subdl.forced
+        ),
+        (0, None, false, false)
     );
     assert_eq!(subdl.fps_milli, Some(23_976));
     assert_eq!(

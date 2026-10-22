@@ -141,6 +141,9 @@ pub struct Found {
     /// 0 to 10; 0 while unrated.
     pub rating: f64,
     pub hearing_impaired: bool,
+    /// Only the parts in another language than the rest: the site's
+    /// `foreign_parts_only`.
+    pub forced: bool,
     pub machine_translated: bool,
     pub ai_translated: bool,
     pub hash_match: bool,
@@ -174,6 +177,7 @@ struct Attributes {
     language: Option<String>,
     download_count: Option<u64>,
     hearing_impaired: Option<bool>,
+    foreign_parts_only: Option<bool>,
     fps: Option<f64>,
     ratings: Option<f64>,
     ai_translated: Option<bool>,
@@ -437,6 +441,7 @@ fn read_search(body: &[u8]) -> Result<Vec<Found>, SiteError> {
                     .unwrap_or(0.0)
                     .clamp(0.0, 10.0),
                 hearing_impaired: a.hearing_impaired.unwrap_or(false),
+                forced: a.foreign_parts_only.unwrap_or(false),
                 machine_translated: a.machine_translated.unwrap_or(false),
                 ai_translated: a.ai_translated.unwrap_or(false),
                 hash_match: a.moviehash_match.unwrap_or(false),
