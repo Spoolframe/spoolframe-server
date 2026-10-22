@@ -2,7 +2,8 @@
 //! part of rollout stage 1: on a film's or an episode's page, its
 //! downloaded subtitles (who downloaded each, its sync, Remove) and "Find
 //! subtitles…" with the results, each marked with its site; Settings ›
-//! Subtitles, the sites searched and their keys; and on a user's page,
+//! Subtitles, the sites searched, their keys and the day's downloads; and
+//! on a user's page,
 //! whether they may download.
 
 use dioxus::prelude::*;
@@ -18,7 +19,8 @@ use super::{icons, rpc};
 use crate::logic::ApiError;
 use crate::subtitle_search::{
     LIMIT, details, downloaded_by, downloaded_line, downloads, languages_value, limit_value, marks,
-    refusal, secret_reference, source_lines, sources_on, sources_value,
+    refusal, secret_reference, site_usage_line, source_lines, sources_on, sources_value,
+    user_usage,
 };
 use crate::subtitle_timing::{any_syncing, sync_text};
 
@@ -431,6 +433,7 @@ fn SubtitleSiteFields(
             "Subtitles are searched and downloaded from OpenSubtitles, SubDL or both only when someone asks, on an item's page or in an app, and kept for everyone. "
             "Searching sends each site the item's IDs, and OpenSubtitles the file's hash. OpenSubtitles works with Spoolframe's built-in key; SubDL needs its own."
         }
+        UsageToday {}
         fieldset { class: "flex flex-col gap-1.5 border-0 p-0 m-0",
             legend { class: "mb-1 text-sm font-semibold", "Sites searched" }
             for site in SubtitleSource::ALL {
@@ -502,6 +505,43 @@ fn SubtitleSiteFields(
         }
         Footer { mode: Mode::Settings, step: "subtitles", busy: busy(), on_save, on_discard: move |_| on_reload.call(()) }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| on_save.call(()) }
+    }
+}
+
+/// Settings › Subtitles: the day's downloads, each site's (with its
+/// account's count as the site said it) and each user's against the
+/// daily limit. Nothing without playback to look at.
+#[component]
+fn UsageToday() -> Element {
+    let usage = use_resource(|| async move {
+        let client = rpc::client().await?;
+        client.subtitle_usage().await.map_err(rpc::error)
+    });
+    let Some(Ok(usage)) = &*usage.read() else {
+        return rsx! {};
+    };
+    let now = super::now();
+    let limit = usage.daily_limit_per_user;
+    rsx! {
+        div { class: "flex flex-col gap-1.5",
+            h3 { class: "m-0 text-sm font-semibold", "Today" }
+            span { class: "text-xs text-ctp-subtext0", "The last 24 hours, as the daily limit counts them. A removed download still counts." }
+            for line in usage.sites.iter().map(|s| site_usage_line(s, now)) {
+                p { key: "{line}", class: "m-0 text-sm", "{line}" }
+            }
+            if usage.users.is_empty() {
+                p { class: "m-0 text-sm text-ctp-subtext0", "No one downloaded a subtitle." }
+            } else {
+                div { class: "dbg-rows",
+                    for (i, user) in usage.users.iter().enumerate() {
+                        div { key: "{i}", class: "dbg-row",
+                            span { class: "cat-break", "{user.name}" }
+                            span { class: "cat-quiet text-xs", "{user_usage(user, limit)}" }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -3088,6 +3088,74 @@ pub struct SubtitleTimingInfo {
     pub download: Option<spoolframe_types::SubtitleDownload>,
 }
 
+/// The day's subtitle downloads (PX-02), for Settings › Subtitles: each
+/// site's, and each user's against the daily limit. A day is the last
+/// 24 hours, as the limit counts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleUsage {
+    /// The sites on, in the order they are asked.
+    pub sites: Vec<SubtitleSiteUsage>,
+    /// `subtitles.daily_limit_per_user`; 0 for no limit.
+    pub daily_limit_per_user: u32,
+    /// Each user who downloaded in the day, the most downloads first.
+    pub users: Vec<SubtitleUserUsage>,
+}
+
+/// One site's day (PX-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleSiteUsage {
+    /// `opensubtitles` or `subdl`, as `SubtitleResult::source`.
+    pub source: String,
+    /// What this server downloaded from it in the day, everyone's,
+    /// removed ones too.
+    pub downloads: u32,
+    /// The server's account at the site, as the site said at the
+    /// server's last download from it. `None` when it has not said since
+    /// the server started, or never says (SubDL).
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub account: Option<SubtitleAccountCount>,
+}
+
+/// A site account's downloads, as the site counts them (PX-02): every
+/// app's that uses the account, not only this server's, over the site's
+/// own day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleAccountCount {
+    /// Made in its day; `None` when the site did not say.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub used: Option<u32>,
+    /// Left in its day.
+    pub remaining: u32,
+    /// `used` and `remaining` together, when both are known.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub limit: Option<u32>,
+    /// When the count starts again, Unix seconds, when the site says.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub resets_at: Option<i64>,
+    /// When the site said it, Unix seconds.
+    pub at: i64,
+}
+
+/// One user's day (PX-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleUserUsage {
+    /// A local user's username; `None` for a portable user.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub username: Option<String>,
+    /// As shown: their display name, else the username, else the name
+    /// they downloaded under.
+    pub name: String,
+    /// From every site, removed ones too.
+    pub downloads: u32,
+    /// Left in the day under `dailyLimitPerUser`; `None` without one.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub remaining: Option<u32>,
+}
+
 /// Where a subtitle's sync is (PX-03).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
@@ -4391,6 +4459,12 @@ pub trait AdminApi {
         allowed: bool,
     ) -> jsonrpsee::core::RpcResult<()>;
 
+    /// The day's subtitle downloads (PX-02): each site's, with its
+    /// account's count as the site last said it, and each user's against
+    /// the daily limit. `NOT_CONFIGURED` without playback to look at.
+    #[method(name = "subtitleUsage", with_extensions)]
+    async fn subtitle_usage(&self) -> jsonrpsee::core::RpcResult<SubtitleUsage>;
+
     /// Make an invite (P6-01): its code, shown this once, and its link.
     /// Needs a recent sign-in: the code makes an account
     /// (`RECENT_SIGN_IN_REQUIRED`). `INVALID_INPUT`, saying why, for a
@@ -4585,6 +4659,36 @@ mod required_field_tests {
                 outcome: "ok".into(),
             },
             &["target", "outcome", "client"],
+        );
+    }
+
+    /// PX-02.
+    #[test]
+    fn subtitle_usage() {
+        let account = SubtitleAccountCount {
+            used: None,
+            remaining: 3,
+            limit: None,
+            resets_at: None,
+            at: 1,
+        };
+        assert_each_required(&account, &["used", "limit", "resetsAt"]);
+        assert_each_required(
+            &SubtitleSiteUsage {
+                source: "opensubtitles".into(),
+                downloads: 1,
+                account: Some(account),
+            },
+            &["account"],
+        );
+        assert_each_required(
+            &SubtitleUserUsage {
+                username: None,
+                name: "Alice".into(),
+                downloads: 1,
+                remaining: None,
+            },
+            &["username", "remaining"],
         );
     }
 

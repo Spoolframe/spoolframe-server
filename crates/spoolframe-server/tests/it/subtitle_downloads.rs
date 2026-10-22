@@ -9,7 +9,9 @@
 
 use crate::support;
 
-use spoolframe_admin_api::{AdminApiClient, error_code};
+use spoolframe_admin_api::{
+    AdminApiClient, SubtitleAccountCount, SubtitleSiteUsage, SubtitleUserUsage, error_code,
+};
 use spoolframe_media::subsync::{self, Span, TextFormat};
 use spoolframe_protocol::features::SUBTITLE_SEARCH;
 use spoolframe_protocol::features::SUBTITLE_SYNC;
@@ -425,6 +427,33 @@ async fn the_admin_api_searches_downloads_and_turns_downloads_off() {
         .await
         .unwrap();
     assert!(root.subtitle_timings(id.clone()).await.unwrap().is_empty());
+    // The day's downloads: the removed one still counts, against the
+    // site's account (as the site said it) and its downloader.
+    let usage = root.subtitle_usage().await.unwrap();
+    assert_eq!(
+        usage.sites,
+        [SubtitleSiteUsage {
+            source: "opensubtitles".into(),
+            downloads: 1,
+            account: Some(SubtitleAccountCount {
+                used: None,
+                remaining: 17,
+                limit: None,
+                resets_at: Some(1_893_456_000),
+                at: usage.sites[0].account.as_ref().unwrap().at,
+            }),
+        }]
+    );
+    assert_eq!(usage.daily_limit_per_user, 0);
+    assert_eq!(
+        usage.users,
+        [SubtitleUserUsage {
+            username: Some("root".into()),
+            name: "root".into(),
+            downloads: 1,
+            remaining: None,
+        }]
+    );
 
     assert!(root.user_subtitle_downloads("bob".into()).await.unwrap());
     root.user_set_subtitle_downloads("bob".into(), false)

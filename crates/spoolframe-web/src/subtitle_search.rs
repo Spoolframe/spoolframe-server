@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 use spoolframe_admin_api::{
-    SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleSearch, SubtitleSource,
-    SubtitleSourceState, SubtitleTimingInfo, error_code,
+    SubtitleAccountCount, SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleSearch,
+    SubtitleSiteUsage, SubtitleSource, SubtitleSourceState, SubtitleTimingInfo, SubtitleUserUsage,
+    error_code,
 };
 
 use crate::logic::{ApiError, thousands};
@@ -160,6 +161,49 @@ fn wait(secs: i64) -> String {
         (0, m) => format!("{m} min"),
         (h, 0) => format!("{h} h"),
         (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+/// A site's day in Settings › Subtitles, `now` being Unix seconds:
+/// `OpenSubtitles: 3 downloads by this server. Its account: 5 of 20
+/// used, more in 3 h.` The account's count is the site's own, as it said
+/// it at the server's last download, and only while it holds.
+pub fn site_usage_line(site: &SubtitleSiteUsage, now: i64) -> String {
+    let name = SubtitleSource::name_of(&site.source);
+    let downloads = match site.downloads {
+        1 => "1 download".to_owned(),
+        n => format!("{} downloads", thousands(n.into())),
+    };
+    let mut line = format!("{name}: {downloads} by this server.");
+    let holds = |a: &SubtitleAccountCount| a.resets_at.is_none_or(|at| at > now);
+    match &site.account {
+        Some(a) if holds(a) => {
+            match (a.used, a.limit) {
+                (Some(used), Some(limit)) => {
+                    line.push_str(&format!(" Its account: {used} of {limit} used"));
+                }
+                _ => line.push_str(&format!(" Its account: {} left", a.remaining)),
+            }
+            if let Some(at) = a.resets_at {
+                line.push_str(&format!(", more in {}", wait(at - now)));
+            }
+            line.push('.');
+        }
+        _ if SubtitleSource::of(&site.source) == Some(SubtitleSource::SubDl) => {
+            line.push_str(" SubDL does not say its account's count.");
+        }
+        _ => line.push_str(" Its account's count shows after the next download."),
+    }
+    line
+}
+
+/// A user's downloads in the day against the daily limit: `2 of 5`, or
+/// `2` without a limit.
+pub fn user_usage(user: &SubtitleUserUsage, limit: u32) -> String {
+    if limit == 0 {
+        user.downloads.to_string()
+    } else {
+        format!("{} of {limit}", user.downloads)
     }
 }
 
@@ -392,6 +436,71 @@ mod tests {
             downloaded_line(&got),
             "Downloaded as subtitle 3, for everyone; you have 1 left today; the account has 17 left today"
         );
+    }
+
+    /// A site's day: this server's downloads, and its account's count
+    /// while it holds; SubDL's says it never has one.
+    #[test]
+    fn a_site_s_day_says_its_downloads_and_its_account() {
+        let site = |source: &str, downloads, account| SubtitleSiteUsage {
+            source: source.into(),
+            downloads,
+            account,
+        };
+        let count = |used, limit, resets_at| SubtitleAccountCount {
+            used,
+            remaining: 15,
+            limit,
+            resets_at,
+            at: 0,
+        };
+        let now = 1_000;
+        assert_eq!(
+            site_usage_line(
+                &site(
+                    "opensubtitles",
+                    3,
+                    Some(count(Some(5), Some(20), Some(now + 3 * 3600)))
+                ),
+                now
+            ),
+            "OpenSubtitles: 3 downloads by this server. Its account: 5 of 20 used, more in 3 h."
+        );
+        assert_eq!(
+            site_usage_line(
+                &site("opensubtitles", 1, Some(count(None, None, None))),
+                now
+            ),
+            "OpenSubtitles: 1 download by this server. Its account: 15 left."
+        );
+        // Past its reset, the count no longer holds.
+        assert_eq!(
+            site_usage_line(
+                &site(
+                    "opensubtitles",
+                    0,
+                    Some(count(Some(5), Some(20), Some(now)))
+                ),
+                now
+            ),
+            "OpenSubtitles: 0 downloads by this server. Its account's count shows after the next download."
+        );
+        assert_eq!(
+            site_usage_line(&site("subdl", 2, None), now),
+            "SubDL: 2 downloads by this server. SubDL does not say its account's count."
+        );
+    }
+
+    #[test]
+    fn a_user_s_day_is_against_the_limit_when_there_is_one() {
+        let alice = SubtitleUserUsage {
+            username: Some("alice".into()),
+            name: "Alice".into(),
+            downloads: 2,
+            remaining: Some(3),
+        };
+        assert_eq!(user_usage(&alice, 5), "2 of 5");
+        assert_eq!(user_usage(&alice, 0), "2");
     }
 
     #[test]

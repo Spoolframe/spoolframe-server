@@ -101,6 +101,52 @@ struct Site {
     /// downloaded once, and the site's quota is counted in order. Another
     /// site's downloads do not wait for it.
     downloading: tokio::sync::Mutex<()>,
+    /// The account's count, as the site said it at the last download:
+    /// none until then, and never from SubDL, which does not say.
+    account: Mutex<Option<AccountSaid>>,
+}
+
+/// A site account's downloads, as the site counts them: every app's that
+/// uses the account, over the site's own day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountSaid {
+    /// Made in its day, when the site says.
+    pub used: Option<u32>,
+    pub remaining: u32,
+    /// When the count starts again, Unix seconds.
+    pub resets_at: Option<i64>,
+    /// When the site said it, Unix seconds.
+    pub at: i64,
+}
+
+/// The day's downloads (the last 24 hours, as the daily limit counts
+/// them): each site's and each user's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    /// The sites on, in the order they are asked.
+    pub sites: Vec<SiteUsage>,
+    /// 0 for no limit.
+    pub daily_limit_per_user: u32,
+    /// Each user who downloaded, the most downloads first.
+    pub users: Vec<UserUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteUsage {
+    pub source: Source,
+    /// This server's downloads from it, everyone's, removed ones too.
+    pub downloads: u32,
+    pub account: Option<AccountSaid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUsage {
+    pub principal: String,
+    /// The name they last downloaded under; empty when the log has none.
+    pub name: String,
+    pub downloads: u32,
+    /// Under the daily limit; `None` without one.
+    pub remaining: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -120,6 +166,7 @@ impl Site {
         Arc::new(Site {
             client,
             downloading: tokio::sync::Mutex::new(()),
+            account: Mutex::new(None),
         })
     }
 }
@@ -742,7 +789,7 @@ impl SubtitleDownloads {
         }
         let media = self.catalog.media_path(id).await?;
         let (got, account_remaining) = match &site.client {
-            Client::OpenSubtitles(site) => {
+            Client::OpenSubtitles(client) => {
                 let file_id = offer.fetch.parse().map_err(|_| not_offered())?;
                 // A format the server reads is taken as it is; any other is
                 // asked for as SRT, which the site converts it to.
@@ -750,10 +797,28 @@ impl SubtitleDownloads {
                     .format
                     .as_deref()
                     .is_some_and(|f| matches!(f, "srt" | "ass" | "ssa" | "vtt"));
-                let got = site
-                    .download(file_id, as_srt.then_some("srt"))
-                    .await
-                    .map_err(|e| DownloadError::of_site(source, e))?;
+                let got = match client.download(file_id, as_srt.then_some("srt")).await {
+                    Ok(got) => got,
+                    Err(e) => {
+                        if let SiteError::QuotaExhausted { resets_at } = e {
+                            *site.account.lock() = Some(AccountSaid {
+                                used: None,
+                                remaining: 0,
+                                resets_at,
+                                at: self.store.now(),
+                            });
+                        }
+                        return Err(DownloadError::of_site(source, e));
+                    }
+                };
+                if let Some(remaining) = got.remaining {
+                    *site.account.lock() = Some(AccountSaid {
+                        used: got.requests,
+                        remaining,
+                        resets_at: got.resets_at,
+                        at: self.store.now(),
+                    });
+                }
                 (got.bytes, got.remaining)
             }
             Client::SubDl(site) => {
@@ -820,6 +885,55 @@ impl SubtitleDownloads {
             self.sync(id, &media, &file).await;
         }
         Ok(answer)
+    }
+
+    /// The day's downloads, each site's and each user's, for the admin.
+    pub async fn usage(&self) -> Result<Usage, StoreError> {
+        let live = self.live.lock().clone();
+        let log = self.store.subtitle_download_log().await?;
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let sites = live
+            .sites
+            .iter()
+            .map(|(site, settings)| {
+                let source = settings.source();
+                SiteUsage {
+                    source,
+                    downloads: count(log.iter().filter(|l| l.source == source.id()).count()),
+                    account: *site.account.lock(),
+                }
+            })
+            .collect();
+        let mut users: Vec<UserUsage> = Vec::new();
+        for logged in &log {
+            let user = match users.iter_mut().find(|u| u.principal == logged.principal) {
+                Some(user) => user,
+                None => {
+                    users.push(UserUsage {
+                        principal: logged.principal.clone(),
+                        name: String::new(),
+                        downloads: 0,
+                        remaining: None,
+                    });
+                    users.last_mut().expect("just pushed")
+                }
+            };
+            user.downloads += 1;
+            if !logged.name.is_empty() {
+                user.name = logged.name.clone();
+            }
+        }
+        let limit = live.daily_limit_per_user;
+        for user in &mut users {
+            user.remaining = (limit > 0).then(|| limit.saturating_sub(user.downloads));
+        }
+        // Stable: of the same count, who downloaded first comes first.
+        users.sort_by_key(|u| std::cmp::Reverse(u.downloads));
+        Ok(Usage {
+            sites,
+            daily_limit_per_user: limit,
+            users,
+        })
     }
 
     /// The downloads `principal` has left today, under a limit of `limit`.

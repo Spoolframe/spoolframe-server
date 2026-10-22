@@ -161,6 +161,7 @@ async fn a_download_signs_in_and_fetches_the_link() {
     let site = Site::new(account(&server, true));
     let got = site.download(101, None).await.unwrap();
     assert_eq!(got.bytes, b"subtitle");
+    assert_eq!(got.requests, Some(1));
     assert_eq!(got.remaining, Some(19));
     assert_eq!(got.resets_at, Some(1_649_422_996));
     // The token is kept: no second sign-in.

@@ -149,10 +149,14 @@ pub struct Found {
     pub hash_match: bool,
 }
 
-/// What a download got: the file, and the account's downloads left.
+/// What a download got: the file, and the account's downloads made and
+/// left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Downloaded {
     pub bytes: Vec<u8>,
+    /// The account's downloads in its current day, this one too: every
+    /// app's that uses the account, not only this server's.
+    pub requests: Option<u32>,
     pub remaining: Option<u32>,
     /// When the account's count starts again, Unix seconds.
     pub resets_at: Option<i64>,
@@ -204,6 +208,8 @@ struct LoginAnswer {
 #[derive(Debug, Deserialize)]
 struct DownloadAnswer {
     link: String,
+    #[serde(default)]
+    requests: Option<i64>,
     #[serde(default)]
     remaining: Option<i64>,
     #[serde(default)]
@@ -302,6 +308,7 @@ impl Site {
                 .await?;
             return Ok(Downloaded {
                 bytes,
+                requests: answer.requests.and_then(|n| u32::try_from(n).ok()),
                 remaining: answer.remaining.and_then(|n| u32::try_from(n).ok()),
                 resets_at: answer.reset_time_utc.as_deref().and_then(utc_seconds),
             });

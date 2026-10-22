@@ -4287,6 +4287,73 @@ impl AdminApiServer for AdminApi {
         Ok(())
     }
 
+    async fn subtitle_usage(
+        &self,
+        ext: &Extensions,
+    ) -> RpcResult<spoolframe_admin_api::SubtitleUsage> {
+        use spoolframe_admin_api::{
+            SubtitleAccountCount, SubtitleSiteUsage, SubtitleUsage, SubtitleUserUsage,
+        };
+        self.admin(ext).await?;
+        let usage = self
+            .playback_debug()?
+            .subtitle_downloads
+            .usage()
+            .await
+            .map_err(internal)?;
+        // A local user by their username and the name they go by now; a
+        // portable user by the name they downloaded under.
+        let local: std::collections::HashMap<String, (String, String)> = self
+            .auth
+            .store()
+            .list_users()
+            .await?
+            .into_iter()
+            .map(|u| {
+                let shown = u.display_name.clone().unwrap_or_else(|| u.username.clone());
+                (
+                    crate::principal::Principal::LocalUser(u.id).to_string(),
+                    (u.username, shown),
+                )
+            })
+            .collect();
+        Ok(SubtitleUsage {
+            sites: usage
+                .sites
+                .into_iter()
+                .map(|s| SubtitleSiteUsage {
+                    source: s.source.id().into(),
+                    downloads: s.downloads,
+                    account: s.account.map(|a| SubtitleAccountCount {
+                        used: a.used,
+                        remaining: a.remaining,
+                        limit: a.used.map(|used| used.saturating_add(a.remaining)),
+                        resets_at: a.resets_at,
+                        at: a.at,
+                    }),
+                })
+                .collect(),
+            daily_limit_per_user: usage.daily_limit_per_user,
+            users: usage
+                .users
+                .into_iter()
+                .map(|u| {
+                    let (username, name) = match local.get(&u.principal) {
+                        Some((username, shown)) => (Some(username.clone()), shown.clone()),
+                        None if u.name.is_empty() => (None, u.principal.clone()),
+                        None => (None, u.name),
+                    };
+                    SubtitleUserUsage {
+                        username,
+                        name,
+                        downloads: u.downloads,
+                        remaining: u.remaining,
+                    }
+                })
+                .collect(),
+        })
+    }
+
     async fn catalog_plan_for(
         &self,
         ext: &Extensions,

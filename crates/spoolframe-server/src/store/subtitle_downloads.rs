@@ -32,6 +32,18 @@ pub struct DownloadRow {
     pub downloaded_at: i64,
 }
 
+/// One download in the log of the last day (migrations 0036 and 0044).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedDownload {
+    /// Who downloaded it.
+    pub principal: String,
+    /// Their display name then; empty in a row from before 0044.
+    pub name: String,
+    /// `opensubtitles` or `subdl`; empty in a row from before 0044.
+    pub source: String,
+    pub at: i64,
+}
+
 /// A day, in seconds: what a daily limit counts over.
 pub const DAY_SECS: i64 = 24 * 60 * 60;
 
@@ -156,11 +168,16 @@ impl Store {
         .bind(download.downloaded_at)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("INSERT INTO subtitle_download_log (principal, at) VALUES (?1, ?2)")
-            .bind(&download.downloaded_by)
-            .bind(download.downloaded_at)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO subtitle_download_log (principal, at, source, name) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&download.downloaded_by)
+        .bind(download.downloaded_at)
+        .bind(&download.source)
+        .bind(&download.downloaded_name)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "DELETE FROM subtitle_rejections WHERE media_id = ?1 AND source = ?2 AND file_id = ?3",
         )
@@ -241,6 +258,30 @@ impl Store {
             .iter()
             .map(|r| r.try_get::<i64, _>("at"))
             .collect::<Result<_, _>>()?)
+    }
+
+    /// Every download of the last day, everyone's, oldest first: what
+    /// counts against each user's daily limit and each site's account.
+    /// Removed ones too.
+    pub async fn subtitle_download_log(&self) -> Result<Vec<LoggedDownload>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT principal, name, source, at FROM subtitle_download_log \
+             WHERE at > ?1 ORDER BY at, rowid",
+        )
+        .bind(self.now() - DAY_SECS)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                Ok(LoggedDownload {
+                    principal: r.try_get("principal")?,
+                    name: r.try_get("name")?,
+                    source: r.try_get("source")?,
+                    at: r.try_get("at")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()?)
     }
 
     /// Whether `principal` may download subtitles: unless an admin took
@@ -468,6 +509,43 @@ mod tests {
             [("b", "5338574"), ("a", "42")]
         );
         assert_eq!(rejected(&store, "opensubtitles").await, ["7"]);
+    }
+
+    /// The day's log says each download's site and downloader, removed
+    /// ones too, and forgets them a day later.
+    #[tokio::test]
+    async fn the_log_says_each_download_s_site_and_downloader() {
+        let store = test_store("subtitle-downloads-log").await;
+        let now = store.now();
+        store
+            .put_subtitle_download(&download("d1", "7", "local:1", now))
+            .await
+            .unwrap();
+        let mut subdl = download("d2", "3172974-3188291", "local:2", now);
+        subdl.source = "subdl".into();
+        subdl.downloaded_name = "Bob".into();
+        store.put_subtitle_download(&subdl).await.unwrap();
+        store
+            .remove_subtitle_download("d1", "local:1")
+            .await
+            .unwrap();
+        let logged = |principal: &str, name: &str, source: &str| LoggedDownload {
+            principal: principal.into(),
+            name: name.into(),
+            source: source.into(),
+            at: now,
+        };
+        assert_eq!(
+            store.subtitle_download_log().await.unwrap(),
+            [
+                logged("local:1", "Alice", "opensubtitles"),
+                logged("local:2", "Bob", "subdl"),
+            ]
+        );
+        store
+            .clock()
+            .advance(Duration::from_secs(DAY_SECS as u64 + 1));
+        assert!(store.subtitle_download_log().await.unwrap().is_empty());
     }
 
     #[tokio::test]

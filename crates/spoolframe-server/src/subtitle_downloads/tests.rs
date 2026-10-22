@@ -158,6 +158,7 @@ impl Fixture {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "link": format!("{}/files/{file_id}", self.site.uri()),
+                "requests": 20 - remaining,
                 "remaining": remaining,
                 "reset_time_utc": "2030-01-01T00:00:00.000Z"
             })))
@@ -520,6 +521,7 @@ async fn an_exhausted_account_is_said_so() {
         .search(&film(), None, &alice().actor)
         .await
         .unwrap();
+    let since = f.store.now();
     assert!(matches!(
         f.downloads
             .download(&film(), "opensubtitles:101", &alice())
@@ -530,6 +532,108 @@ async fn an_exhausted_account_is_said_so() {
             site: Some(Source::OpenSubtitles),
         })
     ));
+    // The day's count says the account has none left, until when.
+    let usage = f.downloads.usage().await.unwrap();
+    assert_eq!(
+        said_since(usage.sites[0].account, since),
+        Some(AccountSaid {
+            used: None,
+            remaining: 0,
+            resets_at: Some(1_893_456_000),
+            at: 0,
+        })
+    );
+    assert_eq!(usage.sites[0].downloads, 0);
+}
+
+/// `said`, checked to be said at `since` or later, its time then left
+/// out of the comparison: the store's clock runs.
+fn said_since(said: Option<AccountSaid>, since: i64) -> Option<AccountSaid> {
+    said.map(|s| {
+        assert!(s.at >= since, "said at {}, before {since}", s.at);
+        AccountSaid { at: 0, ..s }
+    })
+}
+
+/// The day's downloads: each site's, with its account's count as the
+/// site said it at the last download, and each user's against the
+/// limit, the most first.
+#[tokio::test]
+async fn the_day_s_downloads_are_counted_per_site_and_per_user() {
+    let f = fixture_with("usage", |site| Settings {
+        sites: vec![opensubtitles_at(site), subdl_at(site)],
+        daily_limit_per_user: 3,
+    })
+    .await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    f.serves(101, RUSSIAN.as_bytes().to_vec(), 19).await;
+    f.serves(102, RUSSIAN.as_bytes().to_vec(), 18).await;
+    // Before any download, nothing is known of the accounts.
+    let before = f.downloads.usage().await.unwrap();
+    assert_eq!(
+        before.sites,
+        [
+            SiteUsage {
+                source: Source::OpenSubtitles,
+                downloads: 0,
+                account: None,
+            },
+            SiteUsage {
+                source: Source::SubDl,
+                downloads: 0,
+                account: None,
+            },
+        ]
+    );
+    assert!(before.users.is_empty());
+    let since = f.store.now();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    f.downloads
+        .download(&film(), "opensubtitles:101", &bob())
+        .await
+        .unwrap();
+    f.downloads
+        .download(&film(), "opensubtitles:102", &alice())
+        .await
+        .unwrap();
+    // A removed download still counts: the site counted it.
+    let removed = f
+        .store
+        .subtitle_downloads(&film().to_string())
+        .await
+        .unwrap();
+    f.downloads
+        .remove(&film(), &removed[1].id, &alice().actor)
+        .await
+        .unwrap();
+    let usage = f.downloads.usage().await.unwrap();
+    assert_eq!(usage.daily_limit_per_user, 3);
+    assert_eq!(usage.sites[0].downloads, 2);
+    assert_eq!(
+        said_since(usage.sites[0].account, since),
+        Some(AccountSaid {
+            used: Some(2),
+            remaining: 18,
+            resets_at: Some(1_893_456_000),
+            at: 0,
+        })
+    );
+    assert_eq!(usage.sites[1].downloads, 0);
+    assert_eq!(usage.sites[1].account, None);
+    let user = |n: u128, name: &str, downloads, remaining| UserUsage {
+        principal: asker(n, false, name).actor.principal.to_string(),
+        name: name.into(),
+        downloads,
+        remaining,
+    };
+    assert_eq!(
+        usage.users,
+        [user(2, "Bob", 1, Some(2)), user(1, "Alice", 1, Some(2))]
+    );
 }
 
 /// A user an admin took downloading from can search, not download.
