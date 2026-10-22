@@ -45,7 +45,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, watch};
 
 use spoolframe_media::{MediaDescriptor, SubtitleSource, codecs};
-use spoolframe_protocol::downloads::{DownloadEstimate, DownloadReadiness, DownloadSource};
+use spoolframe_protocol::downloads::{
+    DownloadEstimate, DownloadFailure, DownloadReadiness, DownloadSource,
+};
 use spoolframe_types::{AudioCodec, BitmapPreference, ClientCapabilities, Container, Platform};
 
 use crate::config::DownloadSettings;
@@ -53,6 +55,7 @@ use crate::encode::job::{JobError, Jobs, Load, remove_file, stopped};
 use crate::optimized::mux::{DefaultSubtitle, MuxFormat, MuxPicks};
 use crate::optimized::{CopyFiles, Pool};
 use crate::principal::Principal;
+pub use crate::store::downloads::FailureCause;
 use crate::store::downloads::{DownloadRow, NewDownload, Of, StoredState};
 use crate::store::optimized::{CopyState, NewCopy};
 use crate::store::{Store, StoreError};
@@ -123,8 +126,9 @@ pub enum DownloadState {
     Writing { progress: Option<f64> },
     /// Its file is whole: `size` bytes, with this SHA-256 (hex).
     Ready { size: u64, sha256: String },
-    /// It could not be made; preparing it again tries again.
-    Failed { reason: String },
+    /// It could not be made, for `reason`, of `cause`; preparing it again
+    /// tries again.
+    Failed { reason: String, cause: FailureCause },
 }
 
 impl DownloadState {
@@ -142,8 +146,9 @@ impl DownloadState {
                 size: *size_bytes,
                 sha256: sha256.clone(),
             },
-            StoredState::Failed(reason) => Self::Failed {
+            StoredState::Failed { reason, cause } => Self::Failed {
                 reason: reason.clone(),
+                cause: *cause,
             },
         }
     }
@@ -165,8 +170,15 @@ impl DownloadState {
                 size: *size,
                 sha256: sha256.clone(),
             },
-            Self::Failed { reason } => Wire::Failed {
+            Self::Failed { reason, cause } => Wire::Failed {
                 reason: reason.clone(),
+                cause: match cause {
+                    FailureCause::ServerStoppedConverting => {
+                        DownloadFailure::ServerStoppedConverting
+                    }
+                    FailureCause::SourceMissing => DownloadFailure::SourceMissing,
+                    FailureCause::Other => DownloadFailure::Other,
+                },
             },
         }
     }
@@ -177,7 +189,7 @@ impl DownloadState {
             Self::Waiting => Some(StoredState::Waiting),
             Self::Converting { .. } => Some(StoredState::Converting),
             Self::Writing { .. } => Some(StoredState::Writing),
-            Self::Failed { reason } => Some(StoredState::Failed(reason.clone())),
+            Self::Failed { reason, cause } => Some(StoredState::failed(*cause, reason.clone())),
             Self::Ready { .. } => None,
         }
     }
@@ -490,7 +502,9 @@ impl Downloads {
             tracing::info!(dir = %making.display(), "removed the download files a stopped server was writing");
         }
         let store = sources.store;
-        let failed = store.fail_unfinished_downloads(STOPPED).await?;
+        let failed = store
+            .fail_unfinished_downloads(STOPPED, FailureCause::ServerStoppedConverting)
+            .await?;
         if failed > 0 {
             tracing::info!(
                 downloads = failed,
@@ -502,10 +516,17 @@ impl Downloads {
                 continue;
             };
             let file = Path::new(file);
-            let why = if !file.exists() {
-                "its file is gone: prepare it again"
-            } else if !file.starts_with(&dir) && !unchanged(file, &row.stamp).await {
-                MEDIA_CHANGED
+            // Outside the area, the file is the media file itself.
+            let as_is = !file.starts_with(&dir);
+            let (cause, why) = if !file.exists() {
+                let cause = if as_is {
+                    FailureCause::SourceMissing
+                } else {
+                    FailureCause::Other
+                };
+                (cause, "its file is gone: prepare it again")
+            } else if as_is && !unchanged(file, &row.stamp).await {
+                (FailureCause::SourceMissing, MEDIA_CHANGED)
             } else {
                 continue;
             };
@@ -515,7 +536,7 @@ impl Downloads {
                 "a ready download is no longer ready"
             );
             store
-                .set_download_state(Of::Id(&row.id), &StoredState::Failed(why.into()))
+                .set_download_state(Of::Id(&row.id), &StoredState::failed(cause, why))
                 .await?;
         }
         let inner = Arc::new(Inner {
@@ -1070,7 +1091,9 @@ impl Downloads {
         // open, so a file replaced before is caught too.
         if !path.starts_with(&self.inner.dir) && !unchanged(&path, &row.stamp).await {
             tracing::warn!(download = id, file = %path.display(), "a download's media file changed");
-            self.inner.fail(&row.content_key, MEDIA_CHANGED).await?;
+            self.inner
+                .fail(&row.content_key, FailureCause::SourceMissing, MEDIA_CHANGED)
+                .await?;
             return Err(DownloadError::NotReady);
         }
         if note_read(row.last_read_at, self.inner.store.now()) {
@@ -1143,21 +1166,38 @@ impl Drop for Downloads {
 enum Ended {
     /// Cancelled, or the server stops: nothing to say.
     Stopped,
-    Failed(String),
+    Failed(FailureCause, String),
+}
+
+impl Ended {
+    /// Failed for `why`, of no cause more telling.
+    fn other(why: impl Into<String>) -> Self {
+        Self::Failed(FailureCause::Other, why.into())
+    }
+
+    /// Failed for `why`: the media file is gone or changed.
+    fn source_missing(why: impl Into<String>) -> Self {
+        Self::Failed(FailureCause::SourceMissing, why.into())
+    }
+
+    /// Failed for `why`: the conversion failed or was stopped.
+    fn conversion(why: impl Into<String>) -> Self {
+        Self::Failed(FailureCause::ServerStoppedConverting, why.into())
+    }
 }
 
 impl From<RunError> for Ended {
     fn from(e: RunError) -> Self {
         match e {
             RunError::Stopped => Self::Stopped,
-            RunError::Failed(why) => Self::Failed(why),
+            RunError::Failed(why) => Self::other(why),
         }
     }
 }
 
 impl From<StoreError> for Ended {
     fn from(e: StoreError) -> Self {
-        Self::Failed(format!("the server's database failed: {e}"))
+        Self::other(format!("the server's database failed: {e}"))
     }
 }
 
@@ -1211,9 +1251,9 @@ impl Inner {
         };
         let stored = match ended {
             Ok(ready) => Some(ready),
-            Err(Ended::Failed(reason)) => {
-                tracing::warn!(key = job.key, media = %job.media.display(), reason, "a download failed");
-                Some(StoredState::Failed(reason))
+            Err(Ended::Failed(cause, reason)) => {
+                tracing::warn!(key = job.key, media = %job.media.display(), reason, cause = cause.as_str(), "a download failed");
+                Some(StoredState::failed(cause, reason))
             }
             Err(Ended::Stopped) => None,
         };
@@ -1254,15 +1294,16 @@ impl Inner {
                 tracing::warn!(error = %e, "cannot record a download's end");
                 DownloadState::Failed {
                     reason: format!("the server's database failed: {e}"),
+                    cause: FailureCause::Other,
                 }
             }
         }
     }
 
-    /// Every download of file `key`, sent as it is, fails for `why`: its
-    /// media file changed. Recorded and told.
-    async fn fail(&self, key: &str, why: &str) -> Result<(), StoreError> {
-        let failed = StoredState::Failed(why.to_owned());
+    /// Every download of file `key`, sent as it is, fails for `why`, of
+    /// `cause`: its media file changed. Recorded and told.
+    async fn fail(&self, key: &str, cause: FailureCause, why: &str) -> Result<(), StoreError> {
+        let failed = StoredState::failed(cause, why);
         self.store
             .set_download_state(Of::Content(key), &failed)
             .await?;
@@ -1279,12 +1320,15 @@ impl Inner {
         match crate::files::stamp_text(&job.media).await {
             Ok(stamp) if stamp == job.stamp => {}
             Ok(_) => {
-                return Err(Ended::Failed(
-                    "the media file changed since the download was asked for: prepare it again"
-                        .into(),
+                return Err(Ended::source_missing(
+                    "the media file changed since the download was asked for: prepare it again",
                 ));
             }
-            Err(e) => return Err(Ended::Failed(format!("the media file cannot be read: {e}"))),
+            Err(e) => {
+                return Err(Ended::source_missing(format!(
+                    "the media file cannot be read: {e}"
+                )));
+            }
         }
         if job.decision == Decision::AsIs {
             self.set(&job.key, DownloadState::Writing { progress: None })
@@ -1316,7 +1360,7 @@ impl Inner {
         let media_size = std::fs::metadata(&job.media).map_or(0, |m| m.len());
         let expected = media_size + stored_size;
         if expected > self.max_size {
-            return Err(Ended::Failed(format!(
+            return Err(Ended::other(format!(
                 "the file may grow to {} MiB, more than the download area holds \
                  (downloads.max_size_mb)",
                 expected >> 20
@@ -1326,7 +1370,7 @@ impl Inner {
         let _slot = self.place(&job.key, cancelled).await?;
         let lease = match &job.copy {
             Some(copy) => Some(self.pool.lease(copy).await?.ok_or_else(|| {
-                Ended::Failed("the converted copy was removed: prepare it again".into())
+                Ended::conversion("the converted copy was removed: prepare it again")
             })?),
             None => None,
         };
@@ -1359,11 +1403,11 @@ impl Inner {
         drop(lease);
         let (sha256, size) = write::sha256(&part)
             .await
-            .map_err(|e| Ended::Failed(format!("the file cannot be read back: {e}")))?;
+            .map_err(|e| Ended::other(format!("the file cannot be read back: {e}")))?;
         let ext = job.writes.extension();
         let file = self.dir.join(format!("{}.{ext}", job.key));
         std::fs::rename(&part, &file)
-            .map_err(|e| Ended::Failed(format!("cannot keep the file: {e}")))?;
+            .map_err(|e| Ended::other(format!("cannot keep the file: {e}")))?;
         tracing::info!(key = job.key, bytes = size, "a download's file is ready");
         Ok(StoredState::Ready {
             file: file.display().to_string(),
@@ -1385,8 +1429,8 @@ impl Inner {
     ) -> Result<u64, Ended> {
         loop {
             let Some(progress) = self.pool.progress(copy).await? else {
-                return Err(Ended::Failed(
-                    "the converted copy was removed: prepare it again".into(),
+                return Err(Ended::conversion(
+                    "the converted copy was removed: prepare it again",
                 ));
             };
             match progress.state {
@@ -1411,7 +1455,7 @@ impl Inner {
                         .await?
                         .and_then(|r| r.failure)
                         .unwrap_or_else(|| "the conversion failed".into());
-                    return Err(Ended::Failed(format!("the conversion failed: {why}")));
+                    return Err(Ended::conversion(format!("the conversion failed: {why}")));
                 }
                 CopyState::Waiting => self.set(key, DownloadState::Waiting).await?,
                 CopyState::Making => {
@@ -1451,7 +1495,7 @@ impl Inner {
             match now {
                 TextState::Ready(path) => return Ok(path),
                 TextState::Failed(why) => {
-                    return Err(Ended::Failed(format!(
+                    return Err(Ended::conversion(format!(
                         "subtitle {position} could not be read as text: {why}"
                     )));
                 }
@@ -1470,7 +1514,7 @@ impl Inner {
             tokio::select! {
                 changed = text.changed() => {
                     if changed.is_err() && !text.borrow().finished() {
-                        return Err(Ended::Failed(format!(
+                        return Err(Ended::conversion(format!(
                             "subtitle {position} could not be read as text"
                         )));
                     }
@@ -1544,7 +1588,7 @@ impl Inner {
                     self.set(key, DownloadState::Waiting).await?;
                     pause(Duration::from_secs(1), cancelled).await?;
                 }
-                Err(e) => return Err(Ended::Failed(e.to_string())),
+                Err(e) => return Err(Ended::other(e.to_string())),
             }
         }
     }
@@ -1564,10 +1608,9 @@ impl Inner {
         let once = self.hashes.lock().entry(key).or_default().clone();
         let sha = once
             .get_or_try_init(|| async {
-                write::sha256(media)
-                    .await
-                    .map(|(sha, _)| sha)
-                    .map_err(|e| Ended::Failed(format!("the media file cannot be read: {e}")))
+                write::sha256(media).await.map(|(sha, _)| sha).map_err(|e| {
+                    Ended::source_missing(format!("the media file cannot be read: {e}"))
+                })
             })
             .await?
             .clone();
@@ -1714,8 +1757,9 @@ impl Inner {
             tracing::info!(file = %file.display(), "a download file is removed a day after its last read");
             remove_file(file);
             removed = true;
-            let gone = StoredState::Failed(
-                "the file was removed a day after it was last read: prepare it again".into(),
+            let gone = StoredState::failed(
+                FailureCause::Other,
+                "the file was removed a day after it was last read: prepare it again",
             );
             self.store
                 .set_download_state(Of::Content(key), &gone)

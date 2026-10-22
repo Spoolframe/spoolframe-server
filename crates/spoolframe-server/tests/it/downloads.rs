@@ -10,7 +10,7 @@ use spoolframe_media::MediaDescriptor;
 use spoolframe_media::sandbox::Tool;
 use spoolframe_server::downloads::plan::{Decision, Source, Tracks};
 use spoolframe_server::downloads::{
-    DeviceClass, DownloadError, DownloadState, PrepareRequest, Prepared,
+    DeviceClass, DownloadError, DownloadState, FailureCause, PrepareRequest, Prepared,
 };
 use spoolframe_server::optimized::Deleted;
 use spoolframe_server::principal::Principal;
@@ -388,7 +388,11 @@ async fn a_file_sent_as_it_is_whose_media_changed_is_not_read() {
         read.map(|r| r.size)
     );
     assert!(
-        matches!(&state, Some(DownloadState::Failed { reason }) if reason.contains("changed")),
+        matches!(
+            &state,
+            Some(DownloadState::Failed { reason, cause: FailureCause::SourceMissing })
+                if reason.contains("changed")
+        ),
         "{state:?}"
     );
     server.stop().await;
@@ -408,7 +412,11 @@ async fn a_file_sent_as_it_is_whose_media_changed_fails_at_start() {
         .await
         .unwrap();
     assert!(
-        matches!(&state, Some(DownloadState::Failed { reason }) if reason.contains("changed")),
+        matches!(
+            &state,
+            Some(DownloadState::Failed { reason, cause: FailureCause::SourceMissing })
+                if reason.contains("changed")
+        ),
         "{state:?}"
     );
     server.stop().await;
@@ -611,7 +619,13 @@ async fn a_file_is_removed_a_day_after_its_last_read() {
         (
             kept,
             file.exists(),
-            matches!(state, Some(DownloadState::Failed { .. }))
+            matches!(
+                state,
+                Some(DownloadState::Failed {
+                    cause: FailureCause::Other,
+                    ..
+                })
+            )
         ),
         (true, false, true)
     );

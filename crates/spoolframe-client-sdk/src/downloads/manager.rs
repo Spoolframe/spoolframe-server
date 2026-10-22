@@ -7,7 +7,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use spoolframe_protocol::downloads::{
-    DownloadInfo, DownloadSource, DownloadState, DownloadTracks, MAX_ASKED, OfflineWatchOutcome,
+    DownloadFailure, DownloadInfo, DownloadSource, DownloadState, DownloadTracks, MAX_ASKED,
+    OfflineWatchOutcome,
 };
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::{ArtworkSize, Reply, Request};
@@ -270,6 +271,7 @@ async fn failed(shared: &Shared, key: &str, error: SdkError) {
                     if m.phase.is_active() {
                         m.phase = DownloadPhase::Failed {
                             reason: error.to_string(),
+                            cause: cause_of(&error),
                         };
                     }
                     m.note = None;
@@ -278,6 +280,32 @@ async fn failed(shared: &Shared, key: &str, error: SdkError) {
                 .await;
         }
     }
+}
+
+/// The cause of a download failed for `error`: talking to the server
+/// (an answer cut off or one that made no sense) is the network's.
+fn cause_of(error: &SdkError) -> DownloadFailure {
+    if error.is_transport() || matches!(error, SdkError::Protocol(_)) {
+        DownloadFailure::Network
+    } else {
+        DownloadFailure::Other
+    }
+}
+
+/// The phase of a download that needs `needed` bytes free where
+/// `available` are: failed for room, with how much more, when they are
+/// not.
+fn no_room(needed: u64, available: u64) -> Option<DownloadPhase> {
+    let short = needed.checked_sub(available).filter(|&short| short > 0)?;
+    Some(DownloadPhase::Failed {
+        reason: format!(
+            "Not enough space on this device: {} MB more needed",
+            short.div_ceil(1 << 20)
+        ),
+        cause: DownloadFailure::NoSpace {
+            needed_bytes: short,
+        },
+    })
 }
 
 /// Ask the server to prepare `id` (the same id each time for the same
@@ -339,7 +367,7 @@ pub(super) fn take(m: &mut Manifest, info: DownloadInfo) {
             m.sha256 = Some(sha256);
             DownloadPhase::Transferring
         }
-        DownloadState::Failed { reason } => DownloadPhase::Failed { reason },
+        DownloadState::Failed { reason, cause } => DownloadPhase::Failed { reason, cause },
         server => DownloadPhase::Preparing { server },
     };
 }
@@ -552,17 +580,8 @@ async fn transferring(
         .await
         .map_err(disk)?;
     let needed = (size - writer.contiguous()).saturating_add(HEADROOM);
-    let available = shared.available(store)?;
-    if available < needed {
-        return fail(
-            shared,
-            &m.key,
-            format!(
-                "Not enough space on this device: {} MB more needed",
-                (needed - available).div_ceil(1 << 20)
-            ),
-        )
-        .await;
+    if let Some(failed) = no_room(needed, shared.available(store)?) {
+        return fail(shared, &m.key, failed).await;
     }
     let save = |offset: u64| {
         let sha256 = sha256.clone();
@@ -633,7 +652,10 @@ async fn transferring(
             fail(
                 shared,
                 &m.key,
-                "The file arrived damaged; try again".to_owned(),
+                DownloadPhase::Failed {
+                    reason: "The file arrived damaged; try again".to_owned(),
+                    cause: DownloadFailure::Network,
+                },
             )
             .await
         }
@@ -696,10 +718,11 @@ async fn to_prepare(shared: &Shared, key: &str, forget: bool) -> Result<Step, Sd
     Ok(Step::Continue)
 }
 
-async fn fail(shared: &Shared, key: &str, reason: String) -> Result<Step, SdkError> {
+/// Download `key` is `failed`, a [`DownloadPhase::Failed`].
+async fn fail(shared: &Shared, key: &str, failed: DownloadPhase) -> Result<Step, SdkError> {
     shared
         .update(key, |m| {
-            m.phase = DownloadPhase::Failed { reason };
+            m.phase = failed;
             Ok(())
         })
         .await?;
@@ -940,6 +963,98 @@ mod tests {
                 reuse(&from, &to)
             ),
             (true, true, b"cover".to_vec(), false)
+        );
+    }
+
+    /// Short of room, a download fails saying how much more is needed, to
+    /// the byte; with room, it goes on.
+    #[test]
+    fn short_of_room_a_download_fails_with_the_bytes_to_free() {
+        let gib = 1u64 << 30;
+        assert_eq!(
+            (no_room(3 * gib + 1, gib), no_room(gib, gib)),
+            (
+                Some(DownloadPhase::Failed {
+                    reason: "Not enough space on this device: 2049 MB more needed".into(),
+                    cause: DownloadFailure::NoSpace {
+                        needed_bytes: 2 * gib + 1
+                    },
+                }),
+                None
+            )
+        );
+    }
+
+    /// An answer that made no sense, or a connection that broke, is the
+    /// network's; anything else, as the server or the disk says, other.
+    #[test]
+    fn a_failure_talking_to_the_server_is_the_network_s() {
+        assert_eq!(
+            [
+                SdkError::Protocol("an empty read".into()),
+                SdkError::Unreachable("s".into()),
+                SdkError::Server("boom".into()),
+                SdkError::Downloads("disk".into()),
+            ]
+            .map(|e| cause_of(&e)),
+            [
+                DownloadFailure::Network,
+                DownloadFailure::Network,
+                DownloadFailure::Other,
+                DownloadFailure::Other,
+            ]
+        );
+    }
+
+    /// The server's cause is the download's.
+    #[test]
+    fn a_failure_the_server_tells_keeps_its_cause() {
+        let mut m = Store::manifest(
+            EntryKind::Film,
+            "aa".into(),
+            "s".into(),
+            "u".into(),
+            "u".into(),
+            Item::Movie(spoolframe_types::Movie {
+                id: MediaId::new(
+                    spoolframe_types::Namespace::Plex,
+                    spoolframe_types::MediaKind::Movie,
+                    "1",
+                )
+                .unwrap(),
+                title: "Alien".into(),
+                year: None,
+                release_date: None,
+                summary: None,
+                content_rating: None,
+                duration: None,
+                cast: Vec::new(),
+                artwork: Vec::new(),
+                playback: spoolframe_types::PlaybackState::default(),
+            }),
+            spoolframe_types::MediaTracks::default(),
+            DownloadSource::Original,
+            DownloadTracks::All,
+            LocalWatch::default(),
+            1,
+        );
+        take(
+            &mut m,
+            DownloadInfo {
+                id: "ab".repeat(16),
+                state: DownloadState::Failed {
+                    reason: "the media file changed".into(),
+                    cause: DownloadFailure::SourceMissing,
+                },
+                file: None,
+            },
+        );
+        assert_eq!(
+            m.phase,
+            DownloadPhase::Failed {
+                reason: "the media file changed".into(),
+                cause: DownloadFailure::SourceMissing,
+            }
         );
     }
 

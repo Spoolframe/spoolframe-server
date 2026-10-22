@@ -66,8 +66,8 @@ use std::time::Duration;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::downloads::{
-    DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, OfflineWatch,
-    OfflineWatchOutcome,
+    DownloadFailure, DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState,
+    DownloadTracks, OfflineWatch, OfflineWatchOutcome,
 };
 use spoolframe_protocol::features::DOWNLOADS;
 use spoolframe_protocol::{Reply, Request};
@@ -98,7 +98,14 @@ pub enum DownloadPhase {
     Done,
     /// It could not be made or kept, for `reason`, said to the user as it
     /// is. [`Downloads::retry`] tries again.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+        /// Why, for choosing what to show: the server's cause, or this
+        /// device's (`no_space` with the bytes to free, `network`). A
+        /// download that failed before it was kept is `other`.
+        #[serde(default)]
+        cause: DownloadFailure,
+    },
 }
 
 impl DownloadPhase {

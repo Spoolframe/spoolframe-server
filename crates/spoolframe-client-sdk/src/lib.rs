@@ -63,8 +63,8 @@ pub use lan_servers::LanServerInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
 pub use spoolframe_protocol::downloads::{
-    DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, FileTracks,
-    LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
+    DownloadFailure, DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState,
+    DownloadTracks, FileTracks, LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
 };
 // Pairing a guest onto this device by QR code (P7-03).
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};

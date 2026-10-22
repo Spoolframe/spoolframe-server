@@ -1371,6 +1371,26 @@ mod tests {
         assert_eq!(store.scan().len(), 2);
     }
 
+    /// A manifest written before a failure had a cause still loads: its
+    /// failure's cause is `other`.
+    #[test]
+    fn a_failure_kept_before_causes_loads_as_other() {
+        let store = store("old-failure");
+        let m = manifest("ab12", 1);
+        let mut json = serde_json::to_value(&m).unwrap();
+        json["phase"] = serde_json::json!({"type": "failed", "reason": "the conversion failed"});
+        let path = store.dir(&m).join(MANIFEST);
+        std::fs::create_dir_all(store.dir(&m)).unwrap();
+        std::fs::write(&path, json.to_string()).unwrap();
+        assert_eq!(
+            store.find("ab12").map(|m| m.phase),
+            Some(DownloadPhase::Failed {
+                reason: "the conversion failed".into(),
+                cause: spoolframe_protocol::downloads::DownloadFailure::Other,
+            })
+        );
+    }
+
     /// A newer build's entry (a kind this one does not know, or a later
     /// layout) is not listed, and its directory is left as it is.
     #[test]

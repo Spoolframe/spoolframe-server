@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use iroh::endpoint::RecvStream;
 use spoolframe_protocol::codec::read_frame;
 use spoolframe_protocol::downloads::{
-    DownloadInfo, DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks,
-    OriginalDownload,
+    DownloadFailure, DownloadInfo, DownloadOptionsInfo, DownloadSource, DownloadState,
+    DownloadTracks, OriginalDownload,
 };
 use spoolframe_protocol::features::DOWNLOADS;
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
@@ -670,7 +670,13 @@ async fn a_failed_conversion_fails_the_download_and_preparing_again_makes_it() {
     let then = settled(&phone, &session, &again.id).await.state;
     assert_eq!(
         (
-            matches!(failed, DownloadState::Failed { .. }),
+            matches!(
+                failed,
+                DownloadState::Failed {
+                    cause: DownloadFailure::ServerStoppedConverting,
+                    ..
+                }
+            ),
             again.id == first.id,
             matches!(then, DownloadState::Ready { .. })
         ),

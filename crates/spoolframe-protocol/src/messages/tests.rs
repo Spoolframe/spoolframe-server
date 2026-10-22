@@ -3475,9 +3475,9 @@ mod playlist_upcoming {
 mod downloads {
     use super::*;
     use crate::downloads::{
-        DownloadEstimate, DownloadFile, DownloadInfo, DownloadOptionsInfo, DownloadReadiness,
-        DownloadSource, DownloadState, DownloadTracks, FileTracks, LeftOutSubtitle,
-        OriginalDownload,
+        DownloadEstimate, DownloadFailure, DownloadFile, DownloadInfo, DownloadOptionsInfo,
+        DownloadReadiness, DownloadSource, DownloadState, DownloadTracks, FileTracks,
+        LeftOutSubtitle, OriginalDownload,
     };
     use crate::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 
@@ -3496,6 +3496,65 @@ mod downloads {
         ciborium::into_writer(&old, &mut bytes).unwrap();
         let options: DownloadOptionsInfo = ciborium::from_reader(bytes.as_slice()).unwrap();
         assert_eq!(options.estimates, []);
+    }
+
+    /// A server before the cause was sent says only why in words: the
+    /// failure still decodes, its cause `other`.
+    #[test]
+    fn a_failure_without_a_cause_decodes_as_other() {
+        let old = serde_json::json!({"type": "failed", "reason": "the conversion failed"});
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        let state: DownloadState = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(
+            state,
+            DownloadState::Failed {
+                reason: "the conversion failed".into(),
+                cause: DownloadFailure::Other,
+            }
+        );
+    }
+
+    /// A cause a newer peer names is `Unknown`, and its failure decodes.
+    #[test]
+    fn an_unknown_cause_is_unknown() {
+        let newer = serde_json::json!({
+            "type": "failed",
+            "reason": "x",
+            "cause": {"type": "quota", "left": 0},
+        });
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&newer, &mut bytes).unwrap();
+        let state: DownloadState = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(
+            state,
+            DownloadState::Failed {
+                reason: "x".into(),
+                cause: DownloadFailure::Unknown,
+            }
+        );
+    }
+
+    /// The cause's wire names, which the apps match on.
+    #[test]
+    fn a_cause_has_its_wire_name() {
+        assert_eq!(
+            [
+                DownloadFailure::NoSpace { needed_bytes: 5 },
+                DownloadFailure::ServerStoppedConverting,
+                DownloadFailure::SourceMissing,
+                DownloadFailure::Network,
+                DownloadFailure::Other,
+            ]
+            .map(|cause| serde_json::to_value(cause).unwrap()),
+            [
+                serde_json::json!({"type": "no_space", "needed_bytes": 5}),
+                serde_json::json!({"type": "server_stopped_converting"}),
+                serde_json::json!({"type": "source_missing"}),
+                serde_json::json!({"type": "network"}),
+                serde_json::json!({"type": "other"}),
+            ]
+        );
     }
 
     /// A readiness a newer server names is `Unknown`, not an error.
@@ -3681,6 +3740,17 @@ mod downloads {
             },
             DownloadState::Failed {
                 reason: "the conversion failed".into(),
+                cause: DownloadFailure::ServerStoppedConverting,
+            },
+            DownloadState::Failed {
+                reason: "the media file changed".into(),
+                cause: DownloadFailure::SourceMissing,
+            },
+            DownloadState::Failed {
+                reason: "no room".into(),
+                cause: DownloadFailure::NoSpace {
+                    needed_bytes: 3 << 30,
+                },
             },
         ] {
             round_trip(Event::DownloadChanged {

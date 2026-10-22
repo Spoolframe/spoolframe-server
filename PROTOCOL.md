@@ -2259,7 +2259,14 @@ A `DownloadState` is tagged by `type`:
   sent as it is is the media file itself: once that changes, the
   download fails (when it is read, or at the server's start) rather
   than send other bytes under its `size` and `sha256`.
-  `PrepareDownload` again tries again, under the same `id`;
+  `PrepareDownload` again tries again, under the same `id`. `reason`
+  is said to the user as it is; `cause`, tagged by `type`, is why, for
+  the app to choose what to show: `server_stopped_converting` (the
+  conversion failed, or the server stopped while preparing it),
+  `source_missing` (the media file is gone or changed), `other`, or
+  `unknown` for a cause this build does not know. A server before it
+  sends none: read as `other`. `no_space { needed_bytes }` and
+  `network` are a device's own, never sent by a server;
 - `unknown`: a state this build does not know.
 
 `DownloadChanged { id, state }` tells each of the user's connections

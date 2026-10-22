@@ -23,19 +23,61 @@ pub enum StoredState {
         size_bytes: u64,
         sha256: String,
     },
-    /// It could not be made, for this reason; preparing it again tries
+    /// It could not be made, for `reason`; preparing it again tries
     /// again.
-    Failed(String),
+    Failed { reason: String, cause: FailureCause },
+}
+
+/// Why a download failed (migration 0043), for the device to choose what
+/// to show; the reason says it in words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCause {
+    /// Its conversion failed, or the server stopped while it was being
+    /// prepared.
+    ServerStoppedConverting,
+    /// Its media file is gone, or changed since it was asked for.
+    SourceMissing,
+    /// Anything else, and every failure recorded before the cause was.
+    Other,
+}
+
+impl FailureCause {
+    /// As the database keeps it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerStoppedConverting => "server_stopped_converting",
+            Self::SourceMissing => "source_missing",
+            Self::Other => "other",
+        }
+    }
+
+    /// The cause `s` names; `other` for none, or one this build does not
+    /// know.
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("server_stopped_converting") => Self::ServerStoppedConverting,
+            Some("source_missing") => Self::SourceMissing,
+            _ => Self::Other,
+        }
+    }
 }
 
 impl StoredState {
+    /// Failed for `reason`, of `cause`.
+    pub fn failed(cause: FailureCause, reason: impl Into<String>) -> Self {
+        Self::Failed {
+            reason: reason.into(),
+            cause,
+        }
+    }
+
     fn name(&self) -> &'static str {
         match self {
             Self::Waiting => "waiting",
             Self::Converting => "converting",
             Self::Writing => "writing",
             Self::Ready { .. } => "ready",
-            Self::Failed(_) => "failed",
+            Self::Failed { .. } => "failed",
         }
     }
 }
@@ -90,7 +132,7 @@ pub enum Of<'a> {
 macro_rules! columns {
     () => {
         "id, principal, media_id, request, content_key, state, file, size_bytes, sha256, \
-         failure, created_at, last_read_at, carried, stamp"
+         failure, failure_cause, created_at, last_read_at, carried, stamp"
     };
 }
 
@@ -109,10 +151,12 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<DownloadRow, sqlx::Error> {
                 .try_get::<Option<String>, _>("sha256")?
                 .unwrap_or_default(),
         },
-        "failed" => StoredState::Failed(
-            r.try_get::<Option<String>, _>("failure")?
+        "failed" => StoredState::Failed {
+            reason: r
+                .try_get::<Option<String>, _>("failure")?
                 .unwrap_or_default(),
-        ),
+            cause: FailureCause::parse(r.try_get::<Option<String>, _>("failure_cause")?.as_deref()),
+        },
         other => {
             return Err(sqlx::Error::ColumnDecode {
                 index: "state".into(),
@@ -278,7 +322,7 @@ impl Store {
         of: Of<'_>,
         state: &StoredState,
     ) -> Result<(), StoreError> {
-        let (file, size, sha, failure) = match state {
+        let (file, size, sha, failure, cause) = match state {
             StoredState::Ready {
                 file,
                 size_bytes,
@@ -288,21 +332,30 @@ impl Store {
                 Some(i64::try_from(*size_bytes).unwrap_or(i64::MAX)),
                 Some(sha256.as_str()),
                 None,
+                None,
             ),
-            StoredState::Failed(why) => (None, None, None, Some(why.as_str())),
-            _ => (None, None, None, None),
+            StoredState::Failed { reason, cause } => (
+                None,
+                None,
+                None,
+                Some(reason.as_str()),
+                Some(cause.as_str()),
+            ),
+            _ => (None, None, None, None, None),
         };
         let read_at = matches!(state, StoredState::Ready { .. }).then(|| self.now());
         // One statement each, so neither is built at run time.
         let (sql, key) = match of {
             Of::Id(id) => (
                 "UPDATE downloads SET state = ?2, file = ?3, size_bytes = ?4, sha256 = ?5, \
-                 failure = ?6, last_read_at = COALESCE(?7, last_read_at) WHERE id = ?1",
+                 failure = ?6, failure_cause = ?8, last_read_at = COALESCE(?7, last_read_at) \
+                 WHERE id = ?1",
                 id,
             ),
             Of::Content(key) => (
                 "UPDATE downloads SET state = ?2, file = ?3, size_bytes = ?4, sha256 = ?5, \
-                 failure = ?6, last_read_at = COALESCE(?7, last_read_at) WHERE content_key = ?1",
+                 failure = ?6, failure_cause = ?8, last_read_at = COALESCE(?7, last_read_at) \
+                 WHERE content_key = ?1",
                 key,
             ),
         };
@@ -314,6 +367,7 @@ impl Store {
             .bind(sha)
             .bind(failure)
             .bind(read_at)
+            .bind(cause)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -341,14 +395,19 @@ impl Store {
         Ok(found.as_ref().map(row).transpose()?)
     }
 
-    /// Fail every download a stopped server was preparing, for `why`:
-    /// how many. Preparing one again starts it anew.
-    pub async fn fail_unfinished_downloads(&self, why: &str) -> Result<u64, StoreError> {
+    /// Fail every download a stopped server was preparing, for `why`, of
+    /// `cause`: how many. Preparing one again starts it anew.
+    pub async fn fail_unfinished_downloads(
+        &self,
+        why: &str,
+        cause: FailureCause,
+    ) -> Result<u64, StoreError> {
         let done = sqlx::query(
-            "UPDATE downloads SET state = 'failed', failure = ?1 \
+            "UPDATE downloads SET state = 'failed', failure = ?1, failure_cause = ?2 \
              WHERE state IN ('waiting', 'converting', 'writing')",
         )
         .bind(why)
+        .bind(cause.as_str())
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())
@@ -506,10 +565,42 @@ mod tests {
             .put_download(asked("local:a", "{}", "k"))
             .await
             .unwrap();
-        store.fail_unfinished_downloads("stopped").await.unwrap();
+        store
+            .fail_unfinished_downloads("stopped", FailureCause::ServerStoppedConverting)
+            .await
+            .unwrap();
         assert_eq!(
             store.download(&row.id).await.unwrap().unwrap().state,
-            StoredState::Failed("stopped".into())
+            StoredState::failed(FailureCause::ServerStoppedConverting, "stopped")
+        );
+    }
+
+    /// A failure's cause is kept beside its reason, and one recorded
+    /// before causes were (NULL) reads as `other`.
+    #[tokio::test]
+    async fn a_failure_keeps_its_cause() {
+        let store = test_store("downloads-cause").await;
+        let row = store
+            .put_download(asked("local:a", "{}", "k"))
+            .await
+            .unwrap();
+        let gone = StoredState::failed(FailureCause::SourceMissing, "the media file is gone");
+        store
+            .set_download_state(Of::Id(&row.id), &gone)
+            .await
+            .unwrap();
+        let kept = store.download(&row.id).await.unwrap().unwrap().state;
+        sqlx::query("UPDATE downloads SET failure_cause = NULL WHERE id = ?1")
+            .bind(&row.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (kept, store.download(&row.id).await.unwrap().unwrap().state),
+            (
+                gone,
+                StoredState::failed(FailureCause::Other, "the media file is gone")
+            )
         );
     }
 }

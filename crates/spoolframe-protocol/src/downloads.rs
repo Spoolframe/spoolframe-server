@@ -199,8 +199,40 @@ pub enum DownloadState {
     /// It could not be made: a conversion failed, the file is gone, or
     /// the server removed it a day after its last read. `PrepareDownload`
     /// again tries again, under the same id.
-    Failed { reason: String },
+    Failed {
+        /// Said to the user as it is.
+        reason: String,
+        /// Why, for the app to choose what to show and offer; `other`
+        /// from a server before it was sent.
+        #[serde(default)]
+        cause: DownloadFailure,
+    },
     /// A state this build does not know: ask `DownloadStatus` later.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a download failed (`DownloadState::Failed`), beside its reason in
+/// words.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DownloadFailure {
+    /// The device has no room for it: `needed_bytes` more must be free.
+    /// A device's own; a server never sends it.
+    NoSpace { needed_bytes: u64 },
+    /// The server's conversion of it (its video, its audio, or picture
+    /// subtitles read as text) failed, or stopped with the server.
+    ServerStoppedConverting,
+    /// The media file it is made from is gone from the server, or
+    /// changed since it was prepared.
+    SourceMissing,
+    /// Talking to the server failed: a device's own, for an answer that
+    /// broke off or made no sense, or a file that arrived damaged.
+    Network,
+    /// Anything else: the reason says.
+    #[default]
+    Other,
+    /// A cause this build does not know.
     #[serde(other)]
     Unknown,
 }
