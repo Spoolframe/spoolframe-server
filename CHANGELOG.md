@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- Invite lookup before joining. `LookupInvite` is a new pre-auth request,
+  behind the feature `spoolframe:invite-lookup`, the first feature listed
+  before sign-in. It answers `valid` (the kind, the role, when it
+  expires and the inviter's display name), `expired`, `used`, `revoked`
+  or `no_match`. A lookup counts against the same five guesses as a
+  redemption, and `no_match` uses one. Joining still answers `Invalid` for
+  both revoked and no-match codes. SDK: `Client::look_up_invite(link)`,
+  `Client::look_up_invite_code(endpoint_id, addrs, typed)` and
+  `parse_code`. An app enables it with `Features::invite_lookup`.
+- `Hello`'s answer says whether the server is invite-only
+  (`ServerInfo.invite_only`; true when a server before 0.14.4 sends
+  none). SDK: `Client::lan_servers()` lists the servers on the local
+  network, and `Client::lan_server_info(endpoint_id)` asks one for its
+  name, fingerprint, versions and `invite_only` before joining.
+- A failed download says why. `DownloadState::Failed` gains `cause`:
+  `no_space` (with the bytes still to free), `server_stopped_converting`,
+  `source_missing`, `network` or `other`. The server keeps the cause
+  (migration 0043), so it is still sent after a restart. A failure from
+  an older peer reads as `other`. SDK: `DownloadPhase::Failed` gains
+  `cause`, so a match on `Failed { reason }` needs a `..`.
+- A prepared download says how large it will be: `DownloadInfo` gains
+  `expected_size`, and the SDK's `LocalDownload` keeps it next to `size`.
+  Films and episodes use the same estimate as `DownloadOptions`. A track
+  uses its file's size, or the AAC rate over its length when it is
+  converted.
+- SDK: an offline album lists every song (`OfflineAlbum.tracklist`, each
+  `AlbumTrack` saying whether it is on the device) and how many there are
+  (`total_tracks`). An `OfflineTrack` says which of this user's downloads
+  hold it (`held_by`): the track, its album, its artist, a playlist or
+  Liked.
+- A subtitle search result says whether it is forced
+  (`SubtitleResult.forced`, from OpenSubtitles; SubDL does not say). A
+  result from an older server reads as not forced.
+- Subtitle search results follow the asking user's preferences. Right
+  after a hash match come the forced preference, then the SDH preference,
+  then rating and downloads. `SdhPreference` gains `only`, and the new
+  `SubtitlePreferences.forced` takes the same four values. The two "only"
+  choices remove the other results. With the default preferences, SDH
+  results now come after plain ones. An older build reads `only` as
+  `accept`.
+- Settings › Subtitles shows the last 24 hours: each site's downloads
+  by this server and, when the site said, its account's count and when
+  it resets, and each user's downloads against their daily limit (admin
+  API `subtitleUsage`; migration 0044).
+- Open source licenses has a "Run by the server" group: FFmpeg 9.0.1
+  (GPL-3.0-or-later, as nixpkgs builds it), libplacebo 7.360.1
+  (LGPL-2.1-or-later) and Tesseract 5.5.3 (Apache-2.0), each run as a
+  separate program.
+- iroh 1.4.1 and noq 1.4.0, with their bug fixes.
+- rustdoc builds every library crate with no warnings.
+
 ## 0.14.3 (2026-10-21)
 
 - Security: dependencies with known advisories are updated. rustls
