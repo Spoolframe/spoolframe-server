@@ -267,8 +267,9 @@ pub struct DownloadInfo {
     /// ready ("Waiting for Wi-Fi · 2.8 GB"): a film's or an episode's as
     /// `DownloadEstimate::size_bytes` says, a track's its file's size, or
     /// its converted rate over its length. Sent with `PrepareDownload`'s
-    /// answer; `None` in `DownloadStatus`'s, when the server cannot tell,
-    /// and from a server before it was sent. `Ready`'s `size` is exact.
+    /// answer and with `DownloadStatus`'s; `None` when the server cannot
+    /// tell, and from a server before it was sent (an older server
+    /// sends it only with `PrepareDownload`'s). `Ready`'s `size` is exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_size: Option<u64>,
 }

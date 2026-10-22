@@ -3682,6 +3682,39 @@ mod downloads {
         assert_eq!(info.expected_size, None);
     }
 
+    /// A `DownloadStatus` answer from a server before the size was said
+    /// in it decodes, with none; one that says it keeps it.
+    #[test]
+    fn a_status_reply_says_the_expected_size_or_decodes_without() {
+        let download = |extra: serde_json::Value| {
+            let mut d = serde_json::json!({
+                "id": "ab".repeat(16),
+                "state": {"type": "waiting"},
+                "file": null,
+            });
+            d.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            d
+        };
+        let decode = |d: serde_json::Value| {
+            let reply = serde_json::json!({"type": "downloads", "downloads": [d], "gone": []});
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&reply, &mut bytes).unwrap();
+            let Reply::Downloads { mut downloads, .. } =
+                ciborium::from_reader(bytes.as_slice()).unwrap()
+            else {
+                panic!("not a status reply");
+            };
+            downloads.remove(0).expected_size
+        };
+        assert_eq!(decode(download(serde_json::json!({}))), None);
+        assert_eq!(
+            decode(download(serde_json::json!({"expected_size": 7}))),
+            Some(7)
+        );
+    }
+
     #[test]
     fn the_replies_round_trip() {
         for reply in [

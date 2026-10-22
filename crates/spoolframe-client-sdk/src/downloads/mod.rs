@@ -209,7 +209,7 @@ pub struct LocalDownload {
     /// The file's size, once the server has it ready.
     pub size: Option<u64>,
     /// About how large the file will be, as the server said when it was
-    /// prepared: to show before `size` is known ("Waiting for Wi-Fi ·
+    /// prepared or asked about: to show before `size` is known ("Waiting for Wi-Fi ·
     /// 2.8 GB"). `None` from a server that does not say, or cannot tell.
     pub expected_size: Option<u64>,
     /// The file, once [`DownloadPhase::Done`].

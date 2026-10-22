@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A download's status says its expected size. `DownloadStatus` answered
+  without `expected_size`, so a client that only polled it never learned
+  the size to show before the file was ready; only `PrepareDownload` said
+  it. The server keeps the size it estimated (a nullable column, so
+  downloads from before have none) and says it in both. No protocol
+  change: the field was already in `DownloadInfo`, optional. SDK: the
+  manager takes the size from a status too, and keeps the one it knows
+  when a reply has none.
 - A forced subtitle downloaded from a subtitle site is a forced track. It
   played as the whole dialogue before, as the download did not keep
   that it is forced. Downloads from before stay full tracks.

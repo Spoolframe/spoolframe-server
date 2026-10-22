@@ -4074,8 +4074,7 @@ impl ClientProtocol {
                             &status.state,
                             status.class,
                             status.carried,
-                            // Said once, when it is prepared.
-                            None,
+                            status.expected_size,
                         )),
                         None => gone.push(id),
                     }

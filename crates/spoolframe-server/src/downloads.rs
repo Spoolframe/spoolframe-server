@@ -283,6 +283,10 @@ pub struct Status {
     pub class: Option<DeviceClass>,
     /// The tracks it carries; `None` for a row this build cannot read.
     pub carried: Option<Carried>,
+    /// About how many bytes the file will be, as it was prepared; `None`
+    /// where that was not known, and for a download from before it was
+    /// kept.
+    pub expected_size: Option<u64>,
 }
 
 /// A ready download's file, open to read. While it is held the file is
@@ -922,6 +926,7 @@ impl Downloads {
                 content_key: &job.key,
                 carried: &carried,
                 stamp: &job.stamp,
+                expected_size: asked.expected_size,
             })
             .await?;
         let (content_key, decision) = (job.key.clone(), job.decision.clone());
@@ -1075,6 +1080,7 @@ impl Downloads {
             state,
             class,
             carried,
+            expected_size: row.expected_size,
         }
     }
 

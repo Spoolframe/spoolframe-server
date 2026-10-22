@@ -358,7 +358,8 @@ pub(super) fn take(m: &mut Manifest, info: DownloadInfo) {
     if info.file.is_some() {
         m.file = info.file;
     }
-    // Said when it is prepared, not when it is asked about.
+    // Said when it is prepared and when it is asked about; an older server
+    // says it only when it is prepared, and the one known stays.
     if info.expected_size.is_some() {
         m.expected_size = info.expected_size;
     }
@@ -1023,6 +1024,32 @@ mod tests {
         };
         take(&mut m, info(Some(2_800_000_000)));
         take(&mut m, info(None));
+        assert_eq!(m.expected_size, Some(2_800_000_000));
+    }
+
+    /// A device that never saw the prepared answer (its manifest has no
+    /// size) learns the size from the status reply.
+    #[test]
+    fn the_expected_size_is_taken_from_a_status_reply() {
+        let mut m = film_manifest();
+        assert_eq!(m.expected_size, None);
+        let id = "ab".repeat(16);
+        let reply = |expected_size| Reply::Downloads {
+            downloads: vec![DownloadInfo {
+                id: id.clone(),
+                state: DownloadState::Converting {
+                    done_percent: Some(10),
+                    eta_secs: None,
+                },
+                file: None,
+                expected_size,
+            }],
+            gone: Vec::new(),
+        };
+        take(&mut m, status_of(reply(Some(2_800_000_000)), &id).unwrap());
+        assert_eq!(m.expected_size, Some(2_800_000_000));
+        // An older server says none: the one known stays.
+        take(&mut m, status_of(reply(None), &id).unwrap());
         assert_eq!(m.expected_size, Some(2_800_000_000));
     }
 

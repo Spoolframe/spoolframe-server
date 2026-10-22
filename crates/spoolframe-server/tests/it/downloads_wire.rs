@@ -521,6 +521,31 @@ async fn a_file_sent_as_it_is_reads_whole_in_chunks_as_the_film_s_own_bytes() {
     server.stop().await;
 }
 
+/// A device that only polls `DownloadStatus` learns the size too, while
+/// the file is made and once it is ready.
+#[tokio::test]
+async fn the_status_says_the_expected_size_as_prepare_did() {
+    let server = server("downloads-wire-status-size", ServerOptions::default()).await;
+    write_film(&server);
+    let (linux, session) = device(&server, Platform::Linux, "alice").await;
+    let info = prepared(
+        &linux,
+        &session,
+        DownloadSource::Original,
+        DownloadTracks::All,
+    )
+    .await;
+    assert!(info.expected_size.is_some());
+    let Response::Ok(Reply::Downloads { downloads, .. }) = status(&linux, &session, &info.id).await
+    else {
+        panic!("no status");
+    };
+    assert_eq!(downloads[0].expected_size, info.expected_size);
+    let settled = settled(&linux, &session, &info.id).await;
+    assert_eq!(settled.expected_size, info.expected_size);
+    server.stop().await;
+}
+
 /// The rest of the file, from any byte: what a download broken off
 /// resumes with.
 #[tokio::test]

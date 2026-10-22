@@ -105,6 +105,9 @@ pub struct DownloadRow {
     /// The media file's stamp ([`crate::files::stamp_text`]) its content
     /// key was made from.
     pub stamp: String,
+    /// About how many bytes its file will be, as it was prepared; `None`
+    /// where that was not known (migration 0046).
+    pub expected_size: Option<u64>,
 }
 
 /// A download asked for.
@@ -118,6 +121,8 @@ pub struct NewDownload<'a> {
     pub carried: &'a str,
     /// The media file's stamp the content key was made from.
     pub stamp: &'a str,
+    /// About how many bytes its file will be, if known.
+    pub expected_size: Option<u64>,
 }
 
 /// Which downloads a change applies to.
@@ -132,7 +137,7 @@ pub enum Of<'a> {
 macro_rules! columns {
     () => {
         "id, principal, media_id, request, content_key, state, file, size_bytes, sha256, \
-         failure, failure_cause, created_at, last_read_at, carried, stamp"
+         failure, failure_cause, created_at, last_read_at, carried, stamp, expected_size"
     };
 }
 
@@ -175,6 +180,9 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<DownloadRow, sqlx::Error> {
         last_read_at: r.try_get("last_read_at")?,
         carried: r.try_get("carried")?,
         stamp: r.try_get("stamp")?,
+        expected_size: r
+            .try_get::<Option<i64>, _>("expected_size")?
+            .and_then(|n| u64::try_from(n).ok()),
     })
 }
 
@@ -202,18 +210,32 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?;
         let id = match found {
-            // The same content is the same tracks and stamp.
-            Some((id, key)) if key == new.content_key => id,
+            // The same content is the same tracks and stamp; its size is
+            // estimated again, as the estimate may have a better basis.
+            Some((id, key)) if key == new.content_key => {
+                if let Some(size) = new.expected_size {
+                    sqlx::query("UPDATE downloads SET expected_size = ?2 WHERE id = ?1")
+                        .bind(&id)
+                        .bind(i64::try_from(size).unwrap_or(i64::MAX))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                id
+            }
             Some((id, _)) => {
                 sqlx::query(
                     "UPDATE downloads SET content_key = ?2, state = 'waiting', file = NULL, \
-                     size_bytes = NULL, sha256 = NULL, failure = NULL, carried = ?3, stamp = ?4 \
-                     WHERE id = ?1",
+                     size_bytes = NULL, sha256 = NULL, failure = NULL, carried = ?3, stamp = ?4, \
+                     expected_size = ?5 WHERE id = ?1",
                 )
                 .bind(&id)
                 .bind(new.content_key)
                 .bind(new.carried)
                 .bind(new.stamp)
+                .bind(
+                    new.expected_size
+                        .map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
+                )
                 .execute(&mut *tx)
                 .await?;
                 id
@@ -222,8 +244,8 @@ impl Store {
                 let id = new_id();
                 sqlx::query(
                     "INSERT INTO downloads (id, principal, media_id, request, content_key, \
-                     state, created_at, carried, stamp) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'waiting', ?6, ?7, ?8)",
+                     state, created_at, carried, stamp, expected_size) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'waiting', ?6, ?7, ?8, ?9)",
                 )
                 .bind(&id)
                 .bind(new.principal)
@@ -233,6 +255,10 @@ impl Store {
                 .bind(self.now())
                 .bind(new.carried)
                 .bind(new.stamp)
+                .bind(
+                    new.expected_size
+                        .map(|n| i64::try_from(n).unwrap_or(i64::MAX)),
+                )
                 .execute(&mut *tx)
                 .await?;
                 id
@@ -427,7 +453,27 @@ mod tests {
             content_key: key,
             carried: "{}",
             stamp: "1 2",
+            expected_size: None,
         }
+    }
+
+    #[tokio::test]
+    async fn the_expected_size_is_kept_and_made_again_with_the_content() {
+        let store = test_store("downloads-expected-size").await;
+        let sized = |key, size| NewDownload {
+            expected_size: size,
+            ..asked("local:a", "{}", key)
+        };
+        let first = store.put_download(sized("k", Some(5))).await.unwrap();
+        assert_eq!(first.expected_size, Some(5));
+        // Asked again without a size, the one known stays.
+        let again = store.put_download(sized("k", None)).await.unwrap();
+        assert_eq!(again.expected_size, Some(5));
+        // Other content is another file, of another size.
+        let changed = store.put_download(sized("k2", Some(9))).await.unwrap();
+        assert_eq!(changed.expected_size, Some(9));
+        let unknown = store.put_download(sized("k3", None)).await.unwrap();
+        assert_eq!(unknown.expected_size, None);
     }
 
     #[tokio::test]
