@@ -15,7 +15,11 @@
 //!    is sent. [`SdkError::NotAnInvite`] goes under the paste field.
 //! 2. [`Client::connect_invite`]: who answers, for "Is this the server you
 //!    were invited to?" (its fingerprint, and the server id its passkeys
-//!    are for). Nothing is saved.
+//!    are for). Nothing is saved. Or, for "Got an invite?",
+//!    [`Client::look_up_invite`]: the same, and what the code is (valid,
+//!    expired, used, revoked or no match), with nothing used up. A code
+//!    typed in without a link is looked up at a server with
+//!    [`Client::look_up_invite_code`]; [`parse_code`] checks it first.
 //! 3. With a code, the join form, then [`Client::redeem_invite`]: the
 //!    account, the server saved, and a session. Without one, or when a
 //!    redemption is refused and the user picks "Save server only",
@@ -34,15 +38,18 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointId, RelayConfig, RelayUrl};
-use spoolframe_protocol::invite::{Invite, InviteLinkKind, MAX_HINTS, parse_link};
+use spoolframe_protocol::features::INVITE_LOOKUP;
+use spoolframe_protocol::invite::{Invite, InviteLinkKind, MAX_HINTS, normalize_code, parse_link};
 use spoolframe_protocol::relay_access::invite_token;
 use spoolframe_protocol::{
-    RedeemInvite, RedeemPortableInvite, Reply, Request, Response, fingerprint,
+    InviteLookupOutcome, LookupInvite, RedeemInvite, RedeemPortableInvite, Reply, Request,
+    Response, fingerprint,
 };
 use spoolframe_types::Role;
 
 use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
+use crate::invite_admin::{InviteKind, kind_of, time};
 use crate::portable::PortableUserId;
 use crate::servers::{self, SavedServer};
 use crate::session::{Session, SignInMethod};
@@ -83,6 +90,81 @@ pub struct InviteInfo {
     pub saved: bool,
 }
 
+/// What an invite's code is, as its server tells it before joining
+/// ([`Client::look_up_invite`]). Looking never uses it up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteOutcome {
+    /// It can be redeemed now: with [`Client::redeem_invite`] for
+    /// [`InviteKind::CreateUser`], [`Client::redeem_invite_portable`] for
+    /// [`InviteKind::PortableAccount`].
+    Valid {
+        kind: InviteKind,
+        /// The role the account gets; the consumer's for a portable one.
+        role: Role,
+        expires_at: SystemTime,
+        /// The display name of the admin who made it ("Invited by
+        /// Andrey"); `None` when they have none, or the server's CLI made
+        /// it.
+        inviter: Option<String>,
+    },
+    /// It expired at `at`. Offer "Save server only".
+    Expired { at: SystemTime },
+    /// Every use it had is used. Offer "Save server only".
+    Used,
+    /// An admin revoked it. Offer "Save server only".
+    Revoked,
+    /// No invite has this code: check what was typed. Each counts as a
+    /// wrong guess; after a few, [`SdkError::RateLimited`].
+    NoMatch,
+    /// An outcome this SDK does not know, from a newer server.
+    Unknown,
+}
+
+/// An invite looked up: who answered, and what its code is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteLookup {
+    /// The server that answered, as [`Client::connect_invite`] says it:
+    /// its name, fingerprint and server id, for "Is this the server you
+    /// were invited to?". Not saved by the lookup.
+    pub server: ServerEntry,
+    pub outcome: InviteOutcome,
+}
+
+/// `typed` as an invite's code, normalized (`QW7K2MFPXR4T`), whatever
+/// case, dashes or spaces it was typed with. Nothing is sent.
+/// [`SdkError::NotAnInviteCode`] for anything that cannot be one, a link
+/// included: [`Client::look_up_invite`] takes a link.
+pub fn parse_code(typed: &str) -> Result<String, SdkError> {
+    normalize_code(typed).ok_or(SdkError::NotAnInviteCode)
+}
+
+fn outcome_of(outcome: InviteLookupOutcome) -> InviteOutcome {
+    match outcome {
+        InviteLookupOutcome::Valid {
+            kind,
+            role,
+            expires_at,
+            inviter,
+        } => InviteOutcome::Valid {
+            kind: kind_of(kind),
+            role,
+            expires_at: time(expires_at),
+            inviter,
+        },
+        InviteLookupOutcome::Expired { at } => InviteOutcome::Expired { at: time(at) },
+        InviteLookupOutcome::Used => InviteOutcome::Used,
+        InviteLookupOutcome::Revoked => InviteOutcome::Revoked,
+        InviteLookupOutcome::NoMatch => InviteOutcome::NoMatch,
+        InviteLookupOutcome::Unknown => InviteOutcome::Unknown,
+    }
+}
+
+fn lookup_unsupported() -> SdkError {
+    SdkError::Unsupported {
+        feature: INVITE_LOOKUP.to_owned(),
+    }
+}
+
 /// `link` read, and the key it names.
 fn parsed(link: &str) -> Result<(Invite, EndpointId), SdkError> {
     let invite = parse_link(link).ok_or(SdkError::NotAnInvite)?;
@@ -121,13 +203,99 @@ impl Client {
     /// answers with a saved server's server id under another key.
     pub async fn connect_invite(&self, link: &str) -> Result<ServerEntry, SdkError> {
         let (invite, id) = parsed(link)?;
-        let conn = self.reach(&invite, id).await?;
+        Ok(self.connect_invited(&invite, id).await?.0)
+    }
+
+    /// The server `invite` names, reached at its hints, and its entry.
+    /// Nothing is saved.
+    async fn connect_invited(
+        &self,
+        invite: &Invite,
+        id: EndpointId,
+    ) -> Result<(ServerEntry, Arc<ServerConnection>), SdkError> {
+        let conn = self.reach(invite, id).await?;
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let pinned = saved.iter().find(|s| s.endpoint_id == invite.server);
         if pinned.is_none() {
             refuse_another_key(&saved, id, &conn)?;
         }
-        Ok(self.entry(id, &conn, pinned))
+        Ok((self.entry(id, &conn, pinned), conn))
+    }
+
+    /// "Got an invite?" with invite `link`: connect as
+    /// [`Client::connect_invite`] does, and ask the server what the link's
+    /// code is. Nothing is saved, and nothing used up.
+    ///
+    /// Refusals: [`SdkError::NotAnInvite`]; [`SdkError::InvalidInput`] for
+    /// a link with no code (it only finds the server); [`SdkError::Unsupported`]
+    /// when the app did not list [`crate::Features::invite_lookup`]
+    /// (nothing is sent) or the server does not have it (show the join
+    /// form instead); [`SdkError::RateLimited`] after too many codes that
+    /// match nothing; and `connect_invite`'s.
+    pub async fn look_up_invite(&self, link: &str) -> Result<InviteLookup, SdkError> {
+        let (invite, id) = parsed(link)?;
+        let Some(code) = invite.code.clone() else {
+            return Err(SdkError::InvalidInput(
+                "this invite has no code: it only finds the server".into(),
+            ));
+        };
+        if !self.inner.features.invite_lookup {
+            return Err(lookup_unsupported());
+        }
+        let (server, conn) = self.connect_invited(&invite, id).await?;
+        let outcome = self.look_up(id, &conn.info.features, code).await?;
+        Ok(InviteLookup { server, outcome })
+    }
+
+    /// "Got an invite?" with a code typed in, for server `endpoint_id`: a
+    /// saved one, or one heard on the LAN or reached at `addrs`, which
+    /// join the addresses known as a link's do (none needed for a saved
+    /// server). Connects as [`Client::connect`] does, and asks the server
+    /// what code `typed` is. Nothing is saved, and nothing used up.
+    ///
+    /// Refusals: [`SdkError::NotAnInviteCode`] ([`parse_code`]), before
+    /// anything is sent; [`Client::look_up_invite`]'s, and
+    /// [`Client::connect`]'s.
+    pub async fn look_up_invite_code(
+        &self,
+        endpoint_id: &str,
+        addrs: Vec<SocketAddr>,
+        typed: &str,
+    ) -> Result<InviteLookup, SdkError> {
+        let code = parse_code(typed)?;
+        if !self.inner.features.invite_lookup {
+            return Err(lookup_unsupported());
+        }
+        let id = parse_id(endpoint_id)?;
+        self.hint_addrs(id, &addrs);
+        let server = self.connect(&id.to_string()).await?;
+        let features = self.hello(id).map(|info| info.features).unwrap_or_default();
+        let outcome = self.look_up(id, &features, code).await?;
+        Ok(InviteLookup { server, outcome })
+    }
+
+    /// Ask server `id`, whose answer to `Hello` listed `features`, what
+    /// invite `code` is.
+    async fn look_up(
+        &self,
+        id: EndpointId,
+        features: &[String],
+        code: String,
+    ) -> Result<InviteOutcome, SdkError> {
+        if !spoolframe_protocol::features::has(features, INVITE_LOOKUP) {
+            return Err(lookup_unsupported());
+        }
+        let request = Request::LookupInvite(LookupInvite { code });
+        match self.call(id, None, request).await? {
+            Response::Ok(Reply::InviteLookup { outcome }) => Ok(outcome_of(outcome)),
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "LookupInvite answered {other:?}"
+            ))),
+            Response::Err(spoolframe_protocol::Error::Unsupported { .. }) => {
+                Err(lookup_unsupported())
+            }
+            Response::Err(e) => Err(SdkError::from_server(e)),
+        }
     }
 
     /// Save the server invite `link` names: "Save server only", and what a
@@ -320,11 +488,7 @@ impl Client {
         invite: &Invite,
         id: EndpointId,
     ) -> Result<Arc<ServerConnection>, SdkError> {
-        if !invite.addrs.is_empty() {
-            let mut manual = self.inner.manual.lock();
-            let known = manual.remove(&id).unwrap_or_default();
-            manual.insert(id, newest_first(&invite.addrs, &known, MAX_HINTS));
-        }
+        self.hint_addrs(id, &invite.addrs);
         if let Some(url) = &invite.lookup {
             self.look_up_at(url);
         }
@@ -343,6 +507,17 @@ impl Client {
             *known = newest_first(&invite.relays, known, MAX_HINTS);
         }
         self.link(id).connection(self).await
+    }
+
+    /// `addrs` join the addresses server `id` is dialled at, newest first;
+    /// they stay for as long as the app runs.
+    fn hint_addrs(&self, id: EndpointId, addrs: &[SocketAddr]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let mut manual = self.inner.manual.lock();
+        let known = manual.remove(&id).unwrap_or_default();
+        manual.insert(id, newest_first(addrs, &known, MAX_HINTS));
     }
 }
 
@@ -425,6 +600,69 @@ fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
     for relay in &invite.relays {
         if !server.relays.contains(relay) {
             server.relays.push(relay.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_code_is_read_however_it_is_typed() {
+        for typed in ["QW7K-2MFP-XR4T", "qw7k 2mfp xr4t", " Qw7K2mFpxR4t "] {
+            assert_eq!(
+                parse_code(typed),
+                Ok("QW7K2MFPXR4T".to_owned()),
+                "{typed:?}"
+            );
+        }
+    }
+
+    /// A link is not a bare code, even one with a code in it: the app
+    /// looks it up with [`Client::look_up_invite`].
+    #[test]
+    fn a_link_or_a_damaged_code_is_not_a_code() {
+        let link = "spoolframe://invite?server=ab&cap=QW7K-2MFP-XR4T";
+        for typed in ["", "QW7K-2MFP", "QW7K-2MFP-XR40", "QW7K-2MFP-XR4TT", link] {
+            assert_eq!(
+                parse_code(typed),
+                Err(SdkError::NotAnInviteCode),
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_outcome_reads_with_its_times() {
+        use spoolframe_protocol::InviteLookupOutcome as Wire;
+        use spoolframe_protocol::invite_admin::InviteKind as WireKind;
+        let at = UNIX_EPOCH + Duration::from_secs(1_792_003_200);
+        assert_eq!(
+            outcome_of(Wire::Valid {
+                kind: WireKind::PortableAccount,
+                role: Role::Consumer,
+                expires_at: 1_792_003_200,
+                inviter: Some("Andrey".into()),
+            }),
+            InviteOutcome::Valid {
+                kind: InviteKind::PortableAccount,
+                role: Role::Consumer,
+                expires_at: at,
+                inviter: Some("Andrey".into()),
+            }
+        );
+        assert_eq!(
+            outcome_of(Wire::Expired { at: 1_792_003_200 }),
+            InviteOutcome::Expired { at }
+        );
+        for (wire, read) in [
+            (Wire::Used, InviteOutcome::Used),
+            (Wire::Revoked, InviteOutcome::Revoked),
+            (Wire::NoMatch, InviteOutcome::NoMatch),
+            (Wire::Unknown, InviteOutcome::Unknown),
+        ] {
+            assert_eq!(outcome_of(wire), read);
         }
     }
 }

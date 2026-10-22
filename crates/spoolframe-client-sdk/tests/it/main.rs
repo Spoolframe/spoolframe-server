@@ -5,6 +5,7 @@
 
 mod addresses;
 mod closing;
+mod invite_lookup;
 mod lan_info;
 mod leave;
 mod one_time_password;

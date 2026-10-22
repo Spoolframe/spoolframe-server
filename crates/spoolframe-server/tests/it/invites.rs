@@ -1284,7 +1284,10 @@ mod sdk {
     use std::time::{Duration, UNIX_EPOCH};
 
     use spoolframe_admin_api::{AdminApiClient, NewInvite, Role};
-    use spoolframe_client_sdk::{Client, Device, MemoryStorage, SdkError, Selection};
+    use spoolframe_client_sdk::{
+        Client, ClientOptions, Device, InviteKind, InviteOutcome, MemoryStorage, SdkError,
+        Selection,
+    };
     use spoolframe_server::announce::{Added, Announce};
 
     use super::{Invites, create_user};
@@ -1963,5 +1966,176 @@ mod sdk {
         client.close().await;
         first.server.stop().await;
         second.server.stop().await;
+    }
+
+    /// "Got an invite?" with a link: who answers, as `connect_invite`
+    /// says it, and what the code is. Nothing is saved or used up.
+    #[tokio::test]
+    async fn a_link_is_looked_up_with_the_server_that_answered() {
+        let invites = invites("sdk-lookup-link").await;
+        let created = invites.create(create_user()).await;
+        let id = invites.server.server.id().to_string();
+        let client = new_device().await;
+        let found = client.look_up_invite(&created.share_link).await.unwrap();
+        assert_eq!(found.server.endpoint_id, id);
+        assert_eq!(found.server.name, "Home Media");
+        assert_eq!(
+            found.server.fingerprint,
+            spoolframe_protocol::fingerprint::of_hex(&id).unwrap()
+        );
+        assert!(!found.server.pinned, "{:?}", found.server);
+        assert_eq!(
+            found.outcome,
+            InviteOutcome::Valid {
+                kind: InviteKind::CreateUser,
+                role: Role::Consumer,
+                expires_at: UNIX_EPOCH + Duration::from_secs(created.invite.expires_at as u64),
+                // Made with no page: the CLI, which names no one.
+                inviter: None,
+            }
+        );
+        assert!(client.servers().await.unwrap().iter().all(|s| !s.pinned));
+        assert_eq!(invites.root.invite_list().await.unwrap()[0].uses_left, 1);
+        // Still unused: it then makes the account.
+        client
+            .redeem_invite(&created.share_link, "mum", None, PASSWORD)
+            .await
+            .unwrap();
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// "Got an invite?" with a code typed in, for a server given by its
+    /// key and addresses, then for one saved: each outcome is its own.
+    #[tokio::test]
+    async fn a_typed_code_is_looked_up_at_a_server_and_each_outcome_told() {
+        let invites = invites("sdk-lookup-code").await;
+        let live = invites.create(create_user()).await;
+        let revoked = invites.create(create_user()).await;
+        invites
+            .root
+            .invite_revoke(revoked.invite.id.clone())
+            .await
+            .unwrap();
+        let used = invites.create(create_user()).await;
+        let link = spoolframe_protocol::invite::parse_link(&live.link).unwrap();
+        let client = new_device().await;
+        // As typed, in lowercase with spaces.
+        let typed = live.code.replace('-', " ").to_lowercase();
+        let found = client
+            .look_up_invite_code(&link.server, link.addrs.clone(), &typed)
+            .await
+            .unwrap();
+        assert_eq!(found.server.name, "Home Media");
+        assert!(matches!(found.outcome, InviteOutcome::Valid { .. }));
+        let outcome = |code: String| {
+            let client = client.clone();
+            let server = link.server.clone();
+            async move {
+                client
+                    .look_up_invite_code(&server, Vec::new(), &code)
+                    .await
+                    .unwrap()
+                    .outcome
+            }
+        };
+        assert_eq!(outcome(revoked.code.clone()).await, InviteOutcome::Revoked);
+        assert_eq!(outcome(super::WRONG.into()).await, InviteOutcome::NoMatch);
+        client
+            .redeem_invite(&used.link, "anna", None, PASSWORD)
+            .await
+            .unwrap();
+        // Saved now: no address needed.
+        assert_eq!(outcome(used.code.clone()).await, InviteOutcome::Used);
+        let short = invites
+            .create(NewInvite {
+                expires: Some(spoolframe_admin_api::invite::MIN_EXPIRES_SECS),
+                ..create_user()
+            })
+            .await;
+        invites.server.clock.advance(Duration::from_secs(3601));
+        assert_eq!(
+            outcome(short.code.clone()).await,
+            InviteOutcome::Expired {
+                at: UNIX_EPOCH + Duration::from_secs(short.invite.expires_at as u64)
+            }
+        );
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// Guessing through the SDK ends as through the wire.
+    #[tokio::test]
+    async fn codes_that_match_nothing_end_in_rate_limited() {
+        let invites = invites("sdk-lookup-guesses").await;
+        let created = invites.create(create_user()).await;
+        let client = new_device().await;
+        let link = spoolframe_protocol::invite::parse_link(&created.link).unwrap();
+        for _ in 0..5 {
+            assert_eq!(
+                client
+                    .look_up_invite_code(&link.server, link.addrs.clone(), super::WRONG)
+                    .await
+                    .unwrap()
+                    .outcome,
+                InviteOutcome::NoMatch
+            );
+        }
+        assert!(matches!(
+            client.look_up_invite(&created.link).await,
+            Err(SdkError::RateLimited { .. })
+        ));
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// What is not a code, or a link with none, is refused before
+    /// anything is sent; an app that did not list the feature is told so.
+    #[tokio::test]
+    async fn what_cannot_be_looked_up_is_refused_before_it_is_sent() {
+        let invites = invites("sdk-lookup-refused").await;
+        let created = invites.create(create_user()).await;
+        let no_code = invites.root.invite_link().await.unwrap().link;
+        let id = invites.server.server.id().to_string();
+        let client = new_device().await;
+        assert_eq!(
+            client
+                .look_up_invite_code(&id, Vec::new(), "QW7K-2MFP")
+                .await
+                .unwrap_err(),
+            SdkError::NotAnInviteCode
+        );
+        assert_eq!(
+            client
+                .look_up_invite_code(&id, Vec::new(), &created.link)
+                .await
+                .unwrap_err(),
+            SdkError::NotAnInviteCode
+        );
+        assert!(matches!(
+            client.look_up_invite(&no_code).await,
+            Err(SdkError::InvalidInput(_))
+        ));
+        assert_eq!(
+            client.look_up_invite("not a link").await.unwrap_err(),
+            SdkError::NotAnInvite
+        );
+        let unlisted = Client::open_with_options(
+            Arc::new(MemoryStorage::default()),
+            device(),
+            ClientOptions {
+                lan_discovery: false,
+                ..ClientOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            unlisted.look_up_invite(&created.link).await,
+            Err(SdkError::Unsupported { .. })
+        ));
+        client.close().await;
+        unlisted.close().await;
+        invites.server.stop().await;
     }
 }

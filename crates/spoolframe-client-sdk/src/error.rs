@@ -97,6 +97,11 @@ pub enum SdkError {
     /// anything is sent. Say so under the paste field.
     #[error("this isn't a Spoolframe invite")]
     NotAnInvite,
+    /// The text is not an invite's code: 12 letters and digits, typed
+    /// with any case, dashes or spaces ([`crate::parse_code`]). Checked
+    /// before anything is sent. Say so under the code field.
+    #[error("this isn't an invite code")]
+    NotAnInviteCode,
     /// The invite's code is wrong, or its invite was revoked. Offer "Save
     /// server only" ([`crate::Client::save_invite_server`]).
     #[error("this invite doesn't work: its code is wrong or was revoked")]

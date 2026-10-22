@@ -943,6 +943,23 @@ link as the user pasted or opened it:
   as a password sign-in's. A refused redemption saves nothing. Its
   refusals are `InviteInvalid`, `InviteExpired`, `InviteExhausted`,
   `UsernameTaken`, `InvalidInput` and `RateLimited`.
+- `look_up_invite(link) -> InviteLookup`: "Got an invite?". It connects as
+  `connect_invite` does and sends `lookup_invite`: `server` is the
+  `ServerEntry` that answered (name, fingerprint, server id) and
+  `outcome` an `InviteOutcome`: `Valid { kind, role, expires_at, inviter }`,
+  `Expired { at }`, `Used`, `Revoked`, `NoMatch` or `Unknown`. Nothing is
+  saved or used up. A link with no code is `InvalidInput`.
+- `look_up_invite_code(endpoint_id, addrs, typed) -> InviteLookup`: the
+  same for a code typed in, at a saved server or one reached at `addrs`
+  (empty for a saved one), connecting as `connect` does.
+  `parse_code(typed)` normalizes a code (`QW7K2MFPXR4T`) or says
+  `NotAnInviteCode`, a link included; both lookups check it before
+  anything is sent.
+
+Both need `Features::invite_lookup` in `ClientOptions::features`, and a
+server that lists the feature in its answer to `Hello`; otherwise they are
+`Unsupported` and send no lookup. Too many `NoMatch` lookups end in
+`RateLimited`.
 
 An admin's `Session` makes them: `create_invite(InviteSpec) ->
 MintedInvite` (`link` is the `spoolframe://` form, for its QR code;

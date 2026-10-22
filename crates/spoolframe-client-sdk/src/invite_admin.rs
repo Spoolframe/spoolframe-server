@@ -217,7 +217,7 @@ fn unexpected(reply: Reply) -> SdkError {
     SdkError::Protocol(format!("unexpected reply {reply:?}"))
 }
 
-fn kind_of(kind: wire::InviteKind) -> InviteKind {
+pub(crate) fn kind_of(kind: wire::InviteKind) -> InviteKind {
     match kind {
         wire::InviteKind::CreateUser => InviteKind::CreateUser,
         wire::InviteKind::PortableAccount => InviteKind::PortableAccount,
@@ -227,7 +227,7 @@ fn kind_of(kind: wire::InviteKind) -> InviteKind {
 }
 
 /// Unix seconds as a time; one before 1970 (none is) as 1970.
-fn time(secs: i64) -> SystemTime {
+pub(crate) fn time(secs: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0))
 }
 

@@ -58,7 +58,7 @@ pub use experimental::{Experimental, HttpPlayback, HttpPlaybackRefusal};
 pub use invite_admin::{
     InviteCreator, InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite,
 };
-pub use invites::InviteInfo;
+pub use invites::{InviteInfo, InviteLookup, InviteOutcome, parse_code};
 pub use lan_servers::LanServerInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
