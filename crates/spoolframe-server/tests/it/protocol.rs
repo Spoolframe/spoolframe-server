@@ -52,6 +52,18 @@ async fn hello_is_answered_with_server_info() {
     close(server, client).await;
 }
 
+/// An account is made only from an invite, and Hello says so, for a
+/// "servers on my network" list.
+#[tokio::test]
+async fn hello_says_the_server_is_invite_only() {
+    let (server, client) = connect("hello-invite-only").await;
+    let Response::Ok(Reply::ServerInfo(info)) = client.hello_as(None).await else {
+        panic!("no ServerInfo");
+    };
+    assert!(info.invite_only);
+    close(server, client).await;
+}
+
 #[tokio::test]
 async fn hello_says_where_the_web_ui_is_when_it_has_a_public_url() {
     let (server, client) = connect("hello-no-web").await;

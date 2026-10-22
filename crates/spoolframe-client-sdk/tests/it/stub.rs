@@ -541,6 +541,7 @@ fn answer(
             web_url,
             experimental: Vec::new(),
             features: Vec::new(),
+            invite_only: true,
         }),
         Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
             request: "stub-request".into(),

@@ -1870,6 +1870,21 @@ pub struct ServerInfo {
     // compat(v1): required at the protocol reset
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// An account is made only from an invite (`RedeemInvite`); there is
+    /// no open sign-up. For a "servers on my network" list, before
+    /// signing in. Left out by an older server, true: no server so far
+    /// has had open sign-up.
+    // compat(v1): required at the protocol reset
+    #[serde(default = "ServerInfo::invite_only_by_default")]
+    pub invite_only: bool,
+}
+
+impl ServerInfo {
+    /// An older server says nothing, and every one so far makes accounts
+    /// only from invites.
+    fn invite_only_by_default() -> bool {
+        true
+    }
 }
 
 /// Why a request failed. Typed, so clients act on the kind, not on text.

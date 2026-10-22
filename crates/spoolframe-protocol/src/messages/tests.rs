@@ -376,6 +376,7 @@ fn every_reply_round_trips() {
             web_url: Some("https://media.example.org".into()),
             experimental: Vec::new(),
             features: Vec::new(),
+            invite_only: true,
         }),
         Reply::AuthMethods {
             methods: vec![AuthMethod::Password, AuthMethod::DeviceApproval],
@@ -1024,6 +1025,7 @@ fn server_info_without_a_server_id_does_not_decode() {
         web_url: None,
         experimental: Vec::new(),
         features: Vec::new(),
+        invite_only: true,
     })
     .unwrap();
     let ciborium::Value::Map(fields) = &mut value else {
@@ -1032,6 +1034,42 @@ fn server_info_without_a_server_id_does_not_decode() {
     fields.retain(|(key, _)| key.as_text() != Some("server_id"));
     let bytes = codec::encode(&value).unwrap();
     assert!(codec::decode::<ServerInfo>(&bytes).is_err());
+}
+
+fn invite_only_info(invite_only: bool) -> ServerInfo {
+    ServerInfo {
+        name: "Home Media".into(),
+        endpoint_id: "e9c1".into(),
+        server_id: "mzxw6ytbojtg633c".into(),
+        protocol_version: PROTOCOL_VERSION,
+        server_version: "0.14.3".into(),
+        auth_methods: vec![AuthMethod::Password],
+        web_url: None,
+        experimental: Vec::new(),
+        features: Vec::new(),
+        invite_only,
+    }
+}
+
+/// Both answers survive the wire, so a server with open sign-up (none
+/// yet) is not taken for invite-only.
+#[test]
+fn server_info_round_trips_whether_or_not_it_is_invite_only() {
+    round_trip(Reply::ServerInfo(invite_only_info(true)));
+    round_trip(Reply::ServerInfo(invite_only_info(false)));
+}
+
+/// A server before `invite_only` leaves it out. Every such server makes
+/// accounts only from invites, so it decodes as invite-only.
+#[test]
+fn an_older_server_s_info_decodes_as_invite_only() {
+    let mut value = ciborium::Value::serialized(&invite_only_info(false)).unwrap();
+    let ciborium::Value::Map(fields) = &mut value else {
+        panic!("{value:?}");
+    };
+    fields.retain(|(key, _)| key.as_text() != Some("invite_only"));
+    let older = codec::decode::<ServerInfo>(&codec::encode(&value).unwrap()).unwrap();
+    assert!(older.invite_only);
 }
 
 /// An older client's empty handle is `Some` of nothing, for the server
@@ -2490,6 +2528,7 @@ mod experimental_features {
             web_url: None,
             experimental,
             features: Vec::new(),
+            invite_only: true,
         }
     }
 
