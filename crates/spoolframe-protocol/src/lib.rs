@@ -14,6 +14,7 @@ pub mod device_sign_in;
 pub mod downloads;
 pub mod experimental;
 pub mod features;
+pub mod federation;
 pub mod fingerprint;
 pub mod invite;
 pub mod invite_admin;
@@ -69,9 +70,10 @@ pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};
 /// a coordinated server/SDK update; [`PROTOCOL_VERSION`] identifies the revision.
 pub const CLIENT_ALPN: &[u8] = b"spoolframe/client/1";
 
-/// The ALPN of server-to-server federation, version 1 (ARCHITECTURE §26).
-/// Reserved: a server refuses it with [`close::UNSUPPORTED_PROTOCOL`] until
-/// federation exists.
+/// The ALPN of server-to-server federation, version 1 (ARCHITECTURE §26):
+/// [`federation`]. Experimental (P8-01): a server whose
+/// `experimental.federation` is off refuses it with
+/// [`close::UNSUPPORTED_PROTOCOL`].
 pub const FEDERATION_ALPN: &[u8] = b"spoolframe/federation/1";
 
 /// The ALPN a device pairs with a portable identity's phone on (P7-03),
@@ -91,4 +93,10 @@ pub mod close {
     /// revoked, or its user disabled). It may connect again, as a device
     /// that is not signed in.
     pub const SIGNED_OUT: u32 = 3;
+    /// Federation (P8-01): the dialling server's endpoint is paired under
+    /// another server id. Refused every time.
+    pub const SERVER_ID_CHANGED: u32 = 4;
+    /// Federation (P8-01): the two servers no longer pair; the one closing
+    /// revoked its side.
+    pub const UNPAIRED: u32 = 5;
 }

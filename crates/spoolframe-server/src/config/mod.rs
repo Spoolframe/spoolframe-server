@@ -596,6 +596,13 @@ pub struct ExperimentalConfig {
     /// ([`crate::index_ahead`]). Off if left out.
     #[ucl(default)]
     pub index_ahead: Option<bool>,
+    /// Server-to-server federation (P8-01): the `spoolframe/federation/1`
+    /// ALPN is served, `federation` invites are made, and the admin API's
+    /// `federation` methods answer. Off if left out: the ALPN is closed at
+    /// once and a `federation` invite refused, as before it. Read at
+    /// start: the endpoint's ALPNs are fixed when it binds.
+    #[ucl(default)]
+    pub federation: Option<bool>,
 }
 
 impl ExperimentalConfig {
@@ -609,6 +616,11 @@ impl ExperimentalConfig {
         self.index_ahead.unwrap_or(false)
     }
 
+    /// `federation`.
+    pub fn federation(&self) -> bool {
+        self.federation.unwrap_or(false)
+    }
+
     /// The switches turned on, by key, as the start's log names them.
     pub fn on(&self) -> Vec<&'static str> {
         [
@@ -617,6 +629,7 @@ impl ExperimentalConfig {
                 self.libplacebo_shared_on_amd(),
             ),
             ("experimental.index_ahead", self.index_ahead()),
+            ("experimental.federation", self.federation()),
         ]
         .into_iter()
         .filter_map(|(key, on)| on.then_some(key))
@@ -3758,6 +3771,18 @@ mod tests {
             .unwrap();
         assert!(on.experimental.index_ahead());
         assert_eq!(on.experimental.on(), ["experimental.index_ahead"]);
+    }
+
+    /// P8-01: federation is off if left out, and named for the start's
+    /// log when on.
+    #[test]
+    fn federation_is_off_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert!(!config.experimental.federation());
+        let on = plex(r#"plex { url = "http://nas:32400"; } experimental { federation = true; }"#)
+            .unwrap();
+        assert!(on.experimental.federation());
+        assert_eq!(on.experimental.on(), ["experimental.federation"]);
     }
 
     /// Review 2026-10-11 M2: how long a copied video's HLS segments are,

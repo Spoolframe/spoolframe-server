@@ -589,6 +589,12 @@ experimental {
   # and I/O priority, started only while nothing converts. What a play
   # reads is kept too, on or off. Applies at once.
   index_ahead = false;
+  # Pair this server with another (P8): serve spoolframe/federation/1,
+  # make `federation` invites, and pair by redeeming another server's.
+  # Off, the ALPN is closed at once and a `federation` invite refused.
+  # Not reviewed yet: pair only with servers you run. Applies after a
+  # restart.
+  federation = false;
 }
 
 # HTTP playback (PX-49): a playback's HLS, or its file, over plain HTTP on

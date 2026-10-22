@@ -1160,6 +1160,19 @@ mod tests {
         assert_eq!(entry.running, None);
     }
 
+    /// P8-01: federation waits for a restart, as the endpoint's ALPNs are
+    /// fixed when it binds.
+    #[tokio::test]
+    async fn federation_waits_for_a_restart() {
+        let (settings, _dir) = settings(None).await;
+        let entry = settings
+            .set("experimental.federation", &serde_json::json!(true), "root")
+            .unwrap();
+        assert_eq!(entry.apply, SettingApply::Restart);
+        assert!(entry.restart_pending);
+        assert_eq!(entry.running, Some(serde_json::json!(false)));
+    }
+
     /// HTTP playback (PX-49) is set from the web UI as from the CLI: a
     /// listen address waits for a restart, and one that is not an IP
     /// address and a port is refused, nothing saved.

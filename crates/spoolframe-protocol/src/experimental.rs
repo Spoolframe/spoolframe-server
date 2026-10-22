@@ -23,6 +23,12 @@ use serde::{Deserialize, Serialize};
 /// player with no Iroh (AirPlay first): `Request::HttpPlaybackUrl`.
 pub const HTTP_PLAYBACK: &str = "http-playback";
 
+/// Server-to-server federation (P8): the client protocol's `PairServer`
+/// and a `federation` invite. The server's own side, the
+/// `spoolframe/federation/1` ALPN ([`crate::federation`]), is open only
+/// while its `experimental.federation` is on.
+pub const FEDERATION: &str = "federation";
+
 /// The most feature names a server keeps of a `Hello`; the rest are
 /// dropped, as each name is cut to `MAX_HELLO_TEXT` characters (PX-10).
 pub const MAX_ASKED: usize = 16;
