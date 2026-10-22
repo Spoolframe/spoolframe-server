@@ -63,7 +63,7 @@ pub struct Settings {
     /// relay or over the Internet (`http_playback.address`); `None`: such a
     /// client gets no URL. A client on the LAN gets the address it reached
     /// the server at, or another of the same interface's that the port
-    /// listens on ([`host_for`]).
+    /// listens on (`host_for`).
     pub address: Option<String>,
     /// How long a token lives with no request.
     pub idle: Duration,

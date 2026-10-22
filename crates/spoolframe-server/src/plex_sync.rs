@@ -800,7 +800,7 @@ impl WatchSync {
     }
 
     /// Run every linked user now, every interval and soon after their
-    /// state changes ([`schedule`]), and follow links made and removed,
+    /// state changes (`schedule`), and follow links made and removed,
     /// for as long as the server runs.
     pub fn start(self: &Arc<Self>, changes: tokio::sync::broadcast::Receiver<Principal>) {
         let sync = self.clone();

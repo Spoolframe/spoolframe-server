@@ -132,7 +132,7 @@ pub struct PlexAccounts {
     changed: tokio::sync::broadcast::Sender<LocalUserId>,
 }
 
-/// The Plex links a user may begin in [`LINK_BEGIN_WINDOW`] (PX-09
+/// The Plex links a user may begin in `LINK_BEGIN_WINDOW` (PX-09
 /// finding 15): each asks plex.tv for a PIN, which the server keeps. A
 /// person links once; a few is a page reloaded, or a PIN let expire.
 pub const MAX_LINK_BEGINS: usize = 5;
@@ -223,7 +223,7 @@ impl PlexAccounts {
 
     /// Begin linking `user`'s Plex account: a PIN for them to approve,
     /// and Plex's sign-in page for it, which goes on to `forward` when done.
-    /// At most [`MAX_LINK_BEGINS`] a user in [`LINK_BEGIN_WINDOW`], so
+    /// At most [`MAX_LINK_BEGINS`] a user in `LINK_BEGIN_WINDOW`, so
     /// neither plex.tv nor the PINs kept here are asked for without end
     /// (PX-09 finding 15); the user keeps only that many PINs.
     pub async fn begin(&self, user: LocalUserId, forward: Option<&str>) -> Result<Pin, LinkError> {

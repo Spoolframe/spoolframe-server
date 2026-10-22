@@ -491,7 +491,7 @@ impl SubtitleDownloads {
     /// Search every site that is on for item `id`'s subtitles in
     /// `language`, or in each site's languages, at once, for `who`: the
     /// results ordered, and some left out, by their SDH and forced
-    /// preferences ([`order`]). When every site failed, the first one's
+    /// preferences (`order`). When every site failed, the first one's
     /// error.
     pub async fn search(
         &self,

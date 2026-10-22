@@ -5,7 +5,7 @@
 //! The layers are read and checked as at start. A bad one changes
 //! nothing: the server keeps the config it had, and says what is wrong
 //! and where. Otherwise the live settings apply through the path a change
-//! in the web UI takes ([`RuntimeSettings::apply`]), the restart settings
+//! in the web UI takes (`RuntimeSettings::apply`), the restart settings
 //! wait as such a change's do, the config warnings are logged again and
 //! the encoders are detected again.
 

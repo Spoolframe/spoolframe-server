@@ -1,7 +1,7 @@
 //! On-demand requests (PX-37, the user's decision 2026-10-20): an admin
 //! asks for a film, an episode, a season, a show or a library to be
 //! optimized in a profile. Its films and episodes are asked of the pool as
-//! any copy is, in [`Lane::Background`]: behind live playback, downloads
+//! any copy is, in `Lane::Background`: behind live playback, downloads
 //! and binge-ahead, and yielding to live playback as every track does.
 //!
 //! A request is a kept rule: its items are kept in the store, and the

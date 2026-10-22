@@ -1,7 +1,7 @@
 //! The time that expiry, throttle and cache rules judge by (PX-09).
 //!
 //! The server reads the system clock through a [`Clock`], as it did
-//! before. A test moves its clock forward with [`Clock::advance`] instead
+//! before. A test moves its clock forward with `Clock::advance` instead
 //! of sleeping: each deadline judged by that clock passes at once, and
 //! nothing else changes. Timers the runtime runs (`tokio::time`) are not
 //! this clock's; they still wait in real time.

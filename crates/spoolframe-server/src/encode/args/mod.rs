@@ -233,7 +233,7 @@ pub enum Output {
 
 /// The files an encode reads, each a job's link: plain paths (see
 /// `filter_path`), and the files under them may be someone else's. Which
-/// of them ffmpeg reads as which input is [`input_index`]'s to say.
+/// of them ffmpeg reads as which input is `input_index`'s to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inputs<'a> {
     /// The film.

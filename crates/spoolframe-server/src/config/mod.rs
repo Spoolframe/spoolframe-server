@@ -649,7 +649,7 @@ pub const MAX_TRUST_IDLE_DAYS: u64 = 3650;
 #[derive(Debug, Clone, PartialEq, Eq, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct OidcConfig {
-    /// What the buttons say: "Continue with <name>". Unique.
+    /// What the buttons say: "Continue with \<name\>". Unique.
     pub name: String,
     /// The issuer, as its ID tokens' `iss` says it; its discovery document
     /// is at `<issuer>/.well-known/openid-configuration`. HTTPS, or HTTP

@@ -185,7 +185,7 @@ fn redirect_scheme_refused(scheme: &str, host: Option<url::Host<&str>>) -> Optio
 }
 
 /// `uri` as a redirect URI a client may register: `https` anywhere, or
-/// plain `http` on loopback only ([`redirect_scheme_refused`]); never a
+/// plain `http` on loopback only (`redirect_scheme_refused`); never a
 /// fragment, nor credentials.
 pub fn check_redirect(uri: &str) -> Result<url::Url, String> {
     let url = url::Url::parse(uri).map_err(|e| format!("{uri:?} is not a URL: {e}"))?;

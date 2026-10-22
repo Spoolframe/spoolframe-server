@@ -146,7 +146,7 @@ pub struct Announce {
 
 impl Announce {
     /// What to tell, of the endpoint's reachable addresses `direct` (see
-    /// [`direct_addrs`]), with `interfaces` as the machine has them. An
+    /// `direct_addrs`), with `interfaces` as the machine has them. An
     /// added address without a port takes the port of the first of
     /// `bound` (the endpoint's sockets) of its family, else of any.
     pub fn told(

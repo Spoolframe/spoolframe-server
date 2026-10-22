@@ -45,7 +45,7 @@ pub const CACHE: Duration = Duration::from_secs(60);
 /// for as long as it can, so a gate run only on connecting let a device
 /// signed out, or an invite revoked, keep relaying until it happened to
 /// reconnect. A carried endpoint no longer let through is cut within this
-/// and one [`ASK_WAIT`].
+/// and one `ASK_WAIT`.
 pub const RECHECK: Duration = Duration::from_secs(5);
 /// The questions a recheck has open at once: the main server holds each
 /// relay connection to 4 streams, and the questions of endpoints that are

@@ -760,7 +760,7 @@ impl Store {
         Ok(local + portable)
     }
 
-    /// Purge dead sessions every [`PURGE_EVERY`], keeping
+    /// Purge dead sessions every `PURGE_EVERY`, keeping
     /// [`DEAD_SESSION_KEEP_SECS`] of them, and spent OAuth codes and
     /// tokens, until the store is closed.
     pub fn spawn_session_purge(&self) {

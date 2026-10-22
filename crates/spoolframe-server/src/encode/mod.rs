@@ -233,7 +233,7 @@ pub struct ConversionSource<'a> {
     /// For HLS of a copied video: the source's keyframes, its only cuts.
     pub keyframes: Option<Arc<spoolframe_media::KeyframeTimes>>,
     /// For HLS of an AC-3 or E-AC-3 track: where its first packet is, ms
-    /// ([`late_audio`]). `None` where it was not read.
+    /// (`late_audio`). `None` where it was not read.
     pub audio_first_ms: Option<u64>,
     /// The epoch of its first encode: 0 for a new playback; one past the
     /// last for a conversion that replaces another (a subtitle change), so

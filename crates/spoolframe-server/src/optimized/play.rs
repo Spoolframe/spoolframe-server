@@ -105,7 +105,7 @@ fn close(plan: ConvertedVideo, source: &VideoStream, copied: &VideoStream) -> bo
 
 /// Whether a ready copy made as `video` may stand in for `plan` of
 /// `source`, by its row alone, before its file is described: one that may
-/// pass [`close`] (it is never taller than its row says), or any when the
+/// pass `close` (it is never taller than its row says), or any when the
 /// plan encodes its audio, which a copy may hold converted already.
 pub fn worth_describing(plan: &PlaybackPlan, source: &MediaDescriptor, video: &CopyVideo) -> bool {
     let PlaybackPlan::Converted {

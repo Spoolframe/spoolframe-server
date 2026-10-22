@@ -4,7 +4,7 @@
 //!
 //! A copy is not a file (the user's decision, 2026-10-20): it is its
 //! media file and its **tracks**, each converted stream a file of its own
-//! ([`crate::encode::track_args`]). One video-only file per video plan,
+//! (`crate::encode::track_args`). One video-only file per video plan,
 //! one file per converted audio track; a track kept as it is is always
 //! read from the media file. One track serves every copy that needs it:
 //! a DTS track turned into E-AC-3 is the same file for a download's
@@ -12,15 +12,15 @@
 //! ([`mux`], or a playback's remux), which encodes nothing.
 //!
 //! One track is made at a time, in the order they were asked for, in
-//! three lanes ([`Lane`]): a download's tracks first, then those only
+//! three lanes (`Lane`): a download's tracks first, then those only
 //! binge-ahead copies ([`CopyTarget::Ahead`], [`ahead`]) want, then those
 //! only an admin's on-demand requests ([`requests`]) want. A download's
 //! copy is not held up by a guess at what someone watches next, nor that
 //! guess by a whole library asked for at once. Tracks are work for later, and
 //! what the encode budget has spare is live playback's first. The track
 //! at the head of the queue starts once the budget has a free place for
-//! it ([`Jobs::hold_yielding`]): it tries again when the jobs give a
-//! place back ([`Jobs::place_released`]), and at once when a copy is
+//! it (`Jobs::hold_yielding`): it tries again when the jobs give a
+//! place back (`Jobs::place_released`), and at once when a copy is
 //! asked for. A live playback the budget would turn away takes the
 //! running track's place: its ffmpeg is killed, its part file removed,
 //! and it waits again at the head of its lane, to be made from the start

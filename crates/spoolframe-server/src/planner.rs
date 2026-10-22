@@ -1052,7 +1052,7 @@ pub use spoolframe_protocol::playback::Rung;
 /// `top` down to [`RUNG_FLOOR`], at most [`MAX_RUNGS`] and at least
 /// about half apart, so a fast link and a slow one each find one near
 /// them. Each rung's height is what its bitrate carries
-/// ([`height_for`]), so a rung and a single encode at the same bitrate
+/// (`height_for`), so a rung and a single encode at the same bitrate
 /// look the same. Two rungs may share a height: the bitrate step is
 /// what lets AVPlayer fit the link, the picture size only follows it.
 pub fn ladder(top: u64, tallest: u32, codec: VideoCodec) -> Vec<Rung> {

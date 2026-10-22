@@ -212,7 +212,7 @@ pub struct Uplink {
 }
 
 impl Drop for Uplink {
-    /// Wake [`tell_shares`], which then finds the uplink gone and ends.
+    /// Wake `tell_shares`, which then finds the uplink gone and ends.
     fn drop(&mut self) {
         self.changed.notify_waiters();
     }

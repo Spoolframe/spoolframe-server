@@ -248,7 +248,7 @@ async fn ahead_video(pool: &Pool, id: &str) -> Option<CopyVideo> {
 }
 
 /// The episode after `played` in its show's run
-/// ([`crate::watch::show_run`]): a special, not part of the run, has none.
+/// (`crate::watch::show_run`): a special, not part of the run, has none.
 pub async fn next_episode(
     catalog: &dyn Catalog,
     played: &Played,

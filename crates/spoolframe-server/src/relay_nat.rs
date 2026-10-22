@@ -15,7 +15,7 @@
 //! or the server's public address. The last is known only once something
 //! has told the server its public address ([`crate::wan`], or n0's
 //! answers), so the relays are looked at again whenever the server's
-//! addresses change, and every [`RECHECK`] for a name that moves.
+//! addresses change, and every `RECHECK` for a name that moves.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -193,7 +193,7 @@ pub async fn initial(relays: &[Relay], public: &[IpAddr]) -> (RelayMap, HashMap<
 }
 
 /// Place the relays of its own again whenever the endpoint's addresses or
-/// the public ones change, and every [`RECHECK`], changing how iroh dials
+/// the public ones change, and every `RECHECK`, changing how iroh dials
 /// one when its side changed. Ends with the endpoint.
 pub fn watch(
     endpoint: Endpoint,

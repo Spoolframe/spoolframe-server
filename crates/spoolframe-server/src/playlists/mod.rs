@@ -18,7 +18,7 @@
 //! playlist's entries are; and All, every track they may see, whose
 //! entries are never kept but worked out from the catalog's tracks, as
 //! listed within the last minute, so a newly scanned album is in it
-//! within that and no edit is made ([`ALL_KEPT_FOR`]). All has a row all
+//! within that and no edit is made (`ALL_KEPT_FOR`). All has a row all
 //! the same, for the user's place, settings and pin. Neither is renamed,
 //! shared or deleted, and All is not edited: `spoolframe_policy`'s
 //! `builtin_*`. They are listed only while a music library is served, and

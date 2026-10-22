@@ -93,7 +93,7 @@ impl Default for Admission {
 }
 
 /// The endpoint's transport config: a stranger's limits, which a known
-/// device's connection raises ([`Peer`]). The server never accepts a
+/// device's connection raises (`Peer`). The server never accepts a
 /// unidirectional stream (events go the other way), so none may be opened.
 /// Each path's congestion controller comes from `congestion`
 /// (`network.congestion_control`).

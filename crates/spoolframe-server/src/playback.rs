@@ -1561,7 +1561,7 @@ impl Playbacks {
     /// starting another from connection `starting`, and no slot is free
     /// for it, so its own idle encodes give way (one device's two
     /// playbacks with `max_jobs = 1`). A killed app's always does
-    /// ([`Playback::left_behind`]); one its client used in the last
+    /// (`Playback::left_behind`); one its client used in the last
     /// [`READING`] is playing and stays, and the new start is then refused
     /// as busy: a track that stops mid-play is worse than a next track
     /// that waits. Returns how many.
@@ -1598,7 +1598,7 @@ impl Playbacks {
     /// one playing now and the next it prepares (an iOS app opens the next
     /// track while this one plays, for gapless audio). A killed app's
     /// playbacks all end first, however lately they were read
-    /// ([`Playback::left_behind`]): the app opened again can use none of
+    /// (`Playback::left_behind`): the app opened again can use none of
     /// them. Of the others, enough end to keep one besides the new start,
     /// those used least recently first, never used first, the oldest first
     /// among equals. One used in the last [`READING`] is playing and never

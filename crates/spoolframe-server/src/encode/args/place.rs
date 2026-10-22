@@ -17,7 +17,7 @@ use super::*;
 /// it, unless that failed for this file before; and with the frames left
 /// on the GPU when that GPU's encoder takes them there and no filter on
 /// the CPU needs them: on VA-API, which scales there always; on NVIDIA
-/// only with GPU filters on and `scale_cuda` found ([`cuda_frames`]).
+/// only with GPU filters on and `scale_cuda` found (`cuda_frames`).
 ///
 /// A software encode gains too. Measured for 60 s of output, a GPU decode
 /// cut libx264's CPU time by 3% on a 10 Mbit/s 1080p source and 20% on a
@@ -57,7 +57,7 @@ pub fn decode(spec: &EncodeSpec<'_>) -> Decode {
 ///
 /// NVDEC's frames come back to memory (no `-hwaccel_output_format
 /// cuda`) for filters on the CPU, NVENC uploading them as it does after
-/// a software decode; they stay on the GPU where [`cuda_frames`] says.
+/// a software decode; they stay on the GPU where `cuda_frames` says.
 /// QSV decodes in software: its hwaccel is not set up.
 pub fn gpu_decoder(spec: &EncodeSpec<'_>) -> Option<Hardware> {
     placement(spec).and_then(|place| place.decoder)
@@ -688,7 +688,7 @@ pub fn made(spec: &EncodeSpec<'_>) -> Made {
 
 /// The picture `spec` writes, width × height: a copy's is the source's;
 /// an encode's is scaled to the plan's height as `scale=-2:h` does, or to
-/// the size AV1 on VA-API can write ([`whole_av1_size`]), as the filter
+/// the size AV1 on VA-API can write (`whole_av1_size`), as the filter
 /// graph scales it. What [`Made`] reports and the HLS playlist states
 /// (`RESOLUTION`), so neither says a size the encode does not write.
 /// `None` with no video.

@@ -267,12 +267,12 @@ const MAX_KEYS: usize = 100_000;
 ///
 /// What an attempt costs does not grow with the attempts of others: the
 /// keys it names are judged exactly, all the others are swept once per
-/// [`SWEEP_INTERVAL`], and at most [`MAX_KEYS`] are held. When a new key
+/// `SWEEP_INTERVAL`, and at most `MAX_KEYS` are held. When a new key
 /// finds it full, the keys whose failures are all out of the window go,
 /// then those whose last failure is oldest (PX-10, finding 9): names and
 /// sources are free, so refusing new keys instead would let anyone lock
 /// everyone out. Evicting a key forgets its failures; filling the limiter
-/// to evict one takes [`MAX_KEYS`] new keys, each one an attempt, which
+/// to evict one takes `MAX_KEYS` new keys, each one an attempt, which
 /// the stranger sign-in bucket ([`STRANGER_ATTEMPTS`]) spreads over hours.
 #[derive(Debug)]
 pub struct RateLimiter {

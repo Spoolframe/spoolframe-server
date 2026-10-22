@@ -524,7 +524,7 @@ impl Previews {
     /// kept it, after its library stopped being served too.
     ///
     /// Found served, a set's item is not asked of Plex again for
-    /// [`VERIFIED_FOR`] or until the catalog changes: a scrub fetches its
+    /// `VERIFIED_FOR` or until the catalog changes: a scrub fetches its
     /// sheets one after another. Its file is still looked at each time.
     pub async fn sheet(&self, key: &str, n: u32) -> Option<Vec<u8>> {
         let shown = self.shown.lock().get(key).cloned()?;
@@ -560,7 +560,7 @@ impl Previews {
         self.cache.sheet(key, n).await
     }
 
-    /// Ask the catalog again at once, past [`VERIFIED_FOR`], whenever
+    /// Ask the catalog again at once, past `VERIFIED_FOR`, whenever
     /// `changes` says it changed.
     pub fn watch_catalog(&self, changes: watch::Receiver<u64>) {
         *self.changes.lock() = Some(changes);
@@ -920,7 +920,7 @@ pub fn sheet_id(key: &str, n: u32) -> ArtworkId {
 }
 
 /// The set and sheet a [`sheet_id`] names. Anything else is `None`: the
-/// key becomes a path in the cache, so only a key [`key`] could have made
+/// key becomes a path in the cache, so only a key `key` could have made
 /// is taken.
 pub fn sheet_of(id: &ArtworkId) -> Option<(&str, u32)> {
     if id.namespace() != Namespace::Preview {
