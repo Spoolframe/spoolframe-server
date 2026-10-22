@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.14.3 (2026-10-21)
+
 - Security: dependencies with known advisories are updated. rustls
   0.23.46 (RUSTSEC-2026-0346 to -0349: TLS secrets in `Debug` output,
   data sent after an ECH rejection, a 1 GiB allocation before
