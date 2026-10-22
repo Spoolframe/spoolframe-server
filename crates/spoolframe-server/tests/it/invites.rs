@@ -557,9 +557,9 @@ async fn a_consumer_sees_no_invites() {
     invites.server.stop().await;
 }
 
-/// `federation` is parsed and refused, saying when it arrives: nothing
-/// is made, so nothing can be half-redeemed or made another kind of
-/// invite instead.
+/// `federation` is parsed and refused while `experimental.federation` is
+/// off, saying so (P8-01): nothing is made, so nothing can be
+/// half-redeemed or made another kind of invite instead.
 #[tokio::test]
 async fn federation_invites_are_refused_and_nothing_is_made() {
     let invites = Invites::start("invite-kinds").await;
@@ -575,7 +575,11 @@ async fn federation_invites_are_refused_and_nothing_is_made() {
         panic!("not a call error");
     };
     assert_eq!(refused.code(), error_code::INVALID_INPUT);
-    assert!(refused.message().contains("P8"), "{}", refused.message());
+    assert!(
+        refused.message().contains("experimental.federation"),
+        "{}",
+        refused.message()
+    );
     assert!(invites.root.invite_list().await.unwrap().is_empty());
     invites.server.stop().await;
 }

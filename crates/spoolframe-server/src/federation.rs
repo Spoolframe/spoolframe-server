@@ -1,0 +1,607 @@
+//! Federation (P8-01): this server's pairs with others, over
+//! `spoolframe-federation`'s handler and dialler.
+//!
+//! Experimental: there is a [`Federation`] only while
+//! `experimental.federation` is on. Off, `spoolframe/federation/1` closes
+//! at once and a `federation` invite is refused, as before P8.
+//!
+//! Both sides of a pair keep a `federation_peers` row. The server whose
+//! `federation` invite is redeemed (SA) pins the redeemer's endpoint and
+//! server id ([`Peers::redeem`]); the redeemer (SB) keeps SA's as its
+//! admin pasted SA's link ([`Federation::redeem_link`]).
+//!
+//! A stranger on the ALPN is held, counted and limited as a device with no
+//! session is on the client protocol: the same cap on held connections,
+//! the same strangers' budget for a redemption, and the same count of
+//! wrong guesses at a code (`invite@<endpoint>`), which a refused stream
+//! adds to as a wrong code does. A new key that says it is a paired
+//! server spends from the same budget each time it says hello, so turning
+//! keys does not escape the count each key has.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
+use spoolframe_federation::{DialError, Dialed, FederationProtocol, Live, Peers, Strangers};
+use spoolframe_protocol::ServerId;
+use spoolframe_protocol::federation::{
+    MAX_HINTS, PROTOCOL_VERSION, PairingRefused, PeerHello, RedeemPairing, Standing, server_name,
+};
+use spoolframe_protocol::invite::{InviteLinkKind, is_relay_url, parse_link};
+
+use crate::announce::Told;
+use crate::auth::Auth;
+use crate::invites::RedeemError;
+use crate::network::{Connections, ServerName};
+use crate::store::StoreError;
+use crate::store::federation::{KeyHold, NewPeer, PairRedeemed, PeerError, PeerRecord};
+use crate::store::invites::{InviteKind, InviteState};
+
+/// This server's federation: its pairs, the handler that answers the
+/// ALPN, and what dials other servers.
+#[derive(Debug)]
+pub struct Federation {
+    auth: Auth,
+    server_id: ServerId,
+    name: ServerName,
+    live: Live,
+    /// The endpoint, once it is up.
+    attached: OnceLock<Attached>,
+}
+
+/// What the endpoint gives, once it binds.
+#[derive(Debug)]
+struct Attached {
+    endpoint: Endpoint,
+    connections: Connections,
+    told: Told,
+}
+
+/// Why redeeming another server's pairing link made no pair.
+#[derive(Debug, thiserror::Error)]
+pub enum PairError {
+    #[error("that is not an invite link")]
+    NotALink,
+    /// A link with no code only finds a server.
+    #[error("the link has no invite code")]
+    NoCode,
+    #[error("the link is an invite for an account, not to pair a server")]
+    WrongKind,
+    #[error("that link is this server's own, or names this server's id")]
+    Itself,
+    #[error("this server is starting; try again in a moment")]
+    Starting,
+    /// This server has a live pair with that server, by key or by id.
+    #[error("the servers are paired already")]
+    AlreadyPaired,
+    /// The other server holds this server's key for its admin to confirm.
+    #[error("the other server holds this server's new key until its admin confirms it")]
+    KeyHeld,
+    #[error(transparent)]
+    Dial(#[from] DialError),
+    /// The other server answered with what is not a server's.
+    #[error("the other server answered with an id that is not one: {0}")]
+    Unexpected(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl Federation {
+    /// Federation for server `server_id`, called `name`, over `auth`'s
+    /// store and limits.
+    pub fn new(auth: Auth, server_id: ServerId, name: ServerName) -> Self {
+        Self {
+            auth,
+            server_id,
+            name,
+            live: Live::default(),
+            attached: OnceLock::new(),
+        }
+    }
+
+    /// The endpoint is up: what dials from it, holds its connections and
+    /// tells where it is.
+    pub(crate) fn attach(&self, endpoint: Endpoint, connections: Connections, told: Told) {
+        let _ = self.attached.set(Attached {
+            endpoint,
+            connections,
+            told,
+        });
+    }
+
+    /// The handler for `spoolframe/federation/1`.
+    pub(crate) fn protocol(self: &Arc<Self>) -> FederationProtocol<Self, Self> {
+        let name = self.name.clone();
+        FederationProtocol::new(
+            self.clone(),
+            self.clone(),
+            self.server_id.clone(),
+            Arc::new(move || name.get()),
+            self.live.clone(),
+        )
+    }
+
+    fn store(&self) -> &crate::store::Store {
+        self.auth.store()
+    }
+
+    /// What this server says of itself to another.
+    fn hello(&self) -> PeerHello {
+        PeerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: self.server_id.to_string(),
+            name: self.name.get(),
+        }
+    }
+
+    /// Pair with the server whose `federation` invite `link` is, as admin
+    /// `by` (SB's side, P8-01): dial it, check it is not paired here
+    /// already, redeem the code, and keep its row.
+    pub async fn redeem_link(&self, link: &str, by: &str) -> Result<PeerRecord, PairError> {
+        let invite = parse_link(link).ok_or(PairError::NotALink)?;
+        let code = invite.code.clone().ok_or(PairError::NoCode)?;
+        if invite.kind == InviteLinkKind::PortableAccount {
+            return Err(PairError::WrongKind);
+        }
+        let attached = self.attached.get().ok_or(PairError::Starting)?;
+        let server: EndpointId = invite.server.parse().map_err(|_| PairError::NotALink)?;
+        if server == attached.endpoint.id() {
+            return Err(PairError::Itself);
+        }
+        if self
+            .store()
+            .live_peer_by_endpoint(&invite.server)
+            .await?
+            .is_some()
+        {
+            return Err(PairError::AlreadyPaired);
+        }
+        let dial_at = kept_addrs(invite.addrs.iter().copied());
+        let relays = kept_relays(invite.relays.iter().cloned());
+        let addr = endpoint_addr(server, dial_at.iter().copied(), &relays);
+        let addrs: Vec<String> = dial_at.iter().map(ToString::to_string).collect();
+        let (dialed, info) = Dialed::connect(&attached.endpoint, addr, self.hello()).await?;
+        let paired = async {
+            let theirs = ServerId::parse(&info.server_id)
+                .map_err(|_| PairError::Unexpected(info.server_id.clone()))?;
+            if theirs == self.server_id {
+                return Err(PairError::Itself);
+            }
+            match info.standing {
+                Standing::Stranger => {}
+                Standing::KeyHeld => return Err(PairError::KeyHeld),
+                // It has this server's row and this server has none of its:
+                // its admin unpairs first.
+                _ => return Err(PairError::AlreadyPaired),
+            }
+            if self
+                .store()
+                .live_peer_by_server_id(theirs.as_str())
+                .await?
+                .is_some()
+            {
+                return Err(PairError::AlreadyPaired);
+            }
+            let mine = crate::invites::server_link(
+                attached.endpoint.id().to_string(),
+                self.name.get(),
+                Some(attached.told.clone()),
+            )
+            .await;
+            let paired = dialed
+                .redeem(RedeemPairing {
+                    code,
+                    addrs: mine.addrs.iter().map(ToString::to_string).collect(),
+                    relays: mine.relays,
+                })
+                .await?;
+            // The other server has paired from here on: if this side keeps
+            // nothing, it is told so, best effort, rather than left with a
+            // pair this one does not know.
+            let kept = if paired.server_id != theirs.as_str() {
+                Err(PairError::Unexpected(paired.server_id))
+            } else {
+                self.store()
+                    .add_peer(
+                        NewPeer {
+                            server_id: theirs.as_str(),
+                            endpoint_id: &invite.server,
+                            display_name: &server_name(info.name.clone()),
+                            addrs: &addrs,
+                            relays: &relays,
+                        },
+                        by,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        PeerError::Store(e) => PairError::Store(e),
+                        _ => PairError::AlreadyPaired,
+                    })
+            };
+            if let Err(e) = &kept {
+                tracing::warn!(
+                    peer = %server.fmt_short(),
+                    error = %e,
+                    "paired, but the pair cannot be kept here: telling the other server"
+                );
+                if let Err(e) = dialed.unpaired().await {
+                    tracing::warn!(
+                        peer = %server.fmt_short(),
+                        error = %e,
+                        "the other server could not be told: its admin unpairs it"
+                    );
+                }
+            }
+            kept
+        }
+        .await;
+        dialed.close();
+        let peer = paired?;
+        tracing::info!(
+            peer = %server.fmt_short(),
+            server_id = %peer.server_id,
+            name = %peer.display_name,
+            by,
+            "paired with another server"
+        );
+        Ok(peer)
+    }
+}
+
+/// Where server `id` may be dialled: its `addrs` and `relays` hints.
+fn endpoint_addr(
+    id: EndpointId,
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    relays: &[String],
+) -> EndpointAddr {
+    EndpointAddr::from_parts(
+        id,
+        addrs.into_iter().map(TransportAddr::Ip).chain(
+            relays
+                .iter()
+                .filter_map(|r| r.parse::<RelayUrl>().ok())
+                .map(TransportAddr::Relay),
+        ),
+    )
+}
+
+/// Whether `addr` may be dialled as another server's: not loopback,
+/// unspecified, multicast or broadcast, nor port 0. Private, LAN, CGNAT
+/// and link-local addresses are kept: two home servers on one LAN or
+/// tailnet pair over them.
+fn dialable(addr: SocketAddr) -> bool {
+    use std::net::IpAddr;
+    let refused = match addr.ip().to_canonical() {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_multicast(),
+    };
+    !refused && addr.port() != 0
+}
+
+/// The `ip:port` hints among `addrs` that read as one.
+fn parsed(addrs: &[String]) -> impl Iterator<Item = SocketAddr> + '_ {
+    addrs.iter().filter_map(|a| a.parse().ok())
+}
+
+/// The `addrs` that may be dialled, at most [`MAX_HINTS`]: what another
+/// server's addresses are kept as.
+fn kept_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    addrs
+        .into_iter()
+        .filter(|a| dialable(*a))
+        .take(MAX_HINTS)
+        .collect()
+}
+
+/// The `relays` that are HTTPS relay URLs, at most [`MAX_HINTS`]: what
+/// another server's relays are kept as.
+fn kept_relays(relays: impl IntoIterator<Item = String>) -> Vec<String> {
+    relays
+        .into_iter()
+        .filter(|r| r.starts_with("https://") && is_relay_url(r))
+        .take(MAX_HINTS)
+        .collect()
+}
+
+/// A redemption's hints, as [`kept_addrs`] and [`kept_relays`] keep
+/// them, written for the store.
+fn hints(redeem: &RedeemPairing) -> (Vec<String>, Vec<String>) {
+    let addrs = kept_addrs(parsed(&redeem.addrs))
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    (addrs, kept_relays(redeem.relays.iter().cloned()))
+}
+
+/// A redemption's refusal, for the server that asked.
+fn refusal(e: RedeemError) -> PairingRefused {
+    match e {
+        RedeemError::Expired => PairingRefused::InviteExpired,
+        RedeemError::Exhausted => PairingRefused::InviteExhausted,
+        RedeemError::WrongKind => PairingRefused::WrongInviteKind,
+        RedeemError::RateLimited { retry_after } => rate_limited(retry_after),
+        RedeemError::Store(e) => {
+            tracing::error!(error = %e, "cannot check a pairing invite");
+            PairingRefused::InviteInvalid
+        }
+        _ => PairingRefused::InviteInvalid,
+    }
+}
+
+fn rate_limited(retry_after: std::time::Duration) -> PairingRefused {
+    PairingRefused::RateLimited {
+        retry_after_secs: retry_after.as_secs().max(1),
+    }
+}
+
+#[async_trait::async_trait]
+impl Peers for Federation {
+    async fn known(&self, endpoint: EndpointId) -> Option<ServerId> {
+        match self
+            .store()
+            .live_peer_by_endpoint(&endpoint.to_string())
+            .await
+        {
+            Ok(peer) => peer.and_then(|p| ServerId::parse(&p.server_id).ok()),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot look a server's pair up");
+                None
+            }
+        }
+    }
+
+    async fn hello(
+        &self,
+        endpoint: EndpointId,
+        known: Option<&ServerId>,
+        server_id: &ServerId,
+    ) -> Result<Standing, PairingRefused> {
+        if let Some(pinned) = known {
+            return if pinned == server_id {
+                Ok(Standing::Paired)
+            } else {
+                Err(PairingRefused::ServerIdChanged)
+            };
+        }
+        let store = self.store();
+        let hex = endpoint.to_string();
+        // A store error makes it a stranger, which fails safe: a stranger
+        // reaches only a redemption, which asks the store again.
+        let standing = async {
+            if let Some(paired) = store.live_peer_by_server_id(server_id.as_str()).await? {
+                // Each key has its own count of guesses: this budget is
+                // what keys made by the thousand share.
+                if let Err(wait) = self.auth.stranger_attempt() {
+                    return Ok(Err(rate_limited(wait)));
+                }
+                return Ok(match store.hold_peer_key(&paired.id, &hex).await? {
+                    KeyHold::New => {
+                        tracing::warn!(
+                            peer = %endpoint.fmt_short(),
+                            server_id = %server_id,
+                            name = %paired.display_name,
+                            "a paired server presents a new key: held until an admin confirms it"
+                        );
+                        Ok(Standing::KeyHeld)
+                    }
+                    KeyHold::Held => Ok(Standing::KeyHeld),
+                    KeyHold::Rejected => Err(PairingRefused::KeyRefused),
+                    KeyHold::Full => {
+                        tracing::warn!(
+                            peer = %endpoint.fmt_short(),
+                            server_id = %server_id,
+                            name = %paired.display_name,
+                            "a new key for a paired server is dropped: as many as are held \
+                             wait for an admin already"
+                        );
+                        Err(PairingRefused::KeyRefused)
+                    }
+                    // Unpaired since it was looked up.
+                    KeyHold::NoPeer => Ok(Standing::Stranger),
+                });
+            }
+            Ok::<_, StoreError>(Ok(Standing::Stranger))
+        }
+        .await;
+        standing.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cannot look a server's pair up");
+            Ok(Standing::Stranger)
+        })
+    }
+
+    async fn redeem(
+        &self,
+        endpoint: EndpointId,
+        server_id: &ServerId,
+        hello: &PeerHello,
+        redeem: &RedeemPairing,
+    ) -> Result<(), PairingRefused> {
+        // On the strangers' budget first, as an account invite is (PX-10).
+        self.auth.stranger_attempt().map_err(rate_limited)?;
+        let hex = endpoint.to_string();
+        let hash =
+            crate::invites::usable_code(&self.auth, &hex, &redeem.code, InviteKind::Federation)
+                .await
+                .map_err(refusal)?;
+        let (addrs, relays) = hints(redeem);
+        let paired = self
+            .store()
+            .pair_by_invite(
+                &hash,
+                NewPeer {
+                    server_id: server_id.as_str(),
+                    endpoint_id: &hex,
+                    display_name: &hello.name,
+                    addrs: &addrs,
+                    relays: &relays,
+                },
+            )
+            .await
+            .map_err(|e| refusal(RedeemError::Store(e)))?;
+        match paired {
+            PairRedeemed::Paired(peer) => {
+                tracing::info!(
+                    peer = %endpoint.fmt_short(),
+                    server_id = %peer.server_id,
+                    name = %peer.display_name,
+                    invite = ?peer.invite_id,
+                    "a server redeemed a pairing invite"
+                );
+                Ok(())
+            }
+            PairRedeemed::AlreadyPaired => Err(PairingRefused::AlreadyPaired),
+            // Revoked, expired or used up since it was looked at.
+            PairRedeemed::Refused(InviteState::Expired) => Err(PairingRefused::InviteExpired),
+            PairRedeemed::Refused(InviteState::Exhausted) => Err(PairingRefused::InviteExhausted),
+            PairRedeemed::Refused(_) => Err(PairingRefused::InviteInvalid),
+        }
+    }
+
+    async fn unpaired(&self, endpoint: EndpointId) {
+        match self
+            .store()
+            .revoke_peer_by_endpoint(&endpoint.to_string())
+            .await
+        {
+            Ok(Some(peer)) => tracing::info!(
+                peer = %endpoint.fmt_short(),
+                server_id = %peer.server_id,
+                name = %peer.display_name,
+                "a paired server unpaired: its pair is revoked here too"
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "cannot revoke a pair the other server ended"),
+        }
+    }
+}
+
+/// A connection's place among the held ones, given back when it closes.
+#[derive(Debug)]
+pub struct Held {
+    connections: Connections,
+    id: usize,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.connections.remove(self.id);
+    }
+}
+
+impl Strangers for Federation {
+    type Held = Held;
+
+    fn admit(
+        &self,
+        connection: &iroh::endpoint::Connection,
+        peer: Option<&ServerId>,
+    ) -> Option<Held> {
+        let attached = self.attached.get()?;
+        attached
+            .connections
+            .admit_federation(connection, peer.cloned())?;
+        Some(Held {
+            connections: attached.connections.clone(),
+            id: connection.stable_id(),
+        })
+    }
+
+    fn strayed(&self, endpoint: EndpointId) {
+        // Counted only within the strangers' budget: the limiter holds at
+        // most so many keys and makes room by forgetting the oldest, so
+        // keys made by the thousand must not fill it faster than sign-in
+        // attempts can. Past the budget a stray is not counted, and its
+        // endpoint reaches no redemption, which spends the same budget.
+        if self.auth.stranger_attempt().is_err() {
+            return;
+        }
+        let source = endpoint.to_string();
+        // Never taken back: a wrong code stays counted the same way.
+        let _ = self.auth.guess(format!("invite@{source}"), Some(source));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_hints_that_read_are_kept_and_no_more_than_the_limit() {
+        let redeem = RedeemPairing {
+            code: String::new(),
+            addrs: ["nowhere", "203.0.113.7:7420"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain((0..MAX_HINTS + 3).map(|i| format!("10.0.0.{}:7420", i % 250)))
+                .collect(),
+            relays: vec![
+                "ftp://relay.example.org".into(),
+                "https://relay.example.org".into(),
+            ],
+        };
+        let (addrs, relays) = hints(&redeem);
+        assert_eq!(addrs.len(), MAX_HINTS);
+        assert_eq!(addrs[0], "203.0.113.7:7420");
+        assert_eq!(relays, ["https://relay.example.org"]);
+    }
+
+    /// Where no other server is, nothing is dialled: loopback,
+    /// unspecified, multicast, broadcast, and relays not over HTTPS. A
+    /// LAN's and a tailnet's addresses are kept.
+    #[test]
+    fn hints_that_lead_nowhere_else_are_dropped_and_a_lan_s_kept() {
+        let refused = [
+            "127.0.0.1:7420",
+            "[::1]:7420",
+            "0.0.0.0:7420",
+            "[::]:7420",
+            "224.0.0.251:7420",
+            "[ff02::1]:7420",
+            "255.255.255.255:7420",
+            "[::ffff:127.0.0.1]:7420",
+            "203.0.113.7:0",
+        ];
+        let kept = [
+            "10.1.2.3:7420",
+            "172.16.0.9:7420",
+            "192.168.1.20:7420",
+            "100.64.0.7:7420",
+            "[fd00::7]:7420",
+            "[fe80::1]:7420",
+            "203.0.113.7:7420",
+        ];
+        let addrs = kept_addrs(refused.iter().chain(&kept).map(|a| a.parse().unwrap()));
+        let relays = kept_relays(
+            [
+                "http://relay.example.org",
+                "https://relay.example.org",
+                "https:///x",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            addrs,
+            kept.map(|a| a.parse::<SocketAddr>().unwrap()).to_vec()
+        );
+        assert_eq!(relays, ["https://relay.example.org"]);
+    }
+
+    #[test]
+    fn a_wrong_code_and_a_store_error_are_told_alike() {
+        assert_eq!(refusal(RedeemError::Invalid), PairingRefused::InviteInvalid);
+        assert_eq!(
+            refusal(RedeemError::WrongKind),
+            PairingRefused::WrongInviteKind
+        );
+        assert_eq!(
+            refusal(RedeemError::RateLimited {
+                retry_after: std::time::Duration::from_millis(10)
+            }),
+            PairingRefused::RateLimited {
+                retry_after_secs: 1
+            }
+        );
+    }
+}

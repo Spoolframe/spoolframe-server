@@ -20,6 +20,7 @@ exceptions = [
   { crate = "spoolframe-catalog", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-plex", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-admin-api", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-federation", allow = ["AGPL-3.0-or-later"] },
   # Subtitle sync's aligner (PX-03), linked into spoolframe-media only.
   # GPL-3.0 only: AGPL-3.0 §13 and GPL-3.0 §13 let the two be combined.
   { crate = "alass-core", allow = ["GPL-3.0-only"] },

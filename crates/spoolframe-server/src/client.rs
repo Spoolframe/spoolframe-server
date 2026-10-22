@@ -549,7 +549,10 @@ impl ClientProtocol {
 
     /// The experimental features this server has on (PX-49).
     fn experimental_on(&self) -> Vec<&'static str> {
-        crate::protocol_info::experimental_on(self.http_playback.is_some())
+        crate::protocol_info::experimental_on(
+            self.http_playback.is_some(),
+            self.services.federation.is_some(),
+        )
     }
 
     /// One stream: its kind byte, then (for RPC) one request and its
@@ -4000,7 +4003,7 @@ impl ClientProtocol {
                     role: create.role,
                 };
                 let created =
-                    crate::invites::create(self.store(), request, &user.username, &origin)
+                    crate::invites::create(self.store(), request, &user.username, &origin, None)
                         .await
                         .map_err(create_invite_error)?;
                 let server = crate::invites::server_link(

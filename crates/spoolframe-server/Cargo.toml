@@ -50,6 +50,8 @@ libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-catalog = { workspace = true }
+# The federation/1 handler and pairing (P8-01), over this crate's store.
+spoolframe-federation = { workspace = true }
 spoolframe-media = { workspace = true }
 spoolframe-plex = { workspace = true }
 spoolframe-protocol = { workspace = true }

@@ -123,28 +123,30 @@ impl Created {
     pub fn invite(&self, mut server: Invite) -> Invite {
         server.code = Some(self.code.as_str().to_owned());
         server.expires_at = u64::try_from(self.record.expires_at).ok();
-        if self.record.kind == InviteKind::PortableAccount {
-            server.kind = InviteLinkKind::PortableAccount;
-        } else {
-            server.role = Some(self.record.role);
+        match self.record.kind {
+            InviteKind::CreateUser => server.role = Some(self.record.role),
+            InviteKind::PortableAccount => server.kind = InviteLinkKind::PortableAccount,
+            InviteKind::Federation => server.kind = InviteLinkKind::Federation,
         }
         server
     }
 }
 
 /// Make the invite `request` asks for, as `created_by` from `origin`, once
-/// every field is within its limits.
+/// every field is within its limits. A `federation` one only with a
+/// `federation` (`experimental.federation`, P8-01).
 pub async fn create(
     store: &Store,
     request: InviteRequest<'_>,
     created_by: &str,
     origin: &InviteOrigin,
+    federation: Option<&crate::federation::Federation>,
 ) -> Result<Created, CreateError> {
     use spoolframe_admin_api::invite::{
         DEFAULT_EXPIRES_SECS, DEFAULT_USES, MAX_EXPIRES_SECS, MAX_NOTE_CHARS, MAX_USES,
         MIN_EXPIRES_SECS,
     };
-    if request.kind == InviteKind::Federation {
+    if request.kind == InviteKind::Federation && federation.is_none() {
         return Err(InviteError::NotYet(request.kind).into());
     }
     let uses = request.uses.unwrap_or(DEFAULT_USES);
@@ -159,17 +161,10 @@ pub async fn create(
             "an invite lasts an hour to 30 days".into(),
         ));
     }
-    let role = request.role.unwrap_or(Role::Consumer);
-    if role == Role::Unknown {
-        return Err(CreateError::Invalid("use admin or consumer".into()));
-    }
-    // A portable user is no account here, and has no role but a
-    // consumer's (P7-05).
-    if request.kind == InviteKind::PortableAccount && role != Role::Consumer {
-        return Err(CreateError::Invalid(
-            "a portable-account invite grants watching only: leave the role out".into(),
-        ));
-    }
+    let role = request
+        .kind
+        .resolve_role(request.role)
+        .map_err(|why| CreateError::Invalid(why.into()))?;
     let note = request.note.map(str::trim).filter(|n| !n.is_empty());
     if note.is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS || n.chars().any(char::is_control)) {
         return Err(CreateError::Invalid(format!(
@@ -322,7 +317,7 @@ pub async fn redeem(
 /// the caller drew on before this. The guess is counted before the code
 /// is looked at, and taken back for any code an invite has, revoked or
 /// not: expired, used up or of another kind, it was still the right code.
-async fn usable_code(
+pub(crate) async fn usable_code(
     auth: &Auth,
     endpoint: &str,
     typed: &str,
@@ -410,9 +405,10 @@ pub async fn redeem_portable(
 /// owner's. A `portable-account` (P7) or `federation` (P8) invite is for
 /// a user or a server from elsewhere: a friend's.
 pub fn holder_tier_of(kind: InviteKind) -> Tier {
-    match kind {
-        InviteKind::CreateUser => Tier::Owner,
-        InviteKind::PortableAccount | InviteKind::Federation => Tier::Friend,
+    if kind.makes_account() {
+        Tier::Owner
+    } else {
+        Tier::Friend
     }
 }
 

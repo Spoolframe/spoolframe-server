@@ -46,7 +46,7 @@ async fn version_names_the_binary_and_its_version() {
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
             "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed, spoolframe:playlist-sharing, spoolframe:play-history, spoolframe:playlist-art, spoolframe:subtitle-sync, spoolframe:subtitle-search, spoolframe:playlist-upcoming, spoolframe:downloads, spoolframe:music-downloads, spoolframe:invite-lookup",
             "pre-auth features: spoolframe:invite-lookup",
-            "experimental features (each on by its setting): http-playback",
+            "experimental features (each on by its setting): http-playback, federation",
         ]
     );
     // `-V` is the crate's version alone.
@@ -763,7 +763,7 @@ async fn invites_from_the_cli() {
     );
     assert!(!refused.status.success(), "{refused:?}");
     let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(stderr.contains("P8"), "{stderr}");
+    assert!(stderr.contains("experimental.federation"), "{stderr}");
 
     let id = row.split_whitespace().next().unwrap();
     stdout(cli(&config, &["invite", "revoke", id], "", &admin));

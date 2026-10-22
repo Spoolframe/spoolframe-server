@@ -45,12 +45,16 @@ impl ProtocolInfo {
 }
 
 /// The experimental features on: `http-playback` while its port is
-/// configured (`http_playback.listen`), the same answer the client
+/// configured (`http_playback.listen`), `federation` while
+/// `experimental.federation` is on (P8-01); the same answer the client
 /// protocol's `Hello` gets.
-pub fn experimental_on(http_playback: bool) -> Vec<&'static str> {
+pub fn experimental_on(http_playback: bool, federation: bool) -> Vec<&'static str> {
     let mut on = Vec::new();
     if http_playback {
         on.push(experimental::HTTP_PLAYBACK);
+    }
+    if federation {
+        on.push(experimental::FEDERATION);
     }
     on
 }
@@ -58,7 +62,7 @@ pub fn experimental_on(http_playback: bool) -> Vec<&'static str> {
 /// Every experimental feature this build knows, each on by its setting:
 /// what `--version` names, as it reads no config.
 pub fn experimental_known() -> Vec<&'static str> {
-    experimental_on(true)
+    experimental_on(true, true)
 }
 
 /// `names` joined, or "none".
@@ -96,12 +100,17 @@ mod tests {
 
     #[test]
     fn the_features_are_this_build_s() {
-        let info = ProtocolInfo::new(experimental_on(true));
+        let info = ProtocolInfo::new(experimental_on(true, false));
         assert_eq!(info.version, PROTOCOL_VERSION);
         assert!(info.features.contains(&features::LIKED));
         assert!(info.features.contains(&features::PLAYLISTS));
         assert_eq!(info.experimental, [experimental::HTTP_PLAYBACK]);
-        assert!(experimental_on(false).is_empty());
+        assert!(experimental_on(false, false).is_empty());
+        assert_eq!(experimental_on(false, true), [experimental::FEDERATION]);
+        assert_eq!(
+            experimental_known(),
+            [experimental::HTTP_PLAYBACK, experimental::FEDERATION]
+        );
     }
 
     #[test]

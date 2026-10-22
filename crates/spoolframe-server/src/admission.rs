@@ -135,6 +135,19 @@ pub(crate) struct Peer {
     closing: AtomicBool,
     /// How many of its streams are being answered.
     streams: watch::Sender<usize>,
+    /// A device's, or a server's on `spoolframe/federation/1`.
+    kind: PeerKind,
+}
+
+/// Whose connection a [`Peer`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PeerKind {
+    /// A device's, on the client protocol.
+    Device,
+    /// A server's on `spoolframe/federation/1` (P8-01), with the server
+    /// id it is a live pair's under, if it is one. It shares the
+    /// strangers' cap, and has no session to sign out of.
+    Federation(Option<spoolframe_protocol::ServerId>),
 }
 
 /// One stream of a [`Peer`] being answered; it is counted until dropped.
@@ -157,7 +170,25 @@ impl Peer {
             users: parking_lot::Mutex::default(),
             closing: AtomicBool::new(false),
             streams: watch::Sender::new(0),
+            kind: PeerKind::Device,
         }
+    }
+
+    /// A server's connection on `spoolframe/federation/1` (P8-01), from a
+    /// live pair's endpoint under `peer`, or a stranger's.
+    pub(crate) fn federation(
+        connection: &Connection,
+        peer: Option<spoolframe_protocol::ServerId>,
+    ) -> Self {
+        Self {
+            kind: PeerKind::Federation(peer),
+            ..Self::new(connection)
+        }
+    }
+
+    /// Whose connection it is.
+    pub(crate) fn kind(&self) -> &PeerKind {
+        &self.kind
     }
 
     /// Whether its connection goes through a relay now (P6-03); `None`

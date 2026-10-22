@@ -47,6 +47,7 @@ must be updated together. The changes per revision are in
   [up next in a playlist](#up-next-in-a-playlist)
 - [Downloads](#downloads)
 - [Portable identities](#portable-identities)
+- [Federation](#federation) (experimental)
 
 ## Basics
 
@@ -57,7 +58,7 @@ must be updated together. The changes per revision are in
 | `spoolframe/client/1` | an app and a server | most of this document |
 | `spoolframe/pair/1` | a phone and a device, no server | "Pairing" |
 | `spoolframe/relay-access/1` | a server's own relay and that server | "Relay access" |
-| `spoolframe/federation/1` | server and server | reserved; refused with `close::UNSUPPORTED_PROTOCOL` until federation exists |
+| `spoolframe/federation/1` | server and server | "Federation"; experimental, refused with `close::UNSUPPORTED_PROTOCOL` while a server's `experimental.federation` is off |
 
 ### Encoding
 
@@ -3005,3 +3006,65 @@ The test vectors in `spoolframe_protocol::portable` (`portable/mod.rs`; root see
 `[9; 32]` and `[11; 32]`) were computed apart from the code, with Python
 and `openssl pkeyutl -rawin`; the tie vector signs for username `alice`
 on server `[0x5a; 32]` over nonce `[0xa5; 32]`.
+
+## Federation
+
+Experimental (P8): servers pair with each other on their own ALPN,
+`spoolframe/federation/1` (`spoolframe_protocol::federation`). A server
+serves it only while its `experimental { federation = true; }` is on;
+off, it closes the connection at once with `UNSUPPORTED_PROTOCOL`, as
+every server before it did. No app speaks it, and its messages may
+change in any release.
+
+A server's identity is its endpoint key, which the connection proves.
+Its server id is a label with no key that outlives a rotated key. The
+server dialled pins the pair (endpoint id, server id); nothing is signed.
+
+One bidirectional stream per request, one frame each way, as on the
+client protocol: a `PeerRequest`, answered by a `PeerReply`. A request
+is at most 16 KiB and must arrive within 10 s of its stream opening.
+
+- `hello` comes first on every connection: `{protocol_version,
+  server_id, name}`, answered `info` with the dialled server's own and
+  the dialler's `standing`: `stranger`, `paired` or `key_held`; or
+  `refused`. A `server_id` that is the dialled server's own is refused
+  `same_server_id`: a server never pairs with itself, or with a copy of
+  its state. The ALPN versions itself (`protocol_version`, 1), apart from
+  the client protocol's `PROTOCOL_VERSION`.
+- `redeem_pairing` `{code, addrs, relays}` redeems the dialled server's
+  `federation` invite: `paired` `{server_id, name}`, or `refused` with a
+  reason (`invite_invalid`, `invite_expired`, `invite_exhausted`,
+  `wrong_invite_kind`, `rate_limited`, `already_paired`). `addrs` and
+  `relays` are where the dialler may be reached, for the other to dial it
+  back: an address that is loopback, unspecified, multicast or broadcast,
+  or a relay URL that is not `https`, is dropped. Private, CGNAT and
+  link-local addresses are kept, for two servers on one LAN or tailnet.
+- `unpaired` `{}`, from a paired server: the other revokes its side too,
+  answers `done`, and closes the connection with `UNPAIRED` (5).
+
+The ALPN is strict. An endpoint that is not a live pair's reaches only
+`hello` and `redeem_pairing`; a request before `hello`, a second
+`hello`, or anything else resets the stream with `NOT_ALLOWED` (1)
+(`BAD_REQUEST` (2) for one that is late or does not decode). Such a
+stranger is held, limited and counted as a device with no session is on
+the client protocol: its connections share the cap on strangers'
+connections (`BUSY`), a redemption draws on the strangers' sign-in
+budget, and a wrong code and a refused stream each count as a wrong
+guess at an invite's code from that endpoint, on the count `RedeemInvite`
+and `LookupInvite` share; a refused stream counts only while the
+strangers' budget lasts, and spends from it. A live pair's connections
+skip the cap.
+
+A live pair's endpoint that says another server id is refused
+`server_id_changed` every time, and its connection closed with
+`SERVER_ID_CHANGED` (4). A live pair's server id from a new endpoint is
+`key_held`: the new key waits for the dialled server's admin to confirm
+or reject it, and reaches only `hello` until then. Each such `hello`
+draws on the strangers' budget (`rate_limited` past it), so a dialler
+that turns keys does not escape the count each key has. At most four new
+keys are kept for a pair, the rejected among them; a new key past them
+is refused `key_refused` and never replaces one kept, so the key an
+admin is looking at cannot change under them. A key rejected by the
+admin is refused `key_refused` for a day; a held key not seen for a week
+is forgotten.
+

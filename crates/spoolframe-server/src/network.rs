@@ -21,7 +21,7 @@ use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, Server
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
 
-use crate::admission::{self, Admission, Peer};
+use crate::admission::{self, Admission, Peer, PeerKind};
 use crate::announce::{Announce, Told};
 use crate::artwork::ArtworkCache;
 use crate::auth::Auth;
@@ -44,9 +44,9 @@ pub enum Relay {
     Custom(Url),
 }
 
-/// The ALPNs the endpoint takes: the client protocol, federation (to
-/// refuse it with a reason), and its relays' question when it has relays
-/// of its own (P6-04).
+/// The ALPNs the endpoint takes: the client protocol, federation (served
+/// while `experimental.federation` is on, else refused with a reason), and
+/// its relays' question when it has relays of its own (P6-04).
 fn alpns(options: &EndpointOptions) -> Vec<Vec<u8>> {
     let mut alpns = vec![CLIENT_ALPN.to_vec(), FEDERATION_ALPN.to_vec()];
     if !options.own_relays.is_empty() {
@@ -234,8 +234,15 @@ pub struct EndpointOptions {
 #[non_exhaustive]
 pub enum ConnectionAuth {
     /// A client endpoint. Its requests are anonymous unless they carry a
-    /// session.
+    /// session. Also a server on `spoolframe/federation/1` that is not a
+    /// live pair's (P8-01).
     Anonymous { endpoint: EndpointId },
+    /// A paired server on `spoolframe/federation/1` (P8-01): its endpoint
+    /// and the server id it is pinned with.
+    FederationPeer {
+        endpoint: EndpointId,
+        peer: spoolframe_protocol::ServerId,
+    },
 }
 
 /// The open client connections and their auth state, with who may open
@@ -244,6 +251,14 @@ pub enum ConnectionAuth {
 pub struct Connections {
     peers: Arc<Mutex<HashMap<usize, Arc<Peer>>>>,
     admission: Admission,
+}
+
+/// The devices' connections among `peers`: what signing in and out is
+/// about. A server's federation connection has no session.
+fn devices(peers: &HashMap<usize, Arc<Peer>>) -> impl Iterator<Item = (&usize, &Arc<Peer>)> {
+    peers
+        .iter()
+        .filter(|(_, peer)| *peer.kind() == PeerKind::Device)
 }
 
 impl Connections {
@@ -277,12 +292,18 @@ impl Connections {
         (direct, relayed)
     }
 
-    /// Every open client connection.
+    /// Every open connection: the client protocol's, and federation's.
     pub fn snapshot(&self) -> Vec<ConnectionAuth> {
         self.lock()
             .values()
-            .map(|peer| ConnectionAuth::Anonymous {
-                endpoint: peer.endpoint,
+            .map(|peer| match peer.kind() {
+                PeerKind::Federation(Some(server)) => ConnectionAuth::FederationPeer {
+                    endpoint: peer.endpoint,
+                    peer: server.clone(),
+                },
+                PeerKind::Federation(None) | PeerKind::Device => ConnectionAuth::Anonymous {
+                    endpoint: peer.endpoint,
+                },
             })
             .collect()
     }
@@ -296,13 +317,36 @@ impl Connections {
         known: bool,
         local: bool,
     ) -> Option<Arc<Peer>> {
+        self.hold(Peer::new(connection), connection, known, local)
+    }
+
+    /// Hold a server's `spoolframe/federation/1` connection (P8-01) as
+    /// [`Connections::admit`] holds a device's: a live pair's (`peer`)
+    /// always, with the normal limits; a stranger's on the same cap as
+    /// devices that are not signed in.
+    pub(crate) fn admit_federation(
+        &self,
+        connection: &Connection,
+        peer: Option<spoolframe_protocol::ServerId>,
+    ) -> Option<Arc<Peer>> {
+        let known = peer.is_some();
+        self.hold(Peer::federation(connection, peer), connection, known, false)
+    }
+
+    fn hold(
+        &self,
+        peer: Peer,
+        connection: &Connection,
+        known: bool,
+        local: bool,
+    ) -> Option<Arc<Peer>> {
         let mut peers = self.lock();
         if !known
             && peers.values().filter(|peer| !peer.known()).count() >= self.admission.max_strangers
         {
             return None;
         }
-        let peer = Arc::new(Peer::new(connection));
+        let peer = Arc::new(peer);
         if known {
             peer.raise();
         }
@@ -317,9 +361,9 @@ impl Connections {
         self.lock().remove(&id);
     }
 
-    /// Whether `endpoint` has a connection open.
+    /// Whether `endpoint` has a client connection open.
     pub(crate) fn has_endpoint(&self, endpoint: &EndpointId) -> bool {
-        self.lock().values().any(|peer| &peer.endpoint == endpoint)
+        devices(&self.lock()).any(|(_, peer)| &peer.endpoint == endpoint)
     }
 
     /// `endpoint` signed in, as `user` when known, a local user if
@@ -332,7 +376,7 @@ impl Connections {
         local: bool,
     ) -> Vec<usize> {
         let mut raised = Vec::new();
-        for (id, peer) in self.lock().iter().filter(|(_, p)| &p.endpoint == endpoint) {
+        for (id, peer) in devices(&self.lock()).filter(|(_, p)| &p.endpoint == endpoint) {
             peer.raise();
             if local {
                 peer.note_local();
@@ -348,13 +392,12 @@ impl Connections {
         self.lock().get(&id).is_some_and(|peer| peer.signed_in())
     }
 
-    /// The endpoints of the connections that have the normal limits.
+    /// The endpoints of the client connections that have the normal
+    /// limits. A paired server's has them too, with no session behind it.
     fn known_endpoints(&self) -> Vec<EndpointId> {
-        let mut endpoints: Vec<_> = self
-            .lock()
-            .values()
-            .filter(|peer| peer.known())
-            .map(|peer| peer.endpoint)
+        let mut endpoints: Vec<_> = devices(&self.lock())
+            .filter(|(_, peer)| peer.known())
+            .map(|(_, peer)| peer.endpoint)
             .collect();
         endpoints.sort();
         endpoints.dedup();
@@ -367,10 +410,7 @@ impl Connections {
     /// in yet (as an app does once signed out, to sign in again), is not
     /// one it ended.
     fn sign_out(&self, endpoint: &EndpointId) {
-        for peer in self
-            .lock()
-            .values()
-            .filter(|p| &p.endpoint == endpoint && p.known())
+        for (_, peer) in devices(&self.lock()).filter(|(_, p)| &p.endpoint == endpoint && p.known())
         {
             peer.sign_out();
         }
@@ -574,6 +614,9 @@ pub struct Services {
     pub uplink: Arc<crate::uplink::Uplink>,
     /// The HTTP playback port (PX-49), bound at start; off by default.
     pub http_playback: crate::http_playback::Settings,
+    /// Federation (P8-01), while `experimental.federation` is on; `None`
+    /// closes `spoolframe/federation/1` at once.
+    pub federation: Option<Arc<crate::federation::Federation>>,
 }
 
 impl std::fmt::Debug for Services {
@@ -764,6 +807,10 @@ impl Server {
                     })?
             }
         };
+        let federation = services.federation.clone();
+        if let Some(federation) = &federation {
+            federation.attach(endpoint.clone(), connections.clone(), told.clone());
+        }
         let client = ClientProtocol::new(
             endpoint.clone(),
             told.clone(),
@@ -773,9 +820,13 @@ impl Server {
             services,
             http_playback.clone(),
         );
-        let mut router = Router::builder(endpoint)
-            .accept(CLIENT_ALPN, client)
-            .accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1"));
+        let mut router = Router::builder(endpoint).accept(CLIENT_ALPN, client);
+        // Experimental (P8-01): off, the ALPN is refused with a reason, as
+        // it was before federation.
+        router = match federation {
+            Some(federation) => router.accept(FEDERATION_ALPN, federation.protocol()),
+            None => router.accept(FEDERATION_ALPN, Unsupported("spoolframe/federation/1")),
+        };
         if let Some(relay_access) = relay_access {
             router = router.accept(RELAY_ACCESS_ALPN, relay_access);
         }

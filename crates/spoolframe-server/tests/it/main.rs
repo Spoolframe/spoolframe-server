@@ -20,6 +20,7 @@ mod downloads;
 mod downloads_wire;
 mod encode;
 mod endpoint;
+mod federation;
 mod forget_device;
 mod gpu_cards;
 mod gpu_pick;

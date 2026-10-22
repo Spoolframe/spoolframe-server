@@ -42,6 +42,7 @@ foyer = "0.22.5"
 spoolframe-types = { path = "crates/spoolframe-types", version = "0.14.4", registry = "coldsteel" }
 spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.14.4", registry = "coldsteel" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
+spoolframe-federation = { path = "crates/spoolframe-federation" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
 spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.14.4", registry = "coldsteel" }

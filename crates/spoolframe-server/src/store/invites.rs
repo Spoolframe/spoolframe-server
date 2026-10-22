@@ -33,6 +33,30 @@ pub enum InviteKind {
 }
 
 impl InviteKind {
+    /// Whether it makes an account here: only then is its role chosen,
+    /// and its holder relays as the owner's (P6-08).
+    pub fn makes_account(self) -> bool {
+        self == InviteKind::CreateUser
+    }
+
+    /// The role an invite of this kind gives, from the one asked for: a
+    /// consumer's when none is. A `portable-account` invite grants only a
+    /// consumer's (P7-05); a `federation` one pairs a server, and a role
+    /// would say otherwise (P8-01). `Err` says why the role asked for is
+    /// not one.
+    pub fn resolve_role(self, asked: Option<Role>) -> Result<Role, &'static str> {
+        match (self, asked) {
+            (InviteKind::Federation, Some(_)) => {
+                Err("a federation invite pairs a server: leave the role out")
+            }
+            (_, Some(Role::Unknown)) => Err("use admin or consumer"),
+            (InviteKind::PortableAccount, Some(role)) if role != Role::Consumer => {
+                Err("a portable-account invite grants watching only: leave the role out")
+            }
+            (_, asked) => Ok(asked.unwrap_or(Role::Consumer)),
+        }
+    }
+
     /// The name in the database and on the admin API.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -126,9 +150,11 @@ pub struct InviteRecord {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InviteError {
-    /// A kind this server does not make yet.
+    /// A kind this server does not make now: `federation` while
+    /// `experimental.federation` is off (P8-01).
     #[error(
-        "{0} invites arrive with P8; this server makes create-user and portable-account invites"
+        "{0} invites are experimental: this server makes them only with \
+         experimental.federation on"
     )]
     NotYet(InviteKind),
     #[error("no live invite {0:?}")]
@@ -569,6 +595,30 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 24 * 3600;
+
+    /// Each kind's role rule: chosen for an account, a consumer's only for
+    /// a portable user, none for a server.
+    #[test]
+    fn the_kind_says_which_role_an_invite_gives() {
+        use InviteKind::*;
+        assert_eq!(CreateUser.resolve_role(None), Ok(Role::Consumer));
+        assert_eq!(CreateUser.resolve_role(Some(Role::Admin)), Ok(Role::Admin));
+        assert!(CreateUser.resolve_role(Some(Role::Unknown)).is_err());
+        assert_eq!(
+            PortableAccount.resolve_role(Some(Role::Consumer)),
+            Ok(Role::Consumer)
+        );
+        assert!(PortableAccount.resolve_role(Some(Role::Admin)).is_err());
+        assert_eq!(Federation.resolve_role(None), Ok(Role::Consumer));
+        assert!(
+            Federation
+                .resolve_role(Some(Role::Consumer))
+                .unwrap_err()
+                .contains("federation")
+        );
+        assert!(CreateUser.makes_account());
+        assert!(!PortableAccount.makes_account() && !Federation.makes_account());
+    }
 
     fn new_invite<'a>(store: &Store, hash: &'a str, uses: u32) -> NewInvite<'a> {
         NewInvite {

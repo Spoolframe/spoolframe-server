@@ -6961,6 +6961,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "spoolframe-federation"
+version = "0.14.4"
+dependencies = [
+ "async-trait",
+ "iroh",
+ "parking_lot",
+ "spoolframe-protocol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spoolframe-hls-bridge"
 version = "0.14.4"
 dependencies = [
@@ -7121,6 +7134,7 @@ dependencies = [
  "spoolframe-admin-api",
  "spoolframe-catalog",
  "spoolframe-client-sdk",
+ "spoolframe-federation",
  "spoolframe-hls-bridge",
  "spoolframe-media",
  "spoolframe-plex",

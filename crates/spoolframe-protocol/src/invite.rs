@@ -27,6 +27,9 @@
 //!   access (`RedeemPortableInvite`) rather than making an account. Absent,
 //!   it makes an account (`RedeemInvite`). A hint for which form to show:
 //!   the server answers the other request with `WrongInviteKind`.
+//! - `kind=federation` (P8-01, experimental): the code pairs another
+//!   server with this one; that server's admin redeems it
+//!   (`PairServer`, or the admin API's `federation_redeem`).
 //!
 //! Values are percent-encoded where they would break the link (`&`, `=`,
 //! `#`, `%`, `+`, spaces, anything outside ASCII); `:` and `/` stay as
@@ -120,6 +123,9 @@ pub enum InviteLinkKind {
     CreateUser,
     /// Grants a portable identity access (`RedeemPortableInvite`).
     PortableAccount,
+    /// Pairs another server with this one (P8-01): redeemed by that
+    /// server, not a device.
+    Federation,
 }
 
 impl fmt::Debug for Invite {
@@ -179,8 +185,10 @@ impl Invite {
         if let Some(role) = self.role {
             add("role", role.as_str());
         }
-        if self.kind == InviteLinkKind::PortableAccount {
-            add("kind", "portable-account");
+        match self.kind {
+            InviteLinkKind::CreateUser => {}
+            InviteLinkKind::PortableAccount => add("kind", "portable-account"),
+            InviteLinkKind::Federation => add("kind", "federation"),
         }
         if let Some(code) = &self.code {
             add("cap", &display_code(code));
@@ -239,6 +247,9 @@ pub fn parse_link(text: &str) -> Option<Invite> {
             }
             ("kind", Some(value)) if value == "portable-account" => {
                 invite.kind = InviteLinkKind::PortableAccount;
+            }
+            ("kind", Some(value)) if value == "federation" => {
+                invite.kind = InviteLinkKind::Federation;
             }
             // A parameter a newer server added, or a hint past the limit.
             _ => {}
@@ -494,8 +505,23 @@ mod tests {
         assert_eq!(parse_link(&link), Some(portable));
         assert!(!invite().link().contains("kind="));
         // A kind this build does not know is a hint it cannot read.
-        let other = invite().link().replace("&cap=", "&kind=federation&cap=");
+        let other = invite().link().replace("&cap=", "&kind=household&cap=");
         assert_eq!(parse_link(&other).unwrap().kind, InviteLinkKind::CreateUser);
+    }
+
+    /// P8-01: a server's pairing invite says so, with no role.
+    #[test]
+    fn a_federation_link_says_its_kind_and_reads_back() {
+        let federation = Invite {
+            role: None,
+            kind: InviteLinkKind::Federation,
+            ..invite()
+        };
+        let link = federation.link();
+        assert!(link.contains("&kind=federation&"), "{link}");
+        assert!(!link.contains("role="), "{link}");
+        assert_eq!(parse_link(&link), Some(federation.clone()));
+        assert_eq!(parse_link(&federation.share_link()), Some(federation));
     }
 
     #[test]

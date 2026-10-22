@@ -1,0 +1,22 @@
+[package]
+name = "spoolframe-federation"
+description = "Server-to-server federation: the spoolframe/federation/1 handler and pairing."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# The server holds its store and auth behind these traits as `Arc<dyn _>`.
+async-trait = { workspace = true }
+iroh = { workspace = true }
+parking_lot = { workspace = true }
+spoolframe-protocol = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

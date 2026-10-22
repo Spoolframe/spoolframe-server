@@ -1276,7 +1276,7 @@ proprietary clients can interoperate.
 
 ```text
 spoolframe-server          AGPL-3.0-or-later
-spoolframe-federation      AGPL-3.0-or-later   (planned)
+spoolframe-federation      AGPL-3.0-or-later
 spoolframe-plex            AGPL-3.0-or-later
 
 spoolframe-protocol        MIT OR Apache-2.0

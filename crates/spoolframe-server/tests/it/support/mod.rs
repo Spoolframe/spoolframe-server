@@ -515,6 +515,8 @@ pub struct ServerOptions {
     /// has, as a server detects them (E-AC-3 among them), not the
     /// baseline's AAC alone.
     pub detect_encoders: bool,
+    /// `experimental.federation` (P8-01).
+    pub federation: bool,
 }
 
 /// Speech found by a stand-in: always `0`.
@@ -583,6 +585,7 @@ impl Default for ServerOptions {
             downloads_max_size: 1 << 30,
             optimized_max_size: 1 << 30,
             detect_encoders: false,
+            federation: false,
         }
     }
 }
@@ -753,6 +756,8 @@ pub struct TestServer {
     pub copies: Arc<spoolframe_server::optimized::Pool>,
     /// Its downloads (PX-38), their area in `optimized/downloads`.
     pub downloads: Arc<spoolframe_server::downloads::Downloads>,
+    /// Federation (P8-01), when the test turned it on.
+    pub federation: Option<Arc<spoolframe_server::federation::Federation>>,
 }
 
 impl TestServer {
@@ -979,6 +984,14 @@ impl TestServer {
             .await
             .unwrap(),
         );
+        let name = ServerName::new(options.name.clone());
+        let federation = options.federation.then(|| {
+            Arc::new(spoolframe_server::federation::Federation::new(
+                auth.clone(),
+                server_id.clone(),
+                name.clone(),
+            ))
+        });
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),
@@ -1019,6 +1032,7 @@ impl TestServer {
                 options.uplink.clone(),
             )),
             http_playback: options.http_playback.clone(),
+            federation: federation.clone(),
         };
         let debug = Arc::new(spoolframe_server::playback_debug::PlaybackDebug {
             playbacks: services.playbacks.clone(),
@@ -1044,7 +1058,6 @@ impl TestServer {
             wan: options.wan.clone(),
             congestion: Default::default(),
         };
-        let name = ServerName::new(options.name.clone());
         let server = Server::start(key, &endpoint, &name, services)
             .await
             .unwrap();
@@ -1068,6 +1081,7 @@ impl TestServer {
             artwork,
             copies,
             downloads,
+            federation,
         }
     }
 

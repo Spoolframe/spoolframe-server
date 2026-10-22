@@ -22,6 +22,7 @@ pub mod device_sign_in;
 pub mod downloads;
 pub mod encode;
 mod events;
+pub mod federation;
 pub mod files;
 pub mod gpu_status;
 pub mod http_playback;

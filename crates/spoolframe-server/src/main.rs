@@ -947,6 +947,7 @@ async fn run(
             .with_mdns(endpoint_options.mdns)
             .with_experimental(spoolframe_server::protocol_info::experimental_on(
                 http_playback.listen.is_some(),
+                config.experimental.federation(),
             ))
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
@@ -1264,6 +1265,16 @@ async fn run(
         Ok(swept) => tracing::info!(swept, "playlist covers no playlist has deleted"),
         Err(e) => tracing::warn!(error = %e, "cannot sweep the playlist covers"),
     }
+    // Federation (P8-01): experimental, off unless the setting turns it
+    // on; shared by the endpoint, which serves the ALPN, and the admin
+    // API, which pairs.
+    let federation = config.experimental.federation().then(|| {
+        Arc::new(spoolframe_server::federation::Federation::new(
+            auth.clone(),
+            server_id.clone(),
+            name.clone(),
+        ))
+    });
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = (auth.store().user_count().await? == 0).then(SetupCode::generate);
@@ -1355,6 +1366,7 @@ async fn run(
             wan: spoolframe_server::wan::Finders::system(),
             uplink: uplink.clone(),
             http_playback,
+            federation,
         },
     )
     .await?;

@@ -3579,14 +3579,17 @@ impl AdminApiServer for AdminApi {
             expires_secs: invite.expires,
             role: invite.role,
         };
-        let created = crate::invites::create(self.auth.store(), request, &created_by, &origin)
-            .await
-            .map_err(|e| match e {
-                crate::invites::CreateError::Invalid(message) => {
-                    error(error_code::INVALID_INPUT, message)
-                }
-                crate::invites::CreateError::Invite(e) => e.into(),
-            })?;
+        // The admin API's federation methods come with the next stage;
+        // until then a `federation` invite is refused here as before.
+        let created =
+            crate::invites::create(self.auth.store(), request, &created_by, &origin, None)
+                .await
+                .map_err(|e| match e {
+                    crate::invites::CreateError::Invalid(message) => {
+                        error(error_code::INVALID_INPUT, message)
+                    }
+                    crate::invites::CreateError::Invite(e) => e.into(),
+                })?;
         let invite = created.invite(server);
         Ok(InviteCreated {
             code: created.code.shown(),

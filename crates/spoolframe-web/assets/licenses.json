@@ -6955,6 +6955,21 @@
 "Copyright (c) Andrey Cherkashin"
 ],
 "group": "spoolframe",
+"license": "AGPL-3.0-or-later",
+"name": "spoolframe-federation",
+"ships": [
+"server"
+],
+"texts": {
+"AGPL-3.0-or-later": 145
+},
+"version": "0.14.4"
+},
+{
+"copyright": [
+"Copyright (c) Andrey Cherkashin"
+],
+"group": "spoolframe",
 "license": "MIT OR Apache-2.0",
 "name": "spoolframe-hls-bridge",
 "ships": [
