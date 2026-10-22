@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo deny --locked --config deny.toml check licenses
 # The fuzz targets are a workspace of their own (fuzz/, PX-10).
-cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check licenses
+cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check licenses
 cargo deny --locked --manifest-path crates/spoolframe-client-sdk/Cargo.toml --config deny-sdk.toml check licenses
 # Discover the public crates from their license, so new workspace members
 # cannot accidentally skip the stricter SDK boundary.

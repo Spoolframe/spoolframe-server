@@ -1,0 +1,40 @@
+# The fuzz targets' graph (PX-10), apart from the server's (../deny.toml):
+# an exception for a crate a graph lacks is a warning, so each names only
+# its own. The fuzz targets are never built into anything shipped.
+[graph]
+all-features = true
+exclude-dev = true
+
+[licenses]
+confidence-threshold = 0.95
+# The server's list, so the two graphs allow the same: this graph uses
+# fewer of them, which is no reason to warn.
+unused-allowed-license = "allow"
+allow = [
+  "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+  "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense", "BSL-1.0", "CDLA-Permissive-2.0", "MPL-2.0",
+]
+
+exceptions = [
+  { crate = "spoolframe-media", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-catalog", allow = ["AGPL-3.0-or-later"] },
+  { crate = "spoolframe-plex", allow = ["AGPL-3.0-or-later"] },
+  # Subtitle sync's aligner (PX-03), through spoolframe-media.
+  { crate = "alass-core", allow = ["GPL-3.0-only"] },
+  { crate = "spoolframe-fuzz", allow = ["AGPL-3.0-or-later"] },
+  # libFuzzer, which libfuzzer-sys builds in, is LLVM's, under NCSA.
+  { crate = "libfuzzer-sys", allow = ["NCSA"] },
+]
+
+# alass-core says "GPL-3.0", SPDX's deprecated name for GPL-3.0-only, and
+# ships no license file.
+[[licenses.clarify]]
+crate = "alass-core"
+expression = "GPL-3.0-only"
+license-files = []
+
+# Several versions of one crate come from upstream (iroh, the HTTP and
+# TLS stacks pinning different majors), not from a choice made here: a
+# warning for each would bury a real finding. `cargo tree -d` lists them.
+[bans]
+multiple-versions = "allow"

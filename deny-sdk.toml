@@ -5,6 +5,9 @@ exclude-dev = true
 
 [licenses]
 confidence-threshold = 0.95
+# The licenses any public crate may bring in. Each is checked alone, and
+# a small graph uses few of them, which is no reason to warn.
+unused-allowed-license = "allow"
 allow = [
   "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
   "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense", "BSL-1.0", "CDLA-Permissive-2.0",
@@ -14,6 +17,9 @@ allow = [
 # `cargo deny --locked check advisories` passes and a new one stands out.
 # The same acceptances as deny.toml's.
 [advisories]
+# The same list as deny.toml's, and rsa is not in the SDK's graph: an
+# acceptance waiting for a crate that is not there is no reason to warn.
+unused-ignored-advisory = "allow"
 ignore = [
   # rsa: not in the SDK's graph today. Accepted only for verification:
   # should it come in, check that nothing does an RSA private-key
@@ -23,3 +29,9 @@ ignore = [
   # (through iroh's netlink-packet-core); none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the SDK" },
 ]
+
+# Several versions of one crate come from upstream (iroh, the HTTP and
+# TLS stacks pinning different majors), not from a choice made here: a
+# warning for each would bury a real finding. `cargo tree -d` lists them.
+[bans]
+multiple-versions = "allow"

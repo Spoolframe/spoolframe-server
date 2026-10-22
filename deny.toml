@@ -22,12 +22,25 @@ exceptions = [
   { crate = "spoolframe-admin-api", allow = ["AGPL-3.0-or-later"] },
   # Subtitle sync's aligner (PX-03), linked into spoolframe-media only.
   # GPL-3.0 only: AGPL-3.0 §13 and GPL-3.0 §13 let the two be combined.
-  { crate = "alass-core", allow = ["GPL-3.0"] },
-  # The fuzz targets (fuzz/, PX-10): never built into anything shipped.
-  # libFuzzer, which libfuzzer-sys builds in, is LLVM's, under NCSA.
-  { crate = "spoolframe-fuzz", allow = ["AGPL-3.0-or-later"] },
-  { crate = "libfuzzer-sys", allow = ["NCSA"] },
+  { crate = "alass-core", allow = ["GPL-3.0-only"] },
 ]
+# The fuzz targets (fuzz/) are checked with fuzz/deny.toml: an exception
+# for a crate a graph lacks is a warning, so each graph names only its own.
+
+# alass-core says "GPL-3.0", SPDX's deprecated name for GPL-3.0-only, and
+# ships no license file.
+[[licenses.clarify]]
+crate = "alass-core"
+expression = "GPL-3.0-only"
+license-files = []
+
+# uclicious-libucl-sys 0.9.2 names only its license file, which is MIT.
+# It links the system's libucl and vendors none of its C. Pinned to the
+# version read, so a new one is looked at again.
+[[licenses.clarify]]
+crate = "uclicious-libucl-sys@0.9.2"
+expression = "MIT"
+license-files = []
 
 # Accepted advisories (PX-09 C-15, written down in PX-11 finding 39), so
 # `cargo deny --locked check advisories` passes and a new one stands out.
@@ -43,3 +56,9 @@ ignore = [
   # (through iroh's netlink-packet-core); none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the server" },
 ]
+
+# Several versions of one crate come from upstream (iroh, the HTTP and
+# TLS stacks pinning different majors), not from a choice made here: a
+# warning for each would bury a real finding. `cargo tree -d` lists them.
+[bans]
+multiple-versions = "allow"
