@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.4 (2026-10-21)
 
 - Invite lookup before joining. `LookupInvite` is a new pre-auth request,
   behind the feature `spoolframe:invite-lookup`, the first feature listed
