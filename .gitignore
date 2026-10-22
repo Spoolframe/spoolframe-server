@@ -24,3 +24,6 @@ result-*
 # Claude Code's per-checkout state, including agent worktrees: each is a
 # nested repo that `git add -A` would otherwise pick up.
 .claude/
+
+# Fuzz campaign logs
+fuzz/campaign-*.log
