@@ -248,7 +248,10 @@ async fn a_client_without_the_feature_gets_no_playlists_on_an_item() {
     let older = server.client().await;
     let info = older.hello_listing(&[]).await;
     // No playlists before a session: they are not pre-auth.
-    assert!(info.features.is_empty());
+    assert_eq!(
+        info.features,
+        [spoolframe_protocol::features::INVITE_LOOKUP]
+    );
     let request = Request::LoginPassword(spoolframe_protocol::LoginPassword {
         username: "alice".into(),
         password: "correct horse".into(),

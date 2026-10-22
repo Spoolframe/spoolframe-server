@@ -84,8 +84,25 @@ impl Invites {
         }
     }
 
+    /// Made as the CLI makes it: with no page origin, by "server CLI".
     async fn create(&self, invite: NewInvite) -> InviteCreated {
         self.root.invite_create(invite).await.unwrap()
+    }
+
+    /// Made in the web UI: by root.
+    async fn create_from_page(&self, invite: NewInvite) -> InviteCreated {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", self.root_token).parse().unwrap(),
+        );
+        headers.insert("origin", PUBLIC_URL.parse().unwrap());
+        let page = WsClientBuilder::default()
+            .set_headers(headers)
+            .build(format!("ws://{}", self.addr))
+            .await
+            .unwrap();
+        page.invite_create(invite).await.unwrap()
     }
 
     /// A device the server has never seen, past `Hello`, able to play the
@@ -952,6 +969,315 @@ async fn a_redemption_refused_for_its_username_or_password_is_logged() {
 // The SDK (P6-01): a device that has nothing but the link. Its server
 // tells loopback besides its LAN addresses, so the link reaches it on a
 // machine with no network.
+
+// Looking an invite up before joining (spoolframe:invite-lookup): what a
+// code is, from a device with no session, and nothing used up.
+
+mod lookup {
+    use spoolframe_protocol::features::INVITE_LOOKUP;
+    use spoolframe_protocol::invite_admin::InviteKind as WireKind;
+    use spoolframe_protocol::{InviteLookupOutcome as Outcome, LookupInvite};
+
+    use super::*;
+
+    /// A device the server has never seen, its `Hello` listing the
+    /// feature.
+    async fn looker(invites: &Invites) -> TestClient {
+        let device = invites.server.client().await;
+        let info = device.hello_listing(&[INVITE_LOOKUP]).await;
+        assert!(info.features.iter().any(|f| f == INVITE_LOOKUP), "{info:?}");
+        device
+    }
+
+    fn look_up(code: &str) -> Request {
+        Request::LookupInvite(LookupInvite { code: code.into() })
+    }
+
+    async fn outcome(device: &TestClient, code: &str) -> Outcome {
+        match device.call(None, look_up(code)).await {
+            Response::Ok(Reply::InviteLookup { outcome }) => outcome,
+            other => panic!("not looked up: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_invite_is_valid_with_its_kind_role_expiry_and_inviter() {
+        let invites = Invites::start("invite-lookup-valid").await;
+        let store = &invites.server.store;
+        let root = store.user_by_name("root").await.unwrap().unwrap();
+        store
+            .set_display_name(root.id, Some("Andrey"))
+            .await
+            .unwrap();
+        let created = invites
+            .create_from_page(NewInvite {
+                role: Some(Role::Admin),
+                ..create_user()
+            })
+            .await;
+        let device = looker(&invites).await;
+        // Typed in lowercase, without its dashes, as people do.
+        let typed = normalize_code(&created.code).unwrap().to_lowercase();
+        assert_eq!(
+            outcome(&device, &typed).await,
+            Outcome::Valid {
+                kind: WireKind::CreateUser,
+                role: Role::Admin,
+                expires_at: created.invite.expires_at,
+                inviter: Some("Andrey".into()),
+            }
+        );
+        invites.server.stop().await;
+    }
+
+    /// Only a display name is told, never a username: root has none here,
+    /// and the CLI is no one.
+    #[tokio::test]
+    async fn a_guest_invite_is_valid_as_a_portable_account_s_and_names_no_username() {
+        let invites = Invites::start("invite-lookup-guest").await;
+        let guest = NewInvite {
+            kind: InviteKind::PortableAccount,
+            ..create_user()
+        };
+        let from_page = invites.create_from_page(guest.clone()).await;
+        let from_cli = invites.create(guest).await;
+        let device = looker(&invites).await;
+        for created in [from_page, from_cli] {
+            assert!(matches!(
+                outcome(&device, &created.code).await,
+                Outcome::Valid {
+                    kind: WireKind::PortableAccount,
+                    role: Role::Consumer,
+                    inviter: None,
+                    ..
+                }
+            ));
+        }
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_invite_says_when_it_expired() {
+        let invites = Invites::start("invite-lookup-expired").await;
+        let created = invites
+            .create(NewInvite {
+                expires: Some(invite::MIN_EXPIRES_SECS),
+                ..create_user()
+            })
+            .await;
+        invites.server.clock.advance(Duration::from_secs(3601));
+        let device = looker(&invites).await;
+        assert_eq!(
+            outcome(&device, &created.code).await,
+            Outcome::Expired {
+                at: created.invite.expires_at
+            }
+        );
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_used_up_invite_is_used() {
+        let invites = Invites::start("invite-lookup-used").await;
+        let created = invites.create(create_user()).await;
+        logged_in(
+            invites
+                .stranger()
+                .await
+                .call(None, redeem(&created.code, "anna"))
+                .await,
+        );
+        let device = looker(&invites).await;
+        assert_eq!(outcome(&device, &created.code).await, Outcome::Used);
+        invites.server.stop().await;
+    }
+
+    /// Unlike a redemption, which says `InviteInvalid` for both, a lookup
+    /// tells a revoked invite from no invite.
+    #[tokio::test]
+    async fn a_revoked_invite_is_revoked() {
+        let invites = Invites::start("invite-lookup-revoked").await;
+        let created = invites.create(create_user()).await;
+        invites
+            .root
+            .invite_revoke(created.invite.id.clone())
+            .await
+            .unwrap();
+        let device = looker(&invites).await;
+        assert_eq!(outcome(&device, &created.code).await, Outcome::Revoked);
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_code_no_invite_has_is_no_match() {
+        let invites = Invites::start("invite-lookup-no-match").await;
+        invites.create(create_user()).await;
+        let device = looker(&invites).await;
+        for wrong in [WRONG, "not a code"] {
+            assert_eq!(outcome(&device, wrong).await, Outcome::NoMatch, "{wrong}");
+        }
+        invites.server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn looking_up_leaves_the_invite_s_uses_as_they_were() {
+        let invites = Invites::start("invite-lookup-uses").await;
+        let created = invites
+            .create(NewInvite {
+                uses: Some(2),
+                ..create_user()
+            })
+            .await;
+        let device = looker(&invites).await;
+        for _ in 0..3 {
+            assert!(matches!(
+                outcome(&device, &created.code).await,
+                Outcome::Valid { .. }
+            ));
+        }
+        let listed = invites.root.invite_list().await.unwrap();
+        assert_eq!((listed[0].uses, listed[0].uses_left), (2, 2));
+        invites.server.stop().await;
+    }
+
+    /// A-13, as for redeeming: each code no invite has is a wrong guess,
+    /// and after the limit even a right one is refused from that device,
+    /// lookups and redemptions counted together. Another device is not
+    /// held to it.
+    #[tokio::test]
+    async fn codes_that_match_nothing_count_as_guesses_and_are_limited() {
+        let invites = Invites::start("invite-lookup-guesses").await;
+        let created = invites.create(create_user()).await;
+        let guesser = looker(&invites).await;
+        for _ in 0..5 {
+            assert_eq!(outcome(&guesser, WRONG).await, Outcome::NoMatch);
+        }
+        assert!(
+            matches!(
+                guesser.call(None, look_up(&created.code)).await,
+                Response::Err(Error::RateLimited { .. })
+            ),
+            "a sixth lookup was checked"
+        );
+        assert!(
+            matches!(
+                guesser.call(None, redeem(&created.code, "mallory")).await,
+                Response::Err(Error::RateLimited { .. })
+            ),
+            "a redemption after five wrong lookups was checked"
+        );
+        let device = looker(&invites).await;
+        assert!(matches!(
+            outcome(&device, &created.code).await,
+            Outcome::Valid { .. }
+        ));
+        invites.server.stop().await;
+    }
+
+    /// Lookups are guesses strangers make: they share the strangers' one
+    /// budget (PX-10) with sign-ins and redemptions, whatever device they
+    /// come from.
+    #[tokio::test]
+    async fn strangers_lookups_draw_on_the_shared_budget() {
+        let invites = Invites::start_with(
+            "invite-lookup-bucket",
+            ServerOptions {
+                stranger_attempts: Bucket {
+                    capacity: 2,
+                    refill_every: Duration::from_secs(3600),
+                },
+                ..ServerOptions::default()
+            },
+        )
+        .await;
+        let created = invites.create(create_user()).await;
+        for _ in 0..2 {
+            let stranger = looker(&invites).await;
+            assert!(matches!(
+                outcome(&stranger, &created.code).await,
+                Outcome::Valid { .. }
+            ));
+        }
+        let fresh = looker(&invites).await;
+        assert!(
+            matches!(
+                fresh.call(None, look_up(&created.code)).await,
+                Response::Err(Error::RateLimited { .. })
+            ),
+            "a third stranger's lookup was let through"
+        );
+        invites.server.stop().await;
+    }
+
+    /// A revoked or expired code was still a right one: telling so helps
+    /// no one guess, so it is not counted.
+    #[tokio::test]
+    async fn revoked_and_expired_codes_are_not_counted() {
+        let invites = Invites::start("invite-lookup-not-counted").await;
+        let revoked = invites.create(create_user()).await;
+        invites
+            .root
+            .invite_revoke(revoked.invite.id.clone())
+            .await
+            .unwrap();
+        let expiring = invites
+            .create(NewInvite {
+                expires: Some(invite::MIN_EXPIRES_SECS),
+                ..create_user()
+            })
+            .await;
+        // Made before the clock moves, while root's sign-in is recent.
+        let live = invites.create(create_user()).await;
+        invites.server.clock.advance(Duration::from_secs(3601));
+        let device = looker(&invites).await;
+        for _ in 0..3 {
+            assert_eq!(outcome(&device, &revoked.code).await, Outcome::Revoked);
+            assert!(matches!(
+                outcome(&device, &expiring.code).await,
+                Outcome::Expired { .. }
+            ));
+        }
+        assert!(matches!(
+            outcome(&device, &live.code).await,
+            Outcome::Valid { .. }
+        ));
+        invites.server.stop().await;
+    }
+
+    /// PX-16: only a client that listed the feature is answered; one
+    /// that did not is told so, as an older server would, and nothing is
+    /// counted, neither as a guess nor on the strangers' budget.
+    #[tokio::test]
+    async fn a_client_that_did_not_list_the_feature_is_unsupported() {
+        let invites = Invites::start_with(
+            "invite-lookup-unlisted",
+            ServerOptions {
+                stranger_attempts: Bucket {
+                    capacity: 1,
+                    refill_every: Duration::from_secs(3600),
+                },
+                ..ServerOptions::default()
+            },
+        )
+        .await;
+        let created = invites.create(create_user()).await;
+        let older = invites.server.client().await;
+        let info = older.hello_listing(&[]).await;
+        // The server lists it before a session all the same.
+        assert_eq!(info.features, [INVITE_LOOKUP]);
+        for _ in 0..6 {
+            assert!(
+                matches!(
+                    older.call(None, look_up(WRONG)).await,
+                    Response::Err(Error::Unsupported { .. })
+                ),
+                "answered without the feature"
+            );
+        }
+        logged_in(older.call(None, redeem(&created.code, "mum")).await);
+        invites.server.stop().await;
+    }
+}
 
 mod sdk {
     use std::sync::Arc;

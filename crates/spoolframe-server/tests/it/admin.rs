@@ -293,10 +293,11 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
             "spoolframe:subtitle-search",
             "spoolframe:playlist-upcoming",
             "spoolframe:downloads",
-            "spoolframe:music-downloads"
+            "spoolframe:music-downloads",
+            "spoolframe:invite-lookup"
         ]
     );
-    assert!(status.pre_auth_features.is_empty());
+    assert_eq!(status.pre_auth_features, ["spoolframe:invite-lookup"]);
     assert_eq!(status.experimental_features, ["http-playback"]);
     // Nothing detected in tests: the software baseline.
     assert_eq!(status.transcoding.video_encoders, ["libx264"]);

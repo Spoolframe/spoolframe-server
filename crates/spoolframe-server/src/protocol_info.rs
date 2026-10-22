@@ -90,7 +90,7 @@ mod tests {
         assert_eq!(listed(&["a", "b"]), "a, b");
         let info = ProtocolInfo::new(Vec::new());
         let lines = info.lines("experimental features on");
-        assert_eq!(lines[2], "pre-auth features: none");
+        assert_eq!(lines[2], "pre-auth features: spoolframe:invite-lookup");
         assert_eq!(lines[3], "experimental features on: none");
     }
 

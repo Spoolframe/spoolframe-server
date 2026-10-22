@@ -69,7 +69,7 @@ pub(crate) fn reservation(request: &Request) -> usize {
 ///
 /// - sign-ins a stranger makes only with a token from the bucket all
 ///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`,
-///   `RedeemInvite`, `Begin`/`FinishPortableSignIn`,
+///   `RedeemInvite`, `LookupInvite`, `Begin`/`FinishPortableSignIn`,
 ///   `RedeemPortableInvite`, and P7-08's `IdentityRecord`,
 ///   `IdentityRecordByHandle`, `OfferPairing`,
 ///   `FetchPairing` and `AnswerPairing`), which the bucket's
@@ -112,6 +112,7 @@ pub fn on_strangers_budget(request: &Request) -> bool {
             | Request::BeginPasskeySignIn { .. }
             | Request::FinishPasskeySignIn { .. }
             | Request::RedeemInvite(_)
+            | Request::LookupInvite(_)
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)
             | Request::RedeemPortableInvite(_)
@@ -604,6 +605,19 @@ mod tests {
             password: "correct horse".into(),
         });
         let (pool, anonymous) = pools.of(&redeem);
+        assert!(anonymous);
+        assert!(Arc::ptr_eq(pool, &pools.sign_in));
+    }
+
+    /// Looking an invite up is a guess at its code, as redeeming is: held
+    /// in the strangers' sign-in pool too.
+    #[test]
+    fn an_invite_s_lookup_is_held_as_an_anonymous_sign_in() {
+        let pools = Pools::default();
+        let lookup = Request::LookupInvite(spoolframe_protocol::LookupInvite {
+            code: "QW7K-2MFP-XR4T".into(),
+        });
+        let (pool, anonymous) = pools.of(&lookup);
         assert!(anonymous);
         assert!(Arc::ptr_eq(pool, &pools.sign_in));
     }

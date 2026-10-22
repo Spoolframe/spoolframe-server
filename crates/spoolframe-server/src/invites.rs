@@ -10,6 +10,9 @@
 //! some invite has, revoked or not, takes the guess back. Expired or used
 //! up, it was still the right code: telling so helps no one guess.
 //!
+//! Looking a code up before joining ([`look_up`]) is guarded as a
+//! redemption is, on the same count: it is as good a guess.
+//!
 //! Before redeeming, the holder proves the code to the server's relay
 //! with a token (P6-08, [`holder_tier`]), guarded as a redemption is: a
 //! token that matches no live invite is a wrong guess at a code.
@@ -24,8 +27,8 @@ use spoolframe_types::Role;
 use crate::announce::Told;
 use crate::auth::{Auth, PasswordError, hash_password};
 use crate::store::invites::{
-    InviteError, InviteKind, InviteOrigin, InviteRecord, InviteState, NewInvite, PortableRedeemed,
-    Redeemed,
+    InviteError, InviteKind, InviteLookup, InviteOrigin, InviteRecord, InviteState, NewInvite,
+    PortableRedeemed, Redeemed,
 };
 use crate::store::users::{LocalUserId, UserError, display_name, normalize_username};
 use crate::store::{Store, StoreError};
@@ -325,9 +328,7 @@ async fn usable_code(
     typed: &str,
     kind: InviteKind,
 ) -> Result<String, RedeemError> {
-    let guess = auth
-        .guess(format!("invite@{endpoint}"), Some(endpoint.to_owned()))
-        .map_err(|retry_after| RedeemError::RateLimited { retry_after })?;
+    let guess = code_guess(auth, endpoint)?;
     // A code that cannot be one is a wrong one, and stays counted.
     let Some(code) = InviteCode::parse(typed) else {
         return Err(RedeemError::Invalid);
@@ -344,6 +345,35 @@ async fn usable_code(
         InviteState::Usable { kind: found, .. } if found != kind => Err(RedeemError::WrongKind),
         InviteState::Usable { .. } => Ok(hash),
     }
+}
+
+/// A guess at an invite's code from `endpoint`, counted as wrong until
+/// taken back: redemptions and lookups share the one count.
+fn code_guess(auth: &Auth, endpoint: &str) -> Result<crate::auth::Guess, RedeemError> {
+    auth.guess(format!("invite@{endpoint}"), Some(endpoint.to_owned()))
+        .map_err(|retry_after| RedeemError::RateLimited { retry_after })
+}
+
+/// What the invite whose code is `typed` is (`LookupInvite`), for a
+/// device whose guesses are counted as `endpoint`'s. Nothing is used up.
+///
+/// Counted as [`redeem`] counts a code, on the same count: a code no
+/// invite has, or that cannot be one, stays a wrong guess; any other,
+/// revoked, expired or used up, was the right code, and is taken back.
+pub async fn look_up(
+    auth: &Auth,
+    endpoint: &str,
+    typed: &str,
+) -> Result<InviteLookup, RedeemError> {
+    let guess = code_guess(auth, endpoint)?;
+    let Some(code) = InviteCode::parse(typed) else {
+        return Ok(InviteLookup::NoMatch);
+    };
+    let found = auth.store().look_up_invite(&code.hash()).await?;
+    if found != InviteLookup::NoMatch {
+        auth.guessed_right(guess);
+    }
+    Ok(found)
 }
 
 /// Grant `portable` access here with the `portable-account` invite whose

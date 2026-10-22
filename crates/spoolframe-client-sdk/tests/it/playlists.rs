@@ -28,6 +28,7 @@ const ALL: Features = Features {
     playlist_upcoming: true,
     downloads: true,
     music_downloads: true,
+    invite_lookup: true,
 };
 
 /// Alice, signed in on `stub` from an app that lists `features`.

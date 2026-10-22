@@ -377,7 +377,7 @@ These are the only requests served without a session
 | Device approval | `BeginDeviceSignIn { remember }`, `AwaitDeviceSignIn { request }` |
 | App passkey | `BeginPasskeySignIn { username }`, `FinishPasskeySignIn { signed, remember }` |
 | Trusted device | `TrustedProfiles`, `ResumeProfile { user_id }` |
-| Invite | `RedeemInvite`, `RedeemPortableInvite` |
+| Invite | `RedeemInvite`, `RedeemPortableInvite`, `LookupInvite { code }` |
 | Portable credential | `BeginPortableSignIn`, `FinishPortableSignIn` |
 | Portable identity records | `IdentityRecord { user }`, `IdentityRecordByHandle { handle }` |
 | Pairing through a server | `OfferPairing`, `FetchPairing`, `AnswerPairing`, `CollectPairing` |
@@ -804,6 +804,44 @@ in (`rate_limited` once it is spent). A refused redemption is not kept
 as an operation: sent again with the same operation id, it runs again.
 Of two redemptions of an invite's last use, one makes its account and
 the other is `invite_exhausted`. It is never retried on its own on a new
+connection.
+
+### Looking an invite up
+
+Before joining, a device may ask what a code is, for the "Got an invite?"
+screen, without using it up. It needs `spoolframe:invite-lookup` in its
+`Hello`; the answer to `Hello` lists it before any session (`unsupported`
+for a device that did not list it, with nothing counted).
+
+```json
+{"type": "lookup_invite", "code": "qw7k 2mfp xr4t"}
+```
+
+The code is taken as `redeem_invite` takes it. The answer is
+`invite_lookup { outcome }`, one of:
+
+```json
+{"type": "valid", "kind": "create-user", "role": "consumer",
+ "expires_at": 1792003200, "inviter": "Andrey"}
+{"type": "expired", "at": 1792003200}
+{"type": "used"}
+{"type": "revoked"}
+{"type": "no_match"}
+```
+
+`kind` says which redemption takes it (`create-user` or
+`portable-account`); `role` is `consumer` for a `portable-account` one.
+`inviter` is the display name of the admin who made it, `null` when they
+have none or the server's CLI made it: never a username, as the device
+has no session. An outcome a client does not know reads as `unknown`.
+
+`no_match` (no invite has the code, or it cannot be one) is counted as a
+wrong guess, on the same count as redemptions: guessing ends in
+`rate_limited` for lookups and redemptions alike. `revoked`, `expired`
+and `used` were the right code, and are not counted. Unlike a
+redemption, which says `invite_invalid` for both, a lookup tells a
+revoked invite from no invite. It draws on the strangers' sign-in budget
+as a redemption does, and is never retried on its own on a new
 connection.
 
 ### Portable-account invites
@@ -1429,7 +1467,8 @@ server's mask come later.
   lists only those its app said it handles, not every one it knows: an
   app that moves to a newer SDK must not be sent what its code would
   misread.
-- `ServerInfo.features`: only the server's pre-auth features (none yet).
+- `ServerInfo.features`: only the server's pre-auth features
+  (`spoolframe:invite-lookup`).
 - `LoggedIn.features` and `WhoAmI`'s `features`: all of the server's.
   `WhoAmI` carries them for a client holding a session from before, or
   from before the server was upgraded.

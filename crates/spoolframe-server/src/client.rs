@@ -33,9 +33,10 @@ use spoolframe_protocol::{
 };
 use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn, Hello,
-    LoginPassword, PasskeyInfo, PinProof, PinState, PlexLink, PlexSyncSummary, PortableSignIn,
-    RedeemInvite, RedeemPortableInvite, Reply, Request, Response, ServerInfo, SessionId,
-    SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply, is_app_rp_id,
+    InviteLookupOutcome, LoginPassword, LookupInvite, PasskeyInfo, PinProof, PinState, PlexLink,
+    PlexSyncSummary, PortableSignIn, RedeemInvite, RedeemPortableInvite, Reply, Request, Response,
+    ServerInfo, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary,
+    WhoAmIReply, is_app_rp_id,
 };
 use spoolframe_types::{ArtworkId, MediaId, MediaKind, Namespace, SubtitleFormat};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -973,6 +974,15 @@ impl ClientProtocol {
         let Some(hello) = state.hello.get() else {
             return Response::Err(Error::HandshakeRequired);
         };
+        // A pre-auth feature's request from a client that did not list it
+        // is refused before it costs a token of the budget below.
+        if matches!(request, Request::LookupInvite(_))
+            && !features::has(&hello.features, features::INVITE_LOOKUP)
+        {
+            return Response::Err(Error::Unsupported {
+                request: format!("invite lookup without {}", features::INVITE_LOOKUP),
+            });
+        }
         // The sign-ins a stranger makes, and what is guessed only at that
         // rate, draw on the strangers' sign-in budget first (PX-10).
         if crate::operations::on_strangers_budget(&request)
@@ -986,8 +996,7 @@ impl ClientProtocol {
                     request: "subtitle bytes require a resource stream".into(),
                 })
             }
-            // Not served yet: answered as an older server answers it.
-            Request::Unknown | Request::LookupInvite(_) => Err(Error::Unsupported {
+            Request::Unknown => Err(Error::Unsupported {
                 request: name.to_owned(),
             }),
             Request::AuthMethods => Ok(Reply::AuthMethods {
@@ -1145,6 +1154,8 @@ impl ClientProtocol {
                 .map_err(relay_error),
             // P6-01: a sign-in a stranger makes, on the same budget.
             Request::RedeemInvite(redeem) => self.redeem_invite(connection, &redeem, hello).await,
+            // A guess at a code, as a redemption is, on the same budget.
+            Request::LookupInvite(lookup) => self.look_up_invite(connection, &lookup).await,
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
             // serve several users at once (§15).
@@ -4325,6 +4336,22 @@ impl ClientProtocol {
         Ok(self.logged_in(connection, token, false, false).await)
     }
 
+    /// What invite code `lookup` is, from this connection's endpoint: the
+    /// endpoint its wrong codes are counted as, with its redemptions'.
+    async fn look_up_invite(
+        &self,
+        connection: &Connection,
+        lookup: &LookupInvite,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let found = crate::invites::look_up(&self.services.auth, &endpoint_id, &lookup.code)
+            .await
+            .map_err(redeem_error)?;
+        Ok(Reply::InviteLookup {
+            outcome: lookup_outcome(found),
+        })
+    }
+
     /// A sign-in with an app passkey (P3-19) from this connection's
     /// endpoint: a session bound to it, as [`Self::login_password`] opens.
     async fn finish_passkey_sign_in(
@@ -6552,11 +6579,46 @@ fn create_invite_error(e: crate::invites::CreateError) -> Error {
     }
 }
 
+/// A stored invite kind, as the protocol names it.
+fn wire_kind(
+    kind: crate::store::invites::InviteKind,
+) -> spoolframe_protocol::invite_admin::InviteKind {
+    use crate::store::invites::InviteKind as Stored;
+    use spoolframe_protocol::invite_admin::InviteKind as Wire;
+    match kind {
+        Stored::CreateUser => Wire::CreateUser,
+        Stored::PortableAccount => Wire::PortableAccount,
+        Stored::Federation => Wire::Federation,
+    }
+}
+
+/// What a lookup found, for the client.
+fn lookup_outcome(found: crate::store::invites::InviteLookup) -> InviteLookupOutcome {
+    use crate::store::invites::InviteLookup as Found;
+    match found {
+        Found::NoMatch => InviteLookupOutcome::NoMatch,
+        Found::Revoked => InviteLookupOutcome::Revoked,
+        Found::Expired { at } => InviteLookupOutcome::Expired { at },
+        Found::Exhausted => InviteLookupOutcome::Used,
+        Found::Usable {
+            kind,
+            role,
+            expires_at,
+            inviter,
+        } => InviteLookupOutcome::Valid {
+            kind: wire_kind(kind),
+            role,
+            expires_at,
+            inviter,
+        },
+    }
+}
+
 /// An invite as the apps list it (PX-44): who made it by their display
 /// name, and where.
 fn invite_summary(record: crate::store::invites::InviteRecord) -> InviteSummary {
-    use crate::store::invites::{InviteKind as Stored, InviteOrigin as Origin};
-    use spoolframe_protocol::invite_admin::{InviteKind as Wire, InviteOrigin};
+    use crate::store::invites::InviteOrigin as Origin;
+    use spoolframe_protocol::invite_admin::InviteOrigin;
     let created_from = match record.origin {
         Origin::Web => InviteOrigin::WebAdmin,
         Origin::Cli => InviteOrigin::Cli,
@@ -6585,11 +6647,7 @@ fn invite_summary(record: crate::store::invites::InviteRecord) -> InviteSummary 
     };
     InviteSummary {
         id: record.id,
-        kind: match record.kind {
-            Stored::CreateUser => Wire::CreateUser,
-            Stored::PortableAccount => Wire::PortableAccount,
-            Stored::Federation => Wire::Federation,
-        },
+        kind: wire_kind(record.kind),
         note: record.note,
         role: record.role,
         uses: record.uses,

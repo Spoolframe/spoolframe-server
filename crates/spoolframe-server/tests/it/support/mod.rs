@@ -74,6 +74,7 @@ pub async fn sdk_client(
             playlist_upcoming: true,
             downloads: true,
             music_downloads: true,
+            invite_lookup: true,
         },
         ..spoolframe_client_sdk::ClientOptions::default()
     };

@@ -134,11 +134,12 @@ pub const ALL: &[&str] = &[
     PLAYLIST_UPCOMING,
     DOWNLOADS,
     MUSIC_DOWNLOADS,
+    INVITE_LOOKUP,
 ];
 
 /// The ones that change what a client can do before it has a session:
-/// what the answer to `Hello` lists. None yet.
-pub const PRE_AUTH: &[&str] = &[];
+/// what the answer to `Hello` lists.
+pub const PRE_AUTH: &[&str] = &[INVITE_LOOKUP];
 
 /// The most feature names a server keeps of a `Hello`; the rest are
 /// dropped, as each name is cut to `MAX_HELLO_TEXT` characters.
@@ -218,6 +219,14 @@ mod tests {
     fn downloads_is_a_feature_and_not_pre_auth() {
         assert!(ALL.contains(&DOWNLOADS));
         assert!(!PRE_AUTH.contains(&DOWNLOADS));
+    }
+
+    /// A device with no session asks for it, so the answer to `Hello`
+    /// lists it.
+    #[test]
+    fn invite_lookup_is_a_pre_auth_feature() {
+        assert!(ALL.contains(&INVITE_LOOKUP));
+        assert!(PRE_AUTH.contains(&INVITE_LOOKUP));
     }
 
     #[test]

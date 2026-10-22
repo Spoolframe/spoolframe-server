@@ -305,8 +305,8 @@ async fn a_client_initializes_and_lists_the_tools_of_its_scopes_only() {
         lines,
         [
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
-            "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed, spoolframe:playlist-sharing, spoolframe:play-history, spoolframe:playlist-art, spoolframe:subtitle-sync, spoolframe:subtitle-search, spoolframe:playlist-upcoming, spoolframe:downloads, spoolframe:music-downloads",
-            "pre-auth features: none",
+            "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed, spoolframe:playlist-sharing, spoolframe:play-history, spoolframe:playlist-art, spoolframe:subtitle-sync, spoolframe:subtitle-search, spoolframe:playlist-upcoming, spoolframe:downloads, spoolframe:music-downloads, spoolframe:invite-lookup",
+            "pre-auth features: spoolframe:invite-lookup",
             "experimental features on: http-playback",
         ]
     );

@@ -30,8 +30,8 @@
 //! neither field is sent and both calls are [`SdkError::Unsupported`].
 
 use spoolframe_protocol::features::{
-    DOWNLOADS, LAST_VIEWED, LIKED, MUSIC_DOWNLOADS, PLAY_HISTORY, PLAYLIST_ART, PLAYLIST_SHARING,
-    PLAYLIST_UPCOMING, PLAYLISTS, SUBTITLE_SEARCH, SUBTITLE_SYNC,
+    DOWNLOADS, INVITE_LOOKUP, LAST_VIEWED, LIKED, MUSIC_DOWNLOADS, PLAY_HISTORY, PLAYLIST_ART,
+    PLAYLIST_SHARING, PLAYLIST_UPCOMING, PLAYLISTS, SUBTITLE_SEARCH, SUBTITLE_SYNC,
 };
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
@@ -91,6 +91,9 @@ pub struct Features {
     /// from listening, the offline library, and plays and likes made with
     /// no server sent later. Needs `downloads` too.
     pub music_downloads: bool,
+    /// Looking an invite up before joining with it, without using it up.
+    /// Pre-auth: a server says it has it in its answer to `Hello`.
+    pub invite_lookup: bool,
 }
 
 impl Features {
@@ -108,6 +111,7 @@ impl Features {
             (self.playlist_upcoming, PLAYLIST_UPCOMING),
             (self.downloads, DOWNLOADS),
             (self.music_downloads, MUSIC_DOWNLOADS),
+            (self.invite_lookup, INVITE_LOOKUP),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -136,6 +140,7 @@ impl Features {
             playlist_upcoming: self.playlist_upcoming && other.playlist_upcoming,
             downloads: self.downloads && other.downloads,
             music_downloads: self.music_downloads && other.music_downloads,
+            invite_lookup: self.invite_lookup && other.invite_lookup,
         }
         .needing_playlists()
     }
@@ -156,6 +161,7 @@ impl Features {
             playlist_upcoming: has(PLAYLIST_UPCOMING),
             downloads: has(DOWNLOADS),
             music_downloads: has(MUSIC_DOWNLOADS),
+            invite_lookup: has(INVITE_LOOKUP),
         }
         .needing_playlists()
     }
