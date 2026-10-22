@@ -516,6 +516,8 @@ async fn a_file_sent_as_it_is_reads_whole_in_chunks_as_the_film_s_own_bytes() {
         )
     );
     assert_eq!(size, film.len() as u64);
+    // Expected, before it was ready, as the film's own size.
+    assert_eq!(info.expected_size, Some(film.len() as u64));
     server.stop().await;
 }
 
@@ -595,6 +597,12 @@ async fn an_apple_download_of_dts_converts_the_audio_alone_and_only_once() {
             tracks,
         ),
         "{moves:?} then {second_moves:?}"
+    );
+    // Told while it waited for its conversion: the video is kept, so
+    // about the film's own size.
+    assert_eq!(
+        first.expected_size,
+        Some(std::fs::metadata(&server.media).unwrap().len())
     );
     server.stop().await;
 }

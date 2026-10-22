@@ -95,6 +95,14 @@ fn note_read(last: Option<i64>, now: i64) -> bool {
     last.is_none_or(|last| last + READ_NOTED_EVERY.as_secs() as i64 <= now)
 }
 
+/// The bytes of `media`, the file a download is made from.
+async fn media_size(media: &Path) -> Result<u64, DownloadError> {
+    Ok(tokio::fs::metadata(media)
+        .await
+        .map_err(DownloadError::Media)?
+        .len())
+}
+
 /// The directory in the area files are written in: emptied at start.
 pub const MAKING_DIR: &str = "making";
 
@@ -249,6 +257,9 @@ pub struct Prepared {
     /// The tracks the file carries.
     pub carried: Carried,
     pub state: DownloadState,
+    /// About how many bytes the file will be; `None` when its length is
+    /// not known.
+    pub expected_size: Option<u64>,
 }
 
 /// The tracks a download's file carries, by their position in the file's
@@ -468,6 +479,7 @@ struct Asked<'a> {
     container: Container,
     left_out: Vec<(u32, String)>,
     carried: Carried,
+    expected_size: Option<u64>,
 }
 
 /// The request as the database keeps it: the same one is the same id.
@@ -630,6 +642,12 @@ impl Downloads {
             inner.subtitles.ocr(),
         );
         let decision = plan::settled(decision, &ways);
+        // As `DownloadOptions` estimates it, with every track.
+        let expected_size = plan::estimate(
+            descriptor,
+            media_size(request.media).await?,
+            plan::video_rate(descriptor, &decision),
+        );
         let mut left_out = Vec::new();
         let mut written = Vec::new();
         let mut ocr = Vec::new();
@@ -747,6 +765,7 @@ impl Downloads {
                 container: class.container(),
                 left_out,
                 carried,
+                expected_size,
             },
             job,
         )
@@ -764,6 +783,13 @@ impl Downloads {
         let stamp = crate::files::stamp_text(request.media)
             .await
             .map_err(DownloadError::Media)?;
+        let expected_size = music::estimate(
+            request.descriptor,
+            class,
+            request.quality,
+            &planned.decision,
+            media_size(request.media).await?,
+        );
         let mut parts = vec![
             "music-download:1".to_owned(),
             request.media.display().to_string(),
@@ -818,6 +844,7 @@ impl Downloads {
                 container: planned.container,
                 left_out: Vec::new(),
                 carried,
+                expected_size,
             },
             job,
         )
@@ -836,10 +863,7 @@ impl Downloads {
         profiles: &[crate::store::optimized::Profile],
         caps: &ClientCapabilities,
     ) -> Result<Vec<DownloadEstimate>, DownloadError> {
-        let size = tokio::fs::metadata(media)
-            .await
-            .map_err(DownloadError::Media)?
-            .len();
+        let size = media_size(media).await?;
         let stamp = crate::files::stamp_text(media)
             .await
             .map_err(DownloadError::Media)?;
@@ -854,30 +878,29 @@ impl Downloads {
         }
         let mut estimates = Vec::with_capacity(options.len());
         for (source, decision) in options {
-            let (rate, readiness) = match &decision {
-                Decision::AsIs | Decision::Remux => (None, DownloadReadiness::Ready),
+            let readiness = match &decision {
+                Decision::AsIs | Decision::Remux => DownloadReadiness::Ready,
                 Decision::Convert { target, video, .. } => {
-                    let source_rate = descriptor.video.as_ref().and_then(|v| v.bit_rate);
-                    let rate = (!video.copied)
-                        .then(|| video.max_bitrate.or(source_rate))
-                        .flatten();
                     let made = self
                         .inner
                         .store
                         .live_optimized_copy(&media.display().to_string(), target, video)
                         .await?
                         .is_some_and(|c| c.state == CopyState::Ready && c.source_stamp == stamp);
-                    let readiness = if made {
+                    if made {
                         DownloadReadiness::Ready
                     } else {
                         DownloadReadiness::ConvertsFirst
-                    };
-                    (rate, readiness)
+                    }
                 }
             };
             estimates.push(DownloadEstimate {
                 source,
-                size_bytes: plan::estimate(descriptor, size, rate),
+                size_bytes: plan::estimate(
+                    descriptor,
+                    size,
+                    plan::video_rate(descriptor, &decision),
+                ),
                 readiness,
             });
         }
@@ -911,6 +934,7 @@ impl Downloads {
             left_out: asked.left_out,
             carried: asked.carried,
             state,
+            expected_size: asked.expected_size,
         })
     }
 

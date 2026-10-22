@@ -358,6 +358,10 @@ pub(super) fn take(m: &mut Manifest, info: DownloadInfo) {
     if info.file.is_some() {
         m.file = info.file;
     }
+    // Said when it is prepared, not when it is asked about.
+    if info.expected_size.is_some() {
+        m.expected_size = info.expected_size;
+    }
     m.phase = match info.state {
         DownloadState::Ready { size, sha256 } => {
             if m.size != Some(size) || m.sha256.as_deref() != Some(sha256.as_str()) {
@@ -1006,10 +1010,24 @@ mod tests {
         );
     }
 
-    /// The server's cause is the download's.
+    /// The size the server expects when it prepares a download is kept,
+    /// and asking about it later, which does not say, keeps it.
     #[test]
-    fn a_failure_the_server_tells_keeps_its_cause() {
-        let mut m = Store::manifest(
+    fn the_expected_size_said_when_prepared_is_kept() {
+        let mut m = film_manifest();
+        let info = |expected_size| DownloadInfo {
+            id: "ab".repeat(16),
+            state: DownloadState::Waiting,
+            file: None,
+            expected_size,
+        };
+        take(&mut m, info(Some(2_800_000_000)));
+        take(&mut m, info(None));
+        assert_eq!(m.expected_size, Some(2_800_000_000));
+    }
+
+    fn film_manifest() -> Manifest {
+        Store::manifest(
             EntryKind::Film,
             "aa".into(),
             "s".into(),
@@ -1037,7 +1055,13 @@ mod tests {
             DownloadTracks::All,
             LocalWatch::default(),
             1,
-        );
+        )
+    }
+
+    /// The server's cause is the download's.
+    #[test]
+    fn a_failure_the_server_tells_keeps_its_cause() {
+        let mut m = film_manifest();
         take(
             &mut m,
             DownloadInfo {
@@ -1047,6 +1071,7 @@ mod tests {
                     cause: DownloadFailure::SourceMissing,
                 },
                 file: None,
+                expected_size: None,
             },
         );
         assert_eq!(

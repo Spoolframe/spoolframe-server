@@ -291,6 +291,30 @@ pub fn plan(
     })
 }
 
+/// About how many bytes a track's download is, `decision` as [`plan`]
+/// made it for `class` and `quality` of `descriptor`'s file, `size`
+/// bytes: the file's own size when it is kept, remuxed or converted
+/// losslessly (ALAC or FLAC from another lossless codec is about as
+/// large), else the AAC's rate over the track's length. `None` for AAC
+/// when the length is not known.
+pub fn estimate(
+    descriptor: &MediaDescriptor,
+    class: DeviceClass,
+    quality: MusicQuality,
+    decision: &Decision,
+    size: u64,
+) -> Option<u64> {
+    if !matches!(decision, Decision::Convert { .. }) {
+        return Some(size);
+    }
+    let rate = recipe(descriptor, class, quality)?.bitrate;
+    if rate == 0 {
+        return Some(size);
+    }
+    let length = descriptor.duration?;
+    u64::try_from(u128::from(rate) * length.as_millis() / 1000 / 8).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -336,6 +360,31 @@ mod tests {
             Decision::Convert { target, .. } => Some(target),
             _ => None,
         }
+    }
+
+    /// A track's expected size: its file's, kept or converted
+    /// losslessly; AAC 256 at its rate over its 240 s.
+    #[test]
+    fn a_track_s_expected_size_is_its_file_s_or_its_aac_s() {
+        let size = 27_000_000;
+        let expected = |descriptor: &MediaDescriptor, quality| {
+            let planned = plan(descriptor, DeviceClass::Apple, quality).unwrap();
+            estimate(
+                descriptor,
+                DeviceClass::Apple,
+                quality,
+                &planned.decision,
+                size,
+            )
+        };
+        assert_eq!(
+            [
+                expected(&flac(), MusicQuality::Original),
+                expected(&ape(), MusicQuality::Original),
+                expected(&flac(), MusicQuality::Aac256),
+            ],
+            [Some(size), Some(size), Some(256_000 / 8 * 240)]
+        );
     }
 
     #[test]

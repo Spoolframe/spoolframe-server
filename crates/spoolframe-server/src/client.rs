@@ -4074,6 +4074,8 @@ impl ClientProtocol {
                             &status.state,
                             status.class,
                             status.carried,
+                            // Said once, when it is prepared.
+                            None,
                         )),
                         None => gone.push(id),
                     }
@@ -6427,15 +6429,18 @@ fn prepared_info(
         &prepared.state,
         Some(class),
         Some(prepared.carried),
+        prepared.expected_size,
     ))
 }
 
-/// A download on the wire (PX-38).
+/// A download on the wire (PX-38), with the size it is expected to be
+/// when just prepared.
 fn download_info(
     id: String,
     state: &crate::downloads::DownloadState,
     class: Option<crate::downloads::DeviceClass>,
     carried: Option<crate::downloads::Carried>,
+    expected_size: Option<u64>,
 ) -> spoolframe_protocol::downloads::DownloadInfo {
     use spoolframe_protocol::downloads::{DownloadFile, DownloadInfo, FileTracks};
     DownloadInfo {
@@ -6448,6 +6453,7 @@ fn download_info(
                 subtitles: carried.subtitles,
             },
         }),
+        expected_size,
     }
 }
 

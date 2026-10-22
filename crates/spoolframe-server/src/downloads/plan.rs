@@ -282,6 +282,19 @@ pub fn original(
     })
 }
 
+/// The rate (bits/s) `decision` converts `descriptor`'s video to, for
+/// [`estimate`]: `None` when the video is kept, and when it is converted
+/// at a rate neither the copy nor the file says.
+pub fn video_rate(descriptor: &MediaDescriptor, decision: &Decision) -> Option<u64> {
+    let Decision::Convert { video, .. } = decision else {
+        return None;
+    };
+    let source_rate = descriptor.video.as_ref().and_then(|v| v.bit_rate);
+    (!video.copied)
+        .then(|| video.max_bitrate.or(source_rate))
+        .flatten()
+}
+
 /// About how many bytes a download of `descriptor`'s file, `size` bytes,
 /// is with every track: its own size when its video is kept
 /// (`video_rate` `None`), else the video at `video_rate` (bits/s, at

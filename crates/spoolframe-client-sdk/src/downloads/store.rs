@@ -177,6 +177,10 @@ pub(crate) struct Manifest {
     pub id: Option<String>,
     pub file: Option<DownloadFile>,
     pub size: Option<u64>,
+    /// About how large the file will be, as the server said when it was
+    /// prepared.
+    #[serde(default)]
+    pub expected_size: Option<u64>,
     pub sha256: Option<String>,
     /// How much of `media.part` is known to be on disk (synced).
     pub offset: u64,
@@ -548,6 +552,7 @@ impl Store {
             id: None,
             file: None,
             size: None,
+            expected_size: None,
             sha256: None,
             offset: 0,
             phase: DownloadPhase::Preparing {
@@ -1389,6 +1394,20 @@ mod tests {
                 cause: spoolframe_protocol::downloads::DownloadFailure::Other,
             })
         );
+    }
+
+    /// A manifest written before the expected size was kept still loads,
+    /// with none.
+    #[test]
+    fn a_manifest_without_an_expected_size_loads_with_none() {
+        let store = store("old-expected");
+        let mut m = manifest("ab12", 1);
+        m.expected_size = Some(5);
+        let mut json = serde_json::to_value(&m).unwrap();
+        json.as_object_mut().unwrap().remove("expected_size");
+        std::fs::create_dir_all(store.dir(&m)).unwrap();
+        std::fs::write(store.dir(&m).join(MANIFEST), json.to_string()).unwrap();
+        assert_eq!(store.find("ab12").map(|m| m.expected_size), Some(None));
     }
 
     /// A newer build's entry (a kind this one does not know, or a later

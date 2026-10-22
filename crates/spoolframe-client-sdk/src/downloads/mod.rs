@@ -208,6 +208,10 @@ pub struct LocalDownload {
     pub received: u64,
     /// The file's size, once the server has it ready.
     pub size: Option<u64>,
+    /// About how large the file will be, as the server said when it was
+    /// prepared: to show before `size` is known ("Waiting for Wi-Fi ·
+    /// 2.8 GB"). `None` from a server that does not say, or cannot tell.
+    pub expected_size: Option<u64>,
     /// The file, once [`DownloadPhase::Done`].
     pub file_path: Option<PathBuf>,
     /// `file_path` as a `file://` URL, for GStreamer's `uri` and
@@ -974,6 +978,7 @@ impl Shared {
             phase: m.phase.clone(),
             received,
             size: m.size,
+            expected_size: m.expected_size,
             file_path,
             file_url,
             watch: m.watch_of(&self.acting(m)),

@@ -2237,7 +2237,12 @@ item, source and tracks gets the same `id`, ready at once when its file
 is; two users' same request share one file. `file` is `{ container,
 tracks: { audio, subtitles } }`: `matroska` or `mp4`, and the tracks the
 file carries, by place, in the file's order after its video (a subtitle
-left out is not there).
+left out is not there). `expected_size`, in `PrepareDownload`'s reply
+alone, is about how many bytes the file will be, to show while it waits:
+a film's or an episode's as `DownloadOptions`' estimate of its source
+says, a track's its file's size, or the AAC rate over its length. It is
+left out when the server cannot tell, in `DownloadStatus`' replies, and
+by a server before it; `ready`'s `size` is the exact one.
 
 What the device cannot play is converted in the server's copy pool,
 which runs for downloads even with optimized versions off, and is kept

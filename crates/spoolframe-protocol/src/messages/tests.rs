@@ -3662,7 +3662,23 @@ mod downloads {
                     subtitles: vec![0, 1],
                 },
             }),
+            expected_size: Some(5_700_000_000),
         }
+    }
+
+    /// A server before the expected size was sent: the download still
+    /// decodes, with none.
+    #[test]
+    fn a_download_without_an_expected_size_decodes_with_none() {
+        let old = serde_json::json!({
+            "id": "ab".repeat(16),
+            "state": {"type": "waiting"},
+            "file": null,
+        });
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        let info: DownloadInfo = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(info.expected_size, None);
     }
 
     #[test]
@@ -3709,6 +3725,7 @@ mod downloads {
                             eta_secs: Some(90),
                         },
                         file: None,
+                        expected_size: None,
                     },
                 ],
                 gone: vec!["01".repeat(16)],

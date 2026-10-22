@@ -176,6 +176,21 @@ fn container(info: &DownloadInfo) -> Option<Container> {
     info.file.as_ref().map(|f| f.container)
 }
 
+/// Prepared, a track says about how large it will be before it is
+/// ready: a FLAC sent as it is, its file's size.
+#[tokio::test]
+async fn a_prepared_track_says_its_expected_size() {
+    let server = server("music-expected-size", ServerOptions::default()).await;
+    write_flac(&server, "32");
+    let (laptop, session) = device(&server, Platform::Linux, "alice").await;
+    let info = prepared(&laptop, &session, "32", DownloadSource::Original).await;
+    assert_eq!(
+        info.expected_size,
+        Some(std::fs::metadata(track_file(&server, "32")).unwrap().len())
+    );
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_flac_is_sent_byte_identical_to_linux_and_to_apple() {
     let server = server("music-flac-as-is", ServerOptions::default()).await;
