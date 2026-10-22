@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod downloads;
+pub mod federation;
 pub mod grants;
 pub mod identities;
 pub mod invites;

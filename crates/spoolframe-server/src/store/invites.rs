@@ -242,12 +242,10 @@ fn record(row: &sqlx::sqlite::SqliteRow) -> Result<InviteRecord, sqlx::Error> {
 }
 
 impl Store {
-    /// Keep a new invite. A `federation` one is refused before anything
-    /// is written ([`InviteError::NotYet`]): P8 makes it.
+    /// Keep a new invite. Whether its kind may be made here is the
+    /// caller's ([`crate::invites::create`]): a `federation` one only while
+    /// `experimental.federation` is on (P8-01).
     pub async fn create_invite(&self, invite: NewInvite<'_>) -> Result<InviteRecord, InviteError> {
-        if invite.kind == InviteKind::Federation {
-            return Err(InviteError::NotYet(invite.kind));
-        }
         let now = self.now();
         let id = Uuid::now_v7().hyphenated().to_string();
         let (endpoint_id, device_name, platform) = match invite.origin {
@@ -529,7 +527,7 @@ impl Store {
 /// Where the invite whose code hashes to `capability_hash` stands at
 /// `now`, read on `conn`. A revoked one is [`InviteState::Invalid`], as
 /// no invite is.
-async fn state(
+pub(super) async fn state(
     conn: &mut sqlx::SqliteConnection,
     capability_hash: &str,
     now: i64,
@@ -757,26 +755,31 @@ mod tests {
         assert_eq!(store.live_invites().await.unwrap()[0].uses_left, 1);
     }
 
-    /// Federation is known and refused: nothing is kept, so nothing can
-    /// be half-redeemed or quietly made another kind of invite.
+    /// P8-01: a `federation` invite is kept as any other (whether one may
+    /// be made is `crate::invites::create`'s), redeemed only by pairing.
     #[tokio::test]
-    async fn federation_invites_are_refused_and_nothing_is_kept() {
+    async fn a_federation_invite_is_kept_and_makes_no_user() {
         let store = test_store("invite-kinds").await;
-        let refused = store
+        store
             .create_invite(NewInvite {
                 kind: InviteKind::Federation,
                 ..new_invite(&store, "h1", 1)
             })
-            .await;
-        assert!(
-            matches!(refused, Err(InviteError::NotYet(InviteKind::Federation))),
-            "{refused:?}"
-        );
-        assert!(store.live_invites().await.unwrap().is_empty());
+            .await
+            .unwrap();
         assert_eq!(
-            store.invite_state("h1").await.unwrap(),
-            InviteState::Invalid
+            store.live_invites().await.unwrap()[0].kind,
+            InviteKind::Federation
         );
+        assert_eq!(
+            redeem(&store, "h1", "anna").await,
+            Redeemed::Refused(InviteState::Usable {
+                kind: InviteKind::Federation,
+                role: Role::Consumer
+            })
+        );
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        assert_eq!(store.live_invites().await.unwrap()[0].uses_left, 1);
     }
 
     async fn portable_store(test: &str, uses: u32) -> TestStore {
