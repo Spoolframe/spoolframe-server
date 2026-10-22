@@ -96,6 +96,9 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# The tests post forms (OAuth, the fake identity provider); the server
+# itself sends none.
+reqwest = { workspace = true, features = ["form"] }
 # Itself, with the stand-ins the integration tests share with the unit tests.
 spoolframe-server = { path = ".", features = ["test-support"] }
 # The stand-in OTLP collector (P3-14).

@@ -342,6 +342,45 @@ struct Flow {
 }
 
 /// The server's SSO: its providers, and the flows in progress.
+/// openidconnect's HTTP client, over reqwest 0.13: oauth2 5.0 (the latest,
+/// under openidconnect 4.0.1) supports only reqwest 0.12 itself. Each
+/// request is sent as it is; the client follows no redirect.
+struct ProviderHttp(reqwest::Client);
+
+/// Why [`ProviderHttp`] got no response.
+#[derive(Debug, thiserror::Error)]
+enum ProviderHttpError {
+    #[error(transparent)]
+    Send(#[from] reqwest::Error),
+    #[error("the response cannot be read: {0}")]
+    Response(#[from] openidconnect::http::Error),
+}
+
+impl<'c> openidconnect::AsyncHttpClient<'c> for ProviderHttp {
+    type Error = ProviderHttpError;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<openidconnect::HttpResponse, ProviderHttpError>>
+                + Send
+                + Sync
+                + 'c,
+        >,
+    >;
+
+    fn call(&'c self, request: openidconnect::HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let response = self.0.execute(request.try_into()?).await?;
+            let mut built = openidconnect::http::Response::builder()
+                .status(response.status())
+                .version(response.version());
+            for (name, value) in response.headers() {
+                built = built.header(name, value);
+            }
+            Ok(built.body(response.bytes().await?.to_vec())?)
+        })
+    }
+}
+
 pub struct Oidc {
     providers: RwLock<Vec<Provider>>,
     /// `admin.public_url` + [`CALLBACK`]; `None` without a public URL,
@@ -349,7 +388,7 @@ pub struct Oidc {
     redirect: Option<RedirectUrl>,
     /// Where secrets set in the web UI are; `None` in tests without.
     secrets: Option<Secrets>,
-    http: reqwest::Client,
+    http: ProviderHttp,
     flows: Mutex<HashMap<String, Flow>>,
     lifetime: Duration,
     /// Each issuer's discovery document, and when it was fetched.
@@ -412,6 +451,7 @@ impl Oidc {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(PROVIDER_TIMEOUT)
             .build()
+            .map(ProviderHttp)
             .expect("a client with no TLS roots of its own builds");
         Self {
             providers: RwLock::default(),

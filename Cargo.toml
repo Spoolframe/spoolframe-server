@@ -130,7 +130,7 @@ base64 = "0.22"
 # SSO (P3-04): the OpenID Connect client, which checks ID tokens itself
 # (issuer, audience, expiry, nonce, signature from the provider's keys).
 # Its own reqwest feature, on the reqwest 0.12 the server already has.
-openidconnect = { version = "4", default-features = false, features = ["reqwest"] }
+openidconnect = { version = "4", default-features = false }
 # The stand-in provider's ID token times, in tests (openidconnect's own).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # The software authenticator the passkey tests sign with.
@@ -172,7 +172,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # probe install aws-lc-rs first thing (`rustls` above), so ring is linked
 # but never chosen. Its `-no-provider` features would drop ring, but then
 # every client built before that install, in a test say, panics.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 url = "2"
 wiremock = "0.6"
 # Checks the HLS playlists the server writes (P2-05), in tests.
@@ -230,18 +230,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # gRPC's TLS is aws-lc-rs (`tls-aws-lc`). Not `tls-webpki-roots`: it turns
 # on `tls`, which is tonic's ring; the server's tonic takes the webpki
 # roots itself (spoolframe-server's Cargo.toml).
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_periodicreader_with_async_runtime"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-client", "trace", "metrics", "logs", "tls-aws-lc"] }
-tracing-opentelemetry = { version = "0.32", default-features = false }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_periodicreader_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-client", "trace", "metrics", "logs", "tls-aws-lc"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 # `experimental_use_tracing_span_context`: a log record carries the trace
 # and span it was logged in, read from tracing-opentelemetry's span data,
 # as a span carries no log lines (the server's `telemetry::Spans`).
-opentelemetry-appender-tracing = { version = "0.31", default-features = false, features = ["experimental_use_tracing_span_context"] }
+opentelemetry-appender-tracing = { version = "0.33", default-features = false }
 # The headers sent to a gRPC collector, and the test collector's server.
 tonic = { version = "0.14", default-features = false }
 # The test collector decodes what arrives.
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"] }
 prost = "0.14"
 
 # The client wire encoding (spoolframe-protocol): self-describing, so peers

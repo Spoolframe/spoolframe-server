@@ -12,6 +12,13 @@
   `extract`, which the server never calls: it reads a subtitle archive's
   entries itself). An archive entry whose name is not UTF-8 is now a bad
   archive.
+- OpenTelemetry 0.33 (tracing-opentelemetry 0.34) and reqwest 0.13.
+  Exported traces, metrics and logs are unchanged, and log records still
+  carry their span's trace and span ids. reqwest 0.13 checks
+  certificates with the system's roots: the Docker image's
+  (`SSL_CERT_FILE`) or the host's. Sign-in providers (OpenID Connect)
+  are reached through the same reqwest, so reqwest 0.12 is out of the
+  build.
 
 ## 0.14.2 (2026-10-21)
 
