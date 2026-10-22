@@ -16,17 +16,25 @@ pub enum Group {
     Spoolframe,
     /// Every other crate the server or the web app is built from.
     Crates,
+    /// The programs the server runs, as its image ships them.
+    Programs,
     /// What the web app carries into the browser besides crates.
     Browser,
 }
 
 impl Group {
-    pub const ALL: [Group; 3] = [Group::Spoolframe, Group::Crates, Group::Browser];
+    pub const ALL: [Group; 4] = [
+        Group::Spoolframe,
+        Group::Crates,
+        Group::Programs,
+        Group::Browser,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Group::Spoolframe => "Spoolframe",
             Group::Crates => "Crates",
+            Group::Programs => "Run by the server",
             Group::Browser => "In your browser",
         }
     }
@@ -35,8 +43,18 @@ impl Group {
         match self {
             Group::Spoolframe => "The server's and the web app's own crates.",
             Group::Crates => "The Rust crates the server and the web app are built from.",
+            Group::Programs => {
+                "The server runs FFmpeg (with libplacebo built in) and Tesseract as separate \
+                 programs; none of them is linked into the server."
+            }
             Group::Browser => "The web app's palette, icons, fonts and stylesheet.",
         }
+    }
+
+    /// Whether its table says where each one ships: not for a group that
+    /// is all in one place.
+    pub fn shows_ships(self) -> bool {
+        matches!(self, Group::Spoolframe | Group::Crates)
     }
 }
 
@@ -223,8 +241,9 @@ pub fn summary(count: usize) -> String {
         "components"
     };
     format!(
-        "{count} {noun} the server and this web app are built from, each with its license. \
-         The list is made from Spoolframe's Cargo.lock and the web app's assets."
+        "{count} {noun} the server and this web app are built from or run, each with its \
+         license. The list is made from Spoolframe's Cargo.lock, the web app's assets and the \
+         programs the server's image ships."
     )
 }
 
@@ -818,6 +837,34 @@ mod tests {
                 "AGPL-3.0-or-later",
                 env!("CARGO_PKG_VERSION")
             ))
+        );
+    }
+
+    #[test]
+    fn only_the_crate_groups_say_where_each_ships() {
+        let shown: Vec<Group> = Group::ALL.into_iter().filter(|g| g.shows_ships()).collect();
+        assert_eq!(shown, [Group::Spoolframe, Group::Crates]);
+    }
+
+    /// The programs the server image runs, under their licenses as built:
+    /// nixpkgs' FFmpeg is configured with --enable-gpl and
+    /// --enable-version3.
+    #[test]
+    fn the_committed_list_names_what_the_server_runs() {
+        let licenses = committed();
+        let found: Vec<(&str, &str, Vec<Ship>)> = licenses
+            .components()
+            .iter()
+            .filter(|c| c.group == Group::Programs)
+            .map(|c| (c.name.as_str(), c.license.as_str(), c.ships.clone()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("FFmpeg", "GPL-3.0-or-later", vec![Ship::Server]),
+                ("Tesseract", "Apache-2.0", vec![Ship::Server]),
+                ("libplacebo", "LGPL-2.1-or-later", vec![Ship::Server]),
+            ]
         );
     }
 

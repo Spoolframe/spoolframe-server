@@ -27,13 +27,18 @@ What is listed is what the server ships:
   build copies in from nixpkgs (their name tables, SPOOLFRAME_WEB_FONTS)
   and Tailwind, whose output is the stylesheet.
 
-ffmpeg, tesseract and the C libraries the server links from the host
-(OpenSSL, libucl) are not listed: Nix and the distributions that ship
-them carry their notices.
+- The programs the server runs (programs): FFmpeg, built with libplacebo
+  (nix/ffmpeg.nix), and Tesseract (nix/package.nix), as nixpkgs builds
+  them at the revision flake.lock pins. They run as separate programs,
+  not linked into the server; they are listed because the server's image
+  ships them.
+
+The C libraries the server links from the host (OpenSSL, libucl) are not
+listed: Nix and the distributions that ship them carry their notices.
 
 Groups: this workspace's crates are "spoolframe", every other crate is
-"crates", and the fixed entries are "browser". A crate's `ships` names
-where it is: "server", "web" or both.
+"crates", the programs "programs", and the web app's fixed entries
+"browser". A crate's `ships` names where it is: "server", "web" or both.
 
 Texts: each crate's own license files, matched to the SPDX ids of its
 license expression by their wording. An id with no file of its own gets
@@ -82,6 +87,25 @@ FONT_BUILDS = [os.path.join(ROOT, "devenv.nix"), os.path.join(ROOT, "nix", "pack
 # When the committed stylesheet's banner names another, --check fails until
 # the file is looked at again.
 TAILWIND = "4.3.3"
+
+# The programs the server runs, as read in nixpkgs at PROGRAMS_NIXPKGS, the
+# revision flake.lock pinned then: name, version, SPDX id as built, and the
+# copyright line the program itself prints. --check fails when flake.lock
+# pins another nixpkgs, until they are read again there and this is
+# updated.
+#
+# FFmpeg: pkgs/development/libraries/ffmpeg/generic.nix defaults withGPL
+# and withVersion3 to true, so ffmpeg-headless is configured with
+# --enable-gpl and --enable-version3 (and x264, x265, xvid, vid.stab):
+# GPL-3.0-or-later as built, which its meta.license lists and the built
+# `ffmpeg -L` says. libplacebo (pkgs/by-name/li/libplacebo, what FFmpeg
+# 6.1 and later take) is lgpl21Plus. Tesseract (tesseract5.nix) is asl20.
+PROGRAMS_NIXPKGS = "b6c8664de9b6cc07fe5666a29f91884ba81197c4"
+PROGRAMS = [
+    ("FFmpeg", "9.0.1", "GPL-3.0-or-later", ["Copyright (c) 2000-2026 the FFmpeg developers"]),
+    ("libplacebo", "7.360.1", "LGPL-2.1-or-later", []),
+    ("Tesseract", "5.5.3", "Apache-2.0", []),
+]
 
 # A license file's id, by its wording. The first that matches wins, so the
 # more specific come first.
@@ -378,6 +402,29 @@ def fixed_components(text_id):
     return out
 
 
+def programs(text_id):
+    """FFmpeg, libplacebo and Tesseract: what the server runs, as nixpkgs
+    builds them. --check fails when the nixpkgs flake.lock pins, or the
+    way the build takes them, is no longer what PROGRAMS was read from."""
+    with open(os.path.join(ROOT, "flake.lock"), encoding="utf-8") as f:
+        lock = json.load(f)
+    node = lock["nodes"]["root"]["inputs"]["nixpkgs"]
+    pinned = lock["nodes"][node]["locked"].get("rev")
+    if pinned != PROGRAMS_NIXPKGS:
+        sys.exit(f"gen-licenses: flake.lock pins nixpkgs {pinned}, PROGRAMS was read at "
+                 f"{PROGRAMS_NIXPKGS}: check FFmpeg's, libplacebo's and Tesseract's versions and "
+                 "licenses there (ffmpeg's configure flags too) and update PROGRAMS_NIXPKGS")
+    ffmpeg = read(os.path.join(ROOT, "nix", "ffmpeg.nix"))
+    if "ffmpeg-headless.override {withPlacebo = true;}" not in ffmpeg:
+        sys.exit("gen-licenses: nix/ffmpeg.nix no longer builds ffmpeg-headless with libplacebo: "
+                 "update PROGRAMS")
+    if "tesseract.override" not in read(os.path.join(ROOT, "nix", "package.nix")):
+        sys.exit("gen-licenses: nix/package.nix no longer runs nixpkgs' tesseract: update PROGRAMS")
+    return [{"name": name, "version": version, "group": "programs", "ships": ["server"],
+             "license": spdx, "copyright": lines, "texts": {spdx: text_id(standard(spdx))}}
+            for name, version, spdx, lines in PROGRAMS]
+
+
 def generate():
     metadata = json.loads(cargo("metadata", "--locked", "--all-features", "--format-version", "1"))
     workspace = set(metadata["workspace_members"])
@@ -417,6 +464,7 @@ def generate():
         })
 
     components.extend(fixed_components(text_id))
+    components.extend(programs(text_id))
 
     data = {"components": components, "texts": texts}
     # One entry a line, so a change in Cargo.lock reads as a small diff.

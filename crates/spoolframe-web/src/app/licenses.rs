@@ -12,7 +12,7 @@ use gloo_net::http::Request;
 
 use super::admin::CopyButton;
 use super::{Alert, Route, icons};
-use crate::licenses::{Chip, Component, Group, Licenses, choice_note, choices, summary};
+use crate::licenses::{Chip, Component, Licenses, choice_note, choices, summary};
 use crate::logic::ApiError;
 
 const LIST: Asset = asset!("/assets/licenses.json");
@@ -130,7 +130,7 @@ pub fn LicensesPage(open: String) -> Element {
                                     th { "Name" }
                                     th { class: "max-md:hidden", "Version" }
                                     th { "License" }
-                                    if group != Group::Browser {
+                                    if group.shows_ships() {
                                         th { class: "max-md:hidden", "Ships in" }
                                     }
                                 }
@@ -146,7 +146,7 @@ pub fn LicensesPage(open: String) -> Element {
                                                 }
                                                 td { class: "quiet mono max-md:hidden", "{c.version}" }
                                                 td { class: "quiet", "{c.license}" }
-                                                if group != Group::Browser {
+                                                if group.shows_ships() {
                                                     td { class: "quiet whitespace-nowrap max-md:hidden", "{c.ships_line()}" }
                                                 }
                                             }
