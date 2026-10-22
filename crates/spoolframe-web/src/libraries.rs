@@ -346,7 +346,7 @@ pub fn plex_choices(found: &[DiscoveredPlex], account: &[PlexAccountServer]) -> 
 
 /// What a choice says under its name: "Found on this network ·
 /// 192.168.1.10:32400 · Plex Media Server 1.41", or "From your Plex
-/// account · <address>", without an address too long to say for a remote
+/// account · \<address\>", without an address too long to say for a remote
 /// one (the remote note says the rest).
 pub fn choice_line(choice: &PlexChoice) -> String {
     let host_port = crate::logic::host_port(&choice.url);

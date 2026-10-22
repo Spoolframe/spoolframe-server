@@ -208,7 +208,7 @@ pub fn setup_without_passkeys(
 }
 
 /// What a passkey is called in a list: its name, or, for one made in a
-/// Spoolframe app (P3-19), "Spoolframe app · <name>", its name being the
+/// Spoolframe app (P3-19), "Spoolframe app · \<name\>", its name being the
 /// device's.
 pub fn passkey_title(passkey: &PasskeyEntry) -> String {
     if passkey.app {

@@ -82,7 +82,7 @@ fn pages_of(extradata: &[u8]) -> Option<(u16, u16)> {
 }
 
 /// The cues of a track's packets, in order, of the page `extradata` names
-/// ([`pages_of`]). A track that decodes to more than `budget` is an
+/// (`pages_of`). A track that decodes to more than `budget` is an
 /// error.
 pub fn cues_within(
     packets: &[Packet],

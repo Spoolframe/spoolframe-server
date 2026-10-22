@@ -1155,7 +1155,7 @@ impl Session {
 
     /// Keep the passkey the platform made for it, named for this device
     /// (`made.name`, 1 to 64 characters, or [`SdkError::InvalidInput`]).
-    /// The user's profile shows it as "Spoolframe app · <name>". One that
+    /// The user's profile shows it as "Spoolframe app · \<name\>". One that
     /// does not verify, or a registration that is over, is
     /// [`SdkError::InvalidCredentials`]: begin again.
     pub async fn finish_passkey_registration(

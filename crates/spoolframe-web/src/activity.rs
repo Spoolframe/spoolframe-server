@@ -177,7 +177,7 @@ pub fn memory_rows(memory: &MemoryParts) -> Vec<(String, String)> {
     rows
 }
 
-/// The Connections card's users: "Sessions · <username>" and how many,
+/// The Connections card's users: "Sessions · \<username\>" and how many,
 /// the most first.
 pub fn session_rows(sessions: &[UserSessionCount]) -> Vec<(String, u64)> {
     let mut rows: Vec<(String, u64)> = sessions

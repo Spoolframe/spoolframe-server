@@ -3,7 +3,7 @@
 //! are on this host, and a check of every file in a library (P1-04).
 //!
 //! Read-only. A catalog that has an admin's look at it implements
-//! [`Inspect`] as well as [`Catalog`]; the admin pages read through it, so
+//! [`Inspect`] as well as [`Catalog`](crate::Catalog); the admin pages read through it, so
 //! they work for Plex libraries now and native ones later (P9).
 
 use std::path::PathBuf;

@@ -28,7 +28,7 @@ use crate::sandbox::{Command, Jail, Limits, Tool};
 /// and progress moves.
 const CHUNK: usize = 40;
 
-/// The longest one tesseract run over a [`CHUNK`] of cues may take
+/// The longest one tesseract run over a `CHUNK` of cues may take
 /// (PX-09 B-3): seconds is usual.
 pub const OCR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 

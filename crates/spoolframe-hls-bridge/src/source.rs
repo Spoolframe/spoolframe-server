@@ -103,7 +103,7 @@ pub trait Segment: Send + Sized + 'static {
     fn complete(&self) -> bool;
     fn epoch(&self) -> u32;
     /// The next piece, as much as arrived; `None` once all `sent()` bytes
-    /// did. [`Error::PlaybackResumed`] or [`Error::PlaybackRestarted`] if
+    /// did. [`Error::Resumed`](crate::Error::Resumed) or [`Error::Restarted`](crate::Error::Restarted) if
     /// the encode was replaced since it opened; any other error part-way,
     /// read on with [`Self::reopen`].
     fn next(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send;

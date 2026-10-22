@@ -149,7 +149,7 @@ pub struct InviteSummary {
 
 impl Session {
     /// Make an invite as the web UI's Invites page does. An admin's only,
-    /// after a recent confirmation (see the [module docs](self)).
+    /// after a recent confirmation ([`Session::confirm_password`]).
     /// [`SdkError::InvalidInput`] for a field out of its limits, and for a
     /// federation invite until P8 builds them.
     pub async fn create_invite(&self, spec: InviteSpec) -> Result<MintedInvite, SdkError> {

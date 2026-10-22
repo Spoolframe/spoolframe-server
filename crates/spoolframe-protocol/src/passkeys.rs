@@ -63,7 +63,7 @@ const CHALLENGE_TAG: &[u8] = b"spoolframe/app-passkey-challenge/1";
 
 /// The WebAuthn challenge for an app passkey ceremony with the server
 /// whose endpoint id is `server`, from the `nonce` it sent: SHA-256 of
-/// [`CHALLENGE_TAG`], the 32 bytes of the id, then the nonce. The tag and
+/// `CHALLENGE_TAG`, the 32 bytes of the id, then the nonce. The tag and
 /// the id are of fixed length, so nothing else hashes the same.
 pub fn app_passkey_challenge(server: &[u8; 32], nonce: &[u8]) -> Vec<u8> {
     Sha256::new()
@@ -182,7 +182,7 @@ pub struct FinishPasskeyRegistration {
     #[serde(with = "serde_bytes")]
     pub client_data_json: Vec<u8>,
     /// What the device calls itself; the user's profile shows the passkey
-    /// as "Spoolframe app · <name>". 1 to 64 characters.
+    /// as "Spoolframe app · \<name\>". 1 to 64 characters.
     pub name: String,
 }
 
@@ -234,7 +234,7 @@ pub struct PasskeyInfo {
     /// passkey, that of the `credential_id` bytes the platform gave.
     pub id: String,
     /// What its user called it; an app passkey's is the device's (the web
-    /// UI shows it as "Spoolframe app · <name>").
+    /// UI shows it as "Spoolframe app · \<name\>").
     pub name: String,
     /// Unix seconds.
     pub created_at: i64,

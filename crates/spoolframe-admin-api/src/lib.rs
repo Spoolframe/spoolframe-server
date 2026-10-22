@@ -819,7 +819,7 @@ pub struct PasskeyEntry {
     /// added again in the app.
     pub usable: bool,
     /// Made in a Spoolframe app (P3-19), and of use in the apps only: shown
-    /// as "Spoolframe app · <name>", where its name is the device's.
+    /// as "Spoolframe app · \<name\>", where its name is the device's.
     pub app: bool,
 }
 
@@ -3490,7 +3490,7 @@ pub trait MeApi {
     async fn confirm_password(&self, password: String) -> jsonrpsee::core::RpcResult<()>;
 
     /// The device showing sign-in code `code` (P3-07), typed in any case,
-    /// with or without its dash, to ask "Sign in on '<device>'?" before
+    /// with or without its dash, to ask "Sign in on '\<device\>'?" before
     /// approving it. A code that is not pending is `NO_SUCH_SIGN_IN_CODE`,
     /// and such codes are limited as failed logins are (`RATE_LIMITED`).
     #[method(name = "deviceSignInLookup", with_extensions)]
