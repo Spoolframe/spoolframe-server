@@ -65,6 +65,9 @@ struct State {
     all_features: AtomicBool,
     /// Names `LoggedIn` and `WhoAmI` list after those.
     more_features: Mutex<Vec<String>>,
+    /// `ServerInfo` says accounts are made without an invite, as no
+    /// server does yet.
+    open_sign_up: AtomicBool,
 }
 
 pub struct Stub {
@@ -255,6 +258,11 @@ impl Stub {
     /// Say `url` is the server's web UI from now on.
     pub fn web_url(&self, url: &str) {
         *self.state.web_url.lock() = Some(url.to_owned());
+    }
+
+    /// Say in `ServerInfo` that it is not invite-only.
+    pub fn open_sign_up(&self) {
+        self.state.open_sign_up.store(true, Ordering::SeqCst);
     }
 
     pub fn body(&self, announced: u64, bytes: &[u8]) {
@@ -541,7 +549,7 @@ fn answer(
             web_url,
             experimental: Vec::new(),
             features: Vec::new(),
-            invite_only: true,
+            invite_only: !state.open_sign_up.load(Ordering::SeqCst),
         }),
         Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
             request: "stub-request".into(),

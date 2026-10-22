@@ -577,3 +577,67 @@ async fn with_remote_access_on_and_no_internet_the_lan_still_works() {
     client.close().await;
     server.stop().await;
 }
+
+/// "Find a server on my network": the servers heard here, saved or not,
+/// and for each row what its Hello says, with nothing saved by asking.
+/// A saved server that is not heard is not on the network.
+#[tokio::test]
+async fn a_server_on_the_network_says_who_it_is_before_sign_in() {
+    if !private_lan("a_server_on_the_network_says_who_it_is_before_sign_in") {
+        return;
+    }
+    let heard_here = TestServer::start_with(fresh_dir("lan-info").await, on_lan("Den")).await;
+    // Saved, and reached at an address it was given, but never on the air.
+    let elsewhere = TestServer::start_with(
+        fresh_dir("lan-info-away").await,
+        ServerOptions {
+            name: "Cabin".into(),
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let away = elsewhere.server.id().to_string();
+    let client = open(&Arc::new(MemoryStorage::default())).await;
+    client
+        .add_address(&away, elsewhere.server.addr().ip_addrs().copied().collect())
+        .unwrap();
+    client.connect(&away).await.unwrap();
+    client.pin(&away, true).await.unwrap();
+
+    let id = heard_here.server.id().to_string();
+    entry(&client, &heard_here, |e| e.on_network).await;
+    let on_network: Vec<String> = client
+        .lan_servers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.endpoint_id)
+        .collect();
+    assert!(on_network.contains(&id), "{on_network:?}");
+    assert!(!on_network.contains(&away), "{on_network:?}");
+    assert!(listed_of(&client, &[&away]).await.contains(&away));
+
+    let info = client.lan_server_info(&id).await.unwrap();
+    assert_eq!(info.endpoint_id, id);
+    assert_eq!(info.name, "Den");
+    assert_eq!(
+        Some(info.fingerprint.clone()),
+        spoolframe_protocol::fingerprint::of_hex(&id)
+    );
+    assert_eq!(info.server_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.protocol_version, spoolframe_protocol::PROTOCOL_VERSION);
+    assert!(info.invite_only);
+    let row = client
+        .lan_servers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.endpoint_id == id)
+        .unwrap();
+    assert!(!row.pinned, "{row:?}");
+    assert_eq!(row.fingerprint, info.fingerprint);
+
+    client.close().await;
+    elsewhere.stop().await;
+    heard_here.stop().await;
+}

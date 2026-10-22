@@ -22,6 +22,7 @@ mod error;
 mod experimental;
 mod invite_admin;
 mod invites;
+mod lan_servers;
 mod link;
 mod link_meter;
 pub mod pairing;
@@ -58,6 +59,7 @@ pub use invite_admin::{
     InviteCreator, InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite,
 };
 pub use invites::InviteInfo;
+pub use lan_servers::LanServerInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
 pub use spoolframe_protocol::downloads::{

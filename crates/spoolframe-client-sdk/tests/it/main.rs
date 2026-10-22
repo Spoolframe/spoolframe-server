@@ -5,6 +5,7 @@
 
 mod addresses;
 mod closing;
+mod lan_info;
 mod leave;
 mod one_time_password;
 mod playlists;
