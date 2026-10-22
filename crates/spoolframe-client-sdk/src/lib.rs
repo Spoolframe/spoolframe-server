@@ -49,7 +49,7 @@ pub use downloads::{
 };
 // Music offline (PX-51), and its wire types.
 pub use downloads::{
-    CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
+    AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
     MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
     OfflinePlaylist, OfflineTrack, SyncedPlay,
 };

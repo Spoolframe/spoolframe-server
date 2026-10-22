@@ -30,6 +30,11 @@
 //! [`Downloads::record_like`]) are sent with `SyncOfflinePlays` when a
 //! session is made or found, before the followed downloads are asked
 //! about.
+//!
+//! Each album a download reads (an album's own, or a track's album while
+//! its details are fetched) has its tracklist kept in `music.json` while
+//! a track of it is here: [`Downloads::offline_music`] shows the album's
+//! songs not on the device beside those that are.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -153,6 +158,21 @@ pub enum MusicTarget {
 }
 
 impl MusicTarget {
+    /// The download whose hold `hold` is, on `track`; `None` for the
+    /// cache of what was kept from listening, and for a hold this build
+    /// does not know.
+    fn of_hold(hold: &Hold, track: &MediaId) -> Option<Self> {
+        let media = || hold.id.as_deref().and_then(|id| id.parse::<MediaId>().ok());
+        match hold.by.as_str() {
+            "download" => Some(Self::Track { id: track.clone() }),
+            "album" => media().map(|id| Self::Album { id }),
+            "artist" => media().map(|id| Self::Artist { id }),
+            "playlist" => hold.id.clone().map(|id| Self::Playlist { id }),
+            "liked" => Some(Self::Liked),
+            _ => None,
+        }
+    }
+
     /// The hold its tracks get.
     fn hold(&self, user_id: &str) -> Hold {
         let (by, id) = match self {
@@ -249,6 +269,10 @@ pub struct OfflineTrack {
     pub size: u64,
     /// When it was last played here, Unix seconds by this device's clock.
     pub last_played_at: Option<i64>,
+    /// The user's downloads that hold it: [`MusicTarget::Track`] for the
+    /// track downloaded itself, else its album, an artist, a playlist or
+    /// Liked. Empty for one only kept from listening.
+    pub held_by: Vec<MusicTarget>,
 }
 
 /// An album with the tracks of it on this device.
@@ -260,6 +284,63 @@ pub struct OfflineAlbum {
     pub title: String,
     /// By disc, then by place on it.
     pub tracks: Vec<OfflineTrack>,
+    /// How many tracks the album has in all, here or not ("3 of 12
+    /// songs"): its tracklist's, else as the server counted them; `None`
+    /// when neither is known.
+    pub total_tracks: Option<u32>,
+    /// Every track of the album, in its order, each marked whether it is
+    /// on this device: to show the others dimmed. Only those here, when
+    /// no download read its tracklist (an album, an artist, a playlist or
+    /// a track downloaded reads it; a track kept from listening does
+    /// not).
+    pub tracklist: Vec<AlbumTrack>,
+}
+
+impl OfflineAlbum {
+    /// Its tracklist and count, its `tracks` here sorted: `kept`, the
+    /// tracklist a download read, each marked whether it is here, then
+    /// any track here it does not list (the album changed since); else
+    /// the tracks here alone. The count is the tracklist's when one was
+    /// kept, else the album's own, else what its tracks said.
+    fn fill_tracklist(&mut self, kept: Option<&[Item]>) {
+        let here: HashSet<&MediaId> = self.tracks.iter().map(|t| t.item.id()).collect();
+        let mut tracklist: Vec<AlbumTrack> = kept
+            .unwrap_or_default()
+            .iter()
+            .map(|item| AlbumTrack {
+                on_device: here.contains(item.id()),
+                item: item.clone(),
+            })
+            .collect();
+        let listed: HashSet<MediaId> = tracklist.iter().map(|t| t.item.id().clone()).collect();
+        tracklist.extend(
+            self.tracks
+                .iter()
+                .filter(|t| !listed.contains(t.item.id()))
+                .map(|t| AlbumTrack {
+                    item: t.item.clone(),
+                    on_device: true,
+                }),
+        );
+        let counted = match &self.album {
+            Some(Item::Album(album)) => album.track_count,
+            _ => None,
+        };
+        self.total_tracks = match kept {
+            Some(_) => u32::try_from(tracklist.len()).ok(),
+            None => counted.or(self.total_tracks),
+        };
+        self.tracklist = tracklist;
+    }
+}
+
+/// One track of an album's tracklist ([`OfflineAlbum::tracklist`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumTrack {
+    /// The track, as the server had it.
+    pub item: Item,
+    /// It is in [`OfflineAlbum::tracks`]: it plays here.
+    pub on_device: bool,
 }
 
 /// An artist with the albums of theirs on this device.
@@ -333,6 +414,19 @@ struct MusicState {
     /// The last `MusicDownloadChanges` cursor: unchanged sets cost nothing.
     cursor: Option<String>,
     downloads: Vec<StoredMusic>,
+    /// The tracklists of the albums with tracks here, as the server had
+    /// them when a download last read them: for showing the songs not on
+    /// the device. None in a `music.json` from before.
+    #[serde(default)]
+    albums: Vec<StoredAlbum>,
+}
+
+/// An album's tracklist, as kept in `music.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredAlbum {
+    id: MediaId,
+    /// Every track of it, in the server's order.
+    tracks: Vec<Item>,
 }
 
 /// Plays and likes made here, not sent yet.
@@ -440,6 +534,11 @@ impl Downloads {
                 tracing::info!(%id, error = %e, "a track of a music download is left out");
             }
         }
+        // The download stands without them: only the songs not here go
+        // unshown.
+        if let Err(e) = record_albums(shared, &server, &user_id, parents.albums).await {
+            tracing::warn!(error = %e, "the tracklists of a music download's albums not kept");
+        }
         shared.wake.notify_one();
         Ok(shared.music_view(store, &server, &user_id, &stored))
     }
@@ -534,96 +633,7 @@ impl Downloads {
     /// the playlists and Liked downloaded. Each track is marked a
     /// download or kept. Needs no server.
     pub fn offline_music(&self, server: &str, user_id: &str) -> OfflineMusic {
-        let shared = self.shared();
-        let Some(store) = &shared.store else {
-            return OfflineMusic::default();
-        };
-        if shared.locks.is_locked(server, user_id) {
-            return OfflineMusic::default();
-        }
-        let mut by_track: HashMap<MediaId, (Manifest, OfflineTrack)> = HashMap::new();
-        for m in store.scan() {
-            if m.kind != EntryKind::Track || m.server != server || !m.is_for(user_id) {
-                continue;
-            }
-            let Some(track) = shared.offline_track(&m) else {
-                continue;
-            };
-            let id = m.item.id().clone();
-            // One per track: a download before a kept copy.
-            let better = by_track.get(&id).is_none_or(|(_, t)| {
-                t.mark == OfflineMark::Kept && track.mark == OfflineMark::Download
-            });
-            if better {
-                by_track.insert(id, (m, track));
-            }
-        }
-        let mut artists: HashMap<MediaId, OfflineArtist> = HashMap::new();
-        for (m, track) in by_track.values() {
-            let Item::Track(t) = &m.item else {
-                continue;
-            };
-            let artist = artists
-                .entry(t.artist_id.clone())
-                .or_insert_with(|| OfflineArtist {
-                    id: t.artist_id.clone(),
-                    artist: m.artist.clone(),
-                    name: match &m.artist {
-                        Some(Item::Artist(a)) => a.name.clone(),
-                        _ => t.artist_name.clone().unwrap_or_default(),
-                    },
-                    albums: Vec::new(),
-                });
-            if artist.artist.is_none() {
-                artist.artist = m.artist.clone();
-            }
-            let at = match artist.albums.iter().position(|a| a.id == t.album_id) {
-                Some(at) => at,
-                None => {
-                    artist.albums.push(OfflineAlbum {
-                        id: t.album_id.clone(),
-                        album: m.album.clone(),
-                        title: match &m.album {
-                            Some(Item::Album(a)) => a.title.clone(),
-                            _ => t.album_title.clone().unwrap_or_default(),
-                        },
-                        tracks: Vec::new(),
-                    });
-                    artist.albums.len() - 1
-                }
-            };
-            artist.albums[at].tracks.push(track.clone());
-        }
-        let mut artists: Vec<OfflineArtist> = artists.into_values().collect();
-        for artist in &mut artists {
-            for album in &mut artist.albums {
-                album.tracks.sort_by_key(|t| match &t.item {
-                    Item::Track(t) => (t.disc.unwrap_or(0), t.track.unwrap_or(0), t.title.clone()),
-                    _ => (0, 0, String::new()),
-                });
-            }
-            artist.albums.sort_by_key(|a| match &a.album {
-                Some(Item::Album(album)) => (album.year.unwrap_or(0), a.title.clone()),
-                _ => (0, a.title.clone()),
-            });
-        }
-        artists.sort_by_key(|a| a.name.to_lowercase());
-        let state: MusicState = read_json(&store.music_path(server, user_id));
-        let playlists = state
-            .downloads
-            .iter()
-            .filter(|d| matches!(d.target, MusicTarget::Playlist { .. } | MusicTarget::Liked))
-            .map(|d| OfflinePlaylist {
-                target: d.target.clone(),
-                name: d.name.clone(),
-                tracks: d
-                    .tracks
-                    .iter()
-                    .filter_map(|id| by_track.get(id).map(|(_, t)| t.clone()))
-                    .collect(),
-            })
-            .collect();
-        OfflineMusic { artists, playlists }
+        self.shared().offline_music(server, user_id)
     }
 
     /// This device's download settings.
@@ -763,11 +773,10 @@ async fn listed(
             };
             let name = album.title.clone();
             parents.items.insert(id.clone(), Some(detail.item.clone()));
-            let tracks = detail
-                .children
-                .into_iter()
-                .filter(|c| matches!(c, Item::Track(_)))
-                .map(|c| (c.id().clone(), Some(c)))
+            parents.album_read(&detail.item, detail.children);
+            let tracks = parents.albums[id]
+                .iter()
+                .map(|c| (c.id().clone(), Some(c.clone())))
                 .collect();
             Ok((name, tracks))
         }
@@ -841,16 +850,36 @@ async fn changes(
 struct Parents {
     /// `None` for one that could not be read.
     items: HashMap<MediaId, Option<Item>>,
+    /// The tracklists of the albums read, by album: kept in `music.json`
+    /// once the tracks are held ([`record_albums`]).
+    albums: HashMap<MediaId, Vec<Item>>,
     art: manager::KeptArt,
 }
 
 impl Parents {
     async fn get(&mut self, session: &Session, id: &MediaId) -> Option<Item> {
         if !self.items.contains_key(id) {
-            let item = session.item(id).await.ok().map(|d| d.item);
+            let item = match session.item(id).await {
+                Ok(detail) => {
+                    self.album_read(&detail.item, detail.children);
+                    Some(detail.item)
+                }
+                Err(_) => None,
+            };
             self.items.insert(id.clone(), item);
         }
         self.items[id].clone()
+    }
+
+    /// `item` was read with `children`: an album's are its tracklist.
+    fn album_read(&mut self, item: &Item, children: Vec<Item>) {
+        if matches!(item, Item::Album(_)) {
+            let tracks = children
+                .into_iter()
+                .filter(|c| matches!(c, Item::Track(_)))
+                .collect();
+            self.albums.insert(item.id().clone(), tracks);
+        }
     }
 }
 
@@ -1058,6 +1087,126 @@ impl Shared {
         }
     }
 
+    /// [`Downloads::offline_music`].
+    fn offline_music(&self, server: &str, user_id: &str) -> OfflineMusic {
+        let Some(store) = &self.store else {
+            return OfflineMusic::default();
+        };
+        if self.locks.is_locked(server, user_id) {
+            return OfflineMusic::default();
+        }
+        let mut by_track: HashMap<MediaId, (Manifest, OfflineTrack)> = HashMap::new();
+        // What holds each track, over all its entries (one per quality).
+        let mut held_by: HashMap<MediaId, Vec<MusicTarget>> = HashMap::new();
+        for m in store.scan() {
+            if m.kind != EntryKind::Track || m.server != server || !m.is_for(user_id) {
+                continue;
+            }
+            let Some(track) = self.offline_track(&m) else {
+                continue;
+            };
+            let id = m.item.id().clone();
+            let targets = held_by.entry(id.clone()).or_default();
+            for hold in m
+                .holds
+                .iter()
+                .filter(|h| h.user.as_deref() == Some(user_id))
+            {
+                if let Some(target) = MusicTarget::of_hold(hold, &id)
+                    && !targets.contains(&target)
+                {
+                    targets.push(target);
+                }
+            }
+            // One per track: a download before a kept copy.
+            let better = by_track.get(&id).is_none_or(|(_, t)| {
+                t.mark == OfflineMark::Kept && track.mark == OfflineMark::Download
+            });
+            if better {
+                by_track.insert(id, (m, track));
+            }
+        }
+        for (id, (_, track)) in &mut by_track {
+            track.held_by = held_by.remove(id).unwrap_or_default();
+        }
+        let state: MusicState = read_json(&store.music_path(server, user_id));
+        let mut artists: HashMap<MediaId, OfflineArtist> = HashMap::new();
+        for (m, track) in by_track.values() {
+            let Item::Track(t) = &m.item else {
+                continue;
+            };
+            let artist = artists
+                .entry(t.artist_id.clone())
+                .or_insert_with(|| OfflineArtist {
+                    id: t.artist_id.clone(),
+                    artist: m.artist.clone(),
+                    name: match &m.artist {
+                        Some(Item::Artist(a)) => a.name.clone(),
+                        _ => t.artist_name.clone().unwrap_or_default(),
+                    },
+                    albums: Vec::new(),
+                });
+            if artist.artist.is_none() {
+                artist.artist = m.artist.clone();
+            }
+            let at = match artist.albums.iter().position(|a| a.id == t.album_id) {
+                Some(at) => at,
+                None => {
+                    artist.albums.push(OfflineAlbum {
+                        id: t.album_id.clone(),
+                        album: m.album.clone(),
+                        title: match &m.album {
+                            Some(Item::Album(a)) => a.title.clone(),
+                            _ => t.album_title.clone().unwrap_or_default(),
+                        },
+                        tracks: Vec::new(),
+                        total_tracks: None,
+                        tracklist: Vec::new(),
+                    });
+                    artist.albums.len() - 1
+                }
+            };
+            let album = &mut artist.albums[at];
+            if album.album.is_none() {
+                album.album = m.album.clone();
+            }
+            // As the server counted them, should no tracklist be kept.
+            album.total_tracks = album.total_tracks.or(t.album_track_count);
+            album.tracks.push(track.clone());
+        }
+        let mut artists: Vec<OfflineArtist> = artists.into_values().collect();
+        for artist in &mut artists {
+            for album in &mut artist.albums {
+                album.tracks.sort_by_key(|t| match &t.item {
+                    Item::Track(t) => (t.disc.unwrap_or(0), t.track.unwrap_or(0), t.title.clone()),
+                    _ => (0, 0, String::new()),
+                });
+                let kept = state.albums.iter().find(|a| a.id == album.id);
+                album.fill_tracklist(kept.map(|a| a.tracks.as_slice()));
+            }
+            artist.albums.sort_by_key(|a| match &a.album {
+                Some(Item::Album(album)) => (album.year.unwrap_or(0), a.title.clone()),
+                _ => (0, a.title.clone()),
+            });
+        }
+        artists.sort_by_key(|a| a.name.to_lowercase());
+        let playlists = state
+            .downloads
+            .iter()
+            .filter(|d| matches!(d.target, MusicTarget::Playlist { .. } | MusicTarget::Liked))
+            .map(|d| OfflinePlaylist {
+                target: d.target.clone(),
+                name: d.name.clone(),
+                tracks: d
+                    .tracks
+                    .iter()
+                    .filter_map(|id| by_track.get(id).map(|(_, t)| t.clone()))
+                    .collect(),
+            })
+            .collect();
+        OfflineMusic { artists, playlists }
+    }
+
     /// `m` as a track to play offline: `None` until its file is here.
     fn offline_track(&self, m: &Manifest) -> Option<OfflineTrack> {
         let view = self.view(m);
@@ -1075,6 +1224,7 @@ impl Shared {
             artwork: view.artwork,
             size: m.size.unwrap_or(0),
             last_played_at: m.last_played_at,
+            held_by: Vec::new(),
         })
     }
 
@@ -1270,10 +1420,57 @@ async fn refresh(
             }
         }
     }
+    let here = albums_here(store, &server, &user_id);
     let _writing = shared.manifests.lock().await;
     let mut state: MusicState = read_json(&path);
     state.cursor = if unknown { None } else { cursor };
+    keep_albums(&mut state, parents.albums, &here);
     write_json(&path, &state).map_err(disk)
+}
+
+/// Keep the tracklists of the albums `read` in `server`'s `user_id`'s
+/// `music.json`.
+async fn record_albums(
+    shared: &Shared,
+    server: &str,
+    user_id: &str,
+    read: HashMap<MediaId, Vec<Item>>,
+) -> Result<(), SdkError> {
+    if read.is_empty() {
+        return Ok(());
+    }
+    let store = shared.store()?;
+    let here = albums_here(store, server, user_id);
+    let _writing = shared.manifests.lock().await;
+    let path = store.music_path(server, user_id);
+    let mut state: MusicState = read_json(&path);
+    keep_albums(&mut state, read, &here);
+    write_json(&path, &state).map_err(disk)
+}
+
+/// The albums of the tracks `server`'s `user_id` has here.
+fn albums_here(store: &Store, server: &str, user_id: &str) -> HashSet<MediaId> {
+    store
+        .scan()
+        .into_iter()
+        .filter(|m| m.kind == EntryKind::Track && m.server == server && m.is_for(user_id))
+        .filter_map(|m| match m.item {
+            Item::Track(t) => Some(t.album_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `state` keeps the tracklists `read`, the newest of each album, and
+/// lets go of those of albums with no track `here` any more.
+fn keep_albums(state: &mut MusicState, read: HashMap<MediaId, Vec<Item>>, here: &HashSet<MediaId>) {
+    for (id, tracks) in read {
+        match state.albums.iter_mut().find(|a| a.id == id) {
+            Some(album) => album.tracks = tracks,
+            None => state.albums.push(StoredAlbum { id, tracks }),
+        }
+    }
+    state.albums.retain(|a| here.contains(&a.id));
 }
 
 /// A user on a server.
@@ -1657,6 +1854,177 @@ mod tests {
         assert_eq!(
             (unmetered, cellular, shared.network_held()),
             (false, true, false)
+        );
+    }
+
+    /// Each download's hold names it back; the cache's names none.
+    #[test]
+    fn a_hold_names_the_download_that_holds() {
+        let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
+        let targets = [
+            MusicTarget::Track { id: track.clone() },
+            MusicTarget::Album {
+                id: MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap(),
+            },
+            MusicTarget::Artist {
+                id: MediaId::new(Namespace::Plex, MediaKind::Artist, "30").unwrap(),
+            },
+            MusicTarget::Playlist { id: "p".into() },
+            MusicTarget::Liked,
+        ];
+        let named: Vec<Option<MusicTarget>> = targets
+            .iter()
+            .map(|t| MusicTarget::of_hold(&t.hold("u"), &track))
+            .collect();
+        assert_eq!(
+            (named, MusicTarget::of_hold(&Hold::listening(), &track)),
+            (targets.map(Some).to_vec(), None)
+        );
+    }
+
+    /// A whole track entry like [`entry`]'s, with its file on disk.
+    fn playable(store: &Store, key: &str, holds: Vec<Hold>) -> Manifest {
+        let mut m = entry(store, key, Hold::listening(), 3, 1);
+        m.holds = holds;
+        m.file = Some(spoolframe_protocol::downloads::DownloadFile {
+            container: spoolframe_types::Container::Flac,
+            tracks: Default::default(),
+        });
+        store.write(&m).unwrap();
+        std::fs::write(store.media(&m).unwrap(), b"abc").unwrap();
+        m
+    }
+
+    fn album_id() -> MediaId {
+        MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap()
+    }
+
+    /// Offline, an album has its whole tracklist, the songs not here
+    /// marked so, and each track says which of the user's downloads
+    /// hold it; a hold of another user's is not theirs to see.
+    #[test]
+    fn offline_an_album_has_its_tracklist_and_a_track_its_downloads() {
+        let (shared, store) = shared("offline-album", 1 << 30);
+        let album = MusicTarget::Album { id: album_id() };
+        let playlist = MusicTarget::Playlist { id: "p".into() };
+        playable(
+            &store,
+            "1",
+            vec![
+                album.hold("user"),
+                playlist.hold("user"),
+                Hold::download("bob"),
+            ],
+        );
+        playable(&store, "3", vec![Hold::download("user"), Hold::listening()]);
+        let state = MusicState {
+            albums: vec![StoredAlbum {
+                id: album_id(),
+                tracks: vec![track("1"), track("2"), track("3")],
+            }],
+            ..MusicState::default()
+        };
+        write_json(&store.music_path("server", "user"), &state).unwrap();
+        let music = shared.offline_music("server", "user");
+        let album_here = &music.artists[0].albums[0];
+        let three = MediaId::new(Namespace::Plex, MediaKind::Track, "3").unwrap();
+        assert_eq!(
+            (
+                album_here.total_tracks,
+                album_here
+                    .tracklist
+                    .iter()
+                    .map(|t| (t.item.id().clone(), t.on_device))
+                    .collect::<Vec<_>>(),
+                album_here
+                    .tracks
+                    .iter()
+                    .map(|t| t.held_by.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                Some(3),
+                vec![
+                    (track("1").id().clone(), true),
+                    (track("2").id().clone(), false),
+                    (three.clone(), true),
+                ],
+                vec![
+                    vec![album, playlist],
+                    vec![MusicTarget::Track { id: three }]
+                ],
+            )
+        );
+    }
+
+    /// With no tracklist kept (a track kept from listening), an album
+    /// lists the tracks here, and counts as its tracks said.
+    #[test]
+    fn offline_an_album_with_no_tracklist_lists_what_is_here() {
+        let (shared, store) = shared("offline-no-tracklist", 1 << 30);
+        let mut m = playable(&store, "1", vec![Hold::listening()]);
+        if let Item::Track(t) = &mut m.item {
+            t.album_track_count = Some(9);
+        }
+        store.write(&m).unwrap();
+        let music = shared.offline_music("server", "user");
+        let album = &music.artists[0].albums[0];
+        assert_eq!(
+            (
+                album.total_tracks,
+                album
+                    .tracklist
+                    .iter()
+                    .map(|t| t.on_device)
+                    .collect::<Vec<_>>(),
+                album.tracks[0].held_by.clone(),
+            ),
+            (Some(9), vec![true], Vec::new())
+        );
+    }
+
+    /// A tracklist read again replaces the one kept, and an album with
+    /// no track here any more is let go of.
+    #[test]
+    fn tracklists_are_kept_for_the_albums_here() {
+        let other = MediaId::new(Namespace::Plex, MediaKind::Album, "40").unwrap();
+        let mut state = MusicState {
+            albums: vec![
+                StoredAlbum {
+                    id: album_id(),
+                    tracks: vec![track("1")],
+                },
+                StoredAlbum {
+                    id: other,
+                    tracks: vec![track("9")],
+                },
+            ],
+            ..MusicState::default()
+        };
+        keep_albums(
+            &mut state,
+            HashMap::from([(album_id(), vec![track("1"), track("2")])]),
+            &HashSet::from([album_id()]),
+        );
+        assert_eq!(
+            state
+                .albums
+                .iter()
+                .map(|a| (a.id.clone(), a.tracks.len()))
+                .collect::<Vec<_>>(),
+            [(album_id(), 2)]
+        );
+    }
+
+    /// A `music.json` written before tracklists were kept still reads,
+    /// with none.
+    #[test]
+    fn music_state_from_before_tracklists_reads() {
+        let state: MusicState =
+            serde_json::from_str(r#"{"cursor": "c", "downloads": []}"#).unwrap();
+        assert_eq!(
+            (state.cursor.as_deref(), state.albums.len()),
+            (Some("c"), 0)
         );
     }
 

@@ -52,7 +52,7 @@ mod writer;
 pub(crate) use listening::Keeper;
 pub(crate) use lock::Locks;
 pub use music::{
-    CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
+    AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
     MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
     OfflinePlaylist, OfflineTrack, SyncedPlay,
 };
