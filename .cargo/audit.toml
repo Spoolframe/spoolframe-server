@@ -1,0 +1,15 @@
+# cargo audit (ci:audit, daily in .forgejo/workflows/audit.yaml): the
+# advisories deny.toml accepts, with the reasons written there. Keep the
+# two lists the same.
+[advisories]
+ignore = [
+  # rsa: verifies OIDC ID token signatures only; no private-key operation.
+  "RUSTSEC-2023-0071",
+  # paste: unmaintained build-time proc-macro; none of it runs.
+  "RUSTSEC-2024-0436",
+]
+
+[output]
+# An unmaintained or yanked crate fails the audit too.
+deny = ["warnings"]
+quiet = false

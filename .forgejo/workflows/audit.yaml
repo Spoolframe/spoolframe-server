@@ -1,0 +1,39 @@
+name: Audit
+
+# New RustSec advisories land against crates already in Cargo.lock, with
+# no change here to run CI: this audits master's two lockfiles (the
+# workspace's and fuzz/'s) every day, and on demand. The accepted
+# advisories are in .cargo/audit.toml, the same as deny.toml's. A failed
+# run is the alert: fix it with `cargo update -p <crate>`, or accept the
+# advisory in both files with its reason.
+on:
+  schedule:
+    # 06:17 UTC daily: off the hour, when scheduled runs pile up.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+env:
+  CI: "true"
+  TERM: dumb
+  NO_COLOR: "1"
+
+jobs:
+  audit:
+    name: "audit"
+    runs-on: beefy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      # As in ci.yaml: a read-only GH_PAT raises Nix's GitHub API limit.
+      - name: GitHub token for Nix, when this run has one
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            echo "NIX_CONFIG=access-tokens = github.com=$GH_PAT" >> "$GITHUB_ENV"
+          fi
+      # cargo-audit fetches the advisory database each run: never a stale
+      # copy.
+      - name: ci:audit
+        run: devenv --no-tui tasks run --profile ci ci:audit

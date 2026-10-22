@@ -438,7 +438,8 @@ in {
       };
       "ci:audit" = {
         description = "Audit dependencies for known vulnerabilities";
-        exec = "cargo audit";
+        # Both lockfiles: the fuzz targets are a workspace of their own.
+        exec = "cargo audit && cargo audit --file fuzz/Cargo.lock";
       };
       "ci:doc" = {
         description = "Build documentation";
