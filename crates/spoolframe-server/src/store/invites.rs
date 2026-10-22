@@ -152,6 +152,28 @@ pub enum InviteState {
     },
 }
 
+/// What an invite's code is, as a lookup tells it before joining: unlike
+/// [`InviteState`], a revoked invite is told apart from no invite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteLookup {
+    NoMatch,
+    Revoked,
+    /// It expired at `at`, Unix seconds.
+    Expired {
+        at: i64,
+    },
+    Exhausted,
+    Usable {
+        kind: InviteKind,
+        role: Role,
+        /// Unix seconds.
+        expires_at: i64,
+        /// The display name of the user who made it, if they are one
+        /// here who has one.
+        inviter: Option<String>,
+    },
+}
+
 /// What a portable-account redemption did (P7-05).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortableRedeemed {
@@ -353,6 +375,48 @@ impl Store {
             self.now(),
         )
         .await?)
+    }
+
+    /// What the invite whose code hashes to `capability_hash` is now, as
+    /// a lookup tells it. Reads only: no use is taken.
+    pub async fn look_up_invite(&self, capability_hash: &str) -> Result<InviteLookup, StoreError> {
+        // With the display name of the user who made it, as `live_invites`
+        // reads it.
+        let row = sqlx::query(
+            "SELECT invites.kind, invites.role, invites.revoked_at IS NOT NULL AS revoked, \
+                    invites.expires_at, invites.uses_left, u.display_name AS inviter \
+             FROM invites LEFT JOIN users u ON u.username = invites.created_by \
+             WHERE invites.capability_hash = ?1",
+        )
+        .bind(capability_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(InviteLookup::NoMatch);
+        };
+        let kind: String = row.try_get("kind")?;
+        // A kind this build does not know is no invite it can redeem, as
+        // `state` has it.
+        let Ok(kind) = kind.parse::<InviteKind>() else {
+            return Ok(InviteLookup::NoMatch);
+        };
+        let revoked: bool = row.try_get("revoked")?;
+        let expires_at: i64 = row.try_get("expires_at")?;
+        let uses_left: i64 = row.try_get("uses_left")?;
+        Ok(if revoked {
+            InviteLookup::Revoked
+        } else if expires_at <= self.now() {
+            InviteLookup::Expired { at: expires_at }
+        } else if uses_left <= 0 {
+            InviteLookup::Exhausted
+        } else {
+            InviteLookup::Usable {
+                kind,
+                role: role(row.try_get("role")?),
+                expires_at,
+                inviter: row.try_get("inviter")?,
+            }
+        })
     }
 
     /// Make user `username` with the invite whose code hashes to
@@ -850,6 +914,120 @@ mod tests {
         );
         assert_eq!(store.user_count().await.unwrap(), 0);
         assert!(store.grants().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_looked_up_invite_says_its_kind_role_expiry_and_who_made_it() {
+        let store = test_store("invite-lookup-usable").await;
+        store
+            .add_user("root", Some("Andrey"), "$argon2id$x", Role::Admin)
+            .await
+            .unwrap();
+        let made = store
+            .create_invite(NewInvite {
+                role: Role::Admin,
+                ..new_invite(&store, "h1", 2)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.look_up_invite("h1").await.unwrap(),
+            InviteLookup::Usable {
+                kind: InviteKind::CreateUser,
+                role: Role::Admin,
+                expires_at: made.expires_at,
+                inviter: Some("Andrey".into()),
+            }
+        );
+    }
+
+    /// Only a display name is told: a username is a sign-in name, and the
+    /// asker has no session.
+    #[tokio::test]
+    async fn an_inviter_without_a_display_name_or_account_is_not_named() {
+        let store = test_store("invite-lookup-no-name").await;
+        store
+            .add_user("root", None, "$argon2id$x", Role::Admin)
+            .await
+            .unwrap();
+        store
+            .create_invite(new_invite(&store, "h1", 1))
+            .await
+            .unwrap();
+        store
+            .create_invite(NewInvite {
+                created_by: "server CLI",
+                origin: &InviteOrigin::Cli,
+                ..new_invite(&store, "h2", 1)
+            })
+            .await
+            .unwrap();
+        for hash in ["h1", "h2"] {
+            let InviteLookup::Usable { inviter, .. } = store.look_up_invite(hash).await.unwrap()
+            else {
+                panic!("{hash} is not usable");
+            };
+            assert_eq!(inviter, None, "{hash}");
+        }
+    }
+
+    /// The lookup tells revoked from no invite at all; redeeming still
+    /// does not ([`a_revoked_invite_is_as_invalid_as_no_invite`]).
+    #[tokio::test]
+    async fn a_lookup_tells_a_revoked_invite_from_no_invite() {
+        let store = store_with("invite-lookup-revoked", "h1", 3).await;
+        let id = store.live_invites().await.unwrap()[0].id.clone();
+        store.revoke_invite(&id).await.unwrap();
+        assert_eq!(
+            store.look_up_invite("h1").await.unwrap(),
+            InviteLookup::Revoked
+        );
+        assert_eq!(
+            store.look_up_invite("no-such-hash").await.unwrap(),
+            InviteLookup::NoMatch
+        );
+        assert_eq!(
+            store.invite_state("h1").await.unwrap(),
+            InviteState::Invalid
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_says_when_an_invite_expired_and_that_one_is_used_up() {
+        let store = test_store("invite-lookup-expired").await;
+        let at = store.now() - 1;
+        store
+            .create_invite(NewInvite {
+                expires_at: at,
+                ..new_invite(&store, "h1", 1)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.look_up_invite("h1").await.unwrap(),
+            InviteLookup::Expired { at }
+        );
+        store
+            .create_invite(new_invite(&store, "h2", 1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            redeem(&store, "h2", "anna").await,
+            Redeemed::User { .. }
+        ));
+        assert_eq!(
+            store.look_up_invite("h2").await.unwrap(),
+            InviteLookup::Exhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_takes_no_use() {
+        let store = store_with("invite-lookup-no-use", "h1", 1).await;
+        for _ in 0..3 {
+            store.look_up_invite("h1").await.unwrap();
+        }
+        assert_eq!(store.live_invites().await.unwrap()[0].uses_left, 1);
     }
 
     #[test]
