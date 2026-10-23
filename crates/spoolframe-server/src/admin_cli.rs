@@ -228,15 +228,10 @@ fn expiry(text: &str) -> Result<u64, String> {
         .map_err(|_| format!("{text:?}: say hours or days, as 12h or 7d"))
 }
 
+/// `--kind`, by the name the store and the admin API share.
 fn invite_kind(text: &str) -> Result<InviteKind, String> {
-    match text {
-        "create-user" => Ok(InviteKind::CreateUser),
-        "portable-account" => Ok(InviteKind::PortableAccount),
-        "federation" => Ok(InviteKind::Federation),
-        _ => Err(format!(
-            "{text:?}: create-user, portable-account or federation"
-        )),
-    }
+    text.parse::<spoolframe_server::store::invites::InviteKind>()
+        .map(Into::into)
 }
 
 #[derive(Subcommand)]

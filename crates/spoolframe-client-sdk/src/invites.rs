@@ -49,7 +49,7 @@ use spoolframe_types::Role;
 
 use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
-use crate::invite_admin::{InviteKind, kind_of, time};
+use crate::invite_admin::{InviteKind, time};
 use crate::portable::PortableUserId;
 use crate::servers::{self, SavedServer};
 use crate::session::{Session, SignInMethod};
@@ -149,7 +149,7 @@ fn outcome_of(outcome: InviteLookupOutcome) -> InviteOutcome {
             inviter,
             ..
         } => InviteOutcome::Valid {
-            kind: kind_of(kind),
+            kind: kind.into(),
             role,
             expires_at: time(expires_at),
             inviter,

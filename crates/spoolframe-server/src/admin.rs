@@ -37,9 +37,7 @@ use spoolframe_admin_api::{
 };
 use spoolframe_admin_api::{AuditEvent, AuditPage, ConnectedApp};
 use spoolframe_admin_api::{ConfigReload, UplinkMeasurement};
-use spoolframe_admin_api::{
-    InviteCreated, InviteEntry, InviteKind, NewInvite, PortableGrant, ServerLink,
-};
+use spoolframe_admin_api::{InviteCreated, InviteEntry, NewInvite, PortableGrant, ServerLink};
 use spoolframe_admin_api::{LookupStatus, MappingStatus};
 use spoolframe_admin_api::{
     NewPlaylist, PlaylistChanges, PlaylistDetail, PlaylistEditOp, PlaylistInfo, PlexPlaylistImport,
@@ -771,26 +769,11 @@ impl From<InviteError> for ErrorObjectOwned {
     }
 }
 
-/// The admin API's invite kind as the store has it.
-fn store_invite_kind(kind: InviteKind) -> crate::store::invites::InviteKind {
-    use crate::store::invites::InviteKind as Stored;
-    match kind {
-        InviteKind::CreateUser => Stored::CreateUser,
-        InviteKind::PortableAccount => Stored::PortableAccount,
-        InviteKind::Federation => Stored::Federation,
-    }
-}
-
 /// A kept invite as the admin API shows it.
 fn invite_entry(record: crate::store::invites::InviteRecord) -> InviteEntry {
-    use crate::store::invites::InviteKind as Stored;
     InviteEntry {
         id: record.id,
-        kind: match record.kind {
-            Stored::CreateUser => InviteKind::CreateUser,
-            Stored::PortableAccount => InviteKind::PortableAccount,
-            Stored::Federation => InviteKind::Federation,
-        },
+        kind: record.kind.into(),
         note: record.note,
         role: record.role,
         uses: record.uses,
@@ -3599,7 +3582,7 @@ impl AdminApiServer for AdminApi {
         };
         let (created_by, origin) = self.maker(ext, caller).await?;
         let request = crate::invites::InviteRequest {
-            kind: store_invite_kind(invite.kind),
+            kind: invite.kind.into(),
             note: invite.note.as_deref(),
             uses: invite.uses,
             expires_secs: invite.expires,

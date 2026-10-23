@@ -57,12 +57,72 @@ impl InviteKind {
         }
     }
 
+    /// Every kind.
+    pub const ALL: [InviteKind; 3] = [
+        InviteKind::CreateUser,
+        InviteKind::PortableAccount,
+        InviteKind::Federation,
+    ];
+
+    /// Whether redeeming it pairs a server (P8-01): its lookup tells the
+    /// key it pairs with, to compare fingerprints.
+    pub fn pairs_server(self) -> bool {
+        self == InviteKind::Federation
+    }
+
     /// The name in the database and on the admin API.
     pub fn as_str(self) -> &'static str {
         match self {
             InviteKind::CreateUser => "create-user",
             InviteKind::PortableAccount => "portable-account",
             InviteKind::Federation => "federation",
+        }
+    }
+}
+
+/// The client protocol's kind as kept: one this build does not know is
+/// not one.
+impl TryFrom<spoolframe_protocol::invite_admin::InviteKind> for InviteKind {
+    type Error = ();
+
+    fn try_from(kind: spoolframe_protocol::invite_admin::InviteKind) -> Result<Self, ()> {
+        use spoolframe_protocol::invite_admin::InviteKind as Wire;
+        match kind {
+            Wire::CreateUser => Ok(InviteKind::CreateUser),
+            Wire::PortableAccount => Ok(InviteKind::PortableAccount),
+            Wire::Federation => Ok(InviteKind::Federation),
+            Wire::Unknown => Err(()),
+        }
+    }
+}
+
+impl From<InviteKind> for spoolframe_protocol::invite_admin::InviteKind {
+    fn from(kind: InviteKind) -> Self {
+        match kind {
+            InviteKind::CreateUser => Self::CreateUser,
+            InviteKind::PortableAccount => Self::PortableAccount,
+            InviteKind::Federation => Self::Federation,
+        }
+    }
+}
+
+impl From<spoolframe_admin_api::InviteKind> for InviteKind {
+    fn from(kind: spoolframe_admin_api::InviteKind) -> Self {
+        use spoolframe_admin_api::InviteKind as Api;
+        match kind {
+            Api::CreateUser => InviteKind::CreateUser,
+            Api::PortableAccount => InviteKind::PortableAccount,
+            Api::Federation => InviteKind::Federation,
+        }
+    }
+}
+
+impl From<InviteKind> for spoolframe_admin_api::InviteKind {
+    fn from(kind: InviteKind) -> Self {
+        match kind {
+            InviteKind::CreateUser => Self::CreateUser,
+            InviteKind::PortableAccount => Self::PortableAccount,
+            InviteKind::Federation => Self::Federation,
         }
     }
 }
@@ -459,22 +519,14 @@ impl Store {
         let mut tx = self.begin_write().await?;
         // The use is taken first: a write, so a second redemption waits
         // for this one's transaction and then sees what it left.
-        let taken = sqlx::query(
-            "UPDATE invites SET uses_left = uses_left - 1 \
-             WHERE capability_hash = ?1 AND kind = 'create-user' AND revoked_at IS NULL \
-               AND expires_at > ?2 AND uses_left > 0 \
-             RETURNING role",
-        )
-        .bind(capability_hash)
-        .bind(now)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(taken) = taken else {
-            let refused = state(&mut tx, capability_hash, now).await?;
-            tx.rollback().await?;
-            return Ok(Redeemed::Refused(refused));
+        let taken = match take_use(&mut tx, capability_hash, InviteKind::CreateUser, now).await? {
+            Ok(taken) => taken,
+            Err(refused) => {
+                tx.rollback().await?;
+                return Ok(Redeemed::Refused(refused));
+            }
         };
-        let role = role(taken.try_get("role")?);
+        let role = taken.role;
         let id = LocalUserId::generate();
         if !insert_user(&mut tx, id, &name, display, role, now).await? {
             tx.rollback().await?;
@@ -507,21 +559,15 @@ impl Store {
         let now = self.now();
         let id = portable.to_string();
         let mut tx = self.begin_write().await?;
-        let taken: Option<(String, i64)> = sqlx::query_as(
-            "UPDATE invites SET uses_left = uses_left - 1 \
-             WHERE capability_hash = ?1 AND kind = 'portable-account' AND revoked_at IS NULL \
-               AND expires_at > ?2 AND uses_left > 0 \
-             RETURNING id, created_at",
-        )
-        .bind(capability_hash)
-        .bind(now)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((invite_id, created_at)) = taken else {
-            let refused = state(&mut tx, capability_hash, now).await?;
-            tx.rollback().await?;
-            return Ok(PortableRedeemed::Refused(refused));
-        };
+        let taken =
+            match take_use(&mut tx, capability_hash, InviteKind::PortableAccount, now).await? {
+                Ok(taken) => taken,
+                Err(refused) => {
+                    tx.rollback().await?;
+                    return Ok(PortableRedeemed::Refused(refused));
+                }
+            };
+        let (invite_id, created_at) = (taken.id, taken.created_at);
         let grant: Option<Option<i64>> = sqlx::query_scalar(
             "SELECT revoked_at FROM portable_grants WHERE portable_user_id = ?1",
         )
@@ -547,6 +593,50 @@ impl Store {
         }
         tx.commit().await?;
         Ok(PortableRedeemed::Granted)
+    }
+}
+
+/// One use taken of a live invite, and what its redemption needs of it.
+#[derive(Debug)]
+pub(super) struct TakenUse {
+    pub(super) id: String,
+    pub(super) role: Role,
+    pub(super) created_by: String,
+    /// Unix seconds.
+    pub(super) created_at: i64,
+}
+
+/// Take one use of the live invite of `kind` whose code hashes to
+/// `capability_hash`, on `conn`, at `now`: what every redemption does
+/// first, in its own transaction. A write, so the transaction holds the
+/// write lock from here, and a redemption racing it waits, then sees what
+/// it left. `Err` with where the invite stands ([`state`]) when no use
+/// was taken; the caller rolls back.
+pub(super) async fn take_use(
+    conn: &mut sqlx::SqliteConnection,
+    capability_hash: &str,
+    kind: InviteKind,
+    now: i64,
+) -> Result<Result<TakenUse, InviteState>, sqlx::Error> {
+    let taken = sqlx::query(
+        "UPDATE invites SET uses_left = uses_left - 1 \
+         WHERE capability_hash = ?1 AND kind = ?2 AND revoked_at IS NULL \
+           AND expires_at > ?3 AND uses_left > 0 \
+         RETURNING id, role, created_by, created_at",
+    )
+    .bind(capability_hash)
+    .bind(kind.as_str())
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match taken {
+        Some(row) => Ok(Ok(TakenUse {
+            id: row.try_get("id")?,
+            role: role(row.try_get("role")?),
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+        })),
+        None => Ok(Err(state(conn, capability_hash, now).await?)),
     }
 }
 
@@ -595,6 +685,24 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 24 * 3600;
+
+    /// Every kind crosses each conversion and comes back, under the one
+    /// name the database, the admin API and the client protocol share.
+    #[test]
+    fn every_kind_round_trips_through_each_conversion() {
+        use spoolframe_admin_api::InviteKind as Api;
+        use spoolframe_protocol::invite_admin::InviteKind as Wire;
+        for kind in InviteKind::ALL {
+            assert_eq!(kind.as_str().parse::<InviteKind>(), Ok(kind));
+            let wire = Wire::from(kind);
+            assert_eq!(InviteKind::try_from(wire), Ok(kind));
+            assert_eq!(serde_json::to_value(wire).unwrap(), kind.as_str());
+            let api = Api::from(kind);
+            assert_eq!(InviteKind::from(api), kind);
+            assert_eq!(serde_json::to_value(api).unwrap(), kind.as_str());
+        }
+        assert_eq!(InviteKind::try_from(Wire::Unknown), Err(()));
+    }
 
     /// Each kind's role rule: chosen for an account, a consumer's only for
     /// a portable user, none for a server.

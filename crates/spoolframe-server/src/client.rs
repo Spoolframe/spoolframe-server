@@ -4032,7 +4032,9 @@ impl ClientProtocol {
                     platform: hello.platform,
                 };
                 let request = crate::invites::InviteRequest {
-                    kind: invite_kind(create.kind)?,
+                    kind: create.kind.try_into().map_err(|()| Error::InvalidInput {
+                        message: "use create-user, portable-account or federation".into(),
+                    })?,
                     note: create.note.as_deref(),
                     uses: create.uses,
                     expires_secs: create.expires_in_secs,
@@ -6602,23 +6604,6 @@ fn admin(who: &Who) -> Result<&SessionUser, Error> {
     Ok(user)
 }
 
-/// The kind an app asked for, as the store keeps it; one this build does
-/// not know is refused.
-fn invite_kind(
-    kind: spoolframe_protocol::invite_admin::InviteKind,
-) -> Result<crate::store::invites::InviteKind, Error> {
-    use crate::store::invites::InviteKind as Stored;
-    use spoolframe_protocol::invite_admin::InviteKind as Wire;
-    match kind {
-        Wire::CreateUser => Ok(Stored::CreateUser),
-        Wire::PortableAccount => Ok(Stored::PortableAccount),
-        Wire::Federation => Ok(Stored::Federation),
-        Wire::Unknown => Err(Error::InvalidInput {
-            message: "use create-user, portable-account or federation".into(),
-        }),
-    }
-}
-
 fn create_invite_error(e: crate::invites::CreateError) -> Error {
     use crate::invites::CreateError;
     use crate::store::invites::InviteError;
@@ -6631,26 +6616,13 @@ fn create_invite_error(e: crate::invites::CreateError) -> Error {
     }
 }
 
-/// A stored invite kind, as the protocol names it.
-fn wire_kind(
-    kind: crate::store::invites::InviteKind,
-) -> spoolframe_protocol::invite_admin::InviteKind {
-    use crate::store::invites::InviteKind as Stored;
-    use spoolframe_protocol::invite_admin::InviteKind as Wire;
-    match kind {
-        Stored::CreateUser => Wire::CreateUser,
-        Stored::PortableAccount => Wire::PortableAccount,
-        Stored::Federation => Wire::Federation,
-    }
-}
-
 /// What a lookup found, for the client; a `federation` invite's with
 /// `fingerprint`, this server's key's (P8-01).
 fn lookup_outcome(
     found: crate::store::invites::InviteLookup,
     fingerprint: String,
 ) -> InviteLookupOutcome {
-    use crate::store::invites::{InviteKind, InviteLookup as Found};
+    use crate::store::invites::InviteLookup as Found;
     match found {
         Found::NoMatch => InviteLookupOutcome::NoMatch,
         Found::Revoked => InviteLookupOutcome::Revoked,
@@ -6662,11 +6634,11 @@ fn lookup_outcome(
             expires_at,
             inviter,
         } => InviteLookupOutcome::Valid {
-            kind: wire_kind(kind),
+            kind: kind.into(),
             role,
             expires_at,
             inviter,
-            fingerprint: (kind == InviteKind::Federation).then_some(fingerprint),
+            fingerprint: kind.pairs_server().then_some(fingerprint),
         },
     }
 }
@@ -6704,7 +6676,7 @@ fn invite_summary(record: crate::store::invites::InviteRecord) -> InviteSummary 
     };
     InviteSummary {
         id: record.id,
-        kind: wire_kind(record.kind),
+        kind: record.kind.into(),
         note: record.note,
         role: record.role,
         uses: record.uses,

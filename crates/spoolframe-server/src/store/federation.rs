@@ -12,7 +12,7 @@
 use sqlx::Row;
 use uuid::Uuid;
 
-use super::invites::{InviteState, state};
+use super::invites::{InviteKind, InviteState, take_use};
 use super::{Store, StoreError};
 
 /// A paired server, as this one keeps it.
@@ -366,22 +366,14 @@ impl Store {
     ) -> Result<PairRedeemed, StoreError> {
         let now = self.now();
         let mut tx = self.begin_write().await?;
-        let taken: Option<(String, String)> = sqlx::query_as(
-            "UPDATE invites SET uses_left = uses_left - 1 \
-             WHERE capability_hash = ?1 AND kind = 'federation' AND revoked_at IS NULL \
-               AND expires_at > ?2 AND uses_left > 0 \
-             RETURNING id, created_by",
-        )
-        .bind(capability_hash)
-        .bind(now)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((invite_id, created_by)) = taken else {
-            let refused = state(&mut tx, capability_hash, now).await?;
-            tx.rollback().await?;
-            return Ok(PairRedeemed::Refused(refused));
+        let taken = match take_use(&mut tx, capability_hash, InviteKind::Federation, now).await? {
+            Ok(taken) => taken,
+            Err(refused) => {
+                tx.rollback().await?;
+                return Ok(PairRedeemed::Refused(refused));
+            }
         };
-        match insert_peer(&mut tx, peer, &created_by, Some(&invite_id), now).await? {
+        match insert_peer(&mut tx, peer, &taken.created_by, Some(&taken.id), now).await? {
             Some(record) => {
                 tx.commit().await?;
                 Ok(PairRedeemed::Paired(Box::new(record)))

@@ -156,14 +156,8 @@ impl Session {
     /// federation invite unless the session has
     /// [`crate::Experimental::federation`] on.
     pub async fn create_invite(&self, spec: InviteSpec) -> Result<MintedInvite, SdkError> {
-        let kind = match spec.kind {
-            InviteKind::CreateUser => wire::InviteKind::CreateUser,
-            InviteKind::PortableAccount => wire::InviteKind::PortableAccount,
-            InviteKind::Federation => wire::InviteKind::Federation,
-            InviteKind::Unknown => {
-                return Err(SdkError::InvalidInput("pick what the invite is for".into()));
-            }
-        };
+        let kind = wire::InviteKind::try_from(spec.kind)
+            .map_err(|()| SdkError::InvalidInput("pick what the invite is for".into()))?;
         let request = Request::CreateInvite(CreateInvite {
             kind,
             note: spec.note,
@@ -176,7 +170,7 @@ impl Session {
                 share_link: share_link(&created),
                 copy_string: share_link(&created),
                 id: created.invite.id,
-                kind: kind_of(created.invite.kind),
+                kind: created.invite.kind.into(),
                 code: created.code,
                 link: created.link,
                 expires_at: time(created.invite.expires_at),
@@ -220,12 +214,28 @@ fn unexpected(reply: Reply) -> SdkError {
     SdkError::Protocol(format!("unexpected reply {reply:?}"))
 }
 
-pub(crate) fn kind_of(kind: wire::InviteKind) -> InviteKind {
-    match kind {
-        wire::InviteKind::CreateUser => InviteKind::CreateUser,
-        wire::InviteKind::PortableAccount => InviteKind::PortableAccount,
-        wire::InviteKind::Federation => InviteKind::Federation,
-        wire::InviteKind::Unknown => InviteKind::Unknown,
+impl From<wire::InviteKind> for InviteKind {
+    fn from(kind: wire::InviteKind) -> Self {
+        match kind {
+            wire::InviteKind::CreateUser => InviteKind::CreateUser,
+            wire::InviteKind::PortableAccount => InviteKind::PortableAccount,
+            wire::InviteKind::Federation => InviteKind::Federation,
+            wire::InviteKind::Unknown => InviteKind::Unknown,
+        }
+    }
+}
+
+/// The kind to ask for: [`InviteKind::Unknown`] is none.
+impl TryFrom<InviteKind> for wire::InviteKind {
+    type Error = ();
+
+    fn try_from(kind: InviteKind) -> Result<Self, ()> {
+        match kind {
+            InviteKind::CreateUser => Ok(Self::CreateUser),
+            InviteKind::PortableAccount => Ok(Self::PortableAccount),
+            InviteKind::Federation => Ok(Self::Federation),
+            InviteKind::Unknown => Err(()),
+        }
     }
 }
 
@@ -251,7 +261,7 @@ fn summary(invite: wire::InviteSummary, this_device: &str) -> InviteSummary {
     };
     InviteSummary {
         id: invite.id,
-        kind: kind_of(invite.kind),
+        kind: invite.kind.into(),
         note: invite.note,
         role: invite.role,
         uses: invite.uses,
@@ -269,6 +279,25 @@ fn summary(invite: wire::InviteSummary, this_device: &str) -> InviteSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every kind crosses to the wire and back; `Unknown` is never asked
+    /// for, and what the wire does not know reads as it.
+    #[test]
+    fn every_kind_round_trips_through_the_wire() {
+        for kind in [
+            InviteKind::CreateUser,
+            InviteKind::PortableAccount,
+            InviteKind::Federation,
+        ] {
+            let wire = wire::InviteKind::try_from(kind).unwrap();
+            assert_eq!(InviteKind::from(wire), kind);
+        }
+        assert_eq!(wire::InviteKind::try_from(InviteKind::Unknown), Err(()));
+        assert_eq!(
+            InviteKind::from(wire::InviteKind::Unknown),
+            InviteKind::Unknown
+        );
+    }
 
     fn listed(created_from: wire::InviteOrigin) -> wire::InviteSummary {
         wire::InviteSummary {
