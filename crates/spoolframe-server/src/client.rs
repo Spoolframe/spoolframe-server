@@ -29,7 +29,7 @@ use spoolframe_protocol::streams::{bi, reset, uni};
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkSize, BitmapSubtitles, ChosenTracks, ConvertedSubtitle, MAX_READ,
     MediaRead, MediaReadReply, PlaybackHandle, PlaybackPlan, SUBTITLE_CHUNK, Selection,
-    SubtitleAction, TopResult,
+    SubtitleAction,
 };
 use spoolframe_protocol::{
     AuthMethod, DeviceInfo, DeviceSignInRequest, Error, Event, FinishPasskeySignIn, Hello,
@@ -2345,7 +2345,9 @@ impl ClientProtocol {
         if federation.is_none()
             && matches!(
                 request,
-                Request::SetServerRow { .. } | Request::UpdateWatchProgress { .. }
+                Request::SetServerRow { .. }
+                    | Request::UpdateWatchProgress { .. }
+                    | Request::SetPlayFrom { .. }
             )
         {
             return Err(Error::Unsupported {
@@ -3092,6 +3094,19 @@ impl ClientProtocol {
                 } else {
                     (None, None)
                 };
+                // P8-05: the title's copies, for a client that takes them.
+                let copies = match federation {
+                    Some(federation) => Some(
+                        federation
+                            .viewer(principal)
+                            .await
+                            .map_err(internal)?
+                            .item_copies(catalog.as_ref(), &found, &title)
+                            .await
+                            .map_err(internal)?,
+                    ),
+                    None => None,
+                };
                 Ok(Reply::Item {
                     item: found.item,
                     children: found.children,
@@ -3099,6 +3114,7 @@ impl ClientProtocol {
                     playlists,
                     liked,
                     liked_children,
+                    copies,
                 })
             }
             Request::ListPlaylists => {
@@ -3324,29 +3340,63 @@ impl ClientProtocol {
                 .map_err(playlists_error),
             Request::Search(mut search) => {
                 search.limit = search.limit.min(MAX_PAGE);
-                // Experimental (P8-02): the paired servers' cache too, its
-                // hits beside this server's own until P8-05 merges them.
-                let peers = federation.map(|f| f.peer_catalog());
-                let mut results = crate::search::search_with(
+                let Some(federation) = federation else {
+                    let mut results = crate::search::search(
+                        catalog.as_ref(),
+                        &search,
+                        crate::search::this_year(),
+                    )
+                    .await
+                    .map_err(catalog_error)?;
+                    self.fill(principal, crate::search::items_mut(&mut results))
+                        .await?;
+                    return Ok(Reply::Search(results));
+                };
+                // Experimental (P8-02, P8-05): the paired servers' cache
+                // too, a title on several servers one hit.
+                let viewer = federation.viewer(principal).await.map_err(internal)?;
+                let cache = federation.peer_catalog();
+                let peers = crate::search::Peers {
+                    cache: cache.as_ref(),
+                    preferred: &viewer,
+                };
+                let mut searched = crate::search::search_with(
                     catalog.as_ref(),
-                    peers
-                        .as_deref()
-                        .map(|p| p as &dyn spoolframe_catalog::Catalog),
+                    Some(&peers),
                     &search,
                     crate::search::this_year(),
                 )
                 .await
                 .map_err(catalog_error)?;
-                let top = match &mut results.top {
-                    Some(TopResult::Item(item)) => Some(item),
-                    _ => None,
+                self.fill(principal, crate::search::items_mut(&mut searched.results))
+                    .await?;
+                viewer
+                    .fill_titles(&self.services.watch, &mut searched)
+                    .await
+                    .map_err(watch_error)?;
+                Ok(Reply::SearchHits(viewer.hits(searched)))
+            }
+            Request::SetPlayFrom { title, from } => {
+                let Some(federation) = federation else {
+                    return Err(Error::Unsupported {
+                        request: "Play from".into(),
+                    });
                 };
-                let items = top
-                    .into_iter()
-                    .chain(results.groups.iter_mut().flat_map(|g| g.items.iter_mut()))
-                    .chain(results.without_year.iter_mut());
-                self.fill(principal, items).await?;
-                Ok(Reply::Search(results))
+                let found = catalog.item(&title).await.map_err(catalog_error)?;
+                let key = self.services.watch.title_key(&found).await;
+                federation
+                    .set_play_from(principal, &title, &key, from.as_deref())
+                    .await
+                    .map_err(|e| match e {
+                        crate::federation::PlayFromError::NoTitle(_) => Error::InvalidInput {
+                            message: e.to_string(),
+                        },
+                        crate::federation::PlayFromError::NoSuchServer(_) => Error::NotFound {
+                            what: e.to_string(),
+                        },
+                        crate::federation::PlayFromError::Store(e) => internal(e),
+                    })?;
+                Ok(Reply::Done)
             }
             Request::RecentlyPlayed {
                 kinds,

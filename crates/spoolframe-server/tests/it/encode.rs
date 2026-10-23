@@ -2988,6 +2988,74 @@ async fn an_onward_share_that_drops_mid_play_is_planned_again_under_it() {
     server.stop().await;
 }
 
+/// StartPlayback with the overrides a paired server passes for its own
+/// device (P8-04, P8-05): that device's capabilities and its share of the
+/// paired server's uplink.
+async fn start_on_behalf(
+    client: &TestClient,
+    session: &SessionId,
+    capabilities: Option<ClientCapabilities>,
+    onward_share: Option<u64>,
+) -> PlaybackPlan {
+    let response = client
+        .call(
+            Some(session),
+            Request::StartPlayback {
+                id: movie().id().clone(),
+                selection: None,
+                start_ms: None,
+                bitmap: Default::default(),
+                quality: Quality::default(),
+                display: None,
+                capabilities,
+                onward_share,
+            },
+        )
+        .await;
+    match response {
+        Response::Ok(Reply::PlaybackStarted { plan, .. }) => plan,
+        other => panic!("not started: {other:?}"),
+    }
+}
+
+/// P8-05: a remote user's play is planned on the sharing server for the
+/// device that shows it, not for the paired server that asks: the
+/// capabilities a start passes are planned for over the Hello's. The
+/// Hello's take the file's AC-3; the device's do not, so its audio is
+/// converted.
+#[tokio::test]
+async fn a_start_s_capabilities_are_planned_for_over_the_hello_s() {
+    let (server, client, session) = ready_for_range("on-behalf-caps").await;
+    let plan = start_on_behalf(&client, &session, None, None).await;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    let device = ClientCapabilities {
+        audio: [spoolframe_types::AudioCodec::Aac].into(),
+        ..range_or_progressive()
+    };
+    let plan = start_on_behalf(&client, &session, Some(device), None).await;
+    assert!(
+        matches!(plan, PlaybackPlan::Converted { .. }),
+        "the device's capabilities are not planned for: {plan:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// P8-05: a paired server's share of its own uplink, passed with the
+/// start, caps the plan from its first segment: on a slow onward link the
+/// file is encoded, however fast this server's link is.
+#[tokio::test]
+async fn an_onward_share_at_the_start_is_planned_under() {
+    let (server, client, session) = ready_for_range("onward-share-start").await;
+    let plan = start_on_behalf(&client, &session, None, Some(SLOW_LINK)).await;
+    assert!(
+        encoded_video(&plan).is_some_and(|cap| cap.is_some()),
+        "{plan:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 /// A bitrate the viewer chose under the file's is an encode under it.
 #[tokio::test]
 async fn a_chosen_bitrate_under_the_file_s_is_an_encode() {

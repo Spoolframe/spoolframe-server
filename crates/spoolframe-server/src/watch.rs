@@ -636,7 +636,11 @@ impl Watch {
         let mut ids = found.external_ids.clone();
         if let Item::Episode(episode) = &found.item {
             match self.show_ids(&episode.show_id).await {
-                Ok(show) => ids.extend(episode_ids(&show, episode.season, episode.episode)),
+                Ok(show) => ids.extend(spoolframe_catalog::episode_ids(
+                    &show,
+                    episode.season,
+                    episode.episode,
+                )),
                 Err(e) => tracing::debug!(
                     show = %episode.show_id,
                     error = %e,
@@ -671,23 +675,60 @@ impl Watch {
         item: &mut Item,
         title: &[String],
     ) -> Result<(), WatchError> {
-        if !tracked(item.id()) {
-            return Ok(());
-        }
-        let mut keys = self.store.title_rows(principal, title).await?;
-        let own = item.id().to_string();
-        if !keys.contains(&own) {
-            keys.push(own);
-        }
-        let states = self.store.watch_states(principal, &keys).await?;
-        let Some(newest) = states.values().max_by_key(|row| row.updated_at) else {
-            return Ok(());
-        };
-        let position = newest
-            .position_ms
-            .map(|p| Duration::from_millis(p.max(0) as u64));
-        if let Some(playback) = playback_mut(item) {
-            *playback = self.rules().playback_state(position, newest.watched);
+        self.fill_titles(principal, &mut [(item, title)]).await
+    }
+
+    /// [`Watch::fill_title`] for each of `items`, each with its title, in
+    /// two reads however many there are: a search's hits (P8-05).
+    pub async fn fill_titles(
+        &self,
+        principal: Principal,
+        items: &mut [(&mut Item, &[String])],
+    ) -> Result<(), WatchError> {
+        let mut ids: Vec<String> = items
+            .iter()
+            .filter(|(item, _)| tracked(item.id()))
+            .flat_map(|(_, title)| title.iter().cloned())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        let rows = self.store.title_rows_by_id(principal, &ids).await?;
+        // Each item's keys: its title's copies', and its own.
+        let keys: Vec<Vec<String>> = items
+            .iter()
+            .map(|(item, title)| {
+                if !tracked(item.id()) {
+                    return Vec::new();
+                }
+                let mut keys: Vec<String> = rows
+                    .iter()
+                    .filter(|(id, _)| title.contains(id))
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                keys.push(item.id().to_string());
+                keys.sort();
+                keys.dedup();
+                keys
+            })
+            .collect();
+        let mut every: Vec<String> = keys.iter().flatten().cloned().collect();
+        every.sort();
+        every.dedup();
+        let states = self.store.watch_states(principal, &every).await?;
+        for ((item, _), keys) in items.iter_mut().zip(&keys) {
+            let Some(newest) = keys
+                .iter()
+                .filter_map(|key| states.get(key))
+                .max_by_key(|row| row.updated_at)
+            else {
+                continue;
+            };
+            let position = newest
+                .position_ms
+                .map(|p| Duration::from_millis(p.max(0) as u64));
+            if let Some(playback) = playback_mut(item) {
+                *playback = self.rules().playback_state(position, newest.watched);
+            }
         }
         Ok(())
     }
@@ -711,7 +752,7 @@ impl Watch {
         };
         if media_id
             .parse::<MediaId>()
-            .is_ok_and(|to| origin(&to) != origin(&id))
+            .is_ok_and(|to| to.origin() != id.origin())
         {
             return false;
         }
@@ -1075,20 +1116,6 @@ fn remote(key: &str) -> bool {
 
 /// The paired server `id` is from, if it is one's (P8-02): `None` for this
 /// server's own.
-fn origin(id: &MediaId) -> Option<&str> {
-    id.remote().map(|(origin, _)| origin)
-}
-
-/// What an episode `season`×`episode` of a show with `show_ids` is
-/// matched by, beside its own ids: each of the show's ids with its season
-/// and number.
-fn episode_ids(show_ids: &[String], season: u32, episode: u32) -> Vec<String> {
-    show_ids
-        .iter()
-        .map(|id| format!("{id}#s{season}e{episode}"))
-        .collect()
-}
-
 /// A show's run, of its `episodes` (the catalog's): specials (season 0)
 /// are not part of it, and the rest go by season and number. Next up and
 /// binge-ahead (PX-37) both go on along it.

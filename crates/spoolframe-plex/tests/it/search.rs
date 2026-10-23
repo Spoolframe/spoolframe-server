@@ -419,3 +419,56 @@ async fn a_person_id_of_another_shape_is_not_found() {
         assert!(matches!(err, CatalogError::NotFound(_)), "{id}: {err}");
     }
 }
+
+/// A search asks Plex for its hits' agents' ids (`includeGuids`), and says
+/// the title each hit is a copy of: an episode's own ids and its show's
+/// guid with its season and number (P8-05). Nothing of it is on `Item`.
+#[tokio::test]
+async fn a_search_says_each_hit_s_title_by_its_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(fixture("sections"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/1/search"))
+        .and(query_param("type", "4"))
+        .and(query_param("includeGuids", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "size": 1,
+                "totalSize": 1,
+                "Metadata": [{
+                    "ratingKey": "211618",
+                    "type": "episode",
+                    "title": "Letterkenny Talent Show",
+                    "index": 4,
+                    "parentIndex": 4,
+                    "parentRatingKey": "211614",
+                    "grandparentRatingKey": "209050",
+                    "grandparentTitle": "Letterkenny",
+                    "guid": "plex://episode/5d9c0",
+                    "grandparentGuid": "plex://show/5d9c08",
+                    "Guid": [{ "id": "tvdb://6544321" }, { "id": "local://9" }]
+                }]
+            }
+        })))
+        .mount(&server)
+        .await;
+    let found = catalog(&server)
+        .find(&query("letterkenny", &[SearchKind::Episodes]))
+        .await
+        .unwrap();
+    let episode = &group(&found, SearchKind::Episodes).items[0];
+    assert_eq!(
+        found.titles[episode.id()],
+        [
+            "plex://episode/5d9c0",
+            "tvdb://6544321",
+            "plex://show/5d9c08#s4e4"
+        ]
+    );
+}

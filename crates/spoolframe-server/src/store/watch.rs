@@ -155,6 +155,28 @@ impl Store {
         .await?)
     }
 
+    /// [`Store::title_rows`] for many titles at once (P8-05): each key
+    /// with the id of `title_ids` it is kept under, for a search's hits to
+    /// pick their own from.
+    pub async fn title_rows_by_id(
+        &self,
+        principal: Principal,
+        title_ids: &[String],
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if title_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as(
+            "SELECT DISTINCT external_id, media_id FROM watch_state_ids \
+             WHERE principal = ?1 AND external_id IN (SELECT value FROM json_each(?2)) \
+             ORDER BY media_id",
+        )
+        .bind(principal.to_string())
+        .bind(serde_json::to_string(title_ids).expect("strings serialize"))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Remove `media_id` (a movie or an episode: the card, never a show)
     /// from `principal`'s Continue watching and Next up, until its watch
     /// state changes (P1-22). `external_ids` let the hide follow the item

@@ -151,6 +151,28 @@
   `start_proxied_playback`, `RemotePlayback`, `RemoteMode` and
   `SdkError::OriginOffline`. PROTOCOL.md's "Playing a paired server's
   item" has the wire.
+- Experimental, and off by default, as pairing is: one search result
+  per title across servers (P8-05). For an app that names the
+  `federation` feature, a film or show on this server and on a paired
+  one (the same TMDB, IMDb, TVDB, MusicBrainz or Plex id; an episode by
+  its show's, season and number) is one hit, this server's copy, with
+  the others as "also on"; without one here, the copy the user plays
+  from, else the one last played, else the first online. Titles without
+  those ids are never merged. Each hit, and an item, says its copies in
+  Play from order and the copy that plays, and the user's Play from
+  choice is kept per title (migration 0055,
+  `federation_play_from`). Counts after merging are approximate. Plex's
+  search is asked for its hits' ids (`includeGuids=1`). An app that
+  does not name the feature is answered as before, with this server's
+  own results alone.
+- Client protocol, for an app that names the experimental `federation`
+  feature, and no `PROTOCOL_VERSION` change: `Search` is answered
+  `SearchHits`, its items `SearchHit { item, origin, also_on, play_from }`;
+  `Item` gains an optional `copies { origin, also_on, play_from }`; and
+  `SetPlayFrom { title, from }`, answered `Done`. SDK:
+  `Session::search_hits`, `set_play_from` and `ItemDetail.copies`;
+  `Session::search` gives the hits' items. PROTOCOL.md's "One result per
+  title" has the wire.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

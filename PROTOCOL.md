@@ -51,6 +51,7 @@ must be updated together. The changes per revision are in
   [sharing libraries](#sharing-libraries),
   [paired servers in an app](#paired-servers-in-an-app),
   [progress](#progress-on-a-paired-servers-item),
+  [one result per title](#one-result-per-title),
   [delegated authentication](#delegated-authentication),
   [playing a paired server's item](#playing-a-paired-servers-item)
 
@@ -3264,7 +3265,9 @@ watch history leaves them out. `PROTOCOL_VERSION` does not change.
   goes offline, or a sync finds a library shared or no longer shared:
   ask `Libraries` again.
 - Browsing, `Item` and search take `fed:` ids as any other. Search
-  answers the cache's hits after the server's own in each group.
+  answers `search_hits`: the server's own and the cache's, a title found
+  on several servers once ([one result per
+  title](#one-result-per-title)).
 - `HomeScreen.servers` is each paired server's own row: `{server,
   shown, items}`, what it shared most recently first, by when SB cached
   it. `set_server_row {server_id, shown}` shows or hides one, per user:
@@ -3297,6 +3300,76 @@ number). When the user has a state of SB's own copy, SA's copy's
 progress is written there; nothing SA says of its items moves a state of
 SB's copy. `Item` of either copy says the title's newest state, and
 Continue watching has one card for it.
+
+### One result per title
+
+A title on SB and on a paired server, or on several paired servers, is
+one search result (P8-05). Only to an app that names the experimental
+`federation` feature: any other is answered `search` as before, with
+SB's own results alone. `PROTOCOL_VERSION` does not change.
+
+`search` is answered `search_hits`: the same `top`, `groups`, `counts`,
+`year` and `without_year`, each item a `SearchHit`:
+
+```json
+{
+  "item": {"movie": {"id": "plex:movie:500", "title": "Alien", "...": "..."}},
+  "origin": null,
+  "also_on": [
+    {"id": "fed:movie:mzxw6ytbojtg633c:plex:1",
+     "server": {"server_id": "mzxw6ytbojtg633c", "name": "Alice's server", "online": true}}
+  ],
+  "play_from": "plex:movie:500"
+}
+```
+
+- Two copies are one title when they share an external id: TMDB, IMDb,
+  TVDB, MusicBrainz or Plex's own guid. An episode is matched by its
+  show's id with its season and number too. Never across kinds, nor
+  across years when both copies have one: a paired server's ids are its
+  word only. A title with none of these ids is never merged, whatever
+  its name and year, and two copies on one server stay two.
+- The hit is SB's own copy when SB has one (`origin` null), else the
+  copy on the server the user plays the title from, else the one last
+  played, else the first online. `origin` is the paired server `item`
+  is from.
+- `also_on` is the title's other copies, in Play from order: SB's
+  first, then the paired servers online by name, then those offline,
+  which an app greys (browsed, not played).
+- `play_from` is the copy that plays: the one on the server the user
+  chose (`set_play_from`) while that server has one, else `item`'s id.
+- `item.playback` is the title's newest progress, whichever copy played.
+- Counts are approximate, as counts are: a title's copies are counted
+  as one only among the results found, not in each backend's total. The
+  other scopes' counts (an empty scope's) find no items, so there a
+  title on SB and on a paired server counts twice.
+  Search is SB's alone: Plex's per-section search with each hit's ids
+  (`includeGuids=1`), and SB's cache of what the pairs share. No paired
+  server is asked anything.
+
+`item` answers the same for one item, as `copies {origin, also_on,
+play_from}`: its title's copies on SB and on the paired servers, one per
+server. SB finds its own copy of a paired server's item by Plex's guid,
+the one id Plex looks items up by.
+
+`set_play_from {title, from}` plays the title `title` (any copy's id)
+from paired server `from`, or from SB with `from` null: `done`. It is
+kept per user by the title's kind and external ids, so every copy of the
+title finds it, a later choice under any of them replaces it, and a film
+and a show that TMDB numbers alike keep their own. A title with
+no such ids has one copy: `invalid_input`. A server not paired, or an
+item not found, is `not_found`. It may be replayed.
+
+```json
+{"type": "set_play_from", "title": "plex:movie:500", "from": "mzxw6ytbojtg633c"}
+```
+
+#### SDK
+
+`Session::search_hits` (a `SearchResults<SearchHit>`; from a server
+that answers plain results, hits of its own items), `set_play_from`,
+and `ItemDetail.copies`. `Session::search` gives a hit's items to an app
+that names the feature.
 
 ### Delegated authentication
 

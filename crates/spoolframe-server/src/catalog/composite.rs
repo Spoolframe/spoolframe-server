@@ -285,6 +285,10 @@ fn named(e: CatalogError, local: &impl ToString, ours: &impl ToString) -> Catalo
 /// Each kind `query` asked for, from every server's answer: taken from
 /// each server in turn, best first, and their totals summed.
 fn merge(query: &SearchQuery, mut answers: Vec<Found>) -> Found {
+    let titles = answers
+        .iter_mut()
+        .flat_map(|found| std::mem::take(&mut found.titles))
+        .collect();
     let groups = query
         .kinds
         .iter()
@@ -299,7 +303,7 @@ fn merge(query: &SearchQuery, mut answers: Vec<Found>) -> Found {
             FoundGroup::merge(kind, of_kind, query.limit)
         })
         .collect();
-    Found { groups }
+    Found { groups, titles }
 }
 
 /// Newest first across servers; an item without a date after the dated
@@ -741,15 +745,15 @@ mod tests {
 
     #[test]
     fn search_takes_each_kind_from_each_server_in_turn_and_sums_totals() {
-        let found = |items: Vec<Item>, total| Found {
-            groups: vec![
+        let found = |items: Vec<Item>, total| {
+            Found::of(vec![
                 FoundGroup::empty(SearchKind::Shows),
                 FoundGroup {
                     items,
                     total,
                     ..FoundGroup::empty(SearchKind::Movies)
                 },
-            ],
+            ])
         };
         let query = SearchQuery {
             text: "a".into(),

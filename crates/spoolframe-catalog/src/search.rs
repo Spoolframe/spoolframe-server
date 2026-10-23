@@ -3,7 +3,9 @@
 //! leaving quiet episodes out and counting per scope happen above the
 //! catalog, once the results of every catalog are in.
 
-use spoolframe_types::{Item, LibraryId, Person, SearchKind};
+use std::collections::HashMap;
+
+use spoolframe_types::{Item, LibraryId, MediaId, Person, SearchKind};
 
 /// What to search for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,32 @@ pub struct SearchQuery {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Found {
     pub groups: Vec<FoundGroup>,
+    /// The title each item found is a copy of, by its id, where the
+    /// catalog knows it (P8-05): its external ids, and for an episode its
+    /// show's with its season and number ([`episode_ids`]). What a title
+    /// found on several servers is merged by. Server side only, never on
+    /// `Item`; an item missing here is matched to nothing.
+    pub titles: HashMap<MediaId, Vec<String>>,
+}
+
+impl Found {
+    /// `groups`, with no title known.
+    pub fn of(groups: Vec<FoundGroup>) -> Self {
+        Self {
+            groups,
+            titles: HashMap::new(),
+        }
+    }
+}
+
+/// An episode's ids by its show's `show_ids`, its `season` and its number
+/// (`tmdb://1396#s1e2`): two servers' copies of an episode share their
+/// show's ids more often than their own (P8-03, P8-05).
+pub fn episode_ids(show_ids: &[String], season: u32, episode: u32) -> Vec<String> {
+    show_ids
+        .iter()
+        .map(|id| format!("{id}#s{season}e{episode}"))
+        .collect()
 }
 
 /// One kind's results, best first as the backend orders them.
@@ -95,6 +123,16 @@ mod tests {
     fn interleaving_takes_from_each_list_in_turn() {
         assert_eq!(interleave(vec![vec![1, 2, 3], vec![10]], 3), [1, 10, 2]);
         assert_eq!(interleave(vec![vec![1], vec![10, 20]], 9), [1, 10, 20]);
+    }
+
+    /// An episode is matched by each of its show's ids with its season and
+    /// number.
+    #[test]
+    fn an_episode_is_matched_by_its_show_s_ids_season_and_number() {
+        assert_eq!(
+            episode_ids(&["tmdb://1396".into(), "tvdb://81189".into()], 1, 2),
+            ["tmdb://1396#s1e2", "tvdb://81189#s1e2"]
+        );
     }
 
     #[test]

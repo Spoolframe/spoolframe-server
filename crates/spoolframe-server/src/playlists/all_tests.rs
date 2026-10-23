@@ -154,7 +154,7 @@ impl Catalog for Big {
     }
 
     async fn search(&self, _: &SearchQuery) -> Result<Found, CatalogError> {
-        Ok(Found { groups: Vec::new() })
+        Ok(Found::default())
     }
 
     async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {

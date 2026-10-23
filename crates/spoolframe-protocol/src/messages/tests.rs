@@ -16,11 +16,14 @@ use crate::{
     WhoAmIReply,
 };
 use crate::{
+    Copies, SearchCounts, SearchGroup, SearchHit, SearchRequest, SearchResults, TitleCopy,
+    TopResult,
+};
+use crate::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyInfo, PasskeyRegistrationBegun,
     PasskeySignInBegun,
 };
 use crate::{PlannedAudio, PlannedSubtitle, PlaybackPlan, Selection, SubtitleDelivery};
-use crate::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use spoolframe_types::Delivery;
@@ -105,6 +108,67 @@ fn search_results() -> SearchResults {
         year: Some(1979),
         without_year: vec![movie()],
     }
+}
+
+/// `item` as a paired server's hit, its title also on this server.
+fn hit(item: Item) -> SearchHit {
+    let fed = MediaId::federated("aaaaaaaaaaaaaaaa", item.id()).unwrap();
+    SearchHit {
+        origin: Some(spoolframe_types::LibraryServer {
+            server_id: "aaaaaaaaaaaaaaaa".into(),
+            name: "Alice's server".into(),
+            online: true,
+        }),
+        also_on: vec![TitleCopy {
+            id: item.id().clone(),
+            server: None,
+        }],
+        play_from: fed.clone(),
+        item,
+    }
+}
+
+/// P8-05: an Item reply's copies go only when there are some, and a reply
+/// without them, an older server's, reads as none.
+#[test]
+fn an_item_s_copies_are_left_out_when_there_are_none() {
+    let item = |copies| Reply::Item {
+        item: movie(),
+        children: Vec::new(),
+        markers: Vec::new(),
+        playlists: None,
+        liked: None,
+        liked_children: None,
+        copies,
+    };
+    let json = serde_json::to_value(item(None)).unwrap();
+    assert!(json.get("copies").is_none(), "{json}");
+    let copies = Copies {
+        origin: None,
+        also_on: hit(movie()).also_on,
+        play_from: movie().id().clone(),
+    };
+    let with = item(Some(copies.clone()));
+    round_trip(with.clone());
+    let Reply::Item { copies: read, .. } = codec::decode(&codec::encode(&with).unwrap()).unwrap()
+    else {
+        panic!("not an item");
+    };
+    assert_eq!(read, Some(copies));
+}
+
+/// P8-05: a hit's copies are optional on the wire, so a hit with none,
+/// from this server, is its item and the id that plays.
+#[test]
+fn a_hit_needs_only_its_item_and_what_plays() {
+    let json = serde_json::json!({
+        "item": serde_json::to_value(movie()).unwrap(),
+        "play_from": "plex:movie:1",
+    });
+    let hit: SearchHit = serde_json::from_value(json).unwrap();
+    assert_eq!(hit.origin, None);
+    assert!(hit.also_on.is_empty());
+    assert_eq!(&hit.play_from, movie().id());
 }
 
 fn hello() -> Hello {
@@ -218,6 +282,14 @@ fn every_request_round_trips() {
             kind: Some(SearchKind::People),
             library: None,
         }),
+        Request::SetPlayFrom {
+            title: id.clone(),
+            from: Some("aaaaaaaaaaaaaaaa".into()),
+        },
+        Request::SetPlayFrom {
+            title: id.clone(),
+            from: None,
+        },
         Request::PersonItems {
             person: PersonId::new(Namespace::Plex, "director-131768").unwrap(),
             offset: 0,
@@ -500,6 +572,7 @@ fn every_reply_round_trips() {
             playlists: None,
             liked: None,
             liked_children: None,
+            copies: None,
         },
         Reply::Item {
             item: movie(),
@@ -515,8 +588,10 @@ fn every_reply_round_trips() {
             }]),
             liked: None,
             liked_children: None,
+            copies: None,
         },
         Reply::Search(search_results()),
+        Reply::SearchHits(search_results().map(hit)),
         Reply::Tracks(MediaTracks::default()),
         Reply::WhoAmI(WhoAmIReply {
             user: UserSummary {
@@ -1309,7 +1384,7 @@ fn a_person_at_the_top_is_tagged_person_on_the_wire() {
         role: PersonRole::Actor,
         count: Some(9),
     };
-    let top = TopResult::Person(keanu);
+    let top: TopResult = TopResult::Person(keanu);
     let json = serde_json::to_value(&top).unwrap();
     assert_eq!(json["person"]["name"], "Keanu Reeves");
     assert_eq!(json["person"]["id"], "plex:actor-134469");
@@ -1720,6 +1795,7 @@ fn an_older_client_reads_an_item_that_has_markers() {
         playlists: None,
         liked: None,
         liked_children: None,
+        copies: None,
     })
     .unwrap();
     let before_markers::Reply::Item { item, children } = codec::decode(&bytes).unwrap() else {
@@ -1990,6 +2066,7 @@ fn a_reply_missing_a_field_is_refused() {
             playlists: None,
             liked: None,
             liked_children: None,
+            copies: None,
         },
         &["markers"],
     );
@@ -3118,6 +3195,7 @@ mod playlists {
             playlists: Some(Vec::new()),
             liked: Some(crate::playlists::Liked::Some),
             liked_children: Some(vec![track.clone()]),
+            copies: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["liked"], "some");
@@ -3228,6 +3306,7 @@ mod playlists {
             playlists: None,
             liked: None,
             liked_children: None,
+            copies: None,
         };
         let json = serde_json::to_value(&without).unwrap();
         assert!(json.get("playlists").is_none(), "{json}");

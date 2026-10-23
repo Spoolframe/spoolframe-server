@@ -13,7 +13,7 @@ pub use inspect::{
     Browse, FileCheck, Inspect, Inspected, LibraryCheck, MappingUsed, MissingFile, Row, RowFilter,
     RowPage, Version, VersionPart,
 };
-pub use search::{Found, FoundGroup, SearchQuery, interleave};
+pub use search::{Found, FoundGroup, SearchQuery, episode_ids, interleave};
 
 use std::error::Error;
 use std::fmt;

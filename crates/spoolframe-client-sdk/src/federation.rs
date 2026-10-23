@@ -42,7 +42,9 @@ use spoolframe_protocol::federation::{
     PairServer, PeerServer, PlayTokenRedeemed, RedeemPlayToken, RemoteGranted, RemoteHints,
     ShareLibraries,
 };
-use spoolframe_protocol::{Reply, Request, Response, Selection};
+use spoolframe_protocol::{
+    Reply, Request, Response, SearchHit, SearchRequest, SearchResults, Selection,
+};
 use spoolframe_types::{LibraryId, MediaId, Namespace};
 
 use crate::session::unexpected;
@@ -149,6 +151,46 @@ impl Session {
         let request = Request::SetServerRow {
             server_id: server_id.to_owned(),
             shown,
+        };
+        self.done(request).await
+    }
+
+    /// A search over this session's server and what its paired servers
+    /// share (P8-05), each item a [`SearchHit`]: a title on several servers
+    /// once, with where it is from, its other copies and the copy that
+    /// plays. Counts are approximate. A server that answers with plain
+    /// results (one too old for hits) gives hits of its own items.
+    /// [`SdkError::Unsupported`] without
+    /// [`crate::Experimental::federation`], and nothing is sent.
+    pub async fn search_hits(
+        &self,
+        request: SearchRequest,
+    ) -> Result<SearchResults<SearchHit>, SdkError> {
+        self.federated()?;
+        match self.call(Request::Search(request)).await? {
+            Reply::SearchHits(hits) => Ok(hits),
+            Reply::Search(results) => Ok(results.map(|item| SearchHit {
+                play_from: item.id().clone(),
+                origin: None,
+                also_on: Vec::new(),
+                item,
+            })),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Play the title `title` (any copy's id) from paired server `from`,
+    /// or from this session's server with `None` (P8-05): remembered for
+    /// the user, for every copy of the title, while that server has one.
+    /// [`SdkError::InvalidInput`] for a title with no external ids, which
+    /// has one copy; [`SdkError::NotFound`] for a server not paired or an
+    /// item not found. [`SdkError::Unsupported`] without
+    /// [`crate::Experimental::federation`], and nothing is sent.
+    pub async fn set_play_from(&self, title: &MediaId, from: Option<&str>) -> Result<(), SdkError> {
+        self.federated()?;
+        let request = Request::SetPlayFrom {
+            title: title.clone(),
+            from: from.map(str::to_owned),
         };
         self.done(request).await
     }

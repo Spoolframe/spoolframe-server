@@ -504,6 +504,7 @@ async fn an_item_page_shows_what_a_client_would_get() {
         playlists: None,
         liked: None,
         liked_children: None,
+        copies: None,
     };
     assert_eq!(seen.reply, serde_json::to_value(&client).unwrap());
     assert_eq!(seen.reply["markers"].as_array().unwrap().len(), 2);

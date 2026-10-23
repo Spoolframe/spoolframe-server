@@ -32,6 +32,7 @@ pub mod oauth;
 pub mod optimized;
 pub mod passkeys;
 pub mod pins;
+pub mod play_from;
 pub mod playlists;
 pub mod plays;
 pub mod portable;

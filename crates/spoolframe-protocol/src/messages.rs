@@ -245,7 +245,10 @@ pub enum Request {
     Item {
         id: MediaId,
     },
-    /// Scoped, grouped search (P3-09). `Search`.
+    /// Scoped, grouped search (P3-09). `Search`; for a client that names
+    /// the experimental `federation` feature, `SearchHits` (P8-05): this
+    /// server's results and the paired servers' cache's, a title found on
+    /// several servers once.
     Search(SearchRequest),
     /// The items a person a search found is in (P3-09), one page at a
     /// time. `Items`.
@@ -782,6 +785,21 @@ pub enum Request {
     /// `Hello` named the feature.
     RemoteGrant {
         id: MediaId,
+    },
+
+    /// Experimental (`federation`, P8-05): play the title `title` (any
+    /// copy's id) from paired server `from`, or from this server with
+    /// `None`: `Done`. Remembered for the user by the title's external
+    /// ids, so every copy of it, here or on a paired server, plays from
+    /// there (`SearchHit::play_from`, `Copies::play_from`) while that
+    /// server has one. A title with no external ids has one copy:
+    /// `InvalidInput`. A server not paired, or an item not found, is
+    /// `NotFound`. Unsupported unless this connection's `Hello` named the
+    /// feature.
+    SetPlayFrom {
+        title: MediaId,
+        #[serde(default)]
+        from: Option<String>,
     },
 
     /// Leave this server (PX-47): `Done`, and every session of the user
@@ -1604,8 +1622,18 @@ pub enum Reply {
         // compat(v1): required at the protocol reset
         #[serde(default, skip_serializing_if = "Option::is_none")]
         liked_children: Option<Vec<MediaId>>,
+        /// Experimental (`federation`, P8-05): where the item is from, its
+        /// title's copies on other servers and the one that plays, as a
+        /// `SearchHit` has them. Only to a client that named the feature.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        copies: Option<crate::search::Copies>,
     },
     Search(SearchResults),
+    /// Experimental (`federation`, P8-05): `Search`'s answer to a client
+    /// that named the feature, each item a `SearchHit`. Counts are
+    /// approximate: a title on several servers is counted once only among
+    /// what is shown.
+    SearchHits(SearchResults<crate::search::SearchHit>),
     Tracks(MediaTracks),
     WhoAmI(WhoAmIReply),
     LoggedOut,

@@ -10,14 +10,16 @@
 //! items come from the sections, and only people from the hubs: Plex
 //! lists actors and directors nowhere else.
 
+use std::collections::HashMap;
+
 use futures_util::future::try_join_all;
-use spoolframe_catalog::{Catalog, CatalogError, Found, FoundGroup, SearchQuery};
+use spoolframe_catalog::{Catalog, CatalogError, Found, FoundGroup, SearchQuery, episode_ids};
 use spoolframe_types::{
     Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, Namespace, Person, PersonId,
     PersonRole, SearchKind,
 };
 
-use crate::wire::SectionKey;
+use crate::wire::{Metadata, SectionKey};
 use crate::{Call, PlexCatalog, convert, plex_key};
 
 /// Where Plex keeps items of `kind`: the kind of section, the `type`
@@ -55,22 +57,43 @@ pub(crate) fn person_id(role: PersonRole, tag: u64) -> PersonId {
 const INSIDE_A_LIBRARY: u32 = 4;
 const MAX_HUB: u32 = 100;
 
+/// The titles of a search's items, by their ids ([`Found::titles`]).
+type Titles = HashMap<MediaId, Vec<String>>;
+
+/// The title search hit `m` is a copy of (P8-05): its stable ids, and for
+/// an episode its show's guid with its season and number, as the watch
+/// state's title key has them.
+fn title_of(m: &Metadata) -> Vec<String> {
+    let mut ids = convert::external_ids(m);
+    if m.kind == "episode"
+        && let (Some(show), Some(season), Some(episode)) =
+            (&m.grandparent_guid, m.parent_index, m.index)
+    {
+        ids.extend(episode_ids(std::slice::from_ref(show), season, episode));
+    }
+    ids
+}
+
 fn usize_of(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 impl PlexCatalog {
     /// Search the served sections, or only `query.library`, for each kind
-    /// `query` asks for.
+    /// `query` asks for, with the title each item found is a copy of
+    /// (P8-05).
     pub async fn find(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
         let sections = self.searched(query.library.as_ref()).await?;
         let groups = query
             .kinds
             .iter()
             .map(|&kind| self.find_kind(kind, &sections, query));
-        Ok(Found {
-            groups: try_join_all(groups).await?,
-        })
+        let mut found = Found::default();
+        for (group, titles) in try_join_all(groups).await? {
+            found.groups.push(group);
+            found.titles.extend(titles);
+        }
+        Ok(found)
     }
 
     /// The items a person found by [`Self::find`] is in, in the served
@@ -168,36 +191,42 @@ impl PlexCatalog {
         kind: SearchKind,
         sections: &[Library],
         query: &SearchQuery,
-    ) -> Result<FoundGroup, CatalogError> {
+    ) -> Result<(FoundGroup, Titles), CatalogError> {
         let Some((holds, number, name)) = plex_type(kind) else {
             // Plex cannot narrow people to a section, but it says which
             // section it found each in: inside a library, those (P3-18).
             let inside = query.library.as_ref().and_then(|_| sections.first());
-            return self.find_people(query, inside.map(|l| l.id.key())).await;
+            let people = self.find_people(query, inside.map(|l| l.id.key())).await?;
+            return Ok((people, Titles::new()));
         };
         let asked = sections
             .iter()
             .filter(|l| l.kind == holds)
             .map(|l| self.search_section(l.id.key(), (kind, number, name), query));
-        Ok(FoundGroup::merge(
-            kind,
-            try_join_all(asked).await?,
-            query.limit,
+        let (groups, titles): (Vec<_>, Vec<_>) = try_join_all(asked).await?.into_iter().unzip();
+        Ok((
+            FoundGroup::merge(kind, groups, query.limit),
+            titles.into_iter().flatten().collect(),
         ))
     }
 
     /// One kind in one section, at most `query.limit` of it, and how many
-    /// the section has.
+    /// the section has; with each item's title, its agents' ids asked
+    /// with it (`includeGuids`, P8-05).
     async fn search_section(
         &self,
         section: &str,
         (kind, number, name): (SearchKind, &str, &str),
         query: &SearchQuery,
-    ) -> Result<FoundGroup, CatalogError> {
+    ) -> Result<(FoundGroup, Titles), CatalogError> {
         let year = query.year.map(|y| y.to_string());
         let mut call = Call::get(format!("/library/sections/{section}/search"))
             .about(format!("search {:?}", query.text));
-        call.query = vec![("type", number), ("query", &query.text)];
+        call.query = vec![
+            ("type", number),
+            ("query", &query.text),
+            ("includeGuids", "1"),
+        ];
         if let Some(year) = &year {
             call.query.push(("year", year));
         }
@@ -207,26 +236,29 @@ impl PlexCatalog {
         ];
         let container = self.fetch(&call).await?;
         let returned = u32::try_from(container.metadata.len()).unwrap_or(u32::MAX);
-        let mut items = container
-            .metadata
-            .iter()
-            .filter(|m| {
-                let asked = m.kind == name;
-                if !asked {
-                    tracing::debug!(rating_key = %m.rating_key, kind = %m.kind, asked = name, "skipping a search result of another kind");
-                }
-                asked
-            })
-            .map(convert::item)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| self.converted(&call, e))?;
-        items.truncate(usize_of(query.limit));
-        Ok(FoundGroup {
-            kind,
-            items,
-            people: Vec::new(),
-            total: container.total_size.unwrap_or(returned).max(returned),
-        })
+        let mut items = Vec::new();
+        let mut titles = Titles::new();
+        for m in &container.metadata {
+            if m.kind != name {
+                tracing::debug!(rating_key = %m.rating_key, kind = %m.kind, asked = name, "skipping a search result of another kind");
+                continue;
+            }
+            if items.len() == usize_of(query.limit) {
+                break;
+            }
+            let item = convert::item(m).map_err(|e| self.converted(&call, e))?;
+            titles.insert(item.id().clone(), title_of(m));
+            items.push(item);
+        }
+        Ok((
+            FoundGroup {
+                kind,
+                items,
+                people: Vec::new(),
+                total: container.total_size.unwrap_or(returned).max(returned),
+            },
+            titles,
+        ))
     }
 
     /// The actors and directors whose names match, each once: Plex lists

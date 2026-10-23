@@ -20,10 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use spoolframe_catalog::{
     Catalog, CatalogError, Found, FoundGroup, Image, ItemPage, ItemWithChildren, Page, Reach,
-    SearchQuery,
+    SearchQuery, episode_ids,
 };
 use spoolframe_federation::{DialError, Dialed};
-use spoolframe_protocol::federation::RemoteItem;
+use spoolframe_protocol::federation::{RemoteItem, RemoteKind};
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, PersonId, SearchKind,
 };
@@ -398,6 +398,23 @@ impl PeerCache {
         Ok((origin.to_owned(), cached.item, cached.library))
     }
 
+    /// The title `remote` of `origin`'s is a copy of ([`Found::titles`]):
+    /// its external ids, and an episode's show's with its season and
+    /// number. A show not cached adds none.
+    async fn title(&self, origin: &str, remote: &RemoteItem) -> Result<Vec<String>, StoreError> {
+        let mut ids = remote.external_ids.clone();
+        if let (RemoteKind::Episode, Some(show), Some(season), Some(episode)) = (
+            remote.kind,
+            &remote.grandparent,
+            remote.parent_index,
+            remote.index,
+        ) && let Some(show) = self.store.cached_item(origin, show).await?
+        {
+            ids.extend(episode_ids(&show.item.external_ids, season, episode));
+        }
+        Ok(ids)
+    }
+
     /// Whether `origin` is online: its items play now (P8-03).
     pub fn online(&self, origin: &str) -> bool {
         self.links.online(origin)
@@ -545,21 +562,24 @@ impl Catalog for PeerCache {
     /// Each kind asked for, by title, year and library, over the cache
     /// alone: no paired server is asked anything. A library scope that is
     /// not a paired server's finds nothing here, nor do people, whose
-    /// items are not shared. P8-05 merges these hits with the server's own
-    /// by external id; until then they are listed beside them.
+    /// items are not shared. Each hit's title is its replicated external
+    /// ids, and an episode's show's with its season and number, as the
+    /// watch state's title key has them: what the server's search merges
+    /// a title found here and on this server by (P8-05).
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
         let scope = match &query.library {
             Some(library) => match library.remote() {
                 Some((origin, remote)) => Some((origin.to_owned(), remote.to_string())),
                 None => {
-                    return Ok(Found {
-                        groups: query.kinds.iter().map(|&k| FoundGroup::empty(k)).collect(),
-                    });
+                    return Ok(Found::of(
+                        query.kinds.iter().map(|&k| FoundGroup::empty(k)).collect(),
+                    ));
                 }
             },
             None => None,
         };
         let mut groups = Vec::with_capacity(query.kinds.len());
+        let mut titles = HashMap::new();
         for &kind in &query.kinds {
             let Some(name) = search_kind(kind) else {
                 groups.push(FoundGroup::empty(kind));
@@ -575,17 +595,22 @@ impl Catalog for PeerCache {
                     query.limit,
                 )
                 .await?;
+            let mut items = Vec::with_capacity(found.len());
+            for (origin, remote) in &found {
+                let Some(item) = local(origin, remote) else {
+                    continue;
+                };
+                titles.insert(item.id().clone(), self.title(origin, remote).await?);
+                items.push(item);
+            }
             groups.push(FoundGroup {
                 kind,
-                items: found
-                    .iter()
-                    .filter_map(|(origin, item)| local(origin, item))
-                    .collect(),
+                items,
                 people: Vec::new(),
                 total,
             });
         }
-        Ok(Found { groups })
+        Ok(Found { groups, titles })
     }
 
     /// People are the origin's: their items are not shared.

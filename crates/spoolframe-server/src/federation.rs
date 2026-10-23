@@ -21,6 +21,7 @@
 
 mod answer;
 pub mod cache;
+mod copies;
 mod exposure;
 mod grants;
 pub mod items;
@@ -32,6 +33,7 @@ mod replica;
 mod tokens;
 
 pub use cache::{Links, PeerCache};
+pub use copies::{PlayFromError, Viewer};
 pub use exposure::{PeerPage, PlayDay, Received, ServerRowError};
 pub use grants::ShareError;
 pub use limits::Limits;

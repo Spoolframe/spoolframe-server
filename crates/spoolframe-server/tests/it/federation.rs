@@ -1968,7 +1968,80 @@ mod replica {
         dir: crate::support::StateDir,
         options: ServerOptions,
     ) -> (TestServer, Arc<LiveCatalog>) {
-        let plex = PlexCatalog::new(quiet_plex().await.parse().unwrap(), None).unwrap();
+        sb_on(dir, options, quiet_plex().await).await
+    }
+
+    /// A Plex server with one film, Alien (`plex:movie:500`, TMDB 348),
+    /// in its one section, found by any search for films: SB's own copy of
+    /// the film SA shares (P8-05). Anything else is answered empty.
+    async fn alien_plex() -> String {
+        alien_plex_of(1979).await
+    }
+
+    /// [`alien_plex`] with its Alien of `year`.
+    async fn alien_plex_of(year: u16) -> String {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let pms = MockServer::start().await;
+        let alien = serde_json::json!({
+            "ratingKey": "500",
+            "key": "/library/metadata/500",
+            "type": "movie",
+            "title": "Alien",
+            "year": year,
+            "duration": 7_020_000,
+            "librarySectionID": "1",
+            "guid": "plex://movie/5d7768",
+            "Guid": [{ "id": "tmdb://348" }]
+        });
+        let container = |metadata: serde_json::Value| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "MediaContainer": { "size": 1, "totalSize": 1, "Metadata": metadata }
+            }))
+        };
+        Mock::given(method("GET"))
+            .and(path("/library/sections"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "MediaContainer": { "Directory": [{ "key": "1", "type": "movie", "title": "Films" }] }
+            })))
+            .mount(&pms)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/library/sections/1/search"))
+            .and(query_param("type", "1"))
+            .respond_with(container(serde_json::json!([alien.clone()])))
+            .mount(&pms)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/library/metadata/500"))
+            .respond_with(container(serde_json::json!([alien.clone()])))
+            .mount(&pms)
+            .await;
+        // Plex finds an item by its own guid alone.
+        Mock::given(method("GET"))
+            .and(path("/library/sections/1/all"))
+            .and(query_param("guid", "plex://movie/5d7768"))
+            .respond_with(container(serde_json::json!([alien])))
+            .mount(&pms)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "MediaContainer": { "size": 0, "totalSize": 0, "Metadata": [], "Hub": [] }
+            })))
+            .mount(&pms)
+            .await;
+        let uri = pms.uri();
+        std::mem::forget(pms);
+        uri
+    }
+
+    /// As [`sb_with`], its own Plex server `plex`.
+    async fn sb_on(
+        dir: crate::support::StateDir,
+        options: ServerOptions,
+        plex: String,
+    ) -> (TestServer, Arc<LiveCatalog>) {
+        let plex = PlexCatalog::new(plex.parse().unwrap(), None).unwrap();
         let composite = Composite::new(
             vec![PlexSource {
                 id: spoolframe_server::config::FIRST_PLEX_SERVER.to_owned(),
@@ -2027,8 +2100,32 @@ mod replica {
 
         /// `sa` paired with an SB run as `options` say.
         async fn with_sa(test: &str, sa: TestServer, options: ServerOptions) -> Self {
+            Self::with_sa_on(test, sa, options, quiet_plex().await).await
+        }
+
+        /// SA and an SB whose own Plex server is `plex`.
+        async fn with_plex(test: &str, plex: String) -> Self {
+            let sa = TestServer::start_with(
+                fresh_dir(&format!("{test}-sa")).await,
+                ServerOptions {
+                    name: "Alice's server".into(),
+                    federation: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
+            Self::with_sa_on(test, sa, ServerOptions::default(), plex).await
+        }
+
+        /// `sa` paired with an SB run as `options` say, on Plex `plex`.
+        async fn with_sa_on(
+            test: &str,
+            sa: TestServer,
+            options: ServerOptions,
+            plex: String,
+        ) -> Self {
             no_walk_reuse(&sa);
-            let (sb, cache) = sb_with(fresh_dir(&format!("{test}-sb")).await, options).await;
+            let (sb, cache) = sb_on(fresh_dir(&format!("{test}-sb")).await, options, plex).await;
             let sa_on_sb = federation(&sb)
                 .redeem_link(&pairing_link(&sa, None).await, "bob")
                 .await
@@ -2254,13 +2351,21 @@ mod replica {
         }
     }
 
-    /// The ids a search for `query` finds, its top match first.
+    /// The ids a search for `query` finds, its top match first, by an app
+    /// that does not name the feature: plain results.
+    async fn found_old(app: &TestClient, bob: &SessionId, query: &str) -> Vec<MediaId> {
+        found(app, bob, query).await
+    }
+
+    /// The ids a search for `query` finds, its top match first: the hits'
+    /// items for an app that names the feature.
     async fn found(app: &TestClient, bob: &SessionId, query: &str) -> Vec<MediaId> {
         let results = match app
             .call(Some(bob), Request::Search(crate::support::search(query)))
             .await
         {
             Response::Ok(Reply::Search(results)) => results,
+            Response::Ok(Reply::SearchHits(hits)) => hits.map(|hit| hit.item),
             other => panic!("{other:?}"),
         };
         let top = match results.top {
@@ -2854,6 +2959,207 @@ mod replica {
         pair.stop().await;
     }
 
+    /// SB's own Alien (`plex:movie:500`).
+    fn sb_alien() -> MediaId {
+        id(MediaKind::Movie, "500")
+    }
+
+    /// SA and SB both with Alien, TMDB 348 and Plex's guid: SB's own from
+    /// its Plex, SA's shared and cached on SB.
+    async fn both_have_alien(test: &str) -> Pair {
+        let pair = Pair::with_plex(test, alien_plex().await).await;
+        pair.sa
+            .catalog
+            .give_ids(movie().id(), &["plex://movie/5d7768", "tmdb://348"]);
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair
+    }
+
+    /// What a search for `query` finds, as hits (P8-05).
+    async fn hits(
+        app: &TestClient,
+        bob: &SessionId,
+        query: &str,
+    ) -> spoolframe_protocol::SearchResults<spoolframe_protocol::SearchHit> {
+        match app
+            .call(Some(bob), Request::Search(crate::support::search(query)))
+            .await
+        {
+            Response::Ok(Reply::SearchHits(hits)) => hits,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every hit of `results`, its top first.
+    fn every_hit(
+        results: &spoolframe_protocol::SearchResults<spoolframe_protocol::SearchHit>,
+    ) -> Vec<&spoolframe_protocol::SearchHit> {
+        let top = match &results.top {
+            Some(spoolframe_protocol::TopResult::Item(hit)) => Some(hit),
+            _ => None,
+        };
+        top.into_iter()
+            .chain(results.groups.iter().flat_map(|g| &g.items))
+            .collect()
+    }
+
+    /// An item's copies, as an app that names the feature is told them.
+    async fn copies(
+        app: &TestClient,
+        bob: &SessionId,
+        id: &MediaId,
+    ) -> spoolframe_protocol::Copies {
+        match app.call(Some(bob), Request::Item { id: id.clone() }).await {
+            Response::Ok(Reply::Item {
+                copies: Some(copies),
+                ..
+            }) => copies,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn alices(pair: &Pair) -> spoolframe_types::LibraryServer {
+        spoolframe_types::LibraryServer {
+            server_id: pair.origin().to_owned(),
+            name: "Alice's server".into(),
+            online: true,
+        }
+    }
+
+    /// P8-05: the film on both SB and SA (one TMDB id) is one hit, SB's,
+    /// with "also on" SA, and so is its Item page. An app that does not
+    /// name the feature sees what it saw before: SB's film alone, as plain
+    /// results, and no copies.
+    #[tokio::test]
+    async fn a_film_on_sb_and_sa_is_one_hit_from_sb_also_on_sa() {
+        let pair = both_have_alien("fed-merged").await;
+        let sa_alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        let found = hits(&app, &bob, "alien").await;
+        let every = every_hit(&found);
+        assert_eq!(every.len(), 1, "{found:?}");
+        let hit = every[0];
+        assert_eq!(hit.item.id(), &sb_alien());
+        assert_eq!(hit.origin, None);
+        let sa = spoolframe_protocol::TitleCopy {
+            id: sa_alien.clone(),
+            server: Some(alices(&pair)),
+        };
+        assert_eq!(hit.also_on, std::slice::from_ref(&sa));
+        assert_eq!(hit.play_from, sb_alien());
+        let item = copies(&app, &bob, &sb_alien()).await;
+        assert_eq!((item.origin, item.also_on), (None, vec![sa]));
+        // SA's copy names SB's as its other.
+        let theirs = copies(&app, &bob, &sa_alien).await;
+        assert_eq!(theirs.origin, Some(alices(&pair)));
+        assert_eq!(
+            theirs.also_on,
+            [spoolframe_protocol::TitleCopy {
+                id: sb_alien(),
+                server: None,
+            }]
+        );
+        let (old, bob_old) = bob_on(&pair, false).await;
+        assert_eq!(found_old(&old, &bob_old, "alien").await, [sb_alien()]);
+        assert!(matches!(
+            old.call(Some(&bob_old), Request::Item { id: sb_alien() })
+                .await,
+            Response::Ok(Reply::Item { copies: None, .. })
+        ));
+        pair.stop().await;
+    }
+
+    /// P8-05: SA's ids are its word only. Its Alien of 1979 says TMDB 348
+    /// and Plex's guid, as SB's Alien of 2004 does: two hits, and neither
+    /// Item page names the other as a copy.
+    #[tokio::test]
+    async fn a_paired_film_of_another_year_is_not_merged_whatever_its_ids() {
+        let pair = Pair::with_plex("fed-merged-year", alien_plex_of(2004).await).await;
+        pair.sa
+            .catalog
+            .give_ids(movie().id(), &["plex://movie/5d7768", "tmdb://348"]);
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let sa_alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        let found = hits(&app, &bob, "alien").await;
+        let every = every_hit(&found);
+        assert_eq!(every.len(), 2, "{found:?}");
+        assert!(every.iter().all(|hit| hit.also_on.is_empty()), "{found:?}");
+        assert!(copies(&app, &bob, &sb_alien()).await.also_on.is_empty());
+        assert!(copies(&app, &bob, &sa_alien).await.also_on.is_empty());
+        pair.stop().await;
+    }
+
+    /// P8-05: Play from SA is remembered for Bob, by the title: SB's hit
+    /// and either copy's Item page play SA's, in a new session too, until
+    /// he chooses SB again. A server not paired is not one to play from.
+    #[tokio::test]
+    async fn play_from_sa_is_remembered_for_the_title() {
+        let pair = both_have_alien("fed-play-from").await;
+        let sa_alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        let play_from = |from: Option<&str>| Request::SetPlayFrom {
+            title: sb_alien(),
+            from: from.map(str::to_owned),
+        };
+        assert_eq!(
+            app.call(Some(&bob), play_from(Some(pair.origin()))).await,
+            Response::Ok(Reply::Done)
+        );
+        assert_eq!(copies(&app, &bob, &sb_alien()).await.play_from, sa_alien);
+        let (again, bob_again) = bob_on(&pair, true).await;
+        assert_eq!(
+            every_hit(&hits(&again, &bob_again, "alien").await)[0].play_from,
+            sa_alien
+        );
+        assert_eq!(
+            copies(&again, &bob_again, &sa_alien).await.play_from,
+            sa_alien
+        );
+        assert!(matches!(
+            app.call(Some(&bob), play_from(Some("bbbbbbbbbbbbbbbb")))
+                .await,
+            Response::Err(Error::NotFound { .. })
+        ));
+        app.call(Some(&bob), play_from(None)).await;
+        assert_eq!(copies(&app, &bob, &sa_alien).await.play_from, sb_alien());
+        let (old, bob_old) = bob_on(&pair, false).await;
+        assert!(matches!(
+            old.call(Some(&bob_old), play_from(None)).await,
+            Response::Err(Error::Unsupported { .. })
+        ));
+        pair.stop().await;
+    }
+
+    /// P8-05, progress per title (P8-03): after 40 minutes of SA's copy,
+    /// the merged hit, SB's, shows 40 minutes.
+    #[tokio::test]
+    async fn after_40_minutes_of_sa_s_copy_the_merged_hit_shows_40_minutes() {
+        let pair = both_have_alien("fed-merged-progress").await;
+        let (app, bob) = bob_on(&pair, true).await;
+        assert_eq!(
+            app.call(
+                Some(&bob),
+                Request::UpdateWatchProgress {
+                    id: pair.fed(movie().id()),
+                    position_ms: 2_400_000,
+                },
+            )
+            .await,
+            Response::Ok(Reply::Done)
+        );
+        let found = hits(&app, &bob, "alien").await;
+        let hit = every_hit(&found)[0];
+        assert_eq!(hit.item.id(), &sb_alien());
+        let Item::Movie(film) = &hit.item else {
+            panic!("not a film");
+        };
+        assert_eq!(film.playback.position, Some(Duration::from_secs(2400)));
+        pair.stop().await;
+    }
+
     /// P8-03: Bob's app reports where he got to in SA's film to SB, by
     /// item. SB keeps it in his watch state, under the `fed:` id, and his
     /// play in its history; SA keeps nothing. Only a paired server's item
@@ -3165,6 +3471,36 @@ mod replica {
             .unwrap();
         assert_eq!(event.server, pair.sb.server.id().to_string());
         assert!(bob.libraries().await.unwrap().is_empty());
+        pair.stop().await;
+    }
+
+    /// P8-05 in the SDK: Bob's app finds the film on SB and SA as one hit,
+    /// chooses to play it from SA, and the item's copies say so; its plain
+    /// search gives the hits' items.
+    #[tokio::test]
+    async fn the_sdk_finds_one_hit_and_plays_it_from_sa() {
+        use super::app::{FEDERATION, PASSWORD, signed_in};
+        let pair = both_have_alien("fed-sdk-merged").await;
+        pair.sb.add_user("bob", PASSWORD, None).await;
+        let (_phone, bob) = signed_in(&pair.sb, "bob", FEDERATION).await;
+        let found = bob
+            .search_hits(crate::support::search("alien"))
+            .await
+            .unwrap();
+        let every = every_hit(&found);
+        assert_eq!(every.len(), 1);
+        let sa_alien = pair.fed(movie().id());
+        assert_eq!(every[0].also_on[0].id, sa_alien);
+        bob.set_play_from(&sb_alien(), Some(pair.origin()))
+            .await
+            .unwrap();
+        let detail = bob.item(&sb_alien()).await.unwrap();
+        assert_eq!(detail.copies.map(|c| c.play_from), Some(sa_alien));
+        let plain = bob.search(crate::support::search("alien")).await.unwrap();
+        assert!(matches!(
+            plain.top,
+            Some(spoolframe_protocol::TopResult::Item(ref item)) if item.id() == &sb_alien()
+        ));
         pair.stop().await;
     }
 

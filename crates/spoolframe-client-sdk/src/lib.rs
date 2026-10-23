@@ -110,6 +110,8 @@ pub use spoolframe_protocol::{
     SearchGroup, SearchRequest, SearchResults, Selection, SessionInfo, TopResult,
     TrackPreferencesInfo, TrackReason, TrustedProfile, UserSummary,
 };
+// Experimental federation (P8-05): a search's hits and a title's copies.
+pub use spoolframe_protocol::{Copies, SearchHit, TitleCopy};
 // Passkeys in the app (P3-19): the raw WebAuthn bytes the platform's
 // passkey API takes and gives. The relying party is each server's own
 // (PX-14), in the request; `LEGACY_APP_RP_ID` marks passkeys made for the

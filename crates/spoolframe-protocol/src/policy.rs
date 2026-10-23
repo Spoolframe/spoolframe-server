@@ -142,7 +142,9 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::MusicDownloadChanges { .. }
         | Request::SyncOfflinePlays { .. }
         // P8-02: a row shown twice is shown once.
-        | Request::SetServerRow { .. } => true,
+        | Request::SetServerRow { .. }
+        // P8-05: a server chosen twice is chosen once.
+        | Request::SetPlayFrom { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)

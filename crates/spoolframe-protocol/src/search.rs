@@ -1,7 +1,7 @@
 //! Scoped, grouped search (P3-09): `Request::Search` and its reply.
 
 use serde::{Deserialize, Serialize};
-use spoolframe_types::{Item, LibraryId, Person, SearchKind, SearchScope};
+use spoolframe_types::{Item, LibraryId, LibraryServer, MediaId, Person, SearchKind, SearchScope};
 
 /// A search. On the wire, `{"type": "search", "query": …, "scope": …}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,9 +23,10 @@ pub struct SearchRequest {
     pub library: Option<LibraryId>,
 }
 
-/// What a search found.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchResults {
+/// What a search found: `Item`s, or for a client that names the
+/// experimental `federation` feature [`SearchHit`]s (P8-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResults<T = Item> {
     /// The single best match: an exact title, else a title that starts
     /// with the query (case and a leading "the", "a" or "an" aside), else
     /// the first result; on a tie a show before a movie, then artist,
@@ -34,18 +35,117 @@ pub struct SearchResults {
     /// every title (an exact "keanu reeves" over titles that start with
     /// it), or when only people are found: on a tie the item wins. Not
     /// repeated in its group. `None` for a `kind` search.
-    pub top: Option<TopResult>,
+    pub top: Option<TopResult<T>>,
     /// The groups that have something to show, in the order they are
     /// shown: shows, movies, people, artists, albums, tracks, episodes. A
     /// `kind` search has that one group, even when it is empty.
-    pub groups: Vec<SearchGroup>,
+    pub groups: Vec<SearchGroup<T>>,
     pub counts: SearchCounts,
     /// The year taken from the end of the query as a filter, to show as a
     /// removable token.
     pub year: Option<u16>,
     /// With a `year`: up to 3 items the query matches in other years, for
     /// "also matching without the year".
-    pub without_year: Vec<Item>,
+    pub without_year: Vec<T>,
+}
+
+impl<T> Default for SearchResults<T> {
+    fn default() -> Self {
+        Self {
+            top: None,
+            groups: Vec::new(),
+            counts: SearchCounts::default(),
+            year: None,
+            without_year: Vec::new(),
+        }
+    }
+}
+
+impl<T> SearchResults<T> {
+    /// The same results with each item made `f` of it, in place.
+    pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> SearchResults<U> {
+        SearchResults {
+            top: self.top.map(|top| match top {
+                TopResult::Item(item) => TopResult::Item(f(item)),
+                TopResult::Person(person) => TopResult::Person(person),
+            }),
+            groups: self
+                .groups
+                .into_iter()
+                .map(|g| SearchGroup {
+                    kind: g.kind,
+                    items: g.items.into_iter().map(&mut f).collect(),
+                    people: g.people,
+                    more: g.more,
+                    total: g.total,
+                    hidden: g.hidden,
+                })
+                .collect(),
+            counts: self.counts,
+            year: self.year,
+            without_year: self.without_year.into_iter().map(f).collect(),
+        }
+    }
+}
+
+/// Experimental (`federation`, P8-05): a search's item for a client that
+/// names the feature. A title on several servers (the same TMDB, IMDb,
+/// TVDB, MusicBrainz or Plex id; an episode by its show's, season and
+/// number) is one hit: this server's copy when it has one, else the copy
+/// the user plays from or last played, else the first online.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub item: Item,
+    /// The paired server `item` is from; `None` for this server's own.
+    #[serde(default)]
+    pub origin: Option<LibraryServer>,
+    /// The title's copies on other servers ("also on Bob's Media"), in
+    /// the order a Play from list shows them; empty for a title on one
+    /// server.
+    #[serde(default)]
+    pub also_on: Vec<TitleCopy>,
+    /// The copy that plays: the one on the server the user chose for the
+    /// title (`SetPlayFrom`) while it has one, else `item`'s own id.
+    pub play_from: MediaId,
+}
+
+impl SearchHit {
+    pub fn new(item: Item, copies: Copies) -> Self {
+        Self {
+            item,
+            origin: copies.origin,
+            also_on: copies.also_on,
+            play_from: copies.play_from,
+        }
+    }
+}
+
+/// Experimental (`federation`, P8-05): where an item is from, and its
+/// title's copies on other servers, as a [`SearchHit`] and an `Item`
+/// reply have them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Copies {
+    /// The paired server the item is from; `None` for this server's own.
+    #[serde(default)]
+    pub origin: Option<LibraryServer>,
+    /// The title's copies on other servers: this server's first, then the
+    /// paired servers online by name, then those offline (greyed: browsed,
+    /// not played).
+    #[serde(default)]
+    pub also_on: Vec<TitleCopy>,
+    /// The copy that plays: on the server the user chose for the title
+    /// (`SetPlayFrom`) while it has one, else the item's own id.
+    pub play_from: MediaId,
+}
+
+/// One copy of a title, on one server (P8-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TitleCopy {
+    /// The copy's id here: a `fed:` id for a paired server's.
+    pub id: MediaId,
+    /// Its paired server; `None` for this server's own.
+    #[serde(default)]
+    pub server: Option<LibraryServer>,
 }
 
 /// The top match: an item, or a person. On the wire, `{"item": {...}}`
@@ -53,21 +153,17 @@ pub struct SearchResults {
 /// `Request::PersonItems`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per search, built once and encoded at once; boxing would only add noise"
-)]
-pub enum TopResult {
-    Item(Item),
+pub enum TopResult<T = Item> {
+    Item(T),
     Person(Person),
 }
 
 /// One kind's results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchGroup {
+pub struct SearchGroup<T = Item> {
     pub kind: SearchKind,
     /// The items, best first; empty for [`SearchKind::People`].
-    pub items: Vec<Item>,
+    pub items: Vec<T>,
     /// The people, for [`SearchKind::People`] only.
     pub people: Vec<Person>,
     /// There are more than are here: a `kind` search for this group

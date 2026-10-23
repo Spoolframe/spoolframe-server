@@ -616,16 +616,6 @@ async fn a_paired_server_s_film_watched_offline_is_synced() {
     );
 }
 
-/// An episode is matched by each of its show's ids with its season and
-/// number.
-#[test]
-fn an_episode_is_matched_by_its_show_s_ids_season_and_number() {
-    assert_eq!(
-        episode_ids(&["tmdb://1396".into(), "tvdb://81189".into()], 1, 2),
-        ["tmdb://1396#s1e2", "tvdb://81189#s1e2"]
-    );
-}
-
 #[tokio::test]
 async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_hide() {
     let h = harness("two-copies-hide").await;

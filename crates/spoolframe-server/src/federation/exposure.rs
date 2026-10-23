@@ -85,7 +85,7 @@ impl Federation {
     }
 
     /// The live pairs, by server id, as each is shown to a client.
-    async fn servers(&self) -> Result<HashMap<String, LibraryServer>, StoreError> {
+    pub(super) async fn servers(&self) -> Result<HashMap<String, LibraryServer>, StoreError> {
         Ok(self
             .store()
             .federation_peers()

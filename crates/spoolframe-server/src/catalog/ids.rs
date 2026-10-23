@@ -103,6 +103,11 @@ pub fn found(server: &str, found: Found) -> Found {
                 ..g
             })
             .collect(),
+        titles: found
+            .titles
+            .into_iter()
+            .map(|(id, title)| (media(server, id), title))
+            .collect(),
     }
 }
 

@@ -63,7 +63,10 @@ pub use portable::{
     TieProofError, UserDeviceCredential, tie_message,
 };
 pub use previews::{PreviewTile, Previews};
-pub use search::{SearchCounts, SearchGroup, SearchRequest, SearchResults, TopResult};
+pub use search::{
+    Copies, SearchCounts, SearchGroup, SearchHit, SearchRequest, SearchResults, TitleCopy,
+    TopResult,
+};
 pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};
 
 /// Development ALPN. Breaking revisions currently retain `/1` and require

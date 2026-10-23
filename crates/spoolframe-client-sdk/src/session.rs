@@ -167,6 +167,11 @@ pub struct ItemDetail {
     /// An album's tracks among `children` that are liked (PX-43). Empty
     /// otherwise.
     pub liked_children: Vec<MediaId>,
+    /// Experimental (P8-05): where the item is from, its title's copies on
+    /// other servers in Play from order, and the copy that plays. Only
+    /// with [`crate::Experimental::federation`], and from a server that
+    /// sends them.
+    pub copies: Option<spoolframe_protocol::Copies>,
 }
 
 /// How the server would play an item.
@@ -814,6 +819,7 @@ impl Session {
                 playlists,
                 liked,
                 liked_children,
+                copies,
             } => Ok(ItemDetail {
                 item,
                 children,
@@ -821,16 +827,20 @@ impl Session {
                 playlists: playlists.unwrap_or_default(),
                 liked,
                 liked_children: liked_children.unwrap_or_default(),
+                copies,
             }),
             other => Err(unexpected(other)),
         }
     }
 
     /// A scoped, grouped search (P3-09): the top match and a group per
-    /// kind, or, with `request.kind`, one kind's page for "See all".
+    /// kind, or, with `request.kind`, one kind's page for "See all". With
+    /// [`crate::Experimental::federation`] the server answers with hits
+    /// ([`Session::search_hits`]); this gives their items.
     pub async fn search(&self, request: SearchRequest) -> Result<SearchResults, SdkError> {
         match self.call(Request::Search(request)).await? {
             Reply::Search(results) => Ok(results),
+            Reply::SearchHits(hits) => Ok(hits.map(|hit| hit.item)),
             other => Err(unexpected(other)),
         }
     }

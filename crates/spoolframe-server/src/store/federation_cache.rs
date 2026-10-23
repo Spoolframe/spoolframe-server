@@ -781,6 +781,64 @@ impl Store {
         Ok(None)
     }
 
+    /// The available items of live pairs of `kind` with one of
+    /// `external_ids`: a title's copies on paired servers (P8-05), each
+    /// with its origin, by origin. Of `year` when both it and the copy
+    /// have one: an id a paired server says is not taken on its word.
+    pub async fn cached_copies(
+        &self,
+        kind: &str,
+        external_ids: &[String],
+        year: Option<u16>,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if external_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as(
+            "SELECT DISTINCT i.origin, i.item FROM federation_cache_external_ids e \
+             JOIN federation_cache_items i ON i.origin = e.origin AND i.item = e.item \
+             WHERE e.external_id IN (SELECT value FROM json_each(?1)) \
+               AND i.kind = ?2 AND i.unavailable = 0 \
+               AND (?3 IS NULL OR i.year IS NULL OR i.year = ?3) \
+               AND i.origin IN (SELECT server_id FROM federation_peers WHERE revoked_at IS NULL) \
+             ORDER BY i.origin, i.item",
+        )
+        .bind(serde_json::to_string(external_ids).expect("strings serialize"))
+        .bind(kind)
+        .bind(year)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The available episodes of live pairs numbered `episode` of season
+    /// `season` of a show with one of `show_ids`: an episode's copies by
+    /// its show's ids, season and number (P8-05), by origin.
+    pub async fn cached_episode_copies(
+        &self,
+        show_ids: &[String],
+        season: u32,
+        episode: u32,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if show_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as(
+            "SELECT DISTINCT i.origin, i.item FROM federation_cache_external_ids e \
+             JOIN federation_cache_items i \
+               ON i.origin = e.origin AND i.grandparent = e.item \
+             WHERE e.external_id IN (SELECT value FROM json_each(?1)) \
+               AND i.kind = 'episode' AND i.unavailable = 0 AND i.position = ?3 \
+               AND json_extract(i.body, '$.parent_index') = ?2 \
+               AND i.origin IN (SELECT server_id FROM federation_peers WHERE revoked_at IS NULL) \
+             ORDER BY i.origin, i.item",
+        )
+        .bind(serde_json::to_string(show_ids).expect("strings serialize"))
+        .bind(season)
+        .bind(episode)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Whether image `artwork` of `origin`'s is named by an available
     /// cached item: the only artwork served from it.
     pub async fn cached_artwork_named(

@@ -215,6 +215,12 @@ impl MediaId {
             Self::new(namespace.parse().ok()?, self.kind, key).ok()?,
         ))
     }
+
+    /// The server id of the paired server a federated id's item is on;
+    /// `None` for this server's own, as [`MediaId::remote`] reads it.
+    pub fn origin(&self) -> Option<&str> {
+        self.remote().map(|(origin, _)| origin)
+    }
 }
 
 impl fmt::Display for MediaId {

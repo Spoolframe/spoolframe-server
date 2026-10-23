@@ -690,7 +690,7 @@ impl Catalog for FakeCatalog {
                 _ => FoundGroup::empty(kind),
             })
             .collect();
-        Ok(Found { groups })
+        Ok(Found::of(groups))
     }
 
     /// The fake knows no people.

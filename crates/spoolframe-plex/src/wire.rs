@@ -159,6 +159,9 @@ pub struct Metadata {
     pub media: Vec<Media>,
     /// Plex's own stable id, `plex://movie/…`.
     pub guid: Option<String>,
+    /// An episode's show's `guid`: what a search's hit is matched to its
+    /// copies on paired servers by, with its season and number (P8-05).
+    pub grandparent_guid: Option<String>,
     /// The token's account's stars, 0 to 10 (PX-43: a track rated is
     /// liked on import), and when it was last rated (Unix s).
     #[serde(default, deserialize_with = "lenient")]
