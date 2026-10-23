@@ -11,7 +11,8 @@
 //! the device and to that one item, for minutes. P8-04 redeems it.
 //!
 //! Plays are counted one number per server, never per user: the server
-//! whose item is played counts as it mints, the other as it vouches.
+//! whose item is played counts as the token is redeemed (P8-04), the
+//! other as it vouches.
 //! Refused assertions are counted on both sides.
 
 use std::time::Duration;
@@ -27,18 +28,18 @@ use super::{Federation, ShareError};
 use crate::auth::SessionToken;
 use crate::principal::{Principal, RemoteServerId, Who};
 use crate::store::StoreError;
-use crate::store::federation_tokens::{NewToken, PlaySide, TokenKept, TokenLimits};
+use crate::store::federation::PeerRecord;
+use crate::store::federation_tokens::{NewToken, PlaySide, TokenKept};
 use crate::store::users::LocalUserId;
 
 /// How long a play token works once minted.
 pub const PLAY_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
-/// The most play tokens that work at once (H3): a user starts a few plays
-/// in five minutes, and a pair's assertions are paced at one a second.
-pub const TOKEN_LIMITS: TokenLimits = TokenLimits {
-    per_user: 10,
-    per_peer: 500,
-};
+/// The tokens this server had granted to devices, by user, item (its
+/// `fed:` id) and device, and when ([`Federation::granted_to_device`]).
+pub(super) type DeviceGrants = parking_lot::Mutex<
+    std::collections::HashMap<(LocalUserId, String, EndpointId), std::time::Instant>,
+>;
 
 /// Why this server got no token for its user.
 #[derive(Debug, thiserror::Error)]
@@ -75,14 +76,33 @@ impl Federation {
         item: &MediaId,
         device: EndpointId,
     ) -> Result<TokenGranted, AssertError> {
+        let (peer, _) = self.remote_peer(item).await?;
+        self.assert_play_to(&peer, user, display_name, item, device, true)
+            .await
+    }
+
+    /// [`Federation::assert_play`] to `peer`, the live pair `item` is from,
+    /// as the caller found it; counted as a play unless `counted` is false
+    /// (one already counted, P8-04).
+    async fn assert_play_to(
+        &self,
+        peer: &PeerRecord,
+        user: LocalUserId,
+        display_name: &str,
+        item: &MediaId,
+        device: EndpointId,
+        counted: bool,
+    ) -> Result<TokenGranted, AssertError> {
         let (origin, remote) = item
             .remote()
             .ok_or_else(|| AssertError::NotFederated(item.clone()))?;
-        let peer = self
-            .live_peer_by_server_id(origin)
-            .await?
-            .ok_or_else(|| AssertError::NotPaired(origin.to_owned()))?;
         let dialed = self.links.get(origin).ok_or(AssertError::Offline)?;
+        // SA chooses the tracks by them, as this server would: it has none
+        // of the user's own.
+        let preferences = self
+            .store()
+            .track_preferences(Principal::LocalUser(user))
+            .await?;
         let granted = dialed
             .assert_user(AssertUser {
                 user: user.to_string(),
@@ -90,13 +110,16 @@ impl Federation {
                 client_endpoint: device.to_string(),
                 item: remote.to_string(),
                 scope: TokenScope::Play,
+                preferences: Some(preferences),
             })
             .await;
         match granted {
             Ok(granted) => {
-                self.store()
-                    .count_federation_play(&peer.id, PlaySide::Asserted)
-                    .await?;
+                if counted {
+                    self.store()
+                        .count_federation_play(&peer.id, PlaySide::Asserted)
+                        .await?;
+                }
                 tracing::info!(
                     peer = %peer.endpoint_id,
                     %item,
@@ -122,31 +145,56 @@ impl Federation {
         }
     }
 
-    /// [`Federation::assert_play`] for `who`: a local account only. A
-    /// portable guest is not passed on, and is counted as refused.
+    /// [`Federation::assert_play`] for `who` to `peer`, the live pair
+    /// `item` is from: a local account only. A portable guest is not passed
+    /// on, and is counted as refused. Counted as a play unless `counted`
+    /// is false.
     pub async fn assert_play_for(
         &self,
         who: &Who,
+        peer: &PeerRecord,
         item: &MediaId,
         device: EndpointId,
+        counted: bool,
     ) -> Result<TokenGranted, AssertError> {
         let Some(local) = who.local() else {
-            if let Some((origin, _)) = item.remote()
-                && let Some(peer) = self.live_peer_by_server_id(origin).await?
-            {
-                self.store()
-                    .count_federation_refusal(&peer.id, PlaySide::Asserted)
-                    .await?;
-            }
+            self.store()
+                .count_federation_refusal(&peer.id, PlaySide::Asserted)
+                .await?;
             return Err(AssertError::NotALocalUser);
         };
-        self.assert_play(local.user, &local.display_name, item, device)
+        self.assert_play_to(peer, local.user, &local.display_name, item, device, counted)
             .await
     }
 
+    /// `who` was granted a token for `item` on `device` (P8-04): a proxied
+    /// start of it from that device within the token's lifetime is the
+    /// same play, its dial failed, and is not counted again.
+    pub fn granted_to_device(&self, who: &Who, item: &MediaId, device: EndpointId) {
+        let Some(local) = who.local() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let mut granted = self.device_grants.lock();
+        granted.retain(|_, at| now.duration_since(*at) < PLAY_TOKEN_LIFETIME);
+        granted.insert((local.user, item.to_string(), device), now);
+    }
+
+    /// Whether `who` was granted a token for `item` on `device` within its
+    /// lifetime: taken, so it stands for one play only.
+    pub(crate) fn took_device_grant(&self, who: &Who, item: &MediaId, device: EndpointId) -> bool {
+        let Some(local) = who.local() else {
+            return false;
+        };
+        self.device_grants
+            .lock()
+            .remove(&(local.user, item.to_string(), device))
+            .is_some_and(|at| at.elapsed() < PLAY_TOKEN_LIFETIME)
+    }
+
     /// Pair `server_id` vouches for `assertion`'s user (P8-03): a token
-    /// for its item, minted and kept hashed, or why not. Counted as a play
-    /// of the pair's users here, or as a refusal.
+    /// for its item, minted and kept hashed, or why not. A refusal is
+    /// counted here; the play, once the token is redeemed (P8-04).
     pub(crate) async fn mint(
         &self,
         server_id: &ServerId,
@@ -187,6 +235,10 @@ impl Federation {
             server: RemoteServerId::from(server_id),
             user,
         };
+        let preferences = assertion
+            .preferences
+            .as_ref()
+            .and_then(|p| serde_json::to_string(p).ok());
         // A bearer as a session's is, kept by its hash alike.
         let token = SessionToken::generate();
         let expires_at =
@@ -204,8 +256,11 @@ impl Federation {
                     device: &device.to_string(),
                     scope: assertion.scope.name(),
                     expires_at,
+                    // Kept for the session it opens (P8-04).
+                    preferences: preferences.as_deref(),
                 },
-                TOKEN_LIMITS,
+                // The most that work at once (H3), as the settings say.
+                self.limits().tokens,
             )
             .await
             .map_err(|e| unavailable(&e))?;
@@ -222,12 +277,8 @@ impl Federation {
                 return Err(AssertionRefused::Unavailable);
             }
         }
-        if let Err(e) = store
-            .count_federation_play(&peer.id, PlaySide::Served)
-            .await
-        {
-            tracing::warn!(error = %e, "cannot count a paired server's play");
-        }
+        // The play is counted as the token is redeemed, by who redeems it
+        // (P8-04): one never redeemed played nothing.
         tracing::info!(
             peer = %peer.endpoint_id,
             %principal,
@@ -316,12 +367,10 @@ mod tests {
         out
     }
 
-    /// A device named in another encoding the key parser takes (base32)
-    /// is kept as its hex, which is what the redeeming connection says:
-    /// the token works from that device.
-    #[tokio::test]
-    async fn a_token_s_device_is_kept_as_its_canonical_hex() {
-        let store = test_store("fed-token-device").await;
+    /// Alice's server, sharing its movies with Bob's: the store, the
+    /// federation, and Bob's server's id.
+    async fn sharing(test: &str) -> (crate::store::tests::TestStore, Federation, ServerId) {
+        let store = test_store(test).await;
         let federation = Federation::new(
             Auth::new(store.store.clone()),
             Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into())),
@@ -347,26 +396,69 @@ mod tests {
             .share(&peer.id, &["plex:1".parse().unwrap()], "alice")
             .await
             .unwrap();
-        let device = iroh::SecretKey::from_bytes(&[7; 32]).public();
-        let base32 = base32(device.as_bytes());
-        let granted = federation
+        (store, federation, bob_s)
+    }
+
+    /// A token for Bob's play of the movie on `client_endpoint`.
+    async fn minted(federation: &Federation, bob_s: &ServerId, client_endpoint: String) -> String {
+        federation
             .mint(
-                &bob_s,
+                bob_s,
                 &AssertUser {
                     user: uuid::Uuid::from_u128(7).to_string(),
                     display_name: "Bob".into(),
-                    client_endpoint: base32,
+                    client_endpoint,
                     item: movie().id().to_string(),
                     scope: TokenScope::Play,
+                    preferences: None,
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .token
+    }
+
+    /// A device named in another encoding the key parser takes (base32)
+    /// is kept as its hex, which is what the redeeming connection says:
+    /// the token works from that device.
+    #[tokio::test]
+    async fn a_token_s_device_is_kept_as_its_canonical_hex() {
+        let (store, federation, bob_s) = sharing("fed-token-device").await;
+        let device = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let token = minted(&federation, &bob_s, base32(device.as_bytes())).await;
         let kept = store
-            .federation_token(&SessionToken(granted.token).hash())
+            .federation_token(&SessionToken(token).hash())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(kept.device, device.to_string());
+    }
+
+    /// A device that played comes back to the relay with its used token's
+    /// relay token (P8-04): not let through by it, and not counted as a
+    /// guess either, past as many times as a guesser is allowed; its next
+    /// token still lets it through.
+    #[tokio::test]
+    async fn a_device_s_own_used_relay_token_is_not_a_guess() {
+        use spoolframe_protocol::relay_access::play_relay_token;
+        let (_store, federation, bob_s) = sharing("fed-token-stale").await;
+        let device = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let token = minted(&federation, &bob_s, device.to_string()).await;
+        federation
+            .redeem_play_token(&token, &device.to_string())
+            .await
+            .unwrap();
+        // Its play over, its session gone.
+        federation.auth.remote_sessions().end_where(|_| true);
+        let stale = play_relay_token(&token, device.as_bytes());
+        for _ in 0..=crate::auth::MAX_FAILURES {
+            assert!(!federation.holds_play_token(&device, &stale).await);
+        }
+        let next = minted(&federation, &bob_s, device.to_string()).await;
+        assert!(
+            federation
+                .holds_play_token(&device, &play_relay_token(&next, device.as_bytes()))
+                .await
+        );
     }
 }

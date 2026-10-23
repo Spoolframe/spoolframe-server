@@ -940,6 +940,8 @@ impl Session {
             bitmap: options.bitmap,
             quality: self.wire_quality(options.quality),
             display: options.display,
+            capabilities: None,
+            onward_share: None,
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {
@@ -1472,6 +1474,7 @@ impl Session {
             position_ms: millis(position),
             // The playback's own, as it started.
             display: None,
+            onward_share: None,
         };
         match self.call(request).await? {
             Reply::PlaybackChanged { plan, size, epoch } => {
@@ -1538,6 +1541,7 @@ impl Session {
             position_ms: millis(position),
             // The playback's own, as it started.
             display: None,
+            onward_share: None,
         };
         match self.call(request).await? {
             Reply::PlaybackChanged { plan, size, epoch } => {

@@ -1232,6 +1232,7 @@ async fn run(
                 sync_every: config.federation.sync_every(),
                 cache_max_bytes: config.federation.cache_max_bytes(),
                 cache_total_bytes: config.federation.cache_total_bytes(),
+                limits: config.federation.limits(),
             },
         ))
     });

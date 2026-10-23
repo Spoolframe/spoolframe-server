@@ -124,6 +124,8 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
             bitmap: Default::default(),
             quality: Default::default(),
             display: None,
+            capabilities: None,
+            onward_share: None,
         },
     )
     .await
@@ -167,6 +169,8 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             }
         )
         .await,

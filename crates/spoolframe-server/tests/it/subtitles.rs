@@ -81,6 +81,8 @@ async fn start(
                 bitmap,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -539,6 +541,8 @@ async fn text_without_tesseract_cannot_play_and_says_why() {
                 bitmap: BitmapSubtitles::Text,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -644,6 +648,8 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
                 bitmap: BitmapSubtitles::Auto,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -656,6 +662,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
         bitmap: BitmapSubtitles::Auto,
         position_ms: 3_000,
         display: None,
+        onward_share: None,
     };
 
     let response = client.call(Some(&session), change(Some(0))).await;

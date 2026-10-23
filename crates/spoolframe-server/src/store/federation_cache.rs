@@ -32,6 +32,8 @@ pub struct CachedLibrary {
     /// The last whole sync's cursor.
     pub cursor: Option<String>,
     pub synced_at: Option<i64>,
+    /// How many whole syncs brought a change: the revision held here.
+    pub revision: i64,
 }
 
 /// A cached item, as the origin sent it.
@@ -159,6 +161,7 @@ fn library(row: &sqlx::sqlite::SqliteRow) -> Result<CachedLibrary, sqlx::Error> 
         kind: row.try_get("kind")?,
         cursor: row.try_get("cursor")?,
         synced_at: row.try_get("synced_at")?,
+        revision: row.try_get("revision")?,
     })
 }
 
@@ -188,7 +191,7 @@ fn bodies(rows: Vec<String>) -> Vec<RemoteItem> {
 /// literal.
 macro_rules! library_columns {
     () => {
-        "origin, library, peer, title, kind, cursor, synced_at"
+        "origin, library, peer, title, kind, cursor, synced_at, revision"
     };
 }
 
@@ -214,6 +217,12 @@ impl Store {
         .bind(kind)
         .execute(&self.pool)
         .await?;
+        // Shared again: no longer said to be withdrawn.
+        sqlx::query("DELETE FROM federation_withdrawn WHERE origin = ?1 AND library = ?2")
+            .bind(origin)
+            .bind(&shared.id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -492,7 +501,8 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE federation_cache_libraries SET cursor = ?3, synced_at = ?4 \
+            "UPDATE federation_cache_libraries \
+             SET revision = revision + (cursor IS NOT ?3), cursor = ?3, synced_at = ?4 \
              WHERE origin = ?1 AND library = ?2",
         )
         .bind(origin)
@@ -554,6 +564,8 @@ impl Store {
              WHERE origin = ?1 AND (?2 IS NULL OR library = ?2)",
             "DELETE FROM federation_cache_libraries \
              WHERE origin = ?1 AND (?2 IS NULL OR library = ?2)",
+            // Unpaired: what it withdrew is no longer news.
+            "DELETE FROM federation_withdrawn WHERE origin = ?1 AND ?2 IS NULL",
         ] {
             sqlx::query(table)
                 .bind(origin)
@@ -563,6 +575,73 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Keep that `origin`, over pair `peer`, stopped sharing `library_id`
+    /// (titled `title`) now.
+    pub async fn withdraw_cached(
+        &self,
+        origin: &str,
+        peer: &str,
+        library_id: &str,
+        title: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO federation_withdrawn (origin, library, peer, title, withdrawn_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (origin, library) DO UPDATE SET \
+                 peer = ?3, title = ?4, withdrawn_at = ?5",
+        )
+        .bind(origin)
+        .bind(library_id)
+        .bind(peer)
+        .bind(title)
+        .bind(self.now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The libraries pair `peer` stopped sharing at `since` or after, as
+    /// (library, title, when), the latest first.
+    pub async fn withdrawn(
+        &self,
+        peer: &str,
+        since: i64,
+    ) -> Result<Vec<(String, String, i64)>, StoreError> {
+        Ok(sqlx::query_as(
+            "SELECT library, title, withdrawn_at FROM federation_withdrawn \
+             WHERE peer = ?1 AND withdrawn_at >= ?2 ORDER BY withdrawn_at DESC, title",
+        )
+        .bind(peer)
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// How many of `origin`'s films, shows and artists each cached library
+    /// holds, as (library, count): what a user here browses first.
+    pub async fn cached_counts(&self, origin: &str) -> Result<Vec<(String, i64)>, StoreError> {
+        Ok(sqlx::query_as(
+            "SELECT library, COUNT(*) FROM federation_cache_items \
+             WHERE origin = ?1 AND unavailable = 0 AND kind IN ('movie', 'show', 'artist') \
+             GROUP BY library",
+        )
+        .bind(origin)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The bytes of `origin`'s artwork kept here.
+    pub async fn cached_bytes(&self, origin: &str) -> Result<u64, StoreError> {
+        let bytes: Option<i64> =
+            sqlx::query_scalar("SELECT bytes FROM federation_cache_bytes WHERE origin = ?1")
+                .bind(origin)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(bytes
+            .and_then(|b| u64::try_from(b).ok())
+            .unwrap_or_default())
     }
 
     /// Every `fed:` id a user of this server holds: in their watch state,

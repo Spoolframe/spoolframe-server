@@ -60,6 +60,7 @@ pub mod redact;
 pub mod refusals;
 pub mod relay_access;
 pub mod relay_nat;
+pub mod remote_sessions;
 pub mod runtime;
 pub mod search;
 pub mod store;

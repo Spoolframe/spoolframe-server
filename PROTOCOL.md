@@ -51,7 +51,8 @@ must be updated together. The changes per revision are in
   [sharing libraries](#sharing-libraries),
   [paired servers in an app](#paired-servers-in-an-app),
   [progress](#progress-on-a-paired-servers-item),
-  [delegated authentication](#delegated-authentication)
+  [delegated authentication](#delegated-authentication),
+  [playing a paired server's item](#playing-a-paired-servers-item)
 
 ## Basics
 
@@ -187,6 +188,7 @@ The server pushes `Event`s on the events stream, without being asked:
 | `shutting_down` | The server is stopping; the connection will close. |
 | `server_addresses { addrs, relays, lookup }` | Where the server can be reached. See "Server addresses". |
 | `playback_share { handle, max_bitrate }` | A playback's share of the WAN uplink moved. See "The WAN uplink budget". |
+| `playback_ended { handle, error }` | Experimental (`federation`): a paired server's item's playback ended other than by the client's stop; `error` is what its next use is told. See "Proxy mode". |
 
 An event a client does not know decodes as `Unknown`; ignore it.
 
@@ -1094,6 +1096,34 @@ recheck is carried on until a recheck that does. With `access.everyone`,
 and for the main server itself, nothing is asked and nothing rechecked.
 At most 2 recheck questions are open at once.
 
+### The play token holder's token
+
+A device that plays a paired server's item directly (P8-04, while
+`experimental.federation` is on) may reach that server only through
+its own relay. It holds a play token
+([below](#playing-a-paired-servers-item)) before it holds a session
+there, so it proves the token to the relay as an invite holder proves
+a code:
+
+```text
+sf-play.1.<base64url, no padding, of BLAKE3-keyed(key = BLAKE3(play token), msg = endpoint key)>
+```
+
+(`relay_access::play_relay_token`). The relay passes it on in `invite`,
+as it does an invite holder's. The server checks it against the play
+tokens minted for that endpoint that still work (not used, not expired,
+their grant and pair live), in constant time each, and answers
+`friend` for a match. It is guarded as an invite holder's token is: it
+draws on the strangers' budget and counts as a guess from that
+endpoint, taken back only when it matches. Once the device redeemed the
+token, its session there keeps it a `friend` while it lasts. The token
+of one minted for that endpoint and used up or expired, while the
+server still keeps it, matches without counting a guess, and lets
+nothing through: a device that comes back to the relay after its play
+is not guessing. The SDK holds the paired server's relays with the
+token only while the play lives, and lets go of them when the start
+fails or the play is dropped.
+
 ## Profiles and progress
 
 One connection may carry several users' sessions (§15).
@@ -1271,6 +1301,14 @@ plan, and the playback keeps it: a re-plan without one plans for the
 screen it started on. A TV whose display mode changes while the app runs
 (Match Dynamic Range, another TV or receiver) sends it at each start.
 With `null`, `Hello`'s apply.
+
+`StartPlayback` may also carry `capabilities` (P8-04): a whole
+`ClientCapabilities`, in place of `Hello`'s, for this playback and every
+re-plan of it. `display` applies over it. Left out (the key is not
+sent), `Hello`'s apply, as before. A server that plays on to one of its
+own devices (a paired server's proxy,
+[below](#proxy-mode)) has the plan made for that device, whatever its own
+`Hello` said. An app has no need for it.
 
 ## Output codecs and HDR
 
@@ -3190,7 +3228,27 @@ the latest library sync, `null` before the first), `playsHere` and
 `playsThere`: plays of this server's items by the pair's users, and of
 the pair's items by this server's users, and `refusedHere` and
 `refusedThere`, the plays refused each way; one number each, never per
-user.
+user. Of `playsHere`, `directHere` played from this server to the device
+and `proxiedHere` through the pair's server; `proxiedThere` counts this
+server's users' plays it played on to their devices itself (P8-04).
+
+Before pairing, the web UI looks the invite up (P8-01–P8-04):
+`federation.lookUp { link }` (recent sign-in, as `redeem`) dials SA on
+`federation/1` as `redeem` does, hears its name, and asks SA's client
+protocol `lookup_invite` as an app would, on SA's strangers' budget. It
+answers `{name, serverId, fingerprint, inviter, expiresAt}`, the
+fingerprint of the key the link names, for the two admins to compare;
+nothing is used up. An invite used, expired or revoked is refused as
+`redeem` would refuse it. `federation.peerDetail { id }` is a paired
+server's own page: its `peer` (as `peerList` gives it), `lastSeen` (when
+it was last connected, kept to the minute), `identityRefusedAt` (when
+its key last said hello under another server id), `received` (each
+library it shares with this server as cached here: `id`, `title`,
+`kind`, `items`, `revision`, the count of whole syncs that brought a
+change, and `syncedAt`), `cachedBytes` (its artwork kept here),
+`withdrawn` (the libraries it stopped sharing in the last week) and
+`week`: the last seven UTC days' plays, oldest first, each `{day,
+playsHere, proxiedHere, playsThere, proxiedThere}` (migration 0054).
 
 ### Paired servers in an app
 
@@ -3247,13 +3305,18 @@ the connection proves SB, and nothing is signed. Only SB's local
 accounts are vouched for, by their stable user id: a portable guest of
 SB's is not passed on.
 
-- `assert_user` `{user, display_name, client_endpoint, item, scope}`:
+- `assert_user` `{user, display_name, client_endpoint, item, scope,
+  preferences}`:
   `user` is the user's UUID on SB; `display_name` is for SA's logs only;
   `client_endpoint` is the device's endpoint id, hex; `item` is SA's own
   id (what the `fed:` id carries); `scope` is `play`, the default when
   left out. Answered `token {token, scope, expires_at}`: a random bearer
   token, kept by SA as its hash, for that one item, from that one device,
-  for five minutes. Or `assertion_refused {reason}`: `not_shared` (the
+  for five minutes. `preferences`, optional (P8-04), is the user's track
+  preferences on SB, as `SetTrackPreferences` takes them: kept with the
+  token and the session it opens, they choose a play's tracks on SA when
+  the play sends no selection, as SB would; SA has none of the user's
+  own. Or `assertion_refused {reason}`: `not_shared` (the
   item is in no library shared with SB, or is not SA's own),
   `invalid_user`, `invalid_device`, `invalid_scope` (also for an item
   that does not play: a show, a season, an artist, an album) or
@@ -3261,6 +3324,147 @@ SB's is not passed on.
   one a second, or once a user holds 10 working tokens, or the pair
   500). The grant is checked as the token is kept, in one transaction.
 
-SA counts each token as a play of SB's users, and SB counts each as a
-play of SA's items; refusals are counted apart. The client protocol's
-redemption of the token is not specified yet.
+SB counts each token as a play of SA's items as SA mints it, but for
+one it asks to play on to a device that was granted its own token for
+the same item within that token's lifetime, its dial having failed:
+that is the same play (P8-04). SA counts the play as the token is
+redeemed, by who redeemed it: a token never redeemed played nothing.
+Refusals are counted apart.
+
+### Playing a paired server's item
+
+Experimental (P8-04), on the client protocol, for an app that names the
+`federation` feature, and no `PROTOCOL_VERSION` change. Here SA is the
+server whose item it is, and SB the user's own server, which shows it
+under a `fed:` id. `spoolframe/federation/1` carries no media: the item
+plays on SA's own `spoolframe/client/1`, as any of SA's items does.
+
+The device decides how it plays, not SB: SB's route to SA says nothing
+of the device's.
+
+1. It asks SB `RemoteHints { id }` (the `fed:` id; safe to retry):
+   `RemoteHints { server_id, endpoint_id, addrs, relays, online }`, SB's
+   own record of SA from the pairing, and whether SB holds a connection
+   to SA now.
+2. It dials SA at those, once, for about 5 s. It checks that the server
+   answering at `endpoint_id` says `server_id`.
+3. Reached, it asks SB `RemoteGrant { id }` (not safe to retry): SB
+   vouches for its user to SA for this device
+   ([delegated authentication](#delegated-authentication)), and answers
+   `RemoteGranted { token, item, endpoint_id, expires_at }`. `item` is
+   SA's own id. With SA offline to SB, it is refused `OriginOffline` (a
+   new error) at once. A proxied play needs no grant: it is a
+   `StartPlayback` on SB (below).
+4. On SA, before signing in, it sends `RedeemPlayToken { token }` (not
+   safe to retry): `PlayTokenRedeemed { session, item, scope }`.
+5. It plays `item` on SA in that session, as any playback: reads,
+   controls and events are SA's.
+6. It reports its progress to SB, by the `fed:` id
+   ([progress](#progress-on-a-paired-servers-item)). SA keeps no watch
+   state, no history and no play count for the user.
+
+Through SA's own relay, the device asks for the grant before it dials,
+and dials with the token's relay token
+([relay access](#the-play-token-holders-token)); a dial that fails
+leaves the token to expire unused.
+
+#### Redeeming a play token
+
+SA checks the token at redemption, in the one statement that uses it up,
+so it works once: it must be minted for the endpoint that redeems it,
+unused and unexpired, and its pair and its library's grant must be live.
+SA checks again that it opens a film, an episode or a track. A token
+that fails any check is refused `Unauthenticated`, alike, and counts as
+a stranger's wrong guess from that endpoint, on the strangers' budget.
+While the session it opens lives, its endpoint is no stranger: a
+device that reconnects mid-play has the normal limits, past the
+strangers' cap.
+
+The session it opens is the remote user's (`remote:<server id>:<user
+id>`), bound to that endpoint, and kept in memory only: SA's restart ends
+it. It is kept five minutes past its last use. It reaches only its one
+item: `StartPlayback`, `SyncSubtitle`, `UseOriginalSubtitleTiming` and
+`SetSubtitleOffset` of that item, the controls, reads and media of the
+playbacks it starts, and `Logout`, which ends the session and its
+playbacks at once. Anything else, `HttpPlaybackUrl`, artwork and
+downloads among them, is `Unauthenticated`. SA's grant revoked, or the
+pair unpaired, ends the session and its playbacks at once. Off SA's LAN,
+the play takes a guest's share of SA's WAN uplink.
+
+SA counts the play then: `direct` when the device redeemed the token,
+`proxied` when SB's own endpoint did. Its admins see both per pair
+(`federation_peerList`'s `directHere` and `proxiedHere`); no user of
+SB's is named.
+
+#### Proxy mode
+
+The device did not reach SA in step 2, or it plays for an HTTP player
+(a cast target), which cannot present a token to SA. It sends SB a
+plain `StartPlayback` of the `fed:` id. SB then:
+
+- asks SA for a token for its own endpoint, and redeems it on SA's
+  `client/1`, as one more device: a session of its own for this play,
+  on SB's one connection to SA, which carries every play SB makes from
+  SA;
+- starts the playback there with `capabilities` set to the device's,
+  so SA plans for the device, and, off SB's LAN, `onward_share` set to
+  SB's share of its own uplink, so SA plans within the smaller of that
+  and its own share;
+- answers the device `PlaybackStarted` with a handle of its own, SA's
+  plan, size, chosen tracks, epoch and markers.
+
+The playback's re-plans, seeks, manifests and subtitle reads pass
+through to SA, and its media reads are relayed as they arrive. Each
+`ChangeQuality` and `ChangeSubtitle` SB passes on carries `onward_share`
+again, as SB's share is then: a share that drops mid-play (the device
+re-plans on SB's `PlaybackShare`) is planned under on SA. SB's
+revisions are the device's; SA's `PlaybackShare` events reach the
+device under SB's handle. Nothing is written to SB's disk. Its stop ends
+it on SB, which stops it on SA and ends its session there (`Logout`);
+the pair's other plays go on. A re-plan SA answers is kept on SB's
+playback as SA made it, for SB's Playback page and its HTTP port. A
+relayed read that SA stops sending fails, as a read the device stops
+taking does: after the stalled-read limit on the client protocol, after
+30 s on the HTTP port. A device's `UpdateWatchProgress` for an item it
+plays through SB opens no second play: the playback keeps it. SB's HTTP
+playback port serves it through SA too. SB counts the play as one of
+its users' it played on (`federation_peerList`'s `proxiedThere`).
+
+SA sends `playback_ended { handle, error }` to the connection of a play
+token's session when one of its playbacks ends other than by that
+client's stop: an admin stopped it, it idled out, its session or grant
+ended. `error` is what the next use of the handle is told
+(`playback_stopped`: do not start it again). SB ends its own playback at
+once, as stopped when SA's was, and sends the device the same event
+under its own handle. A device playing directly gets it from SA.
+
+SB closes its connection to SA once no play has used it for a minute,
+and at once when the pair is unpaired, which ends the plays on it. Its
+operations' expiry is SA's time at its last answer moved on by the time
+passed on SB since, so a connection kept between plays is not refused
+`OperationExpired`.
+
+`onward_share` (bits per second, optional on `StartPlayback`,
+`ChangeQuality` and `ChangeSubtitle`) is for a server that plays on to
+its own device; left out, as from any device, the plan keeps to SA's
+share alone. SA's Playback page shows SB, by its name, as the device.
+
+A play does not change mode while it plays. When SB's connection to SA
+closes (SA restarts, the route goes), or SA ends its playback or
+session, SB ends its own and tells the device (`playback_ended`): its
+next request on it fails as for any ended playback, and the device
+starts again, which picks the way anew. SB going away ends the play on SA once SA's disconnect grace runs
+out. On SA, each proxied session counts as a device of its own for "now
++ next" and for ending conversions to make room, so two of SB's users,
+both on SB's one endpoint, never end each other's plays.
+
+#### SDK
+
+`Session::remote_hints`, `remote_grant`, `start_remote_playback` (steps
+1 to 5, and proxy mode when the dial fails, but not when another server
+answers at SA's key: `SdkError::ServerIdChanged`) and
+`start_proxied_playback` (proxy mode at once, for an HTTP player).
+`RemotePlayback { session, playback, mode, item }`: `mode` is
+`RemoteMode::Direct` (the session is SA's, `item` SA's id) or
+`RemoteMode::Proxied` (the session is SB's, `item` the `fed:` id).
+`SdkError::OriginOffline`.

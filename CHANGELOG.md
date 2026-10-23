@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- SDK: a stream's receive window is 2 MiB, down from 8 MiB. QUIC
+  closes a connection when, past a lost packet, it holds more than about
+  2,048 packets of one stream, and 8 MiB let a 16 MiB read hold far more:
+  played through a paired server, such reads lost their connection about
+  one time in two ("too many gaps in stream buffer"). A stream now
+  carries about 56 Mbit/s at 300 ms round trip, where it carried four
+  times that.
 - Experimental, and off by default: server-to-server pairing (P8-01),
   the first part of federation. Not reviewed yet: pair only with servers
   you run. `experimental { federation = true; }` (Settings ›
@@ -60,8 +67,7 @@
   accounts only, never a portable guest) and the other mints a play
   token for that item and device, for five minutes (`assert_user`,
   migration 0052), at most 10 working per user and 500 per server, for
-  what plays only; redeeming it is not in this release. PROTOCOL.md's
-  "Federation" has the wire.
+  what plays only. PROTOCOL.md's "Federation" has the wire.
 - Client protocol, used only with an app that names the experimental
   `federation` feature, and no `PROTOCOL_VERSION` change: `Libraries`
   lists the paired servers' libraries after the server's own, each with
@@ -81,6 +87,70 @@
   `Session::share_libraries`, `set_server_row`, `update_watch_progress`,
   `Client::libraries_events` (`LibrariesChanged`), `Library.server`,
   and `ItemsPage.unavailable`.
+- Experimental, as pairing is: a paired server's item plays (P8-04).
+  The device asks its own server (SB) where the other (SA) is, dials SA
+  itself for about 5 s, and, reached, asks SB for a play token for
+  itself and redeems it on SA: the item plays from SA to the device, and
+  SB carries none of it. Through SA's own relay, the token lets the
+  device through (`sf-play.1.` relay tokens). Not reached, the device
+  plays the item from SB, which plays it from SA in its own name and on
+  to the device (proxy mode); an HTTP player always plays this way. SB
+  writes nothing of it to disk. A play does not change mode while it
+  plays: when SA or the route to it goes, the play ends, and the next
+  start picks the way again. SB plays every proxied play from SA over
+  one connection, each in a session of its own, and closes it once no
+  play has used it for a minute, or when the pair is unpaired. SA
+  chooses a play's audio and subtitles by the user's preferences on
+  their own server, which go with the token. When SA ends a playback
+  (an admin's stop, an idle sweep, a grant revoked), SB ends its own at
+  once and the device is told. A device in a direct play that
+  reconnects is not held to SA's strangers' cap, and its relay token
+  after the play is not counted as a guess. The federation limits have
+  a ceiling as well as a floor. SA checks a token as it is redeemed: once
+  only, from the endpoint it was minted for, while its pair and grant
+  are live, for what plays; a bad one counts as a stranger's guess. Its
+  session reaches that one item's playback and nothing else, and SA's
+  restart, a revoked grant or an unpairing ends it. SA counts each play
+  as its token is redeemed, direct or proxied, and SB counts the plays
+  it carried: `federation_peerList` gains `directHere`, `proxiedHere`
+  and `proxiedThere`, and the Federation page shows them (migration
+  0053). Two of SB's users playing through it at once never end each
+  other's plays. The federation limits (sync pages and items, cached
+  items, walk reuse, streams per connection, the image and assertion
+  bursts, play tokens per user and per server) are settings now, under
+  `federation`, shown in Settings › Experimental with advanced settings
+  on; the defaults are as before.
+- The Federation pages follow the design (P8-01–P8-04). Pairing looks
+  the invite up first: the dialog shows the other server's name and
+  fingerprint, for its admin to read theirs, and pairs only then; it
+  then offers this server's libraries to share, or Skip. An invite used
+  or expired says one thing: ask for a new one. Each paired server has
+  its own page, opened from its name: a switch per library shared with
+  it (turning one off asks first), what it shares here with its items,
+  artwork, revision and freshness, the week's plays each way, its state
+  (offline since when, a library it stopped sharing, plays passed on
+  through it, an identity refused) and Unpair. Admin API:
+  `federation_lookUp` and `federation_peerDetail` (migration 0054: a
+  pair's last seen and refused identity, a cached library's revision,
+  plays by the day, and libraries withdrawn). A paired key that says
+  hello under another server id is still refused every time, and now
+  kept so its page says so.
+- Client protocol, for an app that names the experimental `federation`
+  feature, and no `PROTOCOL_VERSION` change: `RemoteHints { id }` and
+  `RemoteGrant { id }` on the user's server, `RedeemPlayToken { token }`
+  on the paired server (whose session may also `Logout`), the new error
+  `OriginOffline`, an optional `capabilities` on `StartPlayback` that
+  plans the playback and its re-plans for those capabilities in place of
+  `Hello`'s (left out, as before), an optional `onward_share` on
+  `StartPlayback`, `ChangeQuality` and `ChangeSubtitle`: the share of
+  its own uplink a server playing on to its device has, which the plan
+  keeps under as under the server's own, and the event `PlaybackEnded {
+  handle, error }`. Federation protocol: `AssertUser` gains an optional
+  `preferences`. SDK: `Session::remote_hints`, `remote_grant`,
+  `start_remote_playback` (direct, else proxy mode),
+  `start_proxied_playback`, `RemotePlayback`, `RemoteMode` and
+  `SdkError::OriginOffline`. PROTOCOL.md's "Playing a paired server's
+  item" has the wire.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

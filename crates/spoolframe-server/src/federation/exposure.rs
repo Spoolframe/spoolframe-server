@@ -12,10 +12,58 @@ use spoolframe_types::{Library, LibraryServer};
 use super::Federation;
 use crate::store::StoreError;
 use crate::store::federation::PeerRecord;
-use crate::store::federation_tokens::{PlayCount, PlaySide};
+use crate::store::federation_tokens::{DAY, PlayCount, PlaySide};
 
 /// How many items a paired server's Home row holds.
 const ROW: u32 = 20;
+
+/// The days a paired server's own page counts plays over, today the last;
+/// what it says a library was withdrawn within, too.
+pub(crate) const WEEK_DAYS: i64 = 7;
+
+/// What a paired server's own page on the Federation page shows beyond
+/// its row (P8-01–P8-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerPage {
+    /// When it was last seen connected, Unix seconds.
+    pub last_seen: Option<i64>,
+    /// When its key last said hello under another server id.
+    pub identity_refused_at: Option<i64>,
+    /// What it shares with this server, as cached here.
+    pub received: Vec<Received>,
+    /// Its artwork kept here, in bytes.
+    pub cached_bytes: u64,
+    /// The libraries it stopped sharing this week, as (library, title,
+    /// when), the latest first.
+    pub withdrawn: Vec<(String, String, i64)>,
+    /// The week's plays, a day each, the oldest first: seven of them.
+    pub week: Vec<PlayDay>,
+}
+
+/// A library a paired server shares with this one, as cached here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Received {
+    pub library: String,
+    pub title: String,
+    pub kind: String,
+    /// Its films, shows or artists.
+    pub items: u64,
+    pub revision: i64,
+    pub synced_at: Option<i64>,
+}
+
+/// One day's plays across a pair, from its first second, Unix seconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayDay {
+    pub day: i64,
+    /// Of this server's items by its users, and of them played through it.
+    pub here: u64,
+    pub proxied_here: u64,
+    /// Of its items by this server's users, and of them played on by this
+    /// server.
+    pub there: u64,
+    pub proxied_there: u64,
+}
 
 /// Why a server's Home row was not set.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +167,66 @@ impl Federation {
             .iter()
             .filter_map(|l| l.synced_at)
             .max())
+    }
+
+    /// What pair `peer`'s own page shows beyond its row.
+    pub async fn peer_page(&self, peer: &PeerRecord) -> Result<PeerPage, StoreError> {
+        let store = self.store();
+        let (last_seen, identity_refused_at) = store.peer_presence(&peer.id).await?;
+        let counts: HashMap<String, i64> = store
+            .cached_counts(&peer.server_id)
+            .await?
+            .into_iter()
+            .collect();
+        let received = store
+            .cached_libraries(Some(&peer.server_id))
+            .await?
+            .into_iter()
+            .map(|l| Received {
+                items: counts
+                    .get(&l.library)
+                    .and_then(|n| u64::try_from(*n).ok())
+                    .unwrap_or_default(),
+                library: l.library,
+                title: l.title,
+                kind: l.kind,
+                revision: l.revision,
+                synced_at: l.synced_at,
+            })
+            .collect();
+        let now = store.now();
+        let first = now.div_euclid(DAY) - (WEEK_DAYS - 1);
+        let mut week: Vec<PlayDay> = (first..first + WEEK_DAYS)
+            .map(|day| PlayDay {
+                day: day * DAY,
+                ..PlayDay::default()
+            })
+            .collect();
+        for (side, there) in [(PlaySide::Served, false), (PlaySide::Asserted, true)] {
+            for (day, plays, proxied) in store.federation_play_days(&peer.id, side, first).await? {
+                let Some(slot) = usize::try_from(day - first)
+                    .ok()
+                    .and_then(|i| week.get_mut(i))
+                else {
+                    continue;
+                };
+                if there {
+                    slot.there = plays;
+                    slot.proxied_there = proxied;
+                } else {
+                    slot.here = plays;
+                    slot.proxied_here = proxied;
+                }
+            }
+        }
+        Ok(PeerPage {
+            last_seen,
+            identity_refused_at,
+            received,
+            cached_bytes: store.cached_bytes(&peer.server_id).await?,
+            withdrawn: store.withdrawn(&peer.id, now - WEEK_DAYS * DAY).await?,
+            week,
+        })
     }
 
     /// Pair `peer`'s plays and refusals (P8-03), one count per server and

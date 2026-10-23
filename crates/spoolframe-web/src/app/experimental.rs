@@ -3,14 +3,17 @@
 //! config file's and the CLI's only, libplacebo's shared Vulkan device on
 //! AMD (PGPU-04), which was at the foot of Playback, keyframes read
 //! ahead of any play (`experimental.index_ahead`), and pairing with other
-//! servers (`experimental.federation`, P8-01).
+//! servers (`experimental.federation`, P8-01), with its cache and limits
+//! under "Show advanced settings" (P8-04).
 
 use dioxus::prelude::*;
 use serde_json::json;
 use spoolframe_admin_api::Settings;
 
 use super::profile::{ConfirmItsYou, asks_to_confirm};
-use super::wizard::{Footer, Mode, Note, flag, load_settings, loading, locked, save, text, typed};
+use super::wizard::{
+    Footer, Limit, Mode, Note, flag, load_settings, loading, locked, number, save, text, typed,
+};
 use super::{Alert, Field, Notice};
 use crate::experimental::Listen;
 use crate::setup;
@@ -54,6 +57,12 @@ fn ExperimentalFields(
     let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
     let mut index_ahead = use_signal(|| flag(&settings, "experimental.index_ahead"));
     let mut federation = use_signal(|| flag(&settings, crate::federation::SETTING));
+    // One field per federation setting, always as many, in one order.
+    let limits: Vec<Signal<String>> = crate::federation::LIMITS
+        .iter()
+        .map(|field| use_signal(|| text(&settings, field.key)))
+        .collect();
+    let advanced = super::settings::show_advanced();
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     // `http_playback.*` is sensitive: from an old session, "Confirm it's
@@ -61,6 +70,7 @@ fn ExperimentalFields(
     let confirming = use_signal(|| None::<String>);
     let s = settings.clone();
     let shown = listen.clone();
+    let typed_limits = limits.clone();
     let on_save = use_callback(move |()| {
         let s = s.clone();
         let listen = match shown.setting(airplay(), &port()) {
@@ -70,7 +80,7 @@ fn ExperimentalFields(
                 return;
             }
         };
-        let changes = vec![
+        let mut changes = vec![
             ("http_playback.listen", listen),
             ("http_playback.address", typed(&address())),
             (
@@ -80,6 +90,15 @@ fn ExperimentalFields(
             ("experimental.index_ahead", Some(json!(index_ahead()))),
             (crate::federation::SETTING, Some(json!(federation()))),
         ];
+        for (field, value) in crate::federation::LIMITS.iter().zip(&typed_limits) {
+            match number(field.label, &value()) {
+                Ok(n) => changes.push((field.key, n)),
+                Err(why) => {
+                    error.set(Some(why));
+                    return;
+                }
+            }
+        }
         busy.set(true);
         spawn(async move {
             match save(&s, changes).await {
@@ -187,6 +206,20 @@ fn ExperimentalFields(
                 }
             }
             Note { settings: settings.clone(), setting: crate::federation::SETTING, on_changed: move |_| on_reload.call(()) }
+            if advanced {
+                span { class: "text-xs text-ctp-subtext0",
+                    "What paired servers share is cached here, and what each may send and ask is limited. Raise the sync's limits for a very large library. Applies at once."
+                }
+                div { class: "limits",
+                    for (field, value) in crate::federation::LIMITS.iter().zip(limits.iter().copied()) {
+                        div { key: "{field.key}", class: "flex flex-col gap-1.5",
+                            Limit { label: field.label, value, unit: field.unit, disabled: locked(&settings, field.key) }
+                            span { class: "text-xs text-ctp-subtext0", "{field.help}" }
+                            Note { settings: settings.clone(), setting: field.key, on_changed: move |_| on_reload.call(()) }
+                        }
+                    }
+                }
+            }
         }
         if let Some(text) = error() {
             Alert { text }

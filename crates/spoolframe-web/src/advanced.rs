@@ -36,6 +36,25 @@ const BY_TAB: &[(&str, &[&str])] = &[
             "transcode.gpus",
         ],
     ),
+    // Federation's cache and limits, under its switch (P8-04, the
+    // 2026-10-23 decision); the switches themselves are not advanced.
+    (
+        "experimental",
+        &[
+            "federation.sync_interval_secs",
+            "federation.cache_max_mb",
+            "federation.cache_total_mb",
+            "federation.sync_max_pages",
+            "federation.sync_max_items",
+            "federation.max_cached_items",
+            "federation.walk_reuse_secs",
+            "federation.max_streams",
+            "federation.artwork_burst",
+            "federation.assertion_burst",
+            "federation.tokens_per_user",
+            "federation.tokens_per_server",
+        ],
+    ),
     (
         "security",
         &[
@@ -176,10 +195,11 @@ mod tests {
         }
     }
 
-    /// Settings › Experimental is shown whole, the switch on or off: AirPlay
-    /// is looked for, and the tab is where experimental switches are.
+    /// Settings › Experimental's switches are shown, the switch on or off:
+    /// AirPlay is looked for, and the tab is where experimental switches
+    /// are. Only federation's limits under its switch are advanced.
     #[test]
-    fn the_experimental_tab_s_settings_are_not() {
+    fn the_experimental_tab_s_switches_are_not() {
         for key in [
             "http_playback.listen",
             "http_playback.address",
@@ -189,7 +209,11 @@ mod tests {
         ] {
             assert!(!is_advanced(key), "{key}");
         }
-        assert!(on_tab("experimental").is_empty());
+        assert!(
+            on_tab("experimental")
+                .iter()
+                .all(|k| k.starts_with("federation."))
+        );
     }
 
     #[test]

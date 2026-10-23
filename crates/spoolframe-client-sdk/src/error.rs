@@ -392,6 +392,10 @@ pub enum SdkError {
     PairingRefused {
         reason: spoolframe_protocol::federation::PairingRefused,
     },
+    /// Experimental (`federation`, P8-04): the paired server a `fed:` item
+    /// is from is offline to the user's server: it cannot be played now.
+    #[error("the paired server the item is from is offline")]
+    OriginOffline,
     #[error("server: {0}")]
     Server(String),
     /// The server's answer made no sense to this build.
@@ -480,6 +484,7 @@ impl SdkError {
             ServerError::NoSubtitleSource => SdkError::NoSubtitleSource,
             ServerError::DownloadNotReady => SdkError::DownloadNotReady,
             ServerError::PairingRefused { reason } => SdkError::PairingRefused { reason },
+            ServerError::OriginOffline => SdkError::OriginOffline,
             other => SdkError::Server(other.to_string()),
         }
     }

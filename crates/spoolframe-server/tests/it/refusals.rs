@@ -530,6 +530,8 @@ async fn another_session_s_playback_is_logged() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await

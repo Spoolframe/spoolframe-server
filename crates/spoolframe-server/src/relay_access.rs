@@ -12,9 +12,10 @@ use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_protocol::close;
 use spoolframe_protocol::codec::{read_frame_within, write_frame};
-use spoolframe_protocol::relay_access::{AccessAnswer, AccessQuery, Tier};
+use spoolframe_protocol::relay_access::{AccessAnswer, AccessQuery, Tier, parse_play_token};
 
 use crate::auth::Auth;
+use crate::store::StoreError;
 
 /// A query is a key and some framing: anything larger is not one.
 const MAX_QUERY: u32 = 1024;
@@ -98,55 +99,69 @@ impl RelayAccess {
     /// is no one's, with a live invite's token for it, is the tier of the
     /// invite's kind (P6-08, [`crate::invites::holder_tier`]); one with a
     /// portable user's session (P7-06) a friend's, as is a server paired
-    /// with this one while federation is on (P8-01); anyone else a
-    /// stranger.
+    /// with this one while federation is on (P8-01), and a paired server's
+    /// user's device with a play token, or the session it opened (P8-04);
+    /// anyone else a stranger.
     pub async fn tier(&self, endpoint: &str, invite: Option<&str>) -> Tier {
+        self.tier_of(endpoint, invite)
+            .await
+            .unwrap_or_else(|stranger| stranger)
+    }
+
+    /// [`RelayAccess::tier`]: asked in turn, most answers ending at the
+    /// first; an answer that cannot be had ends it as a stranger's (`Err`).
+    async fn tier_of(&self, endpoint: &str, invite: Option<&str>) -> Result<Tier, Tier> {
         if endpoint == self.server.to_string() {
-            return Tier::Owner;
+            return Ok(Tier::Owner);
         }
+        let known = |asked: Result<bool, StoreError>| {
+            asked.map_err(|e| {
+                // Not known to be anyone's: refused, as a stranger.
+                tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
+                Tier::Stranger
+            })
+        };
         let store = self.auth.store();
         // A device signed in here is the owner's; one trusted for a user
-        // is too. Asked in turn: most answers end at the first.
-        match store.endpoint_signed_in(endpoint).await {
-            Ok(true) => return Tier::Owner,
-            Ok(false) => {}
-            Err(e) => {
-                // Not known to be the owner's: refused, as a stranger.
-                tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
-                return Tier::Stranger;
-            }
+        // is too.
+        if known(store.endpoint_signed_in(endpoint).await)? {
+            return Ok(Tier::Owner);
         }
-        match self.auth.trusted_profiles(endpoint).await {
-            Ok(profiles) if !profiles.is_empty() => return Tier::Owner,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
-                return Tier::Stranger;
-            }
+        let trusted = self.auth.trusted_profiles(endpoint).await;
+        if known(trusted.map(|profiles| !profiles.is_empty()))? {
+            return Ok(Tier::Owner);
         }
-        match store.endpoint_has_portable_session(endpoint).await {
-            Ok(true) => return Tier::Friend,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
-                return Tier::Stranger;
-            }
+        if known(store.endpoint_has_portable_session(endpoint).await)? {
+            return Ok(Tier::Friend);
         }
+        let id = endpoint.parse::<EndpointId>().ok();
         if let Some(federation) = &self.federation {
-            match federation.is_paired(endpoint).await {
-                Ok(true) => return Tier::Friend,
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, endpoint, "cannot tell the relay who an endpoint is");
-                    return Tier::Stranger;
-                }
+            if known(federation.is_paired(endpoint).await)? {
+                return Ok(Tier::Friend);
+            }
+            // P8-04: a paired server's user's device, while the session its
+            // play token opened lives, or holding the token to redeem.
+            if self.auth.remote_sessions().endpoint_has(endpoint) {
+                return Ok(Tier::Friend);
+            }
+            // A play token's relay token is checked as one alone: one that
+            // does not hold stops here, as a stranger's, and is never tried
+            // as an invite's.
+            if let (Some(token), Some(id)) = (invite, &id)
+                && parse_play_token(token).is_some()
+            {
+                return Ok(if federation.holds_play_token(id, token).await {
+                    Tier::Friend
+                } else {
+                    Tier::Stranger
+                });
             }
         }
-        let holder = match (invite, endpoint.parse::<EndpointId>()) {
-            (Some(token), Ok(id)) => crate::invites::holder_tier(&self.auth, &id, token).await,
+        let holder = match (invite, &id) {
+            (Some(token), Some(id)) => crate::invites::holder_tier(&self.auth, id, token).await,
             _ => None,
         };
-        holder.unwrap_or(Tier::Stranger)
+        Ok(holder.unwrap_or(Tier::Stranger))
     }
 }
 

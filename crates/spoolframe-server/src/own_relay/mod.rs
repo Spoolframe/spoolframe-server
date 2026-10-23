@@ -31,7 +31,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use spoolframe_protocol::codec::{read_frame_within, write_frame};
 use spoolframe_protocol::relay_access::{
-    AccessAnswer, AccessQuery, RELAY_ACCESS_ALPN, Tier, parse_invite_token,
+    AccessAnswer, AccessQuery, RELAY_ACCESS_ALPN, Tier, is_relay_token,
 };
 
 pub use config::{Access, RelayConfig, RelayConfigError, Serve};
@@ -246,11 +246,10 @@ impl Gate {
 impl AccessControl for Gate {
     async fn on_connect(&self, request: &ClientRequest) -> iroh_relay::server::Access {
         let endpoint = request.endpoint_id();
-        // Only an invite holder's token is passed on: anything else in the
-        // header is no token, and does not split the endpoint's answers.
-        let invite = request
-            .auth_token()
-            .filter(|token| parse_invite_token(token).is_some());
+        // Only an invite holder's or a play token holder's (P8-04) token is
+        // passed on: anything else in the header is no token, and does not
+        // split the endpoint's answers.
+        let invite = request.auth_token().filter(|token| is_relay_token(token));
         let admitted = self.needs_no_answer(endpoint) || {
             let tier = self.asker.tier(endpoint, invite.clone()).await;
             let admitted = self.lets_through(tier);

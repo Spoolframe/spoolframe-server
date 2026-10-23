@@ -141,6 +141,11 @@ impl Plays {
 impl Observer for Plays {
     /// Open the play of `opened`'s item (`Plays::open`).
     fn started(&self, handle: &str, opened: &Opened) {
+        // A paired server's user keeps their history at home (P8-03): its
+        // server records the play, not this one.
+        if matches!(opened.played.principal, Principal::RemoteUser { .. }) {
+            return;
+        }
         self.open(
             handle,
             &opened.played,

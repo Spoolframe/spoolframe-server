@@ -40,6 +40,8 @@ async fn a_device_on_the_lan_is_neither_counted_nor_capped() {
                     bitmap: Default::default(),
                     quality: Default::default(),
                     display: None,
+                    capabilities: None,
+                    onward_share: None,
                 },
             )
             .await;

@@ -97,6 +97,8 @@ async fn start(
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;

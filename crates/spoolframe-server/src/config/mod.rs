@@ -1738,16 +1738,19 @@ impl CatalogConfig {
 }
 
 /// `federation { sync_interval_secs = 3600; cache_max_mb = 2048;
-/// cache_total_mb = 8192; }`, optional (P8-02): how often this server
+/// cache_total_mb = 8192; … }`, optional (P8-02): how often this server
 /// syncs what each paired server shares with it, and the most each one's
 /// artwork, and all of theirs together, may take under
-/// `state_dir/cache/federation`. Live settings; read only while
-/// `experimental.federation` is on.
+/// `state_dir/cache/federation`; and the limits on what a pair may send
+/// and ask (P8-04, the 2026-10-23 decision), each with today's value as
+/// its default and a floor. Live settings; read only while
+/// `experimental.federation` is on. A connection's streams change for
+/// the connections made after.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
 pub struct FederationConfig {
     /// Seconds between two syncs of a pair; an hour if left out, a minute
-    /// at the least.
+    /// at the least, a week at the most.
     #[ucl(default)]
     pub sync_interval_secs: Option<u64>,
     /// MiB; 2048 if left out.
@@ -1756,11 +1759,50 @@ pub struct FederationConfig {
     /// MiB, every paired server's together; 8192 if left out.
     #[ucl(default)]
     pub cache_total_mb: Option<u64>,
+    /// Pages in one library's sync; 2,000 if left out, 10 at the least,
+    /// 1,000,000 at the most.
+    #[ucl(default)]
+    pub sync_max_pages: Option<u64>,
+    /// Items in one library's sync; 200,000 if left out, 1,000 at the
+    /// least, 100,000,000 at the most.
+    #[ucl(default)]
+    pub sync_max_items: Option<u64>,
+    /// Items cached of one paired server, every library together; 500,000
+    /// if left out, 1,000 at the least, 100,000,000 at the most.
+    #[ucl(default)]
+    pub max_cached_items: Option<u64>,
+    /// Seconds one walk of a library answers every pair's sync; 60 if left
+    /// out, 10 at the least, a day at the most.
+    #[ucl(default)]
+    pub walk_reuse_secs: Option<u64>,
+    /// Streams a pair's connection is answered on at once; 16 if left out,
+    /// 4 at the least, 1,024 at the most.
+    #[ucl(default)]
+    pub max_streams: Option<u64>,
+    /// Images a pair may ask for in a burst, then a hundred a second; 200
+    /// if left out, 10 at the least, 100,000 at the most.
+    #[ucl(default)]
+    pub artwork_burst: Option<u64>,
+    /// Plays a pair's users may start in a burst, then one a second; 30 if
+    /// left out, 5 at the least, 10,000 at the most.
+    #[ucl(default)]
+    pub assertion_burst: Option<u64>,
+    /// Play tokens that work at once for one user of a pair; 10 if left
+    /// out, 2 at the least, 10,000 at the most.
+    #[ucl(default)]
+    pub tokens_per_user: Option<u64>,
+    /// Play tokens that work at once for a pair; 500 if left out, 10 at the
+    /// least, 1,000,000 at the most.
+    #[ucl(default)]
+    pub tokens_per_server: Option<u64>,
 }
 
 impl FederationConfig {
     pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 3600;
     pub const MIN_SYNC_INTERVAL_SECS: u64 = 60;
+    /// A week: past it a pair's sync is as good as never, and a time
+    /// added to now stays far from overflowing.
+    pub const MAX_SYNC_INTERVAL_SECS: u64 = 7 * 86_400;
     pub const DEFAULT_CACHE_MAX_MB: u64 = 2048;
     pub const DEFAULT_CACHE_TOTAL_MB: u64 = 8192;
 
@@ -1769,7 +1811,7 @@ impl FederationConfig {
         Duration::from_secs(
             self.sync_interval_secs
                 .unwrap_or(Self::DEFAULT_SYNC_INTERVAL_SECS)
-                .max(Self::MIN_SYNC_INTERVAL_SECS),
+                .clamp(Self::MIN_SYNC_INTERVAL_SECS, Self::MAX_SYNC_INTERVAL_SECS),
         )
     }
 
@@ -1785,6 +1827,49 @@ impl FederationConfig {
         self.cache_total_mb
             .unwrap_or(Self::DEFAULT_CACHE_TOTAL_MB)
             .saturating_mul(1 << 20)
+    }
+
+    /// What a pair may send and ask (P8-04): each setting, or its default,
+    /// held between its floor and its ceiling. The ceilings keep a value
+    /// typed too large from what it is used for: a semaphore's permits, a
+    /// time added to now, a count bound into SQL as an i64.
+    pub fn limits(&self) -> crate::federation::Limits {
+        use crate::federation::Limits;
+        let d = Limits::default();
+        let within = |set: Option<u64>, default: u64, (floor, ceiling): (u64, u64)| {
+            set.unwrap_or(default).clamp(floor, ceiling)
+        };
+        let small = |set: Option<u64>, default: u32, range: (u64, u64)| {
+            u32::try_from(within(set, default.into(), range)).unwrap_or(u32::MAX)
+        };
+        Limits {
+            sync: crate::federation::SyncLimits {
+                pages: within(self.sync_max_pages, d.sync.pages, (10, 1_000_000)),
+                items: within(self.sync_max_items, d.sync.items, (1_000, 100_000_000)),
+                origin_items: within(
+                    self.max_cached_items,
+                    d.sync.origin_items,
+                    (1_000, 100_000_000),
+                ),
+            },
+            walk_reuse: Duration::from_secs(within(
+                self.walk_reuse_secs,
+                d.walk_reuse.as_secs(),
+                (10, 86_400),
+            )),
+            max_streams: usize::try_from(within(
+                self.max_streams,
+                d.max_streams as u64,
+                (4, 1_024),
+            ))
+            .unwrap_or(1_024),
+            artwork_burst: small(self.artwork_burst, d.artwork_burst, (10, 100_000)),
+            assertion_burst: small(self.assertion_burst, d.assertion_burst, (5, 10_000)),
+            tokens: crate::store::federation_tokens::TokenLimits {
+                per_user: within(self.tokens_per_user, d.tokens.per_user, (2, 10_000)),
+                per_peer: within(self.tokens_per_server, d.tokens.per_peer, (10, 1_000_000)),
+            },
+        }
     }
 }
 
@@ -3845,6 +3930,76 @@ mod tests {
         assert_eq!(set.federation.sync_every(), Duration::from_secs(60));
         assert_eq!(set.federation.cache_max_bytes(), 10 << 20);
         assert_eq!(set.federation.cache_total_bytes(), 30 << 20);
+    }
+
+    /// P8-04 (2026-10-23): a pair's limits are today's values unless set,
+    /// and none goes under its floor.
+    #[test]
+    fn a_pair_s_limits_are_today_s_unless_set_and_never_under_their_floor() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(
+            config.federation.limits(),
+            crate::federation::Limits::default()
+        );
+        let raised = plex(
+            r#"plex { url = "http://nas:32400"; }
+               federation { sync_max_items = 300000; max_cached_items = 1000000;
+                            tokens_per_user = 40; max_streams = 64; }"#,
+        )
+        .unwrap()
+        .federation
+        .limits();
+        assert_eq!(raised.sync.items, 300_000);
+        assert_eq!(raised.sync.origin_items, 1_000_000);
+        assert_eq!(raised.tokens.per_user, 40);
+        assert_eq!(raised.max_streams, 64);
+        let floored = plex(
+            r#"plex { url = "http://nas:32400"; }
+               federation { sync_max_pages = 0; sync_max_items = 1; max_cached_items = 1;
+                            walk_reuse_secs = 0; max_streams = 0; artwork_burst = 0;
+                            assertion_burst = 0; tokens_per_user = 0; tokens_per_server = 0; }"#,
+        )
+        .unwrap()
+        .federation
+        .limits();
+        assert_eq!(floored.sync.pages, 10);
+        assert_eq!(floored.sync.items, 1_000);
+        assert_eq!(floored.sync.origin_items, 1_000);
+        assert_eq!(floored.walk_reuse, Duration::from_secs(10));
+        assert_eq!(floored.max_streams, 4);
+        assert_eq!(floored.artwork_burst, 10);
+        assert_eq!(floored.assertion_burst, 5);
+        assert_eq!(floored.tokens.per_user, 2);
+        assert_eq!(floored.tokens.per_peer, 10);
+    }
+
+    /// P8-04: a limit typed too large is held to its ceiling, not used as
+    /// it is: a semaphore of more permits than it takes panics, a time
+    /// added to now overflows, a count past i64 does not bind.
+    #[test]
+    fn a_pair_s_limits_never_go_over_their_ceiling() {
+        let huge = i64::MAX;
+        let config = plex(&format!(
+            r#"plex {{ url = "http://nas:32400"; }}
+               federation {{ sync_interval_secs = {huge}; sync_max_pages = {huge};
+                            sync_max_items = {huge}; max_cached_items = {huge};
+                            walk_reuse_secs = {huge}; max_streams = {huge};
+                            artwork_burst = {huge}; assertion_burst = {huge};
+                            tokens_per_user = {huge}; tokens_per_server = {huge}; }}"#
+        ))
+        .unwrap()
+        .federation;
+        assert_eq!(config.sync_every(), Duration::from_secs(7 * 86_400));
+        let capped = config.limits();
+        assert_eq!(capped.sync.pages, 1_000_000);
+        assert_eq!(capped.sync.items, 100_000_000);
+        assert_eq!(capped.sync.origin_items, 100_000_000);
+        assert_eq!(capped.walk_reuse, Duration::from_secs(86_400));
+        assert_eq!(capped.max_streams, 1_024);
+        assert_eq!(capped.artwork_burst, 100_000);
+        assert_eq!(capped.assertion_burst, 10_000);
+        assert_eq!(capped.tokens.per_user, 10_000);
+        assert_eq!(capped.tokens.per_peer, 1_000_000);
     }
 
     #[test]

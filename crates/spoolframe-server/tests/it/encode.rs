@@ -55,6 +55,8 @@ async fn start(client: &TestClient, session: &SessionId, start_ms: Option<u64>) 
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await
@@ -2135,6 +2137,8 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2213,6 +2217,8 @@ async fn an_hls_playback_reads_a_vobsub_or_dvb_track_into_its_webvtt_rendition()
                     bitmap: Default::default(),
                     quality: Default::default(),
                     display: None,
+                    capabilities: None,
+                    onward_share: None,
                 },
             )
             .await;
@@ -2268,6 +2274,7 @@ async fn change(
                 bitmap: Default::default(),
                 position_ms,
                 display: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2453,6 +2460,8 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
                 bitmap: BitmapSubtitles::BurnIn,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2516,6 +2525,8 @@ async fn burned_sidecar(
                 bitmap: BitmapSubtitles::BurnIn,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2626,6 +2637,8 @@ async fn a_copied_pgs_file_beside_the_film_keeps_its_cues_times() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2693,6 +2706,8 @@ async fn a_copied_vobsub_file_beside_the_film_is_in_the_output() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2847,6 +2862,8 @@ async fn start_for(
                 bitmap: Default::default(),
                 quality,
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2877,6 +2894,7 @@ async fn change_quality(
                 bitmap: Default::default(),
                 position_ms: 4_000,
                 display: None,
+                onward_share: None,
             },
         )
         .await;
@@ -2933,6 +2951,39 @@ async fn a_link_fast_enough_leaves_the_playback_as_it_is() {
     let (handle, before) = start_for(&client, &session, Quality::default()).await;
     let (after, epoch) = change_quality(&client, &session, &handle, on_link(1_000_000_000)).await;
     assert_eq!((after, epoch), (before, 0));
+    client.close().await;
+    server.stop().await;
+}
+
+/// A paired server playing on to its own device (P8-04) sends its share
+/// of its uplink with each re-plan: one that dropped under the file's
+/// bitrate mid-play is planned again as an encode under it, the link this
+/// server sees fast enough.
+#[tokio::test]
+async fn an_onward_share_that_drops_mid_play_is_planned_again_under_it() {
+    let (server, client, session) = ready_for_range("onward-share-drops").await;
+    let (handle, plan) = start_for(&client, &session, Quality::default()).await;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    let response = client
+        .call(
+            Some(&session),
+            Request::ChangeQuality {
+                handle: handle.clone(),
+                quality: Quality::default(),
+                bitmap: Default::default(),
+                position_ms: 4_000,
+                display: None,
+                onward_share: Some(SLOW_LINK),
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackChanged { plan, .. }) = response else {
+        panic!("not changed: {response:?}");
+    };
+    assert!(
+        encoded_video(&plan).is_some_and(|cap| cap.is_some()),
+        "{plan:?}"
+    );
     client.close().await;
     server.stop().await;
 }
@@ -3234,6 +3285,8 @@ async fn an_hls_playback_of_an_external_subtitle_carries_it_in_the_rendition_alo
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;

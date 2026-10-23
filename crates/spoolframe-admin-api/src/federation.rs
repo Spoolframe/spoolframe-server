@@ -61,6 +61,19 @@ pub struct PeerEntry {
     pub refused_here: u64,
     /// This server's users' plays that server refused.
     pub refused_there: u64,
+    /// Of `plays_here`, those the device played from this server itself
+    /// (P8-04).
+    #[serde(default)]
+    pub direct_here: u64,
+    /// Of `plays_here`, those that server played from this one in its own
+    /// name and on to its device, the device not reaching this server
+    /// (P8-04): a pair whose plays all go this way is seen, not silent.
+    #[serde(default)]
+    pub proxied_here: u64,
+    /// This server's users' plays of that server's items that this server
+    /// played on to their devices (P8-04): its own uplink carried them.
+    #[serde(default)]
+    pub proxied_there: u64,
 }
 
 /// A key held for a paired server (P8-01's key rotation).
@@ -96,6 +109,96 @@ pub struct GrantEntry {
     pub granted_at: i64,
 }
 
+/// What `lookUp` found of a `federation` invite before it is redeemed
+/// (P8-01): the server that made it, and the fingerprint of the key the
+/// link names, for the two admins to compare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairLookup {
+    /// What the server calls itself.
+    pub name: String,
+    pub server_id: String,
+    /// Of the key this server dials and would pin.
+    pub fingerprint: String,
+    /// The display name of the admin who made the invite; `None` when
+    /// they have none, or the server's CLI made it.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub inviter: Option<String>,
+    /// When the invite expires, Unix seconds.
+    pub expires_at: i64,
+}
+
+/// A paired server's own page (`peerDetail`): its row, and what the list
+/// does not show (P8-01–P8-04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDetail {
+    pub peer: PeerEntry,
+    /// When it was last seen connected, Unix seconds, kept to the
+    /// minute: while it is offline, offline since then. `None` if never.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub last_seen: Option<i64>,
+    /// When its key last said hello under another server id, and was
+    /// refused (as it is every time); `None` if never. Unpairing is the
+    /// only way on.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub identity_refused_at: Option<i64>,
+    /// What it shares with this server, as kept here (P8-02).
+    pub received: Vec<ReceivedLibrary>,
+    /// Its artwork kept here, in bytes.
+    pub cached_bytes: u64,
+    /// The libraries it stopped sharing in the last week, the latest
+    /// first: dropped from users' apps, their progress kept.
+    pub withdrawn: Vec<WithdrawnLibrary>,
+    /// The last seven days' plays across the pair, the oldest first,
+    /// today last.
+    pub week: Vec<PlayDay>,
+}
+
+/// A library a paired server shares with this one, as kept here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceivedLibrary {
+    /// Its id on that server.
+    pub id: String,
+    pub title: String,
+    /// `movies`, `shows` or `music`.
+    pub kind: String,
+    /// Its films, shows or artists kept here.
+    pub items: u64,
+    /// How many whole syncs brought a change.
+    pub revision: u64,
+    /// The last whole sync, Unix seconds; `None` before the first.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub synced_at: Option<i64>,
+}
+
+/// A library a paired server stopped sharing with this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawnLibrary {
+    pub id: String,
+    pub title: String,
+    /// Unix seconds.
+    pub withdrawn_at: i64,
+}
+
+/// A day's plays across a pair: one number per server, never per user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayDay {
+    /// Its first second, Unix seconds (UTC).
+    pub day: i64,
+    /// Plays of this server's items by that server's users, as
+    /// `playsHere` counts them; of them, those played through that server.
+    pub plays_here: u64,
+    pub proxied_here: u64,
+    /// Plays of that server's items by this server's users; of them,
+    /// those this server played on to their devices.
+    pub plays_there: u64,
+    pub proxied_there: u64,
+}
+
 /// Federation's admin methods: `federation_peerList` and the rest.
 /// Only with `client` or `server`: the macro makes one or both.
 #[cfg(any(feature = "client", feature = "server"))]
@@ -127,6 +230,20 @@ pub trait FederationApi {
     /// `rate_limited`, `already_paired`, `key_held`).
     #[method(name = "redeem", with_extensions)]
     async fn redeem(&self, link: String) -> jsonrpsee::core::RpcResult<PeerEntry>;
+
+    /// Look `link`, another server's `federation` invite, up without
+    /// redeeming it: dial that server, hear its name, and ask it whether
+    /// the code still works, as an app looks an invite up. What the admin
+    /// checks before `redeem`. Errors as for `redeem`; an invite used,
+    /// expired or revoked is `PAIRING_REFUSED`, as redeeming it would be.
+    #[method(name = "lookUp", with_extensions)]
+    async fn look_up(&self, link: String) -> jsonrpsee::core::RpcResult<PairLookup>;
+
+    /// Server `id`'s own page: its row, when it was last online, what it
+    /// shares with this server, what it stopped sharing, and the week's
+    /// plays. Live or unpaired. `NO_SUCH_PEER` for an id never paired.
+    #[method(name = "peerDetail", with_extensions)]
+    async fn peer_detail(&self, id: String) -> jsonrpsee::core::RpcResult<PeerDetail>;
 
     /// Unpair server `id`: its row is kept, unpaired, its connections are
     /// closed, and it is told (best effort: it revokes its own side when
@@ -215,6 +332,9 @@ mod tests {
             plays_there: 0,
             refused_here: 0,
             refused_there: 0,
+            direct_here: 0,
+            proxied_here: 0,
+            proxied_there: 0,
         }
     }
 
@@ -248,6 +368,52 @@ mod tests {
         let json = serde_json::to_value(&grant).unwrap();
         assert_eq!(json["grantedBy"], "alice");
         assert_eq!(serde_json::from_value::<GrantEntry>(json).unwrap(), grant);
+    }
+
+    #[test]
+    fn a_peer_s_page_and_a_lookup_go_both_ways_in_camel_case() {
+        let detail = PeerDetail {
+            peer: entry(),
+            last_seen: Some(5),
+            identity_refused_at: None,
+            received: vec![ReceivedLibrary {
+                id: "plex:1".into(),
+                title: "Movies".into(),
+                kind: "movies".into(),
+                items: 412,
+                revision: 3,
+                synced_at: None,
+            }],
+            cached_bytes: 1 << 30,
+            withdrawn: vec![WithdrawnLibrary {
+                id: "plex:2".into(),
+                title: "TV Shows".into(),
+                withdrawn_at: 4,
+            }],
+            week: vec![PlayDay {
+                day: 86_400,
+                plays_here: 44,
+                proxied_here: 3,
+                plays_there: 17,
+                proxied_there: 0,
+            }],
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["received"][0]["syncedAt"], serde_json::Value::Null);
+        assert_eq!(json["week"][0]["proxiedHere"], 3);
+        assert_eq!(json["withdrawn"][0]["withdrawnAt"], 4);
+        assert!(json["identityRefusedAt"].is_null());
+        assert_eq!(serde_json::from_value::<PeerDetail>(json).unwrap(), detail);
+        let found = PairLookup {
+            name: "Bob's Media".into(),
+            server_id: "mzxw6ytbojtg633c".into(),
+            fingerprint: "M4QX-8KDT-2WNF-7RKD".into(),
+            inviter: None,
+            expires_at: 9,
+        };
+        let json = serde_json::to_value(&found).unwrap();
+        assert_eq!(json["expiresAt"], 9);
+        assert_eq!(serde_json::from_value::<PairLookup>(json).unwrap(), found);
     }
 
     /// Every field is sent, `None`s too, as everywhere on the admin API.

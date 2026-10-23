@@ -173,6 +173,17 @@ pub const SETTINGS: &[Setting] = &[
     live("federation.sync_interval_secs"),
     live("federation.cache_max_mb"),
     live("federation.cache_total_mb"),
+    // P8-04 (2026-10-23): a pair's limits. Streams apply to the
+    // connections made after; the rest at once.
+    live("federation.sync_max_pages"),
+    live("federation.sync_max_items"),
+    live("federation.max_cached_items"),
+    live("federation.walk_reuse_secs"),
+    live("federation.max_streams"),
+    live("federation.artwork_burst"),
+    live("federation.assertion_burst"),
+    live("federation.tokens_per_user"),
+    live("federation.tokens_per_server"),
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),
     restart("http_playback.address"),

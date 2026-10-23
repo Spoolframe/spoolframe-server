@@ -429,7 +429,7 @@ impl Connections {
             }
             end_signed_out_playbacks(&auth, &playbacks).await;
             for endpoint in self.known_endpoints() {
-                match store.endpoint_has_any_session(&endpoint.to_string()).await {
+                match auth.endpoint_has_any_session(&endpoint.to_string()).await {
                     Ok(true) => {}
                     Ok(false) => self.sign_out(&endpoint),
                     Err(e) => tracing::warn!(error = %e, "cannot check a device's sessions"),
@@ -845,6 +845,12 @@ impl Server {
     /// The server's identity.
     pub fn id(&self) -> EndpointId {
         self.router.endpoint().id()
+    }
+
+    /// The endpoint: what this server dials others from, as one of their
+    /// devices when it plays their items through itself (P8-04).
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        self.router.endpoint()
     }
 
     /// Where the endpoint can be dialled right now.

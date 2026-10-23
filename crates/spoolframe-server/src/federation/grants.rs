@@ -106,11 +106,13 @@ impl Federation {
 
     /// `grant` was revoked: what hangs on it ends here. The pair's tokens
     /// for the library's items are deleted at once (P8-03), so a new play
-    /// is refused; the sessions P8-04 opens with them end here too. The
+    /// is refused; the sessions P8-04 opened with them end here too, with
+    /// their playbacks. The
     /// paired server drops its cache of the library at its next sync,
     /// when this one refuses it (P8-02). Unpairing deletes every token of
     /// the pair with its row.
     pub(crate) async fn grant_revoked(&self, grant: &GrantRecord) -> Result<(), StoreError> {
+        self.end_remote_sessions(&grant.peer, Some(&grant.library));
         let deleted = self
             .store()
             .delete_federation_tokens(&grant.peer, Some(&grant.library))

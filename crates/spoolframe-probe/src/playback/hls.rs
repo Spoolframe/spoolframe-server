@@ -134,6 +134,8 @@ pub(super) async fn converted(
         bitmap: BitmapSubtitles::Auto,
         quality: Default::default(),
         display: None,
+        capabilities: None,
+        onward_share: None,
     };
     let handle = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) => {

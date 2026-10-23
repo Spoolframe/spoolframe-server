@@ -255,6 +255,8 @@ async fn play(client: &TestClient, session: &SessionId, subtitle: u32) -> Playba
                 bitmap: BitmapSubtitles::Auto,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await
@@ -592,6 +594,8 @@ async fn a_download_is_carried_into_a_converted_file() {
                 bitmap: BitmapSubtitles::Auto,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await

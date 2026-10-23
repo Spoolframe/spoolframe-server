@@ -13,7 +13,7 @@ use crate::logic::thousands;
 use crate::setup::{Sample, mapped, sample};
 
 /// What one top-level item of a library is called, by kind.
-fn unit(kind: LibraryKind, n: u64) -> &'static str {
+pub(crate) fn unit(kind: LibraryKind, n: u64) -> &'static str {
     match (kind, n == 1) {
         (LibraryKind::Movies, true) => "movie",
         (LibraryKind::Movies, false) => "movies",

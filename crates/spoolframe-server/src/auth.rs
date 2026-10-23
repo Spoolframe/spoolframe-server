@@ -666,6 +666,8 @@ pub struct Auth {
     refusals: Arc<Refusals>,
     /// Which refused `Hello`s are logged: one per device an hour.
     hellos: Arc<Refusals>,
+    /// The sessions paired servers' play tokens opened (P8-04).
+    remote: Arc<crate::remote_sessions::RemoteSessions>,
 }
 
 impl Auth {
@@ -687,8 +689,26 @@ impl Auth {
             trust_idle: TRUST_IDLE,
             refusals: Arc::new(Refusals::new(clock.clone())),
             hellos: Arc::new(Refusals::hellos(clock.clone())),
+            remote: Arc::new(crate::remote_sessions::RemoteSessions::new(
+                clock.clone(),
+                crate::remote_sessions::IDLE,
+            )),
             clock,
         }
+    }
+
+    /// The sessions paired servers' play tokens opened (P8-04).
+    pub fn remote_sessions(&self) -> &crate::remote_sessions::RemoteSessions {
+        &self.remote
+    }
+
+    /// Whether `endpoint_id` holds a live session of any kind: a local
+    /// user's, a portable user's, or a play token's (P8-04).
+    pub async fn endpoint_has_any_session(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        if self.remote.endpoint_has(endpoint_id) {
+            return Ok(true);
+        }
+        self.store.endpoint_has_any_session(endpoint_id).await
     }
 
     /// Trust unused for `idle` lapses ([`TRUST_IDLE`] by default).
@@ -968,6 +988,13 @@ impl Auth {
 
     /// Whose session `token` is, live or not (finding 46).
     pub async fn session_owner(&self, token: &str) -> Result<Option<SessionOwner>, StoreError> {
+        if let Some((user, endpoint)) = self.remote.owner(token) {
+            return Ok(Some(SessionOwner {
+                username: user.principal().to_string(),
+                endpoint_id: Some(endpoint),
+                live: true,
+            }));
+        }
         self.store
             .session_owner(&SessionToken(token.to_owned()).hash())
             .await
@@ -1204,6 +1231,10 @@ impl Auth {
         endpoint_id: &str,
     ) -> Result<Option<crate::principal::Who>, StoreError> {
         use crate::principal::Who;
+        // A play token's session (P8-04), in memory: no lookup for it.
+        if let Some(user) = self.remote.who(token, endpoint_id) {
+            return Ok(Some(Who::Remote(user)));
+        }
         if let Some(user) = self.endpoint_session(token, endpoint_id).await? {
             return Ok(Some(Who::Local(user)));
         }

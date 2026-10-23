@@ -18,6 +18,9 @@
 //!   assertions of its users, answered with a token (P8-03).
 //! - [`Dialed`] is the other side: a server redeeming another's invite,
 //!   telling it that it unpaired, or replicating what it shares.
+//! - [`PlayClient`] is a server's own client of another's
+//!   `spoolframe/client/1`, for playing its item in proxy mode (P8-04):
+//!   federation/1 carries no media.
 //!
 //! Experimental: the server registers the handler only while its
 //! `experimental.federation` is on.
@@ -25,18 +28,40 @@
 mod dial;
 mod handler;
 mod live;
+mod play;
 
 pub use dial::{DialError, Dialed, Pages};
-pub use handler::FederationProtocol;
+pub use handler::{FederationProtocol, MAX_STREAMS};
 pub use live::Live;
+pub use play::PlayClient;
 
-use iroh::EndpointId;
+use std::time::Duration;
+
 use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use spoolframe_protocol::ServerId;
 use spoolframe_protocol::federation::{
     AssertUser, AssertionRefused, PairingRefused, PeerHello, RedeemPairing, RemoteItem,
     SharedLibrary, Standing, SyncLibrary, SyncMode, TokenGranted,
 };
+
+/// How long dialling another server may take: one attempt, over every
+/// hint given.
+const DIAL_WAIT: Duration = Duration::from_secs(15);
+
+/// Dial `addr` from `endpoint` on `alpn`, once, within [`DIAL_WAIT`]: the
+/// federation protocol's [`Dialed`] and the client protocol's
+/// [`PlayClient`] alike.
+async fn dial(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    alpn: &[u8],
+) -> Result<Connection, DialError> {
+    tokio::time::timeout(DIAL_WAIT, endpoint.connect(addr, alpn))
+        .await
+        .map_err(|_| DialError::Unreachable("no answer in time".into()))?
+        .map_err(|e| DialError::Unreachable(e.to_string()))
+}
 
 /// The pairs this server keeps: what the handler asks of its store.
 #[async_trait::async_trait]

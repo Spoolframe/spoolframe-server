@@ -54,8 +54,8 @@ use crate::network::{Connections, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
 use crate::playback::{
-    Changed, CopyUse, FileId, FirstSegment, KeyframesFrom, Opened, Playback, Playbacks, Refusal,
-    Sidecar, Source, StartTimes, Using,
+    Changed, CopyUse, FileId, FirstSegment, Holder, KeyframesFrom, Opened, Playback, Playbacks,
+    Refusal, Sidecar, Source, StartTimes, Using,
 };
 use crate::plex_accounts::Link;
 use crate::previews::{self, PreviewState};
@@ -120,7 +120,14 @@ pub(crate) struct ClientProtocol {
     /// Play history (PX-52): every playback's play, and those of a paired
     /// server's items reported by `UpdateWatchProgress` (P8-03).
     plays: Arc<crate::watch::Plays>,
+    /// The playbacks a paired server's user's session started (P8-04), by
+    /// handle, with the connection that started them: told
+    /// `PlaybackEnded` when one ends but by its own stop.
+    remote_plays: RemotePlays,
 }
+
+/// [`ClientProtocol::remote_plays`].
+type RemotePlays = Arc<parking_lot::Mutex<HashMap<String, usize>>>;
 
 /// What one connection has said so far.
 #[derive(Debug)]
@@ -425,6 +432,9 @@ enum ResourceBody {
     /// A file, and for a download's (PX-38) what keeps it there while it
     /// is sent: the area removes no file being read.
     File(tokio::fs::File, Option<crate::downloads::DownloadRead>),
+    /// A paired server's answer, as it arrives (P8-04): a playback played
+    /// from there through this server.
+    Relayed(iroh::endpoint::RecvStream),
 }
 
 impl Locks {
@@ -458,6 +468,15 @@ impl Locks {
 
     fn unlock(&mut self, session: &SessionId) {
         self.unlocked.insert(session.0.clone());
+    }
+
+    /// Keep nothing of `session`, which has ended.
+    fn forget(&mut self, session: &SessionId) {
+        self.needs_pin.remove(&session.0);
+        self.unlocked.remove(&session.0);
+        if self.active.as_deref() == Some(session.0.as_str()) {
+            self.active = None;
+        }
     }
 }
 
@@ -539,6 +558,27 @@ impl ClientProtocol {
             services.auth.clone(),
             users.clone(),
         ));
+        // P8-04: a paired server's user's playback that ends here other than
+        // by its own stop is told to its connection, so a server playing it
+        // on ends its own at once.
+        let remote_plays = RemotePlays::default();
+        let playbacks = Arc::downgrade(&services.playbacks);
+        let (ends, streams) = (remote_plays.clone(), addresses.streams.clone());
+        services.playbacks.on_end(Box::new(move |handle| {
+            let Some(device) = ends.lock().remove(handle) else {
+                return;
+            };
+            let Some(playbacks) = playbacks.upgrade() else {
+                return;
+            };
+            streams.send(
+                device,
+                spoolframe_protocol::Event::PlaybackEnded {
+                    handle: PlaybackHandle(handle.to_owned()),
+                    error: playbacks.gone_error(handle),
+                },
+            );
+        }));
         Self {
             id: endpoint.id(),
             connections,
@@ -559,6 +599,7 @@ impl ClientProtocol {
             music_listeners,
             federation_listeners,
             plays,
+            remote_plays,
         }
     }
 
@@ -852,7 +893,7 @@ impl ClientProtocol {
             let mut user = None;
             if !anonymous {
                 let (session, signed_in) = match self
-                    .authenticate(connection, state, wire.envelope.session.clone())
+                    .authenticate_or_remote(connection, state, wire.envelope.session.clone())
                     .await
                 {
                     Ok(user) => user,
@@ -915,7 +956,10 @@ impl ClientProtocol {
         // A replay can recover an outcome, but cannot restore a PIN
         // unlock from another connection or from before a profile switch.
         if replay && matches!(reply.response, Response::Ok(_)) && relocked {
-            let (session, _) = match self.authenticate(connection, state, session).await {
+            let (session, _) = match self
+                .authenticate_or_remote(connection, state, session)
+                .await
+            {
                 Ok(user) => user,
                 Err(error) => return Response::Err(error).into(),
             };
@@ -1183,12 +1227,19 @@ impl ClientProtocol {
             Request::RedeemInvite(redeem) => self.redeem_invite(connection, &redeem, hello).await,
             // A guess at a code, as a redemption is, on the same budget.
             Request::LookupInvite(lookup) => self.look_up_invite(connection, &lookup).await,
+            // P8-04: a paired server's play token, on the same budget.
+            Request::RedeemPlayToken(redeem) => {
+                self.redeem_play_token(connection, hello, &redeem).await
+            }
             // Everything else needs a session that is live on this
             // endpoint. Each request names its own, so one connection can
             // serve several users at once (§15).
             request => match match known {
                 Some(known) if Some(&known.0) == envelope.session.as_ref() => Ok(known),
-                _ => self.authenticate(connection, state, envelope.session).await,
+                _ => {
+                    self.authenticate_or_remote(connection, state, envelope.session)
+                        .await
+                }
             } {
                 Ok((session, who)) => {
                     // Locked, only these two (P2-08).
@@ -1232,8 +1283,8 @@ impl ClientProtocol {
     }
 
     /// [`Self::authenticate`], refusing a session a one-time password
-    /// opened (`PasswordChangeRequired`): what reads media and artwork use,
-    /// as requests other than choosing a new password do.
+    /// opened (`PasswordChangeRequired`): what reads artwork and downloads
+    /// use, as requests other than choosing a new password do.
     async fn authenticate_unrestricted(
         &self,
         connection: &Connection,
@@ -1241,16 +1292,49 @@ impl ClientProtocol {
         session: Option<SessionId>,
     ) -> Result<(SessionId, Who), Error> {
         let (session, who) = self.authenticate(connection, state, session).await?;
-        if who.password_change_only() {
-            return Err(Error::PasswordChangeRequired);
-        }
-        Ok((session, who))
+        unrestricted(session, who)
+    }
+
+    /// [`Self::authenticate_unrestricted`], a play token's session (P8-04)
+    /// included: a playback's own reads, which only the session that
+    /// started it may make.
+    async fn authenticate_unrestricted_or_remote(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        session: Option<SessionId>,
+    ) -> Result<(SessionId, Who), Error> {
+        let (session, who) = self
+            .authenticate_or_remote(connection, state, session)
+            .await?;
+        unrestricted(session, who)
     }
 
     /// The user of `session`, if it is live and bound to this connection's
-    /// endpoint. Every failure is the same `Unauthenticated`. Whether its
-    /// device asks for the user's PIN is noted for the connection's locks.
+    /// endpoint, and not a play token's (P8-04): a new way in is closed to
+    /// such a session unless it says otherwise
+    /// ([`Self::authenticate_or_remote`]). Every failure is the same
+    /// `Unauthenticated`.
     async fn authenticate(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        session: Option<SessionId>,
+    ) -> Result<(SessionId, Who), Error> {
+        match self
+            .authenticate_or_remote(connection, state, session)
+            .await?
+        {
+            (_, Who::Remote(_)) => Err(Error::Unauthenticated),
+            local => Ok(local),
+        }
+    }
+
+    /// [`Self::authenticate`], a play token's session included: for the
+    /// requests `serve` holds such a session to ([`remote_allows`]). Whether
+    /// its device asks for the user's PIN is noted for the connection's
+    /// locks.
+    async fn authenticate_or_remote(
         &self,
         connection: &Connection,
         state: &ConnectionState,
@@ -1364,10 +1448,20 @@ impl ClientProtocol {
                         ResourceBody::Bytes(bytes) => {
                             send_unless_stalled(&mut send, &bytes, stall).await?;
                         }
-                        ResourceBody::File(file, reading) => {
-                            let copied =
-                                copy_unless_stalled(file.take(length), &mut send, stall).await?;
-                            drop(reading);
+                        body @ (ResourceBody::File(..) | ResourceBody::Relayed(_)) => {
+                            let copied = match body {
+                                ResourceBody::File(file, reading) => {
+                                    let copied =
+                                        copy_unless_stalled(file.take(length), &mut send, stall)
+                                            .await?;
+                                    drop(reading);
+                                    copied
+                                }
+                                ResourceBody::Relayed(stream) => {
+                                    relay_unless_stalled(stream, length, &mut send, stall).await?
+                                }
+                                ResourceBody::Bytes(_) => unreachable!(),
+                            };
                             if media {
                                 self.services.metrics.media_reads.inc();
                                 self.services.metrics.media_read_bytes.add(copied);
@@ -1455,7 +1549,22 @@ impl ClientProtocol {
                 ))
             }
             ResourceRequest::Media { request, revision } => {
-                let result = self.open_range(connection, state, &request, revision).await;
+                let checked = self
+                    .checked_read(connection, state, &request, revision)
+                    .await;
+                if let Ok(RangeOf {
+                    remote: Some(remote),
+                    ..
+                }) = &checked
+                {
+                    return self
+                        .relay_range(connection, &request, revision, remote)
+                        .await;
+                }
+                let result = match checked {
+                    Ok(range) => self.open_range(&range, &request).await,
+                    Err(e) => Err(e),
+                };
                 if let (Some(n), Err(error)) = (request.segment, &result) {
                     tracing::warn!(id = %self.played(&request.handle), endpoint = %connection.remote_id().fmt_short(),
                         segment = n, %error, "an HLS segment read failed");
@@ -1517,7 +1626,7 @@ impl ClientProtocol {
                     _ => unreachable!(),
                 };
                 let (session, who) = self
-                    .authenticate_unrestricted(connection, state, Some(session))
+                    .authenticate_unrestricted_or_remote(connection, state, Some(session))
                     .await?;
                 state.locks.lock().use_session(&session)?;
                 // A stale revision is refused before any work.
@@ -1585,6 +1694,7 @@ impl ClientProtocol {
         let (session, who) = self
             .authenticate_unrestricted(connection, state, Some(session))
             .await?;
+        // P8-07 opens a download token's own; a play token's opens none.
         state.locks.lock().use_session(&session)?;
         let read = self
             .services
@@ -2001,13 +2111,15 @@ impl ClientProtocol {
     }
 
     /// The file positioned for `read`, and the reply that will precede it.
-    async fn open_range(
+    /// `read`'s playback, checked as every read is: its session's and
+    /// endpoint's, at `revision`, and the session's lock.
+    async fn checked_read(
         &self,
         connection: &Connection,
         state: &ConnectionState,
         read: &MediaRead,
         revision: u64,
-    ) -> Result<(tokio::fs::File, MediaReadReply), Error> {
+    ) -> Result<RangeOf, Error> {
         let playback = self
             .use_playback_with(
                 connection,
@@ -2027,15 +2139,53 @@ impl ClientProtocol {
         // looked up first, so a new connection does not skip its lock.
         let known = state.locks.lock().knows(&read.session);
         if !known {
-            self.authenticate_unrestricted(connection, state, Some(read.session.clone()))
+            self.authenticate_unrestricted_or_remote(connection, state, Some(read.session.clone()))
                 .await?;
         }
         state.locks.lock().use_session(&read.session)?;
+        Ok(playback)
+    }
+
+    /// `read` of `playback`, checked: its file open where the bytes start.
+    async fn open_range(
+        &self,
+        playback: &RangeOf,
+        read: &MediaRead,
+    ) -> Result<(tokio::fs::File, MediaReadReply), Error> {
         if let Some(conversion) = &playback.conversion {
             let keep_alive = || self.services.playbacks.touch(&read.handle);
             return converted_range(conversion, read, &keep_alive).await;
         }
-        direct_range(&playback, read).await
+        direct_range(playback, read).await
+    }
+
+    /// A range of a playback played from a paired server through this one
+    /// (P8-04), checked here as any read is: read from there, its bytes
+    /// passed on as they arrive.
+    async fn relay_range(
+        &self,
+        connection: &Connection,
+        read: &MediaRead,
+        revision: u64,
+        remote: &crate::federation::RemotePlay,
+    ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
+        let relayed = self.remote_answered(&read.handle, remote.read(read).await)?;
+        let _control = self
+            .hold_revision(connection, &read.handle, &read.session, revision)
+            .await?;
+        self.services
+            .playbacks
+            .read(&read.handle, read.offset, relayed.length, read.segment);
+        Ok((
+            ResourceMetadata::Media {
+                size: relayed.size,
+                complete: relayed.complete,
+                epoch: relayed.epoch,
+                revision,
+            },
+            relayed.length,
+            ResourceBody::Relayed(relayed.stream),
+        ))
     }
 
     /// Fill in `principal`'s watch state on `items`, in one lookup.
@@ -2080,6 +2230,11 @@ impl ClientProtocol {
             return Err(Error::NotFound {
                 what: "a paired server's item".into(),
             });
+        }
+        // A play token's session (P8-04) reaches its one item's playback
+        // and nothing else.
+        if let Who::Remote(remote) = &who {
+            remote_allows(remote, &request)?;
         }
         let actor = crate::principal::Actor {
             federated: federation.is_some(),
@@ -2284,6 +2439,86 @@ impl ClientProtocol {
                 return Err(Error::RevisionConflict { revision });
             }
         }
+        // A playback played from a paired server through this one (P8-04):
+        // its re-plans and its reads are that server's, passed through.
+        // Its progress is kept here too, and its stop ends it here, which
+        // stops it there.
+        if let Request::ChangeSubtitle { handle, .. }
+        | Request::ChangeQuality { handle, .. }
+        | Request::SeekPlayback { handle, .. }
+        | Request::GetManifest { handle, .. }
+        | Request::ReadSubtitle { handle, .. }
+        | Request::ReadSubtitleSegment { handle, .. } = &request
+            && let Some(remote) = self
+                .use_playback_with(connection, handle, &session, Using::Plays, |p| {
+                    p.remote.clone()
+                })
+                .await?
+        {
+            let handle = handle.clone();
+            let moves = matches!(
+                request,
+                Request::ChangeSubtitle { .. } | Request::SeekPlayback { .. }
+            );
+            let mut request = request;
+            if let Request::ChangeSubtitle { onward_share, .. }
+            | Request::ChangeQuality { onward_share, .. } = &mut request
+            {
+                // SA plans within this server's share of its uplink as
+                // well as its own, as it is now (PX-46).
+                *onward_share = self.services.uplink.share_of(&handle.0);
+            }
+            let before = remote.revision();
+            let asked = request.clone();
+            let answered = remote.control(request).await;
+            let answered = self.remote_answered(&handle, answered);
+            // A re-plan is kept here as SA made it: the Playback page and
+            // the HTTP port read this server's playback.
+            if let Ok(Reply::PlaybackChanged { plan, size, .. }) = &answered {
+                self.services.playbacks.relayed(&handle, |p| {
+                    p.planned = plan.clone();
+                    p.size = *size;
+                    let display = match &asked {
+                        Request::ChangeQuality {
+                            quality, display, ..
+                        } => {
+                            p.quality = *quality;
+                            display
+                        }
+                        Request::ChangeSubtitle {
+                            subtitle, display, ..
+                        } => {
+                            p.selection.subtitle = *subtitle;
+                            display
+                        }
+                        _ => &None,
+                    };
+                    if display.is_some() {
+                        p.display = display.clone();
+                    }
+                });
+            }
+            // Its revision here moves as the rpc layer tells the device:
+            // always for a subtitle or a seek, for a quality as SA's did.
+            if answered.is_ok() && (moves || remote.revision() != before) {
+                self.services.playbacks.revised(&handle);
+            }
+            return answered;
+        }
+        if let Request::UpdatePlaybackProgress { handle, .. } = &request
+            && let Ok(Some(remote)) = self
+                .use_playback_with(connection, handle, &session, Using::Reports, |p| {
+                    p.remote.clone()
+                })
+                .await
+        {
+            // What keeps SA's session and playback while the device is
+            // paused: once checked here, as below.
+            let forwarded = request.clone();
+            tokio::spawn(async move {
+                let _ = remote.control(forwarded).await;
+            });
+        }
         match request {
             Request::ActivateProfile => {
                 state.locks.lock().activate(&session);
@@ -2306,6 +2541,8 @@ impl ClientProtocol {
                     Who::Local(user) => user,
                     // P7-06: no PIN, no lock, no tie; the id is the
                     // name a device keeps their session by.
+                    // Refused before it got here (`remote_allows`).
+                    Who::Remote(_) => return Err(Error::Unauthenticated),
                     Who::Portable(portable) => {
                         // A portable user is never an admin: it may
                         // always leave.
@@ -2641,6 +2878,17 @@ impl ClientProtocol {
             // Forgets the device for the user too (P4-01): signing out is
             // leaving it.
             Request::Logout => {
+                if let Who::Remote(_) = &who {
+                    // A paired server's play ends with its session (P8-04):
+                    // its connection carries the pair's other plays, and
+                    // keeps nothing of the session, so a connection kept
+                    // for many plays does not grow with them.
+                    self.services.auth.remote_sessions().end(&session.0);
+                    self.services.playbacks.end_session(&session);
+                    state.locks.lock().forget(&session);
+                    self.users.forget(&session.0);
+                    return Ok(Reply::LoggedOut);
+                }
                 self.services
                     .auth
                     .logout(&session.0)
@@ -3167,8 +3415,10 @@ impl ClientProtocol {
                 // Its observers first: they need no catalog, so a Plex that
                 // is down does not stop them.
                 self.services.playbacks.progressed(&handle, position);
-                // A track has no watch state, only its plays (PX-52).
-                if crate::watch::tracked(&item) {
+                // A track has no watch state, only its plays (PX-52). A
+                // paired server's user keeps theirs at home (P8-03): the
+                // report only keeps the playback alive here.
+                if crate::watch::tracked(&item) && !matches!(who, Who::Remote(_)) {
                     self.services
                         .watch
                         .progress(principal, &item, position)
@@ -3206,12 +3456,16 @@ impl ClientProtocol {
                     item: found.item,
                     from: position,
                 };
-                self.plays.remote_progressed(
-                    &played,
-                    position,
-                    connection.remote_id().to_string(),
-                    hello.device_name.clone(),
-                );
+                // Played through this server (P8-04), its playback keeps
+                // its play: a report besides opens no second one.
+                if !self.services.playbacks.playing(&principal.to_string(), &id) {
+                    self.plays.remote_progressed(
+                        &played,
+                        position,
+                        connection.remote_id().to_string(),
+                        hello.device_name.clone(),
+                    );
+                }
                 Ok(Reply::Done)
             }
             Request::MarkWatched { id } => {
@@ -3440,10 +3694,8 @@ impl ClientProtocol {
                     });
                 }
                 let (_, descriptor) = self.describe(&id).await?;
-                let (selection, chosen) = self
-                    .selection(principal, &id, &descriptor, selection)
-                    .await?;
-                let bitmap = self.bitmap(principal, bitmap).await?;
+                let (selection, chosen) = self.selection(&who, &id, &descriptor, selection).await?;
+                let bitmap = self.bitmap(&who, bitmap).await?;
                 Ok(Reply::PlaybackPlan {
                     plan: planner::plan(
                         &descriptor,
@@ -3466,7 +3718,35 @@ impl ClientProtocol {
                 bitmap,
                 quality,
                 display,
+                capabilities: device,
+                onward_share,
             } => {
+                // A paired server's item the device could not reach it
+                // for: played from there through this server (P8-04).
+                if id.remote().is_some() {
+                    let federation = federation.ok_or_else(|| Error::NotFound {
+                        what: id.to_string(),
+                    })?;
+                    return self
+                        .start_proxied(
+                            connection,
+                            state,
+                            federation,
+                            (&session, &who),
+                            crate::federation::ProxyStart {
+                                item: id,
+                                selection,
+                                start_ms,
+                                bitmap,
+                                quality,
+                                display,
+                                capabilities: capabilities_over(state, device.as_ref(), None),
+                                onward_share: None,
+                                device: connection.remote_id(),
+                            },
+                        )
+                        .await;
+                }
                 // Its spans link to its `playback` span, a root that ends as
                 // this start does, and this request's does too.
                 let (trace, span) = crate::playback::PlaybackTrace::begin();
@@ -3474,35 +3754,25 @@ impl ClientProtocol {
                 let started = async {
                     // The start's breakdown is timed from here (PX-24).
                     let requested = std::time::Instant::now();
-                    let caps = capabilities(state, display.as_ref());
-                    // Off the LAN, this playback takes a share of the uplink
-                    // (PX-46), and may be one too many.
-                    let wan = (!on_lan(&state.path())).then(|| uplink_class(&who));
-                    // The place is held from here: a start that fails on the
-                    // way gives it back when `admission` is dropped.
-                    let admission = match wan {
-                        Some(class) => {
-                            Some(self.services.uplink.reserve(class).map_err(|full| {
-                                Error::WanStreamsFull {
-                                    max: u32::try_from(full.max).unwrap_or(u32::MAX),
-                                }
-                            })?)
-                        }
-                        None => None,
-                    };
-                    let share = admission.as_ref().and_then(|a| a.share());
+                    let admission = self.reserve_uplink(state, &who)?;
+                    let admission_held = admission.is_some();
+                    let caps = PlayCaps::resolve(
+                        state,
+                        device.as_ref(),
+                        display.as_ref(),
+                        admission.as_ref().and_then(|a| a.share()),
+                        onward_share,
+                    );
                     let (path, descriptor) = self.describe(&id).await?;
-                    let (selection, chosen) = self
-                        .selection(principal, &id, &descriptor, selection)
-                        .await?;
-                    let bitmap = self.bitmap(principal, bitmap).await?;
+                    let (selection, chosen) =
+                        self.selection(&who, &id, &descriptor, selection).await?;
+                    let bitmap = self.bitmap(&who, bitmap).await?;
                     let planned = self
                         .planned(
                             state,
                             (&path, &descriptor),
-                            caps.as_ref(),
+                            &caps,
                             quality,
-                            share,
                             selection,
                             bitmap,
                         )
@@ -3519,14 +3789,7 @@ impl ClientProtocol {
                     // watch state.
                     let duration = crate::watch::length(descriptor.duration, &found.item);
                     let shown = crate::playback::Shown::of(&found.item, descriptor.duration);
-                    let viewer = crate::playback::Viewer {
-                        user_id: principal.to_string(),
-                        username: who.log_name(),
-                        display_name: who.display_name().to_owned(),
-                        device_name: hello.device_name.clone(),
-                        client_name: hello.client_name.clone(),
-                        platform: hello.platform,
-                    };
+                    let viewer = viewer(&who, Some(hello));
                     let handle = Playbacks::new_handle();
                     // A device keeps "now + next": the one playing and this
                     // one, which may be the next track it prepares while that
@@ -3534,10 +3797,17 @@ impl ClientProtocol {
                     // lately, are abandoned: free their slots before this one
                     // takes one. One still read is never ended for it.
                     let endpoint = connection.remote_id().to_string();
+                    // A paired server's proxied plays share its one endpoint:
+                    // each of its users' sessions counts as a device of its
+                    // own (P8-04).
+                    let holder = match &who {
+                        Who::Remote(remote) if remote.proxied => Holder::session_holder(&session),
+                        _ => Holder::Endpoint(endpoint.clone()),
+                    };
                     match self
                         .services
                         .playbacks
-                        .make_room_for_next(&endpoint, state.number)
+                        .make_room_for_next(&holder, state.number)
                     {
                         Ok(_) => {}
                         Err(crate::playback::DeviceFull) => {
@@ -3562,7 +3832,7 @@ impl ClientProtocol {
                             if self
                                 .services
                                 .playbacks
-                                .end_conversions_on(&endpoint, state.number)
+                                .end_conversions_on(&holder, state.number)
                                 > 0 =>
                         {
                             self.prepare(
@@ -3619,6 +3889,9 @@ impl ClientProtocol {
                             conversion,
                             quality,
                             display,
+                            capabilities: device,
+                            holder,
+                            remote: None,
                             video_size: planned
                                 .descriptor
                                 .video
@@ -3642,6 +3915,11 @@ impl ClientProtocol {
                     // follow once starts settle.
                     if let Some(admission) = admission {
                         admission.started(&handle.0, connection.stable_id());
+                    }
+                    if let Who::Remote(_) = &who {
+                        self.remote_plays
+                            .lock()
+                            .insert(handle.0.clone(), connection.stable_id());
                     }
                     if let (Some(pool), Some(episode), true) =
                         (&self.services.optimized, binge, self.services.binge_ahead)
@@ -3677,8 +3955,8 @@ impl ClientProtocol {
                         start_ms = start_ms.unwrap_or(0),
                         ?quality,
                         path = %state.path(),
-                        wan = wan.is_some(),
-                        share,
+                        wan = admission_held,
+                        share = caps.share,
                         "playback started"
                     );
                     // Then how long it took: for direct play now, for a
@@ -3714,25 +3992,30 @@ impl ClientProtocol {
                 bitmap,
                 position_ms,
                 display,
+                onward_share,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
                 let display = playback.display_for(display);
-                let caps = capabilities(state, display.as_ref());
+                let caps = PlayCaps::resolve(
+                    state,
+                    playback.capabilities.as_ref(),
+                    display.as_ref(),
+                    self.services.uplink.share_of(&handle.0),
+                    onward_share,
+                );
                 let quality = playback.quality;
-                let share = self.services.uplink.share_of(&handle.0);
                 let (path, descriptor) = self.describe(&playback.item).await?;
                 let selection = Selection {
                     audio: playback.selection.audio,
                     subtitle,
                 };
-                let bitmap = self.bitmap(principal, bitmap).await?;
+                let bitmap = self.bitmap(&who, bitmap).await?;
                 let planned = self
                     .planned(
                         state,
                         (&path, &descriptor),
-                        caps.as_ref(),
+                        &caps,
                         quality,
-                        share,
                         selection,
                         bitmap,
                     )
@@ -3775,23 +4058,28 @@ impl ClientProtocol {
                 bitmap,
                 position_ms,
                 display,
+                onward_share,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
                 let display = playback.display_for(display);
-                let caps = capabilities(state, display.as_ref());
-                let (path, descriptor) = self.describe(&playback.item).await?;
-                let selection = playback.selection;
-                let bitmap = self.bitmap(principal, bitmap).await?;
                 // Its share now (PX-46): a re-plan after `PlaybackShare`
                 // takes the one the event told.
-                let share = self.services.uplink.share_of(&handle.0);
+                let caps = PlayCaps::resolve(
+                    state,
+                    playback.capabilities.as_ref(),
+                    display.as_ref(),
+                    self.services.uplink.share_of(&handle.0),
+                    onward_share,
+                );
+                let (path, descriptor) = self.describe(&playback.item).await?;
+                let selection = playback.selection;
+                let bitmap = self.bitmap(&who, bitmap).await?;
                 let planned = self
                     .planned(
                         state,
                         (&path, &descriptor),
-                        caps.as_ref(),
+                        &caps,
                         quality,
-                        share,
                         selection,
                         bitmap,
                     )
@@ -3856,7 +4144,8 @@ impl ClientProtocol {
             }
             Request::StopPlayback { handle } => {
                 // Its session and endpoint were checked above, with its
-                // revision.
+                // revision. Its own stop is not told back (P8-04).
+                self.remote_plays.lock().remove(&handle.0);
                 self.services
                     .playbacks
                     .end(&handle, crate::playback::EndReason::Finished);
@@ -3974,6 +4263,49 @@ impl ClientProtocol {
                     }
                     Err(reason) => refused(reason),
                 }
+            }
+            // Experimental (P8-04): a paired server's item, played from
+            // there by the device when it reaches it.
+            Request::RemoteHints { id } => {
+                let federation = self
+                    .federation_for(hello)
+                    .ok_or_else(|| Error::Unsupported {
+                        request: format!(
+                            "remote_hints without {}",
+                            spoolframe_protocol::experimental::FEDERATION
+                        ),
+                    })?;
+                // Only for an item this server serves the user now.
+                catalog.item(&id).await.map_err(catalog_error)?;
+                let (peer, _) = federation.remote_peer(&id).await.map_err(assert_error)?;
+                Ok(Reply::RemoteHints(federation.remote_hints(&peer)))
+            }
+            Request::RemoteGrant { id } => {
+                use spoolframe_protocol::federation::RemoteGranted;
+                let federation = self
+                    .federation_for(hello)
+                    .ok_or_else(|| Error::Unsupported {
+                        request: format!(
+                            "remote_grant without {}",
+                            spoolframe_protocol::experimental::FEDERATION
+                        ),
+                    })?;
+                catalog.item(&id).await.map_err(catalog_error)?;
+                let (peer, item) = federation.remote_peer(&id).await.map_err(assert_error)?;
+                if !federation.online(&peer.server_id) {
+                    return Err(Error::OriginOffline);
+                }
+                let granted = federation
+                    .assert_play_for(&who, &peer, &id, connection.remote_id(), true)
+                    .await
+                    .map_err(assert_error)?;
+                federation.granted_to_device(&who, &id, connection.remote_id());
+                Ok(Reply::RemoteGranted(RemoteGranted {
+                    token: granted.token,
+                    item,
+                    endpoint_id: peer.endpoint_id,
+                    expires_at: granted.expires_at,
+                }))
             }
             // Experimental (P8-01): only when this connection's Hello named
             // it and the server has it on; an admin's, as CreateInvite is.
@@ -4179,6 +4511,8 @@ impl ClientProtocol {
                             "user left the server, in an app; an admin can restore them"
                         );
                     }
+                    // Refused before it got here (`remote_allows`).
+                    Who::Remote(_) => return Err(Error::Unauthenticated),
                     Who::Portable(portable) => {
                         // Its credential, presented again, is a portable
                         // user's recent sign-in: a session opened lately.
@@ -4472,6 +4806,7 @@ impl ClientProtocol {
             | Request::FetchPairing { .. }
             | Request::AnswerPairing { .. }
             | Request::CollectPairing { .. }
+            | Request::RedeemPlayToken(_)
             | Request::Unknown => {
                 unreachable!("pre-auth and unknown requests are answered before the session check")
             }
@@ -4578,6 +4913,55 @@ impl ClientProtocol {
         Ok(Reply::InviteLookup {
             outcome: lookup_outcome(found, key),
         })
+    }
+
+    /// Redeem a paired server's play token from this connection's endpoint
+    /// (P8-04): a session for its one item. A wrong token is counted as a
+    /// stranger's wrong guess, by endpoint, beside the strangers' budget it
+    /// was drawn from; every failure is told as `Unauthenticated`.
+    async fn redeem_play_token(
+        &self,
+        connection: &Connection,
+        hello: &Hello,
+        redeem: &spoolframe_protocol::federation::RedeemPlayToken,
+    ) -> Result<Reply, Error> {
+        let Some(federation) = self.federation_for(hello) else {
+            return Err(Error::Unsupported {
+                request: format!(
+                    "redeem_play_token without {}",
+                    spoolframe_protocol::experimental::FEDERATION
+                ),
+            });
+        };
+        let endpoint_id = connection.remote_id().to_string();
+        let guess = self
+            .services
+            .auth
+            .guess(
+                format!("play-token@{endpoint_id}"),
+                Some(endpoint_id.clone()),
+            )
+            .map_err(rate_limited)?;
+        match federation
+            .redeem_play_token(&redeem.token, &endpoint_id)
+            .await
+        {
+            Ok((session, user)) => {
+                self.services.auth.guessed_right(guess);
+                // The normal limits for its reads, as a portable guest's
+                // device gets; its sign-ins stay on the strangers' budget.
+                self.guest_signed_in(connection);
+                Ok(Reply::PlayTokenRedeemed(
+                    spoolframe_protocol::federation::PlayTokenRedeemed {
+                        session: SessionId(session.0),
+                        item: user.item,
+                        scope: user.scope,
+                    },
+                ))
+            }
+            Err(crate::federation::PlayTokenError::Invalid) => Err(Error::Unauthenticated),
+            Err(crate::federation::PlayTokenError::Store(e)) => Err(internal(e)),
+        }
     }
 
     /// A sign-in with an app passkey (P3-19) from this connection's
@@ -5291,20 +5675,16 @@ impl ClientProtocol {
     /// [`Self::plan`] of `descriptor`, the film at `path`, or of an
     /// optimized copy of it in its place, or with a copy's audio (PX-37,
     /// [`crate::optimized::play`]): what plays, lent for the playback.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the call sites name each part; a struct would only repeat them"
-    )]
     async fn planned(
         &self,
         state: &ConnectionState,
         (path, descriptor): (&Path, &Arc<MediaDescriptor>),
-        caps: Option<&spoolframe_types::ClientCapabilities>,
+        caps: &PlayCaps,
         quality: spoolframe_protocol::Quality,
-        share: Option<u64>,
         selection: Selection,
         bitmap: planner::Bitmap,
     ) -> Planned {
+        let (share, caps) = (caps.share, caps.caps.as_ref());
         // Once for the film and every copy planned in its place.
         let encoders = crate::encode::planning_encoders(
             &self.services.jobs,
@@ -5891,6 +6271,165 @@ impl ClientProtocol {
         prepared_info(prepared, class)
     }
 
+    /// Off the LAN, a playback takes a share of the uplink (PX-46), and
+    /// may be one too many: its place, held from here, so a start that
+    /// fails on the way gives it back when the admission is dropped. None
+    /// on the LAN.
+    fn reserve_uplink(
+        &self,
+        state: &ConnectionState,
+        who: &Who,
+    ) -> Result<Option<crate::uplink::Admission>, Error> {
+        if on_lan(&state.path()) {
+            return Ok(None);
+        }
+        self.services
+            .uplink
+            .reserve(uplink_class(who))
+            .map(Some)
+            .map_err(|full| Error::WanStreamsFull {
+                max: u32::try_from(full.max).unwrap_or(u32::MAX),
+            })
+    }
+
+    /// `StartPlayback` of a paired server's item, played from there
+    /// through this server (proxy mode, P8-04): SA plans and serves it for
+    /// the device, and this server keeps a playback of its own for the
+    /// device with no file and no conversion, whose controls and reads
+    /// pass through. Nothing of it is written here.
+    async fn start_proxied(
+        &self,
+        connection: &Connection,
+        state: &ConnectionState,
+        federation: &Arc<crate::federation::Federation>,
+        (session, who): (&SessionId, &Who),
+        mut start: crate::federation::ProxyStart,
+    ) -> Result<Reply, Error> {
+        let requested = std::time::Instant::now();
+        let id = start.item.clone();
+        // Only an item this server serves the user now.
+        let found = self
+            .services
+            .catalog
+            .item(&id)
+            .await
+            .map_err(catalog_error)?;
+        // The leg to the device is this server's uplink, as any play's
+        // (PX-46); SA plans within this server's share as well as its own.
+        let admission = self.reserve_uplink(state, who)?;
+        start.onward_share = admission.as_ref().and_then(|a| a.share());
+        let from = Duration::from_millis(start.start_ms.unwrap_or(0));
+        let (quality, display, capabilities) = (
+            start.quality,
+            start.display.clone(),
+            start.capabilities.clone(),
+        );
+        let crate::federation::ProxyStarted {
+            remote,
+            plan,
+            size,
+            chosen,
+            epoch,
+            markers,
+        } = federation
+            .start_proxy(who, start)
+            .await
+            .map_err(proxy_error)?;
+        let (trace, _span) = crate::playback::PlaybackTrace::begin();
+        let principal = who.principal();
+        let title_key = self.services.watch.title_key(&found).await;
+        let duration = crate::watch::length(None, &found.item);
+        let hello = state.hello.get();
+        let handle = self.services.playbacks.start(
+            Playbacks::new_handle(),
+            Opened {
+                trace,
+                viewer: viewer(who, hello),
+                shown: crate::playback::Shown::of(&found.item, None),
+                planned: plan.clone(),
+                session: session.clone(),
+                endpoint: connection.remote_id().to_string(),
+                item: id.clone(),
+                selection: chosen.as_ref().map(|c| c.selection).unwrap_or_default(),
+                path: PathBuf::new(),
+                size,
+                file: None,
+                subtitle: None,
+                conversion: None,
+                source: crate::playback::Source::Film,
+                quality,
+                display,
+                capabilities,
+                holder: Holder::Endpoint(connection.remote_id().to_string()),
+                remote: Some(remote.clone()),
+                video_size: None,
+                start: Arc::new(parking_lot::Mutex::new(StartTimes {
+                    plan: requested.elapsed(),
+                    keyframes: None,
+                    first_segment: FirstSegment::Direct,
+                })),
+                requested,
+                connection: state.number,
+                played: crate::playback::Played {
+                    principal,
+                    item: found.item,
+                    title_key,
+                    duration,
+                    credits: spoolframe_policy::watch::credits_to_end(&found.markers),
+                    from,
+                },
+            },
+        );
+        if let Some(admission) = admission {
+            admission.started(&handle.0, connection.stable_id());
+        }
+        tokio::spawn(follow_remote(
+            Arc::downgrade(&remote),
+            handle.clone(),
+            self.services.playbacks.clone(),
+            self.addresses.streams.clone(),
+            connection.stable_id(),
+        ));
+        tracing::info!(
+            %id,
+            user = %who.log_name(),
+            endpoint = %connection.remote_id().fmt_short(),
+            plan = %planner::summary(&plan).kind,
+            "playback started through this server"
+        );
+        Ok(Reply::PlaybackStarted {
+            handle,
+            plan,
+            size,
+            chosen,
+            epoch,
+            markers,
+        })
+    }
+
+    /// `answered`, by the paired server a playback plays from (P8-04): a
+    /// playback that server ended ends here too.
+    fn remote_answered<T>(
+        &self,
+        handle: &PlaybackHandle,
+        answered: Result<T, Error>,
+    ) -> Result<T, Error> {
+        if let Err(
+            e @ (Error::PlaybackExpired
+            | Error::PlaybackStopped
+            | Error::Unauthenticated
+            | Error::OriginOffline),
+        ) = &answered
+        {
+            tracing::info!(handle = %handle.0, error = %e, "the paired server ended a playback; it ends");
+            self.services.playbacks.end(
+                handle,
+                crate::playback::EndReason::Failed(ORIGIN_GONE.into()),
+            );
+        }
+        answered
+    }
+
     /// `id`'s media file and Spoolframe's description of it.
     async fn describe(&self, id: &MediaId) -> Result<(PathBuf, Arc<MediaDescriptor>), Error> {
         let path = self
@@ -5946,7 +6485,7 @@ impl ClientProtocol {
     /// ones the principal's preferences and override choose (P1-20).
     async fn selection(
         &self,
-        principal: Principal,
+        who: &Who,
         id: &MediaId,
         descriptor: &MediaDescriptor,
         selection: Option<Selection>,
@@ -5955,10 +6494,10 @@ impl ClientProtocol {
             return Ok((selection, None));
         }
         let store = self.store();
-        let preferences = store.track_preferences(principal).await.map_err(internal)?;
+        let preferences = self.track_preferences(who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = store
-            .track_override(principal, &scope)
+            .track_override(who.principal(), &scope)
             .await
             .map_err(internal)?;
         let chosen = tracks::choose(&descriptor.tracks(), &preferences, override_.as_ref());
@@ -5969,18 +6508,31 @@ impl ClientProtocol {
     /// `Auto`, as the principal's preferences say.
     async fn bitmap(
         &self,
-        principal: Principal,
+        who: &Who,
         requested: BitmapSubtitles,
     ) -> Result<planner::Bitmap, Error> {
         if let Some(asked) = planner::Bitmap::asked(requested) {
             return Ok(asked);
         }
-        let preferences = self
-            .store()
-            .track_preferences(principal)
-            .await
-            .map_err(internal)?;
+        let preferences = self.track_preferences(who).await?;
         Ok(planner::Bitmap::Preferred(preferences.subtitles.bitmap))
+    }
+
+    /// `who`'s track preferences: a paired server's user's as their own
+    /// server gave them with the play token (P8-04), this server having
+    /// none of theirs; anyone else's as kept here.
+    async fn track_preferences(
+        &self,
+        who: &Who,
+    ) -> Result<spoolframe_types::TrackPreferences, Error> {
+        match who {
+            Who::Remote(remote) => Ok(remote.preferences.clone().unwrap_or_default()),
+            _ => self
+                .store()
+                .track_preferences(who.principal())
+                .await
+                .map_err(internal),
+        }
     }
 
     /// What a track override for `id` applies to: its show for an episode,
@@ -6091,6 +6643,10 @@ impl ProtocolHandler for ClientProtocol {
                 (false, false)
             }
         };
+        // A paired server's user's device, in the session its play token
+        // opened (P8-04), kept in memory: one reconnecting mid-play is not
+        // a stranger.
+        let known = known || self.services.auth.remote_sessions().endpoint_has(&id_text);
         let Some(peer) = self.connections.admit(&connection, known, local) else {
             tracing::info!(
                 endpoint = %endpoint.fmt_short(),
@@ -6308,6 +6864,10 @@ const RESOURCE_PART: usize = 64 << 10;
 /// The size of each read of a file a resource is copied from.
 const READ_PART: usize = 1 << 20;
 
+/// The size of each part of a paired server's answer passed on
+/// ([`relay_unless_stalled`]).
+const RELAY_PART: usize = 256 << 10;
+
 /// `bytes` written to `send`, unless the reader takes none of a part for
 /// `stall` (PX-09 finding 14): then an error, and the stream is reset.
 async fn send_unless_stalled(
@@ -6346,6 +6906,59 @@ async fn copy_unless_stalled(
         send_unless_stalled(send, &part[..n], stall).await?;
         copied += n as u64;
     }
+}
+
+/// At most `length` of a paired server's answer passed on to `send` as
+/// it arrives (P8-04), as [`send_unless_stalled`], in parts of
+/// [`RELAY_PART`]. The bytes passed on.
+///
+/// Not each piece as it comes off the paired server's stream: written
+/// one by one, as they came, a 16 MiB read went on to the device in
+/// bursts that, past one lost packet, left it holding more packets than
+/// QUIC keeps for a stream ("too many gaps in stream buffer"); the
+/// end-to-end test lost about half its 16 MiB proxied reads so. In whole
+/// parts it lost none of six, though the device's connection still
+/// dropped once and the SDK read again.
+async fn relay_unless_stalled(
+    mut from: RecvStream,
+    length: u64,
+    send: &mut SendStream,
+    stall: Duration,
+) -> std::io::Result<u64> {
+    let mut relayed = 0u64;
+    let mut part = bytes::BytesMut::with_capacity(RELAY_PART);
+    let mut done = false;
+    while !done {
+        let left = length - relayed - part.len() as u64;
+        let room = RELAY_PART - part.len();
+        let most = usize::try_from(left).map_or(room, |n| n.min(room));
+        if most > 0 {
+            // A paired server that stops sending fails the read, as a
+            // reader that stops taking does.
+            let read = tokio::time::timeout(stall, from.read_chunk(most))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("the paired server sent nothing for {stall:?}"),
+                    )
+                })?;
+            match read.map_err(std::io::Error::other)? {
+                Some(piece) => part.extend_from_slice(&piece),
+                None => done = true,
+            }
+        } else {
+            done = true;
+        }
+        if part.len() == RELAY_PART || (done && !part.is_empty()) {
+            relayed += part.len() as u64;
+            tokio::time::timeout(stall, send.write_chunk(part.split().freeze()))
+                .await
+                .map_err(|_| stalled(stall))?
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    Ok(relayed)
 }
 
 fn stalled(stall: Duration) -> std::io::Error {
@@ -6759,6 +7372,18 @@ fn login_error(e: LoginError) -> Error {
 
 /// Whose share of the uplink a playback off the LAN takes (PX-46): an
 /// admin's is the owner's.
+/// Who plays a playback, on the device that said `hello`.
+fn viewer(who: &Who, hello: Option<&spoolframe_protocol::Hello>) -> crate::playback::Viewer {
+    crate::playback::Viewer {
+        user_id: who.principal().to_string(),
+        username: who.log_name(),
+        display_name: who.display_name().to_owned(),
+        device_name: hello.and_then(|h| h.device_name.clone()),
+        client_name: hello.map(|h| h.client_name.clone()).unwrap_or_default(),
+        platform: hello.map_or(spoolframe_types::Platform::Unknown, |h| h.platform),
+    }
+}
+
 fn uplink_class(who: &Who) -> crate::uplink::Class {
     match who {
         Who::Local(user) if user.role == spoolframe_types::Role::Admin => {
@@ -6766,6 +7391,49 @@ fn uplink_class(who: &Who) -> crate::uplink::Class {
         }
         _ => crate::uplink::Class::Guest,
     }
+}
+
+/// What a play token's session (P8-04) may ask: `StartPlayback` of its
+/// one item and the controls and reads of its own playback (which only
+/// the session that started a playback may use, checked where each is
+/// served), and a subtitle's timing on that item (P8-07). Anything else
+/// is `Unauthenticated`, as for no session at all.
+fn remote_allows(
+    remote: &crate::remote_sessions::RemoteSessionUser,
+    request: &Request,
+) -> Result<(), Error> {
+    let allowed = match request {
+        Request::StartPlayback { id, .. }
+        | Request::SyncSubtitle { id, .. }
+        | Request::UseOriginalSubtitleTiming { id, .. }
+        | Request::SetSubtitleOffset { id, .. } => *id == remote.item,
+        Request::UpdatePlaybackProgress { .. }
+        | Request::ChangeSubtitle { .. }
+        | Request::ChangeQuality { .. }
+        | Request::SeekPlayback { .. }
+        | Request::StopPlayback { .. }
+        | Request::PlaybackProgressSequence { .. }
+        | Request::PlaybackRevision { .. }
+        | Request::GetManifest { .. }
+        | Request::ReadSubtitle { .. }
+        | Request::ReadSubtitleSegment { .. }
+        // A paired server ends a play it proxies by ending its session.
+        | Request::Logout => true,
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::Unauthenticated)
+    }
+}
+
+/// `session` and `who`, unless a one-time password opened it.
+fn unrestricted(session: SessionId, who: Who) -> Result<(SessionId, Who), Error> {
+    if who.password_change_only() {
+        return Err(Error::PasswordChangeRequired);
+    }
+    Ok((session, who))
 }
 
 /// The session's local account, for a request only an account here can
@@ -6987,6 +7655,28 @@ fn pair_error(e: crate::federation::PairError) -> Error {
         },
         PairError::Dial(_) | PairError::Unexpected(_) => Error::Unavailable { message },
         PairError::Store(e) => internal(e),
+    }
+}
+
+/// Why a paired server's item got no hints or token, for the client
+/// (P8-04).
+fn assert_error(e: crate::federation::AssertError) -> Error {
+    use crate::federation::AssertError;
+    use spoolframe_federation::DialError;
+    use spoolframe_protocol::federation::AssertionRefused;
+    let message = e.to_string();
+    match e {
+        AssertError::NotFederated(_) => Error::InvalidInput { message },
+        AssertError::NotPaired(_)
+        | AssertError::Dial(DialError::NotGranted(AssertionRefused::NotShared)) => {
+            Error::NotFound {
+                what: "a paired server's item".into(),
+            }
+        }
+        AssertError::Offline => Error::OriginOffline,
+        AssertError::NotALocalUser => Error::NotForPortableUsers,
+        AssertError::Dial(_) => Error::Unavailable { message },
+        AssertError::Store(e) => internal(e),
     }
 }
 
@@ -7507,6 +8197,8 @@ pub(crate) async fn direct_range(
 /// What a range read uses of its playback (review 2026-10-11 M10).
 pub(crate) struct RangeOf {
     pub(crate) revision: u64,
+    /// The paired server it plays from (P8-04): its reads are relayed.
+    pub(crate) remote: Option<Arc<crate::federation::RemotePlay>>,
     pub(crate) conversion: Option<Arc<Conversion>>,
     pub(crate) size: u64,
     pub(crate) path: PathBuf,
@@ -7517,6 +8209,7 @@ impl RangeOf {
     pub(crate) fn of(playback: &Playback) -> Self {
         Self {
             revision: playback.revision,
+            remote: playback.remote.clone(),
             conversion: playback.conversion.clone(),
             size: playback.size,
             path: playback.read_path().to_path_buf(),
@@ -7787,6 +8480,121 @@ pub(crate) fn auth_methods() -> Vec<AuthMethod> {
     vec![AuthMethod::Password, AuthMethod::DeviceApproval]
 }
 
+/// Follow a playback played from a paired server through this one
+/// (P8-04): that server's events for it reach the device under this
+/// server's handle. Once that server ends its playback (an admin's stop,
+/// its idle sweep, a grant revoked), or its connection closes, the
+/// playback ends here too, and the device is told. A play does not move
+/// to another way of playing mid-play.
+async fn follow_remote(
+    remote: std::sync::Weak<crate::federation::RemotePlay>,
+    handle: PlaybackHandle,
+    playbacks: Arc<Playbacks>,
+    streams: crate::events::EventStreams,
+    device: usize,
+) {
+    use spoolframe_protocol::Event;
+    use tokio::sync::broadcast::error::RecvError;
+    let Some((client, theirs, ended)) = remote
+        .upgrade()
+        .map(|r| (r.client().clone(), r.handle().clone(), r.ended()))
+    else {
+        return;
+    };
+    let mut events = client.events();
+    let error = loop {
+        tokio::select! {
+            () = ended.notified() => return,
+            () = client.closed() => break Error::PlaybackExpired,
+            event = events.recv() => match event {
+                Ok(Event::PlaybackShare { handle: of, max_bitrate }) if of == theirs => {
+                    streams.send(
+                        device,
+                        Event::PlaybackShare {
+                            handle: handle.clone(),
+                            max_bitrate,
+                        },
+                    );
+                }
+                Ok(Event::PlaybackEnded { handle: of, error }) if of == theirs => break error,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break Error::PlaybackExpired,
+            },
+        }
+    };
+    // Ended there while the playback is still here: not by its end here.
+    if remote.upgrade().is_none() {
+        return;
+    }
+    tracing::info!(handle = %handle.0, %error, "the paired server a playback plays from ended it; it ends");
+    let why = crate::playback::EndReason::Failed(ORIGIN_GONE.into());
+    // Stopped there is stopped here: the device does not start it again.
+    if error == Error::PlaybackStopped {
+        playbacks.end_stopped(&handle, why);
+    } else {
+        playbacks.end(&handle, why);
+    }
+    streams.send(
+        device,
+        Event::PlaybackEnded {
+            error: playbacks.gone_error(&handle.0),
+            handle,
+        },
+    );
+}
+
+/// Why a playback played from a paired server ended when that server's
+/// connection closed (P8-04).
+const ORIGIN_GONE: &str = "the paired server it plays from is gone";
+
+/// Why a paired server's item could not play through this server (P8-04).
+fn proxy_error(e: crate::federation::ProxyError) -> Error {
+    use crate::federation::ProxyError;
+    match e {
+        ProxyError::Assert(e) => assert_error(e),
+        ProxyError::Origin(e) => e,
+    }
+}
+
+/// What a playback is planned for: the device's capabilities, and the
+/// share of the uplink it plays within (PX-46).
+struct PlayCaps {
+    caps: Option<spoolframe_types::ClientCapabilities>,
+    share: Option<u64>,
+}
+
+impl PlayCaps {
+    /// The device's capabilities (`over`, else its Hello's) with
+    /// `display`; and `share`, or `onward`, the share a paired server
+    /// plays it on to its own device over (P8-04), if smaller: the play
+    /// fits both legs.
+    fn resolve(
+        state: &ConnectionState,
+        over: Option<&spoolframe_types::ClientCapabilities>,
+        display: Option<&spoolframe_types::DisplayCapabilities>,
+        share: Option<u64>,
+        onward: Option<u64>,
+    ) -> Self {
+        Self {
+            caps: capabilities_over(state, over, display),
+            share: share.into_iter().chain(onward).min(),
+        }
+    }
+}
+
+/// What a playback plans for (P8-04): `over`, the device's own when a
+/// paired server plays on to it, else Hello's; the screen's over them.
+fn capabilities_over(
+    state: &ConnectionState,
+    over: Option<&spoolframe_types::ClientCapabilities>,
+    display: Option<&spoolframe_types::DisplayCapabilities>,
+) -> Option<spoolframe_types::ClientCapabilities> {
+    match over {
+        Some(caps) => Some(caps.with_display(display)),
+        None => capabilities(state, display),
+    }
+}
+
 /// The connection's capabilities from Hello, with `display` over their
 /// HDR formats and bit depth (PGPU-06); `None` before a Hello that gave
 /// any.
@@ -7804,6 +8612,22 @@ fn capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ended session leaves nothing in a connection's locks: a paired
+    /// server's connection, kept for many plays, does not grow with them
+    /// (P8-04).
+    #[test]
+    fn a_forgotten_session_leaves_nothing_in_the_locks() {
+        let mut locks = Locks::default();
+        let session = SessionId("s".into());
+        locks.learn(&session, true);
+        locks.activate(&session);
+        locks.unlock(&session);
+        locks.forget(&session);
+        assert!(!locks.knows(&session));
+        assert!(locks.needs_pin.is_empty() && locks.unlocked.is_empty());
+        assert_eq!(locks.active, None);
+    }
 
     #[test]
     fn only_an_app_closing_with_no_error_code_is_a_quiet_end() {

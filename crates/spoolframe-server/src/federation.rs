@@ -24,29 +24,46 @@ pub mod cache;
 mod exposure;
 mod grants;
 pub mod items;
+mod limits;
+mod media;
+mod proxy;
+mod redeem;
 mod replica;
 mod tokens;
 
-pub use answer::WALK_REUSE;
 pub use cache::{Links, PeerCache};
-pub use exposure::ServerRowError;
+pub use exposure::{PeerPage, PlayDay, Received, ServerRowError};
 pub use grants::ShareError;
-pub use replica::{DEFAULT_SYNC_EVERY, ReplicaError};
-pub use tokens::{AssertError, PLAY_TOKEN_LIFETIME, TOKEN_LIMITS};
+pub use limits::Limits;
+pub use proxy::{
+    ORIGIN_STALL, ProxyError, ProxyStart, ProxyStarted, RelayedRead, RemotePlay, Stalling,
+};
+pub use redeem::PlayTokenError;
+pub use replica::{DEFAULT_SYNC_EVERY, ReplicaError, SyncLimits};
+pub use tokens::{AssertError, PLAY_TOKEN_LIFETIME};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use spoolframe_catalog::Catalog;
-use spoolframe_federation::{DialError, Dialed, FederationProtocol, Live, Peers, Strangers};
+use spoolframe_federation::{
+    DialError, Dialed, FederationProtocol, Live, Peers, PlayClient, Strangers,
+};
 use spoolframe_protocol::federation::{
-    MAX_HINTS, PROTOCOL_VERSION, PairingRefused, PeerHello, RedeemPairing, Standing, server_name,
+    MAX_HINTS, PROTOCOL_VERSION, PairingRefused, PeerHello, PeerInfo, RedeemPairing, Standing,
+    server_name,
 };
 use spoolframe_protocol::invite::{InviteLinkKind, is_relay_url, parse_link};
-use spoolframe_protocol::{ServerId, close};
+use spoolframe_protocol::invite_admin::InviteKind as LinkedKind;
+use spoolframe_protocol::{
+    Error as ProtocolError, Hello, InviteLookupOutcome, LookupInvite, Reply, Request, Response,
+    ServerId, close, features, fingerprint,
+};
+use spoolframe_types::Platform;
 
 use crate::announce::Told;
 use crate::auth::Auth;
@@ -80,9 +97,21 @@ pub struct Federation {
     answering: answer::Answering,
     /// `federation.sync_interval_secs`.
     sync_every: parking_lot::Mutex<Duration>,
+    /// What a pair may send and ask (P8-04).
+    limits: parking_lot::Mutex<Limits>,
+    /// [`Limits::max_streams`], as the handler reads it for each
+    /// connection.
+    max_streams: Arc<AtomicUsize>,
     /// Wakes the replica before its next tick: a pair made, a setting
     /// changed.
     wake: Arc<tokio::sync::Notify>,
+    /// The connections this server plays its pairs' items through
+    /// (proxy mode, P8-04).
+    plays: Arc<proxy::PlayClients>,
+    /// The tokens granted to devices, by user, item and device, and when:
+    /// a device's play that falls back to proxy mode is not counted twice
+    /// (P8-04).
+    device_grants: tokens::DeviceGrants,
 }
 
 /// Where and how this server caches what its pairs share (P8-02).
@@ -96,6 +125,8 @@ pub struct ReplicaSettings {
     pub cache_max_bytes: u64,
     /// The most every origin's artwork files take together, in bytes.
     pub cache_total_bytes: u64,
+    /// What a pair may send and ask (P8-04).
+    pub limits: Limits,
 }
 
 impl ReplicaSettings {
@@ -106,6 +137,7 @@ impl ReplicaSettings {
             sync_every: DEFAULT_SYNC_EVERY,
             cache_max_bytes: cache::DEFAULT_MAX_BYTES,
             cache_total_bytes: cache::DEFAULT_TOTAL_BYTES,
+            limits: Limits::default(),
         }
     }
 }
@@ -189,7 +221,11 @@ impl Federation {
             syncing: KeyedLocks::default(),
             answering: answer::Answering::default(),
             sync_every: parking_lot::Mutex::new(replica.sync_every),
+            limits: parking_lot::Mutex::new(replica.limits),
+            max_streams: Arc::new(AtomicUsize::new(replica.limits.max_streams)),
             wake: Arc::default(),
+            plays: Arc::default(),
+            device_grants: parking_lot::Mutex::default(),
         }
     }
 
@@ -231,6 +267,7 @@ impl Federation {
             Arc::new(move || name.get()),
             self.live.clone(),
         )
+        .with_max_streams(self.max_streams.clone())
     }
 
     fn store(&self) -> &crate::store::Store {
@@ -250,50 +287,18 @@ impl Federation {
     /// `by` (SB's side, P8-01): dial it, check it is not paired here
     /// already, redeem the code, and keep its row.
     pub async fn redeem_link(&self, link: &str, by: &str) -> Result<PeerRecord, PairError> {
-        let invite = parse_link(link).ok_or(PairError::NotALink)?;
-        let code = invite.code.clone().ok_or(PairError::NoCode)?;
-        if invite.kind == InviteLinkKind::PortableAccount {
-            return Err(PairError::WrongKind);
-        }
-        let attached = self.attached.get().ok_or(PairError::Starting)?;
-        let server: EndpointId = invite.server.parse().map_err(|_| PairError::NotALink)?;
-        if server == attached.endpoint.id() {
-            return Err(PairError::Itself);
-        }
-        if self
-            .store()
-            .live_peer_by_endpoint(&invite.server)
-            .await?
-            .is_some()
-        {
-            return Err(PairError::AlreadyPaired);
-        }
-        let dial_at = kept_addrs(invite.addrs.iter().copied());
-        let relays = kept_relays(invite.relays.iter().cloned());
-        let addr = endpoint_addr(server, dial_at.iter().copied(), &relays);
-        let addrs: Vec<String> = dial_at.iter().map(ToString::to_string).collect();
+        let Aim {
+            attached,
+            code,
+            server,
+            hex,
+            addr,
+            addrs,
+            relays,
+        } = self.aim(link).await?;
         let (dialed, info) = Dialed::connect(&attached.endpoint, addr, self.hello()).await?;
         let paired = async {
-            let theirs = ServerId::parse(&info.server_id)
-                .map_err(|_| PairError::Unexpected(info.server_id.clone()))?;
-            if theirs == self.server_id {
-                return Err(PairError::Itself);
-            }
-            match info.standing {
-                Standing::Stranger => {}
-                Standing::KeyHeld => return Err(PairError::KeyHeld),
-                // It has this server's row and this server has none of its:
-                // its admin unpairs first.
-                _ => return Err(PairError::AlreadyPaired),
-            }
-            if self
-                .store()
-                .live_peer_by_server_id(theirs.as_str())
-                .await?
-                .is_some()
-            {
-                return Err(PairError::AlreadyPaired);
-            }
+            let theirs = self.pairable(&info).await?;
             let mine = crate::invites::server_link(
                 attached.endpoint.id().to_string(),
                 self.name.get(),
@@ -317,7 +322,7 @@ impl Federation {
                     .add_peer(
                         NewPeer {
                             server_id: theirs.as_str(),
-                            endpoint_id: &invite.server,
+                            endpoint_id: &hex,
                             display_name: &server_name(info.name.clone()),
                             addrs: &addrs,
                             relays: &relays,
@@ -362,7 +367,163 @@ impl Federation {
     }
 }
 
+/// Where a `federation` invite link points (SB's side), checked as far
+/// as it can be before dialing.
+struct Aim<'a> {
+    attached: &'a Attached,
+    code: String,
+    server: EndpointId,
+    /// `server`, hex, as a pair keeps it.
+    hex: String,
+    addr: EndpointAddr,
+    /// The addresses and relays kept of the link's.
+    addrs: Vec<String>,
+    relays: Vec<String>,
+}
+
+/// What looking a `federation` invite up before redeeming it found
+/// (P8-01): the server that made it, as it says, and its key's
+/// fingerprint, for the admin to compare with what its own admin reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairLookup {
+    pub name: String,
+    pub server_id: String,
+    pub fingerprint: String,
+    /// The admin who made it, when they have a display name.
+    pub inviter: Option<String>,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
 impl Federation {
+    /// The invite `link` names, if it is one this server can redeem: one
+    /// with a code, not an account's, not this server's own, and not of a
+    /// server paired here already.
+    async fn aim(&self, link: &str) -> Result<Aim<'_>, PairError> {
+        let invite = parse_link(link).ok_or(PairError::NotALink)?;
+        let code = invite.code.clone().ok_or(PairError::NoCode)?;
+        if invite.kind == InviteLinkKind::PortableAccount {
+            return Err(PairError::WrongKind);
+        }
+        let attached = self.attached.get().ok_or(PairError::Starting)?;
+        let server: EndpointId = invite.server.parse().map_err(|_| PairError::NotALink)?;
+        if server == attached.endpoint.id() {
+            return Err(PairError::Itself);
+        }
+        if self
+            .store()
+            .live_peer_by_endpoint(&invite.server)
+            .await?
+            .is_some()
+        {
+            return Err(PairError::AlreadyPaired);
+        }
+        let dial_at = kept_addrs(invite.addrs.iter().copied());
+        let relays = kept_relays(invite.relays.iter().cloned());
+        Ok(Aim {
+            attached,
+            code,
+            server,
+            hex: invite.server,
+            addr: endpoint_addr(server, dial_at.iter().copied(), &relays),
+            addrs: dial_at.iter().map(ToString::to_string).collect(),
+            relays,
+        })
+    }
+
+    /// The server id of the server dialed, which said `info`, if this
+    /// server may pair with it: a stranger to it, and not paired here.
+    async fn pairable(&self, info: &PeerInfo) -> Result<ServerId, PairError> {
+        let theirs = ServerId::parse(&info.server_id)
+            .map_err(|_| PairError::Unexpected(info.server_id.clone()))?;
+        if theirs == self.server_id {
+            return Err(PairError::Itself);
+        }
+        match info.standing {
+            Standing::Stranger => {}
+            Standing::KeyHeld => return Err(PairError::KeyHeld),
+            // It has this server's row and this server has none of its:
+            // its admin unpairs first.
+            _ => return Err(PairError::AlreadyPaired),
+        }
+        if self
+            .store()
+            .live_peer_by_server_id(theirs.as_str())
+            .await?
+            .is_some()
+        {
+            return Err(PairError::AlreadyPaired);
+        }
+        Ok(theirs)
+    }
+
+    /// Look the `federation` invite `link` up without redeeming it (SB's
+    /// side, P8-01): dial the server that made it as pairing would, hear
+    /// its name, and ask its client protocol whether the code still works,
+    /// as an app looks an invite up, on the strangers' budget. A code that
+    /// does not work is refused as redeeming it would be.
+    pub async fn look_up_link(&self, link: &str) -> Result<PairLookup, PairError> {
+        let Aim {
+            attached,
+            code,
+            hex,
+            addr,
+            ..
+        } = self.aim(link).await?;
+        let (dialed, info) =
+            Dialed::connect(&attached.endpoint, addr.clone(), self.hello()).await?;
+        dialed.close();
+        let theirs = self.pairable(&info).await?;
+        let hello = Hello {
+            protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+            client_name: "spoolframe-server".into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            platform: Platform::Unknown,
+            device_name: Some(self.name.get()),
+            capabilities: None,
+            experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features: vec![features::INVITE_LOOKUP.into()],
+        };
+        let (client, _) = PlayClient::connect(&attached.endpoint, addr, hello).await?;
+        let answered = client
+            .call(None, Request::LookupInvite(LookupInvite { code }), None)
+            .await;
+        client.close();
+        let refused = |reason| PairError::Dial(DialError::Refused(reason));
+        match answered?.response {
+            Response::Ok(Reply::InviteLookup { outcome }) => match outcome {
+                InviteLookupOutcome::Valid {
+                    kind: LinkedKind::Federation,
+                    inviter,
+                    expires_at,
+                    ..
+                } => Ok(PairLookup {
+                    name: server_name(info.name),
+                    server_id: theirs.to_string(),
+                    // The key this server dials, not what the other says
+                    // of itself: the admins compare it.
+                    fingerprint: fingerprint::of_hex(&hex).unwrap_or_default(),
+                    inviter,
+                    expires_at,
+                }),
+                InviteLookupOutcome::Valid { .. } => Err(PairError::WrongKind),
+                InviteLookupOutcome::Expired { .. } => Err(refused(PairingRefused::InviteExpired)),
+                InviteLookupOutcome::Used => Err(refused(PairingRefused::InviteExhausted)),
+                InviteLookupOutcome::Revoked
+                | InviteLookupOutcome::NoMatch
+                | InviteLookupOutcome::Unknown => Err(refused(PairingRefused::InviteInvalid)),
+            },
+            Response::Err(ProtocolError::RateLimited { retry_after_ms }) => {
+                Err(refused(PairingRefused::RateLimited {
+                    retry_after_secs: retry_after_ms.div_ceil(1000),
+                }))
+            }
+            other => Err(PairError::Dial(DialError::Unreachable(format!(
+                "the other server did not look the invite up: {other:?}"
+            )))),
+        }
+    }
+
     /// Every pair, live or not, as the store keeps them.
     pub async fn peers(&self) -> Result<Vec<PeerRecord>, StoreError> {
         self.store().federation_peers().await
@@ -418,6 +579,8 @@ impl Federation {
             by,
             "unpaired from another server"
         );
+        self.end_remote_sessions(&peer.id, None);
+        self.close_plays(&peer.id);
         self.forget_origin(&peer.server_id).await;
         if let Ok(endpoint) = peer.endpoint_id.parse::<EndpointId>() {
             self.live.close(&endpoint, close::UNPAIRED, "unpaired");
@@ -628,11 +791,18 @@ impl Peers for Federation {
         server_id: &ServerId,
     ) -> Result<Standing, PairingRefused> {
         if let Some(pinned) = known {
-            return if pinned == server_id {
-                Ok(Standing::Paired)
-            } else {
-                Err(PairingRefused::ServerIdChanged)
-            };
+            if pinned == server_id {
+                return Ok(Standing::Paired);
+            }
+            // Kept for the Federation page, which says so with Unpair.
+            if let Err(e) = self
+                .store()
+                .peer_identity_refused(&endpoint.to_string())
+                .await
+            {
+                tracing::warn!(error = %e, "cannot keep that a paired server's id changed");
+            }
+            return Err(PairingRefused::ServerIdChanged);
         }
         let store = self.store();
         let hex = endpoint.to_string();
@@ -741,6 +911,8 @@ impl Peers for Federation {
                     name = %peer.display_name,
                     "a paired server unpaired: its pair is revoked here too"
                 );
+                self.end_remote_sessions(&peer.id, None);
+                self.close_plays(&peer.id);
                 self.forget_origin(&peer.server_id).await;
             }
             Ok(None) => {}

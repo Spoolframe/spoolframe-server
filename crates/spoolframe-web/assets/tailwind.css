@@ -435,6 +435,9 @@
   .cursor-pointer {
     cursor: pointer;
   }
+  .list-disc {
+    list-style-type: disc;
+  }
   .grid-cols-2 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -524,6 +527,12 @@
   }
   .gap-\[22px\] {
     gap: 22px;
+  }
+  .gap-x-2 {
+    column-gap: calc(var(--spacing) * 2);
+  }
+  .gap-y-1 {
+    row-gap: var(--spacing);
   }
   .self-center {
     align-self: center;
@@ -629,6 +638,9 @@
   }
   .pl-4 {
     padding-left: calc(var(--spacing) * 4);
+  }
+  .pl-5 {
+    padding-left: calc(var(--spacing) * 5);
   }
   .text-center {
     text-align: center;
@@ -791,6 +803,9 @@
   @media (hover: hover) {
     .hover\:text-ctp-text:hover {
       color: var(--ctp-text);
+    }
+    .hover\:underline:hover {
+      text-decoration-line: underline;
     }
   }
   @media (width < 48rem) {

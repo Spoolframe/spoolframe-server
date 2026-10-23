@@ -91,6 +91,8 @@ async fn start(client: &TestClient, session: &SessionId) -> PlaybackHandle {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;

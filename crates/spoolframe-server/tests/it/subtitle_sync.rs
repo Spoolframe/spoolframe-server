@@ -177,6 +177,8 @@ async fn play(client: &TestClient, session: &SessionId) -> PlaybackHandle {
                 bitmap: BitmapSubtitles::Auto,
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await

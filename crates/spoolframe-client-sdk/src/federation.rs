@@ -22,15 +22,62 @@
 //! Watching (P8-03): SB, the user's home, keeps their progress on SA's
 //! items. A paired server's item plays from that server (P8-04), and its
 //! progress goes here, by item ([`Session::update_watch_progress`]).
+//!
+//! Playing (P8-04): [`Session::start_remote_playback`] plays a `fed:` item
+//! from SA itself when this device reaches SA: it asks SB where SA is,
+//! dials SA once with a short budget, asks SB for a token for this device,
+//! redeems it on SA, and plays there. The [`RemotePlayback`]'s session is
+//! SA's, for that one item: read and control the playback through it as
+//! any other. Progress still goes to SB. Not reached, SB plays it from SA
+//! and on to this device (proxy mode, [`RemoteMode::Proxied`]): the
+//! playback is then SB's, read and controlled through this session. An
+//! HTTP player (a cast target) cannot present a token to SA, so its play
+//! is always proxied ([`Session::start_proxied_playback`]). A play that
+//! fails mid-way, SA or the route to it gone, is not moved to the other
+//! way: it ends, and is started again, which picks the way anew.
 
 use std::time::Duration;
 
-use spoolframe_protocol::federation::{PairServer, PeerServer, ShareLibraries};
-use spoolframe_protocol::{Reply, Request};
+use spoolframe_protocol::federation::{
+    PairServer, PeerServer, PlayTokenRedeemed, RedeemPlayToken, RemoteGranted, RemoteHints,
+    ShareLibraries,
+};
+use spoolframe_protocol::{Reply, Request, Response, Selection};
 use spoolframe_types::{LibraryId, MediaId, Namespace};
 
 use crate::session::unexpected;
-use crate::{SdkError, Session};
+use crate::{Playback, PlaybackOptions, SdkError, Session};
+
+/// How long a device tries to reach a paired server itself before it
+/// plays the item another way (P8-04): one dial, a few seconds.
+pub const DIRECT_DIAL: Duration = Duration::from_secs(5);
+
+/// How a paired server's item plays (P8-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteMode {
+    /// From the paired server to this device.
+    Direct,
+    /// Through the user's own server, which plays it from the paired one.
+    Proxied,
+}
+
+/// A paired server's item, playing (P8-04).
+#[derive(Debug, Clone)]
+pub struct RemotePlayback {
+    /// What the playback is read and controlled through: a session on the
+    /// paired server for this one item (direct), or the user's own
+    /// (proxied).
+    pub session: Session,
+    pub playback: Playback,
+    pub mode: RemoteMode,
+    /// The item as `session` names it: the paired server's own id
+    /// (direct), or the `fed:` id (proxied).
+    pub item: MediaId,
+    /// The paired server's relays, held with the play token for as long
+    /// as the play lives, when it went through them. A start that fails
+    /// lets them go at once.
+    _relays: Option<std::sync::Arc<crate::client::PlayRelays>>,
+}
 
 /// A server told that its libraries changed (P8-02): a paired server came
 /// online or went offline, or shared or stopped sharing a library. List
@@ -130,6 +177,175 @@ impl Session {
             position_ms: u64::try_from(position.as_millis()).unwrap_or(u64::MAX),
         };
         self.done(request).await
+    }
+
+    /// Where the paired server `id` (a `fed:` item) is from may be
+    /// dialled, and whether this session's server is connected to it
+    /// (P8-04). [`SdkError::Unsupported`] without
+    /// [`crate::Experimental::federation`].
+    pub async fn remote_hints(&self, id: &MediaId) -> Result<RemoteHints, SdkError> {
+        self.federated()?;
+        match self.call(Request::RemoteHints { id: id.clone() }).await? {
+            Reply::RemoteHints(hints) => Ok(hints),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// A play token for `id`, a `fed:` item, bound to this device: this
+    /// session's server vouches for its user to the paired server (P8-04).
+    /// [`SdkError::OriginOffline`] when that server is offline to this
+    /// one. Each play asks its own; it works once.
+    pub async fn remote_grant(&self, id: &MediaId) -> Result<RemoteGranted, SdkError> {
+        self.federated()?;
+        let request = Request::RemoteGrant { id: id.clone() };
+        match self.call(request).await? {
+            Reply::RemoteGranted(granted) => Ok(granted),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Play `id`, a paired server's (`fed:`) item (P8-04): from that server
+    /// when this device reaches it within [`DIRECT_DIAL`], with `selection`
+    /// and `options` as [`Session::start_playback_with`] takes them.
+    /// [`SdkError::OriginOffline`] when the paired server is offline to
+    /// this session's server. Report progress with
+    /// [`Session::update_watch_progress`] on this session, by `id`.
+    pub async fn start_remote_playback(
+        &self,
+        id: &MediaId,
+        selection: Option<Selection>,
+        options: PlaybackOptions,
+    ) -> Result<RemotePlayback, SdkError> {
+        self.federated()?;
+        if id.namespace() != Namespace::Federated {
+            return Err(SdkError::InvalidInput(format!(
+                "{id} is not a paired server's item"
+            )));
+        }
+        let hints = self.remote_hints(id).await?;
+        if !hints.online {
+            return Err(SdkError::OriginOffline);
+        }
+        let origin = crate::client::parse_id(&hints.endpoint_id)?;
+        self.client
+            .remember_paired_server(self.server, origin, &hints.addrs, &hints.relays);
+        // Through the paired server's own relay, the token is what lets
+        // this device through (P8-04): it is asked first, and a dial that
+        // fails leaves it to expire unused. Without relays, the dial comes
+        // first, and a device that cannot reach the server asks for none.
+        let relayed = !self.client.relays_to(origin).is_empty();
+        let (early, relays) = if relayed {
+            let granted = self.remote_grant(id).await?;
+            let relays = self.client.hold_play_token(origin, &granted.token).await;
+            (Some(granted), relays)
+        } else {
+            (None, None)
+        };
+        match self.reach_origin(origin, &hints).await {
+            Ok(()) => {}
+            // Another server answered at the paired one's key: refused,
+            // never played around.
+            Err(e @ SdkError::ServerIdChanged { .. }) => return Err(e),
+            // Not reached: this session's server plays it from there, and
+            // on to this device (proxy mode).
+            Err(e) => {
+                tracing::info!(%id, error = %e, "a paired server is not reached; playing through this server");
+                drop(relays);
+                return self.start_proxied_playback(id, selection, options).await;
+            }
+        }
+        let granted = match early {
+            Some(granted) => granted,
+            None => self.remote_grant(id).await?,
+        };
+        let redeemed = match self
+            .client
+            .call(
+                origin,
+                None,
+                Request::RedeemPlayToken(RedeemPlayToken {
+                    token: granted.token,
+                }),
+            )
+            .await?
+        {
+            Response::Ok(Reply::PlayTokenRedeemed(redeemed)) => redeemed,
+            Response::Ok(other) => return Err(unexpected(other)),
+            Response::Err(e) => return Err(SdkError::from_server(e)),
+        };
+        let PlayTokenRedeemed { session, item, .. } = redeemed;
+        let on_origin = self.on_paired_server(origin, session);
+        let playback = on_origin
+            .start_playback_with(&item, selection, options)
+            .await?;
+        Ok(RemotePlayback {
+            session: on_origin,
+            playback,
+            mode: RemoteMode::Direct,
+            item,
+            _relays: relays.map(std::sync::Arc::new),
+        })
+    }
+
+    /// Play `id`, a paired server's item, through this session's server
+    /// (proxy mode, P8-04): it plays it from the paired server in its own
+    /// name, and on to this device. Its reads and controls are this
+    /// session's, as any playback's.
+    pub async fn start_proxied_playback(
+        &self,
+        id: &MediaId,
+        selection: Option<Selection>,
+        options: PlaybackOptions,
+    ) -> Result<RemotePlayback, SdkError> {
+        self.federated()?;
+        let playback = self.start_playback_with(id, selection, options).await?;
+        Ok(RemotePlayback {
+            session: self.clone(),
+            playback,
+            mode: RemoteMode::Proxied,
+            item: id.clone(),
+            _relays: None,
+        })
+    }
+
+    /// Dial paired server `origin`, as `hints` name it, once, within
+    /// [`DIRECT_DIAL`]: `Ok` once it answered as the server id its pair
+    /// knows.
+    async fn reach_origin(
+        &self,
+        origin: iroh::EndpointId,
+        hints: &RemoteHints,
+    ) -> Result<(), SdkError> {
+        let link = self.client.link(origin);
+        let conn = tokio::time::timeout(DIRECT_DIAL, link.connection(&self.client))
+            .await
+            .map_err(|_| {
+                SdkError::Unreachable("the paired server did not answer in time".into())
+            })??;
+        if conn.info.server_id != hints.server_id {
+            return Err(SdkError::ServerIdChanged {
+                endpoint_id: hints.endpoint_id.clone(),
+                saved: hints.server_id.clone(),
+                now: conn.info.server_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// A session on paired server `origin` for what `token` opened there:
+    /// this user's, as their own server knows them, for the app to show.
+    fn on_paired_server(
+        &self,
+        origin: iroh::EndpointId,
+        token: spoolframe_protocol::SessionId,
+    ) -> Session {
+        Session {
+            server: origin,
+            token,
+            remembered: None,
+            password_change_required: std::sync::Arc::default(),
+            ..self.clone()
+        }
     }
 
     /// `Ok` when the server turned federation on for this session.

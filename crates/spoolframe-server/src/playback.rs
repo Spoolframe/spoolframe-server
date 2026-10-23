@@ -356,6 +356,25 @@ pub async fn time_first_segment(
     now.log(&id);
 }
 
+/// What "now + next" and conversion cleanup count a playback by
+/// (P8-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    /// A device: its endpoint.
+    Endpoint(String),
+    /// One of a paired server's users, whose plays share that server's
+    /// one endpoint: their proxied session, by its hash.
+    ProxiedSession(String),
+}
+
+impl Holder {
+    /// A proxied session's: each of a paired server's users counts as a
+    /// device of their own, so one's start never ends another's play.
+    pub fn session_holder(session: &SessionId) -> Self {
+        Self::ProxiedSession(crate::auth::SessionToken(session.0.clone()).hash())
+    }
+}
+
 /// One playback.
 #[derive(Debug, Clone)]
 pub struct Playback {
@@ -401,6 +420,16 @@ pub struct Playback {
     /// What the screen showed when it was planned (PGPU-06): a re-plan
     /// that does not say again plans for it.
     pub display: Option<DisplayCapabilities>,
+    /// What the device that shows it plays, in place of its connection's
+    /// Hello's (P8-04): a paired server's proxy plans for its own device.
+    /// Its re-plans plan for it too.
+    pub capabilities: Option<spoolframe_types::ClientCapabilities>,
+    /// What "now + next" and conversion cleanup count it by (P8-04).
+    holder: Holder,
+    /// Where it plays from, when that is a paired server (P8-04, on the
+    /// server whose user plays): its bytes come from there, and pass
+    /// through.
+    pub remote: Option<Arc<crate::federation::RemotePlay>>,
     /// The file's picture, width × height (PX-24): what direct play
     /// writes.
     pub video_size: Option<(u32, u32)>,
@@ -619,6 +648,14 @@ pub struct Opened {
     pub quality: Quality,
     /// What the screen shows (PGPU-06), if the start said.
     pub display: Option<DisplayCapabilities>,
+    /// What the device plays, in place of Hello's (P8-04), if the start
+    /// said.
+    pub capabilities: Option<spoolframe_types::ClientCapabilities>,
+    /// What it is counted by (P8-04): its endpoint, or a paired server's
+    /// proxied session.
+    pub holder: Holder,
+    /// The paired server it plays from (P8-04).
+    pub remote: Option<Arc<crate::federation::RemotePlay>>,
     /// The file's picture, width × height.
     pub video_size: Option<(u32, u32)>,
     /// How long it took to start (PX-24); its first segment filled in
@@ -1156,6 +1193,15 @@ impl Playbacks {
 
     /// Why `handle`, which is not open, cannot be used: an admin stopped
     /// it, its session ended, or it is unknown or idled out.
+    /// What a client using `handle`, which has ended, is told.
+    pub fn gone_error(&self, handle: &str) -> spoolframe_protocol::Error {
+        match self.gone(handle) {
+            Refusal::Stopped => spoolframe_protocol::Error::PlaybackStopped,
+            Refusal::SignedOut => spoolframe_protocol::Error::Unauthenticated,
+            _ => spoolframe_protocol::Error::PlaybackExpired,
+        }
+    }
+
     fn gone(&self, handle: &str) -> Refusal {
         let mut let_go = self.let_go.lock();
         let now = self.clock.now();
@@ -1222,7 +1268,7 @@ impl Playbacks {
         if opened.conversion.is_none() {
             let mut direct: Vec<(&String, &Playback)> = handles
                 .iter()
-                .filter(|(_, p)| p.endpoint == opened.endpoint && p.conversion.is_none())
+                .filter(|(_, p)| p.holder == opened.holder && p.conversion.is_none())
                 .collect();
             let over = (direct.len() + 1).saturating_sub(DIRECT_MOST);
             direct.retain(|(_, p)| !p.reading(now));
@@ -1263,6 +1309,9 @@ impl Playbacks {
                 source: opened.source,
                 quality: opened.quality,
                 display: opened.display,
+                capabilities: opened.capabilities,
+                holder: opened.holder.clone(),
+                remote: opened.remote,
                 video_size: opened.video_size,
                 start: opened.start,
                 requested: opened.requested,
@@ -1500,6 +1549,15 @@ impl Playbacks {
         self.lock().get(&handle.0).map(|playback| playback.revision)
     }
 
+    /// A playback played from a paired server through this one (P8-04),
+    /// changed as that server answered a re-plan: `change` sets what it
+    /// told.
+    pub fn relayed(&self, handle: &PlaybackHandle, change: impl FnOnce(&mut Playback)) {
+        if let Some(playback) = self.lock().get_mut(&handle.0) {
+            change(playback);
+        }
+    }
+
     pub fn revised(&self, handle: &PlaybackHandle) {
         if let Some(playback) = self.lock().get_mut(&handle.0) {
             playback.revision += 1;
@@ -1524,11 +1582,7 @@ impl Playbacks {
         let handles = self.lock();
         let Some(playback) = handles.get(&handle.0) else {
             drop(handles);
-            return Err(match self.gone(&handle.0) {
-                Refusal::Stopped => spoolframe_protocol::Error::PlaybackStopped,
-                Refusal::SignedOut => spoolframe_protocol::Error::Unauthenticated,
-                _ => spoolframe_protocol::Error::PlaybackExpired,
-            });
+            return Err(self.gone_error(&handle.0));
         };
         if playback.progress_superseded || sequence <= playback.progress_sequence {
             return Err(spoolframe_protocol::Error::StaleProgress);
@@ -1564,7 +1618,23 @@ impl Playbacks {
         self.ended_all(ended, why);
     }
 
-    /// End `endpoint`'s converted playbacks that are not playing: it is
+    /// End `handle` as stopped, as an admin's Stop does: its client is
+    /// told `PlaybackStopped` on its next use, so it does not start it
+    /// again. A paired server's playback that one stopped (P8-04).
+    pub fn end_stopped(&self, handle: &PlaybackHandle, why: EndReason) {
+        let mut handles = self.lock();
+        let ended = handles.remove_entry(&handle.0);
+        if ended.is_some() {
+            self.let_go
+                .lock()
+                .insert(handle.0.clone(), (self.clock.now(), Refusal::Stopped));
+        }
+        drop(handles);
+        self.ended_all(ended, why);
+    }
+
+    /// End `holder`'s (its endpoint, or a paired server's proxied
+    /// session, P8-04) converted playbacks that are not playing: it is
     /// starting another from connection `starting`, and no slot is free
     /// for it, so its own idle encodes give way (one device's two
     /// playbacks with `max_jobs = 1`). A killed app's always does
@@ -1572,22 +1642,22 @@ impl Playbacks {
     /// [`READING`] is playing and stays, and the new start is then refused
     /// as busy: a track that stops mid-play is worse than a next track
     /// that waits. Returns how many.
-    pub fn end_conversions_on(&self, endpoint: &str, starting: u64) -> usize {
-        self.end_conversions_on_where(endpoint, starting, |p| p.conversion.is_some())
+    pub fn end_conversions_on(&self, holder: &Holder, starting: u64) -> usize {
+        self.end_conversions_on_where(holder, starting, |p| p.conversion.is_some())
     }
 
     /// [`Playbacks::end_conversions_on`], counting the playbacks `holds`
     /// picks.
     fn end_conversions_on_where(
         &self,
-        endpoint: &str,
+        holder: &Holder,
         starting: u64,
         holds: impl Fn(&Playback) -> bool,
     ) -> usize {
         let now = self.clock.now();
         let starting = self.opened(starting);
         self.end_where(
-            |p| p.endpoint == endpoint && holds(p) && (p.left_behind(starting) || !p.reading(now)),
+            |p| &p.holder == holder && holds(p) && (p.left_behind(starting) || !p.reading(now)),
             EndReason::Replaced,
         )
     }
@@ -1600,7 +1670,8 @@ impl Playbacks {
             .map(|at| (connection, *at))
     }
 
-    /// Make room on `endpoint` for a playback that connection `starting`
+    /// Make room on `holder` (its endpoint, or a paired server's proxied
+    /// session, P8-04) for a playback that connection `starting`
     /// is starting: a device keeps "now + next" ([`NOW_AND_NEXT`]), the
     /// one playing now and the next it prepares (an iOS app opens the next
     /// track while this one plays, for gapless audio). A killed app's
@@ -1614,15 +1685,15 @@ impl Playbacks {
     /// [`DEVICE_MOST`]: past that the start is refused ([`DeviceFull`]).
     /// Direct play holds no slot, and is left alone. Returns how many
     /// ended.
-    pub fn make_room_for_next(&self, endpoint: &str, starting: u64) -> Result<usize, DeviceFull> {
-        self.make_room_for_next_where(endpoint, starting, |p| p.conversion.is_some())
+    pub fn make_room_for_next(&self, holder: &Holder, starting: u64) -> Result<usize, DeviceFull> {
+        self.make_room_for_next_where(holder, starting, |p| p.conversion.is_some())
     }
 
     /// [`Playbacks::make_room_for_next`], counting the playbacks `holds`
     /// picks.
     fn make_room_for_next_where(
         &self,
-        endpoint: &str,
+        holder: &Holder,
         starting: u64,
         holds: impl Fn(&Playback) -> bool,
     ) -> Result<usize, DeviceFull> {
@@ -1631,7 +1702,7 @@ impl Playbacks {
         let mut handles = self.lock();
         let (left_behind, held): (Vec<(&String, &Playback)>, Vec<_>) = handles
             .iter()
-            .filter(|(_, p)| p.endpoint == endpoint && holds(p))
+            .filter(|(_, p)| &p.holder == holder && holds(p))
             .partition(|(_, p)| p.left_behind(starting));
         // One stays besides the one starting: "now", once that is "next".
         let over = held.len().saturating_sub(NOW_AND_NEXT - 1);
@@ -1726,6 +1797,15 @@ impl Playbacks {
     /// End every playback of `item`, `why`. Returns how many.
     pub fn end_item(&self, item: &MediaId, why: EndReason) -> usize {
         self.end_where(|p| &p.item == item, why)
+    }
+
+    /// Whether `user_id` plays `item` here now: a paired server's item
+    /// played through this server (P8-04) is such a play, its play kept
+    /// by its playback.
+    pub fn playing(&self, user_id: &str, item: &MediaId) -> bool {
+        self.lock()
+            .values()
+            .any(|p| p.viewer.user_id == user_id && p.item == *item)
     }
 
     /// The sessions with a playback open, each once.
@@ -2056,6 +2136,11 @@ pub(crate) mod tests {
     }
 
     /// Session `s`'s playback of the movie on `endpoint`.
+    /// The holder a device with `endpoint` is.
+    fn device(endpoint: &str) -> Holder {
+        Holder::Endpoint(endpoint.into())
+    }
+
     pub(crate) fn opened_on(endpoint: &str) -> Opened {
         Opened {
             trace: PlaybackTrace::untraced(),
@@ -2086,6 +2171,9 @@ pub(crate) mod tests {
             requested: Instant::now(),
             connection: 0,
             display: None,
+            capabilities: None,
+            holder: Holder::Endpoint(endpoint.into()),
+            remote: None,
             played: played(),
         }
     }
@@ -2329,8 +2417,8 @@ pub(crate) mod tests {
         let p = Playbacks::default();
         let direct = start_on(&p, "tv");
         // Direct play holds no slot: it stays.
-        assert_eq!(p.end_conversions_on("tv", 0), 0);
-        assert_eq!(p.make_room_for_next("tv", 0), Ok(0));
+        assert_eq!(p.end_conversions_on(&device("tv"), 0), 0);
+        assert_eq!(p.make_room_for_next(&device("tv"), 0), Ok(0));
         assert!(
             p.use_handle(&direct, &SessionId("s".into()), "tv", Using::Plays)
                 .is_ok()
@@ -2345,7 +2433,7 @@ pub(crate) mod tests {
     }
 
     fn start_next_from(p: &Playbacks, endpoint: &str, connection: u64) -> PlaybackHandle {
-        p.make_room_for_next_where(endpoint, connection, |_| true)
+        p.make_room_for_next_where(&device(endpoint), connection, |_| true)
             .expect("room on the device");
         start_from(p, endpoint, connection)
     }
@@ -2398,8 +2486,9 @@ pub(crate) mod tests {
         p.use_handle(&now, &s, "phone", Using::Plays).unwrap();
         clock.advance(Duration::from_secs(1));
         // The next, as StartPlayback starts it with no slot free.
-        p.make_room_for_next_where("phone", 0, |_| true).unwrap();
-        p.end_conversions_on_where("phone", 0, |_| true);
+        p.make_room_for_next_where(&device("phone"), 0, |_| true)
+            .unwrap();
+        p.end_conversions_on_where(&device("phone"), 0, |_| true);
         let next = start_on(&p, "phone");
         assert!(
             p.use_handle(&now, &s, "phone", Using::Plays).is_ok(),
@@ -2411,6 +2500,39 @@ pub(crate) mod tests {
             Refusal::Expired
         );
         assert!(p.use_handle(&next, &s, "phone", Using::Plays).is_ok());
+    }
+
+    /// A paired server plays its users' items through its one endpoint
+    /// (P8-04), each play on a connection of its own and in a session of
+    /// its own: each session is its own "now + next", so one user's start
+    /// does not take another's playback for a killed app's and end it,
+    /// nor does it end their conversions for room.
+    #[test]
+    fn a_paired_server_s_users_do_not_end_each_other_s_plays() {
+        let p = Playbacks::default();
+        let s = SessionId("s".into());
+        let start = |session: &str| {
+            let holder = Holder::session_holder(&SessionId(session.into()));
+            let connection = p.connection_opened();
+            p.make_room_for_next_where(&holder, connection, |_| true)
+                .expect("room on the session");
+            p.end_conversions_on_where(&holder, connection, |_| true);
+            p.start(
+                Playbacks::new_handle(),
+                Opened {
+                    connection,
+                    holder,
+                    ..opened_on("sb")
+                },
+            )
+        };
+        let bob = start("bob");
+        let carol = start("carol");
+        let dave = start("dave");
+        for handle in [&bob, &carol, &dave] {
+            assert!(p.use_handle(handle, &s, "sb", Using::Plays).is_ok());
+        }
+        assert!(p.ended().is_empty());
     }
 
     /// An app that starts more than the next while one track is read: the
@@ -2455,7 +2577,7 @@ pub(crate) mod tests {
         p.connection_closed(killed);
         let relaunched = p.connection_opened();
         assert_eq!(
-            p.make_room_for_next_where("phone", relaunched, |_| true),
+            p.make_room_for_next_where(&device("phone"), relaunched, |_| true),
             Ok(2)
         );
     }
@@ -2474,11 +2596,17 @@ pub(crate) mod tests {
         p.use_handle(&now, &s, "phone", Using::Plays).unwrap();
         clock.advance(Duration::from_millis(1));
         let relaunched = p.connection_opened();
-        assert_eq!(p.end_conversions_on_where("phone", relaunched, |_| true), 1);
+        assert_eq!(
+            p.end_conversions_on_where(&device("phone"), relaunched, |_| true),
+            1
+        );
         // The older connection's own start leaves its playbacks alone.
         let mine = start_next_from(&p, "phone", killed);
         p.use_handle(&mine, &s, "phone", Using::Plays).unwrap();
-        assert_eq!(p.end_conversions_on_where("phone", killed, |_| true), 0);
+        assert_eq!(
+            p.end_conversions_on_where(&device("phone"), killed, |_| true),
+            0
+        );
     }
 
     /// A device that reconnects and reads its playback on keeps it: read
@@ -2525,7 +2653,7 @@ pub(crate) mod tests {
             held.push(h);
         }
         assert_eq!(
-            p.make_room_for_next_where("phone", 0, |_| true),
+            p.make_room_for_next_where(&device("phone"), 0, |_| true),
             Err(DeviceFull)
         );
         for h in &held {
@@ -2535,7 +2663,10 @@ pub(crate) mod tests {
         clock.advance(READING);
         p.use_handle(&held[1], &s, "phone", Using::Plays).unwrap();
         p.use_handle(&held[2], &s, "phone", Using::Plays).unwrap();
-        assert_eq!(p.make_room_for_next_where("phone", 0, |_| true), Ok(1));
+        assert_eq!(
+            p.make_room_for_next_where(&device("phone"), 0, |_| true),
+            Ok(1)
+        );
     }
 
     /// A playback paused for most of the idle limit is alive, and is not
@@ -2551,7 +2682,7 @@ pub(crate) mod tests {
         clock.advance(Duration::from_secs(29 * 60));
         p.sweep();
         assert_eq!(p.counts().ended, 0, "ended while paused");
-        assert_eq!(p.end_conversions_on_where("tv", 0, |_| true), 1);
+        assert_eq!(p.end_conversions_on_where(&device("tv"), 0, |_| true), 1);
         let why: Vec<EndReason> = p.ended().into_iter().map(|e| e.why).collect();
         assert_eq!(why, [EndReason::Replaced]);
     }

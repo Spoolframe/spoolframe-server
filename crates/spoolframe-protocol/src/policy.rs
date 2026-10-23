@@ -109,6 +109,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ListShareCandidates { .. }
         // PX-52: a read.
         | Request::RecentlyPlayed { .. }
+        // P8-04: where a paired server is, read.
+        | Request::RemoteHints { .. }
         // A read; settings saved twice are saved once, and shuffle turned
         // on twice shuffles once.
         | Request::UpcomingInPlaylist { .. }
@@ -211,6 +213,10 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::PairServer(_)
         // Sharing is a change an admin confirmed (P8-03).
         | Request::ShareLibraries(_)
+        // A play token works once (P8-04).
+        | Request::RedeemPlayToken(_)
+        // Each mints a token and counts a play (P8-04).
+        | Request::RemoteGrant { .. }
         // Leaving ends every session; a second try finds none (PX-47).
         | Request::LeaveServer
         // PX-40: a second create is a second playlist; an edit's adds

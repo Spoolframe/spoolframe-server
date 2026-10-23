@@ -194,6 +194,7 @@ struct Sa {
     peers: Arc<FakePeers>,
     strangers: Arc<FakeStrangers>,
     live: Live,
+    max_streams: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Sa {
@@ -201,6 +202,7 @@ impl Sa {
         let peers = Arc::new(FakePeers::default());
         let strangers = Arc::new(FakeStrangers::default());
         let live = Live::default();
+        let max_streams = Arc::new(std::sync::atomic::AtomicUsize::new(crate::MAX_STREAMS));
         let handler = FederationProtocol::new(
             peers.clone(),
             strangers.clone(),
@@ -208,7 +210,8 @@ impl Sa {
             ServerId::parse(SA_ID).unwrap(),
             Arc::new(|| "Alice's server".to_owned()),
             live.clone(),
-        );
+        )
+        .with_max_streams(max_streams.clone());
         let router = Router::builder(endpoint(vec![FEDERATION_ALPN.to_vec()]).await)
             .accept(FEDERATION_ALPN, handler)
             .spawn();
@@ -217,6 +220,7 @@ impl Sa {
             peers,
             strangers,
             live,
+            max_streams,
         }
     }
 
@@ -461,7 +465,23 @@ async fn a_paired_server_unpairs_and_its_connection_closes() {
 /// is answered.
 #[tokio::test]
 async fn a_connection_s_streams_past_the_limit_are_reset() {
+    streams_past(crate::MAX_STREAMS, None).await;
+}
+
+/// The server's setting moves the limit for a connection made after it
+/// (P8-04): four held streams fill a connection when the setting is four.
+#[tokio::test]
+async fn a_connection_s_stream_limit_is_the_server_s_setting() {
+    streams_past(4, Some(4)).await;
+}
+
+/// `limit` streams held fill a connection made with the server's limit
+/// set to `set`, if given.
+async fn streams_past(limit: usize, set: Option<usize>) {
     let sa = Sa::start().await;
+    if let Some(set) = set {
+        sa.max_streams.store(set, Ordering::Relaxed);
+    }
     let sb = endpoint(Vec::new()).await;
     sa.peers
         .paired
@@ -471,7 +491,7 @@ async fn a_connection_s_streams_past_the_limit_are_reset() {
     // Streams that never finish their request: each holds its place for
     // the request's wait.
     let mut held = Vec::new();
-    for _ in 0..crate::handler::MAX_STREAMS {
+    for _ in 0..limit {
         let (mut send, recv) = dialed.connection().open_bi().await.unwrap();
         send.write_all(&[0]).await.unwrap();
         held.push((send, recv));
@@ -595,6 +615,7 @@ fn assertion(item: &str) -> AssertUser {
         client_endpoint: "ab".repeat(32),
         item: item.into(),
         scope: TokenScope::Play,
+        preferences: None,
     }
 }
 

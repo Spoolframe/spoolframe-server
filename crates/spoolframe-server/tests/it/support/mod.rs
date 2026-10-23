@@ -1516,6 +1516,21 @@ impl TestServer {
         }
     }
 
+    /// A new connection from `endpoint`'s device, as after the server let
+    /// it go. It has not said Hello.
+    pub async fn client_from(&self, endpoint: &Endpoint) -> TestClient {
+        let conn = endpoint
+            .connect(self.server.addr(), CLIENT_ALPN)
+            .await
+            .unwrap();
+        TestClient {
+            endpoint: endpoint.clone(),
+            conn,
+            instance: Arc::default(),
+            controls: Arc::default(),
+        }
+    }
+
     /// A client whose only way to the server is loopback: its one socket is
     /// bound to `127.0.0.1` and it dials the server's IPv4 port there, so
     /// the server sees it at `127.0.0.1` whatever other paths this host has.

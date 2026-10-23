@@ -1219,6 +1219,12 @@ mod on_demand {
             .await
             .unwrap();
         assert_eq!(request.items, 1);
+        // The asker looks at the rules once as it starts, then not for an
+        // hour: once it has asked for the first episode, that look is
+        // over. Gained before it, the episode would be its, not this
+        // follow's.
+        s.on_demand_copy(&request.row.id, &media(MediaKind::Episode, "12"), None)
+            .await;
         s.catalog.gain(&later);
         assert_eq!(s.pool.follow_requests().await.unwrap(), 1);
         let copy = s.on_demand_copy(&request.row.id, &later, None).await;

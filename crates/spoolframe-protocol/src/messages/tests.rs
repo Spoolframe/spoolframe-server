@@ -234,6 +234,8 @@ fn every_request_round_trips() {
             bitmap: BitmapSubtitles::Text,
             quality: Default::default(),
             display: None,
+            capabilities: None,
+            onward_share: None,
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -242,6 +244,8 @@ fn every_request_round_trips() {
             bitmap: BitmapSubtitles::Auto,
             quality: Default::default(),
             display: None,
+            capabilities: None,
+            onward_share: None,
         },
         Request::StopPlayback {
             handle: crate::PlaybackHandle("h".into()),
@@ -272,6 +276,7 @@ fn every_request_round_trips() {
             bitmap: BitmapSubtitles::BurnIn,
             position_ms: 61_000,
             display: None,
+            onward_share: None,
         },
         Request::ReadSubtitleSegment {
             handle: crate::PlaybackHandle("h".into()),
@@ -1569,11 +1574,50 @@ fn a_start_playback_without_a_display_decodes_as_none() {
     assert!(
         matches!(
             envelope.request,
-            Request::StartPlayback { display: None, .. }
+            Request::StartPlayback {
+                display: None,
+                capabilities: None,
+                ..
+            }
         ),
         "{:?}",
         envelope.request
     );
+}
+
+/// A start's capabilities in place of Hello's (P8-04) are read back; one
+/// without them is written as before, with no such key.
+#[test]
+fn a_start_playback_s_capabilities_round_trip_and_are_left_out_when_none() {
+    let start = |capabilities| Request::StartPlayback {
+        id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
+        selection: None,
+        start_ms: None,
+        bitmap: BitmapSubtitles::Auto,
+        quality: Quality::Original,
+        display: None,
+        capabilities,
+        onward_share: None,
+    };
+    let caps = spoolframe_types::ClientCapabilities {
+        max_bitrate: Some(4_000_000),
+        ..Default::default()
+    };
+    let decoded: Request =
+        codec::decode(&codec::encode(&start(Some(caps.clone()))).unwrap()).unwrap();
+    assert!(
+        matches!(&decoded, Request::StartPlayback { capabilities: Some(c), .. } if *c == caps),
+        "{decoded:?}"
+    );
+    let plain = codec::encode(&start(None)).unwrap();
+    let value: ciborium::Value = ciborium::from_reader(plain.as_slice()).unwrap();
+    let keys: Vec<String> = value
+        .as_map()
+        .unwrap()
+        .iter()
+        .filter_map(|(k, _)| k.as_text().map(str::to_owned))
+        .collect();
+    assert!(!keys.contains(&"capabilities".to_owned()), "{keys:?}");
 }
 
 /// One that sends a display has it read back.
@@ -1590,6 +1634,8 @@ fn a_start_playback_s_display_round_trips() {
         bitmap: BitmapSubtitles::Auto,
         quality: Quality::Original,
         display: Some(display.clone()),
+        capabilities: None,
+        onward_share: None,
     };
     let decoded: Request = codec::decode(&codec::encode(&request).unwrap()).unwrap();
     assert!(
@@ -1901,6 +1947,8 @@ fn a_request_missing_a_field_is_refused() {
             bitmap: BitmapSubtitles::Auto,
             quality: Default::default(),
             display: None,
+            capabilities: None,
+            onward_share: None,
         },
         &["selection", "start_ms", "bitmap"],
     );
@@ -1918,6 +1966,7 @@ fn a_request_missing_a_field_is_refused() {
             bitmap: BitmapSubtitles::Auto,
             position_ms: 0,
             display: None,
+            onward_share: None,
         },
         &["bitmap"],
     );
@@ -4054,4 +4103,50 @@ mod music_downloads {
             liked: vec![OfflineWatchOutcome::Older],
         }));
     }
+}
+
+/// P8-04: a paired server's share of its uplink, on a re-plan it passes
+/// on, is not on the wire when it has none, and a re-plan with none reads
+/// as one with no share.
+#[test]
+fn a_re_plan_with_no_onward_share_has_none_on_the_wire() {
+    let change = Request::ChangeQuality {
+        handle: crate::PlaybackHandle("h".into()),
+        quality: Quality::default(),
+        bitmap: BitmapSubtitles::default(),
+        position_ms: 0,
+        display: None,
+        onward_share: None,
+    };
+    let bytes = codec::encode(&change).unwrap();
+    let value: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+    let ciborium::Value::Map(fields) = value else {
+        panic!("{value:?}");
+    };
+    assert!(
+        !fields
+            .iter()
+            .any(|(k, _)| k.as_text() == Some("onward_share")),
+        "{fields:?}"
+    );
+    assert_eq!(codec::decode::<Request>(&bytes).unwrap(), change);
+    round_trip(Request::ChangeQuality {
+        handle: crate::PlaybackHandle("h".into()),
+        quality: Quality::default(),
+        bitmap: BitmapSubtitles::default(),
+        position_ms: 0,
+        display: None,
+        onward_share: Some(100_000),
+    });
+}
+
+/// P8-04: a paired server's item's playback that ended there goes to the
+/// client with what its next use is told; an older peer reads it as an
+/// event it does not know.
+#[test]
+fn a_playback_ended_event_goes_both_ways() {
+    round_trip(Event::PlaybackEnded {
+        handle: crate::PlaybackHandle("h".into()),
+        error: Error::PlaybackStopped,
+    });
 }

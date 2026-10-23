@@ -330,6 +330,27 @@ federation {
   sync_interval_secs = 3600;
   cache_max_mb = 2048;
   cache_total_mb = 8192;
+
+  # What a paired server may send and ask (P8-04). Raise the sync's
+  # limits for a very large library (a 300,000-track music collection
+  # needs sync_max_items = 300000 at least). Each has a floor. Applies at
+  # once; max_streams to the connections made after.
+  # Pages and items in one library's sync, and items cached of one
+  # paired server, every library together.
+  sync_max_pages = 2000;
+  sync_max_items = 200000;
+  max_cached_items = 500000;
+  # One walk of a library answers every pair's sync for this long.
+  walk_reuse_secs = 60;
+  # Streams a pair's connection is answered on at once.
+  max_streams = 16;
+  # Images and play starts a pair may ask for in a burst; past it, a
+  # hundred images and one play a second.
+  artwork_burst = 200;
+  assertion_burst = 30;
+  # Play tokens that work at once, for one user of a pair and for a pair.
+  tokens_per_user = 10;
+  tokens_per_server = 500;
 }
 
 # When an item counts as started, and as watched (without credits markers).

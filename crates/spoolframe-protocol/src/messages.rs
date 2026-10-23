@@ -301,6 +301,20 @@ pub enum Request {
         // compat(v1): required at the protocol reset
         #[serde(default)]
         display: Option<DisplayCapabilities>,
+        /// What the device that will show it plays (P8-04), in place of
+        /// Hello's, for this playback and its re-plans: a server that plays
+        /// on to one of its own devices (a paired server's proxy) has the
+        /// plan made for that device over its one connection. `display`
+        /// applies over it. Left out, Hello's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<spoolframe_types::ClientCapabilities>,
+        /// The share of an uplink the playback goes on over, bits per
+        /// second (P8-04): a server that plays it on to its own device
+        /// (a paired server's proxy) sends its own, at the start and at
+        /// each re-plan, and the plan keeps under it as under this
+        /// server's own share. Left out, this server's share alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        onward_share: Option<u64>,
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
@@ -494,6 +508,13 @@ pub enum Request {
         // compat(v1): required at the protocol reset
         #[serde(default)]
         display: Option<DisplayCapabilities>,
+        /// The share of an uplink the playback goes on over, bits per
+        /// second (P8-04): a server that plays it on to its own device
+        /// (a paired server's proxy) sends its own, at the start and at
+        /// each re-plan, and the plan keeps under it as under this
+        /// server's own share. Left out, this server's share alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        onward_share: Option<u64>,
     },
     /// Plan a playing playback again for `quality` (P6-06): the viewer
     /// chose another, or, with `Auto`, the device found its link too slow
@@ -513,6 +534,13 @@ pub enum Request {
         // compat(v1): required at the protocol reset
         #[serde(default)]
         display: Option<DisplayCapabilities>,
+        /// The share of an uplink the playback goes on over, bits per
+        /// second (P8-04): a server that plays it on to its own device
+        /// (a paired server's proxy) sends its own, at the start and at
+        /// each re-plan, and the plan keeps under it as under this
+        /// server's own share. Left out, this server's share alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        onward_share: Option<u64>,
     },
     /// A converted playback's HLS playlist (P2-05).
     GetManifest {
@@ -717,6 +745,43 @@ pub enum Request {
     SetServerRow {
         server_id: String,
         shown: bool,
+    },
+
+    /// Experimental (`federation`, P8-04; see [`crate::federation`]):
+    /// redeem a play token a paired server got from this one for one of
+    /// its users: `PlayTokenRedeemed`, a session for that one item's
+    /// playback. Pre-auth, on the strangers' budget as a sign-in is. The
+    /// token works once, from the endpoint it was minted for, while its
+    /// pair and the library's share are live; every failure is
+    /// `Unauthenticated`, and the device asks its home server for a new
+    /// token. The session reaches `StartPlayback` of that item and its own
+    /// playback's controls and reads; anything else is `Unauthenticated`.
+    /// Unsupported unless this connection's `Hello` named the feature.
+    RedeemPlayToken(crate::federation::RedeemPlayToken),
+
+    /// Experimental (`federation`, P8-04): where the paired server that
+    /// `id`, a `fed:` item, is from may be dialled (`RemoteHints`), and
+    /// whether this server holds a connection to it now. The device dials
+    /// it with a short budget and asks `RemoteGrant` once it reached it; it
+    /// plays `id` from this server otherwise. An id that is not a paired
+    /// server's is `InvalidInput`; one not available here is `NotFound`.
+    /// Unsupported unless this connection's `Hello` named the feature.
+    RemoteHints {
+        id: MediaId,
+    },
+
+    /// Experimental (`federation`, P8-04): vouch for the session's user to
+    /// the paired server `id` is from, for a play token bound to this
+    /// device (`RemoteGranted`), which it redeems there
+    /// (`RedeemPlayToken`). Each play asks its own. With that server
+    /// offline, `OriginOffline` at once: play `id` from this server. A
+    /// portable guest is `NotForPortableUsers`; an item not shared, or not
+    /// a paired server's, `NotFound`; that server unable to answer now,
+    /// `Unavailable`. A proxied play asks for no grant: it is a
+    /// `StartPlayback` of `id` here. Unsupported unless this connection's
+    /// `Hello` named the feature.
+    RemoteGrant {
+        id: MediaId,
     },
 
     /// Leave this server (PX-47): `Done`, and every session of the user
@@ -1124,6 +1189,7 @@ impl Request {
                 | Request::FetchPairing { .. }
                 | Request::AnswerPairing { .. }
                 | Request::CollectPairing { .. }
+                | Request::RedeemPlayToken(_)
         )
     }
 }
@@ -1691,6 +1757,15 @@ pub enum Reply {
     LibrariesShared {
         libraries: Vec<spoolframe_types::LibraryId>,
     },
+    /// Experimental (`federation`, P8-04): the session a play token
+    /// opened (`RedeemPlayToken`).
+    PlayTokenRedeemed(crate::federation::PlayTokenRedeemed),
+    /// Experimental (`federation`, P8-04): where a paired server is
+    /// (`RemoteHints`).
+    RemoteHints(crate::federation::RemoteHints),
+    /// Experimental (`federation`, P8-04): a paired server's play token
+    /// for this device (`RemoteGrant`).
+    RemoteGranted(crate::federation::RemoteGranted),
     /// The playlists the user sees (`ListPlaylists`, PX-40), oldest first,
     /// and the notes of pinned ones that left their Pinned.
     Playlists {
@@ -2285,6 +2360,11 @@ pub enum Error {
     PairingRefused {
         reason: crate::federation::PairingRefused,
     },
+    /// Experimental (`federation`, P8-04): the paired server the item is
+    /// from is offline to this one (`RemoteGrant`): play it from this
+    /// server, or later.
+    #[error("the paired server the item is from is offline")]
+    OriginOffline,
     #[error("internal server error")]
     Internal,
     /// An error type this build does not know.
@@ -2371,6 +2451,18 @@ pub enum Event {
     /// library. `Libraries` again. Only to a client that named the
     /// feature.
     LibrariesChanged,
+    /// Experimental (`federation`, P8-04): playback `handle`, of a paired
+    /// server's item, ended other than by its client's stop: stopped by an
+    /// admin, idle past the limit, its session or its grant ended, or, on
+    /// the user's own server playing it on, ended where it plays from.
+    /// `error` is what the client's next use of it is told
+    /// (`PlaybackStopped`: do not start it again). Only for a play
+    /// token's session's playbacks, and those played through the user's
+    /// own server.
+    PlaybackEnded {
+        handle: PlaybackHandle,
+        error: Error,
+    },
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,

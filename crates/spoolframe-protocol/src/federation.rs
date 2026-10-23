@@ -23,9 +23,11 @@
 //! reaches only `Hello`. Only a live pair reaches replication's requests.
 
 mod assertion;
+mod media;
 mod replication;
 
 pub use assertion::*;
+pub use media::*;
 pub use replication::*;
 
 use std::fmt;
@@ -847,8 +849,16 @@ mod tests {
             client_endpoint: "ab".repeat(32),
             item: "plex:movie:1".into(),
             scope: TokenScope::Play,
+            preferences: None,
         };
         round_trip(PeerRequest::AssertUser(assertion.clone()));
+        // P8-04: the user's track preferences go with it when SB has them.
+        let mut preferences = spoolframe_types::TrackPreferences::default();
+        preferences.audio.languages = vec!["fra".into()];
+        round_trip(PeerRequest::AssertUser(AssertUser {
+            preferences: Some(preferences),
+            ..assertion.clone()
+        }));
         let granted = TokenGranted {
             token: "f00d".repeat(16),
             scope: TokenScope::Play,

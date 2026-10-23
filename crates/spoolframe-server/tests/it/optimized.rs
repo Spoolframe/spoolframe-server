@@ -178,6 +178,8 @@ async fn start_at(
                 bitmap: Default::default(),
                 quality: CAPPED,
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await;

@@ -676,6 +676,46 @@ impl Store {
         tx.commit().await?;
         Ok(peer)
     }
+
+    /// Pair `id` is connected now: its last seen moves to now, written
+    /// at most once a minute.
+    pub async fn peer_seen(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE federation_peers SET last_seen = ?2 \
+             WHERE id = ?1 AND (last_seen IS NULL OR last_seen <= ?2 - 60)",
+        )
+        .bind(id)
+        .bind(self.now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The live pair whose key is `endpoint_id` said hello under another
+    /// server id now, and was refused.
+    pub async fn peer_identity_refused(&self, endpoint_id: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE federation_peers SET identity_refused_at = ?2 \
+             WHERE endpoint_id = ?1 AND revoked_at IS NULL",
+        )
+        .bind(endpoint_id)
+        .bind(self.now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pair `id`'s last seen connected and its last hello under another
+    /// server id, Unix seconds: `None` for one never so.
+    pub async fn peer_presence(&self, id: &str) -> Result<(Option<i64>, Option<i64>), StoreError> {
+        let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT last_seen, identity_refused_at FROM federation_peers WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +835,33 @@ mod tests {
     }
 
     /// Unpairing keeps the row, revoked; pairing again makes a new one.
+    /// A pair seen connected is kept as seen at most once a minute; a
+    /// hello under another server id is kept for its live row alone.
+    #[tokio::test]
+    async fn a_pair_s_last_seen_and_a_changed_id_are_kept() {
+        let store = test_store("fed-presence").await;
+        let peer = store.add_peer(sb(&addrs()), "alice").await.unwrap();
+        assert_eq!(store.peer_presence(&peer.id).await.unwrap(), (None, None));
+        let first = store.now();
+        store.peer_seen(&peer.id).await.unwrap();
+        store.clock().advance(std::time::Duration::from_secs(30));
+        store.peer_seen(&peer.id).await.unwrap();
+        assert_eq!(store.peer_presence(&peer.id).await.unwrap().0, Some(first));
+        store.clock().advance(std::time::Duration::from_secs(30));
+        store.peer_seen(&peer.id).await.unwrap();
+        assert_eq!(
+            store.peer_presence(&peer.id).await.unwrap().0,
+            Some(first + 60)
+        );
+        store.peer_identity_refused(SB_NEW_KEY).await.unwrap();
+        assert_eq!(store.peer_presence(&peer.id).await.unwrap().1, None);
+        store.peer_identity_refused(SB_KEY).await.unwrap();
+        assert_eq!(
+            store.peer_presence(&peer.id).await.unwrap().1,
+            Some(first + 60)
+        );
+    }
+
     #[tokio::test]
     async fn an_unpaired_row_is_kept_and_a_new_pair_is_a_new_row() {
         let store = with_invite("fed-unpair", InviteKind::Federation, 2).await;

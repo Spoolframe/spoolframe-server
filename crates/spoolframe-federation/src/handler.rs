@@ -1,6 +1,7 @@
 //! The dialled server's side of `spoolframe/federation/1`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use iroh::EndpointId;
@@ -27,9 +28,10 @@ const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// the connection closes anyway.
 const LAST_REPLY_WAIT: Duration = Duration::from_secs(2);
 
-/// The most streams one connection has answered at once (H2): a stream
-/// past them is reset `BUSY`, not counted against the endpoint. A sync
-/// and a few images at a time is what a pair asks.
+/// The most streams one connection has answered at once (H2), unless the
+/// server says otherwise ([`FederationProtocol::with_max_streams`]): a
+/// stream past them is reset `BUSY`, not counted against the endpoint. A
+/// sync and a few images at a time is what a pair asks.
 pub const MAX_STREAMS: usize = 16;
 
 /// What the server calls itself now: a live setting.
@@ -44,6 +46,9 @@ pub struct FederationProtocol<P, S, H> {
     server_id: ServerId,
     name: Name,
     live: Live,
+    /// The most streams a connection is answered on at once, read as it
+    /// opens: a live setting of the server's (P8-04).
+    max_streams: Arc<AtomicUsize>,
 }
 
 impl<P, S, H> Clone for FederationProtocol<P, S, H> {
@@ -55,6 +60,7 @@ impl<P, S, H> Clone for FederationProtocol<P, S, H> {
             server_id: self.server_id.clone(),
             name: self.name.clone(),
             live: self.live.clone(),
+            max_streams: self.max_streams.clone(),
         }
     }
 }
@@ -129,7 +135,16 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
             server_id,
             name,
             live,
+            max_streams: Arc::new(AtomicUsize::new(MAX_STREAMS)),
         }
+    }
+
+    /// The most streams a connection is answered on at once, as
+    /// `max_streams` holds it when the connection opens (P8-04).
+    #[must_use]
+    pub fn with_max_streams(mut self, max_streams: Arc<AtomicUsize>) -> Self {
+        self.max_streams = max_streams;
+        self
     }
 
     fn me(&self) -> Paired {
@@ -476,7 +491,9 @@ impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P
             ..State::default()
         });
         let (closing, mut close_asked) = tokio::sync::mpsc::channel::<(u32, &'static str)>(1);
-        let streams = Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS));
+        let streams = Arc::new(tokio::sync::Semaphore::new(
+            self.max_streams.load(Ordering::Relaxed).max(1),
+        ));
         loop {
             tokio::select! {
                 accepted = connection.accept_bi() => match accepted {

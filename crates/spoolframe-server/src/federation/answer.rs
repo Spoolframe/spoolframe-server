@@ -21,8 +21,8 @@ use spoolframe_protocol::federation::{
 use spoolframe_types::{ArtworkId, Item, Library, LibraryId, LibraryKind};
 use uuid::Uuid;
 
-use super::Federation;
 use super::items::remote;
+use super::{Federation, Limits};
 use crate::auth::{Bucket, TokenBucket};
 use crate::keyed_locks::KeyedLocks;
 use crate::store::StoreError;
@@ -32,23 +32,13 @@ use crate::store::federation_sync::{KeptIds, SentItem};
 /// How many top-level items a walk asks the catalog for at once.
 const WALK_PAGE: u32 = 200;
 
-/// How long a library's walk answers every pair's sync (H2): a pair that
-/// asks again within it, or another pair, is answered from the same walk,
-/// so no pair makes this server walk a library more often.
-pub const WALK_REUSE: Duration = Duration::from_secs(60);
+/// Each pair's images: a first sync fetches every poster, so a burst of
+/// [`Limits::artwork_burst`], then a hundred a second.
+const ARTWORK_REFILL: Duration = Duration::from_millis(10);
 
-/// Each pair's images: a first sync fetches every poster, so a burst,
-/// then a hundred a second.
-const ARTWORK_ASKS: Bucket = Bucket {
-    capacity: 200,
-    refill_every: Duration::from_millis(10),
-};
-
-/// Each pair's assertions: one per play its users start.
-const ASSERTIONS: Bucket = Bucket {
-    capacity: 30,
-    refill_every: Duration::from_secs(1),
-};
+/// Each pair's assertions: one per play its users start, a burst of
+/// [`Limits::assertion_burst`], then one a second.
+const ASSERTION_REFILL: Duration = Duration::from_secs(1);
 
 /// The external ids a walk knows: those kept, by item, with the hash of
 /// the rest of it then; and those it read anew.
@@ -63,32 +53,53 @@ struct Ids {
 type Walk = Arc<Vec<RemoteItem>>;
 
 /// What paces the pairs' asks (H2): one walk of a library at a time, kept
-/// for [`WALK_REUSE`]; one sync per pair and library at a time; and each
-/// pair's images and assertions, by token bucket.
-#[derive(Debug)]
+/// for [`Limits::walk_reuse`]; one sync per pair and library at a time;
+/// and each pair's images and assertions, by token bucket. The limits are
+/// [`Federation::limits`]'s, read as each ask comes.
+#[derive(Debug, Default)]
 pub(crate) struct Answering {
     /// Held while a library is walked, by library.
     walking: KeyedLocks,
     /// Each library's last walk, and when it was made.
     walks: parking_lot::Mutex<HashMap<String, (Instant, Walk)>>,
-    reuse: parking_lot::Mutex<Duration>,
     /// Held while a pair's sync of a library is answered, by pair and
     /// library: its kept state is read and written by one at a time.
     syncing: KeyedLocks,
-    /// Each pair's buckets, by its server id: images, then assertions.
-    asks: parking_lot::Mutex<HashMap<String, Arc<(TokenBucket, TokenBucket)>>>,
+    /// Each pair's buckets, by its server id: images, then assertions,
+    /// with the sizes they were made at.
+    asks: parking_lot::Mutex<HashMap<String, Arc<PairBuckets>>>,
 }
 
-impl Default for Answering {
-    fn default() -> Self {
-        Self {
-            walking: KeyedLocks::default(),
-            walks: parking_lot::Mutex::default(),
-            reuse: parking_lot::Mutex::new(WALK_REUSE),
-            syncing: KeyedLocks::default(),
-            asks: parking_lot::Mutex::default(),
-        }
-    }
+/// A pair's buckets, and what they were made as: a change of a burst
+/// makes them again, full.
+#[derive(Debug)]
+struct PairBuckets {
+    made: (Bucket, Bucket),
+    artwork: TokenBucket,
+    assertions: TokenBucket,
+}
+
+/// The buckets `limits` make a pair's: images, then assertions.
+fn buckets(limits: &Limits) -> (Bucket, Bucket) {
+    (
+        Bucket {
+            capacity: limits.artwork_burst,
+            refill_every: ARTWORK_REFILL,
+        },
+        Bucket {
+            capacity: limits.assertion_burst,
+            refill_every: ASSERTION_REFILL,
+        },
+    )
+}
+
+/// A pair's buckets as `made`, full.
+fn fresh(made: (Bucket, Bucket)) -> Arc<PairBuckets> {
+    Arc::new(PairBuckets {
+        made,
+        artwork: TokenBucket::new(made.0),
+        assertions: TokenBucket::new(made.1),
+    })
 }
 
 /// What a pair asks that is paced by bucket.
@@ -99,26 +110,27 @@ enum Ask {
 }
 
 impl Answering {
-    /// Whether pair `peer` may ask `ask` now.
-    fn allowed(&self, peer: &str, ask: Ask) -> bool {
-        let buckets = self
-            .asks
-            .lock()
-            .entry(peer.to_owned())
-            .or_insert_with(|| {
-                Arc::new((TokenBucket::new(ARTWORK_ASKS), TokenBucket::new(ASSERTIONS)))
-            })
-            .clone();
+    /// Whether pair `peer` may ask `ask` now, under `limits`. Its buckets
+    /// are made again, full, when a burst changed.
+    fn allowed(&self, peer: &str, ask: Ask, limits: &Limits) -> bool {
+        let made = buckets(limits);
+        let buckets = {
+            let mut asks = self.asks.lock();
+            let entry = asks.entry(peer.to_owned()).or_insert_with(|| fresh(made));
+            if entry.made != made {
+                *entry = fresh(made);
+            }
+            entry.clone()
+        };
         let bucket = match ask {
-            Ask::Artwork => &buckets.0,
-            Ask::Assertion => &buckets.1,
+            Ask::Artwork => &buckets.artwork,
+            Ask::Assertion => &buckets.assertions,
         };
         bucket.take(Instant::now()).is_ok()
     }
 
-    /// The walk of `library` made within the reuse, if there is one.
-    fn reused(&self, library: &str) -> Option<Walk> {
-        let reuse = *self.reuse.lock();
+    /// The walk of `library` made within `reuse`, if there is one.
+    fn reused(&self, library: &str, reuse: Duration) -> Option<Walk> {
         self.walks
             .lock()
             .get(library)
@@ -126,10 +138,9 @@ impl Answering {
             .map(|(_, walk)| walk.clone())
     }
 
-    /// Let the walks past their reuse go: at each replica tick, so one of
-    /// a library no pair asks for again is not held.
-    pub(super) fn prune_walks(&self) {
-        let reuse = *self.reuse.lock();
+    /// Let the walks past `reuse` go: at each replica tick, so one of a
+    /// library no pair asks for again is not held.
+    pub(super) fn prune_walks(&self, reuse: Duration) {
         self.walks.lock().retain(|_, (at, _)| at.elapsed() < reuse);
     }
 }
@@ -166,19 +177,12 @@ impl Federation {
             .ok_or(Unshared::NotShared)
     }
 
-    /// How long a library's walk answers every pair's sync: a live
-    /// setting, [`WALK_REUSE`] at first. Zero walks the library at each
-    /// sync, as a test that changes it between two syncs needs.
-    pub fn set_walk_reuse(&self, reuse: Duration) {
-        *self.answering.reuse.lock() = reuse;
-    }
-
     /// `library` walked, or its walk made within the reuse: one walk at a
     /// time per library, for every pair.
     async fn walked(&self, library: &LibraryId) -> Result<Walk, CatalogError> {
         let key = library.to_string();
         let _walking = self.answering.walking.lock(&key).await;
-        if let Some(walk) = self.answering.reused(&key) {
+        if let Some(walk) = self.answering.reused(&key, self.limits().walk_reuse) {
             return Ok(walk);
         }
         let walk = Arc::new(self.walk(library).await?);
@@ -406,7 +410,10 @@ impl Shares for Federation {
 
     async fn artwork(&self, server_id: &ServerId, id: &str) -> Result<(String, Vec<u8>), Unshared> {
         let peer = self.pair(server_id).await?;
-        if !self.answering.allowed(server_id.as_str(), Ask::Artwork) {
+        if !self
+            .answering
+            .allowed(server_id.as_str(), Ask::Artwork, &self.limits())
+        {
             tracing::debug!(server_id = %server_id, "a paired server asks for images too fast");
             return Err(Unshared::Unavailable);
         }
@@ -445,7 +452,10 @@ impl Shares for Federation {
         server_id: &ServerId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused> {
-        if !self.answering.allowed(server_id.as_str(), Ask::Assertion) {
+        if !self
+            .answering
+            .allowed(server_id.as_str(), Ask::Assertion, &self.limits())
+        {
             tracing::info!(server_id = %server_id, "a paired server vouches too fast");
             return Err(AssertionRefused::Unavailable);
         }
@@ -462,12 +472,13 @@ mod tests {
     #[test]
     fn each_pair_s_images_are_paced_by_its_own_bucket() {
         let answering = Answering::default();
-        for _ in 0..ARTWORK_ASKS.capacity {
-            assert!(answering.allowed("sb", Ask::Artwork));
+        let limits = Limits::default();
+        for _ in 0..limits.artwork_burst {
+            assert!(answering.allowed("sb", Ask::Artwork, &limits));
         }
-        assert!(!answering.allowed("sb", Ask::Artwork));
-        assert!(answering.allowed("sc", Ask::Artwork));
-        assert!(answering.allowed("sb", Ask::Assertion));
+        assert!(!answering.allowed("sb", Ask::Artwork, &limits));
+        assert!(answering.allowed("sc", Ask::Artwork, &limits));
+        assert!(answering.allowed("sb", Ask::Assertion, &limits));
     }
 
     /// A walk past its reuse goes at the tick, though no pair asks for
@@ -476,7 +487,7 @@ mod tests {
     fn walks_past_their_reuse_go_at_the_tick() {
         let answering = Answering::default();
         let old = Instant::now()
-            .checked_sub(WALK_REUSE + Duration::from_secs(1))
+            .checked_sub(Limits::default().walk_reuse + Duration::from_secs(1))
             .expect("the clock is past it");
         answering
             .walks
@@ -486,8 +497,29 @@ mod tests {
             .walks
             .lock()
             .insert("plex:2".into(), (Instant::now(), Walk::default()));
-        answering.prune_walks();
+        answering.prune_walks(Limits::default().walk_reuse);
         let left: Vec<String> = answering.walks.lock().keys().cloned().collect();
         assert_eq!(left, ["plex:2"]);
+    }
+
+    /// A burst raised by the settings (P8-04) holds at once, for a pair
+    /// that had used its old one up.
+    #[test]
+    fn a_raised_burst_holds_at_once() {
+        let answering = Answering::default();
+        let limits = Limits::default();
+        let first = limits.assertion_burst;
+        for _ in 0..first {
+            assert!(answering.allowed("sb", Ask::Assertion, &limits));
+        }
+        assert!(!answering.allowed("sb", Ask::Assertion, &limits));
+        let limits = Limits {
+            assertion_burst: first * 2,
+            ..limits
+        };
+        for _ in 0..first * 2 {
+            assert!(answering.allowed("sb", Ask::Assertion, &limits));
+        }
+        assert!(!answering.allowed("sb", Ask::Assertion, &limits));
     }
 }

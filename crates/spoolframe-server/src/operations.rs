@@ -72,7 +72,8 @@ pub(crate) fn reservation(request: &Request) -> usize {
 ///   `RedeemInvite`, `LookupInvite`, `Begin`/`FinishPortableSignIn`,
 ///   `RedeemPortableInvite`, and P7-08's `IdentityRecord`,
 ///   `IdentityRecordByHandle`, `OfferPairing`,
-///   `FetchPairing` and `AnswerPairing`), which the bucket's
+///   `FetchPairing` and `AnswerPairing`, and P8-04's `RedeemPlayToken`),
+///   which the bucket's
 ///   rate keeps from filling theirs;
 /// - requests that draw on no rate limit (`BeginDeviceSignIn`,
 ///   `AwaitDeviceSignIn`, `ResumeProfile`, `CollectPairing`), held by what
@@ -121,6 +122,8 @@ pub fn on_strangers_budget(request: &Request) -> bool {
             | Request::OfferPairing(_)
             | Request::FetchPairing { .. }
             | Request::AnswerPairing { .. }
+            // P8-04: a play token, guessed only at that rate.
+            | Request::RedeemPlayToken(_)
     )
 }
 
@@ -470,6 +473,7 @@ mod tests {
             bitmap: Default::default(),
             position_ms: 0,
             display: None,
+            onward_share: None,
         })
     }
 

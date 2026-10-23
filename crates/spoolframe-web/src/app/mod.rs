@@ -47,7 +47,7 @@ use catalog_item::CatalogItem;
 use connect::Connect;
 use connected::AuditPageView;
 use device::DeviceApproval;
-use federation::Federation;
+use federation::{Federation, FederationPeer};
 use invites::Invites;
 use libraries::{AddLibrary, Libraries};
 use licenses::LicensesPage;
@@ -120,6 +120,9 @@ enum Route {
             // in the sidebar while the server has it on.
             #[route("/federation")]
             Federation {},
+            // A paired server's own page, linked from its card.
+            #[route("/federation/:id")]
+            FederationPeer { id: String },
             #[route("/server")]
             Server {},
             // Server's sub-pages (P3-14): what it does now, and its log.
@@ -1443,7 +1446,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
         Route::Invites {} => "Invites",
-        Route::Federation {} => "Federation",
+        Route::Federation {} | Route::FederationPeer { .. } => "Federation",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
         Route::AuditPageView {} => "Audit",
@@ -1629,7 +1632,11 @@ fn users_links(route: &Route, federation: bool) -> Element {
     rsx! {
         Link { class: class(matches!(route, Route::Invites {})), to: Route::Invites {}, "Invites" }
         if federation {
-            Link { class: class(matches!(route, Route::Federation {})), to: Route::Federation {}, "Federation" }
+            Link {
+                class: class(matches!(route, Route::Federation {} | Route::FederationPeer { .. })),
+                to: Route::Federation {},
+                "Federation"
+            }
         }
     }
 }

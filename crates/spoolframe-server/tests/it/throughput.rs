@@ -45,6 +45,8 @@ async fn read_a_large_file() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await

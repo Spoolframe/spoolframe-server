@@ -57,6 +57,11 @@ pub struct AssertUser {
     /// What the token is for; a play when left out.
     #[serde(default)]
     pub scope: TokenScope,
+    /// The user's track preferences on SB (P8-04): what SA chooses the
+    /// audio and subtitles by when the play sends no selection, as SB
+    /// would. Left out, SA's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferences: Option<spoolframe_types::TrackPreferences>,
 }
 
 impl AssertUser {

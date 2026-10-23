@@ -749,6 +749,11 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 });
             }
         }
+        // P8-04: a paired server's item's playback ended where it plays;
+        // the next use of it says so, as it would without this.
+        Event::PlaybackEnded { error, .. } => {
+            tracing::info!(server = %id, %error, "a paired server's item's playback ended");
+        }
         // PX-03: for whoever shows or plays the track.
         Event::SubtitleTimingChanged {
             id: item,

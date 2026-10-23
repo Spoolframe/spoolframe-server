@@ -132,6 +132,9 @@ pub struct Actor {
 pub enum Who {
     Local(SessionUser),
     Portable(PortableSessionUser),
+    /// A paired server's user, by a play token's session (P8-04): one
+    /// item's playback, nothing else.
+    Remote(crate::remote_sessions::RemoteSessionUser),
 }
 
 impl Who {
@@ -139,6 +142,7 @@ impl Who {
         match self {
             Who::Local(user) => Principal::LocalUser(user.user),
             Who::Portable(user) => Principal::PortableUser(user.user),
+            Who::Remote(user) => user.principal(),
         }
     }
 
@@ -157,7 +161,7 @@ impl Who {
     pub fn local(&self) -> Option<&SessionUser> {
         match self {
             Who::Local(user) => Some(user),
-            Who::Portable(_) => None,
+            Who::Portable(_) | Who::Remote(_) => None,
         }
     }
 
@@ -167,6 +171,7 @@ impl Who {
         match self {
             Who::Local(user) => user.username.clone(),
             Who::Portable(user) => user.user.to_string(),
+            Who::Remote(user) => user.principal().to_string(),
         }
     }
 
@@ -180,6 +185,7 @@ impl Who {
         match self {
             Who::Local(user) => &user.display_name,
             Who::Portable(user) => &user.display_name,
+            Who::Remote(user) => &user.display_name,
         }
     }
 
@@ -189,6 +195,7 @@ impl Who {
         match self {
             Who::Local(user) => user.username.clone(),
             Who::Portable(user) => format!("portable:{}", user.user.fingerprint()),
+            Who::Remote(user) => user.principal().to_string(),
         }
     }
 
@@ -197,7 +204,7 @@ impl Who {
     pub fn pin_required(&self) -> bool {
         match self {
             Who::Local(user) => user.pin_required,
-            Who::Portable(_) => false,
+            Who::Portable(_) | Who::Remote(_) => false,
         }
     }
 }

@@ -577,6 +577,7 @@ impl RuntimeSettings {
                     total: config.federation.cache_total_bytes(),
                 },
             );
+            federation.set_limits(config.federation.limits());
         }
         if let Some(artwork) = &live.artwork {
             artwork.set_memory_limit(config.artwork.tiers().memory);

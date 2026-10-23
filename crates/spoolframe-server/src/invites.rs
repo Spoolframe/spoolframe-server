@@ -414,39 +414,62 @@ pub fn holder_tier_of(kind: InviteKind) -> Tier {
 
 /// The tier the holder of a live invite relays as, if `token` is theirs
 /// as `endpoint` (P6-08): [`holder_tier_of`] the invite's kind, else
-/// `None`. For a device that is no one's yet, so it draws on the
-/// strangers' budget first (PX-10), and counts as a guess at a code as
-/// [`redeem`] does (A-13): a token that matches no live invite (revoked,
-/// expired, used up, or never one) stays counted. Every live invite is
-/// checked, in constant time each, whether one matched or not.
+/// `None`. Guarded as `mac_matches` says, as [`redeem`] is (A-13).
 pub async fn holder_tier(auth: &Auth, endpoint: &iroh::EndpointId, token: &str) -> Option<Tier> {
-    use spoolframe_protocol::relay_access::{invite_mac, parse_invite_token};
+    let mac = spoolframe_protocol::relay_access::parse_invite_token(token)?;
+    mac_matches(
+        auth,
+        endpoint,
+        "invite",
+        mac,
+        auth.store().live_invite_hashes(),
+    )
+    .await
+    .map(holder_tier_of)
+}
+
+/// What the secret whose hash among `hashes` makes `mac` for `endpoint`
+/// says, if one does: a relay token's check (P6-08, P8-04), for a device
+/// that is no one's yet. It draws on the strangers' budget first (PX-10),
+/// and counts as a guess at `label` from that endpoint, taken back only
+/// when it matches: a token that matches nothing (revoked, expired, used
+/// up, or never one) stays counted. Every hash is checked, in constant
+/// time each, whether one matched or not; `hashes` is read only once the
+/// budget allows.
+pub(crate) async fn mac_matches<T: Copy>(
+    auth: &Auth,
+    endpoint: &iroh::EndpointId,
+    label: &str,
+    mac: [u8; 32],
+    hashes: impl std::future::Future<Output = Result<Vec<(String, T)>, StoreError>>,
+) -> Option<T> {
+    use spoolframe_protocol::relay_access::invite_mac;
     let source = endpoint.to_string();
     if let Err(wait) = auth.stranger_attempt() {
-        tracing::debug!(endpoint = %source, ?wait, "an invite token not checked: strangers wait");
+        tracing::debug!(endpoint = %source, ?wait, label, "a relay token not checked: strangers wait");
         return None;
     }
-    let Ok(guess) = auth.guess(format!("invite@{source}"), Some(source.clone())) else {
-        tracing::debug!(endpoint = %source, "an invite token not checked: too many wrong codes");
+    let Ok(guess) = auth.guess(format!("{label}@{source}"), Some(source.clone())) else {
+        tracing::debug!(endpoint = %source, label, "a relay token not checked: too many wrong guesses");
         return None;
     };
-    let mac = blake3::Hash::from_bytes(parse_invite_token(token)?);
-    let invites = match auth.store().live_invite_hashes().await {
-        Ok(invites) => invites,
+    let hashes = match hashes.await {
+        Ok(hashes) => hashes,
         Err(e) => {
-            tracing::warn!(error = %e, "cannot check an invite token");
+            tracing::warn!(error = %e, label, "cannot check a relay token");
             return None;
         }
     };
+    let mac = blake3::Hash::from_bytes(mac);
     let mut matched = None;
-    for (hash, kind) in invites {
+    for (hash, said) in hashes {
         let Ok(hash) = blake3::Hash::from_hex(&hash) else {
             continue;
         };
         // blake3::Hash compares in constant time.
         let expected = blake3::Hash::from_bytes(invite_mac(hash.as_bytes(), endpoint.as_bytes()));
         if expected == mac {
-            matched = Some(holder_tier_of(kind));
+            matched = Some(said);
         }
     }
     if matched.is_some() {

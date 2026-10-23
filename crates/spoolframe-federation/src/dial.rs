@@ -14,9 +14,6 @@ use spoolframe_protocol::federation::{
     SyncLibrary, SyncMode, SyncPage, TokenGranted, Unpaired, libraries_within_bounds,
 };
 
-/// How long dialling may take: one attempt, over every hint given.
-const DIAL_WAIT: Duration = Duration::from_secs(15);
-
 /// How long a reply may take.
 const REPLY_WAIT: Duration = Duration::from_secs(15);
 
@@ -117,10 +114,7 @@ impl Dialed {
         addr: EndpointAddr,
         hello: PeerHello,
     ) -> Result<(Self, PeerInfo), DialError> {
-        let connection = tokio::time::timeout(DIAL_WAIT, endpoint.connect(addr, FEDERATION_ALPN))
-            .await
-            .map_err(|_| DialError::Unreachable("no answer in time".into()))?
-            .map_err(|e| DialError::Unreachable(e.to_string()))?;
+        let connection = crate::dial(endpoint, addr, FEDERATION_ALPN).await?;
         let dialed = Self { connection };
         match dialed.ask(&PeerRequest::Hello(hello)).await? {
             PeerReply::Info(info) => Ok((dialed, info)),

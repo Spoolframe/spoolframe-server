@@ -148,6 +148,8 @@ pub(crate) async fn playback_ownership(
         bitmap: BitmapSubtitles::Auto,
         quality: Default::default(),
         display: None,
+        capabilities: None,
+        onward_share: None,
     };
     let (handle, size) = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted {
@@ -393,6 +395,7 @@ fn controls(handle: &PlaybackHandle) -> Vec<(&'static str, Request)> {
                 bitmap: BitmapSubtitles::Auto,
                 position_ms: 0,
                 display: None,
+                onward_share: None,
             },
         ),
     ]

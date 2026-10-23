@@ -1,8 +1,14 @@
 //! Delegated authentication between paired servers (P8-03): the tokens
 //! this server mints for a paired server's users, by their hash, and the
-//! plays counted across each pair, one number per server and side.
+//! plays counted across each pair, one number per server and side. P8-04
+//! redeems a token once ([`Store::redeem_federation_token`]) and counts
+//! the play served then, by who redeemed it.
 
 use super::{Store, StoreError};
+
+/// A day in seconds: plays are also counted a UTC day at a time, for the
+/// Federation page's week.
+pub const DAY: i64 = 86_400;
 
 /// A token to keep: its hash and what it opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +25,8 @@ pub struct NewToken<'a> {
     /// `play`; P8-07 adds `download`.
     pub scope: &'a str,
     pub expires_at: i64,
+    /// The user's track preferences on their own server, as JSON (P8-04).
+    pub preferences: Option<&'a str>,
 }
 
 /// A token kept, as P8-04 reads it to redeem it.
@@ -33,6 +41,23 @@ pub struct TokenRecord {
     pub created_at: i64,
     pub expires_at: i64,
     pub used_at: Option<i64>,
+}
+
+/// A token redeemed (P8-04): what it opens.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RedeemedToken {
+    pub peer: String,
+    pub principal: String,
+    pub item: String,
+    pub library: String,
+    pub scope: String,
+    /// The user's track preferences on their own server, as JSON (P8-04).
+    pub preferences: Option<String>,
+    /// The pair's endpoint, hex: a token it redeemed itself is a proxied
+    /// play's.
+    pub peer_endpoint: String,
+    /// What the pair calls itself.
+    pub peer_name: String,
 }
 
 /// The most tokens that work at once (H3): per pair and user, and per
@@ -80,6 +105,17 @@ impl PlaySide {
 pub struct PlayCount {
     pub plays: u64,
     pub refused: u64,
+    /// Of the plays served, those the pair's server redeemed and played
+    /// on to the device (P8-04). Of the plays asserted, those this server
+    /// played on to its own device.
+    pub proxied: u64,
+}
+
+impl PlayCount {
+    /// Of the plays served, those the device redeemed itself (P8-04).
+    pub fn direct(&self) -> u64 {
+        self.plays.saturating_sub(self.proxied)
+    }
 }
 
 impl Store {
@@ -121,8 +157,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO federation_tokens \
                  (token_hash, peer, principal, item, library, device, scope, created_at, \
-                  expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  expires_at, preferences) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(token.token_hash)
         .bind(token.peer)
@@ -133,10 +169,154 @@ impl Store {
         .bind(token.scope)
         .bind(self.now())
         .bind(token.expires_at)
+        .bind(token.preferences)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(TokenKept::Kept)
+    }
+
+    /// Redeem the token whose hash is `token_hash` from `device` (hex), now
+    /// (P8-04): what it opens, if it was minted for that endpoint, is
+    /// unused and unexpired, and its pair and its library's grant are
+    /// live. Used up by this, in one statement, so two redemptions at once
+    /// open one session. A token tried from another endpoint stays unused.
+    pub async fn redeem_federation_token(
+        &self,
+        token_hash: &str,
+        device: &str,
+    ) -> Result<Option<RedeemedToken>, StoreError> {
+        Ok(sqlx::query_as(
+            "UPDATE federation_tokens SET used_at = ?3 \
+             WHERE token_hash = ?1 AND device = ?2 AND used_at IS NULL AND expires_at > ?3 \
+               AND EXISTS (SELECT 1 FROM federation_grants g \
+                           JOIN federation_peers p ON p.id = g.peer \
+                           WHERE g.peer = federation_tokens.peer \
+                             AND g.library = federation_tokens.library \
+                             AND g.revoked_at IS NULL AND p.revoked_at IS NULL) \
+             RETURNING peer, principal, item, library, scope, preferences, \
+                 (SELECT endpoint_id FROM federation_peers WHERE id = federation_tokens.peer) \
+                     AS peer_endpoint, \
+                 (SELECT display_name FROM federation_peers WHERE id = federation_tokens.peer) \
+                     AS peer_name",
+        )
+        .bind(token_hash)
+        .bind(device)
+        .bind(self.now())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// The hashes of the tokens minted for `device` (hex) and kept, each
+    /// with whether it works now: unused and unexpired (P8-04). What its
+    /// relay token is checked against: one that matches a token used up
+    /// or expired is the device's own, stale, not a guess.
+    pub async fn federation_tokens_of(
+        &self,
+        device: &str,
+    ) -> Result<Vec<(String, bool)>, StoreError> {
+        Ok(sqlx::query_as(
+            "SELECT token_hash, used_at IS NULL AND expires_at > ?2 FROM federation_tokens \
+             WHERE device = ?1",
+        )
+        .bind(device)
+        .bind(self.now())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Count a play of this server's served across pair `peer`, `proxied`
+    /// or played by the device itself (P8-04): at its token's redemption.
+    pub async fn count_federation_served(
+        &self,
+        peer: &str,
+        proxied: bool,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO federation_plays (peer, side, plays, proxied) \
+             VALUES (?1, 'served', 1, ?2) \
+             ON CONFLICT (peer, side) DO UPDATE SET \
+                 plays = plays + 1, proxied = proxied + excluded.proxied",
+        )
+        .bind(peer)
+        .bind(i64::from(proxied))
+        .execute(&self.pool)
+        .await?;
+        self.count_federation_day(peer, PlaySide::Served, 1, i64::from(proxied))
+            .await
+    }
+
+    /// Count a play of pair `peer`'s item that this server plays on to
+    /// its own user's device (P8-04): one of the plays it asserted.
+    pub async fn count_federation_proxied(&self, peer: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO federation_plays (peer, side, proxied) VALUES (?1, 'asserted', 1) \
+             ON CONFLICT (peer, side) DO UPDATE SET proxied = proxied + 1",
+        )
+        .bind(peer)
+        .execute(&self.pool)
+        .await?;
+        self.count_federation_day(peer, PlaySide::Asserted, 0, 1)
+            .await
+    }
+
+    /// Add `plays` and `proxied` to pair `peer`'s count on `side` today.
+    async fn count_federation_day(
+        &self,
+        peer: &str,
+        side: PlaySide,
+        plays: i64,
+        proxied: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO federation_play_days (peer, side, day, plays, proxied) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (peer, side, day) DO UPDATE SET \
+                 plays = plays + excluded.plays, proxied = proxied + excluded.proxied",
+        )
+        .bind(peer)
+        .bind(side.name())
+        .bind(self.now().div_euclid(DAY))
+        .bind(plays)
+        .bind(proxied)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pair `peer`'s counts on `side` for each day from `since` (a Unix
+    /// day) on, as (day, plays, proxied): days with none are left out.
+    pub async fn federation_play_days(
+        &self,
+        peer: &str,
+        side: PlaySide,
+        since: i64,
+    ) -> Result<Vec<(i64, u64, u64)>, StoreError> {
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT day, plays, proxied FROM federation_play_days \
+             WHERE peer = ?1 AND side = ?2 AND day >= ?3 ORDER BY day",
+        )
+        .bind(peer)
+        .bind(side.name())
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let count = |n: i64| u64::try_from(n).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .map(|(day, plays, proxied)| (day, count(plays), count(proxied)))
+            .collect())
+    }
+
+    /// Delete the days' counts before `before`, a Unix day.
+    pub async fn prune_federation_play_days(&self, before: i64) -> Result<u64, StoreError> {
+        Ok(
+            sqlx::query("DELETE FROM federation_play_days WHERE day < ?1")
+                .bind(before)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 
     /// The token whose hash is `token_hash`, expired or not.
@@ -196,7 +376,7 @@ impl Store {
         .bind(side.name())
         .execute(&self.pool)
         .await?;
-        Ok(())
+        self.count_federation_day(peer, side, 1, 0).await
     }
 
     /// Count an assertion refused across pair `peer`, on `side`.
@@ -222,18 +402,20 @@ impl Store {
         peer: &str,
         side: PlaySide,
     ) -> Result<PlayCount, StoreError> {
-        let row: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT plays, refused FROM federation_plays \
+        let row: Option<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT plays, refused, proxied FROM federation_plays \
              WHERE peer = ?1 AND side = ?2",
         )
         .bind(peer)
         .bind(side.name())
         .fetch_optional(&self.pool)
         .await?;
+        let count = |n: i64| u64::try_from(n).unwrap_or_default();
         Ok(
-            row.map_or_else(PlayCount::default, |(plays, refused)| PlayCount {
-                plays: u64::try_from(plays).unwrap_or_default(),
-                refused: u64::try_from(refused).unwrap_or_default(),
+            row.map_or_else(PlayCount::default, |(plays, refused, proxied)| PlayCount {
+                plays: count(plays),
+                refused: count(refused),
+                proxied: count(proxied),
             }),
         )
     }
@@ -293,6 +475,7 @@ mod tests {
             device: "ab",
             scope: "play",
             expires_at,
+            preferences: None,
         }
     }
 
@@ -455,6 +638,122 @@ mod tests {
                 .await
                 .unwrap(),
             PlayCount::default()
+        );
+    }
+
+    /// A redeemed play is counted served, by who redeemed it (P8-04).
+    /// Each count is also kept by the day, for the Federation page's
+    /// week; days past it are pruned.
+    #[tokio::test]
+    async fn plays_are_counted_a_day_at_a_time_too() {
+        let (store, peer) = paired("fed-play-days").await;
+        let today = store.now().div_euclid(DAY);
+        store.count_federation_served(&peer, true).await.unwrap();
+        store.count_federation_served(&peer, false).await.unwrap();
+        store
+            .count_federation_play(&peer, PlaySide::Asserted)
+            .await
+            .unwrap();
+        store.count_federation_proxied(&peer).await.unwrap();
+        store
+            .clock()
+            .advance(std::time::Duration::from_secs(DAY as u64));
+        store.count_federation_served(&peer, false).await.unwrap();
+        assert_eq!(
+            store
+                .federation_play_days(&peer, PlaySide::Served, today)
+                .await
+                .unwrap(),
+            [(today, 2, 1), (today + 1, 1, 0)]
+        );
+        assert_eq!(
+            store
+                .federation_play_days(&peer, PlaySide::Asserted, today)
+                .await
+                .unwrap(),
+            [(today, 1, 1)]
+        );
+        assert_eq!(
+            store.prune_federation_play_days(today + 1).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .federation_play_days(&peer, PlaySide::Served, today)
+                .await
+                .unwrap(),
+            [(today + 1, 1, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_play_is_counted_by_its_mode() {
+        let (store, peer) = paired("fed-plays-mode").await;
+        store.count_federation_served(&peer, false).await.unwrap();
+        for _ in 0..2 {
+            store.count_federation_served(&peer, true).await.unwrap();
+        }
+        let served = store
+            .federation_plays(&peer, PlaySide::Served)
+            .await
+            .unwrap();
+        assert_eq!((served.plays, served.direct(), served.proxied), (3, 1, 2));
+    }
+
+    /// A token is redeemed once, from its device alone, before it expires
+    /// (P8-04); one tried from another endpoint stays good for its own.
+    #[tokio::test]
+    async fn a_token_is_redeemed_once_from_its_device() {
+        let (store, peer) = paired("fed-tokens-redeem").await;
+        let now = store.now();
+        keep(&store, token("h1", &peer, "plex:1", now + 300)).await;
+        assert_eq!(
+            store.redeem_federation_token("h1", "cd").await.unwrap(),
+            None,
+            "another device"
+        );
+        let redeemed = store
+            .redeem_federation_token("h1", "ab")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (redeemed.item.as_str(), redeemed.library.as_str()),
+            ("plex:movie:1", "plex:1")
+        );
+        assert_eq!(
+            store.redeem_federation_token("h1", "ab").await.unwrap(),
+            None,
+            "used"
+        );
+        keep(&store, token("h2", &peer, "plex:1", now + 300)).await;
+        store.clock().advance(std::time::Duration::from_secs(300));
+        assert_eq!(
+            store.redeem_federation_token("h2", "ab").await.unwrap(),
+            None,
+            "expired"
+        );
+    }
+
+    /// A token whose grant was revoked, or whose pair unpaired, since it
+    /// was minted opens nothing, even if it was kept (P8-04).
+    #[tokio::test]
+    async fn a_token_opens_nothing_once_its_grant_or_pair_is_gone() {
+        let (store, peer) = paired("fed-tokens-redeem-revoked").await;
+        let later = store.now() + 300;
+        keep(&store, token("h1", &peer, "plex:1", later)).await;
+        keep(&store, token("h2", &peer, "plex:2", later)).await;
+        store.revoke_library_grant(&peer, "plex:1").await.unwrap();
+        assert_eq!(
+            store.redeem_federation_token("h1", "ab").await.unwrap(),
+            None
+        );
+        assert!(
+            store
+                .redeem_federation_token("h2", "ab")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

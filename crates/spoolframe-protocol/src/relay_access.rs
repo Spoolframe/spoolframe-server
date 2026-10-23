@@ -10,6 +10,8 @@
 //! A device redeeming an invite is no one's yet: it proves it holds the
 //! code with an [`invite_token`] (P6-08), which the relay reads from the
 //! `Authorization` header of its connection and passes in the question.
+//! A device about to play a paired server's item (P8-04) proves it holds
+//! that server's play token the same way, with a [`play_relay_token`].
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,14 +23,17 @@ pub const RELAY_ACCESS_ALPN: &[u8] = b"spoolframe/relay-access/1";
 /// What an invite holder's token starts with: its scheme and version.
 pub const INVITE_TOKEN_PREFIX: &str = "sf-invite.1.";
 
+/// What a play token holder's relay token starts with (P8-04).
+pub const PLAY_TOKEN_PREFIX: &str = "sf-play.1.";
+
 /// Which tier `endpoint` is in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessQuery {
     /// The endpoint's key, hex.
     pub endpoint: String,
     /// The invite holder's token it connected to the relay with (P6-08),
-    /// if it is one. Left out without one; a server from before it
-    /// ignores it, and answers as without it.
+    /// or a play token holder's (P8-04), if it is one. Left out without
+    /// one; a server from before it ignores it, and answers as without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite: Option<String>,
 }
@@ -48,7 +53,9 @@ pub enum Tier {
     /// makes an account here (`create-user`, any role; P6-08).
     Owner,
     /// The holder of an invite for a portable user (P7) or a server (P8),
-    /// and later those users and servers themselves.
+    /// and later those users and servers themselves; a paired server's
+    /// user's device holding a play token, and while the session it opened
+    /// lives (P8-04).
     Friend,
     /// Anyone else.
     Stranger,
@@ -79,9 +86,35 @@ pub fn invite_mac(code_hash: &[u8; 32], endpoint: &[u8; 32]) -> [u8; 32] {
 }
 
 /// The MAC `token` carries, if it is an invite holder's token at all.
-/// The relay passes on only these: anything else is no token.
+/// The relay passes on only these, and play token holders' ([`is_relay_token`]):
+/// anything else is no token.
 pub fn parse_invite_token(token: &str) -> Option<[u8; 32]> {
-    let encoded = token.strip_prefix(INVITE_TOKEN_PREFIX)?;
+    mac_after(token, INVITE_TOKEN_PREFIX)
+}
+
+/// The token whoever holds paired-server play token `token` connects to
+/// that server's relay with, as `endpoint` (P8-04): `sf-play.1.` and the
+/// base64url of BLAKE3 keyed with the play token's hash, over the key, as
+/// an invite holder's is made with the code's. The server keeps only the
+/// play token's hash, and checks with it.
+pub fn play_relay_token(token: &str, endpoint: &[u8; 32]) -> String {
+    let mac = invite_mac(blake3::hash(token.as_bytes()).as_bytes(), endpoint);
+    format!("{PLAY_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(mac))
+}
+
+/// The MAC `token` carries, if it is a play token holder's relay token.
+pub fn parse_play_token(token: &str) -> Option<[u8; 32]> {
+    mac_after(token, PLAY_TOKEN_PREFIX)
+}
+
+/// Whether `token` is one a relay passes on: an invite holder's or a play
+/// token holder's.
+pub fn is_relay_token(token: &str) -> bool {
+    parse_invite_token(token).is_some() || parse_play_token(token).is_some()
+}
+
+fn mac_after(token: &str, prefix: &str) -> Option<[u8; 32]> {
+    let encoded = token.strip_prefix(prefix)?;
     // 32 bytes are 43 characters unpadded: nothing longer is decoded.
     if encoded.len() != 43 {
         return None;
@@ -165,6 +198,25 @@ mod tests {
         );
         assert_ne!(invite_token("QW7K2MFPXR4A", &me), Some(token));
         assert_eq!(invite_token("not a code", &me), None);
+    }
+
+    /// P8-04: a play token holder's relay token is the token hash's MAC
+    /// over the endpoint, and is never an invite holder's.
+    #[test]
+    fn a_play_relay_token_is_its_token_s_mac_over_the_endpoint() {
+        let me = [7u8; 32];
+        let token = play_relay_token("bearer", &me);
+        assert!(token.starts_with(PLAY_TOKEN_PREFIX), "{token}");
+        assert!(!token.contains("bearer"), "{token}");
+        let hash = blake3::hash(b"bearer");
+        assert_eq!(
+            parse_play_token(&token),
+            Some(invite_mac(hash.as_bytes(), &me))
+        );
+        assert_eq!(parse_invite_token(&token), None);
+        assert!(is_relay_token(&token));
+        assert_ne!(play_relay_token("bearer", &[8u8; 32]), token);
+        assert!(!is_relay_token("sf-play.1.x"));
     }
 
     #[test]

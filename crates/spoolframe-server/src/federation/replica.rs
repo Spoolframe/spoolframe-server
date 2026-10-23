@@ -20,10 +20,12 @@ use spoolframe_federation::{DialError, Dialed, Pages};
 use spoolframe_protocol::federation::{SharedLibrary, Standing, SyncLibrary, SyncMode, SyncPage};
 use spoolframe_types::MediaId;
 
+use super::exposure::WEEK_DAYS;
 use super::{Federation, endpoint_addr, parsed};
 use crate::store::StoreError;
 use crate::store::federation::PeerRecord;
 use crate::store::federation_cache::{CacheSynced, FileLimits};
+use crate::store::federation_tokens::DAY;
 
 /// How often the replica looks at its pairs: whether each is connected,
 /// and due a sync.
@@ -44,10 +46,10 @@ const POSTER_FETCHES: usize = 6;
 pub const DEFAULT_SYNC_EVERY: Duration = Duration::from_secs(3600);
 
 /// How much one sync, and one origin, may put in the cache (H1): an
-/// origin that answers without end, or with more than a big library
-/// holds, is cut off, and its cache stays as it was.
+/// origin that answers without end, or with more than the settings allow
+/// (P8-04), is cut off, and its cache stays as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SyncLimits {
+pub struct SyncLimits {
     /// Pages in one library's answer.
     pub pages: u64,
     /// Items, and ids of items gone, in one library's answer.
@@ -55,14 +57,6 @@ pub(crate) struct SyncLimits {
     /// Items of one origin's in the cache, every library together.
     pub origin_items: u64,
 }
-
-/// Generous for a big library: a 200,000-item answer takes 1,000 full
-/// pages.
-pub(crate) const SYNC_LIMITS: SyncLimits = SyncLimits {
-    pages: 2_000,
-    items: 200_000,
-    origin_items: 500_000,
-};
 
 /// Where a sync's pages come from: a pair's answer, or a test's.
 pub(crate) trait PageSource {
@@ -87,7 +81,7 @@ pub enum ReplicaError {
     /// new key.
     #[error("the other server does not pair with this one now ({0:?})")]
     NotPaired(Standing),
-    /// A library's answer went past a limit (`SyncLimits`): it is not
+    /// A library's answer went past a limit ([`SyncLimits`]): it is not
     /// kept.
     #[error("the answer has more {what} than the {limit} kept")]
     TooLarge { what: &'static str, limit: u64 },
@@ -155,9 +149,18 @@ impl Federation {
         if let Err(e) = self.store().prune_federation_tokens().await {
             tracing::warn!(error = %e, "cannot prune the expired play tokens");
         }
+        // The days' play counts past the week the Federation page shows.
+        let today = self.store().now().div_euclid(DAY);
+        if let Err(e) = self
+            .store()
+            .prune_federation_play_days(today - (WEEK_DAYS - 1))
+            .await
+        {
+            tracing::warn!(error = %e, "cannot prune the days' play counts");
+        }
         // The walks past their reuse (H2), of libraries no pair asks for
         // again: a whole library's items each.
-        self.answering.prune_walks();
+        self.answering.prune_walks(self.limits().walk_reuse);
         let peers: Vec<PeerRecord> = match self.store().federation_peers().await {
             Ok(peers) => peers.into_iter().filter(PeerRecord::live).collect(),
             Err(e) => {
@@ -169,6 +172,12 @@ impl Federation {
         for peer in &peers {
             let state = tended.entry(peer.id.clone()).or_default();
             self.tend(peer, state).await;
+            // When it was last online, for "offline since" once it is not.
+            if self.connected(&peer.endpoint_id)
+                && let Err(e) = self.store().peer_seen(&peer.id).await
+            {
+                tracing::warn!(error = %e, "cannot keep when a paired server was seen");
+            }
         }
         // Outside the sync lock: images never hold a sync up.
         self.cache.evict().await;
@@ -328,6 +337,9 @@ impl Federation {
                     "a paired server no longer shares a library: its cache is dropped"
                 );
                 self.drop_cached(origin, Some(&cached.library)).await?;
+                self.store()
+                    .withdraw_cached(origin, &peer.id, &cached.library, &cached.title)
+                    .await?;
             }
         }
         self.cache.sync_began(origin);
@@ -339,6 +351,9 @@ impl Federation {
                 Ok(()) => {}
                 Err(ReplicaError::Dial(DialError::NotShared)) => {
                     self.drop_cached(origin, Some(&library.id)).await?;
+                    self.store()
+                        .withdraw_cached(origin, &peer.id, &library.id, &library.title)
+                        .await?;
                 }
                 Err(ReplicaError::Dial(DialError::Unavailable)) => tracing::info!(
                     peer = %peer.endpoint_id,
@@ -381,23 +396,22 @@ impl Federation {
                 since,
             })
             .await?;
-        self.cache_sync(origin, &peer.id, library, &mut pages, SYNC_LIMITS)
-            .await
+        self.cache_sync(origin, &peer.id, library, &mut pages).await
     }
 
     /// Read `pages`, a sync of `origin`'s `library` over pair `peer`, into
     /// the cache: each
     /// page staged as it comes, and all written, with the cursor, once the
-    /// last is (H1). An answer cut short, or past `limits`, writes
-    /// nothing.
+    /// last is (H1). An answer cut short, or past the limits as the sync
+    /// begins, writes nothing.
     pub(crate) async fn cache_sync(
         &self,
         origin: &str,
         peer: &str,
         library: &str,
         pages: &mut impl PageSource,
-        limits: SyncLimits,
     ) -> Result<(), ReplicaError> {
+        let limits = self.limits().sync;
         let store = self.store();
         store.begin_cache_sync(origin, library).await?;
         let read = async {
@@ -661,8 +675,12 @@ mod tests {
             pages: pages.into_iter(),
             endless,
         };
+        federation.set_limits(crate::federation::Limits {
+            sync: limits,
+            ..crate::federation::Limits::default()
+        });
         federation
-            .cache_sync(ORIGIN, peer, "plex:1", &mut answer, limits)
+            .cache_sync(ORIGIN, peer, "plex:1", &mut answer)
             .await
     }
 
@@ -690,9 +708,14 @@ mod tests {
             "waits for the sync"
         );
         let whole = vec![page(SyncMode::Snapshot, &["1", "2"], false)];
-        sync((&federation, &peer), whole, false, SYNC_LIMITS)
-            .await
-            .unwrap();
+        sync(
+            (&federation, &peer),
+            whole,
+            false,
+            crate::federation::Limits::default().sync,
+        )
+        .await
+        .unwrap();
         drop(syncing);
         forget.await;
         assert_eq!(cached(&federation).await, 0);
@@ -704,9 +727,14 @@ mod tests {
     async fn an_unpaired_server_s_rows_are_not_searched_or_listed() {
         let (store, federation, peer) = replica("fed-replica-live-only").await;
         let whole = vec![page(SyncMode::Snapshot, &["1", "2"], false)];
-        sync((&federation, &peer), whole, false, SYNC_LIMITS)
-            .await
-            .unwrap();
+        sync(
+            (&federation, &peer),
+            whole,
+            false,
+            crate::federation::Limits::default().sync,
+        )
+        .await
+        .unwrap();
         let found = || async {
             let (_, total) = store
                 .search_cached("movie", "Film", None, None, 10)
@@ -728,11 +756,24 @@ mod tests {
         let (_store, federation, peer) = replica("fed-replica-limits").await;
         let pair = (&federation, peer.as_str());
         let whole = vec![page(SyncMode::Snapshot, &["1", "2"], false)];
-        sync(pair, whole, false, SYNC_LIMITS).await.unwrap();
+        sync(
+            pair,
+            whole,
+            false,
+            crate::federation::Limits::default().sync,
+        )
+        .await
+        .unwrap();
         assert_eq!(cached(&federation).await, 2);
 
         let endless = vec![page(SyncMode::Changes, &["3"], true)];
-        let cut = sync(pair, endless, true, SYNC_LIMITS).await;
+        let cut = sync(
+            pair,
+            endless,
+            true,
+            crate::federation::Limits::default().sync,
+        )
+        .await;
         assert!(
             matches!(cut, Err(ReplicaError::TooLarge { what: "pages", .. })),
             "{cut:?}"
@@ -774,6 +815,45 @@ mod tests {
             .unwrap()
             .cursor;
         assert_eq!(cursor.as_deref(), Some("c"), "the last whole sync's");
+    }
+
+    /// A very large library (the 2026-10-23 decision): 300,000 tracks are
+    /// past the default limits and kept out, and sync once the settings
+    /// raise them.
+    #[tokio::test]
+    async fn a_300k_item_library_syncs_once_the_limits_are_raised() {
+        let (_store, federation, peer) = replica("fed-replica-300k").await;
+        let pair = (&federation, peer.as_str());
+        let keys: Vec<String> = (0..300_000).map(|i| i.to_string()).collect();
+        let pages = || {
+            let chunks: Vec<&[String]> = keys.chunks(1_000).collect();
+            let last = chunks.len() - 1;
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(i, keys)| {
+                    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                    page(SyncMode::Snapshot, &keys, i != last)
+                })
+                .collect::<Vec<_>>()
+        };
+        let defaults = crate::federation::Limits::default().sync;
+        let cut = sync(pair, pages(), false, defaults).await;
+        assert!(
+            matches!(cut, Err(ReplicaError::TooLarge { what: "items", .. })),
+            "{cut:?}"
+        );
+        assert_eq!(cached(&federation).await, 0);
+
+        let raised = crate::config::FederationConfig {
+            sync_max_items: Some(300_000),
+            max_cached_items: Some(300_000),
+            ..crate::config::FederationConfig::default()
+        }
+        .limits()
+        .sync;
+        sync(pair, pages(), false, raised).await.unwrap();
+        assert_eq!(cached(&federation).await, 300_000);
     }
 
     #[test]

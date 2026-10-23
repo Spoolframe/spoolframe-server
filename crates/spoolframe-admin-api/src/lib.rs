@@ -29,7 +29,10 @@ mod federation;
 pub use federation::FederationApiClient;
 #[cfg(feature = "server")]
 pub use federation::FederationApiServer;
-pub use federation::{GrantEntry, PeerEntry, PeerKey};
+pub use federation::{
+    GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary,
+    WithdrawnLibrary,
+};
 mod optimized;
 pub use optimized::{
     OptimizedCopy, OptimizedCopyDeleted, OptimizedCopyState, OptimizedDeleted, OptimizedOverview,

@@ -38,6 +38,16 @@ fn federation(server: &TestServer) -> &Arc<Federation> {
     server.federation.as_ref().expect("federation is on")
 }
 
+/// `server` walks a library at each sync: a test that changes it between
+/// two syncs needs it.
+fn no_walk_reuse(server: &TestServer) {
+    let federation = federation(server);
+    federation.set_limits(spoolframe_server::federation::Limits {
+        walk_reuse: std::time::Duration::ZERO,
+        ..federation.limits()
+    });
+}
+
 /// A `federation` invite of `server`'s, made by alice: its link.
 async fn pairing_link(server: &TestServer, uses: Option<u32>) -> String {
     let created = create(
@@ -105,6 +115,7 @@ fn assertion(user: &str, item: &str) -> spoolframe_protocol::federation::AssertU
         client_endpoint: iroh::SecretKey::from_bytes(&[3; 32]).public().to_string(),
         item: item.into(),
         scope: spoolframe_protocol::federation::TokenScope::Play,
+        preferences: None,
     }
 }
 
@@ -167,17 +178,18 @@ async fn assertions_sa_may_not_answer_are_refused_and_counted() {
         .await
         .unwrap();
     assert_eq!((counted.plays, counted.refused), (0, 5));
-    // The pair's own user, for a shared film: a token, and a play.
+    // The pair's own user, for a shared film: a token.
     dialed
         .assert_user(assertion(bob, "plex:movie:1"))
         .await
         .unwrap();
+    // Counted as a play once the token is redeemed (P8-04), not now.
     let counted = sa
         .store
         .federation_plays(&peer.id, PlaySide::Served)
         .await
         .unwrap();
-    assert_eq!((counted.plays, counted.refused), (1, 5));
+    assert_eq!((counted.plays, counted.refused), (0, 5));
     dialed.close();
     sa.stop().await;
 }
@@ -479,6 +491,9 @@ async fn a_paired_key_under_another_server_id_is_refused_every_time() {
         .unwrap()
         .unwrap();
     assert_eq!(row.server_id, "bbbbbbbbbbbbbbbb");
+    // Kept for the Federation page, which says so with Unpair.
+    let (_, refused_at) = sa.store.peer_presence(&row.id).await.unwrap();
+    assert!(refused_at.is_some());
     sa.stop().await;
 }
 
@@ -975,6 +990,57 @@ mod admin {
         sb.server.stop().await;
     }
 
+    /// The web UI's check before pairing: SB's admin looks SA's invite up
+    /// and reads SA's name and fingerprint, and the invite keeps its use;
+    /// one used by another server, or a server paired already, is refused
+    /// as redeeming would refuse it. Paired, SA's own page on SB has its
+    /// row and an empty week.
+    #[tokio::test]
+    async fn an_admin_looks_an_invite_up_before_pairing() {
+        let sa = Site::start("fed-admin-look-sa", "Alice's server", "alice", true).await;
+        let sb = Site::start("fed-admin-look-sb", "Bob's server", "bob", true).await;
+        let sc = Site::start("fed-admin-look-sc", "Carol's server", "carol", true).await;
+        let spent = sa.invite().await;
+        sc.admin.redeem(spent.clone()).await.unwrap();
+        let refused = sb.admin.look_up(spent).await.unwrap_err();
+        let said = format!("{refused:?}");
+        assert!(said.contains("invite_exhausted"), "{said}");
+        assert_eq!(code(refused), error_code::PAIRING_REFUSED);
+
+        let link = sa.invite().await;
+        let found = sb.admin.look_up(link.clone()).await.unwrap();
+        let sa_status = sa.admin.server_status().await.unwrap();
+        assert_eq!(found.name, "Alice's server");
+        assert_eq!(found.server_id, sa.server.server_id.as_str());
+        assert_eq!(Some(found.fingerprint.clone()), sa_status.fingerprint);
+        let open = sa.server.store.live_invites().await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].uses_left, 1, "looking uses nothing");
+
+        let on_sb = sb.admin.redeem(link).await.unwrap();
+        let again = sb.admin.look_up(sa.invite().await).await.unwrap_err();
+        assert!(format!("{again:?}").contains("already_paired"), "{again:?}");
+
+        let detail = sb.admin.peer_detail(on_sb.id.clone()).await.unwrap();
+        assert_eq!(detail.peer.id, on_sb.id);
+        assert_eq!(detail.week.len(), 7);
+        assert!(
+            detail
+                .week
+                .iter()
+                .all(|d| d.plays_here == 0 && d.plays_there == 0)
+        );
+        assert!(detail.received.is_empty() && detail.withdrawn.is_empty());
+        assert_eq!(detail.identity_refused_at, None);
+        assert_eq!(
+            code(sb.admin.peer_detail("nope".into()).await.unwrap_err()),
+            error_code::NO_SUCH_PEER
+        );
+        sa.server.stop().await;
+        sb.server.stop().await;
+        sc.server.stop().await;
+    }
+
     /// The QR check (2026-10-22): looking SA's invite up on SA tells its
     /// kind and SA's fingerprint before SB redeems it.
     #[tokio::test]
@@ -1426,7 +1492,7 @@ mod app {
         (client, session)
     }
 
-    async fn sign_in(client: &Client, server: &TestServer, username: &str) -> Session {
+    pub(super) async fn sign_in(client: &Client, server: &TestServer, username: &str) -> Session {
         let port = server
             .server
             .addr()
@@ -1603,7 +1669,7 @@ mod sharing {
     /// each sync, for the tests that change it between two.
     async fn paired(test: &str) -> (TestServer, Dialed, String, Endpoint) {
         let sa = server(test, "Alice's server").await;
-        federation(&sa).set_walk_reuse(std::time::Duration::ZERO);
+        no_walk_reuse(&sa);
         let link = pairing_link(&sa, None).await;
         let sb = endpoint().await;
         let (dialed, _) = Dialed::connect(&sb, sa.server.addr(), hello("bbbbbbbbbbbbbbbb"))
@@ -1733,7 +1799,7 @@ mod sharing {
     #[tokio::test]
     async fn a_library_is_walked_at_most_once_a_minute() {
         let (sa, dialed, peer, _sb) = paired("fed-sharing-walks").await;
-        federation(&sa).set_walk_reuse(spoolframe_server::federation::WALK_REUSE);
+        federation(&sa).set_limits(spoolframe_server::federation::Limits::default());
         let alien = id(MediaKind::Movie, "1");
         sa.catalog.not_yet(&alien);
         share(&sa, &peer, "plex:1").await;
@@ -1742,7 +1808,7 @@ mod sharing {
         sa.catalog.gain(&alien);
         let (_, cursor, items, _) = sync(&dialed, "plex:1", Some(&first)).await.unwrap();
         assert_eq!((cursor.as_str(), items.len()), (first.as_str(), 0));
-        federation(&sa).set_walk_reuse(std::time::Duration::ZERO);
+        no_walk_reuse(&sa);
         let (_, _, items, _) = sync(&dialed, "plex:1", Some(&first)).await.unwrap();
         assert_eq!(items, ["plex:movie:1"]);
         sa.stop().await;
@@ -1760,6 +1826,7 @@ mod sharing {
             client_endpoint: "nowhere".into(),
             item: "plex:movie:1".into(),
             scope: TokenScope::Play,
+            preferences: None,
         };
         let refused = |e: DialError| match e {
             DialError::NotGranted(reason) => reason,
@@ -1941,8 +2008,26 @@ mod replica {
 
         /// With SB run as `options` say.
         async fn start_with(test: &str, options: ServerOptions) -> Self {
-            let sa = server(&format!("{test}-sa"), "Alice's server").await;
-            federation(&sa).set_walk_reuse(std::time::Duration::ZERO);
+            Self::start_both(test, ServerOptions::default(), options).await
+        }
+
+        /// With SA run as `sa_options` say, and SB as `options`.
+        async fn start_both(test: &str, sa_options: ServerOptions, options: ServerOptions) -> Self {
+            let sa = TestServer::start_with(
+                fresh_dir(&format!("{test}-sa")).await,
+                ServerOptions {
+                    name: "Alice's server".into(),
+                    federation: true,
+                    ..sa_options
+                },
+            )
+            .await;
+            Self::with_sa(test, sa, options).await
+        }
+
+        /// `sa` paired with an SB run as `options` say.
+        async fn with_sa(test: &str, sa: TestServer, options: ServerOptions) -> Self {
+            no_walk_reuse(&sa);
             let (sb, cache) = sb_with(fresh_dir(&format!("{test}-sb")).await, options).await;
             let sa_on_sb = federation(&sb)
                 .redeem_link(&pairing_link(&sa, None).await, "bob")
@@ -2541,13 +2626,13 @@ mod replica {
         pair.stop().await;
     }
 
-    /// A user holds at most TOKEN_LIMITS.per_user play tokens of SA's at
+    /// A user holds at most `Limits::tokens.per_user` play tokens of SA's at
     /// once (H3): past them, SA says to try later, and mints again once
     /// one expires.
     #[tokio::test]
     async fn a_user_s_play_tokens_are_capped() {
         use spoolframe_protocol::federation::AssertionRefused;
-        use spoolframe_server::federation::{AssertError, PLAY_TOKEN_LIFETIME, TOKEN_LIMITS};
+        use spoolframe_server::federation::{AssertError, Limits, PLAY_TOKEN_LIFETIME};
         let pair = Pair::start("fed-assert-flood").await;
         pair.share("plex:1").await;
         pair.refresh().await;
@@ -2556,7 +2641,7 @@ mod replica {
         let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let alien = pair.fed(movie().id());
         let sb = federation(&pair.sb);
-        for _ in 0..TOKEN_LIMITS.per_user {
+        for _ in 0..Limits::default().tokens.per_user {
             sb.assert_play(bob, "Bob", &alien, device).await.unwrap();
         }
         assert!(matches!(
@@ -2572,7 +2657,8 @@ mod replica {
 
     /// P8-03, across two servers: SB vouches for Bob, who wants SA's film
     /// on a device of his; SA mints a token for that film and device,
-    /// kept hashed under Bob's remote principal, and both count the play.
+    /// kept hashed under Bob's remote principal; SB counts the play, and SA
+    /// will once the token is redeemed (P8-04).
     /// A film not shared gets no token, and both count the refusal. The
     /// grant revoked, the token is gone; and SB never vouches for a
     /// portable guest.
@@ -2635,7 +2721,8 @@ mod replica {
             (counted.plays, counted.refused)
         }
         let served = |side| counted(&pair, side);
-        assert_eq!(served(PlaySide::Served).await, (1, 0));
+        // SA counts the play once the token is redeemed (P8-04).
+        assert_eq!(served(PlaySide::Served).await, (0, 0));
         assert_eq!(served(PlaySide::Asserted).await, (1, 0));
 
         // Music is not shared; and an artist does not play (M6).
@@ -2656,7 +2743,7 @@ mod replica {
             refused(pair.fed(&id(MediaKind::Artist, "30"))).await,
             AssertionRefused::InvalidScope
         );
-        assert_eq!(served(PlaySide::Served).await, (1, 2));
+        assert_eq!(served(PlaySide::Served).await, (0, 2));
         assert_eq!(served(PlaySide::Asserted).await, (1, 2));
 
         federation(&pair.sa)
@@ -2711,10 +2798,59 @@ mod replica {
             }
         };
         assert_eq!(counted(sb, pair.sa_on_sb.clone()).await, (0, 1, 0, 1));
+        // SA counts its play once the token is redeemed (P8-04).
         assert_eq!(
             counted(federation(&pair.sa), pair.sb_on_sa.clone()).await,
-            (1, 0, 1, 0)
+            (0, 0, 1, 0)
         );
+        pair.stop().await;
+    }
+
+    /// What a paired server's own page says beyond its row: each library
+    /// it shares as kept here, with its items and revision; the week's
+    /// plays by the day; and a library it stopped sharing, until it shares
+    /// it again.
+    #[tokio::test]
+    async fn a_pair_s_page_says_what_it_shares_its_week_and_what_it_withdrew() {
+        let pair = Pair::start("fed-pair-page").await;
+        let sb = federation(&pair.sb);
+        let page = async || {
+            let peer = sb.peer(&pair.sa_on_sb).await.unwrap().unwrap();
+            sb.peer_page(&peer).await.unwrap()
+        };
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        // Nothing changed since: the revision stands.
+        pair.refresh().await;
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        sb.assert_play(bob, "Bob", &pair.fed(movie().id()), device)
+            .await
+            .unwrap();
+        let shown = page().await;
+        assert_eq!(shown.received.len(), 1, "{shown:?}");
+        let movies = &shown.received[0];
+        assert_eq!((movies.library.as_str(), movies.revision), ("plex:1", 1));
+        assert!(movies.items > 0 && movies.synced_at.is_some(), "{movies:?}");
+        assert_eq!(shown.week.len(), 7);
+        let today = shown.week[6];
+        assert_eq!((today.there, today.here), (1, 0), "{:?}", shown.week);
+        assert_eq!(shown.week[6].day - shown.week[0].day, 6 * 86_400);
+        assert!(shown.withdrawn.is_empty());
+
+        federation(&pair.sa)
+            .unshare(&pair.sb_on_sa, "plex:1", "alice")
+            .await
+            .unwrap();
+        pair.refresh().await;
+        let shown = page().await;
+        assert!(shown.received.is_empty(), "{shown:?}");
+        assert_eq!(shown.withdrawn.len(), 1);
+        assert_eq!(shown.withdrawn[0].0, "plex:1");
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        assert!(page().await.withdrawn.is_empty());
         pair.stop().await;
     }
 
@@ -3174,5 +3310,1104 @@ mod replica {
         pair.refresh().await;
         assert_eq!(pair.titles("plex:1").await.unwrap(), ["Alien"]);
         pair.stop().await;
+    }
+
+    /// The media path (P8-04).
+    mod media {
+        use spoolframe_protocol::federation::{PlayTokenRedeemed, RedeemPlayToken};
+        use spoolframe_protocol::{
+            ArtworkSize, MediaReadResponse, PlaybackHandle, Request, Response, Selection,
+        };
+        use spoolframe_server::store::federation_tokens::PlaySide;
+        use spoolframe_server::store::users::LocalUserId;
+
+        use super::*;
+        use crate::support::{TestClient, mkv_capabilities};
+
+        const FEDERATION: &str = spoolframe_protocol::experimental::FEDERATION;
+
+        /// SA's film shared with SB, synced, its file written on SA, and
+        /// Bob a user of SB's.
+        async fn shared(pair: &Pair) -> (Vec<u8>, LocalUserId) {
+            pair.share("plex:1").await;
+            pair.refresh().await;
+            let file = pair.sa.write_media(1 << 20);
+            pair.sb.add_user("bob", "correct horse", None).await;
+            let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+            (file, bob)
+        }
+
+        /// A device of Bob's on SA, naming the feature.
+        async fn device(pair: &Pair) -> TestClient {
+            let device = pair.sa.client().await;
+            device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            device
+        }
+
+        /// SB vouches for Bob on `device`: SA's token for its film.
+        async fn token(pair: &Pair, bob: LocalUserId, device: &TestClient) -> String {
+            federation(&pair.sb)
+                .assert_play(bob, "Bob", &pair.fed(movie().id()), device.endpoint.id())
+                .await
+                .unwrap()
+                .token
+        }
+
+        async fn redeem(device: &TestClient, token: &str) -> Response {
+            device
+                .call(
+                    None,
+                    Request::RedeemPlayToken(RedeemPlayToken {
+                        token: token.to_owned(),
+                    }),
+                )
+                .await
+        }
+
+        async fn redeemed(device: &TestClient, token: &str) -> PlayTokenRedeemed {
+            match redeem(device, token).await {
+                Response::Ok(Reply::PlayTokenRedeemed(redeemed)) => redeemed,
+                other => panic!("not redeemed: {other:?}"),
+            }
+        }
+
+        fn start(id: &MediaId) -> Request {
+            Request::StartPlayback {
+                id: id.clone(),
+                selection: Some(Selection::default()),
+                start_ms: None,
+                bitmap: Default::default(),
+                quality: Default::default(),
+                display: None,
+                capabilities: None,
+                onward_share: None,
+            }
+        }
+
+        async fn started(device: &TestClient, session: &SessionId) -> PlaybackHandle {
+            match device.call(Some(session), start(movie().id())).await {
+                Response::Ok(Reply::PlaybackStarted { handle, .. }) => handle,
+                other => panic!("did not start: {other:?}"),
+            }
+        }
+
+        fn unauthenticated(response: Response) -> bool {
+            matches!(
+                response,
+                Response::Err(spoolframe_protocol::Error::Unauthenticated)
+            )
+        }
+
+        /// Bob's device redeems SA's token on SA itself and plays SA's
+        /// film from there: the bytes are the file's, SA counts a direct
+        /// play, and keeps no watch state for Bob. The token works once.
+        #[tokio::test]
+        async fn bob_s_device_redeems_sa_s_token_and_plays_the_film() {
+            let pair = Pair::start("fed-media-direct").await;
+            let (file, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            let token = token(&pair, bob, &device).await;
+            let opened = redeemed(&device, &token).await;
+            assert_eq!(&opened.item, movie().id());
+            let handle = started(&device, &opened.session).await;
+            let (read, bytes) = device.read(&opened.session, &handle, 0, 4096).await;
+            assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");
+            assert_eq!(bytes, file[..4096]);
+            let progress = Request::UpdatePlaybackProgress {
+                handle: handle.clone(),
+                sequence: 1,
+                position_ms: 120_000,
+            };
+            assert!(matches!(
+                device.call(Some(&opened.session), progress).await,
+                Response::Ok(Reply::Done)
+            ));
+            let principal = format!("remote:{}:{bob}", pair.sb.server_id)
+                .parse()
+                .unwrap();
+            let states = pair
+                .sa
+                .store
+                .watch_states(principal, &[movie().id().to_string()])
+                .await
+                .unwrap();
+            assert!(states.is_empty(), "SA keeps nothing for Bob: {states:?}");
+            // Counted off the session's way, once it is written.
+            until(|| async {
+                let served = pair
+                    .sa
+                    .store
+                    .federation_plays(&pair.sb_on_sa, PlaySide::Served)
+                    .await
+                    .unwrap();
+                (served.plays, served.direct(), served.proxied) == (1, 1, 0)
+            })
+            .await;
+            assert!(unauthenticated(redeem(&device, &token).await), "used");
+            pair.stop().await;
+        }
+
+        /// The session reaches its film's playback alone: not the
+        /// libraries, nor the item's page, nor another item, nor artwork.
+        /// A token works only from the device it was minted for.
+        #[tokio::test]
+        async fn a_play_token_opens_its_film_s_playback_and_nothing_else() {
+            let pair = Pair::start("fed-media-scope").await;
+            let (_, bob) = shared(&pair).await;
+            let (mine, other) = (device(&pair).await, device(&pair).await);
+            let token = token(&pair, bob, &mine).await;
+            assert!(
+                unauthenticated(redeem(&other, &token).await),
+                "another device"
+            );
+            let session = redeemed(&mine, &token).await.session;
+            let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap();
+            for request in [
+                Request::Libraries,
+                Request::Item {
+                    id: movie().id().clone(),
+                },
+                Request::Home,
+                start(&episode),
+            ] {
+                let name = format!("{request:?}");
+                assert!(
+                    unauthenticated(mine.call(Some(&session), request).await),
+                    "{name}"
+                );
+            }
+            let (artwork, _) = mine
+                .artwork(&session, poster_of("1"), ArtworkSize::Thumb)
+                .await;
+            assert!(
+                matches!(
+                    artwork,
+                    spoolframe_protocol::ArtworkResponse::Err(
+                        spoolframe_protocol::Error::Unauthenticated
+                    )
+                ),
+                "{artwork:?}"
+            );
+            started(&mine, &session).await;
+            pair.stop().await;
+        }
+
+        /// The session is gone and its playback ended: a device that comes
+        /// back, on a new connection, reads nothing of it.
+        async fn ended(
+            pair: &Pair,
+            device: &TestClient,
+            session: &SessionId,
+            handle: &PlaybackHandle,
+        ) {
+            until(|| async {
+                pair.sa
+                    .auth
+                    .session_owner(&session.0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            })
+            .await;
+            let back = pair.sa.client_from(&device.endpoint).await;
+            back.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            let (read, _) = back.read(session, handle, 0, 4096).await;
+            assert!(matches!(read, MediaReadResponse::Err(_)), "{read:?}");
+            assert!(unauthenticated(
+                back.call(Some(session), start(movie().id())).await
+            ));
+        }
+
+        /// SA revokes the grant mid-play: the session and its playback end
+        /// at once, and the device, signed in no more, is let go. Unpairing
+        /// does the same.
+        #[tokio::test]
+        async fn a_revoked_grant_or_an_unpairing_ends_the_remote_play() {
+            let pair = Pair::start("fed-media-revoke").await;
+            let (_, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let handle = started(&device, &session).await;
+            federation(&pair.sa)
+                .unshare(&pair.sb_on_sa, "plex:1", "alice")
+                .await
+                .unwrap();
+            ended(&pair, &device, &session, &handle).await;
+
+            pair.share("plex:1").await;
+            let device = pair.sa.client_from(&device.endpoint).await;
+            device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let handle = started(&device, &session).await;
+            federation(&pair.sa)
+                .unpair(&pair.sb_on_sa, "alice")
+                .await
+                .unwrap();
+            ended(&pair, &device, &session, &handle).await;
+            pair.stop().await;
+        }
+
+        /// Bob's app plays SA's film straight from SA (P8-04): it asks SB
+        /// where SA is, reaches SA, and plays there under the token SB got
+        /// for this device. The bytes are the file's, SA holds the
+        /// playback, and SB opened none: it carried no media. Bob's progress
+        /// goes to SB.
+        #[tokio::test]
+        async fn bob_s_app_plays_sa_s_film_from_sa_and_sb_carries_none_of_it() {
+            use spoolframe_client_sdk::{PlaybackOptions, RemoteMode};
+            let pair = Pair::start("fed-media-sdk-direct").await;
+            let (file, _) = shared(&pair).await;
+            let (client, bob) =
+                super::super::app::signed_in(&pair.sb, "bob", super::super::app::FEDERATION).await;
+            let alien = pair.fed(movie().id());
+            let hints = bob.remote_hints(&alien).await.unwrap();
+            assert_eq!(hints.endpoint_id, pair.sa.server.id().to_string());
+            assert!(hints.online);
+            let remote = bob
+                .start_remote_playback(
+                    &alien,
+                    Some(Selection::default()),
+                    PlaybackOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(remote.mode, RemoteMode::Direct);
+            assert_eq!(&remote.item, movie().id());
+            assert_eq!(remote.session.server(), pair.sa.server.id().to_string());
+            let bytes = remote
+                .session
+                .read(&remote.playback.handle, 0, 4096)
+                .await
+                .unwrap();
+            assert_eq!(bytes, file[..4096]);
+            bob.update_watch_progress(&alien, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(pair.sa.debug.list().open.len(), 1, "SA plays it");
+            let on_sb = pair.sb.debug.list();
+            assert!(
+                on_sb.open.is_empty() && on_sb.ended.is_empty(),
+                "SB carried none of it"
+            );
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// SA reachable only through its own relay, which lets through its
+        /// owners and friends (P8-04): Bob's app, which knows SA by that
+        /// relay alone, plays SA's film directly, the play token getting it
+        /// through the relay. The relay's question is answered as the ticket
+        /// says: the token's holder is a friend, a wrong token a stranger,
+        /// and once redeemed the session keeps the device a friend.
+        #[tokio::test]
+        async fn bob_s_app_plays_through_sa_s_own_relay_with_the_play_token() {
+            use iroh::SecretKey;
+            use spoolframe_client_sdk::{
+                Client, ClientOptions, Device, MemoryStorage, PlaybackOptions, RemoteMode,
+            };
+            use spoolframe_protocol::codec::{read_frame, write_frame};
+            use spoolframe_protocol::relay_access::{
+                AccessAnswer, AccessQuery, RELAY_ACCESS_ALPN, Tier, play_relay_token,
+            };
+            use spoolframe_server::own_relay::{self, Access, RelayConfig, Serve};
+
+            let key = SecretKey::generate();
+            let http = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let url = url::Url::parse(&format!("http://{http}")).unwrap();
+            let sa = TestServer::start_with(
+                fresh_dir("fed-media-relay-sa").await,
+                ServerOptions {
+                    name: "Alice's server".into(),
+                    federation: true,
+                    relays: vec![spoolframe_server::network::Relay::Custom(url.clone())],
+                    own_relays: vec![key.public()],
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
+            let config = RelayConfig {
+                server: sa.server.addr(),
+                access: Access {
+                    owner: true,
+                    friends: true,
+                    everyone: false,
+                },
+                serve: Serve::Proxy,
+                http,
+                quic: None,
+            };
+            let relay = own_relay::spawn(&config, key.clone(), &std::env::temp_dir())
+                .await
+                .unwrap();
+            let home = iroh::RelayUrl::from(url.clone());
+            until(|| async { sa.server.addr().relay_urls().any(|u| *u == home) }).await;
+            let pair = Pair::with_sa("fed-media-relay", sa, ServerOptions::default()).await;
+            let (file, bob) = shared(&pair).await;
+            // SB knows SA by its relay alone, as a phone on cellular would.
+            let pool = sqlx::SqlitePool::connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(pair.sb.dir.join(spoolframe_server::store::DB_FILE)),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE federation_peers SET addrs = '[]', relays = json_array(?1)")
+                .bind(url.as_str().trim_end_matches('/'))
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            // The relay's question, asked as the relay asks it.
+            let asker = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(key)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(vec![RELAY_ACCESS_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let asked = asker
+                .connect(pair.sa.server.addr(), RELAY_ACCESS_ALPN)
+                .await
+                .unwrap();
+            let tier = |endpoint: iroh::EndpointId, invite: Option<String>| {
+                let asked = asked.clone();
+                async move {
+                    let (mut send, mut recv) = asked.open_bi().await.unwrap();
+                    let query = AccessQuery {
+                        endpoint: endpoint.to_string(),
+                        invite,
+                    };
+                    write_frame(&mut send, &query).await.unwrap();
+                    send.finish().unwrap();
+                    let answer: AccessAnswer = read_frame(&mut recv).await.unwrap();
+                    answer.tier
+                }
+            };
+            let probe = device(&pair).await;
+            let token = token(&pair, bob, &probe).await;
+            let probe_id = probe.endpoint.id();
+            assert_eq!(
+                tier(
+                    probe_id,
+                    Some(play_relay_token(&token, probe_id.as_bytes()))
+                )
+                .await,
+                Tier::Friend
+            );
+            assert_eq!(
+                tier(
+                    probe_id,
+                    Some(play_relay_token("not it", probe_id.as_bytes()))
+                )
+                .await,
+                Tier::Stranger
+            );
+            assert_eq!(tier(probe_id, None).await, Tier::Stranger);
+            redeemed(&probe, &token).await;
+            assert_eq!(tier(probe_id, None).await, Tier::Friend, "its session");
+
+            let options = ClientOptions {
+                lan_discovery: false,
+                relays: true,
+                experimental: super::super::app::FEDERATION,
+                ..ClientOptions::default()
+            };
+            let phone = Client::open_with_options(
+                Arc::new(MemoryStorage::default()),
+                Device {
+                    name: "phone".into(),
+                    client_name: "sdk-test".into(),
+                    client_version: "0".into(),
+                    platform: spoolframe_client_sdk::types::Platform::Ios,
+                    capabilities: mkv_capabilities(),
+                },
+                options,
+            )
+            .await
+            .unwrap();
+            let bob_app = super::super::app::sign_in(&phone, &pair.sb, "bob").await;
+            let alien = pair.fed(movie().id());
+            let remote = bob_app
+                .start_remote_playback(
+                    &alien,
+                    Some(Selection::default()),
+                    PlaybackOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(remote.mode, RemoteMode::Direct);
+            let bytes = remote
+                .session
+                .read(&remote.playback.handle, 0, 4096)
+                .await
+                .unwrap();
+            assert_eq!(bytes, file[..4096]);
+            phone.close().await;
+            pair.stop().await;
+            drop(relay);
+        }
+
+        /// Bob's track preferences are SB's: SA has none of his. His play
+        /// of SA's film with no selection chooses its subtitles as SB would,
+        /// by the preferences SB sent with his token: French ones.
+        #[tokio::test]
+        async fn sa_chooses_bob_s_tracks_by_his_preferences_on_sb() {
+            use spoolframe_types::{SubtitleMode, TrackPreferences};
+            let pair = Pair::start("fed-media-preferences").await;
+            let (_, bob) = shared(&pair).await;
+            let mut french = TrackPreferences::default();
+            french.subtitles.mode = SubtitleMode::Always;
+            french.subtitles.languages = vec!["fre".into()];
+            pair.sb
+                .store
+                .set_track_preferences(
+                    spoolframe_server::principal::Principal::LocalUser(bob),
+                    &french,
+                )
+                .await
+                .unwrap();
+            let device = device(&pair).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let mut request = start(movie().id());
+            if let Request::StartPlayback { selection, .. } = &mut request {
+                *selection = None;
+            }
+            let chosen = match device.call(Some(&session), request).await {
+                Response::Ok(Reply::PlaybackStarted {
+                    chosen: Some(chosen),
+                    ..
+                }) => chosen,
+                other => panic!("did not start: {other:?}"),
+            };
+            // SA's own view of the film's tracks, as a user of its own.
+            pair.sa.add_user("alice", "correct horse", None).await;
+            let alice_s = pair.sa.client().await;
+            alice_s.hello_with(None, Some(mkv_capabilities())).await;
+            let alice = alice_s.login("alice", "correct horse").await;
+            let Response::Ok(Reply::Tracks(tracks)) = alice_s
+                .call(
+                    Some(&alice),
+                    Request::Tracks {
+                        id: movie().id().clone(),
+                    },
+                )
+                .await
+            else {
+                panic!("no tracks");
+            };
+            let subtitle = chosen.selection.subtitle.expect("a subtitle chosen");
+            assert_eq!(
+                tracks.subtitles[subtitle as usize].language.as_deref(),
+                Some("fre"),
+                "{chosen:?}"
+            );
+            pair.stop().await;
+        }
+
+        /// A device in a play its token opened is no stranger to SA: with
+        /// the strangers' places all taken, it comes back mid-play.
+        #[tokio::test]
+        async fn a_device_in_a_remote_play_reconnects_past_the_strangers_cap() {
+            let pair = Pair::start_both(
+                "fed-media-reconnect",
+                ServerOptions {
+                    admission: spoolframe_server::admission::Admission {
+                        max_strangers: 1,
+                        ..Default::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            started(&device, &session).await;
+            let held = pair.sa.server.connections().snapshot().len();
+            device.conn.close(0u32.into(), b"later");
+            until(|| async { pair.sa.server.connections().snapshot().len() < held }).await;
+            let stranger = pair.sa.client().await;
+            stranger.hello().await;
+            let back = device.reconnect(&pair.sa).await;
+            assert_eq!(
+                back.call(None, Request::Ping).await,
+                Response::Ok(Reply::Pong)
+            );
+            pair.stop().await;
+        }
+
+        /// With SA offline to SB, a grant is refused at once.
+        #[tokio::test]
+        async fn with_sa_offline_a_grant_is_refused_at_once() {
+            use spoolframe_client_sdk::SdkError;
+            let pair = Pair::start("fed-media-offline").await;
+            shared(&pair).await;
+            let (client, bob) =
+                super::super::app::signed_in(&pair.sb, "bob", super::super::app::FEDERATION).await;
+            let alien = pair.fed(movie().id());
+            let Pair { sa, sb, .. } = pair;
+            let origin = sa.server_id.to_string();
+            sa.stop().await;
+            until(|| async { !federation(&sb).online(&origin) }).await;
+            assert!(!bob.remote_hints(&alien).await.unwrap().online);
+            assert_eq!(
+                bob.remote_grant(&alien).await.unwrap_err(),
+                SdkError::OriginOffline
+            );
+            client.close().await;
+            sb.stop().await;
+        }
+
+        /// A remote user off SA's LAN is a guest WAN stream (PX-46): with
+        /// one stream allowed, a second device's play is refused as full.
+        #[tokio::test]
+        async fn a_remote_play_off_the_lan_is_a_guest_wan_stream() {
+            let loopback: Vec<spoolframe_server::announce::Network> = ["127.0.0.0/8", "::1/128"]
+                .iter()
+                .map(|n| n.parse().unwrap())
+                .collect();
+            let pair = Pair::start_both(
+                "fed-media-wan",
+                ServerOptions {
+                    uplink: spoolframe_server::uplink::UplinkSettings {
+                        max_streams: Some(1),
+                        wan_prefixes: loopback,
+                        ..Default::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let mut sessions = Vec::new();
+            for _ in 0..2 {
+                let device = pair.sa.loopback_client().await;
+                device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+                let session = redeemed(&device, &token(&pair, bob, &device).await)
+                    .await
+                    .session;
+                sessions.push((device, session));
+            }
+            let (first, first_session) = &sessions[0];
+            started(first, first_session).await;
+            let (second, second_session) = &sessions[1];
+            let refused = second.call(Some(second_session), start(movie().id())).await;
+            assert!(
+                matches!(
+                    refused,
+                    Response::Err(spoolframe_protocol::Error::WanStreamsFull { max: 1 })
+                ),
+                "{refused:?}"
+            );
+            pair.stop().await;
+        }
+
+        /// SB's record of SA names no address and no relay: a device
+        /// asking SB where SA is gets no way there. SB itself still holds
+        /// its connection to SA.
+        async fn forget_sa_s_addresses(pair: &Pair) {
+            let pool = sqlx::SqlitePool::connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(pair.sb.dir.join(spoolframe_server::store::DB_FILE)),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE federation_peers SET addrs = '[]', relays = '[]'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        /// A device of Bob's on SB, naming the feature: `name`, signed in.
+        async fn on_sb(pair: &Pair, name: &str) -> (TestClient, SessionId) {
+            if pair.sb.store.user_by_name(name).await.unwrap().is_none() {
+                pair.sb.add_user(name, "correct horse", None).await;
+            }
+            let device = pair.sb.client().await;
+            device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            let session = device.login(name, "correct horse").await;
+            (device, session)
+        }
+
+        /// SA's film, started on SB by its `fed:` id: played from SA
+        /// through SB.
+        async fn proxied(pair: &Pair, device: &TestClient, session: &SessionId) -> PlaybackHandle {
+            match device
+                .call(Some(session), start(&pair.fed(movie().id())))
+                .await
+            {
+                Response::Ok(Reply::PlaybackStarted { handle, .. }) => handle,
+                other => panic!("did not start through SB: {other:?}"),
+            }
+        }
+
+        /// The files under `dir`, but its database's and what is under
+        /// `skip`.
+        fn files_in(dir: &std::path::Path, skip: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut found = Vec::new();
+            let mut left = vec![dir.to_path_buf()];
+            while let Some(at) = left.pop() {
+                for entry in std::fs::read_dir(&at).unwrap().flatten() {
+                    let path = entry.path();
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if path.starts_with(skip) || name.contains(".db") {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        left.push(path);
+                    } else {
+                        found.push(path);
+                    }
+                }
+            }
+            found.sort();
+            found
+        }
+
+        /// SA out of the device's reach (P8-04): SB's record of SA names
+        /// no way there, so Bob's app cannot dial SA, and plays SA's film
+        /// through SB instead. SB plays it from SA in its own name, and on
+        /// to the app: the bytes are the file's, SA counts a proxied play,
+        /// and the app's stop ends SA's playback too.
+        #[tokio::test]
+        async fn out_of_reach_of_sa_bob_s_app_plays_sa_s_film_through_sb() {
+            use spoolframe_client_sdk::{PlaybackOptions, RemoteMode};
+            let pair = Pair::start("fed-media-proxy").await;
+            let (file, _) = shared(&pair).await;
+            forget_sa_s_addresses(&pair).await;
+            let (client, bob) =
+                super::super::app::signed_in(&pair.sb, "bob", super::super::app::FEDERATION).await;
+            let alien = pair.fed(movie().id());
+            let remote = bob
+                .start_remote_playback(
+                    &alien,
+                    Some(Selection::default()),
+                    PlaybackOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(remote.mode, RemoteMode::Proxied);
+            assert_eq!(remote.item, alien);
+            assert_eq!(remote.session.server(), pair.sb.server.id().to_string());
+            let bytes = remote
+                .session
+                .read(&remote.playback.handle, 1000, 4096)
+                .await
+                .unwrap();
+            assert_eq!(bytes, file[1000..5096]);
+            assert_eq!(pair.sa.debug.list().open.len(), 1, "SA plays it");
+            assert_eq!(pair.sb.debug.list().open.len(), 1, "SB plays it on");
+            // Counted beside the redemption.
+            until(|| async {
+                let served = pair
+                    .sa
+                    .store
+                    .federation_plays(&pair.sb_on_sa, PlaySide::Served)
+                    .await
+                    .unwrap();
+                (served.plays, served.direct(), served.proxied) == (1, 0, 1)
+            })
+            .await;
+            let asserted = pair
+                .sb
+                .store
+                .federation_plays(&pair.sa_on_sb, PlaySide::Asserted)
+                .await
+                .unwrap();
+            assert_eq!((asserted.plays, asserted.proxied), (1, 1), "SB carried it");
+            remote
+                .session
+                .stop_playback(&remote.playback.handle)
+                .await
+                .unwrap();
+            until(|| async { pair.sa.debug.list().open.is_empty() }).await;
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// Reads at the protocol's largest through SB arrive whole, read
+        /// after read (the end-to-end test found them lost about half the
+        /// time): SB passes SA's answer on in whole parts, not in each
+        /// piece as it came off SA's stream.
+        #[tokio::test]
+        async fn the_largest_reads_through_sb_arrive_whole() {
+            use spoolframe_client_sdk::PlaybackOptions;
+            let pair = Pair::start("fed-media-proxy-large").await;
+            pair.share("plex:1").await;
+            pair.refresh().await;
+            let file = pair.sa.write_media(20 << 20);
+            pair.sb.add_user("bob", "correct horse", None).await;
+            forget_sa_s_addresses(&pair).await;
+            let (client, bob) =
+                super::super::app::signed_in(&pair.sb, "bob", super::super::app::FEDERATION).await;
+            let remote = bob
+                .start_remote_playback(
+                    &pair.fed(movie().id()),
+                    Some(Selection::default()),
+                    PlaybackOptions::default(),
+                )
+                .await
+                .unwrap();
+            let most = spoolframe_protocol::MAX_READ;
+            for round in 0..10u64 {
+                let offset = (round * 1_000_003) % (file.len() as u64 - most);
+                let bytes = remote
+                    .session
+                    .read(&remote.playback.handle, offset, most)
+                    .await
+                    .unwrap_or_else(|e| panic!("read {round} failed: {e}"));
+                let at = offset as usize;
+                assert!(
+                    bytes == file[at..at + most as usize],
+                    "read {round} differs"
+                );
+            }
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// SB goes away mid-play: SA's playback through it ends with the
+        /// connection, as a device's that is gone does, and neither
+        /// server is left with anything on disk for it. SB, back, has
+        /// nothing of it to play on.
+        #[tokio::test]
+        async fn sb_restarting_mid_proxy_ends_the_play_and_leaves_nothing() {
+            let pair = Pair::start_both(
+                "fed-media-proxy-restart",
+                ServerOptions {
+                    disconnect_grace: std::time::Duration::from_secs(1),
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (file, _) = shared(&pair).await;
+            let skip = pair.files();
+            let before = files_in(&pair.sb.dir, &skip);
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let handle = proxied(&pair, &device, &bob).await;
+            let (read, bytes) = device.read(&bob, &handle, 0, 4096).await;
+            assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");
+            assert_eq!(bytes, file[..4096]);
+            assert_eq!(pair.sa.debug.list().open.len(), 1);
+            let Pair { sa, sb, .. } = pair;
+            let dir = sb.dir.clone();
+            sb.stop().await;
+            until(|| async { sa.debug.list().open.is_empty() }).await;
+            assert_eq!(files_in(&dir, &skip), before, "SB wrote nothing");
+            let (sb, _) = sb_with(dir, ServerOptions::default()).await;
+            assert!(sb.debug.list().open.is_empty());
+            let back = sb.client_from(&device.endpoint).await;
+            back.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            let (read, _) = back.read(&bob, &handle, 0, 4096).await;
+            assert!(matches!(read, MediaReadResponse::Err(_)), "{read:?}");
+            sa.stop().await;
+            sb.stop().await;
+        }
+
+        /// A token SB holds for its own endpoint (proxy mode) opens its
+        /// one film on SA as a device's does: not another item, nor the
+        /// libraries. SA counts it as proxied.
+        #[tokio::test]
+        async fn a_proxy_s_play_token_opens_its_film_and_nothing_else() {
+            let pair = Pair::start("fed-media-proxy-scope").await;
+            let (_, bob) = shared(&pair).await;
+            let token = federation(&pair.sb)
+                .assert_play(bob, "Bob", &pair.fed(movie().id()), pair.sb.server.id())
+                .await
+                .unwrap()
+                .token;
+            let sb_device = pair.sa.client_from(pair.sb.server.endpoint()).await;
+            // As SB's own client takes SA's events (a server's endpoint
+            // takes no stream of its clients').
+            sb_device
+                .conn
+                .set_max_concurrent_uni_streams(iroh::endpoint::VarInt::from_u32(4));
+            sb_device
+                .hello_naming(mkv_capabilities(), &[FEDERATION])
+                .await;
+            let session = redeemed(&sb_device, &token).await.session;
+            let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "12").unwrap();
+            for request in [Request::Libraries, start(&episode)] {
+                let name = format!("{request:?}");
+                assert!(
+                    unauthenticated(sb_device.call(Some(&session), request).await),
+                    "{name}"
+                );
+            }
+            started(&sb_device, &session).await;
+            until(|| async {
+                let served = pair
+                    .sa
+                    .store
+                    .federation_plays(&pair.sb_on_sa, PlaySide::Served)
+                    .await
+                    .unwrap();
+                (served.direct(), served.proxied) == (0, 1)
+            })
+            .await;
+            pair.stop().await;
+        }
+
+        /// Two of SB's users play SA's film through SB at once: one's
+        /// start does not end the other's play, and each reads its own.
+        #[tokio::test]
+        async fn two_of_sb_s_users_play_through_sb_at_once() {
+            let pair = Pair::start("fed-media-proxy-two").await;
+            let (file, _) = shared(&pair).await;
+            let (bob_s, bob) = on_sb(&pair, "bob").await;
+            let (carol_s, carol) = on_sb(&pair, "carol").await;
+            let bob_plays = proxied(&pair, &bob_s, &bob).await;
+            let carol_plays = proxied(&pair, &carol_s, &carol).await;
+            for (device, session, handle) in
+                [(&bob_s, &bob, &bob_plays), (&carol_s, &carol, &carol_plays)]
+            {
+                let (read, bytes) = device.read(session, handle, 0, 4096).await;
+                assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");
+                assert_eq!(bytes, file[..4096]);
+            }
+            assert_eq!(pair.sa.debug.list().open.len(), 2);
+            assert!(pair.sa.debug.list().ended.is_empty());
+            // A re-plan passes through to SA's playback, and the read
+            // after it is at SB's revision.
+            let changed = bob_s
+                .call(
+                    Some(&bob),
+                    Request::ChangeQuality {
+                        handle: bob_plays.clone(),
+                        quality: Default::default(),
+                        bitmap: Default::default(),
+                        position_ms: 1_000,
+                        display: None,
+                        onward_share: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(changed, Response::Ok(Reply::PlaybackChanged { .. })),
+                "{changed:?}"
+            );
+            let (read, _) = bob_s.read(&bob, &bob_plays, 0, 4096).await;
+            assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");
+            // Both play over SB's one connection to SA: Bob's stop ends
+            // his session there, and Carol's play goes on.
+            let stopped = bob_s
+                .call(
+                    Some(&bob),
+                    Request::StopPlayback {
+                        handle: bob_plays.clone(),
+                    },
+                )
+                .await;
+            assert_eq!(stopped, Response::Ok(Reply::Done));
+            until(|| async { pair.sa.debug.list().open.len() == 1 }).await;
+            let (read, bytes) = carol_s.read(&carol, &carol_plays, 4096, 4096).await;
+            assert!(matches!(read, MediaReadResponse::Ok(_)), "{read:?}");
+            assert_eq!(bytes, file[4096..8192]);
+            pair.stop().await;
+        }
+
+        /// Bob's app reports progress on SA's film to SB while SB plays it
+        /// through for him: the playback keeps his play, and the report
+        /// opens no second one.
+        #[tokio::test]
+        async fn a_report_beside_a_proxied_play_opens_no_second_play() {
+            let pair = Pair::start("fed-media-proxy-report").await;
+            let (_, bob_id) = shared(&pair).await;
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let alien = pair.fed(movie().id());
+            proxied(&pair, &device, &bob).await;
+            let principal = spoolframe_server::principal::Principal::LocalUser(bob_id);
+            until(|| async { !pair.sb.store.all_plays(principal).await.unwrap().is_empty() }).await;
+            let report = device
+                .call(
+                    Some(&bob),
+                    Request::UpdateWatchProgress {
+                        id: alien.clone(),
+                        position_ms: 60_000,
+                    },
+                )
+                .await;
+            assert_eq!(report, Response::Ok(Reply::Done));
+            // A second play's row is written in the background: given the
+            // time, there is none.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let plays = pair.sb.store.all_plays(principal).await.unwrap();
+            assert_eq!(plays.len(), 1, "{plays:?}");
+            pair.stop().await;
+        }
+
+        /// SB keeps its connection to SA only while a play needs it, and a
+        /// while after: once its plays stop it is closed after the idle
+        /// time. An unpairing closes it at once, and ends the plays on it.
+        #[tokio::test]
+        async fn sb_s_connection_to_sa_goes_once_no_play_needs_it() {
+            let pair = Pair::start("fed-media-proxy-idle").await;
+            shared(&pair).await;
+            let sb = federation(&pair.sb);
+            sb.set_play_idle(std::time::Duration::from_millis(200));
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let handle = proxied(&pair, &device, &bob).await;
+            assert_eq!(sb.play_connections(), 1);
+            let stopped = device
+                .call(Some(&bob), Request::StopPlayback { handle })
+                .await;
+            assert_eq!(stopped, Response::Ok(Reply::Done));
+            until(|| async { sb.play_connections() == 0 }).await;
+            until(|| async { pair.sa.debug.list().open.is_empty() }).await;
+            proxied(&pair, &device, &bob).await;
+            assert_eq!(sb.play_connections(), 1);
+            sb.unpair(&pair.sa_on_sb, "admin").await.unwrap();
+            assert_eq!(sb.play_connections(), 0);
+            until(|| async { pair.sb.debug.list().open.is_empty() }).await;
+            pair.stop().await;
+        }
+
+        /// SA's admin stops a playback SB plays on: SB's ends at once, as
+        /// stopped, so the device is told not to start it again.
+        #[tokio::test]
+        async fn sa_s_admin_stop_ends_the_play_on_sb_as_stopped() {
+            let pair = Pair::start("fed-media-proxy-admin-stop").await;
+            shared(&pair).await;
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let handle = proxied(&pair, &device, &bob).await;
+            let id = pair.sa.debug.playbacks.snapshots()[0].id.clone();
+            assert!(pair.sa.debug.playbacks.stop(&id));
+            until(|| async { pair.sb.debug.list().open.is_empty() }).await;
+            let (read, _) = device.read(&bob, &handle, 0, 4096).await;
+            assert!(
+                matches!(read, MediaReadResponse::Err(Error::PlaybackStopped)),
+                "{read:?}"
+            );
+            pair.stop().await;
+        }
+
+        /// A re-plan SB passes through is kept on SB as SA made it: SB's
+        /// Playback page shows the plan SA plays, not the start's.
+        #[tokio::test]
+        async fn a_re_plan_through_sb_is_kept_on_sb_as_sa_made_it() {
+            let pair = Pair::start("fed-media-proxy-replan").await;
+            shared(&pair).await;
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let handle = proxied(&pair, &device, &bob).await;
+            let changed = device
+                .call(
+                    Some(&bob),
+                    Request::ChangeSubtitle {
+                        handle,
+                        subtitle: Some(1),
+                        bitmap: Default::default(),
+                        position_ms: 1_000,
+                        display: None,
+                        onward_share: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(changed, Response::Ok(Reply::PlaybackChanged { .. })),
+                "{changed:?}"
+            );
+            let (sa, sb) = (pair.sa.debug.list(), pair.sb.debug.list());
+            assert_eq!(
+                (&sb.open[0].plan, &sb.open[0].line),
+                (&sa.open[0].plan, &sa.open[0].line)
+            );
+            pair.stop().await;
+        }
+
+        /// A device granted a token that could not reach SA with it plays
+        /// the item through SB: one play, as SA counts it, not two on SB.
+        #[tokio::test]
+        async fn a_device_s_fallback_to_sb_is_counted_as_one_play() {
+            let pair = Pair::start("fed-media-proxy-fallback").await;
+            shared(&pair).await;
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let alien = pair.fed(movie().id());
+            let granted = device
+                .call(Some(&bob), Request::RemoteGrant { id: alien.clone() })
+                .await;
+            assert!(
+                matches!(granted, Response::Ok(Reply::RemoteGranted(_))),
+                "{granted:?}"
+            );
+            proxied(&pair, &device, &bob).await;
+            until(|| async {
+                pair.sa
+                    .store
+                    .federation_plays(&pair.sb_on_sa, PlaySide::Served)
+                    .await
+                    .unwrap()
+                    .plays
+                    == 1
+            })
+            .await;
+            let asserted = pair
+                .sb
+                .store
+                .federation_plays(&pair.sa_on_sb, PlaySide::Asserted)
+                .await
+                .unwrap();
+            assert_eq!(asserted.plays, 1);
+            pair.stop().await;
+        }
+
+        /// An HTTP player (a cast target) cannot present a token to SA: its
+        /// play is SB's, through SB, and the bytes it fetches from SB's
+        /// HTTP port are SA's file's.
+        #[tokio::test]
+        async fn an_http_player_plays_sa_s_film_through_sb() {
+            use spoolframe_protocol::experimental::HTTP_PLAYBACK;
+            let pair = Pair::start_with(
+                "fed-media-proxy-http",
+                ServerOptions {
+                    http_playback: spoolframe_server::http_playback::Settings {
+                        listen: Some("0.0.0.0:0".parse().unwrap()),
+                        ..Default::default()
+                    },
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
+            let (file, _) = shared(&pair).await;
+            let device = pair.sb.loopback_client().await;
+            device
+                .hello_naming(mkv_capabilities(), &[FEDERATION, HTTP_PLAYBACK])
+                .await;
+            let bob = device.login("bob", "correct horse").await;
+            let handle = proxied(&pair, &device, &bob).await;
+            let url = match device
+                .call(
+                    Some(&bob),
+                    Request::HttpPlaybackUrl {
+                        handle: handle.clone(),
+                    },
+                )
+                .await
+            {
+                Response::Ok(Reply::HttpPlaybackUrl { url }) => url,
+                other => panic!("no URL: {other:?}"),
+            };
+            let response = reqwest::Client::new()
+                .get(&url)
+                .header("range", "bytes=1000-5095")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 206);
+            assert_eq!(response.bytes().await.unwrap(), file[1000..5096]);
+            pair.stop().await;
+        }
     }
 }

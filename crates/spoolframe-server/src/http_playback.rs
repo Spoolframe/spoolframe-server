@@ -41,6 +41,7 @@ use crate::client::{
 };
 use crate::clock::Clock;
 use crate::encode::Conversion;
+use crate::federation::{ORIGIN_STALL, RelayedRead, RemotePlay, Stalling};
 use crate::network::Services;
 use crate::playback::{Playback, Sidecar, Using};
 
@@ -505,6 +506,12 @@ impl ServerSource {
         self.using(|p| (p.revision, RangeOf::of(p))).await
     }
 
+    /// The paired server the playback plays from, when it is played
+    /// through this one (P8-04): its reads are that server's.
+    async fn remote(&self) -> Result<Option<Arc<RemotePlay>>, BridgeError> {
+        self.using(|p| (p.revision, p.remote.clone())).await
+    }
+
     /// The playback's conversion; none any more is a token for the plan
     /// it had: ended, and the client asks for another.
     async fn conversion(&self) -> Result<Arc<Conversion>, BridgeError> {
@@ -538,9 +545,31 @@ impl ServerSource {
         offset: u64,
         length: u64,
     ) -> Result<ServerSegment, BridgeError> {
-        let conversion = self.conversion().await?;
         let read = self.media_read(offset, length, Some(n), variant);
         let playbacks = &self.0.services.playbacks;
+        if let Some(remote) = self.remote().await? {
+            let RelayedRead {
+                length,
+                size,
+                complete,
+                epoch,
+                stream,
+            } = remote.read(&read).await.map_err(bridge_error)?;
+            playbacks.read(&self.0.handle, offset, length, Some(n));
+            return Ok(ServerSegment {
+                source: self.clone(),
+                variant,
+                n,
+                file: Box::new(Stalling::new(stream, ORIGIN_STALL)),
+                left: length,
+                sent: length,
+                size,
+                complete,
+                epoch,
+                end: offset + length,
+            });
+        }
+        let conversion = self.conversion().await?;
         let keep_alive = || playbacks.touch(&self.0.handle);
         let (file, reply) = converted_range(&conversion, &read, &keep_alive)
             .await
@@ -550,7 +579,7 @@ impl ServerSource {
             source: self.clone(),
             variant,
             n,
-            file,
+            file: Box::new(file),
             left: reply.sent,
             sent: reply.sent,
             size: reply.size,
@@ -575,6 +604,17 @@ impl Source for ServerSource {
     }
 
     async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, BridgeError> {
+        if let Some(remote) = self.remote().await? {
+            let read = self.media_read(offset, length, None, 0);
+            let relayed = remote.read(&read).await.map_err(bridge_error)?;
+            let length = relayed.length;
+            let bytes = read_all(Stalling::new(relayed.stream, ORIGIN_STALL), length).await?;
+            self.0
+                .services
+                .playbacks
+                .read(&self.0.handle, offset, relayed.length, None);
+            return Ok(bytes);
+        }
         let range = self.range().await?;
         if range.conversion.is_some() {
             // Planned again into a conversion: this token's file is gone.
@@ -596,6 +636,9 @@ impl Source for ServerSource {
             ManifestKind::Media => spoolframe_protocol::ManifestKind::Media,
             ManifestKind::Subtitles => spoolframe_protocol::ManifestKind::Subtitles,
         };
+        if let Some(remote) = self.remote().await? {
+            return remote.manifest(kind, variant).await.map_err(bridge_error);
+        }
         self.conversion()
             .await?
             .manifest(kind, variant)
@@ -631,6 +674,10 @@ impl Source for ServerSource {
     }
 
     async fn read_subtitle_segment(&self, n: u32) -> Result<Subtitle, BridgeError> {
+        if let Some(remote) = self.remote().await? {
+            let bytes = remote.subtitle_segment(n).await.map_err(bridge_error)?;
+            return Ok(Subtitle { bytes });
+        }
         let (conversion, subtitle): (Option<Arc<Conversion>>, Option<Sidecar>) = self
             .using(|p| (p.revision, (p.conversion.clone(), p.subtitle.clone())))
             .await?;
@@ -646,7 +693,9 @@ pub struct ServerSegment {
     source: ServerSource,
     variant: u32,
     n: u32,
-    file: tokio::fs::File,
+    /// The segment's file, or a paired server's answer as it arrives
+    /// (P8-04).
+    file: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>,
     /// Of `sent`, the bytes not yet handed on.
     left: u64,
     sent: u64,
@@ -706,7 +755,10 @@ impl Segment for ServerSegment {
 
 /// The `sent` bytes `file` is open at, whole: a file shorter than the
 /// range read said is an error, not a short answer.
-async fn read_all(file: tokio::fs::File, sent: u64) -> Result<Vec<u8>, BridgeError> {
+async fn read_all(
+    file: impl tokio::io::AsyncRead + Unpin,
+    sent: u64,
+) -> Result<Vec<u8>, BridgeError> {
     let mut bytes = Vec::with_capacity(sent as usize);
     file.take(sent)
         .read_to_end(&mut bytes)

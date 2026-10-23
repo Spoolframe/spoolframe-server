@@ -33,6 +33,8 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         )
         .await
@@ -43,6 +45,55 @@ async fn started(client: &TestClient, session: &SessionId) -> (PlaybackHandle, u
         Response::Ok(Reply::PlaybackStarted { handle, size, .. }) => (handle, size),
         other => panic!("playback did not start: {other:?}"),
     }
+}
+
+/// A start's `capabilities` plan it in place of Hello's (P8-04): a
+/// server that plays on to one of its own devices has the plan made for
+/// that device. A client whose Hello said none is planned nothing without
+/// them, and plays the file directly with a device's that play it.
+#[tokio::test]
+async fn a_start_s_capabilities_plan_it_in_place_of_hello_s() {
+    let server = TestServer::start("playback-capabilities-override").await;
+    server.write_media(1 << 20);
+    server.add_user("alice", "correct horse", None).await;
+    let client = server.client().await;
+    client.hello_with(None, None).await;
+    let session = client.login("alice", "correct horse").await;
+    let start = |capabilities| Request::StartPlayback {
+        id: movie().id().clone(),
+        selection: Some(Selection::default()),
+        start_ms: None,
+        bitmap: Default::default(),
+        quality: Default::default(),
+        display: None,
+        capabilities,
+        onward_share: None,
+    };
+    let unplanned = client.call(Some(&session), start(None)).await;
+    assert!(
+        !matches!(
+            unplanned,
+            Response::Ok(Reply::PlaybackStarted {
+                plan: PlaybackPlan::Direct { .. },
+                ..
+            })
+        ),
+        "{unplanned:?}"
+    );
+    let planned = client
+        .call(Some(&session), start(Some(mkv_capabilities())))
+        .await;
+    assert!(
+        matches!(
+            planned,
+            Response::Ok(Reply::PlaybackStarted {
+                plan: PlaybackPlan::Direct { .. },
+                ..
+            })
+        ),
+        "{planned:?}"
+    );
+    server.stop().await;
 }
 
 fn ok(response: MediaReadResponse) -> MediaReadReply {
@@ -663,6 +714,7 @@ async fn a_subtitle_changed_for_another_between_chunks_is_refused() {
                 bitmap: Default::default(),
                 position_ms: 0,
                 display: None,
+                onward_share: None,
             },
         )
         .await;
@@ -799,6 +851,8 @@ async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
                 bitmap: Default::default(),
                 quality: Default::default(),
                 display: None,
+                capabilities: None,
+                onward_share: None,
             },
         },
         operation: Some(client.operation()),
@@ -880,6 +934,7 @@ async fn two_controls_with_the_same_revision_cannot_both_apply() {
                 bitmap: Default::default(),
                 position_ms: 0,
                 display: None,
+                onward_share: None,
             },
         },
         operation: Some(operation),

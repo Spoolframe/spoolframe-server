@@ -45,11 +45,19 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// server's own limit applies.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much the server may send on one stream before this device reads
-/// it (P6-06): a direct read's whole block (`reader::BLOCK`). QUIC's
-/// default, 1.25 MB, lets a stream carry only that per round trip, about
-/// 33 Mbit/s at 300 ms, a relay's or another continent's: less than a
-/// remux needs, however few reads are in flight.
-const STREAM_WINDOW: u32 = 8 << 20;
+/// it (P6-06): 2 MiB, about 56 Mbit/s per stream at 300 ms, a relay's or
+/// another continent's; more than QUIC's default, 1.25 MB (about 33
+/// Mbit/s).
+///
+/// No more: past a lost packet, QUIC (noq-proto 1.4.0) keeps each
+/// full-size packet that follows as its own buffer, never merged, until
+/// the lost one comes again, and closes the connection when it holds
+/// more than about 2,048 ("too many gaps in stream buffer"). At 8 MiB a
+/// stream could have some 7,000 in flight, and a 16 MiB read played
+/// through a paired server lost its connection about one time in two in
+/// the end-to-end test. 2 MiB is under 1,900 packets of the smallest
+/// QUIC allows.
+const STREAM_WINDOW: u32 = 2 << 20;
 
 type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;
 type PlaybackKey = (EndpointId, String, String);
@@ -183,6 +191,9 @@ pub(crate) struct Inner {
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
     /// Invites' relays, for a server not saved yet (P6-03).
     pub(crate) invite_relays: Mutex<HashMap<EndpointId, Vec<String>>>,
+    /// The plays holding each paired server's relays with a play token
+    /// (P8-04): its relays leave the relay map once none does.
+    play_relays: Mutex<HashMap<EndpointId, usize>>,
     /// The pkarr relays servers are looked up at (P6-05).
     lookups: Mutex<std::collections::HashSet<String>>,
     /// [`ClientOptions::relays`].
@@ -231,6 +242,42 @@ impl std::fmt::Debug for Client {
             .field("id", &self.id())
             .field("device", &self.inner.device.name)
             .finish_non_exhaustive()
+    }
+}
+
+/// A play's hold on a paired server's relays with its play token
+/// ([`Client::hold_play_token`]).
+#[derive(Debug)]
+pub(crate) struct PlayRelays {
+    inner: std::sync::Weak<Inner>,
+    id: EndpointId,
+    urls: Vec<RelayUrl>,
+}
+
+impl Drop for PlayRelays {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        {
+            let mut held = inner.play_relays.lock();
+            let Some(count) = held.get_mut(&self.id) else {
+                return;
+            };
+            *count -= 1;
+            if *count > 0 {
+                return;
+            }
+            held.remove(&self.id);
+        }
+        let urls = std::mem::take(&mut self.urls);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for url in urls {
+                    inner.endpoint.remove_relay(&url).await;
+                }
+            });
+        }
     }
 }
 
@@ -344,6 +391,7 @@ impl Client {
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
+                play_relays: Mutex::default(),
                 lookups: Mutex::default(),
                 relays,
                 relay_policy,
@@ -504,6 +552,63 @@ impl Client {
     /// screen listing that server's libraries lists them again.
     pub fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<crate::LibrariesChanged> {
         self.inner.library_events.subscribe()
+    }
+
+    /// Where a paired server of server `home`'s may be dialled (P8-04): its
+    /// `addrs` and `relays` as its pair keeps them, for a dial that is not
+    /// saved. What does not read is left out. Its relays are used as
+    /// `home`'s are: a device that reaches its own server through relays
+    /// reaches the paired one through its relays too.
+    pub(crate) fn remember_paired_server(
+        &self,
+        home: EndpointId,
+        id: EndpointId,
+        addrs: &[String],
+        relays: &[String],
+    ) {
+        let addrs: Vec<SocketAddr> = addrs.iter().filter_map(|a| a.parse().ok()).collect();
+        self.inner.manual.lock().insert(id, addrs);
+        self.inner.invite_relays.lock().insert(id, relays.to_vec());
+        let relayed = self.inner.relay_policy.allows(&home);
+        self.inner.relay_policy.choose(id, Some(relayed));
+    }
+
+    /// The relays server `id` is dialled through now: none with its relays
+    /// off.
+    pub(crate) fn relays_to(&self, id: EndpointId) -> Vec<RelayUrl> {
+        self.relays_of(id, None)
+    }
+
+    /// Reach paired server `id`'s relays with `token`'s relay token
+    /// (P8-04): its relay lets this device through as the token's holder,
+    /// and, once the token is redeemed, as long as the session it opened
+    /// lives. In the endpoint's relay map, as an invite's token is
+    /// ([`crate::invites`]), for as long as the hold lives: dropped, by
+    /// the play's end or its start failing, and no other play holding
+    /// them, they leave it, so a later connection to them never presents a
+    /// token that is used up. None when `id` is not reached through
+    /// relays.
+    pub(crate) async fn hold_play_token(&self, id: EndpointId, token: &str) -> Option<PlayRelays> {
+        use spoolframe_protocol::relay_access::play_relay_token;
+        let urls = self.relays_of(id, None);
+        if urls.is_empty() {
+            return None;
+        }
+        let relay_token = play_relay_token(token, self.inner.endpoint.id().as_bytes());
+        *self.inner.play_relays.lock().entry(id).or_default() += 1;
+        for url in &urls {
+            let config =
+                iroh::RelayConfig::new(url.clone(), None).with_auth_token(relay_token.clone());
+            self.inner
+                .endpoint
+                .insert_relay(url.clone(), std::sync::Arc::new(config))
+                .await;
+        }
+        Some(PlayRelays {
+            inner: Arc::downgrade(&self.inner),
+            id,
+            urls,
+        })
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:
@@ -2570,6 +2675,58 @@ mod tests {
             Some(fingerprint::fingerprint(id.as_bytes())),
             fingerprint::of_hex(&id.to_string())
         );
+    }
+
+    /// P8-04: a paired server's relays are held with a play token for as
+    /// long as a play holds them, and leave the relay map once the last
+    /// play lets go: a later connection to them presents no token used up.
+    #[tokio::test]
+    async fn a_play_token_s_relays_go_once_no_play_holds_them() {
+        let client = Client::open_with_options(
+            Arc::new(MemoryStorage::default()),
+            device(),
+            ClientOptions {
+                lan_discovery: false,
+                relays: true,
+                ..ClientOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let home = SecretKey::generate().public();
+        let paired = SecretKey::generate().public();
+        let relay = "https://relay.example.net./";
+        client.remember_paired_server(home, paired, &[], &[relay.into()]);
+        let url: RelayUrl = relay.parse().unwrap();
+        let first = client.hold_play_token(paired, "one").await.expect("held");
+        let second = client.hold_play_token(paired, "two").await.expect("held");
+        drop(first);
+        assert_eq!(
+            client.inner.play_relays.lock().get(&paired),
+            Some(&1),
+            "another play holds it"
+        );
+        drop(second);
+        assert!(client.inner.play_relays.lock().is_empty());
+        // Taken from the map off the drop, on the runtime.
+        let mut gone = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Asked by putting a stand-in in, which says what was there.
+            let config = Arc::new(iroh::RelayConfig::new(url.clone(), None));
+            if client
+                .inner
+                .endpoint
+                .insert_relay(url.clone(), config)
+                .await
+                .is_none()
+            {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the relay left the map");
+        client.close().await;
     }
 
     /// C3: the server is forgotten while a sign-in is on the way, and the

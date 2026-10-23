@@ -6,7 +6,10 @@ use jsonrpsee::Extensions;
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
-use spoolframe_admin_api::{FederationApiServer, GrantEntry, PeerEntry, PeerKey, error_code};
+use spoolframe_admin_api::{
+    FederationApiServer, GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay,
+    ReceivedLibrary, WithdrawnLibrary, error_code,
+};
 use spoolframe_federation::DialError;
 use spoolframe_protocol::federation::PairingRefused;
 use spoolframe_protocol::fingerprint;
@@ -61,6 +64,9 @@ impl AdminApi {
             plays_there: there.plays,
             refused_here: here.refused,
             refused_there: there.refused,
+            direct_here: here.direct(),
+            proxied_here: here.proxied,
+            proxied_there: there.proxied,
             held_keys: held
                 .into_iter()
                 .map(|key| PeerKey {
@@ -184,6 +190,73 @@ impl FederationApiServer for AdminApi {
             .await
             .map_err(pair_error)?;
         self.peer_entry(federation, peer).await
+    }
+
+    async fn look_up(&self, ext: &Extensions, link: String) -> RpcResult<PairLookup> {
+        // As `redeem`: it dials out and spends the other server's
+        // strangers' budget.
+        self.recent_admin(ext).await?;
+        let found = self
+            .federation()?
+            .look_up_link(&link)
+            .await
+            .map_err(pair_error)?;
+        Ok(PairLookup {
+            name: found.name,
+            server_id: found.server_id,
+            fingerprint: found.fingerprint,
+            inviter: found.inviter,
+            expires_at: found.expires_at,
+        })
+    }
+
+    async fn peer_detail(&self, ext: &Extensions, id: String) -> RpcResult<PeerDetail> {
+        self.admin(ext).await?;
+        let federation = self.federation()?;
+        let peer = federation
+            .peer(&id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| error(error_code::NO_SUCH_PEER, "no server paired by that id"))?;
+        let page = federation.peer_page(&peer).await.map_err(internal)?;
+        Ok(PeerDetail {
+            peer: self.peer_entry(federation, peer).await?,
+            last_seen: page.last_seen,
+            identity_refused_at: page.identity_refused_at,
+            received: page
+                .received
+                .into_iter()
+                .map(|l| ReceivedLibrary {
+                    id: l.library,
+                    title: l.title,
+                    kind: l.kind,
+                    items: l.items,
+                    revision: u64::try_from(l.revision).unwrap_or_default(),
+                    synced_at: l.synced_at,
+                })
+                .collect(),
+            cached_bytes: page.cached_bytes,
+            withdrawn: page
+                .withdrawn
+                .into_iter()
+                .map(|(id, title, withdrawn_at)| WithdrawnLibrary {
+                    id,
+                    title,
+                    withdrawn_at,
+                })
+                .collect(),
+            week: page
+                .week
+                .into_iter()
+                .map(|d| PlayDay {
+                    day: d.day,
+                    plays_here: d.here,
+                    proxied_here: d.proxied_here,
+                    plays_there: d.there,
+                    proxied_there: d.proxied_there,
+                })
+                .collect(),
+        })
     }
 
     async fn peer_revoke(&self, ext: &Extensions, id: String) -> RpcResult<()> {

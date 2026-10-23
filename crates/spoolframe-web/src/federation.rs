@@ -1,17 +1,124 @@
 //! Users and devices › Federation (P8-01), apart from the page: the
-//! servers paired with this one in words, and what a refused pairing
-//! says. Experimental: the page is in the sidebar only while the server
+//! servers paired with this one in words, what a refused pairing says,
+//! the check before pairing, and a paired server's own page (the
+//! WebFederationPeer, WebFederationPair and WebFederationStates boards). Experimental: the page is in the sidebar only while the server
 //! names `federation` among its experimental features. Host-compiled, so
 //! `cargo test` covers it.
 
 use serde_json::Value;
-use spoolframe_admin_api::{PeerEntry, PeerKey, error_code};
+use spoolframe_admin_api::{
+    LibraryKind, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary, error_code,
+};
 
-use crate::logic::ApiError;
+use crate::catalog::bytes;
+use crate::libraries::unit;
+use crate::logic::{ApiError, thousands};
 use crate::portable::{days_ago, short_date};
 
 /// The setting that turns it on (Settings › Experimental).
 pub const SETTING: &str = "experimental.federation";
+
+/// One of `federation { … }`'s settings as Settings › Experimental shows
+/// it, with "Show advanced settings" on (P8-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitField {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub unit: &'static str,
+    /// The default and what it is, under the field.
+    pub help: &'static str,
+}
+
+const fn field(
+    key: &'static str,
+    label: &'static str,
+    unit: &'static str,
+    help: &'static str,
+) -> LimitField {
+    LimitField {
+        key,
+        label,
+        unit,
+        help,
+    }
+}
+
+/// Federation's settings: the cache, then what a pair may send and ask.
+/// Every one is advanced (the 2026-10-23 decision).
+pub const LIMITS: &[LimitField] = &[
+    field(
+        "federation.sync_interval_secs",
+        "Sync every",
+        "s",
+        "Default 3600 s · how often each paired server's libraries are synced; 60 at the least",
+    ),
+    field(
+        "federation.cache_max_mb",
+        "Images per server",
+        "MiB",
+        "Default 2048 MiB · a paired server's artwork kept here",
+    ),
+    field(
+        "federation.cache_total_mb",
+        "Images in all",
+        "MiB",
+        "Default 8192 MiB · every paired server's artwork together",
+    ),
+    field(
+        "federation.sync_max_pages",
+        "Pages per sync",
+        "",
+        "Default 2000 · of one library's sync; 10 at the least",
+    ),
+    field(
+        "federation.sync_max_items",
+        "Items per sync",
+        "",
+        "Default 200000 · of one library's sync; raise it for a very large library",
+    ),
+    field(
+        "federation.max_cached_items",
+        "Items per server",
+        "",
+        "Default 500000 · cached of one paired server, every library together",
+    ),
+    field(
+        "federation.walk_reuse_secs",
+        "Walk reused for",
+        "s",
+        "Default 60 s · one walk of a library answers every pair's sync; 10 at the least",
+    ),
+    field(
+        "federation.max_streams",
+        "Streams per connection",
+        "",
+        "Default 16 · a pair's requests answered at once, 4 to 1024; for connections made after",
+    ),
+    field(
+        "federation.artwork_burst",
+        "Images in a burst",
+        "",
+        "Default 200 · a pair's image requests at once, then 100 a second",
+    ),
+    field(
+        "federation.assertion_burst",
+        "Plays in a burst",
+        "",
+        "Default 30 · plays a pair's users start at once, then 1 a second",
+    ),
+    field(
+        "federation.tokens_per_user",
+        "Play tokens per user",
+        "",
+        "Default 10 · that work at once, for one user of a pair",
+    ),
+    field(
+        "federation.tokens_per_server",
+        "Play tokens per server",
+        "",
+        "Default 500 · that work at once, for a pair",
+    ),
+];
 
 /// The experimental feature's name, as `serverStatus` lists it.
 pub const FEATURE: &str = "federation";
@@ -50,9 +157,11 @@ pub fn state_line(now: i64, peer: &PeerEntry) -> String {
         None => "nothing synced yet".to_owned(),
     };
     let mut line = format!(
-        "{online} · {synced} · {} here from its users · {} there by users here",
+        "{online} · {synced} · {} here from its users{} · {} there by users here{}",
         plays(peer.plays_here),
-        plays(peer.plays_there)
+        modes_here(peer),
+        plays(peer.plays_there),
+        through_here(peer)
     );
     if peer.refused_here > 0 || peer.refused_there > 0 {
         line.push_str(&format!(
@@ -61,6 +170,28 @@ pub fn state_line(now: i64, peer: &PeerEntry) -> String {
         ));
     }
     line
+}
+
+/// How the plays served here went (P8-04): from here to the device, or
+/// through the paired server when the device could not reach this one.
+/// Nothing when none were served.
+fn modes_here(peer: &PeerEntry) -> String {
+    if peer.direct_here == 0 && peer.proxied_here == 0 {
+        return String::new();
+    }
+    format!(
+        " ({} direct, {} through it)",
+        peer.direct_here, peer.proxied_here
+    )
+}
+
+/// How many of this server's users' plays it played on to their devices
+/// itself (P8-04): its own uplink carried them.
+fn through_here(peer: &PeerEntry) -> String {
+    match peer.proxied_there {
+        0 => String::new(),
+        n => format!(" ({n} through this server)"),
+    }
 }
 
 fn plays(n: u64) -> String {
@@ -120,16 +251,32 @@ pub fn key_change_error(e: &ApiError) -> String {
     }
 }
 
-/// The question before unpairing `peer`: its title and its text.
-pub fn unpair_question(peer: &PeerEntry) -> (String, String) {
+/// The question before unpairing `peer`, which this server shares
+/// `shared` (the libraries' names) with: its title and its text. Where
+/// the page does not know what is shared, `None`.
+pub fn unpair_question(peer: &PeerEntry, shared: Option<&[String]>) -> (String, String) {
+    let loses = match shared {
+        Some([]) => String::new(),
+        Some(titles) => format!("{} loses {}, ", peer.name, and_list(titles)),
+        None => format!("{} loses what you share, ", peer.name),
+    };
     (
         format!("Unpair {}?", peer.name),
         format!(
-            "{} stops being paired with this server, and is told so if it can be reached. \
-             Pairing again takes a new invite.",
+            "Sharing ends both ways now: {loses}your users lose {}'s libraries, and every \
+             play token stops. Your users' progress stays. Pairing again takes a new invite.",
             peer.name
         ),
     )
+}
+
+/// `items` as a sentence lists them: "A", "A and B", "A, B and C".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// The question before stopping sharing library `library` (by its name)
@@ -153,6 +300,237 @@ pub fn unpaired(peer: &PeerEntry) -> String {
 /// What the "Confirm it's you" dialog says the change is.
 pub const CONFIRM_ABOUT: &str = "changing which servers are paired with this one";
 
+/// What an invite used or expired says, under "Invite can't be
+/// redeemed".
+pub const INVITE_SPENT: &str =
+    "This invite was already used by another server, or has expired. Ask its admin for a new one.";
+
+/// Whether a refused pairing is an invite used or expired: the dialog
+/// titles it "Invite can't be redeemed".
+pub fn is_spent(e: &ApiError) -> bool {
+    e.code == error_code::PAIRING_REFUSED
+        && e.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            .is_some_and(|r| matches!(r, "invite_expired" | "invite_exhausted"))
+}
+
+/// The check before pairing (WebFederationPair step 3), of what `lookUp`
+/// found: whom to ask to read their fingerprint.
+pub fn ask_to_compare(found: &PairLookup) -> String {
+    match &found.inviter {
+        Some(admin) => format!(
+            "Ask {admin}, who made the invite, to read {}'s from their Federation page. \
+             They must match.",
+            found.name
+        ),
+        None => format!(
+            "Ask {}'s admin to read theirs from their Federation page. They must match.",
+            found.name
+        ),
+    }
+}
+
+/// What pairing does and does not do, under the fingerprint.
+pub fn pairing_means(found: &PairLookup) -> [String; 3] {
+    [
+        format!(
+            "You pair servers, not people. {}'s admin decides who there can watch what you share.",
+            found.name
+        ),
+        "Nothing is shared yet. You choose libraries next; so does the other admin.".into(),
+        "Media goes straight between server and app. If that path is closed, the other server \
+         passes it on."
+            .into(),
+    ]
+}
+
+/// A library's movies, shows or artists, as Libraries counts them:
+/// "1,204 movies", "1 show".
+fn items_of(kind: LibraryKind, n: u64) -> String {
+    format!("{} {}", thousands(n), unit(kind, n))
+}
+
+/// A received library's kind, as the API names it: `None` for one this
+/// build does not know.
+fn received_kind(library: &ReceivedLibrary) -> Option<LibraryKind> {
+    match library.kind.as_str() {
+        "movies" => Some(LibraryKind::Movies),
+        "shows" => Some(LibraryKind::Shows),
+        "music" => Some(LibraryKind::Music),
+        _ => None,
+    }
+}
+
+/// A received library's line: its items, the server's artwork kept here
+/// (`artwork`, on its first row), and its revision.
+pub fn received_line(library: &ReceivedLibrary, artwork: Option<u64>) -> String {
+    let items = match received_kind(library) {
+        Some(kind) => items_of(kind, library.items),
+        None => format!("{} items", thousands(library.items)),
+    };
+    let mut line = items;
+    if let Some(cached) = artwork {
+        line.push_str(&format!(" · artwork {} cached", bytes(cached)));
+    }
+    line.push_str(&format!(" · revision {}", thousands(library.revision)));
+    line
+}
+
+/// Whether a received library is fresh, seen at `now`: up to date while
+/// its server is online, paused while it is not; and when it last synced.
+/// The bool: whether it reads as good news.
+pub fn freshness(now: i64, library: &ReceivedLibrary, online: bool) -> (String, bool) {
+    match (library.synced_at, online) {
+        (None, _) => ("Not synced yet".into(), false),
+        (Some(at), true) => (format!("Up to date · {}", ago(now, at)), true),
+        (Some(at), false) => (format!("Paused · synced {}", ago(now, at)), false),
+    }
+}
+
+/// A pair's header line: when and by whom, or when it was unpaired.
+pub fn paired_line(now: i64, peer: &PeerEntry) -> String {
+    match peer.revoked_at {
+        Some(at) => format!("Unpaired {}", short_date(now, at)),
+        None => format!(
+            "Paired {} by {}",
+            short_date(now, peer.paired_at),
+            peer.paired_by
+        ),
+    }
+}
+
+/// Online, or offline since when it was last seen.
+pub fn presence(now: i64, detail: &PeerDetail) -> String {
+    match (detail.peer.connected, detail.last_seen) {
+        (true, _) => "Online".into(),
+        (false, Some(at)) => format!("Offline since {}", short_date(now, at)),
+        (false, None) => "Offline".into(),
+    }
+}
+
+/// The week's plays across a pair, summed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Week {
+    /// Of this server's items by the pair's users, and of them those its
+    /// server passed on.
+    pub here: u64,
+    pub passed_on: u64,
+    /// Of the pair's items by this server's users.
+    pub there: u64,
+}
+
+pub fn week(days: &[PlayDay]) -> Week {
+    days.iter().fold(Week::default(), |week, day| Week {
+        here: week.here + day.plays_here,
+        passed_on: week.passed_on + day.proxied_here,
+        there: week.there + day.plays_there,
+    })
+}
+
+/// The "From `name`" tile's line: direct, and passed on by its server.
+pub fn from_line(peer: &PeerEntry, week: Week) -> String {
+    format!(
+        "{} direct · {} passed on by {}",
+        week.here.saturating_sub(week.passed_on),
+        week.passed_on,
+        peer.name
+    )
+}
+
+/// What a paired server's state says, over its page (WebFederationStates):
+/// a title and a text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct State {
+    pub title: String,
+    pub text: String,
+    /// Red, not yellow: something refused, not something paused.
+    pub bad: bool,
+}
+
+/// Each state `detail` is in, seen at `now`, on server `me` (this one's
+/// name): its identity changed, it is offline, it stopped sharing a
+/// library, its users' plays went through it. A held new key has its own
+/// row.
+pub fn states(now: i64, me: &str, detail: &PeerDetail) -> Vec<State> {
+    let name = &detail.peer.name;
+    let mut states = Vec::new();
+    if detail.peer.revoked_at.is_some() {
+        return states;
+    }
+    if detail.identity_refused_at.is_some() {
+        states.push(State {
+            title: format!("{name}'s identity changed"),
+            text: format!(
+                "A server answers with {name}'s key but a different server ID. It was refused, \
+                 as it will be every time. If its admin rebuilt it, unpair and pair again."
+            ),
+            bad: true,
+        });
+    }
+    if !detail.peer.connected {
+        let titles: Vec<String> = detail.received.iter().map(|l| l.title.clone()).collect();
+        let browse = if titles.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Your users can still browse its {} from the copy kept here;",
+                and_list(&titles)
+            )
+        };
+        states.push(State {
+            title: presence(now, detail),
+            text: if browse.is_empty() {
+                "Updates are paused, and plays wait until it is back.".into()
+            } else {
+                format!("Updates are paused.{browse} plays wait until it is back.")
+            },
+            bad: false,
+        });
+    }
+    for gone in &detail.withdrawn {
+        states.push(State {
+            title: format!("{name} stopped sharing {}", gone.title),
+            text: format!(
+                "It was removed from your users' apps {}; their progress on it stays on {me}.",
+                days_ago(now, gone.withdrawn_at)
+            ),
+            bad: false,
+        });
+    }
+    let passed = week(&detail.week).passed_on;
+    if passed > 0 {
+        states.push(State {
+            title: format!(
+                "{} went through {name}",
+                if passed == 1 {
+                    "1 play".to_owned()
+                } else {
+                    format!("{passed} plays")
+                }
+            ),
+            text: format!(
+                "Apps on {name} couldn't reach {me} directly, so {name} fetched the media and \
+                 passed it on. Turning on remote access (Settings › Remote access) lets them \
+                 play directly."
+            ),
+            bad: false,
+        });
+    }
+    states
+}
+
+/// What the Unpair section says, on server `me`.
+pub fn unpair_means(peer: &PeerEntry, me: &str) -> String {
+    format!(
+        "Ends sharing both ways at once: grants, play tokens and {0}'s cached libraries go; \
+         your own libraries stay. Your users' progress on {0}'s titles stays on {me}, marked \
+         no longer available.",
+        peer.name
+    )
+}
+
 /// A refused pairing in the page's words: by the other server's reason,
 /// where the admin API names one. The reasons are
 /// `spoolframe_protocol::federation::PairingRefused::name()`'s.
@@ -168,8 +546,9 @@ pub fn refusal(e: &ApiError) -> String {
         .unwrap_or_default();
     match reason {
         "invite_invalid" => "The other server does not know that code: check the link.".into(),
-        "invite_expired" => "That invite has expired: ask for a new one.".into(),
-        "invite_exhausted" => "That invite has been used: ask for a new one.".into(),
+        // One message for both (WebFederationStates): the admin does the
+        // same either way.
+        "invite_expired" | "invite_exhausted" => INVITE_SPENT.into(),
         "wrong_invite_kind" => "That invite is for an account, not for pairing a server.".into(),
         "already_paired" => "The two servers are paired already.".into(),
         "key_held" => "The other server holds this server's new key: its admin confirms it on \
@@ -185,6 +564,20 @@ pub fn refusal(e: &ApiError) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Every federation setting is advanced, on the tab its switch is on.
+    #[test]
+    fn every_federation_setting_is_advanced_under_experimental() {
+        for field in super::LIMITS {
+            assert!(crate::advanced::is_advanced(field.key), "{}", field.key);
+            assert!(
+                crate::advanced::on_tab("experimental").contains(&field.key),
+                "{}",
+                field.key
+            );
+        }
+        assert_eq!(super::LIMITS.len(), 12);
+    }
+
     use super::*;
 
     const DAY: i64 = 86_400;
@@ -209,6 +602,9 @@ mod tests {
             plays_there: 0,
             refused_here: 0,
             refused_there: 0,
+            direct_here: 0,
+            proxied_here: 0,
+            proxied_there: 0,
         }
     }
 
@@ -266,6 +662,31 @@ mod tests {
             )
             .contains("synced just now")
         );
+    }
+
+    /// How the plays went (P8-04): those served here, direct or through
+    /// the paired server, and those this server played on to its own
+    /// users' devices; nothing said of a way no play went.
+    #[test]
+    fn a_live_pair_says_how_its_plays_went() {
+        let served = PeerEntry {
+            plays_here: 5,
+            direct_here: 3,
+            proxied_here: 2,
+            plays_there: 4,
+            proxied_there: 1,
+            ..peer()
+        };
+        assert_eq!(
+            state_line(NOW, &served),
+            "Offline · nothing synced yet · 5 plays here from its users (3 direct, 2 through it) \
+             · 4 plays there by users here (1 through this server)"
+        );
+        let minted_only = PeerEntry {
+            plays_there: 4,
+            ..peer()
+        };
+        assert!(!state_line(NOW, &minted_only).contains('('));
     }
 
     #[test]
@@ -356,9 +777,229 @@ mod tests {
     }
 
     #[test]
-    fn the_question_names_the_server() {
-        let (title, text) = unpair_question(&peer());
+    fn the_question_names_the_server_and_what_it_loses() {
+        let (title, text) = unpair_question(&peer(), None);
         assert_eq!(title, "Unpair Alice's server?");
-        assert!(text.starts_with("Alice's server stops"), "{text}");
+        assert!(
+            text.contains("Alice's server loses what you share"),
+            "{text}"
+        );
+        let shared = ["Movies".to_owned(), "TV Shows".to_owned()];
+        let (_, text) = unpair_question(&peer(), Some(&shared));
+        assert!(
+            text.starts_with("Sharing ends both ways now: Alice's server loses Movies and TV Shows, your users lose"),
+            "{text}"
+        );
+        let (_, text) = unpair_question(&peer(), Some(&[]));
+        assert!(
+            text.starts_with("Sharing ends both ways now: your users lose"),
+            "{text}"
+        );
+    }
+
+    /// Used or expired, the invite says one thing: ask for a new one.
+    #[test]
+    fn a_spent_invite_says_one_thing() {
+        assert_eq!(refusal(&refused("invite_expired")), INVITE_SPENT);
+        assert_eq!(refusal(&refused("invite_exhausted")), INVITE_SPENT);
+        assert!(is_spent(&refused("invite_exhausted")));
+        assert!(!is_spent(&refused("already_paired")));
+    }
+
+    fn lookup(inviter: Option<&str>) -> PairLookup {
+        PairLookup {
+            name: "Bob's Media".into(),
+            server_id: "mzxw6ytbojtg633c".into(),
+            fingerprint: "M4QX-8KDT-2WNF-7RKD".into(),
+            inviter: inviter.map(Into::into),
+            expires_at: NOW + DAY,
+        }
+    }
+
+    #[test]
+    fn the_check_before_pairing_says_whom_to_ask() {
+        assert!(ask_to_compare(&lookup(Some("bob"))).starts_with("Ask bob, who made the invite"));
+        assert!(ask_to_compare(&lookup(None)).starts_with("Ask Bob's Media's admin"));
+        let means = pairing_means(&lookup(None));
+        assert!(means[0].starts_with("You pair servers, not people."));
+        assert!(means[1].starts_with("Nothing is shared yet."));
+        assert!(means[2].contains("the other server passes it on"));
+    }
+
+    fn received(kind: &str, items: u64, synced_at: Option<i64>) -> ReceivedLibrary {
+        ReceivedLibrary {
+            id: "plex:1".into(),
+            title: "Movies".into(),
+            kind: kind.into(),
+            items,
+            revision: 18_422,
+            synced_at,
+        }
+    }
+
+    #[test]
+    fn a_received_library_says_its_items_artwork_and_revision() {
+        assert_eq!(
+            received_line(&received("movies", 412, None), Some(1_800_000_000)),
+            "412 movies · artwork 1.8 GB cached · revision 18,422"
+        );
+        assert_eq!(
+            received_line(&received("shows", 1, None), None),
+            "1 show · revision 18,422"
+        );
+        assert_eq!(items_of(LibraryKind::Music, 3_812), "3,812 artists");
+        assert!(received_line(&received("photos", 2, None), None).starts_with("2 items"));
+    }
+
+    #[test]
+    fn a_received_library_is_up_to_date_only_while_online() {
+        let synced = received("movies", 1, Some(NOW - 120));
+        assert_eq!(
+            freshness(NOW, &synced, true),
+            ("Up to date · 2 min ago".into(), true)
+        );
+        assert_eq!(
+            freshness(NOW, &synced, false),
+            ("Paused · synced 2 min ago".into(), false)
+        );
+        assert_eq!(
+            freshness(NOW, &received("movies", 1, None), true).0,
+            "Not synced yet"
+        );
+    }
+
+    fn detail() -> PeerDetail {
+        PeerDetail {
+            peer: PeerEntry {
+                name: "Bob's Media".into(),
+                connected: true,
+                ..peer()
+            },
+            last_seen: None,
+            identity_refused_at: None,
+            received: Vec::new(),
+            cached_bytes: 0,
+            withdrawn: Vec::new(),
+            week: Vec::new(),
+        }
+    }
+
+    fn day(here: u64, passed: u64, there: u64) -> PlayDay {
+        PlayDay {
+            day: NOW,
+            plays_here: here,
+            proxied_here: passed,
+            plays_there: there,
+            proxied_there: 0,
+        }
+    }
+
+    /// The tiles sum the days: from the pair, direct and passed on; and
+    /// this server's users there.
+    #[test]
+    fn the_week_sums_its_days() {
+        let summed = week(&[day(40, 2, 10), day(4, 1, 7)]);
+        assert_eq!(
+            summed,
+            Week {
+                here: 44,
+                passed_on: 3,
+                there: 17
+            }
+        );
+        assert_eq!(
+            from_line(&detail().peer, summed),
+            "41 direct · 3 passed on by Bob's Media"
+        );
+    }
+
+    #[test]
+    fn an_online_pair_with_nothing_to_say_has_no_state() {
+        assert!(states(NOW, "Home Media", &detail()).is_empty());
+        assert_eq!(presence(NOW, &detail()), "Online");
+        assert_eq!(paired_line(NOW, &detail().peer), "Paired Oct 2 by andrey");
+    }
+
+    #[test]
+    fn an_offline_pair_says_since_when_and_what_stays_browsable() {
+        let offline = PeerDetail {
+            peer: PeerEntry {
+                connected: false,
+                ..detail().peer
+            },
+            last_seen: Some(NOW - 14 * DAY),
+            received: vec![
+                received("movies", 1, Some(NOW)),
+                ReceivedLibrary {
+                    title: "Music".into(),
+                    ..received("music", 1, Some(NOW))
+                },
+            ],
+            ..detail()
+        };
+        let said = states(NOW, "Home Media", &offline);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].title, "Offline since Oct 8");
+        assert_eq!(
+            said[0].text,
+            "Updates are paused. Your users can still browse its Movies and Music from the copy \
+             kept here; plays wait until it is back."
+        );
+        let never = PeerDetail {
+            last_seen: None,
+            received: Vec::new(),
+            ..offline
+        };
+        assert_eq!(states(NOW, "Home Media", &never)[0].title, "Offline");
+    }
+
+    #[test]
+    fn a_withdrawn_library_a_changed_identity_and_passed_on_plays_are_said() {
+        let busy = PeerDetail {
+            identity_refused_at: Some(NOW),
+            withdrawn: vec![spoolframe_admin_api::WithdrawnLibrary {
+                id: "plex:2".into(),
+                title: "TV Shows".into(),
+                withdrawn_at: NOW,
+            }],
+            week: vec![day(10, 3, 0)],
+            ..detail()
+        };
+        let said = states(NOW, "Home Media", &busy);
+        let titles: Vec<&str> = said.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Bob's Media's identity changed",
+                "Bob's Media stopped sharing TV Shows",
+                "3 plays went through Bob's Media"
+            ]
+        );
+        assert!(said[0].bad && !said[1].bad);
+        assert!(
+            said[1].text.ends_with("stays on Home Media."),
+            "{}",
+            said[1].text
+        );
+        assert!(said[2].text.contains("Settings › Remote access"));
+        // Unpaired, none of it is news.
+        let gone = PeerDetail {
+            peer: PeerEntry {
+                revoked_at: Some(NOW),
+                ..busy.peer.clone()
+            },
+            ..busy
+        };
+        assert!(states(NOW, "Home Media", &gone).is_empty());
+    }
+
+    #[test]
+    fn unpairing_says_what_goes_and_what_stays() {
+        let text = unpair_means(&detail().peer, "Home Media");
+        assert!(text.contains("Bob's Media's cached libraries go"), "{text}");
+        assert!(
+            text.contains("stays on Home Media, marked no longer available"),
+            "{text}"
+        );
     }
 }
