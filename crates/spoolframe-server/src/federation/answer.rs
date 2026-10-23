@@ -15,10 +15,13 @@ use spoolframe_catalog::{CatalogError, Page};
 use spoolframe_federation::{Shares, SyncAnswer, Unshared};
 use spoolframe_protocol::ServerId;
 use spoolframe_protocol::federation::{
-    AssertUser, AssertionRefused, RemoteItem, RemoteLibraryKind, SharedLibrary, SyncLibrary,
-    SyncMode, TokenGranted,
+    AssertUser, AssertionRefused, RemoteItem, RemoteLibraryKind, SharedLibrary,
+    SubtitleDownloadAsk, SubtitleRemovalAsk, SubtitleSearchAsk, SyncLibrary, SyncMode,
+    TokenGranted,
 };
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, LibraryKind};
+use spoolframe_types::{
+    ArtworkId, Item, Library, LibraryId, LibraryKind, SubtitleDownloaded, SubtitleSearch,
+};
 use uuid::Uuid;
 
 use super::items::remote;
@@ -39,6 +42,11 @@ const ARTWORK_REFILL: Duration = Duration::from_millis(10);
 /// Each pair's assertions: one per play its users start, a burst of
 /// [`Limits::assertion_burst`], then one a second.
 const ASSERTION_REFILL: Duration = Duration::from_secs(1);
+
+/// Each pair's subtitle searches and downloads (P8-07): each asks a
+/// subtitle site with this server's key, so a burst of
+/// [`Limits::subtitle_burst`], then one every ten seconds.
+const SUBTITLE_REFILL: Duration = Duration::from_secs(10);
 
 /// The external ids a walk knows: those kept, by item, with the hash of
 /// the rest of it then; and those it read anew.
@@ -74,13 +82,15 @@ pub(crate) struct Answering {
 /// makes them again, full.
 #[derive(Debug)]
 struct PairBuckets {
-    made: (Bucket, Bucket),
+    made: (Bucket, Bucket, Bucket),
     artwork: TokenBucket,
     assertions: TokenBucket,
+    subtitles: TokenBucket,
 }
 
-/// The buckets `limits` make a pair's: images, then assertions.
-fn buckets(limits: &Limits) -> (Bucket, Bucket) {
+/// The buckets `limits` make a pair's: images, assertions, then subtitle
+/// asks.
+fn buckets(limits: &Limits) -> (Bucket, Bucket, Bucket) {
     (
         Bucket {
             capacity: limits.artwork_burst,
@@ -90,29 +100,36 @@ fn buckets(limits: &Limits) -> (Bucket, Bucket) {
             capacity: limits.assertion_burst,
             refill_every: ASSERTION_REFILL,
         },
+        Bucket {
+            capacity: limits.subtitle_burst,
+            refill_every: SUBTITLE_REFILL,
+        },
     )
 }
 
 /// A pair's buckets as `made`, full.
-fn fresh(made: (Bucket, Bucket)) -> Arc<PairBuckets> {
+fn fresh(made: (Bucket, Bucket, Bucket)) -> Arc<PairBuckets> {
     Arc::new(PairBuckets {
         made,
         artwork: TokenBucket::new(made.0),
         assertions: TokenBucket::new(made.1),
+        subtitles: TokenBucket::new(made.2),
     })
 }
 
 /// What a pair asks that is paced by bucket.
 #[derive(Debug, Clone, Copy)]
-enum Ask {
+pub(super) enum Ask {
     Artwork,
     Assertion,
+    /// A subtitle search or download (P8-07).
+    Subtitles,
 }
 
 impl Answering {
     /// Whether pair `peer` may ask `ask` now, under `limits`. Its buckets
     /// are made again, full, when a burst changed.
-    fn allowed(&self, peer: &str, ask: Ask, limits: &Limits) -> bool {
+    pub(super) fn allowed(&self, peer: &str, ask: Ask, limits: &Limits) -> bool {
         let made = buckets(limits);
         let buckets = {
             let mut asks = self.asks.lock();
@@ -125,6 +142,7 @@ impl Answering {
         let bucket = match ask {
             Ask::Artwork => &buckets.artwork,
             Ask::Assertion => &buckets.assertions,
+            Ask::Subtitles => &buckets.subtitles,
         };
         bucket.take(Instant::now()).is_ok()
     }
@@ -461,6 +479,30 @@ impl Shares for Federation {
         }
         self.mint(server_id, assertion).await
     }
+
+    async fn search_subtitles(
+        &self,
+        server_id: &ServerId,
+        ask: &SubtitleSearchAsk,
+    ) -> Result<SubtitleSearch, spoolframe_protocol::Error> {
+        self.answer_search(server_id, ask).await
+    }
+
+    async fn download_subtitle(
+        &self,
+        server_id: &ServerId,
+        ask: &SubtitleDownloadAsk,
+    ) -> Result<SubtitleDownloaded, spoolframe_protocol::Error> {
+        self.answer_download(server_id, ask).await
+    }
+
+    async fn remove_subtitle_download(
+        &self,
+        server_id: &ServerId,
+        ask: &SubtitleRemovalAsk,
+    ) -> Result<(), spoolframe_protocol::Error> {
+        self.answer_removal(server_id, ask).await
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +521,23 @@ mod tests {
         assert!(!answering.allowed("sb", Ask::Artwork, &limits));
         assert!(answering.allowed("sc", Ask::Artwork, &limits));
         assert!(answering.allowed("sb", Ask::Assertion, &limits));
+    }
+
+    /// A pair's subtitle asks (P8-07) come in a burst of their own, apart
+    /// from its images and its assertions.
+    #[test]
+    fn a_pair_s_subtitle_asks_are_paced_apart() {
+        let answering = Answering::default();
+        let limits = Limits {
+            subtitle_burst: 2,
+            ..Limits::default()
+        };
+        assert!(answering.allowed("sb", Ask::Subtitles, &limits));
+        assert!(answering.allowed("sb", Ask::Subtitles, &limits));
+        assert!(!answering.allowed("sb", Ask::Subtitles, &limits));
+        assert!(answering.allowed("sb", Ask::Artwork, &limits));
+        assert!(answering.allowed("sb", Ask::Assertion, &limits));
+        assert!(answering.allowed("sc", Ask::Subtitles, &limits));
     }
 
     /// A walk past its reuse goes at the tick, though no pair asks for

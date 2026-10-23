@@ -173,6 +173,57 @@
   `Session::search_hits`, `set_play_from` and `ItemDetail.copies`;
   `Session::search` gives the hits' items. PROTOCOL.md's "One result per
   title" has the wire.
+- Experimental, as pairing is: a paired server's items download
+  (P8-07). Sharing a library includes downloading from it, with no
+  switch of its own. The device prepares a `fed:` item's download on its
+  own server (SB), which has the other (SA) make the file as for SA's
+  own users, for the device SB names, and keeps the record under its own
+  id (migration 0056, `federation_downloads`): status, cancel and the
+  Downloads screen work as for SB's own items, offline watch and plays
+  go to SB, and a followed playlist downloads SA's tracks. The bytes
+  come straight from SA when the device reaches it, else through SB,
+  which writes none of it. Off SA's LAN a read takes one of SA's 4
+  places for download reads, apart from its plays' WAN streams and
+  shares. A revoked grant or an unpairing cancels SA's download; SB's
+  record stays `Ready`, marked `no_longer_available`, when the file was
+  made, so the device keeps it, and is `Failed` with the new cause
+  `no_longer_available` when it was not. SA holds a pair's download
+  tokens to `federation { download_tokens_per_user = 200;
+  download_tokens_per_server = 2000; }`, apart from play tokens, in
+  Settings › Experimental with advanced settings on; SB ends its session
+  for a download once it is made, so a playlist of hundreds of tracks
+  downloads whole, and a download session lives three days at the
+  most.
+- Experimental, as pairing is: subtitle search on a paired server's
+  items (P8-07). SB passes its user's search, download and removal to
+  SA, with the user's SDH and forced choices; SA searches with its own
+  sites and keeps the file, for everyone. Every user of SB's together
+  gets one daily limit on SA, `subtitles { daily_limit_per_peer = 40; }`
+  (0 for no limit), counted under the pair and never under its users;
+  SB holds each of its users to its own limit per user first. Either
+  limit is held from its check to its count, so downloads at once never
+  pass it. SA's Settings › Subtitles shows each paired
+  server as one row, "Bob's server: 12 of 40 today", and never names
+  its users; admin API `subtitle_usage` gains `dailyLimitPerPeer` and
+  `pairs`. SA paces a pair's subtitle asks, `federation { subtitle_burst
+  = 20; }` then one every 10 s. The new limits are in Settings ›
+  Experimental with advanced settings on.
+- Client protocol, for an app that names the experimental `federation`
+  feature, and no `PROTOCOL_VERSION` change: `DownloadOptions` and
+  `PrepareDownload` gain an optional `device { platform, capabilities }`
+  (read only from a paired server's download token's session);
+  `RemoteGrant` gains an optional `download` and `RemoteGranted` says SA's
+  `download`; `DownloadFailure` gains `no_longer_available`, and
+  `DownloadInfo` an optional `no_longer_available`; and
+  `SearchSubtitles`, `DownloadSubtitle` and `RemoveSubtitleDownload`
+  take a `fed:` id. Federation protocol: `AssertUser` takes `scope`
+  `download` with an optional `download`, and the new
+  `search_subtitles`, `download_subtitle` and `remove_subtitle_download`
+  are answered `subtitle_results`, `subtitle_downloaded` or `failed`.
+  SDK: `Session::remote_download` and `RemoteDownload`; the download
+  manager reads a `fed:` download from SA when it can. PROTOCOL.md's
+  "Downloading a paired server's item" and "Subtitles for a paired
+  server's item" have the wire.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

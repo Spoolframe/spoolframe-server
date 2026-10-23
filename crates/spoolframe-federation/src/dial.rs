@@ -11,8 +11,10 @@ use spoolframe_protocol::codec::{MAX_FRAME, read_frame_within, read_reply, write
 use spoolframe_protocol::federation::{
     ArtworkFetch, AssertUser, AssertionRefused, MAX_ARTWORK_BYTES, MAX_REQUEST, Paired,
     PairingRefused, PeerHello, PeerInfo, PeerReply, PeerRequest, RedeemPairing, SharedLibrary,
-    SyncLibrary, SyncMode, SyncPage, TokenGranted, Unpaired, libraries_within_bounds,
+    SubtitleDownloadAsk, SubtitleRemovalAsk, SubtitleSearchAsk, SyncLibrary, SyncMode, SyncPage,
+    TokenGranted, Unpaired, libraries_within_bounds,
 };
+use spoolframe_types::{SubtitleDownloaded, SubtitleSearch};
 
 /// How long a reply may take.
 const REPLY_WAIT: Duration = Duration::from_secs(15);
@@ -26,6 +28,11 @@ const PAGE_WAIT: Duration = Duration::from_secs(60);
 
 /// How long an image may take, the whole of it.
 const ARTWORK_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a subtitle ask may take (P8-07): the other server asks a
+/// subtitle site, as long as the client protocol lets a device wait.
+const SUBTITLE_WAIT: Duration =
+    Duration::from_secs(spoolframe_protocol::policy::wait::SUBTITLE_SITE.as_secs() + 15);
 
 /// Why talking to another server did not go as asked.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +63,10 @@ pub enum DialError {
     /// It minted no token for an assertion (P8-03).
     #[error("the server refused the assertion: {0}")]
     NotGranted(AssertionRefused),
+    /// It refused a subtitle ask as the client protocol refuses one
+    /// (P8-07): what the device is told.
+    #[error("the server refused: {0:?}")]
+    Failed(spoolframe_protocol::Error),
 }
 
 /// The pages of a sync's answer, read one at a time from its stream.
@@ -202,6 +213,61 @@ impl Dialed {
             PeerReply::AssertionRefused { reason } => Err(DialError::NotGranted(reason)),
             _ => Err(DialError::OutOfTurn),
         }
+    }
+
+    /// One of this server's users searches subtitles for the other's item
+    /// (P8-07).
+    pub async fn search_subtitles(
+        &self,
+        ask: SubtitleSearchAsk,
+    ) -> Result<SubtitleSearch, DialError> {
+        match self
+            .ask_subtitles(&PeerRequest::SearchSubtitles(ask))
+            .await?
+        {
+            PeerReply::SubtitleResults { search } => Ok(search),
+            PeerReply::Failed { error } => Err(DialError::Failed(error)),
+            _ => Err(DialError::OutOfTurn),
+        }
+    }
+
+    /// One of this server's users downloads a subtitle result of the
+    /// other's item (P8-07), counted under this server there.
+    pub async fn download_subtitle(
+        &self,
+        ask: SubtitleDownloadAsk,
+    ) -> Result<SubtitleDownloaded, DialError> {
+        match self
+            .ask_subtitles(&PeerRequest::DownloadSubtitle(ask))
+            .await?
+        {
+            PeerReply::SubtitleDownloaded { downloaded } => Ok(downloaded),
+            PeerReply::Failed { error } => Err(DialError::Failed(error)),
+            _ => Err(DialError::OutOfTurn),
+        }
+    }
+
+    /// One of this server's users removes a downloaded subtitle of the
+    /// other's item (P8-07).
+    pub async fn remove_subtitle_download(&self, ask: SubtitleRemovalAsk) -> Result<(), DialError> {
+        match self
+            .ask_subtitles(&PeerRequest::RemoveSubtitleDownload(ask))
+            .await?
+        {
+            PeerReply::Done => Ok(()),
+            PeerReply::Failed { error } => Err(DialError::Failed(error)),
+            _ => Err(DialError::OutOfTurn),
+        }
+    }
+
+    /// A subtitle ask and its reply, a whole frame at most, within
+    /// [`SUBTITLE_WAIT`].
+    async fn ask_subtitles(&self, request: &PeerRequest) -> Result<PeerReply, DialError> {
+        let mut recv = self.send(request).await?;
+        tokio::time::timeout(SUBTITLE_WAIT, read_frame_within(&mut recv, MAX_FRAME))
+            .await
+            .map_err(|_| DialError::Broken("no reply in time".into()))?
+            .map_err(|e| DialError::Broken(e.to_string()))
     }
 
     /// The connection, to wait for its close.

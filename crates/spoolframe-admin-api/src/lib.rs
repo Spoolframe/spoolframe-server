@@ -3122,6 +3122,26 @@ pub struct SubtitleUsage {
     pub daily_limit_per_user: u32,
     /// Each user who downloaded in the day, the most downloads first.
     pub users: Vec<SubtitleUserUsage>,
+    /// `subtitles.daily_limit_per_peer`; 0 for no limit (P8-07).
+    #[serde(default)]
+    pub daily_limit_per_peer: u32,
+    /// Each paired server whose users downloaded in the day, as one row,
+    /// the most downloads first (P8-07). None of its users is named.
+    #[serde(default)]
+    pub pairs: Vec<SubtitlePairUsage>,
+}
+
+/// A paired server's users' downloads of the day, together (P8-07).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitlePairUsage {
+    /// The paired server's name.
+    pub name: String,
+    /// From every site, removed ones too.
+    pub downloads: u32,
+    /// Left in the day under `dailyLimitPerPeer`; `None` without one.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub remaining: Option<u32>,
 }
 
 /// One site's day (PX-02).

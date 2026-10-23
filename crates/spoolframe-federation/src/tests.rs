@@ -616,6 +616,7 @@ fn assertion(item: &str) -> AssertUser {
         item: item.into(),
         scope: TokenScope::Play,
         preferences: None,
+        download: None,
     }
 }
 

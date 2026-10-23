@@ -6968,6 +6968,7 @@ dependencies = [
  "iroh",
  "parking_lot",
  "spoolframe-protocol",
+ "spoolframe-types",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

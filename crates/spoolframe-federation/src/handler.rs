@@ -358,6 +358,41 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 };
                 (reply, After::Next)
             }
+            // P8-07: subtitles for a pair's users, answered as the client
+            // protocol answers them.
+            (
+                request @ (PeerRequest::SearchSubtitles(_)
+                | PeerRequest::DownloadSubtitle(_)
+                | PeerRequest::RemoveSubtitleDownload(_)),
+                Some(Said {
+                    server_id,
+                    standing: Standing::Paired,
+                    ..
+                }),
+            ) => {
+                let failed = |error| PeerReply::Failed { error };
+                let reply = match request {
+                    PeerRequest::SearchSubtitles(ask) => self
+                        .shares
+                        .search_subtitles(&server_id, &ask)
+                        .await
+                        .map_or_else(failed, |search| PeerReply::SubtitleResults { search }),
+                    PeerRequest::DownloadSubtitle(ask) => self
+                        .shares
+                        .download_subtitle(&server_id, &ask)
+                        .await
+                        .map_or_else(failed, |downloaded| PeerReply::SubtitleDownloaded {
+                            downloaded,
+                        }),
+                    PeerRequest::RemoveSubtitleDownload(ask) => self
+                        .shares
+                        .remove_subtitle_download(&server_id, &ask)
+                        .await
+                        .map_or_else(failed, |()| PeerReply::Done),
+                    _ => unreachable!("matched above"),
+                };
+                (reply, After::Next)
+            }
             // Before Hello, a second Hello, a held key's or a stranger's
             // anything else, and what this build does not know.
             _ => {

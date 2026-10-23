@@ -161,6 +161,16 @@ impl Federation {
         // The walks past their reuse (H2), of libraries no pair asks for
         // again: a whole library's items each.
         self.answering.prune_walks(self.limits().walk_reuse);
+        // Downloads of the pairs' items that ended a while ago (P8-07), and
+        // the sessions for reads relayed here that no read uses now.
+        if let Err(e) = self
+            .store()
+            .prune_remote_downloads(super::downloads::ENDED_KEPT)
+            .await
+        {
+            tracing::warn!(error = %e, "cannot forget the ended downloads of the pairs' items");
+        }
+        self.end_idle_sessions().await;
         let peers: Vec<PeerRecord> = match self.store().federation_peers().await {
             Ok(peers) => peers.into_iter().filter(PeerRecord::live).collect(),
             Err(e) => {
@@ -500,6 +510,8 @@ impl Federation {
             })
             .collect();
         self.store().drop_cached(origin, library, &keep).await?;
+        // Its downloads here stay, no longer available (P8-07).
+        self.downloads_unavailable(origin, library).await;
         let gone = self
             .store()
             .forget_cached_files(origin, library.is_none())

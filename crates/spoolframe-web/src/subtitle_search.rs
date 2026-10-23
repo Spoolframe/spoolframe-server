@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 use spoolframe_admin_api::{
-    SubtitleAccountCount, SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleSearch,
-    SubtitleSiteUsage, SubtitleSource, SubtitleSourceState, SubtitleTimingInfo, SubtitleUserUsage,
-    error_code,
+    SubtitleAccountCount, SubtitleDownloaded, SubtitleOrigin, SubtitlePairUsage, SubtitleResult,
+    SubtitleSearch, SubtitleSiteUsage, SubtitleSource, SubtitleSourceState, SubtitleTimingInfo,
+    SubtitleUserUsage, error_code,
 };
 
 use crate::logic::{ApiError, thousands};
@@ -204,6 +204,16 @@ pub fn user_usage(user: &SubtitleUserUsage, limit: u32) -> String {
         user.downloads.to_string()
     } else {
         format!("{} of {limit}", user.downloads)
+    }
+}
+
+/// A paired server's row on Settings › Subtitles (P8-07): its users'
+/// downloads together, as one, against the limit per server.
+pub fn pair_usage(pair: &SubtitlePairUsage, limit: u32) -> String {
+    if limit == 0 {
+        format!("{}: {} today", pair.name, pair.downloads)
+    } else {
+        format!("{}: {} of {limit} today", pair.name, pair.downloads)
     }
 }
 
@@ -501,6 +511,18 @@ mod tests {
         };
         assert_eq!(user_usage(&alice, 5), "2 of 5");
         assert_eq!(user_usage(&alice, 0), "2");
+    }
+
+    /// A paired server's users are one row, by the server's name (P8-07).
+    #[test]
+    fn a_paired_server_s_day_is_one_row_against_its_limit() {
+        let bob = SubtitlePairUsage {
+            name: "Bob's Media".into(),
+            downloads: 12,
+            remaining: Some(28),
+        };
+        assert_eq!(pair_usage(&bob, 40), "Bob's Media: 12 of 40 today");
+        assert_eq!(pair_usage(&bob, 0), "Bob's Media: 12 today");
     }
 
     #[test]

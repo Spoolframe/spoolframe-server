@@ -10,6 +10,10 @@
 //! shared with the pair, and mints a random bearer, kept hashed, bound to
 //! the device and to that one item, for minutes. P8-04 redeems it.
 //!
+//! A download token (P8-07) is asserted and minted the same way, with
+//! limits of its own: the session it opens lives while its download is
+//! made and read.
+//!
 //! Plays are counted one number per server, never per user: the server
 //! whose item is played counts as the token is redeemed (P8-04), the
 //! other as it vouches.
@@ -29,7 +33,7 @@ use crate::auth::SessionToken;
 use crate::principal::{Principal, RemoteServerId, Who};
 use crate::store::StoreError;
 use crate::store::federation::PeerRecord;
-use crate::store::federation_tokens::{NewToken, PlaySide, TokenKept};
+use crate::store::federation_tokens::{AlsoHeld, NewToken, PlaySide, TokenKept};
 use crate::store::users::LocalUserId;
 
 /// How long a play token works once minted.
@@ -77,22 +81,27 @@ impl Federation {
         device: EndpointId,
     ) -> Result<TokenGranted, AssertError> {
         let (peer, _) = self.remote_peer(item).await?;
-        self.assert_play_to(&peer, user, display_name, item, device, true)
+        let wanted = Wanted::play(true);
+        self.assert_to(&peer, user, display_name, item, device, wanted)
             .await
     }
 
     /// [`Federation::assert_play`] to `peer`, the live pair `item` is from,
-    /// as the caller found it; counted as a play unless `counted` is false
-    /// (one already counted, P8-04).
-    async fn assert_play_to(
+    /// as the caller found it, for the token `wanted` says.
+    async fn assert_to(
         &self,
         peer: &PeerRecord,
         user: LocalUserId,
         display_name: &str,
         item: &MediaId,
         device: EndpointId,
-        counted: bool,
+        wanted: Wanted,
     ) -> Result<TokenGranted, AssertError> {
+        let Wanted {
+            scope,
+            download,
+            counted,
+        } = wanted;
         let (origin, remote) = item
             .remote()
             .ok_or_else(|| AssertError::NotFederated(item.clone()))?;
@@ -109,13 +118,14 @@ impl Federation {
                 display_name: display_name.to_owned(),
                 client_endpoint: device.to_string(),
                 item: remote.to_string(),
-                scope: TokenScope::Play,
+                scope,
                 preferences: Some(preferences),
+                download,
             })
             .await;
         match granted {
             Ok(granted) => {
-                if counted {
+                if counted && scope == TokenScope::Play {
                     self.store()
                         .count_federation_play(&peer.id, PlaySide::Asserted)
                         .await?;
@@ -124,7 +134,8 @@ impl Federation {
                     peer = %peer.endpoint_id,
                     %item,
                     user = %user,
-                    "a paired server minted a play token for a user here"
+                    scope = scope.name(),
+                    "a paired server minted a token for a user here"
                 );
                 Ok(granted)
             }
@@ -138,7 +149,8 @@ impl Federation {
                     peer = %peer.endpoint_id,
                     %item,
                     error = %e,
-                    "a paired server minted no play token"
+                    scope = scope.name(),
+                    "a paired server minted no token"
                 );
                 Err(e.into())
             }
@@ -157,13 +169,47 @@ impl Federation {
         device: EndpointId,
         counted: bool,
     ) -> Result<TokenGranted, AssertError> {
+        self.assert_for(who, peer, item, device, Wanted::play(counted))
+            .await
+    }
+
+    /// A download token (P8-07) for `who` to `peer`, the live pair `item` is
+    /// from, bound to `device`: of `download` alone, SA's id of it, for a
+    /// device's own reads, or with `None` for this server, which prepares
+    /// and keeps the download. Not a play, and not counted as one.
+    pub async fn assert_download_for(
+        &self,
+        who: &Who,
+        peer: &PeerRecord,
+        item: &MediaId,
+        device: EndpointId,
+        download: Option<String>,
+    ) -> Result<TokenGranted, AssertError> {
+        let wanted = Wanted {
+            scope: TokenScope::Download,
+            download,
+            counted: false,
+        };
+        self.assert_for(who, peer, item, device, wanted).await
+    }
+
+    /// [`Federation::assert_to`] for `who`: a local account only. A
+    /// portable guest is not passed on, and is counted as refused.
+    async fn assert_for(
+        &self,
+        who: &Who,
+        peer: &PeerRecord,
+        item: &MediaId,
+        device: EndpointId,
+        wanted: Wanted,
+    ) -> Result<TokenGranted, AssertError> {
         let Some(local) = who.local() else {
             self.store()
                 .count_federation_refusal(&peer.id, PlaySide::Asserted)
                 .await?;
             return Err(AssertError::NotALocalUser);
         };
-        self.assert_play_to(peer, local.user, &local.display_name, item, device, counted)
+        self.assert_to(peer, local.user, &local.display_name, item, device, wanted)
             .await
     }
 
@@ -211,7 +257,7 @@ impl Federation {
             .map_err(|e| unavailable(&e))?
             .ok_or(AssertionRefused::NotShared)?;
         let checked = self.checked(&peer.id, assertion).await;
-        let (user, device, item, library) = match checked {
+        let (user, device, item, library, scope) = match checked {
             Ok(checked) => checked,
             Err(reason) => {
                 if reason != AssertionRefused::Unavailable
@@ -239,6 +285,23 @@ impl Federation {
             .preferences
             .as_ref()
             .and_then(|p| serde_json::to_string(p).ok());
+        // Downloads are held to limits of their own, counting the
+        // download sessions open: they live for hours, and must never take
+        // a play's place (P8-07).
+        let (limits, also) = match scope {
+            TokenScope::Download => {
+                let sessions = self.auth.remote_sessions();
+                let downloads = |u: &crate::remote_sessions::RemoteSessionUser| {
+                    u.scope == TokenScope::Download && u.peer == peer.id
+                };
+                let also = AlsoHeld {
+                    of_user: sessions.count(|u| downloads(u) && u.principal() == principal),
+                    of_peer: sessions.count(downloads),
+                };
+                (self.limits().download_tokens, also)
+            }
+            _ => (self.limits().tokens, AlsoHeld::default()),
+        };
         // A bearer as a session's is, kept by its hash alike.
         let token = SessionToken::generate();
         let expires_at =
@@ -254,13 +317,15 @@ impl Federation {
                     // As the redeeming connection names its endpoint: one
                     // key, whichever encoding the assertion used.
                     device: &device.to_string(),
-                    scope: assertion.scope.name(),
+                    scope: scope.name(),
                     expires_at,
                     // Kept for the session it opens (P8-04).
                     preferences: preferences.as_deref(),
+                    download: assertion.download.as_deref(),
                 },
                 // The most that work at once (H3), as the settings say.
-                self.limits().tokens,
+                limits,
+                also,
             )
             .await
             .map_err(|e| unavailable(&e))?;
@@ -272,7 +337,8 @@ impl Federation {
                 tracing::info!(
                     peer = %peer.endpoint_id,
                     %principal,
-                    "a paired server holds as many play tokens as it may"
+                    scope = scope.name(),
+                    "a paired server holds as many tokens as it may"
                 );
                 return Err(AssertionRefused::Unavailable);
             }
@@ -283,22 +349,23 @@ impl Federation {
             peer = %peer.endpoint_id,
             %principal,
             %item,
-            "a play token is minted for a paired server's user"
+            scope = scope.name(),
+            "a token is minted for a paired server's user"
         );
         Ok(TokenGranted {
             token: token.0,
-            scope: assertion.scope,
+            scope,
             expires_at,
         })
     }
 
     /// `assertion` read and checked for pair `peer`: its user, its
-    /// device, its item, and the shared library the item is in.
+    /// device, its item, the shared library the item is in, and its scope.
     async fn checked(
         &self,
         peer: &str,
         assertion: &AssertUser,
-    ) -> Result<(uuid::Uuid, EndpointId, MediaId, String), AssertionRefused> {
+    ) -> Result<(uuid::Uuid, EndpointId, MediaId, String, TokenScope), AssertionRefused> {
         // A stable user id, as a local account's: a portable user's id, or
         // anything else, is not one.
         let user =
@@ -307,7 +374,11 @@ impl Federation {
             .client_endpoint
             .parse::<EndpointId>()
             .map_err(|_| AssertionRefused::InvalidDevice)?;
-        if assertion.scope != TokenScope::Play {
+        // Sharing a library includes downloading from it (P8-07): no
+        // switch of its own.
+        if !matches!(assertion.scope, TokenScope::Play | TokenScope::Download)
+            || (assertion.scope == TokenScope::Play && assertion.download.is_some())
+        {
             return Err(AssertionRefused::InvalidScope);
         }
         let item: MediaId = assertion
@@ -333,7 +404,26 @@ impl Federation {
                 return Err(AssertionRefused::Unavailable);
             }
         };
-        Ok((user, device, item, library.to_string()))
+        Ok((user, device, item, library.to_string(), assertion.scope))
+    }
+}
+
+/// The token an assertion asks for.
+struct Wanted {
+    scope: TokenScope,
+    /// A device's download token's one download, by SA's id.
+    download: Option<String>,
+    /// Counted as a play here (a play not counted already, P8-04).
+    counted: bool,
+}
+
+impl Wanted {
+    fn play(counted: bool) -> Self {
+        Self {
+            scope: TokenScope::Play,
+            download: None,
+            counted,
+        }
     }
 }
 
@@ -411,6 +501,7 @@ mod tests {
                     item: movie().id().to_string(),
                     scope: TokenScope::Play,
                     preferences: None,
+                    download: None,
                 },
             )
             .await

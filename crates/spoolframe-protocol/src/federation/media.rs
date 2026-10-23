@@ -83,6 +83,11 @@ pub struct RemoteGranted {
     pub endpoint_id: String,
     /// When the token stops working, Unix seconds: minutes from now.
     pub expires_at: i64,
+    /// For a download token (P8-07, `RemoteGrant` with a `download`): the
+    /// download's id on SA, what the device reads there
+    /// (`ResourceRequest::Download`) with the session the token opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<String>,
 }
 
 impl fmt::Debug for RemoteGranted {
@@ -93,6 +98,7 @@ impl fmt::Debug for RemoteGranted {
             .field("item", &self.item)
             .field("endpoint_id", &self.endpoint_id)
             .field("expires_at", &self.expires_at)
+            .field("download", &self.download)
             .finish()
     }
 }

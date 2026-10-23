@@ -18,13 +18,18 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// What a token opens. A play token opens one item's playback; P8-07 adds
-/// a download token, which opens one item's download.
+/// What a token opens. A play token opens one item's playback; a
+/// download token (P8-07) opens one item's download.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenScope {
     #[default]
     Play,
+    /// One item's download (P8-07): preparing it, asking how it goes,
+    /// cancelling it, reading its file and hearing `DownloadChanged`. The
+    /// session it opens lives while the download is made and read, not
+    /// minutes as a play's.
+    Download,
     /// A scope this build does not know: refused.
     #[serde(other)]
     Unknown,
@@ -35,6 +40,7 @@ impl TokenScope {
     pub fn name(self) -> &'static str {
         match self {
             TokenScope::Play => "play",
+            TokenScope::Download => "download",
             TokenScope::Unknown => "unknown",
         }
     }
@@ -62,6 +68,11 @@ pub struct AssertUser {
     /// would. Left out, SA's defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferences: Option<spoolframe_types::TrackPreferences>,
+    /// A download token's one download, by SA's id (P8-07): what the
+    /// device's own token reads. Left out, the token's session prepares
+    /// the item's download itself (SB's own, which keeps the record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<String>,
 }
 
 impl AssertUser {

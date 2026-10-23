@@ -351,6 +351,13 @@ federation {
   # Play tokens that work at once, for one user of a pair and for a pair.
   tokens_per_user = 10;
   tokens_per_server = 500;
+  # Download tokens (P8-07) that work at once, each a download being made
+  # or read: apart from play tokens, so downloads never take a play's place.
+  download_tokens_per_user = 200;
+  download_tokens_per_server = 2000;
+  # Subtitle searches and downloads a pair's users ask (P8-07), in a
+  # burst, then one every 10 s.
+  subtitle_burst = 20;
 }
 
 # When an item counts as started, and as watched (without credits markers).
@@ -468,6 +475,9 @@ subtitles {
   # sources = ["opensubtitles", "subdl"];
   # A user's subtitle downloads a day, from every site; 0: no limit.
   # daily_limit_per_user = 0;
+  # Every user of one paired server together, on this server's items
+  # (P8-07); 0: no limit.
+  # daily_limit_per_peer = 40;
 }
 
 # Subtitles from OpenSubtitles (opensubtitles.com) on demand: searched

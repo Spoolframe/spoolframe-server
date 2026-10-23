@@ -22,6 +22,7 @@ pub mod audit;
 pub mod downloads;
 pub mod federation;
 pub mod federation_cache;
+pub mod federation_downloads;
 pub mod federation_grants;
 pub mod federation_sync;
 pub mod federation_tokens;

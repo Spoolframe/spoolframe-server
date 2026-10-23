@@ -23,11 +23,23 @@
 //! sent with [`crate::Request::SyncOfflinePlays`].
 
 use serde::{Deserialize, Serialize};
-use spoolframe_types::{Container, MediaId, MediaTracks};
+use spoolframe_types::{ClientCapabilities, Container, MediaId, MediaTracks, Platform};
 
 /// The most ids one `DownloadStatus` asks about, and the most entries one
 /// `SyncOfflineWatch` carries.
 pub const MAX_ASKED: usize = 500;
+
+/// The device a paired server's item is downloaded for (P8-07): what the
+/// server its user is at home on (SB) sends with `DownloadOptions` and
+/// `PrepareDownload` on the paired server (SA), which plans for it in place
+/// of SB's own `Hello`, as `StartPlayback`'s `capabilities` does a play.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadDevice {
+    pub platform: Platform,
+    /// What it plays; its platform's own when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ClientCapabilities>,
+}
 
 /// What a download is made from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +241,11 @@ pub enum DownloadFailure {
     /// Talking to the server failed: a device's own, for an answer that
     /// broke off or made no sense, or a file that arrived damaged.
     Network,
+    /// A paired server's item (P8-07) that is no longer available before
+    /// its file was made: that server stopped sharing it, or the servers
+    /// unpaired. A download made already stays `Ready`, marked
+    /// [`DownloadInfo::no_longer_available`].
+    NoLongerAvailable,
     /// Anything else: the reason says.
     #[default]
     Other,
@@ -272,6 +289,14 @@ pub struct DownloadInfo {
     /// sends it only with `PrepareDownload`'s). `Ready`'s `size` is exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_size: Option<u64>,
+    /// A paired server's item's download (P8-07) whose file was made, and
+    /// that is no longer available: that server stopped sharing it, or the
+    /// servers unpaired. Its state stays `Ready`, so the device keeps a
+    /// file it has whole; nothing more of it is read. One not made yet is
+    /// `Failed` with the cause `NoLongerAvailable` instead. Left out when
+    /// false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_longer_available: bool,
 }
 
 /// Where a device got to in an item while it had no server

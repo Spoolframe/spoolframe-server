@@ -22,11 +22,14 @@ pub struct NewToken<'a> {
     pub library: &'a str,
     /// The device's endpoint id, hex.
     pub device: &'a str,
-    /// `play`; P8-07 adds `download`.
+    /// `play` or `download` (P8-07).
     pub scope: &'a str,
     pub expires_at: i64,
     /// The user's track preferences on their own server, as JSON (P8-04).
     pub preferences: Option<&'a str>,
+    /// A device's download token's one download, by this server's id
+    /// (P8-07).
+    pub download: Option<&'a str>,
 }
 
 /// A token kept, as P8-04 reads it to redeem it.
@@ -58,15 +61,27 @@ pub struct RedeemedToken {
     pub peer_endpoint: String,
     /// What the pair calls itself.
     pub peer_name: String,
+    /// A device's download token's one download (P8-07).
+    pub download: Option<String>,
 }
 
 /// The most tokens that work at once (H3): per pair and user, and per
 /// pair. A play takes one token, for minutes; past these the pair is told
-/// to try later.
+/// to try later. Download tokens (P8-07) are held to limits of their own,
+/// so downloads that live for hours never take a play's place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenLimits {
     pub per_user: u64,
     pub per_peer: u64,
+}
+
+/// What else holds a token's place beside the unused tokens the store
+/// keeps (P8-07): the download sessions open now, of the pair's user and
+/// of the pair. None for a play token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlsoHeld {
+    pub of_user: u64,
+    pub of_peer: u64,
 }
 
 /// Whether a token was kept.
@@ -120,12 +135,14 @@ impl PlayCount {
 
 impl Store {
     /// Keep `token`, minted now, if its library is shared with its pair
-    /// and the pair is within `limits`: checked and kept in one
-    /// transaction, so a grant revoked meanwhile is never missed (M6).
+    /// and the pair is within `limits`, counting its scope's unused tokens
+    /// and what is `also` held: checked and kept in one transaction, so a
+    /// grant revoked meanwhile is never missed (M6).
     pub async fn keep_federation_token(
         &self,
         token: NewToken<'_>,
         limits: TokenLimits,
+        also: AlsoHeld,
     ) -> Result<TokenKept, StoreError> {
         let mut tx = self.begin_write().await?;
         let shared: bool = sqlx::query_scalar(
@@ -143,22 +160,27 @@ impl Store {
         }
         let (of_user, of_peer): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*) FILTER (WHERE principal = ?2), COUNT(*) FROM federation_tokens \
-             WHERE peer = ?1 AND expires_at > ?3 AND used_at IS NULL",
+             WHERE peer = ?1 AND expires_at > ?3 AND used_at IS NULL AND scope = ?4",
         )
         .bind(token.peer)
         .bind(token.principal)
         .bind(self.now())
+        .bind(token.scope)
         .fetch_one(&mut *tx)
         .await?;
-        let past = |held: i64, limit: u64| u64::try_from(held).unwrap_or_default() >= limit;
-        if past(of_user, limits.per_user) || past(of_peer, limits.per_peer) {
+        let past = |held: i64, also: u64, limit: u64| {
+            u64::try_from(held).unwrap_or_default().saturating_add(also) >= limit
+        };
+        if past(of_user, also.of_user, limits.per_user)
+            || past(of_peer, also.of_peer, limits.per_peer)
+        {
             return Ok(TokenKept::TooMany);
         }
         sqlx::query(
             "INSERT INTO federation_tokens \
                  (token_hash, peer, principal, item, library, device, scope, created_at, \
-                  expires_at, preferences) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  expires_at, preferences, download) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(token.token_hash)
         .bind(token.peer)
@@ -170,6 +192,7 @@ impl Store {
         .bind(self.now())
         .bind(token.expires_at)
         .bind(token.preferences)
+        .bind(token.download)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -194,7 +217,7 @@ impl Store {
                            WHERE g.peer = federation_tokens.peer \
                              AND g.library = federation_tokens.library \
                              AND g.revoked_at IS NULL AND p.revoked_at IS NULL) \
-             RETURNING peer, principal, item, library, scope, preferences, \
+             RETURNING peer, principal, item, library, scope, preferences, download, \
                  (SELECT endpoint_id FROM federation_peers WHERE id = federation_tokens.peer) \
                      AS peer_endpoint, \
                  (SELECT display_name FROM federation_peers WHERE id = federation_tokens.peer) \
@@ -458,7 +481,10 @@ mod tests {
 
     async fn keep(store: &Store, token: NewToken<'_>) {
         assert_eq!(
-            store.keep_federation_token(token, ROOMY).await.unwrap(),
+            store
+                .keep_federation_token(token, ROOMY, AlsoHeld::default())
+                .await
+                .unwrap(),
             TokenKept::Kept
         );
     }
@@ -476,6 +502,7 @@ mod tests {
             scope: "play",
             expires_at,
             preferences: None,
+            download: None,
         }
     }
 
@@ -531,7 +558,7 @@ mod tests {
             per_user: 2,
             per_peer: 3,
         };
-        let kept = |token| store.keep_federation_token(token, limits);
+        let kept = |token| store.keep_federation_token(token, limits, AlsoHeld::default());
         assert_eq!(
             kept(token("h0", &peer, "plex:9", now + 300)).await.unwrap(),
             TokenKept::NotShared
@@ -574,7 +601,10 @@ mod tests {
             principal: "remote:mzxw6ytbojtg633c:00000000-0000-0000-0000-00000000000a",
             ..token("h7", &peer, "plex:2", now + 300)
         };
-        let fresh = store.keep_federation_token(revoked, ROOMY).await.unwrap();
+        let fresh = store
+            .keep_federation_token(revoked, ROOMY, AlsoHeld::default())
+            .await
+            .unwrap();
         assert_eq!(fresh, TokenKept::NotShared);
     }
 
@@ -592,7 +622,11 @@ mod tests {
             let hash = format!("h{n}");
             assert_eq!(
                 store
-                    .keep_federation_token(token(&hash, &peer, "plex:1", now + 300), limits)
+                    .keep_federation_token(
+                        token(&hash, &peer, "plex:1", now + 300),
+                        limits,
+                        AlsoHeld::default(),
+                    )
                     .await
                     .unwrap(),
                 TokenKept::Kept,
@@ -605,6 +639,56 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// Download tokens (P8-07) are counted apart from play tokens, with
+    /// the download sessions held beside them: a user's downloads never
+    /// take their plays' place, nor the other way.
+    #[tokio::test]
+    async fn download_tokens_are_counted_apart_with_their_sessions() {
+        let (store, peer) = paired("fed-tokens-download").await;
+        let now = store.now();
+        let limits = TokenLimits {
+            per_user: 2,
+            per_peer: 100,
+        };
+        let download = |hash| NewToken {
+            scope: "download",
+            ..token(hash, &peer, "plex:1", now + 300)
+        };
+        for hash in ["p1", "p2"] {
+            assert_eq!(
+                store
+                    .keep_federation_token(
+                        token(hash, &peer, "plex:1", now + 300),
+                        limits,
+                        AlsoHeld::default()
+                    )
+                    .await
+                    .unwrap(),
+                TokenKept::Kept
+            );
+        }
+        let one_session = AlsoHeld {
+            of_user: 1,
+            of_peer: 1,
+        };
+        assert_eq!(
+            store
+                .keep_federation_token(download("d1"), limits, one_session)
+                .await
+                .unwrap(),
+            TokenKept::Kept,
+            "two play tokens leave a download its place"
+        );
+        assert_eq!(
+            store
+                .keep_federation_token(download("d2"), limits, one_session)
+                .await
+                .unwrap(),
+            TokenKept::TooMany,
+            "one unused download token and one session"
+        );
     }
 
     #[tokio::test]

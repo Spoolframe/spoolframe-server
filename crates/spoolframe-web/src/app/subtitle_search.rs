@@ -19,8 +19,8 @@ use super::{icons, rpc};
 use crate::logic::ApiError;
 use crate::subtitle_search::{
     LIMIT, details, downloaded_by, downloaded_line, downloads, languages_value, limit_value, marks,
-    refusal, secret_reference, site_usage_line, source_lines, sources_on, sources_value,
-    user_usage,
+    pair_usage, refusal, secret_reference, site_usage_line, source_lines, sources_on,
+    sources_value, user_usage,
 };
 use crate::subtitle_timing::{any_syncing, sync_text};
 
@@ -540,6 +540,10 @@ fn UsageToday() -> Element {
                         }
                     }
                 }
+            }
+            // A paired server's users, as one row each server (P8-07).
+            for line in usage.pairs.iter().map(|p| pair_usage(p, usage.daily_limit_per_peer)) {
+                p { key: "{line}", class: "m-0 text-sm", "{line}" }
             }
         }
     }

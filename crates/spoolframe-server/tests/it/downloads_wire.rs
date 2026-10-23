@@ -101,6 +101,7 @@ async fn prepare(
                 id: movie().id().clone(),
                 source,
                 tracks,
+                device: None,
             },
         )
         .await
@@ -330,6 +331,7 @@ async fn a_client_that_did_not_list_downloads_is_refused_them_and_told_nothing()
             Some(&old_session),
             Request::DownloadOptions {
                 id: movie().id().clone(),
+                device: None,
             },
         )
         .await;
@@ -455,6 +457,7 @@ async fn the_options_offer_the_viewer_s_languages_the_profiles_and_what_original
             Some(&session),
             Request::DownloadOptions {
                 id: movie().id().clone(),
+                device: None,
             },
         )
         .await
@@ -678,6 +681,7 @@ async fn a_failed_conversion_fails_the_download_and_preparing_again_makes_it() {
             Some(&session),
             Request::DownloadOptions {
                 id: movie().id().clone(),
+                device: None,
             },
         )
         .await;
@@ -947,6 +951,7 @@ async fn a_device_is_offered_only_the_profiles_it_plays() {
             Some(&session),
             Request::DownloadOptions {
                 id: movie().id().clone(),
+                device: None,
             },
         )
         .await
@@ -985,6 +990,7 @@ async fn options(client: &TestClient, session: &SessionId) -> DownloadOptionsInf
             Some(session),
             Request::DownloadOptions {
                 id: movie().id().clone(),
+                device: None,
             },
         )
         .await

@@ -1,6 +1,7 @@
 //! The download manager (PX-38): one task per client, moving one download
 //! at a time, oldest first, and sending offline watch entries.
 
+use crate::session::unexpected;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -320,6 +321,7 @@ pub(super) async fn prepare(
         id: id.clone(),
         source: source.clone(),
         tracks: tracks.clone(),
+        device: None,
     };
     match session.call(request).await? {
         Reply::Download(info) => Ok(info),
@@ -344,10 +346,6 @@ fn status_of(reply: Reply, id: &str) -> Result<DownloadInfo, SdkError> {
         }
         other => Err(unexpected(other)),
     }
-}
-
-fn unexpected(reply: Reply) -> SdkError {
-    SdkError::Protocol(format!("unexpected reply {reply:?}"))
 }
 
 /// Take in what the server says of `m`'s download. A ready file other
@@ -597,6 +595,9 @@ async fn transferring(
             Ok(())
         })
     };
+    // A paired server's item (P8-07) is read straight from that server
+    // when this device reaches it, else through the user's own server.
+    let mut direct = remote_source(session, &m, &id).await;
     while !writer.is_complete() {
         let offset = writer.contiguous();
         if shared.should_stop(&m.key) {
@@ -604,8 +605,19 @@ async fn transferring(
             save(offset).await?;
             return Ok(Step::Stop);
         }
-        let read = match read(session, &id, offset).await {
+        let read = match &direct {
+            Some(remote) => read(&remote.session, &remote.id, offset).await,
+            None => read(session, &id, offset).await,
+        };
+        let read = match read {
             Ok(read) => read,
+            // The paired server stopped answering this device: the rest
+            // comes through the user's own server.
+            Err(e) if direct.is_some() => {
+                tracing::info!(key = m.key, error = %e, "a paired server's download goes on through this session's server");
+                direct = None;
+                continue;
+            }
             Err(e) => {
                 writer.sync().await.map_err(disk)?;
                 save(offset).await?;
@@ -642,6 +654,13 @@ async fn transferring(
             shared.emit(&m);
         }
     }
+    // Whole: the paired server's session for this download is ended, and
+    // its place under that server's token caps let go (P8-07).
+    if let Some(remote) = direct.take()
+        && let Err(e) = remote.session.call(Request::Logout).await
+    {
+        tracing::debug!(key = m.key, error = %e, "a paired server's download session was not ended");
+    }
     let media = store
         .media(&m)
         .ok_or_else(|| SdkError::Protocol("a ready download with no container".into()))?;
@@ -666,6 +685,24 @@ async fn transferring(
         }
         Err(Unfinished::Io(e)) => Err(disk(e)),
         Err(Unfinished::Incomplete) => unreachable!("the loop ends once it is whole"),
+    }
+}
+
+/// Where `m`'s download `id` is read from when it is a paired server's
+/// item (P8-07) and that server is reached: its session there for that
+/// download. `None` reads it through `session`'s server.
+async fn remote_source(session: &Session, m: &Manifest, id: &str) -> Option<crate::RemoteDownload> {
+    if m.item.id().namespace() != spoolframe_types::Namespace::Federated
+        || !session.experimental().federation
+    {
+        return None;
+    }
+    match session.remote_download(m.item.id(), id).await {
+        Ok(remote) => Some(remote),
+        Err(e) => {
+            tracing::info!(key = m.key, error = %e, "a paired server's download is read through this session's server");
+            None
+        }
     }
 }
 
@@ -1021,6 +1058,7 @@ mod tests {
             state: DownloadState::Waiting,
             file: None,
             expected_size,
+            no_longer_available: false,
         };
         take(&mut m, info(Some(2_800_000_000)));
         take(&mut m, info(None));
@@ -1043,6 +1081,7 @@ mod tests {
                 },
                 file: None,
                 expected_size,
+                no_longer_available: false,
             }],
             gone: Vec::new(),
         };
@@ -1099,6 +1138,7 @@ mod tests {
                 },
                 file: None,
                 expected_size: None,
+                no_longer_available: false,
             },
         );
         assert_eq!(

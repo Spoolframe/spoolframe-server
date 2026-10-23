@@ -25,10 +25,12 @@
 mod assertion;
 mod media;
 mod replication;
+mod subtitles;
 
 pub use assertion::*;
 pub use media::*;
 pub use replication::*;
+pub use subtitles::*;
 
 use std::fmt;
 
@@ -356,6 +358,15 @@ pub enum PeerRequest {
     /// A pair's: it vouches for one of its users, who wants an item of
     /// this server's (P8-03): `Token`, or `AssertionRefused`.
     AssertUser(AssertUser),
+    /// A pair's: one of its users searches subtitles for an item of this
+    /// server's (P8-07): `SubtitleResults`, or `Failed`.
+    SearchSubtitles(SubtitleSearchAsk),
+    /// A pair's: one of its users downloads a result (P8-07), counted
+    /// under the pair: `SubtitleDownloaded`, or `Failed`.
+    DownloadSubtitle(SubtitleDownloadAsk),
+    /// A pair's: one of its users removes a downloaded subtitle (P8-07):
+    /// `Done`, or `Failed`.
+    RemoveSubtitleDownload(SubtitleRemovalAsk),
     /// A request this build does not know: not allowed.
     #[serde(other)]
     Unknown,
@@ -398,6 +409,19 @@ pub enum PeerReply {
     /// No token for an [`AssertUser`], and why.
     AssertionRefused {
         reason: AssertionRefused,
+    },
+    /// A subtitle search's results (P8-07).
+    SubtitleResults {
+        search: spoolframe_types::SubtitleSearch,
+    },
+    /// A subtitle downloaded (P8-07).
+    SubtitleDownloaded {
+        downloaded: spoolframe_types::SubtitleDownloaded,
+    },
+    /// A subtitle ask refused (P8-07), as the client protocol would refuse
+    /// it: SB passes it on to its device as it is.
+    Failed {
+        error: crate::Error,
     },
     /// A reply this build does not know.
     #[serde(other)]
@@ -850,6 +874,7 @@ mod tests {
             item: "plex:movie:1".into(),
             scope: TokenScope::Play,
             preferences: None,
+            download: None,
         };
         round_trip(PeerRequest::AssertUser(assertion.clone()));
         // P8-04: the user's track preferences go with it when SB has them.
@@ -909,6 +934,56 @@ mod tests {
         );
     }
 
+    /// P8-07: a download token's assertion, its grant, and the device a
+    /// download is planned for, through CBOR and back; what an older
+    /// server sends reads as before.
+    #[test]
+    fn a_download_token_and_its_device_go_both_ways() {
+        use crate::{Reply, Request, Response};
+        round_trip(PeerRequest::AssertUser(AssertUser {
+            user: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+            display_name: "Bob".into(),
+            client_endpoint: "ab".repeat(32),
+            item: "plex:movie:1".into(),
+            scope: TokenScope::Download,
+            preferences: None,
+            download: Some("ab".repeat(16)),
+        }));
+        let alien: spoolframe_types::MediaId = "fed:movie:mzxw6ytbojtg633c:plex:1".parse().unwrap();
+        round_trip(Request::RemoteGrant {
+            id: alien.clone(),
+            download: Some("cd".repeat(16)),
+        });
+        round_trip(Response::Ok(Reply::RemoteGranted(RemoteGranted {
+            token: "f00d".repeat(16),
+            item: "plex:movie:1".parse().unwrap(),
+            endpoint_id: "ab".repeat(32),
+            expires_at: 1_791_000_300,
+            download: Some("ab".repeat(16)),
+        })));
+        round_trip(Request::PrepareDownload {
+            id: alien.clone(),
+            source: crate::downloads::DownloadSource::Original,
+            tracks: crate::downloads::DownloadTracks::All,
+            device: Some(crate::downloads::DownloadDevice {
+                platform: spoolframe_types::Platform::Ios,
+                capabilities: None,
+            }),
+        });
+        round_trip(crate::downloads::DownloadState::Failed {
+            reason: "gone".into(),
+            cause: crate::downloads::DownloadFailure::NoLongerAvailable,
+        });
+        let older = serde_json::json!({ "type": "remote_grant", "id": alien.to_string() });
+        assert_eq!(
+            codec::decode::<Request>(&codec::encode(&older).unwrap()).unwrap(),
+            Request::RemoteGrant {
+                id: alien,
+                download: None
+            }
+        );
+    }
+
     #[test]
     fn a_long_name_is_cut_as_a_device_s_is() {
         let long = PeerHello {
@@ -919,5 +994,59 @@ mod tests {
             long.within_bounds().name.chars().count(),
             crate::MAX_HELLO_TEXT
         );
+    }
+
+    /// P8-07's subtitle asks and their replies, through CBOR and back; an
+    /// ask without the user's choices reads as the defaults.
+    #[test]
+    fn subtitle_asks_go_both_ways() {
+        let subtitles = spoolframe_types::SubtitlePreferences {
+            sdh: spoolframe_types::SdhPreference::Prefer,
+            ..Default::default()
+        };
+        round_trip(PeerRequest::SearchSubtitles(SubtitleSearchAsk {
+            user: "0192f1c4-0000-7000-8000-000000000001".into(),
+            subtitles,
+            item: "plex:1".into(),
+            language: Some("pt-BR".into()),
+        }));
+        round_trip(PeerRequest::DownloadSubtitle(SubtitleDownloadAsk {
+            user: "0192f1c4-0000-7000-8000-000000000001".into(),
+            item: "plex:1".into(),
+            result: "opensubtitles:101".into(),
+        }));
+        round_trip(PeerRequest::RemoveSubtitleDownload(SubtitleRemovalAsk {
+            user: "0192f1c4-0000-7000-8000-000000000001".into(),
+            item: "plex:1".into(),
+            download: "d1".into(),
+        }));
+        round_trip(PeerReply::SubtitleResults {
+            search: spoolframe_types::SubtitleSearch {
+                languages: vec!["en".into()],
+                results: Vec::new(),
+                sources: Vec::new(),
+            },
+        });
+        round_trip(PeerReply::Failed {
+            error: crate::Error::QuotaExhausted {
+                whose: spoolframe_types::QuotaOf::User,
+                resets_at: Some(1_893_456_000),
+                site: None,
+            },
+        });
+
+        #[derive(Serialize)]
+        struct Bare<'a> {
+            user: &'a str,
+            item: &'a str,
+        }
+        let bytes = codec::encode(&Bare {
+            user: "u",
+            item: "plex:1",
+        })
+        .unwrap();
+        let read: SubtitleSearchAsk = codec::decode(&bytes).unwrap();
+        assert_eq!(read.subtitles, Default::default());
+        assert_eq!(read.language, None);
     }
 }

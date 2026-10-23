@@ -3541,3 +3541,117 @@ answers at SA's key: `SdkError::ServerIdChanged`) and
 `RemoteMode::Direct` (the session is SA's, `item` SA's id) or
 `RemoteMode::Proxied` (the session is SB's, `item` the `fed:` id).
 `SdkError::OriginOffline`.
+
+### Downloading a paired server's item
+
+Experimental (P8-07), for an app that names the `federation` feature,
+and no `PROTOCOL_VERSION` change. Sharing a library includes downloading
+from it: there is no switch of its own.
+
+The device asks SB, as for any item: `DownloadOptions` and
+`PrepareDownload` of the `fed:` id. SB vouches for its user to SA with
+`assert_user` and `scope` `download`, redeems the token on SA's
+`client/1` in its own name, and asks SA for the device: both requests
+gain an optional `device {platform, capabilities}`, which SA reads only
+from a download token's session. SA plans and makes the file as for its
+own users, and SB keeps the record under an id of its own, so
+`DownloadStatus`, `CancelDownload` and `DownloadChanged` work as for
+SB's own items. Nothing of the file is written on SB. The tracks of a
+`fed:` item are its `DownloadOptions`' (SB has no file to describe).
+
+The bytes come straight from SA when the device reaches it:
+
+1. `RemoteHints { id }` and the dial, as for a play.
+2. `RemoteGrant { id, download }` on SB, `download` SB's id of it:
+   `RemoteGranted { token, item, endpoint_id, expires_at, download }`, a
+   download token bound to the device and to that one download, and
+   `download` SA's id of it. An SB from before this ignores `download`
+   and grants a play token, which reads no download: an app that gets no
+   `download` back reads through SB.
+3. `RedeemPlayToken { token }` on SA: `PlayTokenRedeemed { scope:
+   "download" }`. The session reads that one download (`Download`
+   resource of `download`), its `DownloadStatus` and `CancelDownload`,
+   and nothing else: it plays nothing. Read off SA's LAN, it takes one of
+   SA's places for download reads (4 at once), apart from the playbacks'
+   WAN streams and shares: downloads never make a play `wan_streams_full`.
+   The app ends the session (`Logout`) once it has the file.
+
+Not reached, the device reads the download from SB by SB's id, and SB
+reads it from SA and relays it as it comes.
+
+A download token's session lives a day past its last use, and three days
+at the most; play tokens read no download. SA holds a pair's download
+tokens and sessions to `federation { download_tokens_per_user = 200;
+download_tokens_per_server = 2000; }`, apart from its play tokens. SB
+ends its own session for a download (`Logout`) once SA says the file is
+made or failed, and one for reads relayed through it after ten minutes
+without a read, so a finished download holds no place: a playlist of
+hundreds of tracks downloads whole.
+
+A grant revoked or the pair gone: SA cancels what it was making for the
+pair's users and ends their tokens. SB keeps the record: one whose file
+was made stays `ready` with `no_longer_available: true` on its
+`DownloadInfo` (an app deletes a failed download's file, and this one's
+is the user's), and one not made is `failed` with the new cause
+`no_longer_available`. A read through SB is refused. Preparing again
+makes a new download. SB forgets such records, and failed ones, 30 days
+after.
+
+#### SDK
+
+`Session::remote_download(id, download)`: `RemoteDownload { session, id
+}`, the session on SA for that one download and its id there;
+`SdkError::OriginOffline`, or `SdkError::Unreachable` to read through
+SB, or `SdkError::Unsupported` from an SB that grants no download token.
+The download manager does this itself for a `fed:` item, turns to SB
+when SA stops answering part way, and ends the session on SA once the
+file is whole.
+
+### Subtitles for a paired server's item
+
+Experimental (P8-07), for an app that names the `federation` and
+`spoolframe:subtitle-search` features, and no `PROTOCOL_VERSION` change. SA plans
+the play and burns subtitles in, so the subtitle file must be on SA.
+`SearchSubtitles`, `DownloadSubtitle` and `RemoveSubtitleDownload` of a
+`fed:` id are sent to SB as for any item; SB passes them to SA on the
+pair's connection with the user's stable id and their SDH and forced
+choices on SB:
+
+- `search_subtitles` `{user, subtitles, item, language}`: answered
+  `subtitle_results {search}`, SA's own sites and ranking, ordered by
+  `subtitles` (as `SetTrackPreferences` takes them; the defaults when
+  left out).
+- `download_subtitle` `{user, item, result}`: answered
+  `subtitle_downloaded {downloaded}`.
+- `remove_subtitle_download` `{user, item, download}`: answered `done`.
+- Refused `failed {error}`, the client protocol's error, which SB passes
+  to the device as it is: `NotFound` for an item in no library shared
+  with SB, `RateLimited` past the pair's pace (`federation {
+  subtitle_burst = 20; }`, then one every 10 s), `QuotaExhausted` as
+  below. A server that answers none says `Unsupported`. SB tells the
+  device `OriginOffline` when SA cannot be reached, and that it cannot
+  be reached now when the connection fails on the way; what failed is
+  SB's log's, not the device's.
+
+What SA downloads is SA's, kept and removed by SA's rules, and every
+user sees it, as SA's own users do. Any of SB's users may remove what
+SB's users downloaded.
+
+Limits:
+
+- SB holds each of its users to its own `subtitles {
+  daily_limit_per_user }` first, and counts each download there as one
+  of theirs; it needs no subtitle site of its own. A user's limit is
+  held while SA is asked, so two of their downloads at once never both
+  take their last.
+- On SA, every user of SB's together gets `subtitles {
+  daily_limit_per_peer = 40; }` downloads a day (0 for no limit),
+  counted under the pair and never under SB's users, whom SA never
+  records. SA holds the limit from its check to its count. At either
+  limit the device is refused `QuotaExhausted { whose: user }`, which an
+  app from before knows.
+- `user_remaining` in `SubtitleDownloaded` is the fewer of the two.
+
+SA's admin API `subtitle_usage` gains `dailyLimitPerPeer` and `pairs`,
+one row per paired server `{name, downloads, remaining}`; Settings ›
+Subtitles shows it as "Bob's server: 12 of 40 today".

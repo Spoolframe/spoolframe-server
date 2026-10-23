@@ -184,6 +184,9 @@ pub const SETTINGS: &[Setting] = &[
     live("federation.assertion_burst"),
     live("federation.tokens_per_user"),
     live("federation.tokens_per_server"),
+    live("federation.download_tokens_per_user"),
+    live("federation.download_tokens_per_server"),
+    live("federation.subtitle_burst"),
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),
     restart("http_playback.address"),
@@ -197,6 +200,7 @@ pub const SETTINGS: &[Setting] = &[
     live("subdl.languages"),
     live("subtitles.sources"),
     live("subtitles.daily_limit_per_user"),
+    live("subtitles.daily_limit_per_peer"),
     // Not `opensubtitles.api_url` nor `subdl.api_url` or
     // `subdl.download_url`: in the config file only (tests). Set at run
     // time, they would send the key, which may name any `SF_ENV_`

@@ -652,7 +652,8 @@ impl Store {
              UNION SELECT media_id FROM plays WHERE media_id LIKE 'fed:%' \
              UNION SELECT media_id FROM liked_changes WHERE media_id LIKE 'fed:%' \
              UNION SELECT media_id FROM playlist_entries WHERE media_id LIKE 'fed:%' \
-             UNION SELECT media_id FROM downloads WHERE media_id LIKE 'fed:%'",
+             UNION SELECT media_id FROM downloads WHERE media_id LIKE 'fed:%' \
+             UNION SELECT item FROM federation_downloads",
         )
         .fetch_all(&self.pool)
         .await?)

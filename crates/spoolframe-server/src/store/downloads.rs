@@ -37,6 +37,9 @@ pub enum FailureCause {
     ServerStoppedConverting,
     /// Its media file is gone, or changed since it was asked for.
     SourceMissing,
+    /// A paired server's item no longer shared (P8-07): only told of a
+    /// download the user's server keeps for a paired server's item.
+    NoLongerAvailable,
     /// Anything else, and every failure recorded before the cause was.
     Other,
 }
@@ -47,6 +50,7 @@ impl FailureCause {
         match self {
             Self::ServerStoppedConverting => "server_stopped_converting",
             Self::SourceMissing => "source_missing",
+            Self::NoLongerAvailable => "no_longer_available",
             Self::Other => "other",
         }
     }
@@ -57,6 +61,7 @@ impl FailureCause {
         match s {
             Some("server_stopped_converting") => Self::ServerStoppedConverting,
             Some("source_missing") => Self::SourceMissing,
+            Some("no_longer_available") => Self::NoLongerAvailable,
             _ => Self::Other,
         }
     }
@@ -329,6 +334,25 @@ impl Store {
         Ok(rows.iter().map(row).collect::<Result<_, _>>()?)
     }
 
+    /// The downloads of the principals `prefix` begins: a paired server's
+    /// users' (`remote:<server id>:`, P8-07). A range of principals, so
+    /// the index on them is used.
+    pub async fn downloads_of_principals(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<DownloadRow>, StoreError> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM downloads WHERE principal >= ?1 AND principal < ?2 ORDER BY created_at, id"
+        ))
+        .bind(prefix)
+        .bind(past(prefix))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row).collect::<Result<_, _>>()?)
+    }
+
     /// The downloads of content `key`: one file's.
     pub async fn downloads_of_content(&self, key: &str) -> Result<Vec<DownloadRow>, StoreError> {
         let rows = sqlx::query(concat!(
@@ -438,6 +462,16 @@ impl Store {
         .await?;
         Ok(done.rows_affected())
     }
+}
+
+/// The least string past every one `prefix` begins: its last character
+/// one more. `prefix` is a principal's start, in ASCII.
+fn past(prefix: &str) -> String {
+    let mut past: Vec<char> = prefix.chars().collect();
+    if let Some(last) = past.last_mut() {
+        *last = char::from_u32(u32::from(*last) + 1).unwrap_or(char::MAX);
+    }
+    past.into_iter().collect()
 }
 
 #[cfg(test)]

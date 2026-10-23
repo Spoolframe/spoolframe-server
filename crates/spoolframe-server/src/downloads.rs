@@ -185,10 +185,48 @@ impl DownloadState {
                         DownloadFailure::ServerStoppedConverting
                     }
                     FailureCause::SourceMissing => DownloadFailure::SourceMissing,
+                    FailureCause::NoLongerAvailable => DownloadFailure::NoLongerAvailable,
                     FailureCause::Other => DownloadFailure::Other,
                 },
             },
         }
+    }
+
+    /// As the wire says it, back (P8-07): what a paired server told of its
+    /// download, for this server's own news. `None` for a state this build
+    /// does not know.
+    pub fn from_wire(wire: &spoolframe_protocol::downloads::DownloadState) -> Option<Self> {
+        use spoolframe_protocol::downloads::DownloadState as Wire;
+        let progress = |p: &Option<u8>| p.map(|p| f64::from(p.min(100)) / 100.0);
+        Some(match wire {
+            Wire::Waiting => Self::Waiting,
+            Wire::Converting {
+                done_percent,
+                eta_secs,
+            } => Self::Converting {
+                progress: progress(done_percent),
+                eta: eta_secs.map(Duration::from_secs),
+            },
+            Wire::Writing { done_percent } => Self::Writing {
+                progress: progress(done_percent),
+            },
+            Wire::Ready { size, sha256 } => Self::Ready {
+                size: *size,
+                sha256: sha256.clone(),
+            },
+            Wire::Failed { reason, cause } => Self::Failed {
+                reason: reason.clone(),
+                cause: match cause {
+                    DownloadFailure::ServerStoppedConverting => {
+                        FailureCause::ServerStoppedConverting
+                    }
+                    DownloadFailure::SourceMissing => FailureCause::SourceMissing,
+                    DownloadFailure::NoLongerAvailable => FailureCause::NoLongerAvailable,
+                    _ => FailureCause::Other,
+                },
+            },
+            Wire::Unknown => return None,
+        })
     }
 
     /// As the database keeps it, ready ones aside.
@@ -287,6 +325,9 @@ pub struct Status {
     /// where that was not known, and for a download from before it was
     /// kept.
     pub expected_size: Option<u64>,
+    /// The item it is of: what a paired server's download token reaches
+    /// (P8-07).
+    pub media_id: String,
 }
 
 /// A ready download's file, open to read. While it is held the file is
@@ -1081,6 +1122,7 @@ impl Downloads {
             class,
             carried,
             expected_size: row.expected_size,
+            media_id: row.media_id.clone(),
         }
     }
 
@@ -1160,6 +1202,28 @@ impl Downloads {
         }
         self.inner.sweep().await?;
         Ok(true)
+    }
+
+    /// Tell `change` as one of this server's own downloads' (P8-07): a
+    /// paired server's news of a download this server keeps for its user.
+    pub fn tell(&self, change: DownloadChange) {
+        let _ = self.inner.changes.send(change);
+    }
+
+    /// Cancel each of `rows` (a paired server's users' downloads, P8-07):
+    /// a revoked grant or an unpairing ends what was being made for them.
+    /// How many.
+    pub async fn cancel_rows(&self, rows: Vec<DownloadRow>) -> Result<usize, DownloadError> {
+        let mut cancelled = 0;
+        for row in rows {
+            let Ok(principal) = row.principal.parse::<Principal>() else {
+                continue;
+            };
+            if self.cancel(&principal, &row.id).await? {
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Remove the files no download names, and those kept a day past

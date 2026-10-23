@@ -759,6 +759,12 @@ pub enum Request {
     /// `Unauthenticated`, and the device asks its home server for a new
     /// token. The session reaches `StartPlayback` of that item and its own
     /// playback's controls and reads; anything else is `Unauthenticated`.
+    /// A download token (P8-07) is redeemed the same way: its session
+    /// reaches that item's download alone (`DownloadOptions`,
+    /// `PrepareDownload`, `DownloadStatus`, `CancelDownload`, the
+    /// `Download` read and `DownloadChanged`), or, for a device's token,
+    /// its one download's read and status. It lives while the download is
+    /// made and read, and ends at its `CancelDownload`.
     /// Unsupported unless this connection's `Hello` named the feature.
     RedeemPlayToken(crate::federation::RedeemPlayToken),
 
@@ -783,8 +789,16 @@ pub enum Request {
     /// `Unavailable`. A proxied play asks for no grant: it is a
     /// `StartPlayback` of `id` here. Unsupported unless this connection's
     /// `Hello` named the feature.
+    ///
+    /// With `download`, the id of a download of `id` this server keeps
+    /// (P8-07): a download token instead, bound to this device and to that
+    /// one download, which reads it on the paired server
+    /// (`RemoteGranted::download` names it there). A download that is not
+    /// the user's, or not of `id`, is `NotFound`.
     RemoteGrant {
         id: MediaId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        download: Option<String>,
     },
 
     /// Experimental (`federation`, P8-05): play the title `title` (any
@@ -1090,8 +1104,14 @@ pub enum Request {
     /// list the feature, `Unsupported`. With `spoolframe:music-downloads`
     /// too, `id` may be a track (PX-51): its one audio track, no
     /// profiles, and what `original` would be.
+    ///
+    /// `device` is read only from a paired server playing its user's part
+    /// (P8-07, a download token's session): the device the download is
+    /// for, in place of the connection's `Hello`.
     DownloadOptions {
         id: MediaId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<crate::downloads::DownloadDevice>,
     },
     /// Prepare a download of film or episode `id` from `source` with
     /// `tracks` (PX-38): `Download`, its id and state. The same user's
@@ -1103,10 +1123,13 @@ pub enum Request {
     /// `DownloadOptions` for who may and from where. A track (PX-51, with
     /// `spoolframe:music-downloads`) takes `original` or `aac256`, and
     /// `tracks` is not read; a film or an episode is refused `aac256`.
+    /// `device` as for `DownloadOptions`.
     PrepareDownload {
         id: MediaId,
         source: crate::downloads::DownloadSource,
         tracks: crate::downloads::DownloadTracks,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<crate::downloads::DownloadDevice>,
     },
     /// The session user's downloads `ids` (PX-38): `Downloads`, those
     /// they have in order, and in `gone` each id they have not (never

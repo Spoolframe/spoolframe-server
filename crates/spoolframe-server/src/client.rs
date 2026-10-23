@@ -430,11 +430,21 @@ struct Locks {
 enum ResourceBody {
     Bytes(Vec<u8>),
     /// A file, and for a download's (PX-38) what keeps it there while it
-    /// is sent: the area removes no file being read.
-    File(tokio::fs::File, Option<crate::downloads::DownloadRead>),
+    /// is sent: the area removes no file being read; and for a paired
+    /// server's user's read off the LAN (P8-07), its place among the
+    /// download reads.
+    File(
+        tokio::fs::File,
+        Option<crate::downloads::DownloadRead>,
+        Option<crate::uplink::DownloadSlot>,
+    ),
     /// A paired server's answer, as it arrives (P8-04): a playback played
-    /// from there through this server.
-    Relayed(iroh::endpoint::RecvStream),
+    /// from there through this server, or a download of its item's (P8-07)
+    /// read there, with its hold on the pair's connection.
+    Relayed(
+        iroh::endpoint::RecvStream,
+        Option<crate::federation::DownloadHold>,
+    ),
 }
 
 impl Locks {
@@ -1448,17 +1458,21 @@ impl ClientProtocol {
                         ResourceBody::Bytes(bytes) => {
                             send_unless_stalled(&mut send, &bytes, stall).await?;
                         }
-                        body @ (ResourceBody::File(..) | ResourceBody::Relayed(_)) => {
+                        body @ (ResourceBody::File(..) | ResourceBody::Relayed(..)) => {
                             let copied = match body {
-                                ResourceBody::File(file, reading) => {
+                                ResourceBody::File(file, reading, slot) => {
                                     let copied =
                                         copy_unless_stalled(file.take(length), &mut send, stall)
                                             .await?;
-                                    drop(reading);
+                                    drop((reading, slot));
                                     copied
                                 }
-                                ResourceBody::Relayed(stream) => {
-                                    relay_unless_stalled(stream, length, &mut send, stall).await?
+                                ResourceBody::Relayed(stream, hold) => {
+                                    let relayed =
+                                        relay_unless_stalled(stream, length, &mut send, stall)
+                                            .await?;
+                                    drop(hold);
+                                    relayed
                                 }
                                 ResourceBody::Bytes(_) => unreachable!(),
                             };
@@ -1591,7 +1605,7 @@ impl ClientProtocol {
                         revision,
                     },
                     reply.sent,
-                    ResourceBody::File(file, None),
+                    ResourceBody::File(file, None, None),
                 ))
             }
             request => {
@@ -1690,18 +1704,70 @@ impl ClientProtocol {
         offset: u64,
         length: u64,
     ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
-        downloads_offered(hello)?;
+        downloads_listed(hello)?;
         let (session, who) = self
-            .authenticate_unrestricted(connection, state, Some(session))
+            .authenticate_unrestricted_or_remote(connection, state, Some(session))
             .await?;
-        // P8-07 opens a download token's own; a play token's opens none.
         state.locks.lock().use_session(&session)?;
-        let read = self
+        let slot = match &who {
+            // A download token's session (P8-07) reads its own item's
+            // download, and a device's its one download; a play token's
+            // reads none. Off the LAN it takes a place among the download
+            // reads, apart from the plays' WAN streams.
+            Who::Remote(remote) => {
+                if remote.scope != spoolframe_protocol::federation::TokenScope::Download {
+                    return Err(Error::Unauthenticated);
+                }
+                let status = self
+                    .services
+                    .downloads
+                    .status(&who.principal(), id)
+                    .await
+                    .map_err(downloads_error)?;
+                if !status.is_some_and(|status| remote.reaches_download(id, &status.media_id)) {
+                    return Err(no_such_download());
+                }
+                match on_lan(&state.path()) {
+                    true => None,
+                    false => Some(self.services.uplink.reserve_download().map_err(|full| {
+                        Error::WanStreamsFull {
+                            max: u32::try_from(full.max).unwrap_or(u32::MAX),
+                        }
+                    })?),
+                }
+            }
+            _ => {
+                downloads_offered(hello)?;
+                None
+            }
+        };
+        let read = match self
             .services
             .downloads
             .open_read(&who.principal(), id)
             .await
-            .map_err(downloads_error)?;
+        {
+            Ok(read) => read,
+            // P8-07: not one of this server's own, so perhaps a paired
+            // server's item's, read there and relayed. Asked only once this
+            // server has none: its own downloads' reads cost nothing more.
+            Err(crate::downloads::DownloadError::NotFound)
+                if let Some(federation) = self.federation_for(hello)
+                    && !matches!(who, Who::Remote(_)) =>
+            {
+                let read = federation
+                    .read_download(&who, id, offset, length.min(MAX_READ))
+                    .await
+                    .map_err(proxy_error)?
+                    .ok_or_else(no_such_download)?;
+                return Ok((
+                    ResourceMetadata::Download { size: read.size },
+                    read.length,
+                    ResourceBody::Relayed(read.stream, Some(read.hold)),
+                ));
+            }
+            Err(e) => return Err(downloads_error(e)),
+        };
         let sent = length.min(MAX_READ).min(read.size.saturating_sub(offset));
         self.services.downloads.sending(sent);
         let unreadable = |e: std::io::Error| {
@@ -1719,7 +1785,7 @@ impl ClientProtocol {
         Ok((
             ResourceMetadata::Download { size: read.size },
             sent,
-            ResourceBody::File(file, Some(read)),
+            ResourceBody::File(file, Some(read), slot),
         ))
     }
 
@@ -2184,7 +2250,7 @@ impl ClientProtocol {
                 revision,
             },
             relayed.length,
-            ResourceBody::Relayed(relayed.stream),
+            ResourceBody::Relayed(relayed.stream, None),
         ))
     }
 
@@ -2231,10 +2297,12 @@ impl ClientProtocol {
                 what: "a paired server's item".into(),
             });
         }
-        // A play token's session (P8-04) reaches its one item's playback
-        // and nothing else.
-        if let Who::Remote(remote) = &who {
-            remote_allows(remote, &request)?;
+        // A paired server's token's session (P8-04, P8-07) reaches its one
+        // item's playback, or its download, and nothing else.
+        if let Who::Remote(remote) = &who
+            && !remote.allows(&request)
+        {
+            return Err(Error::Unauthenticated);
         }
         let actor = crate::principal::Actor {
             federated: federation.is_some(),
@@ -2315,7 +2383,9 @@ impl ClientProtocol {
             _ => {}
         }
         // PX-38: downloads, only for a client that takes them, on a
-        // platform that has them; it is told of its user's downloads.
+        // platform that has them; it is told of its user's downloads. A
+        // paired server downloading for its user's device (P8-07) names
+        // the device's platform with each request instead.
         if matches!(
             request,
             Request::DownloadOptions { .. }
@@ -2324,7 +2394,12 @@ impl ClientProtocol {
                 | Request::CancelDownload { .. }
                 | Request::SyncOfflineWatch { .. }
         ) {
-            downloads_offered(hello)?;
+            match &who {
+                Who::Remote(_) => downloads_listed(hello)?,
+                _ => {
+                    downloads_offered(hello)?;
+                }
+            }
         }
         // PX-51: music offline, on top of downloads.
         if matches!(
@@ -3619,6 +3694,32 @@ impl ClientProtocol {
                 }
                 Ok(Reply::Tracks(tracks))
             }
+            // A paired server's item: its server searches and keeps the
+            // file, as it plans the play (P8-07).
+            Request::SearchSubtitles { id, language }
+                if let Some(federation) = origin_of(federation, &id) =>
+            {
+                federation
+                    .search_subtitles_of(&who, &id, language.as_deref())
+                    .await
+                    .map(Reply::SubtitleResults)
+            }
+            Request::DownloadSubtitle { id, result }
+                if let Some(federation) = origin_of(federation, &id) =>
+            {
+                federation
+                    .download_subtitle_of(&who, &id, &result)
+                    .await
+                    .map(Reply::SubtitleDownloaded)
+            }
+            Request::RemoveSubtitleDownload { id, download }
+                if let Some(federation) = origin_of(federation, &id) =>
+            {
+                federation
+                    .remove_subtitle_download_of(&who, &id, &download)
+                    .await
+                    .map(|()| Reply::Done)
+            }
             Request::SearchSubtitles { id, language } => self
                 .services
                 .subtitle_downloads
@@ -4330,7 +4431,27 @@ impl ClientProtocol {
                 let (peer, _) = federation.remote_peer(&id).await.map_err(assert_error)?;
                 Ok(Reply::RemoteHints(federation.remote_hints(&peer)))
             }
-            Request::RemoteGrant { id } => {
+            // P8-07: a download token for this device, of one download.
+            Request::RemoteGrant {
+                id,
+                download: Some(download),
+            } => {
+                let federation = self
+                    .federation_for(hello)
+                    .ok_or_else(|| Error::Unsupported {
+                        request: format!(
+                            "remote_grant without {}",
+                            spoolframe_protocol::experimental::FEDERATION
+                        ),
+                    })?;
+                catalog.item(&id).await.map_err(catalog_error)?;
+                federation
+                    .grant_download(&who, &id, &download, connection.remote_id())
+                    .await
+                    .map(Reply::RemoteGranted)
+                    .map_err(proxy_error)
+            }
+            Request::RemoteGrant { id, download: None } => {
                 use spoolframe_protocol::federation::RemoteGranted;
                 let federation = self
                     .federation_for(hello)
@@ -4355,6 +4476,7 @@ impl ClientProtocol {
                     item,
                     endpoint_id: peer.endpoint_id,
                     expires_at: granted.expires_at,
+                    download: None,
                 }))
             }
             // Experimental (P8-01): only when this connection's Hello named
@@ -4650,12 +4772,41 @@ impl ClientProtocol {
                     Err(e) => Err(internal(e)),
                 }
             }
-            Request::DownloadOptions { id } => self
-                .download_options(state, hello, principal, &id)
+            // P8-07: a paired server's item is planned and made there, for
+            // this device; this server keeps the record.
+            Request::DownloadOptions { id, .. }
+                if let Some(federation) = origin_of(federation, &id) =>
+            {
+                downloadable(hello, &id)?;
+                catalog.item(&id).await.map_err(catalog_error)?;
+                federation
+                    .download_options(&who, &id, device_of(hello))
+                    .await
+                    .map(Reply::DownloadOptions)
+                    .map_err(proxy_error)
+            }
+            Request::PrepareDownload {
+                id, source, tracks, ..
+            } if let Some(federation) = origin_of(federation, &id) => {
+                downloadable(hello, &id)?;
+                catalog.item(&id).await.map_err(catalog_error)?;
+                federation
+                    .prepare_download(&who, &id, source, tracks, device_of(hello))
+                    .await
+                    .map(Reply::Download)
+                    .map_err(proxy_error)
+            }
+            Request::DownloadOptions { id, device } => self
+                .download_options(state, hello, &who, &id, device.as_ref())
                 .await
                 .map(Reply::DownloadOptions),
-            Request::PrepareDownload { id, source, tracks } => self
-                .prepare_download(state, hello, principal, &id, source, tracks)
+            Request::PrepareDownload {
+                id,
+                source,
+                tracks,
+                device,
+            } => self
+                .prepare_download(state, hello, &who, &id, source, tracks, device.as_ref())
                 .await
                 .map(Reply::Download),
             Request::DownloadStatus { ids } => {
@@ -4675,10 +4826,27 @@ impl ClientProtocol {
                     .statuses(&principal, &ids)
                     .await
                     .map_err(downloads_error)?;
+                // P8-07: those of a paired server's items, as it says.
+                let mut remote = match federation {
+                    Some(federation) if !matches!(who, Who::Remote(_)) => federation
+                        .download_statuses(&who, &ids)
+                        .await
+                        .map_err(proxy_error)?,
+                    _ => Default::default(),
+                };
                 let mut downloads = Vec::with_capacity(ids.len());
                 let mut gone = Vec::new();
                 for id in ids {
-                    match statuses.get(&id).cloned() {
+                    if let Some(info) = remote.found.remove(&id) {
+                        downloads.push(info);
+                        continue;
+                    }
+                    // A download token's session (P8-07) sees its own item's.
+                    let status = statuses.get(&id).cloned().filter(|status| match &who {
+                        Who::Remote(remote) => remote.reaches_download(&id, &status.media_id),
+                        _ => true,
+                    });
+                    match status {
                         Some(status) => downloads.push(download_info(
                             id,
                             &status.state,
@@ -4692,6 +4860,30 @@ impl ClientProtocol {
                 Ok(Reply::Downloads { downloads, gone })
             }
             Request::CancelDownload { id } => {
+                // P8-07: a paired server's item's, told to that server.
+                if let Some(federation) = federation
+                    && !matches!(who, Who::Remote(_))
+                    && federation
+                        .cancel_download(&who, &id)
+                        .await
+                        .map_err(proxy_error)?
+                {
+                    return Ok(Reply::Done);
+                }
+                // A download token's session cancels its own item's, and
+                // ends with it: its download's tokens end at its cancel.
+                if let Who::Remote(remote) = &who {
+                    let status = self
+                        .services
+                        .downloads
+                        .status(&principal, &id)
+                        .await
+                        .map_err(downloads_error)?;
+                    if !status.is_some_and(|status| remote.reaches_download(&id, &status.media_id))
+                    {
+                        return Err(no_such_download());
+                    }
+                }
                 if self
                     .services
                     .downloads
@@ -4699,6 +4891,9 @@ impl ClientProtocol {
                     .await
                     .map_err(downloads_error)?
                 {
+                    if let Who::Remote(remote) = &who {
+                        self.end_download_sessions(remote, &id);
+                    }
                     Ok(Reply::Done)
                 } else {
                     Err(no_such_download())
@@ -6118,26 +6313,50 @@ impl ClientProtocol {
         })
     }
 
-    /// What `principal`'s device may download of `id` (PX-38).
+    /// A download token's session (P8-07) cancelled download `id`: the
+    /// sessions download tokens opened for it end, its user's server's own
+    /// for the item and a device's for that download alike. A download of
+    /// SA's ends at its cancel.
+    fn end_download_sessions(&self, remote: &crate::remote_sessions::RemoteSessionUser, id: &str) {
+        use spoolframe_protocol::federation::TokenScope;
+        let principal = remote.principal();
+        let ended = self.services.auth.remote_sessions().end_where(|u| {
+            u.scope == TokenScope::Download
+                && u.principal() == principal
+                && u.item == remote.item
+                && u.download.as_deref().is_none_or(|one| one == id)
+        });
+        tracing::debug!(
+            download = id,
+            ended,
+            "a paired server's download is cancelled"
+        );
+    }
+
+    /// What `who`'s device may download of `id` (PX-38): the device
+    /// `device` names for a paired server's user (P8-07), else this
+    /// connection's.
     async fn download_options(
         &self,
         state: &ConnectionState,
         hello: &spoolframe_protocol::Hello,
-        principal: Principal,
+        who: &Who,
         id: &MediaId,
+        device: Option<&spoolframe_protocol::downloads::DownloadDevice>,
     ) -> Result<spoolframe_protocol::downloads::DownloadOptionsInfo, Error> {
         use crate::downloads::plan::{self, Decision, Subtitle, Tracks};
         use spoolframe_protocol::downloads::{
             DownloadOptionsInfo, DownloadTracks, LeftOutSubtitle, OriginalDownload,
         };
-        let class = downloads_offered(hello)?;
+        let principal = who.principal();
+        let (class, device_caps) = download_class(hello, who, device)?;
         let kind = downloadable(hello, id)?;
         let (path, descriptor) = self.describe(id).await?;
         if kind == Downloadable::Track {
             return music_download_options(&descriptor, class);
         }
         let store = self.store();
-        let preferences = store.track_preferences(principal).await.map_err(internal)?;
+        let preferences = self.track_preferences(who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = store
             .track_override(principal, &scope)
@@ -6148,7 +6367,9 @@ impl ClientProtocol {
             &preferences,
             override_.as_ref(),
         ));
-        let caps = capabilities(state, None).unwrap_or_else(|| class.capabilities());
+        let caps = device_caps
+            .or_else(|| capabilities(state, None))
+            .unwrap_or_else(|| class.capabilities());
         let every: Vec<u32> = (0..descriptor.subtitles.len() as u32).collect();
         let ways = plan::subtitles(
             &descriptor,
@@ -6206,20 +6427,27 @@ impl ClientProtocol {
         })
     }
 
-    /// Prepare `principal`'s download of `id` (PX-38), with their PX-13
-    /// choice for picture subtitles.
+    /// Prepare `who`'s download of `id` (PX-38), with their PX-13 choice
+    /// for picture subtitles, for the device `device` names for a paired
+    /// server's user (P8-07), else this connection's.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request's parts, named at the one call site"
+    )]
     async fn prepare_download(
         &self,
         state: &ConnectionState,
         hello: &spoolframe_protocol::Hello,
-        principal: Principal,
+        who: &Who,
         id: &MediaId,
         source: spoolframe_protocol::downloads::DownloadSource,
         tracks: spoolframe_protocol::downloads::DownloadTracks,
+        device: Option<&spoolframe_protocol::downloads::DownloadDevice>,
     ) -> Result<spoolframe_protocol::downloads::DownloadInfo, Error> {
         use crate::downloads::plan::{Source, Tracks, UnknownTracks};
         use spoolframe_protocol::downloads::DownloadSource;
-        let class = downloads_offered(hello)?;
+        let principal = who.principal();
+        let (class, device_caps) = download_class(hello, who, device)?;
         if downloadable(hello, id)? == Downloadable::Track {
             return self
                 .prepare_track_download(principal, id, class, source)
@@ -6243,11 +6471,7 @@ impl ClientProtocol {
             message: "a choice of tracks this server does not know".into(),
         })?;
         let (path, descriptor) = self.describe(id).await?;
-        let preferences = self
-            .store()
-            .track_preferences(principal)
-            .await
-            .map_err(internal)?;
+        let preferences = self.track_preferences(who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = self
             .store()
@@ -6258,7 +6482,7 @@ impl ClientProtocol {
             crate::tracks::choose(&descriptor.tracks(), &preferences, override_.as_ref())
                 .selection
                 .subtitle;
-        let caps = capabilities(state, None);
+        let caps = device_caps.or_else(|| capabilities(state, None));
         let media_id = id.to_string();
         let prepared = self
             .services
@@ -7221,6 +7445,66 @@ fn downloads_offered(
     })
 }
 
+/// That a client listed `spoolframe:downloads`, whatever its platform: a
+/// paired server downloading for its user's device (P8-07), which names
+/// Where a request about `id` goes when it is a paired server's item: that
+/// server, through `federation` (P8-07), for a client that named the
+/// feature. `None` for this server's own items, served here as ever.
+fn origin_of<'f>(
+    federation: Option<&'f Arc<crate::federation::Federation>>,
+    id: &MediaId,
+) -> Option<&'f Arc<crate::federation::Federation>> {
+    federation.filter(|_| id.remote().is_some())
+}
+
+/// the device's platform with each request.
+fn downloads_listed(hello: &spoolframe_protocol::Hello) -> Result<(), Error> {
+    if features::has(&hello.features, features::DOWNLOADS) {
+        Ok(())
+    } else {
+        Err(Error::Unsupported {
+            request: format!("downloads without {}", features::DOWNLOADS),
+        })
+    }
+}
+
+/// The class `who`'s download is made for, and what its device plays when
+/// it says: the device `device` names, for a paired server's user (P8-07),
+/// else the connection's, as [`downloads_offered`] says.
+fn download_class(
+    hello: &spoolframe_protocol::Hello,
+    who: &Who,
+    device: Option<&spoolframe_protocol::downloads::DownloadDevice>,
+) -> Result<
+    (
+        crate::downloads::DeviceClass,
+        Option<spoolframe_types::ClientCapabilities>,
+    ),
+    Error,
+> {
+    let (Who::Remote(_), Some(device)) = (who, device) else {
+        return Ok((downloads_offered(hello)?, None));
+    };
+    downloads_listed(hello)?;
+    let class =
+        crate::downloads::DeviceClass::of(device.platform).ok_or_else(|| Error::Unsupported {
+            request: format!(
+                "downloads on {}: only an iPhone, iPad, Mac or Linux client downloads",
+                device.platform.as_str()
+            ),
+        })?;
+    Ok((class, device.capabilities.clone()))
+}
+
+/// The device a paired server's item is downloaded for (P8-07): this
+/// connection's, as its `Hello` says.
+fn device_of(hello: &spoolframe_protocol::Hello) -> spoolframe_protocol::downloads::DownloadDevice {
+    spoolframe_protocol::downloads::DownloadDevice {
+        platform: hello.platform,
+        capabilities: hello.capabilities.clone(),
+    }
+}
+
 /// What a `class` device may download of a track (PX-51): its one audio
 /// track, no profiles, and what original quality would be.
 fn music_download_options(
@@ -7344,6 +7628,7 @@ fn download_info(
             },
         }),
         expected_size,
+        no_longer_available: false,
     }
 }
 
@@ -7440,41 +7725,6 @@ fn uplink_class(who: &Who) -> crate::uplink::Class {
             crate::uplink::Class::Owner
         }
         _ => crate::uplink::Class::Guest,
-    }
-}
-
-/// What a play token's session (P8-04) may ask: `StartPlayback` of its
-/// one item and the controls and reads of its own playback (which only
-/// the session that started a playback may use, checked where each is
-/// served), and a subtitle's timing on that item (P8-07). Anything else
-/// is `Unauthenticated`, as for no session at all.
-fn remote_allows(
-    remote: &crate::remote_sessions::RemoteSessionUser,
-    request: &Request,
-) -> Result<(), Error> {
-    let allowed = match request {
-        Request::StartPlayback { id, .. }
-        | Request::SyncSubtitle { id, .. }
-        | Request::UseOriginalSubtitleTiming { id, .. }
-        | Request::SetSubtitleOffset { id, .. } => *id == remote.item,
-        Request::UpdatePlaybackProgress { .. }
-        | Request::ChangeSubtitle { .. }
-        | Request::ChangeQuality { .. }
-        | Request::SeekPlayback { .. }
-        | Request::StopPlayback { .. }
-        | Request::PlaybackProgressSequence { .. }
-        | Request::PlaybackRevision { .. }
-        | Request::GetManifest { .. }
-        | Request::ReadSubtitle { .. }
-        | Request::ReadSubtitleSegment { .. }
-        // A paired server ends a play it proxies by ending its session.
-        | Request::Logout => true,
-        _ => false,
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(Error::Unauthenticated)
     }
 }
 
@@ -8289,7 +8539,7 @@ fn conversion_error(e: JobError) -> Error {
 /// A subtitle search, download or removal refused, as the client sees it
 /// (PX-02). The site's own words go to the log: they may name the
 /// account.
-fn download_error(e: crate::subtitle_downloads::DownloadError) -> Error {
+pub(crate) fn download_error(e: crate::subtitle_downloads::DownloadError) -> Error {
     use crate::subtitle_downloads::DownloadError;
     use crate::subtitle_site::SiteError;
     match e {

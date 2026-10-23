@@ -81,6 +81,33 @@ pub struct RemotePlayback {
     _relays: Option<std::sync::Arc<crate::client::PlayRelays>>,
 }
 
+/// A download of a paired server's item, read straight from that server
+/// (P8-07): what its download token opened there, for that one download.
+#[derive(Debug, Clone)]
+pub struct RemoteDownload {
+    /// A session on the paired server that reads that download alone.
+    pub session: Session,
+    /// The download, as the paired server names it: what to read there.
+    pub id: String,
+    /// The paired server's relays, held with the token while it is read.
+    _relays: Option<std::sync::Arc<crate::client::PlayRelays>>,
+}
+
+/// Whether [`Session::open_origin`] reached the paired server.
+enum Opening {
+    Reached(Box<Opened>),
+    /// It did not answer: why.
+    NotReached(SdkError),
+}
+
+/// A session opened on a paired server by a token for this device.
+struct Opened {
+    session: Session,
+    redeemed: PlayTokenRedeemed,
+    granted: RemoteGranted,
+    relays: Option<std::sync::Arc<crate::client::PlayRelays>>,
+}
+
 /// A server told that its libraries changed (P8-02): a paired server came
 /// online or went offline, or shared or stopped sharing a library. List
 /// them again ([`Session::libraries`]).
@@ -239,11 +266,86 @@ impl Session {
     /// one. Each play asks its own; it works once.
     pub async fn remote_grant(&self, id: &MediaId) -> Result<RemoteGranted, SdkError> {
         self.federated()?;
-        let request = Request::RemoteGrant { id: id.clone() };
+        self.grant(id, None).await
+    }
+
+    /// A token for `id` bound to this device: a play token, or with
+    /// `download` (this session's server's id of it) a download token of
+    /// that one download (P8-07). A server from before that ignores
+    /// `download`, and grants a play token, which reads no download:
+    /// [`SdkError::Unsupported`].
+    async fn grant(&self, id: &MediaId, download: Option<&str>) -> Result<RemoteGranted, SdkError> {
+        let request = Request::RemoteGrant {
+            id: id.clone(),
+            download: download.map(str::to_owned),
+        };
         match self.call(request).await? {
+            Reply::RemoteGranted(granted) if download.is_some() && granted.download.is_none() => {
+                Err(SdkError::Unsupported {
+                    feature: "reading a paired server's download from that server".into(),
+                })
+            }
             Reply::RemoteGranted(granted) => Ok(granted),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Reach the paired server `id` (a `fed:` item) is from, within
+    /// [`DIRECT_DIAL`], and open a session there with a token for this
+    /// device ([`Session::grant`] of `download`): [`Opening::NotReached`]
+    /// when it did not answer, for the caller to go through this
+    /// session's server instead. Through the paired server's own relay the
+    /// token is what lets this device through (P8-04), so it is asked
+    /// first, and a dial that fails leaves it to expire unused; without
+    /// relays, the dial comes first, and a device that cannot reach the
+    /// server asks for none. [`SdkError::OriginOffline`] when the paired
+    /// server is offline to this session's server; another server answering
+    /// at its key is [`SdkError::ServerIdChanged`], never gone around.
+    async fn open_origin(&self, id: &MediaId, download: Option<&str>) -> Result<Opening, SdkError> {
+        self.federated()?;
+        if id.namespace() != Namespace::Federated {
+            return Err(SdkError::InvalidInput(format!(
+                "{id} is not a paired server's item"
+            )));
+        }
+        let hints = self.remote_hints(id).await?;
+        if !hints.online {
+            return Err(SdkError::OriginOffline);
+        }
+        let origin = crate::client::parse_id(&hints.endpoint_id)?;
+        self.client
+            .remember_paired_server(self.server, origin, &hints.addrs, &hints.relays);
+        let relayed = !self.client.relays_to(origin).is_empty();
+        let (early, relays) = if relayed {
+            let granted = self.grant(id, download).await?;
+            let relays = self.client.hold_play_token(origin, &granted.token).await;
+            (Some(granted), relays)
+        } else {
+            (None, None)
+        };
+        match self.reach_origin(origin, &hints).await {
+            Ok(()) => {}
+            Err(e @ SdkError::ServerIdChanged { .. }) => return Err(e),
+            Err(e) => return Ok(Opening::NotReached(e)),
+        }
+        let granted = match early {
+            Some(granted) => granted,
+            None => self.grant(id, download).await?,
+        };
+        let request = Request::RedeemPlayToken(RedeemPlayToken {
+            token: granted.token.clone(),
+        });
+        let redeemed = match self.client.call(origin, None, request).await? {
+            Response::Ok(Reply::PlayTokenRedeemed(redeemed)) => redeemed,
+            Response::Ok(other) => return Err(unexpected(other)),
+            Response::Err(e) => return Err(SdkError::from_server(e)),
+        };
+        Ok(Opening::Reached(Box::new(Opened {
+            session: self.on_paired_server(origin, redeemed.session.clone()),
+            redeemed,
+            granted,
+            relays: relays.map(std::sync::Arc::new),
+        })))
     }
 
     /// Play `id`, a paired server's (`fed:`) item (P8-04): from that server
@@ -258,74 +360,52 @@ impl Session {
         selection: Option<Selection>,
         options: PlaybackOptions,
     ) -> Result<RemotePlayback, SdkError> {
-        self.federated()?;
-        if id.namespace() != Namespace::Federated {
-            return Err(SdkError::InvalidInput(format!(
-                "{id} is not a paired server's item"
-            )));
-        }
-        let hints = self.remote_hints(id).await?;
-        if !hints.online {
-            return Err(SdkError::OriginOffline);
-        }
-        let origin = crate::client::parse_id(&hints.endpoint_id)?;
-        self.client
-            .remember_paired_server(self.server, origin, &hints.addrs, &hints.relays);
-        // Through the paired server's own relay, the token is what lets
-        // this device through (P8-04): it is asked first, and a dial that
-        // fails leaves it to expire unused. Without relays, the dial comes
-        // first, and a device that cannot reach the server asks for none.
-        let relayed = !self.client.relays_to(origin).is_empty();
-        let (early, relays) = if relayed {
-            let granted = self.remote_grant(id).await?;
-            let relays = self.client.hold_play_token(origin, &granted.token).await;
-            (Some(granted), relays)
-        } else {
-            (None, None)
-        };
-        match self.reach_origin(origin, &hints).await {
-            Ok(()) => {}
-            // Another server answered at the paired one's key: refused,
-            // never played around.
-            Err(e @ SdkError::ServerIdChanged { .. }) => return Err(e),
+        let opened = match self.open_origin(id, None).await? {
+            Opening::Reached(opened) => opened,
             // Not reached: this session's server plays it from there, and
             // on to this device (proxy mode).
-            Err(e) => {
+            Opening::NotReached(e) => {
                 tracing::info!(%id, error = %e, "a paired server is not reached; playing through this server");
-                drop(relays);
                 return self.start_proxied_playback(id, selection, options).await;
             }
-        }
-        let granted = match early {
-            Some(granted) => granted,
-            None => self.remote_grant(id).await?,
         };
-        let redeemed = match self
-            .client
-            .call(
-                origin,
-                None,
-                Request::RedeemPlayToken(RedeemPlayToken {
-                    token: granted.token,
-                }),
-            )
-            .await?
-        {
-            Response::Ok(Reply::PlayTokenRedeemed(redeemed)) => redeemed,
-            Response::Ok(other) => return Err(unexpected(other)),
-            Response::Err(e) => return Err(SdkError::from_server(e)),
-        };
-        let PlayTokenRedeemed { session, item, .. } = redeemed;
-        let on_origin = self.on_paired_server(origin, session);
-        let playback = on_origin
+        let PlayTokenRedeemed { item, .. } = opened.redeemed;
+        let playback = opened
+            .session
             .start_playback_with(&item, selection, options)
             .await?;
         Ok(RemotePlayback {
-            session: on_origin,
+            session: opened.session,
             playback,
             mode: RemoteMode::Direct,
             item,
-            _relays: relays.map(std::sync::Arc::new),
+            _relays: opened.relays,
+        })
+    }
+
+    /// Read `download`, this session's server's download of `id`, a paired
+    /// server's item, straight from that server when this device reaches
+    /// it within [`DIRECT_DIAL`] (P8-07): its session there, for that one
+    /// download, and its id there. Not reached, read it from this session's
+    /// server, which reads it from there in its name
+    /// ([`SdkError::Unreachable`] here). [`SdkError::OriginOffline`] when
+    /// the paired server is offline to this session's server.
+    pub async fn remote_download(
+        &self,
+        id: &MediaId,
+        download: &str,
+    ) -> Result<RemoteDownload, SdkError> {
+        let opened = match self.open_origin(id, Some(download)).await? {
+            Opening::Reached(opened) => opened,
+            Opening::NotReached(e) => return Err(e),
+        };
+        Ok(RemoteDownload {
+            session: opened.session,
+            id: opened
+                .granted
+                .download
+                .expect("a download's grant names it: checked as granted"),
+            _relays: opened.relays,
         })
     }
 

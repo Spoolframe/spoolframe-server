@@ -42,8 +42,10 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use spoolframe_protocol::ServerId;
 use spoolframe_protocol::federation::{
     AssertUser, AssertionRefused, PairingRefused, PeerHello, RedeemPairing, RemoteItem,
-    SharedLibrary, Standing, SyncLibrary, SyncMode, TokenGranted,
+    SharedLibrary, Standing, SubtitleDownloadAsk, SubtitleRemovalAsk, SubtitleSearchAsk,
+    SyncLibrary, SyncMode, TokenGranted,
 };
+use spoolframe_types::{SubtitleDownloaded, SubtitleSearch};
 
 /// How long dialling another server may take: one attempt, over every
 /// hint given.
@@ -143,6 +145,43 @@ pub trait Shares: Send + Sync + 'static {
         peer: &ServerId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused>;
+
+    /// One of `peer`'s users searches subtitles for an item of this
+    /// server's (P8-07): its results, or the client protocol's refusal.
+    /// Not answered unless the server says otherwise.
+    async fn search_subtitles(
+        &self,
+        _peer: &ServerId,
+        _ask: &SubtitleSearchAsk,
+    ) -> Result<SubtitleSearch, spoolframe_protocol::Error> {
+        Err(not_answered())
+    }
+
+    /// One of `peer`'s users downloads a subtitle result (P8-07), counted
+    /// under `peer`.
+    async fn download_subtitle(
+        &self,
+        _peer: &ServerId,
+        _ask: &SubtitleDownloadAsk,
+    ) -> Result<SubtitleDownloaded, spoolframe_protocol::Error> {
+        Err(not_answered())
+    }
+
+    /// One of `peer`'s users removes a downloaded subtitle (P8-07).
+    async fn remove_subtitle_download(
+        &self,
+        _peer: &ServerId,
+        _ask: &SubtitleRemovalAsk,
+    ) -> Result<(), spoolframe_protocol::Error> {
+        Err(not_answered())
+    }
+}
+
+/// What a server that answers no subtitle ask says.
+fn not_answered() -> spoolframe_protocol::Error {
+    spoolframe_protocol::Error::Unsupported {
+        request: "subtitles for a paired server".into(),
+    }
 }
 
 /// A whole answer to a [`SyncLibrary`], before it is paged.

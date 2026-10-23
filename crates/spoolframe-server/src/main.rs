@@ -1238,6 +1238,8 @@ async fn run(
     });
     if let Some(federation) = &federation {
         live.set_peers(federation.peer_catalog());
+        federation.attach_downloads(downloads.clone());
+        federation.attach_subtitle_downloads(subtitle_downloads.clone());
     }
     let settings = Arc::new(RuntimeSettings::new(
         layers.clone(),

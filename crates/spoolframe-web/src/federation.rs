@@ -118,6 +118,30 @@ pub const LIMITS: &[LimitField] = &[
         "",
         "Default 500 · that work at once, for a pair",
     ),
+    field(
+        "federation.download_tokens_per_user",
+        "Download tokens per user",
+        "",
+        "Default 200 · downloads being made or read at once, for one user of a pair",
+    ),
+    field(
+        "federation.download_tokens_per_server",
+        "Download tokens per server",
+        "",
+        "Default 2000 · downloads being made or read at once, for a pair",
+    ),
+    field(
+        "federation.subtitle_burst",
+        "Subtitle asks in a burst",
+        "",
+        "Default 20 · a pair's subtitle searches and downloads at once, then 1 every 10 s",
+    ),
+    field(
+        "subtitles.daily_limit_per_peer",
+        "Subtitle downloads a day per server",
+        "",
+        "Default 40 · every user of one paired server together, a day; 0 for no limit",
+    ),
 ];
 
 /// The experimental feature's name, as `serverStatus` lists it.
@@ -575,7 +599,7 @@ mod tests {
                 field.key
             );
         }
-        assert_eq!(super::LIMITS.len(), 12);
+        assert_eq!(super::LIMITS.len(), 16);
     }
 
     use super::*;

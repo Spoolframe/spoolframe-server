@@ -73,7 +73,7 @@ pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities (P7-01) and their device credentials (P7-02).
-pub use federation::{DIRECT_DIAL, LibrariesChanged, RemoteMode, RemotePlayback};
+pub use federation::{DIRECT_DIAL, LibrariesChanged, RemoteDownload, RemoteMode, RemotePlayback};
 pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
 pub use playlists::{Features, PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
 pub use portable::{

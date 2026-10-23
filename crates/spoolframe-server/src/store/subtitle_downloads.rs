@@ -173,15 +173,13 @@ impl Store {
         .bind(download.downloaded_at)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "INSERT INTO subtitle_download_log (principal, at, source, name) \
-             VALUES (?1, ?2, ?3, ?4)",
+        self.log_download(
+            &mut tx,
+            &download.downloaded_by,
+            download.downloaded_at,
+            &download.source,
+            &download.downloaded_name,
         )
-        .bind(&download.downloaded_by)
-        .bind(download.downloaded_at)
-        .bind(&download.source)
-        .bind(&download.downloaded_name)
-        .execute(&mut *tx)
         .await?;
         sqlx::query(
             "DELETE FROM subtitle_rejections WHERE media_id = ?1 AND source = ?2 AND file_id = ?3",
@@ -191,11 +189,50 @@ impl Store {
         .bind(&download.file_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM subtitle_download_log WHERE at < ?1")
-            .bind(self.now() - DAY_SECS)
-            .execute(&mut *tx)
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Count a download `principal` made, as `name`, at `source`, that is
+    /// kept elsewhere: a paired server's item's subtitle (P8-07), which
+    /// counts under the user's daily limit here as their own do.
+    pub async fn log_subtitle_download(
+        &self,
+        principal: &str,
+        name: &str,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.log_download(&mut tx, principal, self.now(), source, name)
             .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// One download of `principal`'s at `at`, into the day's log that the
+    /// daily limits count, as `name`; the log's entries past the day go.
+    async fn log_download(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        principal: &str,
+        at: i64,
+        source: &str,
+        name: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO subtitle_download_log (principal, at, source, name) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(principal)
+        .bind(at)
+        .bind(source)
+        .bind(name)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("DELETE FROM subtitle_download_log WHERE at < ?1")
+            .bind(self.now() - DAY_SECS)
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 

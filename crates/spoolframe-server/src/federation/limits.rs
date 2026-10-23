@@ -23,8 +23,15 @@ pub struct Limits {
     pub artwork_burst: u32,
     /// Each pair's assertions in a burst, then one a second (H2).
     pub assertion_burst: u32,
+    /// Each pair's subtitle searches and downloads in a burst, then one
+    /// every 10 s (P8-07).
+    pub subtitle_burst: u32,
     /// The most play tokens that work at once (H3).
     pub tokens: TokenLimits,
+    /// The most download tokens that work at once (P8-07): unused ones,
+    /// and the download sessions open. Apart from the play tokens' so
+    /// that downloads, which live for hours, never take a play's place.
+    pub download_tokens: TokenLimits,
 }
 
 impl Default for Limits {
@@ -42,9 +49,15 @@ impl Default for Limits {
             max_streams: spoolframe_federation::MAX_STREAMS,
             artwork_burst: 200,
             assertion_burst: 30,
+            subtitle_burst: 20,
             tokens: TokenLimits {
                 per_user: 10,
                 per_peer: 500,
+            },
+            // A followed playlist's tracks, each its own download.
+            download_tokens: TokenLimits {
+                per_user: 200,
+                per_peer: 2_000,
             },
         }
     }

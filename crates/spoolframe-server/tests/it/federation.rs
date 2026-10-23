@@ -116,6 +116,7 @@ fn assertion(user: &str, item: &str) -> spoolframe_protocol::federation::AssertU
         item: item.into(),
         scope: spoolframe_protocol::federation::TokenScope::Play,
         preferences: None,
+        download: None,
     }
 }
 
@@ -1827,6 +1828,7 @@ mod sharing {
             item: "plex:movie:1".into(),
             scope: TokenScope::Play,
             preferences: None,
+            download: None,
         };
         let refused = |e: DialError| match e {
             DialError::NotGranted(reason) => reason,
@@ -4672,7 +4674,13 @@ mod replica {
             let (device, bob) = on_sb(&pair, "bob").await;
             let alien = pair.fed(movie().id());
             let granted = device
-                .call(Some(&bob), Request::RemoteGrant { id: alien.clone() })
+                .call(
+                    Some(&bob),
+                    Request::RemoteGrant {
+                        id: alien.clone(),
+                        download: None,
+                    },
+                )
                 .await;
             assert!(
                 matches!(granted, Response::Ok(Reply::RemoteGranted(_))),
@@ -4746,4 +4754,7 @@ mod replica {
             pair.stop().await;
         }
     }
+
+    mod downloads;
+    mod subtitles;
 }

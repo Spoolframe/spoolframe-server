@@ -37,7 +37,8 @@ const BY_TAB: &[(&str, &[&str])] = &[
         ],
     ),
     // Federation's cache and limits, under its switch (P8-04, the
-    // 2026-10-23 decision); the switches themselves are not advanced.
+    // 2026-10-23 decision), with the subtitle limit per paired server
+    // (P8-07); the switches themselves are not advanced.
     (
         "experimental",
         &[
@@ -53,6 +54,10 @@ const BY_TAB: &[(&str, &[&str])] = &[
             "federation.assertion_burst",
             "federation.tokens_per_user",
             "federation.tokens_per_server",
+            "federation.download_tokens_per_user",
+            "federation.download_tokens_per_server",
+            "federation.subtitle_burst",
+            "subtitles.daily_limit_per_peer",
         ],
     ),
     (
@@ -197,7 +202,8 @@ mod tests {
 
     /// Settings › Experimental's switches are shown, the switch on or off:
     /// AirPlay is looked for, and the tab is where experimental switches
-    /// are. Only federation's limits under its switch are advanced.
+    /// are. Only federation's limits under its switch are advanced, the
+    /// subtitle limit per paired server among them (P8-07).
     #[test]
     fn the_experimental_tab_s_switches_are_not() {
         for key in [
@@ -212,7 +218,7 @@ mod tests {
         assert!(
             on_tab("experimental")
                 .iter()
-                .all(|k| k.starts_with("federation."))
+                .all(|k| k.starts_with("federation.") || *k == "subtitles.daily_limit_per_peer")
         );
     }
 

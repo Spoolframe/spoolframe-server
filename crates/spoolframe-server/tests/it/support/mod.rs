@@ -1006,6 +1006,10 @@ impl TestServer {
                 },
             ))
         });
+        if let Some(federation) = &federation {
+            federation.attach_downloads(downloads.clone());
+            federation.attach_subtitle_downloads(subtitle_downloads.clone());
+        }
         // What the pairs share is served from the catalog only where the
         // test gave one that can carry it: the fake has no `fed:` ids.
         if let (Some(federation), Some(live)) = (&federation, &options.catalog) {

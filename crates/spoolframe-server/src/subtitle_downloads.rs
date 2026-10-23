@@ -25,6 +25,11 @@
 //! user may be held to a daily limit, over every site, and an admin may
 //! take downloading from a user; searching is everyone's who can play the
 //! item.
+//!
+//! A paired server's users search and download on this server's items
+//! too (P8-07, [`PairAsker`]): all of them together are held to one daily
+//! limit (`daily_limit_per_peer`), counted under the pair and recorded as
+//! the pair's, by its name, so no user of theirs is named here.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -66,6 +71,9 @@ pub struct Settings {
     pub sites: Vec<SiteSettings>,
     /// A user's downloads a day, from every site; 0 for no limit.
     pub daily_limit_per_user: u32,
+    /// Every user of one paired server's downloads together a day (P8-07);
+    /// 0 for no limit.
+    pub daily_limit_per_peer: u32,
 }
 
 /// One site, as the server uses it.
@@ -129,6 +137,23 @@ pub struct Usage {
     pub daily_limit_per_user: u32,
     /// Each user who downloaded, the most downloads first.
     pub users: Vec<UserUsage>,
+    /// 0 for no limit (P8-07).
+    pub daily_limit_per_peer: u32,
+    /// Each paired server whose users downloaded, as one, the most
+    /// downloads first (P8-07).
+    pub pairs: Vec<PairUsage>,
+}
+
+/// A paired server's users' downloads of the day, together (P8-07).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairUsage {
+    /// Its server id.
+    pub server_id: String,
+    /// Its name when it last downloaded.
+    pub name: String,
+    pub downloads: u32,
+    /// Under the daily limit per pair; `None` without one.
+    pub remaining: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +201,7 @@ impl Site {
 struct Live {
     sites: Vec<(Arc<Site>, SiteSettings)>,
     daily_limit_per_user: u32,
+    daily_limit_per_peer: u32,
 }
 
 /// Who asks: their rights, and their name to show on what they download.
@@ -183,6 +209,134 @@ struct Live {
 pub struct Asker {
     pub actor: Actor,
     pub name: String,
+}
+
+/// A paired server's user asking (P8-07): counted, and recorded, as the
+/// pair, never as its user.
+#[derive(Debug, Clone)]
+pub struct PairAsker {
+    /// The pair's server id.
+    pub server_id: String,
+    /// What the pair calls itself: shown as who downloaded.
+    pub name: String,
+    /// The user's subtitle choices on their own server: what results are
+    /// ordered by.
+    pub subtitles: SubtitlePreferences,
+}
+
+/// `subtitles { daily_limit_per_peer }` left out (P8-07): a pair's users
+/// download on this server's site account, so they are held to a limit
+/// unless the admin says none (0). Not the limit per user's default, which
+/// is none.
+pub const DEFAULT_DAILY_LIMIT_PER_PEER: u32 = 40;
+
+/// What a pair's downloads are kept under, in place of a principal.
+const PAIR_KEY: &str = "pair:";
+
+impl PairAsker {
+    /// What its downloads are counted and recorded under.
+    pub fn key(&self) -> String {
+        format!("{PAIR_KEY}{}", self.server_id)
+    }
+}
+
+/// Who a download is made by, as it is counted and recorded.
+#[derive(Debug, Clone)]
+struct By {
+    /// A principal, or a pair's key.
+    key: String,
+    name: String,
+    admin: bool,
+    /// A pair's: held to the limit per pair.
+    pair: bool,
+}
+
+impl By {
+    fn of(who: &Asker) -> Self {
+        Self {
+            key: who.actor.principal.to_string(),
+            name: who.name.clone(),
+            admin: who.actor.admin,
+            pair: false,
+        }
+    }
+
+    fn pair(asker: &PairAsker) -> Self {
+        Self {
+            key: asker.key(),
+            name: asker.name.clone(),
+            admin: false,
+            pair: true,
+        }
+    }
+
+    /// A user here, by `principal`, downloading a paired server's item
+    /// there (P8-07): held to this server's limit per user.
+    fn elsewhere(principal: &str, name: &str) -> Self {
+        Self {
+            key: principal.to_owned(),
+            name: name.to_owned(),
+            admin: false,
+            pair: false,
+        }
+    }
+
+    /// The daily limit it is held to: a pair's, or a user's.
+    fn limit(&self, live: &Live) -> u32 {
+        match self.pair {
+            true => live.daily_limit_per_peer,
+            false => live.daily_limit_per_user,
+        }
+    }
+
+    /// Whose quota ran out, as the device is told: `user` for a pair too,
+    /// which an app from before P8-07 knows, and which is the user's to
+    /// wait out either way.
+    fn quota_of(&self) -> QuotaOf {
+        QuotaOf::User
+    }
+
+    /// Why an admin's refusal refused it.
+    fn denied(&self) -> &'static str {
+        match self.pair {
+            true => "an admin of this server turned subtitle downloads off for the paired server",
+            false => "an admin turned subtitle downloads off for you",
+        }
+    }
+}
+
+/// A user's daily limit here held for a download of a paired server's
+/// item there (P8-07): from [`SubtitleDownloads::elsewhere`].
+pub(crate) struct Elsewhere<'a> {
+    downloads: &'a SubtitleDownloads,
+    _held: crate::keyed_locks::Guard<'a>,
+    who: By,
+    limit: u32,
+    used: usize,
+}
+
+impl Elsewhere<'_> {
+    /// The paired server made the download, logged as from `source`:
+    /// counted here as one of the user's own. What they have left today;
+    /// `None` without a limit. A count that cannot be kept is logged: the
+    /// download is the user's all the same.
+    pub(crate) async fn downloaded(self, source: &str) -> Option<u32> {
+        if let Err(e) = self
+            .downloads
+            .store
+            .log_subtitle_download(&self.who.key, &self.who.name, source)
+            .await
+        {
+            tracing::warn!(error = %e, "a subtitle downloaded on a paired server is not counted here");
+            return remaining(self.limit, self.used);
+        }
+        remaining(self.limit, self.used + 1)
+    }
+}
+
+/// What is left today under `limit` of `used`; `None` without a limit.
+fn remaining(limit: u32, used: usize) -> Option<u32> {
+    (limit > 0).then(|| limit.saturating_sub(u32::try_from(used).unwrap_or(u32::MAX)))
 }
 
 /// Why a search, download or removal was refused.
@@ -374,6 +528,10 @@ pub struct SubtitleDownloads {
     searches: Mutex<HashMap<SearchKey, Kept>>,
     /// Each media file's hash, by its path, size and modification time.
     hashes: Mutex<HashMap<PathBuf, Hashed>>,
+    /// Each downloader's (a principal's, or a pair's key) daily limit,
+    /// held from its check until its download is counted: two downloads
+    /// at once never both take the last one.
+    limits: crate::keyed_locks::KeyedLocks,
 }
 
 impl std::fmt::Debug for SubtitleDownloads {
@@ -404,6 +562,7 @@ impl SubtitleDownloads {
             live: Mutex::new(Live::default()),
             searches: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
+            limits: Default::default(),
         };
         this.configure(settings);
         Ok(this)
@@ -435,6 +594,7 @@ impl SubtitleDownloads {
         *live = Live {
             sites,
             daily_limit_per_user: settings.daily_limit_per_user,
+            daily_limit_per_peer: settings.daily_limit_per_peer,
         };
     }
 
@@ -500,6 +660,31 @@ impl SubtitleDownloads {
         who: &Actor,
     ) -> Result<SubtitleSearch, DownloadError> {
         let live = self.live()?;
+        let wanted = self.store.track_preferences(who.principal).await?.subtitles;
+        self.search_with(live, id, language, &wanted).await
+    }
+
+    /// [`SubtitleDownloads::search`] for a paired server's user (P8-07),
+    /// ordered by their own choices.
+    pub async fn search_for_pair(
+        &self,
+        id: &MediaId,
+        language: Option<&str>,
+        who: &PairAsker,
+    ) -> Result<SubtitleSearch, DownloadError> {
+        let live = self.live()?;
+        self.search_with(live, id, language, &who.subtitles).await
+    }
+
+    /// [`SubtitleDownloads::search`] with the sites `live`, ordered by
+    /// `wanted`.
+    async fn search_with(
+        &self,
+        live: Live,
+        id: &MediaId,
+        language: Option<&str>,
+        wanted: &SubtitlePreferences,
+    ) -> Result<SubtitleSearch, DownloadError> {
         let asked = language.map(language_code).transpose()?;
         // The item is read, and the file hashed, only when a site is asked
         // (not all it found is kept from the last day).
@@ -593,8 +778,7 @@ impl SubtitleDownloads {
                 result(offer, rejected.contains(&key), downloaded.contains(&key))
             })
             .collect();
-        let wanted = self.store.track_preferences(who.principal).await?;
-        order(&mut results, &wanted.subtitles);
+        order(&mut results, wanted);
         let languages = match asked {
             Some(language) => vec![language],
             None => dedupe(
@@ -744,6 +928,27 @@ impl SubtitleDownloads {
         result: &str,
         who: &Asker,
     ) -> Result<SubtitleDownloaded, DownloadError> {
+        self.download_by(id, result, By::of(who)).await
+    }
+
+    /// [`SubtitleDownloads::download`] for a paired server's user (P8-07):
+    /// counted under the pair's daily limit, and recorded as the pair's.
+    pub async fn download_for_pair(
+        &self,
+        id: &MediaId,
+        result: &str,
+        who: &PairAsker,
+    ) -> Result<SubtitleDownloaded, DownloadError> {
+        self.download_by(id, result, By::pair(who)).await
+    }
+
+    /// [`SubtitleDownloads::download`] by `who`.
+    async fn download_by(
+        &self,
+        id: &MediaId,
+        result: &str,
+        who: By,
+    ) -> Result<SubtitleDownloaded, DownloadError> {
         let live = self.live()?;
         let not_offered = || DownloadError::NotFound("a search result for this item; search again");
         let (source, site_id) = result
@@ -762,31 +967,22 @@ impl SubtitleDownloads {
         else {
             return Err(not_offered());
         };
+        // The downloader's limit, held from its check to its count; then
+        // the site's, one download at a time.
+        let _limit = self.limits.lock(&who.key).await;
         let _one = site.downloading.lock().await;
-        let principal = who.actor.principal.to_string();
-        let limit = live.daily_limit_per_user;
+        let principal = who.key.clone();
+        let limit = who.limit(&live);
         if let Some(row) = self
             .store
             .subtitle_download_of(&id.to_string(), source.id(), site_id)
             .await?
         {
             let user_remaining = self.user_remaining(&principal, limit).await?;
-            return self.answer(&row, who, None, user_remaining).await;
+            return self.answer(&row, &who, None, user_remaining).await;
         }
         let offer = self.offered(id, source, site_id).ok_or_else(not_offered)?;
-        if !self.store.may_download_subtitles(&principal).await? {
-            return Err(DownloadError::NotAllowed(
-                "an admin turned subtitle downloads off for you",
-            ));
-        }
-        let today = self.store.subtitle_downloads_today(&principal).await?;
-        if limit > 0 && today.len() >= limit as usize {
-            return Err(DownloadError::QuotaExhausted {
-                whose: QuotaOf::User,
-                resets_at: today.first().map(|at| at + DAY_SECS),
-                site: None,
-            });
-        }
+        let used = self.check_may_download(&who, limit).await?;
         let media = self.catalog.media_path(id).await?;
         let (got, account_remaining) = match &site.client {
             Client::OpenSubtitles(client) => {
@@ -878,14 +1074,56 @@ impl SubtitleDownloads {
             "downloaded a subtitle"
         );
         self.attach(&media).await?;
-        let user_remaining = self.user_remaining(&principal, limit).await?;
+        let user_remaining = remaining(limit, used + 1);
         let answer = self
-            .answer(&row, who, account_remaining, user_remaining)
+            .answer(&row, &who, account_remaining, user_remaining)
             .await?;
         if !row.hash_match {
             self.sync(id, &media, &file).await;
         }
         Ok(answer)
+    }
+
+    /// Whether `who` may download one more now, under a daily limit of
+    /// `limit`: not if an admin took it from them, nor past the limit. How
+    /// many they downloaded in the day.
+    async fn check_may_download(&self, who: &By, limit: u32) -> Result<usize, DownloadError> {
+        if !self.store.may_download_subtitles(&who.key).await? {
+            return Err(DownloadError::NotAllowed(who.denied()));
+        }
+        let today = self.store.subtitle_downloads_today(&who.key).await?;
+        if limit > 0 && today.len() >= limit as usize {
+            return Err(DownloadError::QuotaExhausted {
+                whose: who.quota_of(),
+                resets_at: today.first().map(|at| at + DAY_SECS),
+                site: None,
+            });
+        }
+        Ok(today.len())
+    }
+
+    /// Hold `principal`'s daily limit here, a user here downloading a
+    /// subtitle of a paired server's item (P8-07): checked now, as this
+    /// server's own limit per user applies first, and held while the
+    /// paired server is asked, until the download is counted
+    /// ([`Elsewhere::downloaded`]) or the hold dropped. This server needs
+    /// no site of its own for it: the pair's are asked.
+    pub(crate) async fn elsewhere(
+        &self,
+        principal: &str,
+        name: &str,
+    ) -> Result<Elsewhere<'_>, DownloadError> {
+        let who = By::elsewhere(principal, name);
+        let held = self.limits.lock(principal).await;
+        let limit = who.limit(&self.live.lock());
+        let used = self.check_may_download(&who, limit).await?;
+        Ok(Elsewhere {
+            downloads: self,
+            _held: held,
+            who,
+            limit,
+            used,
+        })
     }
 
     /// The day's downloads, each site's and each user's, for the admin.
@@ -905,23 +1143,44 @@ impl SubtitleDownloads {
                 }
             })
             .collect();
+        // In the order each first downloaded, for a stable sort below.
         let mut users: Vec<UserUsage> = Vec::new();
+        let mut pairs: Vec<PairUsage> = Vec::new();
+        let mut user_at: HashMap<&str, usize> = HashMap::new();
+        let mut pair_at: HashMap<&str, usize> = HashMap::new();
         for logged in &log {
-            let user = match users.iter_mut().find(|u| u.principal == logged.principal) {
-                Some(user) => user,
-                None => {
-                    users.push(UserUsage {
-                        principal: logged.principal.clone(),
-                        name: String::new(),
-                        downloads: 0,
-                        remaining: None,
+            // A pair's users' downloads are one row, the pair's (P8-07).
+            let (downloads, name) = match logged.principal.strip_prefix(PAIR_KEY) {
+                Some(server_id) => {
+                    let at = *pair_at.entry(server_id).or_insert_with(|| {
+                        pairs.push(PairUsage {
+                            server_id: server_id.to_owned(),
+                            name: String::new(),
+                            downloads: 0,
+                            remaining: None,
+                        });
+                        pairs.len() - 1
                     });
-                    users.last_mut().expect("just pushed")
+                    let pair = &mut pairs[at];
+                    (&mut pair.downloads, &mut pair.name)
+                }
+                None => {
+                    let at = *user_at.entry(&logged.principal).or_insert_with(|| {
+                        users.push(UserUsage {
+                            principal: logged.principal.clone(),
+                            name: String::new(),
+                            downloads: 0,
+                            remaining: None,
+                        });
+                        users.len() - 1
+                    });
+                    let user = &mut users[at];
+                    (&mut user.downloads, &mut user.name)
                 }
             };
-            user.downloads += 1;
+            *downloads += 1;
             if !logged.name.is_empty() {
-                user.name = logged.name.clone();
+                name.clone_from(&logged.name);
             }
         }
         let limit = live.daily_limit_per_user;
@@ -930,14 +1189,22 @@ impl SubtitleDownloads {
         }
         // Stable: of the same count, who downloaded first comes first.
         users.sort_by_key(|u| std::cmp::Reverse(u.downloads));
+        let per_peer = live.daily_limit_per_peer;
+        for pair in &mut pairs {
+            pair.remaining = (per_peer > 0).then(|| per_peer.saturating_sub(pair.downloads));
+        }
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.downloads));
         Ok(Usage {
             sites,
             daily_limit_per_user: limit,
             users,
+            daily_limit_per_peer: per_peer,
+            pairs,
         })
     }
 
     /// The downloads `principal` has left today, under a limit of `limit`.
+    /// [`remaining`] where the count is known.
     async fn user_remaining(&self, principal: &str, limit: u32) -> Result<Option<u32>, StoreError> {
         if limit == 0 {
             return Ok(None);
@@ -973,7 +1240,7 @@ impl SubtitleDownloads {
     async fn answer(
         &self,
         row: &DownloadRow,
-        who: &Asker,
+        who: &By,
         account_remaining: Option<u32>,
         user_remaining: Option<u32>,
     ) -> Result<SubtitleDownloaded, DownloadError> {
@@ -983,7 +1250,7 @@ impl SubtitleDownloads {
         let index = track_index(&descriptor, &file)
             .ok_or(DownloadError::NotFound("the downloaded track"))?;
         let mut subtitle = descriptor.tracks().subtitles.swap_remove(index as usize);
-        subtitle.download = Some(wire(row, &who.actor));
+        subtitle.download = Some(wire_for(row, who.admin, &who.key));
         Ok(SubtitleDownloaded {
             track: index,
             subtitle,
@@ -1021,12 +1288,36 @@ impl SubtitleDownloads {
         download: &str,
         actor: &Actor,
     ) -> Result<(), DownloadError> {
+        self.remove_by(id, download, &actor.principal.to_string(), actor.admin)
+            .await
+    }
+
+    /// [`SubtitleDownloads::remove`] for a paired server's user (P8-07):
+    /// what the pair downloaded, any of its users may remove.
+    pub async fn remove_for_pair(
+        &self,
+        id: &MediaId,
+        download: &str,
+        who: &PairAsker,
+    ) -> Result<(), DownloadError> {
+        self.remove_by(id, download, &who.key(), false).await
+    }
+
+    /// [`SubtitleDownloads::remove`] by `principal` (or a pair's key), an
+    /// admin or not.
+    async fn remove_by(
+        &self,
+        id: &MediaId,
+        download: &str,
+        principal: &str,
+        admin: bool,
+    ) -> Result<(), DownloadError> {
         let rows = self.store.subtitle_downloads(&id.to_string()).await?;
         let Some(row) = rows.into_iter().find(|r| r.id == download) else {
             return Ok(());
         };
-        let principal = actor.principal.to_string();
-        if !actor.admin && row.downloaded_by != principal {
+        let principal = principal.to_owned();
+        if !admin && row.downloaded_by != principal {
             return Err(DownloadError::NotAllowed(
                 "only who downloaded it, or an admin, may remove it",
             ));
@@ -1198,6 +1489,12 @@ fn subdl_query(
 
 /// `row` on the wire, for `actor`.
 fn wire(row: &DownloadRow, actor: &Actor) -> SubtitleDownload {
+    wire_for(row, actor.admin, &actor.principal.to_string())
+}
+
+/// `row` on the wire, for `key` (a principal, or a pair's), an admin or
+/// not.
+fn wire_for(row: &DownloadRow, admin: bool, key: &str) -> SubtitleDownload {
     SubtitleDownload {
         id: row.id.clone(),
         source: row.source.clone(),
@@ -1210,7 +1507,7 @@ fn wire(row: &DownloadRow, actor: &Actor) -> SubtitleDownload {
             "ai" => SubtitleOrigin::Ai,
             _ => SubtitleOrigin::Human,
         },
-        can_remove: actor.admin || row.downloaded_by == actor.principal.to_string(),
+        can_remove: admin || row.downloaded_by == key,
     }
 }
 

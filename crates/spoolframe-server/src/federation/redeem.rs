@@ -12,6 +12,10 @@
 //!
 //! A revoked grant or an unpairing ends the sessions it opened, and their
 //! playbacks with them ([`Federation::end_remote_sessions`]).
+//!
+//! A download token (P8-07) is redeemed the same way, and opens a session
+//! for its item's download alone; it is not a play, and is not counted as
+//! one.
 
 use iroh::EndpointId;
 use spoolframe_protocol::federation::TokenScope;
@@ -52,27 +56,31 @@ impl Federation {
             return Err(PlayTokenError::Invalid);
         };
         let item: MediaId = redeemed.item.parse().map_err(|_| PlayTokenError::Invalid)?;
-        // Mint keeps only plays of what plays; read back, it is held to
-        // that again.
-        if redeemed.scope != TokenScope::Play.name()
-            || !matches!(
-                item.kind(),
-                MediaKind::Movie | MediaKind::Episode | MediaKind::Track
-            )
-        {
+        // Mint keeps only plays and downloads of what plays; read back, it
+        // is held to that again.
+        let scope = [TokenScope::Play, TokenScope::Download]
+            .into_iter()
+            .find(|s| s.name() == redeemed.scope)
+            .ok_or(PlayTokenError::Invalid)?;
+        if !matches!(
+            item.kind(),
+            MediaKind::Movie | MediaKind::Episode | MediaKind::Track
+        ) {
             return Err(PlayTokenError::Invalid);
         }
         // The redemption checked its pair is live, and read what it is.
         let proxied = redeemed.peer_endpoint == endpoint;
         // Counted off the way of the session's opening: a count missed is
-        // logged, and the play goes on.
-        let counting = store.clone();
-        let peer = redeemed.peer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = counting.count_federation_served(&peer, proxied).await {
-                tracing::warn!(error = %e, "cannot count a paired server's play");
-            }
-        });
+        // logged, and the play goes on. A download is not a play.
+        if scope == TokenScope::Play {
+            let counting = store.clone();
+            let peer = redeemed.peer.clone();
+            tokio::spawn(async move {
+                if let Err(e) = counting.count_federation_served(&peer, proxied).await {
+                    tracing::warn!(error = %e, "cannot count a paired server's play");
+                }
+            });
+        }
         // SA's admins manage servers, not people (P8-03): the Playback
         // page names the paired server, never its user.
         let session_user = RemoteSessionUser {
@@ -82,12 +90,13 @@ impl Federation {
             peer: redeemed.peer,
             library: redeemed.library,
             item: item.clone(),
-            scope: TokenScope::Play,
+            scope,
             proxied,
             preferences: redeemed
                 .preferences
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok()),
+            download: redeemed.download,
         };
         let session = self
             .auth
@@ -98,7 +107,8 @@ impl Federation {
             principal = %session_user.principal(),
             %item,
             proxied,
-            "a play token is redeemed"
+            scope = scope.name(),
+            "a paired server's token is redeemed"
         );
         Ok((session, session_user))
     }

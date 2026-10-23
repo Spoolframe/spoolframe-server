@@ -4366,6 +4366,21 @@ impl AdminApiServer for AdminApi {
                     }
                 })
                 .collect(),
+            daily_limit_per_peer: usage.daily_limit_per_peer,
+            pairs: usage
+                .pairs
+                .into_iter()
+                .map(|p| spoolframe_admin_api::SubtitlePairUsage {
+                    // A pair that never said its name is named by its id.
+                    name: if p.name.is_empty() {
+                        p.server_id
+                    } else {
+                        p.name
+                    },
+                    downloads: p.downloads,
+                    remaining: p.remaining,
+                })
+                .collect(),
         })
     }
 

@@ -455,6 +455,10 @@ impl ServerConfig {
         Ok(crate::subtitle_downloads::Settings {
             sites,
             daily_limit_per_user: self.subtitles.daily_limit_per_user.unwrap_or(0),
+            daily_limit_per_peer: self
+                .subtitles
+                .daily_limit_per_peer
+                .unwrap_or(crate::subtitle_downloads::DEFAULT_DAILY_LIMIT_PER_PEER),
         })
     }
 }
@@ -1108,6 +1112,13 @@ pub struct SubtitlesConfig {
     /// left out for no limit. A live setting.
     #[ucl(default)]
     pub daily_limit_per_user: Option<u32>,
+    /// The subtitle downloads a day of every user of one paired server
+    /// together (P8-07), on this server's items: 40 if left out, 0 for no
+    /// limit. Not the limit per user, whose default is none: a pair's
+    /// users are on this server's site account unless its admin says so.
+    /// A live setting.
+    #[ucl(default)]
+    pub daily_limit_per_peer: Option<u32>,
 }
 
 impl SubtitlesConfig {
@@ -1795,6 +1806,22 @@ pub struct FederationConfig {
     /// least, 1,000,000 at the most.
     #[ucl(default)]
     pub tokens_per_server: Option<u64>,
+    /// Download tokens (P8-07) that work at once for one user of a pair,
+    /// each a download being made or read; 200 if left out, 10 at the
+    /// least, 100,000 at the most. Apart from play tokens, so downloads
+    /// never take a play's place.
+    #[ucl(default)]
+    pub download_tokens_per_user: Option<u64>,
+    /// Download tokens that work at once for a pair; 2,000 if left out, 50
+    /// at the least, 10,000,000 at the most.
+    #[ucl(default)]
+    pub download_tokens_per_server: Option<u64>,
+    /// Subtitle searches and downloads a pair's users may ask in a burst,
+    /// then one every 10 s (P8-07); 20 if left out, 2 at the least, 10,000
+    /// at the most. Downloads are also held to `subtitles {
+    /// daily_limit_per_peer }`.
+    #[ucl(default)]
+    pub subtitle_burst: Option<u64>,
 }
 
 impl FederationConfig {
@@ -1868,6 +1895,19 @@ impl FederationConfig {
             tokens: crate::store::federation_tokens::TokenLimits {
                 per_user: within(self.tokens_per_user, d.tokens.per_user, (2, 10_000)),
                 per_peer: within(self.tokens_per_server, d.tokens.per_peer, (10, 1_000_000)),
+            },
+            subtitle_burst: small(self.subtitle_burst, d.subtitle_burst, (2, 10_000)),
+            download_tokens: crate::store::federation_tokens::TokenLimits {
+                per_user: within(
+                    self.download_tokens_per_user,
+                    d.download_tokens.per_user,
+                    (10, 100_000),
+                ),
+                per_peer: within(
+                    self.download_tokens_per_server,
+                    d.download_tokens.per_peer,
+                    (50, 10_000_000),
+                ),
             },
         }
     }
@@ -3234,6 +3274,7 @@ mod tests {
         };
         assert_eq!(languages, &["en"]);
         assert_eq!(none.subtitle_downloads().unwrap().daily_limit_per_user, 0);
+        assert_eq!(none.subtitle_downloads().unwrap().daily_limit_per_peer, 40);
         assert_eq!(
             account.api_url.as_str(),
             "https://api.opensubtitles.com/api/v1"
@@ -3957,7 +3998,9 @@ mod tests {
             r#"plex { url = "http://nas:32400"; }
                federation { sync_max_pages = 0; sync_max_items = 1; max_cached_items = 1;
                             walk_reuse_secs = 0; max_streams = 0; artwork_burst = 0;
-                            assertion_burst = 0; tokens_per_user = 0; tokens_per_server = 0; }"#,
+                            assertion_burst = 0; tokens_per_user = 0; tokens_per_server = 0;
+                            download_tokens_per_user = 0; download_tokens_per_server = 0;
+                            subtitle_burst = 0; }"#,
         )
         .unwrap()
         .federation
@@ -3971,6 +4014,9 @@ mod tests {
         assert_eq!(floored.assertion_burst, 5);
         assert_eq!(floored.tokens.per_user, 2);
         assert_eq!(floored.tokens.per_peer, 10);
+        assert_eq!(floored.download_tokens.per_user, 10);
+        assert_eq!(floored.download_tokens.per_peer, 50);
+        assert_eq!(floored.subtitle_burst, 2);
     }
 
     /// P8-04: a limit typed too large is held to its ceiling, not used as
@@ -3985,7 +4031,9 @@ mod tests {
                             sync_max_items = {huge}; max_cached_items = {huge};
                             walk_reuse_secs = {huge}; max_streams = {huge};
                             artwork_burst = {huge}; assertion_burst = {huge};
-                            tokens_per_user = {huge}; tokens_per_server = {huge}; }}"#
+                            tokens_per_user = {huge}; tokens_per_server = {huge};
+                            download_tokens_per_user = {huge};
+                            download_tokens_per_server = {huge}; subtitle_burst = {huge}; }}"#
         ))
         .unwrap()
         .federation;
@@ -4000,6 +4048,9 @@ mod tests {
         assert_eq!(capped.assertion_burst, 10_000);
         assert_eq!(capped.tokens.per_user, 10_000);
         assert_eq!(capped.tokens.per_peer, 1_000_000);
+        assert_eq!(capped.download_tokens.per_user, 100_000);
+        assert_eq!(capped.download_tokens.per_peer, 10_000_000);
+        assert_eq!(capped.subtitle_burst, 10_000);
     }
 
     #[test]

@@ -65,7 +65,7 @@ fn srt(cues: &[Span], shift_ms: i64) -> String {
 
 /// A stand-in site answering the recorded search, and serving every file
 /// as the CP-1251 SRT.
-async fn site() -> MockServer {
+pub(crate) async fn site() -> MockServer {
     let site = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/subtitles"))
@@ -90,7 +90,7 @@ async fn site() -> MockServer {
     site
 }
 
-fn settings(site: &MockServer, limit: u32) -> Settings {
+pub(crate) fn settings(site: &MockServer, limit: u32) -> Settings {
     Settings {
         sites: vec![SiteSettings {
             languages: vec!["en".into()],
@@ -101,6 +101,7 @@ fn settings(site: &MockServer, limit: u32) -> Settings {
             }),
         }],
         daily_limit_per_user: limit,
+        daily_limit_per_peer: limit,
     }
 }
 
@@ -135,7 +136,11 @@ async fn film_in(dir: support::StateDir, site: Settings) -> TestServer {
 
 /// A Linux app that plays SubRip and Matroska, directly or converted,
 /// listing `features`.
-async fn app(server: &TestServer, user: &str, features: &[&str]) -> (TestClient, SessionId) {
+pub(crate) async fn app(
+    server: &TestServer,
+    user: &str,
+    features: &[&str],
+) -> (TestClient, SessionId) {
     let capabilities = ClientCapabilities {
         video: [VideoCodec::H264].into(),
         audio: [AudioCodec::Aac].into(),
@@ -864,6 +869,7 @@ async fn downloads_stay_when_their_site_is_turned_off() {
     downloads.configure(Settings {
         sites: vec![sites.sites[0].clone()],
         daily_limit_per_user: 0,
+        daily_limit_per_peer: 0,
     });
     downloads.configure(Settings::default());
     assert_eq!(search(&alice, &session).await, Err(Error::NoSubtitleSource));

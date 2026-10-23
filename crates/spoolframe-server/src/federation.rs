@@ -22,6 +22,7 @@
 mod answer;
 pub mod cache;
 mod copies;
+mod downloads;
 mod exposure;
 mod grants;
 pub mod items;
@@ -30,10 +31,12 @@ mod media;
 mod proxy;
 mod redeem;
 mod replica;
+mod subtitles;
 mod tokens;
 
 pub use cache::{Links, PeerCache};
 pub use copies::{PlayFromError, Viewer};
+pub use downloads::{DownloadHold, RemoteDownloadRead, RemoteStatuses};
 pub use exposure::{PeerPage, PlayDay, Received, ServerRowError};
 pub use grants::ShareError;
 pub use limits::Limits;
@@ -114,6 +117,16 @@ pub struct Federation {
     /// a device's play that falls back to proxy mode is not counted twice
     /// (P8-04).
     device_grants: tokens::DeviceGrants,
+    /// This server's sessions on its pairs' servers for its users'
+    /// downloads (P8-07).
+    download_sessions: Arc<downloads::DownloadSessions>,
+    /// This server's own downloads: what it makes for its pairs' users,
+    /// and tells its users of theirs (P8-07). Set once, at start.
+    downloads: OnceLock<Arc<crate::downloads::Downloads>>,
+    /// This server's subtitle downloads: what its pairs' users search with,
+    /// and what its own users' downloads of the pairs' items count
+    /// against (P8-07). Set once, at start.
+    subtitle_downloads: OnceLock<Arc<crate::subtitle_downloads::SubtitleDownloads>>,
 }
 
 /// Where and how this server caches what its pairs share (P8-02).
@@ -228,7 +241,17 @@ impl Federation {
             wake: Arc::default(),
             plays: Arc::default(),
             device_grants: parking_lot::Mutex::default(),
+            download_sessions: Arc::default(),
+            downloads: OnceLock::new(),
+            subtitle_downloads: OnceLock::new(),
         }
+    }
+
+    /// This server's downloads (P8-07): what it cancels for a pair's users
+    /// when a grant or the pair ends, and where its users hear of their
+    /// downloads of the pairs' items. Once, at start.
+    pub fn attach_downloads(&self, downloads: Arc<crate::downloads::Downloads>) {
+        let _ = self.downloads.set(downloads);
     }
 
     /// The endpoint is up: what dials from it, holds its connections and
@@ -583,6 +606,7 @@ impl Federation {
         );
         self.end_remote_sessions(&peer.id, None);
         self.close_plays(&peer.id);
+        self.cancel_served_downloads(&peer, None).await;
         self.forget_origin(&peer.server_id).await;
         if let Ok(endpoint) = peer.endpoint_id.parse::<EndpointId>() {
             self.live.close(&endpoint, close::UNPAIRED, "unpaired");
@@ -915,6 +939,7 @@ impl Peers for Federation {
                 );
                 self.end_remote_sessions(&peer.id, None);
                 self.close_plays(&peer.id);
+                self.cancel_served_downloads(&peer, None).await;
                 self.forget_origin(&peer.server_id).await;
             }
             Ok(None) => {}

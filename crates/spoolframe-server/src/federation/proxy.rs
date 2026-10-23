@@ -125,7 +125,7 @@ struct Pooled {
 
 impl PlayClients {
     /// `peer`'s connection, open, held for a play.
-    fn held(self: &Arc<Self>, peer: &str) -> Option<Held> {
+    pub(super) fn held(self: &Arc<Self>, peer: &str) -> Option<Held> {
         let mut open = self.open.lock();
         let pooled = open.get_mut(peer)?;
         if pooled.client.is_closed() {
@@ -208,11 +208,12 @@ impl PlayClients {
 }
 
 /// A play's hold on its pair's connection: dropped, the play is off it.
+/// A download's call or read (P8-07) holds it the same way.
 #[derive(Debug)]
-struct Held {
+pub(super) struct Held {
     pool: std::sync::Weak<PlayClients>,
     peer: String,
-    client: Arc<PlayClient>,
+    pub(super) client: Arc<PlayClient>,
 }
 
 impl Drop for Held {
@@ -499,28 +500,12 @@ impl Federation {
         let held = self.play_client(&endpoint, &peer).await?;
         let client = held.client.clone();
         let started = async {
-            let redeemed = match client
-                .call(
-                    None,
-                    Request::RedeemPlayToken(RedeemPlayToken {
-                        token: granted.token,
-                    }),
-                    None,
-                )
-                .await?
-                .response
-            {
-                Response::Ok(Reply::PlayTokenRedeemed(redeemed)) => redeemed,
-                Response::Ok(other) => {
-                    return Err(ProxyError::Origin(answered_with("a redemption", &other)));
-                }
-                Response::Err(e) => return Err(ProxyError::Origin(e)),
-            };
+            let session = redeem(&client, granted.token).await?;
             // Ended here, its session is ended there: a start that fails
             // leaves none behind.
             let mut play = RemotePlay {
                 client: client.clone(),
-                session: redeemed.session,
+                session,
                 handle: PlaybackHandle(String::new()),
                 revision: AtomicU64::new(0),
                 peer: peer.id.clone(),
@@ -594,7 +579,7 @@ impl Federation {
 
     /// This server's connection to `peer`'s client protocol, held for a
     /// play: the one open, or a new one.
-    async fn play_client(
+    pub(super) async fn play_client(
         &self,
         endpoint: &iroh::Endpoint,
         peer: &PeerRecord,
@@ -612,7 +597,8 @@ impl Federation {
             .map_err(|_| AssertError::NotPaired(peer.server_id.clone()))?;
         let addr = endpoint_addr(peer_id, parsed(&peer.addrs), &peer.relays);
         // SA sees this server as the device; what each play plans for is
-        // its start's.
+        // its start's, and each download its own device's (P8-07), whose
+        // news this connection hears.
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "spoolframe-server".into(),
@@ -621,9 +607,20 @@ impl Federation {
             device_name: Some(self.name.get()),
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
-            features: Vec::new(),
+            features: vec![
+                spoolframe_protocol::features::DOWNLOADS.into(),
+                spoolframe_protocol::features::MUSIC_DOWNLOADS.into(),
+            ],
         };
         let (client, _) = PlayClient::connect(endpoint, addr, hello).await?;
+        tokio::spawn(super::downloads::forward_download_news(
+            self.store().clone(),
+            self.downloads.get().cloned(),
+            self.download_sessions.clone(),
+            peer.server_id.clone(),
+            Arc::downgrade(&client),
+            client.events(),
+        ));
         Ok(self.plays.keep(&peer.id, client))
     }
 
@@ -646,18 +643,43 @@ impl Federation {
     }
 }
 
-/// What the device is told when SA's client protocol failed SB.
-fn origin_error(e: DialError) -> Error {
+/// What the device is told when SA did not answer SB as asked: SA's own
+/// refusal as it is (P8-07's subtitle asks), offline when SA cannot be
+/// reached, else that it cannot be reached now. What went wrong on the
+/// way (an address, a broken stream) is logged here, never told the
+/// device.
+pub(super) fn origin_error(e: DialError) -> Error {
     match e {
+        DialError::Failed(error) => error,
         DialError::Unreachable(_) => Error::OriginOffline,
-        other => Error::Unavailable {
-            message: other.to_string(),
-        },
+        other => {
+            tracing::info!(error = %other, "a paired server did not answer as asked");
+            Error::Unavailable {
+                message: "the paired server cannot be reached now".into(),
+            }
+        }
+    }
+}
+
+/// `token` redeemed on SA's client protocol over `client`: the session it
+/// opens there (P8-04, P8-07).
+pub(super) async fn redeem(client: &PlayClient, token: String) -> Result<SessionId, ProxyError> {
+    let redeemed = client
+        .call(
+            None,
+            Request::RedeemPlayToken(RedeemPlayToken { token }),
+            None,
+        )
+        .await?;
+    match redeemed.response {
+        Response::Ok(Reply::PlayTokenRedeemed(redeemed)) => Ok(redeemed.session),
+        Response::Ok(other) => Err(ProxyError::Origin(answered_with("a redemption", &other))),
+        Response::Err(e) => Err(ProxyError::Origin(e)),
     }
 }
 
 /// SA answered `what` with `other`.
-fn answered_with(what: &str, other: &Reply) -> Error {
+pub(super) fn answered_with(what: &str, other: &Reply) -> Error {
     Error::Unavailable {
         message: format!("the paired server answered {what} with {other:?}"),
     }
@@ -668,6 +690,27 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    /// SA's own refusal reaches the device as it is; what failed on the
+    /// way does not: the device is told SA cannot be reached now.
+    #[test]
+    fn the_device_hears_sa_s_refusal_but_no_transport_error() {
+        assert_eq!(
+            origin_error(DialError::Failed(Error::NoSubtitleSource)),
+            Error::NoSubtitleSource
+        );
+        assert_eq!(
+            origin_error(DialError::Unreachable("10.0.0.7:4433".into())),
+            Error::OriginOffline
+        );
+        let told = origin_error(DialError::Broken("stream reset by 10.0.0.7:4433".into()));
+        assert_eq!(
+            told,
+            Error::Unavailable {
+                message: "the paired server cannot be reached now".into()
+            }
+        );
+    }
 
     /// A paired server that stops sending fails the read once it has sent
     /// nothing for the stall, not at once, and not never.

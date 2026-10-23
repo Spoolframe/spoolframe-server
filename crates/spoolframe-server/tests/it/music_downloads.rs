@@ -119,6 +119,7 @@ async fn prepare(
                 id: track_id(key),
                 source,
                 tracks: DownloadTracks::All,
+                device: None,
             },
         )
         .await
@@ -861,6 +862,7 @@ async fn a_film_is_refused_aac_256_and_a_track_a_profile() {
                 id: crate::support::movie().id().clone(),
                 source: DownloadSource::Aac256,
                 tracks: DownloadTracks::All,
+                device: None,
             },
         )
         .await;

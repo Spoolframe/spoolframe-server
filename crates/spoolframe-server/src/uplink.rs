@@ -16,6 +16,11 @@
 //! owners' playbacks share `owner_share_percent` of it and everyone
 //! else's the rest. A share only caps `Quality::Auto`; one the viewer
 //! chose is theirs.
+//!
+//! A paired server's user's download read off the LAN (P8-07) is not a
+//! playback: reads have a cap of their own ([`MAX_DOWNLOAD_READS`] at
+//! once), and take neither a playback's place nor part of its share, so
+//! downloads never make a play `WanStreamsFull`.
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -73,6 +78,27 @@ impl Admission {
 impl Drop for Admission {
     fn drop(&mut self) {
         self.uplink.pending.lock().remove(&self.ticket);
+    }
+}
+
+/// How many download reads off the LAN are sent at once (P8-07), apart
+/// from the playbacks: each is at most `MAX_READ`, and a device reads one
+/// after another.
+pub const MAX_DOWNLOAD_READS: usize = 4;
+
+/// A download read's place off the LAN while it is sent (P8-07): dropped,
+/// it is let go.
+#[must_use]
+#[derive(Debug)]
+pub struct DownloadSlot {
+    uplink: Arc<Uplink>,
+}
+
+impl Drop for DownloadSlot {
+    fn drop(&mut self) {
+        self.uplink
+            .download_reads
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -205,6 +231,8 @@ pub struct Uplink {
     /// the shares, so two starts at once cannot both take the last place.
     pending: Mutex<HashMap<u64, Class>>,
     next_ticket: std::sync::atomic::AtomicU64,
+    /// Download reads off the LAN being sent ([`DownloadSlot`]).
+    download_reads: std::sync::atomic::AtomicUsize,
     /// Woken at each start and end, for the shares to be worked out again
     /// once things settle. Shared, so [`tell_shares`] waits on it without
     /// holding the uplink.
@@ -232,6 +260,7 @@ impl Uplink {
             streams: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_ticket: std::sync::atomic::AtomicU64::new(0),
+            download_reads: std::sync::atomic::AtomicUsize::new(0),
             changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -319,6 +348,22 @@ impl Uplink {
             ticket,
             class,
             share,
+        })
+    }
+
+    /// A place for a download read off the LAN (P8-07), apart from the
+    /// playbacks'; `Full` with [`MAX_DOWNLOAD_READS`] being sent.
+    pub fn reserve_download(self: &Arc<Self>) -> Result<DownloadSlot, Full> {
+        use std::sync::atomic::Ordering;
+        self.download_reads
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_DOWNLOAD_READS).then_some(n + 1)
+            })
+            .map_err(|_| Full {
+                max: MAX_DOWNLOAD_READS,
+            })?;
+        Ok(DownloadSlot {
+            uplink: Arc::clone(self),
         })
     }
 
@@ -578,6 +623,35 @@ mod tests {
             .unwrap();
     }
     use super::*;
+
+    /// Download reads (P8-07) have a cap of their own, and neither take a
+    /// playback's place nor part of the shares.
+    #[test]
+    fn download_reads_are_apart_from_the_playbacks() {
+        let uplink = Arc::new(Uplink::new(UplinkSettings {
+            budget: Some(8_000_000),
+            max_streams: Some(1),
+            ..UplinkSettings::default()
+        }));
+        let slots: Vec<DownloadSlot> = (0..MAX_DOWNLOAD_READS)
+            .map(|_| uplink.reserve_download().unwrap())
+            .collect();
+        assert_eq!(
+            uplink.reserve_download().unwrap_err(),
+            Full {
+                max: MAX_DOWNLOAD_READS
+            }
+        );
+        assert_eq!(
+            uplink.admit(Class::Guest),
+            Ok(Some(8_000_000)),
+            "the whole budget"
+        );
+        uplink.started("play", Class::Guest, 1, Some(8_000_000));
+        assert_eq!(uplink.wan_streams(), 1);
+        drop(slots);
+        assert!(uplink.reserve_download().is_ok());
+    }
 
     const MBIT: u64 = 1_000_000;
 

@@ -304,7 +304,10 @@ impl Session {
     pub async fn download_options(&self, id: &MediaId) -> Result<DownloadOptionsInfo, SdkError> {
         self.downloads_offered()?;
         match self
-            .call(Request::DownloadOptions { id: id.clone() })
+            .call(Request::DownloadOptions {
+                id: id.clone(),
+                device: None,
+            })
             .await?
         {
             Reply::DownloadOptions(info) => Ok(info),
@@ -361,7 +364,13 @@ impl Downloads {
             return Ok(shared.view(&m));
         }
         let detail = session.item(id).await?;
-        let media_tracks = session.tracks(id).await?;
+        // A paired server's item (P8-07) has no file on this server: its
+        // tracks are what that server's options for the download say.
+        let media_tracks = if id.namespace() == spoolframe_types::Namespace::Federated {
+            session.download_options(id).await?.tracks
+        } else {
+            session.tracks(id).await?
+        };
         let info = manager::prepare(session, id, &source, &tracks).await?;
         let mut m = Store::manifest(
             kind,

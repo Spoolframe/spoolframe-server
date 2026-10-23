@@ -14,6 +14,7 @@ async-trait = { workspace = true }
 iroh = { workspace = true }
 parking_lot = { workspace = true }
 spoolframe-protocol = { workspace = true }
+spoolframe-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

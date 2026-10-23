@@ -85,6 +85,7 @@ fn settings(site: &MockServer, limit: u32) -> Settings {
     Settings {
         sites: vec![opensubtitles_at(site)],
         daily_limit_per_user: limit,
+        daily_limit_per_peer: limit,
     }
 }
 
@@ -594,6 +595,7 @@ async fn the_day_s_downloads_are_counted_per_site_and_per_user() {
     let f = fixture_with("usage", |site| Settings {
         sites: vec![opensubtitles_at(site), subdl_at(site)],
         daily_limit_per_user: 3,
+        daily_limit_per_peer: 3,
     })
     .await;
     f.answers_search().await;
@@ -972,6 +974,7 @@ fn both(site: &MockServer) -> Settings {
     Settings {
         sites: vec![opensubtitles_at(site), subdl_at(site)],
         daily_limit_per_user: 0,
+        daily_limit_per_peer: 0,
     }
 }
 
@@ -1251,6 +1254,7 @@ async fn subdl_alone_asks_only_subdl() {
     let f = fixture_with("subdl-alone", |site| Settings {
         sites: vec![subdl_at(site)],
         daily_limit_per_user: 0,
+        daily_limit_per_peer: 0,
     })
     .await;
     f.subdl_answers_search().await;
@@ -1286,6 +1290,7 @@ async fn an_episode_is_asked_of_subdl_by_its_show_and_taken_from_a_pack() {
     let f = fixture_with("subdl-episode", |site| Settings {
         sites: vec![subdl_at(site)],
         daily_limit_per_user: 0,
+        daily_limit_per_peer: 0,
     })
     .await;
     let show = MediaId::new(Namespace::Plex, MediaKind::Show, "10").unwrap();
@@ -1357,6 +1362,7 @@ async fn downloads_stay_when_their_site_is_turned_off() {
     f.downloads.configure(Settings {
         sites: vec![opensubtitles_at(&f.site)],
         daily_limit_per_user: 0,
+        daily_limit_per_peer: 0,
     });
     f.downloads.configure(Settings::default());
 
@@ -1492,6 +1498,7 @@ async fn a_show_s_ids_are_asked_for_only_when_a_site_needs_them() {
     f.downloads.configure(Settings {
         sites: vec![subdl_at(&f.site)],
         daily_limit_per_user: 0,
+        daily_limit_per_peer: 0,
     });
     Mock::given(method("GET"))
         .and(path("/subdl/api/v1/subtitles"))
@@ -1505,4 +1512,26 @@ async fn a_show_s_ids_are_asked_for_only_when_a_site_needs_them() {
         .await
         .unwrap();
     assert!(f.catalog.take_calls(&show).contains(&"external_ids"));
+}
+
+/// A pair is refused and counted as a server, never as a user of this
+/// one's (P8-07); the device is still told `user`, which apps know.
+#[test]
+fn a_pair_is_held_to_its_own_limit_and_told_of_as_a_server() {
+    let pair = By::pair(&PairAsker {
+        server_id: "mzxw6ytbojtg633c".into(),
+        name: "Bob's server".into(),
+        subtitles: Default::default(),
+    });
+    let live = Live {
+        daily_limit_per_user: 5,
+        daily_limit_per_peer: 40,
+        ..Live::default()
+    };
+    assert_eq!(pair.limit(&live), 40);
+    assert!(pair.denied().contains("paired server"), "{}", pair.denied());
+    assert_eq!(pair.quota_of(), QuotaOf::User);
+    let user = By::elsewhere("local:bob", "Bob");
+    assert_eq!(user.limit(&live), 5);
+    assert!(user.denied().ends_with("for you"));
 }

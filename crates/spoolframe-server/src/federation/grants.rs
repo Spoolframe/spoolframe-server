@@ -113,6 +113,12 @@ impl Federation {
     /// the pair with its row.
     pub(crate) async fn grant_revoked(&self, grant: &GrantRecord) -> Result<(), StoreError> {
         self.end_remote_sessions(&grant.peer, Some(&grant.library));
+        // What was being made for the pair's users of the library stops
+        // (P8-07).
+        if let Some(peer) = self.store().federation_peer(&grant.peer).await? {
+            self.cancel_served_downloads(&peer, Some(&grant.library))
+                .await;
+        }
         let deleted = self
             .store()
             .delete_federation_tokens(&grant.peer, Some(&grant.library))

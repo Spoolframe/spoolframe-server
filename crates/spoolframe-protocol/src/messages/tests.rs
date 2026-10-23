@@ -3734,11 +3734,15 @@ mod downloads {
 
     fn requests() -> Vec<Request> {
         vec![
-            Request::DownloadOptions { id: id() },
+            Request::DownloadOptions {
+                id: id(),
+                device: None,
+            },
             Request::PrepareDownload {
                 id: id(),
                 source: DownloadSource::Original,
                 tracks: DownloadTracks::All,
+                device: None,
             },
             Request::PrepareDownload {
                 id: id(),
@@ -3749,6 +3753,7 @@ mod downloads {
                     audio: vec![0],
                     subtitles: vec![0, 1],
                 },
+                device: None,
             },
             Request::DownloadStatus {
                 ids: vec!["ab".repeat(16)],
@@ -3799,6 +3804,7 @@ mod downloads {
                 audio: vec![1],
                 subtitles: vec![],
             },
+            device: None,
         };
         let json = serde_json::to_value(&prepare).unwrap();
         assert_eq!(
@@ -3825,6 +3831,7 @@ mod downloads {
                 },
             }),
             expected_size: Some(5_700_000_000),
+            no_longer_available: false,
         }
     }
 
@@ -3921,6 +3928,7 @@ mod downloads {
                         },
                         file: None,
                         expected_size: None,
+                        no_longer_available: false,
                     },
                 ],
                 gone: vec!["01".repeat(16)],
@@ -4073,6 +4081,7 @@ mod music_downloads {
             id: track("32"),
             source: DownloadSource::Aac256,
             tracks: DownloadTracks::All,
+            device: None,
         };
         assert_eq!(
             serde_json::to_value(&prepare).unwrap()["source"],
