@@ -43,10 +43,12 @@
 //! `--check-wan <addr>` ([`check_wan`], P6-02) is a mode of its own: it
 //! only dials the server at one public address and says whether it
 //! answered, for an operator checking a port forward from another
-//! network.
+//! network. So is `federation` ([`federation`], P8): a user's device
+//! playing a paired server's item, through the SDK.
 
 mod account;
 mod checks;
+pub mod federation;
 mod playback;
 pub mod wan;
 pub mod web;

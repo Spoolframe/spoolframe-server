@@ -82,6 +82,15 @@
             spoolframeModule = ./nix/nixos-module.nix;
             relayModule = ./nix/relay-module.nix;
           };
+          # P8-01 to P8-04 end to end: two servers pair, and a phone plays
+          # the one's film from the other, directly and through its own.
+          federation-e2e = import ./nix/federation-e2e.nix {
+            inherit pkgs;
+            spoolframePackage = spoolframe;
+            spoolframeModule = ./nix/nixos-module.nix;
+            probePackage = pkgs.callPackage ./nix/probe.nix {inherit craneLib spoolframe;};
+            fakePlex = pkgs.callPackage ./nix/fake-plex {inherit ffmpeg;};
+          };
         };
         formatter = pkgs.alejandra;
       };

@@ -1,23 +1,34 @@
 //! `spoolframe-probe`: checks that a Spoolframe server keeps its documented
 //! limits for devices with no session, over live QUIC, and, given a
 //! consumer account, what that account may and may not do signed in.
+//! `spoolframe-probe federation` plays a paired server's item as a user's
+//! device does (P8), and says how, a JSON object per line.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use iroh::{EndpointAddr, EndpointId};
+use spoolframe_probe::federation::{self, Download, FederationRun, Play, Target};
 use spoolframe_probe::{Account, Config, Status, Web, run, summary};
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// The server's endpoint id, in hex.
-    #[arg(long)]
-    endpoint: EndpointId,
+    #[arg(long, required = true)]
+    endpoint: Option<EndpointId>,
     /// Where to dial it.
     #[arg(long, required_unless_present = "check_wan")]
     addr: Vec<SocketAddr>,
@@ -71,6 +82,144 @@ struct Args {
     json: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Sign in to a user's own server with the experimental `federation`
+    /// feature, list its libraries, and play a paired server's film as an
+    /// app does: from that server when it is reached, else through the
+    /// user's own. Each step is printed as a JSON object on a line.
+    Federation(FederationArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct FederationArgs {
+    /// The user's own server's endpoint id, in hex.
+    #[arg(long)]
+    endpoint: EndpointId,
+    /// Where to dial it.
+    #[arg(long, required = true)]
+    addr: Vec<SocketAddr>,
+    /// The user to sign in as.
+    #[arg(long)]
+    username: String,
+    /// Their password, alone in this file (never on the command line).
+    #[arg(long)]
+    password_file: PathBuf,
+    /// Also print each item of the paired servers' libraries.
+    #[arg(long)]
+    list_items: bool,
+    /// Play the paired server's film of this title.
+    #[arg(long, conflicts_with = "play_id")]
+    play_title: Option<String>,
+    /// Play this `fed:` item, listed or not.
+    #[arg(long)]
+    play_id: Option<String>,
+    /// Play through the user's own server without trying the paired one.
+    #[arg(long)]
+    proxied: bool,
+    /// Read at most this many bytes of the film; all of it if left out.
+    #[arg(long)]
+    max_bytes: Option<u64>,
+    /// The most each read asks for; 16 MiB (the protocol's most) if left
+    /// out.
+    #[arg(long)]
+    read_size: Option<u64>,
+    /// Write the bytes read here.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Report this position, in milliseconds, once the film is read.
+    #[arg(long)]
+    progress_ms: Option<u64>,
+    /// Search the films for this, and print each hit with its copies.
+    #[arg(long)]
+    search: Option<String>,
+    /// Play the title of this id from the paired server --from names,
+    /// then print the copies its details say.
+    #[arg(long, requires = "from")]
+    play_from: Option<String>,
+    /// The paired server's server id, for --play-from.
+    #[arg(long, requires = "play_from")]
+    from: Option<String>,
+    /// Download the paired server's film of this title, every track as it
+    /// is, into --downloads-dir.
+    #[arg(long, requires = "downloads_dir")]
+    download_title: Option<String>,
+    /// Where the downloads are kept.
+    #[arg(long, requires = "download_title")]
+    downloads_dir: Option<PathBuf>,
+    /// How long the download may take, in seconds.
+    #[arg(long, default_value_t = 120)]
+    download_secs: u64,
+    /// Ask the user's own server for this download, by its id there
+    /// (`DownloadStatus`); repeat for several.
+    #[arg(long)]
+    download_status: Vec<String>,
+    /// Have the user's own server prepare a download of this item, every
+    /// track as it is, wait until it is made, and read none of it; then
+    /// print what it says of it (with --download-status's).
+    #[arg(long)]
+    prepare_id: Option<String>,
+}
+
+impl FederationArgs {
+    fn run(&self) -> anyhow::Result<FederationRun> {
+        self.run_with_password(password(&self.password_file)?)
+    }
+
+    /// The run, signing in with `password`.
+    fn run_with_password(&self, password: String) -> anyhow::Result<FederationRun> {
+        let target = match (&self.play_title, &self.play_id) {
+            (Some(title), _) => Some(Target::Title(title.clone())),
+            (None, Some(id)) => Some(Target::Id(
+                id.parse()
+                    .map_err(|e| anyhow::anyhow!("--play-id {id:?}: {e}"))?,
+            )),
+            (None, None) => None,
+        };
+        Ok(FederationRun {
+            server: self.endpoint.to_string(),
+            addrs: self.addr.clone(),
+            username: self.username.clone(),
+            password,
+            list_items: self.list_items,
+            play: target.map(|target| Play {
+                target,
+                proxied: self.proxied,
+                max_bytes: self.max_bytes,
+                read_size: self.read_size,
+                out: self.out.clone(),
+                progress: self.progress_ms.map(Duration::from_millis),
+            }),
+            search: self.search.clone(),
+            play_from: match (&self.play_from, &self.from) {
+                (Some(id), Some(from)) => Some((
+                    id.parse()
+                        .map_err(|e| anyhow::anyhow!("--play-from {id:?}: {e}"))?,
+                    from.clone(),
+                )),
+                _ => None,
+            },
+            download: match (&self.download_title, &self.downloads_dir) {
+                (Some(title), Some(dir)) => Some(Download {
+                    title: title.clone(),
+                    dir: dir.clone(),
+                    within: Duration::from_secs(self.download_secs),
+                }),
+                _ => None,
+            },
+            download_status: self.download_status.clone(),
+            prepare: self
+                .prepare_id
+                .as_ref()
+                .map(|id| {
+                    id.parse()
+                        .map_err(|e| anyhow::anyhow!("--prepare-id {id:?}: {e}"))
+                })
+                .transpose()?,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
@@ -82,9 +231,26 @@ async fn main() -> anyhow::Result<ExitCode> {
     {
         anyhow::bail!("a TLS provider was installed before the probe's own");
     }
+    if let Some(Command::Federation(fed)) = &args.command {
+        let ok = federation::run_federation(&fed.run()?, |event| {
+            // A line each, flushed, for a script reading as it goes.
+            let mut out = std::io::stdout().lock();
+            let _ = serde_json::to_writer(&mut out, &event);
+            let _ = writeln!(out);
+            let _ = out.flush();
+        })
+        .await;
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+    let endpoint = args
+        .endpoint
+        .context("--endpoint is required without a subcommand")?;
     if let Some(addr) = args.check_wan {
-        let check =
-            spoolframe_probe::check_wan(args.endpoint, addr, Duration::from_secs(10)).await?;
+        let check = spoolframe_probe::check_wan(endpoint, addr, Duration::from_secs(10)).await?;
         if args.json {
             println!("{}", serde_json::to_string_pretty(&check)?);
         } else {
@@ -99,7 +265,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let target = args
         .addr
         .iter()
-        .fold(EndpointAddr::new(args.endpoint), |addr, ip| {
+        .fold(EndpointAddr::new(endpoint), |addr, ip| {
             addr.with_ip_addr(*ip)
         });
     let account = match (&args.username, &args.password_file) {
@@ -205,5 +371,79 @@ mod tests {
             assert!(Args::try_parse_from(argv).is_err(), "{other:?}");
         }
         assert!(Args::try_parse_from(["probe", "--endpoint", ENDPOINT]).is_err());
+    }
+
+    #[test]
+    fn the_checks_still_need_the_endpoint() {
+        assert!(Args::try_parse_from(["probe", "--addr", "192.168.1.5:7420"]).is_err());
+    }
+
+    /// The federation run's own arguments, with `extra`.
+    fn federation_args(extra: &[&'static str]) -> Result<Args, clap::Error> {
+        let mut argv = vec![
+            "probe",
+            "federation",
+            "--endpoint",
+            ENDPOINT,
+            "--addr",
+            "192.168.3.4:7420",
+            "--username",
+            "bob",
+            "--password-file",
+            "/run/pw",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn federation_runs_without_the_checks_arguments() {
+        let args = federation_args(&["--play-title", "A Film", "--progress-ms", "3000"]).unwrap();
+        assert!(args.endpoint.is_none());
+        let Some(Command::Federation(fed)) = args.command else {
+            panic!("not the federation run");
+        };
+        assert_eq!(fed.play_title.as_deref(), Some("A Film"));
+        assert_eq!(fed.progress_ms, Some(3000));
+    }
+
+    #[test]
+    fn a_download_needs_somewhere_to_go_and_play_from_a_server() {
+        assert!(federation_args(&["--download-title", "A"]).is_err());
+        assert!(federation_args(&["--download-title", "A", "--downloads-dir", "/d"]).is_ok());
+        assert!(federation_args(&["--play-from", "plex:movie:1"]).is_err());
+        let args = federation_args(&["--play-from", "plex:movie:1", "--from", "srv"]).unwrap();
+        let Some(Command::Federation(fed)) = args.command else {
+            panic!("not the federation run");
+        };
+        let run = fed.run_with_password(String::new()).unwrap();
+        assert_eq!(
+            run.play_from,
+            Some(("plex:movie:1".parse().unwrap(), "srv".to_owned()))
+        );
+    }
+
+    #[test]
+    fn federation_plays_by_title_or_by_id_not_both() {
+        assert!(federation_args(&["--play-title", "A", "--play-id", "fed:x"]).is_err());
+        assert!(federation_args(&["--play-id", "fed:x"]).is_ok());
+    }
+
+    #[test]
+    fn federation_and_the_checks_do_not_mix() {
+        let argv = [
+            "probe",
+            "--check-cap",
+            "federation",
+            "--endpoint",
+            ENDPOINT,
+            "--addr",
+            "192.168.3.4:7420",
+            "--username",
+            "bob",
+            "--password-file",
+            "/run/pw",
+        ];
+        assert!(Args::try_parse_from(argv).is_err());
     }
 }

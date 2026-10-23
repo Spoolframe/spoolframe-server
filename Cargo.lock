@@ -7060,6 +7060,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "spoolframe-client-sdk",
  "spoolframe-protocol",
  "spoolframe-types",
  "tokio",

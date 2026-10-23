@@ -249,6 +249,28 @@ impl Probe {
         }
     }
 
+    /// A connection whose `Hello` names `experimental` and `features`, as
+    /// an app that handles them does (the federation run, P8).
+    pub async fn connect_hello_naming(
+        &self,
+        experimental: Vec<String>,
+        features: Vec<String>,
+    ) -> Result<Conn, Problem> {
+        let conn = self.connect().await?;
+        let mut request = hello(None);
+        if let Request::Hello(hello) = &mut request {
+            hello.experimental = experimental;
+            hello.features = features;
+        }
+        match self.request(&conn, None, request).await? {
+            Response::Ok(Reply::ServerInfo(_)) => Ok(conn),
+            other => Err(Problem::Failed(format!(
+                "a good Hello was answered {}",
+                describe(&other)
+            ))),
+        }
+    }
+
     /// A bidirectional stream, nothing written on it yet.
     pub async fn open(&self, conn: &Connection) -> Result<(SendStream, RecvStream), Problem> {
         self.spend()?;

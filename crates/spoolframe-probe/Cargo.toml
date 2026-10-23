@@ -21,6 +21,9 @@ iroh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-protocol = { workspace = true }
+# The federation run (`federation`, P8) plays as an app does, so it uses
+# the SDK, permissive as this crate is.
+spoolframe-client-sdk = { workspace = true }
 spoolframe-types = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
