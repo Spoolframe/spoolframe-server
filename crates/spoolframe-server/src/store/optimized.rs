@@ -1285,7 +1285,7 @@ async fn outdate_profile_copies(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::test_store;
+    use super::super::tests::{TestStore, test_store};
     use super::*;
 
     fn mobile() -> Profile {
@@ -1389,7 +1389,10 @@ mod tests {
             .execute(&pool.0)
             .await
             .unwrap();
+        let dir = pool.1.to_path_buf();
         let store = pool.open().await;
+        // The pool may open a connection at any time: its file stays.
+        assert!(dir.join(super::super::DB_FILE).exists());
         assert_eq!(
             store.optimized_profile("Mobile").await.unwrap(),
             Some(Profile {
@@ -1404,9 +1407,10 @@ mod tests {
     struct Before(sqlx::SqlitePool, spoolframe_test_dir::TestDir);
 
     impl Before {
-        async fn open(self) -> Store {
+        /// The store, migrated, with the directory it lives in.
+        async fn open(self) -> TestStore {
             self.0.close().await;
-            Store::open(self.1.as_ref()).await.unwrap()
+            super::super::tests::open_in(self.1).await
         }
     }
 

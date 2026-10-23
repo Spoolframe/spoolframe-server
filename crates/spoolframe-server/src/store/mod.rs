@@ -459,7 +459,13 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn test_store(test: &str) -> TestStore {
-        let dir = state_dir(test).await;
+        open_in(state_dir(test).await).await
+    }
+
+    /// The store in `dir`, which lives as long as the store: a pool opens
+    /// connections when it likes, and one opened after its directory went
+    /// fails.
+    pub(crate) async fn open_in(dir: spoolframe_test_dir::TestDir) -> TestStore {
         let store = Store::open(dir.as_ref()).await.unwrap();
         TestStore { store, _dir: dir }
     }
