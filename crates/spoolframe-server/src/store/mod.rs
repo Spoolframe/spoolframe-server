@@ -4,9 +4,27 @@
 //! Only the running server opens it. Admin tools go through the admin
 //! API, so users, sessions and rate limits have a single owner.
 
+/// SQL: whether `column` names this server's own item rather than a
+/// paired server's (a `fed:` id, P8-02); `unless` a bind that is true,
+/// any item. The one place a query tells them apart: a caller that did
+/// not name the experimental `federation` feature is never shown a
+/// paired server's item. A literal, for `concat!`.
+macro_rules! own_item {
+    ($column:literal) => {
+        concat!($column, " NOT LIKE 'fed:%'")
+    };
+    ($column:literal, unless $bind:literal) => {
+        concat!("(", $bind, " OR ", $column, " NOT LIKE 'fed:%')")
+    };
+}
+
 pub mod audit;
 pub mod downloads;
 pub mod federation;
+pub mod federation_cache;
+pub mod federation_grants;
+pub mod federation_sync;
+pub mod federation_tokens;
 pub mod grants;
 pub mod identities;
 pub mod invites;

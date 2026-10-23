@@ -86,6 +86,75 @@ impl Store {
         Ok(true)
     }
 
+    /// Save one title's state (P8-03): `update`, now, or as of `at` and
+    /// only when newer than the state under its key; and `folded`, the
+    /// title's other rows on paired servers' keys, go in the same
+    /// transaction, as this one is its newest state. Whether it was
+    /// written.
+    pub async fn save_title_watch(
+        &self,
+        principal: Principal,
+        update: WatchUpdate<'_>,
+        folded: &[String],
+        at: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        let principal = principal.to_string();
+        let mut tx = self.begin_write().await?;
+        if let Some(at) = at {
+            let stored: Option<i64> = sqlx::query_scalar(
+                "SELECT updated_at FROM watch_state WHERE principal = ?1 AND media_id = ?2",
+            )
+            .bind(&principal)
+            .bind(update.media_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if stored.is_some_and(|stored| stored >= at) {
+                return Ok(false);
+            }
+        }
+        write_watch(
+            &mut tx,
+            &principal,
+            &update,
+            at.unwrap_or_else(|| self.now()),
+        )
+        .await?;
+        for row in folded {
+            // Its ids go with it (ON DELETE CASCADE).
+            sqlx::query(
+                "DELETE FROM watch_state WHERE principal = ?1 AND media_id = ?2 \
+                 AND media_id LIKE 'fed:%'",
+            )
+            .bind(&principal)
+            .bind(row)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The keys `principal`'s state of a title with one of `title_ids`
+    /// is under (P8-03).
+    pub async fn title_rows(
+        &self,
+        principal: Principal,
+        title_ids: &[String],
+    ) -> Result<Vec<String>, StoreError> {
+        if title_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT media_id FROM watch_state_ids \
+             WHERE principal = ?1 AND external_id IN (SELECT value FROM json_each(?2)) \
+             ORDER BY media_id",
+        )
+        .bind(principal.to_string())
+        .bind(serde_json::to_string(title_ids).expect("strings serialize"))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Remove `media_id` (a movie or an episode: the card, never a show)
     /// from `principal`'s Continue watching and Next up, until its watch
     /// state changes (P1-22). `external_ids` let the hide follow the item
@@ -308,30 +377,35 @@ impl Store {
         .await?)
     }
 
-    /// `principal`'s states, the most recently changed first: a page of
-    /// `limit` from `offset`, and how many there are (PX-42's
-    /// `watch_history`). By the `watch_state_recent` index.
+    /// `principal`'s states of this server's own items, the most recently
+    /// changed first: a page of `limit` from `offset`, and how many there
+    /// are (PX-42's `watch_history`, over MCP, which names no feature: a
+    /// paired server's items are not in it, L2). By the
+    /// `watch_state_recent` index.
     pub async fn watch_history(
         &self,
         principal: Principal,
         offset: u32,
         limit: u32,
     ) -> Result<(Vec<WatchRow>, u32), StoreError> {
-        let rows = sqlx::query_as(
+        let rows = sqlx::query_as(concat!(
             "SELECT media_id, show_id, position_ms, duration_ms, watched, updated_at \
-             FROM watch_state WHERE principal = ?1 \
-             ORDER BY updated_at DESC, media_id LIMIT ?2 OFFSET ?3",
-        )
+             FROM watch_state WHERE principal = ?1 AND ",
+            own_item!("media_id"),
+            " ORDER BY updated_at DESC, media_id LIMIT ?2 OFFSET ?3"
+        ))
         .bind(principal.to_string())
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
         .await?;
-        let (total,): (i64,) =
-            sqlx::query_as("SELECT count(*) FROM watch_state WHERE principal = ?1")
-                .bind(principal.to_string())
-                .fetch_one(&self.pool)
-                .await?;
+        let (total,): (i64,) = sqlx::query_as(concat!(
+            "SELECT count(*) FROM watch_state WHERE principal = ?1 AND ",
+            own_item!("media_id")
+        ))
+        .bind(principal.to_string())
+        .fetch_one(&self.pool)
+        .await?;
         Ok((rows, u32::try_from(total).unwrap_or(u32::MAX)))
     }
 
@@ -361,22 +435,26 @@ impl Store {
     }
 
     /// Items started (position at least `min_position_ms`) and not
-    /// watched, most recently updated first.
+    /// watched, most recently updated first; a paired server's (`fed:`)
+    /// only with `federated` (P8-02).
     pub async fn in_progress(
         &self,
         principal: Principal,
         min_position_ms: i64,
         limit: u32,
+        federated: bool,
     ) -> Result<Vec<WatchRow>, StoreError> {
-        Ok(sqlx::query_as(
+        Ok(sqlx::query_as(concat!(
             "SELECT media_id, show_id, position_ms, duration_ms, watched, updated_at \
              FROM watch_state \
-             WHERE principal = ?1 AND watched = 0 AND position_ms >= ?2 \
-             ORDER BY updated_at DESC LIMIT ?3",
-        )
+             WHERE principal = ?1 AND watched = 0 AND position_ms >= ?2 AND ",
+            own_item!("media_id", unless "?4"),
+            " ORDER BY updated_at DESC LIMIT ?3"
+        ))
         .bind(principal.to_string())
         .bind(min_position_ms)
         .bind(limit)
+        .bind(federated)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -425,21 +503,25 @@ impl Store {
     }
 
     /// Shows with an episode watched or in progress since `since` (Unix
-    /// seconds), the most recently active first.
+    /// seconds), the most recently active first; a paired server's
+    /// (`fed:`) only with `federated` (P8-02).
     pub async fn active_shows(
         &self,
         principal: Principal,
         since: i64,
         limit: u32,
+        federated: bool,
     ) -> Result<Vec<String>, StoreError> {
-        Ok(sqlx::query_scalar(
+        Ok(sqlx::query_scalar(concat!(
             "SELECT show_id FROM watch_state \
-             WHERE principal = ?1 AND show_id IS NOT NULL AND updated_at >= ?2 \
-             GROUP BY show_id ORDER BY max(updated_at) DESC LIMIT ?3",
-        )
+             WHERE principal = ?1 AND show_id IS NOT NULL AND updated_at >= ?2 AND ",
+            own_item!("show_id", unless "?4"),
+            " GROUP BY show_id ORDER BY max(updated_at) DESC LIMIT ?3"
+        ))
         .bind(principal.to_string())
         .bind(since)
         .bind(limit)
+        .bind(federated)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -505,11 +587,14 @@ async fn write_watch(
     .await?;
     for id in update.external_ids {
         // An id names one item: if it was another row's, it is this
-        // one's now.
+        // one's now; but a paired server's item never takes one from this
+        // server's own (P8-03): what that server says of its items does
+        // not move a state here.
         sqlx::query(
             "INSERT INTO watch_state_ids (principal, media_id, external_id) \
              VALUES (?1, ?2, ?3) \
-             ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id",
+             ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id \
+             WHERE excluded.media_id NOT LIKE 'fed:%' OR watch_state_ids.media_id LIKE 'fed:%'",
         )
         .bind(principal)
         .bind(update.media_id)
@@ -946,7 +1031,7 @@ mod tests {
             .await
             .unwrap();
         let got: Vec<_> = store
-            .in_progress(ALICE, 60_000, 10)
+            .in_progress(ALICE, 60_000, 10, false)
             .await
             .unwrap()
             .into_iter()

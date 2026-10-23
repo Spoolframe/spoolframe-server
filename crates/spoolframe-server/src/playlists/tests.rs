@@ -68,6 +68,7 @@ async fn harness(test: &str) -> Harness {
         actors.push(Actor {
             principal: Principal::LocalUser(id),
             admin: role == Role::Admin,
+            federated: false,
         });
     }
     // Named seeds, one after another: each test's rounds are the same at
@@ -409,6 +410,7 @@ async fn a_server_wide_playlist_is_made_by_an_admin_seen_by_all_and_edited_by_ad
             spoolframe_protocol::PortableUserId::from_bytes([3; 32]).unwrap(),
         ),
         admin: false,
+        federated: false,
     };
     for who in [&h.alice, &h.bob, &guest] {
         let (seen, _) = h.playlists.list(who, true).await.unwrap();
@@ -419,6 +421,7 @@ async fn a_server_wide_playlist_is_made_by_an_admin_seen_by_all_and_edited_by_ad
     let other_admin = Actor {
         principal: h.carol.principal,
         admin: true,
+        federated: false,
     };
     h.edit(&other_admin, &list, vec![add(episode("12"))]).await;
     assert_eq!(h.items(&h.alice, &list).await, ["plex:episode:12"]);

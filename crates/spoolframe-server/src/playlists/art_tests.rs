@@ -56,6 +56,7 @@ async fn harness(test: &str) -> Harness {
         actors.push(Actor {
             principal: Principal::LocalUser(id),
             admin: false,
+            federated: false,
         });
     }
     let covers = Arc::new(Covers::new(dir.as_ref(), Tool::unconfined("ffmpeg")));

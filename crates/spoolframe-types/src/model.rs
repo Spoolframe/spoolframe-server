@@ -29,6 +29,26 @@ pub struct Library {
     pub id: LibraryId,
     pub title: String,
     pub kind: LibraryKind,
+    /// The paired server a library is shared from (experimental
+    /// `federation`, P8-02): only on a library of another server's, and
+    /// only to a client that named the feature. `None` for the server's
+    /// own libraries.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<LibraryServer>,
+}
+
+/// The server a library of another server's is shared from (P8-02), so a
+/// client groups libraries by server, an offline one last and greyed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LibraryServer {
+    /// Its server id: the origin a `fed:` id names.
+    pub server_id: String,
+    /// What it calls itself.
+    pub name: String,
+    /// Whether this server is connected to it now. Offline, what it shared
+    /// is still browsed from the cache, and its items do not play.
+    pub online: bool,
 }
 
 /// The role a piece of artwork plays.
@@ -664,6 +684,7 @@ mod tests {
             id: LibraryId::new(Namespace::Plex, "1").unwrap(),
             title: "Movies".into(),
             kind: LibraryKind::Movies,
+            server: None,
         });
         round_trip(Movie {
             id: media(MediaKind::Movie, "10"),

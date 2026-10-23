@@ -433,22 +433,36 @@ impl Store {
         .await
     }
 
-    /// Revoke the live row `query` finds by `value`, at now (`?2`), and
-    /// forget the keys held for it.
+    /// Revoke the live row `query` finds by `value`, at now (`?2`), with
+    /// its grants and its users' tokens (P8-03), and forget the keys held
+    /// for it and what it was last given of each library (P8-02).
     async fn revoke_peer_by(
         &self,
         query: &'static str,
         value: &str,
     ) -> Result<Option<PeerRecord>, StoreError> {
+        let now = self.now();
         let mut tx = self.begin_write().await?;
         let row = sqlx::query(query)
             .bind(value)
-            .bind(self.now())
+            .bind(now)
             .fetch_optional(&mut *tx)
             .await?;
         let peer = row.as_ref().map(record).transpose()?;
         if let Some(peer) = &peer {
             sqlx::query("DELETE FROM federation_peer_held_keys WHERE peer = ?1")
+                .bind(&peer.id)
+                .execute(&mut *tx)
+                .await?;
+            super::federation_grants::revoke_all(&mut tx, &peer.id, now).await?;
+            // What it was last given (P8-02): nothing is shared any more.
+            sqlx::query("DELETE FROM federation_sync_states WHERE peer = ?1")
+                .bind(&peer.id)
+                .execute(&mut *tx)
+                .await?;
+            // Its users' tokens (P8-03): nothing of this server's plays
+            // for them any more.
+            sqlx::query("DELETE FROM federation_tokens WHERE peer = ?1")
                 .bind(&peer.id)
                 .execute(&mut *tx)
                 .await?;

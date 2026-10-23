@@ -690,6 +690,7 @@ impl AdminApi {
                     principal: Principal::LocalUser(user),
                     // Only admins browse the catalog here.
                     admin: true,
+                    federated: false,
                 };
                 let playlists = library
                     .playlists

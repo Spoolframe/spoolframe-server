@@ -3,7 +3,8 @@
 
 use std::fmt;
 
-use spoolframe_protocol::PortableUserId;
+use spoolframe_protocol::server_id::SERVER_ID_LEN;
+use spoolframe_protocol::{PortableUserId, ServerId};
 
 use crate::store::grants::PortableSessionUser;
 use crate::store::sessions::SessionUser;
@@ -17,16 +18,60 @@ use crate::store::users::LocalUserId;
 pub enum Principal {
     LocalUser(LocalUserId),
     PortableUser(PortableUserId),
+    /// A paired server's local user, as that server vouched for them
+    /// (P8-03): `user` is their stable id there. For tokens and logs on
+    /// the server whose item they play; that server keeps no watch state,
+    /// playlists or likes for them, and lists none of them to its admins.
+    RemoteUser {
+        server: RemoteServerId,
+        user: uuid::Uuid,
+    },
+}
+
+/// A paired server's [`ServerId`], as a [`Principal::RemoteUser`] holds
+/// it: its 16 characters, so a principal stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RemoteServerId([u8; SERVER_ID_LEN]);
+
+impl From<&ServerId> for RemoteServerId {
+    fn from(id: &ServerId) -> Self {
+        let mut bytes = [0; SERVER_ID_LEN];
+        bytes.copy_from_slice(id.as_str().as_bytes());
+        Self(bytes)
+    }
+}
+
+impl RemoteServerId {
+    /// The server id it holds.
+    pub fn server_id(&self) -> ServerId {
+        ServerId::parse(self.as_str()).expect("made from a server id")
+    }
+
+    fn as_str(&self) -> &str {
+        // Made from a checked server id: ASCII.
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
+impl fmt::Display for RemoteServerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl fmt::Display for Principal {
     /// The key it is stored under, and `WhoAmI`'s `user_id`:
     /// `local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c` (P3-20), or
-    /// `portable:` and the identity's 64 hex digits.
+    /// `portable:` and the identity's 64 hex digits, or (P8-03)
+    /// `remote:`, the paired server's id and the user's id there:
+    /// `remote:mzxw6ytbojtg633c:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Principal::LocalUser(id) => write!(f, "local:{id}"),
             Principal::PortableUser(id) => write!(f, "portable:{id}"),
+            Principal::RemoteUser { server, user } => {
+                write!(f, "remote:{server}:{}", user.hyphenated())
+            }
         }
     }
 }
@@ -48,6 +93,15 @@ impl std::str::FromStr for Principal {
                 .map(Principal::PortableUser)
                 .map_err(|_| InvalidPrincipal);
         }
+        if let Some(rest) = s.strip_prefix("remote:") {
+            let (server, user) = rest.split_once(':').ok_or(InvalidPrincipal)?;
+            let server = ServerId::parse(server).map_err(|_| InvalidPrincipal)?;
+            let user = uuid::Uuid::try_parse(user).map_err(|_| InvalidPrincipal)?;
+            return Ok(Principal::RemoteUser {
+                server: RemoteServerId::from(&server),
+                user,
+            });
+        }
         Err(InvalidPrincipal)
     }
 }
@@ -65,6 +119,10 @@ pub struct Actor {
     pub principal: Principal,
     /// An admin here. Never a portable user.
     pub admin: bool,
+    /// Acting from a client that named the experimental `federation`
+    /// feature (P8-02): a paired server's items are listed to them, in
+    /// playlists and Liked as anywhere. Any other caller sees none.
+    pub federated: bool,
 }
 
 /// Whose a live endpoint session is: a local user's, or a granted
@@ -89,6 +147,7 @@ impl Who {
         Actor {
             principal: self.principal(),
             admin: matches!(self, Who::Local(user) if user.role == spoolframe_types::Role::Admin),
+            federated: false,
         }
     }
 
@@ -151,10 +210,27 @@ mod tests {
     fn a_principal_reads_back_from_what_it_writes() {
         let local = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(7)));
         let portable = Principal::PortableUser(PortableUserId::from_bytes([9; 32]).unwrap());
-        for principal in [local, portable] {
+        let remote = Principal::RemoteUser {
+            server: RemoteServerId::from(&ServerId::parse("mzxw6ytbojtg633c").unwrap()),
+            user: uuid::Uuid::from_u128(7),
+        };
+        for principal in [local, portable, remote] {
             assert_eq!(principal.to_string().parse::<Principal>(), Ok(principal));
         }
-        for text in ["local:", "local:7", "portable:ab", "remote:x", ""] {
+        assert_eq!(
+            remote.to_string(),
+            "remote:mzxw6ytbojtg633c:00000000-0000-0000-0000-000000000007"
+        );
+        for text in [
+            "local:",
+            "local:7",
+            "portable:ab",
+            "remote:x",
+            "remote:mzxw6ytbojtg633c",
+            "remote:MZXW6YTBOJTG633C:00000000-0000-0000-0000-000000000007",
+            "remote:mzxw6ytbojtg633c:7",
+            "",
+        ] {
             assert_eq!(text.parse::<Principal>(), Err(InvalidPrincipal), "{text}");
         }
     }

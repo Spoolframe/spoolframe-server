@@ -1,5 +1,6 @@
 //! Server-to-server federation on `spoolframe/federation/1` (P8-01,
-//! ARCHITECTURE §26–§28): pairing two servers.
+//! ARCHITECTURE §26–§28): pairing two servers, and replicating what one
+//! shares with the other ([`SyncLibrary`] and the rest, P8-02).
 //!
 //! Experimental ([`crate::experimental::FEDERATION`]): a server serves the
 //! ALPN only while its `experimental { federation = true; }` is on, and
@@ -19,7 +20,13 @@
 //! the stream with [`reset::NOT_ALLOWED`] and is counted against it as a
 //! wrong guess at an invite code. A known server id from a new key is
 //! held until an admin confirms the key ([`Standing::KeyHeld`]), and
-//! reaches only `Hello`.
+//! reaches only `Hello`. Only a live pair reaches replication's requests.
+
+mod assertion;
+mod replication;
+
+pub use assertion::*;
+pub use replication::*;
 
 use std::fmt;
 
@@ -46,6 +53,9 @@ pub mod reset {
     pub const NOT_ALLOWED: u32 = 1;
     /// The request did not arrive in time, or did not decode.
     pub const BAD_REQUEST: u32 = 2;
+    /// The connection has as many streams open as it may: wait for one
+    /// to end, and ask again.
+    pub const BUSY: u32 = 3;
 }
 
 /// The first request on every connection: who the dialling server says it
@@ -69,6 +79,39 @@ impl PeerHello {
         self.name = server_name(self.name);
         self
     }
+}
+
+/// Whether `request` names a paired server's item, library or image
+/// anywhere, in any field (a `fed:` id, P8-02): what a server refuses from
+/// a client that did not name the experimental `federation` feature, at
+/// one boundary rather than in each request's handler (L1). Text that
+/// only starts like one, a search's or a name, is not an id.
+pub fn names_federated(request: &crate::Request) -> bool {
+    fn names(value: &ciborium::Value) -> bool {
+        match value {
+            ciborium::Value::Text(text) => federated_id(text),
+            ciborium::Value::Array(values) => values.iter().any(names),
+            ciborium::Value::Map(entries) => entries.iter().any(|(k, v)| names(k) || names(v)),
+            ciborium::Value::Tag(_, value) => names(value),
+            _ => false,
+        }
+    }
+    ciborium::Value::serialized(request).is_ok_and(|value| names(&value))
+}
+
+/// Whether `text` is a `fed:` id of an item, a library or an image.
+fn federated_id(text: &str) -> bool {
+    use spoolframe_types::{ArtworkId, LibraryId, MediaId};
+    text.starts_with("fed:")
+        && (text
+            .parse::<MediaId>()
+            .is_ok_and(|id| id.remote().is_some())
+            || text
+                .parse::<LibraryId>()
+                .is_ok_and(|id| id.remote().is_some())
+            || text
+                .parse::<ArtworkId>()
+                .is_ok_and(|id| id.remote().is_some()))
 }
 
 /// A server's `name` cut to [`crate::MAX_HELLO_TEXT`] characters, as a
@@ -250,6 +293,29 @@ impl fmt::Debug for PairServer {
     }
 }
 
+/// The most libraries one `ShareLibraries` names; the rest are left out.
+pub const MAX_SHARED: usize = 64;
+
+/// An admin's `ShareLibraries` (client protocol, P8-03): share libraries
+/// of this server with a paired one, as the QR flow offers once the pair
+/// is made. Every user of the paired server may browse and watch them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareLibraries {
+    /// The paired server's [`crate::ServerId`], as `ServerPaired` gave it.
+    pub server_id: String,
+    /// At most [`MAX_SHARED`]; the rest are left out.
+    pub libraries: Vec<spoolframe_types::LibraryId>,
+}
+
+impl ShareLibraries {
+    /// This request with at most [`MAX_SHARED`] libraries: what a server
+    /// reads of it.
+    pub fn within_bounds(mut self) -> Self {
+        self.libraries.truncate(MAX_SHARED);
+        self
+    }
+}
+
 /// A server paired by `PairServer` (client protocol, P8-01), as the app
 /// shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +340,20 @@ pub enum PeerRequest {
     /// A paired server unpaired: `Done`, then the connection is closed
     /// with [`crate::close::UNPAIRED`].
     Unpaired(Unpaired),
+    /// A pair's: the libraries shared with it now (P8-02): `Libraries`.
+    Libraries,
+    /// A pair's: one shared library's changes (P8-02): `Page`s on the
+    /// same stream, the last with `more: false`; `NotShared` for a
+    /// library that is not shared with it, `Unavailable` when it cannot
+    /// be walked now.
+    Sync(SyncLibrary),
+    /// A pair's: one image of an item in a library shared with it
+    /// (P8-02): `Artwork`, `NotShared` or `NotFound`, written as a reply
+    /// ([`crate::codec::write_reply`]), not a frame.
+    Artwork(ArtworkFetch),
+    /// A pair's: it vouches for one of its users, who wants an item of
+    /// this server's (P8-03): `Token`, or `AssertionRefused`.
+    AssertUser(AssertUser),
     /// A request this build does not know: not allowed.
     #[serde(other)]
     Unknown,
@@ -289,6 +369,34 @@ pub enum PeerReply {
         reason: PairingRefused,
     },
     Done,
+    /// The libraries shared with the pair, at most
+    /// [`MAX_SHARED_LIBRARIES`].
+    Libraries {
+        libraries: Vec<SharedLibrary>,
+    },
+    /// A page of a [`SyncLibrary`]'s answer.
+    Page(SyncPage),
+    /// An image: at most [`MAX_ARTWORK_BYTES`].
+    Artwork {
+        /// Its media type, as `image/jpeg`.
+        content_type: String,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// The library, or the item the image is of, is not shared with the
+    /// pair (now, or any more): a cache of it goes.
+    NotShared,
+    /// Shared, but the item or image is not there now.
+    NotFound,
+    /// The sharing server cannot answer now (its catalog is down): the
+    /// asker keeps what it has and asks again later.
+    Unavailable,
+    /// The token for an [`AssertUser`] (P8-03).
+    Token(TokenGranted),
+    /// No token for an [`AssertUser`], and why.
+    AssertionRefused {
+        reason: AssertionRefused,
+    },
     /// A reply this build does not know.
     #[serde(other)]
     Unknown,
@@ -305,6 +413,25 @@ mod tests {
     {
         let bytes = codec::encode(&value).unwrap();
         assert_eq!(codec::decode::<T>(&bytes).unwrap(), value);
+    }
+
+    /// A request naming a paired server's item anywhere names one; a
+    /// search for text that only starts like an id does not.
+    #[test]
+    fn a_fed_id_is_found_in_any_field_of_a_request() {
+        let alien: spoolframe_types::MediaId = "fed:movie:mzxw6ytbojtg633c:plex:1".parse().unwrap();
+        assert!(names_federated(&crate::Request::Item { id: alien.clone() }));
+        assert!(names_federated(&crate::Request::UpdateWatchProgress {
+            id: alien,
+            position_ms: 0,
+        }));
+        assert!(!names_federated(&crate::Request::Item {
+            id: "plex:movie:1".parse().unwrap(),
+        }));
+        assert!(!names_federated(&crate::Request::SetServerRow {
+            server_id: "fed:nothing".into(),
+            shown: true,
+        }));
     }
 
     fn hello() -> PeerHello {
@@ -324,6 +451,168 @@ mod tests {
             relays: vec!["https://relay.example.org".into()],
         }));
         round_trip(PeerRequest::Unpaired(Unpaired {}));
+    }
+
+    fn item() -> RemoteItem {
+        RemoteItem {
+            id: "plex:track:33".into(),
+            kind: RemoteKind::Track,
+            title: "Digital Love".into(),
+            parent: Some("plex:album:31".into()),
+            grandparent: Some("plex:artist:30".into()),
+            parent_title: Some("Discovery".into()),
+            grandparent_title: Some("Daft Punk".into()),
+            index: Some(3),
+            parent_index: Some(1),
+            year: Some(2001),
+            date: Some("2001-03-12".into()),
+            summary: None,
+            content_rating: None,
+            duration_ms: Some(301_000),
+            count: Some(14),
+            genres: vec!["Electronic".into()],
+            artwork: vec![RemoteArtwork {
+                id: "plex:/library/metadata/31/thumb/9".into(),
+                kind: RemoteArtworkKind::Poster,
+            }],
+            external_ids: vec!["mbid://5e4b7b2c".into()],
+            hash: String::new(),
+        }
+        .hashed()
+    }
+
+    /// P8-02's requests and replies, through CBOR and back.
+    #[test]
+    fn replication_goes_both_ways() {
+        round_trip(PeerRequest::Libraries);
+        round_trip(PeerRequest::Sync(SyncLibrary {
+            library: "plex:2".into(),
+            since: None,
+        }));
+        round_trip(PeerRequest::Sync(SyncLibrary {
+            library: "plex:2".into(),
+            since: Some("0192f1c4".into()),
+        }));
+        round_trip(PeerRequest::Artwork(ArtworkFetch {
+            id: "plex:/library/metadata/31/thumb/9".into(),
+        }));
+        round_trip(PeerReply::Libraries {
+            libraries: vec![SharedLibrary {
+                id: "plex:2".into(),
+                title: "Music".into(),
+                kind: RemoteLibraryKind::Music,
+            }],
+        });
+        for mode in [SyncMode::Changes, SyncMode::Snapshot] {
+            round_trip(PeerReply::Page(SyncPage {
+                mode,
+                cursor: "0192f1c4".into(),
+                items: vec![item()],
+                removed: vec!["plex:track:32".into()],
+                more: true,
+            }));
+        }
+        round_trip(PeerReply::Artwork {
+            content_type: "image/png".into(),
+            bytes: vec![0x89, b'P', b'N', b'G'],
+        });
+        round_trip(PeerReply::NotShared);
+        round_trip(PeerReply::NotFound);
+        round_trip(PeerReply::Unavailable);
+    }
+
+    /// The hash is of the content: it moves when the item does, not when
+    /// the hash field itself is set.
+    #[test]
+    fn an_item_s_hash_follows_its_content() {
+        let a = item();
+        assert_eq!(a.digest(), a.hash);
+        assert_eq!(a.clone().hashed(), a);
+        let renamed = RemoteItem {
+            title: "Something About Us".into(),
+            ..a.clone()
+        };
+        assert_ne!(renamed.digest(), a.hash);
+    }
+
+    /// A page past the bounds is cut to them as it is read: items,
+    /// removed ids, and each item's lists and texts.
+    #[test]
+    fn a_page_is_cut_to_its_bounds() {
+        let long = RemoteItem {
+            title: "x".repeat(MAX_ITEM_TEXT + 10),
+            summary: Some("y".repeat(MAX_ITEM_SUMMARY + 10)),
+            genres: vec!["g".into(); MAX_ITEM_GENRES + 1],
+            artwork: vec![item().artwork[0].clone(); MAX_ITEM_ARTWORK + 1],
+            external_ids: vec!["tmdb://1".into(); MAX_ITEM_EXTERNAL_IDS + 1],
+            ..item()
+        };
+        let page = SyncPage {
+            mode: SyncMode::Snapshot,
+            cursor: "c".into(),
+            items: vec![long; MAX_PAGE_ITEMS + 1],
+            removed: vec!["plex:movie:1".into(); MAX_PAGE_REMOVED + 1],
+            more: false,
+        }
+        .within_bounds();
+        assert_eq!(page.items.len(), MAX_PAGE_ITEMS);
+        assert_eq!(page.removed.len(), MAX_PAGE_REMOVED);
+        let item = &page.items[0];
+        assert_eq!(item.title.chars().count(), MAX_ITEM_TEXT);
+        assert_eq!(
+            item.summary.as_ref().unwrap().chars().count(),
+            MAX_ITEM_SUMMARY
+        );
+        assert_eq!(item.genres.len(), MAX_ITEM_GENRES);
+        assert_eq!(item.artwork.len(), MAX_ITEM_ARTWORK);
+        assert_eq!(item.external_ids.len(), MAX_ITEM_EXTERNAL_IDS);
+        let listed = libraries_within_bounds(vec![
+            SharedLibrary {
+                id: "plex:1".into(),
+                title: "Movies".into(),
+                kind: RemoteLibraryKind::Movies,
+            };
+            MAX_SHARED_LIBRARIES + 1
+        ]);
+        assert_eq!(listed.len(), MAX_SHARED_LIBRARIES);
+    }
+
+    /// What a newer sharing server adds reads as `Unknown`, item by item,
+    /// never failing the page: an item kind, an artwork role, a library
+    /// kind, a sync mode.
+    #[test]
+    fn what_a_newer_server_replicates_reads_as_unknown() {
+        let decode = |value: serde_json::Value| codec::encode(&value).unwrap();
+        let page = serde_json::json!({
+            "type": "page",
+            "mode": "patch",
+            "cursor": "c",
+            "items": [{
+                "id": "plex:clip:1",
+                "kind": "clip",
+                "title": "Trailer",
+                "artwork": [{ "id": "a", "kind": "banner" }],
+                "hash": "h",
+                "rating": 7,
+            }],
+            "more": false,
+        });
+        let PeerReply::Page(page) = codec::decode::<PeerReply>(&decode(page)).unwrap() else {
+            panic!("not a page");
+        };
+        assert_eq!(page.mode, SyncMode::Unknown);
+        assert_eq!(page.items[0].kind, RemoteKind::Unknown);
+        assert_eq!(page.items[0].artwork[0].kind, RemoteArtworkKind::Unknown);
+        let libraries = serde_json::json!({
+            "type": "libraries",
+            "libraries": [{ "id": "plex:4", "title": "Photos", "kind": "photos" }],
+        });
+        let PeerReply::Libraries { libraries } =
+            codec::decode::<PeerReply>(&decode(libraries)).unwrap()
+        else {
+            panic!("not libraries");
+        };
+        assert_eq!(libraries[0].kind, RemoteLibraryKind::Unknown);
     }
 
     #[test]
@@ -453,6 +742,90 @@ mod tests {
         }));
     }
 
+    /// The client protocol's share request and reply (P8-03), and its
+    /// bound.
+    #[test]
+    fn sharing_from_an_app_goes_both_ways_and_is_bounded() {
+        use crate::{Reply, Request, Response};
+        let library: spoolframe_types::LibraryId = "plex:1".parse().unwrap();
+        let share = ShareLibraries {
+            server_id: "mzxw6ytbojtg633c".into(),
+            libraries: vec![library.clone(); MAX_SHARED + 3],
+        };
+        round_trip(Request::ShareLibraries(share.clone()));
+        round_trip(Response::Ok(Reply::LibrariesShared {
+            libraries: vec![library],
+        }));
+        assert_eq!(share.within_bounds().libraries.len(), MAX_SHARED);
+    }
+
+    /// P8-02's client exposure: a library's server, Home's server rows
+    /// and items no longer available, the row setting and the event. What
+    /// is empty is left out, so a reply to an app that does not name the
+    /// feature reads as before.
+    #[test]
+    fn client_exposure_goes_both_ways_and_is_left_out_when_empty() {
+        use crate::{Event, HomeScreen, Reply, Request, Response, ServerRow};
+        use spoolframe_types::{Library, LibraryKind, LibraryServer};
+        let server = LibraryServer {
+            server_id: "mzxw6ytbojtg633c".into(),
+            name: "Alice's server".into(),
+            online: false,
+        };
+        let shared = Library {
+            id: "fed:mzxw6ytbojtg633c:plex:1".parse().unwrap(),
+            title: "Movies".into(),
+            kind: LibraryKind::Movies,
+            server: Some(server.clone()),
+        };
+        round_trip(Response::Ok(Reply::Libraries {
+            libraries: vec![shared],
+        }));
+        round_trip(Response::Ok(Reply::Home(HomeScreen {
+            unavailable: vec!["fed:movie:mzxw6ytbojtg633c:plex:1".parse().unwrap()],
+            servers: vec![ServerRow {
+                server,
+                shown: false,
+                items: Vec::new(),
+            }],
+            ..HomeScreen::default()
+        })));
+        round_trip(Request::SetServerRow {
+            server_id: "mzxw6ytbojtg633c".into(),
+            shown: true,
+        });
+        round_trip(Event::LibrariesChanged);
+        // P8-03: progress by item, and history's items no longer available.
+        let alien: spoolframe_types::MediaId = "fed:movie:mzxw6ytbojtg633c:plex:1".parse().unwrap();
+        round_trip(Request::UpdateWatchProgress {
+            id: alien.clone(),
+            position_ms: 2_400_000,
+        });
+        round_trip(Response::Ok(Reply::Items {
+            items: Vec::new(),
+            total: 1,
+            unavailable: vec![alien],
+        }));
+        let items = serde_json::to_value(Reply::Items {
+            items: Vec::new(),
+            total: 0,
+            unavailable: Vec::new(),
+        })
+        .unwrap();
+        assert!(items.get("unavailable").is_none(), "{items}");
+        let own = Library {
+            id: "plex:1".parse().unwrap(),
+            title: "Movies".into(),
+            kind: LibraryKind::Movies,
+            server: None,
+        };
+        let json = serde_json::to_value(&own).unwrap();
+        assert!(json.get("server").is_none(), "{json}");
+        let home = serde_json::to_value(HomeScreen::default()).unwrap();
+        assert!(home.get("servers").is_none() && home.get("unavailable").is_none());
+        assert_eq!(serde_json::from_value::<Library>(json).unwrap(), own);
+    }
+
     #[test]
     fn the_code_stays_out_of_debug_output() {
         let redeem = RedeemPairing {
@@ -461,6 +834,69 @@ mod tests {
             relays: Vec::new(),
         };
         assert!(!format!("{redeem:?}").contains("QW7K"));
+    }
+
+    /// P8-03's assertion and its answers, through CBOR and back; a scope
+    /// left out is a play, a newer one reads as unknown, and the token
+    /// stays out of debug output.
+    #[test]
+    fn an_assertion_goes_both_ways() {
+        let assertion = AssertUser {
+            user: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
+            display_name: "Bob".into(),
+            client_endpoint: "ab".repeat(32),
+            item: "plex:movie:1".into(),
+            scope: TokenScope::Play,
+        };
+        round_trip(PeerRequest::AssertUser(assertion.clone()));
+        let granted = TokenGranted {
+            token: "f00d".repeat(16),
+            scope: TokenScope::Play,
+            expires_at: 1_791_000_300,
+        };
+        assert!(!format!("{granted:?}").contains("f00d"));
+        round_trip(PeerReply::Token(granted));
+        for reason in [
+            AssertionRefused::NotShared,
+            AssertionRefused::InvalidUser,
+            AssertionRefused::InvalidDevice,
+            AssertionRefused::InvalidScope,
+            AssertionRefused::Unavailable,
+        ] {
+            round_trip(PeerReply::AssertionRefused { reason });
+        }
+        let decode = |value: serde_json::Value| codec::encode(&value).unwrap();
+        let sent = serde_json::json!({
+            "type": "assert_user",
+            "user": assertion.user,
+            "display_name": "Bob",
+            "client_endpoint": assertion.client_endpoint,
+            "item": "plex:movie:1",
+        });
+        assert_eq!(
+            codec::decode::<PeerRequest>(&decode(sent)).unwrap(),
+            PeerRequest::AssertUser(assertion.clone())
+        );
+        let later = serde_json::json!({
+            "type": "assert_user",
+            "user": assertion.user,
+            "display_name": "Bob",
+            "client_endpoint": assertion.client_endpoint,
+            "item": "plex:movie:1",
+            "scope": "subtitles",
+        });
+        let PeerRequest::AssertUser(later) = codec::decode(&decode(later)).unwrap() else {
+            panic!("not an assertion");
+        };
+        assert_eq!(later.scope, TokenScope::Unknown);
+        let long = AssertUser {
+            display_name: "x".repeat(500),
+            ..assertion
+        };
+        assert_eq!(
+            long.within_bounds().display_name.chars().count(),
+            crate::MAX_HELLO_TEXT
+        );
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub fn library(dir: &Directory) -> Result<Option<Library>, ConvertError> {
         id,
         title: dir.title.clone(),
         kind,
+        server: None,
     }))
 }
 
@@ -545,16 +546,19 @@ mod tests {
                     id: LibraryId::new(Namespace::Plex, "2").unwrap(),
                     title: "Movies".into(),
                     kind: LibraryKind::Movies,
+                    server: None,
                 },
                 Library {
                     id: LibraryId::new(Namespace::Plex, "1").unwrap(),
                     title: "TV Shows".into(),
                     kind: LibraryKind::Shows,
+                    server: None,
                 },
                 Library {
                     id: LibraryId::new(Namespace::Plex, "12").unwrap(),
                     title: "Music".into(),
                     kind: LibraryKind::Music,
+                    server: None,
                 },
             ]
         );

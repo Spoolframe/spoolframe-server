@@ -235,7 +235,7 @@ async fn recently_played(tv: &TestClient, who: &SessionId, kinds: Option<Kinds>)
 /// Recently played's items, by id, with their total.
 async fn recent_ids(tv: &TestClient, who: &SessionId, kinds: Option<Kinds>) -> (Vec<String>, u32) {
     match recently_played(tv, who, kinds).await {
-        Response::Ok(Reply::Items { items, total }) => {
+        Response::Ok(Reply::Items { items, total, .. }) => {
             (items.iter().map(|i| i.id().to_string()).collect(), total)
         }
         other => panic!("no Recently played: {other:?}"),

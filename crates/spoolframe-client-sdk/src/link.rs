@@ -770,6 +770,14 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 inner.downloads.server_event(id, download);
             }
         }
+        // Experimental (P8-02): for whoever lists the libraries.
+        Event::LibrariesChanged => {
+            if let Some(inner) = client.upgrade() {
+                let _ = inner.library_events.send(crate::LibrariesChanged {
+                    server: id.to_string(),
+                });
+            }
+        }
         Event::Unknown => {}
     }
     std::ops::ControlFlow::Continue(())

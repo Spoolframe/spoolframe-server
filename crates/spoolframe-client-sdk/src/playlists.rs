@@ -42,6 +42,7 @@ use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::ArtworkId;
 use spoolframe_types::MediaId;
 
+use crate::session::unexpected;
 use crate::{SdkError, Session};
 
 /// Regular features (PX-16) this SDK knows: those an app handles
@@ -215,11 +216,6 @@ pub enum PlaylistChange {
     Gone { id: String },
     /// Their Pinned, or its notes, changed: list them again.
     PinsChanged,
-}
-
-/// The reply was not the one the request has.
-fn unexpected(reply: Reply) -> SdkError {
-    SdkError::Protocol(format!("unexpected reply {reply:?}"))
 }
 
 impl Session {

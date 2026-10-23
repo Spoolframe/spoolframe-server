@@ -80,6 +80,21 @@ pub async fn search(
     request: &SearchRequest,
     this_year: u16,
 ) -> Result<SearchResults, CatalogError> {
+    search_with(catalog, None, request, this_year).await
+}
+
+/// [`search`], over `peers` too: the paired servers' cache (experimental
+/// `federation`, P8-02), for a client that named the feature. A search
+/// over every library finds the cache's items after the server's own in
+/// each group; one scoped to a library asks only `catalog`, which sends a
+/// paired server's library to the cache itself. P8-05 merges a title found
+/// on several servers into one result; until then each is listed.
+pub async fn search_with(
+    catalog: &dyn Catalog,
+    peers: Option<&dyn Catalog>,
+    request: &SearchRequest,
+    this_year: u16,
+) -> Result<SearchResults, CatalogError> {
     let Parsed { text, year } = parse(&request.query, this_year);
     if text.is_empty() {
         return Ok(SearchResults::default());
@@ -114,9 +129,9 @@ pub async fn search(
             ..query.clone()
         })
     });
-    let (found, any_year) = tokio::join!(catalog.search(&query), async {
+    let (found, any_year) = tokio::join!(found_in(catalog, peers, &query), async {
         match &any_year {
-            Some(any_year) => Some(catalog.search(any_year).await),
+            Some(any_year) => Some(found_in(catalog, peers, any_year).await),
             None => None,
         }
     });
@@ -136,7 +151,7 @@ pub async fn search(
                 limit: 0,
                 ..query.clone()
             };
-            match catalog.search(&counting).await {
+            match found_in(catalog, peers, &counting).await {
                 Ok(counted) => totals.extend(counted.groups.iter().map(|g| (g.kind, g.total))),
                 Err(e) => tracing::warn!(error = %e, "search: the other scopes are not counted"),
             }
@@ -152,6 +167,38 @@ pub async fn search(
     }
 
     Ok(group(request, &query.text, found, &totals, year, also))
+}
+
+/// What `catalog` finds for `query`, and after it in each group what
+/// `peers` finds, when there are peers and `query` covers every library.
+/// The peers failing costs only their items.
+async fn found_in(
+    catalog: &dyn Catalog,
+    peers: Option<&dyn Catalog>,
+    query: &SearchQuery,
+) -> Result<Found, CatalogError> {
+    let Some(peers) = peers.filter(|_| query.library.is_none()) else {
+        return catalog.search(query).await;
+    };
+    let (own, theirs) = tokio::join!(catalog.search(query), peers.search(query));
+    let mut own = own?;
+    let theirs = match theirs {
+        Ok(theirs) => theirs,
+        Err(e) => {
+            tracing::warn!(error = %e, "search: the paired servers' cache is left out");
+            return Ok(own);
+        }
+    };
+    let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
+    for group in &mut own.groups {
+        let Some(more) = theirs.groups.iter().find(|g| g.kind == group.kind) else {
+            continue;
+        };
+        let room = limit.saturating_sub(group.items.len());
+        group.items.extend(more.items.iter().take(room).cloned());
+        group.total = group.total.saturating_add(more.total);
+    }
+    Ok(own)
 }
 
 /// What a client is shown of `found`.

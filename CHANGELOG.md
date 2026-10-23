@@ -38,6 +38,49 @@
   change. SDK: `Experimental.federation` (a new field: a struct literal
   needs it), `Session::pair_server`, `SdkError::PairingRefused`, and
   `InviteLinkKind::Federation`.
+- Experimental, and off by default, as pairing is: paired servers share
+  libraries (P8-02, P8-03). An admin shares a library of this server's
+  with a pair (Federation page: Share and Revoke per pair; admin API
+  `federation_grantList`, `federation_grantAdd`,
+  `federation_grantRevoke`), and every user of the paired server may
+  browse it; nothing is shared per user, and neither server lists the
+  other's users. The paired server syncs what is shared on connecting,
+  every `federation.sync_interval_secs` (an hour) and on Refresh
+  (`federation_refresh`), and browses it from its cache, offline too
+  (migrations 0048 to 0051). A sync is written whole or not at all, and
+  within limits; the sharing server walks a library at most once a
+  minute, paces each pair's images and assertions, and answers 16 streams
+  of a connection at once. Images are kept within
+  `federation.cache_max_mb` per server and the new `cache_total_mb` (8
+  GiB) in all. `federation_peerList` gains `lastSync`, `playsHere`,
+  `playsThere`, `refusedHere` and `refusedThere`: one number per server,
+  never per user; the Federation page shows them with whether the pair is
+  online, and asks before it stops sharing a library.
+  To play a paired server's item, a server vouches for its user (local
+  accounts only, never a portable guest) and the other mints a play
+  token for that item and device, for five minutes (`assert_user`,
+  migration 0052), at most 10 working per user and 500 per server, for
+  what plays only; redeeming it is not in this release. PROTOCOL.md's
+  "Federation" has the wire.
+- Client protocol, used only with an app that names the experimental
+  `federation` feature, and no `PROTOCOL_VERSION` change: `Libraries`
+  lists the paired servers' libraries after the server's own, each with
+  its `server` (name, server id, online); their items have `fed:` ids,
+  which an app that does not name the feature never sees. Search,
+  browsing and `Item` take them; `HomeScreen.servers` is each paired
+  server's own row, which `SetServerRow` hides or shows per user;
+  `HomeScreen.unavailable` and `RecentlyPlayed`'s `unavailable` list the
+  items no longer available; `LibrariesChanged` is a new event; and
+  `UpdateWatchProgress` keeps the user's progress on a paired server's
+  item here, and never on Plex; a title's copies share one progress,
+  and a paired server's copy never takes the state of the server's own.
+  An app that does not name the feature gets `NotFound` for any request
+  naming a `fed:` id, and MCP's watch history leaves them out. Playlists
+  keep a paired server's items, shown as unavailable when it stops
+  sharing them. SDK:
+  `Session::share_libraries`, `set_server_row`, `update_watch_progress`,
+  `Client::libraries_events` (`LibrariesChanged`), `Library.server`,
+  and `ItemsPage.unavailable`.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

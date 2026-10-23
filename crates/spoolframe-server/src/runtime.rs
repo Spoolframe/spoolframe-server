@@ -70,6 +70,8 @@ pub struct Live {
     pub mcp: crate::oauth::McpSwitch,
     /// `subtitles.sources`, `opensubtitles.*` and `subdl.*` (PX-02).
     pub subtitle_downloads: Option<Arc<crate::subtitle_downloads::SubtitleDownloads>>,
+    /// `federation.*` (P8-02), while `experimental.federation` is on.
+    pub federation: Option<Arc<crate::federation::Federation>>,
 }
 
 /// Why a change was not made.
@@ -140,6 +142,7 @@ fn served(plex: &PlexConfig, libraries: &[LibraryConfig]) -> Result<Vec<Served>,
                     id: ids::library(&l.plex.server, section),
                     title: l.name.clone(),
                     kind: l.kind()?,
+                    server: None,
                 },
                 server: l.plex.server.clone(),
                 section: l.plex.section.clone(),
@@ -565,6 +568,15 @@ impl RuntimeSettings {
         }
         if let Some(ahead) = &live.index_ahead {
             ahead.set_on(config.experimental.index_ahead());
+        }
+        if let Some(federation) = &live.federation {
+            federation.set_replica(
+                config.federation.sync_every(),
+                crate::store::federation_cache::FileLimits {
+                    per_origin: config.federation.cache_max_bytes(),
+                    total: config.federation.cache_total_bytes(),
+                },
+            );
         }
         if let Some(artwork) = &live.artwork {
             artwork.set_memory_limit(config.artwork.tiers().memory);

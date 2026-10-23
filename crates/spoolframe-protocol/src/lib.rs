@@ -43,7 +43,7 @@ pub use messages::{
     DeviceSignInRequest, Error, Event, Hello, HomeScreen, InviteLookupOutcome, LoginPassword,
     LookupInvite, MAX_HELLO_TEXT, ManifestKind, PROTOCOL_VERSION, PinProof, PinState,
     PortableSignIn, PortableTie, RedeemInvite, RedeemPortableInvite, Reply, Request,
-    RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, SessionId, SessionInfo,
+    RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, ServerRow, SessionId, SessionInfo,
     TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply,
 };
 pub use passkeys::{

@@ -29,7 +29,7 @@ mod federation;
 pub use federation::FederationApiClient;
 #[cfg(feature = "server")]
 pub use federation::FederationApiServer;
-pub use federation::{PeerEntry, PeerKey};
+pub use federation::{GrantEntry, PeerEntry, PeerKey};
 mod optimized;
 pub use optimized::{
     OptimizedCopy, OptimizedCopyDeleted, OptimizedCopyState, OptimizedDeleted, OptimizedOverview,
@@ -209,7 +209,8 @@ pub mod error_code {
     /// Not an invite that can still make an account (P6-01): unknown,
     /// revoked, expired or used up.
     pub const NO_SUCH_INVITE: i32 = -32025;
-    /// Not a portable user with a grant here (P7-06).
+    /// Not a portable user with a grant here (P7-06), nor a library
+    /// shared with a paired server (P8-03).
     pub const NO_SUCH_GRANT: i32 = -32026;
     /// The session was signed in with a one-time password an admin reset
     /// to: it may only `me.setPassword` (with the one-time password as the

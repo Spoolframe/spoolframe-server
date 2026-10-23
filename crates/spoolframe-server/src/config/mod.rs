@@ -129,6 +129,10 @@ pub struct ServerConfig {
     /// The catalog's replies kept in memory.
     #[ucl(default)]
     pub catalog: CatalogConfig,
+    /// How this server caches what paired servers share with it (P8-02):
+    /// read only while `experimental.federation` is on.
+    #[ucl(default)]
+    pub federation: FederationConfig,
     /// When an item counts as started and watched.
     #[ucl(default)]
     pub watch: WatchConfig,
@@ -1730,6 +1734,57 @@ impl CatalogConfig {
     /// The replies' limit in bytes.
     pub fn memory_bytes(&self) -> u64 {
         self.memory_mb.unwrap_or(Self::DEFAULT_MEMORY_MB) << 20
+    }
+}
+
+/// `federation { sync_interval_secs = 3600; cache_max_mb = 2048;
+/// cache_total_mb = 8192; }`, optional (P8-02): how often this server
+/// syncs what each paired server shares with it, and the most each one's
+/// artwork, and all of theirs together, may take under
+/// `state_dir/cache/federation`. Live settings; read only while
+/// `experimental.federation` is on.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct FederationConfig {
+    /// Seconds between two syncs of a pair; an hour if left out, a minute
+    /// at the least.
+    #[ucl(default)]
+    pub sync_interval_secs: Option<u64>,
+    /// MiB; 2048 if left out.
+    #[ucl(default)]
+    pub cache_max_mb: Option<u64>,
+    /// MiB, every paired server's together; 8192 if left out.
+    #[ucl(default)]
+    pub cache_total_mb: Option<u64>,
+}
+
+impl FederationConfig {
+    pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 3600;
+    pub const MIN_SYNC_INTERVAL_SECS: u64 = 60;
+    pub const DEFAULT_CACHE_MAX_MB: u64 = 2048;
+    pub const DEFAULT_CACHE_TOTAL_MB: u64 = 8192;
+
+    /// The time between two syncs of a pair.
+    pub fn sync_every(&self) -> Duration {
+        Duration::from_secs(
+            self.sync_interval_secs
+                .unwrap_or(Self::DEFAULT_SYNC_INTERVAL_SECS)
+                .max(Self::MIN_SYNC_INTERVAL_SECS),
+        )
+    }
+
+    /// The most each pair's artwork may take, in bytes.
+    pub fn cache_max_bytes(&self) -> u64 {
+        self.cache_max_mb
+            .unwrap_or(Self::DEFAULT_CACHE_MAX_MB)
+            .saturating_mul(1 << 20)
+    }
+
+    /// The most every pair's artwork may take together, in bytes.
+    pub fn cache_total_bytes(&self) -> u64 {
+        self.cache_total_mb
+            .unwrap_or(Self::DEFAULT_CACHE_TOTAL_MB)
+            .saturating_mul(1 << 20)
     }
 }
 
@@ -3775,6 +3830,23 @@ mod tests {
 
     /// P8-01: federation is off if left out, and named for the start's
     /// log when on.
+    /// P8-02: the replica's settings, their defaults and their floor.
+    #[test]
+    fn the_federation_cache_is_hourly_and_two_gigabytes_unless_set() {
+        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
+        assert_eq!(config.federation.sync_every(), Duration::from_secs(3600));
+        assert_eq!(config.federation.cache_max_bytes(), 2 << 30);
+        assert_eq!(config.federation.cache_total_bytes(), 8 << 30);
+        let set = plex(
+            r#"plex { url = "http://nas:32400"; }
+               federation { sync_interval_secs = 5; cache_max_mb = 10; cache_total_mb = 30; }"#,
+        )
+        .unwrap();
+        assert_eq!(set.federation.sync_every(), Duration::from_secs(60));
+        assert_eq!(set.federation.cache_max_bytes(), 10 << 20);
+        assert_eq!(set.federation.cache_total_bytes(), 30 << 20);
+    }
+
     #[test]
     fn federation_is_off_unless_set() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();

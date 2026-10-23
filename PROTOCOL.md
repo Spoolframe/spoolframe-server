@@ -47,7 +47,11 @@ must be updated together. The changes per revision are in
   [up next in a playlist](#up-next-in-a-playlist)
 - [Downloads](#downloads)
 - [Portable identities](#portable-identities)
-- [Federation](#federation) (experimental)
+- [Federation](#federation) (experimental):
+  [sharing libraries](#sharing-libraries),
+  [paired servers in an app](#paired-servers-in-an-app),
+  [progress](#progress-on-a-paired-servers-item),
+  [delegated authentication](#delegated-authentication)
 
 ## Basics
 
@@ -3129,3 +3133,134 @@ paired already, is `pairing_refused { reason }` (`already_paired`,
 `key_held`, `key_refused`, `server_id_changed`, `same_server_id`). It is never retried on its own: a
 second try may meet a used-up invite.
 
+
+### Sharing libraries
+
+An admin of SA shares a library of SA's with a pair, and every user of
+the paired server SB may then browse and watch it; nothing is shared per
+user, and SB's users are never listed on SA. The admin API's
+`federation.grantList { peer }`, `grantAdd { peer, library }` and
+`grantRevoke { peer, library }` list, add and revoke the grants (the
+last two need a recent sign-in, as `peerRevoke` does; `NO_SUCH_GRANT`
+for a library not shared). A grant revoked, or the pair unpaired, also
+deletes the play tokens SA minted for that library's items.
+
+SA keeps no change feed. SB asks, on a live pair's connection, on
+connecting, every `federation.sync_interval_secs` (an hour by default)
+and on `federation.refresh { id }`:
+
+- `libraries` `{}`: `libraries { libraries }`, each `{id, title, kind}`,
+  at most 256. A library SB has cached and that is no longer listed is
+  dropped from SB's cache.
+- `sync` `{library, since}`: `page`s on the request's stream, the last
+  with `more: false`, each `{mode, cursor, items, removed, more}`.
+  `mode` is `changes` (items added or changed, and the ids of those
+  gone, since `since`) or `snapshot` (the whole library: what is not
+  named is gone), the latter for a `since` that SA does not know or that
+  is left out. SB keeps nothing until the last page is read, and names
+  its `cursor` next time. A page holds at most 200 items and 2,000
+  removed ids, and texts and lists in an item are cut to their bounds.
+  `not_shared` for a library not shared with SB, `unavailable` when SA
+  cannot walk it now (SB keeps what it has). SA walks a library at most
+  once a minute, for every pair: a sync within a minute of a walk is
+  answered from it, and a pair's syncs of one library are answered one
+  at a time. SB writes an answer to its cache only once it is whole and
+  within its limits (2,000 pages, 200,000 items and removed ids, and
+  500,000 items of one origin's in all); one past them, or cut short,
+  leaves its cache and cursor as they were.
+- `artwork` `{id}`: one image of a shared item, by the id its item gave,
+  as a reply rather than a frame: `artwork {content_type, bytes}` (at
+  most 16 MiB), `not_shared` or `not_found`; `unavailable` past the
+  pair's pace (a burst of 200, then 100 a second). SB keeps only a JPEG,
+  PNG or WebP that says it is an `image/` type, fetches the posters of
+  what it synced a few at a time after the sync, and holds the images to
+  `federation.cache_max_mb` per origin and `cache_total_mb` in all.
+
+A connection answers at most 16 streams at once: one past them is reset
+`BUSY` (3), and not counted against its endpoint.
+
+SB names each item it caches `fed:<kind>:<origin>:<namespace>:<key>`,
+where `origin` is SA's server id and the rest SA's own id for it. A
+server id is a label, not a key: an item a user of SB holds after its
+pair went is written again only by that pair, or one with its key,
+never by another server that pairs later under the same server id.
+
+The admin API's `peerList` says, per pair, `lastSync` (Unix seconds of
+the latest library sync, `null` before the first), `playsHere` and
+`playsThere`: plays of this server's items by the pair's users, and of
+the pair's items by this server's users, and `refusedHere` and
+`refusedThere`, the plays refused each way; one number each, never per
+user.
+
+### Paired servers in an app
+
+Only to an app that names the experimental `federation` feature in its
+`Hello`; any other sees none of this, and never a `fed:` id in any
+reply: a request of its that names one anywhere is `not_found`, and MCP's
+watch history leaves them out. `PROTOCOL_VERSION` does not change.
+
+- `Libraries` lists the paired servers' shared libraries after the
+  server's own, each with `server {server_id, name, online}`. An offline
+  server's libraries are still browsed, from SB's cache, and its items
+  do not play. `libraries_changed` is sent when a pair comes online or
+  goes offline, or a sync finds a library shared or no longer shared:
+  ask `Libraries` again.
+- Browsing, `Item` and search take `fed:` ids as any other. Search
+  answers the cache's hits after the server's own in each group.
+- `HomeScreen.servers` is each paired server's own row: `{server,
+  shown, items}`, what it shared most recently first, by when SB cached
+  it. `set_server_row {server_id, shown}` shows or hides one, per user:
+  `done`, or `not_found` for a server not paired. A paired server's
+  items stay in Continue watching either way.
+- `HomeScreen.unavailable`, and `items`' `unavailable` from
+  `recently_played`, list the `fed:` items shown that are no longer
+  available: their pair unpaired, or their library no longer shared.
+  They are shown as such and do not play. Playlists keep them too.
+
+### Progress on a paired server's item
+
+A `fed:` movie or episode plays from SA, not from a playback of SB's.
+The app reports where the user got to to SB, now and then while playing
+and on pause or stop:
+
+```json
+{"type": "update_watch_progress", "id": "fed:movie:mzxw6ytbojtg633c:plex:1", "position_ms": 2400000}
+```
+
+answered `done`. SB keeps it as the user's progress, as it would its
+own item's, and SA keeps nothing of it; nothing is written to Plex.
+An id that is not a paired server's is `invalid_input`, one no longer
+available `not_found`. It is not replayed on its own. Its play is closed
+after as long without a report as a playback may idle.
+
+A title's copies, here and on a paired server, share one progress, by
+their external ids (an episode's by its show's too, with its season and
+number). When the user has a state of SB's own copy, SA's copy's
+progress is written there; nothing SA says of its items moves a state of
+SB's copy. `Item` of either copy says the title's newest state, and
+Continue watching has one card for it.
+
+### Delegated authentication
+
+To play SA's item, SB vouches for its user on the pair's connection;
+the connection proves SB, and nothing is signed. Only SB's local
+accounts are vouched for, by their stable user id: a portable guest of
+SB's is not passed on.
+
+- `assert_user` `{user, display_name, client_endpoint, item, scope}`:
+  `user` is the user's UUID on SB; `display_name` is for SA's logs only;
+  `client_endpoint` is the device's endpoint id, hex; `item` is SA's own
+  id (what the `fed:` id carries); `scope` is `play`, the default when
+  left out. Answered `token {token, scope, expires_at}`: a random bearer
+  token, kept by SA as its hash, for that one item, from that one device,
+  for five minutes. Or `assertion_refused {reason}`: `not_shared` (the
+  item is in no library shared with SB, or is not SA's own),
+  `invalid_user`, `invalid_device`, `invalid_scope` (also for an item
+  that does not play: a show, a season, an artist, an album) or
+  `unavailable` (try again later: also past the pair's pace of 30, then
+  one a second, or once a user holds 10 working tokens, or the pair
+  500). The grant is checked as the token is kept, in one transaction.
+
+SA counts each token as a play of SB's users, and SB counts each as a
+play of SA's items; refusals are counted apart. The client protocol's
+redemption of the token is not specified yet.

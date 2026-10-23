@@ -221,7 +221,7 @@ async fn choosing_a_person_lists_their_items_a_page_at_a_time() {
                 limit: 5,
             };
             match searcher.client.call(Some(&searcher.session), request).await {
-                Response::Ok(Reply::Items { items, total }) => (items, total),
+                Response::Ok(Reply::Items { items, total, .. }) => (items, total),
                 other => panic!("{other:?}"),
             }
         }

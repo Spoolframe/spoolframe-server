@@ -517,6 +517,10 @@ pub struct ServerOptions {
     pub detect_encoders: bool,
     /// `experimental.federation` (P8-01).
     pub federation: bool,
+    /// `federation.sync_interval_secs` and `federation.cache_max_mb`
+    /// (P8-02): an hour and 2 GiB, unless a test is about them.
+    pub federation_sync_every: Duration,
+    pub federation_cache_max_bytes: u64,
 }
 
 /// Speech found by a stand-in: always `0`.
@@ -586,6 +590,8 @@ impl Default for ServerOptions {
             optimized_max_size: 1 << 30,
             detect_encoders: false,
             federation: false,
+            federation_sync_every: spoolframe_server::federation::DEFAULT_SYNC_EVERY,
+            federation_cache_max_bytes: 2 << 30,
         }
     }
 }
@@ -988,10 +994,23 @@ impl TestServer {
         let federation = options.federation.then(|| {
             Arc::new(spoolframe_server::federation::Federation::new(
                 auth.clone(),
+                catalog.clone(),
                 server_id.clone(),
                 name.clone(),
+                spoolframe_server::federation::ReplicaSettings {
+                    sync_every: options.federation_sync_every,
+                    cache_max_bytes: options.federation_cache_max_bytes,
+                    ..spoolframe_server::federation::ReplicaSettings::in_dir(
+                        dir.join("cache").join("federation"),
+                    )
+                },
             ))
         });
+        // What the pairs share is served from the catalog only where the
+        // test gave one that can carry it: the fake has no `fed:` ids.
+        if let (Some(federation), Some(live)) = (&federation, &options.catalog) {
+            live.set_peers(federation.peer_catalog());
+        }
         let services = Services {
             auth: auth.clone(),
             public_url: options.public_url.clone(),

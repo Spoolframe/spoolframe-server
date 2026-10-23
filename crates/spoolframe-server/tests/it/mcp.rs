@@ -553,6 +553,7 @@ async fn a_playlist_of_every_heist_episode_is_made_through_search_and_add_to_pla
     let actor = spoolframe_server::principal::Actor {
         principal: alice,
         admin: false,
+        federated: false,
     };
     let (theirs, _) = server.playlists.list(&actor, true).await.unwrap();
     assert_eq!(theirs.len(), 1);
@@ -578,6 +579,7 @@ async fn without_the_scope_the_playlist_tools_are_absent_and_refused() {
     let actor = spoolframe_server::principal::Actor {
         principal: user(&server, "bob", Role::Consumer).await,
         admin: false,
+        federated: false,
     };
     // Nothing was made, for anyone.
     assert!(
@@ -601,6 +603,7 @@ async fn with_playlists_read_the_playlists_are_read_and_not_changed() {
     let actor = spoolframe_server::principal::Actor {
         principal: alice,
         admin: false,
+        federated: false,
     };
     let made = server
         .playlists

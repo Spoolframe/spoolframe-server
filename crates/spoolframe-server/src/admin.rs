@@ -4462,6 +4462,7 @@ fn admin_actor(admin: &ApiSessionUser) -> crate::principal::Actor {
     crate::principal::Actor {
         principal: crate::principal::Principal::LocalUser(admin.user),
         admin: true,
+        federated: false,
     }
 }
 

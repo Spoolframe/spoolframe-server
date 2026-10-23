@@ -6,14 +6,15 @@ use jsonrpsee::Extensions;
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
-use spoolframe_admin_api::{FederationApiServer, PeerEntry, PeerKey, error_code};
+use spoolframe_admin_api::{FederationApiServer, GrantEntry, PeerEntry, PeerKey, error_code};
 use spoolframe_federation::DialError;
 use spoolframe_protocol::federation::PairingRefused;
 use spoolframe_protocol::fingerprint;
 
 use super::{AdminApi, error, internal};
-use crate::federation::{Federation, PairError};
+use crate::federation::{Federation, PairError, ReplicaError, ShareError};
 use crate::store::federation::{PeerError, PeerRecord};
+use crate::store::federation_grants::GrantRecord;
 
 impl AdminApi {
     /// Federation, or why there is none. Gated on the server's switch
@@ -48,9 +49,18 @@ impl AdminApi {
         } else {
             Vec::new()
         };
+        let (here, there) = federation.play_counts(&peer.id).await.map_err(internal)?;
         Ok(PeerEntry {
             fingerprint: print(&peer.endpoint_id),
             connected: live && federation.connected(&peer.endpoint_id),
+            last_sync: federation
+                .last_sync(&peer.server_id)
+                .await
+                .map_err(internal)?,
+            plays_here: here.plays,
+            plays_there: there.plays,
+            refused_here: here.refused,
+            refused_there: there.refused,
             held_keys: held
                 .into_iter()
                 .map(|key| PeerKey {
@@ -101,6 +111,44 @@ fn pair_error(e: PairError) -> ErrorObjectOwned {
         PairError::Dial(DialError::Refused(reason)) => refused(reason.name(), message),
         PairError::Dial(_) | PairError::Unexpected(_) => error(error_code::UNAVAILABLE, message),
         PairError::Store(e) => internal(e),
+    }
+}
+
+fn grant_entry(grant: GrantRecord) -> GrantEntry {
+    GrantEntry {
+        peer: grant.peer,
+        library: grant.library,
+        granted_by: grant.granted_by,
+        granted_at: grant.granted_at,
+    }
+}
+
+fn share_error(e: ShareError) -> ErrorObjectOwned {
+    match e {
+        ShareError::NoSuchPeer(_) => error(error_code::NO_SUCH_PEER, e.to_string()),
+        ShareError::NoSuchLibrary(_) => error(error_code::INVALID_INPUT, e.to_string()),
+        ShareError::Catalog(e) => error(error_code::UNAVAILABLE, e.to_string()),
+        ShareError::Store(e) => internal(e),
+    }
+}
+
+/// The live pair `id`, or `NO_SUCH_PEER`.
+async fn live_peer(federation: &Federation, id: &str) -> RpcResult<PeerRecord> {
+    federation
+        .peer(id)
+        .await
+        .map_err(internal)?
+        .filter(PeerRecord::live)
+        .ok_or_else(|| error(error_code::NO_SUCH_PEER, "no server paired by that id"))
+}
+
+fn replica_error(e: ReplicaError) -> ErrorObjectOwned {
+    match e {
+        ReplicaError::NoSuchPeer(_) => error(error_code::NO_SUCH_PEER, e.to_string()),
+        ReplicaError::Dial(_) | ReplicaError::NotPaired(_) | ReplicaError::TooLarge { .. } => {
+            error(error_code::UNAVAILABLE, e.to_string())
+        }
+        ReplicaError::Store(e) => internal(e),
     }
 }
 
@@ -175,6 +223,56 @@ impl FederationApiServer for AdminApi {
             .await
             .map_err(peer_error)?;
         self.peer_entry(federation, peer).await
+    }
+
+    async fn peer_grant_list(&self, ext: &Extensions, peer: String) -> RpcResult<Vec<GrantEntry>> {
+        self.admin(ext).await?;
+        let federation = self.federation()?;
+        let peer = live_peer(federation, &peer).await?;
+        let grants = federation.grants(&peer.id).await.map_err(internal)?;
+        Ok(grants.into_iter().map(grant_entry).collect())
+    }
+
+    async fn peer_grant_add(
+        &self,
+        ext: &Extensions,
+        peer: String,
+        library: String,
+    ) -> RpcResult<GrantEntry> {
+        let (federation, by) = self.pair_change(ext).await?;
+        let library = library
+            .parse()
+            .map_err(|_| error(error_code::INVALID_INPUT, format!("no library {library}")))?;
+        let mut grants = federation
+            .share(&peer, &[library], &by)
+            .await
+            .map_err(share_error)?;
+        Ok(grant_entry(grants.remove(0)))
+    }
+
+    async fn peer_grant_revoke(
+        &self,
+        ext: &Extensions,
+        peer: String,
+        library: String,
+    ) -> RpcResult<()> {
+        let (federation, by) = self.pair_change(ext).await?;
+        match federation
+            .unshare(&peer, &library, &by)
+            .await
+            .map_err(internal)?
+        {
+            Some(_) => Ok(()),
+            None => Err(error(
+                error_code::NO_SUCH_GRANT,
+                "that library is not shared with that server",
+            )),
+        }
+    }
+
+    async fn peer_refresh(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        self.admin(ext).await?;
+        self.federation()?.refresh(&id).await.map_err(replica_error)
     }
 }
 

@@ -15,6 +15,7 @@ use spoolframe_protocol::invite_admin::{self as wire, CreateInvite};
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::{Platform, Role};
 
+use crate::session::unexpected;
 use crate::{SdkError, Session};
 
 /// What redeeming an invite does.
@@ -200,18 +201,8 @@ impl Session {
     /// made stays. An admin's only, after a recent confirmation.
     /// [`SdkError::NotFound`] for one no longer on the list.
     pub async fn revoke_invite(&self, id: &str) -> Result<(), SdkError> {
-        match self
-            .call(Request::RevokeInvite { id: id.to_owned() })
-            .await?
-        {
-            Reply::Done => Ok(()),
-            other => Err(unexpected(other)),
-        }
+        self.done(Request::RevokeInvite { id: id.to_owned() }).await
     }
-}
-
-fn unexpected(reply: Reply) -> SdkError {
-    SdkError::Protocol(format!("unexpected reply {reply:?}"))
 }
 
 impl From<wire::InviteKind> for InviteKind {

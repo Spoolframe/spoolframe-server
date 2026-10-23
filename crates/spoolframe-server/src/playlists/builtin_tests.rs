@@ -63,6 +63,7 @@ impl Music {
             id: LibraryId::new(Namespace::Plex, "9").unwrap(),
             title: "Music".into(),
             kind: LibraryKind::Music,
+            server: None,
         }
     }
 
@@ -243,6 +244,7 @@ async fn harness(test: &str) -> Harness {
         actors.push(Actor {
             principal: Principal::LocalUser(id),
             admin: false,
+            federated: false,
         });
     }
     let playlists = Playlists::with_visibility(

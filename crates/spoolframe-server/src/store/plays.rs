@@ -286,6 +286,7 @@ impl Store {
         kinds: &[PlayedKind],
         offset: u32,
         limit: u32,
+        federated: bool,
     ) -> Result<(Vec<String>, u32), StoreError> {
         let principal = principal.to_string();
         let filter = |query: &mut QueryBuilder<Sqlite>| {
@@ -295,6 +296,11 @@ impl Store {
             if !kinds.is_empty() {
                 query.push(" AND kind IN ");
                 push_in_list(query, kinds.iter().map(|k| k.as_str()));
+            }
+            // A paired server's items only for a client that names the
+            // experimental `federation` feature (P8-02).
+            if !federated {
+                query.push(concat!(" AND ", own_item!("media_id")));
             }
         };
         let mut page: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT media_id");
@@ -455,11 +461,14 @@ mod tests {
             .unwrap();
         store.update_play(id, COUNTED).await.unwrap();
 
-        let (all, total) = store.recently_played(ALICE, &[], 0, 10).await.unwrap();
+        let (all, total) = store
+            .recently_played(ALICE, &[], 0, 10, false)
+            .await
+            .unwrap();
         assert_eq!(all, ["plex:track:3", "plex:track:1", "plex:movie:2"]);
         assert_eq!(total, 3);
         let (tracks, total) = store
-            .recently_played(ALICE, &[PlayedKind::Track], 1, 10)
+            .recently_played(ALICE, &[PlayedKind::Track], 1, 10, false)
             .await
             .unwrap();
         assert_eq!(

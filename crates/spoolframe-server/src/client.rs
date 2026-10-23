@@ -114,6 +114,12 @@ pub(crate) struct ClientProtocol {
     /// The connections that listed music downloads (PX-51): told of
     /// their users' likes.
     music_listeners: crate::events::DownloadListeners,
+    /// The connections that named the experimental `federation` feature
+    /// (P8-02): told `LibrariesChanged`.
+    federation_listeners: crate::events::FederationListeners,
+    /// Play history (PX-52): every playback's play, and those of a paired
+    /// server's items reported by `UpdateWatchProgress` (P8-03).
+    plays: Arc<crate::watch::Plays>,
 }
 
 /// What one connection has said so far.
@@ -481,9 +487,8 @@ impl ClientProtocol {
         }));
         // PX-52: every playback's play is kept, from its start to its end,
         // however it ends; the HTTP playback port's included.
-        services
-            .playbacks
-            .observe(Arc::new(crate::watch::Plays::new(services.watch.clone())));
+        let plays = Arc::new(crate::watch::Plays::new(services.watch.clone()));
+        services.playbacks.observe(plays.clone());
         tokio::spawn(crate::uplink::tell_shares(
             Arc::downgrade(&services.uplink),
             addresses.streams.clone(),
@@ -522,6 +527,14 @@ impl ClientProtocol {
             music_listeners.clone(),
             addresses.streams.clone(),
         ));
+        let federation_listeners = crate::events::FederationListeners::default();
+        if let Some(federation) = &services.federation {
+            tokio::spawn(crate::events::tell_libraries_news(
+                federation.libraries_changed(),
+                federation_listeners.clone(),
+                addresses.streams.clone(),
+            ));
+        }
         tokio::spawn(crate::connection_users::forget_ended_sessions(
             services.auth.clone(),
             users.clone(),
@@ -544,6 +557,8 @@ impl ClientProtocol {
             subtitle_listeners,
             download_listeners,
             music_listeners,
+            federation_listeners,
+            plays,
         }
     }
 
@@ -2054,7 +2069,22 @@ impl ClientProtocol {
     ) -> Result<Reply, Error> {
         let catalog = &self.services.catalog;
         let principal = who.principal();
-        let actor = who.actor();
+        // Experimental (P8-02): a paired server's libraries, items and
+        // `fed:` ids only for a client that named the feature; any other
+        // sees this server as if it had no pairs.
+        let federation = self.federation_for(hello);
+        // One boundary for every request (L1): a client that did not name
+        // the feature never reaches a paired server's item, library or
+        // image by its id either, whatever the request.
+        if federation.is_none() && spoolframe_protocol::federation::names_federated(&request) {
+            return Err(Error::NotFound {
+                what: "a paired server's item".into(),
+            });
+        }
+        let actor = crate::principal::Actor {
+            federated: federation.is_some(),
+            ..who.actor()
+        };
         // PX-40: a connection that takes playlist events is told of the
         // changes to what each user it acts as sees.
         let playlists_listed = features::has(&hello.features, features::PLAYLISTS);
@@ -2153,6 +2183,22 @@ impl ClientProtocol {
         }
         if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
             self.music_listeners.note(connection.stable_id());
+        }
+        if federation.is_some() {
+            self.federation_listeners.note(connection.stable_id());
+        }
+        if federation.is_none()
+            && matches!(
+                request,
+                Request::SetServerRow { .. } | Request::UpdateWatchProgress { .. }
+            )
+        {
+            return Err(Error::Unsupported {
+                request: format!(
+                    "a paired server's rows or progress without {}",
+                    spoolframe_protocol::experimental::FEDERATION
+                ),
+            });
         }
         // PX-02: subtitle downloads, only for a client that takes them.
         let subtitle_search_listed = features::has(&hello.features, features::SUBTITLE_SEARCH);
@@ -2702,9 +2748,15 @@ impl ClientProtocol {
                     .collect();
                 Ok(Reply::Sessions { sessions })
             }
-            Request::Libraries => Ok(Reply::Libraries {
-                libraries: catalog.libraries().await.map_err(catalog_error)?,
-            }),
+            Request::Libraries => {
+                let mut libraries = catalog.libraries().await.map_err(catalog_error)?;
+                // Experimental (P8-02): what the paired servers share, from
+                // the cache, each with its server.
+                if let Some(federation) = federation {
+                    libraries.extend(federation.libraries().await.map_err(catalog_error)?);
+                }
+                Ok(Reply::Libraries { libraries })
+            }
             Request::Items {
                 library,
                 offset,
@@ -2719,15 +2771,17 @@ impl ClientProtocol {
                 Ok(Reply::Items {
                     items: page.items,
                     total: page.total,
+                    unavailable: Vec::new(),
                 })
             }
             Request::Item { id } => {
                 let mut found = catalog.item(&id).await.map_err(catalog_error)?;
                 // The one place a client looks at a single item: bring over
                 // any state it had under an earlier key.
+                let title = self.services.watch.title_key(&found).await;
                 self.services
                     .watch
-                    .relink(principal, &id, &found.external_ids)
+                    .relink(principal, &id, &title)
                     .await
                     .map_err(watch_error)?;
                 self.fill(
@@ -2735,6 +2789,14 @@ impl ClientProtocol {
                     std::iter::once(&mut found.item).chain(found.children.iter_mut()),
                 )
                 .await?;
+                // Where the title was left, whichever server's copy played.
+                if federation.is_some() {
+                    self.services
+                        .watch
+                        .fill_title(principal, &mut found.item, &title)
+                        .await
+                        .map_err(watch_error)?;
+                }
                 if last_viewed_listed {
                     let mut items: Vec<&mut spoolframe_types::Item> =
                         std::iter::once(&mut found.item)
@@ -3014,10 +3076,19 @@ impl ClientProtocol {
                 .map_err(playlists_error),
             Request::Search(mut search) => {
                 search.limit = search.limit.min(MAX_PAGE);
-                let mut results =
-                    crate::search::search(catalog.as_ref(), &search, crate::search::this_year())
-                        .await
-                        .map_err(catalog_error)?;
+                // Experimental (P8-02): the paired servers' cache too, its
+                // hits beside this server's own until P8-05 merges them.
+                let peers = federation.map(|f| f.peer_catalog());
+                let mut results = crate::search::search_with(
+                    catalog.as_ref(),
+                    peers
+                        .as_deref()
+                        .map(|p| p as &dyn spoolframe_catalog::Catalog),
+                    &search,
+                    crate::search::this_year(),
+                )
+                .await
+                .map_err(catalog_error)?;
                 let top = match &mut results.top {
                     Some(TopResult::Item(item)) => Some(item),
                     _ => None,
@@ -3034,13 +3105,23 @@ impl ClientProtocol {
                 offset,
                 limit,
             } => {
-                let (items, total) = self
+                let (items, total, unavailable) = self
                     .services
                     .watch
-                    .recently_played(principal, kinds, offset, limit.min(MAX_PAGE))
+                    .recently_played(
+                        principal,
+                        kinds,
+                        offset,
+                        limit.min(MAX_PAGE),
+                        federation.is_some(),
+                    )
                     .await
                     .map_err(watch_error)?;
-                Ok(Reply::Items { items, total })
+                Ok(Reply::Items {
+                    items,
+                    total,
+                    unavailable,
+                })
             }
             Request::PersonItems {
                 person,
@@ -3057,7 +3138,11 @@ impl ClientProtocol {
                     .take(usize::try_from(limit.min(MAX_PAGE)).unwrap_or(usize::MAX))
                     .collect();
                 self.fill(principal, items.iter_mut()).await?;
-                Ok(Reply::Items { items, total })
+                Ok(Reply::Items {
+                    items,
+                    total,
+                    unavailable: Vec::new(),
+                })
             }
             Request::UpdatePlaybackProgress {
                 handle,
@@ -3095,6 +3180,40 @@ impl ClientProtocol {
                     .record_progress(&handle, sequence, position_ms);
                 Ok(Reply::Done)
             }
+            // Experimental (P8-03): a paired server's item plays from
+            // there, and its progress comes here, to the user's home.
+            Request::UpdateWatchProgress { id, position_ms } => {
+                if id.namespace() != spoolframe_types::Namespace::Federated {
+                    return Err(Error::InvalidInput {
+                        message: format!("{id} is not a paired server's item"),
+                    });
+                }
+                let found = catalog.item(&id).await.map_err(catalog_error)?;
+                let position = Duration::from_millis(position_ms);
+                // A track has no watch state, only its plays (PX-52).
+                if crate::watch::tracked(&id) {
+                    self.services
+                        .watch
+                        .progress(principal, &id, position)
+                        .await
+                        .map_err(watch_error)?;
+                }
+                let played = crate::playback::Played {
+                    principal,
+                    duration: crate::watch::length(None, &found.item),
+                    credits: spoolframe_policy::watch::credits_to_end(&found.markers),
+                    title_key: self.services.watch.title_key(&found).await,
+                    item: found.item,
+                    from: position,
+                };
+                self.plays.remote_progressed(
+                    &played,
+                    position,
+                    connection.remote_id().to_string(),
+                    hello.device_name.clone(),
+                );
+                Ok(Reply::Done)
+            }
             Request::MarkWatched { id } => {
                 self.services
                     .watch
@@ -3109,6 +3228,23 @@ impl ClientProtocol {
                     .mark(principal, &id, false)
                     .await
                     .map_err(watch_error)?;
+                Ok(Reply::Done)
+            }
+            Request::SetServerRow { server_id, shown } => {
+                let Some(federation) = federation else {
+                    return Err(Error::Unsupported {
+                        request: "server rows".into(),
+                    });
+                };
+                federation
+                    .set_server_row(&principal.to_string(), &server_id, shown)
+                    .await
+                    .map_err(|e| match e {
+                        crate::federation::ServerRowError::NoSuchServer(_) => Error::NotFound {
+                            what: e.to_string(),
+                        },
+                        crate::federation::ServerRowError::Store(e) => internal(e),
+                    })?;
                 Ok(Reply::Done)
             }
             Request::HideFromContinueWatching { id } => {
@@ -3131,9 +3267,18 @@ impl ClientProtocol {
                 let mut home = self
                     .services
                     .watch
-                    .home(principal)
+                    .home_as(principal, federation.is_some())
                     .await
                     .map_err(watch_error)?;
+                // Experimental (P8-02): each paired server's own row.
+                if let Some(federation) = federation {
+                    home.servers = federation
+                        .home_rows(&principal.to_string())
+                        .await
+                        .map_err(internal)?;
+                    let rows = home.servers.iter_mut().flat_map(|row| row.items.iter_mut());
+                    self.fill(principal, rows).await?;
+                }
                 if last_viewed_listed {
                     let mut rows: Vec<&mut spoolframe_types::Item> = home
                         .continue_watching
@@ -3368,6 +3513,7 @@ impl ClientProtocol {
                     // player needs no second request for them.
                     let found = catalog.item(&id).await.map_err(catalog_error)?;
                     let credits = spoolframe_policy::watch::credits_to_end(&found.markers);
+                    let title_key = self.services.watch.title_key(&found).await;
                     let markers = found.markers;
                     // One length for the Playback page, the play and its
                     // watch state.
@@ -3485,7 +3631,7 @@ impl ClientProtocol {
                             played: crate::playback::Played {
                                 principal,
                                 item: found.item,
-                                external_ids: found.external_ids,
+                                title_key,
                                 duration,
                                 credits,
                                 from: start.unwrap_or_default(),
@@ -3854,6 +4000,38 @@ impl ClientProtocol {
                         server_id: peer.server_id,
                         endpoint_id: peer.endpoint_id,
                     },
+                })
+            }
+            // Experimental (P8-03): as PairServer, which it follows in the
+            // QR flow.
+            Request::ShareLibraries(share) => {
+                let Some(federation) = self.federation_for(hello) else {
+                    return Err(Error::Unsupported {
+                        request: format!(
+                            "share_libraries without {}",
+                            spoolframe_protocol::experimental::FEDERATION
+                        ),
+                    });
+                };
+                let user = admin(&who)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
+                let share = share.within_bounds();
+                let peer = federation
+                    .live_peer_by_server_id(&share.server_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| Error::NotFound {
+                        what: format!("paired server {}", share.server_id),
+                    })?;
+                let grants = federation
+                    .share(&peer.id, &share.libraries, &user.username)
+                    .await
+                    .map_err(share_error)?;
+                Ok(Reply::LibrariesShared {
+                    libraries: grants
+                        .into_iter()
+                        .filter_map(|g| g.library.parse().ok())
+                        .collect(),
                 })
             }
             Request::LookupDeviceSignIn { code } => {
@@ -5984,6 +6162,7 @@ impl ProtocolHandler for ClientProtocol {
         self.subtitle_listeners.remove(id);
         self.download_listeners.remove(id);
         self.music_listeners.remove(id);
+        self.federation_listeners.remove(id);
         self.users.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
@@ -6808,6 +6987,18 @@ fn pair_error(e: crate::federation::PairError) -> Error {
         },
         PairError::Dial(_) | PairError::Unexpected(_) => Error::Unavailable { message },
         PairError::Store(e) => internal(e),
+    }
+}
+
+/// Why `ShareLibraries` shared nothing, for the client (P8-03).
+fn share_error(e: crate::federation::ShareError) -> Error {
+    use crate::federation::ShareError;
+    let message = e.to_string();
+    match e {
+        ShareError::NoSuchPeer(_) => Error::NotFound { what: message },
+        ShareError::NoSuchLibrary(_) => Error::InvalidInput { message },
+        ShareError::Catalog(_) => Error::Unavailable { message },
+        ShareError::Store(e) => internal(e),
     }
 }
 

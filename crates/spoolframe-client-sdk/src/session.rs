@@ -142,6 +142,11 @@ pub struct ItemsPage {
     pub items: Vec<Item>,
     /// How many items the library has in all.
     pub total: u32,
+    /// Experimental (`federation`, P8-03): the items listed that are no
+    /// longer available, their paired server unpaired or their library
+    /// no longer shared ([`Session::recently_played`]): shown as such, and
+    /// not played. Empty elsewhere.
+    pub unavailable: Vec<MediaId>,
 }
 
 /// An item and what is under it: a show's seasons, a season's episodes.
@@ -540,7 +545,8 @@ impl std::fmt::Debug for Session {
 }
 
 /// The reply was not the one the request has.
-fn unexpected(reply: Reply) -> SdkError {
+/// The reply was not the one the request has.
+pub(crate) fn unexpected(reply: Reply) -> SdkError {
     SdkError::Protocol(format!("unexpected reply {reply:?}"))
 }
 
@@ -790,7 +796,11 @@ impl Session {
             limit,
         };
         match self.call(request).await? {
-            Reply::Items { items, total } => Ok(ItemsPage { items, total }),
+            Reply::Items { items, total, .. } => Ok(ItemsPage {
+                items,
+                total,
+                unavailable: Vec::new(),
+            }),
             other => Err(unexpected(other)),
         }
     }
@@ -838,7 +848,11 @@ impl Session {
             limit,
         };
         match self.call(request).await? {
-            Reply::Items { items, total } => Ok(ItemsPage { items, total }),
+            Reply::Items { items, total, .. } => Ok(ItemsPage {
+                items,
+                total,
+                unavailable: Vec::new(),
+            }),
             other => Err(unexpected(other)),
         }
     }
@@ -1949,7 +1963,7 @@ impl Session {
         }
     }
 
-    async fn done(&self, request: Request) -> Result<(), SdkError> {
+    pub(crate) async fn done(&self, request: Request) -> Result<(), SdkError> {
         match self.call(request).await? {
             Reply::Done => Ok(()),
             other => Err(unexpected(other)),

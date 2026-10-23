@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use futures_util::{StreamExt, TryStreamExt, stream};
-use spoolframe_catalog::{Catalog, CatalogError, ItemWithChildren};
+use spoolframe_catalog::{Catalog, CatalogError, ItemWithChildren, Reach};
 use spoolframe_policy::playlists::{self as policy, Access, Standing};
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +36,9 @@ use spoolframe_protocol::playlists::{
     Kinds, PinNote, PinNoteReason, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage,
     PlaylistRef, PlaylistShare, PlaylistSummary, ShareCandidatePage, Visibility,
 };
-use spoolframe_types::{ArtworkId, ArtworkKind, Item, LibraryKind, Marker, MediaId, MediaKind};
+use spoolframe_types::{
+    ArtworkId, ArtworkKind, Item, LibraryKind, Marker, MediaId, MediaKind, Namespace,
+};
 
 use crate::covers::{CoverError, Covers, Tile};
 use crate::principal::{Actor, Principal};
@@ -397,6 +399,14 @@ impl Playlists {
         self
     }
 
+    /// Whether `actor` may see `item`: a paired server's only from a
+    /// client that named the experimental `federation` feature (P8-03),
+    /// and anything only as [`ItemVisibility`] says.
+    fn may_see(&self, actor: &Actor, item: &Item) -> bool {
+        (actor.federated || item.id().namespace() != Namespace::Federated)
+            && self.visibility.may_see(actor, item)
+    }
+
     /// Every change, as it is made.
     pub fn news(&self) -> tokio::sync::broadcast::Receiver<PlaylistNews> {
         self.news.subscribe()
@@ -688,9 +698,7 @@ impl Playlists {
     /// The tracks of `all` that `actor` may see, in its order: All's
     /// entries (PX-43).
     fn seen_tracks<'a>(&self, actor: &Actor, all: &'a [Item]) -> Vec<&'a Item> {
-        all.iter()
-            .filter(|t| self.visibility.may_see(actor, t))
-            .collect()
+        all.iter().filter(|t| self.may_see(actor, t)).collect()
     }
 
     /// Every track in the music libraries served, each once, by artist,
@@ -831,7 +839,7 @@ impl Playlists {
                     continue;
                 }
             };
-            if self.visibility.may_see(actor, &item) {
+            if self.may_see(actor, &item) {
                 shown.push(PlaylistEntry {
                     entry: entry.entry_id,
                     item,
@@ -855,8 +863,20 @@ impl Playlists {
         let Ok(id) = entry.media_id.parse::<MediaId>() else {
             return Ok(Resolved::Gone);
         };
-        match self.catalog.item(&id).await {
-            Ok(found) => Ok(Resolved::Here {
+        match self.catalog.item_kept(&id).await {
+            // A paired server's item whose pair or library went stays,
+            // as no longer available (P8-03); one whose server is offline
+            // does not play now.
+            Ok((found, reach @ (Reach::Gone | Reach::Offline))) => Ok(Resolved::Here {
+                unavailable: true,
+                item: found.item,
+                markers: if reach == Reach::Gone {
+                    Vec::new()
+                } else {
+                    found.markers
+                },
+            }),
+            Ok((found, Reach::Here)) => Ok(Resolved::Here {
                 unavailable: self.unavailable(&id).await?,
                 item: found.item,
                 markers: found.markers,
@@ -890,8 +910,12 @@ impl Playlists {
         }
     }
 
-    /// Whether `id`'s file cannot be read now.
+    /// Whether `id`'s file cannot be read now; a paired server's item
+    /// (P8-03), whether it does not play now: it plays from there.
     async fn unavailable(&self, id: &MediaId) -> Result<bool, PlaylistsError> {
+        if id.namespace() == Namespace::Federated {
+            return Ok(self.catalog.item_kept(id).await?.1 != Reach::Here);
+        }
         match self.catalog.media_path(id).await {
             Ok(_) => Ok(false),
             Err(
@@ -995,6 +1019,9 @@ impl Playlists {
                 })?
                 .is_some(),
             Principal::PortableUser(id) => self.store.grant_of(id).await?.is_some(),
+            // A paired server's user has nothing here (P8-03): their
+            // playlists are on their own server.
+            Principal::RemoteUser { .. } => false,
         })
     }
 
@@ -1138,7 +1165,7 @@ impl Playlists {
             }
             Err(e) => return Err(e.into()),
         };
-        if !self.visibility.may_see(actor, &found.item) {
+        if !self.may_see(actor, &found.item) {
             return Err(PlaylistsError::NoItem(item.clone()));
         }
         let mut leaves = match &found.item {
@@ -1158,7 +1185,7 @@ impl Playlists {
             Item::Album(_) => tracks_of(found.children),
             Item::Artist(_) => self.artist_tracks(found).await?,
         };
-        leaves.retain(|leaf| self.visibility.may_see(actor, leaf));
+        leaves.retain(|leaf| self.may_see(actor, leaf));
         // Each one's stable ids, for following it to a new key later.
         let entries = stream::iter(leaves)
             .map(|leaf| async move {
@@ -1556,7 +1583,7 @@ impl Playlists {
             // Unavailable, or in a library not served now.
             _ => return Ok(None),
         };
-        if !self.visibility.may_see(actor, &item) {
+        if !self.may_see(actor, &item) {
             return Ok(None);
         }
         self.watch.fill(actor.principal, &mut [&mut item]).await?;
@@ -1620,7 +1647,7 @@ impl Playlists {
                 continue;
             }
             match self.catalog.item(id).await {
-                Ok(found) if self.visibility.may_see(actor, &found.item) => {
+                Ok(found) if self.may_see(actor, &found.item) => {
                     entries.push(new_entry(&found.item, found.external_ids));
                 }
                 Ok(_) => left_out.push((title.clone(), "not in this server's libraries".into())),
@@ -1789,11 +1816,11 @@ impl Playlists {
                     Err(e) if crate::client::unserved(&e) => return Ok(None),
                     Err(e) => return Err(e.into()),
                 };
-                if !self.visibility.may_see(actor, &found.item) {
+                if !self.may_see(actor, &found.item) {
                     return Ok(None);
                 }
                 let mut tracks = self.artist_tracks(found).await?;
-                tracks.retain(|t| self.visibility.may_see(actor, t));
+                tracks.retain(|t| self.may_see(actor, t));
                 tracks
             }
             Followed::Playlist(id) => {
@@ -2115,7 +2142,7 @@ impl Playlists {
         }
         let tracks: Vec<&MediaId> = children
             .iter()
-            .filter(|c| matches!(c, Item::Track(_)) && self.visibility.may_see(actor, c))
+            .filter(|c| matches!(c, Item::Track(_)) && self.may_see(actor, c))
             .map(Item::id)
             .collect();
         let hearted: Vec<MediaId> = tracks
@@ -2152,7 +2179,7 @@ impl Playlists {
                 continue;
             }
             match self.catalog.item(id).await {
-                Ok(found) if self.visibility.may_see(actor, &found.item) => {
+                Ok(found) if self.may_see(actor, &found.item) => {
                     let entry = new_entry(&found.item, found.external_ids);
                     if held.insert(entry.media_id.clone()) {
                         entries.push(entry);
@@ -2199,7 +2226,14 @@ impl Playlists {
     /// when there are fewer; the placeholder when there are none. Kept a
     /// while per revision and viewer.
     async fn mosaic(&self, actor: &Actor, row: &PlaylistRow) -> Result<ArtworkId, PlaylistsError> {
-        let key = (row.id.clone(), row.revision, actor.principal.to_string());
+        // A viewer's mosaic has a paired server's covers only when they
+        // see its items (P8-03).
+        let viewer = format!(
+            "{}{}",
+            actor.principal,
+            if actor.federated { " federated" } else { "" }
+        );
+        let key = (row.id.clone(), row.revision, viewer);
         if let Some((at, id)) = self.mosaics.lock().get(&key)
             && at.elapsed() < MOSAIC_FOR
         {
@@ -2238,7 +2272,7 @@ impl Playlists {
                     continue;
                 }
             };
-            if !self.visibility.may_see(actor, &item) {
+            if !self.may_see(actor, &item) {
                 continue;
             }
             if let Some(poster) = poster_of(&item)

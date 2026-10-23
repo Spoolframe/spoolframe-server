@@ -170,6 +170,9 @@ pub const SETTINGS: &[Setting] = &[
     live("experimental.index_ahead"),
     // The endpoint's ALPNs are fixed when it binds (P8-01).
     restart("experimental.federation"),
+    live("federation.sync_interval_secs"),
+    live("federation.cache_max_mb"),
+    live("federation.cache_total_mb"),
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),
     restart("http_playback.address"),

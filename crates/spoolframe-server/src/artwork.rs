@@ -402,6 +402,20 @@ impl ArtworkCache {
         size: ArtworkSize,
     ) -> Result<(Artwork, bool), ArtworkError> {
         let key = cache_key(id, size);
+        // A paired server's original is kept once, as a file of the
+        // federation cache, which holds it to its own limits and drops it
+        // with the pair (P8-02): not in this cache too. Its sizes are.
+        if size.width().is_none() && id.namespace() == Namespace::Federated {
+            let image = self.make(id, size).await?;
+            return Ok((
+                Artwork {
+                    bytes: image.bytes,
+                    content_type: image.content_type,
+                    etag: key,
+                },
+                false,
+            ));
+        }
         if let Some(hit) = self.read(&key).await? {
             return Ok((hit, true));
         }
@@ -494,6 +508,12 @@ fn reader(bytes: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>, ArtworkError> {
     limits.max_alloc = Some(MAX_ALLOC);
     reader.limits(limits);
     Ok(reader)
+}
+
+/// Whether `bytes` are an image this server serves and resizes: a JPEG,
+/// PNG or WebP by its first bytes (a paired server's, P8-02).
+pub(crate) fn is_raster(bytes: &[u8]) -> bool {
+    reader(bytes).is_ok()
 }
 
 /// `bytes`, from the catalog or the cache, decoded within the same limits
@@ -754,6 +774,23 @@ mod tests {
         assert_eq!(image::load_from_memory(&small.bytes).unwrap().width(), 320);
         assert_eq!(image::load_from_memory(&medium.bytes).unwrap().width(), 640);
         assert_ne!(small.etag, medium.etag);
+    }
+
+    /// A paired server's original is kept by the federation cache alone
+    /// (P8-02): each original asked for is the catalog's, and its sizes
+    /// are kept here as any other's.
+    #[tokio::test]
+    async fn a_paired_server_s_original_is_not_kept_twice() {
+        let (cache, catalog, _dir) = cache("fed-originals", ROOMY).await;
+        let theirs = ArtworkId::federated("aaaaaaaaaaaaaaaa", &id(1)).unwrap();
+        for _ in 0..2 {
+            cache.get(&theirs, ArtworkSize::Original).await.unwrap();
+        }
+        assert_eq!(fetches(&catalog), 2);
+        for _ in 0..2 {
+            cache.get(&theirs, ArtworkSize::Small).await.unwrap();
+        }
+        assert_eq!(fetches(&catalog), 3, "the size is made once");
     }
 
     #[tokio::test]

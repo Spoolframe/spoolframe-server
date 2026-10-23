@@ -99,6 +99,14 @@ fn kind_of(kind: MediaKind) -> Option<(PlayedKind, PlayKind)> {
     Some((played, rule))
 }
 
+impl std::fmt::Debug for Plays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Plays")
+            .field("open", &self.open.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Plays {
     pub fn new(watch: Arc<Watch>) -> Self {
         Self {
@@ -131,14 +139,107 @@ impl Plays {
 }
 
 impl Observer for Plays {
-    /// Open the play of `opened`'s item: anything but a film, an episode
-    /// or a track has none. In memory now, so whatever ends the playback
-    /// finds it; its row in the background, after the item's state under
-    /// an earlier key is brought over ([`Watch::relink`]): the row takes
-    /// the item's external ids for its key, and the earlier key's plays
-    /// would not be found by them after.
+    /// Open the play of `opened`'s item (`Plays::open`).
     fn started(&self, handle: &str, opened: &Opened) {
-        let played = &opened.played;
+        self.open(
+            handle,
+            &opened.played,
+            Where {
+                endpoint_id: opened.endpoint.clone(),
+                device_name: opened.viewer.device_name.clone(),
+                playback_id: Some(opened.trace.id.clone()),
+            },
+        );
+    }
+
+    /// The playback `handle` reported `position`: its play moves on.
+    /// Written at most once per throttle interval, and always when it
+    /// comes to count; the close writes what is left.
+    fn progressed(&self, handle: &str, position: Duration, over_http: bool) {
+        self.moved_on(handle, position, over_http);
+    }
+
+    /// `handle`'s playback ended, however it ended: its play is closed as
+    /// far as it got.
+    fn ended(&self, handle: &str, over_http: bool) {
+        self.close(handle, over_http);
+    }
+
+    /// A paired server's item's play with no report for `idle` is closed
+    /// as far as it got, as a playback idle as long is ended (L8).
+    fn swept(&self, idle: Duration) {
+        let idle: Vec<String> = self
+            .open
+            .lock()
+            .iter()
+            .filter(|(handle, play)| {
+                handle.starts_with(REMOTE) && self.watch.since(play.progress.lock().at) >= idle
+            })
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        for handle in idle {
+            self.close(&handle, false);
+        }
+    }
+}
+
+/// Where a play is played from: its device, and its playback's trace,
+/// when it has a playback here.
+struct Where {
+    endpoint_id: String,
+    device_name: Option<String>,
+    playback_id: Option<String>,
+}
+
+/// What the handles of a paired server's items' plays start with: they
+/// have no playback here.
+const REMOTE: &str = "remote:";
+
+impl Plays {
+    /// A paired server's item, `played` from that server (P8-03), as its
+    /// user reported being at `position` (`UpdateWatchProgress`) from the
+    /// device `endpoint_id`: its play is kept as a playback's is. The
+    /// first report opens it, from where it is; each after moves it on;
+    /// with no report for as long as a playback may idle, the playbacks'
+    /// sweep closes it, and the next report opens another. The server's
+    /// next start closes one still open. Nothing of it is the paired
+    /// server's: this server is the user's home.
+    pub fn remote_progressed(
+        &self,
+        played: &crate::playback::Played,
+        position: Duration,
+        endpoint_id: String,
+        device_name: Option<String>,
+    ) {
+        let handle = format!("{REMOTE}{}:{}", played.principal, played.item.id());
+        if self.open.lock().contains_key(&handle) {
+            self.moved_on(&handle, position, false);
+            return;
+        }
+        let from = crate::playback::Played {
+            from: position,
+            ..played.clone()
+        };
+        let at = Where {
+            endpoint_id,
+            device_name,
+            playback_id: None,
+        };
+        self.open(&handle, &from, at);
+    }
+
+    /// Open the play of `played`'s item under `handle`: anything but a
+    /// film, an episode or a track has none. In memory now, so whatever
+    /// ends it finds it; its row in the background, after the item's
+    /// state under an earlier key is brought over ([`Watch::relink`]): the
+    /// row takes the item's external ids for its key, and the earlier
+    /// key's plays would not be found by them after.
+    fn open(&self, handle: &str, played: &crate::playback::Played, at: Where) {
+        let Where {
+            endpoint_id,
+            device_name,
+            playback_id,
+        } = at;
         let Some((kind, rule)) = kind_of(played.item.id().kind()) else {
             return;
         };
@@ -170,14 +271,11 @@ impl Observer for Plays {
         let watch = self.watch.clone();
         let principal = played.principal;
         let item = played.item.clone();
-        let external_ids = played.external_ids.clone();
+        let title = played.title_key.clone();
         let duration_ms = played.duration.map(ms);
-        let endpoint_id = opened.endpoint.clone();
-        let device_name = opened.viewer.device_name.clone();
-        let playback_id = opened.trace.id.clone();
         runtime.spawn(async move {
             let id = item.id();
-            if let Err(e) = watch.relink(principal, id, &external_ids).await {
+            if let Err(e) = watch.relink(principal, id, &title).await {
                 tracing::warn!(%id, error = %e, "its state could not be re-linked");
             }
             let media_id = id.to_string();
@@ -196,11 +294,11 @@ impl Observer for Plays {
                 show_id: show_id.as_deref(),
                 album_id: album_id.as_deref(),
                 artist_id: artist_id.as_deref(),
-                external_ids: &external_ids,
+                external_ids: &title,
                 duration_ms,
                 endpoint_id: Some(&endpoint_id),
                 device_name: device_name.as_deref(),
-                playback_id: Some(&playback_id),
+                playback_id: playback_id.as_deref(),
             };
             match watch.store.open_play(principal, new).await {
                 Ok(row) => *opening = Some(row),
@@ -209,10 +307,10 @@ impl Observer for Plays {
         });
     }
 
-    /// The playback `handle` reported `position`: its play moves on.
-    /// Written at most once per throttle interval, and always when it
-    /// comes to count; the close writes what is left.
-    fn progressed(&self, handle: &str, position: Duration, over_http: bool) {
+    /// The play `handle` got to `position`: it moves on. Written at most
+    /// once per throttle interval, and always when it comes to count; the
+    /// close writes what is left.
+    fn moved_on(&self, handle: &str, position: Duration, over_http: bool) {
         let Some(play) = self.open.lock().get(handle).cloned() else {
             return;
         };
@@ -250,9 +348,8 @@ impl Observer for Plays {
         self.write(play, false);
     }
 
-    /// `handle`'s playback ended, however it ended: its play is closed as
-    /// far as it got.
-    fn ended(&self, handle: &str, over_http: bool) {
+    /// The play `handle` ended: it is closed as far as it got.
+    fn close(&self, handle: &str, over_http: bool) {
         let Some(play) = self.open.lock().remove(handle) else {
             return;
         };
@@ -315,6 +412,7 @@ impl Watch {
         let media_id = id.to_string();
         let album_id = track.album_id.to_string();
         let artist_id = track.artist_id.to_string();
+        let title = self.title_key(&found).await;
         // What makes it one play: the device's own time of it, which a
         // second send has unchanged (the clock fix may move).
         let key = format!("offline:{}", play.at);
@@ -327,7 +425,7 @@ impl Watch {
                     show_id: None,
                     album_id: Some(&album_id),
                     artist_id: Some(&artist_id),
-                    external_ids: &found.external_ids,
+                    external_ids: &title,
                     duration_ms: duration.map(ms),
                     endpoint_id: play.endpoint_id,
                     device_name: play.device_name,
@@ -379,18 +477,22 @@ impl Watch {
     /// latest counted play, newest first, of `kinds` (all, for `None`),
     /// with their watch state and plays; and how many there are. An item
     /// gone from the catalog, not served now, or on a Plex server that is
-    /// down is left out of the page.
+    /// down is left out of the page. A paired server's items only with
+    /// `federated` (a client that named the experimental `federation`
+    /// feature, P8-02), those no longer available kept and named in the
+    /// third list (P8-03).
     pub async fn recently_played(
         &self,
         principal: Principal,
         kinds: Option<Kinds>,
         offset: u32,
         limit: u32,
-    ) -> Result<(Vec<Item>, u32), WatchError> {
+        federated: bool,
+    ) -> Result<(Vec<Item>, u32, Vec<MediaId>), WatchError> {
         let kinds: Vec<PlayedKind> = match kinds {
             None => Vec::new(),
             // Kinds that tick none ask for nothing.
-            Some(k) if k.is_empty() => return Ok((Vec::new(), 0)),
+            Some(k) if k.is_empty() => return Ok((Vec::new(), 0, Vec::new())),
             Some(k) => [
                 (k.movies, PlayedKind::Movie),
                 (k.episodes, PlayedKind::Episode),
@@ -402,12 +504,12 @@ impl Watch {
         };
         let (ids, total) = self
             .store
-            .recently_played(principal, &kinds, offset, limit)
+            .recently_played(principal, &kinds, offset, limit, federated)
             .await?;
-        let mut items = self.look_up(ids, "Recently played").await?;
+        let (mut items, unavailable) = self.look_up_kept(ids, "Recently played", federated).await?;
         let mut all: Vec<&mut Item> = items.iter_mut().collect();
         self.fill(principal, &mut all).await?;
         self.fill_plays(principal, &mut all).await?;
-        Ok((items, total))
+        Ok((items, total, unavailable))
     }
 }

@@ -14,11 +14,13 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
-    Catalog, CatalogError, Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames,
+    Catalog, CatalogError, Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames, Reach,
     SearchQuery,
 };
 use spoolframe_plex::PlexCatalog;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, PersonId};
+use spoolframe_types::{
+    ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, Namespace, PersonId,
+};
 
 pub use composite::{Composite, PlexSource, Served, Synced};
 pub use replies::{Invalidated, Replies};
@@ -29,6 +31,8 @@ use replies::{Call, Reply};
 /// [`CatalogError::NotSetUp`].
 pub struct LiveCatalog {
     now: RwLock<Option<Arc<Composite>>>,
+    /// The paired servers' cache (P8-02), given to each composite served.
+    peers: OnceLock<Arc<dyn Catalog>>,
     /// Bumped at each [`LiveCatalog::replace`]: libraries may have gone
     /// (B-10).
     replaced: tokio::sync::watch::Sender<u64>,
@@ -59,6 +63,7 @@ impl LiveCatalog {
     pub fn new(now: Option<Arc<Composite>>) -> Self {
         Self {
             now: RwLock::new(now),
+            peers: OnceLock::new(),
             replaced: tokio::sync::watch::Sender::new(0),
             hook: OnceLock::new(),
             replies: Replies::new(crate::config::CatalogConfig::DEFAULT_MEMORY_MB << 20),
@@ -103,8 +108,36 @@ impl LiveCatalog {
         self.composite().map(|c| c.first().catalog.clone())
     }
 
+    /// Serve `fed:` ids from `peers`, the paired servers' cache (P8-02),
+    /// in the composite now and each one that replaces it. Only the first
+    /// is kept.
+    pub fn set_peers(&self, peers: Arc<dyn Catalog>) {
+        if self.peers.set(peers).is_err() {
+            return;
+        }
+        let now = self.composite();
+        let mut held = self.now.write();
+        // Unless it was replaced meanwhile, by one that has them already.
+        if let Some(now) = now
+            && held.as_ref().is_some_and(|h| Arc::ptr_eq(h, &now))
+        {
+            *held = Some(self.with_peers(now));
+        }
+    }
+
+    /// `composite` with the paired servers' cache, if there is one.
+    fn with_peers(&self, composite: Arc<Composite>) -> Arc<Composite> {
+        match self.peers.get() {
+            Some(peers) if !composite.has_peers() => {
+                Arc::new(Arc::unwrap_or_clone(composite).with_peers(peers.clone()))
+            }
+            _ => composite,
+        }
+    }
+
     /// Serve from `now` from now on; `None` is not set up.
     pub fn replace(&self, now: Option<Arc<Composite>>) {
+        let now = now.map(|c| self.with_peers(c));
         if let (Some(now), Some(hook)) = (&now, self.hook.get()) {
             hook(now);
         }
@@ -118,6 +151,9 @@ impl LiveCatalog {
     }
 }
 
+/// Replies are kept for Plex's answers only: a paired server's cache
+/// (`fed:` ids) is read from this server's own database, and a sync
+/// changes it at any time.
 #[async_trait]
 impl Catalog for LiveCatalog {
     async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
@@ -135,6 +171,9 @@ impl Catalog for LiveCatalog {
     }
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
+        if library.namespace() == Namespace::Federated {
+            return self.current()?.items(library, page).await;
+        }
         self.replies
             .read(
                 Call::Items(library.to_string(), page.offset, page.limit),
@@ -149,6 +188,9 @@ impl Catalog for LiveCatalog {
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
+        if id.namespace() == Namespace::Federated {
+            return self.current()?.item(id).await;
+        }
         self.replies
             .read(
                 Call::Item(id.to_string()),
@@ -163,6 +205,9 @@ impl Catalog for LiveCatalog {
     }
 
     async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
+        if show.namespace() == Namespace::Federated {
+            return self.current()?.episodes(show).await;
+        }
         self.replies
             .read(Call::Episodes(show.to_string()), list, Reply::List, async {
                 self.current()?.episodes(show).await
@@ -177,6 +222,9 @@ impl Catalog for LiveCatalog {
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
+        if id.namespace() == Namespace::Federated {
+            return self.current()?.external_ids(id).await;
+        }
         self.replies
             .read(
                 Call::ExternalIds(id.to_string()),
@@ -196,6 +244,17 @@ impl Catalog for LiveCatalog {
         external_ids: &[String],
     ) -> Result<Option<MediaId>, CatalogError> {
         self.current()?.find_external(kind, external_ids).await
+    }
+
+    async fn library_of(&self, id: &MediaId) -> Result<Option<LibraryId>, CatalogError> {
+        self.current()?.library_of(id).await
+    }
+
+    async fn item_kept(&self, id: &MediaId) -> Result<(ItemWithChildren, Reach), CatalogError> {
+        if id.namespace() == Namespace::Federated {
+            return self.current()?.item_kept(id).await;
+        }
+        Ok((self.item(id).await?, Reach::Here))
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
@@ -279,6 +338,40 @@ mod tests {
         live.replace(None);
         live.replace(single());
         assert_eq!(shown.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// P8-02: the paired servers' cache serves `fed:` ids in the
+    /// composite now and in each one that replaces it; every other id
+    /// still goes to Plex.
+    #[tokio::test]
+    async fn fed_ids_go_to_the_cache_through_every_composite() {
+        let single = || {
+            let plex = PlexCatalog::new("http://127.0.0.1:9".parse().unwrap(), None).unwrap();
+            Some(Arc::new(Composite::single("Tower", plex)))
+        };
+        let live = LiveCatalog::new(single());
+        let fed: MediaId = "fed:movie:mzxw6ytbojtg633c:plex:1".parse().unwrap();
+        assert!(matches!(
+            live.item(&fed).await,
+            Err(CatalogError::NotServed(_))
+        ));
+        let cache = crate::test_support::FakeCatalog::new("/nowhere/movie.mkv".into());
+        live.set_peers(Arc::new(cache));
+        // The fake says it has no such key: it was asked.
+        assert!(matches!(
+            live.item(&fed).await,
+            Err(CatalogError::NotFound(_))
+        ));
+        live.replace(single());
+        assert!(matches!(
+            live.item(&fed).await,
+            Err(CatalogError::NotFound(_))
+        ));
+        let plex: MediaId = "plex:movie:1".parse().unwrap();
+        assert!(matches!(
+            live.item(&plex).await,
+            Err(CatalogError::Unreachable { .. })
+        ));
     }
 
     #[tokio::test]

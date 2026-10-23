@@ -3,12 +3,16 @@
 //! what that server's admin sees, and Unpair; a paired server's new key,
 //! held until it is confirmed or rejected; inviting a server (a
 //! `federation` invite, shown as Invites shows one) and pairing with
-//! another by its invite link. Every change asks "Confirm it's you" when
-//! the sign-in is old.
+//! another by its invite link. Each live pair says whether it is online,
+//! when what it shares was last synced, with Refresh (P8-02), and its
+//! plays, one number each way and no user named; and lists the libraries
+//! shared with it, with Share and Revoke (P8-03). Every change asks
+//! "Confirm it's you" when the sign-in is old.
 
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
-    AdminApiClient, FederationApiClient, InviteCreated, InviteKind, NewInvite, PeerEntry, PeerKey,
+    AdminApiClient, FederationApiClient, GrantEntry, InviteCreated, InviteKind, LibraryEntry,
+    NewInvite, PeerEntry, PeerKey,
 };
 
 use super::admin::{Said, Toast, say};
@@ -17,7 +21,8 @@ use super::optimized::DangerDialog;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, icons, now, rpc};
 use crate::federation::{
-    CONFIRM_ABOUT, key_change_error, new_key_line, peer_line, refusal, unpair_question, unpaired,
+    CONFIRM_ABOUT, CONFIRM_SHARE, key_change_error, new_key_line, peer_line, refusal,
+    revoke_question, shared, state_line, unpair_question, unpaired,
 };
 use crate::logic::ApiError;
 
@@ -162,7 +167,9 @@ pub fn Federation() -> Element {
                                 key: "{peer.id}",
                                 peer: peer.clone(),
                                 now,
+                                toast,
                                 on_change: move |c: Change| asking.set(Some(c)),
+                                on_refreshed: move |_| list.restart(),
                             }
                         }
                     }
@@ -194,9 +201,40 @@ pub fn Federation() -> Element {
 
 /// One pair: its name, fingerprint and line, Unpair while paired, and
 /// each new key held for it, with its fingerprint, Confirm and Reject.
+/// While paired: its state and Refresh, and what is shared with it.
 #[component]
-fn PeerRow(peer: PeerEntry, now: i64, on_change: EventHandler<Change>) -> Element {
+fn PeerRow(
+    peer: PeerEntry,
+    now: i64,
+    toast: Signal<Option<Said>>,
+    on_change: EventHandler<Change>,
+    on_refreshed: EventHandler<()>,
+) -> Element {
     let live = peer.revoked_at.is_none();
+    let mut refreshing = use_signal(|| false);
+    let refresh = {
+        let peer = peer.clone();
+        move |_| {
+            let peer = peer.clone();
+            refreshing.set(true);
+            spawn(async move {
+                let synced = async {
+                    let client = rpc::client().await?;
+                    client
+                        .peer_refresh(peer.id.clone())
+                        .await
+                        .map_err(rpc::error)
+                }
+                .await;
+                match synced {
+                    Ok(()) => say(toast, true, format!("Synced {}", peer.name)),
+                    Err(e) => say(toast, false, e.explain()),
+                }
+                refreshing.set(false);
+                on_refreshed.call(());
+            });
+        }
+    };
     rsx! {
         div { class: "tie-row",
             span { class: "tie-icon", icons::Server { size: 20 } }
@@ -204,6 +242,10 @@ fn PeerRow(peer: PeerEntry, now: i64, on_change: EventHandler<Change>) -> Elemen
                 b { "{peer.name}" }
                 span { class: "tie-fp", title: "Key {peer.endpoint_id}", "{peer.fingerprint}" }
                 span { class: "tie-sub", {peer_line(now, &peer)} }
+                if live {
+                    span { class: "tie-sub", {state_line(now, &peer)} }
+                    Shares { peer: peer.clone(), toast }
+                }
                 for key in peer.held_keys.clone() {
                     span { class: "tie-sub", {new_key_line(now, &key)} }
                     span { class: "tie-fp", title: "Key {key.endpoint_id}", "{key.fingerprint}" }
@@ -232,17 +274,182 @@ fn PeerRow(peer: PeerEntry, now: i64, on_change: EventHandler<Change>) -> Elemen
                 }
             }
             if live {
-                button {
-                    class: "btn btn-sever",
-                    onclick: {
-                        let peer = peer.clone();
-                        move |_| on_change.call(Change::Unpair(peer.clone()))
-                    },
-                    icons::Unlink { size: 14 }
-                    "Unpair…"
+                span { class: "flex gap-2",
+                    button { class: "btn", disabled: refreshing(), onclick: refresh,
+                        "Refresh"
+                    }
+                    button {
+                        class: "btn btn-sever",
+                        onclick: {
+                            let peer = peer.clone();
+                            move |_| on_change.call(Change::Unpair(peer.clone()))
+                        },
+                        icons::Unlink { size: 14 }
+                        "Unpair…"
+                    }
                 }
             }
         }
+    }
+}
+
+/// The libraries shared with `peer`, and the server's own that are not.
+async fn shares_of(peer: String) -> Result<(Vec<GrantEntry>, Vec<LibraryEntry>), ApiError> {
+    let client = rpc::client().await?;
+    let grants = client.peer_grant_list(peer).await.map_err(rpc::error)?;
+    let libraries = client.libraries().await.map_err(rpc::error)?.libraries;
+    Ok((grants, libraries))
+}
+
+/// A share asked for: a library to share with the pair, or to stop
+/// sharing.
+#[derive(Debug, Clone, PartialEq)]
+enum Share {
+    Add(String),
+    Revoke(String),
+}
+
+/// What is shared with `peer` (P8-03): each library with Revoke, and
+/// Share for one of the server's own that is not. Every user of the
+/// paired server may browse and watch what is shared; there is nothing
+/// per user.
+#[component]
+fn Shares(peer: PeerEntry, toast: Signal<Option<Said>>) -> Element {
+    let id = peer.id.clone();
+    let mut listed = use_resource(move || shares_of(id.clone()));
+    let mut chosen = use_signal(String::new);
+    let mut asked = use_signal(|| None::<Share>);
+    let confirming = use_signal(|| None::<String>);
+    // The library to stop sharing, by id and name, while asked to confirm
+    // (as Unpair is).
+    let mut revoking = use_signal(|| None::<(String, String)>);
+    let mut busy = use_signal(|| false);
+    let go = {
+        let peer = peer.clone();
+        use_callback(move |()| {
+            let Some(share) = asked() else {
+                return;
+            };
+            let peer = peer.clone();
+            busy.set(true);
+            spawn(async move {
+                let done = async {
+                    let client = rpc::client().await?;
+                    match &share {
+                        Share::Add(library) => client
+                            .peer_grant_add(peer.id.clone(), library.clone())
+                            .await
+                            .map(|_| ())
+                            .map_err(rpc::error),
+                        Share::Revoke(library) => client
+                            .peer_grant_revoke(peer.id.clone(), library.clone())
+                            .await
+                            .map_err(rpc::error),
+                    }
+                }
+                .await;
+                match done {
+                    Ok(()) => {
+                        let (library, now_shared) = match &share {
+                            Share::Add(l) => (l, true),
+                            Share::Revoke(l) => (l, false),
+                        };
+                        say(toast, true, shared(&peer, library, now_shared));
+                    }
+                    // Kept asked, to try again once confirmed.
+                    Err(e) if asks_to_confirm(&e, confirming, CONFIRM_SHARE) => {
+                        busy.set(false);
+                        return;
+                    }
+                    Err(e) => say(toast, false, e.explain()),
+                }
+                busy.set(false);
+                asked.set(None);
+                revoking.set(None);
+                chosen.set(String::new());
+                listed.restart();
+            });
+        })
+    };
+    let current = listed.read().clone();
+    rsx! {
+        match current {
+            None => rsx! { span { class: "tie-sub", "Loading what is shared…" } },
+            Some(Err(error)) => rsx! { span { class: "tie-sub", {error.explain()} } },
+            Some(Ok((grants, libraries))) => {
+                let name = |id: &str| {
+                    libraries
+                        .iter()
+                        .find(|l| l.id == id)
+                        .map_or_else(|| id.to_owned(), |l| l.name.clone())
+                };
+                let unshared: Vec<LibraryEntry> = libraries
+                    .iter()
+                    .filter(|l| !grants.iter().any(|g| g.library == l.id))
+                    .cloned()
+                    .collect();
+                rsx! {
+                    if grants.is_empty() {
+                        span { class: "tie-sub", "Nothing shared with this server." }
+                    }
+                    for grant in grants.clone() {
+                        span { key: "{grant.library}", class: "flex items-center gap-2",
+                            span { class: "tie-sub", "Shared: " {name(&grant.library)} }
+                            button {
+                                class: "btn btn-sever",
+                                onclick: {
+                                    let named = (grant.library.clone(), name(&grant.library));
+                                    move |_| revoking.set(Some(named.clone()))
+                                },
+                                "Revoke…"
+                            }
+                        }
+                    }
+                    if !unshared.is_empty() {
+                        span { class: "flex items-center gap-2",
+                            select {
+                                class: "pref-select",
+                                onchange: move |e| chosen.set(e.value()),
+                                option { value: "", selected: chosen().is_empty(), "Choose a library…" }
+                                for library in unshared {
+                                    option {
+                                        key: "{library.id}",
+                                        value: "{library.id}",
+                                        selected: library.id == chosen(),
+                                        "{library.name}"
+                                    }
+                                }
+                            }
+                            button {
+                                class: "btn",
+                                disabled: chosen().is_empty(),
+                                onclick: move |_| {
+                                    asked.set(Some(Share::Add(chosen())));
+                                    go.call(());
+                                },
+                                "Share"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((library, named)) = revoking() {
+            DangerDialog {
+                title: revoke_question(&peer, &named).0,
+                text: revoke_question(&peer, &named).1,
+                icon: rsx! { icons::Server { size: 22 } },
+                cancel: "Cancel",
+                confirm: "Stop sharing",
+                busy: busy(),
+                on_cancel: move |()| revoking.set(None),
+                on_confirm: move |()| {
+                    asked.set(Some(Share::Revoke(library.clone())));
+                    go.call(());
+                },
+            }
+        }
+        ConfirmItsYou { asking: confirming, on_confirmed: move |_| go.call(()) }
     }
 }
 

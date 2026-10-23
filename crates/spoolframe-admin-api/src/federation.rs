@@ -1,6 +1,8 @@
 //! Users and devices › Federation (P8-01): the servers paired with this
 //! one, pairing with another by its invite link, unpairing, and the new
-//! keys held for a paired server until the admin confirms one. Experimental: every method is
+//! keys held for a paired server until the admin confirms one; the
+//! libraries shared with each (P8-03), and syncing what each shares with
+//! this one (P8-02). Experimental: every method is
 //! `NOT_CONFIGURED` while `experimental.federation` is off.
 //!
 //! Admins only (`FORBIDDEN`). What changes a pair needs a recent sign-in
@@ -42,6 +44,23 @@ pub struct PeerEntry {
     pub held_keys: Vec<PeerKey>,
     /// Whether it has a federation connection open to this server now.
     pub connected: bool,
+    /// When this server last synced what that one shares with it (P8-02),
+    /// Unix seconds: its latest whole sync of a library. `None` before the
+    /// first, or while it shares nothing with this server.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub last_sync: Option<i64>,
+    /// Plays of this server's items by that server's users (P8-03),
+    /// counted as this server minted their play tokens: one number for the
+    /// server. Admins manage servers, not people: no user of it is named.
+    pub plays_here: u64,
+    /// Plays of that server's items by this server's users, counted as
+    /// this server vouched for them.
+    pub plays_there: u64,
+    /// That server's users' plays this server refused to mint a token
+    /// for: an item not shared, a user or device that does not read.
+    pub refused_here: u64,
+    /// This server's users' plays that server refused.
+    pub refused_there: u64,
 }
 
 /// A key held for a paired server (P8-01's key rotation).
@@ -59,6 +78,22 @@ pub struct PeerKey {
     /// When an admin rejected it; `None` while it is held.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub rejected_at: Option<i64>,
+}
+
+/// A library this server shares with a paired server (P8-03): every user
+/// of that server may browse and watch it. Grants are server-wide; there
+/// is none per remote user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantEntry {
+    /// The paired server's `id`, as `peerList` gives it.
+    pub peer: String,
+    /// The library's id, as `libraryList` gives it.
+    pub library: String,
+    /// Who shared it: an admin's username, or `server CLI`.
+    pub granted_by: String,
+    /// Unix seconds.
+    pub granted_at: i64,
 }
 
 /// Federation's admin methods: `federation_peerList` and the rest.
@@ -120,6 +155,42 @@ pub trait FederationApi {
         id: String,
         endpoint_id: String,
     ) -> jsonrpsee::core::RpcResult<PeerEntry>;
+
+    /// The libraries shared with paired server `peer` now (P8-03), the
+    /// first shared first. `NO_SUCH_PEER` for one that is not paired.
+    #[method(name = "grantList", with_extensions)]
+    async fn peer_grant_list(&self, peer: String) -> jsonrpsee::core::RpcResult<Vec<GrantEntry>>;
+
+    /// Share `library`, one of this server's, with paired server `peer`:
+    /// its users may browse and watch it from now on. Shared already, the
+    /// grant is kept as it was. The grant. `NO_SUCH_PEER` for a server
+    /// that is not paired; `INVALID_INPUT` for a library this server does
+    /// not serve.
+    #[method(name = "grantAdd", with_extensions)]
+    async fn peer_grant_add(
+        &self,
+        peer: String,
+        library: String,
+    ) -> jsonrpsee::core::RpcResult<GrantEntry>;
+
+    /// Stop sharing `library` with paired server `peer`. Its cached copy
+    /// on that server goes at that server's next sync. `NO_SUCH_GRANT`
+    /// for a library not shared with it.
+    #[method(name = "grantRevoke", with_extensions)]
+    async fn peer_grant_revoke(
+        &self,
+        peer: String,
+        library: String,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// Sync now what paired server `id` shares with this one (P8-02), as
+    /// the replica does on connecting and every
+    /// `federation.sync_interval_secs`: dial it if it is offline, drop
+    /// the libraries it no longer shares, and sync the others. Admins
+    /// only. `NO_SUCH_PEER` for one that is not paired; `UNAVAILABLE` when
+    /// it cannot be reached, or does not pair with this server now.
+    #[method(name = "refresh", with_extensions)]
+    async fn peer_refresh(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 }
 
 #[cfg(test)]
@@ -139,6 +210,11 @@ mod tests {
             revoked_at: None,
             held_keys: Vec::new(),
             connected: false,
+            last_sync: None,
+            plays_here: 0,
+            plays_there: 0,
+            refused_here: 0,
+            refused_there: 0,
         }
     }
 
@@ -159,6 +235,19 @@ mod tests {
         assert!(json["heldKeys"][0]["rejectedAt"].is_null(), "{json}");
         assert!(json.get("revokedAt").unwrap().is_null(), "{json}");
         assert_eq!(serde_json::from_value::<PeerEntry>(json).unwrap(), held);
+    }
+
+    #[test]
+    fn a_grant_goes_both_ways_in_camel_case() {
+        let grant = GrantEntry {
+            peer: "id".into(),
+            library: "plex:1".into(),
+            granted_by: "alice".into(),
+            granted_at: 7,
+        };
+        let json = serde_json::to_value(&grant).unwrap();
+        assert_eq!(json["grantedBy"], "alice");
+        assert_eq!(serde_json::from_value::<GrantEntry>(json).unwrap(), grant);
     }
 
     /// Every field is sent, `None`s too, as everywhere on the admin API.

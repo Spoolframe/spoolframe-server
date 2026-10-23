@@ -333,6 +333,7 @@ fn library(id: &str, title: &str, kind: LibraryKind) -> Library {
         id: id.parse().unwrap(),
         title: title.into(),
         kind,
+        server: None,
     }
 }
 
@@ -518,7 +519,7 @@ async fn a_search_counts_every_server_s_results_and_a_library_asks_only_its_own(
         limit: 10,
     };
     match served.call(person).await {
-        Response::Ok(Reply::Items { items, total }) => {
+        Response::Ok(Reply::Items { items, total, .. }) => {
             assert_eq!(ids(&items), ["plex:movie:cabin:11", "plex:movie:cabin:12"]);
             assert_eq!(total, 2);
         }

@@ -18,11 +18,14 @@ pub struct Experimental {
     /// own port, for a player with no Iroh: an AirPlay receiver
     /// ([`crate::Session::http_playback_url`]).
     pub http_playback: bool,
-    /// Server-to-server federation (P8-01): pairing the server with
-    /// another by that one's invite ([`crate::Session::pair_server`]),
-    /// and making `federation` invites
-    /// ([`crate::InviteKind::Federation`]). An admin's, on a server with
-    /// `experimental.federation` on.
+    /// Server-to-server federation (P8): pairing the server with another
+    /// by that one's invite ([`crate::Session::pair_server`]) and sharing
+    /// libraries with it ([`crate::Session::share_libraries`]), an
+    /// admin's; making `federation` invites
+    /// ([`crate::InviteKind::Federation`]); and for every user, a paired
+    /// server's libraries and items, progress on them
+    /// ([`crate::Session::update_watch_progress`]) and its Home row. On a
+    /// server with `experimental.federation` on.
     pub federation: bool,
 }
 

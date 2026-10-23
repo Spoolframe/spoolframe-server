@@ -1,5 +1,6 @@
 //! Federation (P8-01): this server's pairs with others, over
-//! `spoolframe-federation`'s handler and dialler.
+//! `spoolframe-federation`'s handler and dialler; what it shares with them
+//! (P8-03's grants), and how it answers their replication (P8-02).
 //!
 //! Experimental: there is a [`Federation`] only while
 //! `experimental.federation` is on. Off, `spoolframe/federation/1` closes
@@ -18,10 +19,28 @@
 //! server spends from the same budget each time it says hello, so turning
 //! keys does not escape the count each key has.
 
+mod answer;
+pub mod cache;
+mod exposure;
+mod grants;
+pub mod items;
+mod replica;
+mod tokens;
+
+pub use answer::WALK_REUSE;
+pub use cache::{Links, PeerCache};
+pub use exposure::ServerRowError;
+pub use grants::ShareError;
+pub use replica::{DEFAULT_SYNC_EVERY, ReplicaError};
+pub use tokens::{AssertError, PLAY_TOKEN_LIFETIME, TOKEN_LIMITS};
+
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
+use spoolframe_catalog::Catalog;
 use spoolframe_federation::{DialError, Dialed, FederationProtocol, Live, Peers, Strangers};
 use spoolframe_protocol::federation::{
     MAX_HINTS, PROTOCOL_VERSION, PairingRefused, PeerHello, RedeemPairing, Standing, server_name,
@@ -32,21 +51,63 @@ use spoolframe_protocol::{ServerId, close};
 use crate::announce::Told;
 use crate::auth::Auth;
 use crate::invites::RedeemError;
+use crate::keyed_locks::KeyedLocks;
 use crate::network::{Connections, ServerName};
 use crate::store::StoreError;
 use crate::store::federation::{HeldKey, KeyHold, NewPeer, PairRedeemed, PeerError, PeerRecord};
+use crate::store::federation_cache::FileLimits;
 use crate::store::invites::{InviteKind, InviteState};
 
 /// This server's federation: its pairs, the handler that answers the
 /// ALPN, and what dials other servers.
-#[derive(Debug)]
 pub struct Federation {
     auth: Auth,
+    /// The libraries this server serves: what it may share (P8-03).
+    catalog: Arc<dyn Catalog>,
     server_id: ServerId,
     name: ServerName,
     live: Live,
     /// The endpoint, once it is up.
     attached: OnceLock<Attached>,
+    /// What the pairs share with this server, cached (P8-02).
+    cache: Arc<PeerCache>,
+    /// The connections the replica holds to the pairs.
+    links: Arc<Links>,
+    /// Each origin's sync lock ([`replica`]): the replica's and an
+    /// admin's never run at once.
+    syncing: KeyedLocks,
+    /// How the pairs' asks of this server are paced (H2).
+    answering: answer::Answering,
+    /// `federation.sync_interval_secs`.
+    sync_every: parking_lot::Mutex<Duration>,
+    /// Wakes the replica before its next tick: a pair made, a setting
+    /// changed.
+    wake: Arc<tokio::sync::Notify>,
+}
+
+/// Where and how this server caches what its pairs share (P8-02).
+#[derive(Debug, Clone)]
+pub struct ReplicaSettings {
+    /// The directory the artwork files go in, one per origin.
+    pub dir: PathBuf,
+    /// The time between two syncs of a pair.
+    pub sync_every: Duration,
+    /// The most each origin's artwork files take, in bytes.
+    pub cache_max_bytes: u64,
+    /// The most every origin's artwork files take together, in bytes.
+    pub cache_total_bytes: u64,
+}
+
+impl ReplicaSettings {
+    /// The defaults, with the files under `dir`.
+    pub fn in_dir(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            sync_every: DEFAULT_SYNC_EVERY,
+            cache_max_bytes: cache::DEFAULT_MAX_BYTES,
+            cache_total_bytes: cache::DEFAULT_TOTAL_BYTES,
+        }
+    }
 }
 
 /// What the endpoint gives, once it binds.
@@ -86,33 +147,84 @@ pub enum PairError {
     Store(#[from] StoreError),
 }
 
+impl std::fmt::Debug for Federation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Federation")
+            .field("server_id", &self.server_id)
+            .field("live", &self.live)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Federation {
     /// Federation for server `server_id`, called `name`, over `auth`'s
-    /// store and limits.
-    pub fn new(auth: Auth, server_id: ServerId, name: ServerName) -> Self {
+    /// store and limits, sharing from `catalog`, and caching what its pairs
+    /// share as `replica` says.
+    pub fn new(
+        auth: Auth,
+        catalog: Arc<dyn Catalog>,
+        server_id: ServerId,
+        name: ServerName,
+        replica: ReplicaSettings,
+    ) -> Self {
+        let links = Arc::new(Links::default());
+        let cache = Arc::new(PeerCache::new(
+            auth.store().clone(),
+            replica.dir,
+            FileLimits {
+                per_origin: replica.cache_max_bytes,
+                total: replica.cache_total_bytes,
+            },
+            links.clone(),
+        ));
         Self {
             auth,
+            catalog,
             server_id,
             name,
             live: Live::default(),
             attached: OnceLock::new(),
+            cache,
+            links,
+            syncing: KeyedLocks::default(),
+            answering: answer::Answering::default(),
+            sync_every: parking_lot::Mutex::new(replica.sync_every),
+            wake: Arc::default(),
         }
     }
 
     /// The endpoint is up: what dials from it, holds its connections and
-    /// tells where it is.
-    pub(crate) fn attach(&self, endpoint: Endpoint, connections: Connections, told: Told) {
-        let _ = self.attached.set(Attached {
-            endpoint,
-            connections,
-            told,
-        });
+    /// tells where it is. The replica starts (P8-02).
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        endpoint: Endpoint,
+        connections: Connections,
+        told: Told,
+    ) {
+        if self
+            .attached
+            .set(Attached {
+                endpoint,
+                connections,
+                told,
+            })
+            .is_ok()
+        {
+            self.start_replica();
+        }
+    }
+
+    /// What the pairs share with this server, cached: the backend of
+    /// every `fed:` id ([`crate::catalog::LiveCatalog::set_peers`]).
+    pub fn peer_catalog(&self) -> Arc<PeerCache> {
+        self.cache.clone()
     }
 
     /// The handler for `spoolframe/federation/1`.
-    pub(crate) fn protocol(self: &Arc<Self>) -> FederationProtocol<Self, Self> {
+    pub(crate) fn protocol(self: &Arc<Self>) -> FederationProtocol<Self, Self, Self> {
         let name = self.name.clone();
         FederationProtocol::new(
+            self.clone(),
             self.clone(),
             self.clone(),
             self.server_id.clone(),
@@ -244,6 +356,8 @@ impl Federation {
             by,
             "paired with another server"
         );
+        // The replica connects to it at once (P8-02).
+        self.wake.notify_one();
         Ok(peer)
     }
 }
@@ -254,9 +368,22 @@ impl Federation {
         self.store().federation_peers().await
     }
 
+    /// Pair `id`, live or not.
+    pub async fn peer(&self, id: &str) -> Result<Option<PeerRecord>, StoreError> {
+        self.store().federation_peer(id).await
+    }
+
     /// The new keys kept for pair `id`, held and rejected.
     pub async fn held_keys(&self, id: &str) -> Result<Vec<HeldKey>, StoreError> {
         self.store().held_peer_keys(id).await
+    }
+
+    /// The live pair whose server id is `server_id`.
+    pub async fn live_peer_by_server_id(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<PeerRecord>, StoreError> {
+        self.store().live_peer_by_server_id(server_id).await
     }
 
     /// Whether `endpoint_id` (hex) is a live pair's key.
@@ -275,10 +402,11 @@ impl Federation {
             .is_ok_and(|endpoint| self.live.has(&endpoint))
     }
 
-    /// Unpair `id` (P8-01): revoke this side's row, close the other's
-    /// connections, and tell it, best effort, so it revokes its own. The
-    /// row as it was; `None` for no live pair. The relay's tier falls
-    /// back once its cache of the answer expires.
+    /// Unpair `id` (P8-01): revoke this side's row and its grants
+    /// (P8-03), drop the cache of what it shared but for what a user here
+    /// holds (P8-02), close the other's connections, and tell it, best
+    /// effort, so it revokes its own. The row as it was; `None` for no live pair.
+    /// The relay's tier falls back once its cache of the answer expires.
     pub async fn unpair(&self, id: &str, by: &str) -> Result<Option<PeerRecord>, StoreError> {
         let Some(peer) = self.store().revoke_peer(id).await? else {
             return Ok(None);
@@ -290,6 +418,7 @@ impl Federation {
             by,
             "unpaired from another server"
         );
+        self.forget_origin(&peer.server_id).await;
         if let Ok(endpoint) = peer.endpoint_id.parse::<EndpointId>() {
             self.live.close(&endpoint, close::UNPAIRED, "unpaired");
             if let Some(attached) = self.attached.get() {
@@ -605,12 +734,15 @@ impl Peers for Federation {
             .revoke_peer_by_endpoint(&endpoint.to_string())
             .await
         {
-            Ok(Some(peer)) => tracing::info!(
-                peer = %endpoint.fmt_short(),
-                server_id = %peer.server_id,
-                name = %peer.display_name,
-                "a paired server unpaired: its pair is revoked here too"
-            ),
+            Ok(Some(peer)) => {
+                tracing::info!(
+                    peer = %endpoint.fmt_short(),
+                    server_id = %peer.server_id,
+                    name = %peer.display_name,
+                    "a paired server unpaired: its pair is revoked here too"
+                );
+                self.forget_origin(&peer.server_id).await;
+            }
             Ok(None) => {}
             Err(e) => tracing::error!(error = %e, "cannot revoke a pair the other server ended"),
         }

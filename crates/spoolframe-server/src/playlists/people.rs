@@ -58,6 +58,8 @@ pub fn kind_of(principal: Principal) -> UserKind {
     match principal {
         Principal::LocalUser(_) => UserKind::Local,
         Principal::PortableUser(_) => UserKind::Portable,
+        // Never shared with (P8-03): `exists` says no such user here.
+        Principal::RemoteUser { .. } => UserKind::Unknown,
     }
 }
 

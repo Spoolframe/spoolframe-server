@@ -36,8 +36,8 @@ pub use media::{
     VideoTrack,
 };
 pub use model::{
-    Album, Artist, Artwork, ArtworkKind, CastMember, Episode, Item, Library, LibraryKind, Marker,
-    MarkerKind, Movie, PlaybackState, Season, Show, Track,
+    Album, Artist, Artwork, ArtworkKind, CastMember, Episode, Item, Library, LibraryKind,
+    LibraryServer, Marker, MarkerKind, Movie, PlaybackState, Season, Show, Track,
 };
 pub use platform::Platform;
 pub use preferences::{

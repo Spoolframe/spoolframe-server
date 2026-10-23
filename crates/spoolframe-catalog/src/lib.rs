@@ -56,6 +56,18 @@ pub struct ItemWithChildren {
     pub markers: Vec<Marker>,
 }
 
+/// Whether an item a catalog names plays now (P8-02): a paired server's
+/// is kept after its pair or library goes, to be shown as no longer
+/// available, and does not play while that server is offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Here,
+    /// Its server is offline: browsed, not played.
+    Offline,
+    /// Its pair or library went: only what a user holds names it.
+    Gone,
+}
+
 /// Why a catalog call failed. A catalog never answers a failure with an
 /// empty result.
 #[derive(Debug, thiserror::Error)]
@@ -220,6 +232,22 @@ pub trait Catalog: Send + Sync {
         _external_ids: &[String],
     ) -> Result<Option<MediaId>, CatalogError> {
         Ok(None)
+    }
+
+    /// The library item `id` is in, among the libraries served (P8-03):
+    /// what a library shared with a paired server is checked against.
+    /// `None` when it is in no library served, or this catalog cannot
+    /// say; an error is "cannot say now", and the caller refuses.
+    async fn library_of(&self, _id: &MediaId) -> Result<Option<LibraryId>, CatalogError> {
+        Ok(None)
+    }
+
+    /// Item `id` as [`Catalog::item`] gives it, or as it was last known
+    /// when it is kept no longer available (a paired server's after its
+    /// pair or library went, P8-02), with whether it plays now. A
+    /// catalog of its own items alone has every item it finds here.
+    async fn item_kept(&self, id: &MediaId) -> Result<(ItemWithChildren, Reach), CatalogError> {
+        Ok((self.item(id).await?, Reach::Here))
     }
 
     /// Each kind `query` asks for, in the libraries it covers (P3-09).

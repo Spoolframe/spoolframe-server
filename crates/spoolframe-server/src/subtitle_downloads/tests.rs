@@ -28,6 +28,7 @@ fn asker(n: u128, admin: bool, name: &str) -> Asker {
         actor: Actor {
             principal: Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(n))),
             admin,
+            federated: false,
         },
         name: name.into(),
     }

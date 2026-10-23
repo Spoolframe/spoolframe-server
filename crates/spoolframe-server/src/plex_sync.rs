@@ -133,7 +133,9 @@ fn push(id: &MediaId, state: State, plex: Option<&State>) -> Option<Action> {
     }
 }
 
-/// Whether `id` takes part at all: a Plex movie or episode.
+/// Whether `id` takes part at all: a Plex movie or episode. A paired
+/// server's item (`fed:`, P8-03) never does: its progress is the user's
+/// on this server alone, and goes to no Plex account.
 fn synced_kind(id: &MediaId) -> bool {
     id.namespace() == Namespace::Plex && matches!(id.kind(), MediaKind::Movie | MediaKind::Episode)
 }
@@ -1399,6 +1401,24 @@ mod tests {
                 Action::PushWatched { id: episode("4") }
             ]
         );
+    }
+
+    /// P8-03: progress on a paired server's film, in progress or watched,
+    /// is never sent to Plex, nor looked up there.
+    #[test]
+    fn a_paired_server_s_progress_never_goes_to_plex() {
+        let fed = MediaId::federated("aaaaaaaaaaaaaaaa", &id(MediaKind::Movie, "1")).unwrap();
+        let rows = [
+            row(&fed, false, Some(2_400_000), 10),
+            row(
+                &MediaId::federated("aaaaaaaaaaaaaaaa", &episode("2")).unwrap(),
+                true,
+                None,
+                10,
+            ),
+        ];
+        assert!(both(&rows, &[], STARTED).is_empty());
+        assert!(only_here(&rows, &[], STARTED).is_empty());
     }
 
     #[test]

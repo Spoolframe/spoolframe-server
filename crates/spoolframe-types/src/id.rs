@@ -5,6 +5,12 @@
 //! never take them apart. The namespace is part of the ID so that `native:`
 //! IDs (and, with federation, IDs from another server) can be added without
 //! a format change. Only the server reads the parts, through the accessors.
+//!
+//! A paired server's item (P8-02) is in [`Namespace::Federated`]: its key
+//! is the origin's server id, then the id the origin knows it by without
+//! the kind, which the federated id carries already
+//! (`fed:movie:mzxw6ytbojtg633c:plex:12`). The origin is the server id,
+//! not its endpoint key, so a rotated key keeps every id.
 
 use std::fmt;
 use std::str::FromStr;
@@ -20,6 +26,9 @@ pub enum IdError {
     UnknownKind(String),
     #[error("{0:?} has no key")]
     MissingKey(String),
+    /// A federated id's origin is empty or has a `:` in it.
+    #[error("{0:?} is not a server id to name an origin by")]
+    InvalidOrigin(String),
 }
 
 /// Which catalog an ID belongs to.
@@ -35,6 +44,10 @@ pub enum Namespace {
     /// uploaded cover (`image:playlist/<hash>`), its mosaic, a built-in
     /// playlist's tile. Only ever an [`ArtworkId`].
     Image,
+    /// A paired server's (P8-02), as this server caches it: the key is the
+    /// origin's server id and the id the origin knows it by
+    /// (`fed:movie:<origin>:plex:12`, `fed:<origin>:plex:2`).
+    Federated,
 }
 
 impl Namespace {
@@ -43,8 +56,23 @@ impl Namespace {
             Namespace::Plex => "plex",
             Namespace::Preview => "preview",
             Namespace::Image => "image",
+            Namespace::Federated => "fed",
         }
     }
+}
+
+/// `origin` checked as a federated id's: not empty, and no `:` in it.
+fn origin(origin: &str) -> Result<&str, IdError> {
+    if origin.is_empty() || origin.contains(':') {
+        return Err(IdError::InvalidOrigin(origin.to_owned()));
+    }
+    Ok(origin)
+}
+
+/// A federated key's origin and the rest, if it is one.
+fn split_origin(key: &str) -> Option<(&str, &str)> {
+    key.split_once(':')
+        .filter(|(origin, rest)| !origin.is_empty() && !rest.is_empty())
 }
 
 impl FromStr for Namespace {
@@ -55,6 +83,7 @@ impl FromStr for Namespace {
             "plex" => Ok(Namespace::Plex),
             "preview" => Ok(Namespace::Preview),
             "image" => Ok(Namespace::Image),
+            "fed" => Ok(Namespace::Federated),
             other => Err(IdError::UnknownNamespace(other.to_owned())),
         }
     }
@@ -73,7 +102,8 @@ pub enum MediaKind {
 }
 
 impl MediaKind {
-    fn as_str(self) -> &'static str {
+    /// Its name in an id (`movie` in `plex:movie:12`).
+    pub fn as_str(self) -> &'static str {
         match self {
             MediaKind::Movie => "movie",
             MediaKind::Show => "show",
@@ -158,6 +188,33 @@ impl MediaId {
     pub fn key(&self) -> &str {
         &self.key
     }
+
+    /// `remote`, an item of the server whose server id is `origin`, as
+    /// this server names it (P8-02): `fed:<kind>:<origin>:<namespace>:<key>`.
+    pub fn federated(origin_id: &str, remote: &MediaId) -> Result<Self, IdError> {
+        let key = format!(
+            "{}:{}:{}",
+            origin(origin_id)?,
+            remote.namespace.as_str(),
+            remote.key
+        );
+        Self::new(Namespace::Federated, remote.kind, key)
+    }
+
+    /// For a federated id: the origin's server id, and the id the origin
+    /// knows the item by. `None` for any other id, or one that does not
+    /// read as one.
+    pub fn remote(&self) -> Option<(&str, MediaId)> {
+        if self.namespace != Namespace::Federated {
+            return None;
+        }
+        let (origin, rest) = split_origin(&self.key)?;
+        let (namespace, key) = rest.split_once(':')?;
+        Some((
+            origin,
+            Self::new(namespace.parse().ok()?, self.kind, key).ok()?,
+        ))
+    }
 }
 
 impl fmt::Display for MediaId {
@@ -217,6 +274,26 @@ macro_rules! namespaced_id {
             /// For the server: the catalog's own key.
             pub fn key(&self) -> &str {
                 &self.key
+            }
+
+            /// `remote`, of the server whose server id is `origin`, as
+            /// this server names it (P8-02): `fed:<origin>:<remote>`.
+            pub fn federated(origin_id: &str, remote: &$name) -> Result<Self, IdError> {
+                Self::new(
+                    Namespace::Federated,
+                    format!("{}:{remote}", origin(origin_id)?),
+                )
+            }
+
+            /// For a federated id: the origin's server id, and the id the
+            /// origin knows it by. `None` for any other id, or one that
+            /// does not read as one.
+            pub fn remote(&self) -> Option<(&str, $name)> {
+                if self.namespace != Namespace::Federated {
+                    return None;
+                }
+                let (origin, rest) = split_origin(&self.key)?;
+                Some((origin, rest.parse().ok()?))
             }
         }
 
@@ -374,6 +451,80 @@ mod tests {
         assert_eq!(id.namespace(), Namespace::Image);
         assert_eq!(id.key(), "playlist/0f3a");
         assert_eq!(id.to_string(), "image:playlist/0f3a");
+    }
+
+    const ORIGIN: &str = "mzxw6ytbojtg633c";
+
+    /// P8-02: a paired server's item names its origin and the origin's
+    /// id, reads back with the parser every id reads with, and says what
+    /// it is of.
+    #[test]
+    fn a_federated_id_round_trips_and_names_its_origin() {
+        let remote: MediaId = "plex:episode:cabin:12".parse().unwrap();
+        let id = MediaId::federated(ORIGIN, &remote).unwrap();
+        assert_eq!(id.to_string(), "fed:episode:mzxw6ytbojtg633c:plex:cabin:12");
+        assert_eq!(id.namespace(), Namespace::Federated);
+        assert_eq!(id.kind(), MediaKind::Episode);
+        let read: MediaId = id.to_string().parse().unwrap();
+        assert_eq!(read, id);
+        assert_eq!(read.remote(), Some((ORIGIN, remote)));
+        assert_eq!(
+            serde_json::from_str::<MediaId>(&serde_json::to_string(&id).unwrap()).unwrap(),
+            id
+        );
+
+        let library = LibraryId::federated(ORIGIN, &"plex:2".parse().unwrap()).unwrap();
+        assert_eq!(library.to_string(), "fed:mzxw6ytbojtg633c:plex:2");
+        assert_eq!(
+            library.to_string().parse::<LibraryId>().unwrap().remote(),
+            Some((ORIGIN, "plex:2".parse().unwrap()))
+        );
+        let art: ArtworkId = "plex:/library/metadata/1/thumb/2".parse().unwrap();
+        let ours = ArtworkId::federated(ORIGIN, &art).unwrap();
+        assert_eq!(
+            ours.to_string(),
+            "fed:mzxw6ytbojtg633c:plex:/library/metadata/1/thumb/2"
+        );
+        assert_eq!(ours.remote(), Some((ORIGIN, art)));
+    }
+
+    /// The namespaces there were read and print as they did, and are not
+    /// federated.
+    #[test]
+    fn the_namespaces_there_were_are_unchanged() {
+        for text in [
+            "plex:movie:12345",
+            "plex:episode:cabin:12",
+            "plex:movie:a:b",
+        ] {
+            let id: MediaId = text.parse().unwrap();
+            assert_eq!(id.to_string(), text);
+            assert_eq!(id.remote(), None);
+        }
+        for text in ["plex:3", "preview:0f3a/2", "image:playlist/0f3a"] {
+            let id: ArtworkId = text.parse().unwrap();
+            assert_eq!(id.to_string(), text);
+            assert_eq!(id.remote(), None);
+        }
+    }
+
+    #[test]
+    fn a_federated_id_needs_an_origin_and_an_id_the_origin_reads() {
+        let remote: MediaId = "plex:movie:1".parse().unwrap();
+        assert_eq!(
+            MediaId::federated("", &remote),
+            Err(IdError::InvalidOrigin(String::new()))
+        );
+        assert!(MediaId::federated("a:b", &remote).is_err());
+        // Read, but not as anything an origin has.
+        for text in [
+            "fed:movie:mzxw",
+            "fed:movie:mzxw:nope:1",
+            "fed:movie::plex:1",
+        ] {
+            let id: MediaId = text.parse().unwrap();
+            assert_eq!(id.remote(), None, "{text}");
+        }
     }
 
     #[test]

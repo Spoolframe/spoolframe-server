@@ -17,7 +17,8 @@ use crate::clock::Clock;
 use crate::principal::Principal;
 use crate::store::watch::WatchUpdate;
 use crate::test_support::{
-    FakeCatalog, OldKey, episode, fake_ffprobe, movie, second_copy, show, write_episode,
+    FED_ORIGIN, FakeCatalog, OldKey, episode, fake_ffprobe, fed_copy, movie, second_copy, show,
+    write_episode,
 };
 
 #[test]
@@ -460,6 +461,171 @@ async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_state() {
     );
 }
 
+/// `id`'s state as an app that names the federation feature is shown it
+/// on its Item page: its title's newest, whichever copy played.
+async fn title_state_of(h: &Harness, who: Principal, id: &MediaId) -> PlaybackState {
+    let mut found = h.catalog.item(id).await.unwrap();
+    let title = h.watch.title_key(&found).await;
+    h.watch.relink(who, id, &title).await.unwrap();
+    h.watch
+        .fill_title(who, &mut found.item, &title)
+        .await
+        .unwrap();
+    match found.item {
+        Item::Movie(m) => m.playback,
+        Item::Episode(e) => e.playback,
+        other => panic!("no state: {other:?}"),
+    }
+}
+
+/// The keys `who` has a state under.
+async fn rows(h: &Harness, who: Principal) -> Vec<String> {
+    let mut rows: Vec<String> = h
+        .store
+        .all_watch(who)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.media_id)
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// P8-03's one progress per title: 40 minutes of a paired server's copy
+/// of the film, and this server's own copy resumes at 40 minutes; 30 on
+/// this one, and the paired server's resumes at 30. The state is kept
+/// once, under this server's own copy once it played: one card in
+/// Continue watching.
+#[tokio::test]
+async fn a_title_s_progress_is_shared_by_its_copies_across_servers() {
+    let h = harness("one-per-title").await;
+    let theirs = fed_copy().id().clone();
+    let own = movie().id().clone();
+    h.progress(h.alice, &theirs, 2400).await;
+    assert_eq!(
+        title_state_of(&h, h.alice, &own).await.position,
+        Some(Duration::from_secs(2400))
+    );
+    h.clock.advance(Duration::from_secs(60));
+    h.progress(h.alice, &own, 1800).await;
+    assert_eq!(
+        title_state_of(&h, h.alice, &theirs).await.position,
+        Some(Duration::from_secs(1800))
+    );
+    assert_eq!(rows(&h, h.alice).await, [own.to_string()], "folded");
+    let home = h.watch.home_as(h.alice, true).await.unwrap();
+    assert_eq!(ids(&home.continue_watching), [own.to_string()]);
+}
+
+/// MCP's watch history names no feature: a paired server's items are not
+/// in it, nor counted (L2).
+#[tokio::test]
+async fn watch_history_leaves_a_paired_server_s_items_out() {
+    let h = harness("fed-history").await;
+    h.progress(h.alice, fed_copy().id(), 2400).await;
+    let (items, total) = h.watch.history(h.alice, 0, 10).await.unwrap();
+    assert_eq!((items.len(), total), (0, 0));
+}
+
+/// This server's own copy keeps its state when a paired server's copy of
+/// the same title turns up and is looked at and played (M1): that copy's
+/// progress is written to this server's row, which keeps its key.
+#[tokio::test]
+async fn a_paired_server_s_copy_never_takes_the_own_copy_s_state() {
+    let h = harness("own-copy-kept").await;
+    let theirs = fed_copy().id().clone();
+    let own = movie().id().clone();
+    h.progress(h.alice, &own, 600).await;
+    assert_eq!(
+        title_state_of(&h, h.alice, &theirs).await.position,
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(rows(&h, h.alice).await, [own.to_string()], "not moved");
+    h.clock.advance(Duration::from_secs(60));
+    h.progress(h.alice, &theirs, 2400).await;
+    assert_eq!(rows(&h, h.alice).await, [own.to_string()]);
+    assert_eq!(
+        h.state_of(h.alice, &own).await.position,
+        Some(Duration::from_secs(2400))
+    );
+}
+
+/// A paired server's copy of a title played here reaches watched within
+/// the throttle: the crossing is judged on the row its progress is
+/// written to, this server's own copy's, not on its own `fed:` id, which
+/// holds no row.
+#[tokio::test]
+async fn a_paired_copy_s_progress_reaches_watched_within_the_throttle() {
+    let h = harness("fed-copy-watched").await;
+    let theirs = fed_copy().id().clone();
+    let own = movie().id().clone();
+    h.progress(h.alice, &own, 600).await;
+    h.clock.advance(Duration::from_secs(60));
+    h.progress(h.alice, &theirs, 2400).await;
+    // Within the throttle, at 98% of the 7020 s film.
+    h.progress(h.alice, &theirs, 6900).await;
+    assert!(h.state_of(h.alice, &own).await.watched);
+}
+
+/// An episode played here and its copy on a paired server are one title,
+/// by their show's ids, season and number: the paired copy's progress
+/// lands on the row the episode's own play wrote.
+#[tokio::test]
+async fn an_episode_s_copies_land_on_one_row() {
+    let h = harness("episode-one-row").await;
+    let own = episode("12", "11", 1, 1).id().clone();
+    let theirs = MediaId::federated(FED_ORIGIN, &own).unwrap();
+    h.progress(h.alice, &own, 300).await;
+    h.clock.advance(Duration::from_secs(60));
+    h.progress(h.alice, &theirs, 600).await;
+    assert_eq!(rows(&h, h.alice).await, [own.to_string()]);
+    assert_eq!(
+        h.state_of(h.alice, &own).await.position,
+        Some(Duration::from_secs(600))
+    );
+}
+
+/// Offline (PX-38), a paired server's film is synced as the server's own
+/// are (P8-03).
+#[tokio::test]
+async fn a_paired_server_s_film_watched_offline_is_synced() {
+    let h = harness("fed-offline").await;
+    let theirs = fed_copy().id().clone();
+    let now = h.store.now();
+    let synced = h
+        .watch
+        .offline(
+            h.alice,
+            vec![(
+                theirs.clone(),
+                Offline {
+                    position: Some(Duration::from_secs(1200)),
+                    watched: None,
+                    at: now,
+                    device_now: now,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(synced, [Synced::Applied]);
+    assert_eq!(
+        h.state_of(h.alice, &theirs).await.position,
+        Some(Duration::from_secs(1200))
+    );
+}
+
+/// An episode is matched by each of its show's ids with its season and
+/// number.
+#[test]
+fn an_episode_is_matched_by_its_show_s_ids_season_and_number() {
+    assert_eq!(
+        episode_ids(&["tmdb://1396".into(), "tvdb://81189".into()], 1, 2),
+        ["tmdb://1396#s1e2", "tvdb://81189#s1e2"]
+    );
+}
+
 #[tokio::test]
 async fn a_second_copy_of_a_film_does_not_take_the_first_copy_s_hide() {
     let h = harness("two-copies-hide").await;
@@ -864,6 +1030,49 @@ async fn a_copy_s_plays_stay_with_it() {
     played_under(&h, h.alice, &movie().id().to_string()).await;
     assert_eq!(play_count(&h, h.alice, second_copy()).await, 0);
     assert_eq!(play_count(&h, h.alice, movie()).await, 1);
+}
+
+/// A paired server's item's play, which has no playback here, is closed
+/// when the playbacks' sweep finds it idle as long as a playback may be
+/// (L8); one reported within it stays open.
+#[tokio::test]
+async fn a_remote_play_idle_past_the_limit_is_closed_by_the_sweep() {
+    use crate::playback::tests::played;
+    use crate::playback::{IDLE, Observer, Played};
+
+    let h = harness("remote-play-idle").await;
+    let plays = Plays::new(h.watch.clone());
+    let theirs = Played {
+        principal: h.alice,
+        item: fed_copy(),
+        ..played()
+    };
+    plays.remote_progressed(&theirs, Duration::from_secs(60), "tv".into(), None);
+    let closed = || async {
+        let rows = h.store.all_plays(h.alice).await.unwrap();
+        rows.first().map(|r| r.closed)
+    };
+    for _ in 0..100 {
+        if closed().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.clock.advance(IDLE / 2);
+    plays.swept(IDLE);
+    assert_eq!(closed().await, Some(false), "reported within the limit");
+    h.clock.advance(IDLE);
+    plays.swept(IDLE);
+    for _ in 0..100 {
+        if closed().await == Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "not closed: {:?}",
+        h.store.all_plays(h.alice).await.unwrap()
+    );
 }
 
 /// Plays are kept by observing the playbacks, not by the requests: a

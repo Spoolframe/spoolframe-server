@@ -564,6 +564,19 @@ pub enum Request {
         sequence: u64,
         position_ms: u64,
     },
+    /// Experimental (`federation`, P8-03): where the user got to in `id`,
+    /// a paired server's (`fed:`) movie or episode, which plays from that
+    /// server rather than from a playback of this one's: `Done`. Sent to
+    /// the user's own server, as `UpdatePlaybackProgress` would be, now and
+    /// then while playing and on pause or stop; the server decides what is
+    /// written, and when. The paired server keeps nothing of it. An id
+    /// that is not a paired server's is `InvalidInput`; one no longer
+    /// available is `NotFound`. Unsupported unless this connection's
+    /// `Hello` named the feature.
+    UpdateWatchProgress {
+        id: MediaId,
+        position_ms: u64,
+    },
     MarkWatched {
         id: MediaId,
     },
@@ -683,6 +696,28 @@ pub enum Request {
     /// Look the code up on the other server first (`LookupInvite`): it
     /// tells the kind, the inviter and the key's fingerprint.
     PairServer(crate::federation::PairServer),
+
+    /// Experimental (`federation`, P8-03; see [`crate::federation`]):
+    /// share libraries of this server with a paired one, as the app offers
+    /// once `PairServer` paired them: `LibrariesShared`. Every user of the
+    /// paired server may browse and watch them; a library shared already
+    /// stays shared. Unsupported unless this connection's `Hello` named the
+    /// feature and the server's answer named it back. An admin's only
+    /// (`AdminRequired`), after a recent confirmation
+    /// (`RecentSignInRequired`), as `PairServer`. A server not paired is
+    /// `NotFound`; a library this server does not serve is `InvalidInput`,
+    /// and then none is shared.
+    ShareLibraries(crate::federation::ShareLibraries),
+
+    /// Experimental (`federation`, P8-02): show or hide paired server
+    /// `server_id`'s own row on the user's Home (`HomeScreen::servers`):
+    /// `Done`. Kept per user and server; a server's items stay in Continue
+    /// watching either way. Unsupported unless this connection's `Hello`
+    /// named the feature.
+    SetServerRow {
+        server_id: String,
+        shown: bool,
+    },
 
     /// Leave this server (PX-47): `Done`, and every session of the user
     /// here is ended, this one too. Needs a recent sign-in
@@ -1471,6 +1506,13 @@ pub enum Reply {
     Items {
         items: Vec<Item>,
         total: u32,
+        /// Experimental (`federation`, P8-03): the items listed that are
+        /// no longer available, their paired server unpaired or their
+        /// library no longer shared (`RecentlyPlayed`): shown as such, and
+        /// not played. Only to a client that named the feature.
+        // compat(v1): required at the protocol reset
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unavailable: Vec<MediaId>,
     },
     Item {
         item: Item,
@@ -1644,6 +1686,11 @@ pub enum Reply {
     ServerPaired {
         server: crate::federation::PeerServer,
     },
+    /// Experimental (`federation`, P8-03): the libraries shared with the
+    /// paired server (`ShareLibraries`), as asked.
+    LibrariesShared {
+        libraries: Vec<spoolframe_types::LibraryId>,
+    },
     /// The playlists the user sees (`ListPlaylists`, PX-40), oldest first,
     /// and the notes of pinned ones that left their Pinned.
     Playlists {
@@ -1732,6 +1779,30 @@ pub struct HomeScreen {
     /// For each recently watched show, its next unwatched episode.
     pub next_up: Vec<Item>,
     pub recently_added: Vec<Item>,
+    /// Experimental (`federation`, P8-02): the items of these rows that
+    /// are no longer available: their paired server unpaired, or stopped
+    /// sharing their library. Shown as such, and not played. Only to a
+    /// client that named the feature, as every `fed:` id is.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<MediaId>,
+    /// Experimental (`federation`, P8-02): each paired server's own row,
+    /// what it shared lately, by the server's name. A row the user turned
+    /// off (`SetServerRow`) is listed with no items, for the setting.
+    // compat(v1): required at the protocol reset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<ServerRow>,
+}
+
+/// A paired server's row on Home (P8-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerRow {
+    pub server: spoolframe_types::LibraryServer,
+    /// Whether the user shows it (`SetServerRow`); a row not shown has no
+    /// items.
+    pub shown: bool,
+    /// What it shared most recently first, as this server cached it.
+    pub items: Vec<Item>,
 }
 
 /// A session's user.
@@ -2295,6 +2366,11 @@ pub enum Event {
         id: String,
         state: crate::downloads::DownloadState,
     },
+    /// Experimental (`federation`, P8-02): the libraries changed: a paired
+    /// server came online or went offline, or shared or stopped sharing a
+    /// library. `Libraries` again. Only to a client that named the
+    /// feature.
+    LibrariesChanged,
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,

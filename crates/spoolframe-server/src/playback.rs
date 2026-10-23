@@ -641,7 +641,9 @@ pub struct Played {
     /// The item as the catalog has it: its kind, and its show, or its
     /// album and artist.
     pub item: Item,
-    pub external_ids: Vec<String>,
+    /// Its title's key ([`crate::watch::Watch::title_key`]): what its play
+    /// is kept with.
+    pub title_key: Vec<String>,
     /// Its length ([`crate::watch::length`]).
     pub duration: Option<Duration>,
     /// Where its credits that run to the end start, when known.
@@ -665,6 +667,11 @@ pub trait Observer: Send + Sync {
     /// It ended: its client stopped it, it expired, an admin stopped it,
     /// its session or device ended, another took its place.
     fn ended(&self, handle: &str, over_http: bool);
+
+    /// The idle playbacks were just ended ([`Playbacks::sweep`]): one that
+    /// keeps plays of its own, with no playback here (a paired server's
+    /// item, P8-03), ends its idle ones on the same beat.
+    fn swept(&self, _idle: Duration) {}
 }
 
 /// What a playback becomes when its subtitle or its quality changes.
@@ -1767,6 +1774,9 @@ impl Playbacks {
             |p| now.duration_since(p.last_used) >= self.idle,
             EndReason::Idle,
         );
+        for observer in self.observers.read().iter() {
+            observer.swept(self.idle);
+        }
     }
 
     /// How often [`Playbacks::sweep`] should run.
@@ -2087,7 +2097,7 @@ pub(crate) mod tests {
                 crate::store::users::LocalUserId::from_uuid(uuid::Uuid::nil()),
             ),
             item: crate::test_support::movie(),
-            external_ids: Vec::new(),
+            title_key: Vec::new(),
             duration: Some(Duration::from_secs(10)),
             credits: None,
             from: Duration::ZERO,

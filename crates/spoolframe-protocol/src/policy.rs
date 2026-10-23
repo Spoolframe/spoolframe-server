@@ -138,7 +138,9 @@ pub fn retry_safe(request: &Request) -> bool {
         // PX-51: a read; a play is recorded once by its track and time,
         // and a like is newest-wins as a watch is.
         | Request::MusicDownloadChanges { .. }
-        | Request::SyncOfflinePlays { .. } => true,
+        | Request::SyncOfflinePlays { .. }
+        // P8-02: a row shown twice is shown once.
+        | Request::SetServerRow { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
         Request::LoginPassword(_)
@@ -189,6 +191,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ApproveDeviceSignIn { .. }
         | Request::DenyDeviceSignIn { .. }
         | Request::UpdatePlaybackProgress { .. }
+        // P8-03: as a playback's progress.
+        | Request::UpdateWatchProgress { .. }
         | Request::MarkWatched { .. }
         | Request::MarkUnwatched { .. }
         | Request::HideFromContinueWatching { .. }
@@ -205,6 +209,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::RevokeInvite { .. }
         // A pairing takes the other server's use (P8-01).
         | Request::PairServer(_)
+        // Sharing is a change an admin confirmed (P8-03).
+        | Request::ShareLibraries(_)
         // Leaving ends every session; a second try finds none (PX-47).
         | Request::LeaveServer
         // PX-40: a second create is a second playlist; an edit's adds

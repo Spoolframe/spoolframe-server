@@ -356,6 +356,39 @@ pub(crate) async fn tell_subtitle_news(
     }
 }
 
+/// The connections that named the experimental `federation` feature, by
+/// stable id (P8-02): told when the paired servers' libraries change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FederationListeners(Arc<Mutex<HashSet<usize>>>);
+
+impl FederationListeners {
+    pub(crate) fn note(&self, id: usize) {
+        self.0.lock().insert(id);
+    }
+
+    pub(crate) fn remove(&self, id: usize) {
+        self.0.lock().remove(&id);
+    }
+
+    fn ids(&self) -> Vec<usize> {
+        self.0.lock().iter().copied().collect()
+    }
+}
+
+/// Tell each connection that named the `federation` feature that the
+/// libraries changed, each time `news` says so, until it ends.
+pub(crate) async fn tell_libraries_news(
+    mut news: tokio::sync::broadcast::Receiver<()>,
+    listeners: FederationListeners,
+    streams: EventStreams,
+) {
+    while next_news(&mut news, "library changes").await.is_some() {
+        for id in listeners.ids() {
+            streams.send(id, Event::LibrariesChanged);
+        }
+    }
+}
+
 /// The connections that listed `spoolframe:downloads`, by stable id:
 /// told when a download of a user they act as ([`ConnectionUsers`])
 /// moves (PX-38). Only their own: a download is its user's business. The

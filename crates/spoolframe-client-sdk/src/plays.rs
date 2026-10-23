@@ -37,7 +37,15 @@ impl Session {
             limit,
         };
         match self.call(request).await? {
-            Reply::Items { items, total } => Ok(ItemsPage { items, total }),
+            Reply::Items {
+                items,
+                total,
+                unavailable,
+            } => Ok(ItemsPage {
+                items,
+                total,
+                unavailable,
+            }),
             other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
         }
     }

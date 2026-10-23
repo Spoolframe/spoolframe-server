@@ -98,6 +98,90 @@ fn code_of(link: &str) -> String {
         .unwrap()
 }
 
+fn assertion(user: &str, item: &str) -> spoolframe_protocol::federation::AssertUser {
+    spoolframe_protocol::federation::AssertUser {
+        user: user.into(),
+        display_name: "Bob".into(),
+        client_endpoint: iroh::SecretKey::from_bytes(&[3; 32]).public().to_string(),
+        item: item.into(),
+        scope: spoolframe_protocol::federation::TokenScope::Play,
+    }
+}
+
+/// P8-03: an assertion from an endpoint that is not a pair's is reset (and
+/// counted as a stranger's stray, as `spoolframe-federation`'s tests
+/// check); one from a pair naming a portable guest, or
+/// no user, or an item not shared, is refused and counted against the
+/// pair, and no token is minted.
+#[tokio::test]
+async fn assertions_sa_may_not_answer_are_refused_and_counted() {
+    use spoolframe_protocol::federation::AssertionRefused;
+    use spoolframe_server::store::federation_tokens::PlaySide;
+    let sa = server("fed-assert-refused", "Alice's server").await;
+    let bob = "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c";
+    let stranger = endpoint().await;
+    let (dialed, _) = Dialed::connect(&stranger, sa.server.addr(), hello("bbbbbbbbbbbbbbbb"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        dialed.assert_user(assertion(bob, "plex:movie:1")).await,
+        Err(DialError::Broken(_))
+    ));
+    let link = pairing_link(&sa, None).await;
+    dialed.redeem(redeem(&code_of(&link))).await.unwrap();
+    let peer = sa
+        .store
+        .live_peer_by_endpoint(&stranger.id().to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    federation(&sa)
+        .share(&peer.id, &["plex:1".parse().unwrap()], "alice")
+        .await
+        .unwrap();
+    let portable = format!("portable:{}", "ab".repeat(32));
+    for (user, item, refused) in [
+        (
+            portable.as_str(),
+            "plex:movie:1",
+            AssertionRefused::InvalidUser,
+        ),
+        ("bob", "plex:movie:1", AssertionRefused::InvalidUser),
+        (bob, "plex:track:32", AssertionRefused::NotShared),
+        (bob, "plex:artist:30", AssertionRefused::InvalidScope),
+        (
+            bob,
+            "fed:movie:cccccccccccccccc:plex:1",
+            AssertionRefused::NotShared,
+        ),
+    ] {
+        let answer = dialed.assert_user(assertion(user, item)).await;
+        assert!(
+            matches!(&answer, Err(DialError::NotGranted(reason)) if *reason == refused),
+            "{user} {item}: {answer:?}"
+        );
+    }
+    let counted = sa
+        .store
+        .federation_plays(&peer.id, PlaySide::Served)
+        .await
+        .unwrap();
+    assert_eq!((counted.plays, counted.refused), (0, 5));
+    // The pair's own user, for a shared film: a token, and a play.
+    dialed
+        .assert_user(assertion(bob, "plex:movie:1"))
+        .await
+        .unwrap();
+    let counted = sa
+        .store
+        .federation_plays(&peer.id, PlaySide::Served)
+        .await
+        .unwrap();
+    assert_eq!((counted.plays, counted.refused), (1, 5));
+    dialed.close();
+    sa.stop().await;
+}
+
 /// The full dance: SA's invite, redeemed by SB, and both keep the pair
 /// with the other's key and server id, so both admins see the same
 /// fingerprints.
@@ -248,6 +332,57 @@ async fn wrong_codes_and_strays_count_on_the_endpoint_s_invite_guesses() {
         .await
         .unwrap();
     dialed.redeem(redeem(&code_of(&link))).await.unwrap();
+    sa.stop().await;
+}
+
+/// Whether `request`, sent on a stream of its own on `dialed`, is reset
+/// rather than answered.
+async fn reset(dialed: &Dialed, request: &PeerRequest) -> bool {
+    let (mut send, mut recv) = dialed.connection().open_bi().await.unwrap();
+    spoolframe_protocol::codec::write_frame(&mut send, request)
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    spoolframe_protocol::codec::read_frame::<_, spoolframe_protocol::federation::PeerReply>(
+        &mut recv,
+    )
+    .await
+    .is_err()
+}
+
+/// P8-02's requests, from anyone but a live pair (§28): a stranger and a
+/// held key are reset, as for anything else they may not ask.
+#[tokio::test]
+async fn replication_is_reset_for_a_stranger_and_a_held_key() {
+    use spoolframe_protocol::federation::{ArtworkFetch, SyncLibrary};
+    let sa = server("fed-replication-strangers", "Alice's server").await;
+    let link = pairing_link(&sa, None).await;
+    let asks = [
+        PeerRequest::Libraries,
+        PeerRequest::Sync(SyncLibrary {
+            library: "plex:1".into(),
+            since: None,
+        }),
+        PeerRequest::Artwork(ArtworkFetch {
+            id: spoolframe_server::test_support::POSTER.into(),
+        }),
+    ];
+    let stranger = endpoint().await;
+    let (dialed, _) = Dialed::connect(&stranger, sa.server.addr(), hello("bbbbbbbbbbbbbbbb"))
+        .await
+        .unwrap();
+    for ask in &asks {
+        assert!(reset(&dialed, ask).await, "{ask:?}");
+    }
+    dialed.redeem(redeem(&code_of(&link))).await.unwrap();
+    let held = endpoint().await;
+    let (dialed, info) = Dialed::connect(&held, sa.server.addr(), hello("bbbbbbbbbbbbbbbb"))
+        .await
+        .unwrap();
+    assert_eq!(info.standing, Standing::KeyHeld);
+    for ask in &asks {
+        assert!(reset(&dialed, ask).await, "{ask:?}");
+    }
     sa.stop().await;
 }
 
@@ -579,6 +714,99 @@ async fn a_federation_invite_takes_no_role() {
         "{refused:?}"
     );
     sa.stop().await;
+}
+
+/// P8-03's share call for the QR flow, on the client protocol: an admin of
+/// SB, recently signed in, from an app that names the feature, shares
+/// SB's Movies with SA, which SB just paired with. Anyone else, or an app
+/// that does not name the feature, shares nothing.
+#[tokio::test]
+async fn an_admin_s_app_shares_libraries_with_a_paired_server() {
+    use spoolframe_protocol::federation::ShareLibraries;
+    use spoolframe_protocol::{Reply, experimental::FEDERATION};
+    const PASSWORD: &str = "correct horse";
+    let sa = server("fed-share-sa", "Alice's server").await;
+    let sb = server("fed-share-sb", "Bob's server").await;
+    sb.add_user("bob", PASSWORD, None).await;
+    sb.store
+        .set_role("bob", spoolframe_types::Role::Admin)
+        .await
+        .unwrap();
+    sb.add_user("guest", PASSWORD, None).await;
+    federation(&sb)
+        .redeem_link(&pairing_link(&sa, None).await, "bob")
+        .await
+        .unwrap();
+    let movies: spoolframe_types::LibraryId = "plex:1".parse().unwrap();
+    let share = |server_id: &str, library: &spoolframe_types::LibraryId| {
+        Request::ShareLibraries(ShareLibraries {
+            server_id: server_id.into(),
+            libraries: vec![library.clone()],
+        })
+    };
+    let sa_id = sa.server_id.as_str();
+
+    let app = sb.client().await;
+    app.hello_naming(crate::support::mkv_capabilities(), &[FEDERATION])
+        .await;
+    let bob = app.login("bob", PASSWORD).await;
+    assert_eq!(
+        app.call(Some(&bob), share(sa_id, &movies)).await,
+        Response::Ok(Reply::LibrariesShared {
+            libraries: vec![movies.clone()]
+        })
+    );
+    let peer = sb
+        .store
+        .live_peer_by_server_id(sa_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let grants = sb.store.live_grants(&peer.id).await.unwrap();
+    assert_eq!(
+        grants
+            .iter()
+            .map(|g| (g.library.as_str(), g.granted_by.as_str()))
+            .collect::<Vec<_>>(),
+        [("plex:1", "bob")]
+    );
+    assert!(matches!(
+        app.call(Some(&bob), share(sa_id, &"plex:9".parse().unwrap()))
+            .await,
+        Response::Err(Error::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        app.call(Some(&bob), share("aaaaaaaaaaaaaaaa", &movies))
+            .await,
+        Response::Err(Error::NotFound { .. })
+    ));
+    let guest = app.login("guest", PASSWORD).await;
+    assert!(matches!(
+        app.call(Some(&guest), share(sa_id, &movies)).await,
+        Response::Err(Error::AdminRequired)
+    ));
+
+    // An app that does not name the feature is not heard.
+    let plain = sb.client().await;
+    plain.hello().await;
+    let bob = plain.login("bob", PASSWORD).await;
+    assert!(matches!(
+        plain.call(Some(&bob), share(sa_id, &movies)).await,
+        Response::Err(Error::Unsupported { .. })
+    ));
+
+    // Nor is an admin who did not sign in recently.
+    sb.clock
+        .advance(spoolframe_server::auth::RECENT_SIGN_IN + std::time::Duration::from_secs(1));
+    let bob = app.login("bob", PASSWORD).await;
+    sb.clock
+        .advance(spoolframe_server::auth::RECENT_SIGN_IN + std::time::Duration::from_secs(1));
+    assert!(matches!(
+        app.call(Some(&bob), share(sa_id, &movies)).await,
+        Response::Err(Error::RecentSignInRequired)
+    ));
+    sa.stop().await;
+    sb.stop().await;
 }
 
 // P8-01's admin surface: the `federation_*` methods, each server with its
@@ -943,6 +1171,109 @@ mod admin {
         sa.server.stop().await;
     }
 
+    /// P8-03: SA's admin shares Movies with the paired server, sees it
+    /// listed, and revokes it; a library SA does not serve is refused, and
+    /// unpairing revokes whatever is still shared.
+    #[tokio::test]
+    async fn an_admin_shares_a_library_with_a_paired_server_and_revokes_it() {
+        let sa = Site::start("fed-admin-grant-sa", "Alice's server", "alice", true).await;
+        let sb = Site::start("fed-admin-grant-sb", "Bob's server", "bob", true).await;
+        pair(&sa, &sb).await;
+        let peer = sa.peers().await.remove(0).id;
+        let grant = sa
+            .admin
+            .peer_grant_add(peer.clone(), "plex:1".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                grant.peer.as_str(),
+                grant.library.as_str(),
+                grant.granted_by.as_str()
+            ),
+            (peer.as_str(), "plex:1", "alice")
+        );
+        // Shared again, the grant is the one there was.
+        assert_eq!(
+            sa.admin
+                .peer_grant_add(peer.clone(), "plex:1".into())
+                .await
+                .unwrap(),
+            grant
+        );
+        assert_eq!(
+            code(
+                sa.admin
+                    .peer_grant_add(peer.clone(), "plex:9".into())
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::INVALID_INPUT
+        );
+        assert_eq!(
+            code(
+                sa.admin
+                    .peer_grant_add("no-such".into(), "plex:1".into())
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::NO_SUCH_PEER
+        );
+        assert_eq!(
+            sa.admin.peer_grant_list(peer.clone()).await.unwrap(),
+            std::slice::from_ref(&grant)
+        );
+        // Only SA shares it: SB has nothing shared with SA.
+        let sa_on_sb = sb.peers().await.remove(0).id;
+        assert!(
+            sb.admin
+                .peer_grant_list(sa_on_sb.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // SB's admin syncs what SA shares now (P8-02).
+        sb.admin.peer_refresh(sa_on_sb).await.unwrap();
+        assert_eq!(
+            code(sb.admin.peer_refresh("no-such".into()).await.unwrap_err()),
+            error_code::NO_SUCH_PEER
+        );
+
+        sa.admin
+            .peer_grant_revoke(peer.clone(), "plex:1".into())
+            .await
+            .unwrap();
+        assert!(
+            sa.admin
+                .peer_grant_list(peer.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            code(
+                sa.admin
+                    .peer_grant_revoke(peer.clone(), "plex:1".into())
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::NO_SUCH_GRANT
+        );
+
+        sa.admin
+            .peer_grant_add(peer.clone(), "plex:1".into())
+            .await
+            .unwrap();
+        sa.admin.peer_revoke(peer.clone()).await.unwrap();
+        assert!(sa.server.store.live_grants(&peer).await.unwrap().is_empty());
+        assert_eq!(
+            code(sa.admin.peer_grant_list(peer).await.unwrap_err()),
+            error_code::NO_SUCH_PEER
+        );
+        sa.server.stop().await;
+        sb.server.stop().await;
+    }
+
     /// What changes a pair needs an admin who signed in recently; a
     /// consumer is told no; listing needs neither recency nor change.
     #[tokio::test]
@@ -955,6 +1286,10 @@ mod admin {
         );
         assert_eq!(
             code(guest.peer_revoke("x".into()).await.unwrap_err()),
+            error_code::FORBIDDEN
+        );
+        assert_eq!(
+            code(guest.peer_grant_list("x".into()).await.unwrap_err()),
             error_code::FORBIDDEN
         );
         sa.server
@@ -975,6 +1310,13 @@ mod admin {
                 .key_reject("x".into(), "y".into())
                 .await
                 .map(|_| ()),
+            sa.admin
+                .peer_grant_add("x".into(), "plex:1".into())
+                .await
+                .map(|_| ()),
+            sa.admin
+                .peer_grant_revoke("x".into(), "plex:1".into())
+                .await,
         ] {
             assert_eq!(
                 code(refused.unwrap_err()),
@@ -1052,11 +1394,11 @@ mod app {
     use super::*;
     use crate::support::mkv_capabilities;
 
-    const PASSWORD: &str = "correct horse";
+    pub(super) const PASSWORD: &str = "correct horse";
 
     /// An app on loopback that asks for `experimental` (and lists invite
     /// lookup), signed in to `server` as `username`.
-    async fn signed_in(
+    pub(super) async fn signed_in(
         server: &TestServer,
         username: &str,
         experimental: Experimental,
@@ -1104,7 +1446,7 @@ mod app {
             .unwrap()
     }
 
-    const FEDERATION: Experimental = Experimental {
+    pub(super) const FEDERATION: Experimental = Experimental {
         http_playback: false,
         federation: true,
     };
@@ -1239,5 +1581,1598 @@ mod app {
             Err(SdkError::RecentSignInRequired)
         ));
         sb.stop().await;
+    }
+}
+
+// P8-02 on the sharing server: a pair's sync is answered from SA's
+// catalog (the fake Plex catalog) for a library shared with it, as
+// changes since its cursor or the whole library, and its artwork only for
+// what it was sent.
+
+mod sharing {
+    use spoolframe_federation::Pages;
+    use spoolframe_protocol::federation::{RemoteKind, SyncLibrary, SyncMode, SyncPage};
+    use spoolframe_server::test_support::{POSTER, poster_of};
+    use spoolframe_types::{MediaId, MediaKind, Namespace};
+
+    use super::*;
+
+    /// SA, and SB's key paired with it as `bbbbbbbbbbbbbbbb`: the
+    /// connection, and the pair's id on SA. The endpoint is kept in the
+    /// connection's place: dropped, it closes. SA walks its library at
+    /// each sync, for the tests that change it between two.
+    async fn paired(test: &str) -> (TestServer, Dialed, String, Endpoint) {
+        let sa = server(test, "Alice's server").await;
+        federation(&sa).set_walk_reuse(std::time::Duration::ZERO);
+        let link = pairing_link(&sa, None).await;
+        let sb = endpoint().await;
+        let (dialed, _) = Dialed::connect(&sb, sa.server.addr(), hello("bbbbbbbbbbbbbbbb"))
+            .await
+            .unwrap();
+        dialed.redeem(redeem(&code_of(&link))).await.unwrap();
+        let peer = sa
+            .store
+            .live_peer_by_server_id("bbbbbbbbbbbbbbbb")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        (sa, dialed, peer, sb)
+    }
+
+    async fn share(sa: &TestServer, peer: &str, library: &str) {
+        federation(sa)
+            .share(peer, &[library.parse().unwrap()], "alice")
+            .await
+            .unwrap();
+    }
+
+    /// Every page of a sync, read to the last.
+    async fn read(mut pages: Pages) -> Result<Vec<SyncPage>, DialError> {
+        let mut read = Vec::new();
+        while let Some(page) = pages.next().await? {
+            read.push(page);
+        }
+        Ok(read)
+    }
+
+    async fn sync(
+        dialed: &Dialed,
+        library: &str,
+        since: Option<&str>,
+    ) -> Result<(SyncMode, String, Vec<String>, Vec<String>), DialError> {
+        let pages = read(
+            dialed
+                .sync(SyncLibrary {
+                    library: library.into(),
+                    since: since.map(str::to_owned),
+                })
+                .await?,
+        )
+        .await?;
+        let mut items: Vec<String> = pages
+            .iter()
+            .flat_map(|p| p.items.iter().map(|i| i.id.clone()))
+            .collect();
+        items.sort();
+        let removed = pages.iter().flat_map(|p| p.removed.clone()).collect();
+        Ok((pages[0].mode, pages[0].cursor.clone(), items, removed))
+    }
+
+    fn id(kind: MediaKind, key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, kind, key).unwrap()
+    }
+
+    /// Nothing shared, nothing answered; Movies shared, the pair gets the
+    /// whole of it, then only what changed; a cursor SA does not keep gets
+    /// the whole of it again.
+    #[tokio::test]
+    async fn a_pair_gets_a_shared_library_whole_then_its_changes() {
+        let (sa, dialed, peer, _sb) = paired("fed-sharing-movies").await;
+        assert!(dialed.libraries().await.unwrap().is_empty());
+        assert!(matches!(
+            sync(&dialed, "plex:1", None).await,
+            Err(DialError::NotShared)
+        ));
+        share(&sa, &peer, "plex:1").await;
+        let libraries = dialed.libraries().await.unwrap();
+        assert_eq!(
+            libraries
+                .iter()
+                .map(|l| (l.id.as_str(), l.title.as_str()))
+                .collect::<Vec<_>>(),
+            [("plex:1", "Movies")]
+        );
+
+        let pages = read(
+            dialed
+                .sync(SyncLibrary {
+                    library: "plex:1".into(),
+                    since: None,
+                })
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].mode, SyncMode::Snapshot);
+        let film = &pages[0].items[0];
+        assert_eq!(
+            (film.id.as_str(), film.kind, film.title.as_str()),
+            ("plex:movie:1", RemoteKind::Movie, "Alien")
+        );
+        assert_eq!(film.external_ids, ["test://1"]);
+        assert_eq!(film.duration_ms, Some(7_020_000));
+        assert_eq!(film.hash, film.digest());
+        let first = pages[0].cursor.clone();
+
+        // Nothing changed: no items, and the cursor stands.
+        let (mode, cursor, items, removed) = sync(&dialed, "plex:1", Some(&first)).await.unwrap();
+        assert_eq!((mode, cursor.as_str()), (SyncMode::Changes, first.as_str()));
+        assert!(items.is_empty() && removed.is_empty());
+
+        // The film goes: it is named as removed.
+        sa.catalog.remove(&id(MediaKind::Movie, "1"));
+        let (mode, cursor, items, removed) = sync(&dialed, "plex:1", Some(&first)).await.unwrap();
+        assert_eq!(mode, SyncMode::Changes);
+        assert_ne!(cursor, first);
+        assert!(items.is_empty());
+        assert_eq!(removed, ["plex:movie:1"]);
+
+        let (mode, _, items, _) = sync(&dialed, "plex:1", Some("no-such-cursor"))
+            .await
+            .unwrap();
+        assert_eq!((mode, items.len()), (SyncMode::Snapshot, 0));
+        sa.stop().await;
+    }
+
+    /// A sync within a minute of a walk of the library is answered from
+    /// that walk (H2): a pair asking again and again does not make SA walk
+    /// it again, and what changed since shows at a later sync.
+    #[tokio::test]
+    async fn a_library_is_walked_at_most_once_a_minute() {
+        let (sa, dialed, peer, _sb) = paired("fed-sharing-walks").await;
+        federation(&sa).set_walk_reuse(spoolframe_server::federation::WALK_REUSE);
+        let alien = id(MediaKind::Movie, "1");
+        sa.catalog.not_yet(&alien);
+        share(&sa, &peer, "plex:1").await;
+        let (_, first, items, _) = sync(&dialed, "plex:1", None).await.unwrap();
+        assert!(items.is_empty());
+        sa.catalog.gain(&alien);
+        let (_, cursor, items, _) = sync(&dialed, "plex:1", Some(&first)).await.unwrap();
+        assert_eq!((cursor.as_str(), items.len()), (first.as_str(), 0));
+        federation(&sa).set_walk_reuse(std::time::Duration::ZERO);
+        let (_, _, items, _) = sync(&dialed, "plex:1", Some(&first)).await.unwrap();
+        assert_eq!(items, ["plex:movie:1"]);
+        sa.stop().await;
+    }
+
+    /// A pair's assertions are paced (H2): past its bucket, SA cannot
+    /// answer now.
+    #[tokio::test]
+    async fn a_pair_asking_too_fast_is_told_to_wait() {
+        use spoolframe_protocol::federation::{AssertUser, AssertionRefused, TokenScope};
+        let (sa, dialed, _peer, _sb) = paired("fed-sharing-paced").await;
+        let bogus = || AssertUser {
+            user: "not-a-uuid".into(),
+            display_name: "Bob".into(),
+            client_endpoint: "nowhere".into(),
+            item: "plex:movie:1".into(),
+            scope: TokenScope::Play,
+        };
+        let refused = |e: DialError| match e {
+            DialError::NotGranted(reason) => reason,
+            e => panic!("{e:?}"),
+        };
+        for _ in 0..30 {
+            let reason = refused(dialed.assert_user(bogus()).await.unwrap_err());
+            assert_eq!(reason, AssertionRefused::InvalidUser);
+        }
+        let reason = refused(dialed.assert_user(bogus()).await.unwrap_err());
+        assert_eq!(reason, AssertionRefused::Unavailable);
+        sa.stop().await;
+    }
+
+    /// Music replicates whole: the artist, its albums and their tracks. A
+    /// track the library gains comes as a change; a pair that did not
+    /// take the last answer up (it names the cursor before) gets the
+    /// changes since the one it has.
+    #[tokio::test]
+    async fn music_replicates_artists_albums_and_tracks() {
+        let (sa, dialed, peer, _sb) = paired("fed-sharing-music").await;
+        sa.catalog.serve_music();
+        let late = id(MediaKind::Track, "35");
+        sa.catalog.not_yet(&late);
+        share(&sa, &peer, "plex:2").await;
+        let (mode, first, items, _) = sync(&dialed, "plex:2", None).await.unwrap();
+        assert_eq!(mode, SyncMode::Snapshot);
+        assert_eq!(
+            items,
+            [
+                "plex:album:31",
+                "plex:album:34",
+                "plex:artist:30",
+                "plex:track:32",
+                "plex:track:33"
+            ]
+        );
+        sa.catalog.gain(&late);
+        let (mode, second, items, _) = sync(&dialed, "plex:2", Some(&first)).await.unwrap();
+        // The album's listing of its tracks changed with it.
+        assert_eq!(mode, SyncMode::Changes);
+        assert!(items.contains(&"plex:track:35".to_owned()), "{items:?}");
+        // Asked again from the first cursor, as after a lost answer: the
+        // same changes, under a cursor of their own, and the answer not
+        // taken up is forgotten.
+        let (mode, third, again, _) = sync(&dialed, "plex:2", Some(&first)).await.unwrap();
+        assert_eq!((mode, again), (SyncMode::Changes, items));
+        assert_ne!(third, second);
+        let (mode, _, _, _) = sync(&dialed, "plex:2", Some(&second)).await.unwrap();
+        assert_eq!(mode, SyncMode::Snapshot);
+        sa.stop().await;
+    }
+
+    /// Artwork goes only for what was sent, while its library is shared;
+    /// revoked, the library and its artwork are refused as not shared.
+    #[tokio::test]
+    async fn artwork_goes_only_for_items_sent_while_shared() {
+        let (sa, dialed, peer, _sb) = paired("fed-sharing-artwork").await;
+        sa.catalog.show_posters();
+        share(&sa, &peer, "plex:1").await;
+        let poster = poster_of("1").to_string();
+        // Not sent yet.
+        assert!(matches!(
+            dialed.artwork(&poster).await,
+            Err(DialError::NotShared)
+        ));
+        let (_, cursor, _, _) = sync(&dialed, "plex:1", None).await.unwrap();
+        let (content_type, bytes) = dialed.artwork(&poster).await.unwrap();
+        assert_eq!(content_type, "image/png");
+        assert!(!bytes.is_empty());
+        // An image of SA's that no item sent names.
+        assert!(matches!(
+            dialed.artwork(&format!("plex:{POSTER}")).await,
+            Err(DialError::NotShared)
+        ));
+
+        federation(&sa)
+            .unshare(&peer, "plex:1", "alice")
+            .await
+            .unwrap();
+        assert!(dialed.libraries().await.unwrap().is_empty());
+        assert!(matches!(
+            sync(&dialed, "plex:1", Some(&cursor)).await,
+            Err(DialError::NotShared)
+        ));
+        assert!(matches!(
+            dialed.artwork(&poster).await,
+            Err(DialError::NotShared)
+        ));
+        sa.stop().await;
+    }
+}
+
+// P8-02 on the server a library is shared with: SB pairs with SA, SA
+// shares a library, and SB syncs it into its cache and serves it from
+// there under `fed:` ids, with SA online or not. SA's library is the
+// fake Plex catalog; SB's own catalog is a composite with no library of
+// its own, which carries the cache as one more backend.
+
+mod replica {
+    use std::time::Duration;
+
+    use spoolframe_catalog::{Catalog, CatalogError, Page};
+    use spoolframe_plex::PlexCatalog;
+    use spoolframe_protocol::{Reply, SessionId};
+    use spoolframe_server::catalog::{Composite, LiveCatalog, PlexSource};
+    use spoolframe_server::store::watch::WatchUpdate;
+    use spoolframe_server::test_support::{movie, poster_of};
+    use spoolframe_types::{ArtworkId, Item, LibraryId, MediaId, MediaKind, Namespace};
+
+    use super::*;
+
+    /// SB on `dir`, its catalog the composite carrying its cache.
+    async fn sb_in(dir: crate::support::StateDir) -> (TestServer, Arc<LiveCatalog>) {
+        sb_with(dir, ServerOptions::default()).await
+    }
+
+    /// A Plex server with nothing in it, which answers everything with an
+    /// empty list: SB's own, so Home and search have a Plex to ask.
+    async fn quiet_plex() -> String {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let pms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "MediaContainer": { "size": 0, "totalSize": 0, "Metadata": [], "Hub": [] }
+            })))
+            .mount(&pms)
+            .await;
+        let uri = pms.uri();
+        // Kept for the rest of the test run: a test's servers stop before
+        // it ends, and the mock outlives them.
+        std::mem::forget(pms);
+        uri
+    }
+
+    /// As [`sb_in`], run as `options` say.
+    async fn sb_with(
+        dir: crate::support::StateDir,
+        options: ServerOptions,
+    ) -> (TestServer, Arc<LiveCatalog>) {
+        let plex = PlexCatalog::new(quiet_plex().await.parse().unwrap(), None).unwrap();
+        let composite = Composite::new(
+            vec![PlexSource {
+                id: spoolframe_server::config::FIRST_PLEX_SERVER.to_owned(),
+                name: "Bob's Plex".into(),
+                catalog: Arc::new(plex),
+            }],
+            Some(Vec::new()),
+        );
+        let live = Arc::new(LiveCatalog::new(Some(Arc::new(composite))));
+        let sb = TestServer::start_with(
+            dir,
+            ServerOptions {
+                name: "Bob's server".into(),
+                federation: true,
+                catalog: Some(live.clone()),
+                ..options
+            },
+        )
+        .await;
+        (sb, live)
+    }
+
+    /// SA and SB paired, SB having redeemed SA's invite: the pair's id on
+    /// SA (SB's row) and on SB (SA's row).
+    struct Pair {
+        sa: TestServer,
+        sb: TestServer,
+        cache: Arc<LiveCatalog>,
+        sb_on_sa: String,
+        sa_on_sb: String,
+    }
+
+    impl Pair {
+        async fn start(test: &str) -> Self {
+            Self::start_with(test, ServerOptions::default()).await
+        }
+
+        /// With SB run as `options` say.
+        async fn start_with(test: &str, options: ServerOptions) -> Self {
+            let sa = server(&format!("{test}-sa"), "Alice's server").await;
+            federation(&sa).set_walk_reuse(std::time::Duration::ZERO);
+            let (sb, cache) = sb_with(fresh_dir(&format!("{test}-sb")).await, options).await;
+            let sa_on_sb = federation(&sb)
+                .redeem_link(&pairing_link(&sa, None).await, "bob")
+                .await
+                .unwrap()
+                .id;
+            let sb_on_sa = sa
+                .store
+                .live_peer_by_endpoint(&sb.server.id().to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            Self {
+                sa,
+                sb,
+                cache,
+                sb_on_sa,
+                sa_on_sb,
+            }
+        }
+
+        async fn share(&self, library: &str) {
+            federation(&self.sa)
+                .share(&self.sb_on_sa, &[library.parse().unwrap()], "alice")
+                .await
+                .unwrap();
+        }
+
+        async fn refresh(&self) {
+            federation(&self.sb).refresh(&self.sa_on_sb).await.unwrap();
+        }
+
+        fn origin(&self) -> &str {
+            self.sa.server_id.as_str()
+        }
+
+        /// SA's `id` as SB serves it.
+        /// SB's replica woken, and its posters fetched: `count` files.
+        async fn posters_fetched(&self, count: usize) {
+            // A setting applied wakes the replica before its tick.
+            federation(&self.sb).set_replica(
+                std::time::Duration::from_secs(3600),
+                spoolframe_server::store::federation_cache::FileLimits {
+                    per_origin: 1 << 30,
+                    total: 1 << 30,
+                },
+            );
+            let files = self.files();
+            until(|| {
+                let files = files.clone();
+                async move { kept(&files) == count }
+            })
+            .await;
+        }
+
+        /// Where SB keeps SA's images.
+        fn files(&self) -> std::path::PathBuf {
+            self.sb
+                .dir
+                .join("cache")
+                .join("federation")
+                .join(self.origin())
+        }
+
+        fn fed(&self, id: &MediaId) -> MediaId {
+            MediaId::federated(self.origin(), id).unwrap()
+        }
+
+        fn fed_library(&self, id: &str) -> LibraryId {
+            LibraryId::federated(self.origin(), &id.parse().unwrap()).unwrap()
+        }
+
+        fn fed_artwork(&self, id: &ArtworkId) -> ArtworkId {
+            ArtworkId::federated(self.origin(), id).unwrap()
+        }
+
+        /// The titles of the first page of SA's `library` in SB's cache.
+        async fn titles(&self, library: &str) -> Result<Vec<String>, CatalogError> {
+            let page = self
+                .cache
+                .items(
+                    &self.fed_library(library),
+                    Page {
+                        offset: 0,
+                        limit: 50,
+                    },
+                )
+                .await?;
+            Ok(page.items.iter().map(title).collect())
+        }
+
+        async fn stop(self) {
+            self.sa.stop().await;
+            self.sb.stop().await;
+        }
+    }
+
+    fn title(item: &Item) -> String {
+        match item {
+            Item::Movie(m) => m.title.clone(),
+            Item::Show(s) => s.title.clone(),
+            Item::Season(s) => s.title.clone(),
+            Item::Episode(e) => e.title.clone(),
+            Item::Artist(a) => a.name.clone(),
+            Item::Album(a) => a.title.clone(),
+            Item::Track(t) => t.title.clone(),
+        }
+    }
+
+    fn id(kind: MediaKind, key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, kind, key).unwrap()
+    }
+
+    /// Wait for `done`, at most ten seconds.
+    /// How many files are in `dir`.
+    fn kept(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, |d| d.filter(|f| f.is_ok()).count())
+    }
+
+    async fn until<F, Fut>(mut done: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..100 {
+            if done().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("not in ten seconds");
+    }
+
+    /// The whole of it: SA shares Movies, SB syncs and serves the film
+    /// from its cache under its `fed:` id, with its external ids and the
+    /// poster fetched as it came. Nothing of it is in SB's own libraries.
+    #[tokio::test]
+    async fn a_shared_library_is_cached_and_served_from_the_cache() {
+        let pair = Pair::start("fed-replica-movies").await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        assert!(federation(&pair.sb).online(pair.origin()));
+        assert_eq!(pair.titles("plex:1").await.unwrap(), ["Alien"]);
+        let alien = pair.fed(movie().id());
+        let found = pair.cache.item(&alien).await.unwrap();
+        assert_eq!(found.item.id(), &alien);
+        assert_eq!(found.external_ids, ["test://1"]);
+        let Item::Movie(film) = &found.item else {
+            panic!("not a film");
+        };
+        assert_eq!(film.year, Some(1979));
+        let poster = pair.fed_artwork(&poster_of("1"));
+        assert_eq!(film.artwork[0].id, poster);
+        let image = pair.cache.artwork(&poster).await.unwrap();
+        assert_eq!(image.content_type, "image/png");
+        // Its file gone, it is fetched from SA again when asked for.
+        let files = pair.sb.dir.join("cache").join("federation");
+        assert!(files.join(pair.origin()).is_dir());
+        std::fs::remove_dir_all(&files).unwrap();
+        assert_eq!(pair.cache.artwork(&poster).await.unwrap(), image);
+        assert!(files.join(pair.origin()).is_dir());
+        assert_eq!(
+            pair.cache.library_of(&alien).await.unwrap(),
+            Some(pair.fed_library("plex:1"))
+        );
+        // SB's own libraries are as they were: none. The client protocol
+        // adds the cache's, and only for an app that names the feature.
+        assert!(pair.cache.libraries().await.unwrap().is_empty());
+        pair.stop().await;
+    }
+
+    /// Bob on SB, signed in on an app that names the experimental feature
+    /// (`federated`) or one that does not.
+    async fn bob_on(pair: &Pair, federated: bool) -> (TestClient, SessionId) {
+        if pair.sb.store.user_by_name("bob").await.unwrap().is_none() {
+            pair.sb.add_user("bob", "correct horse", None).await;
+        }
+        let app = pair.sb.client().await;
+        let experimental: &[&str] = if federated {
+            &[spoolframe_protocol::experimental::FEDERATION]
+        } else {
+            &[]
+        };
+        app.hello_naming(crate::support::mkv_capabilities(), experimental)
+            .await;
+        let bob = app.login("bob", "correct horse").await;
+        (app, bob)
+    }
+
+    /// Bob is 40 minutes into `id` on SB.
+    async fn bob_watched(pair: &Pair, id: &MediaId) {
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        pair.sb
+            .store
+            .save_watch(
+                spoolframe_server::principal::Principal::LocalUser(bob),
+                WatchUpdate {
+                    media_id: &id.to_string(),
+                    show_id: None,
+                    external_ids: &[],
+                    position_ms: Some(2_400_000),
+                    duration_ms: Some(7_020_000),
+                    watched: false,
+                    unhide: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn libraries(app: &TestClient, bob: &SessionId) -> Vec<spoolframe_types::Library> {
+        match app.call(Some(bob), Request::Libraries).await {
+            Response::Ok(Reply::Libraries { libraries }) => libraries,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn home(app: &TestClient, bob: &SessionId) -> spoolframe_protocol::HomeScreen {
+        match app.call(Some(bob), Request::Home).await {
+            Response::Ok(Reply::Home(home)) => home,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The ids a search for `query` finds, its top match first.
+    async fn found(app: &TestClient, bob: &SessionId, query: &str) -> Vec<MediaId> {
+        let results = match app
+            .call(Some(bob), Request::Search(crate::support::search(query)))
+            .await
+        {
+            Response::Ok(Reply::Search(results)) => results,
+            other => panic!("{other:?}"),
+        };
+        let top = match results.top {
+            Some(spoolframe_protocol::TopResult::Item(item)) => Some(item.id().clone()),
+            _ => None,
+        };
+        top.into_iter()
+            .chain(
+                results
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.items.iter().map(|i| i.id().clone())),
+            )
+            .collect()
+    }
+
+    fn ids(items: &[Item]) -> Vec<MediaId> {
+        items.iter().map(|i| i.id().clone()).collect()
+    }
+
+    /// P8-02's client exposure: an app that names the feature lists SA's
+    /// library with its server, finds SA's film, has it in Continue
+    /// watching and in SA's own Home row, which Bob turns off and on.
+    #[tokio::test]
+    async fn an_app_naming_the_feature_browses_and_finds_what_sa_shares() {
+        let pair = Pair::start("fed-exposure").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        bob_watched(&pair, &alien).await;
+        let server = spoolframe_types::LibraryServer {
+            server_id: pair.origin().to_owned(),
+            name: "Alice's server".into(),
+            online: true,
+        };
+        let listed = libraries(&app, &bob).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, pair.fed_library("plex:1"));
+        assert_eq!(listed[0].server.as_ref(), Some(&server));
+        let screen = home(&app, &bob).await;
+        assert_eq!(ids(&screen.continue_watching), std::slice::from_ref(&alien));
+        assert!(screen.unavailable.is_empty());
+        assert_eq!(screen.servers.len(), 1);
+        assert_eq!(screen.servers[0].server, server);
+        assert!(screen.servers[0].shown);
+        assert_eq!(ids(&screen.servers[0].items), std::slice::from_ref(&alien));
+        assert_eq!(
+            found(&app, &bob, "alien").await,
+            std::slice::from_ref(&alien)
+        );
+        let turned = |shown: bool| Request::SetServerRow {
+            server_id: pair.origin().to_owned(),
+            shown,
+        };
+        assert_eq!(
+            app.call(Some(&bob), turned(false)).await,
+            Response::Ok(Reply::Done)
+        );
+        let screen = home(&app, &bob).await;
+        assert!(!screen.servers[0].shown);
+        assert!(screen.servers[0].items.is_empty());
+        assert_eq!(
+            ids(&screen.continue_watching),
+            std::slice::from_ref(&alien),
+            "a server's items stay in Continue watching"
+        );
+        app.call(Some(&bob), turned(true)).await;
+        assert!(home(&app, &bob).await.servers[0].shown);
+        assert!(matches!(
+            app.call(
+                Some(&bob),
+                Request::SetServerRow {
+                    server_id: "bbbbbbbbbbbbbbbb".into(),
+                    shown: false,
+                },
+            )
+            .await,
+            Response::Err(Error::NotFound { .. })
+        ));
+        pair.stop().await;
+    }
+
+    /// An app that does not name the feature sees SB as if it had no
+    /// pairs: no library, no Home row, no hit, no Continue watching card
+    /// of SA's, and no `fed:` id anywhere; it may not set a server's row.
+    #[tokio::test]
+    async fn an_app_not_naming_the_feature_sees_nothing_of_sa() {
+        let pair = Pair::start("fed-exposure-old").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let (app, bob) = bob_on(&pair, false).await;
+        bob_watched(&pair, &pair.fed(movie().id())).await;
+        assert!(libraries(&app, &bob).await.is_empty());
+        let screen = home(&app, &bob).await;
+        assert_eq!(screen, spoolframe_protocol::HomeScreen::default());
+        assert!(found(&app, &bob, "alien").await.is_empty());
+        assert!(matches!(
+            app.call(
+                Some(&bob),
+                Request::SetServerRow {
+                    server_id: pair.origin().to_owned(),
+                    shown: false,
+                },
+            )
+            .await,
+            Response::Err(Error::Unsupported { .. })
+        ));
+        // Nor by id, whatever the request (L1).
+        let alien = pair.fed(movie().id());
+        for request in [
+            Request::Item { id: alien.clone() },
+            Request::MarkWatched { id: alien.clone() },
+            Request::Items {
+                library: pair.fed_library("plex:1"),
+                offset: 0,
+                limit: 10,
+            },
+        ] {
+            assert!(
+                matches!(
+                    app.call(Some(&bob), request.clone()).await,
+                    Response::Err(Error::NotFound { .. })
+                ),
+                "{request:?}"
+            );
+        }
+        pair.stop().await;
+    }
+
+    /// Unpaired, SA's film Bob was watching stays in his Continue
+    /// watching, listed as no longer available, for an app that names the
+    /// feature; and SA's library and row are gone.
+    #[tokio::test]
+    async fn after_unpairing_continue_watching_says_sa_s_film_is_no_longer_available() {
+        let pair = Pair::start("fed-exposure-unpaired").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        bob_watched(&pair, &alien).await;
+        federation(&pair.sb)
+            .unpair(&pair.sa_on_sb, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        let screen = home(&app, &bob).await;
+        assert_eq!(ids(&screen.continue_watching), std::slice::from_ref(&alien));
+        assert_eq!(screen.unavailable, [alien]);
+        assert!(screen.servers.is_empty());
+        assert!(libraries(&app, &bob).await.is_empty());
+        let (old, bob_old) = bob_on(&pair, false).await;
+        assert!(home(&old, &bob_old).await.continue_watching.is_empty());
+        pair.stop().await;
+    }
+
+    /// An app that names the feature is told `LibrariesChanged` when SA
+    /// stops sharing a library, and when SA goes offline.
+    #[tokio::test]
+    async fn an_app_naming_the_feature_is_told_when_the_libraries_change() {
+        use spoolframe_protocol::Event;
+        use spoolframe_protocol::codec::read_frame;
+        use spoolframe_protocol::streams::uni;
+        use tokio::io::AsyncReadExt;
+        let pair = Pair::start("fed-exposure-told").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let (app, bob) = bob_on(&pair, true).await;
+        let mut events = tokio::time::timeout(Duration::from_secs(5), app.conn.accept_uni())
+            .await
+            .expect("no events stream within 5 s")
+            .unwrap();
+        assert_eq!(events.read_u8().await.unwrap(), uni::EVENTS);
+        // Any signed-in request makes the connection one that is told.
+        libraries(&app, &bob).await;
+        let mut next = async || loop {
+            let event =
+                tokio::time::timeout(Duration::from_secs(10), read_frame::<_, Event>(&mut events))
+                    .await
+                    .expect("no event within 10 s")
+                    .unwrap();
+            if !matches!(event, Event::ServerAddresses { .. }) {
+                return event;
+            }
+        };
+        federation(&pair.sa)
+            .unshare(&pair.sb_on_sa, "plex:1", "alice")
+            .await
+            .unwrap();
+        pair.refresh().await;
+        assert_eq!(next().await, Event::LibrariesChanged);
+        pair.sa.stop().await;
+        assert_eq!(next().await, Event::LibrariesChanged);
+        pair.sb.stop().await;
+    }
+
+    /// Each origin's artwork takes at most `federation.cache_max_mb`:
+    /// past it, the least recently used file goes, and an image whose file
+    /// went is fetched again when it is asked for.
+    #[tokio::test]
+    async fn artwork_past_the_cap_goes_and_is_fetched_again() {
+        let pair = Pair::start_with(
+            "fed-replica-cap",
+            ServerOptions {
+                federation_cache_max_bytes: 1,
+                ..ServerOptions::default()
+            },
+        )
+        .await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let files = pair
+            .sb
+            .dir
+            .join("cache")
+            .join("federation")
+            .join(pair.origin());
+        let kept = |dir: &std::path::Path| {
+            std::fs::read_dir(dir).map_or(0, |d| d.filter(|f| f.is_ok()).count())
+        };
+        assert_eq!(kept(&files), 0, "the poster is over the cap");
+        let poster = pair.fed_artwork(&poster_of("1"));
+        assert!(pair.cache.artwork(&poster).await.is_ok());
+        assert_eq!(kept(&files), 0);
+        pair.stop().await;
+    }
+
+    /// A sync's posters are fetched by the replica's next tick, outside
+    /// the sync (M5).
+    #[tokio::test]
+    async fn posters_come_at_the_replica_s_next_tick() {
+        let pair = Pair::start("fed-replica-posters").await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair.posters_fetched(1).await;
+        pair.stop().await;
+    }
+
+    /// An image that is not one is neither kept nor served (L7), whatever
+    /// type it says it is.
+    #[tokio::test]
+    async fn only_an_image_is_kept_of_a_paired_server_s_artwork() {
+        let pair = Pair::start("fed-replica-not-images").await;
+        pair.sa.catalog.show_posters();
+        pair.sa.catalog.bogus_images("text/html");
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let poster = pair.fed_artwork(&poster_of("1"));
+        for content_type in ["text/html", "image/png"] {
+            pair.sa.catalog.bogus_images(content_type);
+            assert!(pair.cache.artwork(&poster).await.is_err(), "{content_type}");
+        }
+        assert_eq!(kept(&pair.files()), 0);
+        pair.stop().await;
+    }
+
+    /// SA gains a film: SB has it at its next sync, without anything
+    /// else done.
+    #[tokio::test]
+    async fn an_item_sa_adds_is_cached_at_the_next_sync() {
+        let pair = Pair::start("fed-replica-adds").await;
+        let alien = id(MediaKind::Movie, "1");
+        pair.sa.catalog.not_yet(&alien);
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        assert!(pair.titles("plex:1").await.unwrap().is_empty());
+        pair.sa.catalog.gain(&alien);
+        pair.refresh().await;
+        assert_eq!(pair.titles("plex:1").await.unwrap(), ["Alien"]);
+        pair.stop().await;
+    }
+
+    /// SA revokes the grant: SB's next sync drops the library, and the
+    /// film and its artwork with it.
+    #[tokio::test]
+    async fn a_revoked_grant_drops_the_cached_library() {
+        let pair = Pair::start("fed-replica-revoke").await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        assert!(pair.cache.item(&alien).await.is_ok());
+        federation(&pair.sa)
+            .unshare(&pair.sb_on_sa, "plex:1", "alice")
+            .await
+            .unwrap();
+        pair.refresh().await;
+        assert!(matches!(
+            pair.cache.item(&alien).await,
+            Err(CatalogError::NotFound(_))
+        ));
+        assert!(matches!(
+            pair.titles("plex:1").await,
+            Err(CatalogError::NotFound(_))
+        ));
+        assert!(
+            pair.cache
+                .authorize_artwork(&pair.fed_artwork(&poster_of("1")))
+                .await
+                .is_err()
+        );
+        pair.stop().await;
+    }
+
+    /// With SA offline, SB still browses what it cached, its poster too,
+    /// and says SA is offline.
+    #[tokio::test]
+    async fn with_sa_offline_the_cache_is_still_served() {
+        let pair = Pair::start("fed-replica-offline").await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair.posters_fetched(1).await;
+        let Pair { sa, sb, cache, .. } = pair;
+        let origin = sa.server_id.to_string();
+        sa.stop().await;
+        until(|| async { !federation(&sb).online(&origin) }).await;
+        let alien = MediaId::federated(&origin, movie().id()).unwrap();
+        assert_eq!(title(&cache.item(&alien).await.unwrap().item), "Alien");
+        let poster = ArtworkId::federated(&origin, &poster_of("1")).unwrap();
+        assert!(cache.artwork(&poster).await.is_ok());
+        sb.stop().await;
+    }
+
+    /// A shared music library replicates whole: the artist, its albums,
+    /// their tracks, and the library's tracks at once.
+    #[tokio::test]
+    async fn a_music_library_replicates_artists_albums_and_tracks() {
+        let pair = Pair::start("fed-replica-music").await;
+        pair.sa.catalog.serve_music();
+        pair.share("plex:2").await;
+        pair.refresh().await;
+        assert_eq!(pair.titles("plex:2").await.unwrap(), ["Daft Punk"]);
+        let artist = pair
+            .cache
+            .item(&pair.fed(&id(MediaKind::Artist, "30")))
+            .await
+            .unwrap();
+        assert_eq!(
+            artist.children.iter().map(title).collect::<Vec<_>>(),
+            ["Discovery", "Homework"]
+        );
+        let album = pair
+            .cache
+            .item(&pair.fed(&id(MediaKind::Album, "31")))
+            .await
+            .unwrap();
+        let Item::Track(first) = &album.children[0] else {
+            panic!("not a track");
+        };
+        // In the album's order, with its ids the origin's.
+        assert_eq!(first.track, Some(1));
+        assert_eq!(first.album_id, pair.fed(&id(MediaKind::Album, "31")));
+        assert_eq!(first.artist_id, pair.fed(&id(MediaKind::Artist, "30")));
+        let tracks = pair
+            .cache
+            .tracks(&pair.fed_library("plex:2"))
+            .await
+            .unwrap();
+        assert_eq!(tracks.len(), 3);
+        pair.stop().await;
+    }
+
+    /// A user holds at most TOKEN_LIMITS.per_user play tokens of SA's at
+    /// once (H3): past them, SA says to try later, and mints again once
+    /// one expires.
+    #[tokio::test]
+    async fn a_user_s_play_tokens_are_capped() {
+        use spoolframe_protocol::federation::AssertionRefused;
+        use spoolframe_server::federation::{AssertError, PLAY_TOKEN_LIFETIME, TOKEN_LIMITS};
+        let pair = Pair::start("fed-assert-flood").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let alien = pair.fed(movie().id());
+        let sb = federation(&pair.sb);
+        for _ in 0..TOKEN_LIMITS.per_user {
+            sb.assert_play(bob, "Bob", &alien, device).await.unwrap();
+        }
+        assert!(matches!(
+            sb.assert_play(bob, "Bob", &alien, device).await,
+            Err(AssertError::Dial(DialError::NotGranted(
+                AssertionRefused::Unavailable
+            )))
+        ));
+        pair.sa.store.clock().advance(PLAY_TOKEN_LIFETIME);
+        sb.assert_play(bob, "Bob", &alien, device).await.unwrap();
+        pair.stop().await;
+    }
+
+    /// P8-03, across two servers: SB vouches for Bob, who wants SA's film
+    /// on a device of his; SA mints a token for that film and device,
+    /// kept hashed under Bob's remote principal, and both count the play.
+    /// A film not shared gets no token, and both count the refusal. The
+    /// grant revoked, the token is gone; and SB never vouches for a
+    /// portable guest.
+    #[tokio::test]
+    async fn sb_vouches_for_bob_and_sa_mints_a_play_token() {
+        use spoolframe_protocol::federation::{AssertionRefused, TokenScope};
+        use spoolframe_server::auth::SessionToken;
+        use spoolframe_server::federation::{AssertError, PLAY_TOKEN_LIFETIME};
+        use spoolframe_server::store::federation_tokens::PlaySide;
+        let pair = Pair::start("fed-assert").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let alien = pair.fed(movie().id());
+        let granted = federation(&pair.sb)
+            .assert_play(bob, "Bob", &alien, device)
+            .await
+            .unwrap();
+        assert_eq!(granted.scope, TokenScope::Play);
+        let now = pair.sa.store.clock().unix_secs();
+        let lifetime = PLAY_TOKEN_LIFETIME.as_secs() as i64;
+        assert!((now..=now + lifetime).contains(&granted.expires_at));
+        let hash = SessionToken(granted.token.clone()).hash();
+        let kept = pair
+            .sa
+            .store
+            .federation_token(&hash)
+            .await
+            .unwrap()
+            .expect("kept by its hash");
+        assert_eq!(
+            kept.principal,
+            format!("remote:{}:{bob}", pair.sb.server_id)
+        );
+        assert_eq!(
+            (
+                kept.item.as_str(),
+                kept.library.as_str(),
+                kept.device.as_str(),
+                kept.peer.as_str(),
+                kept.scope.as_str(),
+            ),
+            (
+                "plex:movie:1",
+                "plex:1",
+                device.to_string().as_str(),
+                pair.sb_on_sa.as_str(),
+                "play",
+            )
+        );
+        // Plays and refusals: SA's of SB's users, SB's of its users on SA.
+        async fn counted(pair: &Pair, side: PlaySide) -> (u64, u64) {
+            let (store, peer) = match side {
+                PlaySide::Served => (&pair.sa.store, &pair.sb_on_sa),
+                PlaySide::Asserted => (&pair.sb.store, &pair.sa_on_sb),
+            };
+            let counted = store.federation_plays(peer, side).await.unwrap();
+            (counted.plays, counted.refused)
+        }
+        let served = |side| counted(&pair, side);
+        assert_eq!(served(PlaySide::Served).await, (1, 0));
+        assert_eq!(served(PlaySide::Asserted).await, (1, 0));
+
+        // Music is not shared; and an artist does not play (M6).
+        let refused = |item: MediaId| {
+            let federation = federation(&pair.sb);
+            async move {
+                match federation.assert_play(bob, "Bob", &item, device).await {
+                    Err(AssertError::Dial(DialError::NotGranted(reason))) => reason,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            refused(pair.fed(&id(MediaKind::Track, "32"))).await,
+            AssertionRefused::NotShared
+        );
+        assert_eq!(
+            refused(pair.fed(&id(MediaKind::Artist, "30"))).await,
+            AssertionRefused::InvalidScope
+        );
+        assert_eq!(served(PlaySide::Served).await, (1, 2));
+        assert_eq!(served(PlaySide::Asserted).await, (1, 2));
+
+        federation(&pair.sa)
+            .unshare(&pair.sb_on_sa, "plex:1", "alice")
+            .await
+            .unwrap();
+        assert_eq!(pair.sa.store.federation_token(&hash).await.unwrap(), None);
+        assert!(matches!(
+            federation(&pair.sb)
+                .assert_play(bob, "Bob", &pair.fed(movie().id()), device)
+                .await,
+            Err(AssertError::Dial(DialError::NotGranted(
+                AssertionRefused::NotShared
+            )))
+        ));
+        assert!(matches!(
+            federation(&pair.sb)
+                .assert_play(bob, "Bob", movie().id(), device)
+                .await,
+            Err(AssertError::NotFederated(_))
+        ));
+        pair.stop().await;
+    }
+
+    /// What the admin's pair list says of a pair (P8-02, P8-03): when what
+    /// it shares was last synced, and its plays and refusals each way, one
+    /// number per server.
+    #[tokio::test]
+    async fn a_pair_says_its_last_sync_and_its_plays_each_way() {
+        let pair = Pair::start("fed-pair-state").await;
+        let sb = federation(&pair.sb);
+        assert_eq!(sb.last_sync(pair.origin()).await.unwrap(), None);
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let synced = sb.last_sync(pair.origin()).await.unwrap();
+        let now = pair.sb.store.clock().unix_secs();
+        assert!(synced.is_some_and(|at| at <= now), "{synced:?}");
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        sb.assert_play(bob, "Bob", &pair.fed(movie().id()), device)
+            .await
+            .unwrap();
+        // An artist does not play: refused, and counted on both sides.
+        let artist = pair.fed(&MediaId::new(Namespace::Plex, MediaKind::Artist, "30").unwrap());
+        assert!(sb.assert_play(bob, "Bob", &artist, device).await.is_err());
+        let counted = |federation: &Arc<Federation>, peer: String| {
+            let federation = federation.clone();
+            async move {
+                let (here, there) = federation.play_counts(&peer).await.unwrap();
+                (here.plays, there.plays, here.refused, there.refused)
+            }
+        };
+        assert_eq!(counted(sb, pair.sa_on_sb.clone()).await, (0, 1, 0, 1));
+        assert_eq!(
+            counted(federation(&pair.sa), pair.sb_on_sa.clone()).await,
+            (1, 0, 1, 0)
+        );
+        pair.stop().await;
+    }
+
+    /// P8-03: Bob's app reports where he got to in SA's film to SB, by
+    /// item. SB keeps it in his watch state, under the `fed:` id, and his
+    /// play in its history; SA keeps nothing. Only a paired server's item
+    /// is reported so, and only by an app that names the feature; once
+    /// unpaired, the film is no longer available to report on.
+    #[tokio::test]
+    async fn progress_on_sa_s_film_is_kept_on_sb_alone() {
+        let pair = Pair::start("fed-progress").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        let report = |id: &MediaId, position_ms: u64| Request::UpdateWatchProgress {
+            id: id.clone(),
+            position_ms,
+        };
+        assert_eq!(
+            app.call(Some(&bob), report(&alien, 2_400_000)).await,
+            Response::Ok(Reply::Done)
+        );
+        let screen = home(&app, &bob).await;
+        let Some(Item::Movie(film)) = screen.continue_watching.first() else {
+            panic!("{screen:?}");
+        };
+        assert_eq!(
+            (&film.id, film.playback.position),
+            (&alien, Some(Duration::from_secs(2400)))
+        );
+        let bob_id = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let principal = spoolframe_server::principal::Principal::LocalUser(bob_id);
+        // Its play's row is opened in the background.
+        until(|| async { !pair.sb.store.all_plays(principal).await.unwrap().is_empty() }).await;
+        let plays = pair.sb.store.all_plays(principal).await.unwrap();
+        assert_eq!(plays.len(), 1);
+        assert_eq!(plays[0].media_id, alien.to_string());
+        assert!(
+            pair.sa
+                .store
+                .in_progress_anyone(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "SA keeps no watch state for SB's users"
+        );
+        assert!(matches!(
+            app.call(Some(&bob), report(movie().id(), 1)).await,
+            Response::Err(Error::InvalidInput { .. })
+        ));
+        // Without the feature, a paired server's id is not one at all.
+        let (old, bob_old) = bob_on(&pair, false).await;
+        assert!(matches!(
+            old.call(Some(&bob_old), report(&alien, 1)).await,
+            Response::Err(Error::NotFound { .. })
+        ));
+        federation(&pair.sb)
+            .unpair(&pair.sa_on_sb, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            app.call(Some(&bob), report(&alien, 2_500_000)).await,
+            Response::Err(Error::NotFound { .. })
+        ));
+        pair.stop().await;
+    }
+
+    /// P8-03: SA's film in Bob's playlist on SB: listed and playable while
+    /// SA is paired, to an app that names the feature; kept and listed as
+    /// no longer available once SA is unpaired. An app that does not name
+    /// the feature lists none of it, and may not add it.
+    #[tokio::test]
+    async fn a_playlist_holds_sa_s_film_and_keeps_it_after_unpairing() {
+        use spoolframe_protocol::playlists::{Kinds, PlaylistEdit, Visibility};
+        let pair = Pair::start("fed-playlist").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        let (app, bob) = bob_on(&pair, true).await;
+        let made = match app
+            .call(
+                Some(&bob),
+                Request::CreatePlaylist {
+                    name: "Space".into(),
+                    kinds: Kinds {
+                        movies: true,
+                        episodes: false,
+                        tracks: false,
+                    },
+                    visibility: Visibility::Personal,
+                },
+            )
+            .await
+        {
+            Response::Ok(Reply::PlaylistInfo(made)) => made,
+            other => panic!("{other:?}"),
+        };
+        async fn add(
+            client: &TestClient,
+            session: &SessionId,
+            playlist: &str,
+            id: &MediaId,
+        ) -> Response {
+            let edit = Request::EditPlaylist {
+                id: playlist.into(),
+                revision: 0,
+                edits: vec![PlaylistEdit::Add {
+                    id: id.clone(),
+                    before: None,
+                }],
+            };
+            client.call(Some(session), edit).await
+        }
+        async fn page(
+            client: &TestClient,
+            session: &SessionId,
+            playlist: &str,
+        ) -> spoolframe_protocol::playlists::PlaylistPage {
+            let get = Request::GetPlaylist {
+                id: playlist.into(),
+                offset: 0,
+                limit: 10,
+            };
+            match client.call(Some(session), get).await {
+                Response::Ok(Reply::Playlist(page)) => page,
+                other => panic!("{other:?}"),
+            }
+        }
+        let (old, bob_old) = bob_on(&pair, false).await;
+        let refused = add(&old, &bob_old, &made.id, &alien).await;
+        assert!(
+            matches!(refused, Response::Err(Error::NotFound { .. })),
+            "{refused:?}"
+        );
+        let added = add(&app, &bob, &made.id, &alien).await;
+        assert!(
+            matches!(added, Response::Ok(Reply::PlaylistEdited { .. })),
+            "{added:?}"
+        );
+        let listed = page(&app, &bob, &made.id).await;
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].item.id(), &alien);
+        assert!(!listed.entries[0].unavailable);
+        let unseen = page(&old, &bob_old, &made.id).await;
+        assert!(unseen.entries.is_empty() && unseen.total == 0, "{unseen:?}");
+        federation(&pair.sb)
+            .unpair(&pair.sa_on_sb, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        let kept = page(&app, &bob, &made.id).await;
+        assert_eq!(kept.entries.len(), 1);
+        assert_eq!(kept.entries[0].item.id(), &alien);
+        assert!(kept.entries[0].unavailable);
+        assert_eq!(kept.playable, 0);
+        pair.stop().await;
+    }
+
+    /// P8-03: Bob's play of SA's film stays in his Recently played on SB
+    /// once SA is unpaired, listed as no longer available, to an app that
+    /// names the feature.
+    #[tokio::test]
+    async fn recently_played_keeps_sa_s_film_after_unpairing() {
+        use spoolframe_server::store::plays::{NewPlay, PlayUpdate, PlayedKind};
+        let pair = Pair::start("fed-history").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob_id = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let principal = spoolframe_server::principal::Principal::LocalUser(bob_id);
+        let media_id = alien.to_string();
+        let play = pair
+            .sb
+            .store
+            .open_play(
+                principal,
+                NewPlay {
+                    media_id: &media_id,
+                    kind: PlayedKind::Movie,
+                    show_id: None,
+                    album_id: None,
+                    artist_id: None,
+                    external_ids: &[],
+                    duration_ms: Some(7_020_000),
+                    endpoint_id: None,
+                    device_name: None,
+                    playback_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        pair.sb
+            .store
+            .update_play(
+                play,
+                PlayUpdate {
+                    played_ms: 7_000_000,
+                    counted: true,
+                    over_http: false,
+                    close: true,
+                },
+            )
+            .await
+            .unwrap();
+        federation(&pair.sb)
+            .unpair(&pair.sa_on_sb, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        let app = pair.sb.client().await;
+        let hello = spoolframe_protocol::Hello {
+            protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+            client_name: "test".into(),
+            client_version: "0".into(),
+            platform: spoolframe_types::Platform::Linux,
+            device_name: None,
+            capabilities: None,
+            experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features: vec![spoolframe_protocol::features::PLAY_HISTORY.into()],
+        };
+        app.call(None, Request::Hello(hello)).await;
+        let bob = app.login("bob", "correct horse").await;
+        let played = app
+            .call(
+                Some(&bob),
+                Request::RecentlyPlayed {
+                    kinds: None,
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await;
+        let Response::Ok(Reply::Items {
+            items,
+            total,
+            unavailable,
+        }) = played
+        else {
+            panic!("{played:?}");
+        };
+        assert_eq!(ids(&items), std::slice::from_ref(&alien));
+        assert_eq!(total, 1);
+        assert_eq!(unavailable, [alien]);
+        pair.stop().await;
+    }
+
+    /// The SDK's side of P8-02 and P8-03: SA's admin shares a library
+    /// from an app; Bob's app on SB lists it with its server, turns SA's
+    /// Home row off, reports progress on SA's film to SB, and is told when
+    /// the libraries change.
+    #[tokio::test]
+    async fn the_sdk_shares_lists_and_reports_progress() {
+        use super::app::{FEDERATION, PASSWORD, signed_in};
+        let pair = Pair::start("fed-sdk").await;
+        pair.sa.add_user("alice", PASSWORD, None).await;
+        pair.sa
+            .store
+            .set_role("alice", spoolframe_types::Role::Admin)
+            .await
+            .unwrap();
+        pair.sb.add_user("bob", PASSWORD, None).await;
+        let (_on_sa, alice) = signed_in(&pair.sa, "alice", FEDERATION).await;
+        let library: LibraryId = "plex:1".parse().unwrap();
+        assert_eq!(
+            alice
+                .share_libraries(pair.sb.server_id.as_str(), std::slice::from_ref(&library))
+                .await
+                .unwrap(),
+            [library]
+        );
+        pair.refresh().await;
+        let (phone, bob) = signed_in(&pair.sb, "bob", FEDERATION).await;
+        let mut told = phone.libraries_events();
+        let listed = bob.libraries().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let server = listed[0]
+            .server
+            .clone()
+            .expect("SA's library has its server");
+        assert_eq!(
+            (
+                server.server_id.as_str(),
+                server.name.as_str(),
+                server.online
+            ),
+            (pair.origin(), "Alice's server", true)
+        );
+        bob.set_server_row(pair.origin(), false).await.unwrap();
+        assert!(!bob.home().await.unwrap().servers[0].shown);
+        let alien = pair.fed(movie().id());
+        bob.update_watch_progress(&alien, Duration::from_secs(600))
+            .await
+            .unwrap();
+        let screen = bob.home().await.unwrap();
+        assert_eq!(ids(&screen.continue_watching), std::slice::from_ref(&alien));
+        assert!(matches!(
+            bob.update_watch_progress(movie().id(), Duration::from_secs(1))
+                .await,
+            Err(spoolframe_client_sdk::SdkError::InvalidInput(_))
+        ));
+        federation(&pair.sa)
+            .unshare(&pair.sb_on_sa, "plex:1", "alice")
+            .await
+            .unwrap();
+        pair.refresh().await;
+        let event = tokio::time::timeout(Duration::from_secs(10), told.recv())
+            .await
+            .expect("told within 10 s")
+            .unwrap();
+        assert_eq!(event.server, pair.sb.server.id().to_string());
+        assert!(bob.libraries().await.unwrap().is_empty());
+        pair.stop().await;
+    }
+
+    /// Unpairing deletes the pair's tokens on SA; one past its expiry is
+    /// pruned.
+    #[tokio::test]
+    async fn unpairing_and_expiry_end_sa_s_tokens() {
+        use spoolframe_server::auth::SessionToken;
+        use spoolframe_server::federation::PLAY_TOKEN_LIFETIME;
+        let pair = Pair::start("fed-assert-end").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let alien = pair.fed(movie().id());
+        let play = || async {
+            let granted = federation(&pair.sb)
+                .assert_play(bob, "Bob", &alien, device)
+                .await
+                .unwrap();
+            SessionToken(granted.token.clone()).hash()
+        };
+        let first = play().await;
+        pair.sa
+            .store
+            .clock()
+            .advance(PLAY_TOKEN_LIFETIME + std::time::Duration::from_secs(1));
+        assert_eq!(pair.sa.store.prune_federation_tokens().await.unwrap(), 1);
+        assert_eq!(pair.sa.store.federation_token(&first).await.unwrap(), None);
+        let second = play().await;
+        assert!(
+            pair.sa
+                .store
+                .federation_token(&second)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        federation(&pair.sa)
+            .unpair(&pair.sb_on_sa, "alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.sa.store.federation_token(&second).await.unwrap(), None);
+        pair.stop().await;
+    }
+
+    /// Unpairing on SB keeps only the film a user of SB watched, flagged
+    /// unavailable and without artwork: not browsed, but still known for
+    /// Continue watching. Everything else of SA's goes.
+    #[tokio::test]
+    async fn unpairing_keeps_only_what_a_user_holds_and_flags_it() {
+        let pair = Pair::start("fed-replica-unpair").await;
+        pair.sa.catalog.show_posters();
+        pair.sa.catalog.serve_music();
+        pair.share("plex:1").await;
+        pair.share("plex:2").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        let artist = pair.fed(&id(MediaKind::Artist, "30"));
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+        pair.sb
+            .store
+            .save_watch(
+                spoolframe_server::principal::Principal::LocalUser(bob),
+                WatchUpdate {
+                    media_id: &alien.to_string(),
+                    show_id: None,
+                    external_ids: &[],
+                    position_ms: Some(2_400_000),
+                    duration_ms: Some(7_020_000),
+                    watched: false,
+                    unhide: true,
+                },
+            )
+            .await
+            .unwrap();
+        federation(&pair.sb)
+            .unpair(&pair.sa_on_sb, "bob")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!federation(&pair.sb).online(pair.origin()));
+        assert!(matches!(
+            pair.cache.item(&alien).await,
+            Err(CatalogError::NotServed(_))
+        ));
+        let (kept, reach) = pair.cache.item_kept(&alien).await.unwrap();
+        assert_eq!(
+            (title(&kept.item), reach),
+            ("Alien".to_owned(), spoolframe_catalog::Reach::Gone)
+        );
+        assert!(matches!(
+            pair.cache.item_kept(&artist).await,
+            Err(CatalogError::NotFound(_))
+        ));
+        assert!(
+            pair.cache
+                .authorize_artwork(&pair.fed_artwork(&poster_of("1")))
+                .await
+                .is_err()
+        );
+        assert!(
+            pair.sb
+                .store
+                .cached_libraries(None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        pair.stop().await;
+    }
+
+    /// SB syncs on connecting, without being asked: started again after
+    /// SA shared a library, it has it soon after.
+    #[tokio::test]
+    async fn sb_syncs_on_connecting() {
+        let pair = Pair::start("fed-replica-connect").await;
+        pair.share("plex:1").await;
+        let Pair { sa, sb, .. } = pair;
+        let dir = sb.dir.clone();
+        sb.stop().await;
+        let (sb, cache) = sb_in(dir).await;
+        let alien = MediaId::federated(sa.server_id.as_str(), movie().id()).unwrap();
+        until(|| async { cache.item(&alien).await.is_ok() }).await;
+        assert!(federation(&sb).online(sa.server_id.as_str()));
+        sa.stop().await;
+        sb.stop().await;
+    }
+
+    /// The admin's Refresh: an admin syncs a pair now; another id is no
+    /// pair.
+    #[tokio::test]
+    async fn the_admin_refresh_syncs_now() {
+        let pair = Pair::start("fed-replica-refresh").await;
+        pair.share("plex:1").await;
+        assert!(matches!(
+            federation(&pair.sb).refresh("no-such").await,
+            Err(spoolframe_server::federation::ReplicaError::NoSuchPeer(_))
+        ));
+        pair.refresh().await;
+        assert_eq!(pair.titles("plex:1").await.unwrap(), ["Alien"]);
+        pair.stop().await;
     }
 }

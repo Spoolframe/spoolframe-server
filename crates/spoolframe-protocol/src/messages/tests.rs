@@ -480,11 +480,13 @@ fn every_reply_round_trips() {
                 id: LibraryId::new(Namespace::Plex, "2").unwrap(),
                 title: "Movies".into(),
                 kind: LibraryKind::Movies,
+                server: None,
             }],
         },
         Reply::Items {
             items: vec![movie()],
             total: 770,
+            unavailable: Vec::new(),
         },
         Reply::Item {
             item: movie(),
@@ -572,6 +574,8 @@ fn every_reply_round_trips() {
             continue_watching: vec![movie()],
             next_up: Vec::new(),
             recently_added: vec![movie()],
+            unavailable: Vec::new(),
+            servers: Vec::new(),
         }),
         Reply::PlaybackStarted {
             handle: crate::PlaybackHandle("h".into()),
@@ -3029,6 +3033,8 @@ mod playlists {
             continue_watching: vec![seen],
             next_up: Vec::new(),
             recently_added: Vec::new(),
+            unavailable: Vec::new(),
+            servers: Vec::new(),
         })));
         let json = serde_json::to_value(movie()).unwrap();
         assert!(json["playback"].get("last_viewed_at").is_none(), "{json}");
@@ -3265,6 +3271,7 @@ mod play_history {
         round_trip(Response::Ok(Reply::Items {
             items: vec![played],
             total: 1,
+            unavailable: Vec::new(),
         }));
         let json = serde_json::to_value(movie()).unwrap();
         assert!(json["playback"].get("play_count").is_none(), "{json}");

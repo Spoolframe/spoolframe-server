@@ -72,6 +72,7 @@ impl Big {
             id: LibraryId::new(Namespace::Plex, n.to_string()).unwrap(),
             title: format!("Music {n}"),
             kind: LibraryKind::Music,
+            server: None,
         }
     }
 
@@ -214,6 +215,7 @@ async fn harness(test: &str, music: Big, kept: impl FnOnce(Playlists) -> Playlis
     let alice = Actor {
         principal: Principal::LocalUser(id),
         admin: false,
+        federated: false,
     };
     let playlists = kept(Playlists::new(store, music.clone(), watch));
     let (list, _) = playlists.list(&alice, true).await.unwrap();

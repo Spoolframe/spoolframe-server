@@ -321,6 +321,17 @@ catalog {
   memory_mb = 64;
 }
 
+# What paired servers share with this one (P8-02), cached so it browses
+# while they are offline: synced this often, and each one's artwork kept
+# under the state directory up to this many MiB, and all of theirs up to
+# the total, the least recently used going first. Only while
+# experimental.federation is on. Applies at once.
+federation {
+  sync_interval_secs = 3600;
+  cache_max_mb = 2048;
+  cache_total_mb = 8192;
+}
+
 # When an item counts as started, and as watched (without credits markers).
 watch {
   started_after_secs = 60;

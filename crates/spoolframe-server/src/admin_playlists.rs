@@ -317,6 +317,7 @@ fn actor(user: &ApiSessionUser) -> Actor {
     Actor {
         principal: Principal::LocalUser(user.user),
         admin: user.role.is_admin(),
+        federated: false,
     }
 }
 

@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, TryStreamExt, stream};
 
-use spoolframe_catalog::{Catalog, CatalogError};
+use spoolframe_catalog::{Catalog, CatalogError, Reach};
 use spoolframe_media::Prober;
 use spoolframe_protocol::HomeScreen;
-use spoolframe_types::{Item, MediaId, MediaKind, PlaybackState};
+use spoolframe_types::{Item, MediaId, MediaKind, Namespace, PlaybackState};
 
 use crate::principal::Principal;
 use crate::store::plays::PlayedKind;
@@ -40,12 +40,19 @@ pub enum WatchError {
 /// this long to be seen.
 const SAME_ITEM_CACHE: Duration = Duration::from_secs(60);
 
+/// How long a show's external ids are kept for its episodes' title keys.
+const SHOW_IDS_CACHE: Duration = Duration::from_secs(10 * 60);
+
 const ROW: usize = 20;
 const NEXT_UP_SHOWS: u32 = 20;
 /// The most catalog (Plex) lookups one Home load or one show-wide mark
 /// has in flight at once: they go out a few at a time, and come back in
 /// the order asked, so rows, errors and saves keep their order.
 const CATALOG_FETCHES: usize = 8;
+
+/// Whose Next up is cached, and whether a paired server's shows are in it
+/// (P8-02).
+type NextUpKey = (Principal, bool);
 
 pub struct Watch {
     store: Store,
@@ -56,10 +63,14 @@ pub struct Watch {
     /// Each (principal, item)'s last progress write, while it is still
     /// within the throttle.
     written: Mutex<HashMap<(Principal, String), Written>>,
-    next_up: Mutex<HashMap<Principal, (Instant, Vec<Item>)>>,
+    next_up: Mutex<HashMap<NextUpKey, (Instant, Vec<Item>)>>,
     /// (Another key, an item): when the catalog last said that the key
     /// holds a copy of the item, so its state is not the item's to take.
     copies: Mutex<HashMap<(String, String), Instant>>,
+    /// Each show's external ids, as the catalog last gave them: what its
+    /// episodes' title keys are made of, asked once a while rather than at
+    /// each progress report.
+    show_ids: Mutex<HashMap<MediaId, (Instant, Vec<String>)>>,
     /// Whose state was saved, for whoever mirrors it elsewhere (PX-04):
     /// each one, since every linked user's state syncs (P3-12).
     changed: tokio::sync::broadcast::Sender<Principal>,
@@ -100,11 +111,15 @@ impl From<Synced> for spoolframe_protocol::downloads::OfflineWatchOutcome {
 }
 
 /// A progress write, for judging the reports the throttle skips.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Written {
     at: Instant,
     /// The item's [`credits_to_end`], as the catalog had them then.
     credits: Option<Duration>,
+    /// The row the state was written to: the item's own, or, for a paired
+    /// server's copy of a title the user has here, this server's copy's
+    /// (P8-03). What the throttle judges and un-hides.
+    row: String,
 }
 
 impl std::fmt::Debug for Watch {
@@ -176,6 +191,7 @@ impl Watch {
             written: Mutex::default(),
             next_up: Mutex::default(),
             copies: Mutex::default(),
+            show_ids: Mutex::default(),
             changed: tokio::sync::broadcast::Sender::new(CHANGES),
         }
     }
@@ -223,7 +239,7 @@ impl Watch {
             .written
             .lock()
             .get(&key)
-            .copied()
+            .cloned()
             .filter(|written| self.since(written.at) < self.rules().throttle);
         if let Some(written) = recent {
             // Within the throttle only a crossing into watched is written,
@@ -232,9 +248,9 @@ impl Watch {
             // catalog or probe work for the many updates in between.
             let stored = self
                 .store
-                .watch_states(principal, std::slice::from_ref(&key.1))
+                .watch_states(principal, std::slice::from_ref(&written.row))
                 .await?;
-            let row = stored.get(&key.1);
+            let row = stored.get(&written.row);
             let duration = row
                 .and_then(|r| r.duration_ms)
                 .map(|d| Duration::from_millis(d.max(0) as u64));
@@ -243,7 +259,7 @@ impl Watch {
             if !crossing {
                 // Not written, but played: it is back in Continue watching
                 // (P1-22).
-                self.store.clear_hidden(principal, &key.1).await?;
+                self.store.clear_hidden(principal, &written.row).await?;
                 return Ok(());
             }
         }
@@ -251,8 +267,18 @@ impl Watch {
         let duration = self.duration(id, &found.item).await;
         let credits = credits_to_end(&found.markers);
         let watched = self.rules().is_watched(position, duration, credits);
-        self.save(principal, id, &found, Some(position), duration, watched)
-            .await?;
+        let row = self
+            .save_as_of(
+                principal,
+                id,
+                &found,
+                Some(position),
+                duration,
+                watched,
+                None,
+            )
+            .await?
+            .unwrap_or_else(|| key.1.clone());
         // Writes older than the throttle judge nothing more: let them go,
         // so the map holds what is being played now, not every item ever
         // played since the server started.
@@ -264,6 +290,7 @@ impl Watch {
             Written {
                 at: self.now(),
                 credits,
+                row,
             },
         );
         Ok(())
@@ -328,7 +355,7 @@ impl Watch {
         let written = self
             .save_as_of(principal, id, found, position, duration, watched, Some(at))
             .await?;
-        Ok(if written {
+        Ok(if written.is_some() {
             Synced::Applied
         } else {
             Synced::Older
@@ -358,8 +385,9 @@ impl Watch {
             return Err(WatchError::NotTracked(id.clone()));
         }
         let found = self.catalog.item(id).await?;
+        let title = self.title_key(&found).await;
         self.store
-            .hide_continue(principal, &id.to_string(), &found.external_ids)
+            .hide_continue(principal, &id.to_string(), &title)
             .await?;
         Ok(())
     }
@@ -462,7 +490,9 @@ impl Watch {
     }
 
     /// [`Watch::save`], now; or, with `at` (Unix seconds), as of then and
-    /// only when newer than the state there is: whether it was written.
+    /// only when newer than the state there is: the row written, the
+    /// item's own or its title's copy here (P8-03), or `None` when it was
+    /// not.
     #[allow(clippy::too_many_arguments)]
     async fn save_as_of(
         &self,
@@ -473,40 +503,55 @@ impl Watch {
         duration: Option<Duration>,
         watched: bool,
         at: Option<i64>,
-    ) -> Result<bool, WatchError> {
+    ) -> Result<Option<String>, WatchError> {
         let media_id = id.to_string();
+        let title = self.title_key(found).await;
         // Bring over any state this item had under an earlier key first.
-        self.relink(principal, id, &found.external_ids).await?;
+        self.relink(principal, id, &title).await?;
+        // One state per title (P8-03): a paired server's copy writes the
+        // state of this server's own copy, when the user has one; the
+        // title's other states on paired servers' keys are folded into
+        // the one written. This server's own copies keep theirs.
+        let rows = self.store.title_rows(principal, &title).await?;
+        let into = match rows.iter().find(|row| !remote(row)) {
+            Some(own) if id.namespace() == Namespace::Federated => own.clone(),
+            _ => media_id.clone(),
+        };
+        let folded: Vec<String> = rows
+            .into_iter()
+            .chain(std::iter::once(media_id.clone()))
+            .filter(|row| remote(row) && *row != into)
+            .collect();
         let show_id = match &found.item {
             Item::Episode(e) => Some(e.show_id.to_string()),
             _ => None,
         };
+        let own = into == media_id;
         let update = WatchUpdate {
-            media_id: &media_id,
-            show_id: show_id.as_deref(),
-            external_ids: &found.external_ids,
+            media_id: &into,
+            // Another copy's row keeps its own show, length and ids: what
+            // a paired server says of its copy changes nothing of it.
+            show_id: show_id.as_deref().filter(|_| own),
+            external_ids: if own { &title } else { &[] },
             position_ms: position.map(ms),
-            duration_ms: duration.map(ms),
+            duration_ms: duration.map(ms).filter(|_| own),
             watched,
             unhide: true,
         };
-        match at {
-            None => self.store.save_watch(principal, update).await?,
-            Some(at) => {
-                if !self
-                    .store
-                    .save_watch_if_newer(principal, update, at)
-                    .await?
-                {
-                    return Ok(false);
-                }
-            }
+        if !self
+            .store
+            .save_title_watch(principal, update, &folded, at)
+            .await?
+        {
+            return Ok(None);
         }
         // What is next up may have changed.
-        self.next_up.lock().remove(&principal);
+        self.next_up
+            .lock()
+            .retain(|(cached, _), _| *cached != principal);
         // Nobody listening is fine: nothing syncs.
         let _ = self.changed.send(principal);
-        Ok(true)
+        Ok(Some(into))
     }
 
     /// The duration from the server's own probe, else the catalog's; never
@@ -579,21 +624,117 @@ impl Watch {
         Ok(())
     }
 
+    /// The title `found` is a copy of (P8-03): the ids its state, plays
+    /// and hide are kept with, and what its other copies, here or on a
+    /// paired server, are matched to it by. Its external ids, and for an
+    /// episode its show's, with its season and number
+    /// (`tmdb://1396#s1e2`), as two servers' copies of an episode have
+    /// their show's ids in common more often than their own. Every write
+    /// of a state, a play or a hide keys by this, whichever path made it.
+    /// A show the catalog cannot place now adds none.
+    pub async fn title_key(&self, found: &spoolframe_catalog::ItemWithChildren) -> Vec<String> {
+        let mut ids = found.external_ids.clone();
+        if let Item::Episode(episode) = &found.item {
+            match self.show_ids(&episode.show_id).await {
+                Ok(show) => ids.extend(episode_ids(&show, episode.season, episode.episode)),
+                Err(e) => tracing::debug!(
+                    show = %episode.show_id,
+                    error = %e,
+                    "an episode is matched by its own ids alone"
+                ),
+            }
+        }
+        ids
+    }
+
+    /// Show `id`'s external ids, from the catalog at most once a while.
+    async fn show_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
+        let fresh = |at: &Instant| self.since(*at) < SHOW_IDS_CACHE;
+        if let Some((_, ids)) = self.show_ids.lock().get(id).filter(|(at, _)| fresh(at)) {
+            return Ok(ids.clone());
+        }
+        let ids = self.catalog.external_ids(id).await?;
+        let mut cached = self.show_ids.lock();
+        cached.retain(|_, (at, _)| fresh(at));
+        cached.insert(id.clone(), (self.now(), ids.clone()));
+        Ok(ids)
+    }
+
+    /// [`Watch::fill`] for one item, a copy of the title `title`
+    /// ([`Watch::title_key`]): with no state of its own, or an older one,
+    /// it shows the newest state of its title's other copies (P8-03), so
+    /// the film half watched from a paired server resumes here where it
+    /// was left, and the other way round.
+    pub async fn fill_title(
+        &self,
+        principal: Principal,
+        item: &mut Item,
+        title: &[String],
+    ) -> Result<(), WatchError> {
+        if !tracked(item.id()) {
+            return Ok(());
+        }
+        let mut keys = self.store.title_rows(principal, title).await?;
+        let own = item.id().to_string();
+        if !keys.contains(&own) {
+            keys.push(own);
+        }
+        let states = self.store.watch_states(principal, &keys).await?;
+        let Some(newest) = states.values().max_by_key(|row| row.updated_at) else {
+            return Ok(());
+        };
+        let position = newest
+            .position_ms
+            .map(|p| Duration::from_millis(p.max(0) as u64));
+        if let Some(playback) = playback_mut(item) {
+            *playback = self.rules().playback_state(position, newest.watched);
+        }
+        Ok(())
+    }
+
     /// Whether the item `media_id`, with `external_ids`, has left `key`:
     /// the catalog has nothing under it now, or another item (after a
     /// rebuild Plex hands the same keys out again), or it is not a key of
     /// this catalog. It has not if what is under `key` shares an external
-    /// id with the item. If the catalog cannot say, it has not, for now.
+    /// id with the item (an episode's show ids, season and number count,
+    /// [`Watch::title_key`]). If the catalog cannot say, it has not, for
+    /// now.
+    ///
+    /// A copy on another server (one key a paired server's, P8-03) never
+    /// has: a state is never moved between servers' keys, so nothing a
+    /// paired server says of its items takes a state from this server's
+    /// copy. A title's copies share their state by its key instead
+    /// ([`Watch::fill_title`]).
     async fn left(&self, key: &str, media_id: &str, external_ids: &[String]) -> bool {
         let Ok(id) = key.parse::<MediaId>() else {
             return false;
         };
+        if media_id
+            .parse::<MediaId>()
+            .is_ok_and(|to| origin(&to) != origin(&id))
+        {
+            return false;
+        }
         let pair = (key.to_owned(), media_id.to_owned());
         let fresh = |at: &Instant| self.since(*at) < SAME_ITEM_CACHE;
         if self.copies.lock().get(&pair).is_some_and(fresh) {
             return false;
         }
-        match self.catalog.external_ids(&id).await {
+        let there = match self.catalog.external_ids(&id).await {
+            // Matched by its show's ids, season and number only: an
+            // episode looked at whole.
+            Ok(there)
+                if id.kind() == MediaKind::Episode
+                    && !there.iter().any(|id| external_ids.contains(id)) =>
+            {
+                match self.catalog.item(&id).await {
+                    Ok(found) => Ok(self.title_key(&found).await),
+                    Err(e) => Err(e),
+                }
+            }
+            there => there,
+        };
+        match there {
             Ok(there) if there.iter().any(|id| external_ids.contains(id)) => {
                 let mut copies = self.copies.lock();
                 copies.retain(|_, at| fresh(at));
@@ -700,22 +841,43 @@ impl Watch {
         ids: impl IntoIterator<Item = String>,
         list: &'static str,
     ) -> Result<Vec<Item>, WatchError> {
+        Ok(self.look_up_kept(ids, list, false).await?.0)
+    }
+
+    /// [`Watch::look_up`]; with `federated`, a paired server's item no
+    /// longer available (its pair or library gone) is kept, as the cache
+    /// last had it, and named in the second list (P8-03).
+    async fn look_up_kept(
+        &self,
+        ids: impl IntoIterator<Item = String>,
+        list: &'static str,
+        federated: bool,
+    ) -> Result<(Vec<Item>, Vec<MediaId>), WatchError> {
         let ids: Vec<MediaId> = ids
             .into_iter()
             .filter_map(|id| id.parse::<MediaId>().ok())
             .collect();
         let found: Vec<(MediaId, Result<_, CatalogError>)> = stream::iter(ids)
             .map(|id| async move {
-                let item = self.catalog.item(&id).await;
+                let item = self.catalog.item_kept(&id).await;
                 (id, item)
             })
             .buffered(CATALOG_FETCHES)
             .collect()
             .await;
         let mut items = Vec::new();
+        let mut unavailable = Vec::new();
         for (id, item) in found {
             match item {
-                Ok(found) => items.push(found.item),
+                // A paired server's item whose pair or library went stays,
+                // as no longer available (P8-02).
+                Ok((found, Reach::Gone)) => {
+                    if federated {
+                        items.push(found.item);
+                        unavailable.push(id);
+                    }
+                }
+                Ok((found, _)) => items.push(found.item),
                 Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
                 Err(e) if is_down(&e) => {
                     tracing::warn!(item = %id, error = %e, "{list}: left out");
@@ -723,50 +885,49 @@ impl Watch {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(items)
+        Ok((items, unavailable))
     }
 
-    /// `principal`'s home screen.
+    /// `principal`'s home screen, with nothing of a paired server's in
+    /// it: for a client that did not name the experimental `federation`
+    /// feature (P8-02).
     pub async fn home(&self, principal: Principal) -> Result<HomeScreen, WatchError> {
+        self.home_as(principal, false).await
+    }
+
+    /// `principal`'s home screen. With `federated` (a client that named
+    /// the experimental `federation` feature, P8-02), a paired server's
+    /// items are in Continue watching and Next up as the server's own are,
+    /// and those no longer available (their pair or library gone) stay,
+    /// listed as such; without, none of them is, and the rows fill with
+    /// the server's own as if it had no pairs.
+    pub async fn home_as(
+        &self,
+        principal: Principal,
+        federated: bool,
+    ) -> Result<HomeScreen, WatchError> {
         // Cards removed (P1-22): movies and episodes, each by its own id.
         let hidden = self.store.hidden(principal).await?;
-        let mut continue_watching = Vec::new();
         let min = ms(self.rules().started_after);
         // As many more as are hidden, so the row stays full.
         let wanted = (ROW + hidden.len()) as u32;
-        let ids: Vec<MediaId> = self
+        let ids: Vec<String> = self
             .store
-            .in_progress(principal, min, wanted)
+            .in_progress(principal, min, wanted, federated)
             .await?
             .into_iter()
-            .filter(|row| !hidden.contains(&row.media_id))
-            .filter_map(|row| row.media_id.parse::<MediaId>().ok())
+            .map(|row| row.media_id)
+            .filter(|id| !hidden.contains(id))
             .collect();
-        // Looked up a few at a time, in the row's order: one Plex server
-        // down costs one timeout, not one per item on it.
-        let mut found = stream::iter(ids)
-            .map(|id| async move {
-                let item = self.catalog.item(&id).await;
-                (id, item)
-            })
-            .buffered(CATALOG_FETCHES);
-        while continue_watching.len() < ROW {
-            let Some((id, item)) = found.next().await else {
-                break;
-            };
-            // An item gone from the catalog, or in a library not served
-            // now, drops out of the row; so does one whose Plex server is
-            // down (P3-11), until it is back, while the others still show.
-            match item {
-                Ok(found) => continue_watching.push(found.item),
-                Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
-                Err(e) if is_down(&e) => {
-                    tracing::warn!(item = %id, error = %e, "Continue watching: left out");
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let mut next_up = self.next_up(principal).await?;
+        // An item gone from the catalog, or in a library not served now,
+        // drops out of the row; so does one whose Plex server is down
+        // (P3-11), until it is back, while the others still show.
+        let (mut continue_watching, mut unavailable) = self
+            .look_up_kept(ids, "Continue watching", federated)
+            .await?;
+        continue_watching.truncate(ROW);
+        unavailable.retain(|id| continue_watching.iter().any(|item| item.id() == id));
+        let mut next_up = self.next_up(principal, federated).await?;
         // One row per show: while an episode of a show is in progress, the
         // show is in Continue watching and has nothing in Next up. Every
         // episode in progress counts, not only the ones the row has room
@@ -801,6 +962,8 @@ impl Watch {
             continue_watching,
             next_up,
             recently_added,
+            unavailable,
+            servers: Vec::new(),
         };
         let mut all: Vec<&mut Item> = home
             .continue_watching
@@ -816,8 +979,13 @@ impl Watch {
     /// episode after the one watched most recently. It walks the
     /// show through the catalog, so it covers recent shows only, and is
     /// cached briefly.
-    async fn next_up(&self, principal: Principal) -> Result<Vec<Item>, WatchError> {
-        if let Some((at, items)) = self.next_up.lock().get(&principal)
+    /// A paired server's shows only when `federated` (P8-02).
+    async fn next_up(
+        &self,
+        principal: Principal,
+        federated: bool,
+    ) -> Result<Vec<Item>, WatchError> {
+        if let Some((at, items)) = self.next_up.lock().get(&(principal, federated))
             && self.since(*at) < self.rules().next_up_cache
         {
             return Ok(items.clone());
@@ -825,7 +993,7 @@ impl Watch {
         let since = self.store.now() - self.rules().next_up_window.as_secs() as i64;
         let shows: Vec<MediaId> = self
             .store
-            .active_shows(principal, since, NEXT_UP_SHOWS)
+            .active_shows(principal, since, NEXT_UP_SHOWS, federated)
             .await?
             .into_iter()
             .filter_map(|show| show.parse::<MediaId>().ok())
@@ -849,7 +1017,7 @@ impl Watch {
         }
         self.next_up
             .lock()
-            .insert(principal, (self.now(), next.clone()));
+            .insert((principal, federated), (self.now(), next.clone()));
         Ok(next)
     }
 
@@ -898,6 +1066,27 @@ impl Watch {
             .is_some_and(|row| !row.watched && row.position_ms.is_some_and(|p| p >= min));
         Ok((!started).then_some(next))
     }
+}
+
+/// Whether `key` is a paired server's item's.
+fn remote(key: &str) -> bool {
+    key.starts_with("fed:")
+}
+
+/// The paired server `id` is from, if it is one's (P8-02): `None` for this
+/// server's own.
+fn origin(id: &MediaId) -> Option<&str> {
+    id.remote().map(|(origin, _)| origin)
+}
+
+/// What an episode `season`×`episode` of a show with `show_ids` is
+/// matched by, beside its own ids: each of the show's ids with its season
+/// and number.
+fn episode_ids(show_ids: &[String], season: u32, episode: u32) -> Vec<String> {
+    show_ids
+        .iter()
+        .map(|id| format!("{id}#s{season}e{episode}"))
+        .collect()
 }
 
 /// A show's run, of its `episodes` (the catalog's): specials (season 0)

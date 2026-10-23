@@ -219,6 +219,8 @@ pub(crate) struct Inner {
     pub(crate) playlist_events: tokio::sync::broadcast::Sender<crate::PlaylistEvent>,
     /// Subtitle timing changes the servers told (PX-03).
     pub(crate) subtitle_events: tokio::sync::broadcast::Sender<crate::SubtitleTimingEvent>,
+    /// Library changes the servers told (P8-02).
+    pub(crate) library_events: tokio::sync::broadcast::Sender<crate::LibrariesChanged>,
     /// This device's downloads and their manager (PX-38).
     pub(crate) downloads: Arc<crate::downloads::Shared>,
 }
@@ -359,6 +361,7 @@ impl Client {
                 shares: tokio::sync::broadcast::channel(16).0,
                 playlist_events: tokio::sync::broadcast::channel(64).0,
                 subtitle_events: tokio::sync::broadcast::channel(64).0,
+                library_events: tokio::sync::broadcast::channel(16).0,
                 downloads: crate::downloads::Shared::new(downloads_dir),
             }),
         };
@@ -493,6 +496,14 @@ impl Client {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::SubtitleTimingEvent> {
         self.inner.subtitle_events.subscribe()
+    }
+
+    /// Every time a server this device is connected to says its libraries
+    /// changed (experimental `federation`, P8-02): a paired server came
+    /// online or went offline, or shared or stopped sharing a library. A
+    /// screen listing that server's libraries lists them again.
+    pub fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<crate::LibrariesChanged> {
+        self.inner.library_events.subscribe()
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:

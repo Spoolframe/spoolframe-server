@@ -39,6 +39,60 @@ pub fn peer_line(now: i64, peer: &PeerEntry) -> String {
     )
 }
 
+/// A live pair's state line, seen at `now`: online or not, when what it
+/// shares was last synced here, and its plays, one number each way, with
+/// the plays refused when there were any (P8-02, P8-03). No user of it is
+/// named.
+pub fn state_line(now: i64, peer: &PeerEntry) -> String {
+    let online = if peer.connected { "Online" } else { "Offline" };
+    let synced = match peer.last_sync {
+        Some(at) => format!("synced {}", ago(now, at)),
+        None => "nothing synced yet".to_owned(),
+    };
+    let mut line = format!(
+        "{online} · {synced} · {} here from its users · {} there by users here",
+        plays(peer.plays_here),
+        plays(peer.plays_there)
+    );
+    if peer.refused_here > 0 || peer.refused_there > 0 {
+        line.push_str(&format!(
+            " · {} refused here · {} refused there",
+            peer.refused_here, peer.refused_there
+        ));
+    }
+    line
+}
+
+fn plays(n: u64) -> String {
+    match n {
+        1 => "1 play".to_owned(),
+        n => format!("{n} plays"),
+    }
+}
+
+/// How long before `now` `at` was: by the minute within the hour, by the
+/// hour within the day, then by the day.
+fn ago(now: i64, at: i64) -> String {
+    match now.saturating_sub(at) {
+        ..60 => "just now".to_owned(),
+        s @ 60..3_600 => format!("{} min ago", s / 60),
+        s @ 3_600..86_400 => format!("{} h ago", s / 3_600),
+        _ => days_ago(now, at),
+    }
+}
+
+/// What the page says once `library` is shared with `peer`, or no longer.
+pub fn shared(peer: &PeerEntry, library: &str, now_shared: bool) -> String {
+    if now_shared {
+        format!("{library} is shared with {}", peer.name)
+    } else {
+        format!("{library} is no longer shared with {}", peer.name)
+    }
+}
+
+/// What the "Confirm it's you" dialog says sharing is.
+pub const CONFIRM_SHARE: &str = "changing what this server shares with a paired server";
+
 /// What a held key's row says, seen at `now`.
 pub fn new_key_line(now: i64, key: &PeerKey) -> String {
     match key.rejected_at {
@@ -74,6 +128,19 @@ pub fn unpair_question(peer: &PeerEntry) -> (String, String) {
             "{} stops being paired with this server, and is told so if it can be reached. \
              Pairing again takes a new invite.",
             peer.name
+        ),
+    )
+}
+
+/// The question before stopping sharing library `library` (by its name)
+/// with `peer` (P8-03): its title and text.
+pub fn revoke_question(peer: &PeerEntry, library: &str) -> (String, String) {
+    (
+        format!("Stop sharing {library} with {}?", peer.name),
+        format!(
+            "{}'s users can no longer browse or play it. Their plays of it stop now, and \
+             what {} cached of it goes at its next sync.",
+            peer.name, peer.name
         ),
     )
 }
@@ -137,7 +204,68 @@ mod tests {
             revoked_at: None,
             held_keys: Vec::new(),
             connected: false,
+            last_sync: None,
+            plays_here: 0,
+            plays_there: 0,
+            refused_here: 0,
+            refused_there: 0,
         }
+    }
+
+    #[test]
+    fn stopping_a_share_says_what_the_paired_server_loses() {
+        let (title, text) = revoke_question(&peer(), "Movies");
+        assert_eq!(title, format!("Stop sharing Movies with {}?", peer().name));
+        assert!(text.contains("can no longer browse or play it"), "{text}");
+    }
+
+    /// Online or not, the last sync, and one play count each way.
+    #[test]
+    fn a_live_pair_says_whether_it_is_online_when_it_synced_and_its_plays() {
+        assert_eq!(
+            state_line(NOW, &peer()),
+            "Offline · nothing synced yet · 0 plays here from its users · 0 plays there by users here"
+        );
+        let busy = PeerEntry {
+            connected: true,
+            last_sync: Some(NOW - 5 * 60),
+            plays_here: 1,
+            plays_there: 12,
+            ..peer()
+        };
+        assert_eq!(
+            state_line(NOW, &busy),
+            "Online · synced 5 min ago · 1 play here from its users · 12 plays there by users here"
+        );
+        let refused = PeerEntry {
+            refused_here: 2,
+            ..busy.clone()
+        };
+        assert!(
+            state_line(NOW, &refused).ends_with(" · 2 refused here · 0 refused there"),
+            "{}",
+            state_line(NOW, &refused)
+        );
+        let hours = PeerEntry {
+            last_sync: Some(NOW - 3 * 3_600),
+            ..peer()
+        };
+        assert!(state_line(NOW, &hours).contains("synced 3 h ago"));
+        let days = PeerEntry {
+            last_sync: Some(NOW - 2 * DAY),
+            ..peer()
+        };
+        assert!(state_line(NOW, &days).contains("synced 2 days ago"));
+        assert!(
+            state_line(
+                NOW,
+                &PeerEntry {
+                    last_sync: Some(NOW - 10),
+                    ..peer()
+                }
+            )
+            .contains("synced just now")
+        );
     }
 
     #[test]

@@ -1,4 +1,12 @@
-//! Libraries from several Plex servers as one catalog (P3-11).
+//! Libraries from several Plex servers as one catalog (P3-11), and the
+//! cache of what paired servers share (P8-02) as one more backend.
+//!
+//! An id in the `fed:` namespace goes to the cache, every other to the
+//! Plex server it names. The cache's libraries are not listed here, and it
+//! is not searched nor asked for recently added items: what of it a client
+//! sees is the client protocol's to add, and only for an app that names
+//! the experimental `federation` feature, so nothing here hands out a
+//! `fed:` id it was not asked about.
 //!
 //! Each call goes to the Plex server its ID names ([`super::ids`]); the
 //! library listing is the configured one, and search and recently added
@@ -13,10 +21,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use spoolframe_catalog::{
     Browse, Catalog, CatalogError, Found, FoundGroup, Image, Inspect, Inspected, ItemPage,
-    ItemWithChildren, LibraryCheck, MissingFile, Page, PreviewFrames, Row, RowPage, SearchQuery,
+    ItemWithChildren, LibraryCheck, MissingFile, Page, PreviewFrames, Reach, Row, RowPage,
+    SearchQuery,
 };
 use spoolframe_plex::{Dated, PlexCatalog};
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, PersonId};
+use spoolframe_types::{
+    ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, Namespace, PersonId,
+};
 
 use spoolframe_admin_api::SyncDirection;
 
@@ -54,8 +65,9 @@ pub enum Synced {
     Every(SyncDirection),
 }
 
-/// Every configured Plex server and library, as one [`Catalog`].
-#[derive(Debug)]
+/// Every configured Plex server and library, as one [`Catalog`], and the
+/// paired servers' cache.
+#[derive(Clone)]
 pub struct Composite {
     /// The first server first, then the others in order. Never empty.
     servers: Vec<PlexSource>,
@@ -64,6 +76,20 @@ pub struct Composite {
     libraries: Option<Vec<Served>>,
     /// Which way those libraries sync while they are not chosen.
     default_sync: SyncDirection,
+    /// What paired servers share, cached here (P8-02): the backend of
+    /// every `fed:` id. `None` with federation off.
+    peers: Option<Arc<dyn Catalog>>,
+}
+
+impl std::fmt::Debug for Composite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Composite")
+            .field("servers", &self.servers)
+            .field("libraries", &self.libraries)
+            .field("default_sync", &self.default_sync)
+            .field("peers", &self.peers.is_some())
+            .finish()
+    }
 }
 
 impl Composite {
@@ -78,7 +104,34 @@ impl Composite {
             servers,
             libraries,
             default_sync: SyncDirection::Off,
+            peers: None,
         }
+    }
+
+    /// Serve `fed:` ids from `peers`, the paired servers' cache (P8-02).
+    pub fn with_peers(mut self, peers: Arc<dyn Catalog>) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    /// Whether `fed:` ids are served from a cache.
+    pub fn has_peers(&self) -> bool {
+        self.peers.is_some()
+    }
+
+    /// The paired servers' cache, for an id in `namespace` that is
+    /// federated; `None` for any other. A federated id with no cache is in
+    /// no library served.
+    fn federated(
+        &self,
+        namespace: Namespace,
+        id: &impl ToString,
+    ) -> Option<Result<&Arc<dyn Catalog>, CatalogError>> {
+        (namespace == Namespace::Federated).then(|| {
+            self.peers
+                .as_ref()
+                .ok_or_else(|| CatalogError::NotServed(id.to_string()))
+        })
     }
 
     /// Libraries not chosen yet sync `sync` (P3-12).
@@ -270,6 +323,9 @@ impl Catalog for Composite {
     }
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
+        if let Some(peers) = self.federated(library.namespace(), library) {
+            return peers?.items(library, page).await;
+        }
         let (server, local) = ids::library_local(library);
         let source = self.source(server, library)?;
         let page = source
@@ -288,6 +344,9 @@ impl Catalog for Composite {
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.item(id).await;
+        }
         let (server, local) = ids::media_local(id);
         let found = self
             .source(server, id)?
@@ -299,6 +358,9 @@ impl Catalog for Composite {
     }
 
     async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
+        if let Some(peers) = self.federated(show.namespace(), show) {
+            return peers?.episodes(show).await;
+        }
         let (server, local) = ids::media_local(show);
         let episodes = self
             .source(server, show)?
@@ -310,6 +372,9 @@ impl Catalog for Composite {
     }
 
     async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
+        if let Some(peers) = self.federated(library.namespace(), library) {
+            return peers?.tracks(library).await;
+        }
         let (server, local) = ids::library_local(library);
         let tracks = self
             .source(server, library)?
@@ -321,6 +386,9 @@ impl Catalog for Composite {
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.external_ids(id).await;
+        }
         let (server, local) = ids::media_local(id);
         self.source(server, id)?
             .catalog
@@ -354,8 +422,46 @@ impl Catalog for Composite {
         failed.map_or(Ok(None), Err)
     }
 
+    /// A paired server's item as the cache keeps it, with its reach; any
+    /// other is here when Plex finds it.
+    async fn item_kept(&self, id: &MediaId) -> Result<(ItemWithChildren, Reach), CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.item_kept(id).await;
+        }
+        Ok((self.item(id).await?, Reach::Here))
+    }
+
+    /// The section Plex says the item is in, as the library it is here:
+    /// none for a section that is not one.
+    async fn library_of(&self, id: &MediaId) -> Result<Option<LibraryId>, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.library_of(id).await;
+        }
+        let (server, local) = ids::media_local(id);
+        let Some(section) = self
+            .source(server, id)?
+            .catalog
+            .section_of(&local)
+            .await
+            .map_err(|e| named(e, &local, id))?
+        else {
+            return Ok(None);
+        };
+        if self.libraries.is_none() {
+            return Ok((server == FIRST_PLEX_SERVER)
+                .then(|| LibraryId::new(spoolframe_types::Namespace::Plex, section).ok())
+                .flatten());
+        }
+        Ok(self
+            .served_library(server, &section)
+            .map(|s| s.library.id.clone()))
+    }
+
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
         if let Some(library) = &query.library {
+            if let Some(peers) = self.federated(library.namespace(), library) {
+                return peers?.search(query).await;
+            }
             let (server, local) = ids::library_local(library);
             let source = self.source(server, library)?;
             let asked = SearchQuery {
@@ -383,6 +489,9 @@ impl Catalog for Composite {
     }
 
     async fn person_items(&self, id: &PersonId) -> Result<Vec<Item>, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.person_items(id).await;
+        }
         let (server, local) = ids::person_local(id);
         let items = self
             .source(server, id)?
@@ -394,6 +503,9 @@ impl Catalog for Composite {
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.media_path(id).await;
+        }
         let (server, local) = ids::media_local(id);
         self.source(server, id)?
             .catalog
@@ -403,6 +515,9 @@ impl Catalog for Composite {
     }
 
     async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.preview_frames(id).await;
+        }
         let (server, local) = ids::media_local(id);
         self.source(server, id)?
             .catalog
@@ -431,6 +546,9 @@ impl Catalog for Composite {
     }
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.artwork(id).await;
+        }
         let (server, local) = ids::artwork_local(id);
         self.source(server, id)?
             .catalog
@@ -440,6 +558,9 @@ impl Catalog for Composite {
     }
 
     async fn authorize_artwork(&self, id: &ArtworkId) -> Result<(), CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.authorize_artwork(id).await;
+        }
         let (server, local) = ids::artwork_local(id);
         self.source(server, id)?
             .catalog
@@ -510,7 +631,39 @@ impl Inspect for Composite {
         Ok(rows(server, found))
     }
 
+    /// A paired server's item (P8-02) as its cache has it: no files, no
+    /// match, no folders, which are its origin's, and its children as
+    /// rows with nothing but the item.
     async fn inspect(&self, id: &MediaId) -> Result<Inspected, CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            let peers = peers?;
+            let found = peers.item(id).await?;
+            let children = found
+                .children
+                .iter()
+                .map(|item| Row {
+                    item: item.clone(),
+                    guid: None,
+                    agents: Vec::new(),
+                    added_at: None,
+                    updated_at: None,
+                    children: None,
+                    leaves: None,
+                    files: Vec::new(),
+                })
+                .collect();
+            return Ok(Inspected {
+                library: peers.library_of(id).await?,
+                found,
+                ancestors: Vec::new(),
+                guid: None,
+                added_at: None,
+                updated_at: None,
+                folders: Vec::new(),
+                versions: Vec::new(),
+                children,
+            });
+        }
         let (server, local) = ids::media_local(id);
         let seen = self
             .source(server, id)?

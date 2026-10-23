@@ -63,6 +63,8 @@ pub struct FakeCatalog {
     music: Mutex<bool>,
     /// Whether its films, episodes and tracks have posters (PX-53).
     posters: Mutex<bool>,
+    /// What its images say they are, when they are not images.
+    bogus: Mutex<Option<String>>,
     /// Agents' ids an item has besides its `test://` one (PX-02:
     /// `imdb://tt…`).
     more_ids: Mutex<HashMap<MediaId, Vec<String>>>,
@@ -97,6 +99,7 @@ impl FakeCatalog {
             unreadable: Mutex::default(),
             music: Mutex::default(),
             posters: Mutex::default(),
+            bogus: Mutex::default(),
             more_ids: Mutex::default(),
         }
     }
@@ -122,6 +125,12 @@ impl FakeCatalog {
     /// ([`poster_color`]). Without, items have none (PX-53).
     pub fn show_posters(&self) {
         *self.posters.lock() = true;
+    }
+
+    /// Serve every image as a page of HTML that says it is
+    /// `content_type`: what a paired server's cache refuses (L7).
+    pub fn bogus_images(&self, content_type: &str) {
+        *self.bogus.lock() = Some(content_type.to_owned());
     }
 
     /// Serve its music as a second library, `plex:library:2`, holding
@@ -165,6 +174,16 @@ impl FakeCatalog {
     /// What the fake's tree has under `id` now, with its children: none
     /// for a removed item or a key given away, the item for its new key.
     fn current(&self, id: &MediaId) -> Option<(Item, Vec<Item>)> {
+        // A paired server's copy ([`FED_ORIGIN`]) of an item of the tree,
+        // as the composite's cache would serve it (P8-03).
+        if let Some((origin, remote)) = id.remote() {
+            if origin != FED_ORIGIN || self.removed.lock().contains(id) {
+                return None;
+            }
+            return self
+                .current(&remote)
+                .map(|(item, children)| (with_id(item, id), children));
+        }
         if self.removed.lock().contains(id)
             || self.ungained.lock().contains(id)
             || self.rekeyed.lock().iter().any(|(old, _)| old == id)
@@ -229,7 +248,8 @@ impl FakeCatalog {
     }
 }
 
-/// The external ids of an item of the fake's tree.
+/// The external ids of an item of the fake's tree; a paired server's
+/// copy has its own's.
 fn external_ids(item: &Item) -> Vec<String> {
     let first = movie();
     let of = if item.id() == second_copy().id() {
@@ -237,7 +257,24 @@ fn external_ids(item: &Item) -> Vec<String> {
     } else {
         item
     };
-    vec![format!("test://{}", of.id().key())]
+    let key = match of.id().remote() {
+        Some((_, remote)) => remote.key().to_owned(),
+        None => of.id().key().to_owned(),
+    };
+    vec![format!("test://{key}")]
+}
+
+/// The paired server whose copies of the tree's items the fake serves
+/// (P8-03): `fed:` ids of any other origin are not found.
+pub const FED_ORIGIN: &str = "aaaaaaaaaaaaaaaa";
+
+/// The film as the paired server [`FED_ORIGIN`] shares it: the same title,
+/// its external ids the film's own.
+pub fn fed_copy() -> Item {
+    with_id(
+        movie(),
+        &MediaId::federated(FED_ORIGIN, movie().id()).unwrap(),
+    )
 }
 
 /// `item` under the key of `id`.
@@ -460,6 +497,7 @@ pub fn library() -> Library {
         id: LibraryId::new(Namespace::Plex, "1").unwrap(),
         title: "Movies".into(),
         kind: LibraryKind::Movies,
+        server: None,
     }
 }
 
@@ -469,6 +507,7 @@ pub fn music_library() -> Library {
         id: LibraryId::new(Namespace::Plex, "2").unwrap(),
         title: "Music".into(),
         kind: LibraryKind::Music,
+        server: None,
     }
 }
 
@@ -481,24 +520,31 @@ impl Catalog for FakeCatalog {
         Ok(vec![library()])
     }
 
+    /// Movies' film, or Music's artist: as a listing has them, with
+    /// their posters while there are any, and not once removed.
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
-        if library.key() == "2" && *self.music.lock() {
-            let items = if page.offset == 0 && page.limit > 0 {
-                vec![artist()]
-            } else {
-                Vec::new()
-            };
-            return Ok(ItemPage { items, total: 1 });
-        }
-        if library.key() != "1" {
+        let listed = if library.key() == "2" && *self.music.lock() {
+            artist()
+        } else if library.key() == "1" {
+            movie()
+        } else {
             return Err(CatalogError::NotFound(library.to_string()));
+        };
+        let mut listed: Vec<Item> = self
+            .current(listed.id())
+            .map(|(item, _)| item)
+            .into_iter()
+            .collect();
+        if *self.posters.lock() {
+            listed.iter_mut().for_each(with_poster);
         }
+        let total = listed.len() as u32;
         let items = if page.offset == 0 && page.limit > 0 {
-            vec![movie()]
+            listed
         } else {
             Vec::new()
         };
-        Ok(ItemPage { items, total: 1 })
+        Ok(ItemPage { items, total })
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
@@ -589,6 +635,21 @@ impl Catalog for FakeCatalog {
         Ok(None)
     }
 
+    /// The films in Movies, the music in Music while it is served; the
+    /// show is in no library.
+    async fn library_of(&self, id: &MediaId) -> Result<Option<LibraryId>, CatalogError> {
+        if self.current(id).is_none() {
+            return Err(CatalogError::NotFound(id.to_string()));
+        }
+        Ok(match id.kind() {
+            MediaKind::Movie => Some(library().id),
+            MediaKind::Artist | MediaKind::Album | MediaKind::Track if *self.music.lock() => {
+                Some(music_library().id)
+            }
+            _ => None,
+        })
+    }
+
     /// The movie, for a part of "alien" or for [`A_TITLE_OVER_A_FRAME`];
     /// two episodes for [`HEIST`]; nothing else.
     async fn search(&self, query: &SearchQuery) -> Result<Found, CatalogError> {
@@ -638,6 +699,10 @@ impl Catalog for FakeCatalog {
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
+        // A paired server's copy has no file here, as the cache's has none.
+        if id.namespace() == Namespace::Federated {
+            return Err(CatalogError::NotServed(id.to_string()));
+        }
         if self.removed.lock().contains(id) || self.rekeyed.lock().iter().any(|(old, _)| old == id)
         {
             return Err(CatalogError::NotFound(id.to_string()));
@@ -678,6 +743,12 @@ impl Catalog for FakeCatalog {
     }
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
+        if let Some(content_type) = self.bogus.lock().clone() {
+            return Ok(Image {
+                bytes: b"<!doctype html><script>alert(1)</script>".to_vec(),
+                content_type,
+            });
+        }
         let color = match (*self.posters.lock(), poster_color(id)) {
             (true, Some(color)) => color,
             _ if id.key() == POSTER => [10, 120, 200],

@@ -459,6 +459,7 @@ pub(crate) async fn alice(server: &TestServer) -> Actor {
     Actor {
         principal: Principal::LocalUser(user.id),
         admin: false,
+        federated: false,
     }
 }
 

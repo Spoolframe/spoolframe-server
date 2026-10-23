@@ -316,6 +316,7 @@ mod tests {
             id: LibraryId::new(Namespace::Plex, key).unwrap(),
             title: key.into(),
             kind,
+            server: None,
         }
     }
 

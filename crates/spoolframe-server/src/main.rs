@@ -1217,6 +1217,27 @@ async fn run(
     let uplink = Arc::new(spoolframe_server::uplink::Uplink::new(
         config.network.uplink()?,
     ));
+    // Federation (P8-01): experimental, off unless the setting turns it
+    // on; shared by the endpoint, which serves the ALPN, the admin API,
+    // which pairs, and the catalog, which serves what the pairs share
+    // from its cache (P8-02).
+    let federation = config.experimental.federation().then(|| {
+        Arc::new(spoolframe_server::federation::Federation::new(
+            auth.clone(),
+            catalog.clone(),
+            server_id.clone(),
+            name.clone(),
+            spoolframe_server::federation::ReplicaSettings {
+                dir: state_dir.join("cache").join("federation"),
+                sync_every: config.federation.sync_every(),
+                cache_max_bytes: config.federation.cache_max_bytes(),
+                cache_total_bytes: config.federation.cache_total_bytes(),
+            },
+        ))
+    });
+    if let Some(federation) = &federation {
+        live.set_peers(federation.peer_catalog());
+    }
     let settings = Arc::new(RuntimeSettings::new(
         layers.clone(),
         state_dir,
@@ -1237,6 +1258,7 @@ async fn run(
             transcoding: Some(transcoding.clone()),
             mcp: mcp.clone(),
             subtitle_downloads: Some(subtitle_downloads.clone()),
+            federation: federation.clone(),
         },
         restart_mode,
     ));
@@ -1265,16 +1287,6 @@ async fn run(
         Ok(swept) => tracing::info!(swept, "playlist covers no playlist has deleted"),
         Err(e) => tracing::warn!(error = %e, "cannot sweep the playlist covers"),
     }
-    // Federation (P8-01): experimental, off unless the setting turns it
-    // on; shared by the endpoint, which serves the ALPN, and the admin
-    // API, which pairs.
-    let federation = config.experimental.federation().then(|| {
-        Arc::new(spoolframe_server::federation::Federation::new(
-            auth.clone(),
-            server_id.clone(),
-            name.clone(),
-        ))
-    });
     // Only a server with no users offers setup, and only to someone who
     // can read this log.
     let setup_code = (auth.store().user_count().await? == 0).then(SetupCode::generate);

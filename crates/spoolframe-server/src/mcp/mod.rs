@@ -97,6 +97,7 @@ impl McpCaller {
         Actor {
             principal: self.principal(),
             admin: self.may(Scope::Admin),
+            federated: false,
         }
     }
 
@@ -992,7 +993,11 @@ impl McpServer {
         // comes over.
         library
             .watch
-            .relink(caller.principal(), &id, &found.external_ids)
+            .relink(
+                caller.principal(),
+                &id,
+                &library.watch.title_key(&found).await,
+            )
             .await?;
         let mut items: Vec<&mut Item> = std::iter::once(&mut found.item)
             .chain(found.children.iter_mut())
