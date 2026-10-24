@@ -88,9 +88,11 @@ impl PeerHello {
 /// Whether `request` names a paired server's item, library or image
 /// anywhere, in any field (a `fed:` id, P8-02): what a server refuses from
 /// a client that did not name the experimental `federation` feature, at
-/// one boundary rather than in each request's handler (L1). Text that
-/// only starts like one, a search's or a name, is not an id.
-pub fn names_federated(request: &crate::Request) -> bool {
+/// one boundary rather than in each request's handler (L1). A
+/// [`crate::Request`], or a resource's request, as an image's is
+/// (F8-11). Text that only starts like one, a search's or a name, is not
+/// an id.
+pub fn names_federated<T: Serialize + ?Sized>(request: &T) -> bool {
     fn names(value: &ciborium::Value) -> bool {
         match value {
             ciborium::Value::Text(text) => federated_id(text),

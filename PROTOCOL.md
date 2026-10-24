@@ -3105,7 +3105,9 @@ budget, and a wrong code and a refused stream each count as a wrong
 guess at an invite's code from that endpoint, on the count `RedeemInvite`
 and `LookupInvite` share; a refused stream counts only while the
 strangers' budget lasts, and spends from it. A live pair's connections
-skip the cap.
+skip that cap, and have their own: at most 4 at once from one pair's
+key, and 64 from every pair's together; one past either is closed
+`BUSY`.
 
 A live pair's endpoint that says another server id is refused
 `server_id_changed` every time, and its connection closed with
@@ -3192,7 +3194,8 @@ deletes the play tokens SA minted for that library's items.
 
 SA keeps no change feed. SB asks, on a live pair's connection, on
 connecting, every `federation.sync_interval_secs` (an hour by default)
-and on `federation.refresh { id }`:
+and on `federation.refresh { id }` (an admin's, signed in recently: it
+dials the pair and writes the cache):
 
 - `libraries` `{}`: `libraries { libraries }`, each `{id, title, kind}`,
   at most 256. A library SB has cached and that is no longer listed is
@@ -3263,8 +3266,10 @@ playsHere, proxiedHere, playsThere, proxiedThere}` (migration 0054).
 
 Only to an app that names the experimental `federation` feature in its
 `Hello`; any other sees none of this, and never a `fed:` id in any
-reply: a request of its that names one anywhere is `not_found`, and MCP's
-watch history leaves them out. `PROTOCOL_VERSION` does not change.
+reply: a request of its that names one anywhere, a resource's (an
+image's) too, is `not_found`. MCP never names the feature: its tools
+refuse a `fed:` item id as one not in the library, and its watch
+history leaves them out. `PROTOCOL_VERSION` does not change.
 
 - `Libraries` lists the paired servers' shared libraries after the
   server's own, each with `server {server_id, name, online}`. An offline
@@ -3388,7 +3393,9 @@ SB's is not passed on.
 
 - `assert_user` `{user, display_name, client_endpoint, item, scope,
   preferences}`:
-  `user` is the user's UUID on SB; `display_name` is for SA's logs only;
+  `user` is the user's UUID on SB; `display_name` is always empty: a
+  server never sends its users' names to another, which knows them by
+  their UUID alone (the field goes in the ALPN's next version);
   `client_endpoint` is the device's endpoint id, hex; `item` is SA's own
   id (what the `fed:` id carries); `scope` is `play`, the default when
   left out. Answered `token {token, scope, expires_at}`: a random bearer

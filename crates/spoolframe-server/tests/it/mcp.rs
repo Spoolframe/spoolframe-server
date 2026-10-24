@@ -26,6 +26,15 @@ const PROTOCOL: &str = "2025-06-18";
 /// its tools reading the server's library, watch state and playlists.
 pub(crate) async fn beside(test: &str) -> (TestServer, SocketAddr) {
     let server = TestServer::start(test).await;
+    let addr = serve_beside(&server, server.catalog.clone()).await;
+    (server, addr)
+}
+
+/// [`beside`]'s admin listener for `server`, its tools reading `catalog`.
+pub(crate) async fn serve_beside(
+    server: &TestServer,
+    catalog: std::sync::Arc<dyn spoolframe_catalog::Catalog>,
+) -> SocketAddr {
     let origins = Origins::Exactly(ORIGIN.to_owned());
     let (addr, handle) = admin::serve(
         "127.0.0.1:0".parse().unwrap(),
@@ -33,7 +42,7 @@ pub(crate) async fn beside(test: &str) -> (TestServer, SocketAddr) {
             passkeys: std::sync::Arc::new(Passkeys::new(&origins, &server.server_id)),
             mcp: McpSwitch::new(true),
             library: Some(spoolframe_server::mcp::Library {
-                catalog: server.catalog.clone(),
+                catalog,
                 watch: server.watch.clone(),
                 playlists: server.playlists.clone(),
             }),
@@ -47,7 +56,7 @@ pub(crate) async fn beside(test: &str) -> (TestServer, SocketAddr) {
     .await
     .unwrap();
     std::mem::forget(handle);
-    (server, addr)
+    addr
 }
 
 /// A user called `name` with role `role`: their principal.

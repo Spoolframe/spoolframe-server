@@ -52,9 +52,10 @@ impl TokenScope {
 pub struct AssertUser {
     /// The user's stable id on SB: a UUID, never a portable user's id.
     pub user: String,
-    /// What SB shows them as: for SA's logs, cut to
-    /// [`crate::MAX_HELLO_TEXT`] characters. SA's admin pages never list
-    /// it.
+    /// Always empty (F8-08): a server never sends its users' names to
+    /// another, which knows them by `user` alone. Kept for the wire, to
+    /// go in the federation protocol's next version; what a server reads
+    /// of it is cut to [`crate::MAX_HELLO_TEXT`] characters.
     pub display_name: String,
     /// The device's endpoint id, hex: the only one the token works from.
     pub client_endpoint: String,

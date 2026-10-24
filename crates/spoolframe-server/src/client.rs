@@ -1523,6 +1523,16 @@ impl ClientProtocol {
         let Some(hello) = state.hello.get() else {
             return Err(Error::HandshakeRequired);
         };
+        // The boundary requests have (L1), for a resource's too: an image
+        // of a paired server's is not there for a client that did not
+        // name the feature (F8-11).
+        if self.federation_for(hello).is_none()
+            && spoolframe_protocol::federation::names_federated(&request)
+        {
+            return Err(Error::NotFound {
+                what: "a paired server's item".into(),
+            });
+        }
         match request {
             ResourceRequest::Download {
                 session,

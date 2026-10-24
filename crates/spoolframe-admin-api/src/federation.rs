@@ -304,7 +304,8 @@ pub trait FederationApi {
     /// the replica does on connecting and every
     /// `federation.sync_interval_secs`: dial it if it is offline, drop
     /// the libraries it no longer shares, and sync the others. Admins
-    /// only. `NO_SUCH_PEER` for one that is not paired; `UNAVAILABLE` when
+    /// only, signed in recently, as for any change of a pair's
+    /// (`RECENT_SIGN_IN_REQUIRED`). `NO_SUCH_PEER` for one that is not paired; `UNAVAILABLE` when
     /// it cannot be reached, or does not pair with this server now.
     #[method(name = "refresh", with_extensions)]
     async fn peer_refresh(&self, id: String) -> jsonrpsee::core::RpcResult<()>;

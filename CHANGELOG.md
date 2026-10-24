@@ -230,22 +230,37 @@
   where one saying a huge length and sending nothing could abort SB on
   its HTTP port and was told on to the device over QUIC. An image's
   reply from SA is refused once it says it is longer than 16 MiB and 64
-  KiB, where SB held up to 64 MiB of it before refusing it.
-- Experimental, as pairing is: fixes from the federation security
-  review (P8-06). A token used up just before its grant is revoked, its
-  pair unpaired or its pair's new key confirmed opens no session: the
-  redemption registers the session before it uses the token up, and
-  the revocation ends it with the others. Each use of a paired server's
-  session checks its pair and grant again, so one that outlived them
-  ends. Confirming a pair's new key ends what the old key held: the
-  tokens minted for it, the sessions it opened in proxy mode, and the
-  connection this server plays the pair's items through; a device's own
-  tokens and sessions stay. A download token being redeemed holds its
-  place under the download token limits, so racing a mint with a
-  redemption never passes them. A token, and a session, are held to the
-  library their item is in now: an item moved to a library not shared
-  with the pair opens nothing, and the catalog change ends its sessions,
-  though the library it was in stays shared. A pair holds at most
+  KiB, where SB held up to 64 MiB of it before refusing it. A paired
+  server holds at most 4 federation connections at once, and every pair
+  64 together, apart from the strangers' cap; one past either is closed
+  `BUSY`, where a pair's connections had no cap, each with its own 16
+  streams. A server's assertion no longer says its user's display name
+  (`AssertUser.display_name` is sent empty; SA never needed it), so a
+  paired server learns SB's users by their UUID alone.
+  `federation_refresh` needs a recent sign-in, as every other change of
+  a pair's does: it dials the pair and writes the cache. An app that
+  does not name the `federation` feature is told `NotFound` for a paired
+  server's image, as for its items, where the image was served; and
+  MCP's tools refuse a `fed:` item id as not in the library, where
+  `get_item` read it and `set_watched` marked it. SB keeps a paired
+  server's download by that server and its id together (migration 0057),
+  so the same id from two paired servers is two downloads, where the
+  second took the first's record over. A token used up just before its
+  grant is revoked, its pair unpaired or its pair's new key confirmed
+  opens no session: the redemption registers the session before it uses
+  the token up, and the revocation ends it with the others. Each use of
+  a paired server's session checks its pair and grant again, so one that
+  outlived them ends. Confirming a pair's new key ends what the old key
+  held: the tokens minted for it, the sessions it opened in proxy mode,
+  and the connection this server plays the pair's items through; a
+  device's own tokens and sessions stay. A download token being
+  redeemed holds its place under the download token limits, so racing a
+  mint with a redemption never passes them. A token, and a session, are
+  held to the library their item is in now: once the item moves to
+  another library, even one also shared with the pair, its old tokens
+  open nothing and its sessions end, when the catalog is replaced or at
+  the session's next playback or download start; a fresh token plays the
+  item from its new library if that one is shared. A pair holds at most
   `federation { play_sessions_per_server = 200; }` play sessions at once
   (Settings › Experimental with advanced settings on), and the server
   10,000 in all; past them a token is refused `Unavailable` and is not

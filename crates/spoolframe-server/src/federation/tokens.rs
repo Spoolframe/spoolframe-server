@@ -76,14 +76,12 @@ impl Federation {
     pub async fn assert_play(
         &self,
         user: LocalUserId,
-        display_name: &str,
         item: &MediaId,
         device: EndpointId,
     ) -> Result<TokenGranted, AssertError> {
         let (peer, _) = self.remote_peer(item).await?;
         let wanted = Wanted::play(true);
-        self.assert_to(&peer, user, display_name, item, device, wanted)
-            .await
+        self.assert_to(&peer, user, item, device, wanted).await
     }
 
     /// [`Federation::assert_play`] to `peer`, the live pair `item` is from,
@@ -92,7 +90,6 @@ impl Federation {
         &self,
         peer: &PeerRecord,
         user: LocalUserId,
-        display_name: &str,
         item: &MediaId,
         device: EndpointId,
         wanted: Wanted,
@@ -115,7 +112,10 @@ impl Federation {
         let granted = dialed
             .assert_user(AssertUser {
                 user: user.to_string(),
-                display_name: display_name.to_owned(),
+                // Never the user's name: SA hears who they are by their
+                // stable id alone (F8-08). Empty, as the wire still has
+                // the field, until the protocol's next revision drops it.
+                display_name: String::new(),
                 client_endpoint: device.to_string(),
                 item: remote.to_string(),
                 scope,
@@ -209,8 +209,7 @@ impl Federation {
                 .await?;
             return Err(AssertError::NotALocalUser);
         };
-        self.assert_to(peer, local.user, &local.display_name, item, device, wanted)
-            .await
+        self.assert_to(peer, local.user, item, device, wanted).await
     }
 
     /// `who` was granted a token for `item` on `device` (P8-04): a proxied
@@ -580,5 +579,98 @@ pub(crate) mod tests {
                 .holds_play_token(&device, &play_relay_token(&next, device.as_bytes()))
                 .await
         );
+    }
+
+    /// F8-08: SB tells SA who its user is by their stable id, never their
+    /// name: SA needs none (its pages name the pair), and a paired server
+    /// is not trusted with SB's users. The assertion SA hears says the
+    /// user's UUID and an empty `display_name`, however they are called.
+    #[tokio::test]
+    async fn an_assertion_says_the_user_s_id_and_not_their_name() {
+        use iroh::endpoint::presets;
+        use spoolframe_federation::Dialed;
+        use spoolframe_protocol::FEDERATION_ALPN;
+        use spoolframe_protocol::codec::{read_frame_within, write_frame};
+        use spoolframe_protocol::federation::{
+            MAX_REQUEST, PROTOCOL_VERSION, PeerHello, PeerInfo, PeerReply, PeerRequest, Standing,
+        };
+        let endpoint = |alpns| {
+            iroh::Endpoint::builder(presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(alpns)
+                .bind()
+        };
+        // SA, as far as hearing an assertion: it refuses every one.
+        let sa = endpoint(vec![FEDERATION_ALPN.to_vec()]).await.unwrap();
+        let (heard, mut assertions) = tokio::sync::mpsc::unbounded_channel();
+        let answering = sa.clone();
+        tokio::spawn(async move {
+            let connection = answering.accept().await.unwrap().await.unwrap();
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                let reply = match read_frame_within(&mut recv, MAX_REQUEST).await.unwrap() {
+                    PeerRequest::Hello(_) => PeerReply::Info(PeerInfo {
+                        protocol_version: PROTOCOL_VERSION,
+                        server_id: "aaaaaaaaaaaaaaaa".into(),
+                        name: "Alice's server".into(),
+                        standing: Standing::Paired,
+                    }),
+                    PeerRequest::AssertUser(assertion) => {
+                        let _ = heard.send(assertion);
+                        PeerReply::AssertionRefused {
+                            reason: AssertionRefused::NotShared,
+                        }
+                    }
+                    other => panic!("not asked of SA here: {other:?}"),
+                };
+                write_frame(&mut send, &reply).await.unwrap();
+                send.finish().unwrap();
+            }
+        });
+        // SB, paired with SA and connected to it.
+        let store = test_store("fed-token-no-name").await;
+        let federation = Federation::new(
+            Auth::new(store.store.clone()),
+            Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into())),
+            "mzxw6ytbojtg633c".parse().unwrap(),
+            ServerName::new("Bob's server"),
+            super::super::ReplicaSettings::in_dir("/nowhere/federation".into()),
+        );
+        store
+            .add_peer(
+                NewPeer {
+                    server_id: "aaaaaaaaaaaaaaaa",
+                    endpoint_id: &sa.id().to_string(),
+                    display_name: "Alice's server",
+                    addrs: &[],
+                    relays: &[],
+                },
+                "bob",
+            )
+            .await
+            .unwrap();
+        let sb = endpoint(Vec::new()).await.unwrap();
+        let hello = PeerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_id: "mzxw6ytbojtg633c".into(),
+            name: "Bob's server".into(),
+        };
+        let (dialed, _) = Dialed::connect(&sb, sa.addr(), hello).await.unwrap();
+        federation.links.set("aaaaaaaaaaaaaaaa", Arc::new(dialed));
+        let bob = store
+            .add_user(
+                "bob",
+                Some("Robert Distinctive"),
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA",
+                spoolframe_types::Role::Consumer,
+            )
+            .await
+            .unwrap();
+        let alien = MediaId::federated("aaaaaaaaaaaaaaaa", movie().id()).unwrap();
+        let device = iroh::SecretKey::from_bytes(&[5; 32]).public();
+        let refused = federation.assert_play(bob, &alien, device).await;
+        assert!(refused.is_err(), "SA refuses every assertion");
+        let heard = assertions.recv().await.unwrap();
+        assert_eq!(heard.user, bob.to_string());
+        assert_eq!(heard.display_name, "");
     }
 }

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use iroh::endpoint::{ConnectionError, presets};
+use iroh::endpoint::{Connection, ConnectionError, presets};
 use iroh::{Endpoint, RelayMode};
 use spoolframe_federation::{DialError, Dialed};
 use spoolframe_protocol::federation::{
@@ -15,6 +15,7 @@ use spoolframe_protocol::federation::{
 use spoolframe_protocol::invite::InviteLinkKind;
 use spoolframe_protocol::{CLIENT_ALPN, Error, FEDERATION_ALPN, RedeemInvite, Request, Response};
 use spoolframe_protocol::{close, fingerprint};
+use spoolframe_server::admission::Admission;
 use spoolframe_server::federation::{Federation, PairError};
 use spoolframe_server::invites::{InviteRequest, create, server_link};
 use spoolframe_server::store::invites::{InviteKind, InviteOrigin};
@@ -673,6 +674,132 @@ async fn a_pair_the_redeemer_cannot_keep_is_unpaired_on_the_other_side() {
     assert!(!on_sa[0].live(), "and was told to unpair");
     sa.stop().await;
     sb.stop().await;
+}
+
+/// `endpoint`, paired with `sa` as `server_id` by a use of `link`.
+async fn paired(sa: &TestServer, link: &str, server_id: &str) -> Endpoint {
+    let sb = endpoint().await;
+    let (dialed, _) = Dialed::connect(&sb, sa.server.addr(), hello(server_id))
+        .await
+        .unwrap();
+    dialed.redeem(redeem(&code_of(link))).await.unwrap();
+    dialed.close();
+    sb
+}
+
+/// A connection from `from` to `sa`'s federation ALPN, its `hello` as
+/// `server_id` answered paired; or `Err` once it is closed `BUSY`.
+async fn busy(sa: &TestServer, from: &Endpoint, server_id: &str) -> Result<Connection, ()> {
+    use spoolframe_protocol::codec::{read_frame, write_frame};
+    use spoolframe_protocol::federation::PeerReply;
+    let conn = from
+        .connect(sa.server.addr(), FEDERATION_ALPN)
+        .await
+        .unwrap();
+    let said = async {
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        write_frame(&mut send, &PeerRequest::Hello(hello(server_id)))
+            .await
+            .ok()?;
+        send.finish().ok()?;
+        read_frame::<_, PeerReply>(&mut recv).await.ok()
+    };
+    match said.await {
+        Some(PeerReply::Info(info)) => {
+            assert_eq!(info.standing, Standing::Paired);
+            Ok(conn)
+        }
+        other => {
+            let closed = conn.closed().await;
+            assert!(
+                matches!(
+                    &closed,
+                    ConnectionError::ApplicationClosed(c) if c.error_code == close::BUSY.into()
+                ),
+                "{other:?}, {closed:?}"
+            );
+            Err(())
+        }
+    }
+}
+
+/// F8-07: a paired server's connections are capped, per key and in all,
+/// apart from the strangers' cap: one past either is closed `BUSY`, and
+/// another pair, a stranger and a device still get in. Once one closes,
+/// the next is let in.
+#[tokio::test]
+async fn a_paired_server_s_connections_are_capped_apart_from_the_strangers() {
+    let sa = server("fed-pair-cap", "Alice's server").await;
+    let link = pairing_link(&sa, Some(2)).await;
+    let bob_s = paired(&sa, &link, "bbbbbbbbbbbbbbbb").await;
+    let carol_s = paired(&sa, &link, "cccccccccccccccc").await;
+    let mut held = Vec::new();
+    for _ in 0..Admission::DEFAULT_MAX_PAIR_CONNECTIONS {
+        held.push(busy(&sa, &bob_s, "bbbbbbbbbbbbbbbb").await.expect("let in"));
+    }
+    assert!(busy(&sa, &bob_s, "bbbbbbbbbbbbbbbb").await.is_err());
+    // Another pair's, a stranger's and a device's are their own.
+    let carol = busy(&sa, &carol_s, "cccccccccccccccc")
+        .await
+        .expect("let in");
+    let stranger = endpoint().await;
+    let (_stranger, info) = Dialed::connect(&stranger, sa.server.addr(), hello("dddddddddddddddd"))
+        .await
+        .unwrap();
+    assert_eq!(info.standing, Standing::Stranger);
+    let device = sa.client().await;
+    device.hello().await;
+    // One of Bob's closed, the next is let in.
+    held.remove(0).close(0u32.into(), b"done");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(again) = busy(&sa, &bob_s, "bbbbbbbbbbbbbbbb").await {
+                break again;
+            }
+        }
+    })
+    .await
+    .expect("let in once one closed");
+    drop((held, carol));
+    sa.stop().await;
+}
+
+/// F8-07: every pair's connections together are capped too: with room
+/// for three, Bob's two and Carol's one fill it, and Carol's second is
+/// closed `BUSY` though her key has room; a stranger still gets in.
+#[tokio::test]
+async fn every_pair_s_connections_together_are_capped() {
+    let sa = TestServer::start_with(
+        fresh_dir("fed-pairs-cap").await,
+        ServerOptions {
+            name: "Alice's server".into(),
+            federation: true,
+            admission: Admission {
+                max_pair_connections: 2,
+                max_paired_connections: 3,
+                ..Admission::default()
+            },
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let link = pairing_link(&sa, Some(2)).await;
+    let bob_s = paired(&sa, &link, "bbbbbbbbbbbbbbbb").await;
+    let carol_s = paired(&sa, &link, "cccccccccccccccc").await;
+    let _held = [
+        busy(&sa, &bob_s, "bbbbbbbbbbbbbbbb").await.expect("let in"),
+        busy(&sa, &bob_s, "bbbbbbbbbbbbbbbb").await.expect("let in"),
+        busy(&sa, &carol_s, "cccccccccccccccc")
+            .await
+            .expect("let in"),
+    ];
+    assert!(busy(&sa, &carol_s, "cccccccccccccccc").await.is_err());
+    let stranger = endpoint().await;
+    let (_stranger, info) = Dialed::connect(&stranger, sa.server.addr(), hello("dddddddddddddddd"))
+        .await
+        .unwrap();
+    assert_eq!(info.standing, Standing::Stranger);
+    sa.stop().await;
 }
 
 /// Off, as in 0.14.4: the ALPN closes at once, and no `federation` invite
@@ -1359,6 +1486,10 @@ mod admin {
             code(guest.peer_grant_list("x".into()).await.unwrap_err()),
             error_code::FORBIDDEN
         );
+        assert_eq!(
+            code(guest.peer_refresh("x".into()).await.unwrap_err()),
+            error_code::FORBIDDEN
+        );
         sa.server
             .clock
             .advance(spoolframe_server::auth::RECENT_SIGN_IN + Duration::from_secs(1));
@@ -1384,6 +1515,8 @@ mod admin {
             sa.admin
                 .peer_grant_revoke("x".into(), "plex:1".into())
                 .await,
+            // It dials the pair and writes the cache (F8-09).
+            sa.admin.peer_refresh("x".into()).await,
         ] {
             assert_eq!(
                 code(refused.unwrap_err()),
@@ -2498,6 +2631,38 @@ mod replica {
         pair.stop().await;
     }
 
+    /// F8-11: nor by an image's id, which is a resource, not a request: an
+    /// app that does not name the feature is told `NotFound` and sent no
+    /// bytes of SA's poster, as it is, or resized; one that names it gets
+    /// the image.
+    #[tokio::test]
+    async fn an_app_not_naming_the_feature_gets_no_image_of_sa_s() {
+        use spoolframe_protocol::ArtworkResponse;
+        use spoolframe_protocol::ArtworkSize;
+        let pair = Pair::start("fed-exposure-old-image").await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let poster = pair.fed_artwork(&poster_of("1"));
+        let (app, bob) = bob_on(&pair, true).await;
+        let (old, bob_old) = bob_on(&pair, false).await;
+        for size in [ArtworkSize::Original, ArtworkSize::Small] {
+            let (response, bytes) = app.artwork(&bob, poster.clone(), size).await;
+            assert!(
+                matches!(response, ArtworkResponse::Ok(_)),
+                "{size:?}: {response:?}"
+            );
+            assert!(!bytes.is_empty());
+            let (response, bytes) = old.artwork(&bob_old, poster.clone(), size).await;
+            assert!(
+                matches!(response, ArtworkResponse::Err(Error::NotFound { .. })),
+                "{size:?}: {response:?}"
+            );
+            assert!(bytes.is_empty());
+        }
+        pair.stop().await;
+    }
+
     /// Unpaired, SA's film Bob was watching stays in his Continue
     /// watching, listed as no longer available, for an app that names the
     /// feature; and SA's library and row are gone.
@@ -2749,16 +2914,16 @@ mod replica {
         let alien = pair.fed(movie().id());
         let sb = federation(&pair.sb);
         for _ in 0..Limits::default().tokens.per_user {
-            sb.assert_play(bob, "Bob", &alien, device).await.unwrap();
+            sb.assert_play(bob, &alien, device).await.unwrap();
         }
         assert!(matches!(
-            sb.assert_play(bob, "Bob", &alien, device).await,
+            sb.assert_play(bob, &alien, device).await,
             Err(AssertError::Dial(DialError::NotGranted(
                 AssertionRefused::Unavailable
             )))
         ));
         pair.sa.store.clock().advance(PLAY_TOKEN_LIFETIME);
-        sb.assert_play(bob, "Bob", &alien, device).await.unwrap();
+        sb.assert_play(bob, &alien, device).await.unwrap();
         pair.stop().await;
     }
 
@@ -2783,7 +2948,7 @@ mod replica {
         let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let alien = pair.fed(movie().id());
         let granted = federation(&pair.sb)
-            .assert_play(bob, "Bob", &alien, device)
+            .assert_play(bob, &alien, device)
             .await
             .unwrap();
         assert_eq!(granted.scope, TokenScope::Play);
@@ -2836,7 +3001,7 @@ mod replica {
         let refused = |item: MediaId| {
             let federation = federation(&pair.sb);
             async move {
-                match federation.assert_play(bob, "Bob", &item, device).await {
+                match federation.assert_play(bob, &item, device).await {
                     Err(AssertError::Dial(DialError::NotGranted(reason))) => reason,
                     other => panic!("{other:?}"),
                 }
@@ -2860,7 +3025,7 @@ mod replica {
         assert_eq!(pair.sa.store.federation_token(&hash).await.unwrap(), None);
         assert!(matches!(
             federation(&pair.sb)
-                .assert_play(bob, "Bob", &pair.fed(movie().id()), device)
+                .assert_play(bob, &pair.fed(movie().id()), device)
                 .await,
             Err(AssertError::Dial(DialError::NotGranted(
                 AssertionRefused::NotShared
@@ -2868,7 +3033,7 @@ mod replica {
         ));
         assert!(matches!(
             federation(&pair.sb)
-                .assert_play(bob, "Bob", movie().id(), device)
+                .assert_play(bob, movie().id(), device)
                 .await,
             Err(AssertError::NotFederated(_))
         ));
@@ -2891,12 +3056,12 @@ mod replica {
         pair.sb.add_user("bob", "correct horse", None).await;
         let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
         let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
-        sb.assert_play(bob, "Bob", &pair.fed(movie().id()), device)
+        sb.assert_play(bob, &pair.fed(movie().id()), device)
             .await
             .unwrap();
         // An artist does not play: refused, and counted on both sides.
         let artist = pair.fed(&MediaId::new(Namespace::Plex, MediaKind::Artist, "30").unwrap());
-        assert!(sb.assert_play(bob, "Bob", &artist, device).await.is_err());
+        assert!(sb.assert_play(bob, &artist, device).await.is_err());
         let counted = |federation: &Arc<Federation>, peer: String| {
             let federation = federation.clone();
             async move {
@@ -2932,7 +3097,7 @@ mod replica {
         pair.sb.add_user("bob", "correct horse", None).await;
         let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
         let device = iroh::SecretKey::from_bytes(&[3; 32]).public();
-        sb.assert_play(bob, "Bob", &pair.fed(movie().id()), device)
+        sb.assert_play(bob, &pair.fed(movie().id()), device)
             .await
             .unwrap();
         let shown = page().await;
@@ -3521,7 +3686,7 @@ mod replica {
         let alien = pair.fed(movie().id());
         let play = || async {
             let granted = federation(&pair.sb)
-                .assert_play(bob, "Bob", &alien, device)
+                .assert_play(bob, &alien, device)
                 .await
                 .unwrap();
             SessionToken(granted.token.clone()).hash()
@@ -3650,6 +3815,40 @@ mod replica {
         pair.stop().await;
     }
 
+    /// F8-10: MCP never names the feature, so a paired server's item is
+    /// not in its library, by its `fed:` id either: `get_item` and
+    /// `set_watched` of it are refused as of an item that is not there,
+    /// though the cache has the item.
+    #[tokio::test]
+    async fn mcp_reaches_no_paired_server_s_item_by_its_id() {
+        use crate::mcp::{Mcp, serve_beside, user};
+        let pair = Pair::start("fed-replica-mcp").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        assert!(pair.cache.item(&alien).await.is_ok(), "cached");
+        let addr = serve_beside(&pair.sb, pair.cache.clone()).await;
+        user(&pair.sb, "bob", spoolframe_types::Role::Consumer).await;
+        let mcp = Mcp::connect(addr, "bob", &["library:read", "playlists:write"]).await;
+        let id = alien.to_string();
+        let got = mcp.call("get_item", serde_json::json!({ "id": id })).await;
+        assert!(
+            got.as_ref().unwrap_err().contains("not in the library"),
+            "{got:?}"
+        );
+        let marked = mcp
+            .call(
+                "set_watched",
+                serde_json::json!({ "id": id, "watched": true }),
+            )
+            .await;
+        assert!(
+            marked.as_ref().unwrap_err().contains("not in the library"),
+            "{marked:?}"
+        );
+        pair.stop().await;
+    }
+
     /// The media path (P8-04).
     mod media {
         use spoolframe_protocol::federation::{PlayTokenRedeemed, RedeemPlayToken};
@@ -3685,7 +3884,7 @@ mod replica {
         /// SB vouches for Bob on `device`: SA's token for its film.
         async fn token(pair: &Pair, bob: LocalUserId, device: &TestClient) -> String {
             federation(&pair.sb)
-                .assert_play(bob, "Bob", &pair.fed(movie().id()), device.endpoint.id())
+                .assert_play(bob, &pair.fed(movie().id()), device.endpoint.id())
                 .await
                 .unwrap()
                 .token
@@ -4484,7 +4683,7 @@ mod replica {
             let pair = Pair::start("fed-media-proxy-scope").await;
             let (_, bob) = shared(&pair).await;
             let token = federation(&pair.sb)
-                .assert_play(bob, "Bob", &pair.fed(movie().id()), pair.sb.server.id())
+                .assert_play(bob, &pair.fed(movie().id()), pair.sb.server.id())
                 .await
                 .unwrap()
                 .token;

@@ -322,8 +322,10 @@ impl Connections {
 
     /// Hold a server's `spoolframe/federation/1` connection (P8-01) as
     /// [`Connections::admit`] holds a device's: a live pair's (`peer`)
-    /// always, with the normal limits; a stranger's on the same cap as
-    /// devices that are not signed in.
+    /// with the normal limits, while its key holds fewer than
+    /// [`Admission::max_pair_connections`] and every pair's fewer than
+    /// [`Admission::max_paired_connections`] (F8-07); a stranger's on the
+    /// same cap as devices that are not signed in.
     pub(crate) fn admit_federation(
         &self,
         connection: &Connection,
@@ -345,6 +347,20 @@ impl Connections {
             && peers.values().filter(|peer| !peer.known()).count() >= self.admission.max_strangers
         {
             return None;
+        }
+        // Counted under the same lock as the insert, so connections at
+        // once never pass a cap.
+        if matches!(peer.kind(), PeerKind::Federation(Some(_))) {
+            let pairs: Vec<_> = peers
+                .values()
+                .filter(|held| matches!(held.kind(), PeerKind::Federation(Some(_))))
+                .collect();
+            let this_key = pairs.iter().filter(|held| held.endpoint == peer.endpoint);
+            if pairs.len() >= self.admission.max_paired_connections
+                || this_key.count() >= self.admission.max_pair_connections
+            {
+                return None;
+            }
         }
         let peer = Arc::new(peer);
         if known {

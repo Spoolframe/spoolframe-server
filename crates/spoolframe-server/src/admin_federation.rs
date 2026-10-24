@@ -344,7 +344,8 @@ impl FederationApiServer for AdminApi {
     }
 
     async fn peer_refresh(&self, ext: &Extensions, id: String) -> RpcResult<()> {
-        self.admin(ext).await?;
+        // As `look_up`: it dials the pair, and writes the cache (F8-09).
+        self.recent_admin(ext).await?;
         self.federation()?.refresh(&id).await.map_err(replica_error)
     }
 }

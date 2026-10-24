@@ -52,8 +52,9 @@ fn size(n: Option<u64>) -> Option<i64> {
 }
 
 impl Store {
-    /// Keep `new`: the user's same download of SA's (by SA's id) keeps its
-    /// id here, and is available again.
+    /// Keep `new`: the user's same download of SA's (by SA's id, which
+    /// names it on that origin alone) keeps its id here, and is available
+    /// again.
     pub async fn put_remote_download(
         &self,
         new: NewRemoteDownload<'_>,
@@ -64,8 +65,8 @@ impl Store {
                  (id, principal, origin, library, item, remote_id, state, file, expected_size, \
                   created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10) \
-             ON CONFLICT (principal, remote_id) DO UPDATE SET \
-                 origin = excluded.origin, library = excluded.library, item = excluded.item, \
+             ON CONFLICT (principal, origin, remote_id) DO UPDATE SET \
+                 library = excluded.library, item = excluded.item, \
                  state = excluded.state, file = COALESCE(excluded.file, file), \
                  expected_size = COALESCE(excluded.expected_size, expected_size), \
                  unavailable_at = NULL, updated_at = excluded.updated_at \
@@ -380,6 +381,130 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// F8-13: SA's id names a download only on SA. The same id from two
+    /// paired servers is two downloads here, each with its own id, item
+    /// and library, told to and made unavailable with its own origin
+    /// alone; one origin's never takes the other's row over.
+    #[tokio::test]
+    async fn the_same_remote_id_from_two_origins_is_two_downloads() {
+        let store = test_store("fed-downloads-origins").await;
+        let alice_s = store
+            .put_remote_download(new("r1", "plex:1"))
+            .await
+            .unwrap();
+        let carol_s = store
+            .put_remote_download(NewRemoteDownload {
+                origin: "cccccccccccccccc",
+                item: "fed:movie:cccccccccccccccc:plex:9",
+                ..new("r1", "plex:9")
+            })
+            .await
+            .unwrap();
+        assert_ne!(alice_s.id, carol_s.id);
+        let ids = [alice_s.id.clone(), carol_s.id.clone()];
+        let rows = store
+            .remote_downloads(&alice_s.principal, &ids)
+            .await
+            .unwrap();
+        let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
+        assert_eq!(row(&alice_s.id), alice_s);
+        assert_eq!(
+            (
+                row(&carol_s.id).origin.as_str(),
+                row(&carol_s.id).item.as_str()
+            ),
+            ("cccccccccccccccc", "fed:movie:cccccccccccccccc:plex:9")
+        );
+        let told = store
+            .remote_downloads_by_remote_id("mzxw6ytbojtg633c", "r1")
+            .await
+            .unwrap();
+        assert_eq!(told, std::slice::from_ref(&alice_s));
+        assert_eq!(
+            store
+                .remote_downloads_unavailable("cccccccccccccccc", None)
+                .await
+                .unwrap(),
+            1
+        );
+        let alice_s_now = store
+            .remote_download(&alice_s.principal, &alice_s.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice_s_now.unavailable_at, None);
+    }
+
+    /// Migration 0057 keeps the downloads 0056 made, as they were, and a
+    /// second paired server's same id is a download of its own after it.
+    #[tokio::test]
+    async fn the_migration_keeps_every_download_and_widens_its_key() {
+        let dir = super::super::tests::state_dir("fed-downloads-by-origin").await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.as_ref().join(super::super::DB_FILE))
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = before
+            .iter()
+            .filter(|m| m.version < 57)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        before.run(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO federation_downloads (id, principal, origin, library, item, \
+               remote_id, state, file, expected_size, created_at, updated_at, \
+               unavailable_at) VALUES \
+               ('d1', 'local:00000000-0000-0000-0000-000000000007', 'mzxw6ytbojtg633c', \
+                'plex:1', 'fed:movie:mzxw6ytbojtg633c:plex:1', 'r1', '{\"type\":\"waiting\"}', \
+                NULL, 10, 5, 6, 7);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let store = Store::open(dir.as_ref()).await.unwrap();
+        let principal = "local:00000000-0000-0000-0000-000000000007";
+        let kept = store.remote_download(principal, "d1").await.unwrap();
+        assert_eq!(
+            kept,
+            Some(RemoteDownloadRow {
+                id: "d1".into(),
+                principal: principal.into(),
+                origin: "mzxw6ytbojtg633c".into(),
+                library: "plex:1".into(),
+                item: "fed:movie:mzxw6ytbojtg633c:plex:1".into(),
+                remote_id: "r1".into(),
+                state: r#"{"type":"waiting"}"#.into(),
+                file: None,
+                expected_size: Some(10),
+                unavailable_at: Some(7),
+            })
+        );
+        let other = store
+            .put_remote_download(NewRemoteDownload {
+                origin: "nbswy3dpo5xxe3de",
+                ..new("r1", "plex:1")
+            })
+            .await
+            .unwrap();
+        assert_ne!(other.id, "d1");
+        assert!(
+            store
+                .remote_download(principal, "d1")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

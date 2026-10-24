@@ -60,12 +60,21 @@ pub const SIGN_OUT_DRAIN: Duration = Duration::from_secs(2);
 /// session, besides each time sessions end: a session can also expire.
 pub const RECHECK: Duration = Duration::from_secs(60);
 
-/// What an operator sets in `network {}`.
+/// What an operator sets in `network {}`, and the caps on paired servers'
+/// connections, which no setting moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Admission {
     /// The most stranger connections held at once; one more is closed with
     /// [`spoolframe_protocol::close::BUSY`].
     pub max_strangers: usize,
+    /// The most `spoolframe/federation/1` connections one live pair's key
+    /// holds at once (F8-07); one more is closed `BUSY`. A pair keeps one,
+    /// and a second while it dials again or refreshes.
+    pub max_pair_connections: usize,
+    /// The most connections of every live pair's together; one more is
+    /// closed `BUSY`. Apart from the strangers' cap, so pairs and devices
+    /// never take each other's places.
+    pub max_paired_connections: usize,
     /// How long a stream's kind byte and first frame may take to arrive
     /// before the stream is reset.
     pub first_frame: Duration,
@@ -76,6 +85,8 @@ pub struct Admission {
 
 impl Admission {
     pub const DEFAULT_MAX_STRANGERS: usize = 64;
+    pub const DEFAULT_MAX_PAIR_CONNECTIONS: usize = 4;
+    pub const DEFAULT_MAX_PAIRED_CONNECTIONS: usize = 64;
     pub const DEFAULT_FIRST_FRAME: Duration = Duration::from_secs(10);
     /// Long enough for a player paused with a read under way: it takes
     /// what is sent as it plays on.
@@ -86,6 +97,8 @@ impl Default for Admission {
     fn default() -> Self {
         Self {
             max_strangers: Self::DEFAULT_MAX_STRANGERS,
+            max_pair_connections: Self::DEFAULT_MAX_PAIR_CONNECTIONS,
+            max_paired_connections: Self::DEFAULT_MAX_PAIRED_CONNECTIONS,
             first_frame: Self::DEFAULT_FIRST_FRAME,
             stalled_read: Self::DEFAULT_STALLED_READ,
         }

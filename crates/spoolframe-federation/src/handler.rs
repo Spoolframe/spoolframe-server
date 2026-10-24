@@ -508,13 +508,15 @@ impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P
         let endpoint = connection.remote_id();
         let known = self.peers.known(endpoint).await;
         let Some(held) = self.strangers.admit(&connection, known.as_ref()) else {
+            // A stranger past the strangers' cap, or a pair past its own.
             tracing::info!(
                 peer = %endpoint.fmt_short(),
-                "refusing a server: too many connections from endpoints that are not known"
+                known = known.is_some(),
+                "refusing a server: too many connections"
             );
             connection.close(
                 VarInt::from_u32(close::BUSY),
-                b"too many connections from unknown endpoints; try again later",
+                b"too many connections; try again later",
             );
             let _ = tokio::time::timeout(LAST_REPLY_WAIT, connection.closed()).await;
             return Ok(());

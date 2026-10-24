@@ -323,7 +323,7 @@ async fn a_download_token_reads_its_download_alone_and_plays_nothing() {
     let bob_id = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
     let player = app_from(&pair.sa, &app).await;
     let play = federation(&pair.sb)
-        .assert_play(bob_id, "Bob", &alien, player.endpoint.id())
+        .assert_play(bob_id, &alien, player.endpoint.id())
         .await
         .unwrap();
     let playing = redeemed(&player, &play.token).await.session;
@@ -729,7 +729,7 @@ async fn reading_sa_s_file_off_its_lan_takes_no_play_s_wan_stream() {
         .await;
     let bob_id = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
     let play = federation(&pair.sb)
-        .assert_play(bob_id, "Bob", &alien, player.endpoint.id())
+        .assert_play(bob_id, &alien, player.endpoint.id())
         .await
         .unwrap();
     let playing = redeemed(&player, &play.token).await.session;

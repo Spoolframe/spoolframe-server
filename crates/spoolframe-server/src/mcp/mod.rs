@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use spoolframe_catalog::{Catalog, CatalogError};
-use spoolframe_types::{Item, MediaId, SearchScope};
+use spoolframe_types::{Item, MediaId, Namespace, SearchScope};
 
 use jsonrpsee::types::ErrorObjectOwned;
 use spoolframe_protocol::playlists::{
@@ -722,10 +722,17 @@ fn args<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, ToolErr
         .map_err(|e| ToolError(format!("arguments: {e}")))
 }
 
-/// `text` as an item id.
+/// `text` as an item id. A paired server's (`fed:`) is not in the library
+/// MCP reads: MCP never names the federation feature, so it reaches such
+/// an item by its id no more than an app that does not name it (F8-10).
 fn media_id(text: &str) -> Result<MediaId, ToolError> {
-    text.parse()
-        .map_err(|_| ToolError(format!("{text:?} is not an item id")))
+    let id: MediaId = text
+        .parse()
+        .map_err(|_| ToolError(format!("{text:?} is not an item id")))?;
+    if id.namespace() == Namespace::Federated {
+        return Err(ToolError(format!("{id} is not in the library")));
+    }
+    Ok(id)
 }
 
 /// Seconds, from a duration.

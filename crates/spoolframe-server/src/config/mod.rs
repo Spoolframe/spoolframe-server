@@ -2639,6 +2639,7 @@ impl NetworkConfig {
             stalled_read: self
                 .stalled_read_secs
                 .map_or(Admission::DEFAULT_STALLED_READ, Duration::from_secs),
+            ..Admission::default()
         };
         if admission.max_strangers == 0 {
             return Err(ConfigError::Invalid {

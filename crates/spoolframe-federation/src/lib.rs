@@ -110,9 +110,10 @@ pub trait Strangers: Send + Sync + 'static {
     /// closes.
     type Held: Send + 'static;
 
-    /// Hold `connection`, if there is room: a live pair's (`peer`) always,
-    /// with the normal limits; a stranger's only while the server holds
-    /// fewer than its cap of connections from no one it knows.
+    /// Hold `connection`, if there is room: a live pair's (`peer`) with the
+    /// normal limits, within the server's caps on pairs' connections; a
+    /// stranger's only while the server holds fewer than its cap of
+    /// connections from no one it knows. `None` closes it `BUSY`.
     fn admit(&self, connection: &Connection, peer: Option<&ServerId>) -> Option<Self::Held>;
 
     /// `endpoint`, not a live pair's, asked for what it may not: counted
