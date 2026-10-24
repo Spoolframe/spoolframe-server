@@ -2304,6 +2304,39 @@ impl ClientProtocol {
         {
             return Err(Error::Unauthenticated);
         }
+        // And only while its item is in the library its token was for
+        // (F8-04), checked as each playback or download starts: a PMS
+        // moves an item between its sections without the catalog being
+        // replaced, which is all that ends sessions at once. Moved, the
+        // session ends; unplaced now, the start is refused, as a
+        // redemption is.
+        if let (Who::Remote(remote), Some(federation)) = (&who, federation)
+            && matches!(
+                request,
+                Request::StartPlayback { .. }
+                    | Request::DownloadOptions { .. }
+                    | Request::PrepareDownload { .. }
+            )
+        {
+            match federation
+                .shared_in(&remote.peer, &remote.item, &remote.library)
+                .await
+            {
+                Some(true) => {}
+                Some(false) => {
+                    let ended = self.services.auth.remote_sessions().end(&session.0);
+                    self.services
+                        .auth
+                        .remote_sessions_ended(usize::from(ended), "its item left its library");
+                    return Err(Error::Unauthenticated);
+                }
+                None => {
+                    return Err(Error::Unavailable {
+                        message: "the item cannot be looked up now".into(),
+                    });
+                }
+            }
+        }
         let actor = crate::principal::Actor {
             federated: federation.is_some(),
             ..who.actor()
@@ -5205,6 +5238,19 @@ impl ClientProtocol {
                 ))
             }
             Err(crate::federation::PlayTokenError::Invalid) => Err(Error::Unauthenticated),
+            // The token is the endpoint's own, and works when it can.
+            Err(crate::federation::PlayTokenError::Unavailable) => {
+                self.services.auth.guessed_right(guess);
+                Err(Error::Unavailable {
+                    message: "the item cannot be looked up now".into(),
+                })
+            }
+            Err(crate::federation::PlayTokenError::Busy) => {
+                self.services.auth.guessed_right(guess);
+                Err(Error::Unavailable {
+                    message: "as many of the paired server's plays are open as may be".into(),
+                })
+            }
             Err(crate::federation::PlayTokenError::Store(e)) => Err(internal(e)),
         }
     }

@@ -613,7 +613,8 @@ impl Store {
 
     /// Confirm `endpoint_id`, a key held for live pair `id`: the pin moves
     /// to it, the pair's held keys are forgotten, and the pair, its id and
-    /// what hangs on it stay. The row as it is now.
+    /// what hangs on it stay, but for the tokens minted for the old key.
+    /// The row as it is now.
     /// [`PeerError::KeyNotHeld`] for a key that is not held for it (the
     /// admin confirms the key they saw, or nothing), and
     /// [`PeerError::AlreadyPaired`] for one that is another live pair's.
@@ -634,6 +635,15 @@ impl Store {
         if taken {
             return Err(PeerError::AlreadyPaired);
         }
+        // The tokens minted for the old key go with its pin (F8-03): they
+        // were its proxied plays', and it is no one's now.
+        sqlx::query(
+            "DELETE FROM federation_tokens WHERE peer = ?1 \
+               AND device = (SELECT endpoint_id FROM federation_peers WHERE id = ?1)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let row = sqlx::query(concat!(
             "UPDATE federation_peers SET endpoint_id = ?2 WHERE id = ?1 RETURNING ",
             columns!()

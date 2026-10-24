@@ -9,6 +9,20 @@
 //! token's lifetime more; a revoked grant, or the pair unpaired, ends it at
 //! once ([`RemoteSessions::end_where`]).
 //!
+//! A redemption registers its session before it uses its token up, and
+//! opens it after only if nothing ended it meanwhile
+//! ([`RemoteSessions::register`]): a revocation that commits just after the
+//! token is used up finds the session to end, and the download sessions
+//! a mint counts include it from before its token stops being counted
+//! unused (the security review's F8-02 and F8-05).
+//!
+//! Play token sessions are bounded (F8-06): a pair holds at most its
+//! setting's worth at once, and the server [`MAX_PLAY_SESSIONS`], those
+//! being redeemed among them; and one with no playback open ends
+//! [`PLAY_MAX_AGE`] after it opened, however it is used
+//! ([`RemoteSessions::end_unplayed`]). A session that plays lives while
+//! it is used, however long the film.
+//!
 //! A download token's session (P8-07) reaches one item's download alone,
 //! and lives as long as its file is kept after a read
 //! ([`DOWNLOAD_IDLE`]): a download is made and read over hours. Its
@@ -16,7 +30,7 @@
 //! [`DOWNLOAD_MAX_AGE`]: a session the user's server forgot to end holds a
 //! place under the download token caps no longer than that.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use spoolframe_protocol::Request;
@@ -39,6 +53,24 @@ pub const DOWNLOAD_IDLE: Duration = crate::downloads::KEPT_AFTER_READ;
 /// not: a film is made and read well within it, and the user's server
 /// opens another when it needs one.
 pub const DOWNLOAD_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// How long a play token's session lives at the most with no playback
+/// open (F8-06): a play starts moments after its token is redeemed, so
+/// one past this with none is a client holding it, not playing. Once it
+/// is past, the next check with no playback open ends it.
+pub const PLAY_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The most play token sessions this server holds at once, every pair's
+/// together (F8-06): each pair is held to its own setting
+/// (`federation.play_sessions_per_server`) too, and this bounds them all.
+pub const MAX_PLAY_SESSIONS: u64 = 10_000;
+
+/// The most play token sessions open at once: of one pair, and in all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayRoom {
+    pub per_peer: u64,
+    pub total: u64,
+}
 
 /// Who a play token's session acts as, and what it may reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +172,12 @@ struct Open {
     lifetime: Duration,
     /// When it ends however it is used; `None` for a play token's.
     ends: Option<Instant>,
+    /// When it was registered: a play token's with no playback ends
+    /// [`PLAY_MAX_AGE`] after.
+    opened: Instant,
+    /// Registered for a redemption still using its token up: counted and
+    /// ended as an open session is, but no one's to use yet.
+    pending: bool,
 }
 
 /// Every play token's session, by its token's hash.
@@ -181,9 +219,9 @@ impl Kept {
         true
     }
 
-    /// Keep only the sessions `keep` says.
-    fn retain(&mut self, keep: impl Fn(&Open) -> bool) {
-        self.by_token.retain(|_, o| keep(o));
+    /// Keep only the sessions `keep` says, by hash.
+    fn retain(&mut self, keep: impl Fn(&str, &Open) -> bool) {
+        self.by_token.retain(|h, o| keep(h, o));
         let by_token = &self.by_token;
         self.by_endpoint.retain(|_, hashes| {
             hashes.retain(|h| by_token.contains_key(h));
@@ -202,10 +240,19 @@ impl RemoteSessions {
         }
     }
 
-    /// Open a session for `user` on `endpoint` (hex): its bearer. A
-    /// download token's lives [`DOWNLOAD_IDLE`] past each use, a play
-    /// token's this store's lifetime.
-    pub fn open(&self, user: RemoteSessionUser, endpoint: &str) -> SessionToken {
+    /// Register a session for `user` on `endpoint` (hex), which no one
+    /// can use until it is [opened](Pending::open): counted, and ended as
+    /// an open session is, from now. Dropped unopened, it goes. A download
+    /// token's lives [`DOWNLOAD_IDLE`] past each use, a play token's this
+    /// store's lifetime. `None` for a play token's past `room`: its pair,
+    /// or this server, holds as many as it may (F8-06). A download
+    /// token's is held to the download token limits as it is minted.
+    pub fn register(
+        &self,
+        user: RemoteSessionUser,
+        endpoint: &str,
+        room: PlayRoom,
+    ) -> Option<Pending<'_>> {
         let (lifetime, max_age) = match user.scope {
             TokenScope::Download => (DOWNLOAD_IDLE.max(self.lifetime), Some(DOWNLOAD_MAX_AGE)),
             _ => (self.lifetime, None),
@@ -213,7 +260,19 @@ impl RemoteSessions {
         let token = SessionToken::generate();
         let now = self.clock.now();
         let mut open = self.open.lock();
-        open.retain(|o| o.until > now);
+        open.retain(|_, o| o.until > now);
+        if user.scope == TokenScope::Play {
+            let (of_peer, total) = open
+                .by_token
+                .values()
+                .filter(|o| o.user.scope == TokenScope::Play)
+                .fold((0, 0), |(of_peer, total), o| {
+                    (of_peer + u64::from(o.user.peer == user.peer), total + 1)
+                });
+            if of_peer >= room.per_peer || total >= room.total {
+                return None;
+            }
+        }
         open.insert(
             token.hash(),
             Open {
@@ -222,9 +281,14 @@ impl RemoteSessions {
                 until: now + lifetime,
                 lifetime,
                 ends: max_age.map(|age| now + age),
+                opened: now,
+                pending: true,
             },
         );
-        token
+        Some(Pending {
+            sessions: self,
+            token: Some(token),
+        })
     }
 
     /// The user of session `token`, if it is live and bound to `endpoint`:
@@ -233,9 +297,9 @@ impl RemoteSessions {
         let hash = SessionToken(token.to_owned()).hash();
         let now = self.clock.now();
         let mut open = self.open.lock();
-        let found = open.by_token.get_mut(&hash)?;
+        let found = open.by_token.get_mut(&hash).filter(|o| !o.pending)?;
         if found.until <= now {
-            open.retain(|o| o.until > now);
+            open.retain(|_, o| o.until > now);
             return None;
         }
         if found.endpoint != endpoint {
@@ -257,7 +321,7 @@ impl RemoteSessions {
             .lock()
             .by_token
             .get(&hash)
-            .filter(|o| o.until > now)
+            .filter(|o| o.until > now && !o.pending)
             .map(|o| (o.user.clone(), o.endpoint.clone()))
     }
 
@@ -269,7 +333,7 @@ impl RemoteSessions {
             hashes
                 .iter()
                 .filter_map(|h| open.by_token.get(h))
-                .any(|o| o.until > now)
+                .any(|o| o.until > now && !o.pending)
         })
     }
 
@@ -279,7 +343,8 @@ impl RemoteSessions {
         self.open.lock().remove(&hash)
     }
 
-    /// How many live sessions `counted` says of.
+    /// How many live sessions `counted` says of, those registered and not
+    /// open yet among them.
     pub fn count(&self, counted: impl Fn(&RemoteSessionUser) -> bool) -> u64 {
         let now = self.clock.now();
         self.open
@@ -290,18 +355,118 @@ impl RemoteSessions {
             .count() as u64
     }
 
+    /// The pair, item and library of every session, each once: what a
+    /// catalog change checks again (F8-04).
+    pub fn places(&self) -> HashSet<(String, MediaId, String)> {
+        self.open
+            .lock()
+            .by_token
+            .values()
+            .map(|o| {
+                (
+                    o.user.peer.clone(),
+                    o.user.item.clone(),
+                    o.user.library.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// End every session whose user `ended` says: how many ended.
     pub fn end_where(&self, ended: impl Fn(&RemoteSessionUser) -> bool) -> usize {
         let mut open = self.open.lock();
         let before = open.by_token.len();
-        open.retain(|o| !ended(&o.user));
+        open.retain(|_, o| !ended(&o.user));
         before - open.by_token.len()
+    }
+
+    /// End every play token session opened [`PLAY_MAX_AGE`] ago or more
+    /// with no playback open, which `playing` says by the session's hash
+    /// (F8-06): how many ended. One that plays lives on while it is used.
+    pub fn end_unplayed(&self, playing: impl Fn(&str) -> bool) -> usize {
+        let now = self.clock.now();
+        let mut open = self.open.lock();
+        let before = open.by_token.len();
+        open.retain(|hash, o| {
+            o.user.scope != TokenScope::Play
+                || o.pending
+                || now.duration_since(o.opened) < PLAY_MAX_AGE
+                || playing(hash)
+        });
+        before - open.by_token.len()
+    }
+
+    /// End every session bound to `endpoint` (hex) whose user `ended`
+    /// says: how many ended.
+    pub fn end_bound_to(
+        &self,
+        endpoint: &str,
+        ended: impl Fn(&RemoteSessionUser) -> bool,
+    ) -> usize {
+        let mut open = self.open.lock();
+        let before = open.by_token.len();
+        open.retain(|_, o| o.endpoint != endpoint || !ended(&o.user));
+        before - open.by_token.len()
+    }
+}
+
+/// A session [registered](RemoteSessions::register) for a redemption,
+/// not open yet.
+#[derive(Debug)]
+pub struct Pending<'a> {
+    sessions: &'a RemoteSessions,
+    /// Taken as it opens.
+    token: Option<SessionToken>,
+}
+
+impl Pending<'_> {
+    /// Open the session as `user`, the redeemed token's: its bearer, kept
+    /// a lifetime from now. `None` if it was ended since it was
+    /// registered: its grant revoked, its pair unpaired or moved to a new
+    /// key.
+    pub fn open(mut self, user: RemoteSessionUser) -> Option<SessionToken> {
+        let token = self.token.take()?;
+        let now = self.sessions.clock.now();
+        let mut open = self.sessions.open.lock();
+        let found = open
+            .by_token
+            .get_mut(&token.hash())
+            .filter(|o| o.pending && o.until > now)?;
+        found.user = user;
+        found.pending = false;
+        found.until = now + found.lifetime;
+        if let Some(ends) = found.ends {
+            found.until = found.until.min(ends);
+        }
+        Some(token)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.sessions.open.lock().remove(&token.hash());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ROOMY: PlayRoom = PlayRoom {
+        per_peer: 100,
+        total: 100,
+    };
+
+    /// A session for `user` on `endpoint`, registered and opened.
+    fn open(sessions: &RemoteSessions, user: RemoteSessionUser, endpoint: &str) -> SessionToken {
+        sessions
+            .register(user.clone(), endpoint, ROOMY)
+            .unwrap()
+            .open(user)
+            .unwrap()
+    }
 
     fn user(peer: &str, library: &str) -> RemoteSessionUser {
         RemoteSessionUser {
@@ -326,7 +491,7 @@ mod tests {
     fn a_session_works_from_its_device_while_it_is_used() {
         let clock = Clock::default();
         let sessions = RemoteSessions::new(clock.clone(), Duration::from_secs(60));
-        let token = sessions.open(user("p", "plex:1"), "ab");
+        let token = open(&sessions, user("p", "plex:1"), "ab");
         assert!(sessions.who(&token.0, "cd").is_none(), "another device");
         clock.advance(Duration::from_secs(50));
         assert!(sessions.who(&token.0, "ab").is_some());
@@ -342,8 +507,8 @@ mod tests {
     #[test]
     fn ending_a_library_s_sessions_leaves_the_others() {
         let sessions = RemoteSessions::new(Clock::default(), Duration::from_secs(60));
-        let one = sessions.open(user("p", "plex:1"), "ab");
-        let two = sessions.open(user("p", "plex:2"), "ab");
+        let one = open(&sessions, user("p", "plex:1"), "ab");
+        let two = open(&sessions, user("p", "plex:2"), "ab");
         assert_eq!(sessions.end_where(|u| u.library == "plex:1"), 1);
         assert!(sessions.owner(&one.0).is_none());
         assert!(sessions.owner(&two.0).is_some());
@@ -355,8 +520,9 @@ mod tests {
     fn a_download_session_lives_while_its_file_is_kept() {
         let clock = Clock::default();
         let sessions = RemoteSessions::new(clock.clone(), Duration::from_secs(60));
-        let play = sessions.open(user("p", "plex:1"), "ab");
-        let download = sessions.open(
+        let play = open(&sessions, user("p", "plex:1"), "ab");
+        let download = open(
+            &sessions,
             RemoteSessionUser {
                 scope: TokenScope::Download,
                 ..user("p", "plex:1")
@@ -380,7 +546,8 @@ mod tests {
     fn a_download_session_ends_at_its_most_however_used() {
         let clock = Clock::default();
         let sessions = RemoteSessions::new(clock.clone(), Duration::from_secs(60));
-        let download = sessions.open(
+        let download = open(
+            &sessions,
             RemoteSessionUser {
                 scope: TokenScope::Download,
                 ..user("p", "plex:1")
@@ -404,12 +571,108 @@ mod tests {
     #[test]
     fn ending_a_session_leaves_its_device_s_others() {
         let sessions = RemoteSessions::new(Clock::default(), Duration::from_secs(60));
-        let one = sessions.open(user("p", "plex:1"), "ab");
-        let two = sessions.open(user("p", "plex:1"), "ab");
+        let one = open(&sessions, user("p", "plex:1"), "ab");
+        let two = open(&sessions, user("p", "plex:1"), "ab");
         assert!(sessions.end(&one.0));
         assert!(!sessions.end(&one.0), "ended once");
         assert!(sessions.owner(&one.0).is_none());
         assert!(sessions.owner(&two.0).is_some());
         assert!(sessions.endpoint_has("ab"));
+    }
+
+    /// A registered session is counted, and ended as an open one is, but
+    /// is no one's until it opens: ended meanwhile, it opens no more;
+    /// dropped unopened, it goes.
+    #[test]
+    fn a_registered_session_is_counted_and_ended_but_used_by_no_one() {
+        let sessions = RemoteSessions::new(Clock::default(), Duration::from_secs(60));
+        let pending = sessions.register(user("p", "plex:1"), "ab", ROOMY).unwrap();
+        assert_eq!(sessions.count(|_| true), 1);
+        assert!(!sessions.endpoint_has("ab"), "no one's yet");
+        assert_eq!(sessions.end_where(|u| u.peer == "p"), 1);
+        assert!(pending.open(user("p", "plex:1")).is_none());
+        drop(sessions.register(user("p", "plex:1"), "ab", ROOMY));
+        assert_eq!(sessions.count(|_| true), 0);
+        let token = open(&sessions, user("p", "plex:1"), "ab");
+        assert!(sessions.who(&token.0, "ab").is_some());
+    }
+
+    /// A key moved on ends the sessions bound to the old one alone.
+    #[test]
+    fn ending_an_endpoint_s_sessions_leaves_the_others() {
+        let sessions = RemoteSessions::new(Clock::default(), Duration::from_secs(60));
+        let old = open(&sessions, user("p", "plex:1"), "ab");
+        let device = open(&sessions, user("p", "plex:1"), "cd");
+        let other = open(&sessions, user("q", "plex:1"), "ab");
+        assert_eq!(sessions.end_bound_to("ab", |u| u.peer == "p"), 1);
+        assert!(sessions.owner(&old.0).is_none());
+        assert!(sessions.owner(&device.0).is_some());
+        assert!(sessions.owner(&other.0).is_some());
+    }
+
+    /// A pair holds at most its room's play sessions, those registered
+    /// among them, and the server its total; a download session is not
+    /// a play's, and an ended one makes room (F8-06).
+    #[test]
+    fn play_sessions_are_held_to_their_room() {
+        let sessions = RemoteSessions::new(Clock::default(), Duration::from_secs(60));
+        let room = PlayRoom {
+            per_peer: 2,
+            total: 3,
+        };
+        let register = |peer: &str| {
+            sessions
+                .register(user(peer, "plex:1"), "ab", room)
+                .map(|pending| pending.open(user(peer, "plex:1")).unwrap())
+        };
+        let first = register("p").unwrap();
+        let pending = sessions.register(user("p", "plex:1"), "ab", room).unwrap();
+        assert!(register("p").is_none(), "the pair's two, one registered");
+        let download = RemoteSessionUser {
+            scope: TokenScope::Download,
+            ..user("p", "plex:1")
+        };
+        assert!(sessions.register(download, "ab", room).is_some());
+        assert!(register("q").is_some(), "another pair's");
+        assert!(register("r").is_none(), "the server's three");
+        drop(pending);
+        assert!(sessions.end(&first.0));
+        assert!(register("p").is_some());
+    }
+
+    /// A play session with no playback ends [`PLAY_MAX_AGE`] after it
+    /// opened, however often it is used; one that plays lives on while
+    /// it is used, and a younger one, and a download's, are left
+    /// (F8-06).
+    #[test]
+    fn a_play_session_with_no_playback_ends_at_its_most() {
+        let clock = Clock::default();
+        let sessions = RemoteSessions::new(clock.clone(), IDLE);
+        let idle = open(&sessions, user("p", "plex:1"), "ab");
+        let playing = open(&sessions, user("p", "plex:1"), "ab");
+        let download = open(
+            &sessions,
+            RemoteSessionUser {
+                scope: TokenScope::Download,
+                ..user("p", "plex:1")
+            },
+            "ab",
+        );
+        let step = IDLE - Duration::from_secs(1);
+        let mut used = Duration::ZERO;
+        while used < PLAY_MAX_AGE {
+            clock.advance(step);
+            used += step;
+            for token in [&idle, &playing, &download] {
+                assert!(sessions.who(&token.0, "ab").is_some(), "{used:?}");
+            }
+        }
+        let young = open(&sessions, user("p", "plex:1"), "ab");
+        let plays = playing.hash();
+        assert_eq!(sessions.end_unplayed(|hash| hash == plays), 1);
+        assert!(sessions.who(&idle.0, "ab").is_none());
+        for token in [&playing, &download, &young] {
+            assert!(sessions.who(&token.0, "ab").is_some());
+        }
     }
 }

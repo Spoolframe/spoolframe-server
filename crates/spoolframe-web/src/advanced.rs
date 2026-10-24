@@ -56,6 +56,7 @@ const BY_TAB: &[(&str, &[&str])] = &[
             "federation.tokens_per_server",
             "federation.download_tokens_per_user",
             "federation.download_tokens_per_server",
+            "federation.play_sessions_per_server",
             "federation.subtitle_burst",
             "subtitles.daily_limit_per_peer",
         ],

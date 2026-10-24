@@ -175,6 +175,26 @@ impl Store {
         .fetch_one(&self.pool)
         .await?)
     }
+
+    /// The endpoint (hex) live pair `peer` is pinned to, while `library`
+    /// is shared with it: what a paired server's session is checked
+    /// against as it is used (F8-02, F8-03).
+    pub async fn granted_endpoint(
+        &self,
+        peer: &str,
+        library: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT p.endpoint_id FROM federation_grants g \
+             JOIN federation_peers p ON p.id = g.peer \
+             WHERE g.peer = ?1 AND g.library = ?2 \
+               AND g.revoked_at IS NULL AND p.revoked_at IS NULL",
+        )
+        .bind(peer)
+        .bind(library)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
 }
 
 #[cfg(test)]

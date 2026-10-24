@@ -68,6 +68,8 @@ pub struct FakeCatalog {
     /// Agents' ids an item has besides its `test://` one (PX-02:
     /// `imdb://tt…`).
     more_ids: Mutex<HashMap<MediaId, Vec<String>>>,
+    /// Items moved to another library than their kind's.
+    moved: Mutex<HashMap<MediaId, LibraryId>>,
 }
 
 /// What a key holds after the catalog gave its item a new one. A key the
@@ -101,7 +103,14 @@ impl FakeCatalog {
             posters: Mutex::default(),
             bogus: Mutex::default(),
             more_ids: Mutex::default(),
+            moved: Mutex::default(),
         }
+    }
+
+    /// Move item `id` to `library`, as an admin moves a file between a
+    /// PMS's sections: the library it is in from now.
+    pub fn move_to(&self, id: &MediaId, library: LibraryId) {
+        self.moved.lock().insert(id.clone(), library);
     }
 
     /// Give item `id` these agents' ids too (`imdb://tt0078748`).
@@ -636,10 +645,14 @@ impl Catalog for FakeCatalog {
     }
 
     /// The films in Movies, the music in Music while it is served; the
-    /// show is in no library.
+    /// show is in no library. An item moved is in the library it was
+    /// moved to.
     async fn library_of(&self, id: &MediaId) -> Result<Option<LibraryId>, CatalogError> {
         if self.current(id).is_none() {
             return Err(CatalogError::NotFound(id.to_string()));
+        }
+        if let Some(moved) = self.moved.lock().get(id) {
+            return Ok(Some(moved.clone()));
         }
         Ok(match id.kind() {
             MediaKind::Movie => Some(library().id),

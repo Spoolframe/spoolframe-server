@@ -3830,6 +3830,27 @@ mod replica {
             pair.stop().await;
         }
 
+        /// SA's PMS moving the film to a library not shared with SB, with
+        /// no catalog change SA hears of, still ends the session as it
+        /// next starts a playback (F8-04).
+        #[tokio::test]
+        async fn a_session_whose_film_moved_starts_no_playback() {
+            let pair = Pair::start("fed-media-moved").await;
+            let (_, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            let token = token(&pair, bob, &device).await;
+            let session = redeemed(&device, &token).await.session;
+            pair.sa.catalog.move_to(
+                movie().id(),
+                spoolframe_server::test_support::music_library().id,
+            );
+            assert!(unauthenticated(
+                device.call(Some(&session), start(movie().id())).await
+            ));
+            assert_eq!(pair.sa.auth.remote_sessions().count(|_| true), 0);
+            pair.stop().await;
+        }
+
         /// The session is gone and its playback ended: a device that comes
         /// back, on a new connection, reads nothing of it.
         async fn ended(
@@ -4608,6 +4629,29 @@ mod replica {
             proxied(&pair, &device, &bob).await;
             assert_eq!(sb.play_connections(), 1);
             sb.unpair(&pair.sa_on_sb, "admin").await.unwrap();
+            assert_eq!(sb.play_connections(), 0);
+            until(|| async { pair.sb.debug.list().open.is_empty() }).await;
+            pair.stop().await;
+        }
+
+        /// SB's admin confirming a new key for SA closes SB's connection
+        /// to SA's old one at once (F8-03), and the plays on it end: the
+        /// next play dials the new key.
+        #[tokio::test]
+        async fn a_confirmed_key_closes_the_connection_to_the_old_one() {
+            let pair = Pair::start("fed-media-proxy-rotated").await;
+            shared(&pair).await;
+            let sb = federation(&pair.sb);
+            let (device, bob) = on_sb(&pair, "bob").await;
+            proxied(&pair, &device, &bob).await;
+            assert_eq!(sb.play_connections(), 1);
+            let new = iroh::SecretKey::from_bytes(&[12; 32]).public().to_string();
+            pair.sb
+                .store
+                .hold_peer_key(&pair.sa_on_sb, &new)
+                .await
+                .unwrap();
+            sb.confirm_key(&pair.sa_on_sb, &new, "admin").await.unwrap();
             assert_eq!(sb.play_connections(), 0);
             until(|| async { pair.sb.debug.list().open.is_empty() }).await;
             pair.stop().await;

@@ -3138,10 +3138,16 @@ switch is off. `peerRevoke` revokes this side's row (kept, unpaired),
 closes the other's connections with `UNPAIRED`, and dials it once to
 send `unpaired`. A pair's `heldKeys` lists the new keys kept for it,
 each with its fingerprint; `keyConfirm { id, endpointId }` moves the pair
-to that key and forgets the pair's other held keys, and
-`keyReject { id, endpointId }` refuses that key for a day. Both name the
-key the admin saw: one that is not held for the pair (the keys changed
-since they were listed) is `KEY_NOT_HELD`, and nothing changes.
+to that key and forgets the pair's other held keys, and ends what the old
+key held: the tokens minted for it, the sessions it opened as the pair's
+endpoint (proxy mode), and the connection this server plays the pair's
+items through, which dials the new key at the next play; a device's own
+tokens and sessions stay. An assertion already on its way on the old
+key's connection may still mint a token for it, but that connection is
+closed at the confirm, so the token most likely never reaches the old
+key. `keyReject { id, endpointId }` refuses that key for a day. Both
+name the key the admin saw: one that is not held for the pair (the keys
+changed since they were listed) is `KEY_NOT_HELD`, and nothing changes.
 
 When SA has paired but SB cannot keep its side (its store fails), SB
 sends `unpaired` on the same connection, best effort, so SA does not
@@ -3448,7 +3454,11 @@ leaves the token to expire unused.
 SA checks the token at redemption, in the one statement that uses it up,
 so it works once: it must be minted for the endpoint that redeems it,
 unused and unexpired, and its pair and its library's grant must be live.
-SA checks again that it opens a film, an episode or a track. A token
+SA checks again that it opens a film, an episode or a track, and that
+the item is in that library still: one moved to a library not shared
+with the pair opens nothing, though the library it was in stays shared.
+A catalog lookup that fails then is `Unavailable`, and the token is not
+used up. A token
 that fails any check is refused `Unauthenticated`, alike, and counts as
 a stranger's wrong guess from that endpoint, on the strangers' budget.
 While the session it opens lives, its endpoint is no stranger: a
@@ -3463,8 +3473,22 @@ item: `StartPlayback`, `SyncSubtitle`, `UseOriginalSubtitleTiming` and
 playbacks it starts, and `Logout`, which ends the session and its
 playbacks at once. Anything else, `HttpPlaybackUrl`, artwork and
 downloads among them, is `Unauthenticated`. SA's grant revoked, or the
-pair unpaired, ends the session and its playbacks at once. Off SA's LAN,
-the play takes a guest's share of SA's WAN uplink.
+pair unpaired, ends the session and its playbacks at once, a session
+still being redeemed then among them: a token used up just before opens
+nothing. SA confirming the pair's new key ends the sessions its old key
+opened. The item found moved out of the session's library, as SA's
+catalog is replaced or as the session starts a playback or a download,
+ends the session. Each use checks the session again, and one
+whose pair or grant is gone, or that the pair's old key opened, is
+`Unauthenticated` and ends. Off SA's LAN, the play takes a guest's share
+of SA's WAN uplink.
+
+A pair holds at most `federation { play_sessions_per_server = 200; }`
+play sessions at once, those being redeemed among them, and SA 10,000 of
+every pair's together; past either, a token is refused `Unavailable`,
+and is not used up. A play session with no playback open ends an hour
+after it opened, however it is used; one that plays lives while it is
+used, however long the film.
 
 SA counts the play then: `direct` when the device redeemed the token,
 `proxied` when SB's own endpoint did. Its admins see both per pair

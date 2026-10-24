@@ -186,6 +186,7 @@ pub const SETTINGS: &[Setting] = &[
     live("federation.tokens_per_server"),
     live("federation.download_tokens_per_user"),
     live("federation.download_tokens_per_server"),
+    live("federation.play_sessions_per_server"),
     live("federation.subtitle_burst"),
     // The port is bound at start (PX-49).
     restart("http_playback.listen"),

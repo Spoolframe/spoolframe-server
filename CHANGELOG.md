@@ -231,6 +231,26 @@
   its HTTP port and was told on to the device over QUIC. An image's
   reply from SA is refused once it says it is longer than 16 MiB and 64
   KiB, where SB held up to 64 MiB of it before refusing it.
+- Experimental, as pairing is: fixes from the federation security
+  review (P8-06). A token used up just before its grant is revoked, its
+  pair unpaired or its pair's new key confirmed opens no session: the
+  redemption registers the session before it uses the token up, and
+  the revocation ends it with the others. Each use of a paired server's
+  session checks its pair and grant again, so one that outlived them
+  ends. Confirming a pair's new key ends what the old key held: the
+  tokens minted for it, the sessions it opened in proxy mode, and the
+  connection this server plays the pair's items through; a device's own
+  tokens and sessions stay. A download token being redeemed holds its
+  place under the download token limits, so racing a mint with a
+  redemption never passes them. A token, and a session, are held to the
+  library their item is in now: an item moved to a library not shared
+  with the pair opens nothing, and the catalog change ends its sessions,
+  though the library it was in stays shared. A pair holds at most
+  `federation { play_sessions_per_server = 200; }` play sessions at once
+  (Settings › Experimental with advanced settings on), and the server
+  10,000 in all; past them a token is refused `Unavailable` and is not
+  used up. A play session with no playback open ends an hour after it
+  opened, however it is used.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

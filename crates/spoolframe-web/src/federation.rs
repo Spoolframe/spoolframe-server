@@ -131,6 +131,12 @@ pub const LIMITS: &[LimitField] = &[
         "Default 2000 · downloads being made or read at once, for a pair",
     ),
     field(
+        "federation.play_sessions_per_server",
+        "Plays per server",
+        "",
+        "Default 200 · plays a pair's users hold open at once, 10 to 10000",
+    ),
+    field(
         "federation.subtitle_burst",
         "Subtitle asks in a burst",
         "",
@@ -599,7 +605,7 @@ mod tests {
                 field.key
             );
         }
-        assert_eq!(super::LIMITS.len(), 16);
+        assert_eq!(super::LIMITS.len(), 17);
     }
 
     use super::*;

@@ -1816,6 +1816,11 @@ pub struct FederationConfig {
     /// at the least, 10,000,000 at the most.
     #[ucl(default)]
     pub download_tokens_per_server: Option<u64>,
+    /// Play sessions a pair's users hold open at once (P8-06); 200 if
+    /// left out, 10 at the least, 10,000 at the most, which is also the
+    /// most of every pair's together.
+    #[ucl(default)]
+    pub play_sessions_per_server: Option<u64>,
     /// Subtitle searches and downloads a pair's users may ask in a burst,
     /// then one every 10 s (P8-07); 20 if left out, 2 at the least, 10,000
     /// at the most. Downloads are also held to `subtitles {
@@ -1909,6 +1914,11 @@ impl FederationConfig {
                     (50, 10_000_000),
                 ),
             },
+            play_sessions: within(
+                self.play_sessions_per_server,
+                d.play_sessions,
+                (10, crate::remote_sessions::MAX_PLAY_SESSIONS),
+            ),
         }
     }
 }
@@ -4000,7 +4010,7 @@ mod tests {
                             walk_reuse_secs = 0; max_streams = 0; artwork_burst = 0;
                             assertion_burst = 0; tokens_per_user = 0; tokens_per_server = 0;
                             download_tokens_per_user = 0; download_tokens_per_server = 0;
-                            subtitle_burst = 0; }"#,
+                            subtitle_burst = 0; play_sessions_per_server = 0; }"#,
         )
         .unwrap()
         .federation
@@ -4017,6 +4027,7 @@ mod tests {
         assert_eq!(floored.download_tokens.per_user, 10);
         assert_eq!(floored.download_tokens.per_peer, 50);
         assert_eq!(floored.subtitle_burst, 2);
+        assert_eq!(floored.play_sessions, 10);
     }
 
     /// P8-04: a limit typed too large is held to its ceiling, not used as
@@ -4033,7 +4044,8 @@ mod tests {
                             artwork_burst = {huge}; assertion_burst = {huge};
                             tokens_per_user = {huge}; tokens_per_server = {huge};
                             download_tokens_per_user = {huge};
-                            download_tokens_per_server = {huge}; subtitle_burst = {huge}; }}"#
+                            download_tokens_per_server = {huge}; subtitle_burst = {huge};
+                            play_sessions_per_server = {huge}; }}"#
         ))
         .unwrap()
         .federation;
@@ -4051,6 +4063,7 @@ mod tests {
         assert_eq!(capped.download_tokens.per_user, 100_000);
         assert_eq!(capped.download_tokens.per_peer, 10_000_000);
         assert_eq!(capped.subtitle_burst, 10_000);
+        assert_eq!(capped.play_sessions, 10_000);
     }
 
     #[test]

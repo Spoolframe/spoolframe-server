@@ -287,20 +287,22 @@ impl Federation {
             .and_then(|p| serde_json::to_string(p).ok());
         // Downloads are held to limits of their own, counting the
         // download sessions open: they live for hours, and must never take
-        // a play's place (P8-07).
-        let (limits, also) = match scope {
-            TokenScope::Download => {
-                let sessions = self.auth.remote_sessions();
-                let downloads = |u: &crate::remote_sessions::RemoteSessionUser| {
-                    u.scope == TokenScope::Download && u.peer == peer.id
-                };
-                let also = AlsoHeld {
-                    of_user: sessions.count(|u| downloads(u) && u.principal() == principal),
-                    of_peer: sessions.count(downloads),
-                };
-                (self.limits().download_tokens, also)
-            }
-            _ => (self.limits().tokens, AlsoHeld::default()),
+        // a play's place (P8-07). Counted as the token is kept, those
+        // being redeemed among them (F8-05).
+        let sessions = self.auth.remote_sessions();
+        let downloads = |u: &crate::remote_sessions::RemoteSessionUser| {
+            u.scope == TokenScope::Download && u.peer == peer.id
+        };
+        let also = || match scope {
+            TokenScope::Download => AlsoHeld {
+                of_user: sessions.count(|u| downloads(u) && u.principal() == principal),
+                of_peer: sessions.count(downloads),
+            },
+            _ => AlsoHeld::default(),
+        };
+        let limits = match scope {
+            TokenScope::Download => self.limits().download_tokens,
+            _ => self.limits().tokens,
         };
         // A bearer as a session's is, kept by its hash alike.
         let token = SessionToken::generate();
@@ -428,7 +430,7 @@ impl Wanted {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
@@ -459,11 +461,25 @@ mod tests {
 
     /// Alice's server, sharing its movies with Bob's: the store, the
     /// federation, and Bob's server's id.
-    async fn sharing(test: &str) -> (crate::store::tests::TestStore, Federation, ServerId) {
+    pub(crate) async fn sharing(
+        test: &str,
+    ) -> (crate::store::tests::TestStore, Federation, ServerId) {
+        sharing_from(
+            test,
+            Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into())),
+        )
+        .await
+    }
+
+    /// [`sharing`], from `catalog`.
+    pub(crate) async fn sharing_from(
+        test: &str,
+        catalog: Arc<FakeCatalog>,
+    ) -> (crate::store::tests::TestStore, Federation, ServerId) {
         let store = test_store(test).await;
         let federation = Federation::new(
             Auth::new(store.store.clone()),
-            Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into())),
+            catalog,
             "aaaaaaaaaaaaaaaa".parse().unwrap(),
             ServerName::new("Alice's server"),
             super::super::ReplicaSettings::in_dir("/nowhere/federation".into()),
@@ -473,7 +489,7 @@ mod tests {
             .add_peer(
                 NewPeer {
                     server_id: bob_s.as_str(),
-                    endpoint_id: &"0b".repeat(32),
+                    endpoint_id: &bob_s_key().to_string(),
                     display_name: "Bob's server",
                     addrs: &[],
                     relays: &[],
@@ -489,24 +505,37 @@ mod tests {
         (store, federation, bob_s)
     }
 
+    /// Bob's server's key: the pair's endpoint, which redeems a proxied
+    /// play's token.
+    pub(crate) fn bob_s_key() -> EndpointId {
+        iroh::SecretKey::from_bytes(&[11; 32]).public()
+    }
+
     /// A token for Bob's play of the movie on `client_endpoint`.
-    async fn minted(federation: &Federation, bob_s: &ServerId, client_endpoint: String) -> String {
+    pub(crate) async fn minted(
+        federation: &Federation,
+        bob_s: &ServerId,
+        client_endpoint: String,
+    ) -> String {
         federation
-            .mint(
-                bob_s,
-                &AssertUser {
-                    user: uuid::Uuid::from_u128(7).to_string(),
-                    display_name: "Bob".into(),
-                    client_endpoint,
-                    item: movie().id().to_string(),
-                    scope: TokenScope::Play,
-                    preferences: None,
-                    download: None,
-                },
-            )
+            .mint(bob_s, &bob_wants(client_endpoint, TokenScope::Play, 7))
             .await
             .unwrap()
             .token
+    }
+
+    /// User `user` of Bob's server wants the movie on `client_endpoint`,
+    /// for `scope`.
+    pub(crate) fn bob_wants(client_endpoint: String, scope: TokenScope, user: u128) -> AssertUser {
+        AssertUser {
+            user: uuid::Uuid::from_u128(user).to_string(),
+            display_name: "Bob".into(),
+            client_endpoint,
+            item: movie().id().to_string(),
+            scope,
+            preferences: None,
+            download: None,
+        }
     }
 
     /// A device named in another encoding the key parser takes (base32)

@@ -32,6 +32,11 @@ pub struct Limits {
     /// and the download sessions open. Apart from the play tokens' so
     /// that downloads, which live for hours, never take a play's place.
     pub download_tokens: TokenLimits,
+    /// The most play token sessions a pair holds open at once (F8-06),
+    /// those being redeemed among them: past it a token is refused, and
+    /// not used up. Every pair's together are held to
+    /// [`crate::remote_sessions::MAX_PLAY_SESSIONS`] too.
+    pub play_sessions: u64,
 }
 
 impl Default for Limits {
@@ -59,6 +64,9 @@ impl Default for Limits {
                 per_user: 200,
                 per_peer: 2_000,
             },
+            // A pair's users' plays at once, each kept five minutes past
+            // its last use.
+            play_sessions: 200,
         }
     }
 }

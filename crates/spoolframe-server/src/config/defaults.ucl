@@ -355,6 +355,8 @@ federation {
   # or read: apart from play tokens, so downloads never take a play's place.
   download_tokens_per_user = 200;
   download_tokens_per_server = 2000;
+  # Play sessions a pair's users hold open at once (P8-06).
+  play_sessions_per_server = 200;
   # Subtitle searches and downloads a pair's users ask (P8-07), in a
   # burst, then one every 10 s.
   subtitle_burst = 20;

@@ -986,13 +986,55 @@ impl Auth {
         &self.hellos
     }
 
+    /// Whether play token session `token`, of `user`, bound to `endpoint`
+    /// (hex), may still be used: its pair and its library's grant live,
+    /// and a proxied one's endpoint the pair's key still. Their cleanup
+    /// ends a session at once; this is the check behind it, so one it
+    /// missed works no more (the security review's F8-02 and F8-03). One
+    /// that may not is ended here, with its playbacks.
+    async fn remote_live(
+        &self,
+        token: &str,
+        user: &crate::remote_sessions::RemoteSessionUser,
+        endpoint: &str,
+    ) -> Result<bool, StoreError> {
+        let pinned = self
+            .store
+            .granted_endpoint(&user.peer, &user.library)
+            .await?;
+        let live = pinned.is_some_and(|pinned| !user.proxied || pinned == endpoint);
+        if !live {
+            let ended = usize::from(self.remote.end(token));
+            self.remote_sessions_ended(
+                ended,
+                format_args!(
+                    "{} of pair {} outlived its grant, pair or key",
+                    user.principal(),
+                    user.peer
+                ),
+            );
+        }
+        Ok(live)
+    }
+
+    /// `ended` paired servers' sessions were ended, `why`: logged, and the
+    /// playbacks they held end with them, at once, as signed-out
+    /// sessions' do. Nothing when none was.
+    pub(crate) fn remote_sessions_ended(&self, ended: usize, why: impl std::fmt::Display) {
+        if ended > 0 {
+            tracing::info!(ended, %why, "paired servers' sessions ended");
+            self.store.note_sessions_ended();
+        }
+    }
+
     /// Whose session `token` is, live or not (finding 46).
     pub async fn session_owner(&self, token: &str) -> Result<Option<SessionOwner>, StoreError> {
         if let Some((user, endpoint)) = self.remote.owner(token) {
+            let live = self.remote_live(token, &user, &endpoint).await?;
             return Ok(Some(SessionOwner {
                 username: user.principal().to_string(),
                 endpoint_id: Some(endpoint),
-                live: true,
+                live,
             }));
         }
         self.store
@@ -1231,9 +1273,11 @@ impl Auth {
         endpoint_id: &str,
     ) -> Result<Option<crate::principal::Who>, StoreError> {
         use crate::principal::Who;
-        // A play token's session (P8-04), in memory: no lookup for it.
+        // A play token's session (P8-04), in memory, checked against its
+        // pair and grant as it is used.
         if let Some(user) = self.remote.who(token, endpoint_id) {
-            return Ok(Some(Who::Remote(user)));
+            let live = self.remote_live(token, &user, endpoint_id).await?;
+            return Ok(live.then_some(Who::Remote(user)));
         }
         if let Some(user) = self.endpoint_session(token, endpoint_id).await? {
             return Ok(Some(Who::Local(user)));

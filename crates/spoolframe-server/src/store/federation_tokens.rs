@@ -136,13 +136,16 @@ impl PlayCount {
 impl Store {
     /// Keep `token`, minted now, if its library is shared with its pair
     /// and the pair is within `limits`, counting its scope's unused tokens
-    /// and what is `also` held: checked and kept in one transaction, so a
-    /// grant revoked meanwhile is never missed (M6).
+    /// and what `also` says is held: checked and kept in one transaction,
+    /// so a grant revoked meanwhile is never missed (M6). `also` is asked
+    /// within it, once no redemption can use a token up until it ends: a
+    /// session registered before its token was used up is counted
+    /// (F8-05).
     pub async fn keep_federation_token(
         &self,
         token: NewToken<'_>,
         limits: TokenLimits,
-        also: AlsoHeld,
+        also: impl FnOnce() -> AlsoHeld,
     ) -> Result<TokenKept, StoreError> {
         let mut tx = self.begin_write().await?;
         let shared: bool = sqlx::query_scalar(
@@ -168,6 +171,7 @@ impl Store {
         .bind(token.scope)
         .fetch_one(&mut *tx)
         .await?;
+        let also = also();
         let past = |held: i64, also: u64, limit: u64| {
             u64::try_from(held).unwrap_or_default().saturating_add(also) >= limit
         };
@@ -482,7 +486,7 @@ mod tests {
     async fn keep(store: &Store, token: NewToken<'_>) {
         assert_eq!(
             store
-                .keep_federation_token(token, ROOMY, AlsoHeld::default())
+                .keep_federation_token(token, ROOMY, AlsoHeld::default)
                 .await
                 .unwrap(),
             TokenKept::Kept
@@ -558,7 +562,7 @@ mod tests {
             per_user: 2,
             per_peer: 3,
         };
-        let kept = |token| store.keep_federation_token(token, limits, AlsoHeld::default());
+        let kept = |token| store.keep_federation_token(token, limits, AlsoHeld::default);
         assert_eq!(
             kept(token("h0", &peer, "plex:9", now + 300)).await.unwrap(),
             TokenKept::NotShared
@@ -602,7 +606,7 @@ mod tests {
             ..token("h7", &peer, "plex:2", now + 300)
         };
         let fresh = store
-            .keep_federation_token(revoked, ROOMY, AlsoHeld::default())
+            .keep_federation_token(revoked, ROOMY, AlsoHeld::default)
             .await
             .unwrap();
         assert_eq!(fresh, TokenKept::NotShared);
@@ -625,7 +629,7 @@ mod tests {
                     .keep_federation_token(
                         token(&hash, &peer, "plex:1", now + 300),
                         limits,
-                        AlsoHeld::default(),
+                        AlsoHeld::default,
                     )
                     .await
                     .unwrap(),
@@ -662,7 +666,7 @@ mod tests {
                     .keep_federation_token(
                         token(hash, &peer, "plex:1", now + 300),
                         limits,
-                        AlsoHeld::default()
+                        AlsoHeld::default
                     )
                     .await
                     .unwrap(),
@@ -675,7 +679,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .keep_federation_token(download("d1"), limits, one_session)
+                .keep_federation_token(download("d1"), limits, || one_session)
                 .await
                 .unwrap(),
             TokenKept::Kept,
@@ -683,7 +687,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .keep_federation_token(download("d2"), limits, one_session)
+                .keep_federation_token(download("d2"), limits, || one_session)
                 .await
                 .unwrap(),
             TokenKept::TooMany,

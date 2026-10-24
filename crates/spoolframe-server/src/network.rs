@@ -427,6 +427,7 @@ impl Connections {
                 changed = ended.changed() => if changed.is_err() { return },
                 () = tokio::time::sleep(admission::RECHECK) => {}
             }
+            end_unplayed_remote_sessions(&auth, &playbacks);
             end_signed_out_playbacks(&auth, &playbacks).await;
             for endpoint in self.known_endpoints() {
                 match auth.endpoint_has_any_session(&endpoint.to_string()).await {
@@ -499,6 +500,20 @@ async fn log_home_relay(endpoint: Endpoint, metrics: Arc<crate::metrics::Metrics
     }
 }
 
+/// End the paired servers' play token sessions past their most with no
+/// playback open (F8-06): a client's cheap requests keep none for ever.
+fn end_unplayed_remote_sessions(auth: &Auth, playbacks: &Playbacks) {
+    let playing: std::collections::HashSet<String> = playbacks
+        .sessions()
+        .into_iter()
+        .map(|session| crate::auth::SessionToken(session.0).hash())
+        .collect();
+    let ended = auth
+        .remote_sessions()
+        .end_unplayed(|hash| playing.contains(hash));
+    auth.remote_sessions_ended(ended, "past their most with no playback");
+}
+
 /// End the playbacks of each session that is no longer live, at once
 /// (B-10): their encodes stop, rather than after the disconnect grace that
 /// closing the device's connection starts. A session that cannot be
@@ -516,14 +531,19 @@ async fn end_signed_out_playbacks(auth: &Auth, playbacks: &Playbacks) {
 }
 
 /// Each time the catalog changes, end the playbacks of items it no longer
-/// serves (B-10).
+/// serves (B-10), and the paired servers' sessions of items no longer in
+/// the library shared with them (F8-04).
 async fn end_unserved_playbacks_on_change(
     mut changes: tokio::sync::watch::Receiver<u64>,
     catalog: Arc<dyn Catalog>,
     playbacks: Arc<Playbacks>,
+    federation: Option<Arc<crate::federation::Federation>>,
 ) {
     while changes.changed().await.is_ok() {
         end_unserved_playbacks(catalog.as_ref(), &playbacks).await;
+        if let Some(federation) = &federation {
+            federation.end_moved_sessions().await;
+        }
     }
 }
 
@@ -771,6 +791,7 @@ impl Server {
                 changes,
                 services.catalog.clone(),
                 services.playbacks.clone(),
+                services.federation.clone(),
             ))
         });
         // Unknown ALPNs never get this far: the TLS handshake refuses them.
@@ -970,5 +991,89 @@ mod tests {
             published().apply(&addrs).into_owned(),
             [iroh::TransportAddr::Relay(relay), ip("203.0.113.7:7420")]
         );
+    }
+
+    /// A device of Bob's with a play token's session open on a server
+    /// sharing its movies, from `catalog`: the federation, and the
+    /// device's endpoint.
+    async fn bob_playing(
+        test: &str,
+        catalog: Arc<crate::test_support::FakeCatalog>,
+    ) -> (
+        crate::store::tests::TestStore,
+        Arc<crate::federation::Federation>,
+        crate::auth::SessionToken,
+        String,
+    ) {
+        use crate::federation::test_pairs::{minted, sharing_from};
+        let (store, federation, bob_s) = sharing_from(test, catalog).await;
+        let device = iroh::SecretKey::from_bytes(&[9; 32]).public().to_string();
+        let token = minted(&federation, &bob_s, device.clone()).await;
+        let (session, _) = federation.redeem_play_token(&token, &device).await.unwrap();
+        (store, Arc::new(federation), session, device)
+    }
+
+    /// A catalog replaced runs the check of the paired servers' sessions
+    /// (F8-04): the session of an item moved out of its library ends.
+    #[tokio::test]
+    async fn a_catalog_change_ends_a_moved_item_s_sessions() {
+        use crate::test_support::{FakeCatalog, movie, music_library};
+        let catalog = Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into()));
+        let (store, federation, session, _) = bob_playing("net-moved", catalog.clone()).await;
+        let (changed, changes) = tokio::sync::watch::channel(0);
+        let task = tokio::spawn(end_unserved_playbacks_on_change(
+            changes,
+            catalog.clone(),
+            Arc::default(),
+            Some(federation.clone()),
+        ));
+        catalog.move_to(movie().id(), music_library().id);
+        let mut ended = store.sessions_ended();
+        changed.send(1).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), ended.changed())
+            .await
+            .expect("the sessions' check never ran")
+            .unwrap();
+        assert!(
+            federation
+                .auth()
+                .remote_sessions()
+                .owner(&session.0)
+                .is_none()
+        );
+        task.abort();
+    }
+
+    /// The sweep of ended sessions runs on its own and ends a play
+    /// token's session kept past its most with no playback (F8-06).
+    #[tokio::test]
+    async fn the_sweep_ends_a_play_session_with_no_playback_past_its_most() {
+        let catalog = Arc::new(crate::test_support::FakeCatalog::new(
+            "/nowhere/movie.mkv".into(),
+        ));
+        let (store, federation, session, device) = bob_playing("net-unplayed", catalog).await;
+        let auth = federation.auth().clone();
+        let step = crate::remote_sessions::IDLE - std::time::Duration::from_secs(1);
+        let mut used = std::time::Duration::ZERO;
+        while used < crate::remote_sessions::PLAY_MAX_AGE {
+            store.clock().advance(step);
+            used += step;
+            assert!(auth.remote_sessions().who(&session.0, &device).is_some());
+        }
+        let sweep = tokio::spawn(
+            Connections::new(Admission::default()).close_signed_out(auth.clone(), Arc::default()),
+        );
+        // Until the sweep has subscribed, a nudge may go unseen: nudged
+        // again until the session is gone.
+        let ended = async {
+            while auth.remote_sessions().owner(&session.0).is_some() {
+                store.note_sessions_ended();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), ended)
+            .await
+            .expect("the sweep never ended the session");
+        sweep.abort();
     }
 }

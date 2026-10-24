@@ -45,6 +45,10 @@ pub use proxy::{
 };
 pub use redeem::PlayTokenError;
 pub use replica::{DEFAULT_SYNC_EVERY, ReplicaError, SyncLimits};
+/// A server sharing its movies with Bob's, for the tests of what uses a
+/// federation.
+#[cfg(test)]
+pub(crate) use tokens::tests as test_pairs;
 pub use tokens::{AssertError, PLAY_TOKEN_LIFETIME};
 
 use std::net::SocketAddr;
@@ -127,6 +131,10 @@ pub struct Federation {
     /// and what its own users' downloads of the pairs' items count
     /// against (P8-07). Set once, at start.
     subtitle_downloads: OnceLock<Arc<crate::subtitle_downloads::SubtitleDownloads>>,
+    /// Where a test holds a redemption once its token is used up, before
+    /// its session opens: the moment a revocation races.
+    #[cfg(test)]
+    hold_redeeming: redeem::Hold,
 }
 
 /// Where and how this server caches what its pairs share (P8-02).
@@ -244,6 +252,8 @@ impl Federation {
             download_sessions: Arc::default(),
             downloads: OnceLock::new(),
             subtitle_downloads: OnceLock::new(),
+            #[cfg(test)]
+            hold_redeeming: redeem::Hold::default(),
         }
     }
 
@@ -297,6 +307,12 @@ impl Federation {
 
     fn store(&self) -> &crate::store::Store {
         self.auth.store()
+    }
+
+    /// The auth its sessions are kept in: for tests.
+    #[cfg(test)]
+    pub(crate) fn auth(&self) -> &Auth {
+        &self.auth
     }
 
     /// What this server says of itself to another.
@@ -620,7 +636,11 @@ impl Federation {
 
     /// Confirm `endpoint_id`, a key held for pair `id`: the pin moves to
     /// it, and the old key's connections are closed, with those of the
-    /// pair's other held keys.
+    /// pair's other held keys. What the old key held goes (F8-03): the
+    /// tokens minted for it, with the pin; the proxied sessions it opened,
+    /// those being redeemed among them; and this server's connection to
+    /// it for its own users' plays. A device's own tokens and sessions are
+    /// not the key's, and stay.
     pub async fn confirm_key(
         &self,
         id: &str,
@@ -654,6 +674,15 @@ impl Federation {
                     .close(&endpoint, close::UNPAIRED, "the pair moved to a new key");
             }
         }
+        let ended = self
+            .auth
+            .remote_sessions()
+            .end_bound_to(&old.endpoint_id, |u| u.peer == peer.id);
+        self.auth.remote_sessions_ended(
+            ended,
+            format_args!("pair {} moved to a new key", peer.server_id),
+        );
+        self.close_plays(&peer.id);
         Ok(peer)
     }
 
