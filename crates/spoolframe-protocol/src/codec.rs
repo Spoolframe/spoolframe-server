@@ -76,19 +76,30 @@ pub async fn write_reply<W: AsyncWrite + Unpin, T: Serialize>(
 pub async fn read_reply<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T, CodecError> {
+    read_reply_within(reader, MAX_REPLY).await
+}
+
+/// As [`read_reply`], refusing a reply longer than `max` (at most
+/// [`MAX_REPLY`]) once its length is read, before any of it is held: what
+/// a request whose answer has a smaller bound of its own reads it with.
+pub async fn read_reply_within<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+    max: usize,
+) -> Result<T, CodecError> {
     let mut bytes = Vec::new();
-    read_reply_bytes(reader, &mut bytes).await?;
+    read_reply_bytes(reader, &mut bytes, max).await?;
     decode(&bytes)
 }
 
-/// A reply's bytes, read into `bytes`: kept by the caller so a test can
-/// see what was held for a reply that stalls.
+/// A reply's bytes, at most `max` of them, read into `bytes`: kept by the
+/// caller so a test can see what was held for a reply that stalls.
 pub(crate) async fn read_reply_bytes<R: AsyncRead + Unpin>(
     reader: &mut R,
     bytes: &mut Vec<u8>,
+    max: usize,
 ) -> Result<(), CodecError> {
     let length = reader.read_u64().await?;
-    if length == 0 || length > MAX_REPLY as u64 {
+    if length == 0 || length > max.min(MAX_REPLY) as u64 {
         return Err(CodecError::TooLarge { len: length });
     }
     let length = length as usize;

@@ -7,12 +7,12 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, RecvStream, VarInt};
 use iroh::{Endpoint, EndpointAddr};
 use spoolframe_protocol::FEDERATION_ALPN;
-use spoolframe_protocol::codec::{MAX_FRAME, read_frame_within, read_reply, write_frame};
+use spoolframe_protocol::codec::{MAX_FRAME, read_frame_within, read_reply_within, write_frame};
 use spoolframe_protocol::federation::{
-    ArtworkFetch, AssertUser, AssertionRefused, MAX_ARTWORK_BYTES, MAX_REQUEST, Paired,
-    PairingRefused, PeerHello, PeerInfo, PeerReply, PeerRequest, RedeemPairing, SharedLibrary,
-    SubtitleDownloadAsk, SubtitleRemovalAsk, SubtitleSearchAsk, SyncLibrary, SyncMode, SyncPage,
-    TokenGranted, Unpaired, libraries_within_bounds,
+    ArtworkFetch, AssertUser, AssertionRefused, MAX_ARTWORK_BYTES, MAX_ARTWORK_REPLY, MAX_REQUEST,
+    Paired, PairingRefused, PeerHello, PeerInfo, PeerReply, PeerRequest, RedeemPairing,
+    SharedLibrary, SubtitleDownloadAsk, SubtitleRemovalAsk, SubtitleSearchAsk, SyncLibrary,
+    SyncMode, SyncPage, TokenGranted, Unpaired, libraries_within_bounds,
 };
 use spoolframe_types::{SubtitleDownloaded, SubtitleSearch};
 
@@ -186,10 +186,13 @@ impl Dialed {
         let mut recv = self
             .send(&PeerRequest::Artwork(ArtworkFetch { id: id.to_owned() }))
             .await?;
-        let reply = tokio::time::timeout(ARTWORK_WAIT, read_reply(&mut recv))
-            .await
-            .map_err(|_| DialError::Broken("no image in time".into()))?
-            .map_err(|e| DialError::Broken(e.to_string()))?;
+        let reply = tokio::time::timeout(
+            ARTWORK_WAIT,
+            read_reply_within(&mut recv, MAX_ARTWORK_REPLY),
+        )
+        .await
+        .map_err(|_| DialError::Broken("no image in time".into()))?
+        .map_err(|e| DialError::Broken(e.to_string()))?;
         match reply {
             PeerReply::Artwork {
                 content_type,

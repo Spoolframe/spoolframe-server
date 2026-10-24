@@ -30,8 +30,8 @@ use spoolframe_protocol::federation::RedeemPlayToken;
 use spoolframe_protocol::media::MediaRead;
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::{
-    BitmapSubtitles, ChosenTracks, Error, Hello, ManifestKind, PROTOCOL_VERSION, PlaybackHandle,
-    PlaybackPlan, Quality, Reply, Request, Response, Selection, SessionId,
+    BitmapSubtitles, ChosenTracks, Error, Hello, MAX_READ, ManifestKind, PROTOCOL_VERSION,
+    PlaybackHandle, PlaybackPlan, Quality, Reply, Request, Response, Selection, SessionId,
 };
 use spoolframe_types::{ClientCapabilities, DisplayCapabilities, Marker, MediaId, Platform};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -425,6 +425,7 @@ impl RemotePlay {
                             ..
                         },
                 } => {
+                    let length = within_read(&request, length, size)?;
                     return Ok(RelayedRead {
                         length,
                         size,
@@ -446,6 +447,31 @@ impl RemotePlay {
         }
         Err(Error::Busy)
     }
+}
+
+/// SA's `length` for `read`, if it is one this server's own reads could
+/// answer: no more than asked, nor than [`MAX_READ`], nor past the `size`
+/// SA gives from the read's offset (F8-01). The device is told it, the
+/// relay sends that much of SA's stream on, and the HTTP side holds it
+/// whole: a paired server that says more is not believed, nor read.
+fn within_read(read: &MediaRead, length: u64, size: u64) -> Result<u64, Error> {
+    let most = read
+        .length
+        .min(MAX_READ)
+        .min(size.saturating_sub(read.offset));
+    if length > most {
+        tracing::warn!(
+            offset = read.offset,
+            asked = read.length,
+            length,
+            size,
+            "a paired server answered a read with more than it could send"
+        );
+        return Err(Error::Unavailable {
+            message: "the paired server answered a read with more than it asked for".into(),
+        });
+    }
+    Ok(length)
 }
 
 impl Drop for RemotePlay {
@@ -710,6 +736,52 @@ mod tests {
                 message: "the paired server cannot be reached now".into()
             }
         );
+    }
+
+    fn read_of(offset: u64, length: u64) -> MediaRead {
+        MediaRead {
+            session: SessionId("s".into()),
+            handle: PlaybackHandle("h".into()),
+            offset,
+            length,
+            epoch: 0,
+            segment: None,
+            variant: 0,
+        }
+    }
+
+    /// F8-01: SA's answer to a read is held to what this server's own
+    /// would be. Asked for 16 MiB of a 1 GiB file, an answer of that, of
+    /// less, or of the file's last bytes passes; more than asked, than
+    /// `MAX_READ`, or than is left past the offset does not, whatever the
+    /// numbers, and nothing overflows.
+    #[test]
+    fn a_paired_server_s_read_is_no_longer_than_asked_or_than_the_file() {
+        const GIB: u64 = 1 << 30;
+        let asked = read_of(0, MAX_READ);
+        assert_eq!(within_read(&asked, MAX_READ, GIB), Ok(MAX_READ));
+        assert_eq!(within_read(&asked, 100, GIB), Ok(100));
+        assert_eq!(within_read(&read_of(GIB - 10, MAX_READ), 10, GIB), Ok(10));
+        for (read, length, size) in [
+            (read_of(0, MAX_READ), MAX_READ + 1, GIB),
+            (read_of(0, MAX_READ), u64::MAX, u64::MAX),
+            (read_of(0, 100), 101, GIB),
+            // A device asking past MAX_READ is still answered no more.
+            (read_of(0, u64::MAX), MAX_READ + 1, u64::MAX),
+            (read_of(GIB - 10, MAX_READ), 11, GIB),
+            (read_of(u64::MAX, MAX_READ), 1, u64::MAX),
+            (read_of(u64::MAX - 1, MAX_READ), MAX_READ, u64::MAX),
+            (read_of(2 * GIB, MAX_READ), 1, GIB),
+        ] {
+            assert!(
+                matches!(
+                    within_read(&read, length, size),
+                    Err(Error::Unavailable { .. })
+                ),
+                "{} + {length} of {size}",
+                read.offset
+            );
+        }
     }
 
     /// A paired server that stops sending fails the read once it has sent

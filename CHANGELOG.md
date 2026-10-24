@@ -224,6 +224,13 @@
   manager reads a `fed:` download from SA when it can. PROTOCOL.md's
   "Downloading a paired server's item" and "Subtitles for a paired
   server's item" have the wire.
+- Experimental, as pairing is: federation's security review (P8-06).
+  A proxied play's read is held to what SB's own reads answer: SA's
+  answer longer than asked, than 16 MiB or than the file fails the read,
+  where one saying a huge length and sending nothing could abort SB on
+  its HTTP port and was told on to the device over QUIC. An image's
+  reply from SA is refused once it says it is longer than 16 MiB and 64
+  KiB, where SB held up to 64 MiB of it before refusing it.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

@@ -759,7 +759,11 @@ async fn read_all(
     file: impl tokio::io::AsyncRead + Unpin,
     sent: u64,
 ) -> Result<Vec<u8>, BridgeError> {
-    let mut bytes = Vec::with_capacity(sent as usize);
+    // Room for no more than a read may be, whatever `sent` says. A
+    // paired server's length for a proxied play is held to its read
+    // before it gets here (`within_read`, F8-01); this is the defence
+    // behind it, so no length sizes the buffer alone.
+    let mut bytes = Vec::with_capacity(sent.min(spoolframe_protocol::MAX_READ) as usize);
     file.take(sent)
         .read_to_end(&mut bytes)
         .await
@@ -919,5 +923,15 @@ mod tests {
             Bound::of(v6.local_addr().unwrap(), only),
             Bound::AnyV6 { v6_only: only }
         );
+    }
+
+    /// F8-01's defence behind `within_read`: the length a read is said
+    /// to have never sizes its buffer alone. Were a huge one to get past
+    /// the check, `u64::MAX` with nothing sent ends short, rather than
+    /// panicking (or aborting the process) on the allocation.
+    #[tokio::test]
+    async fn a_huge_length_past_the_check_sizes_no_buffer_and_ends_short() {
+        let read = read_all(tokio::io::empty(), u64::MAX).await;
+        assert!(matches!(read, Err(BridgeError::Other(_))));
     }
 }

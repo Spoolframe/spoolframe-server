@@ -41,6 +41,12 @@ pub const MAX_ITEM_SUMMARY: usize = 8_192;
 /// The largest image an [`ArtworkFetch`] is answered with, in bytes.
 pub const MAX_ARTWORK_BYTES: usize = 16 << 20;
 
+/// The largest reply to an [`ArtworkFetch`] a server reads, in bytes: the
+/// image's [`MAX_ARTWORK_BYTES`] and room for its media type and the
+/// reply around it. One announced longer is refused before any of it is
+/// held, not read to the reply's own 64 MiB bound first (F8-12).
+pub const MAX_ARTWORK_REPLY: usize = MAX_ARTWORK_BYTES + (64 << 10);
+
 /// Ask for one shared library's changes since `since`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncLibrary {

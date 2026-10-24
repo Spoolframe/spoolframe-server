@@ -356,6 +356,69 @@ async fn a_reply_is_read_within_its_request_s_bound() {
     assert!(!dialed.libraries().await.unwrap().is_empty());
 }
 
+/// F8-12: an image's reply is read within the image's bound, not the
+/// 64 MiB any reply may have. One announcing 64 MiB is refused as soon as
+/// it says so, though it goes on sending and never ends; an image just
+/// past the bound is refused; one at it loads.
+#[tokio::test]
+async fn an_image_s_reply_is_read_within_the_image_s_bound() {
+    use spoolframe_protocol::codec::{MAX_FRAME, MAX_REPLY, read_frame_within, write_reply};
+    use spoolframe_protocol::federation::{MAX_ARTWORK_BYTES, MAX_REQUEST, PeerReply};
+    use tokio::io::AsyncWriteExt;
+    let sa = endpoint(vec![FEDERATION_ALPN.to_vec()]).await;
+    let answering = sa.clone();
+    tokio::spawn(async move {
+        let connection = answering.accept().await.unwrap().await.unwrap();
+        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let PeerRequest::Artwork(fetch) =
+                read_frame_within(&mut recv, MAX_REQUEST).await.unwrap()
+            else {
+                panic!("not an image's fetch");
+            };
+            tokio::spawn(async move {
+                let image = |len| PeerReply::Artwork {
+                    content_type: "image/png".into(),
+                    bytes: vec![7; len],
+                };
+                match fetch.id.as_str() {
+                    "huge" => {
+                        // 64 MiB announced, and its frames sent, slowly,
+                        // past the image's bound; never the rest.
+                        let _ = send.write_u64(MAX_REPLY as u64).await;
+                        for _ in 0..(MAX_ARTWORK_BYTES / MAX_FRAME as usize + 2) {
+                            let _ = send.write_u32(MAX_FRAME).await;
+                            let _ = send.write_all(&vec![0; MAX_FRAME as usize]).await;
+                        }
+                        let _ = send.stopped().await;
+                    }
+                    "over" => {
+                        let _ = write_reply(&mut send, &image(MAX_ARTWORK_BYTES + 1)).await;
+                        let _ = send.finish();
+                    }
+                    _ => {
+                        let _ = write_reply(&mut send, &image(MAX_ARTWORK_BYTES)).await;
+                        let _ = send.finish();
+                    }
+                }
+            });
+        }
+    });
+    let sb = endpoint(vec![]).await;
+    let connection = sb.connect(sa.addr(), FEDERATION_ALPN).await.unwrap();
+    let dialed = Dialed::for_tests(connection);
+    let quickly = std::time::Duration::from_secs(10);
+    let huge = tokio::time::timeout(quickly, dialed.artwork("huge"))
+        .await
+        .expect("refused before the image's wait is out");
+    assert!(matches!(huge, Err(DialError::Broken(_))), "{huge:?}");
+    assert!(matches!(
+        dialed.artwork("over").await,
+        Err(DialError::OutOfTurn)
+    ));
+    let (_, bytes) = dialed.artwork("at").await.unwrap();
+    assert_eq!(bytes.len(), MAX_ARTWORK_BYTES);
+}
+
 #[tokio::test]
 async fn nothing_but_hello_is_answered_before_hello() {
     let sa = Sa::start().await;

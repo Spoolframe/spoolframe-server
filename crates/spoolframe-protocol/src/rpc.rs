@@ -122,7 +122,7 @@ mod tests {
         writer.write_all(&head).await.unwrap();
         let mut bytes = Vec::new();
         {
-            let read = std::pin::pin!(codec::read_reply_bytes(&mut reader, &mut bytes));
+            let read = std::pin::pin!(codec::read_reply_bytes(&mut reader, &mut bytes, MAX_REPLY));
             // One poll reads all that was sent, then waits.
             let polled = read.poll(&mut Context::from_waker(Waker::noop()));
             assert!(polled.is_pending());

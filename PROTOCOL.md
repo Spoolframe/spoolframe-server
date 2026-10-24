@@ -3209,7 +3209,9 @@ and on `federation.refresh { id }`:
   leaves its cache and cursor as they were.
 - `artwork` `{id}`: one image of a shared item, by the id its item gave,
   as a reply rather than a frame: `artwork {content_type, bytes}` (at
-  most 16 MiB), `not_shared` or `not_found`; `unavailable` past the
+  most 16 MiB, and the reply at most 64 KiB more: SB refuses one that
+  says it is longer before it holds any of it), `not_shared` or
+  `not_found`; `unavailable` past the
   pair's pace (a burst of 200, then 100 a second). SB keeps only a JPEG,
   PNG or WebP that says it is an `image/` type, fetches the posters of
   what it synced a few at a time after the sync, and holds the images to
@@ -3498,7 +3500,11 @@ the pair's other plays go on. A re-plan SA answers is kept on SB's
 playback as SA made it, for SB's Playback page and its HTTP port. A
 relayed read that SA stops sending fails, as a read the device stops
 taking does: after the stalled-read limit on the client protocol, after
-30 s on the HTTP port. A device's `UpdateWatchProgress` for an item it
+30 s on the HTTP port. SB holds SA's answer to a read to what its own
+would be: no longer than asked, than 16 MiB, or than is left of the
+file (or segment) past the offset at the size SA gives. One longer
+fails the read `unavailable`; SB tells the device no length it did not
+ask for, and reads none of SA's stream. A device's `UpdateWatchProgress` for an item it
 plays through SB opens no second play: the playback keeps it. SB's HTTP
 playback port serves it through SA too. SB counts the play as one of
 its users' it played on (`federation_peerList`'s `proxiedThere`).
