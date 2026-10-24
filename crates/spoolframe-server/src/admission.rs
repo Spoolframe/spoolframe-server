@@ -81,6 +81,10 @@ pub struct Admission {
     /// How long a resource stream (media, artwork) may wait for its
     /// reader to take any more before it is reset (PX-09 finding 14).
     pub stalled_read: Duration,
+    /// How long a signed-out device's connection may drain:
+    /// [`SIGN_OUT_DRAIN`]. No setting moves it; a test lengthens it to
+    /// watch the drain without racing it.
+    pub sign_out_drain: Duration,
 }
 
 impl Admission {
@@ -101,6 +105,7 @@ impl Default for Admission {
             max_paired_connections: Self::DEFAULT_MAX_PAIRED_CONNECTIONS,
             first_frame: Self::DEFAULT_FIRST_FRAME,
             stalled_read: Self::DEFAULT_STALLED_READ,
+            sign_out_drain: SIGN_OUT_DRAIN,
         }
     }
 }
@@ -292,17 +297,17 @@ impl Peer {
     }
 
     /// The device has no live session left: let the streams being answered
-    /// finish, for at most [`SIGN_OUT_DRAIN`], then close the connection
-    /// with [`spoolframe_protocol::close::SIGNED_OUT`]. The device may
-    /// connect again, as a stranger.
-    pub(crate) fn sign_out(self: &Arc<Self>) {
+    /// finish, for at most `drain` ([`Admission::sign_out_drain`]), then
+    /// close the connection with [`spoolframe_protocol::close::SIGNED_OUT`].
+    /// The device may connect again, as a stranger.
+    pub(crate) fn sign_out(self: &Arc<Self>, drain: Duration) {
         if self.closing.swap(true, Ordering::AcqRel) {
             return;
         }
         let peer = self.clone();
         tokio::spawn(async move {
             let mut streams = peer.streams.subscribe();
-            let _ = tokio::time::timeout(SIGN_OUT_DRAIN, streams.wait_for(|n| *n == 0)).await;
+            let _ = tokio::time::timeout(drain, streams.wait_for(|n| *n == 0)).await;
             tracing::info!(endpoint = %peer.endpoint.fmt_short(), "closing a signed-out device's connection");
             peer.connection.close(
                 VarInt::from_u32(spoolframe_protocol::close::SIGNED_OUT),

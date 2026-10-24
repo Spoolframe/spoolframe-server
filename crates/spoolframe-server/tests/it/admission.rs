@@ -359,12 +359,21 @@ async fn strangers_share_one_sign_in_budget_and_a_signed_in_device_does_not() {
 async fn a_signed_out_device_s_sign_ins_draw_on_the_strangers_budget_while_it_drains() {
     // The device's own sign-in takes the only token, for an hour.
     const REFILL: Duration = Duration::from_secs(3600);
+    // The drain, held open by a stream waiting for its first frame, lasts
+    // a minute rather than 2 s, so a loaded machine's slow guesses still
+    // land in it; the test ends at the first guess the budget answers.
+    const DRAIN: Duration = Duration::from_secs(60);
     let server = TestServer::start_with(
         support::fresh_dir("signed-out-stranger-attempts").await,
         ServerOptions {
             stranger_attempts: Bucket {
                 capacity: 1,
                 refill_every: REFILL,
+            },
+            admission: Admission {
+                sign_out_drain: DRAIN,
+                first_frame: DRAIN,
+                ..Admission::default()
             },
             ..ServerOptions::default()
         },

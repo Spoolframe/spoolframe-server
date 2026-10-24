@@ -28,6 +28,10 @@ ignore = [
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
   # (through iroh's netlink-packet-core); none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the SDK" },
+  # crypto-bigint 0.5: through p256 0.13, which the SDK's protocol crate
+  # uses only to verify security-key signatures with public keys; the
+  # test-only soft key is the one signer. As deny.toml's.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through p256 0.13, used only to verify ECDSA signatures (public keys); no secret operations" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and

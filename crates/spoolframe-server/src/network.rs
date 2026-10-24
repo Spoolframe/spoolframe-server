@@ -428,7 +428,7 @@ impl Connections {
     fn sign_out(&self, endpoint: &EndpointId) {
         for (_, peer) in devices(&self.lock()).filter(|(_, p)| &p.endpoint == endpoint && p.known())
         {
-            peer.sign_out();
+            peer.sign_out(self.admission.sign_out_drain);
         }
     }
 
