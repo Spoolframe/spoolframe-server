@@ -340,6 +340,10 @@ federation {
   sync_max_pages = 2000;
   sync_max_items = 200000;
   max_cached_items = 500000;
+  # MiB of their metadata, as cached (C8-02): one library's sync, and one
+  # paired server's, every library together.
+  sync_max_metadata_mb = 1024;
+  max_cached_metadata_mb = 2048;
   # One walk of a library answers every pair's sync for this long.
   walk_reuse_secs = 60;
   # Streams a pair's connection is answered on at once.

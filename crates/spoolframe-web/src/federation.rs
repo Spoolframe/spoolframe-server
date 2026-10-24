@@ -83,6 +83,18 @@ pub const LIMITS: &[LimitField] = &[
         "Default 500000 · cached of one paired server, every library together",
     ),
     field(
+        "federation.sync_max_metadata_mb",
+        "Metadata per sync",
+        "MiB",
+        "Default 1024 MiB · of one library's sync, 16 to 65536",
+    ),
+    field(
+        "federation.max_cached_metadata_mb",
+        "Metadata per server",
+        "MiB",
+        "Default 2048 MiB · cached of one paired server, every library together, 64 to 262144",
+    ),
+    field(
         "federation.walk_reuse_secs",
         "Walk reused for",
         "s",
@@ -605,7 +617,7 @@ mod tests {
                 field.key
             );
         }
-        assert_eq!(super::LIMITS.len(), 17);
+        assert_eq!(super::LIMITS.len(), 19);
     }
 
     use super::*;

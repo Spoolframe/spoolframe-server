@@ -24,7 +24,7 @@ use super::exposure::WEEK_DAYS;
 use super::{Federation, endpoint_addr, parsed};
 use crate::store::StoreError;
 use crate::store::federation::PeerRecord;
-use crate::store::federation_cache::{CacheSynced, FileLimits};
+use crate::store::federation_cache::{CacheSynced, FileLimits, OriginLimits};
 use crate::store::federation_tokens::DAY;
 
 /// How often the replica looks at its pairs: whether each is connected,
@@ -42,6 +42,15 @@ const MAX_RETRY: Duration = Duration::from_secs(30 * 60);
 const POSTER_SWEEP: u32 = 200;
 const POSTER_FETCHES: usize = 6;
 
+/// How many pairs are dialled and synced at once: one that stops
+/// answering holds its own place, not the others' (C8-05).
+const PAIRS_AT_ONCE: usize = 4;
+
+/// How long one pair's sync may take, every library together (C8-05):
+/// each page comes within its own wait, but 2,000 of them, each just
+/// inside it, would hold the pair's place for more than a day.
+pub const SYNC_BUDGET: Duration = Duration::from_secs(30 * 60);
+
 /// The default time between two syncs of a pair.
 pub const DEFAULT_SYNC_EVERY: Duration = Duration::from_secs(3600);
 
@@ -56,6 +65,12 @@ pub struct SyncLimits {
     pub items: u64,
     /// Items of one origin's in the cache, every library together.
     pub origin_items: u64,
+    /// Bytes of one library's answer, its items as the cache keeps them
+    /// (JSON, every character escaped as it is there): counted as each
+    /// page is staged, so one past it ends the sync at that page (C8-02).
+    pub bytes: u64,
+    /// Bytes of one origin's items in the cache, every library together.
+    pub origin_bytes: u64,
 }
 
 /// Where a sync's pages come from: a pair's answer, or a test's.
@@ -85,6 +100,10 @@ pub enum ReplicaError {
     /// kept.
     #[error("the answer has more {what} than the {limit} kept")]
     TooLarge { what: &'static str, limit: u64 },
+    /// The sync took longer than [`SYNC_BUDGET`]: what it read of the
+    /// library it was on is not kept.
+    #[error("the sync took longer than its {0:?}")]
+    TooSlow(Duration),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -115,23 +134,35 @@ fn retry_after(failures: u32) -> Duration {
 
 impl Federation {
     /// Start replicating from the pairs, once the endpoint is up: until it
-    /// closes, or the federation is dropped.
+    /// closes, or the federation is dropped. The upkeep runs on its own,
+    /// so a pair that stops answering never holds it up (C8-05).
     pub(crate) fn start_replica(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut tended: HashMap<String, Tended> = HashMap::new();
             loop {
                 let Some(this) = weak.upgrade() else {
                     return;
                 };
-                if this
-                    .attached
-                    .get()
-                    .is_none_or(|attached| attached.endpoint.is_closed())
-                {
+                if !this.endpoint_open() {
                     return;
                 }
-                this.tend_all(&mut tended).await;
+                this.upkeep().await;
+                drop(this);
+                tokio::time::sleep(TICK).await;
+            }
+        });
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tended = HashMap::new();
+            let places = Arc::new(tokio::sync::Semaphore::new(PAIRS_AT_ONCE));
+            loop {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                if !this.endpoint_open() {
+                    return;
+                }
+                this.tend_all(&mut tended, &places).await;
                 let wake = this.wake.clone();
                 drop(this);
                 tokio::select! {
@@ -142,9 +173,16 @@ impl Federation {
         });
     }
 
-    /// Look at each pair once: dial it if it is not connected (and its
-    /// wait is over), and sync it on connecting or when it is due.
-    async fn tend_all(&self, tended: &mut HashMap<String, Tended>) {
+    /// Whether this server's endpoint is up, and not closed since.
+    fn endpoint_open(&self) -> bool {
+        self.attached
+            .get()
+            .is_some_and(|attached| !attached.endpoint.is_closed())
+    }
+
+    /// What the replica keeps tidy each tick, whoever answers: what has
+    /// expired, and the artwork past its caps.
+    async fn upkeep(&self) {
         // The play tokens past their expiry (P8-03), whoever minted them.
         if let Err(e) = self.store().prune_federation_tokens().await {
             tracing::warn!(error = %e, "cannot prune the expired play tokens");
@@ -171,6 +209,19 @@ impl Federation {
             tracing::warn!(error = %e, "cannot forget the ended downloads of the pairs' items");
         }
         self.end_idle_sessions().await;
+        // Outside the sync lock: images never hold a sync up.
+        self.cache.evict().await;
+    }
+
+    /// Look at each pair: dial it if it is not connected (and its wait is
+    /// over), and sync it on connecting or when it is due, then fetch some
+    /// of its posters. Each pair on its own, [`PAIRS_AT_ONCE`] at once; one
+    /// still at it from an earlier tick is left to it.
+    async fn tend_all(
+        self: &Arc<Self>,
+        tended: &mut HashMap<String, Arc<tokio::sync::Mutex<Tended>>>,
+        places: &Arc<tokio::sync::Semaphore>,
+    ) {
         let peers: Vec<PeerRecord> = match self.store().federation_peers().await {
             Ok(peers) => peers.into_iter().filter(PeerRecord::live).collect(),
             Err(e) => {
@@ -179,20 +230,25 @@ impl Federation {
             }
         };
         tended.retain(|id, _| peers.iter().any(|p| &p.id == id));
-        for peer in &peers {
-            let state = tended.entry(peer.id.clone()).or_default();
-            self.tend(peer, state).await;
-            // When it was last online, for "offline since" once it is not.
-            if self.connected(&peer.endpoint_id)
-                && let Err(e) = self.store().peer_seen(&peer.id).await
-            {
-                tracing::warn!(error = %e, "cannot keep when a paired server was seen");
-            }
-        }
-        // Outside the sync lock: images never hold a sync up.
-        self.cache.evict().await;
-        for peer in &peers {
-            self.sweep_posters(&peer.server_id).await;
+        for peer in peers {
+            let state = tended.entry(peer.id.clone()).or_default().clone();
+            let Ok(mut state) = state.try_lock_owned() else {
+                continue;
+            };
+            let (this, places) = (self.clone(), places.clone());
+            tokio::spawn(async move {
+                let Ok(_place) = places.acquire_owned().await else {
+                    return;
+                };
+                this.tend(&peer, &mut state).await;
+                // When it was last online, for "offline since" once it is not.
+                if this.connected(&peer.endpoint_id)
+                    && let Err(e) = this.store().peer_seen(&peer.id).await
+                {
+                    tracing::warn!(error = %e, "cannot keep when a paired server was seen");
+                }
+                this.sweep_posters(&peer.server_id).await;
+            });
         }
     }
 
@@ -232,14 +288,15 @@ impl Federation {
     }
 
     async fn tend(&self, peer: &PeerRecord, state: &mut Tended) {
-        let _syncing = self.syncing.lock(&peer.server_id).await;
         let now = Instant::now();
         let connected = self.links.get(&peer.server_id).is_some();
         if !connected {
             if now < state.retry_at {
                 return;
             }
-            if let Err(e) = self.dial(peer).await {
+            // Not under the sync lock: an unpairing waits for a sync in
+            // flight, never for a dial (C8-05).
+            if let Err(e) = self.connect(peer).await {
                 state.failures += 1;
                 let wait = retry_after(state.failures);
                 state.retry_at = now + wait;
@@ -258,7 +315,7 @@ impl Federation {
             .last_sync
             .is_none_or(|at| now.duration_since(at) >= self.sync_every());
         if !connected || due {
-            match self.sync_peer(peer).await {
+            match self.sync_live(peer).await {
                 Ok(()) => state.last_sync = Some(now),
                 Err(e) => tracing::warn!(
                     peer = %peer.endpoint_id,
@@ -268,6 +325,16 @@ impl Federation {
                 ),
             }
         }
+    }
+
+    /// Dial `peer` unless a connection to it is open: one dial at a time,
+    /// so the replica's and a refresh's never replace each other's.
+    async fn connect(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
+        let _dialing = self.dialing.lock(&peer.server_id).await;
+        if self.links.get(&peer.server_id).is_some() {
+            return Ok(());
+        }
+        self.dial(peer).await
     }
 
     /// Dial `peer` and keep the connection: it is online. One that does
@@ -292,6 +359,7 @@ impl Federation {
                     name = %peer.display_name,
                     "a paired server no longer pairs with this one: what it shared is dropped"
                 );
+                let _syncing = self.syncing.lock(&peer.server_id).await;
                 self.drop_cached(&peer.server_id, None).await?;
             }
             return Err(ReplicaError::NotPaired(info.standing));
@@ -305,11 +373,34 @@ impl Federation {
         Ok(())
     }
 
+    /// Sync `peer` under its origin's sync lock, within [`SYNC_BUDGET`], if
+    /// it is a live pair still: one unpaired while it was dialled is not
+    /// written again, and its connection goes.
+    async fn sync_live(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
+        let _syncing = self.syncing.lock(&peer.server_id).await;
+        // The pair as it is now, under the lock: what the sync goes by.
+        let Some(now) = self
+            .store()
+            .federation_peer(&peer.id)
+            .await?
+            .filter(PeerRecord::live)
+        else {
+            self.links.drop_origin(&peer.server_id);
+            return Err(ReplicaError::NoSuchPeer(peer.id.clone()));
+        };
+        self.sync_peer(&now, tokio::time::Instant::now() + SYNC_BUDGET)
+            .await
+    }
+
     /// Sync every library `peer` shares with this one, over the
-    /// connection held to it: libraries it no longer lists go, each other
-    /// is synced from its cursor, and the posters of the items that came
-    /// are fetched.
-    async fn sync_peer(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
+    /// connection held to it, by `deadline`: libraries it no longer lists
+    /// go, each other is synced from its cursor, and the posters of the
+    /// items that came are fetched.
+    async fn sync_peer(
+        &self,
+        peer: &PeerRecord,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ReplicaError> {
         let origin = peer.server_id.as_str();
         let dialed = self
             .links
@@ -357,7 +448,10 @@ impl Federation {
             self.store()
                 .cache_library(origin, &peer.id, library, kind)
                 .await?;
-            match self.sync_library(peer, &dialed, &library.id).await {
+            match self
+                .sync_library(peer, &dialed, &library.id, deadline)
+                .await
+            {
                 Ok(()) => {}
                 Err(ReplicaError::Dial(DialError::NotShared)) => {
                     self.drop_cached(origin, Some(&library.id)).await?;
@@ -387,12 +481,13 @@ impl Federation {
         Ok(())
     }
 
-    /// Sync `peer`'s `library` from its cursor.
+    /// Sync `peer`'s `library` from its cursor, by `deadline`.
     async fn sync_library(
         &self,
         peer: &PeerRecord,
         dialed: &Dialed,
         library: &str,
+        deadline: tokio::time::Instant,
     ) -> Result<(), ReplicaError> {
         let origin = peer.server_id.as_str();
         let since = self
@@ -406,28 +501,41 @@ impl Federation {
                 since,
             })
             .await?;
-        self.cache_sync(origin, &peer.id, library, &mut pages).await
+        self.cache_sync(origin, &peer.id, library, &mut pages, deadline)
+            .await
     }
 
     /// Read `pages`, a sync of `origin`'s `library` over pair `peer`, into
     /// the cache: each
     /// page staged as it comes, and all written, with the cursor, once the
-    /// last is (H1). An answer cut short, or past the limits as the sync
-    /// begins, writes nothing.
+    /// last is (H1). An answer cut short, past the limits as the sync
+    /// begins, or not whole by `deadline` (C8-05), writes nothing.
     pub(crate) async fn cache_sync(
         &self,
         origin: &str,
         peer: &str,
         library: &str,
         pages: &mut impl PageSource,
+        deadline: tokio::time::Instant,
     ) -> Result<(), ReplicaError> {
         let limits = self.limits().sync;
         let store = self.store();
         store.begin_cache_sync(origin, library).await?;
         let read = async {
-            let (mut read, mut items) = (0u64, 0u64);
+            let (mut read, mut items, mut bytes) = (0u64, 0u64, 0u64);
             let mut whole = None;
-            while let Some(page) = pages.next_page().await? {
+            let too_slow = || ReplicaError::TooSlow(SYNC_BUDGET);
+            loop {
+                // A page that is there at once is still past the deadline.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(too_slow());
+                }
+                let Some(page) = tokio::time::timeout_at(deadline, pages.next_page())
+                    .await
+                    .map_err(|_| too_slow())??
+                else {
+                    break;
+                };
                 if page.mode == SyncMode::Unknown {
                     return Err(DialError::OutOfTurn.into());
                 }
@@ -445,9 +553,15 @@ impl Federation {
                         limit: limits.items,
                     });
                 }
-                store
+                bytes += store
                     .stage_cache_page(origin, library, &page.items, &page.removed)
                     .await?;
+                if bytes > limits.bytes {
+                    return Err(ReplicaError::TooLarge {
+                        what: "bytes of metadata",
+                        limit: limits.bytes,
+                    });
+                }
                 whole = Some((page.mode, page.cursor));
             }
             whole.ok_or_else(|| DialError::OutOfTurn.into())
@@ -468,15 +582,24 @@ impl Federation {
                 library,
                 &cursor,
                 mode == SyncMode::Snapshot,
-                limits.origin_items,
+                OriginLimits {
+                    items: limits.origin_items,
+                    bytes: limits.origin_bytes,
+                },
             )
             .await?
         {
             CacheSynced::Written => {}
-            CacheSynced::OverLimit { .. } => {
+            CacheSynced::OverLimit { items, .. } if items > limits.origin_items => {
                 return Err(ReplicaError::TooLarge {
                     what: "items cached of the server",
                     limit: limits.origin_items,
+                });
+            }
+            CacheSynced::OverLimit { .. } => {
+                return Err(ReplicaError::TooLarge {
+                    what: "bytes of metadata cached of the server",
+                    limit: limits.origin_bytes,
                 });
             }
         };
@@ -546,11 +669,8 @@ impl Federation {
             .await?
             .filter(PeerRecord::live)
             .ok_or_else(|| ReplicaError::NoSuchPeer(id.to_owned()))?;
-        let _syncing = self.syncing.lock(&peer.server_id).await;
-        if self.links.get(&peer.server_id).is_none() {
-            self.dial(&peer).await?;
-        }
-        self.sync_peer(&peer).await
+        self.connect(&peer).await?;
+        self.sync_live(&peer).await
     }
 
     /// Whether the paired server whose server id is `origin` is online:
@@ -692,8 +812,12 @@ mod tests {
             ..crate::federation::Limits::default()
         });
         federation
-            .cache_sync(ORIGIN, peer, "plex:1", &mut answer)
+            .cache_sync(ORIGIN, peer, "plex:1", &mut answer, in_budget())
             .await
+    }
+
+    fn in_budget() -> tokio::time::Instant {
+        tokio::time::Instant::now() + SYNC_BUDGET
     }
 
     async fn cached(federation: &Federation) -> u32 {
@@ -796,6 +920,7 @@ mod tests {
             pages: 10,
             items: 2,
             origin_items: 3,
+            ..crate::federation::Limits::default().sync
         };
         let many = vec![page(SyncMode::Changes, &["3", "4", "5"], false)];
         let cut = sync(pair, many, false, few).await;
@@ -827,6 +952,230 @@ mod tests {
             .unwrap()
             .cursor;
         assert_eq!(cursor.as_deref(), Some("c"), "the last whole sync's");
+    }
+
+    /// A paired server's answer for ever, each page a while after the
+    /// last: well within a page's own wait.
+    struct Slow {
+        every: Duration,
+        served: usize,
+    }
+
+    impl PageSource for Slow {
+        async fn next_page(&mut self) -> Result<Option<SyncPage>, DialError> {
+            tokio::time::sleep(self.every).await;
+            self.served += 1;
+            let key = self.served.to_string();
+            Ok(Some(page(SyncMode::Snapshot, &[&key], true)))
+        }
+    }
+
+    /// C8-05: an answer whose every page comes in its page's time, but
+    /// that never ends, is cut off at the sync's budget, not read for a
+    /// day: the cache and its cursor stay as the last whole sync left them.
+    #[tokio::test]
+    async fn an_answer_past_the_sync_s_budget_is_cut_off_and_the_cache_kept() {
+        let (_store, federation, peer) = replica("fed-replica-budget").await;
+        let whole = vec![page(SyncMode::Snapshot, &["1", "2"], false)];
+        sync(
+            (&federation, &peer),
+            whole,
+            false,
+            crate::federation::Limits::default().sync,
+        )
+        .await
+        .unwrap();
+        let mut slow = Slow {
+            every: Duration::from_millis(20),
+            served: 0,
+        };
+        let budget = tokio::time::Instant::now() + Duration::from_millis(300);
+        let cut = federation
+            .cache_sync(ORIGIN, &peer, "plex:1", &mut slow, budget)
+            .await;
+        assert!(matches!(cut, Err(ReplicaError::TooSlow(_))), "{cut:?}");
+        assert!(slow.served > 1, "pages came in their time");
+        assert_eq!(cached(&federation).await, 2);
+        let cursor = federation
+            .store()
+            .cached_library(ORIGIN, "plex:1")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor.as_deref(), Some("c"), "the last whole sync's");
+    }
+
+    /// A paired server's answer for ever: pages of `per_page` films,
+    /// each film's summary as long as the protocol lets it be, all NULs,
+    /// which JSON escapes to six bytes each (C8-02).
+    struct Padded {
+        per_page: usize,
+        served: usize,
+    }
+
+    impl PageSource for Padded {
+        async fn next_page(&mut self) -> Result<Option<SyncPage>, DialError> {
+            let first = self.served * self.per_page;
+            self.served += 1;
+            let keys: Vec<String> = (first..first + self.per_page)
+                .map(|n| n.to_string())
+                .collect();
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let mut page = page(SyncMode::Snapshot, &keys, true);
+            for item in &mut page.items {
+                item.summary = Some("\0".repeat(spoolframe_protocol::federation::MAX_ITEM_SUMMARY));
+            }
+            Ok(Some(page.within_bounds()))
+        }
+    }
+
+    /// C8-02: an answer within the page and item limits, its summaries
+    /// padded to the protocol's bound with characters JSON escapes, is
+    /// cut off at the page that takes it past its bytes of metadata, not
+    /// read to the end and loaded whole: the cache and its cursor stay as
+    /// the last whole sync left them.
+    #[tokio::test]
+    async fn an_answer_past_its_bytes_of_metadata_is_cut_off_at_that_page() {
+        let (_store, federation, peer) = replica("fed-replica-bytes").await;
+        let pair = (&federation, peer.as_str());
+        let whole = vec![page(SyncMode::Snapshot, &["1", "2"], false)];
+        sync(
+            pair,
+            whole,
+            false,
+            crate::federation::Limits::default().sync,
+        )
+        .await
+        .unwrap();
+        // Each page is 10 films of about 48 KiB of JSON each: the fourth
+        // goes past 1.5 MiB.
+        federation.set_limits(crate::federation::Limits {
+            sync: SyncLimits {
+                bytes: 3 << 19,
+                ..crate::federation::Limits::default().sync
+            },
+            ..crate::federation::Limits::default()
+        });
+        let mut padded = Padded {
+            per_page: 10,
+            served: 0,
+        };
+        let cut = federation
+            .cache_sync(ORIGIN, &peer, "plex:1", &mut padded, in_budget())
+            .await;
+        assert!(
+            matches!(
+                cut,
+                Err(ReplicaError::TooLarge {
+                    what: "bytes of metadata",
+                    ..
+                })
+            ),
+            "{cut:?}"
+        );
+        assert_eq!(padded.served, 4, "no page read past it");
+        assert_eq!(cached(&federation).await, 2);
+        let cursor = federation
+            .store()
+            .cached_library(ORIGIN, "plex:1")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor.as_deref(), Some("c"), "the last whole sync's");
+    }
+
+    /// C8-02: a whole answer that would take the origin's cache past its
+    /// bytes of metadata, every library together, is not written.
+    #[tokio::test]
+    async fn an_answer_past_the_origin_s_bytes_of_metadata_is_not_kept() {
+        let (_store, federation, peer) = replica("fed-replica-origin-bytes").await;
+        let pair = (&federation, peer.as_str());
+        let defaults = crate::federation::Limits::default().sync;
+        sync(
+            pair,
+            vec![page(SyncMode::Snapshot, &["1", "2"], false)],
+            false,
+            defaults,
+        )
+        .await
+        .unwrap();
+        let mut films = page(SyncMode::Changes, &["3", "4"], false);
+        for item in &mut films.items {
+            item.summary = Some("x".repeat(4_000));
+        }
+        let small = SyncLimits {
+            origin_bytes: 6_000,
+            ..defaults
+        };
+        let cut = sync(pair, vec![films.clone()], false, small).await;
+        assert!(
+            matches!(
+                cut,
+                Err(ReplicaError::TooLarge {
+                    what: "bytes of metadata cached of the server",
+                    ..
+                })
+            ),
+            "{cut:?}"
+        );
+        assert_eq!(cached(&federation).await, 2);
+        sync(pair, vec![films], false, defaults).await.unwrap();
+        assert_eq!(cached(&federation).await, 4);
+    }
+
+    /// C8-02: the staged items are written a batch at a time, and a sync
+    /// of many batches is written as one of a single batch would be: the
+    /// new and changed items, those unchanged kept, those gone gone.
+    #[tokio::test]
+    async fn a_sync_of_many_batches_is_written_whole() {
+        let (store, federation, peer) = replica("fed-replica-batches").await;
+        let pair = (&federation, peer.as_str());
+        let defaults = crate::federation::Limits::default().sync;
+        let keys: Vec<String> = (0..350).map(|n| format!("{n:03}")).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        sync(
+            pair,
+            vec![
+                page(SyncMode::Snapshot, &keys[..200], true),
+                page(SyncMode::Snapshot, &keys[200..], false),
+            ],
+            false,
+            defaults,
+        )
+        .await
+        .unwrap();
+        let (_, total) = store
+            .cached_page(ORIGIN, "plex:1", "movie", 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(total, 350);
+        // Every other film retitled, the last fifty gone.
+        let mut changed = page(SyncMode::Changes, &[], false);
+        let mut retitled = page(SyncMode::Changes, &keys[..300], false);
+        for (n, item) in retitled.items.iter_mut().enumerate() {
+            if n % 2 == 0 {
+                item.title = format!("Retitled {}", keys[n]);
+                *item = item.clone().hashed();
+            }
+        }
+        changed.items = retitled.items;
+        changed.removed = keys[300..]
+            .iter()
+            .map(|key| format!("plex:movie:{key}"))
+            .collect();
+        sync(pair, vec![changed], false, defaults).await.unwrap();
+        let (items, total) = store
+            .cached_page(ORIGIN, "plex:1", "movie", 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(total, 300);
+        let retitled = items
+            .iter()
+            .filter(|i| i.title.starts_with("Retitled"))
+            .count();
+        assert_eq!(retitled, 150);
     }
 
     /// A very large library (the 2026-10-23 decision): 300,000 tracks are

@@ -48,6 +48,8 @@ const BY_TAB: &[(&str, &[&str])] = &[
             "federation.sync_max_pages",
             "federation.sync_max_items",
             "federation.max_cached_items",
+            "federation.sync_max_metadata_mb",
+            "federation.max_cached_metadata_mb",
             "federation.walk_reuse_secs",
             "federation.max_streams",
             "federation.artwork_burst",

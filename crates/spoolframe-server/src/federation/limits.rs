@@ -49,6 +49,10 @@ impl Default for Limits {
                 pages: 2_000,
                 items: 200_000,
                 origin_items: 500_000,
+                // A film's item is a KiB or two; past these, an answer is
+                // its summaries' padding, not a library.
+                bytes: 1 << 30,
+                origin_bytes: 2 << 30,
             },
             walk_reuse: Duration::from_secs(60),
             max_streams: spoolframe_federation::MAX_STREAMS,

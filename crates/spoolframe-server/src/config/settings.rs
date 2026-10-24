@@ -178,6 +178,8 @@ pub const SETTINGS: &[Setting] = &[
     live("federation.sync_max_pages"),
     live("federation.sync_max_items"),
     live("federation.max_cached_items"),
+    live("federation.sync_max_metadata_mb"),
+    live("federation.max_cached_metadata_mb"),
     live("federation.walk_reuse_secs"),
     live("federation.max_streams"),
     live("federation.artwork_burst"),

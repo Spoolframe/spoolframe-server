@@ -4405,6 +4405,106 @@ mod replica {
             pair.stop().await;
         }
 
+        /// A new connection from `from`'s endpoint to SA's client protocol,
+        /// its Hello answered; or `Err` once it is closed `BUSY`.
+        async fn connection(pair: &Pair, from: &Endpoint) -> Result<TestClient, ()> {
+            let client = pair.sa.client_from(from).await;
+            tokio::select! {
+                biased;
+                closed = client.conn.closed() => {
+                    assert!(
+                        matches!(
+                            &closed,
+                            ConnectionError::ApplicationClosed(c)
+                                if c.error_code == close::BUSY.into()
+                        ),
+                        "{closed:?}"
+                    );
+                    Err(())
+                }
+                () = client.hello() => Ok(client),
+            }
+        }
+
+        /// C8-04: a device known to SA only by a paired server's session
+        /// holds at most so many client connections at once: one more is
+        /// closed `BUSY`, while another such device and a local one still
+        /// get in. Once one closes, the next is let in.
+        #[tokio::test]
+        async fn a_device_known_by_a_remote_session_alone_is_capped_in_connections() {
+            let pair = Pair::start("fed-media-remote-cap").await;
+            let (_, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            redeemed(&device, &token(&pair, bob, &device).await).await;
+            // The connection it redeemed on came as a stranger's, and is
+            // counted as one; those after are the remote session's.
+            let mut held = vec![device.clone()];
+            for _ in 0..Admission::DEFAULT_MAX_REMOTE_CONNECTIONS {
+                held.push(connection(&pair, &device.endpoint).await.expect("let in"));
+            }
+            assert!(connection(&pair, &device.endpoint).await.is_err());
+            // Another device in a remote play, and a local user's device,
+            // are their own.
+            let other = self::device(&pair).await;
+            redeemed(&other, &token(&pair, bob, &other).await).await;
+            connection(&pair, &other.endpoint).await.expect("let in");
+            pair.sa.add_user("carol", "correct horse", None).await;
+            let local = pair.sa.client().await;
+            local.hello().await;
+            local.login("carol", "correct horse").await;
+            connection(&pair, &local.endpoint).await.expect("let in");
+            // One of the device's closed, the next is let in.
+            held.remove(1).conn.close(0u32.into(), b"done");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(again) = connection(&pair, &device.endpoint).await {
+                        break again;
+                    }
+                }
+            })
+            .await
+            .expect("let in once one closed");
+            drop(held);
+            pair.stop().await;
+        }
+
+        /// C8-04: every such device's connections together are capped too:
+        /// with room for two, two devices' fill it, and a third device's is
+        /// closed `BUSY` though its own key has room; a local device still
+        /// gets in.
+        #[tokio::test]
+        async fn every_remote_session_device_s_connections_together_are_capped() {
+            let pair = Pair::start_both(
+                "fed-media-remote-all",
+                ServerOptions {
+                    admission: Admission {
+                        max_all_remote_connections: 2,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let mut devices = Vec::new();
+            for _ in 0..3 {
+                let device = device(&pair).await;
+                redeemed(&device, &token(&pair, bob, &device).await).await;
+                devices.push(device);
+            }
+            let _first = connection(&pair, &devices[0].endpoint)
+                .await
+                .expect("let in");
+            let _second = connection(&pair, &devices[1].endpoint)
+                .await
+                .expect("let in");
+            assert!(connection(&pair, &devices[2].endpoint).await.is_err());
+            let local = pair.sa.client().await;
+            local.hello().await;
+            pair.stop().await;
+        }
+
         /// With SA offline to SB, a grant is refused at once.
         #[tokio::test]
         async fn with_sa_offline_a_grant_is_refused_at_once() {
@@ -4999,5 +5099,7 @@ mod replica {
     }
 
     mod downloads;
+    mod lying;
+    mod stuck;
     mod subtitles;
 }

@@ -102,6 +102,9 @@ pub struct Federation {
     /// Each origin's sync lock ([`replica`]): the replica's and an
     /// admin's never run at once.
     syncing: KeyedLocks,
+    /// One dial at a time to each origin, the replica's or a refresh's
+    /// (C8-05): apart from `syncing`, which an unpairing waits on.
+    dialing: KeyedLocks,
     /// How the pairs' asks of this server are paced (H2).
     answering: answer::Answering,
     /// `federation.sync_interval_secs`.
@@ -242,6 +245,7 @@ impl Federation {
             cache,
             links,
             syncing: KeyedLocks::default(),
+            dialing: KeyedLocks::default(),
             answering: answer::Answering::default(),
             sync_every: parking_lot::Mutex::new(replica.sync_every),
             limits: parking_lot::Mutex::new(replica.limits),

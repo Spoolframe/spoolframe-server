@@ -3214,8 +3214,10 @@ dials the pair and writes the cache):
   answered from it, and a pair's syncs of one library are answered one
   at a time. SB writes an answer to its cache only once it is whole and
   within its limits (2,000 pages, 200,000 items and removed ids, and
-  500,000 items of one origin's in all); one past them, or cut short,
-  leaves its cache and cursor as they were.
+  500,000 items of one origin's in all; 1 GiB of the items' metadata, as
+  SB keeps it, JSON-escaped, and 2 GiB of one origin's in all); one past
+  them, or cut short, leaves its cache and cursor as they were. SB stops
+  reading an answer at the page that takes it past its bytes.
 - `artwork` `{id}`: one image of a shared item, by the id its item gave,
   as a reply rather than a frame: `artwork {content_type, bytes}` (at
   most 16 MiB, and the reply at most 64 KiB more: SB refuses one that
@@ -3228,6 +3230,14 @@ dials the pair and writes the cache):
 
 A connection answers at most 16 streams at once: one past them is reset
 `BUSY` (3), and not counted against its endpoint.
+
+SB gives each request 15 s from opening its stream to its whole reply, a
+sync's request 15 s to be sent, and a dial and its `hello` 30 s together:
+a server that grants no stream, or no room to write the request in, is
+given up on as one that never answers. One pair's sync, every library
+together, has 30 minutes; past it, the library it was on is kept as it
+was. SB dials and syncs up to four pairs at once, each apart from the
+others, and its upkeep apart from them all.
 
 SB names each item it caches `fed:<kind>:<origin>:<namespace>:<key>`,
 where `origin` is SA's server id and the rest SA's own id for it. A
@@ -3496,6 +3506,12 @@ every pair's together; past either, a token is refused `Unavailable`,
 and is not used up. A play session with no playback open ends an hour
 after it opened, however it is used; one that plays lives while it is
 used, however long the film.
+
+An endpoint SA knows only by such sessions (a device in a remote play,
+or SB playing through itself) gets the normal limits on `client/1`, but
+holds at most 4 connections at once that way, and every such endpoint 256
+together; one more is closed `BUSY` (2). The connection a token is
+redeemed on came as a stranger's, and is counted as one.
 
 SA counts the play then: `direct` when the device redeemed the token,
 `proxied` when SB's own endpoint did. Its admins see both per pair

@@ -75,6 +75,14 @@ pub struct Admission {
     /// closed `BUSY`. Apart from the strangers' cap, so pairs and devices
     /// never take each other's places.
     pub max_paired_connections: usize,
+    /// The most client connections one endpoint holds at once that it is
+    /// let in on by a paired server's session alone (C8-04): a device in a
+    /// remote play, or the paired server playing through its own. One more
+    /// is closed `BUSY`. A device keeps one, and another as it reconnects.
+    pub max_remote_connections: usize,
+    /// The most such connections of every endpoint's together; one more is
+    /// closed `BUSY`. Apart from the strangers' and the pairs' caps.
+    pub max_all_remote_connections: usize,
     /// How long a stream's kind byte and first frame may take to arrive
     /// before the stream is reset.
     pub first_frame: Duration,
@@ -91,6 +99,10 @@ impl Admission {
     pub const DEFAULT_MAX_STRANGERS: usize = 64;
     pub const DEFAULT_MAX_PAIR_CONNECTIONS: usize = 4;
     pub const DEFAULT_MAX_PAIRED_CONNECTIONS: usize = 64;
+    pub const DEFAULT_MAX_REMOTE_CONNECTIONS: usize = 4;
+    /// Far above the plays of every pair's users at once that go straight
+    /// to this server.
+    pub const DEFAULT_MAX_ALL_REMOTE_CONNECTIONS: usize = 256;
     pub const DEFAULT_FIRST_FRAME: Duration = Duration::from_secs(10);
     /// Long enough for a player paused with a read under way: it takes
     /// what is sent as it plays on.
@@ -103,6 +115,8 @@ impl Default for Admission {
             max_strangers: Self::DEFAULT_MAX_STRANGERS,
             max_pair_connections: Self::DEFAULT_MAX_PAIR_CONNECTIONS,
             max_paired_connections: Self::DEFAULT_MAX_PAIRED_CONNECTIONS,
+            max_remote_connections: Self::DEFAULT_MAX_REMOTE_CONNECTIONS,
+            max_all_remote_connections: Self::DEFAULT_MAX_ALL_REMOTE_CONNECTIONS,
             first_frame: Self::DEFAULT_FIRST_FRAME,
             stalled_read: Self::DEFAULT_STALLED_READ,
             sign_out_drain: SIGN_OUT_DRAIN,
@@ -155,6 +169,10 @@ pub(crate) struct Peer {
     streams: watch::Sender<usize>,
     /// A device's, or a server's on `spoolframe/federation/1`.
     kind: PeerKind,
+    /// Let in by a paired server's session alone (C8-04): counted under
+    /// [`Admission::max_remote_connections`] until its device signs in
+    /// here.
+    remote: AtomicBool,
 }
 
 /// Whose connection a [`Peer`] is.
@@ -189,7 +207,27 @@ impl Peer {
             closing: AtomicBool::new(false),
             streams: watch::Sender::new(0),
             kind: PeerKind::Device,
+            remote: AtomicBool::new(false),
         }
+    }
+
+    /// A device's connection let in by a paired server's session alone
+    /// (C8-04): one in a remote play, or that server's own.
+    pub(crate) fn remote(connection: &Connection) -> Self {
+        let peer = Self::new(connection);
+        peer.remote.store(true, Ordering::Release);
+        peer
+    }
+
+    /// Whether it is held under the remote sessions' caps.
+    pub(crate) fn is_remote(&self) -> bool {
+        self.remote.load(Ordering::Acquire)
+    }
+
+    /// Its device signed in here: a session of this server's own, no
+    /// longer only a paired server's.
+    pub(crate) fn note_own_session(&self) {
+        self.remote.store(false, Ordering::Release);
     }
 
     /// A server's connection on `spoolframe/federation/1` (P8-01), from a

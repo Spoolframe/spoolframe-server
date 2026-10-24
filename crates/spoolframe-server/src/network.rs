@@ -320,6 +320,16 @@ impl Connections {
         self.hold(Peer::new(connection), connection, known, local)
     }
 
+    /// Hold the connection of a device known here by a paired server's
+    /// session alone (C8-04), with the normal limits, while its endpoint
+    /// holds fewer than [`Admission::max_remote_connections`] such and
+    /// every endpoint's fewer than [`Admission::max_all_remote_connections`].
+    /// "Known" is not a local user here: a paired server holding one
+    /// session must not hold connections without end.
+    pub(crate) fn admit_remote(&self, connection: &Connection) -> Option<Arc<Peer>> {
+        self.hold(Peer::remote(connection), connection, true, false)
+    }
+
     /// Hold a server's `spoolframe/federation/1` connection (P8-01) as
     /// [`Connections::admit`] holds a device's: a live pair's (`peer`)
     /// with the normal limits, while its key holds fewer than
@@ -362,6 +372,15 @@ impl Connections {
                 return None;
             }
         }
+        if peer.is_remote() {
+            let remote: Vec<_> = peers.values().filter(|held| held.is_remote()).collect();
+            let this_key = remote.iter().filter(|held| held.endpoint == peer.endpoint);
+            if remote.len() >= self.admission.max_all_remote_connections
+                || this_key.count() >= self.admission.max_remote_connections
+            {
+                return None;
+            }
+        }
         let peer = Arc::new(peer);
         if known {
             peer.raise();
@@ -394,6 +413,7 @@ impl Connections {
         let mut raised = Vec::new();
         for (id, peer) in devices(&self.lock()).filter(|(_, p)| &p.endpoint == endpoint) {
             peer.raise();
+            peer.note_own_session();
             if local {
                 peer.note_local();
             }

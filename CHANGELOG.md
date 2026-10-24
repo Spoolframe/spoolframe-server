@@ -265,7 +265,25 @@
   (Settings › Experimental with advanced settings on), and the server
   10,000 in all; past them a token is refused `Unavailable` and is not
   used up. A play session with no playback open ends an hour after it
-  opened, however it is used.
+  opened, however it is used. A sync is held to its items' metadata too,
+  as SB caches it (JSON, every character escaped): `federation {
+  sync_max_metadata_mb = 1024; max_cached_metadata_mb = 2048; }` for one
+  library's sync and one paired server's cache (Settings › Experimental
+  with advanced settings on); SB stops reading at the page that goes past
+  it and keeps its cache as it was, and writes a whole sync 100 items at a
+  time, where it read every staged item into memory at once, gigabytes
+  for summaries padded within the page and item limits. An endpoint SA
+  knows only by a paired server's sessions holds at most 4 client
+  connections at once, and every such endpoint 256 together; one more is
+  closed `BUSY`, where one session let a paired server open as many as
+  it liked, each with a signed-in device's limits. A paired server that
+  takes SB's connection and never lets a request through is given up on
+  in the request's time: SB's wait covers opening the stream and writing
+  to it, and a dial and its `hello` 30 s together, where SB waited for
+  ever, and with it every other pair's sync and the replica's upkeep.
+  One pair's sync has 30 minutes in all; SB syncs up to four pairs at
+  once, each apart from the others, runs its upkeep apart from them, and
+  unpairs a server it is dialling at once.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

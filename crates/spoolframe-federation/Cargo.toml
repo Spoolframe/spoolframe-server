@@ -20,4 +20,5 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Paused time, for the requests' waits.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

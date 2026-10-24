@@ -50,12 +50,37 @@ pub struct CachedItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheSynced {
     Written,
-    /// Not written: the origin's items would have been `items`, past the
-    /// limit. The cache stays as it was.
+    /// Not written: the origin's items would have been `items`, their
+    /// bodies `bytes`, one of them past its limit. The cache stays as it
+    /// was.
     OverLimit {
         items: u64,
+        bytes: u64,
     },
 }
+
+/// The most one origin's cache may hold, every library together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginLimits {
+    /// Items.
+    pub items: u64,
+    /// Bytes of their bodies, as JSON (C8-02).
+    pub bytes: u64,
+}
+
+impl OriginLimits {
+    /// No limit: for tests.
+    pub const NONE: Self = Self {
+        items: u64::MAX,
+        bytes: u64::MAX,
+    };
+}
+
+/// How many staged items a sync's end reads back at once (C8-02): what it
+/// holds in memory is one batch, not the whole answer. An item is a few
+/// hundred KiB at the most the protocol's bounds let it be, every
+/// character escaped, so a batch is some tens of MiB at worst.
+const FINISH_BATCH: i64 = 100;
 
 /// The most the paired servers' image files take, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,19 +294,23 @@ impl Store {
 
     /// Keep one page of a sync of `origin`'s `library_id` aside, until
     /// the answer is whole: its items, and the ids it names as gone. An
-    /// item named twice is kept as last named.
+    /// item named twice is kept as last named. The bytes of the items'
+    /// bodies it kept, as JSON: what a sync's size is counted in (C8-02).
     pub async fn stage_cache_page(
         &self,
         origin: &str,
         library_id: &str,
         items: &[RemoteItem],
         removed: &[String],
-    ) -> Result<(), StoreError> {
+    ) -> Result<u64, StoreError> {
         let mut tx = self.begin_write().await?;
+        let mut bytes = 0u64;
         for item in items {
             if item.kind.as_str().is_none() {
                 continue;
             }
+            let body = serde_json::to_string(item).expect("an item serializes");
+            bytes += body.len() as u64;
             sqlx::query(
                 "INSERT OR REPLACE INTO federation_cache_staged \
                      (origin, library, item, hash, body) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -290,7 +319,7 @@ impl Store {
             .bind(library_id)
             .bind(&item.id)
             .bind(&item.hash)
-            .bind(serde_json::to_string(item).expect("an item serializes"))
+            .bind(body)
             .execute(&mut *tx)
             .await?;
         }
@@ -306,7 +335,7 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(bytes)
     }
 
     /// Drop what a sync of `origin`'s `library_id` staged: the cache and
@@ -325,8 +354,11 @@ impl Store {
     /// cursor kept as the library's. Items added or changed are written,
     /// with their external ids and artwork; those named as gone go; with
     /// `snapshot`, the answer was the whole library, and the items it did
-    /// not name go too. Past `max_items` items of `origin`'s in all,
-    /// nothing is written. Either way the staged pages go.
+    /// not name go too. Past `limits`, of `origin`'s items or their
+    /// bodies' bytes in all, nothing is written. Either way the staged
+    /// pages go. The staged items are read back a batch at a time, in the
+    /// one transaction: however large the answer, what is held is a batch
+    /// (C8-02).
     ///
     /// An item kept unavailable from another pair is not written, unless
     /// that pair had `peer`'s key (M2): a server that pairs later under
@@ -338,25 +370,9 @@ impl Store {
         library_id: &str,
         cursor: &str,
         snapshot: bool,
-        max_items: u64,
+        limits: OriginLimits,
     ) -> Result<CacheSynced, StoreError> {
         let mut tx = self.begin_write().await?;
-        // Only what is new or changed is read back: an item whose hash is
-        // the one kept stays as it is, but for the library it is in.
-        let changed: Vec<(String, bool)> = sqlx::query_as(
-            "SELECT s.body, i.item IS NOT NULL FROM federation_cache_staged s \
-             LEFT JOIN federation_cache_items i ON i.origin = s.origin AND i.item = s.item \
-             WHERE s.origin = ?1 AND s.library = ?2 AND s.body IS NOT NULL \
-               AND (i.item IS NULL OR i.hash IS NOT s.hash OR i.unavailable = 1) \
-               AND (i.item IS NULL OR i.unavailable = 0 OR i.peer = ?3 \
-                    OR (SELECT endpoint_id FROM federation_peers WHERE id = i.peer) = \
-                       (SELECT endpoint_id FROM federation_peers WHERE id = ?3))",
-        )
-        .bind(origin)
-        .bind(library_id)
-        .bind(peer)
-        .fetch_all(&mut *tx)
-        .await?;
         let taken_over: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM federation_cache_staged s \
              JOIN federation_cache_items i ON i.origin = s.origin AND i.item = s.item \
@@ -379,76 +395,36 @@ impl Store {
                  holds: they stay unavailable"
             );
         }
-        for (text, had) in changed {
-            let Some(item) = body(&text) else {
-                continue;
-            };
-            let Some(kind) = item.kind.as_str() else {
-                continue;
-            };
-            sqlx::query(
-                "INSERT INTO federation_cache_items \
-                     (origin, item, library, kind, parent, grandparent, title, position, year, \
-                      body, hash, unavailable, cached_at, peer) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13) \
-                 ON CONFLICT (origin, item) DO UPDATE SET \
-                     library = ?3, kind = ?4, parent = ?5, grandparent = ?6, title = ?7, \
-                     position = ?8, year = ?9, body = ?10, hash = ?11, unavailable = 0, \
-                     peer = ?13",
+        // Only what is new or changed is read back: an item whose hash is
+        // the one kept stays as it is, but for the library it is in. A
+        // batch at a time, by staged id: the rows a batch writes are not
+        // staged ones, so the next batch's query sees the same set.
+        let mut after = String::new();
+        loop {
+            let changed: Vec<(String, String, bool)> = sqlx::query_as(
+                "SELECT s.item, s.body, i.item IS NOT NULL FROM federation_cache_staged s \
+                 LEFT JOIN federation_cache_items i ON i.origin = s.origin AND i.item = s.item \
+                 WHERE s.origin = ?1 AND s.library = ?2 AND s.item > ?4 AND s.body IS NOT NULL \
+                   AND (i.item IS NULL OR i.hash IS NOT s.hash OR i.unavailable = 1) \
+                   AND (i.item IS NULL OR i.unavailable = 0 OR i.peer = ?3 \
+                        OR (SELECT endpoint_id FROM federation_peers WHERE id = i.peer) = \
+                           (SELECT endpoint_id FROM federation_peers WHERE id = ?3)) \
+                 ORDER BY s.item LIMIT ?5",
             )
             .bind(origin)
-            .bind(&item.id)
             .bind(library_id)
-            .bind(kind)
-            .bind(&item.parent)
-            .bind(&item.grandparent)
-            .bind(&item.title)
-            .bind(item.index.map(i64::from))
-            .bind(item.year.map(i64::from))
-            .bind(&text)
-            .bind(&item.hash)
-            .bind(self.now())
             .bind(peer)
-            .execute(&mut *tx)
+            .bind(&after)
+            .bind(FINISH_BATCH)
+            .fetch_all(&mut *tx)
             .await?;
-            // A new row has nothing of its own yet to replace.
-            if had {
-                for table in [
-                    "DELETE FROM federation_cache_external_ids WHERE origin = ?1 AND item = ?2",
-                    "DELETE FROM federation_cache_item_artwork WHERE origin = ?1 AND item = ?2",
-                ] {
-                    sqlx::query(table)
-                        .bind(origin)
-                        .bind(&item.id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-            }
-            for id in &item.external_ids {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO federation_cache_external_ids \
-                         (origin, item, external_id) VALUES (?1, ?2, ?3)",
-                )
-                .bind(origin)
-                .bind(&item.id)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            }
-            for artwork in &item.artwork {
-                let Some(kind) = artwork.kind.as_str() else {
-                    continue;
-                };
-                sqlx::query(
-                    "INSERT OR IGNORE INTO federation_cache_item_artwork \
-                         (origin, item, artwork, kind) VALUES (?1, ?2, ?3, ?4)",
-                )
-                .bind(origin)
-                .bind(&item.id)
-                .bind(&artwork.id)
-                .bind(kind)
-                .execute(&mut *tx)
-                .await?;
+            let Some((last, _, _)) = changed.last() else {
+                break;
+            };
+            after.clone_from(last);
+            for (_, text, had) in changed {
+                self.write_staged(&mut tx, origin, peer, library_id, &text, had)
+                    .await?;
             }
         }
         // An unchanged item may have moved library on the origin.
@@ -484,16 +460,22 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        let held: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM federation_cache_items WHERE origin = ?1")
-                .bind(origin)
-                .fetch_one(&mut *tx)
-                .await?;
-        let held = u64::try_from(held).unwrap_or_default();
-        if held > max_items {
+        // `octet_length` reads each body's size, not the body.
+        let (items, bytes): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(body)), 0) \
+             FROM federation_cache_items WHERE origin = ?1",
+        )
+        .bind(origin)
+        .fetch_one(&mut *tx)
+        .await?;
+        let (items, bytes) = (
+            u64::try_from(items).unwrap_or_default(),
+            u64::try_from(bytes).unwrap_or_default(),
+        );
+        if items > limits.items || bytes > limits.bytes {
             tx.rollback().await?;
             self.abort_cache_sync(origin, library_id).await?;
-            return Ok(CacheSynced::OverLimit { items: held });
+            return Ok(CacheSynced::OverLimit { items, bytes });
         }
         sqlx::query("DELETE FROM federation_cache_staged WHERE origin = ?1 AND library = ?2")
             .bind(origin)
@@ -513,6 +495,91 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(CacheSynced::Written)
+    }
+
+    /// Write staged item `text` of `origin`'s `library_id` over pair
+    /// `peer`, in `tx`: the row, and its external ids and artwork, those
+    /// it had (`had`) replaced.
+    async fn write_staged(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        origin: &str,
+        peer: &str,
+        library_id: &str,
+        text: &str,
+        had: bool,
+    ) -> Result<(), StoreError> {
+        let Some(item) = body(text) else {
+            return Ok(());
+        };
+        let Some(kind) = item.kind.as_str() else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO federation_cache_items \
+                 (origin, item, library, kind, parent, grandparent, title, position, year, \
+                  body, hash, unavailable, cached_at, peer) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13) \
+             ON CONFLICT (origin, item) DO UPDATE SET \
+                 library = ?3, kind = ?4, parent = ?5, grandparent = ?6, title = ?7, \
+                 position = ?8, year = ?9, body = ?10, hash = ?11, unavailable = 0, \
+                 peer = ?13",
+        )
+        .bind(origin)
+        .bind(&item.id)
+        .bind(library_id)
+        .bind(kind)
+        .bind(&item.parent)
+        .bind(&item.grandparent)
+        .bind(&item.title)
+        .bind(item.index.map(i64::from))
+        .bind(item.year.map(i64::from))
+        .bind(text)
+        .bind(&item.hash)
+        .bind(self.now())
+        .bind(peer)
+        .execute(&mut **tx)
+        .await?;
+        // A new row has nothing of its own yet to replace.
+        if had {
+            for table in [
+                "DELETE FROM federation_cache_external_ids WHERE origin = ?1 AND item = ?2",
+                "DELETE FROM federation_cache_item_artwork WHERE origin = ?1 AND item = ?2",
+            ] {
+                sqlx::query(table)
+                    .bind(origin)
+                    .bind(&item.id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
+        for id in &item.external_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO federation_cache_external_ids \
+                     (origin, item, external_id) VALUES (?1, ?2, ?3)",
+            )
+            .bind(origin)
+            .bind(&item.id)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        for artwork in &item.artwork {
+            let Some(kind) = artwork.kind.as_str() else {
+                continue;
+            };
+            sqlx::query(
+                "INSERT OR IGNORE INTO federation_cache_item_artwork \
+                     (origin, item, artwork, kind) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(origin)
+            .bind(&item.id)
+            .bind(&artwork.id)
+            .bind(kind)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
     }
 
     /// Drop `origin`'s cached `library_id`, or every library of it with
@@ -1199,7 +1266,7 @@ mod tests {
             .await
             .unwrap();
         match store
-            .finish_cache_sync(ORIGIN, peer, "plex:1", cursor, snapshot, u64::MAX)
+            .finish_cache_sync(ORIGIN, peer, "plex:1", cursor, snapshot, OriginLimits::NONE)
             .await
             .unwrap()
         {
@@ -1282,13 +1349,17 @@ mod tests {
             .stage_cache_page(ORIGIN, "plex:1", &[film("2", "Brazil")], &[])
             .await
             .unwrap();
-        assert_eq!(
+        let one = OriginLimits {
+            items: 1,
+            bytes: u64::MAX,
+        };
+        assert!(matches!(
             store
-                .finish_cache_sync(ORIGIN, &peer, "plex:1", "c2", false, 1)
+                .finish_cache_sync(ORIGIN, &peer, "plex:1", "c2", false, one)
                 .await
                 .unwrap(),
-            CacheSynced::OverLimit { items: 2 }
-        );
+            CacheSynced::OverLimit { items: 2, .. }
+        ));
         holds_alien_under(&store, "c1").await;
         // Nothing staged is left for the next sync.
         synced(&store, &peer, "c3", &[], &[], false).await;
@@ -1363,7 +1434,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_cache_sync(ORIGIN, &peer, "plex:1", "c1", false, u64::MAX)
+            .finish_cache_sync(ORIGIN, &peer, "plex:1", "c1", false, OriginLimits::NONE)
             .await
             .unwrap();
         assert_eq!(

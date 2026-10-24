@@ -6975,24 +6975,36 @@ impl ProtocolHandler for ClientProtocol {
         };
         // A paired server's user's device, in the session its play token
         // opened (P8-04), kept in memory: one reconnecting mid-play is not
-        // a stranger.
-        let known = known || self.services.auth.remote_sessions().endpoint_has(&id_text);
-        let Some(peer) = self.connections.admit(&connection, known, local) else {
-            tracing::info!(
-                endpoint = %endpoint.fmt_short(),
-                "refusing a connection: too many devices that are not signed in"
-            );
-            connection.close(
-                VarInt::from_u32(close::BUSY),
-                b"too many devices that are not signed in; try again later",
-            );
+        // a stranger, but its connections are capped (C8-04), as a paired
+        // server holding one session could open them without end.
+        let remote = !known && self.services.auth.remote_sessions().endpoint_has(&id_text);
+        let admitted = if remote {
+            self.connections.admit_remote(&connection)
+        } else {
+            self.connections.admit(&connection, known, local)
+        };
+        let Some(peer) = admitted else {
+            let why: &[u8] = if remote {
+                tracing::info!(
+                    endpoint = %endpoint.fmt_short(),
+                    "refusing a connection: too many in a paired server's sessions"
+                );
+                b"too many connections in a paired server's sessions; try again later"
+            } else {
+                tracing::info!(
+                    endpoint = %endpoint.fmt_short(),
+                    "refusing a connection: too many devices that are not signed in"
+                );
+                b"too many devices that are not signed in; try again later"
+            };
+            connection.close(VarInt::from_u32(close::BUSY), why);
             // Stay until the close is delivered, or the peer never sees why.
             let _ = tokio::time::timeout(SHUTDOWN_NOTICE, connection.closed()).await;
             return Ok(());
         };
         // Every connection starts anonymous, and most that stay so are an
         // app checking in: INFO is for the sign-in, and the disconnect.
-        tracing::debug!(endpoint = %endpoint.fmt_short(), known, "client connected");
+        tracing::debug!(endpoint = %endpoint.fmt_short(), known, remote, "client connected");
         let state = Arc::new(ConnectionState {
             number: self.services.playbacks.connection_opened(),
             peer,

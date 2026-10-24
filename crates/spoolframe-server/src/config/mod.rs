@@ -1782,6 +1782,15 @@ pub struct FederationConfig {
     /// if left out, 1,000 at the least, 100,000,000 at the most.
     #[ucl(default)]
     pub max_cached_items: Option<u64>,
+    /// MiB of metadata in one library's sync, as the cache keeps it (JSON,
+    /// escaped); 1024 if left out, 16 at the least, 65,536 at the most
+    /// (C8-02).
+    #[ucl(default)]
+    pub sync_max_metadata_mb: Option<u64>,
+    /// MiB of metadata cached of one paired server, every library
+    /// together; 2048 if left out, 64 at the least, 262,144 at the most.
+    #[ucl(default)]
+    pub max_cached_metadata_mb: Option<u64>,
     /// Seconds one walk of a library answers every pair's sync; 60 if left
     /// out, 10 at the least, a day at the most.
     #[ucl(default)]
@@ -1883,6 +1892,12 @@ impl FederationConfig {
                     d.sync.origin_items,
                     (1_000, 100_000_000),
                 ),
+                bytes: within(self.sync_max_metadata_mb, d.sync.bytes >> 20, (16, 65_536)) << 20,
+                origin_bytes: within(
+                    self.max_cached_metadata_mb,
+                    d.sync.origin_bytes >> 20,
+                    (64, 262_144),
+                ) << 20,
             },
             walk_reuse: Duration::from_secs(within(
                 self.walk_reuse_secs,
@@ -4008,6 +4023,7 @@ mod tests {
         let floored = plex(
             r#"plex { url = "http://nas:32400"; }
                federation { sync_max_pages = 0; sync_max_items = 1; max_cached_items = 1;
+                            sync_max_metadata_mb = 0; max_cached_metadata_mb = 0;
                             walk_reuse_secs = 0; max_streams = 0; artwork_burst = 0;
                             assertion_burst = 0; tokens_per_user = 0; tokens_per_server = 0;
                             download_tokens_per_user = 0; download_tokens_per_server = 0;
@@ -4019,6 +4035,8 @@ mod tests {
         assert_eq!(floored.sync.pages, 10);
         assert_eq!(floored.sync.items, 1_000);
         assert_eq!(floored.sync.origin_items, 1_000);
+        assert_eq!(floored.sync.bytes, 16 << 20);
+        assert_eq!(floored.sync.origin_bytes, 64 << 20);
         assert_eq!(floored.walk_reuse, Duration::from_secs(10));
         assert_eq!(floored.max_streams, 4);
         assert_eq!(floored.artwork_burst, 10);
@@ -4041,6 +4059,7 @@ mod tests {
             r#"plex {{ url = "http://nas:32400"; }}
                federation {{ sync_interval_secs = {huge}; sync_max_pages = {huge};
                             sync_max_items = {huge}; max_cached_items = {huge};
+                            sync_max_metadata_mb = {huge}; max_cached_metadata_mb = {huge};
                             walk_reuse_secs = {huge}; max_streams = {huge};
                             artwork_burst = {huge}; assertion_burst = {huge};
                             tokens_per_user = {huge}; tokens_per_server = {huge};
@@ -4055,6 +4074,8 @@ mod tests {
         assert_eq!(capped.sync.pages, 1_000_000);
         assert_eq!(capped.sync.items, 100_000_000);
         assert_eq!(capped.sync.origin_items, 100_000_000);
+        assert_eq!(capped.sync.bytes, 65_536 << 20);
+        assert_eq!(capped.sync.origin_bytes, 262_144 << 20);
         assert_eq!(capped.walk_reuse, Duration::from_secs(86_400));
         assert_eq!(capped.max_streams, 1_024);
         assert_eq!(capped.artwork_burst, 100_000);

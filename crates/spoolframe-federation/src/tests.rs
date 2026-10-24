@@ -741,6 +741,103 @@ async fn a_stranger_is_reset_on_replication() {
     assert_eq!(sa.strays(), 3);
 }
 
+/// An endpoint on the federation ALPN that holds every connection made to
+/// it and every stream opened on it, reading nothing, with `transport` as
+/// its limits.
+async fn holding(transport: iroh::endpoint::QuicTransportConfig) -> Endpoint {
+    let held = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .alpns(vec![FEDERATION_ALPN.to_vec()])
+        .transport_config(transport)
+        .bind()
+        .await
+        .unwrap();
+    let answering = held.clone();
+    tokio::spawn(async move {
+        let mut connections = Vec::new();
+        while let Some(incoming) = answering.accept().await {
+            let Ok(connection) = incoming.await else {
+                continue;
+            };
+            let streams = connection.clone();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok(stream) = streams.accept_bi().await {
+                    held.push(stream);
+                }
+            });
+            connections.push(connection);
+        }
+    });
+    held
+}
+
+/// `asked` ends `Broken` within a request's wait: the paused clock is
+/// moved on a second at a time while it is asked, as the endpoints' own
+/// work keeps the runtime too busy to move it on by itself.
+async fn given_up_on(what: &str, asked: impl std::future::Future<Output = Result<(), DialError>>) {
+    let second = std::time::Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    tokio::pin!(asked);
+    let asked = loop {
+        tokio::select! {
+            biased;
+            asked = &mut asked => break asked,
+            () = tokio::time::advance(second) => {}
+        }
+        assert!(
+            started.elapsed() < 40 * crate::dial::REPLY_WAIT,
+            "{what}: never given up on"
+        );
+    };
+    assert!(
+        matches!(asked, Err(DialError::Broken(_))),
+        "{what}: {asked:?}"
+    );
+    assert!(
+        started.elapsed() <= crate::dial::REPLY_WAIT + second,
+        "{what}: {:?}",
+        started.elapsed()
+    );
+}
+
+/// C8-05: a paired server that takes a connection but no request on it,
+/// granting no stream or no credit to write the request with, is given
+/// up on within the request's wait, Hello among them: the wait covers
+/// opening the stream and writing to it, not only the reply. Paused time,
+/// once the connection is made.
+#[tokio::test]
+async fn a_peer_that_takes_no_request_is_given_up_on_in_its_wait() {
+    use iroh::endpoint::{QuicTransportConfig, VarInt};
+    let no_stream = QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(VarInt::from_u32(0))
+        .build();
+    let no_credit = QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(0))
+        .receive_window(VarInt::from_u32(0))
+        .build();
+    for (what, transport) in [("no stream", no_stream), ("no credit", no_credit)] {
+        let sa = holding(transport).await;
+        let sb = endpoint(Vec::new()).await;
+        let connection = sb.connect(sa.addr(), FEDERATION_ALPN).await.unwrap();
+        let dialed = Dialed::for_tests(connection.clone());
+        tokio::time::pause();
+        given_up_on(what, async { dialed.libraries().await.map(drop) }).await;
+        let sync = SyncLibrary {
+            library: "plex:1".into(),
+            since: None,
+        };
+        given_up_on(what, async { dialed.sync(sync).await.map(drop) }).await;
+        given_up_on(what, async {
+            Dialed::hello_on(connection.clone(), hello(SB_ID))
+                .await
+                .map(drop)
+        })
+        .await;
+        tokio::time::resume();
+    }
+}
+
 /// Pages hold at most so many items, then the removed ids; the last says
 /// so; an empty answer is one empty page.
 #[test]

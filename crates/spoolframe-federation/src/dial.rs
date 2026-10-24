@@ -16,8 +16,14 @@ use spoolframe_protocol::federation::{
 };
 use spoolframe_types::{SubtitleDownloaded, SubtitleSearch};
 
-/// How long a reply may take.
-const REPLY_WAIT: Duration = Duration::from_secs(15);
+/// How long a request may take, from opening its stream to its whole
+/// reply: a peer that grants no stream, or no credit to write the request
+/// with, is given up on as one that never replies (C8-05).
+pub(crate) const REPLY_WAIT: Duration = Duration::from_secs(15);
+
+/// How long dialling another server and its `Hello` may take together:
+/// the dial's own wait, and a reply's.
+const CONNECT_WAIT: Duration = Duration::from_secs(30);
 
 /// How long a sync's first page may take: the other server walks the
 /// whole library before it answers.
@@ -26,7 +32,7 @@ const FIRST_PAGE_WAIT: Duration = Duration::from_secs(600);
 /// How long each page after the first may take.
 const PAGE_WAIT: Duration = Duration::from_secs(60);
 
-/// How long an image may take, the whole of it.
+/// How long an image may take, from its request to the whole of it.
 const ARTWORK_WAIT: Duration = Duration::from_secs(60);
 
 /// How long a subtitle ask may take (P8-07): the other server asks a
@@ -125,7 +131,23 @@ impl Dialed {
         addr: EndpointAddr,
         hello: PeerHello,
     ) -> Result<(Self, PeerInfo), DialError> {
-        let connection = crate::dial(endpoint, addr, FEDERATION_ALPN).await?;
+        let connected = async {
+            let connection = crate::dial(endpoint, addr, FEDERATION_ALPN).await?;
+            Self::hello_on(connection, hello).await
+        };
+        // One that takes the connection and never lets Hello through holds
+        // no dial for ever (C8-05).
+        tokio::time::timeout(CONNECT_WAIT, connected)
+            .await
+            .map_err(|_| DialError::Unreachable("no answer in time".into()))?
+    }
+
+    /// Say `hello` on `connection`, just made: the connection and what the
+    /// other said of itself and of this server.
+    pub(crate) async fn hello_on(
+        connection: Connection,
+        hello: PeerHello,
+    ) -> Result<(Self, PeerInfo), DialError> {
         let dialed = Self { connection };
         match dialed.ask(&PeerRequest::Hello(hello)).await? {
             PeerReply::Info(info) => Ok((dialed, info)),
@@ -172,7 +194,12 @@ impl Dialed {
     /// answer, to read in turn. Nothing of it is to be kept until the last
     /// page is read.
     pub async fn sync(&self, sync: SyncLibrary) -> Result<Pages, DialError> {
-        let recv = self.send(&PeerRequest::Sync(sync)).await?;
+        let recv = within(
+            REPLY_WAIT,
+            "no stream in time",
+            self.send(&PeerRequest::Sync(sync)),
+        )
+        .await?;
         Ok(Pages {
             recv,
             first: None,
@@ -183,16 +210,14 @@ impl Dialed {
     /// Image `id` of an item the other server shares with this one
     /// (P8-02): its media type and bytes.
     pub async fn artwork(&self, id: &str) -> Result<(String, Vec<u8>), DialError> {
-        let mut recv = self
-            .send(&PeerRequest::Artwork(ArtworkFetch { id: id.to_owned() }))
-            .await?;
-        let reply = tokio::time::timeout(
-            ARTWORK_WAIT,
-            read_reply_within(&mut recv, MAX_ARTWORK_REPLY),
-        )
-        .await
-        .map_err(|_| DialError::Broken("no image in time".into()))?
-        .map_err(|e| DialError::Broken(e.to_string()))?;
+        let fetch = PeerRequest::Artwork(ArtworkFetch { id: id.to_owned() });
+        let reply = within(ARTWORK_WAIT, "no image in time", async {
+            let mut recv = self.send(&fetch).await?;
+            read_reply_within(&mut recv, MAX_ARTWORK_REPLY)
+                .await
+                .map_err(|e| DialError::Broken(e.to_string()))
+        })
+        .await?;
         match reply {
             PeerReply::Artwork {
                 content_type,
@@ -266,11 +291,12 @@ impl Dialed {
     /// A subtitle ask and its reply, a whole frame at most, within
     /// [`SUBTITLE_WAIT`].
     async fn ask_subtitles(&self, request: &PeerRequest) -> Result<PeerReply, DialError> {
-        let mut recv = self.send(request).await?;
-        tokio::time::timeout(SUBTITLE_WAIT, read_frame_within(&mut recv, MAX_FRAME))
-            .await
-            .map_err(|_| DialError::Broken("no reply in time".into()))?
-            .map_err(|e| DialError::Broken(e.to_string()))
+        within(
+            SUBTITLE_WAIT,
+            "no reply in time",
+            self.exchange(request, MAX_FRAME),
+        )
+        .await
     }
 
     /// The connection, to wait for its close.
@@ -299,10 +325,20 @@ impl Dialed {
     /// [`Dialed::ask`], its reply at most `bound`: a whole frame for the
     /// answers that list (`Libraries`).
     async fn ask_within(&self, request: &PeerRequest, bound: u32) -> Result<PeerReply, DialError> {
+        within(
+            REPLY_WAIT,
+            "no reply in time",
+            self.exchange(request, bound),
+        )
+        .await
+    }
+
+    /// `request` on a stream of its own, and its reply, at most `bound`:
+    /// with no wait of its own, for the caller's to cover all of it.
+    async fn exchange(&self, request: &PeerRequest, bound: u32) -> Result<PeerReply, DialError> {
         let mut recv = self.send(request).await?;
-        tokio::time::timeout(REPLY_WAIT, read_frame_within(&mut recv, bound))
+        read_frame_within(&mut recv, bound)
             .await
-            .map_err(|_| DialError::Broken("no reply in time".into()))?
             .map_err(|e| DialError::Broken(e.to_string()))
     }
 
@@ -320,4 +356,15 @@ impl Dialed {
         send.finish().map_err(|e| broken(e.to_string()))?;
         Ok(recv)
     }
+}
+
+/// `exchange`, given up on as `Broken` (`why`) once `wait` is out.
+async fn within<T>(
+    wait: Duration,
+    why: &str,
+    exchange: impl std::future::Future<Output = Result<T, DialError>>,
+) -> Result<T, DialError> {
+    tokio::time::timeout(wait, exchange)
+        .await
+        .map_err(|_| DialError::Broken(why.into()))?
 }
