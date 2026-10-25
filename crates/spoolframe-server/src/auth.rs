@@ -604,6 +604,13 @@ impl TokenBucket {
         Ok(())
     }
 
+    /// Give back a token [`TokenBucket::take`] took, for an ask that was
+    /// then not answered. Never past the bucket's capacity.
+    pub fn give_back(&self) {
+        let mut state = self.state.lock();
+        state.0 = state.0.saturating_add(1).min(self.bucket.capacity);
+    }
+
     /// Whether the bucket is full at `now`: as one made anew would be, so
     /// that it may be let go.
     pub fn full(&self, now: Instant) -> bool {

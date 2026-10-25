@@ -257,6 +257,10 @@ pub const DEFAULT_DAILY_LIMIT_PER_PEER: u32 = 40;
 /// What a pair's downloads are kept under, in place of a principal.
 const PAIR_KEY: &str = "pair:";
 
+/// What a pair's download of a result kept already is logged as from: no
+/// site's, as no site was asked.
+const KEPT_AGAIN: &str = "kept";
+
 /// A pair's searches that reach a site, a day, for each download of its
 /// daily limit (G8-03): every one asks a site with this server's key, as a
 /// download does. A search answered from the day's kept results is not
@@ -419,23 +423,23 @@ impl By {
 }
 
 /// A user's daily limit here held for a download of a paired server's
-/// item there (P8-07): from [`SubtitleDownloads::elsewhere`].
-pub(crate) struct Elsewhere<'a> {
-    downloads: &'a SubtitleDownloads,
+/// item there (P8-07): from [`SubtitleDownloads::elsewhere`]. Owned, so
+/// work of its own may carry it past its request.
+pub(crate) struct Elsewhere {
+    store: Store,
     _held: crate::keyed_locks::Guard,
     who: By,
     limit: u32,
     used: usize,
 }
 
-impl Elsewhere<'_> {
+impl Elsewhere {
     /// The paired server made the download, logged as from `source`:
     /// counted here as one of the user's own. What they have left today;
     /// `None` without a limit. A count that cannot be kept is logged: the
     /// download is the user's all the same.
     pub(crate) async fn downloaded(self, source: &str) -> Option<u32> {
         if let Err(e) = self
-            .downloads
             .store
             .log_subtitle_download(&self.who.key, &self.who.name, source)
             .await
@@ -705,13 +709,29 @@ impl Spent {
 
     /// When each of `key`'s spent in the day to `now` was.
     fn of(&self, key: &str, now: i64) -> Vec<i64> {
-        self.0.lock().get(key).map_or_else(Vec::new, |of| {
-            of.iter()
-                .map(|(t, _)| *t)
-                .filter(|t| now - t < DAY_SECS)
-                .collect()
-        })
+        self.0
+            .lock()
+            .get(key)
+            .map_or_else(Vec::new, |of| in_the_day(of, now).collect())
     }
+
+    /// How many each downloader spent in the day to `now`, as [`Spent::of`]
+    /// counts them: what the admin's usage adds to the rows.
+    fn counts(&self, now: i64) -> Vec<(String, usize)> {
+        self.0
+            .lock()
+            .iter()
+            .map(|(key, of)| (key.clone(), in_the_day(of, now).count()))
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+}
+
+/// When each of `of` spent in the day to `now` was.
+fn in_the_day(of: &[(i64, String)], now: i64) -> impl Iterator<Item = i64> + '_ {
+    of.iter()
+        .map(|(t, _)| *t)
+        .filter(move |t| now - t < DAY_SECS)
 }
 
 /// How long keeping a downloaded file and its row may take: a local write
@@ -754,7 +774,13 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
     } = finishing;
     let _limit = limit;
     let file = file_of(&dir, &row);
+    let media_path = media.display().to_string();
+    // The media file's other downloads, read before this one is kept: what
+    // it is given with this one should the read once it is kept fail. A
+    // download counted and kept is never failed for want of its track.
+    let mut others = Vec::new();
     let kept = tokio::time::timeout(FINISH_WAIT, async {
+        others = store.subtitle_downloads_of_file(&media_path).await?;
         #[cfg(any(test, feature = "test-support"))]
         holds.writing.wait().await;
         write_into_place(&file, &bytes).await?;
@@ -788,7 +814,17 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
     }
     // Counted by its row from now on, the limit still held.
     spent.kept(&row.downloaded_by, &row.id);
-    attach(&store, &prober, &dir, &media).await?;
+    if let Err(e) = attach(&store, &prober, &dir, &media).await {
+        tracing::warn!(
+            media = %media.display(),
+            error = %e,
+            "cannot read a media file's subtitle downloads: given them as read before this one"
+        );
+        others.retain(|r| r.id != row.id);
+        others.push(row);
+        let streams = others.iter().map(|r| stream(&dir, r)).collect();
+        prober.set_added_subtitles(&media, streams);
+    }
     Ok(())
 }
 
@@ -1329,7 +1365,19 @@ impl SubtitleDownloads {
             .subtitle_download_of(&id.to_string(), source.id(), site_id)
             .await?
         {
-            let user_remaining = self.user_remaining(&principal, limit).await?;
+            // Kept already: the site is not asked, and a user here is not
+            // counted. A pair's is, under its limit: its server counts it
+            // under its user, as it cannot tell it from a new one, and the
+            // two count the same.
+            let user_remaining = if who.pair {
+                let used = self.check_may_download(&who, limit).await?;
+                self.store
+                    .log_subtitle_download(&who.key, &who.name, KEPT_AGAIN)
+                    .await?;
+                remaining(limit, used + 1)
+            } else {
+                self.user_remaining(&principal, limit).await?
+            };
             return self.answer(&row, &who, None, user_remaining).await;
         }
         let offer = self.offered(id, source, site_id).ok_or_else(not_offered)?;
@@ -1508,13 +1556,13 @@ impl SubtitleDownloads {
         &self,
         principal: &str,
         name: &str,
-    ) -> Result<Elsewhere<'_>, DownloadError> {
+    ) -> Result<Elsewhere, DownloadError> {
         let who = By::elsewhere(principal, name);
         let held = self.limits.lock(principal).await;
         let limit = who.limit(&self.live.lock());
         let used = self.check_may_download(&who, limit).await?;
         Ok(Elsewhere {
-            downloads: self,
+            store: self.store.clone(),
             _held: held,
             who,
             limit,
@@ -1522,10 +1570,14 @@ impl SubtitleDownloads {
         })
     }
 
-    /// The day's downloads, each site's and each user's, for the admin.
+    /// The day's downloads, each site's and each user's, for the admin:
+    /// each user's and pair's as their daily limit counts them
+    /// ([`SubtitleDownloads::today`]), the kept and those the site spent
+    /// that are not kept yet.
     pub async fn usage(&self) -> Result<Usage, StoreError> {
         let live = self.live.lock().clone();
         let log = self.store.subtitle_download_log().await?;
+        let spent = self.spent.counts(self.store.now());
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         let sites = live
             .sites
@@ -1544,9 +1596,15 @@ impl SubtitleDownloads {
         let mut pairs: Vec<PairUsage> = Vec::new();
         let mut user_at: HashMap<&str, usize> = HashMap::new();
         let mut pair_at: HashMap<&str, usize> = HashMap::new();
-        for logged in &log {
+        // Each kept download, by who and their name then; then each
+        // downloader's spent ones, which have no name.
+        let kept = log
+            .iter()
+            .map(|l| (l.principal.as_str(), l.name.as_str(), 1));
+        let spent = spent.iter().map(|(key, n)| (key.as_str(), "", count(*n)));
+        for (principal, logged_name, n) in kept.chain(spent) {
             // A pair's users' downloads are one row, the pair's (P8-07).
-            let (downloads, name) = match logged.principal.strip_prefix(PAIR_KEY) {
+            let (downloads, name) = match principal.strip_prefix(PAIR_KEY) {
                 Some(server_id) => {
                     let at = *pair_at.entry(server_id).or_insert_with(|| {
                         pairs.push(PairUsage {
@@ -1561,9 +1619,9 @@ impl SubtitleDownloads {
                     (&mut pair.downloads, &mut pair.name)
                 }
                 None => {
-                    let at = *user_at.entry(&logged.principal).or_insert_with(|| {
+                    let at = *user_at.entry(principal).or_insert_with(|| {
                         users.push(UserUsage {
-                            principal: logged.principal.clone(),
+                            principal: principal.to_owned(),
                             name: String::new(),
                             downloads: 0,
                             remaining: None,
@@ -1574,9 +1632,9 @@ impl SubtitleDownloads {
                     (&mut user.downloads, &mut user.name)
                 }
             };
-            *downloads += 1;
-            if !logged.name.is_empty() {
-                name.clone_from(&logged.name);
+            *downloads += n;
+            if !logged_name.is_empty() {
+                *name = logged_name.to_owned();
             }
         }
         let limit = live.daily_limit_per_user;

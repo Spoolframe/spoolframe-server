@@ -62,4 +62,7 @@ pub(super) struct Holds {
     /// has cleaned up after it, then again at the end: where its
     /// connection closing races the cleanup.
     pub(super) unpairing: Hold,
+    /// A pair's poster sweep once it starts: where the pair's place in the
+    /// tick is, or is not, still held.
+    pub(super) sweeping: Hold,
 }

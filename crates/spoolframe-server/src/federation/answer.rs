@@ -155,13 +155,27 @@ impl Answering {
         if buckets.made != made {
             *buckets = fresh(made);
         }
-        let bucket = match ask {
+        Self::bucket(buckets, ask).take(Instant::now()).is_ok()
+    }
+
+    /// Give pair `peer` back the token its `ask` took in [`allowed`], for
+    /// an ask that was then not answered. A pair whose buckets are gone
+    /// (full again, pruned) has nothing to get back.
+    ///
+    /// [`allowed`]: Answering::allowed
+    fn give_back(&self, peer: &str, ask: Ask) {
+        if let Some(buckets) = self.asks.lock().get(peer) {
+            Self::bucket(buckets, ask).give_back();
+        }
+    }
+
+    fn bucket(buckets: &PairBuckets, ask: Ask) -> &TokenBucket {
+        match ask {
             Ask::Artwork => &buckets.artwork,
             Ask::Assertion => &buckets.assertions,
             Ask::Subtitles => &buckets.subtitles,
             Ask::Snapshot => &buckets.snapshots,
-        };
-        bucket.take(Instant::now()).is_ok()
+        }
     }
 
     /// The walk of `library` made within `reuse`, if there is one.
@@ -489,7 +503,8 @@ impl Shares for Federation {
             }
             _ => false,
         };
-        if (base.is_none() || replay)
+        let whole = base.is_none() || replay;
+        if whole
             && !self
                 .answering
                 .allowed(server_id.as_str(), Ask::Snapshot, &self.limits())
@@ -501,23 +516,32 @@ impl Shares for Federation {
             );
             return Err(Unshared::Unavailable);
         }
-        let walked = self
-            .walked(&library.id)
-            .await
-            .map_err(|e| unavailable("sync", e))?;
-        // The pair and the grant are read again after the walk, which can
-        // take minutes: revoked, or the pair moved to another key,
-        // meanwhile, none of it is sent, nor kept as sent to the pair
-        // (X8-01). A change between this read and `diff`'s write is not
-        // caught here, and heals itself: what `diff` keeps is which items
-        // were sent, and a revoked pair's state goes with the grant, a
-        // moved key's with the next sync the pair's new key makes, whose
-        // cursor it never saw.
-        let peer = self.pair(server_id, endpoint).await?;
-        self.shared_library(&peer, &sync.library).await?;
-        self.diff(&peer, sync, base, &walked)
-            .await
-            .map_err(|e| unavailable("sync", e))
+        let answered = async {
+            let walked = self
+                .walked(&library.id)
+                .await
+                .map_err(|e| unavailable("sync", e))?;
+            // The pair and the grant are read again after the walk, which
+            // can take minutes: revoked, or the pair moved to another key,
+            // meanwhile, none of it is sent, nor kept as sent to the pair
+            // (X8-01). A change between this read and `diff`'s write is
+            // not caught here, and heals itself: what `diff` keeps is
+            // which items were sent, and a revoked pair's state goes with
+            // the grant, a moved key's with the next sync the pair's new
+            // key makes, whose cursor it never saw.
+            let peer = self.pair(server_id, endpoint).await?;
+            self.shared_library(&peer, &sync.library).await?;
+            self.diff(&peer, sync, base, &walked)
+                .await
+                .map_err(|e| unavailable("sync", e))
+        }
+        .await;
+        // The pace is for answers: a walk that failed, or a grant revoked
+        // while it ran, sent the pair nothing, and costs it no token.
+        if whole && answered.is_err() {
+            self.answering.give_back(server_id.as_str(), Ask::Snapshot);
+        }
+        answered
     }
 
     async fn artwork(
@@ -527,6 +551,8 @@ impl Shares for Federation {
         id: &str,
     ) -> Result<(String, Vec<u8>), Unshared> {
         let peer = self.pair(server_id, endpoint).await?;
+        // Before the shared check, on purpose: asking for images that are
+        // not shared is a probe, and is paced as any ask is.
         if !self
             .answering
             .allowed(server_id.as_str(), Ask::Artwork, &self.limits())
@@ -679,6 +705,65 @@ mod tests {
                 .await
                 .map(|a| a.mode),
             Ok(SyncMode::Changes)
+        );
+    }
+
+    /// A whole-library sync that the pair's key moved under, while it
+    /// ran, sent nothing and keeps its token; one that is answered does
+    /// not.
+    #[tokio::test]
+    async fn a_whole_library_sync_that_fails_gives_its_token_back() {
+        use super::super::tokens::tests::{bob_s_key, sharing};
+        let (store, federation, bob_s) = sharing("fed-sync-refund").await;
+        let limits = federation.limits();
+        // Fifteen of sixteen used up; one is left.
+        for _ in 1..SNAPSHOTS.capacity {
+            assert!(
+                federation
+                    .answering
+                    .allowed(bob_s.as_str(), Ask::Snapshot, &limits)
+            );
+        }
+        let peer = store
+            .live_peer_by_server_id(bob_s.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let new = iroh::SecretKey::from_bytes(&[12; 32]).public();
+        store
+            .hold_peer_key(&peer.id, &new.to_string())
+            .await
+            .unwrap();
+        let whole = SyncLibrary {
+            library: "plex:1".into(),
+            since: None,
+        };
+        let (held, go) = federation.holds.answering.next();
+        let confirm = async {
+            held.await.unwrap();
+            federation
+                .confirm_key(&peer.id, &new.to_string(), "alice")
+                .await
+                .unwrap();
+            go.send(()).unwrap();
+        };
+        let (failed, ()) = tokio::join!(
+            Shares::sync(&federation, &bob_s, bob_s_key(), &whole),
+            confirm
+        );
+        assert_eq!(failed.map(|a| a.mode), Err(Unshared::NotShared));
+        // The token is back: the new key's whole-library sync is answered
+        // with it, and takes the last.
+        assert_eq!(
+            Shares::sync(&federation, &bob_s, new, &whole)
+                .await
+                .map(|a| a.mode),
+            Ok(SyncMode::Snapshot)
+        );
+        assert!(
+            !federation
+                .answering
+                .allowed(bob_s.as_str(), Ask::Snapshot, &limits)
         );
     }
 

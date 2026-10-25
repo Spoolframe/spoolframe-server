@@ -99,6 +99,10 @@ pub mod wan {
             Some("a documentation address (2001:db8::/32)")
         } else if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
             Some("a NAT64 address (64:ff9b::/96)")
+        } else if segments[..3] == [0x64, 0xff9b, 1] {
+            Some("a local-use NAT64 address (64:ff9b:1::/48)")
+        } else if first == 0x3fff && segments[1] & 0xf000 == 0 {
+            Some("a documentation address (3fff::/20)")
         } else {
             None
         }

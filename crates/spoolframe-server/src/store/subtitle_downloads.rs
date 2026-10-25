@@ -193,6 +193,16 @@ impl Store {
         Ok(())
     }
 
+    /// The kept downloads can no longer be read: a test's store failing
+    /// once a download is kept.
+    #[cfg(test)]
+    pub(crate) async fn lose_subtitle_downloads(&self) {
+        sqlx::query("ALTER TABLE subtitle_downloads RENAME TO subtitle_downloads_lost")
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
     /// Count a download `principal` made, as `name`, at `source`, that is
     /// kept elsewhere: a paired server's item's subtitle (P8-07), which
     /// counts under the user's daily limit here as their own do.

@@ -2016,3 +2016,133 @@ async fn a_grant_the_site_failed_on_is_uncertain() {
         })
     ));
 }
+
+/// The admin's usage counts what the daily limit counts: a download the
+/// site spent that is not kept yet, a user's or a pair's, is among the
+/// day's, where the usage showed one more left than the limit allowed.
+#[tokio::test]
+async fn the_usage_counts_a_download_spent_and_not_kept_as_the_limit_does() {
+    let f = fixture("usage-spent", 2).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.grants_and_stalls(101, 18).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    cancelled_at(&f, &holds.recording, "opensubtitles:103", &alice()).await;
+    let pair = pair_of("mzxw6ytbojtg633c");
+    pair_cancelled_once_asked(&f, "opensubtitles:101", &pair, "/files/101").await;
+    let usage = f.downloads.usage().await.unwrap();
+    let users: Vec<_> = usage
+        .users
+        .iter()
+        .map(|u| (u.principal.clone(), u.downloads, u.remaining))
+        .collect();
+    assert_eq!(
+        users,
+        [(alice().actor.principal.to_string(), 1, Some(1))],
+        "Alice's, as its file is kept"
+    );
+    assert_eq!(
+        usage
+            .pairs
+            .iter()
+            .map(|p| (p.server_id.as_str(), p.downloads, p.remaining))
+            .collect::<Vec<_>>(),
+        [("mzxw6ytbojtg633c", 1, Some(1))],
+        "the pair's, granted and cancelled"
+    );
+    holds.recording.let_go();
+}
+
+/// A pair's download of a result kept already counts under the pair, as
+/// its server counts it under its user, which cannot tell it from a new
+/// one; no site is asked, and the site's count is not one more. A user's
+/// here is not counted, as before.
+#[tokio::test]
+async fn a_pair_s_download_of_a_kept_result_counts_under_it_as_its_server_counts_it() {
+    let f = fixture("pair-again", 2).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.serves(101, RUSSIAN.into(), 18).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let pair = pair_of("mzxw6ytbojtg633c");
+    let first = f
+        .downloads
+        .download_for_pair(&film(), "opensubtitles:103", &pair)
+        .await
+        .unwrap();
+    assert_eq!(first.user_remaining, Some(1));
+    let again = f
+        .downloads
+        .download_for_pair(&film(), "opensubtitles:103", &pair)
+        .await
+        .unwrap();
+    assert_eq!(again.user_remaining, Some(0), "counted again");
+    assert!(matches!(
+        f.downloads
+            .download_for_pair(&film(), "opensubtitles:101", &pair)
+            .await,
+        Err(DownloadError::QuotaExhausted {
+            whose: QuotaOf::User,
+            site: None,
+            ..
+        })
+    ));
+    assert_eq!(f.site_calls("/api/v1/download").await, 1, "asked once");
+    let usage = f.downloads.usage().await.unwrap();
+    assert_eq!(usage.sites[0].downloads, 1, "the site's one");
+    assert_eq!(usage.pairs[0].downloads, 2);
+    f.downloads
+        .download(&film(), "opensubtitles:103", &alice())
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .subtitle_downloads_today(&alice().actor.principal.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a user's of a kept one is not counted"
+    );
+}
+
+/// A download counted and kept is its track though the media file's
+/// downloads cannot be read once it is kept: given with those read before
+/// it, where the download failed with its file and its count kept.
+#[tokio::test]
+async fn a_kept_download_whose_downloads_cannot_be_read_again_is_its_track_all_the_same() {
+    let f = fixture("attach-failed", 0).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.serves(101, RUSSIAN.into(), 18).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let own = f.subtitles().await.len();
+    f.downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    holds.recorded.hold();
+    let (item, asker) = (film(), alice());
+    let download = f.downloads.download(&item, "opensubtitles:103", &asker);
+    tokio::pin!(download);
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the hold: {done:?}"),
+        () = holds.recorded.until_at_it(1) => {}
+    }
+    f.store.lose_subtitle_downloads().await;
+    holds.recorded.let_go();
+    let got = download.await.expect("kept and counted: not failed");
+    assert_eq!(got.track as usize, own + 1, "after the one before");
+    assert_eq!(f.subtitles().await.len(), own + 2, "both are tracks");
+}

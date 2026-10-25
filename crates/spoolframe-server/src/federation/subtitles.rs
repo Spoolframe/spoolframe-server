@@ -220,19 +220,27 @@ impl Federation {
             .elsewhere(&principal, who.display_name())
             .await
             .map_err(download_error)?;
-        let mut downloaded = route
-            .dialed
-            .download_subtitle(SubtitleDownloadAsk {
-                user: route.user.to_string(),
-                item: route.remote,
-                result: result.to_owned(),
-            })
-            .await
-            .map_err(origin_error)?;
         // Logged as the pair's, not a site's: this server's own downloads
         // from each site stay its own.
         let (origin, _) = item.remote().expect("routed as a paired server's item");
-        let here = held.downloaded(&format!("pair:{origin}")).await;
+        let source = format!("pair:{origin}");
+        let ask = SubtitleDownloadAsk {
+            user: route.user.to_string(),
+            item: route.remote,
+            result: result.to_owned(),
+        };
+        let dialed = route.dialed;
+        // The ask and its count on work of their own, as SA's keeping is: a
+        // request cancelled once the pair is asked still counts what the
+        // pair downloads for the user, their limit held until then. The
+        // ask has a wait of its own.
+        let (mut downloaded, here) = tokio::spawn(async move {
+            let downloaded = dialed.download_subtitle(ask).await.map_err(origin_error)?;
+            let here = held.downloaded(&source).await;
+            Ok::<_, Error>((downloaded, here))
+        })
+        .await
+        .map_err(|e| unavailable(&e))??;
         // What the user may still download: the fewer of theirs here and
         // the pair's there.
         downloaded.user_remaining = match (here, downloaded.user_remaining) {

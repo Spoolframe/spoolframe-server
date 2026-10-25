@@ -305,8 +305,9 @@ events stream:
   `network.wan` takes only a public address: one that is private,
   loopback, link-local, CGNAT, unique local, multicast or reserved, or
   in a documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24,
-  2001:db8::/32), protocol-assignment (192.0.0.0/24), benchmarking
-  (198.18.0.0/15) or NAT64 (64:ff9b::/96) range, is refused at load when
+  2001:db8::/32, 3fff::/20), protocol-assignment (192.0.0.0/24),
+  benchmarking (198.18.0.0/15) or NAT64 (64:ff9b::/96, 64:ff9b:1::/48)
+  range, is refused at load when
   written, and dropped when looked up or given by the router. Each is
   text, `192.168.1.10:4433` or `[2001:db8::1]:4433`, in CBOR as in JSON.
   The event does not say where each address came from; the admin status
@@ -2237,7 +2238,11 @@ One not found by the file's hash (every SubDL one) is synced in the
 background (`spoolframe:subtitle-sync`: `timing` says `syncing`, then
 `synced` or `uncertain`), and a player showing it gets the synced
 timing without a restart. The same result is never downloaded twice:
-asking again answers the same track, at no cost.
+asking again answers the same track, at no cost (a paired server's
+users' excepted, P8-07). A download counted and kept is never refused
+for its track: if the server cannot read the item's downloads again
+once it is kept, it gives the item those it read before, and this
+one.
 
 A downloaded track has `download` on `Tracks`, a `SubtitleDownload`:
 its `id` (what `RemoveSubtitleDownload` names), `source` (the site's
@@ -3823,7 +3828,13 @@ Limits:
   daily_limit_per_user }` first, and counts each download there as one
   of theirs; it needs no subtitle site of its own. A user's limit is
   held while SA is asked, so two of their downloads at once never both
-  take their last.
+  take their last. SB asks SA and counts the download on work of its
+  own: a device's request cancelled once SA is asked still counts the
+  download SA makes.
+- SB cannot tell a download of a result SA has kept already from a new
+  one, and counts both. So SA counts both under the pair too, though
+  its site is not asked for a kept one; SA's own users' are still at no
+  cost.
 - On SA, every user of SB's together gets `subtitles {
   daily_limit_per_peer = 40; }` downloads a day (0 for no limit),
   counted under the pair and never under SB's users, whom SA never
@@ -3863,6 +3874,6 @@ Limits:
 
 SA's admin API `subtitle_usage` gains `dailyLimitPerPeer` and `pairs`,
 one row per paired server `{name, downloads, remaining}`; Settings ›
-Subtitles shows it as "Bob's server: 12 of 40 today". It counts the
-downloads kept: one granted and not kept counts against the limit but is
-not shown there.
+Subtitles shows it as "Bob's server: 12 of 40 today". It counts what the
+limits count: the downloads kept, and those granted and not kept yet.
+Each site's count there is of the downloads kept from it.

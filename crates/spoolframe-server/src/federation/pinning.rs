@@ -16,7 +16,7 @@ use spoolframe_protocol::rpc::{RpcRequest, RpcResponse, ServerInstance};
 use spoolframe_protocol::{
     CLIENT_ALPN, Error, FEDERATION_ALPN, Reply, Request, Response, ServerInfo,
 };
-use spoolframe_types::{MediaId, Role};
+use spoolframe_types::{MediaId, Role, SubtitleDownloaded, SubtitleRole, SubtitleTrack};
 use tokio::io::AsyncReadExt;
 
 use super::tokens::tests::{bob_s_key, bob_wants, sharing};
@@ -166,12 +166,43 @@ async fn answer(connection: Connection, server_id: &'static str, lists: bool, he
                     }),
                 ),
                 PeerRequest::RemoveSubtitleDownload(_) => ("subtitles", PeerReply::Done),
+                // Downloaded, after a while: what a request dropped
+                // meanwhile was asked for.
+                PeerRequest::DownloadSubtitle(_) => {
+                    heard.lock().push("subtitle asked");
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    (
+                        "subtitle downloaded",
+                        PeerReply::SubtitleDownloaded {
+                            downloaded: a_download(),
+                        },
+                    )
+                }
                 _ => ("other", PeerReply::Unavailable),
             };
             heard.lock().push(said);
             let _ = write_frame(&mut send, &reply).await;
         }
         let _ = send.finish();
+    }
+}
+
+/// A subtitle Alice's server downloaded, as it answers.
+fn a_download() -> SubtitleDownloaded {
+    SubtitleDownloaded {
+        track: 3,
+        subtitle: SubtitleTrack {
+            language: Some("eng".into()),
+            title: Some("OpenSubtitles".into()),
+            forced: false,
+            default: false,
+            external: true,
+            role: SubtitleRole::Full,
+            timing: None,
+            download: None,
+        },
+        account_remaining: None,
+        user_remaining: Some(39),
     }
 }
 
@@ -843,4 +874,89 @@ async fn an_assertion_of_the_old_key_as_a_new_one_is_confirmed_mints_nothing() {
             .is_err()
     );
     federation.mint(&bob_s, new, &wants()).await.unwrap();
+}
+
+/// This server's subtitle downloads, holding each user to `per_user` a
+/// day, with no site of its own: its users download on the pair's.
+fn subtitle_downloads(
+    store: &Store,
+    dir: &std::path::Path,
+    per_user: u32,
+) -> Arc<crate::subtitle_downloads::SubtitleDownloads> {
+    use spoolframe_media::sandbox::Tool;
+
+    use crate::subtitle_sync::{FfmpegSpeech, SubtitleTimings, SyncSettings};
+    let timings = SubtitleTimings::new(
+        store.clone(),
+        Tool::unconfined("/nonexistent/ffmpeg"),
+        Arc::new(FfmpegSpeech(Tool::unconfined("/nonexistent/ffmpeg"))),
+        &SyncSettings {
+            at_once: 1,
+            dir: dir.join("subtitles"),
+            speech_dir: dir.join("speech"),
+        },
+    )
+    .unwrap();
+    let downloads = crate::subtitle_downloads::SubtitleDownloads::new(
+        store.clone(),
+        Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into())),
+        Arc::new(spoolframe_media::Prober::new(
+            Tool::unconfined("/nonexistent/ffprobe"),
+            std::time::Duration::from_secs(10),
+        )),
+        Arc::new(timings),
+        dir.join("subtitles").join("downloaded"),
+        crate::subtitle_downloads::Settings {
+            sites: Vec::new(),
+            daily_limit_per_user: per_user,
+            daily_limit_per_peer: 0,
+        },
+    )
+    .unwrap();
+    Arc::new(downloads)
+}
+
+/// Bob's download of Alice's film's subtitle, its request dropped once
+/// Alice's server is asked, is counted here as Alice's server makes it:
+/// work of its own carries the ask and the count, where the count went
+/// with the request and Bob's next got past his limit.
+#[tokio::test]
+async fn a_download_asked_of_the_pair_counts_here_though_its_request_is_dropped() {
+    let alice = Answering::start(31, SA).await;
+    let (store, federation, peer, bob) = bob_s("fed-subs-dropped", &alice).await;
+    let dir = spoolframe_test_dir::TestDir::new("spoolframe-fed-subs-dropped").await;
+    federation.attach_subtitle_downloads(subtitle_downloads(&store, dir.path(), 1));
+    federation.refresh(&peer.id).await.unwrap();
+    let (bob_now, item) = (who(bob), alien());
+    let mut download =
+        Box::pin(federation.download_subtitle_of(&bob_now, &item, "opensubtitles:101"));
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the pair was asked: {done:?}"),
+        () = async {
+            while !alice.heard().contains(&"subtitle asked") {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        } => {}
+    }
+    drop(download);
+    let principal = crate::principal::Principal::LocalUser(bob).to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while store
+            .subtitle_downloads_today(&principal)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("counted here once the pair answered");
+    assert!(matches!(
+        federation
+            .download_subtitle_of(&who(bob), &alien(), "opensubtitles:102")
+            .await,
+        Err(Error::QuotaExhausted { .. })
+    ));
 }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed: a `network.wan` or relay address in 3fff::/20 (IPv6
+  documentation, RFC 9637) or 64:ff9b:1::/48 (local-use NAT64, RFC 8215)
+  is now refused as not public, as 2001:db8::/32 and 64:ff9b::/96 were
+  (P8-06).
 - Fixed: playback over a lossy link no longer drops. The QUIC release
   iroh builds on (noq-proto 1.4.0, crates.io's latest) kept each
   full-size packet past a lost one, or ahead of a reader that had fallen
@@ -363,7 +367,14 @@
     grants it (for SubDL, as its file comes), so one cancelled or failed
     after that, or kept too late, still counts for 24 hours; that count
     is in memory until the download is kept, and a restart forgets it.
-    The admin usage view counts kept downloads only. The file and its
+    The admin usage view counts what the limits count, those granted and
+    not kept yet too. A paired server counts its user's download on work
+    of its own, so a request cancelled once the pair is asked is still
+    counted; and a pair's download of a result kept already counts under
+    the pair, as the paired server counts it under its user, which
+    cannot tell it from a new one. A download counted and kept is never
+    failed for its track: if its item's downloads cannot be read once it
+    is kept, the item is given those read before, and it. The file and its
     record are kept on work of their own within 30 s, so no file is left
     that the limit does not count. A download whose request was
     cancelled before OpenSubtitles answered, or that the site failed on

@@ -7,11 +7,14 @@
 //! Redeeming is a sign-in a stranger makes, so it is guarded as one. The
 //! caller draws on the strangers' budget first (PX-10); then the code is
 //! counted as a wrong guess before it is checked (A-13), and only a code
-//! some invite has, revoked or not, takes the guess back. Expired or used
-//! up, it was still the right code: telling so helps no one guess.
+//! of an invite that was not revoked takes the guess back: a redemption
+//! says `invalid` for a revoked invite as for no invite, so it counts them
+//! alike. Expired or used up, it was still the right code: telling so
+//! helps no one guess.
 //!
 //! Looking a code up before joining ([`look_up`]) is guarded as a
-//! redemption is, on the same count: it is as good a guess.
+//! redemption is, on the same count: it is as good a guess. It does tell
+//! a revoked invite from none, so it takes the guess back for a revoked one.
 //!
 //! Before redeeming, the holder proves the code to the server's relay
 //! with a token (P6-08, [`holder_tier`]), guarded as a redemption is: a
@@ -315,8 +318,9 @@ pub async fn redeem(
 /// Per device, as device sign-in codes are: endpoints are free, so what
 /// holds guessing from many to a crawl is the strangers' budget, which
 /// the caller drew on before this. The guess is counted before the code
-/// is looked at, and taken back for any code an invite has, revoked or
-/// not: expired, used up or of another kind, it was still the right code.
+/// is looked at, and taken back for any code a live-or-spent invite has:
+/// expired, used up or of another kind, it was still the right code. A
+/// revoked invite is `Invalid` here, as no invite is, and stays counted.
 pub(crate) async fn usable_code(
     auth: &Auth,
     endpoint: &str,
@@ -353,8 +357,10 @@ fn code_guess(auth: &Auth, endpoint: &str) -> Result<crate::auth::Guess, RedeemE
 /// device whose guesses are counted as `endpoint`'s. Nothing is used up.
 ///
 /// Counted as [`redeem`] counts a code, on the same count: a code no
-/// invite has, or that cannot be one, stays a wrong guess; any other,
-/// revoked, expired or used up, was the right code, and is taken back.
+/// invite has, or that cannot be one, stays a wrong guess. Unlike a
+/// redemption, which says `invalid` for a revoked invite too and counts it,
+/// a lookup tells a revoked invite apart, so it takes the guess back for it
+/// as for an expired or used up one: all were the right code.
 pub async fn look_up(
     auth: &Auth,
     endpoint: &str,

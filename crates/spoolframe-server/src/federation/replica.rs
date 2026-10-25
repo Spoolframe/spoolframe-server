@@ -287,7 +287,7 @@ impl Federation {
             };
             let (this, places) = (self.clone(), places.clone());
             tokio::spawn(async move {
-                let Ok(_place) = places.acquire_owned().await else {
+                let Ok(place) = places.acquire_owned().await else {
                     return;
                 };
                 this.tend(&peer, &mut state).await;
@@ -297,6 +297,11 @@ impl Federation {
                 {
                     tracing::warn!(error = %e, "cannot keep when a paired server was seen");
                 }
+                // The place is for dials and syncs: the sweep, up to
+                // SWEEP_WAIT, must not hold one from the other pairs. It
+                // is still one at a time per pair, by `state`, held to the
+                // end of the task.
+                drop(place);
                 // Within a while: the rest come at the next tick.
                 let _ = tokio::time::timeout(SWEEP_WAIT, this.sweep_posters(&peer)).await;
             });
@@ -307,6 +312,8 @@ impl Federation {
     /// a time; when it says to wait, the rest wait for the next tick. One
     /// that fails is not asked for again until the origin's next sync.
     async fn sweep_posters(&self, peer: &PeerRecord) {
+        #[cfg(test)]
+        self.holds.sweeping.here().await;
         let origin = peer.server_id.as_str();
         let Some(dialed) = self.links.pinned(peer) else {
             return;
@@ -970,6 +977,23 @@ mod tests {
             .await
             .unwrap()
             .1
+    }
+
+    /// A pair's poster sweep, which may take minutes, does not hold the
+    /// pair's place: the other pairs are dialled and synced meanwhile.
+    #[tokio::test]
+    async fn a_poster_sweep_does_not_hold_a_place() {
+        let (_store, federation, _peer) = replica("fed-replica-sweep-place").await;
+        let federation = Arc::new(federation);
+        let places = Arc::new(tokio::sync::Semaphore::new(1));
+        let (swept, go) = federation.holds.sweeping.next();
+        federation.tend_all(&mut HashMap::new(), &places).await;
+        tokio::time::timeout(Duration::from_secs(10), swept)
+            .await
+            .expect("the sweep starts")
+            .unwrap();
+        assert_eq!(places.available_permits(), 1, "the sweep holds the place");
+        go.send(()).unwrap();
     }
 
     /// The pair goes while a sync of it is in flight: the cache is dropped
