@@ -57,12 +57,11 @@ ignore = [
   # (through iroh's netlink-packet-core); none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the server" },
   # crypto-bigint 0.5: constant-time operations that may branch on secret
-  # values. It comes in through p256 0.13 (elliptic-curve), which the
-  # server uses only to verify ECDSA signatures with public keys:
-  # openidconnect's ES256 ID tokens and portable security-key roots. The
-  # one P-256 signer is the test-only soft key. The fix is crypto-bigint
-  # 0.7.6, behind p256 0.14, and openidconnect 4.0.1 still asks for 0.13.
-  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through p256 0.13, used only to verify ECDSA signatures (public keys); no secret operations" },
+  # values. It now comes in only through openidconnect 4.0.1, whose p256
+  # and p384 0.13 (elliptic-curve) verify ES256 and ES384 ID tokens with
+  # public keys. Our own p256 is 0.14, so the SDK graph is clear. The fix
+  # is crypto-bigint 0.7.6; drop this when openidconnect moves to 0.14.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through p256 0.13 in openidconnect, used only to verify ECDSA signatures (public keys); no secret operations" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and

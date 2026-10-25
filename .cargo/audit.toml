@@ -7,7 +7,8 @@ ignore = [
   "RUSTSEC-2023-0071",
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",
-  # crypto-bigint 0.5, through p256 0.13: ECDSA verification only.
+  # crypto-bigint 0.5, through openidconnect's p256/p384 0.13 on the server:
+  # ECDSA verification only.
   "RUSTSEC-2026-0387",
 ]
 

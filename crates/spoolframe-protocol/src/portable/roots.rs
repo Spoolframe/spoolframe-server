@@ -1121,7 +1121,7 @@ mod tests {
 
     fn public(key: &SigningKey) -> [u8; P256_PUBLIC_KEY_LEN] {
         key.verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .try_into()
             .unwrap()
@@ -1508,7 +1508,7 @@ mod tests {
 
     fn cose_key(key: &SigningKey) -> ciborium::Value {
         use ciborium::Value;
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         Value::Map(vec![
             (Value::from(1), Value::from(2)),
             (Value::from(3), Value::from(-7)),

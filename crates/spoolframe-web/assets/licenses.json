@@ -1108,6 +1108,22 @@
 },
 {
 "copyright": [
+"Copyright (c) 2023-2026 The RustCrypto Project Developers"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "cpubits",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.1.1"
+},
+{
+"copyright": [
 "Copyright (c) 2020-2025 The RustCrypto Project Developers"
 ],
 "group": "crates",
@@ -1249,6 +1265,22 @@
 "MIT": 1
 },
 "version": "0.5.5"
+},
+{
+"copyright": [
+"Copyright (c) 2021-2026 The RustCrypto Project Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "crypto-bigint",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.7.9"
 },
 {
 "copyright": [
@@ -1924,6 +1956,23 @@
 {
 "copyright": [
 "Copyright 2018-2022 RustCrypto Developers",
+"Copyright (c) 2018-2026 RustCrypto Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "ecdsa",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 45,
+"MIT": 1
+},
+"version": "0.17.0"
+},
+{
+"copyright": [
+"Copyright 2018-2022 RustCrypto Developers",
 "Copyright (c) 2018-2023 RustCrypto Developers"
 ],
 "group": "crates",
@@ -2016,6 +2065,22 @@
 "MIT": 1
 },
 "version": "0.13.8"
+},
+{
+"copyright": [
+"Copyright (c) 2020-2026 RustCrypto Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "elliptic-curve",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.14.3"
 },
 {
 "copyright": [
@@ -2192,6 +2257,22 @@
 "MIT": 50
 },
 "version": "0.13.1"
+},
+{
+"copyright": [
+"Copyright (c) 2017 Sean Bowe"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "ff",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 9,
+"MIT": 50
+},
+"version": "0.14.0"
 },
 {
 "copyright": [
@@ -2799,6 +2880,22 @@
 },
 {
 "copyright": [
+"Copyright (c) Sean Bowe, Jack Grigg"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "group",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 9,
+"MIT": 1
+},
+"version": "0.14.0"
+},
+{
+"copyright": [
 "Copyright (c) 2017 h2 authors"
 ],
 "group": "crates",
@@ -2956,6 +3053,22 @@
 "MIT": 1
 },
 "version": "0.12.1"
+},
+{
+"copyright": [
+"Copyright (c) 2017 Artyom Pavlov"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "hmac",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.13.0"
 },
 {
 "copyright": [
@@ -4985,6 +5098,22 @@
 },
 {
 "copyright": [
+"Copyright (c) 2020-2026 RustCrypto Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "p256",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.14.0"
+},
+{
+"copyright": [
 "Copyright (c) 2020-2021 RustCrypto Developers"
 ],
 "group": "crates",
@@ -5382,6 +5511,22 @@
 },
 {
 "copyright": [
+"Copyright (c) 2024-2026 RustCrypto Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "primefield",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.14.0"
+},
+{
+"copyright": [
 "Copyright (c) 2020-2023 RustCrypto Developers"
 ],
 "group": "crates",
@@ -5395,6 +5540,22 @@
 "MIT": 1
 },
 "version": "0.13.6"
+},
+{
+"copyright": [
+"Copyright (c) 2020-2023 RustCrypto Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "primeorder",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.14.0"
 },
 {
 "copyright": [
@@ -5783,6 +5944,23 @@
 "MIT": 1
 },
 "version": "0.4.0"
+},
+{
+"copyright": [
+"Copyright 2018-2022 RustCrypto Developers",
+"Copyright (c) 2018-2026 RustCrypto Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "rfc6979",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 45,
+"MIT": 1
+},
+"version": "0.6.0"
 },
 {
 "copyright": [
@@ -6192,6 +6370,22 @@
 "MIT": 1
 },
 "version": "0.7.3"
+},
+{
+"copyright": [
+"Copyright (c) 2021-2026 The RustCrypto Project Developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "sec1",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.8.1"
 },
 {
 "copyright": [
@@ -8258,6 +8452,23 @@
 "MIT": 1
 },
 "version": "1.0.4"
+},
+{
+"copyright": [
+"Copyright (c) 2026 RustCrypto Developers",
+"Copyright (c) 2018-2025 `group` crate developers"
+],
+"group": "crates",
+"license": "Apache-2.0 OR MIT",
+"name": "wnaf",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 4,
+"MIT": 1
+},
+"version": "0.14.1"
 },
 {
 "copyright": [

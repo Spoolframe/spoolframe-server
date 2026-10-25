@@ -97,7 +97,7 @@ impl SoftKey {
 
     /// Its root.
     pub fn root(&self) -> RootKey {
-        let point = self.signing.verifying_key().to_encoded_point(false);
+        let point = self.signing.verifying_key().to_sec1_point(false);
         let public_key: [u8; P256_PUBLIC_KEY_LEN] = point
             .as_bytes()
             .try_into()
@@ -176,7 +176,7 @@ impl SoftKey {
     /// whose `authData` carries the credential id and its COSE ES256 key.
     pub fn register_webauthn(&self, handle: &[u8; HANDLE_LEN]) -> RootRegistration {
         use ciborium::Value;
-        let point = self.signing.verifying_key().to_encoded_point(false);
+        let point = self.signing.verifying_key().to_sec1_point(false);
         let cose = Value::Map(vec![
             (Value::from(1), Value::from(2)),
             (Value::from(3), Value::from(-7)),
