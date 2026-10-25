@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.1 (2026-10-25)
+
+- Security: the SDK verifies security-key signatures with p256 0.14
+  (ecdsa 0.17, elliptic-curve 0.14, crypto-bigint 0.7.9), so
+  crypto-bigint 0.5 and its timing advisory RUSTSEC-2026-0387 leave the
+  SDK crates' dependency graph. Behaviour is the same. The server still
+  carries crypto-bigint 0.5 through openidconnect 4.0.1, which verifies
+  ID tokens with public keys only.
+
 ## 0.15.0 (2026-10-25)
 
 - New: `ClientCapabilities.video_codecs`, the RFC 6381 codec strings a
