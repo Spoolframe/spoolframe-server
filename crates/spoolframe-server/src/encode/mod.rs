@@ -1241,6 +1241,7 @@ pub(crate) mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -1270,6 +1271,7 @@ pub(crate) mod tests {
                 })
                 .to_vec(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {
@@ -1583,6 +1585,7 @@ pub(crate) mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -1615,6 +1618,7 @@ pub(crate) mod tests {
                 },
             ],
             reasons: Vec::new(),
+            source_codec: None,
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {
@@ -1714,6 +1718,7 @@ pub(crate) mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let started = Conversion::start(
             jobs.clone(),
@@ -1801,6 +1806,7 @@ pub(crate) mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -1818,6 +1824,7 @@ pub(crate) mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {
@@ -1929,6 +1936,7 @@ pub(crate) mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -1946,6 +1954,7 @@ pub(crate) mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {
@@ -2054,6 +2063,7 @@ pub(crate) mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -2071,6 +2081,7 @@ pub(crate) mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {
@@ -2188,6 +2199,7 @@ pub(crate) mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -2205,6 +2217,7 @@ pub(crate) mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let encoders = Encoders {
             video: vec![VideoEncoder {

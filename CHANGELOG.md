@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- New: `ClientCapabilities.video_codecs`, the RFC 6381 codec strings a
+  device plays (`hvc1.2.4.L153.B0`, `dvh1.08.06`). With a list, a video
+  is copied only where a listed string covers the source's own (codec,
+  profile, tier, level; Dolby Vision's profile and level), and is
+  converted otherwise. Dolby Vision whose own string is not listed is
+  copied as its base layer where that is listed. A first-generation
+  Apple TV 4K was sent copies it could not show (plex:movie:1936).
+  `null` keeps today's plans. `DisplayCapabilities.video_codecs` may
+  list them again for the screen's mode.
+- New: a `direct` or `converted` plan carries `source_codec`, the
+  source's codec string it judged, and the server's playback log lines
+  print it. The probe reads it from the stream's codec record; nothing
+  is stored, and no rescan is needed.
+- Fixed: an HLS playlist names a copied video by the source's own codec
+  string where the probe read it. It named every HEVC copy main tier
+  (`hvc1.2.4.L…`) and every H.264 copy High, whatever the stream was.
 - Fixed: a subtitle download whose keeping ran out of its 30 s wait with
   its row unreadable afterwards no longer has its file removed: the row
   may have landed. The download is still told failed, and the file stays

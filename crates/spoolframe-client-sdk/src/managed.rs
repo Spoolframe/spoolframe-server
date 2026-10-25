@@ -1802,6 +1802,7 @@ mod tests {
                 video: None,
                 audio: None,
                 subtitle: None,
+                source_codec: None,
             },
             size: 100,
             chosen: None,
@@ -2291,6 +2292,7 @@ mod tests {
                         subtitle: None,
                         ladder: Vec::new(),
                         reasons: vec![],
+                        source_codec: None,
                     };
                 }
                 *self.plan.lock() = Some(p.plan.clone());
@@ -2399,6 +2401,7 @@ mod tests {
             spoolframe_types::DisplayCapabilities {
                 bit_depth: Some(8),
                 hdr: Some(std::collections::BTreeSet::new()),
+                video_codecs: None,
             }
         }
 

@@ -53,6 +53,7 @@ fn capabilities() -> ClientCapabilities {
         max_audio_channels: None,
         max_bitrate: None,
         hardware_video: None,
+        video_codecs: None,
     }
 }
 
@@ -502,6 +503,7 @@ mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         }
     }
 
@@ -558,6 +560,7 @@ mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         assert!(copy_only(&plan).is_err());
     }

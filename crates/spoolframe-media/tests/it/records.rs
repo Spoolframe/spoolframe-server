@@ -106,3 +106,53 @@ async fn an_hev1_track_does_not() {
     );
     assert!(!in_record(&path).await);
 }
+
+async fn codec_string(path: &Path) -> Option<String> {
+    let prober = Prober::new(Tool::unconfined("ffprobe"), Duration::from_secs(30));
+    let described = prober.describe(path).await.unwrap();
+    described
+        .video
+        .as_ref()
+        .unwrap()
+        .codec_string
+        .map(|s| s.to_string())
+}
+
+/// The string a client's `video_codecs` are judged against, from the
+/// record as ffprobe dumps it: an `hvcC` in Matroska, the SPS (Annex B)
+/// of the same stream in MPEG-TS, an `avcC`.
+#[tokio::test]
+async fn a_stream_s_codec_string_is_read_from_its_record() {
+    let tmp = scratch("codec-string").await;
+    let hevc = film(
+        tmp.as_ref(),
+        "e.mkv",
+        "libx265",
+        &[
+            "-pix_fmt",
+            "yuv420p10le",
+            "-x265-params",
+            "log-level=error:level-idc=5.1:high-tier=1",
+        ],
+    );
+    assert_eq!(
+        codec_string(&hevc).await.as_deref(),
+        Some("hvc1.2.4.H153.90")
+    );
+    let ts = tmp.as_ref().join("e.ts");
+    ffmpeg(&[
+        "-i",
+        hevc.to_str().unwrap(),
+        "-c",
+        "copy",
+        ts.to_str().unwrap(),
+    ]);
+    assert_eq!(codec_string(&ts).await.as_deref(), Some("hvc1.2.4.H153.90"));
+    let h264 = film(
+        tmp.as_ref(),
+        "f.mkv",
+        "libx264",
+        &["-profile:v", "main", "-level", "3.1"],
+    );
+    assert_eq!(codec_string(&h264).await.as_deref(), Some("avc1.4D401F"));
+}

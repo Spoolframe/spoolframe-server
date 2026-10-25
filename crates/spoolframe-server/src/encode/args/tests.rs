@@ -52,6 +52,7 @@ fn film() -> MediaDescriptor {
             dolby_vision: None,
             bit_rate: None,
             parameter_sets_in_record: false,
+            codec_string: None,
         }),
         audio: vec![AudioStream {
             index: 1,

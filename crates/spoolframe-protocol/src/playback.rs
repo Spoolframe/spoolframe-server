@@ -140,6 +140,15 @@ pub enum PlaybackPlan {
         video: Option<VideoCodec>,
         audio: Option<PlannedAudio>,
         subtitle: Option<PlannedSubtitle>,
+        /// The source video's RFC 6381 codec string as the plan judged
+        /// it against `ClientCapabilities::video_codecs`
+        /// (`hvc1.2.4.L153.B0`; `dvh1.08.06` for Dolby Vision shown as
+        /// such): for a client's log. `None` where the server did not read
+        /// it, or there is no video. Unlike the rest of a plan it may be
+        /// left out, as a server before it does, and is `None` then.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        source_codec: Option<String>,
     },
     /// The server converts the file for this client (P2): copies the
     /// streams that fit, encodes the ones that do not, and delivers the
@@ -160,6 +169,10 @@ pub enum PlaybackPlan {
         /// converted, e.g. "subtitle 0: pgs cannot be shown; burned into
         /// the video". A client can offer to avoid them (subtitles off).
         reasons: Vec<String>,
+        /// As in `Direct`.
+        // compat(v1): required at the protocol reset
+        #[serde(default)]
+        source_codec: Option<String>,
     },
     /// The client cannot play this selection. Each reason names a stream
     /// and why, e.g. "audio 0: dts not supported".
@@ -167,6 +180,19 @@ pub enum PlaybackPlan {
     /// A plan kind this build does not know.
     #[serde(other)]
     Unknown,
+}
+
+impl PlaybackPlan {
+    /// Its `source_codec`: `None` where it has none, as an unsupported
+    /// plan has not.
+    pub fn source_codec(&self) -> Option<&str> {
+        match self {
+            Self::Direct { source_codec, .. } | Self::Converted { source_codec, .. } => {
+                source_codec.as_deref()
+            }
+            Self::Unsupported { .. } | Self::Unknown => None,
+        }
+    }
 }
 
 /// What happens to the video in a converted plan.

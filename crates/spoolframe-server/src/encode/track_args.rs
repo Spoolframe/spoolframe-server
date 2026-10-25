@@ -180,6 +180,7 @@ mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: vec![audio(1, "dts"), audio(2, "ac3")],
             subtitles: Vec::new(),

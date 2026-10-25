@@ -36,6 +36,7 @@ must be updated together. The changes per revision are in
   [playback revisions](#playback-revisions),
   [resource streams](#resource-streams), [quality](#quality-and-adaptive-hls),
   [output codecs and HDR](#output-codecs-and-hdr),
+  [codec strings](#codec-strings),
   [the WAN uplink budget](#the-wan-uplink-budget),
   [picture subtitles](#picture-subtitles),
   [idle playbacks](#paused-playback-and-the-idle-limit)
@@ -99,11 +100,13 @@ protocol reset` in the code:
 | Field | Read as, when left out |
 |---|---|
 | `ClientCapabilities.hardware_video` | `null` |
+| `ClientCapabilities.video_codecs`, `DisplayCapabilities.video_codecs` | `null` |
 | `display` on `PlaybackPlan`, `StartPlayback`, `ChangeSubtitle`, `ChangeQuality` | `null` |
 | `LoggedIn.password_change_required` | `false` |
 | `can_leave` in the `WhoAmI` reply | `true` |
 | `Rung.video` | `null` |
 | `ConvertedVideo::Copy.dolby_vision` | `false` |
+| `source_codec` on a `direct` or `converted` plan | `null` |
 | `servers` in pairing's `credential` frame | none |
 | `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent (these are also left out when empty) |
 | `year`, `air_date` on an item; `bit_rate` on a file's tracks and its video | `null` |
@@ -1317,10 +1320,11 @@ source's keyframes, on one grid.
 ### Display capabilities
 
 `PlaybackPlan`, `StartPlayback`, `ChangeSubtitle` and `ChangeQuality`
-carry `display`: `{ bit_depth, hdr }` (`DisplayCapabilities`, both fields
-required inside it, as in `VideoLimits`), what the screen shows now. It
-replaces `Hello`'s `max_video.bit_depth` and `max_video.hdr` for that
-plan, and the playback keeps it: a re-plan without one plans for the
+carry `display`: `{ bit_depth, hdr, video_codecs }` (`DisplayCapabilities`,
+`bit_depth` and `hdr` required inside it, as in `VideoLimits`), what the
+screen shows now. It replaces `Hello`'s `max_video.bit_depth` and
+`max_video.hdr` for that plan, and `video_codecs` too when it is not
+`null` ([codec strings](#codec-strings)); the playback keeps it: a re-plan without one plans for the
 screen it started on. A TV whose display mode changes while the app runs
 (Match Dynamic Range, another TV or receiver) sends it at each start.
 With `null`, `Hello`'s apply.
@@ -1366,7 +1370,61 @@ software the server encodes only H.264.
   `av01.0.<level>M.10` for kept HDR, with `VIDEO-RANGE=PQ` or `HLG`; a
   tone-mapped or 8-bit encode `hvc1.1.6.L…`, `av01.0.<level>M.08` or
   `avc1…`, with `VIDEO-RANGE=SDR`. The fMP4 init segment carries `colr`,
-  `mdcv` and `clli`, and HEVC is tagged `hvc1`.
+  `mdcv` and `clli`, and HEVC is tagged `hvc1`. A copy is named by the
+  source's own codec string where the server read it
+  ([codec strings](#codec-strings)): `hvc1.2.4.H153.90` for a high-tier
+  stream, `avc1.4D401F` for Main-profile H.264.
+
+## Codec strings
+
+`ClientCapabilities.video_codecs` (`[string]` or `null`) lists the
+RFC 6381 codec strings the device plays, as its player answers for each
+(Apple: `AVURLAsset.isPlayableExtendedMIMEType`), for example:
+
+```json
+"video_codecs": ["av01.0.13M.10", "dvh1.05.06", "dvh1.08.06",
+                 "hvc1.2.4.L153.B0", "hvc1.2.4.L186.B0"]
+```
+
+- The forms read: `avc1`/`avc3` (`avc1.PPCCLL`), `hvc1`/`hev1`
+  (`hvc1.[A-C]P.F.TL.CC…`), `av01` (`av01.P.LLT.DD`, later fields read
+  past), and Dolby Vision's `dvh1`/`dvhe`, `dva1`/`dvav` and `dav1`
+  (`dvh1.PP.LL`). The server passes over a string it does not read.
+- `null`, or the field left out: the device does not say. `video` and
+  `max_video` alone decide, as before.
+- With a list, a video is copied (or played directly) only where a
+  listed string covers the source's own: the same codec (`hvc1` and
+  `hev1` are one; so are `dvh1` and `dvhe`), the same profile, and a
+  tier and level at most the listed one's; for `av01` the same bit
+  depth. HEVC Main 10 covers Main, and H.264's High profiles cover Main,
+  constrained baseline and the High profiles under them. Otherwise the
+  video is converted, with the reason `video: <string> not supported`.
+- The source's string comes from its codec record (`hvcC`, `avcC`,
+  `av1C`, or the SPS in MPEG-TS), as a copy is written (`hvc1`, `avc1`),
+  and Dolby Vision's from its configuration record. Where the server
+  could not read the record, the source's string is unknown and the
+  list has no say over it.
+- Dolby Vision: copied and labelled only where its own string
+  (`dvh1.08.06`) is listed, besides `max_video.hdr` having
+  `dolby_vision`. Where it is not, a stream with a base layer the device
+  shows (profile 8, profile 7) is judged by the base layer's string
+  (`hvc1.2.4.L153.B0`) and copied as that base layer, unlabelled, as for
+  a device that shows no Dolby Vision. Profile 5, which has no base
+  layer, is converted.
+- A device sends the strings it asks about; the Apple apps ask for
+  `avc1` High to level 5.2, `hvc1` Main and Main 10 at levels 4.1 to
+  6.2 in both tiers, `dvh1` profiles 5, 8 and 7 to level 09, and
+  `av01` Main at 8 and 10 bits to level 6.x.
+- `DisplayCapabilities.video_codecs` lists them again for the screen's
+  mode, and replaces `Hello`'s for that plan; `null` keeps `Hello`'s.
+
+A `direct` or `converted` plan carries `source_codec` (string or
+`null`): the source's string the plan judged, for the app's log.
+It is Dolby Vision's (`dvh1.08.06`) where the plan copies it labelled,
+or for profile 5; otherwise the stream's own, the base layer's for
+Dolby Vision (`hvc1.2.4.L153.B0`). It is sent whether or not the device
+lists `video_codecs`, and is `null` where the server could not read it
+or there is no video.
 
 ## The WAN uplink budget
 

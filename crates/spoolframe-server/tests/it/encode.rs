@@ -922,8 +922,10 @@ async fn hls_of_a_copied_video_is_cut_at_its_keyframes_and_plays_whole() {
         ),
         "{multivariant}"
     );
+    // x264's High at level 3.0, the stream's own string, not the 1080p
+    // level a copy was once named by.
     assert!(
-        multivariant.contains("avc1.640028,mp4a.40.2"),
+        multivariant.contains("avc1.64001E,mp4a.40.2"),
         "{multivariant}"
     );
     // The 360p test pattern, 25 frames a second, says no transfer.

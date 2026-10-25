@@ -2288,10 +2288,12 @@ pub(crate) mod tests {
         let sdr = DisplayCapabilities {
             bit_depth: Some(8),
             hdr: Some(std::collections::BTreeSet::new()),
+            video_codecs: None,
         };
         let hdr = DisplayCapabilities {
             bit_depth: Some(10),
             hdr: Some([spoolframe_types::HdrFormat::Hdr10].into()),
+            video_codecs: None,
         };
         let h = p.start(
             Playbacks::new_handle(),

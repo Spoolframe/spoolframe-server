@@ -4228,6 +4228,7 @@ impl ClientProtocol {
                         plan = %decided.kind,
                         delivery = %decided.delivery,
                         video = %decided.video,
+                        source_codec = plan.source_codec().unwrap_or("unknown"),
                         audio = %decided.audio,
                         subtitle = %decided.subtitle,
                         start_ms = start_ms.unwrap_or(0),
@@ -4416,6 +4417,7 @@ impl ClientProtocol {
                     ?quality,
                     plan = %decided.kind,
                     video = %decided.video,
+                    source_codec = plan.source_codec().unwrap_or("unknown"),
                     "playback planned again for its quality"
                 );
                 Ok(Reply::PlaybackChanged { plan, size, epoch })

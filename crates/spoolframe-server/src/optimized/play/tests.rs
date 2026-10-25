@@ -32,6 +32,7 @@ fn video(index: u32, codec: &str, height: u32) -> VideoStream {
         dolby_vision: None,
         bit_rate: None,
         parameter_sets_in_record: false,
+        codec_string: None,
     }
 }
 

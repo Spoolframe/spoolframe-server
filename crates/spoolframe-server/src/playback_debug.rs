@@ -1432,6 +1432,7 @@ mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -1449,6 +1450,7 @@ mod tests {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let selection = Selection {
             audio: None,

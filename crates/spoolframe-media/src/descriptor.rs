@@ -6,7 +6,8 @@ use std::time::Duration;
 use easy_ffprobe::{FfProbe, Ratio, SideData, StreamKinds};
 use serde::Serialize;
 use spoolframe_types::{
-    AudioRole, AudioTrack, HdrFormat, MediaTracks, SubtitleRole, SubtitleTrack, VideoTrack,
+    AudioRole, AudioTrack, CodecString, HdrFormat, MediaTracks, SubtitleRole, SubtitleTrack,
+    VideoCodec, VideoTrack,
 };
 
 use crate::codecs;
@@ -63,6 +64,12 @@ pub struct VideoStream {
     /// Bits per second of this stream alone: what an MP4 says of it, else
     /// a Matroska muxer's `BPS` statistics tag; `None` where neither does.
     pub bit_rate: Option<u64>,
+    /// Its RFC 6381 codec string (`hvc1.2.4.L153.B0`), from its codec
+    /// record, as a copy of it is written: a client's `video_codecs` are
+    /// judged against it. Dolby Vision's base layer's; its own is
+    /// [`VideoStream::dolby_vision_string`]. `None` where the probe read
+    /// no record, or one of a codec or form not read here.
+    pub codec_string: Option<CodecString>,
     /// Whether its codec record (`avcC`, `hvcC`) holds every parameter set
     /// it starts with, so a header written before the first packet is
     /// whole: H.264's SPS and PPS, HEVC's VPS, SPS and PPS. False for a
@@ -193,6 +200,22 @@ impl VideoStream {
         self.dolby_vision.is_some_and(|dv| dv.profile == 5)
     }
 
+    /// Its Dolby Vision codec string (`dvh1.08.06`), from its
+    /// configuration record: `dvh1` over HEVC, `dva1` over H.264, `dav1`
+    /// over AV1. `None` without Dolby Vision.
+    pub fn dolby_vision_string(&self) -> Option<CodecString> {
+        let dv = self.dolby_vision?;
+        let base = codecs::video_codec(&self.codec);
+        matches!(base, VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1).then_some(
+            CodecString::DolbyVision {
+                base,
+                in_band: false,
+                profile: dv.profile,
+                level: dv.level,
+            },
+        )
+    }
+
     /// From the transfer function, not from `hdr`: Dolby Vision is over
     /// either PQ or HLG.
     pub fn range(&self) -> VideoRange {
@@ -320,6 +343,13 @@ impl MediaDescriptor {
                             &stream.codec_tag,
                             stream.extradata.as_deref(),
                         ),
+                        codec_string: stream
+                            .extradata
+                            .as_deref()
+                            .and_then(crate::record::hex_dump_bytes)
+                            .and_then(|record| {
+                                crate::codec_string::of_record(&codec_name(&v.codec_name), &record)
+                            }),
                     });
                 }
                 StreamKinds::Audio(a) => {
@@ -499,7 +529,7 @@ fn parameter_sets_in_record(codec: &str, codec_tag: &[u8], extradata: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spoolframe_types::{Container, VideoCodec};
+    use spoolframe_types::Container;
 
     fn probe(name: &str) -> FfProbe {
         let path = format!("{}/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"));
@@ -749,6 +779,58 @@ mod tests {
         assert_eq!(hlg.keepable_hdr(), Some(HdrFormat::Hlg));
         let sdr = describe("mp4-h264-aac").video.unwrap();
         assert_eq!(sdr.keepable_hdr(), None);
+    }
+
+    /// A recording without `-show_data` has no record, and so no string;
+    /// Dolby Vision's own comes from its configuration record, which it
+    /// has.
+    #[test]
+    fn dolby_vision_s_string_is_its_profile_and_level() {
+        let p8 = describe("mkv-forced-subs").video.unwrap();
+        assert_eq!(p8.codec_string, None);
+        assert_eq!(
+            p8.dolby_vision_string().map(|s| s.to_string()).as_deref(),
+            Some("dvh1.08.06")
+        );
+        let p7 = describe("mkv-hevc-pgs").video.unwrap();
+        assert_eq!(
+            p7.dolby_vision_string().map(|s| s.to_string()).as_deref(),
+            Some("dvh1.07.06")
+        );
+        assert_eq!(
+            describe("mkv-cover-art")
+                .video
+                .unwrap()
+                .dolby_vision_string(),
+            None
+        );
+    }
+
+    /// ffprobe's dump of the record is read into the string.
+    #[test]
+    fn the_record_s_dump_is_the_stream_s_codec_string() {
+        let path = format!(
+            "{}/tests/fixtures/mp4-h264-aac.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let video = json["streams"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["codec_type"] == "video")
+            .unwrap();
+        video["extradata"] = "\n00000000: 0164 0029 ffe1 0017 6764 0029  .d.)....gd.)\n".into();
+        let d = MediaDescriptor::from_probe(&serde_json::from_value(json).unwrap());
+        assert_eq!(
+            d.video
+                .unwrap()
+                .codec_string
+                .map(|s| s.to_string())
+                .as_deref(),
+            Some("avc1.640029")
+        );
     }
 
     #[test]

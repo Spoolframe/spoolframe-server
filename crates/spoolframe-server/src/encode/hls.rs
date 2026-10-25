@@ -452,10 +452,17 @@ fn stream_inf(
             } => source.dolby_vision,
             _ => None,
         };
+        // A copy is the source's own string where the probe read it: its
+        // tier and its profile's flags, which the fallback guesses.
+        let named = match plan {
+            ConvertedVideo::Copy { .. } => source.codec_string.map(|s| s.to_string()),
+            _ => None,
+        }
+        .unwrap_or_else(|| video_codec_string(codec, depth, height, level, fast));
         match dolby_vision {
             Some(dv) if dv.profile == 5 => codecs.push(format!("dvh1.05.{:02}", dv.level)),
             Some(dv) => {
-                codecs.push(video_codec_string(codec, depth, height, level, fast));
+                codecs.push(named);
                 let brand = match dv.compatibility {
                     4 => "db4h",
                     2 => "db2g",
@@ -463,7 +470,7 @@ fn stream_inf(
                 };
                 supplemental = Some(format!("dvh1.{:02}.{:02}/{brand}", dv.profile, dv.level));
             }
-            None => codecs.push(video_codec_string(codec, depth, height, level, fast)),
+            None => codecs.push(named),
         }
         resolution = Some(size.unwrap_or_else(|| {
             let width = (u64::from(source.width) * u64::from(height)
@@ -970,6 +977,7 @@ mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: Vec::new(),
             subtitles: Vec::new(),
@@ -1225,6 +1233,68 @@ mod tests {
         // The base layer alone: HEVC, nothing beside.
         let base = multivariant_playlist(&dv(8, 1, "smpte2084"), copy(false), None, None, None);
         assert!(!variant(&base).contains("dvh1"), "{base}");
+    }
+
+    /// A copy is named by the source's own string where the probe read
+    /// it: a high-tier stream is not called main tier, nor Main-profile
+    /// H.264 High. Where it was not read, by its codec, depth and level.
+    #[test]
+    fn a_copy_is_named_by_the_source_s_own_string() {
+        let copy = |codec| {
+            Some(ConvertedVideo::Copy {
+                codec,
+                dolby_vision: false,
+            })
+        };
+        let mut film = film("smpte2084");
+        let unread = multivariant_playlist(&film, copy(VideoCodec::Hevc), None, None, None);
+        assert!(variant(&unread).contains("CODECS=\"hvc1.2.4.L"), "{unread}");
+        film.video.as_mut().unwrap().codec_string = Some("hvc1.2.4.H153.90".parse().unwrap());
+        let read = multivariant_playlist(&film, copy(VideoCodec::Hevc), None, None, None);
+        assert!(
+            variant(&read).contains("CODECS=\"hvc1.2.4.H153.90"),
+            "{read}"
+        );
+        // Dolby Vision 8 labelled: its base layer's string, its own beside.
+        let video = film.video.as_mut().unwrap();
+        video.hdr = Some(spoolframe_types::HdrFormat::DolbyVision);
+        video.dolby_vision = Some(spoolframe_media::DolbyVision {
+            profile: 8,
+            level: 6,
+            compatibility: 1,
+        });
+        let labelled = multivariant_playlist(
+            &film,
+            Some(ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: true,
+            }),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            variant(&labelled).contains("CODECS=\"hvc1.2.4.H153.90"),
+            "{labelled}"
+        );
+        assert!(
+            variant(&labelled).contains("SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\""),
+            "{labelled}"
+        );
+        // An encode is named for what it writes, not the source.
+        let encode = multivariant_playlist(
+            &film,
+            Some(ConvertedVideo::Encode {
+                codec: VideoCodec::Hevc,
+                height: 1080,
+                max_bitrate: Some(8_000_000),
+                tone_map: false,
+            }),
+            None,
+            None,
+            None,
+        );
+        assert!(!variant(&encode).contains("H153"), "{encode}");
     }
 
     /// PGPU-06: an encode names what it writes. HEVC or AV1 keeping HDR

@@ -561,6 +561,7 @@ mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: true,
+                codec_string: None,
             }),
             audio: audio_codecs
                 .iter()

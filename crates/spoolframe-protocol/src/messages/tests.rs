@@ -699,6 +699,7 @@ fn every_reply_round_trips() {
                     format: SubtitleFormat::Srt,
                     delivery: SubtitleDelivery::External,
                 }),
+                source_codec: None,
             },
             chosen: None,
         },
@@ -786,6 +787,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
             subtitle: None,
             ladder: Vec::new(),
             reasons: vec!["container: matroska not supported".into()],
+            source_codec: None,
         },
         PlaybackPlan::Converted {
             delivery: Delivery::Hls,
@@ -812,6 +814,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
             }),
             ladder: Vec::new(),
             reasons: vec!["subtitle 0: pgs cannot be shown; burned into the video".into()],
+            source_codec: None,
         },
         PlaybackPlan::Converted {
             delivery: Delivery::Progressive,
@@ -830,6 +833,7 @@ fn every_plan_kind_round_trips_phase_2_ones_included() {
             }),
             ladder: Vec::new(),
             reasons: vec!["subtitle 2: pgs read as text".into()],
+            source_codec: None,
         },
         PlaybackPlan::Unsupported {
             reasons: vec!["audio 0: dts not supported".into()],
@@ -1701,6 +1705,7 @@ fn a_start_playback_s_display_round_trips() {
     let display = spoolframe_types::DisplayCapabilities {
         bit_depth: Some(10),
         hdr: Some([spoolframe_types::HdrFormat::Hdr10].into()),
+        video_codecs: None,
     };
     let request = Request::StartPlayback {
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -1735,10 +1740,6 @@ mod before_markers {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
-    #[expect(
-        clippy::large_enum_variant,
-        reason = "an older peer's reply, made once to be encoded; as the real Reply"
-    )]
     pub enum Reply {
         Item {
             item: Item,

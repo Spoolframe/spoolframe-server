@@ -11,6 +11,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::CodecString;
+
 macro_rules! vocabulary {
     ($(#[$doc:meta])* $name:ident { $($(#[$vdoc:meta])* $variant:ident => $wire:literal,)* }) => {
         $(#[$doc])*
@@ -171,6 +173,16 @@ pub struct ClientCapabilities {
     // compat(v1): required at the protocol reset
     #[serde(default)]
     pub hardware_video: Option<BTreeSet<VideoCodec>>,
+    /// The RFC 6381 codec strings it plays (`hvc1.2.4.L153.B0`,
+    /// `dvh1.08.06`; [`CodecString`]), as its player answers for each:
+    /// a video is copied only where one of them covers the source's own
+    /// string (its profile, tier and level, its Dolby Vision profile).
+    /// One the server does not read is passed over. `None`: it does not
+    /// say, and [`ClientCapabilities::video`] and `max_video` alone
+    /// decide, as before. It may be left out, and is `None` then.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub video_codecs: Option<BTreeSet<String>>,
 }
 
 /// What the screen shows now, as a playback starts: [`VideoLimits::hdr`]
@@ -189,6 +201,13 @@ pub struct DisplayCapabilities {
     /// As [`VideoLimits::hdr`].
     #[serde(deserialize_with = "crate::required::option")]
     pub hdr: Option<BTreeSet<HdrFormat>>,
+    /// As [`ClientCapabilities::video_codecs`], asked again for this
+    /// display: a Dolby Vision string may be played on one mode and not
+    /// on another. `None` keeps Hello's. It may be left out, and is
+    /// `None` then.
+    // compat(v1): required at the protocol reset
+    #[serde(default)]
+    pub video_codecs: Option<BTreeSet<String>>,
 }
 
 impl ClientCapabilities {
@@ -201,8 +220,25 @@ impl ClientCapabilities {
             let limits = caps.max_video.get_or_insert_with(VideoLimits::default);
             limits.hdr = display.hdr.clone();
             limits.bit_depth = display.bit_depth;
+            if display.video_codecs.is_some() {
+                caps.video_codecs = display.video_codecs.clone();
+            }
         }
         caps
+    }
+
+    /// Whether it plays a video whose own codec string is `source`, by
+    /// [`ClientCapabilities::video_codecs`]: some string listed there
+    /// [covers](CodecString::covers) it. `None` when it lists none (it
+    /// does not say), and nothing is known of it here.
+    pub fn plays_codec_string(&self, source: &CodecString) -> Option<bool> {
+        let listed = self.video_codecs.as_ref()?;
+        Some(
+            listed
+                .iter()
+                .filter_map(|s| s.parse::<CodecString>().ok())
+                .any(|listed| listed.covers(source)),
+        )
     }
 
     /// Whether it decodes `codec` in hardware, as it says; every codec it
@@ -247,6 +283,7 @@ mod tests {
         let sdr = DisplayCapabilities {
             bit_depth: Some(8),
             hdr: Some(BTreeSet::new()),
+            video_codecs: None,
         };
         let now = hello.with_display(Some(&sdr));
         assert_eq!(
@@ -303,6 +340,69 @@ mod tests {
         assert!(!said.decodes_in_hardware(VideoCodec::Av1));
         let wire = serde_json::to_value(&said).unwrap();
         assert_eq!(wire["hardware_video"], serde_json::json!(["hevc"]));
+    }
+
+    /// The Apple TV of the ticket (plex:movie:1936): its list read as
+    /// `video_codecs`, a string it does not list refused, one the server
+    /// cannot read passed over; a client that left the field out says
+    /// nothing.
+    #[test]
+    fn a_client_lists_the_codec_strings_it_plays() {
+        let hello = r#"{"video":["hevc"],"audio":[],"containers":[],"subtitles":[],
+            "delivery":[],"max_video":null,"max_audio_channels":null,"max_bitrate":null,
+            "hardware_video":["hevc"],
+            "video_codecs":["hvc1.2.4.L153.B0","dvh1.08.06","vp09.00.10.08","nonsense"]}"#;
+        let caps: ClientCapabilities = serde_json::from_str(hello).unwrap();
+        let judge = |s: &str| caps.plays_codec_string(&s.parse().unwrap());
+        assert_eq!(judge("hvc1.2.4.L150.B0"), Some(true));
+        assert_eq!(judge("hvc1.2.4.L186.B0"), Some(false));
+        assert_eq!(judge("dvh1.08.06"), Some(true));
+        assert_eq!(judge("dvh1.07.06"), Some(false));
+        let wire = serde_json::to_value(&caps).unwrap();
+        assert_eq!(wire["video_codecs"][0], "dvh1.08.06", "a sorted set");
+        let unsaid = ClientCapabilities {
+            video_codecs: None,
+            ..caps.clone()
+        };
+        assert_eq!(
+            unsaid.plays_codec_string(&"hvc1.2.4.L186.B0".parse().unwrap()),
+            None
+        );
+        let old = r#"{"video":["hevc"],"audio":[],"containers":[],"subtitles":[],
+            "delivery":[],"max_video":null,"max_audio_channels":null,"max_bitrate":null}"#;
+        let old: ClientCapabilities = serde_json::from_str(old).unwrap();
+        assert_eq!(old.video_codecs, None);
+    }
+
+    /// A start's display may list the strings again (its Dolby Vision
+    /// answer is that mode's); one that does not keeps Hello's.
+    #[test]
+    fn a_display_s_codec_strings_replace_hello_s() {
+        let hello = ClientCapabilities {
+            video: [VideoCodec::Hevc].into(),
+            video_codecs: Some(["dvh1.08.06".to_owned(), "hvc1.2.4.L153.B0".to_owned()].into()),
+            ..ClientCapabilities::default()
+        };
+        let sdr = DisplayCapabilities {
+            bit_depth: Some(8),
+            hdr: Some(BTreeSet::new()),
+            video_codecs: None,
+        };
+        assert_eq!(
+            hello.with_display(Some(&sdr)).video_codecs,
+            hello.video_codecs
+        );
+        let hdr10 = DisplayCapabilities {
+            video_codecs: Some(["hvc1.2.4.L153.B0".to_owned()].into()),
+            ..sdr
+        };
+        assert_eq!(
+            hello.with_display(Some(&hdr10)).video_codecs,
+            hdr10.video_codecs
+        );
+        let json = r#"{"bit_depth":10,"hdr":null}"#;
+        let display: DisplayCapabilities = serde_json::from_str(json).unwrap();
+        assert_eq!(display.video_codecs, None);
     }
 
     #[test]

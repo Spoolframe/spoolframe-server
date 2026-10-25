@@ -7,6 +7,7 @@
 
 pub mod bitmap;
 mod capped;
+mod codec_string;
 pub mod codecs;
 pub mod decode;
 mod descriptor;

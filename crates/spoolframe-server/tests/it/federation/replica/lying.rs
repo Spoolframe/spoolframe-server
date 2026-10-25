@@ -192,6 +192,7 @@ impl Lying {
                     video: None,
                     audio: None,
                     subtitle: None,
+                    source_codec: None,
                 },
                 size: 1 << 20,
                 chosen: None,

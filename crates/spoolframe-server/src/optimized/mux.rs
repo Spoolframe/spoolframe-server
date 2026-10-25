@@ -355,6 +355,7 @@ mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: true,
+                codec_string: None,
             }),
             audio: vec![audio(1, "dts", "eng"), audio(2, "ac3", "fre")],
             subtitles: vec![sub(3, "subrip"), sub(4, "dvb_teletext")],

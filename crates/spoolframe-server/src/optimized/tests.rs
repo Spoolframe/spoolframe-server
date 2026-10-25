@@ -1296,6 +1296,7 @@ mod binge {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         }
     }
 
@@ -1464,6 +1465,7 @@ mod binge {
             subtitle: None,
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         w.look(&s.pool, seen(audio, true)).await;
         assert!(s.pool.queued().is_empty());

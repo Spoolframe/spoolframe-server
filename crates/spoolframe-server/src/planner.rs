@@ -41,7 +41,7 @@ use spoolframe_protocol::{
     PlannedSubtitle, PlaybackPlan, Quality, Selection, SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::{
-    AudioCodec, BitmapPreference, ClientCapabilities, Container, Delivery, HdrFormat,
+    AudioCodec, BitmapPreference, ClientCapabilities, CodecString, Container, Delivery, HdrFormat,
     SubtitleFormat, VideoCodec,
 };
 
@@ -153,7 +153,7 @@ fn plan_checked(
     let fit = Fit::check(descriptor, caps, audio, subtitle, shown, copy_peak);
     let deliveries = caps.deliveries();
     if fit.reasons().is_empty() && deliveries.contains(&Delivery::Range) {
-        return direct(descriptor, audio, subtitle, shown);
+        return direct(descriptor, caps, audio, subtitle, shown);
     }
     // The first way in the client takes that is not the file itself.
     let Some(delivery) = deliveries
@@ -437,12 +437,20 @@ impl Fit {
     }
 }
 
-/// Where `video` goes past the client's `max_video`.
+/// Where `video` goes past the client's `max_video`, or its codec string
+/// is not one the client lists.
 fn over_limits(video: &VideoStream, caps: &ClientCapabilities) -> Vec<String> {
-    let Some(limits) = &caps.max_video else {
-        return Vec::new();
-    };
     let mut over = Vec::new();
+    // The string of what a copy would be: Dolby Vision's own when it is
+    // shown, the base layer's when that is copied instead.
+    if let Some(judged) = judged_string(video, caps)
+        && caps.plays_codec_string(&judged) == Some(false)
+    {
+        over.push(format!("video: {judged} not supported"));
+    }
+    let Some(limits) = &caps.max_video else {
+        return over;
+    };
     if let Some(max) = limits.height
         && video.height > max
     {
@@ -511,7 +519,12 @@ fn hdr_shown(video: &VideoStream, caps: &ClientCapabilities) -> Showing {
         };
     }
     let streamable = video.dolby_vision.is_none_or(|dv| dv.streamable());
-    if streamable && shows(HdrFormat::DolbyVision) {
+    // Where the client lists codec strings, Dolby Vision's own must be
+    // one of them; otherwise its base layer is judged.
+    let listed = video
+        .dolby_vision_string()
+        .is_none_or(|dv| caps.plays_codec_string(&dv) != Some(false));
+    if streamable && shows(HdrFormat::DolbyVision) && listed {
         return Showing::DolbyVision;
     }
     let base = match video.dolby_vision.map(|dv| dv.base()) {
@@ -527,6 +540,19 @@ fn hdr_shown(video: &VideoStream, caps: &ClientCapabilities) -> Showing {
         },
     };
     if base { Showing::Base } else { Showing::No }
+}
+
+/// The codec string of `video` a client with `caps` is judged on: Dolby
+/// Vision's own where it is shown as Dolby Vision, or where there is no
+/// base layer to show (profile 5); else the stream's, the base layer's
+/// for Dolby Vision. `None` where it was not read: the client's
+/// `video_codecs` then have no say.
+pub(crate) fn judged_string(video: &VideoStream, caps: &ClientCapabilities) -> Option<CodecString> {
+    match hdr_shown(video, caps) {
+        Showing::DolbyVision => video.dolby_vision_string(),
+        Showing::No if video.needs_rpu() => video.dolby_vision_string(),
+        _ => video.codec_string,
+    }
 }
 
 /// Whether a client with `caps` plays `video` as it is, bitrate aside: a
@@ -549,6 +575,7 @@ fn mbits(bits: u64) -> String {
 
 fn direct(
     descriptor: &MediaDescriptor,
+    caps: &ClientCapabilities,
     audio: Option<usize>,
     subtitle: Option<u32>,
     shown: Option<Shown>,
@@ -581,7 +608,14 @@ fn direct(
                 },
             }
         }),
+        source_codec: source_codec(descriptor, caps),
     }
+}
+
+/// [`PlaybackPlan`]'s `source_codec`: [`judged_string`], written out.
+fn source_codec(descriptor: &MediaDescriptor, caps: &ClientCapabilities) -> Option<String> {
+    let video = descriptor.video.as_ref()?;
+    judged_string(video, caps).map(|s| s.to_string())
 }
 
 /// The output container for `delivery`: fragmented MP4 for HLS where the
@@ -731,6 +765,7 @@ fn converted(
         subtitle,
         ladder: Vec::new(),
         reasons,
+        source_codec: source_codec(descriptor, caps),
     })
 }
 
@@ -788,6 +823,7 @@ pub fn plan_for(
         audio,
         subtitle,
         reasons,
+        source_codec,
         ..
     } = plan
     else {
@@ -827,6 +863,7 @@ pub fn plan_for(
         // One rung is one encode, as any other plan.
         ladder: if rungs.len() > 1 { rungs } else { Vec::new() },
         reasons,
+        source_codec,
     }
 }
 
@@ -895,6 +932,7 @@ fn remux_ladder(
         audio,
         subtitle,
         mut reasons,
+        source_codec,
         ..
     } = plan
     else {
@@ -917,6 +955,7 @@ fn remux_ladder(
         subtitle,
         ladder: std::iter::once(top).chain(under).collect(),
         reasons,
+        source_codec,
     }
 }
 
@@ -1454,6 +1493,7 @@ mod tests {
                 dolby_vision: None,
                 bit_rate: None,
                 parameter_sets_in_record: false,
+                codec_string: None,
             }),
             audio: vec![audio(1, "dts", true), audio(2, "aac", false)],
             subtitles: vec![
@@ -1563,6 +1603,7 @@ mod tests {
                     codec: AudioCodec::Aac
                 }),
                 subtitle: None,
+                source_codec: None,
             }
         );
     }
@@ -2082,6 +2123,37 @@ mod tests {
         )
     }
 
+    /// A ladder, of encodes or under a copy, names the source's string
+    /// as its plan did.
+    #[test]
+    fn a_ladder_keeps_the_source_s_string() {
+        let plan = |d: &MediaDescriptor, link: u64| {
+            super::plan_for(
+                d,
+                Some(&avplayer()),
+                Quality::Auto {
+                    link_bitrate: Some(link),
+                },
+                None,
+                true,
+                picked(1, None),
+                Bitmap::Preferred(BitmapPreference::Text),
+                &dev_encoders(),
+                &Ocr::disabled(),
+            )
+        };
+        let film = with_string(hevc_dts(), "hvc1.2.4.L153.B0");
+        let encodes = plan(&film, 8_000_000);
+        assert!(ladder_of(&encodes).len() > 1, "{encodes:?}");
+        assert_eq!(source_of(&encodes), Some("hvc1.2.4.L153.B0"));
+        let remux = plan(&film, 200_000_000);
+        assert!(
+            copies_video(&remux) && ladder_of(&remux).len() > 1,
+            "{remux:?}"
+        );
+        assert_eq!(source_of(&remux), Some("hvc1.2.4.L153.B0"));
+    }
+
     fn ladder_of(plan: &PlaybackPlan) -> &[Rung] {
         match plan {
             PlaybackPlan::Converted { ladder, .. } => ladder,
@@ -2522,6 +2594,7 @@ mod tests {
         let sdr_now = DisplayCapabilities {
             bit_depth: None,
             hdr: Some(BTreeSet::new()),
+            video_codecs: None,
         };
         assert_eq!(
             encoded(
@@ -2542,6 +2615,7 @@ mod tests {
         let hdr_now = DisplayCapabilities {
             bit_depth: Some(10),
             hdr: Some([HdrFormat::Hdr10].into()),
+            video_codecs: None,
         };
         assert_eq!(
             encoded(&sdr_at_hello, &hevc_dts(), &encoders),
@@ -2785,6 +2859,217 @@ mod tests {
                 tone_map: false,
                 ..
             }
+        ));
+    }
+
+    /// `video_codecs` as a set, as a client sends it.
+    fn listing(strings: &[&str]) -> Option<BTreeSet<String>> {
+        Some(strings.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// `d` with its video's codec string read as `s`.
+    fn with_string(mut d: MediaDescriptor, s: &str) -> MediaDescriptor {
+        d.video.as_mut().unwrap().codec_string = Some(s.parse().unwrap());
+        d
+    }
+
+    /// An Apple TV at 4K showing HDR10 and Dolby Vision, over HLS, that
+    /// lists `strings` as the ones it plays.
+    fn listing_tv(strings: &[&str]) -> ClientCapabilities {
+        ClientCapabilities {
+            video_codecs: listing(strings),
+            ..showing(&[HdrFormat::Hdr10, HdrFormat::DolbyVision])
+        }
+    }
+
+    /// plex:movie:1936: a device that lists HEVC Main 10 only to level
+    /// 5.1 is sent a level 6.2 source converted; one that lists 6.2, and
+    /// one that lists nothing, a copy.
+    #[test]
+    fn a_video_is_copied_only_at_a_level_the_device_lists() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let source = with_string(hevc_dts(), "hvc1.2.4.L186.B0");
+        let video = |caps: &ClientCapabilities| {
+            video_of(plan_with(&source, Some(caps), picked(1, None), &encoders))
+        };
+        let copy = ConvertedVideo::Copy {
+            codec: VideoCodec::Hevc,
+            dolby_vision: false,
+        };
+        assert!(matches!(
+            video(&listing_tv(&["hvc1.2.4.L153.B0"])),
+            ConvertedVideo::Encode {
+                codec: VideoCodec::Hevc,
+                tone_map: false,
+                ..
+            }
+        ));
+        assert_eq!(video(&listing_tv(&["hvc1.2.4.L186.B0"])), copy);
+        let unsaid = ClientCapabilities {
+            video_codecs: None,
+            ..listing_tv(&[])
+        };
+        assert_eq!(video(&unsaid), copy);
+        let PlaybackPlan::Converted { source_codec, .. } =
+            plan_with(&source, Some(&unsaid), picked(1, None), &encoders)
+        else {
+            panic!("not converted");
+        };
+        assert_eq!(source_codec.as_deref(), Some("hvc1.2.4.L186.B0"));
+        let plan = plan_with(
+            &source,
+            Some(&listing_tv(&["hvc1.2.4.L153.B0"])),
+            picked(1, None),
+            &encoders,
+        );
+        assert!(
+            converted(plan)
+                .5
+                .contains(&"video: hvc1.2.4.L186.B0 not supported".to_owned())
+        );
+    }
+
+    /// A source whose string was not read (no record) is judged as
+    /// before, by `video` and `max_video`: copied, not converted for not
+    /// being listed.
+    #[test]
+    fn a_source_with_no_string_is_judged_as_before() {
+        let video = video_of(plan_with(
+            &hevc_dts(),
+            Some(&listing_tv(&["hvc1.2.4.L153.B0"])),
+            picked(1, None),
+            &dev_encoders(),
+        ));
+        assert_eq!(
+            video,
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
+            }
+        );
+    }
+
+    /// Played as it is only when listed: a range client whose list stops
+    /// under the file's level has nothing to play it with.
+    #[test]
+    fn a_file_plays_directly_only_at_a_string_listed() {
+        let caps = ClientCapabilities {
+            video_codecs: listing(&["avc1.640033"]),
+            ..caps()
+        };
+        let file = with_string(dts_aac_pgs(), "avc1.640033");
+        let PlaybackPlan::Direct { source_codec, .. } = plan(&file, Some(&caps), picked(1, None))
+        else {
+            panic!("not direct");
+        };
+        assert_eq!(source_codec.as_deref(), Some("avc1.640033"));
+        let above = with_string(dts_aac_pgs(), "avc1.640034");
+        assert_eq!(
+            reasons(plan(&above, Some(&caps), picked(1, None))),
+            ["video: avc1.640034 not supported"]
+        );
+    }
+
+    fn source_of(plan: &PlaybackPlan) -> Option<&str> {
+        assert!(Kind::of(plan) != Kind::Unsupported, "{plan:?}");
+        plan.source_codec()
+    }
+
+    /// Dolby Vision 8.1 is labelled only for a device that lists its
+    /// string; for one that lists only the base layer's, the base layer
+    /// is copied; for one that lists neither, converted. The plan names
+    /// the string it judged: Dolby Vision's where it is labelled, the
+    /// base layer's where that is copied.
+    #[test]
+    fn dolby_vision_8_is_labelled_only_when_its_string_is_listed() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let p8 = with_string(dolby_vision(8, 1), "hvc1.2.4.L153.B0");
+        let both = listing_tv(&["dvh1.08.06", "hvc1.2.4.L153.B0"]);
+        let base = listing_tv(&["dvh1.05.06", "hvc1.2.4.L153.B0"]);
+        let judged = |caps: &ClientCapabilities| {
+            source_of(&plan_with(&p8, Some(caps), picked(1, None), &encoders)).map(str::to_owned)
+        };
+        assert_eq!(judged(&both).as_deref(), Some("dvh1.08.06"));
+        assert_eq!(judged(&base).as_deref(), Some("hvc1.2.4.L153.B0"));
+        let video = |caps: &ClientCapabilities| {
+            video_of(plan_with(&p8, Some(caps), picked(1, None), &encoders))
+        };
+        assert_eq!(
+            video(&listing_tv(&["dvh1.08.06", "hvc1.2.4.L153.B0"])),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: true,
+            }
+        );
+        assert_eq!(
+            video(&listing_tv(&["dvh1.05.06", "hvc1.2.4.L153.B0"])),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
+            }
+        );
+        assert!(matches!(
+            video(&listing_tv(&["dvh1.05.06", "hvc1.2.4.L120.B0"])),
+            ConvertedVideo::Encode {
+                tone_map: false,
+                ..
+            }
+        ));
+    }
+
+    /// Profile 7 is its base layer as before, but only where the base
+    /// layer's string is listed: the A10X Apple TV, which says no to
+    /// dvh1.07.06, gets the base layer; a device listing only Dolby
+    /// Vision 8 a conversion.
+    #[test]
+    fn dolby_vision_7_s_base_layer_is_copied_only_when_listed() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let p7 = with_string(dolby_vision(7, 6), "hvc1.2.4.L153.B0");
+        let video = |caps: &ClientCapabilities| {
+            video_of(plan_with(&p7, Some(caps), picked(1, None), &encoders))
+        };
+        let a10x = listing_tv(&[
+            "hvc1.2.4.L153.B0",
+            "hvc1.2.4.L186.B0",
+            "dvh1.05.06",
+            "dvh1.08.06",
+            "av01.0.13M.10",
+        ]);
+        assert_eq!(
+            video(&a10x),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: false,
+            }
+        );
+        assert!(matches!(
+            video(&listing_tv(&["dvh1.08.06"])),
+            ConvertedVideo::Encode {
+                tone_map: false,
+                ..
+            }
+        ));
+    }
+
+    /// Profile 5 has no base layer: copied labelled where its string is
+    /// listed, converted where it is not.
+    #[test]
+    fn dolby_vision_5_is_copied_only_when_its_string_is_listed() {
+        let encoders = gpu_encoders(&AV1_HEVC_H264, &["av1_vaapi", "hevc_vaapi"]);
+        let p5 = with_string(dolby_vision(5, 0), "hvc1.2.4.L153.B0");
+        let video = |caps: &ClientCapabilities| {
+            video_of(plan_with(&p5, Some(caps), picked(1, None), &encoders))
+        };
+        assert_eq!(
+            video(&listing_tv(&["dvh1.05.06", "hvc1.2.4.L153.B0"])),
+            ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+                dolby_vision: true,
+            }
+        );
+        assert!(matches!(
+            video(&listing_tv(&["dvh1.08.06", "hvc1.2.4.L153.B0"])),
+            ConvertedVideo::Encode { .. }
         ));
     }
 
@@ -3370,6 +3655,7 @@ mod tests {
             }),
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         assert_eq!(
             summary(&plan),
@@ -3405,6 +3691,7 @@ mod tests {
             }),
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         let burned = summary(&burned);
         assert_eq!(burned.kind, "transcode");
@@ -3421,6 +3708,7 @@ mod tests {
                 format: SubtitleFormat::Srt,
                 delivery: SubtitleDelivery::External,
             }),
+            source_codec: None,
         };
         assert_eq!(
             summary(&direct),
@@ -3460,6 +3748,7 @@ mod tests {
             }),
             ladder: Vec::new(),
             reasons: Vec::new(),
+            source_codec: None,
         };
         assert_eq!(summary(&plan).kind, "remux");
     }
