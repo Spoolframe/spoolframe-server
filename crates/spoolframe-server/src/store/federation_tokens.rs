@@ -30,6 +30,9 @@ pub struct NewToken<'a> {
     /// A device's download token's one download, by this server's id
     /// (P8-07).
     pub download: Option<&'a str>,
+    /// The key the assertion came from, hex: kept only while it is still
+    /// the pair's.
+    pub asserted_by: &'a str,
 }
 
 /// A token kept, as P8-04 reads it to redeem it.
@@ -134,13 +137,13 @@ impl PlayCount {
 }
 
 impl Store {
-    /// Keep `token`, minted now, if its library is shared with its pair
-    /// and the pair is within `limits`, counting its scope's unused tokens
-    /// and what `also` says is held: checked and kept in one transaction,
-    /// so a grant revoked meanwhile is never missed (M6). `also` is asked
-    /// within it, once no redemption can use a token up until it ends: a
-    /// session registered before its token was used up is counted
-    /// (F8-05).
+    /// Keep `token`, minted now, if its library is shared with its pair,
+    /// pinned to the key that asserted it, and the pair is within `limits`,
+    /// counting its scope's unused tokens and what `also` says is held:
+    /// checked and kept in one transaction, so a grant revoked meanwhile is
+    /// never missed (M6). `also` is asked within it, once no redemption can
+    /// use a token up until it ends: a session registered before its token
+    /// was used up is counted (F8-05).
     pub async fn keep_federation_token(
         &self,
         token: NewToken<'_>,
@@ -148,16 +151,12 @@ impl Store {
         also: impl FnOnce() -> AlsoHeld,
     ) -> Result<TokenKept, StoreError> {
         let mut tx = self.begin_write().await?;
-        let shared: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM federation_grants g \
-                            JOIN federation_peers p ON p.id = g.peer \
-                            WHERE g.peer = ?1 AND g.library = ?2 \
-                              AND g.revoked_at IS NULL AND p.revoked_at IS NULL)",
-        )
-        .bind(token.peer)
-        .bind(token.library)
-        .fetch_one(&mut *tx)
-        .await?;
+        // And its pair still pinned to the key that asserted it: a new key
+        // confirmed commits first and is seen here, or after the token was
+        // kept, minted while the key was still the pair's.
+        let shared = Self::granted_endpoint_on(&mut *tx, token.peer, token.library)
+            .await?
+            .is_some_and(|pinned| pinned == token.asserted_by);
         if !shared {
             return Ok(TokenKept::NotShared);
         }
@@ -460,7 +459,7 @@ mod tests {
             .add_peer(
                 NewPeer {
                     server_id: "mzxw6ytbojtg633c",
-                    endpoint_id: &"0b".repeat(32),
+                    endpoint_id: BOB_S_KEY,
                     display_name: "Bob's server",
                     addrs: &[],
                     relays: &[],
@@ -494,6 +493,7 @@ mod tests {
     }
 
     const BOB: &str = "remote:mzxw6ytbojtg633c:00000000-0000-0000-0000-000000000007";
+    const BOB_S_KEY: &str = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
 
     fn token<'a>(hash: &'a str, peer: &'a str, library: &'a str, expires_at: i64) -> NewToken<'a> {
         NewToken {
@@ -507,6 +507,7 @@ mod tests {
             expires_at,
             preferences: None,
             download: None,
+            asserted_by: BOB_S_KEY,
         }
     }
 

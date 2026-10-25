@@ -177,16 +177,28 @@ impl Federation {
     /// `peer`: what a paired server's token and sessions are held to as
     /// the catalog changes (F8-04). `None` when the catalog cannot say now.
     pub(crate) async fn shared_in(&self, peer: &str, id: &MediaId, library: &str) -> Option<bool> {
-        match self.shared_library_of(peer, id).await {
+        match self.placed_shared(peer, id).await {
             Ok(found) => Some(found.is_some_and(|l| l.to_string() == library)),
-            // Not there, or in no library served: not shared.
-            Err(ShareError::Catalog(
-                CatalogError::NotFound(_) | CatalogError::NotServed(_) | CatalogError::ForeignId(_),
-            )) => Some(false),
             Err(e) => {
                 tracing::warn!(%id, error = %e, "cannot place a paired server's session's item");
                 None
             }
+        }
+    }
+
+    /// [`Federation::shared_library_of`], with an item the catalog does
+    /// not have (not there, or in no library served) as not shared: only
+    /// what keeps the catalog from saying is an error.
+    pub(crate) async fn placed_shared(
+        &self,
+        peer: &str,
+        id: &MediaId,
+    ) -> Result<Option<LibraryId>, ShareError> {
+        match self.shared_library_of(peer, id).await {
+            Err(ShareError::Catalog(
+                CatalogError::NotFound(_) | CatalogError::NotServed(_) | CatalogError::ForeignId(_),
+            )) => Ok(None),
+            placed => placed,
         }
     }
 }

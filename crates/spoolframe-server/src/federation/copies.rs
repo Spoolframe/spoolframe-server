@@ -114,14 +114,12 @@ impl Viewer<'_> {
             })
             .collect();
         // This server's first, then those online by name, then the rest.
-        also_on.sort_by(|a, b| {
-            let key = |c: &TitleCopy| {
-                c.server
-                    .as_ref()
-                    .map(|s| (!s.online, s.name.clone(), s.server_id.clone()))
-            };
-            key(a).cmp(&key(b))
-        });
+        fn key(c: &TitleCopy) -> Option<(bool, &str, &str)> {
+            c.server
+                .as_ref()
+                .map(|s| (!s.online, s.name.as_str(), s.server_id.as_str()))
+        }
+        also_on.sort_by(|a, b| key(a).cmp(&key(b)));
         let play_from = chosen(&self.choices, id.kind(), title)
             .and_then(|choice| {
                 std::iter::once(id)

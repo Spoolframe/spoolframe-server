@@ -1,5 +1,7 @@
 //! The dialled server's side of `spoolframe/federation/1`.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -7,14 +9,16 @@ use std::time::Duration;
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use spoolframe_protocol::codec::{read_frame_within, write_frame, write_reply};
+use spoolframe_protocol::codec::{CodecError, read_frame_within, write_frame, write_reply};
 use spoolframe_protocol::federation::{
-    MAX_ARTWORK_BYTES, MAX_PAGE_ITEMS, MAX_PAGE_REMOVED, MAX_REQUEST, PROTOCOL_VERSION, Paired,
-    PairingRefused, PeerHello, PeerInfo, PeerReply, PeerRequest, Standing, SyncLibrary, SyncPage,
-    reset,
+    AssertionRefused, MAX_ARTWORK_BYTES, MAX_PAGE_ITEMS, MAX_PAGE_REMOVED, MAX_REQUEST,
+    PROTOCOL_VERSION, Paired, PairingRefused, PeerHello, PeerInfo, PeerReply, PeerRequest,
+    RemoteItem, Standing, SyncLibrary, SyncMode, SyncPage, reset,
 };
 use spoolframe_protocol::{ServerId, close};
+use tokio::time::Instant;
 
+use crate::dial::{ARTWORK_WAIT, FIRST_PAGE_WAIT, PAGE_WAIT, REPLY_WAIT, SUBTITLE_WAIT, SYNC_WAIT};
 use crate::{Live, Peers, Shares, Strangers, SyncAnswer, Unshared};
 
 /// The most a page's items take, encoded: half a frame, so a page with
@@ -34,6 +38,27 @@ const LAST_REPLY_WAIT: Duration = Duration::from_secs(2);
 /// sync and a few images at a time is what a pair asks.
 pub const MAX_STREAMS: usize = 16;
 
+/// The connections one pair may hold at once, as the server caps them
+/// (its `Admission::max_pair_connections`): a pair's requests at once are
+/// this many connections' streams (X8-02), so raising the streams setting
+/// raises them too. One past them is reset `BUSY`, as a stream past a
+/// connection's is. A request's work ends with its connection, so this
+/// bounds what is in hand, not what a connection closed and opened again
+/// could leave behind.
+pub const PEER_CONNECTIONS: usize = 4;
+
+/// The most requests answered at once from every paired endpoint together
+/// (X8-02): what the server's catalog and store are asked at one time by
+/// its pairs, however many.
+pub const MAX_REQUESTS: usize = 256;
+
+/// The most requests answered at once from every endpoint that is no
+/// pair's, together: a stranger's `hello` and redemption, and a held key's
+/// `hello`, each a store lookup. Apart from the pairs', so strangers'
+/// streams, held open for a request that never comes, take no pair's
+/// place.
+pub const MAX_STRANGER_REQUESTS: usize = 16;
+
 /// What the server calls itself now: a live setting.
 pub type Name = Arc<dyn Fn() -> String + Send + Sync>;
 
@@ -49,6 +74,8 @@ pub struct FederationProtocol<P, S, H> {
     /// The most streams a connection is answered on at once, read as it
     /// opens: a live setting of the server's (P8-04).
     max_streams: Arc<AtomicUsize>,
+    /// The requests being answered now, every connection together.
+    requests: Arc<Requests>,
 }
 
 impl<P, S, H> Clone for FederationProtocol<P, S, H> {
@@ -61,6 +88,176 @@ impl<P, S, H> Clone for FederationProtocol<P, S, H> {
             name: self.name.clone(),
             live: self.live.clone(),
             max_streams: self.max_streams.clone(),
+            requests: self.requests.clone(),
+        }
+    }
+}
+
+/// The requests being answered now (X8-02): a pair's by the endpoint each
+/// came from and in all, and those of endpoints that are no pair's apart.
+/// Each holds its place for the whole of its work, and gives it back as
+/// its task ends, aborted with its connection or not.
+#[derive(Debug)]
+struct Requests {
+    /// From one paired endpoint; `None` takes the caller's, derived from
+    /// the streams setting and [`PEER_CONNECTIONS`] as each is taken.
+    per_peer: Option<usize>,
+    total: usize,
+    strangers: usize,
+    counts: parking_lot::Mutex<Counts>,
+}
+
+/// How many are in hand: the pairs' in all and by endpoint, and the
+/// strangers'.
+#[derive(Debug, Default)]
+struct Counts {
+    all: usize,
+    by_peer: HashMap<EndpointId, usize>,
+    strangers: usize,
+}
+
+impl Requests {
+    fn new(per_peer: Option<usize>, total: usize, strangers: usize) -> Self {
+        Self {
+            per_peer,
+            total,
+            strangers,
+            counts: parking_lot::Mutex::default(),
+        }
+    }
+
+    /// A place for a request from `endpoint`, a live pair's if `paired`,
+    /// if there is one: held while it is kept.
+    fn take(
+        self: &Arc<Self>,
+        endpoint: EndpointId,
+        paired: bool,
+        per_peer_default: usize,
+    ) -> Option<Place> {
+        let mut counts = self.counts.lock();
+        if !paired {
+            if counts.strangers >= self.strangers {
+                return None;
+            }
+            counts.strangers += 1;
+            return Some(Place {
+                requests: self.clone(),
+                of: None,
+            });
+        }
+        let per_peer = self.per_peer.unwrap_or(per_peer_default);
+        let mine = counts.by_peer.get(&endpoint).copied().unwrap_or(0);
+        if counts.all >= self.total || mine >= per_peer {
+            return None;
+        }
+        counts.all += 1;
+        counts.by_peer.insert(endpoint, mine + 1);
+        Some(Place {
+            requests: self.clone(),
+            of: Some(endpoint),
+        })
+    }
+}
+
+/// One request's place among [`Requests`], given back when dropped: a
+/// pair's endpoint's, or a stranger's (`None`).
+#[derive(Debug)]
+struct Place {
+    requests: Arc<Requests>,
+    of: Option<EndpointId>,
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut counts = self.requests.counts.lock();
+        let Some(endpoint) = self.of else {
+            counts.strangers = counts.strangers.saturating_sub(1);
+            return;
+        };
+        counts.all = counts.all.saturating_sub(1);
+        if let Some(mine) = counts.by_peer.get_mut(&endpoint) {
+            *mine = mine.saturating_sub(1);
+            if *mine == 0 {
+                counts.by_peer.remove(&endpoint);
+            }
+        }
+    }
+}
+
+/// How much sooner than the asker's wait for a reply its work is given up
+/// on: the asker is told `unavailable`, rather than left to its wait.
+pub(crate) const ANSWER_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long the asker of `request` waits for its reply, as the dialler
+/// does: what the dialled side has, less [`ANSWER_MARGIN`], for the
+/// request's work and the sending of its reply together. A sync's is its
+/// first page's; the pages after have [`PAGE_WAIT`] each.
+fn reply_wait(request: &PeerRequest) -> Duration {
+    match request {
+        PeerRequest::Sync(_) => FIRST_PAGE_WAIT,
+        PeerRequest::Artwork(_) => ARTWORK_WAIT,
+        PeerRequest::SearchSubtitles(_)
+        | PeerRequest::DownloadSubtitle(_)
+        | PeerRequest::RemoveSubtitleDownload(_) => SUBTITLE_WAIT,
+        _ => REPLY_WAIT,
+    }
+}
+
+/// `work` by `by`, the asker's wait for its reply less [`ANSWER_MARGIN`]
+/// from when the request was read; else `late`. A request whose work
+/// takes longer than the asker waits is given up on (X8-02), so one held
+/// on a lock, or a walk of the catalog, does not hold its place for ever.
+async fn within<T>(
+    peer: &ServerId,
+    what: &'static str,
+    by: Instant,
+    work: impl Future<Output = T>,
+    late: T,
+) -> T {
+    match tokio::time::timeout_at(by, work).await {
+        Ok(answered) => answered,
+        Err(_) => {
+            tracing::warn!(
+                server_id = %peer,
+                what,
+                "a paired server's request took longer than its wait: given up on"
+            );
+            late
+        }
+    }
+}
+
+/// When a reply is to be written by, its work done by `by`: `by`, or the
+/// margin from now for a reply made late (`unavailable` after the work was
+/// given up on), which the asker still waits that long for.
+fn reply_by(by: Instant) -> Instant {
+    by.max(Instant::now() + ANSWER_MARGIN)
+}
+
+/// Whether a reply's write, `written` by its deadline or not, went: one
+/// the asker took none of in time is given up on, its stream reset
+/// `STALLED`, so a peer that stops reading holds neither the reply nor the
+/// request's place past its own wait for it.
+fn sent(
+    peer: &str,
+    what: &'static str,
+    written: Result<Result<(), CodecError>, tokio::time::error::Elapsed>,
+    send: &mut SendStream,
+) -> bool {
+    match written {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::debug!(peer, what, error = %e, "a reply was not sent");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                peer,
+                what,
+                "a peer took none of a reply in time: given up on"
+            );
+            let _ = send.reset(VarInt::from_u32(reset::STALLED));
+            false
         }
     }
 }
@@ -128,6 +325,7 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
         name: Name,
         live: Live,
     ) -> Self {
+        let max_streams = Arc::new(AtomicUsize::new(MAX_STREAMS));
         Self {
             peers,
             strangers,
@@ -135,16 +333,42 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
             server_id,
             name,
             live,
-            max_streams: Arc::new(AtomicUsize::new(MAX_STREAMS)),
+            requests: Arc::new(Requests::new(None, MAX_REQUESTS, MAX_STRANGER_REQUESTS)),
+            max_streams,
         }
     }
 
     /// The most streams a connection is answered on at once, as
-    /// `max_streams` holds it when the connection opens (P8-04).
+    /// `max_streams` holds it when the connection opens (P8-04); a pair's
+    /// requests at once follow it.
     #[must_use]
     pub fn with_max_streams(mut self, max_streams: Arc<AtomicUsize>) -> Self {
         self.max_streams = max_streams;
         self
+    }
+
+    /// The most requests answered at once from one paired endpoint (its
+    /// connections' streams unless given), from every pair together and
+    /// from the strangers, instead of [`PEER_CONNECTIONS`]' streams,
+    /// [`MAX_REQUESTS`] and [`MAX_STRANGER_REQUESTS`]: for tests, which
+    /// set them small.
+    #[must_use]
+    pub fn with_request_budget(
+        mut self,
+        per_peer: Option<usize>,
+        total: usize,
+        strangers: usize,
+    ) -> Self {
+        self.requests = Arc::new(Requests::new(per_peer, total, strangers));
+        self
+    }
+
+    /// How many requests are being answered now, every endpoint's: for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn in_hand(&self) -> usize {
+        let counts = self.requests.counts.lock();
+        counts.all + counts.strangers
     }
 
     fn me(&self) -> Paired {
@@ -171,6 +395,9 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 return After::Next;
             }
         };
+        // One deadline for the request's work and its reply's sending: the
+        // asker's wait, less the margin, from here.
+        let by = Instant::now() + reply_wait(&request).saturating_sub(ANSWER_MARGIN);
         let said = state.said();
         let (reply, after) = match (request, said) {
             (PeerRequest::Hello(hello), None)
@@ -285,7 +512,11 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     ..
                 }),
             ) => {
-                self.peers.unpaired(endpoint).await;
+                // On a task of its own, not the connection's: the pair is
+                // revoked and cleaned up after to the end though the
+                // connection closes meanwhile, which aborts this one.
+                let peers = self.peers.clone();
+                let _ = tokio::spawn(async move { peers.unpaired(endpoint).await }).await;
                 tracing::info!(
                     peer = %endpoint.fmt_short(),
                     server_id = %server_id,
@@ -300,10 +531,20 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     standing: Standing::Paired,
                     ..
                 }),
-            ) => match self.shares.libraries(&server_id).await {
-                Ok(libraries) => (PeerReply::Libraries { libraries }, After::Next),
-                Err(unshared) => (refusal(unshared), After::Next),
-            },
+            ) => {
+                let libraries = within(
+                    &server_id,
+                    "libraries",
+                    by,
+                    self.shares.libraries(&server_id, endpoint),
+                    Err(Unshared::Unavailable),
+                )
+                .await;
+                match libraries {
+                    Ok(libraries) => (PeerReply::Libraries { libraries }, After::Next),
+                    Err(unshared) => (refusal(unshared), After::Next),
+                }
+            }
             (
                 PeerRequest::Sync(sync),
                 Some(Said {
@@ -312,7 +553,7 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     ..
                 }),
             ) => {
-                self.sync(&server_id, &sync, send).await;
+                self.sync(&server_id, endpoint, &sync, by, send).await;
                 return After::Next;
             }
             (
@@ -323,7 +564,15 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     ..
                 }),
             ) => {
-                let reply = match self.shares.artwork(&server_id, &fetch.id).await {
+                let artwork = within(
+                    &server_id,
+                    "artwork",
+                    by,
+                    self.shares.artwork(&server_id, endpoint, &fetch.id),
+                    Err(Unshared::Unavailable),
+                )
+                .await;
+                let reply = match artwork {
                     Ok((_, bytes)) if bytes.len() > MAX_ARTWORK_BYTES => PeerReply::NotFound,
                     Ok((content_type, bytes)) => PeerReply::Artwork {
                         content_type,
@@ -331,7 +580,9 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     },
                     Err(unshared) => refusal(unshared),
                 };
-                if write_reply(&mut send, &reply).await.is_ok() {
+                let written =
+                    tokio::time::timeout_at(reply_by(by), write_reply(&mut send, &reply)).await;
+                if sent(server_id.as_str(), "artwork", written, &mut send) {
                     let _ = send.finish();
                 }
                 return After::Next;
@@ -345,7 +596,15 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 }),
             ) => {
                 let assertion = assertion.within_bounds();
-                let reply = match self.shares.assert_user(&server_id, &assertion).await {
+                let granted = within(
+                    &server_id,
+                    "assertion",
+                    by,
+                    self.shares.assert_user(&server_id, endpoint, &assertion),
+                    Err(AssertionRefused::Unavailable),
+                )
+                .await;
+                let reply = match granted {
                     Ok(granted) => PeerReply::Token(granted),
                     Err(reason) => {
                         tracing::info!(
@@ -371,24 +630,40 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 }),
             ) => {
                 let failed = |error| PeerReply::Failed { error };
+                let late = || spoolframe_protocol::Error::Unavailable {
+                    message: "the server cannot answer now".into(),
+                };
                 let reply = match request {
-                    PeerRequest::SearchSubtitles(ask) => self
-                        .shares
-                        .search_subtitles(&server_id, &ask)
-                        .await
-                        .map_or_else(failed, |search| PeerReply::SubtitleResults { search }),
-                    PeerRequest::DownloadSubtitle(ask) => self
-                        .shares
-                        .download_subtitle(&server_id, &ask)
-                        .await
-                        .map_or_else(failed, |downloaded| PeerReply::SubtitleDownloaded {
-                            downloaded,
-                        }),
-                    PeerRequest::RemoveSubtitleDownload(ask) => self
-                        .shares
-                        .remove_subtitle_download(&server_id, &ask)
-                        .await
-                        .map_or_else(failed, |()| PeerReply::Done),
+                    PeerRequest::SearchSubtitles(ask) => within(
+                        &server_id,
+                        "subtitle search",
+                        by,
+                        self.shares.search_subtitles(&server_id, endpoint, &ask),
+                        Err(late()),
+                    )
+                    .await
+                    .map_or_else(failed, |search| PeerReply::SubtitleResults { search }),
+                    PeerRequest::DownloadSubtitle(ask) => within(
+                        &server_id,
+                        "subtitle download",
+                        by,
+                        self.shares.download_subtitle(&server_id, endpoint, &ask),
+                        Err(late()),
+                    )
+                    .await
+                    .map_or_else(failed, |downloaded| PeerReply::SubtitleDownloaded {
+                        downloaded,
+                    }),
+                    PeerRequest::RemoveSubtitleDownload(ask) => within(
+                        &server_id,
+                        "subtitle removal",
+                        by,
+                        self.shares
+                            .remove_subtitle_download(&server_id, endpoint, &ask),
+                        Err(late()),
+                    )
+                    .await
+                    .map_or_else(failed, |()| PeerReply::Done),
                     _ => unreachable!("matched above"),
                 };
                 (reply, After::Next)
@@ -400,7 +675,9 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 return After::Next;
             }
         };
-        if write_frame(&mut send, &reply).await.is_ok()
+        let peer = endpoint.fmt_short().to_string();
+        let written = tokio::time::timeout_at(reply_by(by), write_frame(&mut send, &reply)).await;
+        if sent(&peer, "reply", written, &mut send)
             && send.finish().is_ok()
             && let After::Close(..) = after
         {
@@ -410,9 +687,32 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
         after
     }
 
-    /// Answer pair `peer`'s `sync` on `send`: its pages, or why not.
-    async fn sync(&self, peer: &ServerId, sync: &SyncLibrary, mut send: SendStream) {
-        let pages = match self.shares.sync(peer, sync).await {
+    /// Answer pair `peer`'s `sync`, from `endpoint`, on `send`: its pages,
+    /// or why not. The walk and the first page by `by`; each page after
+    /// within the asker's wait for it, and the whole answer within the
+    /// asker's budget for a sync. A page is made as it is sent and dropped
+    /// after.
+    async fn sync(
+        &self,
+        peer: &ServerId,
+        endpoint: EndpointId,
+        sync: &SyncLibrary,
+        by: Instant,
+        mut send: SendStream,
+    ) {
+        // Within what the asker waits for the first page: the whole
+        // library is walked before it.
+        let answer = within(
+            peer,
+            "sync",
+            by,
+            self.shares.sync(peer, endpoint, sync),
+            Err(Unshared::Unavailable),
+        )
+        .await;
+        let whole = Instant::now() + SYNC_WAIT;
+        let mut by = by;
+        let pages = match answer {
             Ok(answer) => {
                 tracing::debug!(
                     server_id = %peer,
@@ -422,15 +722,29 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     removed = answer.removed.len(),
                     "answering a paired server's sync"
                 );
-                pages(answer).into_iter().map(PeerReply::Page).collect()
+                pages(answer)
             }
-            Err(unshared) => vec![refusal(unshared)],
-        };
-        for page in &pages {
-            if let Err(e) = write_frame(&mut send, page).await {
-                tracing::debug!(server_id = %peer, error = %e, "a sync's page was not sent");
+            Err(unshared) => {
+                let written = tokio::time::timeout_at(
+                    reply_by(by),
+                    write_frame(&mut send, &refusal(unshared)),
+                )
+                .await;
+                if sent(peer.as_str(), "sync", written, &mut send) {
+                    let _ = send.finish();
+                }
                 return;
             }
+        };
+        for page in pages {
+            let reply = PeerReply::Page(page);
+            let written =
+                tokio::time::timeout_at(by.min(whole), write_frame(&mut send, &reply)).await;
+            if !sent(peer.as_str(), "sync", written, &mut send) {
+                return;
+            }
+            drop(reply);
+            by = Instant::now() + PAGE_WAIT.saturating_sub(ANSWER_MARGIN);
         }
         let _ = send.finish();
     }
@@ -467,45 +781,74 @@ fn refusal(unshared: Unshared) -> PeerReply {
 /// `answer` as pages, in order: its items, at most [`MAX_PAGE_ITEMS`] and
 /// [`PAGE_BUDGET`] bytes of them a page, then the ids of those gone, at
 /// most [`MAX_PAGE_REMOVED`] a page. Never none: an answer with nothing
-/// in it is one empty page. Only the last says no more follow.
-pub(crate) fn pages(answer: SyncAnswer) -> Vec<SyncPage> {
-    let page = |items, removed| SyncPage {
+/// in it is one empty page. Only the last says no more follow. Each page
+/// is made as it is asked for, so a page is held only until it is sent.
+pub(crate) fn pages(answer: SyncAnswer) -> Paged {
+    Paged {
         mode: answer.mode,
-        cursor: answer.cursor.clone(),
-        items,
-        removed,
-        more: true,
-    };
-    let mut pages = Vec::new();
-    let mut items = Vec::new();
-    let mut size = 0;
-    for item in answer.items {
-        let len = spoolframe_protocol::codec::encode(&item).map_or(PAGE_BUDGET, |b| b.len());
-        if !items.is_empty() && (items.len() == MAX_PAGE_ITEMS || size + len > PAGE_BUDGET) {
-            pages.push(page(std::mem::take(&mut items), Vec::new()));
-            size = 0;
+        cursor: answer.cursor,
+        items: answer.items,
+        at: 0,
+        removed: answer.removed.into_iter().peekable(),
+        done: false,
+    }
+}
+
+/// The pages of an answer, made in turn: see [`pages`].
+pub(crate) struct Paged {
+    mode: SyncMode,
+    cursor: String,
+    items: Arc<Vec<RemoteItem>>,
+    /// The first item not paged yet.
+    at: usize,
+    removed: std::iter::Peekable<std::vec::IntoIter<String>>,
+    done: bool,
+}
+
+impl Iterator for Paged {
+    type Item = SyncPage;
+
+    fn next(&mut self) -> Option<SyncPage> {
+        if self.done {
+            return None;
         }
-        size += len;
-        items.push(item);
-    }
-    let mut removed = answer.removed.into_iter().peekable();
-    loop {
-        let gone: Vec<String> = removed.by_ref().take(MAX_PAGE_REMOVED).collect();
-        let last = removed.peek().is_none();
-        pages.push(page(std::mem::take(&mut items), gone));
-        if last {
-            break;
+        let mut items = Vec::new();
+        let mut size = 0;
+        while let Some(item) = self.items.get(self.at) {
+            let len = spoolframe_protocol::codec::encoded_len(item).unwrap_or(PAGE_BUDGET);
+            if !items.is_empty() && (items.len() == MAX_PAGE_ITEMS || size + len > PAGE_BUDGET) {
+                break;
+            }
+            size += len;
+            items.push(item.clone());
+            self.at += 1;
         }
+        // The ids gone follow the last page of items, on it.
+        let more_items = self.at < self.items.len();
+        let removed: Vec<String> = if more_items {
+            Vec::new()
+        } else {
+            self.removed.by_ref().take(MAX_PAGE_REMOVED).collect()
+        };
+        let more = more_items || self.removed.peek().is_some();
+        self.done = !more;
+        Some(SyncPage {
+            mode: self.mode,
+            cursor: self.cursor.clone(),
+            items,
+            removed,
+            more,
+        })
     }
-    if let Some(last) = pages.last_mut() {
-        last.more = false;
-    }
-    pages
 }
 
 impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P, S, H> {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let endpoint = connection.remote_id();
+        // Kept among the live connections before its pair is looked up
+        // (X8-01): a key confirmed after the lookup finds this connection
+        // to close; one confirmed before is what the lookup reads.
+        self.live.opened(&connection);
         let known = self.peers.known(endpoint).await;
         let Some(held) = self.strangers.admit(&connection, known.as_ref()) else {
             // A stranger past the strangers' cap, or a pair past its own.
@@ -514,6 +857,7 @@ impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P
                 known = known.is_some(),
                 "refusing a server: too many connections"
             );
+            self.live.closed(&connection);
             connection.close(
                 VarInt::from_u32(close::BUSY),
                 b"too many connections; try again later",
@@ -522,7 +866,6 @@ impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P
             return Ok(());
         };
         tracing::debug!(peer = %endpoint.fmt_short(), known = known.is_some(), "server connected");
-        self.live.opened(&connection);
         let state = Arc::new(State {
             known,
             ..State::default()
@@ -531,25 +874,36 @@ impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P
         let streams = Arc::new(tokio::sync::Semaphore::new(
             self.max_streams.load(Ordering::Relaxed).max(1),
         ));
+        // The connection's requests are its own (X8-02): aborted with it,
+        // so one waiting on a lock or walking the catalog outlives it not.
+        let mut requests = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 accepted = connection.accept_bi() => match accepted {
-                    Ok((mut send, mut recv)) => {
-                        let Ok(permit) = streams.clone().try_acquire_owned() else {
+                    Ok((send, recv)) => {
+                        let reset_busy = |mut send: SendStream, mut recv: RecvStream, what| {
                             let busy = VarInt::from_u32(reset::BUSY);
                             let _ = send.reset(busy);
                             let _ = recv.stop(busy);
-                            tracing::debug!(
-                                peer = %endpoint.fmt_short(),
-                                "a server's stream past the limit is reset"
-                            );
+                            tracing::debug!(peer = %endpoint.fmt_short(), what, "a server's stream is reset");
+                        };
+                        let Ok(permit) = streams.clone().try_acquire_owned() else {
+                            reset_busy(send, recv, "past the connection's streams");
+                            continue;
+                        };
+                        // A pair's from its first stream: its standing is known
+                        // as it connects, or once it says hello or pairs.
+                        let paired = state.known.is_some() || state.paired();
+                        let per_peer = self.max_streams.load(Ordering::Relaxed) * PEER_CONNECTIONS;
+                        let Some(place) = self.requests.take(endpoint, paired, per_peer) else {
+                            reset_busy(send, recv, "past the requests answered at once");
                             continue;
                         };
                         let this = self.clone();
                         let state = state.clone();
                         let closing = closing.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
+                        requests.spawn(async move {
+                            let (_permit, _place) = (permit, place);
                             if let After::Close(code, reason) =
                                 this.stream(endpoint, &state, send, recv).await
                             {
@@ -563,8 +917,15 @@ impl<P: Peers, S: Strangers, H: Shares> ProtocolHandler for FederationProtocol<P
                     connection.close(VarInt::from_u32(code), reason.as_bytes());
                     break;
                 }
+                // Those that ended, so the set holds only what is in hand.
+                Some(_) = requests.join_next(), if !requests.is_empty() => {}
             }
         }
+        // Aborted and joined before the connection's place is given back:
+        // nothing of it is at work, or holds a request's place, once
+        // another may take the place.
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
         self.live.closed(&connection);
         drop(held);
         tracing::debug!(peer = %endpoint.fmt_short(), "server disconnected");

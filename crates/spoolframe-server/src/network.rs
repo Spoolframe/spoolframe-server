@@ -20,6 +20,7 @@ use spoolframe_protocol::{CLIENT_ALPN, FEDERATION_ALPN, PROTOCOL_VERSION, Server
 
 use spoolframe_catalog::Catalog;
 use spoolframe_media::Prober;
+use tokio::sync::watch;
 
 use crate::admission::{self, Admission, Peer, PeerKind};
 use crate::announce::{Announce, Told};
@@ -251,6 +252,48 @@ pub enum ConnectionAuth {
 pub struct Connections {
     peers: Arc<Mutex<HashMap<usize, Arc<Peer>>>>,
     admission: Admission,
+    /// The requests in hand on connections let in by a paired server's
+    /// sessions alone: by pair, and in all.
+    remote_requests: Arc<Mutex<RemoteRequests>>,
+}
+
+/// How many requests of paired servers' sessions are in hand: every
+/// pair's together (watched, so a test waits for one to end), and each
+/// pair's by its row.
+#[derive(Debug)]
+struct RemoteRequests {
+    all: watch::Sender<usize>,
+    by_pair: HashMap<String, usize>,
+}
+
+impl Default for RemoteRequests {
+    fn default() -> Self {
+        Self {
+            all: watch::Sender::new(0),
+            by_pair: HashMap::new(),
+        }
+    }
+}
+
+/// One request's place among a pair's [`RemoteRequests`], given back when
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct RemotePlace {
+    requests: Arc<Mutex<RemoteRequests>>,
+    pair: String,
+}
+
+impl Drop for RemotePlace {
+    fn drop(&mut self) {
+        let mut requests = self.requests.lock();
+        requests.all.send_modify(|n| *n = n.saturating_sub(1));
+        if let Some(mine) = requests.by_pair.get_mut(&self.pair) {
+            *mine = mine.saturating_sub(1);
+            if *mine == 0 {
+                requests.by_pair.remove(&self.pair);
+            }
+        }
+    }
 }
 
 /// The devices' connections among `peers`: what signing in and out is
@@ -266,7 +309,37 @@ impl Connections {
         Self {
             peers: Arc::default(),
             admission,
+            remote_requests: Arc::default(),
         }
+    }
+
+    /// A place for a request of pair `pair`'s sessions, if there is one:
+    /// the pair's together hold [`Admission::max_pair_remote_connections`]
+    /// connections' worth of [`Admission::remote_requests_each`], every
+    /// pair's [`Admission::max_all_remote_connections`] connections' worth.
+    /// Held while it is kept.
+    pub(crate) fn take_remote_request(&self, pair: &str) -> Option<RemotePlace> {
+        let each = self.admission.remote_requests_each;
+        let mut requests = self.remote_requests.lock();
+        let mine = requests.by_pair.get(pair).copied().unwrap_or(0);
+        if *requests.all.borrow() >= self.admission.max_all_remote_connections * each
+            || mine >= self.admission.max_pair_remote_connections * each
+        {
+            return None;
+        }
+        requests.all.send_modify(|n| *n += 1);
+        requests.by_pair.insert(pair.to_owned(), mine + 1);
+        Some(RemotePlace {
+            requests: self.remote_requests.clone(),
+            pair: pair.to_owned(),
+        })
+    }
+
+    /// How many requests of paired servers' sessions are in hand, as it
+    /// changes: for tests, which wait for a stream to end.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn remote_requests_in_hand(&self) -> watch::Receiver<usize> {
+        self.remote_requests.lock().all.subscribe()
     }
 
     fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<usize, Arc<Peer>>> {
@@ -320,14 +393,16 @@ impl Connections {
         self.hold(Peer::new(connection), connection, known, local)
     }
 
-    /// Hold the connection of a device known here by a paired server's
+    /// Hold the connection of a device known here by pair `pair`'s
     /// session alone (C8-04), with the normal limits, while its endpoint
-    /// holds fewer than [`Admission::max_remote_connections`] such and
-    /// every endpoint's fewer than [`Admission::max_all_remote_connections`].
-    /// "Known" is not a local user here: a paired server holding one
-    /// session must not hold connections without end.
-    pub(crate) fn admit_remote(&self, connection: &Connection) -> Option<Arc<Peer>> {
-        self.hold(Peer::remote(connection), connection, true, false)
+    /// holds fewer than [`Admission::max_remote_connections`] such, the
+    /// pair's endpoints fewer than [`Admission::max_pair_remote_connections`]
+    /// and every endpoint's fewer than
+    /// [`Admission::max_all_remote_connections`]. "Known" is not a local
+    /// user here: a paired server holding one session must not hold
+    /// connections without end.
+    pub(crate) fn admit_remote(&self, connection: &Connection, pair: String) -> Option<Arc<Peer>> {
+        self.hold(Peer::remote(connection, pair), connection, true, false)
     }
 
     /// Hold a server's `spoolframe/federation/1` connection (P8-01) as
@@ -361,22 +436,32 @@ impl Connections {
         // Counted under the same lock as the insert, so connections at
         // once never pass a cap.
         if matches!(peer.kind(), PeerKind::Federation(Some(_))) {
-            let pairs: Vec<_> = peers
+            let (all, this_key) = peers
                 .values()
                 .filter(|held| matches!(held.kind(), PeerKind::Federation(Some(_))))
-                .collect();
-            let this_key = pairs.iter().filter(|held| held.endpoint == peer.endpoint);
-            if pairs.len() >= self.admission.max_paired_connections
-                || this_key.count() >= self.admission.max_pair_connections
+                .fold((0, 0), |(all, mine), held| {
+                    (all + 1, mine + usize::from(held.endpoint == peer.endpoint))
+                });
+            if all >= self.admission.max_paired_connections
+                || this_key >= self.admission.max_pair_connections
             {
                 return None;
             }
         }
-        if peer.is_remote() {
-            let remote: Vec<_> = peers.values().filter(|held| held.is_remote()).collect();
-            let this_key = remote.iter().filter(|held| held.endpoint == peer.endpoint);
-            if remote.len() >= self.admission.max_all_remote_connections
-                || this_key.count() >= self.admission.max_remote_connections
+        if let Some(pair) = peer.remote_pair() {
+            let (all, this_pair, this_key) = peers
+                .values()
+                .filter_map(|held| Some((held, held.remote_pair()?)))
+                .fold((0, 0, 0), |(all, of_pair, mine), (held, of)| {
+                    (
+                        all + 1,
+                        of_pair + usize::from(of == pair),
+                        mine + usize::from(held.endpoint == peer.endpoint),
+                    )
+                });
+            if all >= self.admission.max_all_remote_connections
+                || this_pair >= self.admission.max_pair_remote_connections
+                || this_key >= self.admission.max_remote_connections
             {
                 return None;
             }

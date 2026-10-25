@@ -98,8 +98,67 @@ impl Strangers for FakeStrangers {
     }
 }
 
-/// Movies, of `ITEMS` films, shared with SB alone; one poster.
-struct FakeShares;
+/// Movies, of `ITEMS` films, shared with SB alone; one poster. Its syncs
+/// wait while a test holds them (X8-02).
+#[derive(Default)]
+struct FakeShares {
+    held: Held,
+}
+
+/// Where a test holds the fake's syncs: how many are at it now, how many
+/// ran to their end, and what lets them go on.
+struct Held {
+    holding: std::sync::atomic::AtomicBool,
+    at_it: tokio::sync::watch::Sender<usize>,
+    go_on: tokio::sync::Notify,
+    done: AtomicUsize,
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self {
+            holding: std::sync::atomic::AtomicBool::new(false),
+            at_it: tokio::sync::watch::Sender::new(0),
+            go_on: tokio::sync::Notify::new(),
+            done: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Held {
+    /// A sync waits here while syncs are held, counted among those at it
+    /// until it goes on or is dropped.
+    async fn wait(&self) {
+        if !self.holding.load(Ordering::Acquire) {
+            return;
+        }
+        struct Leaving<'a>(&'a Held);
+        impl Drop for Leaving<'_> {
+            fn drop(&mut self) {
+                self.0.at_it.send_modify(|n| *n -= 1);
+            }
+        }
+        self.at_it.send_modify(|n| *n += 1);
+        let _leaving = Leaving(self);
+        self.go_on.notified().await;
+        self.done.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Until `n` syncs are at it, within 5 s.
+    async fn until_at_it(&self, n: usize) {
+        let mut at_it = self.at_it.subscribe();
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            at_it.wait_for(|at| *at == n),
+        )
+        .await;
+        assert!(
+            waited.is_ok(),
+            "{} syncs at it, not {n}",
+            *self.at_it.borrow()
+        );
+    }
+}
 
 const ITEMS: usize = MAX_PAGE_ITEMS * 2 + 5;
 
@@ -130,7 +189,11 @@ fn film(n: usize) -> RemoteItem {
 
 #[async_trait::async_trait]
 impl Shares for FakeShares {
-    async fn libraries(&self, peer: &ServerId) -> Result<Vec<SharedLibrary>, Unshared> {
+    async fn libraries(
+        &self,
+        peer: &ServerId,
+        _endpoint: EndpointId,
+    ) -> Result<Vec<SharedLibrary>, Unshared> {
         Ok(if peer.as_str() == SB_ID {
             vec![SharedLibrary {
                 id: "plex:1".into(),
@@ -142,19 +205,30 @@ impl Shares for FakeShares {
         })
     }
 
-    async fn sync(&self, peer: &ServerId, sync: &SyncLibrary) -> Result<SyncAnswer, Unshared> {
+    async fn sync(
+        &self,
+        peer: &ServerId,
+        _endpoint: EndpointId,
+        sync: &SyncLibrary,
+    ) -> Result<SyncAnswer, Unshared> {
+        self.held.wait().await;
         if peer.as_str() != SB_ID || sync.library != "plex:1" {
             return Err(Unshared::NotShared);
         }
         Ok(SyncAnswer {
             mode: SyncMode::Snapshot,
             cursor: "c1".into(),
-            items: (0..ITEMS).map(film).collect(),
+            items: Arc::new((0..ITEMS).map(film).collect()),
             removed: Vec::new(),
         })
     }
 
-    async fn artwork(&self, peer: &ServerId, id: &str) -> Result<(String, Vec<u8>), Unshared> {
+    async fn artwork(
+        &self,
+        peer: &ServerId,
+        _endpoint: EndpointId,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), Unshared> {
         match (peer.as_str(), id) {
             (SB_ID, "poster") => Ok(("image/png".into(), vec![7; 2 << 20])),
             (SB_ID, _) => Err(Unshared::NotFound),
@@ -166,6 +240,7 @@ impl Shares for FakeShares {
     async fn assert_user(
         &self,
         peer: &ServerId,
+        _endpoint: EndpointId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused> {
         if peer.as_str() != SB_ID || assertion.item != "plex:movie:1" {
@@ -191,42 +266,132 @@ async fn endpoint(alpns: Vec<Vec<u8>>) -> Endpoint {
 /// Server A on its own endpoint, and the fakes behind it.
 struct Sa {
     router: Router,
+    handler: FederationProtocol<FakePeers, FakeStrangers, FakeShares>,
     peers: Arc<FakePeers>,
     strangers: Arc<FakeStrangers>,
+    shares: Arc<FakeShares>,
     live: Live,
     max_streams: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Sa {
     async fn start() -> Self {
+        Self::start_with(None, crate::MAX_REQUESTS, crate::MAX_STRANGER_REQUESTS).await
+    }
+
+    /// With `per_peer` requests answered at once from one paired endpoint
+    /// (its connections' streams if `None`), `total` from every pair and
+    /// `strangers` from the rest (X8-02).
+    async fn start_with(per_peer: Option<usize>, total: usize, strangers_total: usize) -> Self {
         let peers = Arc::new(FakePeers::default());
         let strangers = Arc::new(FakeStrangers::default());
+        let shares = Arc::new(FakeShares::default());
         let live = Live::default();
         let max_streams = Arc::new(std::sync::atomic::AtomicUsize::new(crate::MAX_STREAMS));
         let handler = FederationProtocol::new(
             peers.clone(),
             strangers.clone(),
-            Arc::new(FakeShares),
+            shares.clone(),
             ServerId::parse(SA_ID).unwrap(),
             Arc::new(|| "Alice's server".to_owned()),
             live.clone(),
         )
-        .with_max_streams(max_streams.clone());
+        .with_max_streams(max_streams.clone())
+        .with_request_budget(per_peer, total, strangers_total);
         let router = Router::builder(endpoint(vec![FEDERATION_ALPN.to_vec()]).await)
-            .accept(FEDERATION_ALPN, handler)
+            .accept(FEDERATION_ALPN, handler.clone())
             .spawn();
         Self {
             router,
+            handler,
             peers,
             strangers,
+            shares,
             live,
             max_streams,
         }
     }
 
+    /// `endpoint` is a live pair's, under `server_id`.
+    fn pair(&self, endpoint: &Endpoint, server_id: &str) {
+        self.peers
+            .paired
+            .lock()
+            .insert(endpoint.id(), ServerId::parse(server_id).unwrap());
+    }
+
+    /// Syncs wait until the test lets them go on (X8-02).
+    fn hold_syncs(&self) {
+        self.shares.held.holding.store(true, Ordering::Release);
+    }
+
     fn strays(&self) -> usize {
         self.strangers.strays.load(Ordering::Acquire)
     }
+
+    /// Until `n` requests are in hand, within 5 s of real time.
+    async fn until_in_hand(&self, n: usize) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.handler.in_hand() != n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "{} requests in hand, not {n}",
+            self.handler.in_hand()
+        );
+    }
+}
+
+/// An endpoint that takes `window` bytes of each stream and no more until
+/// it reads: a peer that stops reading a reply (Y8-04).
+async fn endpoint_taking(window: u32) -> Endpoint {
+    use iroh::endpoint::{QuicTransportConfig, VarInt};
+    Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .transport_config(
+            QuicTransportConfig::builder()
+                .stream_receive_window(VarInt::from_u32(window))
+                .build(),
+        )
+        .bind()
+        .await
+        .unwrap()
+}
+
+/// `request` sent on a stream of `dialed`'s, its reply left unread: the
+/// stream to read it from later.
+async fn ask_unread(dialed: &Dialed, request: &PeerRequest) -> iroh::endpoint::RecvStream {
+    let (mut send, recv) = dialed.connection().open_bi().await.unwrap();
+    spoolframe_protocol::codec::write_frame(&mut send, request)
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    recv
+}
+
+/// The paused clock moved on a second at a time until no request is in
+/// hand: how long that took. Never, within `wait` twice over, fails.
+async fn until_given_up(sa: &Sa, what: &str, wait: std::time::Duration) -> std::time::Duration {
+    let second = std::time::Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    while sa.handler.in_hand() > 0 {
+        tokio::time::advance(second).await;
+        assert!(started.elapsed() < 2 * wait, "{what}: never given up on");
+    }
+    started.elapsed()
+}
+
+/// Whether `recv` was reset `STALLED`: the reply given up on.
+async fn stalled(mut recv: iroh::endpoint::RecvStream) -> bool {
+    use iroh::endpoint::{ReadError, ReadToEndError, VarInt};
+    matches!(
+        recv.read_to_end(usize::MAX).await,
+        Err(ReadToEndError::Read(ReadError::Reset(code)))
+            if code == VarInt::from_u32(spoolframe_protocol::federation::reset::STALLED)
+    )
 }
 
 fn hello(server_id: &str) -> PeerHello {
@@ -838,6 +1003,300 @@ async fn a_peer_that_takes_no_request_is_given_up_on_in_its_wait() {
     }
 }
 
+/// C8-05: a dial to a server that takes the connection and never lets its
+/// Hello through ends within the dial's and the Hello's wait together. Real
+/// time: the handshake is a real one, so the clock is not paused.
+#[tokio::test]
+async fn a_dial_whose_hello_never_goes_through_ends_in_its_wait() {
+    use iroh::endpoint::{QuicTransportConfig, VarInt};
+    let sa = holding(
+        QuicTransportConfig::builder()
+            .max_concurrent_bidi_streams(VarInt::from_u32(0))
+            .build(),
+    )
+    .await;
+    let sb = endpoint(Vec::new()).await;
+    let started = std::time::Instant::now();
+    let dialled = tokio::time::timeout(
+        crate::dial::CONNECT_WAIT + std::time::Duration::from_secs(5),
+        Dialed::connect(&sb, sa.addr(), hello(SB_ID)),
+    )
+    .await
+    .expect("given up on in the dial's wait");
+    assert!(dialled.is_err());
+    assert!(started.elapsed() <= crate::dial::CONNECT_WAIT + std::time::Duration::from_secs(1));
+}
+
+/// Movies, whole.
+fn movies() -> SyncLibrary {
+    SyncLibrary {
+        library: "plex:1".into(),
+        since: None,
+    }
+}
+
+/// The audit's X8-02: a connection's requests end with it. Syncs held at
+/// the service from connections since closed are aborted, not left at
+/// work: closing and connecting again, as often as one likes, leaves
+/// nothing in hand, and what was held never runs to its end once let go.
+/// Another pair is answered meanwhile.
+#[tokio::test]
+async fn a_closed_connection_s_requests_are_aborted_with_it() {
+    const SC_ID: &str = "cccccccccccccccc";
+    let sa = Sa::start().await;
+    sa.max_streams.store(2, Ordering::Relaxed);
+    sa.hold_syncs();
+    let (sb, sc) = (endpoint(Vec::new()).await, endpoint(Vec::new()).await);
+    sa.pair(&sb, SB_ID);
+    sa.pair(&sc, SC_ID);
+    for round in 1..=3 {
+        let (dialed, _) = dial(&sa, &sb, SB_ID).await;
+        let mut pages = Vec::new();
+        for _ in 0..2 {
+            pages.push(dialed.sync(movies()).await.unwrap());
+        }
+        sa.shares.held.until_at_it(2).await;
+        if round == 1 {
+            let (other, _) = dial(&sa, &sc, SC_ID).await;
+            other.libraries().await.expect("another pair is answered");
+        }
+        dialed.close();
+        drop(pages);
+        // Aborted with the connection, not left at the hold.
+        sa.shares.held.until_at_it(0).await;
+    }
+    sa.shares.held.go_on.notify_waiters();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        sa.shares.held.done.load(Ordering::Acquire),
+        0,
+        "no abandoned sync ran to its end"
+    );
+    assert_eq!(sa.strays(), 0);
+}
+
+/// X8-02's budgets: an endpoint's requests at once are capped across its
+/// connections, and every endpoint's together; one past either is reset
+/// `BUSY` and not counted against it, and a place is given back as its
+/// connection closes.
+#[tokio::test]
+async fn requests_at_once_are_capped_per_endpoint_and_in_all() {
+    const SC_ID: &str = "cccccccccccccccc";
+    let sa = Sa::start_with(Some(3), 4, crate::MAX_STRANGER_REQUESTS).await;
+    sa.hold_syncs();
+    let (sb, sc) = (endpoint(Vec::new()).await, endpoint(Vec::new()).await);
+    sa.pair(&sb, SB_ID);
+    sa.pair(&sc, SC_ID);
+    let (first, _) = dial(&sa, &sb, SB_ID).await;
+    let (second, _) = dial(&sa, &sb, SB_ID).await;
+    // SB's three, over two connections: its budget, with streams to spare
+    // on each.
+    let mut held = vec![
+        first.sync(movies()).await.unwrap(),
+        first.sync(movies()).await.unwrap(),
+        second.sync(movies()).await.unwrap(),
+    ];
+    sa.shares.held.until_at_it(3).await;
+    assert!(
+        matches!(second.libraries().await, Err(DialError::Broken(_))),
+        "past the endpoint's budget"
+    );
+    // SC takes the fourth place of all, and no more.
+    let (third, _) = dial(&sa, &sc, SC_ID).await;
+    held.push(third.sync(movies()).await.unwrap());
+    sa.shares.held.until_at_it(4).await;
+    assert!(
+        matches!(third.libraries().await, Err(DialError::Broken(_))),
+        "past the server's budget"
+    );
+    assert_eq!(sa.strays(), 0);
+    // SB's second connection closes: its place is given back, and SC is
+    // answered.
+    second.close();
+    sa.shares.held.until_at_it(3).await;
+    third.libraries().await.unwrap();
+    drop(held);
+}
+
+/// The review of X8-02: a stranger's streams, held open for a request
+/// that never comes, draw on the strangers' own budget and never on the
+/// pairs': with the strangers' full, a pair is answered still, and the
+/// stranger's next stream is reset without being counted against it.
+#[tokio::test]
+async fn strangers_requests_have_a_budget_of_their_own() {
+    let sa = Sa::start_with(None, 2, 2).await;
+    let stranger = endpoint(Vec::new()).await;
+    let (dialed, standing) = dial(&sa, &stranger, SB_ID).await;
+    assert_eq!(standing, Standing::Stranger);
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let (mut send, recv) = dialed.connection().open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        held.push((send, recv));
+    }
+    assert!(matches!(
+        dialed.ask(&PeerRequest::RedeemPairing(redeem(CODE))).await,
+        Err(DialError::Broken(_))
+    ));
+    assert_eq!(sa.strays(), 0, "a stream past the budget is not a stray");
+    let sb = endpoint(Vec::new()).await;
+    sa.pair(&sb, SB_ID);
+    let (paired, _) = dial(&sa, &sb, SB_ID).await;
+    paired
+        .libraries()
+        .await
+        .expect("the pairs' budget is their own");
+    drop(held);
+}
+
+/// The review of X8-02: a pair's requests at once follow the streams
+/// setting, so raising it takes effect: with one stream a connection, a
+/// pair holds four connections' worth, and a fifth request is reset.
+#[tokio::test]
+async fn a_pair_s_requests_at_once_follow_the_streams_setting() {
+    let sa = Sa::start().await;
+    sa.max_streams.store(1, Ordering::Relaxed);
+    sa.hold_syncs();
+    let sb = endpoint(Vec::new()).await;
+    sa.pair(&sb, SB_ID);
+    let mut connections = Vec::new();
+    let mut held = Vec::new();
+    for _ in 0..crate::PEER_CONNECTIONS {
+        let (dialed, _) = dial(&sa, &sb, SB_ID).await;
+        held.push(dialed.sync(movies()).await.unwrap());
+        connections.push(dialed);
+    }
+    sa.shares.held.until_at_it(crate::PEER_CONNECTIONS).await;
+    // A fifth request, its hello: reset, past four connections' streams.
+    let fifth = Dialed::connect(&sb, sa.router.endpoint().addr(), hello(SB_ID)).await;
+    assert!(matches!(fifth, Err(DialError::Broken(_))), "{fifth:?}");
+    assert_eq!(sa.strays(), 0);
+    drop(held);
+}
+
+/// X8-02's deadline: a sync whose work does not end within what the asker
+/// waits for its first page, less a margin, is answered `unavailable`
+/// then, and its work dropped. Paused time, once the connection is made;
+/// the page is read with no wait of the asker's own, so only the dialled
+/// side's deadline ends it.
+#[tokio::test]
+async fn a_request_whose_work_outlasts_the_asker_s_wait_is_given_up_on() {
+    use spoolframe_protocol::codec::{MAX_FRAME, read_frame_within, write_frame};
+    use spoolframe_protocol::federation::PeerReply;
+    let sa = Sa::start().await;
+    sa.hold_syncs();
+    let sb = endpoint(Vec::new()).await;
+    sa.pair(&sb, SB_ID);
+    let (dialed, _) = dial(&sa, &sb, SB_ID).await;
+    let (mut send, mut recv) = dialed.connection().open_bi().await.unwrap();
+    write_frame(&mut send, &PeerRequest::Sync(movies()))
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    sa.shares.held.until_at_it(1).await;
+    tokio::time::pause();
+    let second = std::time::Duration::from_secs(1);
+    let started = tokio::time::Instant::now();
+    let page = read_frame_within::<_, PeerReply>(&mut recv, MAX_FRAME);
+    tokio::pin!(page);
+    let page = loop {
+        tokio::select! {
+            biased;
+            page = &mut page => break page,
+            () = tokio::time::advance(second) => {}
+        }
+        assert!(
+            started.elapsed() < 2 * crate::dial::FIRST_PAGE_WAIT,
+            "never given up on"
+        );
+    };
+    tokio::time::resume();
+    assert!(matches!(page, Ok(PeerReply::Unavailable)), "{page:?}");
+    let given_up = crate::dial::FIRST_PAGE_WAIT - crate::handler::ANSWER_MARGIN;
+    assert!(
+        started.elapsed() >= given_up && started.elapsed() <= given_up + 10 * second,
+        "{:?}",
+        started.elapsed()
+    );
+    sa.shares.held.until_at_it(0).await;
+}
+
+/// Y8-04: a reply the asker takes none of, keeping the connection alive
+/// but reading nothing of the stream, is given up on when the asker's own
+/// wait for it is up, less the margin: its stream is reset `STALLED`, and
+/// the request's place given back, so another is answered. A sync's first
+/// page and an image; paused time, once the request is in hand.
+#[tokio::test]
+async fn a_reply_the_asker_takes_none_of_is_given_up_on_in_its_wait() {
+    use spoolframe_protocol::federation::ArtworkFetch;
+    let sa = Sa::start_with(Some(1), 4, crate::MAX_STRANGER_REQUESTS).await;
+    // SB takes a KiB of a stream and no more: a page, or the image, never
+    // fits.
+    let sb = endpoint_taking(1024).await;
+    sa.pair(&sb, SB_ID);
+    let (dialed, _) = dial(&sa, &sb, SB_ID).await;
+    let poster = PeerRequest::Artwork(ArtworkFetch {
+        id: "poster".into(),
+    });
+    for (what, request, wait) in [
+        (
+            "sync",
+            PeerRequest::Sync(movies()),
+            crate::dial::FIRST_PAGE_WAIT,
+        ),
+        ("artwork", poster, crate::dial::ARTWORK_WAIT),
+    ] {
+        let recv = ask_unread(&dialed, &request).await;
+        sa.until_in_hand(1).await;
+        // SB's one place is the stalled reply's: nothing else of SB's is
+        // answered meanwhile.
+        assert!(
+            matches!(dialed.libraries().await, Err(DialError::Broken(_))),
+            "{what}: the place is held"
+        );
+        tokio::time::pause();
+        let took = until_given_up(&sa, what, wait).await;
+        tokio::time::resume();
+        let second = std::time::Duration::from_secs(1);
+        let given_up = wait - crate::handler::ANSWER_MARGIN;
+        assert!(
+            took >= given_up - second && took <= given_up + 10 * second,
+            "{what}: given up on after {took:?}"
+        );
+        assert!(stalled(recv).await, "{what}: the stream is reset");
+        dialed.libraries().await.expect("the place is given back");
+    }
+    assert_eq!(sa.strays(), 0);
+}
+
+/// Y8-04: a sync's later page the asker takes none of is given up on
+/// within the asker's wait for a page, less the margin, not the first
+/// page's long wait: SB takes the first page and no more.
+#[tokio::test]
+async fn a_later_page_the_asker_takes_none_of_is_given_up_on_in_a_page_s_wait() {
+    let first_page: usize = (0..MAX_PAGE_ITEMS)
+        .map(|n| spoolframe_protocol::codec::encoded_len(&film(n)).unwrap())
+        .sum();
+    let sa = Sa::start().await;
+    // Room for the first page, its envelope and frame, and part of the
+    // second.
+    let sb = endpoint_taking(u32::try_from(first_page).unwrap() + 2048).await;
+    sa.pair(&sb, SB_ID);
+    let (dialed, _) = dial(&sa, &sb, SB_ID).await;
+    let recv = ask_unread(&dialed, &PeerRequest::Sync(movies())).await;
+    sa.until_in_hand(1).await;
+    tokio::time::pause();
+    let took = until_given_up(&sa, "a later page", crate::dial::PAGE_WAIT).await;
+    tokio::time::resume();
+    let second = std::time::Duration::from_secs(1);
+    let given_up = crate::dial::PAGE_WAIT - crate::handler::ANSWER_MARGIN;
+    assert!(
+        took >= given_up - second && took <= given_up + 10 * second,
+        "given up on after {took:?}"
+    );
+    assert!(stalled(recv).await, "the stream is reset");
+}
+
 /// Pages hold at most so many items, then the removed ids; the last says
 /// so; an empty answer is one empty page.
 #[test]
@@ -845,12 +1304,11 @@ fn an_answer_is_paged_items_first_then_removals() {
     let answer = |items: usize, removed: usize| SyncAnswer {
         mode: SyncMode::Changes,
         cursor: "c".into(),
-        items: (0..items).map(film).collect(),
+        items: Arc::new((0..items).map(film).collect()),
         removed: (0..removed).map(|n| format!("plex:movie:{n}")).collect(),
     };
     let shape = |items, removed| {
         pages(answer(items, removed))
-            .iter()
             .map(|p| (p.items.len(), p.removed.len(), p.more))
             .collect::<Vec<_>>()
     };

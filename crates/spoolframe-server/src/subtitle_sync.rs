@@ -132,11 +132,17 @@ pub struct SubtitleTimings {
     speech_dir: PathBuf,
     turns: Arc<Semaphore>,
     /// One change to a row at a time: each reads it, changes it, writes
-    /// it whole, and writes the served file to match.
-    writing: tokio::sync::Mutex<()>,
-    /// Subtitle files whose sync is waiting or running.
-    syncing: Mutex<HashSet<PathBuf>>,
+    /// it whole, and writes the served file to match. Shared, so a
+    /// change's writes hold it on their own task ([`SubtitleTimings::change`]).
+    writing: Arc<tokio::sync::Mutex<()>>,
+    /// Subtitle files whose sync is waiting or running; each entry is held
+    /// by a [`Syncing`] claim, so a sync cancelled anywhere lets go of it.
+    syncing: Arc<Mutex<HashSet<PathBuf>>>,
     news: broadcast::Sender<TimingNews>,
+    /// Where a test holds each change, before its lock and its writes: a
+    /// request's work to race its connection's close against (Y8-02).
+    #[cfg(any(test, feature = "test-support"))]
+    pub held: crate::test_holds::Held,
 }
 
 impl std::fmt::Debug for SubtitleTimings {
@@ -179,9 +185,11 @@ impl SubtitleTimings {
             dir: settings.dir.clone(),
             speech_dir: settings.speech_dir.clone(),
             turns: Arc::new(Semaphore::new(settings.at_once.max(1))),
-            writing: tokio::sync::Mutex::new(()),
-            syncing: Mutex::new(HashSet::new()),
+            writing: Arc::default(),
+            syncing: Arc::default(),
             news: broadcast::channel(64).0,
+            #[cfg(any(test, feature = "test-support"))]
+            held: crate::test_holds::Held::default(),
         })
     }
 
@@ -264,26 +272,24 @@ impl SubtitleTimings {
     }
 
     /// Sync `track` in the background: its timing now, `Syncing`. A track
-    /// already syncing is left to it.
+    /// already syncing is left to it. The claim on the file is a guard,
+    /// carried into the worker: a request cancelled before the worker is
+    /// spawned (aborted with its connection, or past its wait) leaves no
+    /// file claimed for ever.
     pub async fn sync(self: &Arc<Self>, track: TrackRef) -> Result<SubtitleTiming, TimingError> {
         let (sidecar, format) = track.sidecar()?;
         let stamp = crate::files::stamp_text(&sidecar)
             .await
             .map_err(|e| TimingError::Io(format!("the subtitle file cannot be read: {e}")))?;
-        if !self.syncing.lock().insert(sidecar.clone()) {
+        let Some(claim) = Syncing::claim(&self.syncing, &sidecar) else {
             return Ok(self.timing_of(&sidecar).await);
-        }
-        let begun = self
-            .change(&track, &sidecar, |row| {
-                row.state = "syncing".into();
-                row.failure = None;
-                Ok(())
-            })
-            .await;
-        if let Err(e) = begun {
-            self.syncing.lock().remove(&sidecar);
-            return Err(e);
-        }
+        };
+        self.change(&track, &sidecar, |row| {
+            row.state = "syncing".into();
+            row.failure = None;
+            Ok(())
+        })
+        .await?;
         let timing = self.timing_of(&sidecar).await;
         self.tell(&track, timing.clone());
         let this = self.clone();
@@ -297,7 +303,7 @@ impl SubtitleTimings {
                     .expect("never closed");
                 this.align(&track, &sidecar, format).await
             };
-            this.finish(&track, &sidecar, &stamp, outcome).await;
+            this.finish(&track, &sidecar, &stamp, outcome, claim).await;
         });
         Ok(timing)
     }
@@ -383,14 +389,19 @@ impl SubtitleTimings {
 
     /// `sidecar`'s row changed by `edit` (a new one if it has none, or if
     /// the file changed since), written whole, and its served file
-    /// written to match.
+    /// written to match. The two writes run on a task of their own, with
+    /// the lock, so a request aborted with its connection (Y8-02) leaves
+    /// the served file and the row as a pair, not the file changed and the
+    /// row as it was.
     async fn change(
         &self,
         track: &TrackRef,
         sidecar: &Path,
         edit: impl FnOnce(&mut TimingRow) -> Result<(), TimingError>,
     ) -> Result<(), TimingError> {
-        let _writing = self.writing.lock().await;
+        #[cfg(any(test, feature = "test-support"))]
+        self.held.wait().await;
+        let writing = self.writing.clone().lock_owned().await;
         let stamp = crate::files::stamp_text(sidecar)
             .await
             .map_err(|e| TimingError::Io(format!("the subtitle file cannot be read: {e}")))?;
@@ -400,40 +411,23 @@ impl SubtitleTimings {
             .unwrap_or_else(|| TimingRow::new(&path_text(sidecar), &track.id.to_string(), &stamp));
         edit(&mut row)?;
         row.media_id = track.id.to_string();
-        self.write_served(sidecar, &row).await?;
-        self.store.put_subtitle_timing(&row).await?;
-        Ok(())
+        let (store, dir, sidecar) = (self.store.clone(), self.dir.clone(), sidecar.to_owned());
+        tokio::spawn(async move {
+            let _writing = writing;
+            write_served(&dir, &sidecar, &row).await?;
+            store.put_subtitle_timing(&row).await?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| TimingError::Io(format!("the timing change was not written: {e}")))?
     }
 
     fn served_path(&self, sidecar: &Path, key: &str) -> PathBuf {
-        self.dir
-            .join(format!("{}.{}", name(key), extension(sidecar)))
+        served_path(&self.dir, sidecar, key)
     }
 
     fn synced_path(&self, sidecar: &Path, key: &str) -> PathBuf {
-        self.dir
-            .join(format!("{}.synced.{}", name(key), extension(sidecar)))
-    }
-
-    /// The file served for `row`: its synced file or `sidecar`, moved by
-    /// its offset; written aside and renamed in, so a reader has the old
-    /// one or the new one whole.
-    async fn write_served(&self, sidecar: &Path, row: &TimingRow) -> Result<(), TimingError> {
-        let source = if row.serving_synced {
-            self.synced_path(sidecar, &row.sidecar)
-        } else {
-            sidecar.to_owned()
-        };
-        let bytes = read_subtitle(&source).await?;
-        let bytes = if row.offset_ms == 0 {
-            bytes
-        } else {
-            let format = format_of(sidecar).ok_or(TimingError::NotExternalText)?;
-            subsync::shift(&bytes, format, row.offset_ms)
-                .map_err(|e| TimingError::Io(format!("the subtitle cannot be offset: {e}")))?
-        };
-        let served = self.served_path(sidecar, &row.sidecar);
-        write_into_place(&served, &bytes).await
+        synced_path(&self.dir, sidecar, key)
     }
 
     /// The sync's work, in its turn: the subtitle's cues aligned to the
@@ -561,7 +555,14 @@ impl SubtitleTimings {
     /// The sync's outcome written, unless the subtitle file changed while
     /// it ran (its row then no longer holds, and the outcome is of a file
     /// that is gone).
-    async fn finish(&self, track: &TrackRef, sidecar: &Path, began: &str, outcome: Outcome) {
+    async fn finish(
+        &self,
+        track: &TrackRef,
+        sidecar: &Path,
+        began: &str,
+        outcome: Outcome,
+        claim: Syncing,
+    ) {
         let changed = crate::files::stamp_text(sidecar).await.ok().as_deref() != Some(began);
         let written = if changed {
             Err(TimingError::Io(
@@ -603,12 +604,34 @@ impl SubtitleTimings {
                 Ok(())
             })
             .await;
-        self.syncing.lock().remove(sidecar);
+        drop(claim);
         if let Err(e) = result {
             tracing::warn!(subtitle = %sidecar.display(), error = %e, "cannot record a subtitle's sync");
         }
         let timing = self.timing_of(sidecar).await;
         self.tell(track, timing);
+    }
+}
+
+/// A claim on a subtitle file among those syncing, let go of when dropped.
+struct Syncing {
+    syncing: Arc<Mutex<HashSet<PathBuf>>>,
+    sidecar: PathBuf,
+}
+
+impl Syncing {
+    /// The claim on `sidecar`, if no sync holds one.
+    fn claim(syncing: &Arc<Mutex<HashSet<PathBuf>>>, sidecar: &Path) -> Option<Self> {
+        syncing.lock().insert(sidecar.to_owned()).then(|| Self {
+            syncing: syncing.clone(),
+            sidecar: sidecar.to_owned(),
+        })
+    }
+}
+
+impl Drop for Syncing {
+    fn drop(&mut self) {
+        self.syncing.lock().remove(&self.sidecar);
     }
 }
 
@@ -672,6 +695,34 @@ fn format_of(sidecar: &Path) -> Option<TextFormat> {
         "ass" | "ssa" => Some(TextFormat::Ass),
         _ => None,
     }
+}
+
+fn served_path(dir: &Path, sidecar: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{}.{}", name(key), extension(sidecar)))
+}
+
+fn synced_path(dir: &Path, sidecar: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{}.synced.{}", name(key), extension(sidecar)))
+}
+
+/// The file served for `row`, in `dir`: its synced file or `sidecar`,
+/// moved by its offset; written aside and renamed in, so a reader has the
+/// old one or the new one whole.
+async fn write_served(dir: &Path, sidecar: &Path, row: &TimingRow) -> Result<(), TimingError> {
+    let source = if row.serving_synced {
+        synced_path(dir, sidecar, &row.sidecar)
+    } else {
+        sidecar.to_owned()
+    };
+    let bytes = read_subtitle(&source).await?;
+    let bytes = if row.offset_ms == 0 {
+        bytes
+    } else {
+        let format = format_of(sidecar).ok_or(TimingError::NotExternalText)?;
+        subsync::shift(&bytes, format, row.offset_ms)
+            .map_err(|e| TimingError::Io(format!("the subtitle cannot be offset: {e}")))?
+    };
+    write_into_place(&served_path(dir, sidecar, &row.sidecar), &bytes).await
 }
 
 /// A subtitle file, never through a symlink, at most

@@ -1034,8 +1034,8 @@ token.
   role) is `owner`; `portable-account` and `federation` are `friend`.
   The kind alone decides it.
 - A server paired with this one (P8-01, while `experimental.federation`
-  is on) is `friend`; unpaired, it falls back once the relay's cache of
-  the answer expires.
+  is on) is `friend`; unpaired, or once its new key is confirmed, its
+  key falls back at once: the server tells its relays (below).
 - Anyone else is a `stranger`.
 
 ### The invite holder's token
@@ -1095,7 +1095,22 @@ session ended, an invite or grant revoked stops being relayed within
 the new answer. An endpoint the main server does not answer for in a
 recheck is carried on until a recheck that does. With `access.everyone`,
 and for the main server itself, nothing is asked and nothing rechecked.
-At most 2 recheck questions are open at once.
+At most 2 recheck questions are open at once. The one endpoint not
+carried on through a question that fails is one the main server said no
+longer holds (below): it is cut at the first recheck the main server
+cannot answer, and let through again only on a fresh answer.
+
+The main server also tells a relay when an answer no longer holds: a
+pair unpaired, or its old key once its new one is confirmed. It opens a
+unidirectional stream on the relay's connection and sends one frame,
+`{"endpoint": "3f9a…a0f1"}`, within 10 s. The relay forgets what it kept
+for that endpoint, with any token, keeps no answer to a question asked
+before it heard, and asks again about every endpoint it carries at once,
+not at the next 5 s. A relay connection that falls more than 64 such
+frames behind is closed `BUSY`; a relay that connects again keeps no
+answer from before. A relay from before this ignores the frame, and the
+endpoint falls back as its kept answer expires and its next recheck
+asks.
 
 ### The play token holder's token
 
@@ -3111,7 +3126,11 @@ key, and 64 from every pair's together; one past either is closed
 
 A live pair's endpoint that says another server id is refused
 `server_id_changed` every time, and its connection closed with
-`SERVER_ID_CHANGED` (4). A live pair's server id from a new endpoint is
+`SERVER_ID_CHANGED` (4). The same holds the other way: a server that
+dials a pair's key, on this ALPN or on the client protocol, and is
+answered under another server id closes the connection, sends nothing
+on it and keeps nothing from it, and shows the refusal as it shows an
+incoming one. A live pair's server id from a new endpoint is
 `key_held`: the new key waits for the dialled server's admin to confirm
 or reject it, and reaches only `hello` until then. Each such `hello`
 draws on the strangers' budget (`rate_limited` past it), so a dialler
@@ -3143,11 +3162,19 @@ each with its fingerprint; `keyConfirm { id, endpointId }` moves the pair
 to that key and forgets the pair's other held keys, and ends what the old
 key held: the tokens minted for it, the sessions it opened as the pair's
 endpoint (proxy mode), and the connection this server plays the pair's
-items through, which dials the new key at the next play; a device's own
-tokens and sessions stay. An assertion already on its way on the old
-key's connection may still mint a token for it, but that connection is
-closed at the confirm, so the token most likely never reaches the old
-key. `keyReject { id, endpointId }` refuses that key for a day. Both
+items through, which dials the new key at the next play; this server's
+replication connection to the old key, the replica dialling the new key
+at once; and the old key's friend tier on the relays. A device's own
+tokens and sessions stay. An assertion on the old key's connection mints
+a token only while that key is the pair's: one minted as the confirm
+commits mints nothing. A dial of the old key answered as the confirm
+commits keeps no connection, and a sync read from it writes nothing.
+An incoming connection of the old key's registering as the confirm
+commits is closed with the others, and every request on a pair's
+connection is answered only while the key it came from is the pair's:
+one on a connection that outlived the confirm is `not_shared`, as no
+pair's is.
+`keyReject { id, endpointId }` refuses that key for a day. Both
 name the key the admin saw: one that is not held for the pair (the keys
 changed since they were listed) is `KEY_NOT_HELD`, and nothing changes.
 
@@ -3229,7 +3256,21 @@ dials the pair and writes the cache):
   `federation.cache_max_mb` per origin and `cache_total_mb` in all.
 
 A connection answers at most 16 streams at once: one past them is reset
-`BUSY` (3), and not counted against its endpoint.
+`BUSY` (3), and not counted against its endpoint. One pair's connections
+together are answered at most four connections' streams of requests at
+once (64 with the default setting), every pair's 256, and every
+endpoint that is no pair's 16 together, apart from the pairs'; one past
+them is reset `BUSY` too. A request's work
+ends with its connection: a sync, walk or lookup whose connection closed
+is abandoned. The dialled server gives each request's work the asker's
+wait for its reply, less 5 s, and answers `unavailable` past it; the
+reply's sending has the same deadline, so a peer that takes none of a
+reply by then, keeping the connection alive, has the stream reset
+`STALLED` (4) and the request's place given back. A sync's pages are
+made one at a time as they are sent: the first by the first page's wait,
+each after within the page wait less 5 s, and the whole answer within
+the 30 minutes an asker gives a sync; a snapshot's pages are read from
+the one walk every request of it shares, never a copy per request.
 
 SB gives each request 15 s from opening its stream to its whole reply, a
 sync's request 15 s to be sent, and a dial and its `hello` 30 s together:
@@ -3237,7 +3278,10 @@ a server that grants no stream, or no room to write the request in, is
 given up on as one that never answers. One pair's sync, every library
 together, has 30 minutes; past it, the library it was on is kept as it
 was. SB dials and syncs up to four pairs at once, each apart from the
-others, and its upkeep apart from them all.
+others, and its upkeep apart from them all. A pair whose dial or sync
+failed is tried again after 30 s, twice as long each time to 30
+minutes, counted from when the attempt failed, not from when it began;
+a new key confirmed is dialled at once.
 
 SB names each item it caches `fed:<kind>:<origin>:<namespace>:<key>`,
 where `origin` is SA's server id and the rest SA's own id for it. A
@@ -3290,7 +3334,14 @@ history leaves them out. `PROTOCOL_VERSION` does not change.
 - Browsing, `Item` and search take `fed:` ids as any other. Search
   answers `search_hits`: the server's own and the cache's, a title found
   on several servers once ([one result per
-  title](#one-result-per-title)).
+  title](#one-result-per-title)). A paired server's hierarchy is browsed
+  at most 60,000 items, and 48 MiB of their cached metadata, at once
+  (a 50,000-track music library, at the 600 bytes a track's metadata
+  measures, browses whole): `Item` of a show, season, artist or album
+  with more under it, and a music library's tracks for All, answer
+  `ReplyTooLarge { bytes }`, `bytes` being the metadata's, with nothing
+  of it read. `Items` pages a library as any other and is not held to
+  this.
 - `HomeScreen.servers` is each paired server's own row: `{server,
   shown, items}`, what it shared most recently first, by when SB cached
   it. `set_server_row {server_id, shown}` shows or hides one, per user:
@@ -3494,8 +3545,13 @@ pair unpaired, ends the session and its playbacks at once, a session
 still being redeemed then among them: a token used up just before opens
 nothing. SA confirming the pair's new key ends the sessions its old key
 opened. The item found moved out of the session's library, as SA's
-catalog is replaced or as the session starts a playback or a download,
-ends the session. Each use checks the session again, and one
+catalog is replaced, or as the session starts a playback or a download,
+begins a download read, or asks to change the item's subtitle timing,
+ends the session, a playback running then with it: a timing change is a
+change for everyone, not a control of the playback. SA checks this
+itself, whether or not the connection's `Hello` names the `federation`
+feature.
+Each use checks the session again, and one
 whose pair or grant is gone, or that the pair's old key opened, is
 `Unauthenticated` and ends. Off SA's LAN, the play takes a guest's share
 of SA's WAN uplink.
@@ -3509,9 +3565,18 @@ used, however long the film.
 
 An endpoint SA knows only by such sessions (a device in a remote play,
 or SB playing through itself) gets the normal limits on `client/1`, but
-holds at most 4 connections at once that way, and every such endpoint 256
-together; one more is closed `BUSY` (2). The connection a token is
-redeemed on came as a stranger's, and is counted as one.
+holds at most 4 connections at once that way, one pair's endpoints 128
+together, and every such endpoint 256; one more is closed `BUSY` (2). The connection a token is
+redeemed on came as a stranger's, and is counted as one. Such a
+connection's requests at once, resource streams included, are held to 4
+for each connection the caps allow: one pair's sessions together are
+answered at most 512 at once, and every pair's 1,024; one more has its
+stream reset `BUSY` (3) before it is read, and the device asks again
+once one ends. Each request's work runs to its end, whole, within the
+server's wait for its kind and 30 s, holding its place meanwhile, though
+the connection it came on closes: closing and connecting again admits
+nothing past the budget, and leaves nothing half done. A local user's
+device is held to neither.
 
 SA counts the play then: `direct` when the device redeemed the token,
 `proxied` when SB's own endpoint did. Its admins see both per pair
@@ -3648,7 +3713,9 @@ was made stays `ready` with `no_longer_available: true` on its
 is the user's), and one not made is `failed` with the new cause
 `no_longer_available`. A read through SB is refused. Preparing again
 makes a new download. SB forgets such records, and failed ones, 30 days
-after.
+after. Each download read SA begins checks that the item is in the
+library its token was for still, as a play's start does: moved out of
+it, the read is `Unauthenticated` and the session ends.
 
 #### SDK
 
@@ -3700,9 +3767,13 @@ Limits:
 - On SA, every user of SB's together gets `subtitles {
   daily_limit_per_peer = 40; }` downloads a day (0 for no limit),
   counted under the pair and never under SB's users, whom SA never
-  records. SA holds the limit from its check to its count. At either
-  limit the device is refused `QuotaExhausted { whose: user }`, which an
-  app from before knows.
+  records. SA holds the limit from its check to its count, and keeps
+  the file and its record on work of its own, within 30 s: a request
+  cancelled meanwhile (SB's connection closed, or its wait up) ends with
+  a recorded, counted file or none at all, never a file the limit does
+  not count; one not kept in time is removed and the download fails. At
+  either limit the device is refused `QuotaExhausted { whose: user }`,
+  which an app from before knows.
 - `user_remaining` in `SubtitleDownloaded` is the fewer of the two.
 
 SA's admin API `subtitle_usage` gains `dailyLimitPerPeer` and `pairs`,

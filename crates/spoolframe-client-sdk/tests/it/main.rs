@@ -13,5 +13,6 @@ mod playlists;
 mod reachability;
 mod reconnect;
 mod stalls;
+mod stream_window;
 mod stub;
 mod web_url;

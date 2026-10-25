@@ -402,6 +402,44 @@ async fn a_revoked_grant_ends_the_download_and_sb_marks_it_unavailable() {
     pair.stop().await;
 }
 
+/// The audit's C8-03: SA's PMS moving the film to a library not shared
+/// with SB, with no catalog change SA hears of, ends the device's
+/// download session as it begins its next read, which reads nothing.
+#[tokio::test]
+async fn a_moved_film_s_download_reads_nothing_more() {
+    let pair = sharing_a_film("fed-dl-moved").await;
+    let (app, bob) = bob_s_app(&pair).await;
+    let alien = pair.fed(movie().id());
+    let info = prepared(&app, &bob, &alien).await;
+    settled(&app, &bob, &info.id).await;
+    let granted = granted(&app, &bob, &alien, &info.id).await;
+    let remote = granted.download.clone().unwrap();
+    let device = app_from(&pair.sa, &app).await;
+    let session = redeemed(&device, &granted.token).await.session;
+    let (before, _) = read(&device, &session, &remote, 0, 4096).await;
+    assert!(
+        matches!(before, ResourceResponse::Ready { .. }),
+        "{before:?}"
+    );
+    pair.sa.catalog.move_to(
+        movie().id(),
+        spoolframe_server::test_support::music_library().id,
+    );
+    let (after, bytes) = read(&device, &session, &remote, 4096, 4096).await;
+    assert!(
+        matches!(
+            after,
+            ResourceResponse::Error {
+                error: Error::Unauthenticated
+            }
+        ),
+        "{after:?}"
+    );
+    assert!(bytes.is_empty());
+    assert!(session_ended(&pair, &session).await);
+    pair.stop().await;
+}
+
 /// Bob follows a playlist on SB holding SA's track: what it holds names
 /// SA's track, which his app downloads from SB as it would SB's own, with
 /// a download token of its own on SA.

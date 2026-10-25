@@ -172,15 +172,29 @@ impl Federation {
     /// What pair `peer`'s own page shows beyond its row.
     pub async fn peer_page(&self, peer: &PeerRecord) -> Result<PeerPage, StoreError> {
         let store = self.store();
-        let (last_seen, identity_refused_at) = store.peer_presence(&peer.id).await?;
-        let counts: HashMap<String, i64> = store
-            .cached_counts(&peer.server_id)
-            .await?
-            .into_iter()
-            .collect();
-        let received = store
-            .cached_libraries(Some(&peer.server_id))
-            .await?
+        let now = store.now();
+        let first = now.div_euclid(DAY) - (WEEK_DAYS - 1);
+        // Seven reads that depend on nothing but the pair, at once: the
+        // page waits for the slowest, not their sum.
+        let (
+            (last_seen, identity_refused_at),
+            counts,
+            libraries,
+            served_days,
+            asserted_days,
+            cached_bytes,
+            withdrawn,
+        ) = tokio::try_join!(
+            store.peer_presence(&peer.id),
+            store.cached_counts(&peer.server_id),
+            store.cached_libraries(Some(&peer.server_id)),
+            store.federation_play_days(&peer.id, PlaySide::Served, first),
+            store.federation_play_days(&peer.id, PlaySide::Asserted, first),
+            store.cached_bytes(&peer.server_id),
+            store.withdrawn(&peer.id, now - WEEK_DAYS * DAY),
+        )?;
+        let counts: HashMap<String, i64> = counts.into_iter().collect();
+        let received = libraries
             .into_iter()
             .map(|l| Received {
                 items: counts
@@ -194,16 +208,14 @@ impl Federation {
                 synced_at: l.synced_at,
             })
             .collect();
-        let now = store.now();
-        let first = now.div_euclid(DAY) - (WEEK_DAYS - 1);
         let mut week: Vec<PlayDay> = (first..first + WEEK_DAYS)
             .map(|day| PlayDay {
                 day: day * DAY,
                 ..PlayDay::default()
             })
             .collect();
-        for (side, there) in [(PlaySide::Served, false), (PlaySide::Asserted, true)] {
-            for (day, plays, proxied) in store.federation_play_days(&peer.id, side, first).await? {
+        for (days, there) in [(served_days, false), (asserted_days, true)] {
+            for (day, plays, proxied) in days {
                 let Some(slot) = usize::try_from(day - first)
                     .ok()
                     .and_then(|i| week.get_mut(i))
@@ -223,8 +235,8 @@ impl Federation {
             last_seen,
             identity_refused_at,
             received,
-            cached_bytes: store.cached_bytes(&peer.server_id).await?,
-            withdrawn: store.withdrawn(&peer.id, now - WEEK_DAYS * DAY).await?,
+            cached_bytes,
+            withdrawn,
             week,
         })
     }
@@ -233,15 +245,10 @@ impl Federation {
     /// never per user: of this server's items by its users, and of its
     /// items by this server's users.
     pub async fn play_counts(&self, peer: &str) -> Result<(PlayCount, PlayCount), StoreError> {
-        let here = self
-            .store()
-            .federation_plays(peer, PlaySide::Served)
-            .await?;
-        let there = self
-            .store()
-            .federation_plays(peer, PlaySide::Asserted)
-            .await?;
-        Ok((here, there))
+        tokio::try_join!(
+            self.store().federation_plays(peer, PlaySide::Served),
+            self.store().federation_plays(peer, PlaySide::Asserted),
+        )
     }
 
     /// Show paired server `server_id`'s own Home row to `principal` (by

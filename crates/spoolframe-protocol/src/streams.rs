@@ -22,4 +22,7 @@ pub mod reset {
     /// The stream's kind byte and first frame did not arrive in time
     /// (PX-10).
     pub const FIRST_FRAME_TIMEOUT: u32 = 2;
+    /// The server answers as many requests of a paired server's sessions
+    /// at once as it will (Y8-02): wait for one to end, and ask again.
+    pub const BUSY: u32 = 3;
 }

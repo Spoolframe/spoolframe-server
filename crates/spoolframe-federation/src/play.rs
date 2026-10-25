@@ -15,9 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, RecvStream, VarInt};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 
 use crate::DialError;
+use crate::dial::within;
 use spoolframe_protocol::codec::{CodecError, read_frame, read_reply, write_frame};
 use spoolframe_protocol::policy::retry_safe;
 use spoolframe_protocol::resource::{ResourceRequest, ResourceResponse};
@@ -159,9 +160,7 @@ impl PlayClient {
                 .await
                 .map_err(codec_error)
         };
-        let response = tokio::time::timeout(wait, exchange)
-            .await
-            .map_err(|_| DialError::Broken("no answer in time".into()))??;
+        let response = within(wait, "no answer in time", exchange).await?;
         *self.instance.lock() = (response.server, Instant::now());
         Ok(response.reply)
     }
@@ -181,15 +180,18 @@ impl PlayClient {
             let response: ResourceResponse = read_frame(&mut recv).await.map_err(codec_error)?;
             Ok::<_, DialError>((response, recv))
         };
-        tokio::time::timeout(RESOURCE_WAIT, exchange)
-            .await
-            .map_err(|_| DialError::Broken("no answer in time".into()))?
+        within(RESOURCE_WAIT, "no answer in time", exchange).await
     }
 
     /// The other server's events from now: a playback's share of its
     /// uplink, among others.
     pub fn events(&self) -> tokio::sync::broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// The other server's key: the one this connection was dialled at.
+    pub fn remote_id(&self) -> EndpointId {
+        self.connection.remote_id()
     }
 
     /// Whether the connection is closed.

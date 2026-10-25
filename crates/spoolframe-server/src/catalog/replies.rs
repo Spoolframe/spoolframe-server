@@ -45,6 +45,21 @@ pub enum Call {
     RecentlyAdded(u32),
 }
 
+impl Call {
+    /// Whether the call is about a paired server's `fed:` id: an item, a
+    /// library or a person of theirs.
+    fn is_federated(&self) -> bool {
+        match self {
+            Call::Libraries | Call::RecentlyAdded(_) => false,
+            Call::Items(id, ..)
+            | Call::Item(id)
+            | Call::Episodes(id)
+            | Call::ExternalIds(id)
+            | Call::PersonItems(id) => spoolframe_protocol::federation::federated_id(id),
+        }
+    }
+}
+
 /// What a call answered.
 #[derive(Debug, Clone)]
 pub enum Reply {
@@ -166,7 +181,8 @@ impl Replies {
 
     /// `call`'s reply, kept if it was asked for less than [`KEPT_FOR`] ago
     /// under this catalog; otherwise `fetch`ed, and kept if it succeeds.
-    /// `of` finds the reply's value, `into` makes one of it.
+    /// `of` finds the reply's value, `into` makes one of it. A paired
+    /// server's call is only `fetch`ed.
     pub async fn read<T: Clone>(
         &self,
         call: Call,
@@ -174,6 +190,12 @@ impl Replies {
         into: fn(T) -> Reply,
         fetch: impl Future<Output = Result<T, CatalogError>>,
     ) -> Result<T, CatalogError> {
+        // Replies are kept for Plex's answers only: a paired server's
+        // cache (`fed:` ids) is read from this server's own database, and
+        // a sync changes it at any time.
+        if call.is_federated() {
+            return fetch.await;
+        }
         // Before `fetch` reads which catalog is served (it is not polled
         // yet): a reply of one replaced after this is never kept.
         let generation = self.generation.load(Ordering::SeqCst);

@@ -12,6 +12,11 @@
 //! `Authorization` header of its connection and passes in the question.
 //! A device about to play a paired server's item (P8-04) proves it holds
 //! that server's play token the same way, with a [`play_relay_token`].
+//!
+//! The main server tells its relays when an answer no longer holds: on a
+//! unidirectional stream it opens on the relay's connection, an
+//! [`AccessRevoked`] frame. A relay forgets what it kept for that endpoint
+//! and asks again about those it carries.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -42,6 +47,19 @@ pub struct AccessQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessAnswer {
     pub tier: Tier,
+}
+
+/// The most bytes an access frame takes, on either side: a query, an
+/// answer or a revocation is a key and some framing, so anything larger
+/// is not one.
+pub const MAX_FRAME: u32 = 1024;
+
+/// The main server's word that what it answered for `endpoint` no longer
+/// holds: a paired server unpaired, or moved to a new key (C8-01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessRevoked {
+    /// The endpoint's key, hex.
+    pub endpoint: String,
 }
 
 /// Who an endpoint is to the main server, for its relay.
@@ -142,6 +160,11 @@ mod tests {
             let back: AccessAnswer = codec::decode(&codec::encode(&answer).unwrap()).unwrap();
             assert_eq!(back, answer);
         }
+        let revoked = AccessRevoked {
+            endpoint: "3f9a".into(),
+        };
+        let back: AccessRevoked = codec::decode(&codec::encode(&revoked).unwrap()).unwrap();
+        assert_eq!(back, revoked);
     }
 
     #[test]

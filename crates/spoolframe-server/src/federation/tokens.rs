@@ -22,13 +22,12 @@
 use std::time::Duration;
 
 use iroh::EndpointId;
-use spoolframe_catalog::CatalogError;
 use spoolframe_federation::DialError;
 use spoolframe_protocol::ServerId;
 use spoolframe_protocol::federation::{AssertUser, AssertionRefused, TokenGranted, TokenScope};
-use spoolframe_types::{MediaId, MediaKind};
+use spoolframe_types::MediaId;
 
-use super::{Federation, ShareError};
+use super::Federation;
 use crate::auth::SessionToken;
 use crate::principal::{Principal, RemoteServerId, Who};
 use crate::store::StoreError;
@@ -99,10 +98,10 @@ impl Federation {
             download,
             counted,
         } = wanted;
-        let (origin, remote) = item
+        let (_, remote) = item
             .remote()
             .ok_or_else(|| AssertError::NotFederated(item.clone()))?;
-        let dialed = self.links.get(origin).ok_or(AssertError::Offline)?;
+        let dialed = self.links.pinned(peer).ok_or(AssertError::Offline)?;
         // SA chooses the tracks by them, as this server would: it has none
         // of the user's own.
         let preferences = self
@@ -243,6 +242,7 @@ impl Federation {
     pub(crate) async fn mint(
         &self,
         server_id: &ServerId,
+        endpoint: EndpointId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused> {
         let store = self.store();
@@ -293,16 +293,21 @@ impl Federation {
             u.scope == TokenScope::Download && u.peer == peer.id
         };
         let also = || match scope {
-            TokenScope::Download => AlsoHeld {
-                of_user: sessions.count(|u| downloads(u) && u.principal() == principal),
-                of_peer: sessions.count(downloads),
-            },
+            TokenScope::Download => {
+                let (of_user, of_peer) = sessions.count_both(|u| {
+                    let of_peer = downloads(u);
+                    (of_peer && u.principal() == principal, of_peer)
+                });
+                AlsoHeld { of_user, of_peer }
+            }
             _ => AlsoHeld::default(),
         };
         let limits = match scope {
             TokenScope::Download => self.limits().download_tokens,
             _ => self.limits().tokens,
         };
+        #[cfg(test)]
+        self.holds.minting.here().await;
         // A bearer as a session's is, kept by its hash alike.
         let token = SessionToken::generate();
         let expires_at =
@@ -323,6 +328,10 @@ impl Federation {
                     // Kept for the session it opens (P8-04).
                     preferences: preferences.as_deref(),
                     download: assertion.download.as_deref(),
+                    // Kept only while it is the pair's key: an assertion
+                    // on the old key's connection as a new one is
+                    // confirmed mints nothing.
+                    asserted_by: &endpoint.to_string(),
                 },
                 // The most that work at once (H3), as the settings say.
                 limits,
@@ -332,7 +341,8 @@ impl Federation {
             .map_err(|e| unavailable(&e))?;
         match kept {
             TokenKept::Kept => {}
-            // Revoked since the item was placed.
+            // Revoked since the item was placed, or the pair moved from
+            // the key that asserted.
             TokenKept::NotShared => return Err(AssertionRefused::NotShared),
             TokenKept::TooMany => {
                 tracing::info!(
@@ -387,19 +397,12 @@ impl Federation {
             .parse()
             .map_err(|_| AssertionRefused::NotShared)?;
         // Only what plays: never a show, a season or an album (M6).
-        if !matches!(
-            item.kind(),
-            MediaKind::Movie | MediaKind::Episode | MediaKind::Track
-        ) {
+        if !item.kind().plays() {
             return Err(AssertionRefused::InvalidScope);
         }
-        let library = match self.shared_library_of(peer, &item).await {
+        let library = match self.placed_shared(peer, &item).await {
             Ok(Some(library)) => library,
-            // Not there, or in no library served: not shared.
-            Ok(None)
-            | Err(ShareError::Catalog(
-                CatalogError::NotFound(_) | CatalogError::NotServed(_) | CatalogError::ForeignId(_),
-            )) => return Err(AssertionRefused::NotShared),
+            Ok(None) => return Err(AssertionRefused::NotShared),
             Err(e) => {
                 tracing::warn!(%item, error = %e, "cannot place an item a paired server asked for");
                 return Err(AssertionRefused::Unavailable);
@@ -517,7 +520,11 @@ pub(crate) mod tests {
         client_endpoint: String,
     ) -> String {
         federation
-            .mint(bob_s, &bob_wants(client_endpoint, TokenScope::Play, 7))
+            .mint(
+                bob_s,
+                bob_s_key(),
+                &bob_wants(client_endpoint, TokenScope::Play, 7),
+            )
             .await
             .unwrap()
             .token

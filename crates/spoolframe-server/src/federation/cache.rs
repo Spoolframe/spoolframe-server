@@ -29,7 +29,8 @@ use spoolframe_types::{
 };
 
 use super::items::{self, local};
-use crate::store::federation_cache::{CachedFile, FileLimits};
+use crate::store::federation::PeerRecord;
+use crate::store::federation_cache::{BrowseLimits, Browsed, CachedFile, FileLimits};
 use crate::store::{Store, StoreError};
 
 /// The default limit on each origin's artwork files: 2 GiB.
@@ -69,18 +70,26 @@ impl Links {
         let _ = self.changed.send(());
     }
 
-    /// The open connection to `origin`, if there is one: one that closed
-    /// is forgotten.
-    pub fn get(&self, origin: &str) -> Option<Arc<Dialed>> {
+    /// The open connection to `peer`, the live pair as the caller read
+    /// it, if there is one to the key it is pinned to (C8-01): nothing is
+    /// sent to, or taken from, a key the pair has moved from. One that
+    /// closed is forgotten; one to another key is left to the cleanup of
+    /// the pair's move, as the caller's `peer` may be the older.
+    pub fn pinned(&self, peer: &PeerRecord) -> Option<Arc<Dialed>> {
+        self.open(&peer.server_id)
+            .filter(|dialed| peer.pinned_to(&dialed.connection().remote_id()))
+    }
+
+    /// The connection to `origin` that is open now, whatever key it is
+    /// to; one that closed is forgotten.
+    fn open(&self, origin: &str) -> Option<Arc<Dialed>> {
         let mut open = self.open.lock();
-        match open.get(origin) {
-            Some(dialed) if dialed.connection().close_reason().is_none() => Some(dialed.clone()),
-            Some(_) => {
-                open.remove(origin);
-                None
-            }
-            None => None,
+        let dialed = open.get(origin)?;
+        if dialed.connection().close_reason().is_some() {
+            open.remove(origin);
+            return None;
         }
+        Some(dialed.clone())
     }
 
     /// `origin` is online over `dialed`, until that connection closes.
@@ -104,9 +113,16 @@ impl Links {
         }
     }
 
-    /// Whether `origin` is online: a connection to it is open.
+    /// Close `dialed`, and forget it as `origin`'s if it still is.
+    pub(crate) fn forget(&self, origin: &str, dialed: &Arc<Dialed>) {
+        super::forget_kept(&mut self.open.lock(), origin, dialed, |kept| kept);
+        close(dialed);
+    }
+
+    /// Whether `origin` is online: a connection to it is open. Only what
+    /// the pages say: anything sent goes over [`Links::pinned`].
     pub fn online(&self, origin: &str) -> bool {
-        self.get(origin).is_some()
+        self.open(origin).is_some()
     }
 }
 
@@ -130,6 +146,21 @@ pub struct PeerCache {
     /// Each origin's posters that failed since its last sync: not asked
     /// for again until the next.
     misses: parking_lot::Mutex<HashMap<String, HashSet<String>>>,
+    /// The most of a hierarchy browsed at once; the default but in tests.
+    browse: BrowseLimits,
+}
+
+/// `browsed`, the items under `what` of `origin`'s: a hierarchy past what
+/// is browsed at once is refused as too large, nothing of it read.
+fn within_browse(what: &str, browsed: Browsed) -> Result<Vec<RemoteItem>, CatalogError> {
+    match browsed {
+        Browsed::Items(items) => Ok(items),
+        Browsed::OverLimit { items, bytes } => Err(CatalogError::TooLarge {
+            what: what.to_owned(),
+            items,
+            bytes,
+        }),
+    }
 }
 
 /// A store failure as a catalog's: the federation cache is the one
@@ -203,7 +234,16 @@ impl PeerCache {
             total_bytes: AtomicU64::new(limits.total),
             links,
             misses: parking_lot::Mutex::default(),
+            browse: BrowseLimits::default(),
         }
+    }
+
+    /// With `limits` on a hierarchy browsed at once instead of
+    /// [`BrowseLimits::default`]: for tests, which set them small.
+    #[must_use]
+    pub fn with_browse_limits(mut self, limits: BrowseLimits) -> Self {
+        self.browse = limits;
+        self
     }
 
     /// At most `limit` of `origin`'s posters to fetch: an available
@@ -481,7 +521,11 @@ impl Catalog for PeerCache {
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
         let (origin, remote, _) = self.available(id).await?;
         let item = local(&origin, &remote).ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
-        let children = self.store.cached_children(&origin, &remote.id).await?;
+        let children = self
+            .store
+            .cached_children(&origin, &remote.id, self.browse)
+            .await?;
+        let children = within_browse(&remote.id, children)?;
         Ok(ItemWithChildren {
             item,
             children: locals(&origin, &children),
@@ -494,17 +538,20 @@ impl Catalog for PeerCache {
         let (origin, remote, _) = self.available(show).await?;
         let episodes = self
             .store
-            .cached_grandchildren(&origin, &remote.id, "episode")
+            .cached_grandchildren(&origin, &remote.id, "episode", self.browse)
             .await?;
+        let episodes = within_browse(&remote.id, episodes)?;
         Ok(locals(&origin, &episodes))
     }
 
     async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
         let (origin, remote) = library.remote().ok_or_else(|| foreign(library))?;
-        let (tracks, _) = self
+        let remote = remote.to_string();
+        let tracks = self
             .store
-            .cached_page(origin, &remote.to_string(), "track", 0, u32::MAX)
+            .cached_all(origin, &remote, "track", self.browse)
             .await?;
+        let tracks = within_browse(&remote, tracks)?;
         Ok(locals(origin, &tracks))
     }
 
@@ -660,9 +707,14 @@ impl Catalog for PeerCache {
             call: "artwork".into(),
             source: e.into(),
         };
+        let peer = self
+            .store
+            .live_peer_by_server_id(origin)
+            .await?
+            .ok_or_else(|| unreachable("it is not paired".into()))?;
         let dialed = self
             .links
-            .get(origin)
+            .pinned(&peer)
             .ok_or_else(|| unreachable("it is offline".into()))?;
         match self.fetch(origin, &dialed, &remote).await {
             Ok(image) => Ok(image),
@@ -671,5 +723,402 @@ impl Catalog for PeerCache {
             }
             Err(e) => Err(unreachable(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spoolframe_protocol::federation::{RemoteKind, RemoteLibraryKind, SharedLibrary};
+
+    use super::*;
+    use crate::store::federation::NewPeer;
+    use crate::store::federation_cache::{CacheSynced, OriginLimits};
+    use crate::store::tests::{TestStore, state_dir, test_store};
+
+    const ORIGIN: &str = "aaaaaaaaaaaaaaaa";
+
+    fn remote(
+        id: &str,
+        kind: RemoteKind,
+        parent: Option<&str>,
+        grandparent: Option<&str>,
+        index: Option<u32>,
+    ) -> RemoteItem {
+        RemoteItem {
+            id: id.into(),
+            kind,
+            title: id.into(),
+            parent: parent.map(str::to_owned),
+            grandparent: grandparent.map(str::to_owned),
+            parent_title: None,
+            grandparent_title: None,
+            index,
+            parent_index: index.map(|_| 1),
+            year: None,
+            date: None,
+            // Padding, so each body is a few hundred bytes.
+            summary: Some("s".repeat(200)),
+            content_rating: None,
+            duration_ms: None,
+            count: None,
+            genres: Vec::new(),
+            artwork: Vec::new(),
+            external_ids: Vec::new(),
+            hash: String::new(),
+        }
+        .hashed()
+    }
+
+    /// A show of one season of four episodes in Shows (`plex:2`), and an
+    /// artist of one album of four tracks in Music (`plex:3`), cached
+    /// from the origin, whole, within the sync limits.
+    async fn cached_hierarchies(test: &str) -> (TestStore, String) {
+        let store = test_store(test).await;
+        let peer = store
+            .add_peer(
+                NewPeer {
+                    server_id: ORIGIN,
+                    endpoint_id: &"0a".repeat(32),
+                    display_name: "Alice's server",
+                    addrs: &[],
+                    relays: &[],
+                },
+                "bob",
+            )
+            .await
+            .unwrap();
+        let key = store
+            .federation_peer(&peer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .endpoint_id;
+        let show = remote("plex:show:1", RemoteKind::Show, None, None, None);
+        let season = remote(
+            "plex:season:2",
+            RemoteKind::Season,
+            Some(&show.id),
+            None,
+            Some(1),
+        );
+        let episodes = (10..14).map(|n| {
+            remote(
+                &format!("plex:episode:{n}"),
+                RemoteKind::Episode,
+                Some(&season.id),
+                Some(&show.id),
+                Some(n),
+            )
+        });
+        let shows: Vec<RemoteItem> = [show.clone(), season.clone()]
+            .into_iter()
+            .chain(episodes)
+            .collect();
+        let artist = remote("plex:artist:5", RemoteKind::Artist, None, None, None);
+        let album = remote(
+            "plex:album:6",
+            RemoteKind::Album,
+            Some(&artist.id),
+            None,
+            None,
+        );
+        let tracks = (20..24).map(|n| {
+            remote(
+                &format!("plex:track:{n}"),
+                RemoteKind::Track,
+                Some(&album.id),
+                Some(&artist.id),
+                Some(n),
+            )
+        });
+        let music: Vec<RemoteItem> = [artist.clone(), album.clone()]
+            .into_iter()
+            .chain(tracks)
+            .collect();
+        for (library, title, kind, name, items) in [
+            ("plex:2", "Shows", RemoteLibraryKind::Shows, "shows", shows),
+            ("plex:3", "Music", RemoteLibraryKind::Music, "music", music),
+        ] {
+            store
+                .cache_library(
+                    ORIGIN,
+                    &peer.id,
+                    &SharedLibrary {
+                        id: library.into(),
+                        title: title.into(),
+                        kind,
+                    },
+                    name,
+                )
+                .await
+                .unwrap();
+            store.begin_cache_sync(ORIGIN, library).await.unwrap();
+            store
+                .stage_cache_page(ORIGIN, library, &items, &[])
+                .await
+                .unwrap();
+            let synced = store
+                .finish_cache_sync(
+                    ORIGIN,
+                    (&peer.id, &key),
+                    library,
+                    "c1",
+                    true,
+                    OriginLimits::NONE,
+                )
+                .await
+                .unwrap();
+            assert_eq!(synced, CacheSynced::Written);
+        }
+        (store, peer.id)
+    }
+
+    /// The cache over `store`, browsing at most `limits` at once.
+    async fn cache(test: &str, store: &TestStore, limits: BrowseLimits) -> PeerCache {
+        let dir = state_dir(&format!("{test}-art")).await;
+        PeerCache::new(
+            store.store.clone(),
+            dir.as_ref().join("peers"),
+            FileLimits {
+                per_origin: u64::MAX,
+                total: u64::MAX,
+            },
+            Arc::new(Links::default()),
+        )
+        .with_browse_limits(limits)
+    }
+
+    fn fed(id: &str) -> MediaId {
+        MediaId::federated(ORIGIN, &id.parse().unwrap()).unwrap()
+    }
+
+    fn fed_library(id: &str) -> LibraryId {
+        LibraryId::federated(ORIGIN, &id.parse().unwrap()).unwrap()
+    }
+
+    /// The refusal: too large, naming what was browsed.
+    fn refused(what: &str, e: CatalogError) -> bool {
+        matches!(e, CatalogError::TooLarge { what: item, .. } if item == what)
+    }
+
+    /// Y8-01: a season of more episodes than are browsed at once, or of
+    /// more bytes of them, is refused as the client's `Item`, counted
+    /// before a body is read; one within the limits is browsed whole.
+    #[tokio::test]
+    async fn a_parent_of_more_children_than_are_browsed_at_once_is_refused() {
+        let (store, _) = cached_hierarchies("fed-browse-children").await;
+        let four_items = BrowseLimits {
+            items: 4,
+            bytes: u64::MAX,
+        };
+        let season = fed("plex:season:2");
+        let found = cache("fed-browse-children", &store, four_items)
+            .await
+            .item(&season)
+            .await
+            .unwrap();
+        assert_eq!(found.children.len(), 4);
+        for limits in [
+            BrowseLimits {
+                items: 3,
+                bytes: u64::MAX,
+            },
+            // Four bodies of a few hundred bytes each.
+            BrowseLimits {
+                items: 4,
+                bytes: 1000,
+            },
+        ] {
+            let e = cache("fed-browse-children", &store, limits)
+                .await
+                .item(&season)
+                .await
+                .expect_err("past the limits");
+            assert!(refused("plex:season:2", e));
+        }
+        // The show itself, of one season, is browsed under any of them.
+        cache(
+            "fed-browse-children",
+            &store,
+            BrowseLimits {
+                items: 1,
+                bytes: 1000,
+            },
+        )
+        .await
+        .item(&fed("plex:show:1"))
+        .await
+        .unwrap();
+    }
+
+    /// Y8-01: a show's episodes, every season's at once, are held to the
+    /// same limits.
+    #[tokio::test]
+    async fn a_show_of_more_episodes_than_are_browsed_at_once_is_refused() {
+        let (store, _) = cached_hierarchies("fed-browse-episodes").await;
+        let show = fed("plex:show:1");
+        let episodes = cache(
+            "fed-browse-episodes",
+            &store,
+            BrowseLimits {
+                items: 4,
+                bytes: u64::MAX,
+            },
+        )
+        .await
+        .episodes(&show)
+        .await
+        .unwrap();
+        assert_eq!(episodes.len(), 4);
+        let e = cache(
+            "fed-browse-episodes",
+            &store,
+            BrowseLimits {
+                items: 3,
+                bytes: u64::MAX,
+            },
+        )
+        .await
+        .episodes(&show)
+        .await
+        .expect_err("past the limits");
+        assert!(refused("plex:show:1", e));
+    }
+
+    /// Y8-01: a music library's tracks, every album's at once (All,
+    /// PX-43), are held to the same limits; its albums browse still.
+    #[tokio::test]
+    async fn a_library_of_more_tracks_than_are_browsed_at_once_is_refused() {
+        let (store, _) = cached_hierarchies("fed-browse-tracks").await;
+        let music = fed_library("plex:3");
+        let tracks = cache(
+            "fed-browse-tracks",
+            &store,
+            BrowseLimits {
+                items: 4,
+                bytes: u64::MAX,
+            },
+        )
+        .await
+        .tracks(&music)
+        .await
+        .unwrap();
+        assert_eq!(tracks.len(), 4);
+        let three = cache(
+            "fed-browse-tracks",
+            &store,
+            BrowseLimits {
+                items: 3,
+                bytes: u64::MAX,
+            },
+        )
+        .await;
+        let e = three.tracks(&music).await.expect_err("past the limits");
+        assert!(refused("plex:3", e));
+        // The album, of four tracks, is past them too; the artist, of one
+        // album, is not.
+        assert!(refused(
+            "plex:album:6",
+            three
+                .item(&fed("plex:album:6"))
+                .await
+                .expect_err("past the limits")
+        ));
+        three.item(&fed("plex:artist:5")).await.unwrap();
+    }
+
+    /// The review of Y8-01: a music library of 50,000 tracks, each body
+    /// as a real track's measures and some, browses whole for All under
+    /// the default limits.
+    #[tokio::test]
+    async fn a_library_of_fifty_thousand_tracks_browses_for_all() {
+        let store = test_store("fed-browse-fifty-thousand").await;
+        let peer = store
+            .add_peer(
+                NewPeer {
+                    server_id: ORIGIN,
+                    endpoint_id: &"0a".repeat(32),
+                    display_name: "Alice's server",
+                    addrs: &[],
+                    relays: &[],
+                },
+                "bob",
+            )
+            .await
+            .unwrap();
+        let key = store
+            .federation_peer(&peer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .endpoint_id;
+        store
+            .cache_library(
+                ORIGIN,
+                &peer.id,
+                &SharedLibrary {
+                    id: "plex:3".into(),
+                    title: "Music".into(),
+                    kind: RemoteLibraryKind::Music,
+                },
+                "music",
+            )
+            .await
+            .unwrap();
+        store.begin_cache_sync(ORIGIN, "plex:3").await.unwrap();
+        let track = |n: u32| {
+            RemoteItem {
+                id: format!("plex:track:{n}"),
+                kind: RemoteKind::Track,
+                title: format!("Track {n}: a title about as long as a real one"),
+                parent: Some(format!("plex:album:{}", n / 12)),
+                grandparent: Some(format!("plex:artist:{}", n / 120)),
+                parent_title: Some("An album title of the usual length".into()),
+                grandparent_title: Some("An artist's name".into()),
+                index: Some(n % 12),
+                parent_index: Some(1),
+                year: Some(2001),
+                date: None,
+                summary: None,
+                content_rating: None,
+                duration_ms: Some(240_000),
+                count: None,
+                genres: vec!["Electronic".into()],
+                artwork: vec![spoolframe_protocol::federation::RemoteArtwork {
+                    id: format!("plex:/library/metadata/{}/thumb/1700000000", n / 12),
+                    kind: spoolframe_protocol::federation::RemoteArtworkKind::Poster,
+                }],
+                external_ids: vec![format!("mbid://a1b2c3d4-e5f6-7890-abcd-ef12345{n:05}")],
+                hash: String::new(),
+            }
+            .hashed()
+        };
+        let body = serde_json::to_string(&track(49_999)).unwrap().len();
+        assert!(body >= 600, "a track's body is {body} bytes");
+        for page in 0..50 {
+            let items: Vec<RemoteItem> = (page * 1000..(page + 1) * 1000).map(track).collect();
+            store
+                .stage_cache_page(ORIGIN, "plex:3", &items, &[])
+                .await
+                .unwrap();
+        }
+        let synced = store
+            .finish_cache_sync(
+                ORIGIN,
+                (&peer.id, &key),
+                "plex:3",
+                "c1",
+                true,
+                OriginLimits::NONE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(synced, CacheSynced::Written);
+        let tracks = cache("fed-browse-fifty-thousand", &store, BrowseLimits::default())
+            .await
+            .tracks(&fed_library("plex:3"))
+            .await
+            .unwrap();
+        assert_eq!(tracks.len(), 50_000);
     }
 }

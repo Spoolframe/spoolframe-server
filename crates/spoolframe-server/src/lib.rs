@@ -71,6 +71,8 @@ pub mod subtitle_sync;
 pub mod subtitles;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
+pub mod test_holds;
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod ties;
 pub mod tls;

@@ -1,7 +1,9 @@
 //! The main server's side of its relay's question (P6-04): which tier an
 //! endpoint is in, for a relay of its own to let through or not. Only the
 //! relays `network.own_relays` names are answered; anyone else is closed
-//! on at once.
+//! on at once. A relay is told at once when a paired server's answer no
+//! longer holds, unpaired or moved to a new key, rather than left to keep
+//! it until it expires.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,13 +14,14 @@ use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use spoolframe_protocol::close;
 use spoolframe_protocol::codec::{read_frame_within, write_frame};
-use spoolframe_protocol::relay_access::{AccessAnswer, AccessQuery, Tier, parse_play_token};
+use spoolframe_protocol::relay_access::{
+    AccessAnswer, AccessQuery, AccessRevoked, MAX_FRAME, Tier, parse_play_token,
+};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::auth::Auth;
 use crate::store::StoreError;
 
-/// A query is a key and some framing: anything larger is not one.
-const MAX_QUERY: u32 = 1024;
 /// How long a relay may take to send its question once it opens a stream.
 const QUERY_WAIT: Duration = Duration::from_secs(10);
 /// The connections one named relay may hold on this ALPN at once (P6-07,
@@ -188,22 +191,165 @@ impl ProtocolHandler for RelayAccess {
             return Ok(());
         };
         tracing::debug!(relay = %relay.fmt_short(), "the server's relay connected");
-        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            let this = self.clone();
-            tokio::spawn(async move {
-                let query: AccessQuery =
-                    match tokio::time::timeout(QUERY_WAIT, read_frame_within(&mut recv, MAX_QUERY))
-                        .await
-                    {
-                        Ok(Ok(query)) => query,
-                        _ => return,
-                    };
-                let tier = this.tier(&query.endpoint, query.invite.as_deref()).await;
-                if write_frame(&mut send, &AccessAnswer { tier }).await.is_ok() {
-                    let _ = send.finish();
+        let mut revoked = self.federation.as_ref().map(|f| f.revocations());
+        loop {
+            let revocation = async {
+                match revoked.as_mut() {
+                    Some(revoked) => revoked.recv().await,
+                    None => std::future::pending().await,
                 }
-            });
+            };
+            tokio::select! {
+                accepted = connection.accept_bi() => {
+                    let Ok((send, recv)) = accepted else {
+                        break;
+                    };
+                    tokio::spawn(self.clone().answer(send, recv));
+                }
+                revocation = revocation => match revocation {
+                    Ok(endpoint) => {
+                        tokio::spawn(tell_revoked(connection.clone(), endpoint));
+                    }
+                    // Behind by more than are kept: closed, the relay
+                    // forgets every answer as it connects again.
+                    Err(RecvError::Lagged(_)) => {
+                        connection.close(VarInt::from_u32(close::BUSY), b"answers revoked");
+                        break;
+                    }
+                    Err(RecvError::Closed) => revoked = None,
+                },
+            }
         }
         Ok(())
+    }
+}
+
+impl RelayAccess {
+    /// The question on `recv`, answered on `send`.
+    async fn answer(
+        self,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) {
+        let query: AccessQuery =
+            match tokio::time::timeout(QUERY_WAIT, read_frame_within(&mut recv, MAX_FRAME)).await {
+                Ok(Ok(query)) => query,
+                _ => return,
+            };
+        let tier = self.tier(&query.endpoint, query.invite.as_deref()).await;
+        if write_frame(&mut send, &AccessAnswer { tier }).await.is_ok() {
+            let _ = send.finish();
+        }
+    }
+}
+
+/// Tell the relay on `connection` that what it was answered for
+/// `endpoint` no longer holds, within [`QUERY_WAIT`]. A relay from before
+/// this never reads it, and keeps its answer until it expires.
+async fn tell_revoked(connection: Connection, endpoint: EndpointId) {
+    let told = tokio::time::timeout(QUERY_WAIT, async {
+        let mut send = connection.open_uni().await.map_err(|e| e.to_string())?;
+        let revoked = AccessRevoked {
+            endpoint: endpoint.to_string(),
+        };
+        write_frame(&mut send, &revoked)
+            .await
+            .map_err(|e| e.to_string())?;
+        send.finish().map_err(|e| e.to_string())
+    })
+    .await;
+    match told {
+        Ok(Ok(())) => {
+            tracing::debug!(endpoint = %endpoint.fmt_short(), "the relay is told an answer no longer holds")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(endpoint = %endpoint.fmt_short(), error = %e, "the relay cannot be told an answer no longer holds")
+        }
+        Err(_) => {
+            tracing::warn!(endpoint = %endpoint.fmt_short(), "the relay was not told in time that an answer no longer holds")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, SecretKey};
+    use spoolframe_protocol::relay_access::RELAY_ACCESS_ALPN;
+
+    use super::*;
+    use crate::federation::test_pairs::{bob_s_key, sharing};
+    use crate::store::federation::KeyHold;
+
+    fn endpoint() -> iroh::endpoint::Builder {
+        Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Disabled)
+    }
+
+    /// What the server tells `relay` next of an answer that no longer
+    /// holds.
+    async fn told(relay: &Connection) -> AccessRevoked {
+        let wait = std::time::Duration::from_secs(10);
+        let mut recv = tokio::time::timeout(wait, relay.accept_uni())
+            .await
+            .expect("told in time")
+            .unwrap();
+        read_frame_within(&mut recv, MAX_FRAME).await.unwrap()
+    }
+
+    /// The audit's C8-01: a relay connected is told at once that a pair's
+    /// old key, its new one confirmed, is no friend now, and then that an
+    /// unpaired server's key is not.
+    #[tokio::test]
+    async fn a_relay_is_told_of_a_pair_s_old_key_and_of_an_unpairing_at_once() {
+        let (store, federation, bob_s) = sharing("relay-access-revoked").await;
+        let federation = Arc::new(federation);
+        let peer = store
+            .live_peer_by_server_id(bob_s.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let server = endpoint()
+            .alpns(vec![RELAY_ACCESS_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let relay_key = SecretKey::from_bytes(&[4; 32]);
+        let access = RelayAccess::new(
+            vec![relay_key.public()],
+            server.id(),
+            federation.auth().clone(),
+            Some(federation.clone()),
+        );
+        let _router = iroh::protocol::Router::builder(server.clone())
+            .accept(RELAY_ACCESS_ALPN, access)
+            .spawn();
+        let relay = endpoint().secret_key(relay_key).bind().await.unwrap();
+        let connection = relay
+            .connect(server.addr(), RELAY_ACCESS_ALPN)
+            .await
+            .unwrap();
+        // Answered once: the server is listening for what it revokes.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let query = AccessQuery {
+            endpoint: bob_s_key().to_string(),
+            invite: None,
+        };
+        write_frame(&mut send, &query).await.unwrap();
+        send.finish().unwrap();
+        let answer: AccessAnswer = read_frame_within(&mut recv, MAX_FRAME).await.unwrap();
+        assert_eq!(answer.tier, Tier::Friend);
+
+        let new = SecretKey::from_bytes(&[12; 32]).public().to_string();
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &new).await.unwrap(),
+            KeyHold::New
+        );
+        federation
+            .confirm_key(&peer.id, &new, "alice")
+            .await
+            .unwrap();
+        assert_eq!(told(&connection).await.endpoint, bob_s_key().to_string());
+        federation.unpair(&peer.id, "alice").await.unwrap().unwrap();
+        assert_eq!(told(&connection).await.endpoint, new);
     }
 }

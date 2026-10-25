@@ -23,7 +23,7 @@
 
 use iroh::EndpointId;
 use spoolframe_protocol::federation::TokenScope;
-use spoolframe_types::{MediaId, MediaKind};
+use spoolframe_types::MediaId;
 
 use super::Federation;
 use crate::auth::SessionToken;
@@ -77,10 +77,7 @@ impl Federation {
             .into_iter()
             .find(|s| s.name() == kept.scope)
             .ok_or(PlayTokenError::Invalid)?;
-        if !matches!(
-            item.kind(),
-            MediaKind::Movie | MediaKind::Episode | MediaKind::Track
-        ) {
+        if !item.kind().plays() {
             return Err(PlayTokenError::Invalid);
         }
         let mut session_user = RemoteSessionUser {
@@ -125,7 +122,7 @@ impl Federation {
             .await?
             .ok_or(PlayTokenError::Invalid)?;
         #[cfg(test)]
-        self.hold_redeeming.here().await;
+        self.holds.redeeming.here().await;
         // The redemption checked its pair is live, and read what it is.
         let proxied = redeemed.peer_endpoint == endpoint;
         // SA's admins manage servers, not people (P8-03): the Playback
@@ -228,44 +225,6 @@ impl Federation {
     }
 }
 
-/// A test's hold on the next redemption, once its token is used up and
-/// before its session opens: it says it is there, and waits to go on.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(super) struct Hold(
-    parking_lot::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
-);
-
-#[cfg(test)]
-impl Hold {
-    /// Hold the next redemption: what says it is held there, and what
-    /// lets it go on.
-    pub(super) fn next(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (reached, held) = tokio::sync::oneshot::channel();
-        let (go, going) = tokio::sync::oneshot::channel();
-        *self.0.lock() = Some((reached, going));
-        (held, go)
-    }
-
-    async fn here(&self) {
-        let held = self.0.lock().take();
-        if let Some((reached, go)) = held {
-            let _ = reached.send(());
-            let _ = go.await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -292,7 +251,7 @@ mod tests {
         endpoint: &str,
         meanwhile: F,
     ) -> Result<(SessionToken, RemoteSessionUser), PlayTokenError> {
-        let (held, go) = federation.hold_redeeming.next();
+        let (held, go) = federation.holds.redeeming.next();
         let racing = async {
             held.await.unwrap();
             meanwhile.await;
@@ -480,7 +439,11 @@ mod tests {
             });
             let device = device().to_string();
             let token = federation
-                .mint(&bob_s, &bob_wants(device.clone(), TokenScope::Download, 7))
+                .mint(
+                    &bob_s,
+                    bob_s_key(),
+                    &bob_wants(device.clone(), TokenScope::Download, 7),
+                )
                 .await
                 .unwrap()
                 .token;
@@ -490,6 +453,7 @@ mod tests {
                     federation
                         .mint(
                             &bob_s,
+                            bob_s_key(),
                             &bob_wants(device.clone(), TokenScope::Download, next_user),
                         )
                         .await,
@@ -548,7 +512,11 @@ mod tests {
         ));
         assert_eq!(
             federation
-                .mint(&bob_s, &bob_wants(device.clone(), TokenScope::Play, 7))
+                .mint(
+                    &bob_s,
+                    bob_s_key(),
+                    &bob_wants(device.clone(), TokenScope::Play, 7)
+                )
                 .await
                 .map(|g| g.scope),
             Err(AssertionRefused::NotShared)
@@ -594,7 +562,11 @@ mod tests {
             Err(PlayTokenError::Busy)
         ));
         let download = federation
-            .mint(&bob_s, &bob_wants(device.clone(), TokenScope::Download, 7))
+            .mint(
+                &bob_s,
+                bob_s_key(),
+                &bob_wants(device.clone(), TokenScope::Download, 7),
+            )
             .await
             .unwrap()
             .token;

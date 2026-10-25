@@ -114,6 +114,15 @@ impl MediaKind {
             MediaKind::Track => "track",
         }
     }
+
+    /// Whether an item of this kind plays: a movie, an episode or a
+    /// track, never a show, a season, an artist or an album.
+    pub fn plays(self) -> bool {
+        matches!(
+            self,
+            MediaKind::Movie | MediaKind::Episode | MediaKind::Track
+        )
+    }
 }
 
 impl FromStr for MediaKind {

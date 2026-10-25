@@ -21,7 +21,7 @@ use spoolframe_protocol::federation::{SharedLibrary, Standing, SyncLibrary, Sync
 use spoolframe_types::MediaId;
 
 use super::exposure::WEEK_DAYS;
-use super::{Federation, endpoint_addr, parsed};
+use super::{Federation, peer_addr};
 use crate::store::StoreError;
 use crate::store::federation::PeerRecord;
 use crate::store::federation_cache::{CacheSynced, FileLimits, OriginLimits};
@@ -33,8 +33,8 @@ const TICK: Duration = Duration::from_secs(15);
 
 /// The first wait before dialling an origin again after it could not be
 /// reached; doubled at each failure, to at most [`MAX_RETRY`].
-const FIRST_RETRY: Duration = Duration::from_secs(30);
-const MAX_RETRY: Duration = Duration::from_secs(30 * 60);
+pub(super) const FIRST_RETRY: Duration = Duration::from_secs(30);
+pub(super) const MAX_RETRY: Duration = Duration::from_secs(30 * 60);
 
 /// The most posters fetched from an origin at one tick, and how many at
 /// once (M5): a first sync of a big library is fetched over a few minutes,
@@ -42,14 +42,19 @@ const MAX_RETRY: Duration = Duration::from_secs(30 * 60);
 const POSTER_SWEEP: u32 = 200;
 const POSTER_FETCHES: usize = 6;
 
+/// How long one pair's poster sweep may take, its fetches together: the
+/// next tick fetches the rest.
+const SWEEP_WAIT: Duration = Duration::from_secs(5 * 60);
+
 /// How many pairs are dialled and synced at once: one that stops
 /// answering holds its own place, not the others' (C8-05).
 const PAIRS_AT_ONCE: usize = 4;
 
 /// How long one pair's sync may take, every library together (C8-05):
 /// each page comes within its own wait, but 2,000 of them, each just
-/// inside it, would hold the pair's place for more than a day.
-pub const SYNC_BUDGET: Duration = Duration::from_secs(30 * 60);
+/// inside it, would hold the pair's place for more than a day. The
+/// dialled side's bound on sending an answer is the same constant.
+pub const SYNC_BUDGET: Duration = spoolframe_federation::SYNC_WAIT;
 
 /// The default time between two syncs of a pair.
 pub const DEFAULT_SYNC_EVERY: Duration = Duration::from_secs(3600);
@@ -96,6 +101,14 @@ pub enum ReplicaError {
     /// new key.
     #[error("the other server does not pair with this one now ({0:?})")]
     NotPaired(Standing),
+    /// The pair's key answered under another server id than the pair's
+    /// (C8-06): refused, as an incoming hello is.
+    #[error("the paired server's key answered as another server, {0:?}")]
+    OtherServer(String),
+    /// The pair moved to another key, or ended, while it was dialled or
+    /// synced (C8-01): what came from the old key is not kept.
+    #[error("the pair moved to another key, or ended, meanwhile")]
+    Moved,
     /// A library's answer went past a limit ([`SyncLimits`]): it is not
     /// kept.
     #[error("the answer has more {what} than the {limit} kept")]
@@ -108,21 +121,41 @@ pub enum ReplicaError {
     Store(#[from] StoreError),
 }
 
-/// What the replica keeps of each pair between ticks.
+/// What the replica keeps of each pair between ticks: of the key it was
+/// last tended at, as a new key starts afresh. Its times are the server's
+/// [`Clock`](crate::clock::Clock)'s, read as each attempt ends, not as it
+/// began (X8-05): an attempt that fails after its wait's worth of time
+/// would otherwise have used its wait up before it ended, and be made
+/// again at the next tick.
 #[derive(Debug)]
-struct Tended {
-    last_sync: Option<Instant>,
-    retry_at: Instant,
-    failures: u32,
+pub(super) struct Tended {
+    /// The key, hex.
+    pub(super) endpoint: String,
+    pub(super) last_sync: Option<Instant>,
+    /// No dial nor sync before then: one failed, or the pair could not be
+    /// reached.
+    pub(super) retry_at: Instant,
+    pub(super) failures: u32,
 }
 
-impl Default for Tended {
-    fn default() -> Self {
+impl Tended {
+    /// Nothing tended yet, as of `now`: due at once.
+    pub(super) fn at(now: Instant) -> Self {
         Self {
+            endpoint: String::new(),
             last_sync: None,
-            retry_at: Instant::now(),
+            retry_at: now,
             failures: 0,
         }
+    }
+
+    /// Another failure, ending at `now`: no dial nor sync for a while
+    /// from then, longer each time.
+    fn failed(&mut self, now: Instant) -> Duration {
+        self.failures += 1;
+        let wait = retry_after(self.failures);
+        self.retry_at = now + wait;
+        wait
     }
 }
 
@@ -137,6 +170,12 @@ impl Federation {
     /// closes, or the federation is dropped. The upkeep runs on its own,
     /// so a pair that stops answering never holds it up (C8-05).
     pub(crate) fn start_replica(self: &Arc<Self>) {
+        self.spawn_upkeep();
+        self.spawn_tending();
+    }
+
+    /// The upkeep, each tick.
+    fn spawn_upkeep(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
@@ -151,6 +190,10 @@ impl Federation {
                 tokio::time::sleep(TICK).await;
             }
         });
+    }
+
+    /// The pairs, each tick, and when woken.
+    fn spawn_tending(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut tended = HashMap::new();
@@ -230,8 +273,12 @@ impl Federation {
             }
         };
         tended.retain(|id, _| peers.iter().any(|p| &p.id == id));
+        let now = self.store().clock().now();
         for peer in peers {
-            let state = tended.entry(peer.id.clone()).or_default().clone();
+            let state = tended
+                .entry(peer.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(Tended::at(now))))
+                .clone();
             let Ok(mut state) = state.try_lock_owned() else {
                 continue;
             };
@@ -247,16 +294,18 @@ impl Federation {
                 {
                     tracing::warn!(error = %e, "cannot keep when a paired server was seen");
                 }
-                this.sweep_posters(&peer.server_id).await;
+                // Within a while: the rest come at the next tick.
+                let _ = tokio::time::timeout(SWEEP_WAIT, this.sweep_posters(&peer)).await;
             });
         }
     }
 
-    /// Fetch some of `origin`'s posters that have no file yet, a few at
+    /// Fetch some of `peer`'s posters that have no file yet, a few at
     /// a time; when it says to wait, the rest wait for the next tick. One
     /// that fails is not asked for again until the origin's next sync.
-    async fn sweep_posters(&self, origin: &str) {
-        let Some(dialed) = self.links.get(origin) else {
+    async fn sweep_posters(&self, peer: &PeerRecord) {
+        let origin = peer.server_id.as_str();
+        let Some(dialed) = self.links.pinned(peer) else {
             return;
         };
         let posters = match self.cache.missing_posters(origin, POSTER_SWEEP).await {
@@ -287,51 +336,95 @@ impl Federation {
         }
     }
 
-    async fn tend(&self, peer: &PeerRecord, state: &mut Tended) {
-        let now = Instant::now();
-        let connected = self.links.get(&peer.server_id).is_some();
-        if !connected {
-            if now < state.retry_at {
+    /// Tend pair `listed`, as the list of pairs gave it, once: dial it if
+    /// it is not connected, and sync it on connecting or when it is due,
+    /// unless its last dial or sync failed a while ago. A key confirmed
+    /// since the last time is dialled at once, whatever the old one's
+    /// failures (C8-01).
+    pub(super) async fn tend(&self, listed: &PeerRecord, state: &mut Tended) {
+        // Read again: a key confirmed since the list was read is dialled
+        // now, not the old one (C8-01). Not under the sync lock, which
+        // only the sync takes (C8-05).
+        let peer = match self.pair_now(listed).await {
+            Ok(Some(peer)) => peer,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot look a pair up to sync it");
                 return;
             }
+        };
+        let peer = &peer;
+        let clock = self.store().clock();
+        let now = clock.now();
+        if state.endpoint != peer.endpoint_id {
+            *state = Tended {
+                endpoint: peer.endpoint_id.clone(),
+                ..Tended::at(now)
+            };
+        }
+        if now < state.retry_at {
+            return;
+        }
+        let connected = self.links.pinned(peer).is_some();
+        if !connected {
             // Not under the sync lock: an unpairing waits for a sync in
             // flight, never for a dial (C8-05).
-            if let Err(e) = self.connect(peer).await {
-                state.failures += 1;
-                let wait = retry_after(state.failures);
-                state.retry_at = now + wait;
-                tracing::info!(
-                    peer = %peer.endpoint_id,
-                    name = %peer.display_name,
-                    error = %e,
-                    retry_in_secs = wait.as_secs(),
-                    "a paired server is offline"
-                );
-                return;
+            match self.connect(peer).await {
+                Ok(()) => {}
+                // Its key moved meanwhile: the new one is dialled at the
+                // next tick, not as one that failed.
+                Err(ReplicaError::Moved) => return,
+                // The wait runs from the failure, not from the attempt's
+                // start (X8-05): a dial that fails late waits its whole
+                // wait still, and the log says so.
+                Err(e) => {
+                    let wait = state.failed(clock.now());
+                    tracing::info!(
+                        peer = %peer.endpoint_id,
+                        name = %peer.display_name,
+                        error = %e,
+                        retry_in_secs = wait.as_secs(),
+                        "a paired server is offline"
+                    );
+                    return;
+                }
             }
-            state.failures = 0;
         }
         let due = state
             .last_sync
             .is_none_or(|at| now.duration_since(at) >= self.sync_every());
         if !connected || due {
             match self.sync_live(peer).await {
-                Ok(()) => state.last_sync = Some(now),
-                Err(e) => tracing::warn!(
-                    peer = %peer.endpoint_id,
-                    name = %peer.display_name,
-                    error = %e,
-                    "cannot sync a paired server"
-                ),
+                Ok(()) => {
+                    state.last_sync = Some(clock.now());
+                    state.failures = 0;
+                }
+                Err(ReplicaError::Moved) => {}
+                // A pair whose sync fails waits as one that cannot be
+                // dialled does: it does not take a place each tick, and
+                // the wait runs from the failure (X8-05).
+                Err(e) => {
+                    let wait = state.failed(clock.now());
+                    tracing::warn!(
+                        peer = %peer.endpoint_id,
+                        name = %peer.display_name,
+                        error = %e,
+                        retry_in_secs = wait.as_secs(),
+                        "cannot sync a paired server"
+                    );
+                }
             }
         }
     }
 
     /// Dial `peer` unless a connection to it is open: one dial at a time,
-    /// so the replica's and a refresh's never replace each other's.
-    async fn connect(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
+    /// so the replica's and a refresh's never replace each other's. The
+    /// pair is read again under the lock, as the play pool's is: a key
+    /// confirmed while another dial held it is the one dialled.
+    pub(super) async fn connect(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
         let _dialing = self.dialing.lock(&peer.server_id).await;
-        if self.links.get(&peer.server_id).is_some() {
+        let peer = &self.pair_now(peer).await?.ok_or(ReplicaError::Moved)?;
+        if self.links.pinned(peer).is_some() {
             return Ok(());
         }
         self.dial(peer).await
@@ -339,18 +432,22 @@ impl Federation {
 
     /// Dial `peer` and keep the connection: it is online. One that does
     /// not pair with this server any more shares nothing: its cached
-    /// libraries go.
+    /// libraries go. One that answers under another server id is not the
+    /// pair (C8-06): refused, and kept for the Federation page, as an
+    /// incoming hello under another id is.
     async fn dial(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
         let attached = self
             .attached
             .get()
             .ok_or_else(|| DialError::Unreachable("this server is starting".into()))?;
-        let endpoint: iroh::EndpointId = peer
-            .endpoint_id
-            .parse()
-            .map_err(|_| DialError::Unreachable("a pair's key does not read".into()))?;
-        let addr = endpoint_addr(endpoint, parsed(&peer.addrs), &peer.relays);
+        let addr = peer_addr(peer)
+            .ok_or_else(|| DialError::Unreachable("a pair's key does not read".into()))?;
         let (dialed, info) = Dialed::connect(&attached.endpoint, addr, self.hello()).await?;
+        if info.server_id != peer.server_id {
+            dialed.close();
+            self.identity_refused(peer, &info.server_id).await;
+            return Err(ReplicaError::OtherServer(info.server_id));
+        }
         if info.standing != Standing::Paired {
             dialed.close();
             if info.standing == Standing::Stranger {
@@ -359,17 +456,33 @@ impl Federation {
                     name = %peer.display_name,
                     "a paired server no longer pairs with this one: what it shared is dropped"
                 );
+                // Only while the pair is the one that said so: a key
+                // confirmed, or another pairing, meanwhile keeps its cache.
                 let _syncing = self.syncing.lock(&peer.server_id).await;
-                self.drop_cached(&peer.server_id, None).await?;
+                if self.still_pinned(peer).await? {
+                    self.drop_cached(&peer.server_id, None).await?;
+                }
             }
             return Err(ReplicaError::NotPaired(info.standing));
+        }
+        #[cfg(test)]
+        self.holds.dialing.here().await;
+        // Kept, then checked against the pin (C8-01): a key confirmed, or
+        // an unpairing, while this dial was on its way is either seen here
+        // or commits after the connection is kept, and its cleanup closes
+        // it. Checked before keeping, a cleanup between the two would find
+        // nothing to close.
+        let dialed = Arc::new(dialed);
+        self.links.set(&peer.server_id, dialed.clone());
+        if !self.still_pinned(peer).await? {
+            self.links.forget(&peer.server_id, &dialed);
+            return Err(ReplicaError::Moved);
         }
         tracing::info!(
             peer = %peer.endpoint_id,
             name = %peer.display_name,
             "connected to a paired server"
         );
-        self.links.set(&peer.server_id, Arc::new(dialed));
         Ok(())
     }
 
@@ -379,13 +492,9 @@ impl Federation {
     async fn sync_live(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
         let _syncing = self.syncing.lock(&peer.server_id).await;
         // The pair as it is now, under the lock: what the sync goes by.
-        let Some(now) = self
-            .store()
-            .federation_peer(&peer.id)
-            .await?
-            .filter(PeerRecord::live)
-        else {
-            self.links.drop_origin(&peer.server_id);
+        // Gone: its unpairing closes its connection, and one made after,
+        // to a server paired again under its id, is not this pair's.
+        let Some(now) = self.pair_now(peer).await? else {
             return Err(ReplicaError::NoSuchPeer(peer.id.clone()));
         };
         self.sync_peer(&now, tokio::time::Instant::now() + SYNC_BUDGET)
@@ -404,7 +513,7 @@ impl Federation {
         let origin = peer.server_id.as_str();
         let dialed = self
             .links
-            .get(origin)
+            .pinned(peer)
             .ok_or_else(|| DialError::Unreachable("not connected".into()))?;
         let listed = match dialed.libraries().await {
             Ok(listed) => listed,
@@ -413,6 +522,12 @@ impl Federation {
                 return Err(e.into());
             }
         };
+        // What it lists drops and withdraws: only while its key is the
+        // pair's, as when the sync began.
+        if !self.still_pinned(peer).await? {
+            self.links.forget(origin, &dialed);
+            return Err(ReplicaError::Moved);
+        }
         let listed: Vec<(SharedLibrary, &str)> = listed
             .into_iter()
             .filter_map(|l| {
@@ -501,23 +616,23 @@ impl Federation {
                 since,
             })
             .await?;
-        self.cache_sync(origin, &peer.id, library, &mut pages, deadline)
-            .await
+        self.cache_sync(peer, library, &mut pages, deadline).await
     }
 
-    /// Read `pages`, a sync of `origin`'s `library` over pair `peer`, into
-    /// the cache: each
-    /// page staged as it comes, and all written, with the cursor, once the
-    /// last is (H1). An answer cut short, past the limits as the sync
-    /// begins, or not whole by `deadline` (C8-05), writes nothing.
+    /// Read `pages`, a sync of `peer`'s `library` from its key, into the
+    /// cache: each page staged as it comes, and all written, with the
+    /// cursor, once the last is (H1). An answer cut short, past the limits
+    /// as the sync begins, or not whole by `deadline` (C8-05), writes
+    /// nothing; nor does one whose pair moved to another key, or ended,
+    /// before it is written (C8-01).
     pub(crate) async fn cache_sync(
         &self,
-        origin: &str,
-        peer: &str,
+        peer: &PeerRecord,
         library: &str,
         pages: &mut impl PageSource,
         deadline: tokio::time::Instant,
     ) -> Result<(), ReplicaError> {
+        let origin = peer.server_id.as_str();
         let limits = self.limits().sync;
         let store = self.store();
         store.begin_cache_sync(origin, library).await?;
@@ -575,10 +690,12 @@ impl Federation {
                 return Err(e);
             }
         };
+        #[cfg(test)]
+        self.holds.committing.here().await;
         match store
             .finish_cache_sync(
                 origin,
-                peer,
+                (&peer.id, &peer.endpoint_id),
                 library,
                 &cursor,
                 mode == SyncMode::Snapshot,
@@ -590,6 +707,7 @@ impl Federation {
             .await?
         {
             CacheSynced::Written => {}
+            CacheSynced::Moved => return Err(ReplicaError::Moved),
             CacheSynced::OverLimit { items, .. } if items > limits.origin_items => {
                 return Err(ReplicaError::TooLarge {
                     what: "items cached of the server",
@@ -811,9 +929,24 @@ mod tests {
             sync: limits,
             ..crate::federation::Limits::default()
         });
-        federation
-            .cache_sync(ORIGIN, peer, "plex:1", &mut answer, in_budget())
+        let peer = federation
+            .store()
+            .federation_peer(peer)
             .await
+            .unwrap()
+            .unwrap();
+        federation
+            .cache_sync(&peer, "plex:1", &mut answer, in_budget())
+            .await
+    }
+
+    async fn record_of(federation: &Federation, peer: &str) -> PeerRecord {
+        federation
+            .store()
+            .federation_peer(peer)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     fn in_budget() -> tokio::time::Instant {
@@ -855,6 +988,40 @@ mod tests {
         drop(syncing);
         forget.await;
         assert_eq!(cached(&federation).await, 0);
+    }
+
+    /// The audit's C8-01: a sync read from the pair's old key, written
+    /// after a new key is confirmed, writes nothing. The cache and the
+    /// cursor stay as they were.
+    #[tokio::test]
+    async fn a_sync_of_the_old_key_written_after_a_new_one_is_confirmed_is_not_kept() {
+        let (store, federation, peer) = replica("fed-replica-moved").await;
+        let record = store.federation_peer(&peer).await.unwrap().unwrap();
+        let new = iroh::SecretKey::from_bytes(&[12; 32]).public().to_string();
+        store.hold_peer_key(&peer, &new).await.unwrap();
+        let mut answer = Answer {
+            pages: vec![page(SyncMode::Snapshot, &["1", "2"], false)].into_iter(),
+            endless: false,
+        };
+        let (held, go) = federation.holds.committing.next();
+        let confirm = async {
+            held.await.unwrap();
+            federation.confirm_key(&peer, &new, "bob").await.unwrap();
+            go.send(()).unwrap();
+        };
+        let (synced, ()) = tokio::join!(
+            federation.cache_sync(&record, "plex:1", &mut answer, in_budget()),
+            confirm
+        );
+        assert!(matches!(synced, Err(ReplicaError::Moved)), "{synced:?}");
+        assert_eq!(cached(&federation).await, 0);
+        let cursor = store
+            .cached_library(ORIGIN, "plex:1")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor, None);
     }
 
     /// An unpaired server's rows, not dropped yet, are found by no search
@@ -991,7 +1158,12 @@ mod tests {
         };
         let budget = tokio::time::Instant::now() + Duration::from_millis(300);
         let cut = federation
-            .cache_sync(ORIGIN, &peer, "plex:1", &mut slow, budget)
+            .cache_sync(
+                &record_of(&federation, &peer).await,
+                "plex:1",
+                &mut slow,
+                budget,
+            )
             .await;
         assert!(matches!(cut, Err(ReplicaError::TooSlow(_))), "{cut:?}");
         assert!(slow.served > 1, "pages came in their time");
@@ -1062,7 +1234,12 @@ mod tests {
             served: 0,
         };
         let cut = federation
-            .cache_sync(ORIGIN, &peer, "plex:1", &mut padded, in_budget())
+            .cache_sync(
+                &record_of(&federation, &peer).await,
+                "plex:1",
+                &mut padded,
+                in_budget(),
+            )
             .await;
         assert!(
             matches!(

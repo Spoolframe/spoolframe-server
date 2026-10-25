@@ -167,6 +167,22 @@ impl Store {
         .await?)
     }
 
+    /// Whether image `artwork` was sent to live pair `peer` from a library
+    /// still shared with it: what its ask for the image is answered on.
+    pub async fn artwork_shared(&self, peer: &str, artwork: &str) -> Result<bool, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM federation_sync_artwork a \
+                            JOIN federation_grants g ON g.peer = a.peer AND g.library = a.library \
+                            JOIN federation_peers p ON p.id = g.peer \
+                            WHERE a.peer = ?1 AND a.artwork = ?2 \
+                              AND g.revoked_at IS NULL AND p.revoked_at IS NULL)",
+        )
+        .bind(peer)
+        .bind(artwork)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// The kept external ids of `library`'s items, by item: each with the
     /// hash of the rest of it when they were read. Read once per walk of
     /// the library, not once per item, and not the other libraries'.

@@ -50,6 +50,9 @@ pub struct CachedItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheSynced {
     Written,
+    /// Not written: the pair is not pinned to the key synced from now,
+    /// or ended (C8-01). The cache stays as it was.
+    Moved,
     /// Not written: the origin's items would have been `items`, their
     /// bodies `bytes`, one of them past its limit. The cache stays as it
     /// was.
@@ -81,6 +84,50 @@ impl OriginLimits {
 /// hundred KiB at the most the protocol's bounds let it be, every
 /// character escaped, so a batch is some tens of MiB at worst.
 const FINISH_BATCH: i64 = 100;
+
+/// The most of an origin's hierarchy a user here browses at once: one
+/// item's children or grandchildren, or one library's tracks. Past these
+/// the hierarchy is refused, not read. Constants: a reply carries at most
+/// [`spoolframe_protocol::codec::MAX_REPLY`], which no setting moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowseLimits {
+    pub items: u64,
+    /// Bytes of their bodies, as JSON.
+    pub bytes: u64,
+}
+
+impl Default for BrowseLimits {
+    /// A 50,000-track library browses whole for All, at the 600 bytes a
+    /// track's body measures and some way past it; a hierarchy padded to
+    /// the protocol's bounds does not.
+    fn default() -> Self {
+        Self {
+            items: 60_000,
+            bytes: 48 << 20,
+        }
+    }
+}
+
+/// What a browse of an origin's hierarchy read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Browsed {
+    Items(Vec<RemoteItem>),
+    /// Nothing: `items` items of `bytes` bytes, past the limits, counted
+    /// before any body was read.
+    OverLimit {
+        items: u64,
+        bytes: u64,
+    },
+}
+
+impl Browsed {
+    /// `OverLimit` when `items` or `bytes` is past `limits`.
+    fn over(limits: BrowseLimits, (items, bytes): (i64, i64)) -> Option<Self> {
+        let items = u64::try_from(items).unwrap_or_default();
+        let bytes = u64::try_from(bytes).unwrap_or_default();
+        (items > limits.items || bytes > limits.bytes).then_some(Self::OverLimit { items, bytes })
+    }
+}
 
 /// The most the paired servers' image files take, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,38 +350,29 @@ impl Store {
         items: &[RemoteItem],
         removed: &[String],
     ) -> Result<u64, StoreError> {
-        let mut tx = self.begin_write().await?;
+        // One statement for the page, as `keep_sync_state` writes its
+        // rows: the items first, then those gone as (id, NULL, NULL), in
+        // order, so the last named wins.
         let mut bytes = 0u64;
+        let mut rows: Vec<(&str, Option<&str>, Option<String>)> = Vec::new();
         for item in items {
             if item.kind.as_str().is_none() {
                 continue;
             }
             let body = serde_json::to_string(item).expect("an item serializes");
             bytes += body.len() as u64;
-            sqlx::query(
-                "INSERT OR REPLACE INTO federation_cache_staged \
-                     (origin, library, item, hash, body) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .bind(origin)
-            .bind(library_id)
-            .bind(&item.id)
-            .bind(&item.hash)
-            .bind(body)
-            .execute(&mut *tx)
-            .await?;
+            rows.push((&item.id, Some(&item.hash), Some(body)));
         }
-        for id in removed {
-            sqlx::query(
-                "INSERT OR REPLACE INTO federation_cache_staged \
-                     (origin, library, item, hash, body) VALUES (?1, ?2, ?3, NULL, NULL)",
-            )
-            .bind(origin)
-            .bind(library_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
+        rows.extend(removed.iter().map(|id| (id.as_str(), None, None)));
+        sqlx::query(
+            "INSERT OR REPLACE INTO federation_cache_staged (origin, library, item, hash, body) \
+             SELECT ?1, ?2, value ->> 0, value ->> 1, value ->> 2 FROM json_each(?3)",
+        )
+        .bind(origin)
+        .bind(library_id)
+        .bind(serde_json::to_string(&rows).expect("strings serialize"))
+        .execute(&self.pool)
+        .await?;
         Ok(bytes)
     }
 
@@ -349,30 +387,46 @@ impl Store {
         Ok(())
     }
 
-    /// A sync of `origin`'s `library_id` over pair `peer` is whole, under
-    /// `cursor`: what it staged is written, in one transaction, and the
-    /// cursor kept as the library's. Items added or changed are written,
-    /// with their external ids and artwork; those named as gone go; with
-    /// `snapshot`, the answer was the whole library, and the items it did
-    /// not name go too. Past `limits`, of `origin`'s items or their
-    /// bodies' bytes in all, nothing is written. Either way the staged
-    /// pages go. The staged items are read back a batch at a time, in the
-    /// one transaction: however large the answer, what is held is a batch
-    /// (C8-02).
+    /// A sync of `origin`'s `library_id` over pair `peer`, from its key
+    /// `key` (hex), is whole, under `cursor`: what it staged is written, in
+    /// one transaction, and the cursor kept as the library's. Items added
+    /// or changed are written, with their external ids and artwork; those
+    /// named as gone go; with `snapshot`, the answer was the whole library,
+    /// and the items it did not name go too. Past `limits`, of `origin`'s
+    /// items or their bodies' bytes in all, nothing is written. Either way
+    /// the staged pages go. The staged items are read back a batch at a
+    /// time, in the one transaction: however large the answer, what is held
+    /// is a batch (C8-02).
     ///
     /// An item kept unavailable from another pair is not written, unless
     /// that pair had `peer`'s key (M2): a server that pairs later under
     /// the same server id does not take over the ids a user here holds.
+    /// Nor is anything written once `peer` is not live and pinned to `key`
+    /// (C8-01): checked in the transaction, so a key confirmed or an
+    /// unpairing either commits first and is seen, or waits for this one.
     pub async fn finish_cache_sync(
         &self,
         origin: &str,
-        peer: &str,
+        (peer, key): (&str, &str),
         library_id: &str,
         cursor: &str,
         snapshot: bool,
         limits: OriginLimits,
     ) -> Result<CacheSynced, StoreError> {
         let mut tx = self.begin_write().await?;
+        let pinned: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM federation_peers \
+                            WHERE id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL)",
+        )
+        .bind(peer)
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !pinned {
+            tx.rollback().await?;
+            self.abort_cache_sync(origin, library_id).await?;
+            return Ok(CacheSynced::Moved);
+        }
         let taken_over: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM federation_cache_staged s \
              JOIN federation_cache_items i ON i.origin = s.origin AND i.item = s.item \
@@ -593,38 +647,27 @@ impl Store {
         keep: &HashSet<String>,
     ) -> Result<(), StoreError> {
         let mut tx = self.begin_write().await?;
-        let items: Vec<String> = sqlx::query_scalar(
-            "SELECT item FROM federation_cache_items \
-             WHERE origin = ?1 AND (?2 IS NULL OR library = ?2)",
-        )
-        .bind(origin)
-        .bind(library_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        for item in items {
-            if keep.contains(&item) {
-                sqlx::query(
-                    "UPDATE federation_cache_items SET unavailable = 1 \
-                     WHERE origin = ?1 AND item = ?2",
-                )
+        // Set by set, `keep` bound once as a JSON array: the kept items
+        // are flagged and lose their artwork, the rest go.
+        let kept = serde_json::to_string(keep).expect("strings serialize");
+        for statement in [
+            "UPDATE federation_cache_items SET unavailable = 1 \
+             WHERE origin = ?1 AND (?2 IS NULL OR library = ?2) \
+               AND item IN (SELECT value FROM json_each(?3))",
+            "DELETE FROM federation_cache_item_artwork WHERE origin = ?1 \
+               AND item IN (SELECT item FROM federation_cache_items \
+                            WHERE origin = ?1 AND (?2 IS NULL OR library = ?2) \
+                              AND item IN (SELECT value FROM json_each(?3)))",
+            "DELETE FROM federation_cache_items \
+             WHERE origin = ?1 AND (?2 IS NULL OR library = ?2) \
+               AND item NOT IN (SELECT value FROM json_each(?3))",
+        ] {
+            sqlx::query(statement)
                 .bind(origin)
-                .bind(&item)
+                .bind(library_id)
+                .bind(&kept)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query(
-                    "DELETE FROM federation_cache_item_artwork WHERE origin = ?1 AND item = ?2",
-                )
-                .bind(origin)
-                .bind(&item)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query("DELETE FROM federation_cache_items WHERE origin = ?1 AND item = ?2")
-                    .bind(origin)
-                    .bind(&item)
-                    .execute(&mut *tx)
-                    .await?;
-            }
         }
         for table in [
             "DELETE FROM federation_cache_staged \
@@ -751,43 +794,98 @@ impl Store {
 
     /// The available items under `parent` of `origin`'s: a show's
     /// seasons, a season's episodes, an artist's albums, an album's
-    /// tracks, in their order.
+    /// tracks, in their order; within `limits`.
     pub async fn cached_children(
         &self,
         origin: &str,
         parent: &str,
-    ) -> Result<Vec<RemoteItem>, StoreError> {
-        let rows = sqlx::query_scalar(
+        limits: BrowseLimits,
+    ) -> Result<Browsed, StoreError> {
+        self.browsed(
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(body)), 0) \
+             FROM federation_cache_items \
+             WHERE origin = ?1 AND parent = ?2 AND unavailable = 0",
             "SELECT body FROM federation_cache_items \
              WHERE origin = ?1 AND parent = ?2 AND unavailable = 0 \
              ORDER BY position IS NULL, position, title, item",
+            &[origin, parent],
+            limits,
         )
-        .bind(origin)
-        .bind(parent)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(bodies(rows))
+        .await
     }
 
     /// The available items of `kind` under `grandparent` of `origin`'s: a
-    /// show's episodes.
+    /// show's episodes; within `limits`.
     pub async fn cached_grandchildren(
         &self,
         origin: &str,
         grandparent: &str,
         kind: &str,
-    ) -> Result<Vec<RemoteItem>, StoreError> {
-        let rows = sqlx::query_scalar(
+        limits: BrowseLimits,
+    ) -> Result<Browsed, StoreError> {
+        self.browsed(
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(body)), 0) \
+             FROM federation_cache_items \
+             WHERE origin = ?1 AND grandparent = ?2 AND kind = ?3 AND unavailable = 0",
             "SELECT body FROM federation_cache_items \
              WHERE origin = ?1 AND grandparent = ?2 AND kind = ?3 AND unavailable = 0 \
              ORDER BY item",
+            &[origin, grandparent, kind],
+            limits,
         )
-        .bind(origin)
-        .bind(grandparent)
-        .bind(kind)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(bodies(rows))
+        .await
+    }
+
+    /// Every available item of `kind` in `origin`'s `library_id`, by title:
+    /// a music library's tracks for All (PX-43); within `limits`. A page of
+    /// them is [`Store::cached_page`].
+    pub async fn cached_all(
+        &self,
+        origin: &str,
+        library_id: &str,
+        kind: &str,
+        limits: BrowseLimits,
+    ) -> Result<Browsed, StoreError> {
+        self.browsed(
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(body)), 0) \
+             FROM federation_cache_items \
+             WHERE origin = ?1 AND library = ?2 AND kind = ?3 AND unavailable = 0",
+            "SELECT body FROM federation_cache_items \
+             WHERE origin = ?1 AND library = ?2 AND kind = ?3 AND unavailable = 0 \
+             ORDER BY title COLLATE NOCASE, item",
+            &[origin, library_id, kind],
+            limits,
+        )
+        .await
+    }
+
+    /// The bodies `select` reads, within `limits`: `count` (the same rows,
+    /// counted with `octet_length`, which reads each body's size, not the
+    /// body) comes first, in the same transaction, so the count is of what
+    /// is read. Both take `binds` in order.
+    async fn browsed(
+        &self,
+        count: &'static str,
+        select: &'static str,
+        binds: &[&str],
+        limits: BrowseLimits,
+    ) -> Result<Browsed, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let mut counted = sqlx::query_as::<_, (i64, i64)>(count);
+        for bind in binds {
+            counted = counted.bind(*bind);
+        }
+        let counted = counted.fetch_one(&mut *tx).await?;
+        if let Some(over) = Browsed::over(limits, counted) {
+            return Ok(over);
+        }
+        let mut rows = sqlx::query_scalar::<_, String>(select);
+        for bind in binds {
+            rows = rows.bind(*bind);
+        }
+        let rows = rows.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Browsed::Items(bodies(rows)))
     }
 
     /// One page of the available items of `kind` in `origin`'s
@@ -1251,6 +1349,16 @@ mod tests {
             .unwrap();
     }
 
+    /// Pair `peer`'s key: what its syncs come from.
+    async fn key_of(store: &Store, peer: &str) -> String {
+        store
+            .federation_peer(peer)
+            .await
+            .unwrap()
+            .unwrap()
+            .endpoint_id
+    }
+
     /// One whole sync of Movies under `cursor`, staged and written.
     async fn synced(
         store: &Store,
@@ -1266,7 +1374,14 @@ mod tests {
             .await
             .unwrap();
         match store
-            .finish_cache_sync(ORIGIN, peer, "plex:1", cursor, snapshot, OriginLimits::NONE)
+            .finish_cache_sync(
+                ORIGIN,
+                (peer, &key_of(store, peer).await),
+                "plex:1",
+                cursor,
+                snapshot,
+                OriginLimits::NONE,
+            )
             .await
             .unwrap()
         {
@@ -1355,7 +1470,14 @@ mod tests {
         };
         assert!(matches!(
             store
-                .finish_cache_sync(ORIGIN, &peer, "plex:1", "c2", false, one)
+                .finish_cache_sync(
+                    ORIGIN,
+                    (&peer, &key_of(&store, &peer).await),
+                    "plex:1",
+                    "c2",
+                    false,
+                    one
+                )
                 .await
                 .unwrap(),
             CacheSynced::OverLimit { items: 2, .. }
@@ -1434,7 +1556,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_cache_sync(ORIGIN, &peer, "plex:1", "c1", false, OriginLimits::NONE)
+            .finish_cache_sync(
+                ORIGIN,
+                (&peer, &key_of(&store, &peer).await),
+                "plex:1",
+                "c1",
+                false,
+                OriginLimits::NONE,
+            )
             .await
             .unwrap();
         assert_eq!(

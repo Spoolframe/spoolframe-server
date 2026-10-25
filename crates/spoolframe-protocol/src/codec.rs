@@ -153,6 +153,24 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     Ok(bytes)
 }
 
+/// How many bytes `value` encodes to, without keeping them: what a page's
+/// budget is measured against.
+pub fn encoded_len<T: Serialize>(value: &T) -> Result<usize, CodecError> {
+    struct Counting(usize);
+    impl std::io::Write for Counting {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counted = Counting(0);
+    ciborium::into_writer(value, &mut counted).map_err(|e| CodecError::Encode(e.to_string()))?;
+    Ok(counted.0)
+}
+
 /// Decode one frame's payload.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     ciborium::from_reader(bytes).map_err(|e| CodecError::Decode(e.to_string()))

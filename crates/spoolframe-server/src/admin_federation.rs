@@ -153,6 +153,8 @@ fn replica_error(e: ReplicaError) -> ErrorObjectOwned {
         ReplicaError::NoSuchPeer(_) => error(error_code::NO_SUCH_PEER, e.to_string()),
         ReplicaError::Dial(_)
         | ReplicaError::NotPaired(_)
+        | ReplicaError::OtherServer(_)
+        | ReplicaError::Moved
         | ReplicaError::TooLarge { .. }
         | ReplicaError::TooSlow(_) => error(error_code::UNAVAILABLE, e.to_string()),
         ReplicaError::Store(e) => internal(e),

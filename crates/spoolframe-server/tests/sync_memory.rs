@@ -132,7 +132,14 @@ async fn the_end_of_a_sync_holds_a_batch_of_it_not_the_whole() {
     let before = HELD.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
     let synced = store
-        .finish_cache_sync(ORIGIN, &peer.id, "plex:1", "c1", true, OriginLimits::NONE)
+        .finish_cache_sync(
+            ORIGIN,
+            (&peer.id, &peer.endpoint_id),
+            "plex:1",
+            "c1",
+            true,
+            OriginLimits::NONE,
+        )
         .await
         .unwrap();
     assert_eq!(synced, CacheSynced::Written);

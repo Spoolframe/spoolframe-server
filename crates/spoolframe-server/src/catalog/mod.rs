@@ -151,9 +151,8 @@ impl LiveCatalog {
     }
 }
 
-/// Replies are kept for Plex's answers only: a paired server's cache
-/// (`fed:` ids) is read from this server's own database, and a sync
-/// changes it at any time.
+/// Replies are kept for Plex's answers only ([`Replies::read`] declines a
+/// paired server's `fed:` call).
 #[async_trait]
 impl Catalog for LiveCatalog {
     async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
@@ -171,9 +170,6 @@ impl Catalog for LiveCatalog {
     }
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
-        if library.namespace() == Namespace::Federated {
-            return self.current()?.items(library, page).await;
-        }
         self.replies
             .read(
                 Call::Items(library.to_string(), page.offset, page.limit),
@@ -188,9 +184,6 @@ impl Catalog for LiveCatalog {
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
-        if id.namespace() == Namespace::Federated {
-            return self.current()?.item(id).await;
-        }
         self.replies
             .read(
                 Call::Item(id.to_string()),
@@ -205,9 +198,6 @@ impl Catalog for LiveCatalog {
     }
 
     async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
-        if show.namespace() == Namespace::Federated {
-            return self.current()?.episodes(show).await;
-        }
         self.replies
             .read(Call::Episodes(show.to_string()), list, Reply::List, async {
                 self.current()?.episodes(show).await
@@ -222,9 +212,6 @@ impl Catalog for LiveCatalog {
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {
-        if id.namespace() == Namespace::Federated {
-            return self.current()?.external_ids(id).await;
-        }
         self.replies
             .read(
                 Call::ExternalIds(id.to_string()),
@@ -251,6 +238,7 @@ impl Catalog for LiveCatalog {
     }
 
     async fn item_kept(&self, id: &MediaId) -> Result<(ItemWithChildren, Reach), CatalogError> {
+        // The composite says where a paired server's item is reached.
         if id.namespace() == Namespace::Federated {
             return self.current()?.item_kept(id).await;
         }

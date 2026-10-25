@@ -2,13 +2,31 @@
 
 ## Unreleased
 
-- SDK: a stream's receive window is 2 MiB, down from 8 MiB. QUIC
-  closes a connection when, past a lost packet, it holds more than about
-  2,048 packets of one stream, and 8 MiB let a 16 MiB read hold far more:
-  played through a paired server, such reads lost their connection about
-  one time in two ("too many gaps in stream buffer"). A stream now
-  carries about 56 Mbit/s at 300 ms round trip, where it carried four
-  times that.
+- Fixed: playback over a lossy link no longer drops. The QUIC release
+  iroh builds on (noq-proto 1.4.0, crates.io's latest) kept each
+  full-size packet past a lost one, or ahead of a reader that had fallen
+  behind, as a buffer of its own and closed the connection once a stream
+  held more than 2,048 of them ("too many gaps in stream buffer"). The
+  workspace carries noq-proto 1.4.0 with quinn's fix for this
+  (quinn-rs/quinn#2814, as n0-computer/noq#828 ports it) in
+  `vendor/noq-proto`, and takes it in place of the release
+  (`[patch.crates-io]`, PX-62). A `[patch]` reaches only the workspace it
+  is in: the Linux app and the tvOS bridge take the SDK from the registry
+  and build against the unfixed release until their own workspaces carry
+  the patch, either as `[patch.crates-io] noq-proto = { version =
+  "=1.4.0+spoolframe.1", registry = "coldsteel" }` once the vendored
+  crate is published to kellnr under that version, or as a copy of
+  `vendor/noq-proto` with a `path` patch. To be dropped once noq#828
+  ships.
+- SDK: a stream's receive window is 2 MiB, down from 8 MiB, until the
+  apps carry the patch above: without it, QUIC closes a connection when,
+  past a lost packet, it holds more than about 2,048 packets of one
+  stream, and 8 MiB let a 16 MiB read hold far more: played through a
+  paired server, such reads lost their connection about one time in two
+  ("too many gaps in stream buffer"). A stream now carries about
+  56 Mbit/s at 300 ms round trip, where it carried four times that. With
+  the patch, 8 MiB holds (the SDK's `stream_window` test), and the window
+  goes back to it once the apps have the patch (PX-62).
 - Experimental, and off by default: server-to-server pairing (P8-01),
   the first part of federation. Not reviewed yet: pair only with servers
   you run. `experimental { federation = true; }` (Settings ›
@@ -265,25 +283,122 @@
   (Settings › Experimental with advanced settings on), and the server
   10,000 in all; past them a token is refused `Unavailable` and is not
   used up. A play session with no playback open ends an hour after it
-  opened, however it is used. A sync is held to its items' metadata too,
-  as SB caches it (JSON, every character escaped): `federation {
-  sync_max_metadata_mb = 1024; max_cached_metadata_mb = 2048; }` for one
-  library's sync and one paired server's cache (Settings › Experimental
-  with advanced settings on); SB stops reading at the page that goes past
-  it and keeps its cache as it was, and writes a whole sync 100 items at a
-  time, where it read every staged item into memory at once, gigabytes
-  for summaries padded within the page and item limits. An endpoint SA
-  knows only by a paired server's sessions holds at most 4 client
-  connections at once, and every such endpoint 256 together; one more is
-  closed `BUSY`, where one session let a paired server open as many as
-  it liked, each with a signed-in device's limits. A paired server that
-  takes SB's connection and never lets a request through is given up on
-  in the request's time: SB's wait covers opening the stream and writing
-  to it, and a dial and its `hello` 30 s together, where SB waited for
-  ever, and with it every other pair's sync and the replica's upkeep.
-  One pair's sync has 30 minutes in all; SB syncs up to four pairs at
-  once, each apart from the others, runs its upkeep apart from them, and
-  unpairs a server it is dialling at once.
+  opened, however it is used.
+  - A session's moved-item check holds whether or not the app's `Hello`
+    names the feature, and at every download read too, where an app that
+    left the feature out, and every download read, skipped it.
+  - A sync is held to its items' metadata too, as SB caches it (JSON,
+    every character escaped): `federation { sync_max_metadata_mb = 1024;
+    max_cached_metadata_mb = 2048; }` for one library's sync and one
+    paired server's cache (Settings › Experimental with advanced
+    settings on). SB stops reading at the page that goes past it and
+    keeps its cache as it was, and writes a whole sync 100 items at a
+    time, where it read every staged item into memory at once, gigabytes
+    for summaries padded within the page and item limits.
+  - An endpoint SA knows only by a paired server's sessions holds at
+    most 4 client connections at once, one pair's endpoints 128
+    together, and every such endpoint 256; one more is closed `BUSY`,
+    where one session let a paired server open as many as it liked, each
+    with a signed-in device's limits.
+  - A paired server that takes SB's connection and never lets a request
+    through is given up on in the request's time: SB's wait covers
+    opening the stream and writing to it, and a dial and its `hello` 30
+    s together, where SB waited for ever, and with it every other pair's
+    sync and the replica's upkeep. One pair's sync has 30 minutes in
+    all. SB syncs up to four pairs at once, each apart from the others,
+    runs its upkeep apart from them, and unpairs a server it is dialling
+    at once. A pair whose dial or sync fails waits before it is tried
+    again, longer each time.
+  - Confirming a pair's new key also closes this server's replication
+    connection to the old key, which kept syncing from it and carried
+    its users' assertions and subtitle asks until it closed, and the
+    replica dials the new key at once, whatever the old key's wait after
+    failed dials.
+  - Every connection to a pair is bound to the key it was dialled at:
+    one is used only while that key is the pair's, a dial answered as
+    the key moves keeps no connection, a sync read from the old key
+    writes nothing, and an assertion on the old key's connection mints a
+    token only while that key is the pair's (it could mint one as the
+    confirm committed). A pair's key that answers this server's dial
+    under another server id is refused, as an incoming hello under
+    another id is, before anything is sent or kept.
+  - The main server tells its relays at once when a pair is unpaired or
+    moves to a new key, on the relay-access connection (a new
+    `AccessRevoked` frame), and the relay forgets that key's answer and
+    rechecks what it carries, where the key stayed a friend until the
+    relay's kept answer expired.
+  - A pair's wait after a failed dial or sync runs from the failure, not
+    from the attempt's start, where an attempt that took longer than its
+    wait was tried again at the next tick, and the log said a wait that
+    was already over.
+  - A relay told that a key's answer no longer holds cuts that key's
+    connections at its next recheck though the main server cannot be
+    asked then, and lets them through again only on a fresh answer, where
+    a main server out of reach kept the key carried as it keeps every
+    other; other keys are carried on through an outage as before. The
+    relay keeps such a key as revoked for an hour at the most, or until
+    an answer asked after the revocation, for the key itself, comes.
+  - A paired server's play session changes none of its item's subtitle
+    timing once the item has left the library its token was for, as it
+    starts no playback of it: every request of the item by its id is held
+    to where the item is now, where only a start was, and
+    `SyncSubtitle`, `UseOriginalSubtitleTiming` and `SetSubtitleOffset`
+    changed the timing everyone is served. Such a request during a
+    running playback of the moved item ends the session, and the
+    playback with it: it is a change, not a control of the playback.
+  - A paired server's connection that was registering as its pair's new
+    key was confirmed is closed with the old key's others, where one that
+    looked its pair up just before the confirm kept the old key's standing
+    for as long as it stayed open; and every request on a pair's
+    connection is answered only while the key it came from is the pair's,
+    as an assertion already was.
+  - A paired server's requests end with their connection: one closed
+    leaves no sync, walk or lookup at work behind it, where closing and
+    connecting again left as many behind as one liked, past the caps on
+    connections. One pair is answered at most four connections' streams
+    of requests at once (64 with the default `max_streams`), every pair
+    256, and the strangers 16 of their own; one more is reset `BUSY`. A
+    request's work is given up on, `unavailable`, 5 s before the asker
+    stops waiting for its reply, and a pair's unpairing is cleaned up
+    after to the end though its connection closes meanwhile.
+  - Browsing a paired server's hierarchy reads at most 60,000 items, and
+    48 MiB of their metadata, at once (a 50,000-track music library
+    browses whole): a season's episodes, a show's, an album's tracks or a
+    music library's for All. Past that, `Item` answers
+    `ReplyTooLarge`, the show's episodes are not walked for Next
+    Up and the library's tracks are left out of All, where a season of
+    100,000 padded episodes, legal under the sync limits, was read and
+    decoded whole at the first browse of it, about 1.5 GiB at once. The
+    count is made before any body is read.
+  - A paired server's reply is sent within the same deadline its work
+    has, the asker's wait less 5 s: a pair that asked and then took none
+    of the reply, keeping the connection alive, held a whole sync answer
+    in memory for as long as it liked, 64 of them with the request
+    budget, where now its stream is reset `STALLED` and the request's
+    place given back. A sync's pages are made as they are sent and
+    dropped after, each later page within the page wait less 5 s and
+    the whole answer within 30 minutes, and every snapshot of one walk
+    in hand is the one copy of it, not one per request.
+  - A paired server's session's requests on `client/1` are held to a
+    budget, as a paired server's own are on `federation/1`: a device
+    that sent subtitle timing changes, closed and connected again left
+    them queued at the writer, as many as it liked past the caps on its
+    connections. Such connections' requests at once are held to 4 for
+    each connection the caps allow, 512 for one pair's sessions and
+    1,024 for every pair's, resource streams included; one more is reset
+    `BUSY`. Each request's work runs to its end, whole, within the
+    server's wait for its kind and 30 s, holding its place though the
+    connection closes, so nothing is left half done (a sync's claim on
+    its subtitle file, a timing change's served file and row). Local
+    users' devices are as they were.
+  - A subtitle download cancelled as its file is kept, by a paired
+    server closing its connection or its wait running out, leaves a
+    recorded, counted file or no file at all: the file's write and its
+    row run on work of their own that the request awaits, holding the
+    downloader's daily limit until the row is counted or the file gone,
+    within 30 s, where a cancellation between the two left a file no
+    record named and the daily limit never counted, as many as the pair
+    cared to make until a restart cleaned them up.
 - `spoolframe-server invite create --role` is optional: a consumer's if
   left out, as the server's default was; a `federation` invite takes
   none.

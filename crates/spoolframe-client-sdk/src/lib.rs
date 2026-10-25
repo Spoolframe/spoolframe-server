@@ -41,7 +41,7 @@ pub mod storage;
 mod subtitle_search;
 mod subtitle_sync;
 
-pub use client::{Client, ClientOptions, Device, DeviceSignIn, ServersWatch};
+pub use client::{Client, ClientOptions, Device, DeviceSignIn, STREAM_WINDOW, ServersWatch};
 pub use connection::Timeouts;
 // Downloads for offline viewing (PX-38), and their wire types.
 pub use downloads::{

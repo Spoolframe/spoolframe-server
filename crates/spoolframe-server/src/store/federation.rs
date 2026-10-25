@@ -44,6 +44,12 @@ impl PeerRecord {
     pub fn live(&self) -> bool {
         self.revoked_at.is_none()
     }
+
+    /// Whether `key` is the key this pair is pinned to (C8-01): what a
+    /// connection to or from it is kept on.
+    pub fn pinned_to(&self, key: &iroh::EndpointId) -> bool {
+        self.endpoint_id == key.to_string()
+    }
 }
 
 /// A new key that said it is a paired server (P8-01's key rotation).
@@ -698,6 +704,22 @@ impl Store {
         .bind(self.now())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Pair `id` is reached at `addrs` from now: for a test whose pair's
+    /// new key answers elsewhere.
+    #[cfg(test)]
+    pub(crate) async fn set_peer_addrs(
+        &self,
+        id: &str,
+        addrs: &[String],
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE federation_peers SET addrs = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(serde_json::to_string(addrs).expect("strings serialize"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

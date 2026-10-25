@@ -764,6 +764,8 @@ pub struct TestServer {
     pub downloads: Arc<spoolframe_server::downloads::Downloads>,
     /// Federation (P8-01), when the test turned it on.
     pub federation: Option<Arc<spoolframe_server::federation::Federation>>,
+    /// Its subtitle timings: where a test holds a timing change (Y8-02).
+    pub subtitle_timings: Arc<spoolframe_server::subtitle_sync::SubtitleTimings>,
 }
 
 impl TestServer {
@@ -1069,6 +1071,7 @@ impl TestServer {
             previews: services.previews.clone(),
             jobs: Some(jobs.clone()),
         });
+        let subtitle_timings = services.subtitle_timings.clone();
         let endpoint = EndpointOptions {
             port: options.port,
             ipv6: options.ipv6,
@@ -1105,6 +1108,7 @@ impl TestServer {
             copies,
             downloads,
             federation,
+            subtitle_timings,
         }
     }
 

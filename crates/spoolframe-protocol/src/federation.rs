@@ -60,6 +60,9 @@ pub mod reset {
     /// The connection has as many streams open as it may: wait for one
     /// to end, and ask again.
     pub const BUSY: u32 = 3;
+    /// The asker took none of the reply within its own wait for it: the
+    /// reply is given up on, and what was not read is lost.
+    pub const STALLED: u32 = 4;
 }
 
 /// The first request on every connection: who the dialling server says it
@@ -106,7 +109,7 @@ pub fn names_federated<T: Serialize + ?Sized>(request: &T) -> bool {
 }
 
 /// Whether `text` is a `fed:` id of an item, a library or an image.
-fn federated_id(text: &str) -> bool {
+pub fn federated_id(text: &str) -> bool {
     use spoolframe_types::{ArtworkId, LibraryId, MediaId};
     text.starts_with("fed:")
         && (text

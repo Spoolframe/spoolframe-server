@@ -1219,7 +1219,7 @@ impl Playbacks {
         handle: &PlaybackHandle,
         session: &SessionId,
         endpoint: &str,
-    ) -> Result<crate::keyed_locks::Guard<'_>, Refusal> {
+    ) -> Result<crate::keyed_locks::Guard, Refusal> {
         {
             let handles = self.lock();
             let Some(playback) = handles.get(&handle.0) else {
@@ -1568,7 +1568,7 @@ impl Playbacks {
         &self,
         session: &SessionId,
         item: &MediaId,
-    ) -> crate::keyed_locks::Guard<'_> {
+    ) -> crate::keyed_locks::Guard {
         self.progress_controls
             .lock(&format!("{}:{item}", session.0))
             .await

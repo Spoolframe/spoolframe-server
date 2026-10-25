@@ -101,6 +101,23 @@ pub struct RemoteSessionUser {
     pub download: Option<String>,
 }
 
+/// What a request a remote session allows reaches
+/// ([`RemoteSessionUser::allows`]): what the check that its item is still
+/// where its token placed it (F8-04) is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Its one item, by id: a start, or a change of its subtitles'
+    /// timing. Served only while the item is in the library the token was
+    /// for, checked as each is served (X8-03): a timing change of an item
+    /// that left its library is a change for everyone who still has it.
+    Item,
+    /// A playback it started, a download it prepared, or the session
+    /// itself: begun while the item was placed, and checked where each is
+    /// served. A playback already running finishes after its item moves,
+    /// as agreed; a download's reads are checked at each read (C8-03).
+    Held,
+}
+
 impl RemoteSessionUser {
     pub fn principal(&self) -> Principal {
         Principal::RemoteUser {
@@ -109,23 +126,31 @@ impl RemoteSessionUser {
         }
     }
 
-    /// Whether the session may ask `request` at all; anything else is
-    /// `Unauthenticated`, as for no session. A play token's (P8-04):
-    /// `StartPlayback` of its one item, the controls and reads of its own
-    /// playback (which only the session that started a playback may use,
-    /// checked where each is served), and a subtitle's timing on that item
-    /// (P8-07). A download token's (P8-07): its item's `DownloadOptions`
-    /// and `PrepareDownload` (not a device's, whose token is of one
-    /// download to read), and `DownloadStatus` and `CancelDownload` of the
-    /// downloads it [reaches](RemoteSessionUser::reaches_download). Either
-    /// may `Logout`: a paired server ends a session so.
-    pub fn allows(&self, request: &Request) -> bool {
+    /// What the session may ask `request` for, if it may at all; anything
+    /// else is `Unauthenticated`, as for no session. A play token's
+    /// (P8-04): `StartPlayback` of its one item, the controls and reads of
+    /// its own playback (which only the session that started a playback
+    /// may use, checked where each is served), and a subtitle's timing on
+    /// that item (P8-07). A download token's (P8-07): its item's
+    /// `DownloadOptions` and `PrepareDownload` (not a device's, whose
+    /// token is of one download to read), and `DownloadStatus` and
+    /// `CancelDownload` of the downloads it
+    /// [reaches](RemoteSessionUser::reaches_download). Either may
+    /// `Logout`: a paired server ends a session so.
+    ///
+    /// What names the item is [`Reach::Item`], held to where the item is
+    /// now; what names a playback, a download or the session itself is
+    /// [`Reach::Held`]. A request added here later is one or the other,
+    /// never checked less than the item's.
+    pub fn allows(&self, request: &Request) -> Option<Reach> {
         match self.scope {
             TokenScope::Play => match request {
                 Request::StartPlayback { id, .. }
                 | Request::SyncSubtitle { id, .. }
                 | Request::UseOriginalSubtitleTiming { id, .. }
-                | Request::SetSubtitleOffset { id, .. } => *id == self.item,
+                | Request::SetSubtitleOffset { id, .. } => {
+                    (*id == self.item).then_some(Reach::Item)
+                }
                 Request::UpdatePlaybackProgress { .. }
                 | Request::ChangeSubtitle { .. }
                 | Request::ChangeQuality { .. }
@@ -136,19 +161,19 @@ impl RemoteSessionUser {
                 | Request::GetManifest { .. }
                 | Request::ReadSubtitle { .. }
                 | Request::ReadSubtitleSegment { .. }
-                | Request::Logout => true,
-                _ => false,
+                | Request::Logout => Some(Reach::Held),
+                _ => None,
             },
             TokenScope::Download => match request {
                 Request::DownloadOptions { id, .. } | Request::PrepareDownload { id, .. } => {
-                    *id == self.item && self.download.is_none()
+                    (*id == self.item && self.download.is_none()).then_some(Reach::Item)
                 }
                 Request::DownloadStatus { .. }
                 | Request::CancelDownload { .. }
-                | Request::Logout => true,
-                _ => false,
+                | Request::Logout => Some(Reach::Held),
+                _ => None,
             },
-            TokenScope::Unknown => false,
+            TokenScope::Unknown => None,
         }
     }
 
@@ -178,6 +203,16 @@ struct Open {
     /// Registered for a redemption still using its token up: counted and
     /// ended as an open session is, but no one's to use yet.
     pending: bool,
+}
+
+impl Open {
+    /// Used at `now`: kept a lifetime more, but never past when it ends.
+    fn touch(&mut self, now: Instant) {
+        self.until = now + self.lifetime;
+        if let Some(ends) = self.ends {
+            self.until = self.until.min(ends);
+        }
+    }
 }
 
 /// Every play token's session, by its token's hash.
@@ -305,10 +340,7 @@ impl RemoteSessions {
         if found.endpoint != endpoint {
             return None;
         }
-        found.until = now + found.lifetime;
-        if let Some(ends) = found.ends {
-            found.until = found.until.min(ends);
-        }
+        found.touch(now);
         Some(found.user.clone())
     }
 
@@ -337,6 +369,22 @@ impl RemoteSessions {
         })
     }
 
+    /// The pair of a live session `endpoint` (hex) holds, the first by its
+    /// row if it holds several: what its connections are counted under
+    /// (C8-04).
+    pub fn endpoint_pair(&self, endpoint: &str) -> Option<String> {
+        let now = self.clock.now();
+        let open = self.open.lock();
+        open.by_endpoint
+            .get(endpoint)?
+            .iter()
+            .filter_map(|h| open.by_token.get(h))
+            .filter(|o| o.until > now && !o.pending)
+            .map(|o| &o.user.peer)
+            .min()
+            .cloned()
+    }
+
     /// End session `token`: whether it was open.
     pub fn end(&self, token: &str) -> bool {
         let hash = SessionToken(token.to_owned()).hash();
@@ -353,6 +401,21 @@ impl RemoteSessions {
             .values()
             .filter(|o| o.until > now && counted(&o.user))
             .count() as u64
+    }
+
+    /// Two counts of the live sessions in one walk: how many `counted`
+    /// says the first of, and how many the second.
+    pub fn count_both(&self, counted: impl Fn(&RemoteSessionUser) -> (bool, bool)) -> (u64, u64) {
+        let now = self.clock.now();
+        self.open
+            .lock()
+            .by_token
+            .values()
+            .filter(|o| o.until > now)
+            .fold((0, 0), |(first, second), o| {
+                let (a, b) = counted(&o.user);
+                (first + u64::from(a), second + u64::from(b))
+            })
     }
 
     /// The pair, item and library of every session, each once: what a
@@ -374,9 +437,15 @@ impl RemoteSessions {
 
     /// End every session whose user `ended` says: how many ended.
     pub fn end_where(&self, ended: impl Fn(&RemoteSessionUser) -> bool) -> usize {
+        self.end_matching(|_, o| !ended(&o.user))
+    }
+
+    /// End every session but those `keep` says of, by hash and session:
+    /// how many ended.
+    fn end_matching(&self, keep: impl Fn(&str, &Open) -> bool) -> usize {
         let mut open = self.open.lock();
         let before = open.by_token.len();
-        open.retain(|_, o| !ended(&o.user));
+        open.retain(keep);
         before - open.by_token.len()
     }
 
@@ -385,15 +454,12 @@ impl RemoteSessions {
     /// (F8-06): how many ended. One that plays lives on while it is used.
     pub fn end_unplayed(&self, playing: impl Fn(&str) -> bool) -> usize {
         let now = self.clock.now();
-        let mut open = self.open.lock();
-        let before = open.by_token.len();
-        open.retain(|hash, o| {
+        self.end_matching(|hash, o| {
             o.user.scope != TokenScope::Play
                 || o.pending
                 || now.duration_since(o.opened) < PLAY_MAX_AGE
                 || playing(hash)
-        });
-        before - open.by_token.len()
+        })
     }
 
     /// End every session bound to `endpoint` (hex) whose user `ended`
@@ -403,10 +469,7 @@ impl RemoteSessions {
         endpoint: &str,
         ended: impl Fn(&RemoteSessionUser) -> bool,
     ) -> usize {
-        let mut open = self.open.lock();
-        let before = open.by_token.len();
-        open.retain(|_, o| o.endpoint != endpoint || !ended(&o.user));
-        before - open.by_token.len()
+        self.end_matching(|_, o| o.endpoint != endpoint || !ended(&o.user))
     }
 }
 

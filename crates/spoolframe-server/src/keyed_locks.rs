@@ -6,13 +6,15 @@ use std::sync::{Arc, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+/// The locks, by key. Shared with each [`Guard`], so a guard is owned:
+/// one may be carried by a task that outlives its taker (Y8-03).
 #[derive(Debug, Default)]
 pub(crate) struct KeyedLocks {
-    entries: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    entries: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
 }
 
 impl KeyedLocks {
-    pub async fn lock(&self, key: &str) -> Guard<'_> {
+    pub async fn lock(&self, key: &str) -> Guard {
         let lock = {
             let mut entries = self.entries.lock();
             match entries.get(key).and_then(Weak::upgrade) {
@@ -27,7 +29,7 @@ impl KeyedLocks {
         // Register cleanup before waiting: cancelling a waiter must also
         // release its reference and remove the entry if it was the last.
         let mut lease = Guard {
-            owner: self,
+            owner: self.entries.clone(),
             key: key.to_owned(),
             lock,
             held: None,
@@ -37,17 +39,17 @@ impl KeyedLocks {
     }
 }
 
-pub(crate) struct Guard<'a> {
-    owner: &'a KeyedLocks,
+pub(crate) struct Guard {
+    owner: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     key: String,
     lock: Arc<AsyncMutex<()>>,
     held: Option<OwnedMutexGuard<()>>,
 }
 
-impl Drop for Guard<'_> {
+impl Drop for Guard {
     fn drop(&mut self) {
         self.held.take();
-        let mut entries = self.owner.entries.lock();
+        let mut entries = self.owner.lock();
         if Arc::strong_count(&self.lock) == 1 {
             entries.remove(&self.key);
         }

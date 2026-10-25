@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use iroh::EndpointId;
 use spoolframe_federation::Dialed;
 use spoolframe_protocol::federation::{SubtitleDownloadAsk, SubtitleRemovalAsk, SubtitleSearchAsk};
 use spoolframe_protocol::{Error, ServerId};
@@ -68,9 +69,12 @@ impl Federation {
     pub(super) async fn answer_search(
         &self,
         server_id: &ServerId,
+        endpoint: EndpointId,
         ask: &SubtitleSearchAsk,
     ) -> Result<SubtitleSearch, Error> {
-        let mut checked = self.pair_ask(server_id, &ask.user, &ask.item).await?;
+        let mut checked = self
+            .pair_ask(server_id, endpoint, &ask.user, &ask.item)
+            .await?;
         checked.asker.subtitles = ask.subtitles.clone();
         checked
             .subtitles
@@ -83,9 +87,12 @@ impl Federation {
     pub(super) async fn answer_download(
         &self,
         server_id: &ServerId,
+        endpoint: EndpointId,
         ask: &SubtitleDownloadAsk,
     ) -> Result<SubtitleDownloaded, Error> {
-        let checked = self.pair_ask(server_id, &ask.user, &ask.item).await?;
+        let checked = self
+            .pair_ask(server_id, endpoint, &ask.user, &ask.item)
+            .await?;
         checked
             .subtitles
             .download_for_pair(&checked.item, &ask.result, &checked.asker)
@@ -98,9 +105,12 @@ impl Federation {
     pub(super) async fn answer_removal(
         &self,
         server_id: &ServerId,
+        endpoint: EndpointId,
         ask: &SubtitleRemovalAsk,
     ) -> Result<(), Error> {
-        let checked = self.pair_ask(server_id, &ask.user, &ask.item).await?;
+        let checked = self
+            .pair_ask(server_id, endpoint, &ask.user, &ask.item)
+            .await?;
         checked
             .subtitles
             .remove_for_pair(&checked.item, &ask.download, &checked.asker)
@@ -109,11 +119,12 @@ impl Federation {
     }
 
     /// A pair's ask read and checked: paced by the pair's bucket, from a
-    /// live pair, for a local user of its, of an item in a library shared
-    /// with it.
+    /// live pair at the key it is pinned to (X8-01), for a local user of
+    /// its, of an item in a library shared with it.
     async fn pair_ask(
         &self,
         server_id: &ServerId,
+        endpoint: EndpointId,
         user: &str,
         item: &str,
     ) -> Result<PairAsk<'_>, Error> {
@@ -126,16 +137,18 @@ impl Federation {
                 retry_after_ms: TOO_FAST_MS,
             });
         }
-        let subtitles = self.subtitles()?;
         let not_found = || Error::NotFound {
             what: "a shared item".into(),
         };
+        // The pair before the subtitle source: a key that is not the
+        // pair's is told nothing, not even that this server has no
+        // subtitle sites (X8-01).
         let peer = self
-            .store()
-            .live_peer_by_server_id(server_id.as_str())
+            .live_pair_at(server_id, endpoint)
             .await
             .map_err(|e| unavailable(&e))?
             .ok_or_else(not_found)?;
+        let subtitles = self.subtitles()?;
         // A stable user id, as an assertion's (P8-03): never recorded here.
         uuid::Uuid::try_parse(user).map_err(|_| Error::InvalidInput {
             message: "the user is not a local account's id".into(),
@@ -261,10 +274,7 @@ impl Federation {
             AssertError::NotPaired(_) => Error::OriginOffline,
             other => unavailable(&other),
         })?;
-        let dialed = self
-            .links
-            .get(&peer.server_id)
-            .ok_or(Error::OriginOffline)?;
+        let dialed = self.links.pinned(&peer).ok_or(Error::OriginOffline)?;
         Ok(Route {
             user: local.user,
             remote: remote.to_string(),

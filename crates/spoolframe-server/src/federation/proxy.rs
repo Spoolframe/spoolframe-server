@@ -30,14 +30,14 @@ use spoolframe_protocol::federation::RedeemPlayToken;
 use spoolframe_protocol::media::MediaRead;
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::{
-    BitmapSubtitles, ChosenTracks, Error, Hello, MAX_READ, ManifestKind, PROTOCOL_VERSION,
-    PlaybackHandle, PlaybackPlan, Quality, Reply, Request, Response, Selection, SessionId,
+    BitmapSubtitles, ChosenTracks, Error, MAX_READ, ManifestKind, PlaybackHandle, PlaybackPlan,
+    Quality, Reply, Request, Response, Selection, SessionId,
 };
-use spoolframe_types::{ClientCapabilities, DisplayCapabilities, Marker, MediaId, Platform};
+use spoolframe_types::{ClientCapabilities, DisplayCapabilities, Marker, MediaId};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
 
-use super::{AssertError, Federation, endpoint_addr, parsed};
+use super::{AssertError, Federation, peer_addr};
 use crate::keyed_locks::KeyedLocks;
 use crate::principal::Who;
 use crate::store::federation::PeerRecord;
@@ -124,18 +124,22 @@ struct Pooled {
 }
 
 impl PlayClients {
-    /// `peer`'s connection, open, held for a play.
-    pub(super) fn held(self: &Arc<Self>, peer: &str) -> Option<Held> {
+    /// `peer`'s connection, open, held for a play: only one to the key
+    /// the pair is pinned to as the caller read it (C8-01).
+    pub(super) fn held(self: &Arc<Self>, peer: &PeerRecord) -> Option<Held> {
         let mut open = self.open.lock();
-        let pooled = open.get_mut(peer)?;
+        let pooled = open.get_mut(&peer.id)?;
         if pooled.client.is_closed() {
-            open.remove(peer);
+            open.remove(&peer.id);
+            return None;
+        }
+        if !peer.pinned_to(&pooled.client.remote_id()) {
             return None;
         }
         pooled.plays += 1;
         Some(Held {
             pool: Arc::downgrade(self),
-            peer: peer.to_owned(),
+            peer: peer.id.clone(),
             client: pooled.client.clone(),
         })
     }
@@ -199,6 +203,12 @@ impl PlayClients {
         if let Some(pooled) = self.open.lock().remove(peer) {
             pooled.client.close();
         }
+    }
+
+    /// Close `client`, and forget it as `peer`'s if it still is.
+    fn forget(&self, peer: &str, client: &Arc<PlayClient>) {
+        super::forget_kept(&mut self.open.lock(), peer, client, |p| &p.client);
+        client.close();
     }
 
     /// How many connections are kept.
@@ -604,41 +614,52 @@ impl Federation {
     }
 
     /// This server's connection to `peer`'s client protocol, held for a
-    /// play: the one open, or a new one.
+    /// play: the one open to its key, or a new one. One whose key answers
+    /// under another server id is not the pair (C8-06): refused, before
+    /// any token is sent on it.
     pub(super) async fn play_client(
         &self,
         endpoint: &iroh::Endpoint,
         peer: &PeerRecord,
     ) -> Result<Held, ProxyError> {
-        if let Some(held) = self.plays.held(&peer.id) {
+        if let Some(held) = self.plays.held(peer) {
             return Ok(held);
         }
         let _dialing = self.plays.dialing.lock(&peer.id).await;
-        if let Some(held) = self.plays.held(&peer.id) {
+        // Read again under the lock every dial to it takes: a key
+        // confirmed since the caller read it is dialled, not the old one.
+        let not_paired = || AssertError::NotPaired(peer.server_id.clone());
+        let peer = &self
+            .pair_now(peer)
+            .await
+            .map_err(AssertError::from)?
+            .ok_or_else(not_paired)?;
+        if let Some(held) = self.plays.held(peer) {
             return Ok(held);
         }
-        let peer_id: EndpointId = peer
-            .endpoint_id
-            .parse()
-            .map_err(|_| AssertError::NotPaired(peer.server_id.clone()))?;
-        let addr = endpoint_addr(peer_id, parsed(&peer.addrs), &peer.relays);
+        let addr = peer_addr(peer).ok_or_else(not_paired)?;
         // SA sees this server as the device; what each play plans for is
         // its start's, and each download its own device's (P8-07), whose
         // news this connection hears.
-        let hello = Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_name: "spoolframe-server".into(),
-            client_version: env!("CARGO_PKG_VERSION").into(),
-            platform: Platform::Unknown,
-            device_name: Some(self.name.get()),
-            capabilities: None,
-            experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
-            features: vec![
-                spoolframe_protocol::features::DOWNLOADS.into(),
-                spoolframe_protocol::features::MUSIC_DOWNLOADS.into(),
-            ],
-        };
-        let (client, _) = PlayClient::connect(endpoint, addr, hello).await?;
+        let hello = self.client_hello(vec![
+            spoolframe_protocol::features::DOWNLOADS.into(),
+            spoolframe_protocol::features::MUSIC_DOWNLOADS.into(),
+        ]);
+        let (client, info) = PlayClient::connect(endpoint, addr, hello).await?;
+        if info.server_id != peer.server_id {
+            client.close();
+            self.identity_refused(peer, &info.server_id).await;
+            return Err(not_paired().into());
+        }
+        #[cfg(test)]
+        self.holds.dialing.here().await;
+        // Kept, then checked against the pin, as the replica's connection
+        // is (`replica.rs`): a key confirmed meanwhile closes it either way.
+        let held = self.plays.keep(&peer.id, client.clone());
+        if !self.still_pinned(peer).await.map_err(AssertError::from)? {
+            self.plays.forget(&peer.id, &client);
+            return Err(not_paired().into());
+        }
         tokio::spawn(super::downloads::forward_download_news(
             self.store().clone(),
             self.downloads.get().cloned(),
@@ -647,7 +668,7 @@ impl Federation {
             Arc::downgrade(&client),
             client.events(),
         ));
-        Ok(self.plays.keep(&peer.id, client))
+        Ok(held)
     }
 
     /// Close this server's connection to pair `peer`'s client protocol

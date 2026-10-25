@@ -83,6 +83,15 @@ pub struct Admission {
     /// The most such connections of every endpoint's together; one more is
     /// closed `BUSY`. Apart from the strangers' and the pairs' caps.
     pub max_all_remote_connections: usize,
+    /// The most such connections of one pair's sessions, every endpoint
+    /// together; one more is closed `BUSY`. Half of every pair's, so one
+    /// pair with many device keys leaves the others room.
+    pub max_pair_remote_connections: usize,
+    /// The requests answered at once allowed for each such connection: a
+    /// pair's sessions get this many times their connection cap, every
+    /// pair's times the cap on all. No setting moves it; a test sets it
+    /// small.
+    pub remote_requests_each: usize,
     /// How long a stream's kind byte and first frame may take to arrive
     /// before the stream is reset.
     pub first_frame: Duration,
@@ -103,6 +112,9 @@ impl Admission {
     /// Far above the plays of every pair's users at once that go straight
     /// to this server.
     pub const DEFAULT_MAX_ALL_REMOTE_CONNECTIONS: usize = 256;
+    pub const DEFAULT_MAX_PAIR_REMOTE_CONNECTIONS: usize =
+        Self::DEFAULT_MAX_ALL_REMOTE_CONNECTIONS / 2;
+    pub const DEFAULT_REMOTE_REQUESTS_EACH: usize = 4;
     pub const DEFAULT_FIRST_FRAME: Duration = Duration::from_secs(10);
     /// Long enough for a player paused with a read under way: it takes
     /// what is sent as it plays on.
@@ -117,6 +129,8 @@ impl Default for Admission {
             max_paired_connections: Self::DEFAULT_MAX_PAIRED_CONNECTIONS,
             max_remote_connections: Self::DEFAULT_MAX_REMOTE_CONNECTIONS,
             max_all_remote_connections: Self::DEFAULT_MAX_ALL_REMOTE_CONNECTIONS,
+            max_pair_remote_connections: Self::DEFAULT_MAX_PAIR_REMOTE_CONNECTIONS,
+            remote_requests_each: Self::DEFAULT_REMOTE_REQUESTS_EACH,
             first_frame: Self::DEFAULT_FIRST_FRAME,
             stalled_read: Self::DEFAULT_STALLED_READ,
             sign_out_drain: SIGN_OUT_DRAIN,
@@ -169,10 +183,10 @@ pub(crate) struct Peer {
     streams: watch::Sender<usize>,
     /// A device's, or a server's on `spoolframe/federation/1`.
     kind: PeerKind,
-    /// Let in by a paired server's session alone (C8-04): counted under
-    /// [`Admission::max_remote_connections`] until its device signs in
-    /// here.
-    remote: AtomicBool,
+    /// Let in by a paired server's session alone (C8-04), that pair's row:
+    /// counted under [`Admission::max_remote_connections`] and its pair's
+    /// share until its device signs in here.
+    remote: parking_lot::Mutex<Option<String>>,
 }
 
 /// Whose connection a [`Peer`] is.
@@ -207,27 +221,28 @@ impl Peer {
             closing: AtomicBool::new(false),
             streams: watch::Sender::new(0),
             kind: PeerKind::Device,
-            remote: AtomicBool::new(false),
+            remote: parking_lot::Mutex::default(),
         }
     }
 
-    /// A device's connection let in by a paired server's session alone
+    /// A device's connection let in by pair `pair`'s session alone
     /// (C8-04): one in a remote play, or that server's own.
-    pub(crate) fn remote(connection: &Connection) -> Self {
+    pub(crate) fn remote(connection: &Connection, pair: String) -> Self {
         let peer = Self::new(connection);
-        peer.remote.store(true, Ordering::Release);
+        *peer.remote.lock() = Some(pair);
         peer
     }
 
-    /// Whether it is held under the remote sessions' caps.
-    pub(crate) fn is_remote(&self) -> bool {
-        self.remote.load(Ordering::Acquire)
+    /// The pair whose session it is held under, by the remote sessions'
+    /// caps; `None` for any other.
+    pub(crate) fn remote_pair(&self) -> Option<String> {
+        self.remote.lock().clone()
     }
 
     /// Its device signed in here: a session of this server's own, no
     /// longer only a paired server's.
     pub(crate) fn note_own_session(&self) {
-        self.remote.store(false, Ordering::Release);
+        *self.remote.lock() = None;
     }
 
     /// A server's connection on `spoolframe/federation/1` (P8-01), from a

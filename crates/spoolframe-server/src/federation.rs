@@ -28,10 +28,14 @@ mod grants;
 pub mod items;
 mod limits;
 mod media;
+#[cfg(test)]
+mod pinning;
 mod proxy;
 mod redeem;
 mod replica;
 mod subtitles;
+#[cfg(test)]
+mod test_holds;
 mod tokens;
 
 pub use cache::{Links, PeerCache};
@@ -134,11 +138,18 @@ pub struct Federation {
     /// and what its own users' downloads of the pairs' items count
     /// against (P8-07). Set once, at start.
     subtitle_downloads: OnceLock<Arc<crate::subtitle_downloads::SubtitleDownloads>>,
-    /// Where a test holds a redemption once its token is used up, before
-    /// its session opens: the moment a revocation races.
+    /// The keys whose relay answers no longer hold: a pair's old key once
+    /// its new one is confirmed, and an unpaired server's
+    /// ([`crate::relay_access`] tells the relays at once).
+    revoked: tokio::sync::broadcast::Sender<EndpointId>,
+    /// Where a test holds the federation mid-way through a race.
     #[cfg(test)]
-    hold_redeeming: redeem::Hold,
+    holds: test_holds::Holds,
 }
+
+/// The keys revoked that a relay connection may fall behind by before it
+/// is closed: an admin's unpairings and key confirmations, so a few.
+const REVOKED_KEPT: usize = 64;
 
 /// Where and how this server caches what its pairs share (P8-02).
 #[derive(Debug, Clone)]
@@ -256,8 +267,9 @@ impl Federation {
             download_sessions: Arc::default(),
             downloads: OnceLock::new(),
             subtitle_downloads: OnceLock::new(),
+            revoked: tokio::sync::broadcast::Sender::new(REVOKED_KEPT),
             #[cfg(test)]
-            hold_redeeming: redeem::Hold::default(),
+            holds: test_holds::Holds::default(),
         }
     }
 
@@ -287,6 +299,24 @@ impl Federation {
         {
             self.start_replica();
         }
+    }
+
+    /// As [`Federation::attach`], without starting the replica: a test
+    /// dials and syncs when it says.
+    #[cfg(test)]
+    pub(crate) fn attach_quietly(&self, endpoint: Endpoint) {
+        let told = Told::new(
+            endpoint.clone(),
+            Default::default(),
+            Vec::new(),
+            None,
+            Default::default(),
+        );
+        let _ = self.attached.set(Attached {
+            endpoint,
+            connections: Connections::new(Default::default()),
+            told,
+        });
     }
 
     /// What the pairs share with this server, cached: the backend of
@@ -519,16 +549,7 @@ impl Federation {
             Dialed::connect(&attached.endpoint, addr.clone(), self.hello()).await?;
         dialed.close();
         let theirs = self.pairable(&info).await?;
-        let hello = Hello {
-            protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
-            client_name: "spoolframe-server".into(),
-            client_version: env!("CARGO_PKG_VERSION").into(),
-            platform: Platform::Unknown,
-            device_name: Some(self.name.get()),
-            capabilities: None,
-            experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
-            features: vec![features::INVITE_LOOKUP.into()],
-        };
+        let hello = self.client_hello(vec![features::INVITE_LOOKUP.into()]);
         let (client, _) = PlayClient::connect(&attached.endpoint, addr, hello).await?;
         let answered = client
             .call(None, Request::LookupInvite(LookupInvite { code }), None)
@@ -566,6 +587,22 @@ impl Federation {
             other => Err(PairError::Dial(DialError::Unreachable(format!(
                 "the other server did not look the invite up: {other:?}"
             )))),
+        }
+    }
+
+    /// This server's hello as a client of another server's client
+    /// protocol, naming `features`: the other sees it as a device, called
+    /// by this server's name.
+    fn client_hello(&self, features: Vec<String>) -> Hello {
+        Hello {
+            protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+            client_name: "spoolframe-server".into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            platform: Platform::Unknown,
+            device_name: Some(self.name.get()),
+            capabilities: None,
+            experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features,
         }
     }
 
@@ -608,11 +645,103 @@ impl Federation {
             .is_ok_and(|endpoint| self.live.has(&endpoint))
     }
 
+    /// Pair `peer` as it is now: the same row, while it is live.
+    async fn pair_now(&self, peer: &PeerRecord) -> Result<Option<PeerRecord>, StoreError> {
+        Ok(self
+            .store()
+            .live_peer_by_server_id(&peer.server_id)
+            .await?
+            .filter(|now| now.id == peer.id))
+    }
+
+    /// The live pair whose server id is `server_id`, if it is pinned to
+    /// `key` (hex) now (C8-01): what a connection to or from that key is
+    /// answered as, and kept on.
+    async fn pair_at(&self, server_id: &str, key: &str) -> Result<Option<PeerRecord>, StoreError> {
+        Ok(self
+            .store()
+            .live_peer_by_server_id(server_id)
+            .await?
+            .filter(|now| now.endpoint_id == key))
+    }
+
+    /// Whether pair `peer` is still live and pinned to the key it was read
+    /// with: what a connection dialled at that key is kept on (C8-01).
+    async fn still_pinned(&self, peer: &PeerRecord) -> Result<bool, StoreError> {
+        Ok(self
+            .pair_at(&peer.server_id, &peer.endpoint_id)
+            .await?
+            .is_some_and(|now| now.id == peer.id))
+    }
+
+    /// Pair `peer`'s key answered this server's dial as `answered_as`,
+    /// another server id (C8-06): the caller closed the connection; this
+    /// says so and keeps it for the Federation page, as an incoming
+    /// hello's.
+    async fn identity_refused(&self, peer: &PeerRecord, answered_as: &str) {
+        tracing::warn!(
+            peer = %peer.endpoint_id,
+            name = %peer.display_name,
+            server_id = %answered_as,
+            "a paired server's key answered under another server id: refused"
+        );
+        self.note_identity_refused(&peer.endpoint_id).await;
+    }
+
+    /// Keep that the pair pinned to `endpoint_hex` said it is another
+    /// server (C8-06), for the Federation page, which says so with Unpair.
+    async fn note_identity_refused(&self, endpoint_hex: &str) {
+        if let Err(e) = self.store().peer_identity_refused(endpoint_hex).await {
+            tracing::warn!(error = %e, "cannot keep that a paired server's id changed");
+        }
+    }
+
+    /// The keys revoked from now: an old key once its pair's new one is
+    /// confirmed, and an unpaired server's. What a relay was told of them
+    /// no longer holds.
+    pub fn revocations(&self) -> tokio::sync::broadcast::Receiver<EndpointId> {
+        self.revoked.subscribe()
+    }
+
+    /// `endpoint_id` (hex) is no pair's now: the relays are told.
+    fn revoke(&self, endpoint_id: &str) {
+        if let Ok(endpoint) = endpoint_id.parse::<EndpointId>() {
+            // No relay connected is fine.
+            let _ = self.revoked.send(endpoint);
+        }
+    }
+
+    /// Close every federation connection `endpoint_id` (hex) has, as
+    /// unpaired, for `reason`.
+    fn close_key(&self, endpoint_id: &str, reason: &'static str) {
+        if let Ok(endpoint) = endpoint_id.parse::<EndpointId>() {
+            self.live.close(&endpoint, close::UNPAIRED, reason);
+        }
+    }
+
+    /// Pair `peer`'s row is revoked, by this side's admin or the other's:
+    /// what it held goes. The relays forget its friend tier at once, its
+    /// users' sessions here and this server's plays through it end, the
+    /// downloads made for its users are cancelled, and the cache of what it
+    /// shared is dropped but for what a user here holds (P8-02). The
+    /// sessions and plays end before the slower cleanup, so nothing of the
+    /// pair's is used meanwhile.
+    async fn pair_ended(&self, peer: &PeerRecord) {
+        self.revoke(&peer.endpoint_id);
+        self.end_remote_sessions(&peer.id, None);
+        self.close_plays(&peer.id);
+        #[cfg(test)]
+        self.holds.unpairing.here().await;
+        self.cancel_served_downloads(peer, None).await;
+        self.forget_origin(&peer.server_id).await;
+        #[cfg(test)]
+        self.holds.unpairing.here().await;
+    }
+
     /// Unpair `id` (P8-01): revoke this side's row and its grants
-    /// (P8-03), drop the cache of what it shared but for what a user here
-    /// holds (P8-02), close the other's connections, and tell it, best
-    /// effort, so it revokes its own. The row as it was; `None` for no live pair.
-    /// The relay's tier falls back once its cache of the answer expires.
+    /// (P8-03), clean up after it ([`Federation::pair_ended`]), close the
+    /// other's connections, and tell it, best effort, so it revokes its
+    /// own. The row as it was; `None` for no live pair.
     pub async fn unpair(&self, id: &str, by: &str) -> Result<Option<PeerRecord>, StoreError> {
         let Some(peer) = self.store().revoke_peer(id).await? else {
             return Ok(None);
@@ -624,16 +753,10 @@ impl Federation {
             by,
             "unpaired from another server"
         );
-        self.end_remote_sessions(&peer.id, None);
-        self.close_plays(&peer.id);
-        self.cancel_served_downloads(&peer, None).await;
-        self.forget_origin(&peer.server_id).await;
-        if let Ok(endpoint) = peer.endpoint_id.parse::<EndpointId>() {
-            self.live.close(&endpoint, close::UNPAIRED, "unpaired");
-            if let Some(attached) = self.attached.get() {
-                let addr = endpoint_addr(endpoint, parsed(&peer.addrs), &peer.relays);
-                tokio::spawn(tell_unpaired(attached.endpoint.clone(), addr, self.hello()));
-            }
+        self.pair_ended(&peer).await;
+        self.close_key(&peer.endpoint_id, "unpaired");
+        if let (Some(attached), Some(addr)) = (self.attached.get(), peer_addr(&peer)) {
+            tokio::spawn(tell_unpaired(attached.endpoint.clone(), addr, self.hello()));
         }
         Ok(Some(peer))
     }
@@ -642,9 +765,10 @@ impl Federation {
     /// it, and the old key's connections are closed, with those of the
     /// pair's other held keys. What the old key held goes (F8-03): the
     /// tokens minted for it, with the pin; the proxied sessions it opened,
-    /// those being redeemed among them; and this server's connection to
-    /// it for its own users' plays. A device's own tokens and sessions are
-    /// not the key's, and stay.
+    /// those being redeemed among them; this server's connections to it,
+    /// the replica's and its users' plays' (C8-01), the replica dialling
+    /// the new key at once; and its friend tier on the relays. A device's
+    /// own tokens and sessions are not the key's, and stay.
     pub async fn confirm_key(
         &self,
         id: &str,
@@ -673,10 +797,7 @@ impl Federation {
                 .filter(|k| *k != endpoint_id),
         );
         for key in gone {
-            if let Ok(endpoint) = key.parse::<EndpointId>() {
-                self.live
-                    .close(&endpoint, close::UNPAIRED, "the pair moved to a new key");
-            }
+            self.close_key(key, "the pair moved to a new key");
         }
         let ended = self
             .auth
@@ -686,7 +807,12 @@ impl Federation {
             ended,
             format_args!("pair {} moved to a new key", peer.server_id),
         );
+        // A dial or sync of the old key on its way finds the pin moved as
+        // it is kept or written (`replica.rs`, `proxy.rs`).
+        self.links.drop_origin(&peer.server_id);
         self.close_plays(&peer.id);
+        self.revoke(&old.endpoint_id);
+        self.wake.notify_one();
         Ok(peer)
     }
 
@@ -706,9 +832,7 @@ impl Federation {
             by,
             "a key that said it is a paired server was rejected"
         );
-        if let Ok(endpoint) = endpoint_id.parse::<EndpointId>() {
-            self.live.close(&endpoint, close::UNPAIRED, "key rejected");
-        }
+        self.close_key(endpoint_id, "key rejected");
         Ok(peer)
     }
 }
@@ -756,6 +880,13 @@ fn endpoint_addr(
     )
 }
 
+/// Where pair `peer` may be dialled: its key with its `addrs` and
+/// `relays` hints; `None` for a key that does not read.
+fn peer_addr(peer: &PeerRecord) -> Option<EndpointAddr> {
+    let id = peer.endpoint_id.parse::<EndpointId>().ok()?;
+    Some(endpoint_addr(id, parsed(&peer.addrs), &peer.relays))
+}
+
 /// Whether `addr` may be dialled as another server's: not loopback,
 /// unspecified, multicast or broadcast, nor port 0. Private, LAN, CGNAT
 /// and link-local addresses are kept: two home servers on one LAN or
@@ -769,6 +900,19 @@ fn dialable(addr: SocketAddr) -> bool {
         IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_multicast(),
     };
     !refused && addr.port() != 0
+}
+
+/// Forget `key`'s connection in `open` if it is still `closing` (by
+/// pointer): a newer one kept since stays. The caller closes `closing`.
+fn forget_kept<V, C>(
+    open: &mut std::collections::HashMap<String, V>,
+    key: &str,
+    closing: &Arc<C>,
+    kept: impl FnOnce(&V) -> &Arc<C>,
+) {
+    if open.get(key).is_some_and(|v| Arc::ptr_eq(kept(v), closing)) {
+        open.remove(key);
+    }
 }
 
 /// The `ip:port` hints among `addrs` that read as one.
@@ -830,7 +974,7 @@ fn rate_limited(retry_after: std::time::Duration) -> PairingRefused {
 #[async_trait::async_trait]
 impl Peers for Federation {
     async fn known(&self, endpoint: EndpointId) -> Option<ServerId> {
-        match self
+        let known = match self
             .store()
             .live_peer_by_endpoint(&endpoint.to_string())
             .await
@@ -840,7 +984,10 @@ impl Peers for Federation {
                 tracing::warn!(error = %e, "cannot look a server's pair up");
                 None
             }
-        }
+        };
+        #[cfg(test)]
+        self.holds.knowing.here().await;
+        known
     }
 
     async fn hello(
@@ -853,14 +1000,7 @@ impl Peers for Federation {
             if pinned == server_id {
                 return Ok(Standing::Paired);
             }
-            // Kept for the Federation page, which says so with Unpair.
-            if let Err(e) = self
-                .store()
-                .peer_identity_refused(&endpoint.to_string())
-                .await
-            {
-                tracing::warn!(error = %e, "cannot keep that a paired server's id changed");
-            }
+            self.note_identity_refused(&endpoint.to_string()).await;
             return Err(PairingRefused::ServerIdChanged);
         }
         let store = self.store();
@@ -970,10 +1110,7 @@ impl Peers for Federation {
                     name = %peer.display_name,
                     "a paired server unpaired: its pair is revoked here too"
                 );
-                self.end_remote_sessions(&peer.id, None);
-                self.close_plays(&peer.id);
-                self.cancel_served_downloads(&peer, None).await;
-                self.forget_origin(&peer.server_id).await;
+                self.pair_ended(&peer).await;
             }
             Ok(None) => {}
             Err(e) => tracing::error!(error = %e, "cannot revoke a pair the other server ended"),

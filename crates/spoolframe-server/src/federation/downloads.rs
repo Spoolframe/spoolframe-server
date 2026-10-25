@@ -445,6 +445,32 @@ impl Federation {
         Err(ProxyError::Origin(Error::Unauthenticated))
     }
 
+    /// A play token for the device `device`, of `who`'s play of `item`,
+    /// which it plays from SA itself (`RemoteGrant` with no `download`,
+    /// P8-04): counted as a play, and remembered as the device's, so the
+    /// play is not counted again should it fall back to proxy mode.
+    /// `OriginOffline` with SA offline.
+    pub async fn grant_play(
+        &self,
+        who: &Who,
+        item: &MediaId,
+        device: iroh::EndpointId,
+    ) -> Result<RemoteGranted, ProxyError> {
+        let (peer, remote) = self.remote_peer(item).await?;
+        if !self.online(&peer.server_id) {
+            return Err(ProxyError::Origin(Error::OriginOffline));
+        }
+        let granted = self.assert_play_for(who, &peer, item, device, true).await?;
+        self.granted_to_device(who, item, device);
+        Ok(RemoteGranted {
+            token: granted.token,
+            item: remote,
+            endpoint_id: peer.endpoint_id,
+            expires_at: granted.expires_at,
+            download: None,
+        })
+    }
+
     /// A download token for the device `device`, of `who`'s download `id`
     /// of `item` alone, which it reads on SA itself (`RemoteGrant` with a
     /// `download`). `OriginOffline` with SA offline.
@@ -573,7 +599,7 @@ impl Federation {
     /// none is dialled to end a session, which SA ends in time itself.
     async fn client_of(&self, origin: &str) -> Option<Arc<PlayClient>> {
         let peer = self.live_peer_by_server_id(origin).await.ok()??;
-        self.plays.held(&peer.id).map(|held| held.client.clone())
+        self.plays.held(&peer).map(|held| held.client.clone())
     }
 
     /// The library `item`, a paired server's, is in, by that server's id,

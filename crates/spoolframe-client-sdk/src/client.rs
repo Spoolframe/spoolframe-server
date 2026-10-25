@@ -49,15 +49,25 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// another continent's; more than QUIC's default, 1.25 MB (about 33
 /// Mbit/s).
 ///
-/// No more: past a lost packet, QUIC (noq-proto 1.4.0) keeps each
-/// full-size packet that follows as its own buffer, never merged, until
-/// the lost one comes again, and closes the connection when it holds
-/// more than about 2,048 ("too many gaps in stream buffer"). At 8 MiB a
-/// stream could have some 7,000 in flight, and a 16 MiB read played
-/// through a paired server lost its connection about one time in two in
-/// the end-to-end test. 2 MiB is under 1,900 packets of the smallest
-/// QUIC allows.
-const STREAM_WINDOW: u32 = 2 << 20;
+/// Past a lost packet, or ahead of a reader that has fallen behind, QUIC
+/// holds what follows until it can be read. The noq-proto release iroh
+/// builds on (1.4.0) kept each full-size packet of it as its own buffer
+/// and closed the connection when it held more than about 2,048 ("too
+/// many gaps in stream buffer"): at 8 MiB a stream could have some 7,000
+/// in flight, and a 16 MiB read played through a paired server lost its
+/// connection about one time in two (PX-62). The workspace's noq-proto
+/// (vendor/noq-proto) merges them as quinn does, so a window is no longer
+/// bounded by a packet count, and `tests/it/stream_window.rs` holds 8 MiB
+/// through a lost packet. But a `[patch]` reaches only this workspace: the
+/// Linux app and the tvOS bridge take the SDK from the registry and build
+/// against the unpatched release. So 2 MiB, under 1,900 packets of the
+/// smallest QUIC allows, stays until they carry the patch, either as
+/// `[patch.crates-io] noq-proto = { version = "=1.4.0+spoolframe.1",
+/// registry = "coldsteel" }` once the vendored crate is published to
+/// kellnr under that version, or as a copy of vendor/noq-proto with a
+/// `path` patch (PX-62). Then 8 MiB, the 0.14.4 value, about four times
+/// the throughput.
+pub const STREAM_WINDOW: u32 = 2 << 20;
 
 type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;
 type PlaybackKey = (EndpointId, String, String);

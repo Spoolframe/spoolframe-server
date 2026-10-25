@@ -50,7 +50,7 @@ use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, Init, hls};
 use crate::events::{Addresses, EventStreams};
-use crate::network::{Connections, ServerName, Services};
+use crate::network::{Connections, RemotePlace, ServerName, Services};
 use crate::passkeys::{CeremonyError, SignInError};
 use crate::planner;
 use crate::playback::{
@@ -62,6 +62,7 @@ use crate::previews::{self, PreviewState};
 use crate::principal::Principal;
 use crate::principal::Who;
 use crate::refusals::{self, Channel, Kind};
+use crate::remote_sessions::Reach;
 use crate::store::passkeys::{PasskeyError, PasskeyRecord};
 use crate::store::pins::PinError;
 use crate::store::sessions::{SessionBinding, SessionUser, SignedInWith};
@@ -75,6 +76,11 @@ use spoolframe_types::Delivery;
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
 const SHUTDOWN_NOTICE: Duration = Duration::from_millis(500);
+
+/// What a paired server's session's request has to run to its end beyond
+/// the server's wait for its kind (`policy::server_wait`): its work goes
+/// on though the connection it came on closes, but not for ever.
+const REMOTE_ANSWER_GRACE: Duration = Duration::from_secs(30);
 
 /// The client protocol handler shared by every connection.
 #[derive(Debug, Clone)]
@@ -638,8 +644,10 @@ impl ClientProtocol {
         state: Arc<ConnectionState>,
         mut send: SendStream,
         mut recv: RecvStream,
+        place: Option<RemotePlace>,
     ) {
         let _answering = state.peer.answering();
+        let mut place = place;
         // A stream holds one of the peer's few stream credits, and its
         // frame's memory, until its first frame is in (PX-10).
         let first = tokio::time::timeout(self.connections.admission().first_frame, async {
@@ -677,6 +685,8 @@ impl ClientProtocol {
             return;
         };
         if kind == bi::RESOURCE {
+            // The place is the stream's: what it sends is the reply.
+            let _place = place;
             self.resource(&connection, &state, send, recv, request)
                 .await;
             return;
@@ -710,7 +720,15 @@ impl ClientProtocol {
                         Ok(wire) => {
                             let known = !matches!(wire.envelope.request, Request::Unknown);
                             (
-                                self.answer(&connection, &state, bytes, wire, &name).await,
+                                self.answer_whole(
+                                    &connection,
+                                    &state,
+                                    bytes,
+                                    wire,
+                                    &name,
+                                    place.take(),
+                                )
+                                .await,
                                 known,
                             )
                         }
@@ -790,6 +808,60 @@ impl ClientProtocol {
         }
         let _ = send.finish();
         delivered(&send).await;
+    }
+
+    /// `answer`, for a request holding `place`, a paired server's
+    /// session's: on a task of its own, within the server's wait for its
+    /// kind and a grace, so it runs to its end whole though the connection
+    /// closes meanwhile, which ends only the reply; what it holds is the
+    /// place. Any other request is answered as it is.
+    async fn answer_whole(
+        &self,
+        connection: &Connection,
+        state: &Arc<ConnectionState>,
+        bytes: &[u8],
+        wire: RpcRequest,
+        name: &str,
+        place: Option<RemotePlace>,
+    ) -> RpcReply {
+        let Some(place) = place else {
+            return self.answer(connection, state, bytes, wire, name).await;
+        };
+        let wait =
+            spoolframe_protocol::policy::server_wait(&wire.envelope.request) + REMOTE_ANSWER_GRACE;
+        let (this, connection, state, bytes, named) = (
+            self.clone(),
+            connection.clone(),
+            state.clone(),
+            bytes.to_vec(),
+            name.to_owned(),
+        );
+        let answered = tokio::spawn(async move {
+            let _place = place;
+            tokio::time::timeout(wait, this.answer(&connection, &state, &bytes, wire, &named)).await
+        })
+        .await;
+        match answered {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    request = name,
+                    wait_secs = wait.as_secs(),
+                    "a paired server's session's request took longer than its wait: given up on"
+                );
+                Response::Err(Error::Unavailable {
+                    message: "the server cannot answer now".into(),
+                })
+                .into()
+            }
+            Err(e) => {
+                tracing::warn!(request = name, error = %e, "a request's task ended early");
+                Response::Err(Error::Unavailable {
+                    message: "the server cannot answer now".into(),
+                })
+                .into()
+            }
+        }
     }
 
     fn instance(&self) -> ServerInstance {
@@ -1454,38 +1526,36 @@ impl ClientProtocol {
                 Ok((metadata, length, body)) => {
                     let media = matches!(metadata, ResourceMetadata::Media { .. });
                     write_frame(&mut send, &ResourceResponse::Ready { length, metadata }).await?;
-                    match body {
+                    // How many bytes a streamed body sent; bytes in hand
+                    // are whole, and not counted as media reads.
+                    let copied: Option<u64> = match body {
                         ResourceBody::Bytes(bytes) => {
                             send_unless_stalled(&mut send, &bytes, stall).await?;
+                            None
                         }
-                        body @ (ResourceBody::File(..) | ResourceBody::Relayed(..)) => {
-                            let copied = match body {
-                                ResourceBody::File(file, reading, slot) => {
-                                    let copied =
-                                        copy_unless_stalled(file.take(length), &mut send, stall)
-                                            .await?;
-                                    drop((reading, slot));
-                                    copied
-                                }
-                                ResourceBody::Relayed(stream, hold) => {
-                                    let relayed =
-                                        relay_unless_stalled(stream, length, &mut send, stall)
-                                            .await?;
-                                    drop(hold);
-                                    relayed
-                                }
-                                ResourceBody::Bytes(_) => unreachable!(),
-                            };
-                            if media {
-                                self.services.metrics.media_reads.inc();
-                                self.services.metrics.media_read_bytes.add(copied);
-                            }
-                            if copied != length {
-                                return Err(codec::CodecError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "resource ended before its advertised length",
-                                )));
-                            }
+                        ResourceBody::File(file, reading, slot) => {
+                            let copied =
+                                copy_unless_stalled(file.take(length), &mut send, stall).await?;
+                            drop((reading, slot));
+                            Some(copied)
+                        }
+                        ResourceBody::Relayed(stream, hold) => {
+                            let relayed =
+                                relay_unless_stalled(stream, length, &mut send, stall).await?;
+                            drop(hold);
+                            Some(relayed)
+                        }
+                    };
+                    if let Some(copied) = copied {
+                        if media {
+                            self.services.metrics.media_reads.inc();
+                            self.services.metrics.media_read_bytes.add(copied);
+                        }
+                        if copied != length {
+                            return Err(codec::CodecError::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "resource ended before its advertised length",
+                            )));
                         }
                     }
                 }
@@ -1700,6 +1770,43 @@ impl ClientProtocol {
         }
     }
 
+    /// Whether paired server session `session`'s item, of `remote`, is
+    /// still in the library its token was for (F8-04): a PMS moves an
+    /// item between its sections without the catalog being replaced,
+    /// which is all that ends sessions at once. Asked of this server's
+    /// federation, whatever the client's hello names (C8-03): the feature
+    /// decides what a client is shown, not what a session may do. Moved,
+    /// the session ends; unplaced now, the request is refused, as a
+    /// redemption is.
+    async fn still_placed(
+        &self,
+        session: &SessionId,
+        remote: &crate::remote_sessions::RemoteSessionUser,
+    ) -> Result<(), Error> {
+        // Only a federation opens such a session: with none, it does
+        // nothing.
+        let federation = self
+            .services
+            .federation
+            .as_ref()
+            .ok_or(Error::Unauthenticated)?;
+        match federation
+            .shared_in(&remote.peer, &remote.item, &remote.library)
+            .await
+        {
+            Some(true) => Ok(()),
+            Some(false) => {
+                self.services
+                    .auth
+                    .end_remote_session(&session.0, "its item left its library");
+                Err(Error::Unauthenticated)
+            }
+            None => Err(Error::Unavailable {
+                message: "the item cannot be looked up now".into(),
+            }),
+        }
+    }
+
     /// A read of download `id`'s file (PX-38): at most `length` bytes
     /// from `offset`, and at most [`MAX_READ`]. Not a playback: no
     /// admission, no play. The file is held for the read.
@@ -1737,6 +1844,9 @@ impl ClientProtocol {
                 if !status.is_some_and(|status| remote.reaches_download(id, &status.media_id)) {
                     return Err(no_such_download());
                 }
+                // Each read begins only while the item is where its token
+                // was for, as a start does (C8-03).
+                self.still_placed(&session, remote).await?;
                 match on_lan(&state.path()) {
                     true => None,
                     false => Some(self.services.uplink.reserve_download().map_err(|full| {
@@ -2009,7 +2119,7 @@ impl ClientProtocol {
         handle: &PlaybackHandle,
         session: &SessionId,
         revision: u64,
-    ) -> Result<crate::keyed_locks::Guard<'_>, Error> {
+    ) -> Result<crate::keyed_locks::Guard, Error> {
         let control = self
             .services
             .playbacks
@@ -2308,43 +2418,17 @@ impl ClientProtocol {
             });
         }
         // A paired server's token's session (P8-04, P8-07) reaches its one
-        // item's playback, or its download, and nothing else.
-        if let Who::Remote(remote) = &who
-            && !remote.allows(&request)
-        {
-            return Err(Error::Unauthenticated);
-        }
-        // And only while its item is in the library its token was for
-        // (F8-04), checked as each playback or download starts: a PMS
-        // moves an item between its sections without the catalog being
-        // replaced, which is all that ends sessions at once. Moved, the
-        // session ends; unplaced now, the start is refused, as a
-        // redemption is.
-        if let (Who::Remote(remote), Some(federation)) = (&who, federation)
-            && matches!(
-                request,
-                Request::StartPlayback { .. }
-                    | Request::DownloadOptions { .. }
-                    | Request::PrepareDownload { .. }
-            )
-        {
-            match federation
-                .shared_in(&remote.peer, &remote.item, &remote.library)
-                .await
-            {
-                Some(true) => {}
-                Some(false) => {
-                    let ended = self.services.auth.remote_sessions().end(&session.0);
-                    self.services
-                        .auth
-                        .remote_sessions_ended(usize::from(ended), "its item left its library");
-                    return Err(Error::Unauthenticated);
-                }
-                None => {
-                    return Err(Error::Unavailable {
-                        message: "the item cannot be looked up now".into(),
-                    });
-                }
+        // item's playback, or its download, and nothing else; and what it
+        // asks of the item by its id, it asks only while the item is in
+        // the library its token was for (F8-04): every such request, a
+        // subtitle timing's change as much as a start (X8-03), so one
+        // added later is held the same. A playback or download it holds
+        // already is checked where each is served.
+        if let Who::Remote(remote) = &who {
+            match remote.allows(&request) {
+                None => return Err(Error::Unauthenticated),
+                Some(Reach::Item) => self.still_placed(&session, remote).await?,
+                Some(Reach::Held) => {}
             }
         }
         let actor = crate::principal::Actor {
@@ -4461,14 +4545,7 @@ impl ClientProtocol {
             // Experimental (P8-04): a paired server's item, played from
             // there by the device when it reaches it.
             Request::RemoteHints { id } => {
-                let federation = self
-                    .federation_for(hello)
-                    .ok_or_else(|| Error::Unsupported {
-                        request: format!(
-                            "remote_hints without {}",
-                            spoolframe_protocol::experimental::FEDERATION
-                        ),
-                    })?;
+                let federation = federation_required(federation, "remote_hints")?;
                 // Only for an item this server serves the user now.
                 catalog.item(&id).await.map_err(catalog_error)?;
                 let (peer, _) = federation.remote_peer(&id).await.map_err(assert_error)?;
@@ -4479,14 +4556,7 @@ impl ClientProtocol {
                 id,
                 download: Some(download),
             } => {
-                let federation = self
-                    .federation_for(hello)
-                    .ok_or_else(|| Error::Unsupported {
-                        request: format!(
-                            "remote_grant without {}",
-                            spoolframe_protocol::experimental::FEDERATION
-                        ),
-                    })?;
+                let federation = federation_required(federation, "remote_grant")?;
                 catalog.item(&id).await.map_err(catalog_error)?;
                 federation
                     .grant_download(&who, &id, &download, connection.remote_id())
@@ -4495,44 +4565,18 @@ impl ClientProtocol {
                     .map_err(proxy_error)
             }
             Request::RemoteGrant { id, download: None } => {
-                use spoolframe_protocol::federation::RemoteGranted;
-                let federation = self
-                    .federation_for(hello)
-                    .ok_or_else(|| Error::Unsupported {
-                        request: format!(
-                            "remote_grant without {}",
-                            spoolframe_protocol::experimental::FEDERATION
-                        ),
-                    })?;
+                let federation = federation_required(federation, "remote_grant")?;
                 catalog.item(&id).await.map_err(catalog_error)?;
-                let (peer, item) = federation.remote_peer(&id).await.map_err(assert_error)?;
-                if !federation.online(&peer.server_id) {
-                    return Err(Error::OriginOffline);
-                }
-                let granted = federation
-                    .assert_play_for(&who, &peer, &id, connection.remote_id(), true)
+                federation
+                    .grant_play(&who, &id, connection.remote_id())
                     .await
-                    .map_err(assert_error)?;
-                federation.granted_to_device(&who, &id, connection.remote_id());
-                Ok(Reply::RemoteGranted(RemoteGranted {
-                    token: granted.token,
-                    item,
-                    endpoint_id: peer.endpoint_id,
-                    expires_at: granted.expires_at,
-                    download: None,
-                }))
+                    .map(Reply::RemoteGranted)
+                    .map_err(proxy_error)
             }
             // Experimental (P8-01): only when this connection's Hello named
             // it and the server has it on; an admin's, as CreateInvite is.
             Request::PairServer(pair) => {
-                let Some(federation) = self.federation_for(hello) else {
-                    return Err(Error::Unsupported {
-                        request: format!(
-                            "pair_server without {}",
-                            spoolframe_protocol::experimental::FEDERATION
-                        ),
-                    });
-                };
+                let federation = federation_required(federation, "pair_server")?;
                 let user = admin(&who)?;
                 recently_signed_in(user, self.services.auth.store().now())?;
                 let peer = federation
@@ -4552,14 +4596,7 @@ impl ClientProtocol {
             // Experimental (P8-03): as PairServer, which it follows in the
             // QR flow.
             Request::ShareLibraries(share) => {
-                let Some(federation) = self.federation_for(hello) else {
-                    return Err(Error::Unsupported {
-                        request: format!(
-                            "share_libraries without {}",
-                            spoolframe_protocol::experimental::FEDERATION
-                        ),
-                    });
-                };
+                let federation = federation_required(federation, "share_libraries")?;
                 let user = admin(&who)?;
                 recently_signed_in(user, self.services.auth.store().now())?;
                 let share = share.within_bounds();
@@ -5213,14 +5250,7 @@ impl ClientProtocol {
         hello: &Hello,
         redeem: &spoolframe_protocol::federation::RedeemPlayToken,
     ) -> Result<Reply, Error> {
-        let Some(federation) = self.federation_for(hello) else {
-            return Err(Error::Unsupported {
-                request: format!(
-                    "redeem_play_token without {}",
-                    spoolframe_protocol::experimental::FEDERATION
-                ),
-            });
-        };
+        let federation = federation_required(self.federation_for(hello), "redeem_play_token")?;
         let endpoint_id = connection.remote_id().to_string();
         let guess = self
             .services
@@ -6977,14 +7007,17 @@ impl ProtocolHandler for ClientProtocol {
         // opened (P8-04), kept in memory: one reconnecting mid-play is not
         // a stranger, but its connections are capped (C8-04), as a paired
         // server holding one session could open them without end.
-        let remote = !known && self.services.auth.remote_sessions().endpoint_has(&id_text);
-        let admitted = if remote {
-            self.connections.admit_remote(&connection)
+        let remote = if known {
+            None
         } else {
-            self.connections.admit(&connection, known, local)
+            self.services.auth.remote_sessions().endpoint_pair(&id_text)
+        };
+        let admitted = match remote.clone() {
+            Some(pair) => self.connections.admit_remote(&connection, pair),
+            None => self.connections.admit(&connection, known, local),
         };
         let Some(peer) = admitted else {
-            let why: &[u8] = if remote {
+            let why: &[u8] = if remote.is_some() {
                 tracing::info!(
                     endpoint = %endpoint.fmt_short(),
                     "refusing a connection: too many in a paired server's sessions"
@@ -7004,7 +7037,7 @@ impl ProtocolHandler for ClientProtocol {
         };
         // Every connection starts anonymous, and most that stay so are an
         // app checking in: INFO is for the sign-in, and the disconnect.
-        tracing::debug!(endpoint = %endpoint.fmt_short(), known, remote, "client connected");
+        tracing::debug!(endpoint = %endpoint.fmt_short(), known, remote = remote.is_some(), "client connected");
         let state = Arc::new(ConnectionState {
             number: self.services.playbacks.connection_opened(),
             peer,
@@ -7041,17 +7074,53 @@ impl ProtocolHandler for ClientProtocol {
             self.services.playbacks.clone(),
         ));
 
+        // A connection let in by a paired server's session owns its streams'
+        // tasks: aborted with it, as a paired server's are on federation/1.
+        // A local user's run on as before: a request of its that outlives
+        // the connection (a sign-out's drain, a mutation's spawned
+        // execution) is meant to.
+        let mut requests = tokio::task::JoinSet::new();
         let reason = loop {
-            match connection.accept_bi().await {
+            let accepted = tokio::select! {
+                accepted = connection.accept_bi() => accepted,
+                // Those that ended, so the set holds only what is in hand.
+                Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+            };
+            match accepted {
                 Ok((send, recv)) => {
+                    // A remote session's stream takes its pair's place among
+                    // the requests in hand before anything of it is read,
+                    // resource streams included; past the budget it is
+                    // reset `BUSY`. The place also says whose the stream is.
+                    let place = match state.peer.remote_pair() {
+                        Some(pair) => match self.connections.take_remote_request(&pair) {
+                            Some(place) => Some(place),
+                            None => {
+                                reset_busy(send, recv, &endpoint);
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let owned = place.is_some();
                     let this = self.clone();
                     let connection = connection.clone();
                     let state = state.clone();
-                    tokio::spawn(async move { this.stream(connection, state, send, recv).await });
+                    let stream =
+                        async move { this.stream(connection, state, send, recv, place).await };
+                    if owned {
+                        requests.spawn(stream);
+                    } else {
+                        tokio::spawn(stream);
+                    }
                 }
                 Err(reason) => break reason,
             }
         };
+        // Aborted and joined before the connection's place is given back
+        // (`remove` below). A request's work runs on apart, to its end.
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
 
         // What it carried since the last count: the rest of its bytes.
         state.count_link(&connection, false);
@@ -7109,6 +7178,18 @@ impl ProtocolHandler for ClientProtocol {
             });
         deliver(notices).await;
     }
+}
+
+/// Reset a stream `BUSY`: past the requests of paired servers' sessions
+/// answered at once.
+fn reset_busy(mut send: SendStream, mut recv: RecvStream, endpoint: &iroh::EndpointId) {
+    let busy = VarInt::from_u32(reset::BUSY);
+    let _ = send.reset(busy);
+    let _ = recv.stop(busy);
+    tracing::debug!(
+        endpoint = %endpoint.fmt_short(),
+        "a remote session's stream is reset: past the requests answered at once"
+    );
 }
 
 /// Whether a connection ended as an app ends one that is done: closed by
@@ -7513,8 +7594,21 @@ fn downloads_offered(
     })
 }
 
-/// That a client listed `spoolframe:downloads`, whatever its platform: a
-/// paired server downloading for its user's device (P8-07), which names
+/// Federation (P8-01) for `request`, if this server has it on and the
+/// connection's Hello named it ([`ClientProtocol::federation_for`]); else
+/// `Unsupported`, saying which.
+fn federation_required<'f>(
+    federation: Option<&'f Arc<crate::federation::Federation>>,
+    request: &str,
+) -> Result<&'f Arc<crate::federation::Federation>, Error> {
+    federation.ok_or_else(|| Error::Unsupported {
+        request: format!(
+            "{request} without {}",
+            spoolframe_protocol::experimental::FEDERATION
+        ),
+    })
+}
+
 /// Where a request about `id` goes when it is a paired server's item: that
 /// server, through `federation` (P8-07), for a client that named the
 /// feature. `None` for this server's own items, served here as ever.
@@ -7525,6 +7619,8 @@ fn origin_of<'f>(
     federation.filter(|_| id.remote().is_some())
 }
 
+/// That a client listed `spoolframe:downloads`, whatever its platform: a
+/// paired server downloading for its user's device (P8-07), which names
 /// the device's platform with each request.
 fn downloads_listed(hello: &spoolframe_protocol::Hello) -> Result<(), Error> {
     if features::has(&hello.features, features::DOWNLOADS) {
@@ -7773,8 +7869,6 @@ fn login_error(e: LoginError) -> Error {
     }
 }
 
-/// Whose share of the uplink a playback off the LAN takes (PX-46): an
-/// admin's is the owner's.
 /// Who plays a playback, on the device that said `hello`.
 fn viewer(who: &Who, hello: Option<&spoolframe_protocol::Hello>) -> crate::playback::Viewer {
     crate::playback::Viewer {
@@ -7787,6 +7881,8 @@ fn viewer(who: &Who, hello: Option<&spoolframe_protocol::Hello>) -> crate::playb
     }
 }
 
+/// Whose share of the uplink a playback off the LAN takes (PX-46): an
+/// admin's is the owner's.
 fn uplink_class(who: &Who) -> crate::uplink::Class {
     match who {
         Who::Local(user) if user.role == spoolframe_types::Role::Admin => {
@@ -8708,6 +8804,11 @@ fn catalog_error(e: CatalogError) -> Error {
             }
         }
         CatalogError::NotSetUp => Error::NotSetUp,
+        // Said as the reply it would have been: an app from before knows it.
+        CatalogError::TooLarge { bytes, .. } => {
+            tracing::warn!(error = %e, "a paired server's hierarchy is too large to browse");
+            Error::ReplyTooLarge { bytes }
+        }
     }
 }
 

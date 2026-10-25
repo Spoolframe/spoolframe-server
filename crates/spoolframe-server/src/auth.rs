@@ -1004,9 +1004,8 @@ impl Auth {
             .await?;
         let live = pinned.is_some_and(|pinned| !user.proxied || pinned == endpoint);
         if !live {
-            let ended = usize::from(self.remote.end(token));
-            self.remote_sessions_ended(
-                ended,
+            self.end_remote_session(
+                token,
                 format_args!(
                     "{} of pair {} outlived its grant, pair or key",
                     user.principal(),
@@ -1015,6 +1014,15 @@ impl Auth {
             );
         }
         Ok(live)
+    }
+
+    /// End paired servers' session `token`, `why`: whether it was open,
+    /// in which case it is logged and the playbacks it held end with it,
+    /// as [`Auth::remote_sessions_ended`] says.
+    pub(crate) fn end_remote_session(&self, token: &str, why: impl std::fmt::Display) -> bool {
+        let ended = self.remote.end(token);
+        self.remote_sessions_ended(usize::from(ended), why);
+        ended
     }
 
     /// `ended` paired servers' sessions were ended, `why`: logged, and the

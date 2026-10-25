@@ -30,11 +30,14 @@ mod handler;
 mod live;
 mod play;
 
-pub use dial::{DialError, Dialed, Pages};
-pub use handler::{FederationProtocol, MAX_STREAMS};
+pub use dial::{DialError, Dialed, Pages, SYNC_WAIT};
+pub use handler::{
+    FederationProtocol, MAX_REQUESTS, MAX_STRANGER_REQUESTS, MAX_STREAMS, PEER_CONNECTIONS,
+};
 pub use live::Live;
 pub use play::PlayClient;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
@@ -122,28 +125,48 @@ pub trait Strangers: Send + Sync + 'static {
 }
 
 /// What a server shares with its live pairs (P8-02): what the handler
-/// asks of it for a pair's replication. Each is asked only on a live
-/// pair's connection, `peer` being the server id that pair is pinned
-/// under, and checks the pair's grants itself.
+/// asks of it for a pair's replication. Each is asked only on a connection
+/// that said hello as a live pair, `peer` being the server id that pair is
+/// pinned under and `endpoint` the key the request came from, and checks
+/// the pair's grants itself. The key is the request's proof (X8-01): a
+/// pair whose key was confirmed anew while the connection was open is
+/// found by its server id still, and the request from the old key must
+/// be refused, as a connection that outlived its standing.
 #[async_trait::async_trait]
 pub trait Shares: Send + Sync + 'static {
     /// The libraries shared with `peer` now.
-    async fn libraries(&self, peer: &ServerId) -> Result<Vec<SharedLibrary>, Unshared>;
+    async fn libraries(
+        &self,
+        peer: &ServerId,
+        endpoint: EndpointId,
+    ) -> Result<Vec<SharedLibrary>, Unshared>;
 
     /// Library `sync.library`'s changes since `sync.since`, or the whole
     /// of it when that cursor is not known: the handler pages it out.
-    async fn sync(&self, peer: &ServerId, sync: &SyncLibrary) -> Result<SyncAnswer, Unshared>;
+    async fn sync(
+        &self,
+        peer: &ServerId,
+        endpoint: EndpointId,
+        sync: &SyncLibrary,
+    ) -> Result<SyncAnswer, Unshared>;
 
     /// Image `id` of an item in a library shared with `peer`: its media
     /// type and bytes.
-    async fn artwork(&self, peer: &ServerId, id: &str) -> Result<(String, Vec<u8>), Unshared>;
+    async fn artwork(
+        &self,
+        peer: &ServerId,
+        endpoint: EndpointId,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), Unshared>;
 
     /// `peer` vouches for one of its users, who wants an item of this
     /// server's (P8-03): a token for it, or why not. The assertion
-    /// arrived on `peer`'s connection, which is its proof.
+    /// arrived on `peer`'s connection from `endpoint`, which is its proof:
+    /// one from a key that is no longer the pair's mints nothing.
     async fn assert_user(
         &self,
         peer: &ServerId,
+        endpoint: EndpointId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused>;
 
@@ -153,6 +176,7 @@ pub trait Shares: Send + Sync + 'static {
     async fn search_subtitles(
         &self,
         _peer: &ServerId,
+        _endpoint: EndpointId,
         _ask: &SubtitleSearchAsk,
     ) -> Result<SubtitleSearch, spoolframe_protocol::Error> {
         Err(not_answered())
@@ -163,6 +187,7 @@ pub trait Shares: Send + Sync + 'static {
     async fn download_subtitle(
         &self,
         _peer: &ServerId,
+        _endpoint: EndpointId,
         _ask: &SubtitleDownloadAsk,
     ) -> Result<SubtitleDownloaded, spoolframe_protocol::Error> {
         Err(not_answered())
@@ -172,6 +197,7 @@ pub trait Shares: Send + Sync + 'static {
     async fn remove_subtitle_download(
         &self,
         _peer: &ServerId,
+        _endpoint: EndpointId,
         _ask: &SubtitleRemovalAsk,
     ) -> Result<(), spoolframe_protocol::Error> {
         Err(not_answered())
@@ -191,8 +217,10 @@ pub struct SyncAnswer {
     pub mode: SyncMode,
     /// The cursor the asker names next time.
     pub cursor: String,
-    /// Added or changed items; every item, for a snapshot.
-    pub items: Vec<RemoteItem>,
+    /// Added or changed items; every item, for a snapshot. Shared: a
+    /// snapshot is the server's walk of the library, one copy for every
+    /// request of it in hand.
+    pub items: Arc<Vec<RemoteItem>>,
     /// Ids of items gone since the cursor.
     pub removed: Vec<String>,
 }

@@ -4050,6 +4050,511 @@ mod replica {
             pair.stop().await;
         }
 
+        /// The audit's C8-03: the moved film's play session, used from a
+        /// connection whose hello does not name the feature, starts no
+        /// playback either, and a download token's session prepares no
+        /// download of it: SA checks where the film is itself, whatever
+        /// the client names.
+        #[tokio::test]
+        async fn a_moved_film_s_session_does_nothing_from_a_hello_without_the_feature() {
+            use spoolframe_protocol::downloads::DownloadSource;
+            use spoolframe_protocol::downloads::DownloadTracks;
+            use spoolframe_protocol::federation::TokenScope;
+            use spoolframe_server::principal::Who;
+            use spoolframe_server::store::sessions::SessionUser;
+            let pair = Pair::start("fed-media-moved-plain").await;
+            let (_, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            let play = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let sb = federation(&pair.sb);
+            let sa = sb.peer(&pair.sa_on_sb).await.unwrap().unwrap();
+            let who = Who::Local(SessionUser {
+                user: bob,
+                username: "bob".into(),
+                display_name: "bob".into(),
+                role: spoolframe_types::Role::Consumer,
+                pin_required: false,
+                authenticated_at: 0,
+                signed_in_with: None,
+                password_change_only: false,
+            });
+            let granted = sb
+                .assert_download_for(
+                    &who,
+                    &sa,
+                    &pair.fed(movie().id()),
+                    device.endpoint.id(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let download = redeemed(&device, &granted.token).await;
+            assert_eq!(download.scope, TokenScope::Download);
+            pair.sa.catalog.move_to(
+                movie().id(),
+                spoolframe_server::test_support::music_library().id,
+            );
+            let plain = pair.sa.client_from(&device.endpoint).await;
+            plain.hello_naming(mkv_capabilities(), &[]).await;
+            assert!(unauthenticated(
+                plain.call(Some(&play), start(movie().id())).await
+            ));
+            let prepare = Request::PrepareDownload {
+                id: movie().id().clone(),
+                source: DownloadSource::Original,
+                tracks: DownloadTracks::All,
+                device: None,
+            };
+            assert!(unauthenticated(
+                plain.call(Some(&download.session), prepare).await
+            ));
+            assert_eq!(pair.sa.auth.remote_sessions().count(|_| true), 0);
+            assert!(pair.sa.store.downloads().await.unwrap().is_empty());
+            pair.stop().await;
+        }
+
+        /// The audit's X8-03: a play session of a film moved to a library
+        /// not shared with SB changes none of the film's subtitle timing,
+        /// which is served to everyone, and ends; from a hello naming the
+        /// feature and from one that does not. The timing request is the
+        /// session's first after the move: a start first would end the
+        /// session by itself (F8-04) and prove nothing. A real film with a
+        /// real subtitle file beside it, so that with the check missing
+        /// the offset is set and the timing row written.
+        #[tokio::test]
+        async fn a_moved_film_s_session_changes_no_subtitle_timing() {
+            use spoolframe_protocol::features::SUBTITLE_SYNC;
+            let pair = Pair::start_both(
+                "fed-media-moved-subtitles",
+                ServerOptions {
+                    real_media: true,
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            pair.share("plex:1").await;
+            pair.refresh().await;
+            pair.sa.generate_media(4, "libx264", "aac");
+            let sidecar = pair.sa.media.with_extension("en.srt");
+            let text = "1\n00:00:01,000 --> 00:00:02,000\nA line\n\n";
+            std::fs::write(&sidecar, text).unwrap();
+            pair.sb.add_user("bob", "correct horse", None).await;
+            let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+            let hello = |experimental: &[&str]| spoolframe_protocol::Hello {
+                protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+                client_name: "test".into(),
+                client_version: "0".into(),
+                platform: spoolframe_types::Platform::Linux,
+                device_name: None,
+                capabilities: Some(mkv_capabilities()),
+                experimental: experimental.iter().map(|n| (*n).to_owned()).collect(),
+                features: vec![SUBTITLE_SYNC.into()],
+            };
+            let timing = [
+                (
+                    "sync",
+                    Request::SyncSubtitle {
+                        id: movie().id().clone(),
+                        track: 0,
+                    },
+                ),
+                (
+                    "original",
+                    Request::UseOriginalSubtitleTiming {
+                        id: movie().id().clone(),
+                        track: 0,
+                    },
+                ),
+                (
+                    "offset",
+                    Request::SetSubtitleOffset {
+                        id: movie().id().clone(),
+                        track: 0,
+                        offset_ms: 1_500,
+                    },
+                ),
+            ];
+            // One session for each request, each redeemed before the move
+            // (a token for a moved film opens nothing), from a device
+            // naming the feature; the plain connection is the same
+            // device's, saying hello without it.
+            let mut sessions = Vec::new();
+            for (name, request) in timing {
+                for federated in [true, false] {
+                    let device = pair.sa.client().await;
+                    device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+                    let session = redeemed(&device, &token(&pair, bob, &device).await)
+                        .await
+                        .session;
+                    let asking = pair.sa.client_from(&device.endpoint).await;
+                    let named: &[&str] = if federated { &[FEDERATION] } else { &[] };
+                    assert!(matches!(
+                        asking.call(None, Request::Hello(hello(named))).await,
+                        Response::Ok(Reply::ServerInfo(_))
+                    ));
+                    sessions.push((
+                        format!("{name}, federated {federated}"),
+                        asking,
+                        session,
+                        request.clone(),
+                    ));
+                }
+            }
+            pair.sa.catalog.move_to(
+                movie().id(),
+                spoolframe_server::test_support::music_library().id,
+            );
+            for (name, asking, session, request) in sessions {
+                let response = asking.call(Some(&session), request).await;
+                let refused = matches!(
+                    response,
+                    Response::Err(spoolframe_protocol::Error::Unauthenticated)
+                );
+                assert!(refused, "{name}: {response:?}");
+            }
+            assert_eq!(pair.sa.auth.remote_sessions().count(|_| true), 0);
+            assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), text);
+            assert!(
+                pair.sa
+                    .store
+                    .subtitle_timing(sidecar.to_str().unwrap())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no timing row"
+            );
+            pair.stop().await;
+        }
+
+        /// SA's film, real, with a subtitle file beside it, shared with SB
+        /// and synced; Bob a user of SB's. The file's path and text.
+        async fn subtitled_film(pair: &Pair) -> (std::path::PathBuf, &'static str, LocalUserId) {
+            pair.share("plex:1").await;
+            pair.refresh().await;
+            pair.sa.generate_media(4, "libx264", "aac");
+            let sidecar = pair.sa.media.with_extension("en.srt");
+            let text = "1\n00:00:01,000 --> 00:00:02,000\nA line\n\n";
+            std::fs::write(&sidecar, text).unwrap();
+            pair.sb.add_user("bob", "correct horse", None).await;
+            let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+            (sidecar, text, bob)
+        }
+
+        /// A new connection from `device`'s endpoint, let in by its remote
+        /// session, saying hello with the feature and subtitle sync.
+        async fn timing_connection(pair: &Pair, device: &TestClient) -> TestClient {
+            use spoolframe_protocol::features::SUBTITLE_SYNC;
+            let asking = pair.sa.client_from(&device.endpoint).await;
+            let hello = spoolframe_protocol::Hello {
+                protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+                client_name: "test".into(),
+                client_version: "0".into(),
+                platform: spoolframe_types::Platform::Linux,
+                device_name: None,
+                capabilities: Some(mkv_capabilities()),
+                experimental: vec![FEDERATION.into()],
+                features: vec![SUBTITLE_SYNC.into()],
+            };
+            assert!(matches!(
+                asking.call(None, Request::Hello(hello)).await,
+                Response::Ok(Reply::ServerInfo(_))
+            ));
+            asking
+        }
+
+        /// `request` under `session` on a stream of `client`'s, its reply
+        /// left unread: the stream to read it from later.
+        async fn ask_unread(
+            client: &TestClient,
+            session: &SessionId,
+            request: Request,
+        ) -> iroh::endpoint::RecvStream {
+            use spoolframe_protocol::codec::write_frame;
+            use spoolframe_protocol::streams::bi;
+            use tokio::io::AsyncWriteExt as _;
+            let (mut send, recv) = client.conn.open_bi().await.unwrap();
+            send.write_u8(bi::RPC).await.unwrap();
+            write_frame(
+                &mut send,
+                &spoolframe_protocol::rpc::RpcRequest {
+                    envelope: spoolframe_protocol::RequestEnvelope {
+                        session: Some(session.clone()),
+                        request,
+                    },
+                    operation: Some(client.operation()),
+                    expected_revision: None,
+                },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            recv
+        }
+
+        /// Whether `recv` was reset `BUSY`: past the requests of paired
+        /// servers' sessions answered at once (Y8-02).
+        async fn reset_busy(mut recv: iroh::endpoint::RecvStream) -> bool {
+            use iroh::endpoint::{ReadError, ReadToEndError, VarInt};
+            matches!(
+                recv.read_to_end(1 << 20).await,
+                Err(ReadToEndError::Read(ReadError::Reset(code)))
+                    if code == VarInt::from_u32(spoolframe_protocol::streams::reset::BUSY)
+            )
+        }
+
+        fn offset() -> Request {
+            Request::SetSubtitleOffset {
+                id: movie().id().clone(),
+                track: 0,
+                offset_ms: 1_500,
+            }
+        }
+
+        /// Until `n` requests of paired servers' sessions are in hand on
+        /// SA, within 5 s: a hello's stream holds its place until the
+        /// client has taken the reply, a moment after the client read it.
+        async fn in_hand(pair: &Pair, n: usize) {
+            let mut in_hand = pair.sa.server.connections().remote_requests_in_hand();
+            tokio::time::timeout(Duration::from_secs(5), in_hand.wait_for(|at| *at == n))
+                .await
+                .expect("in time")
+                .expect("the server is up");
+        }
+
+        /// The third Codex audit's Y8-02, as reviewed: a remote session's
+        /// request runs to its end, whole, though its connection closes,
+        /// holding its place meanwhile. Timing changes held at the writer
+        /// from connections since closed keep the pair's places, so closing
+        /// and connecting again admits no more past the budget; let go,
+        /// each runs to its end once. A local user is answered meanwhile.
+        #[tokio::test]
+        async fn a_remote_session_s_abandoned_requests_hold_their_places_to_their_end() {
+            let pair = Pair::start_both(
+                "fed-media-remote-requests-end",
+                ServerOptions {
+                    real_media: true,
+                    admission: Admission {
+                        max_pair_remote_connections: 5,
+                        remote_requests_each: 1,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (sidecar, _, bob) = subtitled_film(&pair).await;
+            let device = device(&pair).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let held = &pair.sa.subtitle_timings.held;
+            held.hold();
+            // Four of the pair's budget of five, over two connections.
+            let connections = [
+                timing_connection(&pair, &device).await,
+                timing_connection(&pair, &device).await,
+            ];
+            let mut streams = Vec::new();
+            for connection in &connections {
+                for _ in 0..2 {
+                    streams.push(ask_unread(connection, &session, offset()).await);
+                }
+            }
+            held.until_at_it(4).await;
+            for connection in &connections {
+                connection.conn.close(0u32.into(), b"done");
+            }
+            // Closed, the four stay at the writer with their places: the
+            // next connection's hello takes the fifth and gives it back, a
+            // fifth change takes it for good, and a sixth is past the budget.
+            let again = timing_connection(&pair, &device).await;
+            in_hand(&pair, 4).await;
+            held.until_at_it(4).await;
+            streams.push(ask_unread(&again, &session, offset()).await);
+            held.until_at_it(5).await;
+            assert!(
+                reset_busy(ask_unread(&again, &session, offset()).await).await,
+                "the abandoned changes hold the pair's places"
+            );
+            pair.sa.add_user("carol", "correct horse", None).await;
+            let local = pair.sa.client().await;
+            local.hello().await;
+            let carol = local.login("carol", "correct horse").await;
+            assert!(
+                matches!(
+                    local.call(Some(&carol), Request::WhoAmI).await,
+                    Response::Ok(Reply::WhoAmI(_))
+                ),
+                "a local user is answered"
+            );
+            // Let go, each runs to its end, whole: the offset is set.
+            held.let_go();
+            in_hand(&pair, 0).await;
+            drop(streams);
+            assert_eq!(held.done(), 5);
+            let row = pair
+                .sa
+                .store
+                .subtitle_timing(sidecar.to_str().unwrap())
+                .await
+                .unwrap()
+                .expect("the change was written");
+            assert_eq!(row.offset_ms, 1_500);
+            pair.stop().await;
+        }
+
+        /// Y8-02's budget: one pair's sessions are answered at most their
+        /// connections' share of requests at once, resource streams
+        /// included; one more is reset `BUSY`, while another pair's device
+        /// and a local user are answered.
+        #[tokio::test]
+        async fn a_pair_s_remote_sessions_requests_at_once_are_capped() {
+            use spoolframe_protocol::streams::bi;
+            use tokio::io::AsyncWriteExt as _;
+            let pair = Pair::start_both(
+                "fed-media-remote-requests-pair",
+                ServerOptions {
+                    real_media: true,
+                    admission: Admission {
+                        max_pair_remote_connections: 2,
+                        remote_requests_each: 1,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, _, bob) = subtitled_film(&pair).await;
+            let device = device(&pair).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let held = &pair.sa.subtitle_timings.held;
+            held.hold();
+            // Two connections' worth: SB's budget, on one connection.
+            let asking = timing_connection(&pair, &device).await;
+            in_hand(&pair, 0).await;
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                streams.push(ask_unread(&asking, &session, offset()).await);
+            }
+            held.until_at_it(2).await;
+            assert!(
+                reset_busy(ask_unread(&asking, &session, offset()).await).await,
+                "past the pair's budget"
+            );
+            // A resource stream takes a place too: reset before it is read.
+            let (mut send, recv) = asking.conn.open_bi().await.unwrap();
+            send.write_u8(bi::RESOURCE).await.unwrap();
+            assert!(reset_busy(recv).await, "a resource stream past the budget");
+            drop(send);
+            // A local user is answered.
+            pair.sa.add_user("carol", "correct horse", None).await;
+            let local = pair.sa.client().await;
+            local.hello().await;
+            let carol = local.login("carol", "correct horse").await;
+            assert!(matches!(
+                local.call(Some(&carol), Request::WhoAmI).await,
+                Response::Ok(Reply::WhoAmI(_))
+            ));
+            // Dave's server, paired with SA too, and its user's device: its
+            // own budget.
+            let (dave_s, _) = sb_on(
+                fresh_dir("fed-media-remote-requests-pair-dave").await,
+                ServerOptions::default(),
+                quiet_plex().await,
+            )
+            .await;
+            let sa_on_dave = federation(&dave_s)
+                .redeem_link(&pairing_link(&pair.sa, None).await, "dave")
+                .await
+                .unwrap();
+            let dave_on_sa = pair
+                .sa
+                .store
+                .live_peer_by_endpoint(&dave_s.server.id().to_string())
+                .await
+                .unwrap()
+                .unwrap();
+            federation(&pair.sa)
+                .share(&dave_on_sa.id, &["plex:1".parse().unwrap()], "alice")
+                .await
+                .unwrap();
+            federation(&dave_s).refresh(&sa_on_dave.id).await.unwrap();
+            dave_s.add_user("dave", "correct horse", None).await;
+            let dave = dave_s.store.user_by_name("dave").await.unwrap().unwrap().id;
+            let other = self::device(&pair).await;
+            let token = federation(&dave_s)
+                .assert_play(dave, &pair.fed(movie().id()), other.endpoint.id())
+                .await
+                .unwrap()
+                .token;
+            let other_session = redeemed(&other, &token).await.session;
+            let other_asking = timing_connection(&pair, &other).await;
+            in_hand(&pair, 2).await;
+            streams.push(ask_unread(&other_asking, &other_session, offset()).await);
+            held.until_at_it(3).await;
+            // Let go, every held change runs to its end.
+            held.let_go();
+            in_hand(&pair, 0).await;
+            drop(streams);
+            dave_s.stop().await;
+            pair.stop().await;
+        }
+
+        /// Y8-02's budget: every pair's sessions together are answered at
+        /// most every such connection's share of requests at once; one more
+        /// is reset `BUSY`, while a local user is answered.
+        #[tokio::test]
+        async fn remote_sessions_requests_at_once_are_capped_in_all() {
+            let pair = Pair::start_both(
+                "fed-media-remote-requests-all",
+                ServerOptions {
+                    real_media: true,
+                    admission: Admission {
+                        max_all_remote_connections: 1,
+                        remote_requests_each: 1,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, _, bob) = subtitled_film(&pair).await;
+            let device = device(&pair).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let held = &pair.sa.subtitle_timings.held;
+            held.hold();
+            let asking = timing_connection(&pair, &device).await;
+            in_hand(&pair, 0).await;
+            let first = ask_unread(&asking, &session, offset()).await;
+            held.until_at_it(1).await;
+            assert!(
+                reset_busy(ask_unread(&asking, &session, offset()).await).await,
+                "past every pair's budget"
+            );
+            pair.sa.add_user("carol", "correct horse", None).await;
+            let local = pair.sa.client().await;
+            local.hello().await;
+            let carol = local.login("carol", "correct horse").await;
+            assert!(matches!(
+                local.call(Some(&carol), Request::WhoAmI).await,
+                Response::Ok(Reply::WhoAmI(_))
+            ));
+            held.let_go();
+            in_hand(&pair, 0).await;
+            drop(first);
+            pair.stop().await;
+        }
+
         /// The session is gone and its playback ended: a device that comes
         /// back, on a new connection, reads nothing of it.
         async fn ended(
@@ -4502,6 +5007,83 @@ mod replica {
             assert!(connection(&pair, &devices[2].endpoint).await.is_err());
             let local = pair.sa.client().await;
             local.hello().await;
+            pair.stop().await;
+        }
+
+        /// C8-04: one pair's devices hold at most their pair's share of
+        /// those connections, every key of theirs together: with a share
+        /// of two, SB's third device is closed `BUSY` though its key and
+        /// the server have room, and Carol's server's device still gets in.
+        #[tokio::test]
+        async fn one_pair_s_devices_hold_only_their_pair_s_share_of_connections() {
+            let pair = Pair::start_both(
+                "fed-media-remote-pair",
+                ServerOptions {
+                    admission: Admission {
+                        max_pair_remote_connections: 2,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let mut devices = Vec::new();
+            for _ in 0..3 {
+                let device = device(&pair).await;
+                redeemed(&device, &token(&pair, bob, &device).await).await;
+                devices.push(device);
+            }
+            let _first = connection(&pair, &devices[0].endpoint)
+                .await
+                .expect("let in");
+            let _second = connection(&pair, &devices[1].endpoint)
+                .await
+                .expect("let in");
+            assert!(connection(&pair, &devices[2].endpoint).await.is_err());
+            // Carol's server, paired with SA too, and its user's device.
+            let (carol_s, _) = sb_on(
+                fresh_dir("fed-media-remote-pair-carol").await,
+                ServerOptions::default(),
+                quiet_plex().await,
+            )
+            .await;
+            let sa_on_carol = federation(&carol_s)
+                .redeem_link(&pairing_link(&pair.sa, None).await, "carol")
+                .await
+                .unwrap();
+            let carol_on_sa = pair
+                .sa
+                .store
+                .live_peer_by_endpoint(&carol_s.server.id().to_string())
+                .await
+                .unwrap()
+                .unwrap();
+            federation(&pair.sa)
+                .share(&carol_on_sa.id, &["plex:1".parse().unwrap()], "alice")
+                .await
+                .unwrap();
+            federation(&carol_s).refresh(&sa_on_carol.id).await.unwrap();
+            carol_s.add_user("carol", "correct horse", None).await;
+            let carol = carol_s
+                .store
+                .user_by_name("carol")
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            let device = device(&pair).await;
+            let token = federation(&carol_s)
+                .assert_play(carol, &pair.fed(movie().id()), device.endpoint.id())
+                .await
+                .unwrap()
+                .token;
+            redeemed(&device, &token).await;
+            connection(&pair, &device.endpoint)
+                .await
+                .expect("another pair's share");
+            carol_s.stop().await;
             pair.stop().await;
         }
 

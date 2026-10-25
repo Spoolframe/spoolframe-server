@@ -473,3 +473,38 @@ async fn only_an_external_text_subtitle_is_retimed() {
         [false, false, true]
     );
 }
+
+/// The review of Y8-02: a sync cancelled before its worker is spawned (its
+/// request aborted with its connection, or past its wait) lets go of its
+/// claim on the file: the next sync of the file runs to its end, where the
+/// claim stayed and every sync after said "syncing" until a restart.
+#[tokio::test]
+async fn a_sync_cancelled_before_its_worker_lets_go_of_the_file() {
+    let cues = film_cues(7);
+    let source = speech(cues.clone(), Duration::ZERO);
+    let f = fixture("cancelled", None, source).await;
+    let en = write_sidecar(&f.dir, "Film.en.srt", &srt(&cues, 3_200));
+    let t = track(&f.dir, "Film.mkv", vec![sidecar(en.clone())], 0);
+    f.sync.held.hold();
+    let mut cancelled = Box::pin(f.sync.sync(t.clone()));
+    tokio::select! {
+        biased;
+        done = &mut cancelled => panic!("done before the hold: {done:?}"),
+        () = f.sync.held.until_at_it(1) => {}
+    }
+    drop(cancelled);
+    f.sync.held.let_go();
+    let mut news = f.sync.changes();
+    assert_eq!(f.sync.sync(t).await.unwrap().sync, SubtitleSync::Syncing);
+    let done = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let told = news.recv().await.unwrap();
+            if told.timing.sync != SubtitleSync::Syncing {
+                return told.timing;
+            }
+        }
+    })
+    .await
+    .expect("the next sync runs");
+    assert!(matches!(done.sync, SubtitleSync::Synced { .. }), "{done:?}");
+}

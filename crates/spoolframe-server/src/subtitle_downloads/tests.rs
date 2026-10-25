@@ -1535,3 +1535,210 @@ fn a_pair_is_held_to_its_own_limit_and_told_of_as_a_server() {
     assert_eq!(user.limit(&live), 5);
     assert!(user.denied().ends_with("for you"));
 }
+
+/// The files in the downloads directory, by name: what a download left.
+fn kept_files(f: &Fixture) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(f.downloads.dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `download`, run until the keeping reaches `hold`, then cancelled, as a
+/// request is with its connection's close or its wait's end (Y8-03). The
+/// download's future is dropped there, nothing of it awaited.
+async fn cancelled_at(f: &Fixture, hold: &crate::test_holds::Held, result: &str, who: &Asker) {
+    hold.hold();
+    let item = film();
+    let mut download = Box::pin(f.downloads.download(&item, result, who));
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the hold: {done:?}"),
+        () = hold.until_at_it(1) => {}
+    }
+    drop(download);
+}
+
+/// Y8-03: a download cancelled as its file is being written, or once the
+/// file is in place and before its row is, is kept all the same: the file,
+/// its row and the day's count, the track attached; and no second file,
+/// partial or whole, nor a second fetch, for the same result asked again.
+#[tokio::test]
+async fn a_download_cancelled_as_it_is_kept_is_kept_whole_and_counted() {
+    let f = fixture("cancel-kept", 0).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.serves(101, RUSSIAN.into(), 18).await;
+    let own = f.subtitles().await.len();
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    for (n, (hold, result)) in [
+        (&holds.writing, "opensubtitles:103"),
+        (&holds.recording, "opensubtitles:101"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cancelled_at(&f, hold, result, &alice()).await;
+        hold.let_go();
+        // Alice's again waits on her limit, which the keeping holds, then
+        // finds the download kept: the same file, fetched once.
+        let again = f
+            .downloads
+            .download(&film(), result, &alice())
+            .await
+            .unwrap();
+        assert_eq!(again.track as usize, own + n, "{result}: attached");
+        assert_eq!(f.site_calls("/api/v1/download").await, n + 1, "{result}");
+        let rows = f.store.all_subtitle_downloads().await.unwrap();
+        assert_eq!(rows.len(), n + 1, "{result}: recorded");
+        assert_eq!(
+            f.store
+                .subtitle_downloads_today(&alice().actor.principal.to_string())
+                .await
+                .unwrap()
+                .len(),
+            n + 1,
+            "{result}: counted"
+        );
+        let files = kept_files(&f);
+        assert_eq!(files.len(), n + 1, "{result}: no file left over: {files:?}");
+        assert!(
+            files.iter().all(|name| !name.ends_with(".partial")),
+            "{files:?}"
+        );
+    }
+}
+
+/// Y8-03: a download's limit is held by its keeping, not its request: the
+/// downloader's next, asked as the first is kept after its request was
+/// cancelled, waits for it and is refused at the limit, where both taking
+/// the day's last would pass it.
+#[tokio::test]
+async fn a_cancelled_download_s_limit_is_held_until_it_is_counted() {
+    let f = fixture("cancel-limit", 1).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.serves(101, RUSSIAN.into(), 18).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    cancelled_at(&f, &holds.recording, "opensubtitles:103", &alice()).await;
+    let (item, asker) = (film(), alice());
+    let second = f.downloads.download(&item, "opensubtitles:101", &asker);
+    tokio::pin!(second);
+    // Waiting on Alice's limit, not answered.
+    tokio::select! {
+        biased;
+        answered = &mut second => panic!("not held to the limit: {answered:?}"),
+        () = std::future::ready(()) => {}
+    }
+    holds.recording.release();
+    assert!(
+        matches!(
+            second.await,
+            Err(DownloadError::QuotaExhausted {
+                whose: QuotaOf::User,
+                ..
+            })
+        ),
+        "the kept download is the day's one"
+    );
+    assert_eq!(f.store.all_subtitle_downloads().await.unwrap().len(), 1);
+    assert_eq!(f.site_calls("/api/v1/download").await, 1);
+    assert_eq!(kept_files(&f).len(), 1);
+}
+
+/// Y8-03: a keeping that outlasts its wait leaves no file, partial or
+/// whole, no row and no charge, and gives the limit back: the same result
+/// is downloaded afresh after. Paused time once the keeping is held.
+#[tokio::test]
+async fn a_download_whose_keeping_outlasts_its_wait_leaves_no_file_and_no_charge() {
+    let f = fixture("cancel-late", 1).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    holds.recording.hold();
+    let (item, asker) = (film(), alice());
+    let download = f.downloads.download(&item, "opensubtitles:103", &asker);
+    tokio::pin!(download);
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the hold: {done:?}"),
+        () = holds.recording.until_at_it(1) => {}
+    }
+    assert_eq!(kept_files(&f).len(), 1, "the file is in place");
+    tokio::time::pause();
+    tokio::time::advance(FINISH_WAIT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    // The keeping's wait is up: what it held is dropped, and the request
+    // told.
+    holds.recording.until_at_it(0).await;
+    assert!(
+        matches!(download.await, Err(DownloadError::Io(_))),
+        "not kept in time"
+    );
+    assert!(kept_files(&f).is_empty(), "{:?}", kept_files(&f));
+    assert!(f.store.all_subtitle_downloads().await.unwrap().is_empty());
+    assert!(
+        f.store
+            .subtitle_downloads_today(&alice().actor.principal.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "no charge"
+    );
+    // The limit given back, and the hold off: asked again, it is fetched
+    // and kept.
+    holds.recording.let_go();
+    f.downloads
+        .download(&film(), "opensubtitles:103", &alice())
+        .await
+        .unwrap();
+    assert_eq!(f.site_calls("/api/v1/download").await, 2);
+    assert_eq!(kept_files(&f).len(), 1);
+    assert_eq!(f.store.all_subtitle_downloads().await.unwrap().len(), 1);
+}
+
+/// The review of Y8-03: a keeping whose wait is up as its row's commit is
+/// in flight keeps the file if the row landed: the row decides, where the
+/// error path removed a file the record named.
+#[tokio::test]
+async fn a_keeping_whose_wait_ends_with_the_row_written_keeps_the_file() {
+    let f = fixture("cancel-recorded", 1).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    holds.recorded.hold();
+    let (item, asker) = (film(), alice());
+    let download = f.downloads.download(&item, "opensubtitles:103", &asker);
+    tokio::pin!(download);
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the hold: {done:?}"),
+        () = holds.recorded.until_at_it(1) => {}
+    }
+    tokio::time::pause();
+    tokio::time::advance(FINISH_WAIT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    holds.recorded.until_at_it(0).await;
+    download.await.expect("the row landed: kept");
+    assert_eq!(kept_files(&f).len(), 1);
+    assert_eq!(f.store.all_subtitle_downloads().await.unwrap().len(), 1);
+    assert_eq!(f.site_calls("/api/v1/download").await, 1);
+}

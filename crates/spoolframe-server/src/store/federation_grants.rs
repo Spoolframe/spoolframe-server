@@ -164,16 +164,7 @@ impl Store {
     /// Whether `library` is shared with pair `peer` now: a live grant of
     /// a live pair.
     pub async fn is_granted(&self, peer: &str, library: &str) -> Result<bool, StoreError> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM federation_grants g \
-                            JOIN federation_peers p ON p.id = g.peer \
-                            WHERE g.peer = ?1 AND g.library = ?2 \
-                              AND g.revoked_at IS NULL AND p.revoked_at IS NULL)",
-        )
-        .bind(peer)
-        .bind(library)
-        .fetch_one(&self.pool)
-        .await?)
+        Ok(self.granted_endpoint(peer, library).await?.is_some())
     }
 
     /// The endpoint (hex) live pair `peer` is pinned to, while `library`
@@ -181,6 +172,16 @@ impl Store {
     /// against as it is used (F8-02, F8-03).
     pub async fn granted_endpoint(
         &self,
+        peer: &str,
+        library: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Self::granted_endpoint_on(&self.pool, peer, library).await
+    }
+
+    /// [`Store::granted_endpoint`] on `conn`: within a transaction that
+    /// writes what the grant allows.
+    pub(super) async fn granted_endpoint_on(
+        conn: impl sqlx::SqliteExecutor<'_>,
         peer: &str,
         library: &str,
     ) -> Result<Option<String>, StoreError> {
@@ -192,7 +193,7 @@ impl Store {
         )
         .bind(peer)
         .bind(library)
-        .fetch_optional(&self.pool)
+        .fetch_optional(conn)
         .await?)
     }
 }

@@ -23,21 +23,30 @@ pub(crate) const REPLY_WAIT: Duration = Duration::from_secs(15);
 
 /// How long dialling another server and its `Hello` may take together:
 /// the dial's own wait, and a reply's.
-const CONNECT_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_WAIT: Duration = Duration::from_secs(30);
 
 /// How long a sync's first page may take: the other server walks the
-/// whole library before it answers.
-const FIRST_PAGE_WAIT: Duration = Duration::from_secs(600);
+/// whole library before it answers. The dialled side gives its work the
+/// same (X8-02): what the asker has given up on is not worth finishing.
+pub(crate) const FIRST_PAGE_WAIT: Duration = Duration::from_secs(600);
 
-/// How long each page after the first may take.
-const PAGE_WAIT: Duration = Duration::from_secs(60);
+/// How long each page after the first may take. The dialled side gives
+/// each page's sending the same, less its margin (Y8-04).
+pub(crate) const PAGE_WAIT: Duration = Duration::from_secs(60);
+
+/// How long one pair's sync may take, every library and page together
+/// (C8-05): each page comes within its own wait, but 2,000 of them, each
+/// just inside it, would hold the pair's place for more than a day. The
+/// dialled side gives a sync's whole answer the same (Y8-04): what the
+/// asker has given up on is not worth sending.
+pub const SYNC_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// How long an image may take, from its request to the whole of it.
-const ARTWORK_WAIT: Duration = Duration::from_secs(60);
+pub(crate) const ARTWORK_WAIT: Duration = Duration::from_secs(60);
 
 /// How long a subtitle ask may take (P8-07): the other server asks a
 /// subtitle site, as long as the client protocol lets a device wait.
-const SUBTITLE_WAIT: Duration =
+pub(crate) const SUBTITLE_WAIT: Duration =
     Duration::from_secs(spoolframe_protocol::policy::wait::SUBTITLE_SITE.as_secs() + 15);
 
 /// Why talking to another server did not go as asked.
@@ -359,7 +368,7 @@ impl Dialed {
 }
 
 /// `exchange`, given up on as `Broken` (`why`) once `wait` is out.
-async fn within<T>(
+pub(crate) async fn within<T>(
     wait: Duration,
     why: &str,
     exchange: impl std::future::Future<Output = Result<T, DialError>>,

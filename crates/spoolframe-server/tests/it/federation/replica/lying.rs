@@ -84,7 +84,11 @@ struct OneFilm;
 
 #[async_trait::async_trait]
 impl Shares for OneFilm {
-    async fn libraries(&self, _peer: &ServerId) -> Result<Vec<SharedLibrary>, Unshared> {
+    async fn libraries(
+        &self,
+        _peer: &ServerId,
+        _endpoint: iroh::EndpointId,
+    ) -> Result<Vec<SharedLibrary>, Unshared> {
         Ok(vec![SharedLibrary {
             id: "plex:1".into(),
             title: "Movies".into(),
@@ -92,7 +96,12 @@ impl Shares for OneFilm {
         }])
     }
 
-    async fn sync(&self, _peer: &ServerId, _sync: &SyncLibrary) -> Result<SyncAnswer, Unshared> {
+    async fn sync(
+        &self,
+        _peer: &ServerId,
+        _endpoint: iroh::EndpointId,
+        _sync: &SyncLibrary,
+    ) -> Result<SyncAnswer, Unshared> {
         let alien = RemoteItem {
             id: "plex:movie:1".into(),
             kind: RemoteKind::Movie,
@@ -118,18 +127,24 @@ impl Shares for OneFilm {
         Ok(SyncAnswer {
             mode: SyncMode::Snapshot,
             cursor: "c".into(),
-            items: vec![alien],
+            items: std::sync::Arc::new(vec![alien]),
             removed: Vec::new(),
         })
     }
 
-    async fn artwork(&self, _peer: &ServerId, _id: &str) -> Result<(String, Vec<u8>), Unshared> {
+    async fn artwork(
+        &self,
+        _peer: &ServerId,
+        _endpoint: iroh::EndpointId,
+        _id: &str,
+    ) -> Result<(String, Vec<u8>), Unshared> {
         Err(Unshared::NotFound)
     }
 
     async fn assert_user(
         &self,
         _peer: &ServerId,
+        _endpoint: iroh::EndpointId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused> {
         Ok(TokenGranted {

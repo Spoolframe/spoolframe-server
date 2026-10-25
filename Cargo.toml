@@ -300,3 +300,12 @@ codegen-units = 1
 strip = "symbols"
 debug = false
 opt-level = "z"
+
+# iroh's QUIC state machine, with one fix of its stream assembler
+# (vendor/noq-proto/VENDORED.md, PX-62): crates.io's latest, 1.4.0,
+# closes a connection past a lost packet or ahead of a slow reader once a
+# stream holds more than 2,048 packets. This reaches only this workspace:
+# the published SDK's users must carry the same line, or build against
+# the unfixed release. Drop it once noq#828 ships.
+[patch.crates-io]
+noq-proto = { path = "vendor/noq-proto" }

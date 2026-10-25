@@ -177,14 +177,32 @@ fn unavailable(what: &str, e: impl std::fmt::Display) -> Unshared {
 }
 
 impl Federation {
-    /// The live pair pinned under `server_id`: a connection's standing
-    /// said so when it said hello, and it may have been unpaired since.
-    async fn pair(&self, server_id: &ServerId) -> Result<PeerRecord, Unshared> {
-        self.store()
-            .live_peer_by_server_id(server_id.as_str())
+    /// The live pair pinned under `server_id`, at `endpoint`: a
+    /// connection's standing said so when it said hello, and it may have
+    /// been unpaired, or moved to another key, since (X8-01). A request
+    /// from a key that is no longer the pair's is refused as not shared,
+    /// as one from no pair is: the pin is the key's proof, read for each
+    /// request.
+    async fn pair(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+    ) -> Result<PeerRecord, Unshared> {
+        self.live_pair_at(server_id, endpoint)
             .await
             .map_err(|e| unavailable("request", e))?
             .ok_or(Unshared::NotShared)
+    }
+
+    /// The live pair pinned under `server_id`, if it is pinned to
+    /// `endpoint` now: what a request from that key is answered as.
+    pub(super) async fn live_pair_at(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+    ) -> Result<Option<PeerRecord>, StoreError> {
+        self.pair_at(server_id.as_str(), &endpoint.to_string())
+            .await
     }
 
     /// Library `id`, if it is shared with `peer` and served now.
@@ -319,7 +337,7 @@ impl Federation {
         &self,
         peer: &PeerRecord,
         sync: &SyncLibrary,
-        walked: &[RemoteItem],
+        walked: &Walk,
     ) -> Result<SyncAnswer, StoreError> {
         let store = self.store();
         let base = match &sync.since {
@@ -340,10 +358,12 @@ impl Federation {
             store
                 .keep_sync_state(&peer.id, &sync.library, None, &cursor, &sent)
                 .await?;
+            // The walk itself, not a copy of it (Y8-04): every snapshot
+            // in hand of this walk is the one vector.
             return Ok(SyncAnswer {
                 mode: SyncMode::Snapshot,
                 cursor,
-                items: walked.to_vec(),
+                items: walked.clone(),
                 removed: Vec::new(),
             });
         };
@@ -371,7 +391,7 @@ impl Federation {
         Ok(SyncAnswer {
             mode: SyncMode::Changes,
             cursor,
-            items: changed,
+            items: Arc::new(changed),
             removed,
         })
     }
@@ -379,15 +399,16 @@ impl Federation {
 
 #[async_trait::async_trait]
 impl Shares for Federation {
-    async fn libraries(&self, server_id: &ServerId) -> Result<Vec<SharedLibrary>, Unshared> {
-        let peer = self.pair(server_id).await?;
-        let granted = self
-            .grants(&peer.id)
-            .await
-            .map_err(|e| unavailable("libraries", e))?;
-        let served: HashMap<String, Library> = self
-            .shareable()
-            .await
+    async fn libraries(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+    ) -> Result<Vec<SharedLibrary>, Unshared> {
+        let peer = self.pair(server_id, endpoint).await?;
+        // The store and the catalog at once: neither waits on the other.
+        let (granted, served) = tokio::join!(self.grants(&peer.id), self.shareable());
+        let granted = granted.map_err(|e| unavailable("libraries", e))?;
+        let served: HashMap<String, Library> = served
             .map_err(|e| unavailable("libraries", e))?
             .into_iter()
             .map(|l| (l.id.to_string(), l))
@@ -405,9 +426,16 @@ impl Shares for Federation {
             .collect())
     }
 
-    async fn sync(&self, server_id: &ServerId, sync: &SyncLibrary) -> Result<SyncAnswer, Unshared> {
-        let peer = self.pair(server_id).await?;
+    async fn sync(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        sync: &SyncLibrary,
+    ) -> Result<SyncAnswer, Unshared> {
+        let peer = self.pair(server_id, endpoint).await?;
         let library = self.shared_library(&peer, &sync.library).await?;
+        #[cfg(test)]
+        self.holds.answering.here().await;
         let _syncing = self
             .answering
             .syncing
@@ -417,17 +445,28 @@ impl Shares for Federation {
             .walked(&library.id)
             .await
             .map_err(|e| unavailable("sync", e))?;
-        let answer = self
-            .diff(&peer, sync, &walked)
-            .await
-            .map_err(|e| unavailable("sync", e))?;
-        // Revoked while it was walked: none of it is sent.
+        // The pair and the grant are read again after the walk, which can
+        // take minutes: revoked, or the pair moved to another key,
+        // meanwhile, none of it is sent, nor kept as sent to the pair
+        // (X8-01). A change between this read and `diff`'s write is not
+        // caught here, and heals itself: what `diff` keeps is which items
+        // were sent, and a revoked pair's state goes with the grant, a
+        // moved key's with the next sync the pair's new key makes, whose
+        // cursor it never saw.
+        let peer = self.pair(server_id, endpoint).await?;
         self.shared_library(&peer, &sync.library).await?;
-        Ok(answer)
+        self.diff(&peer, sync, &walked)
+            .await
+            .map_err(|e| unavailable("sync", e))
     }
 
-    async fn artwork(&self, server_id: &ServerId, id: &str) -> Result<(String, Vec<u8>), Unshared> {
-        let peer = self.pair(server_id).await?;
+    async fn artwork(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), Unshared> {
+        let peer = self.pair(server_id, endpoint).await?;
         if !self
             .answering
             .allowed(server_id.as_str(), Ask::Artwork, &self.limits())
@@ -435,26 +474,14 @@ impl Shares for Federation {
             tracing::debug!(server_id = %server_id, "a paired server asks for images too fast");
             return Err(Unshared::Unavailable);
         }
-        let libraries = self
-            .store()
-            .sent_artwork_libraries(&peer.id, id)
-            .await
-            .map_err(|e| unavailable("artwork", e))?;
         // Only an image of an item this server sent the pair, from a
         // library still shared with it.
-        let mut shared = false;
-        for library in &libraries {
-            if self
-                .store()
-                .is_granted(&peer.id, library)
-                .await
-                .map_err(|e| unavailable("artwork", e))?
-            {
-                shared = true;
-                break;
-            }
-        }
-        if !shared {
+        if !self
+            .store()
+            .artwork_shared(&peer.id, id)
+            .await
+            .map_err(|e| unavailable("artwork", e))?
+        {
             return Err(Unshared::NotShared);
         }
         let artwork: ArtworkId = id.parse().map_err(|_| Unshared::NotShared)?;
@@ -468,6 +495,7 @@ impl Shares for Federation {
     async fn assert_user(
         &self,
         server_id: &ServerId,
+        endpoint: iroh::EndpointId,
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused> {
         if !self
@@ -477,31 +505,34 @@ impl Shares for Federation {
             tracing::info!(server_id = %server_id, "a paired server vouches too fast");
             return Err(AssertionRefused::Unavailable);
         }
-        self.mint(server_id, assertion).await
+        self.mint(server_id, endpoint, assertion).await
     }
 
     async fn search_subtitles(
         &self,
         server_id: &ServerId,
+        endpoint: iroh::EndpointId,
         ask: &SubtitleSearchAsk,
     ) -> Result<SubtitleSearch, spoolframe_protocol::Error> {
-        self.answer_search(server_id, ask).await
+        self.answer_search(server_id, endpoint, ask).await
     }
 
     async fn download_subtitle(
         &self,
         server_id: &ServerId,
+        endpoint: iroh::EndpointId,
         ask: &SubtitleDownloadAsk,
     ) -> Result<SubtitleDownloaded, spoolframe_protocol::Error> {
-        self.answer_download(server_id, ask).await
+        self.answer_download(server_id, endpoint, ask).await
     }
 
     async fn remove_subtitle_download(
         &self,
         server_id: &ServerId,
+        endpoint: iroh::EndpointId,
         ask: &SubtitleRemovalAsk,
     ) -> Result<(), spoolframe_protocol::Error> {
-        self.answer_removal(server_id, ask).await
+        self.answer_removal(server_id, endpoint, ask).await
     }
 }
 

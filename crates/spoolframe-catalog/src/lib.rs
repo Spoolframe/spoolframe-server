@@ -109,6 +109,15 @@ pub enum CatalogError {
     /// re-links it elsewhere, so adding the library back restores it.
     #[error("{0} is in a library this server does not serve")]
     NotServed(String),
+    /// More under `what` than is browsed at once: `items` items, `bytes`
+    /// bytes of their metadata. A paired server's hierarchy; the limit is
+    /// the catalog's, so a client is told the reply would be too large.
+    #[error("{what} has too much under it to browse at once: {items} items, {bytes} bytes")]
+    TooLarge {
+        what: String,
+        items: u64,
+        bytes: u64,
+    },
 }
 
 /// A media file that cannot be read on this host. Names the path the
