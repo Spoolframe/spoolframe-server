@@ -30,8 +30,11 @@ use spoolframe_types::ClientCapabilities;
 use support::{ServerOptions, TestServer, fresh_dir};
 
 /// How long a record may take to be heard. mDNS answers within a second
-/// or two on a quiet host; this is the bound, not the expected time.
-const HEAR_WITHIN: Duration = Duration::from_secs(20);
+/// or two on a quiet host; this is the bound, not the expected time. A
+/// browser asks again on a doubling backoff (1, 2, 4, 8, 16 s ...), so one
+/// answer lost on a loaded CI host can put the next one past 20 s: the
+/// bound leaves room for two more.
+const HEAR_WITHIN: Duration = Duration::from_secs(60);
 
 /// A listen-only mDNS browser on one service name, recording the user data
 /// of every endpoint it hears.
@@ -552,7 +555,7 @@ async fn with_remote_access_on_and_no_internet_the_lan_still_works() {
     use spoolframe_server::network::{Pkarr, Relay};
     let options = ServerOptions {
         wan: Some(spoolframe_server::wan::Wan {
-            statics: vec!["203.0.113.7:7420".parse().unwrap()],
+            statics: vec!["203.0.114.7:7420".parse().unwrap()],
             mapped_port: None,
         }),
         relays: vec![
