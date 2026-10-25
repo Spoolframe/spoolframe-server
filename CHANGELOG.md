@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 (2026-10-25)
 
 - New: `ClientCapabilities.video_codecs`, the RFC 6381 codec strings a
   device plays (`hvc1.2.4.L153.B0`, `dvh1.08.06`). With a list, a video
