@@ -155,7 +155,7 @@ in
   assert check "a lookup with lookups forbidden is refused" (wanRefused {mappedPort.lookupVia = null;});
   assert check "a written public IP without lookups is accepted" (!wanRefused {
     mappedPort = {
-      publicIp = "203.0.113.7";
+      publicIp = "203.0.114.7";
       lookupVia = null;
     };
   });
@@ -171,13 +171,13 @@ in
   assert check "wan's defaults are written out" (lib.hasInfix ''mode = "auto";'' (rendered {wan = {};}) && lib.hasInfix ''lookup_via = "wtfismyip";'' (rendered {wan = {};}));
   assert check "a static-only wan turns the mapped port off" (lib.hasInfix "mapped_port = false;" (rendered {
       wan = {
-        static = ["203.0.113.7:7420"];
+        static = ["203.0.114.7:7420"];
         mappedPort = null;
       };
     })
-    && lib.hasInfix ''static = ["203.0.113.7:7420"];'' (rendered {
+    && lib.hasInfix ''static = ["203.0.114.7:7420"];'' (rendered {
       wan = {
-        static = ["203.0.113.7:7420"];
+        static = ["203.0.114.7:7420"];
         mappedPort = null;
       };
     }));
@@ -185,7 +185,7 @@ in
     wan.mappedPort = {
       mode = "manual";
       port = 443;
-      publicIp = "203.0.113.7";
+      publicIp = "203.0.114.7";
       lookupVia = null;
     };
   }));

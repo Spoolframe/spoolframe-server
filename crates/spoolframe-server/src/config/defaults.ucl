@@ -153,8 +153,8 @@ network {
   # shows the list told now.
   announce {
     # Addresses the server does not see itself, for example the public
-    # address of a NAT that forwards the port: "203.0.113.7" (with the
-    # server's port) or "203.0.113.7:7420".
+    # address of a NAT that forwards the port: "203.0.114.7" (with the
+    # server's port) or "203.0.114.7:7420".
     add = [];
     # Addresses and CIDR ranges never told: "172.17.0.0/16", "10.0.0.9".
     ignore = [];
@@ -170,13 +170,13 @@ network {
   # on the LAN. Present, each part below adds addresses to what a
   # signed-in device is told, and the status page lists each one with
   # where it came from. Only public addresses: a private, loopback,
-  # link-local, carrier-grade NAT (100.64.0.0/10) or unique local one is
-  # refused. Nothing here waits at start: a router that refuses, or a
+  # link-local, carrier-grade NAT (100.64.0.0/10), unique local or
+  # documentation (203.0.113.0/24, 2001:db8::/32) one is refused. Nothing here waits at start: a router that refuses, or a
   # lookup that fails, is one line in the log and a note on the status
   # page. A change applies at the next start.
   # wan {
   #   # Public addresses with their port, told as written. The forward is
-  #   # yours to set up: ["203.0.113.7:7420", "[2001:db8::1]:7420"].
+  #   # yours to set up: ["203.0.114.7:7420", "[2001:db9::1]:7420"].
   #   static = [];
   #   # One address made of the port forwarded on the router and this
   #   # network's public IP. On, with these defaults, whenever `wan` is

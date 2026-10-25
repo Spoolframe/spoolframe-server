@@ -453,7 +453,7 @@ in {
 
     wan = lib.mkOption {
       default = null;
-      example = lib.literalExpression ''{ static = ["203.0.113.7:7420"]; mappedPort = null; }'';
+      example = lib.literalExpression ''{ static = ["203.0.114.7:7420"]; mappedPort = null; }'';
       description = ''
         The server's public addresses, the ones a device off the LAN dials
         (`network.wan`). Null, the default: none is advertised, and devices
@@ -471,7 +471,7 @@ in {
           static = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [];
-            example = ["203.0.113.7:7420" "[2001:db8::1]:7420"];
+            example = ["203.0.114.7:7420" "[2001:db9::1]:7420"];
             description = "Public addresses with their port, advertised as written. The forward is yours to set up.";
           };
           mappedPort = lib.mkOption {
@@ -495,7 +495,7 @@ in {
                 publicIp = lib.mkOption {
                   type = lib.types.str;
                   default = "lookup";
-                  example = "203.0.113.7";
+                  example = "203.0.114.7";
                   description = ''
                     This network's public IP address, or "lookup": asked of
                     {option}`wan.mappedPort.lookupVia` once at start.

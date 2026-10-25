@@ -48,7 +48,7 @@ pkgs.testers.runNixOSTest {
       # P6-02: a public address written down, nothing asked of a router or
       # a lookup service (the VM has neither).
       wan = {
-        static = ["203.0.113.7:7420"];
+        static = ["203.0.114.7:7420"];
         mappedPort = null;
       };
       subtitles.ocrLanguages = ["eng" "fra"];
@@ -179,7 +179,7 @@ pkgs.testers.runNixOSTest {
     assert "libx264" in status, status
     assert "vaapi" not in status and "nvenc" not in status, status
     # The module's wan table parses, and each address shows its source.
-    assert "public addresses: 203.0.113.7:7420 (static)" in status, status
+    assert "public addresses: 203.0.114.7:7420 (static)" in status, status
 
     # tesseract with the languages asked for, and the cache for its text.
     ocr = [line for line in journal().splitlines() if "subtitle OCR available" in line]
