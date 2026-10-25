@@ -5,7 +5,8 @@
 //! It talks to the PMS directly over the LAN and never to plex.tv, so the
 //! catalog keeps working when the Internet is down (ARCHITECTURE §32). It
 //! reads on demand and does not copy the Plex database. Only [`account`],
-//! signing in with Plex at setup, reaches plex.tv, and only then.
+//! signing in with Plex at setup, reaches plex.tv; and an image the PMS
+//! redirects to Plex's image proxy ([`redirect`]) is fetched there.
 
 pub mod account;
 mod bif;
@@ -15,6 +16,7 @@ pub mod gdm;
 pub mod inspect;
 pub mod paths;
 pub mod playlists;
+mod redirect;
 mod search;
 pub mod stats;
 mod watch;
@@ -92,6 +94,11 @@ pub struct PlexCatalog {
     /// without auth.
     token: Option<String>,
     http: reqwest::Client,
+    /// What an image redirected off the PMS is fetched with: its names
+    /// resolve to public addresses only ([`redirect::PublicOnly`]).
+    outside: reqwest::Client,
+    /// Which hosts off the PMS an image's redirect may go to.
+    hosts: redirect::Outside,
     /// Plex paths → local paths. Applied here and only here: nothing
     /// outside this crate sees a Plex-side path.
     paths: PathMap,
@@ -137,6 +144,8 @@ struct Call<'a> {
     headers: Vec<(&'static str, String)>,
     /// The Spoolframe ID the call is about, for errors.
     subject: Option<String>,
+    /// Whether a redirect is followed ([`redirect`]): for an image only.
+    redirects: bool,
 }
 
 impl<'a> Call<'a> {
@@ -146,6 +155,7 @@ impl<'a> Call<'a> {
             query: Vec::new(),
             headers: Vec::new(),
             subject: None,
+            redirects: false,
         }
     }
 
@@ -164,28 +174,29 @@ impl PlexCatalog {
     /// `http://192.168.1.20:32400`. A path prefix (a reverse proxy) is kept.
     pub fn new(base: Url, token: Option<String>) -> Result<Self, CatalogError> {
         let base = base.as_str().trim_end_matches('/').to_owned();
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            // Not followed (PX-09 B-2): reqwest keeps custom headers across
-            // hosts, so a redirect would hand X-Plex-Token to wherever a
-            // PMS, or whoever answers as one, points.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| CatalogError::Backend {
-                url: base.clone(),
-                call: "build HTTP client".into(),
-                item: None,
-                message: e.to_string(),
-            })?;
+        let hosts = redirect::Outside::default();
         Ok(Self {
+            http: http_client(&base, None)?,
+            outside: http_client(&base, Some(redirect::PublicOnly(hosts)))?,
+            hosts,
             base,
             token,
-            http,
             paths: PathMap::default(),
             sections: None,
             stats: Arc::default(),
         })
+    }
+
+    /// An image's redirect off the PMS may go to any host, over HTTP too:
+    /// for a test whose image proxy is on loopback. The token is still
+    /// never sent there.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn reaching_inner_hosts(mut self) -> Self {
+        self.hosts = redirect::Outside { inner: true };
+        self.outside = http_client(&self.base, Some(redirect::PublicOnly(self.hosts)))
+            .expect("the client was built once already");
+        self
     }
 
     /// Map the media paths Plex reports with `paths`.
@@ -201,6 +212,8 @@ impl PlexCatalog {
             base: self.base.clone(),
             token: self.token.clone(),
             http: self.http.clone(),
+            outside: self.outside.clone(),
+            hosts: self.hosts,
             paths,
             sections: self.sections.clone(),
             stats: self.stats.clone(),
@@ -321,33 +334,74 @@ impl PlexCatalog {
         accept: &str,
         limit: usize,
     ) -> Result<(Vec<u8>, Option<String>), CatalogError> {
-        let mut req = self
-            .http
-            .get(format!("{}{}", self.base, call.path))
-            .header(reqwest::header::ACCEPT, accept)
-            .query(&call.query);
-        if let Some(token) = &self.token {
-            req = req.header("X-Plex-Token", token);
-        }
-        for (name, value) in &call.headers {
-            req = req.header(*name, value);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|source| CatalogError::Unreachable {
-                url: self.base.clone(),
-                call: call.describe(),
-                source: Box::new(source),
-            })?;
+        // One request's time for the whole chain of redirects, the body
+        // too: each hop has what is left of it.
+        let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+        let pms = self.url(call)?;
+        let mut url = pms.clone();
+        // Once off the PMS, nothing after is sent the token.
+        let mut on_pms = true;
+        let mut hops = 0;
+        let resp = loop {
+            let client = if on_pms { &self.http } else { &self.outside };
+            let mut req = client
+                .get(url.clone())
+                .header(reqwest::header::ACCEPT, accept)
+                .timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            if on_pms {
+                if let Some(token) = &self.token {
+                    req = req.header("X-Plex-Token", token);
+                }
+                for (name, value) in &call.headers {
+                    req = req.header(*name, value);
+                }
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|source| CatalogError::Unreachable {
+                    url: self.reached(on_pms, &url),
+                    call: call.describe(),
+                    source: Box::new(source),
+                })?;
+            if !(call.redirects && resp.status().is_redirection()) {
+                break resp;
+            }
+            hops += 1;
+            if hops > redirect::MAX_REDIRECTS {
+                return Err(self.backend(
+                    call,
+                    None,
+                    format!("more than {} redirects", redirect::MAX_REDIRECTS),
+                ));
+            }
+            let next = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|location| url.join(location).ok())
+                .ok_or_else(|| {
+                    let status = resp.status();
+                    self.backend(call, None, format!("HTTP {status} names nowhere to go"))
+                })?;
+            on_pms = on_pms && redirect::same_origin(&next, &pms);
+            if !on_pms && let Some(why) = self.hosts.refused(&next, self.token.as_deref()) {
+                let to = next.host_str().unwrap_or("nowhere");
+                return Err(self.backend(
+                    call,
+                    None,
+                    format!("a redirect to {to} is refused: {why}"),
+                ));
+            }
+            url = next;
+        };
         let status = resp.status();
         if status == StatusCode::NOT_FOUND {
             return Err(CatalogError::NotFound(
                 call.subject.clone().unwrap_or_else(|| call.path.clone()),
             ));
         }
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        if on_pms && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN) {
             let message = match self.token {
                 Some(_) => format!("the PMS rejected the token ({status})"),
                 None => format!("the PMS requires a token and none is configured ({status})"),
@@ -355,7 +409,12 @@ impl PlexCatalog {
             return Err(self.backend(call, None, message));
         }
         if !status.is_success() {
-            return Err(self.backend(call, None, format!("unexpected HTTP {status}")));
+            let message = if on_pms {
+                format!("unexpected HTTP {status}")
+            } else {
+                format!("unexpected HTTP {status} from {}", origin(&url))
+            };
+            return Err(self.backend(call, None, message));
         }
         let content_type = resp
             .headers()
@@ -372,7 +431,7 @@ impl PlexCatalog {
                 .chunk()
                 .await
                 .map_err(|source| CatalogError::Unreachable {
-                    url: self.base.clone(),
+                    url: self.reached(on_pms, &url),
                     call: call.describe(),
                     source: Box::new(source),
                 })?;
@@ -389,6 +448,26 @@ impl PlexCatalog {
             body.extend_from_slice(&chunk);
         }
         Ok((body, content_type))
+    }
+
+    /// Where a request went, for errors: the PMS as configured, or the
+    /// origin of `url` off it.
+    fn reached(&self, on_pms: bool, url: &Url) -> String {
+        if on_pms {
+            self.base.clone()
+        } else {
+            origin(url)
+        }
+    }
+
+    /// Where `call` is asked of the PMS: the base, its path and query.
+    fn url(&self, call: &Call<'_>) -> Result<Url, CatalogError> {
+        let mut url = Url::parse(&format!("{}{}", self.base, call.path))
+            .map_err(|e| self.backend(call, None, format!("not a URL: {e}")))?;
+        if !call.query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&call.query);
+        }
+        Ok(url)
     }
 
     fn backend(&self, call: &Call<'_>, item: Option<String>, message: String) -> CatalogError {
@@ -654,6 +733,35 @@ impl PlexCatalog {
             ))),
         }
     }
+}
+
+/// A client for the PMS at `base` (for errors). It follows no redirect
+/// (PX-09 B-2): reqwest keeps custom headers across hosts, so one would
+/// hand X-Plex-Token to wherever a PMS, or whoever answers as one,
+/// points. An image's are followed by hand ([`redirect`]), those off the
+/// PMS with a client whose names `resolver` resolves.
+fn http_client(
+    base: &str,
+    resolver: Option<redirect::PublicOnly>,
+) -> Result<reqwest::Client, CatalogError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(resolver) = resolver {
+        builder = builder.dns_resolver(resolver);
+    }
+    builder.build().map_err(|e| CatalogError::Backend {
+        url: base.to_owned(),
+        call: "build HTTP client".into(),
+        item: None,
+        message: e.to_string(),
+    })
+}
+
+/// `url`'s origin, for errors: never its path nor its query.
+fn origin(url: &Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 /// The largest image passed on; posters and backgrounds are far smaller.
@@ -924,6 +1032,11 @@ impl Catalog for PlexCatalog {
                 call
             }
             None => Call::get(id.key()).about(id),
+        };
+        // Agent art is a redirect to Plex's image proxy ([`redirect`]).
+        let call = Call {
+            redirects: true,
+            ..call
         };
         let (bytes, content_type) = self.get_bytes(&call, "image/*", MAX_IMAGE_BYTES).await?;
         match content_type {

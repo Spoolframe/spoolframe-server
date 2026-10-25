@@ -8,6 +8,16 @@
   SDK crates' dependency graph. Behaviour is the same. The server still
   carries crypto-bigint 0.5 through openidconnect 4.0.1, which verifies
   ID tokens with public keys only.
+- Fixed: a Plex item's art that an agent gave is served, to this
+  server's devices and to a paired server. A PMS answers its thumb with
+  a 302 to Plex's image proxy (images.plex.tv), which was an error
+  (`unexpected HTTP 302 Found`). An image's redirect is now followed, at
+  most three of them within the one request's 15 s and the image's
+  32 MiB: one within the PMS as any PMS request, one off it only over
+  HTTPS to a public host (a public address, or a name that is not a
+  local one and resolves only to public addresses, checked as it is
+  dialled), and never with the token: not as `X-Plex-Token`, and a URL
+  that names it is refused. Other PMS requests still follow none.
 
 ## 0.15.0 (2026-10-25)
 

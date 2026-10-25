@@ -1413,3 +1413,149 @@ async fn the_rated_tracks_are_the_last_rated_first() {
     let keys: Vec<&str> = rated.iter().map(|t| t.id().key()).collect();
     assert_eq!(keys, ["43", "41"]);
 }
+
+/// The thumb of an item whose art an agent gave, as a PMS answers it: a
+/// redirect to `location`. The item is the fixture's film.
+async fn redirected_thumb(pms: &MockServer, location: &str) -> spoolframe_types::ArtworkId {
+    serve(pms, "/library/metadata/134883", "metadata-movie").await;
+    Mock::given(path("/library/metadata/134883/thumb/1792415642"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+        .mount(pms)
+        .await;
+    artwork_id("/library/metadata/134883/thumb/1792415642")
+}
+
+/// A server that answers `/photo` with a JPEG, as Plex's image proxy does.
+async fn image_proxy() -> MockServer {
+    let proxy = MockServer::start().await;
+    Mock::given(path("/photo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"\xff\xd8 proxied".to_vec(), "image/jpeg"),
+        )
+        .mount(&proxy)
+        .await;
+    proxy
+}
+
+/// A PMS sends an agent's art to Plex's image proxy (images.plex.tv) with
+/// a 302: the image is fetched there, and the token stays with the PMS.
+#[tokio::test]
+async fn artwork_redirected_to_plex_s_image_proxy_is_fetched_without_the_token() {
+    let pms = MockServer::start().await;
+    let proxy = image_proxy().await;
+    let thumb = redirected_thumb(
+        &pms,
+        &format!(
+            "{}/photo?height=480&url=https%3A%2F%2Fmetadata-static.plex.tv%2F1%2Fa.jpg",
+            proxy.uri()
+        ),
+    )
+    .await;
+    let catalog = PlexCatalog::new(pms.uri().parse().unwrap(), Some("s3cr3t".into()))
+        .unwrap()
+        .reaching_inner_hosts();
+
+    let image = catalog.artwork(&thumb).await.unwrap();
+
+    assert_eq!(
+        (image.content_type.as_str(), image.bytes.as_slice()),
+        ("image/jpeg", b"\xff\xd8 proxied".as_slice())
+    );
+    let reached = proxy.received_requests().await.unwrap();
+    assert_eq!(reached.len(), 1);
+    assert!(
+        !reached[0].headers.contains_key("x-plex-token")
+            && !reached[0].url.as_str().contains("s3cr3t"),
+        "the token reached the proxy: {:?}",
+        reached[0]
+    );
+}
+
+/// A redirect within the PMS is followed with the token, as the PMS
+/// asks for it on every path.
+#[tokio::test]
+async fn artwork_redirected_within_the_pms_keeps_the_token() {
+    let pms = MockServer::start().await;
+    let thumb = redirected_thumb(&pms, "/library/metadata/134883/thumb/2").await;
+    Mock::given(path("/library/metadata/134883/thumb/2"))
+        .and(header("X-Plex-Token", "s3cr3t"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(b"\x89PNG moved".to_vec(), "image/png"),
+        )
+        .expect(1)
+        .mount(&pms)
+        .await;
+    let catalog = PlexCatalog::new(pms.uri().parse().unwrap(), Some("s3cr3t".into())).unwrap();
+
+    let image = catalog.artwork(&thumb).await.unwrap();
+
+    assert_eq!(image.bytes, b"\x89PNG moved");
+}
+
+/// A redirect off the PMS goes only to a public host over HTTPS: one to
+/// an inner host, or in the clear, is refused before anything is sent to
+/// it, and the error says why.
+#[tokio::test]
+async fn artwork_redirected_off_the_pms_to_an_inner_host_is_refused() {
+    let proxy = image_proxy().await;
+    let port = proxy.address().port();
+    for (location, why) in [
+        (format!("{}/photo", proxy.uri()), "not HTTPS"),
+        (format!("https://127.0.0.1:{port}/photo"), "loopback"),
+        ("https://10.1.2.3/photo".to_owned(), "private"),
+        ("https://[fe80::1]/photo".to_owned(), "link-local"),
+        ("https://169.254.169.254/latest".to_owned(), "link-local"),
+        (format!("https://localhost:{port}/photo"), "local name"),
+        ("https://nas.lan/photo".to_owned(), "local name"),
+    ] {
+        let pms = MockServer::start().await;
+        let thumb = redirected_thumb(&pms, &location).await;
+        let err = catalog(&pms).artwork(&thumb).await.unwrap_err();
+        assert!(
+            matches!(err, CatalogError::Backend { .. }) && err.to_string().contains(why),
+            "{location}: {err}"
+        );
+    }
+    assert!(proxy.received_requests().await.unwrap().is_empty());
+}
+
+/// A redirect off the PMS that would carry the token in its URL is
+/// refused: the token is the PMS's alone.
+#[tokio::test]
+async fn artwork_redirected_off_the_pms_with_the_token_in_its_url_is_refused() {
+    let pms = MockServer::start().await;
+    let proxy = image_proxy().await;
+    let thumb = redirected_thumb(
+        &pms,
+        &format!("{}/photo?url=%2Fx%3FX-Plex-Token%3Ds3cr3t", proxy.uri()),
+    )
+    .await;
+    let catalog = PlexCatalog::new(pms.uri().parse().unwrap(), Some("s3cr3t".into()))
+        .unwrap()
+        .reaching_inner_hosts();
+
+    let err = catalog.artwork(&thumb).await.unwrap_err();
+
+    assert!(err.to_string().contains("token"), "{err}");
+    assert!(proxy.received_requests().await.unwrap().is_empty());
+}
+
+/// At most three redirects are followed: a PMS that keeps redirecting is
+/// asked four times for the image, and then it is an error.
+#[tokio::test]
+async fn artwork_past_three_redirects_is_an_error() {
+    let pms = MockServer::start().await;
+    let thumb = redirected_thumb(&pms, "/library/metadata/134883/thumb/1792415642").await;
+
+    let err = catalog(&pms).artwork(&thumb).await.unwrap_err();
+
+    let asked = pms
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/thumb/1792415642"))
+        .count();
+    assert_eq!(asked, 4, "{err}");
+    assert!(err.to_string().contains("redirects"), "{err}");
+}

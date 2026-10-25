@@ -16,6 +16,8 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spoolframe-catalog = { workspace = true }
+# `wan::not_public`: where an image redirected off the PMS may go.
+spoolframe-admin-api = { workspace = true }
 # `MAX_DURATION`: a preview index's frame times are held to it (finding 52).
 spoolframe-media = { workspace = true }
 spoolframe-types = { workspace = true }
@@ -30,7 +32,11 @@ libc = { workspace = true }
 [features]
 # `fuzzing`: the PMS response parsers, for the fuzz targets in fuzz/.
 fuzzing = []
+# `test-support`: `PlexCatalog::reaching_inner_hosts`, for tests whose
+# image proxy is on loopback.
+test-support = []
 
 [dev-dependencies]
+spoolframe-plex = { path = ".", features = ["test-support"] }
 spoolframe-test-dir = { workspace = true }
 wiremock = { workspace = true }
