@@ -488,6 +488,45 @@ mod tests {
         assert!(played(&high, "hvc1.2.4.H150.90"));
     }
 
+    /// Apple answers no for every `hev1` and `dvhe` string, so an app
+    /// lists `hvc1` and `dvh1` only: a source named in-band is judged as
+    /// its out-of-band twin, which is what a copy is written as.
+    #[test]
+    fn an_in_band_source_is_judged_by_an_out_of_band_list() {
+        let list = [read("hvc1.2.4.L153.B0"), read("dvh1.08.06")];
+        assert!(played(&list, "hev1.2.4.L153.B0"));
+        assert!(!played(&list, "hev1.2.4.H120.B0"), "high tier");
+        assert!(played(&list, "dvhe.08.06"));
+        assert!(!played(&list, "hev1.2.4.L186.B0"));
+    }
+
+    /// The compatibility flags are not the profile: a Main 10 source
+    /// that also says it is Main-compatible (`2.6`) or none (`2.0`) is
+    /// judged by its profile, 2, as `2.4` is.
+    #[test]
+    fn hevc_compatibility_flags_are_not_compared() {
+        let list = [read("hvc1.2.4.L153.B0")];
+        assert!(played(&list, "hvc1.2.6.L153.B0"));
+        assert!(played(&list, "hvc1.2.0.L153.B0"));
+        assert!(played(&list, "hvc1.2.4.L153.90"), "constraint bytes");
+        assert!(played(&[read("hvc1.1.6.L153.B0")], "hvc1.1.2.L120.B0"));
+    }
+
+    /// Dolby Vision 5 and 8 at the levels an Apple TV lists, 01 to 09:
+    /// a source at 10 or above is not played; 7 never is.
+    #[test]
+    fn dolby_vision_levels_past_the_list_are_not_played() {
+        let list = [read("dvh1.05.09"), read("dvh1.08.09")];
+        for level in 1..=9 {
+            assert!(played(&list, &format!("dvh1.08.{level:02}")), "{level}");
+            assert!(played(&list, &format!("dvh1.05.{level:02}")), "{level}");
+        }
+        for level in 10..=13 {
+            assert!(!played(&list, &format!("dvh1.08.{level:02}")), "{level}");
+        }
+        assert!(!played(&list, "dvh1.07.06"));
+    }
+
     /// HEVC Main 10 decoders decode Main; not the other way round.
     #[test]
     fn hevc_main_10_plays_main() {

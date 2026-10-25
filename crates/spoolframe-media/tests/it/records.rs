@@ -155,4 +155,23 @@ async fn a_stream_s_codec_string_is_read_from_its_record() {
         &["-profile:v", "main", "-level", "3.1"],
     );
     assert_eq!(codec_string(&h264).await.as_deref(), Some("avc1.4D401F"));
+    // An MP4 track tagged `hev1` is named as its copy is written, `hvc1`:
+    // the string an app lists, as Apple says no to every `hev1`.
+    let hev1 = film(
+        tmp.as_ref(),
+        "g.mp4",
+        "libx265",
+        &[
+            "-pix_fmt",
+            "yuv420p10le",
+            "-x265-params",
+            "log-level=error:level-idc=5.1:high-tier=0",
+            "-tag:v",
+            "hev1",
+        ],
+    );
+    assert_eq!(
+        codec_string(&hev1).await.as_deref(),
+        Some("hvc1.2.4.L153.90")
+    );
 }

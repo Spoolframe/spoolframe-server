@@ -1401,7 +1401,11 @@ RFC 6381 codec strings the device plays, as its player answers for each
   video is converted, with the reason `video: <string> not supported`.
 - The source's string comes from its codec record (`hvcC`, `avcC`,
   `av1C`, or the SPS in MPEG-TS), as a copy is written (`hvc1`, `avc1`),
-  and Dolby Vision's from its configuration record. Where the server
+  and Dolby Vision's from its configuration record (`dvh1`). A file
+  tagged `hev1` or `dvhe` is judged so too, so an app need list only
+  `hvc1` and `dvh1` (Apple's player says no to every `hev1` and `dvhe`
+  string). A copy is tagged `hvc1`, profile 5 `dvh1`, and profile 8
+  `hvc1` with its `dvvC` and `SUPPLEMENTAL-CODECS="dvh1.08.LL/…"`. Where the server
   could not read the record, the source's string is unknown and the
   list has no say over it.
 - Dolby Vision: copied and labelled only where its own string
