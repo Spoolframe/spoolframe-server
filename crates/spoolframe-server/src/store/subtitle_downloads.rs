@@ -79,6 +79,23 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<DownloadRow, sqlx::Error> {
     })
 }
 
+/// The downloads of the media file at `media_path`, oldest first, read
+/// through `on`: the pool, or a transaction that wrote them.
+async fn downloads_of_file<'e>(
+    on: impl sqlx::SqliteExecutor<'e>,
+    media_path: &str,
+) -> Result<Vec<DownloadRow>, StoreError> {
+    let rows = sqlx::query(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM subtitle_downloads WHERE media_path = ?1 ORDER BY rowid"
+    ))
+    .bind(media_path)
+    .fetch_all(on)
+    .await?;
+    Ok(rows.iter().map(row).collect::<Result<_, _>>()?)
+}
+
 impl Store {
     /// Every download, in the order they were made: what the server gives the media
     /// files at start.
@@ -114,15 +131,7 @@ impl Store {
         &self,
         media_path: &str,
     ) -> Result<Vec<DownloadRow>, StoreError> {
-        let rows = sqlx::query(concat!(
-            "SELECT ",
-            columns!(),
-            " FROM subtitle_downloads WHERE media_path = ?1 ORDER BY rowid"
-        ))
-        .bind(media_path)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(row).collect::<Result<_, _>>()?)
+        downloads_of_file(&self.pool, media_path).await
     }
 
     /// Item `media_id`'s download of the site's `file_id`, if it has one.
@@ -148,8 +157,13 @@ impl Store {
 
     /// Keep `download`, and count it against its downloader's day. A
     /// rejection of the same result is taken back: someone wanted it
-    /// again.
-    pub async fn put_subtitle_download(&self, download: &DownloadRow) -> Result<(), StoreError> {
+    /// again. Its media file's downloads once it is kept, as
+    /// [`Store::subtitle_downloads_of_file`] says them, read in the same
+    /// transaction: what the file is given is what the store holds.
+    pub async fn put_subtitle_download(
+        &self,
+        download: &DownloadRow,
+    ) -> Result<Vec<DownloadRow>, StoreError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(concat!(
             "INSERT INTO subtitle_downloads (",
@@ -189,8 +203,9 @@ impl Store {
         .bind(&download.file_id)
         .execute(&mut *tx)
         .await?;
+        let of_file = downloads_of_file(&mut *tx, &download.media_path).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(of_file)
     }
 
     /// The kept downloads can no longer be read: a test's store failing
@@ -247,12 +262,14 @@ impl Store {
     }
 
     /// Take download `id` away, as `by` (a principal), and remember its
-    /// result as rejected for its item. `None` if there was none.
+    /// result as rejected for its item: what was taken, and its media
+    /// file's downloads left, read in the same transaction. `None` if
+    /// there was none.
     pub async fn remove_subtitle_download(
         &self,
         id: &str,
         by: &str,
-    ) -> Result<Option<DownloadRow>, StoreError> {
+    ) -> Result<Option<(DownloadRow, Vec<DownloadRow>)>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let found = sqlx::query(concat!(
             "DELETE FROM subtitle_downloads WHERE id = ?1 RETURNING ",
@@ -275,8 +292,9 @@ impl Store {
         .bind(self.now())
         .execute(&mut *tx)
         .await?;
+        let left = downloads_of_file(&mut *tx, &removed.media_path).await?;
         tx.commit().await?;
-        Ok(Some(removed))
+        Ok(Some((removed, left)))
     }
 
     /// The results removed as bad for item `media_id`, every site's:
@@ -468,7 +486,7 @@ mod tests {
             .remove_subtitle_download("d1", "local:1")
             .await
             .unwrap();
-        assert_eq!(removed.map(|r| r.file_id).as_deref(), Some("7"));
+        assert_eq!(removed.map(|(r, _)| r.file_id).as_deref(), Some("7"));
         assert_eq!(
             store
                 .remove_subtitle_download("d1", "local:1")
@@ -486,6 +504,36 @@ mod tests {
             .await
             .unwrap();
         assert!(rejected(&store, "opensubtitles").await.is_empty());
+    }
+
+    /// A keeping and a removal say the media file's downloads as their
+    /// own transaction left them: the one kept among the others, oldest
+    /// first; the one removed gone, the others left.
+    #[tokio::test]
+    async fn a_keeping_and_a_removal_say_the_file_s_downloads_they_left() {
+        let store = test_store("subtitle-downloads-of-file").await;
+        let now = store.now();
+        let ids = |rows: &[DownloadRow]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let kept = store
+            .put_subtitle_download(&download("d1", "7", "local:1", now))
+            .await
+            .unwrap();
+        assert_eq!(ids(&kept), ["d1"]);
+        let mut elsewhere = download("d9", "9", "local:1", now);
+        elsewhere.media_path = "/media/Other.mkv".into();
+        store.put_subtitle_download(&elsewhere).await.unwrap();
+        let kept = store
+            .put_subtitle_download(&download("d2", "8", "local:2", now))
+            .await
+            .unwrap();
+        assert_eq!(ids(&kept), ["d1", "d2"], "not another file's");
+        let (removed, left) = store
+            .remove_subtitle_download("d1", "local:1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.id, "d1");
+        assert_eq!(ids(&left), ["d2"]);
     }
 
     /// SubDL's ids are text; one site's id is not another's.

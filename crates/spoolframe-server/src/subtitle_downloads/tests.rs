@@ -2113,8 +2113,9 @@ async fn a_pair_s_download_of_a_kept_result_counts_under_it_as_its_server_counts
 }
 
 /// A download counted and kept is its track though the media file's
-/// downloads cannot be read once it is kept: given with those read before
-/// it, where the download failed with its file and its count kept.
+/// downloads cannot be read once it is kept: nothing is read then, the
+/// file given them as the row's transaction read them, where the download
+/// failed with its file and its count kept.
 #[tokio::test]
 async fn a_kept_download_whose_downloads_cannot_be_read_again_is_its_track_all_the_same() {
     let f = fixture("attach-failed", 0).await;
@@ -2144,5 +2145,53 @@ async fn a_kept_download_whose_downloads_cannot_be_read_again_is_its_track_all_t
     holds.recorded.let_go();
     let got = download.await.expect("kept and counted: not failed");
     assert_eq!(got.track as usize, own + 1, "after the one before");
+    assert_eq!(f.subtitles().await.len(), own + 2, "both are tracks");
+}
+
+/// A media file is given its downloads one write's at a time, each as the
+/// write read them: two kept at once, Alice's from one site and Bob's from
+/// the other, are never at the end of their keeping together, so neither
+/// list given leaves out the other's track; both are tracks. Where each
+/// was given a list read apart from its write, the one given last could
+/// be the one read first.
+#[tokio::test]
+async fn two_downloads_kept_at_once_are_both_the_file_s_tracks() {
+    let f = fixture_with("kept-at-once", both).await;
+    f.answers_search().await;
+    f.subdl_answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode(RUSSIAN);
+    f.subdl_serves(
+        "/subtitle/3172974-3188291.zip",
+        zipped(&[("Film.2019.srt", &cp1251)]),
+    )
+    .await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let own = f.subtitles().await.len();
+    let holds = f.downloads.holds.clone();
+    holds.recorded.hold();
+    let (item, alice, bob) = (film(), alice(), bob());
+    let watching = async {
+        holds.recorded.until_at_it(1).await;
+        // The other waits on the file, not at the end of its keeping.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), holds.recorded.until_at_it(2))
+                .await
+                .is_err(),
+            "both kept and not yet given at once"
+        );
+        holds.recorded.let_go();
+    };
+    let (a, b, ()) = tokio::join!(
+        f.downloads.download(&item, "opensubtitles:103", &alice),
+        f.downloads.download(&item, "subdl:3172974-3188291", &bob),
+        watching,
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(f.store.all_subtitle_downloads().await.unwrap().len(), 2);
     assert_eq!(f.subtitles().await.len(), own + 2, "both are tracks");
 }

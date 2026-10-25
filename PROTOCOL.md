@@ -2240,9 +2240,10 @@ background (`spoolframe:subtitle-sync`: `timing` says `syncing`, then
 timing without a restart. The same result is never downloaded twice:
 asking again answers the same track, at no cost (a paired server's
 users' excepted, P8-07). A download counted and kept is never refused
-for its track: if the server cannot read the item's downloads again
-once it is kept, it gives the item those it read before, and this
-one.
+for its track: the item's tracks are read in the same transaction that
+keeps it, or removes one, and nothing is read after. Two downloads or
+removals of one file at once give it its tracks one after the other,
+so the last one's are what it has.
 
 A downloaded track has `download` on `Tracks`, a `SubtitleDownload`:
 its `id` (what `RemoveSubtitleDownload` names), `source` (the site's

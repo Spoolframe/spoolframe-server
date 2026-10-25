@@ -650,6 +650,12 @@ pub struct SubtitleDownloads {
     /// at once never both take the last one. A download's keeping carries
     /// the hold ([`finish`]).
     limits: crate::keyed_locks::KeyedLocks,
+    /// Each media file's downloads, by its path, held from a write of
+    /// them (a download kept, or removed) until the file is given what
+    /// that write read: two writes at once, one from each site, give it
+    /// in the order they were made, so the last one's list is what it
+    /// has.
+    files: crate::keyed_locks::KeyedLocks,
     /// The downloads a site spent that are not kept as rows yet, by
     /// downloader: counted against its day as the rows are.
     spent: Arc<Spent>,
@@ -749,6 +755,9 @@ struct Finishing {
     row: DownloadRow,
     bytes: Vec<u8>,
     limit: crate::keyed_locks::Guard,
+    /// The media file's downloads' hold ([`SubtitleDownloads::files`]),
+    /// until it is given them.
+    file_hold: crate::keyed_locks::Guard,
     /// Where the download is counted until its row is.
     spent: Arc<Spent>,
     #[cfg(any(test, feature = "test-support"))]
@@ -756,9 +765,11 @@ struct Finishing {
 }
 
 /// Keep `finishing` as its file and its row within [`FINISH_WAIT`], then
-/// give its media file its downloads: on a task of its own, so a request
-/// cancelled meanwhile ends with a recorded, counted file or no file at
-/// all, the downloader's limit held until then.
+/// give its media file its downloads as the row's transaction read them:
+/// on a task of its own, so a request cancelled meanwhile ends with a
+/// recorded, counted file or no file at all, the downloader's limit held
+/// until then. Nothing is read once the download is counted, so nothing
+/// fails it then.
 async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
     let Finishing {
         store,
@@ -768,25 +779,23 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
         row,
         bytes,
         limit,
+        file_hold,
         spent,
         #[cfg(any(test, feature = "test-support"))]
         holds,
     } = finishing;
-    let _limit = limit;
+    let (_limit, _file_hold) = (limit, file_hold);
     let file = file_of(&dir, &row);
-    let media_path = media.display().to_string();
-    // The media file's other downloads, read before this one is kept: what
-    // it is given with this one should the read once it is kept fail. A
-    // download counted and kept is never failed for want of its track.
-    let mut others = Vec::new();
+    // The media file's downloads with this one, as the transaction that
+    // kept it read them.
+    let mut of_file = Vec::new();
     let kept = tokio::time::timeout(FINISH_WAIT, async {
-        others = store.subtitle_downloads_of_file(&media_path).await?;
         #[cfg(any(test, feature = "test-support"))]
         holds.writing.wait().await;
         write_into_place(&file, &bytes).await?;
         #[cfg(any(test, feature = "test-support"))]
         holds.recording.wait().await;
-        store.put_subtitle_download(&row).await?;
+        of_file = store.put_subtitle_download(&row).await?;
         #[cfg(any(test, feature = "test-support"))]
         holds.recorded.wait().await;
         Ok::<(), DownloadError>(())
@@ -795,12 +804,16 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
     let failed = match kept {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(e),
-        // The wait up with the commit in flight: the row decides.
+        // The wait up with the commit in flight: the row decides, read
+        // with the file's other downloads, which the file is given.
         Err(_) => match store
-            .subtitle_download_of(&row.media_id, &row.source, &row.file_id)
+            .subtitle_downloads_of_file(&media.display().to_string())
             .await
         {
-            Ok(Some(_)) => None,
+            Ok(rows) if rows.iter().any(|r| r.id == row.id) => {
+                of_file = rows;
+                None
+            }
             _ => Some(DownloadError::Io(
                 "the subtitle was not kept in time".into(),
             )),
@@ -814,33 +827,16 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
     }
     // Counted by its row from now on, the limit still held.
     spent.kept(&row.downloaded_by, &row.id);
-    if let Err(e) = attach(&store, &prober, &dir, &media).await {
-        tracing::warn!(
-            media = %media.display(),
-            error = %e,
-            "cannot read a media file's subtitle downloads: given them as read before this one"
-        );
-        others.retain(|r| r.id != row.id);
-        others.push(row);
-        let streams = others.iter().map(|r| stream(&dir, r)).collect();
-        prober.set_added_subtitles(&media, streams);
-    }
+    give(&prober, &dir, &media, &of_file);
     Ok(())
 }
 
-/// Give the media file at `media` its downloads as they are now.
-async fn attach(
-    store: &Store,
-    prober: &Prober,
-    dir: &Path,
-    media: &Path,
-) -> Result<(), StoreError> {
-    let rows = store
-        .subtitle_downloads_of_file(&media.display().to_string())
-        .await?;
+/// Give the media file at `media` `rows`, its downloads as the write that
+/// left them read them, under the file's hold: the last write's are what
+/// it has.
+fn give(prober: &Prober, dir: &Path, media: &Path, rows: &[DownloadRow]) {
     let streams = rows.iter().map(|r| stream(dir, r)).collect();
     prober.set_added_subtitles(media, streams);
-    Ok(())
 }
 
 fn file_of(dir: &Path, row: &DownloadRow) -> PathBuf {
@@ -905,6 +901,7 @@ impl SubtitleDownloads {
             searches: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
             limits: Default::default(),
+            files: Default::default(),
             spent: Arc::default(),
             pair_searches: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
@@ -1490,6 +1487,7 @@ impl SubtitleDownloads {
             downloaded_at: self.store.now(),
         };
         let file = file_of(&self.dir, &row);
+        let file_hold = self.files.lock(&row.media_path).await;
         // The file and the row on a task of their own: a request cancelled
         // from here on leaves them both, counted, or neither.
         let finishing = Finishing {
@@ -1500,6 +1498,7 @@ impl SubtitleDownloads {
             row: row.clone(),
             bytes: kept.bytes,
             limit: held_limit,
+            file_hold,
             spent: self.spent.clone(),
             #[cfg(any(test, feature = "test-support"))]
             holds: self.holds.clone(),
@@ -1785,12 +1784,26 @@ impl SubtitleDownloads {
                 "only who downloaded it, or an admin, may remove it",
             ));
         }
-        self.store
-            .remove_subtitle_download(&row.id, &principal)
-            .await?;
         let file = file_of(&self.dir, &row);
-        let media = PathBuf::from(&row.media_path);
-        attach(&self.store, &self.prober, &self.dir, &media).await?;
+        let hold = self.files.lock(&row.media_path).await;
+        let (store, prober, dir) = (self.store.clone(), self.prober.clone(), self.dir.clone());
+        let (media, removing, by) = (
+            PathBuf::from(&row.media_path),
+            row.id.clone(),
+            principal.clone(),
+        );
+        // The row and the file's downloads on work of their own, as a
+        // keeping is: a request cancelled meanwhile leaves the file given
+        // what the removal left.
+        tokio::spawn(async move {
+            let _hold = hold;
+            if let Some((_, left)) = store.remove_subtitle_download(&removing, &by).await? {
+                give(&prober, &dir, &media, &left);
+            }
+            Ok::<(), StoreError>(())
+        })
+        .await
+        .map_err(|e| DownloadError::Io(format!("the subtitle was not removed: {e}")))??;
         if let Err(e) = self.timings.forget(&file).await {
             tracing::warn!(%id, error = %e, "cannot forget a removed subtitle's timing");
         }

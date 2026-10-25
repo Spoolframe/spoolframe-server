@@ -373,8 +373,10 @@
     counted; and a pair's download of a result kept already counts under
     the pair, as the paired server counts it under its user, which
     cannot tell it from a new one. A download counted and kept is never
-    failed for its track: if its item's downloads cannot be read once it
-    is kept, the item is given those read before, and it. The file and its
+    failed for its track: the item's tracks are read in the transaction
+    that keeps it (or removes one), not after, and two at once on one
+    file give it its tracks in turn, so a download kept at the same
+    moment from the other site is never left out. The file and its
     record are kept on work of their own within 30 s, so no file is left
     that the limit does not count. A download whose request was
     cancelled before OpenSubtitles answered, or that the site failed on
