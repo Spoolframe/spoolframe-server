@@ -492,23 +492,32 @@ impl Connections {
             .filter(|(_, of)| !of.is_empty())
             .collect();
         let this_key = held.iter().filter(|(e, _)| e == endpoint).count();
-        let pair_full = |pair: &String| {
-            held.iter().filter(|(_, of)| of.contains(pair)).count()
-                >= self.admission.max_pair_remote_connections
-        };
         held.len() < self.admission.max_all_remote_connections
-            && !pairs.iter().any(pair_full)
+            && self.pairs_have_room(peers, pairs)
             && this_key < self.admission.max_remote_connections
+    }
+
+    /// Whether each of `pairs` holds fewer than
+    /// [`Admission::max_pair_remote_connections`] of `peers`.
+    fn pairs_have_room(&self, peers: &HashMap<usize, Arc<Peer>>, pairs: &[String]) -> bool {
+        pairs.iter().all(|pair| {
+            peers
+                .values()
+                .filter(|held| held.remote_pairs().contains(pair))
+                .count()
+                < self.admission.max_pair_remote_connections
+        })
     }
 
     /// `endpoint` redeemed a paired server's token (Z8-01): its sessions
     /// here are pairs `pairs`' alone. Each of its connections that holds
     /// no session of this server's own counts under every one of those
     /// pairs from now on, as one let in by them would: one held so
-    /// already takes the pairs as they are now; a stranger's gets the
-    /// normal limits only while the remote caps have room for it, and is
-    /// closed `BUSY` once its streams are answered otherwise
-    /// ([`Peer::refuse`]), as one more past the caps is. A device signed
+    /// already takes the pairs as they are now, if each it joins has room
+    /// for it (W4); a stranger's gets the normal limits only while the
+    /// remote caps have room for it. Either is closed `BUSY` once its
+    /// streams are answered otherwise ([`Peer::refuse`]), as one more past
+    /// the caps is. A device signed
     /// in here is left as it is. The ids raised.
     pub(crate) fn remote_signed_in(&self, endpoint: &EndpointId, pairs: &[String]) -> Vec<usize> {
         let mut raised = Vec::new();
@@ -521,8 +530,21 @@ impl Connections {
             .map(|(id, p)| (*id, p.clone()))
             .collect();
         for (id, peer) in mine {
-            if !peer.remote_pairs().is_empty() {
-                peer.set_remote_pairs(pairs.to_vec());
+            let held_by = peer.remote_pairs();
+            if !held_by.is_empty() {
+                // Already counted, so the caps it fills are not asked
+                // again; only the pairs it joins now, whose shares it
+                // would spend without a place (W4).
+                let joined: Vec<String> = pairs
+                    .iter()
+                    .filter(|pair| !held_by.contains(pair))
+                    .cloned()
+                    .collect();
+                if self.pairs_have_room(&peers, &joined) {
+                    peer.set_remote_pairs(pairs.to_vec());
+                } else {
+                    peer.refuse(self.admission.sign_out_drain);
+                }
             } else if !peer.known() {
                 if self.remote_room(&peers, endpoint, pairs) {
                     peer.set_remote_pairs(pairs.to_vec());

@@ -25,6 +25,8 @@ pub struct RemoteDownloadRow {
     pub file: Option<String>,
     pub expected_size: Option<i64>,
     pub unavailable_at: Option<i64>,
+    /// Bumped by every write of the row: what an answer is kept against.
+    pub revision: i64,
 }
 
 /// A download to keep, as SA answered its preparation.
@@ -43,7 +45,7 @@ pub struct NewRemoteDownload<'a> {
 macro_rules! columns {
     () => {
         "id, principal, origin, library, item, remote_id, state, file, expected_size, \
-         unavailable_at"
+         unavailable_at, revision"
     };
 }
 
@@ -77,7 +79,8 @@ impl Store {
                  library = excluded.library, item = excluded.item, \
                  state = excluded.state, file = COALESCE(excluded.file, file), \
                  expected_size = COALESCE(excluded.expected_size, expected_size), \
-                 unavailable_at = NULL, updated_at = excluded.updated_at \
+                 unavailable_at = NULL, updated_at = excluded.updated_at, \
+                 revision = revision + 1 \
              RETURNING ",
             columns!()
         ))
@@ -167,27 +170,33 @@ impl Store {
     }
 
     /// Download `id`'s state and file as SA told them now, unless it is no
-    /// longer available.
+    /// longer available, or was written since `revision`, the one the
+    /// answer was asked under (G8-02): an answer that raced a newer
+    /// preparation or answer is older than it, and moves nothing back.
+    /// Whether it was kept.
     pub async fn set_remote_download_state(
         &self,
         id: &str,
+        revision: i64,
         state: &str,
         file: Option<&str>,
         expected_size: Option<u64>,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let kept = sqlx::query(
             "UPDATE federation_downloads SET state = ?2, file = COALESCE(?3, file), \
-                 expected_size = COALESCE(?4, expected_size), updated_at = ?5 \
-             WHERE id = ?1 AND unavailable_at IS NULL",
+                 expected_size = COALESCE(?4, expected_size), updated_at = ?5, \
+                 revision = revision + 1 \
+             WHERE id = ?1 AND revision = ?6 AND unavailable_at IS NULL",
         )
         .bind(id)
         .bind(state)
         .bind(file)
         .bind(size(expected_size))
         .bind(self.now())
+        .bind(revision)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(kept.rows_affected() == 1)
     }
 
     /// Delete `principal`'s download `id`: whether there was one.
@@ -355,6 +364,48 @@ mod tests {
         assert_eq!(count().await, MAX_REMOTE_DOWNLOADS as usize - 1);
     }
 
+    /// An answer asked under an older revision of the row is not kept: a
+    /// status answer that raced a newer preparation moves nothing back.
+    #[tokio::test]
+    async fn a_stale_answer_leaves_a_newer_state_alone() {
+        let store = test_store("fed-downloads-stale").await;
+        let asked = store
+            .put_remote_download(new("r1", "plex:1"))
+            .await
+            .unwrap();
+        // Prepared again while the status was being asked.
+        let again = store
+            .put_remote_download(NewRemoteDownload {
+                state: r#"{"type":"ready","size":1,"sha256":"00"}"#,
+                ..new("r1", "plex:1")
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.id, asked.id);
+        let kept = store
+            .set_remote_download_state(
+                &asked.id,
+                asked.revision,
+                r#"{"type":"waiting"}"#,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!kept);
+        let row = store
+            .remote_download(&asked.principal, &asked.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, again.state);
+        let kept = store
+            .set_remote_download_state(&row.id, row.revision, r#"{"type":"waiting"}"#, None, None)
+            .await
+            .unwrap();
+        assert!(kept, "an answer to the current row is kept");
+    }
+
     /// Downloads that ended a while ago are forgotten: no longer available,
     /// or failed. A made one, or one being made, stays.
     #[tokio::test]
@@ -367,6 +418,7 @@ mod tests {
         store
             .set_remote_download_state(
                 &made.id,
+                made.revision,
                 r#"{"type":"ready","size":1,"sha256":"00"}"#,
                 None,
                 None,
@@ -384,6 +436,7 @@ mod tests {
         store
             .set_remote_download_state(
                 &failed.id,
+                failed.revision,
                 r#"{"type":"failed","reason":"no room","cause":"other"}"#,
                 None,
                 None,
@@ -603,6 +656,7 @@ mod tests {
                 file: None,
                 expected_size: Some(10),
                 unavailable_at: Some(7),
+                revision: 0,
             })
         );
         let other = store

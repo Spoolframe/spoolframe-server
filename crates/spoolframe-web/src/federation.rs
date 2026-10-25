@@ -7,7 +7,8 @@
 
 use serde_json::Value;
 use spoolframe_admin_api::{
-    LibraryKind, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary, error_code,
+    ExpectedKey, LibraryKind, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary,
+    error_code,
 };
 
 use crate::catalog::bytes;
@@ -282,6 +283,20 @@ pub fn new_key_line(now: i64, key: &PeerKey) -> String {
     }
 }
 
+/// What the "Confirm it's you" dialog says expecting a new key is.
+pub const CONFIRM_EXPECT: &str = "changing which new key a paired server is let in with";
+
+/// What the "Expected new key" section says of `expected`, a key `name`'s
+/// admin said their server moves to, seen at `now` (M8-06).
+pub fn expected_line(now: i64, name: &str, expected: &ExpectedKey) -> String {
+    format!(
+        "Entered by {} {}. A key with this fingerprint is held even when the new keys held for \
+         {name} are full; you still confirm it. Kept for a week.",
+        expected.expected_by,
+        days_ago(now, expected.expected_at)
+    )
+}
+
 /// A key change that failed, in the page's words: the held keys having
 /// changed since the page listed them is said as that.
 pub fn key_change_error(e: &ApiError) -> String {
@@ -541,6 +556,28 @@ pub fn states(now: i64, me: &str, detail: &PeerDetail) -> Vec<State> {
             bad: false,
         });
     }
+    // M8-06: a stranger who knows the pair's server id can fill the
+    // places; the admin sees why a rotation is stuck, and the way on.
+    if detail.peer.held_keys_full {
+        states.push(State {
+            title: format!("No room for another new key from {name}"),
+            text: if detail.peer.expected_key.is_some() {
+                format!(
+                    "As many new keys are held as are kept, so another that says it is {name} is \
+                     refused, but for the key you expect. Reject the keys {name}'s admin does not \
+                     read you on the Federation page."
+                )
+            } else {
+                format!(
+                    "As many new keys are held as are kept, so another that says it is {name} is \
+                     refused. If {name} moved to a new key, ask its admin for its fingerprint and \
+                     enter it under Expected new key, or reject the keys you do not recognise on \
+                     the Federation page."
+                )
+            },
+            bad: true,
+        });
+    }
     let passed = week(&detail.week).passed_on;
     if passed > 0 {
         states.push(State {
@@ -597,7 +634,8 @@ pub fn refusal(e: &ApiError) -> String {
                        their Federation page."
             .into(),
         "key_refused" => "The other server refuses this server's new key: its admin rejected \
-                          it, or holds as many new keys as it keeps."
+                          it, or holds as many new keys as it keeps. Read its admin this \
+                          server's fingerprint to enter as the expected new key."
             .into(),
         "same_server_id" => "The other server has this server's id: they cannot pair.".into(),
         _ => e.message.clone(),
@@ -638,6 +676,8 @@ mod tests {
             paired_at: NOW - 20 * DAY,
             revoked_at: None,
             held_keys: Vec::new(),
+            held_keys_full: false,
+            expected_key: None,
             connected: false,
             last_sync: None,
             plays_here: 0,
@@ -807,6 +847,7 @@ mod tests {
         assert!(refusal(&refused("already_paired")).contains("paired already"));
         assert!(refusal(&refused("key_held")).contains("new key"));
         assert!(refusal(&refused("key_refused")).contains("refuses"));
+        assert!(refusal(&refused("key_refused")).contains("expected new key"));
         assert!(refusal(&refused("same_server_id")).contains("this server's id"));
         // A reason this build does not know: the server's own words.
         assert_eq!(refusal(&refused("busy")), "the server message");
@@ -1033,6 +1074,63 @@ mod tests {
             ..busy
         };
         assert!(states(NOW, "Home Media", &gone).is_empty());
+    }
+
+    /// M8-06: held keys full is said, with the way on; with a key
+    /// expected, only the rejecting is left to do.
+    #[test]
+    fn held_keys_full_is_said_with_the_way_on() {
+        let full = PeerDetail {
+            peer: PeerEntry {
+                held_keys_full: true,
+                ..detail().peer
+            },
+            ..detail()
+        };
+        let said = states(NOW, "Home Media", &full);
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            said[0].title,
+            "No room for another new key from Bob's Media"
+        );
+        assert!(said[0].bad);
+        assert!(
+            said[0].text.contains("enter it under Expected new key"),
+            "{}",
+            said[0].text
+        );
+        let expecting = PeerDetail {
+            peer: PeerEntry {
+                expected_key: Some(ExpectedKey {
+                    fingerprint: "QAJ7-XQG9-2MDW-AN9H".into(),
+                    expected_at: NOW,
+                    expected_by: "andrey".into(),
+                }),
+                ..full.peer.clone()
+            },
+            ..full
+        };
+        let said = states(NOW, "Home Media", &expecting);
+        assert!(
+            said[0].text.contains("but for the key you expect"),
+            "{}",
+            said[0].text
+        );
+    }
+
+    #[test]
+    fn an_expected_key_says_who_entered_it_and_when() {
+        let expected = ExpectedKey {
+            fingerprint: "QAJ7-XQG9-2MDW-AN9H".into(),
+            expected_at: NOW - 2 * DAY,
+            expected_by: "andrey".into(),
+        };
+        let line = expected_line(NOW, "Bob's Media", &expected);
+        assert!(line.starts_with("Entered by andrey 2 days ago."), "{line}");
+        assert!(
+            line.contains("held even when the new keys held for Bob's Media are full"),
+            "{line}"
+        );
     }
 
     #[test]

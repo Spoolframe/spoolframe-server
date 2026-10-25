@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Fixed: a subtitle download whose keeping ran out of its 30 s wait with
+  its row unreadable afterwards no longer has its file removed: the row
+  may have landed. The download is still told failed, and the file stays
+  for the next start to give its media file or remove (P8-06).
+- Fixed: a device already holding connections in one paired server's
+  sessions no longer spends another pair's share past its cap by
+  redeeming that pair's token. Its connections are charged to the second
+  pair only while its share has room for them, and are closed `BUSY`
+  once answered otherwise, as a stranger's are (P8-06).
+- Fixed: a paired server's answer about a download that came late no
+  longer overwrites a newer state of it. SB's record of each download
+  carries a revision that every write bumps, and an answer is kept only
+  for the revision it was asked under (P8-06).
+- Fixed, experimental federation: a stranger that knew a paired
+  server's server id could fill the four new keys held for that pair
+  and keep the pair's own rotated key out for a week (P8-06).
+  Before the other server moves to its new key, its admin reads out the
+  new fingerprint. The admin here enters it on the paired server's page
+  (Expected new key) or with the admin API's new `federation_keyExpect
+  { id, fingerprint }` (`null` clears it). A key with that fingerprint
+  is held even when the four places are full, and is still confirmed
+  with `federation_keyConfirm`. Every other key past the four is still
+  refused. The expected fingerprint is kept for a week, and is cleared
+  when a key is confirmed, when that key is rejected, or when the pair
+  is unpaired. A pair now shows `heldKeysFull` and `expectedKey`, and
+  its page says when the places are full and what to do. Migration
+  0059 adds `expected_fingerprint`, `expected_at` and `expected_by` to
+  `federation_peers`.
 - Fixed: a `network.wan` or relay address in 3fff::/20 (IPv6
   documentation, RFC 9637) or 64:ff9b:1::/48 (local-use NAT64, RFC 8215)
   is now refused as not public, as 2001:db8::/32 and 64:ff9b::/96 were

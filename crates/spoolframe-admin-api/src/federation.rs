@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerEntry {
-    /// What `peerRevoke`, `keyConfirm` and `keyReject` take.
+    /// What `peerRevoke`, `keyConfirm`, `keyReject` and `keyExpect` take.
     pub id: String,
     /// What it called itself when the pair was made.
     pub name: String,
@@ -40,8 +40,18 @@ pub struct PeerEntry {
     /// New keys that say they are this server, first seen first: those
     /// held wait for `keyConfirm` or `keyReject`; a rejected one is shown
     /// until it expires, a day after. At most four held, the rejected
-    /// apart: a key past them is not held.
+    /// apart: a key past them is not held, unless it is `expectedKey`.
     pub held_keys: Vec<PeerKey>,
+    /// Whether as many keys are held as are kept (M8-06): a new key that
+    /// says it is this server is refused (`key_refused`), unless it is
+    /// `expectedKey`. A stranger who knows its server id can fill them;
+    /// rejecting one frees its place.
+    #[serde(default)]
+    pub held_keys_full: bool,
+    /// The new key this server's admin said to expect (`keyExpect`), in
+    /// its week; `None` for none.
+    #[serde(default)]
+    pub expected_key: Option<ExpectedKey>,
     /// Whether it has a federation connection open to this server now.
     pub connected: bool,
     /// When this server last synced what that one shares with it (P8-02),
@@ -91,6 +101,19 @@ pub struct PeerKey {
     /// When an admin rejected it; `None` while it is held.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub rejected_at: Option<i64>,
+}
+
+/// The new key a paired server's admin said, out of band, their server
+/// moves to, as this server's admin entered it (`keyExpect`, M8-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedKey {
+    /// In the form a held key's `fingerprint` is: `K7QX-3MPA-9TRD-WF2H`.
+    pub fingerprint: String,
+    /// When it was entered, Unix seconds: it is kept a week from then.
+    pub expected_at: i64,
+    /// The admin who entered it.
+    pub expected_by: String,
 }
 
 /// A library this server shares with a paired server (P8-03): every user
@@ -275,6 +298,25 @@ pub trait FederationApi {
         endpoint_id: String,
     ) -> jsonrpsee::core::RpcResult<PeerEntry>;
 
+    /// Expect `fingerprint` as paired server `id`'s new key (M8-06), as
+    /// its admin read it out from their `serverStatus`; `None` expects
+    /// none. A key with that fingerprint is held even when as many keys
+    /// are held as are kept (`heldKeysFull`): keys a stranger had held
+    /// cannot keep it out. It still waits for `keyConfirm`. Kept a week,
+    /// or until a key is confirmed, that key is rejected, or the pair is
+    /// unpaired; entered again, the week starts again. The pair, as
+    /// `peerList` gives it. Admins only, signed in recently
+    /// (`RECENT_SIGN_IN_REQUIRED`). `NO_SUCH_PEER` for one that is not
+    /// paired; `INVALID_INPUT` for what is not a fingerprint (case,
+    /// spaces and dashes do not matter) or is the fingerprint of the key
+    /// it is paired with now.
+    #[method(name = "keyExpect", with_extensions)]
+    async fn key_expect(
+        &self,
+        id: String,
+        fingerprint: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<PeerEntry>;
+
     /// The libraries shared with paired server `peer` now (P8-03), the
     /// first shared first. `NO_SUCH_PEER` for one that is not paired.
     #[method(name = "grantList", with_extensions)]
@@ -329,6 +371,8 @@ mod tests {
             paired_at: 1,
             revoked_at: None,
             held_keys: Vec::new(),
+            held_keys_full: false,
+            expected_key: None,
             connected: false,
             last_sync: None,
             plays_here: 0,
@@ -351,10 +395,17 @@ mod tests {
                 last_seen: 3,
                 rejected_at: None,
             }],
+            expected_key: Some(ExpectedKey {
+                fingerprint: "NWXF-HYJ0-Y9VH-1R2M".into(),
+                expected_at: 4,
+                expected_by: "alice".into(),
+            }),
             ..entry()
         };
         let json = serde_json::to_value(&held).unwrap();
         assert!(json["heldKeys"][0].get("lastSeen").is_some(), "{json}");
+        assert_eq!(json["expectedKey"]["expectedBy"], "alice");
+        assert_eq!(json["heldKeysFull"], false);
         assert!(json["heldKeys"][0]["rejectedAt"].is_null(), "{json}");
         assert!(json.get("revokedAt").unwrap().is_null(), "{json}");
         assert_eq!(serde_json::from_value::<PeerEntry>(json).unwrap(), held);

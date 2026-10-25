@@ -741,7 +741,8 @@ fn in_the_day(of: &[(i64, String)], now: i64) -> impl Iterator<Item = i64> + '_ 
 }
 
 /// How long keeping a downloaded file and its row may take: a local write
-/// and a store transaction. Past it the file goes and the download fails.
+/// and a store transaction. Past it the download fails, and its file goes
+/// unless it is not known whether its row landed.
 const FINISH_WAIT: Duration = Duration::from_secs(30);
 
 /// A download fetched and read, to keep: its file, its row, and the
@@ -801,9 +802,11 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
         Ok::<(), DownloadError>(())
     })
     .await;
-    let failed = match kept {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(e),
+    // Whether the file goes with the failure: not when it is not known
+    // whether its row landed.
+    let (failed, file_goes) = match kept {
+        Ok(Ok(())) => (None, true),
+        Ok(Err(e)) => (Some(e), true),
         // The wait up with the commit in flight: the row decides, read
         // with the file's other downloads, which the file is given.
         Err(_) => match store
@@ -812,16 +815,36 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
         {
             Ok(rows) if rows.iter().any(|r| r.id == row.id) => {
                 of_file = rows;
-                None
+                (None, true)
             }
-            _ => Some(DownloadError::Io(
-                "the subtitle was not kept in time".into(),
-            )),
+            Ok(_) => (
+                Some(DownloadError::Io(
+                    "the subtitle was not kept in time".into(),
+                )),
+                true,
+            ),
+            // The row may have landed and the file be the record's: it
+            // stays, and the next start gives the media file it or
+            // removes it ([`SubtitleDownloads::restore`]).
+            Err(e) => {
+                tracing::warn!(
+                    file = %file.display(),
+                    error = %e,
+                    "cannot tell whether a subtitle download was kept; its file stays"
+                );
+                (
+                    Some(DownloadError::Io(
+                        "the subtitle may not have been kept in time".into(),
+                    )),
+                    false,
+                )
+            }
         },
     };
     if let Some(e) = failed {
-        for gone in [file.with_extension("partial"), file] {
-            let _ = tokio::fs::remove_file(&gone).await;
+        let _ = tokio::fs::remove_file(file.with_extension("partial")).await;
+        if file_goes {
+            let _ = tokio::fs::remove_file(&file).await;
         }
         return Err(e);
     }

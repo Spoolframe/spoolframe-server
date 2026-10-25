@@ -9,7 +9,8 @@
 //! its plays, one number each way and no user named; and lists the
 //! libraries shared with it, with Share and Revoke (P8-03). Each pair's
 //! name opens its own page: what is shared each way, the week's plays,
-//! what state it is in, and Unpair (the WebFederationPeer board). Every
+//! what state it is in, the new key its admin said to expect (M8-06),
+//! and Unpair (the WebFederationPeer board). Every
 //! change asks "Confirm it's you" when the sign-in is old.
 
 use dioxus::prelude::*;
@@ -24,10 +25,10 @@ use super::optimized::DangerDialog;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, Route, icons, now, rpc};
 use crate::federation::{
-    CONFIRM_ABOUT, CONFIRM_SHARE, INVITE_SPENT, ask_to_compare, freshness, from_line, is_spent,
-    key_change_error, new_key_line, paired_line, pairing_means, peer_line, presence, received_line,
-    refusal, revoke_question, shared, state_line, states, unpair_means, unpair_question, unpaired,
-    week,
+    CONFIRM_ABOUT, CONFIRM_EXPECT, CONFIRM_SHARE, INVITE_SPENT, ask_to_compare, expected_line,
+    freshness, from_line, is_spent, key_change_error, new_key_line, paired_line, pairing_means,
+    peer_line, presence, received_line, refusal, revoke_question, shared, state_line, states,
+    unpair_means, unpair_question, unpaired, week,
 };
 use crate::libraries::items_line;
 use crate::logic::ApiError;
@@ -876,6 +877,55 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
             });
         })
     };
+    // The fingerprint typed under Expected new key, and the change asked
+    // for: `Some(None)` clears it (M8-06).
+    let mut expect_typed = use_signal(String::new);
+    let mut expect_error = use_signal(|| None::<String>);
+    let mut expect_asked = use_signal(|| None::<Option<String>>);
+    let confirming_expect = use_signal(|| None::<String>);
+    let go_expect = {
+        let peer = peer.clone();
+        use_callback(move |()| {
+            let Some(fingerprint) = expect_asked() else {
+                return;
+            };
+            let peer = peer.clone();
+            busy.set(true);
+            expect_error.set(None);
+            spawn(async move {
+                let set = fingerprint.is_some();
+                let done = match rpc::client().await {
+                    Ok(c) => c
+                        .key_expect(peer.id.clone(), fingerprint)
+                        .await
+                        .map_err(rpc::error),
+                    Err(e) => Err(e),
+                };
+                match done {
+                    Ok(_) => {
+                        say(
+                            toast,
+                            true,
+                            if set {
+                                format!("{}'s new key is expected", peer.name)
+                            } else {
+                                format!("No new key is expected from {}", peer.name)
+                            },
+                        );
+                        expect_typed.set(String::new());
+                    }
+                    Err(e) if asks_to_confirm(&e, confirming_expect, CONFIRM_EXPECT) => {
+                        busy.set(false);
+                        return;
+                    }
+                    Err(e) => expect_error.set(Some(e.explain())),
+                }
+                busy.set(false);
+                expect_asked.set(None);
+                on_changed.call(());
+            });
+        })
+    };
     let name_of = |id: &str| {
         libraries
             .iter()
@@ -926,6 +976,48 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
             }
         }
         if live {
+            section { class: "flex flex-col gap-2.5",
+                div { class: "section-head",
+                    h2 { "Expected new key" }
+                    span { "When {peer.name} moves to a new key, ask its admin for the new fingerprint and enter it here: that key is let in to wait for you even if others fill the places." }
+                }
+                if let Some(expected) = peer.expected_key.clone() {
+                    div { class: "card tie-list",
+                        div { class: "tie-row",
+                            span { class: "tie-what",
+                                b { class: "mono", "{expected.fingerprint}" }
+                                span { class: "tie-sub", {expected_line(now, &peer.name, &expected)} }
+                            }
+                            button {
+                                class: "btn",
+                                r#type: "button",
+                                disabled: busy(),
+                                onclick: move |_| {
+                                    expect_asked.set(Some(None));
+                                    go_expect.call(());
+                                },
+                                "Clear"
+                            }
+                        }
+                    }
+                } else {
+                    form {
+                        class: "flex flex-wrap items-end gap-2.5",
+                        onsubmit: move |e| {
+                            e.prevent_default();
+                            let typed = expect_typed().trim().to_owned();
+                            if typed.is_empty() {
+                                expect_error.set(Some("Type the fingerprint its admin reads you.".into()));
+                                return;
+                            }
+                            expect_asked.set(Some(Some(typed)));
+                            go_expect.call(());
+                        },
+                        Field { label: "New key's fingerprint", value: expect_typed, placeholder: "K7QX-3MPA-9TRD-WF2H", error: expect_error() }
+                        button { class: "btn", r#type: "submit", disabled: busy(), "Expect" }
+                    }
+                }
+            }
             section { class: "flex flex-col gap-2.5",
                 div { class: "section-head",
                     h2 { "What you share with {peer.name}" }
@@ -1065,5 +1157,6 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
         }
         ConfirmItsYou { asking: confirming_share, on_confirmed: move |_| go_share.call(()) }
         ConfirmItsYou { asking: confirming_unpair, on_confirmed: move |_| go_unpair.call(()) }
+        ConfirmItsYou { asking: confirming_expect, on_confirmed: move |_| go_expect.call(()) }
     }
 }

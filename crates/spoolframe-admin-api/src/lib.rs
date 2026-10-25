@@ -30,7 +30,7 @@ pub use federation::FederationApiClient;
 #[cfg(feature = "server")]
 pub use federation::FederationApiServer;
 pub use federation::{
-    GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary,
+    ExpectedKey, GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary,
     WithdrawnLibrary,
 };
 mod optimized;

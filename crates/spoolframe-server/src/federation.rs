@@ -84,7 +84,9 @@ use crate::invites::RedeemError;
 use crate::keyed_locks::KeyedLocks;
 use crate::network::{Connections, ServerName};
 use crate::store::StoreError;
-use crate::store::federation::{HeldKey, KeyHold, NewPeer, PairRedeemed, PeerError, PeerRecord};
+use crate::store::federation::{
+    ExpectedKey, HeldKey, KeyHold, NewPeer, PairRedeemed, PeerError, PeerRecord,
+};
 use crate::store::federation_cache::FileLimits;
 use crate::store::invites::{InviteKind, InviteState};
 
@@ -640,6 +642,11 @@ impl Federation {
         self.store().held_peer_keys(id).await
     }
 
+    /// The new key live pair `id`'s admin said to expect, in its time.
+    pub async fn expected_key(&self, id: &str) -> Result<Option<ExpectedKey>, StoreError> {
+        self.store().expected_peer_key(id).await
+    }
+
     /// The live pair whose server id is `server_id`.
     pub async fn live_peer_by_server_id(
         &self,
@@ -854,6 +861,34 @@ impl Federation {
             "a key that said it is a paired server was rejected"
         );
         self.close_key(endpoint_id, "key rejected");
+        Ok(peer)
+    }
+
+    /// Expect `fingerprint` (as `fingerprint::parse` writes it) as live
+    /// pair `id`'s new key, or none, by admin `by` (M8-06): see
+    /// [`crate::store::Store::expect_peer_key`].
+    pub async fn expect_key(
+        &self,
+        id: &str,
+        fingerprint: Option<&str>,
+        by: &str,
+    ) -> Result<PeerRecord, PeerError> {
+        let peer = self.store().expect_peer_key(id, fingerprint, by).await?;
+        match fingerprint {
+            Some(fingerprint) => tracing::info!(
+                server_id = %peer.server_id,
+                name = %peer.display_name,
+                expected = fingerprint,
+                by,
+                "a paired server's new key is expected: held past the others until confirmed"
+            ),
+            None => tracing::info!(
+                server_id = %peer.server_id,
+                name = %peer.display_name,
+                by,
+                "a paired server's new key is no longer expected"
+            ),
+        }
         Ok(peer)
     }
 }

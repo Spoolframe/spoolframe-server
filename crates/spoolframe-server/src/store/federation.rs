@@ -100,6 +100,20 @@ pub enum KeyHold {
     NoPeer,
 }
 
+/// The new key a pair's admin said their server moves to, as this
+/// server's admin entered it (M8-06): a key with its fingerprint is held
+/// past [`MAX_HELD_KEYS`]. Kept for [`HELD_FOR`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedKey {
+    /// In the form [`spoolframe_protocol::fingerprint::fingerprint`]
+    /// writes it.
+    pub fingerprint: String,
+    /// Unix seconds.
+    pub expected_at: i64,
+    /// The admin who entered it.
+    pub expected_by: String,
+}
+
 /// A pair to keep: everything but its id, who made it and when.
 #[derive(Debug, Clone, Copy)]
 pub struct NewPeer<'a> {
@@ -121,6 +135,9 @@ pub enum PeerError {
     /// held keys changed since the admin looked.
     #[error("that key is not held for that server: the held keys changed, look again")]
     KeyNotHeld,
+    /// Expecting the key the pair is pinned to already: it is no new key.
+    #[error("that is the fingerprint of the key that server is paired with now, not of a new one")]
+    KeyIsPinned,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -218,6 +235,19 @@ async fn insert_peer(
     Ok(Some(record(&row)?))
 }
 
+/// Pair `id` expects no new key, on `conn`.
+async fn clear_expected(conn: &mut sqlx::SqliteConnection, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE federation_peers \
+         SET expected_fingerprint = NULL, expected_at = NULL, expected_by = NULL \
+         WHERE id = ?1",
+    )
+    .bind(id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Whether pair `id` is live, on `conn`.
 async fn peer_is_live(conn: &mut sqlx::SqliteConnection, id: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
@@ -242,6 +272,28 @@ async fn fetch_peer(
     .fetch_optional(conn)
     .await?;
     row.as_ref().map(record).transpose()
+}
+
+/// Whether `endpoint_id` (hex) has the fingerprint pair `id`'s admin said
+/// to expect, in its time at `now`, on `conn` (M8-06).
+async fn is_expected(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    endpoint_id: &str,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    let expected: Option<String> = sqlx::query_scalar(
+        "SELECT expected_fingerprint FROM federation_peers \
+         WHERE id = ?1 AND expected_at > ?2",
+    )
+    .bind(id)
+    .bind(now - HELD_FOR)
+    .fetch_optional(conn)
+    .await?
+    .flatten();
+    Ok(expected.is_some_and(|expected| {
+        spoolframe_protocol::fingerprint::of_hex(endpoint_id).as_ref() == Some(&expected)
+    }))
 }
 
 /// What saying hello again does for `endpoint_id`, a new key of pair
@@ -290,7 +342,11 @@ async fn hold_without_writing(
             .bind(id)
             .fetch_one(&mut *conn)
             .await?;
-            (kept >= MAX_HELD_KEYS).then_some(KeyHold::Full)
+            if kept >= MAX_HELD_KEYS && !is_expected(&mut *conn, id, endpoint_id, now).await? {
+                Some(KeyHold::Full)
+            } else {
+                None
+            }
         }
     })
 }
@@ -464,6 +520,7 @@ impl Store {
                 .bind(&peer.id)
                 .execute(&mut *tx)
                 .await?;
+            clear_expected(&mut tx, &peer.id).await?;
             super::federation_grants::revoke_all(&mut tx, &peer.id, now).await?;
             // What it was last given (P8-02): nothing is shared any more.
             sqlx::query("DELETE FROM federation_sync_states WHERE peer = ?1")
@@ -484,7 +541,8 @@ impl Store {
     /// Hold `endpoint_id` (hex), which said it is live pair `id`'s server,
     /// for an admin. A key held already is only seen again, written at
     /// most once per [`SEEN_EVERY`]; a rejected one is refused; a new one
-    /// past [`MAX_HELD_KEYS`] is dropped. Keys out of their time are
+    /// past [`MAX_HELD_KEYS`] is dropped, unless it is the key the admin
+    /// said to expect ([`Self::expect_peer_key`]). Keys out of their time are
     /// forgotten first. Nothing is written unless something changes, and
     /// the write lock is taken only then: a key that keeps saying hello
     /// is answered from a read.
@@ -544,7 +602,9 @@ impl Store {
                 .bind(id)
                 .fetch_one(&mut *tx)
                 .await?;
-                if kept >= MAX_HELD_KEYS {
+                // The key the admin said to expect is held past the others
+                // (M8-06): they may be a stranger's, there to keep it out.
+                if kept >= MAX_HELD_KEYS && !is_expected(&mut tx, id, endpoint_id, now).await? {
                     KeyHold::Full
                 } else {
                     sqlx::query(
@@ -667,6 +727,9 @@ impl Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        // What was expected is the pair's key now, or was not the key the
+        // admin chose: either way, nothing is expected any more.
+        clear_expected(&mut tx, id).await?;
         tx.commit().await?;
         Ok(record(&row)?)
     }
@@ -691,11 +754,79 @@ impl Store {
         .bind(self.now())
         .execute(&mut *tx)
         .await?;
+        // The admin rejected the key they had said to expect: it is not
+        // to be held past the others any more.
+        if is_expected(&mut tx, id, endpoint_id, self.now()).await? {
+            clear_expected(&mut tx, id).await?;
+        }
         let peer = fetch_peer(&mut tx, id)
             .await?
             .ok_or_else(|| PeerError::NoSuchPeer(id.to_owned()))?;
         tx.commit().await?;
         Ok(peer)
+    }
+
+    /// Expect `fingerprint` (as [`spoolframe_protocol::fingerprint::parse`]
+    /// writes it) as live pair `id`'s new key, entered by admin `by`, or
+    /// expect none (M8-06). A key with it is held past [`MAX_HELD_KEYS`]
+    /// for [`HELD_FOR`] from now; it is still the admin who confirms it.
+    /// The pair's row. [`PeerError::NoSuchPeer`] for a pair that is not
+    /// live, [`PeerError::KeyIsPinned`] for the fingerprint of its key
+    /// now.
+    pub async fn expect_peer_key(
+        &self,
+        id: &str,
+        fingerprint: Option<&str>,
+        by: &str,
+    ) -> Result<PeerRecord, PeerError> {
+        let mut tx = self.begin_write().await?;
+        let peer = fetch_peer(&mut tx, id)
+            .await?
+            .filter(PeerRecord::live)
+            .ok_or_else(|| PeerError::NoSuchPeer(id.to_owned()))?;
+        match fingerprint {
+            Some(fingerprint) => {
+                if spoolframe_protocol::fingerprint::of_hex(&peer.endpoint_id).as_deref()
+                    == Some(fingerprint)
+                {
+                    return Err(PeerError::KeyIsPinned);
+                }
+                sqlx::query(
+                    "UPDATE federation_peers \
+                     SET expected_fingerprint = ?2, expected_at = ?3, expected_by = ?4 \
+                     WHERE id = ?1",
+                )
+                .bind(id)
+                .bind(fingerprint)
+                .bind(self.now())
+                .bind(by)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => clear_expected(&mut tx, id).await?,
+        }
+        tx.commit().await?;
+        Ok(peer)
+    }
+
+    /// The new key live pair `id`'s admin said to expect, in its time.
+    pub async fn expected_peer_key(&self, id: &str) -> Result<Option<ExpectedKey>, StoreError> {
+        let row: Option<(Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT expected_fingerprint, expected_at, expected_by FROM federation_peers \
+             WHERE id = ?1 AND revoked_at IS NULL AND expected_at > ?2",
+        )
+        .bind(id)
+        .bind(self.now() - HELD_FOR)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((Some(fingerprint), Some(expected_at), Some(expected_by))) => Some(ExpectedKey {
+                fingerprint,
+                expected_at,
+                expected_by,
+            }),
+            _ => None,
+        })
     }
 
     /// Pair `id` is connected now: its last seen moves to now, written
@@ -1097,6 +1228,149 @@ mod tests {
             KeyHold::Rejected
         );
         store.confirm_peer_key(&peer.id, &own).await.unwrap();
+    }
+
+    /// The fingerprint of the key `n` makes, as an admin would type it.
+    fn print(n: u8) -> String {
+        spoolframe_protocol::fingerprint::of_hex(&key(n)).unwrap()
+    }
+
+    /// M8-06: four keys a stranger had held for a pair keep out the one
+    /// key its admin said to expect no longer; a fifth that is not it is
+    /// still dropped, and the expected key is confirmed as any other.
+    #[tokio::test]
+    async fn the_expected_key_is_held_past_the_strangers_keys() {
+        let store = test_store("fed-key-expected").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        for k in (1..=MAX_HELD_KEYS as u8).map(key) {
+            store.hold_peer_key(&peer.id, &k).await.unwrap();
+        }
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xee)), "bob")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &key(0xdd)).await.unwrap(),
+            KeyHold::Full
+        );
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &key(0xee)).await.unwrap(),
+            KeyHold::New
+        );
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &key(0xee)).await.unwrap(),
+            KeyHold::Held
+        );
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &key(0xdd)).await.unwrap(),
+            KeyHold::Full
+        );
+        let moved = store.confirm_peer_key(&peer.id, &key(0xee)).await.unwrap();
+        assert_eq!(moved.endpoint_id, key(0xee));
+    }
+
+    /// What the admin entered is kept, by whom, and shown until it is
+    /// cleared, used or out of its week.
+    #[tokio::test]
+    async fn the_expected_key_is_kept_until_cleared_used_or_a_week_old() {
+        let store = test_store("fed-key-expected-kept").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xee)), "bob")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.expected_peer_key(&peer.id).await.unwrap(),
+            Some(ExpectedKey {
+                fingerprint: print(0xee),
+                expected_at: store.now(),
+                expected_by: "bob".into(),
+            })
+        );
+        store.expect_peer_key(&peer.id, None, "bob").await.unwrap();
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+
+        // Confirmed, the key it named is the pair's, and nothing is
+        // expected any more.
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xee)), "bob")
+            .await
+            .unwrap();
+        store.hold_peer_key(&peer.id, &key(0xee)).await.unwrap();
+        store.confirm_peer_key(&peer.id, &key(0xee)).await.unwrap();
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+
+        // Its key rejected, the admin changed their mind about it.
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xa1)), "bob")
+            .await
+            .unwrap();
+        store.hold_peer_key(&peer.id, &key(0xa1)).await.unwrap();
+        store.reject_peer_key(&peer.id, &key(0xa1)).await.unwrap();
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+
+        // Another key rejected leaves it.
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xa2)), "bob")
+            .await
+            .unwrap();
+        store.hold_peer_key(&peer.id, &key(0xa3)).await.unwrap();
+        store.reject_peer_key(&peer.id, &key(0xa3)).await.unwrap();
+        assert!(store.expected_peer_key(&peer.id).await.unwrap().is_some());
+
+        store
+            .clock()
+            .advance(std::time::Duration::from_secs(HELD_FOR as u64));
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+    }
+
+    /// Out of its week, the expected key is held only as any other: past
+    /// the strangers' keys, dropped.
+    #[tokio::test]
+    async fn an_expected_key_a_week_old_is_not_held_past_the_others() {
+        let store = test_store("fed-key-expected-old").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xee)), "bob")
+            .await
+            .unwrap();
+        store
+            .clock()
+            .advance(std::time::Duration::from_secs(HELD_FOR as u64));
+        for k in (1..=MAX_HELD_KEYS as u8).map(key) {
+            store.hold_peer_key(&peer.id, &k).await.unwrap();
+        }
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &key(0xee)).await.unwrap(),
+            KeyHold::Full
+        );
+    }
+
+    /// The key the pair is pinned to is not a new key to expect, and an
+    /// unpaired server expects nothing.
+    #[tokio::test]
+    async fn the_pinned_key_and_an_unpaired_server_expect_nothing() {
+        let store = test_store("fed-key-expected-refused").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        let pinned = spoolframe_protocol::fingerprint::of_hex(SB_KEY).unwrap();
+        assert!(matches!(
+            store.expect_peer_key(&peer.id, Some(&pinned), "bob").await,
+            Err(PeerError::KeyIsPinned)
+        ));
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+        store
+            .expect_peer_key(&peer.id, Some(&print(0xee)), "bob")
+            .await
+            .unwrap();
+        store.revoke_peer(&peer.id).await.unwrap();
+        assert_eq!(store.expected_peer_key(&peer.id).await.unwrap(), None);
+        assert!(matches!(
+            store
+                .expect_peer_key(&peer.id, Some(&print(0xee)), "bob")
+                .await,
+            Err(PeerError::NoSuchPeer(_))
+        ));
     }
 
     /// A key held already is seen again without a write, but once per

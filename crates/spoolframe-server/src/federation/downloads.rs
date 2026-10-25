@@ -319,7 +319,7 @@ impl Federation {
         match asked {
             Ok(Reply::Downloads { mut downloads, .. }) if downloads.len() == 1 => {
                 let now = downloads.remove(0);
-                self.keep_state(&row.id, &now).await;
+                self.keep_state(row, &now).await;
                 if settled(&now.state) {
                     self.end_download_session(who, &item).await;
                 }
@@ -610,15 +610,23 @@ impl Federation {
         Some(library.remote()?.1.to_string())
     }
 
-    /// Keep what SA said of download `id` here.
-    async fn keep_state(&self, id: &str, info: &DownloadInfo) {
+    /// Keep what SA said of download `row` here, unless the row was
+    /// written since it was read (G8-02): the answer is then older than
+    /// what is kept.
+    async fn keep_state(&self, row: &RemoteDownloadRow, info: &DownloadInfo) {
         let file = info.file.as_ref().map(json);
         if let Err(e) = self
             .store()
-            .set_remote_download_state(id, &json(&info.state), file.as_deref(), info.expected_size)
+            .set_remote_download_state(
+                &row.id,
+                row.revision,
+                &json(&info.state),
+                file.as_deref(),
+                info.expected_size,
+            )
             .await
         {
-            tracing::warn!(download = id, error = %e, "cannot keep a paired server's download's state");
+            tracing::warn!(download = %row.id, error = %e, "cannot keep a paired server's download's state");
         }
     }
 
@@ -732,11 +740,16 @@ pub(super) async fn forward_download_news(
             }
         };
         for row in rows.into_iter().filter(|r| r.unavailable_at.is_none()) {
-            if let Err(e) = store
-                .set_remote_download_state(&row.id, &json(&state), None, None)
+            match store
+                .set_remote_download_state(&row.id, row.revision, &json(&state), None, None)
                 .await
             {
-                tracing::warn!(error = %e, "cannot keep a paired server's download's state");
+                Ok(true) => {}
+                // Written since it was read: this news is older than that.
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot keep a paired server's download's state");
+                }
             }
             if settled(&state)
                 && let Some((_, remote)) = row
@@ -824,6 +837,7 @@ mod tests {
             file: None,
             expected_size: None,
             unavailable_at: unavailable.then_some(1),
+            revision: 0,
         }
     }
 

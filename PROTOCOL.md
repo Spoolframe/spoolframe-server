@@ -3163,7 +3163,13 @@ and never replaces one held, so the key an admin is looking at cannot
 change under them. A key rejected by the admin is refused `key_refused`
 for a day, and no longer takes one of the four: rejecting the keys a
 stranger had held makes room for the pair's own at once. A held key not
-seen for a week is forgotten.
+seen for a week is forgotten. A stranger that knows a pair's server id
+can still fill the four with keys of its own. The key the dialled
+server's admin said to expect (`keyExpect`, below) is held past the
+four: a new key whose fingerprint is the one expected is held, and
+waits to be confirmed, as any other. Every other key past the four is
+still refused `key_refused`. Only a key whose fingerprint matches gets
+in, and making a key with a given 80-bit fingerprint is out of reach.
 
 ### Pairing and unpairing
 
@@ -3206,6 +3212,23 @@ that key for a day. Both name the key the admin saw: one that is not
 held for the pair (the keys changed since they were listed) is
 `KEY_NOT_HELD`, and nothing changes. Confirming a key that is another
 live pair's is `PAIRING_REFUSED` `already_paired`.
+
+A pair's `heldKeysFull` is true while four keys are held for it: a new
+key that is not the expected one is refused. `keyExpect { id,
+fingerprint }` keeps `fingerprint` as the new key the pair's admin read
+out, from their own `serverStatus`, before they moved their server to
+it. The fingerprint is in the form `heldKeys` shows it
+(`K7QX-3MPA-9TRD-WF2H`). Case, spaces and dashes do not matter, and `O`,
+`I` and `L` are read as `0`, `1` and `1`. Something that is not a
+fingerprint, or the fingerprint of the key the pair has now, is
+`INVALID_INPUT`. `fingerprint: null` clears it. The pair's
+`expectedKey` shows it (`fingerprint`, `expectedAt`, `expectedBy`). It
+is kept for a week from when it was entered, and is cleared when a key
+of the pair's is confirmed, when the expected key is rejected, or when
+the pair is unpaired. A key with that fingerprint is held past the four,
+but is not confirmed by it: the admin still confirms it with
+`keyConfirm`. The pin moves in one place only, and to the full key the
+admin sees, not to a fingerprint.
 
 When SA has paired but SB cannot keep its side (its store fails), SB
 sends `unpaired` on the same connection, best effort, so SA does not
@@ -3620,8 +3643,9 @@ endpoint's other stranger's connections the caps have no room for are
 closed the same way. The device connects again once there is room. A
 redemption never lets a connection of the endpoint's go uncounted: each
 one held by a pair's session alone counts under every pair the
-endpoint's sessions are of now. Only a sign-in of this server's own
-frees them.
+endpoint's sessions are of now, if that pair's share has room for it,
+else it is closed `BUSY` the same way. Only a sign-in of this server's
+own frees them.
 
 Such a connection's requests at once, resource streams included, are
 held to 4 for each connection the caps allow: one pair's sessions
@@ -3777,7 +3801,10 @@ tracks) is one more record on both servers, so both bound them: SA keeps
 at most 2,000 of one pair's users' downloads together, and past them
 cancels those read or made longest ago, as a revoked grant's; SB keeps
 at most 1,000 of one user's from one paired server, and past them
-forgets those SA told it of longest ago. Each download read SA begins checks that the item is in the
+forgets those SA told it of longest ago. An answer SA gave to a
+`DownloadStatus`, or its `DownloadChanged`, is kept only over the record as it was when SB asked: one written
+since (SB prepared the download again, or kept a newer answer) is not
+moved back to an older state. Each download read SA begins checks that the item is in the
 library its token was for still, as a play's start does: moved out of
 it, the read is `Unauthenticated` and the session ends.
 

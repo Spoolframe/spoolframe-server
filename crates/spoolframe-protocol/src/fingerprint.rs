@@ -50,6 +50,36 @@ pub fn of_hex(endpoint_id: &str) -> Option<String> {
     Some(fingerprint(&key))
 }
 
+/// A fingerprint as a person typed it, read back from another screen or
+/// aloud: in the form [`fingerprint`] writes it, or `None` if it is not
+/// one. Case, spaces and dashes do not matter, and the letters Crockford
+/// reads as digits are read so (`O` as `0`, `I` and `L` as `1`); anything
+/// else, and any length but sixteen characters, is not a fingerprint.
+pub fn parse(typed: &str) -> Option<String> {
+    let mut digits = String::with_capacity(16);
+    for c in typed.chars() {
+        let c = match c.to_ascii_uppercase() {
+            '-' | ' ' => continue,
+            'O' => '0',
+            'I' | 'L' => '1',
+            c if c.is_ascii() && CROCKFORD.contains(&(c as u8)) => c,
+            _ => return None,
+        };
+        digits.push(c);
+    }
+    if digits.len() != 16 {
+        return None;
+    }
+    let mut out = String::with_capacity(19);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push('-');
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
 /// Keys and their fingerprints, computed apart from this code (Python's
 /// hashlib), so the format cannot drift. The server's and the SDK's tests
 /// check them too.
@@ -90,5 +120,40 @@ mod tests {
     fn a_string_that_is_not_a_key_has_no_fingerprint() {
         assert_eq!(of_hex("abc"), None);
         assert_eq!(of_hex(&"zz".repeat(32)), None);
+    }
+
+    #[test]
+    fn a_typed_fingerprint_is_read_in_the_written_form() {
+        let written = TEST_VECTORS[1].1;
+        for typed in [
+            written,
+            "qaj7-xqg9-2mdw-an9h",
+            "QAJ7 XQG9 2MDW AN9H",
+            "QAJ7XQG92MDWAN9H",
+        ] {
+            assert_eq!(parse(typed).as_deref(), Some(written), "{typed}");
+        }
+        assert_eq!(
+            parse("PGJA-BHZI-F68M-DFSE").as_deref(),
+            Some(TEST_VECTORS[0].1)
+        );
+        assert_eq!(
+            parse("NWXF-HYJO-Y9VH-LR2M").as_deref(),
+            Some(TEST_VECTORS[2].1)
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_fingerprint_is_not_read_as_one() {
+        for typed in [
+            "",
+            "QAJ7-XQG9-2MDW",
+            "QAJ7-XQG9-2MDW-AN9H-0",
+            "QAJ7-XQG9-2MDW-AN9U",
+            "QAJ7_XQG9_2MDW_AN9H",
+            "QAJ7-XQG9-2MDW-AN9É",
+        ] {
+            assert_eq!(parse(typed), None, "{typed}");
+        }
     }
 }

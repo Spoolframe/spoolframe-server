@@ -7,8 +7,8 @@ use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::json;
 use spoolframe_admin_api::{
-    FederationApiServer, GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay,
-    ReceivedLibrary, WithdrawnLibrary, error_code,
+    ExpectedKey, FederationApiServer, GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey,
+    PlayDay, ReceivedLibrary, WithdrawnLibrary, error_code,
 };
 use spoolframe_federation::DialError;
 use spoolframe_protocol::federation::PairingRefused;
@@ -16,7 +16,7 @@ use spoolframe_protocol::fingerprint;
 
 use super::{AdminApi, error, internal};
 use crate::federation::{Federation, PairError, ReplicaError, ShareError};
-use crate::store::federation::{PeerError, PeerRecord};
+use crate::store::federation::{MAX_HELD_KEYS, PeerError, PeerRecord};
 use crate::store::federation_grants::GrantRecord;
 
 impl AdminApi {
@@ -47,11 +47,15 @@ impl AdminApi {
     async fn peer_entry(&self, federation: &Federation, peer: PeerRecord) -> RpcResult<PeerEntry> {
         let print = |endpoint: &str| fingerprint::of_hex(endpoint).unwrap_or_default();
         let live = peer.live();
-        let held = if live {
-            federation.held_keys(&peer.id).await.map_err(internal)?
+        let (held, expected) = if live {
+            (
+                federation.held_keys(&peer.id).await.map_err(internal)?,
+                federation.expected_key(&peer.id).await.map_err(internal)?,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
+        let waiting = held.iter().filter(|k| k.rejected_at.is_none()).count();
         let (here, there) = federation.play_counts(&peer.id).await.map_err(internal)?;
         Ok(PeerEntry {
             fingerprint: print(&peer.endpoint_id),
@@ -77,6 +81,12 @@ impl AdminApi {
                     rejected_at: key.rejected_at,
                 })
                 .collect(),
+            held_keys_full: i64::try_from(waiting).unwrap_or(i64::MAX) >= MAX_HELD_KEYS,
+            expected_key: expected.map(|e| ExpectedKey {
+                fingerprint: e.fingerprint,
+                expected_at: e.expected_at,
+                expected_by: e.expected_by,
+            }),
             id: peer.id,
             name: peer.display_name,
             server_id: peer.server_id,
@@ -165,6 +175,7 @@ fn peer_error(e: PeerError) -> ErrorObjectOwned {
     match e {
         PeerError::NoSuchPeer(_) => error(error_code::NO_SUCH_PEER, e.to_string()),
         PeerError::KeyNotHeld => error(error_code::KEY_NOT_HELD, e.to_string()),
+        PeerError::KeyIsPinned => error(error_code::INVALID_INPUT, e.to_string()),
         PeerError::AlreadyPaired => refused(
             PairingRefused::AlreadyPaired.name(),
             "that key is another pair's",
@@ -296,6 +307,31 @@ impl FederationApiServer for AdminApi {
         let (federation, by) = self.pair_change(ext).await?;
         let peer = federation
             .reject_key(&id, &endpoint_id, &by)
+            .await
+            .map_err(peer_error)?;
+        self.peer_entry(federation, peer).await
+    }
+
+    async fn key_expect(
+        &self,
+        ext: &Extensions,
+        id: String,
+        fingerprint: Option<String>,
+    ) -> RpcResult<PeerEntry> {
+        let (federation, by) = self.pair_change(ext).await?;
+        let fingerprint = fingerprint
+            .map(|typed| {
+                fingerprint::parse(&typed).ok_or_else(|| {
+                    error(
+                        error_code::INVALID_INPUT,
+                        "that is not a key's fingerprint: sixteen letters and digits, as \
+                         K7QX-3MPA-9TRD-WF2H",
+                    )
+                })
+            })
+            .transpose()?;
+        let peer = federation
+            .expect_key(&id, fingerprint.as_deref(), &by)
             .await
             .map_err(peer_error)?;
         self.peer_entry(federation, peer).await

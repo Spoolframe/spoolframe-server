@@ -1365,6 +1365,126 @@ mod admin {
         sa.server.stop().await;
     }
 
+    /// M8-06: a stranger who knows SB's server id fills the keys SA holds
+    /// for it. SA's admin enters the fingerprint SB's admin reads them,
+    /// and SB's rotated key is held past the stranger's, and confirmed; a
+    /// key that is not it is still refused. The page says the held keys
+    /// are full, and what is expected.
+    #[tokio::test]
+    async fn the_expected_key_is_held_past_a_stranger_s_and_confirmed() {
+        use spoolframe_server::store::federation::MAX_HELD_KEYS;
+        let sa = Site::start("fed-admin-key-expected", "Alice's server", "alice", true).await;
+        let link = sa.invite().await;
+        let old = endpoint().await;
+        let (dialed, _) = Dialed::connect(&old, sa.server.server.addr(), hello("bbbbbbbbbbbbbbbb"))
+            .await
+            .unwrap();
+        dialed.redeem(redeem(&code_of(&link))).await.unwrap();
+        dialed.close();
+        let say_hello = |from: Endpoint| {
+            let addr = sa.server.server.addr();
+            async move {
+                let said = Dialed::connect(&from, addr, hello("bbbbbbbbbbbbbbbb")).await;
+                said.map(|(dialed, info)| {
+                    dialed.close();
+                    info.standing
+                })
+            }
+        };
+        for _ in 0..MAX_HELD_KEYS {
+            assert_eq!(
+                say_hello(endpoint().await).await.unwrap(),
+                Standing::KeyHeld
+            );
+        }
+        let peer = sa.peers().await.remove(0);
+        assert!(peer.held_keys_full);
+        assert_eq!(peer.expected_key, None);
+
+        // What is not a fingerprint, or is the pinned key's, is refused.
+        let pinned = fingerprint::fingerprint(old.id().as_bytes());
+        for typed in ["K7QX-3MPA", pinned.as_str()] {
+            assert_eq!(
+                code(
+                    sa.admin
+                        .key_expect(peer.id.clone(), Some(typed.into()))
+                        .await
+                        .unwrap_err()
+                ),
+                error_code::INVALID_INPUT,
+                "{typed}"
+            );
+        }
+
+        let rotated = endpoint().await;
+        let print = fingerprint::fingerprint(rotated.id().as_bytes());
+        let expecting = sa
+            .admin
+            .key_expect(
+                peer.id.clone(),
+                Some(print.to_lowercase().replace('-', " ")),
+            )
+            .await
+            .unwrap();
+        let expected = expecting.expected_key.unwrap();
+        assert_eq!(
+            (expected.fingerprint.as_str(), expected.expected_by.as_str()),
+            (print.as_str(), "alice")
+        );
+        assert!(matches!(
+            say_hello(endpoint().await).await,
+            Err(DialError::Refused(PairingRefused::KeyRefused))
+        ));
+        assert_eq!(say_hello(rotated.clone()).await.unwrap(), Standing::KeyHeld);
+        let detail = sa.admin.peer_detail(peer.id.clone()).await.unwrap();
+        assert_eq!(
+            detail.peer.held_keys.last().map(|k| k.fingerprint.as_str()),
+            Some(print.as_str())
+        );
+        assert!(detail.peer.held_keys_full);
+
+        let moved = sa
+            .admin
+            .key_confirm(peer.id.clone(), rotated.id().to_string())
+            .await
+            .unwrap();
+        assert_eq!(moved.endpoint_id, rotated.id().to_string());
+        assert_eq!(moved.expected_key, None);
+        assert!(!moved.held_keys_full);
+        assert_eq!(say_hello(rotated).await.unwrap(), Standing::Paired);
+        sa.server.stop().await;
+    }
+
+    /// Clearing what is expected leaves nothing expected; an unpaired
+    /// server expects nothing.
+    #[tokio::test]
+    async fn an_expected_key_is_cleared_and_an_unpaired_server_expects_none() {
+        let sa = Site::start("fed-admin-key-unexpect", "Alice's server", "alice", true).await;
+        let sb = Site::start("fed-admin-key-unexpect-sb", "Bob's server", "bob", true).await;
+        let on_sb = pair(&sa, &sb).await;
+        let print = fingerprint::fingerprint(endpoint().await.id().as_bytes());
+        let expecting = sb
+            .admin
+            .key_expect(on_sb.id.clone(), Some(print))
+            .await
+            .unwrap();
+        assert!(expecting.expected_key.is_some());
+        let cleared = sb.admin.key_expect(on_sb.id.clone(), None).await.unwrap();
+        assert_eq!(cleared.expected_key, None);
+        sb.admin.peer_revoke(on_sb.id.clone()).await.unwrap();
+        assert_eq!(
+            code(
+                sb.admin
+                    .key_expect(on_sb.id, Some("QAJ7-XQG9-2MDW-AN9H".into()))
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::NO_SUCH_PEER
+        );
+        sa.server.stop().await;
+        sb.server.stop().await;
+    }
+
     /// P8-03: SA's admin shares Movies with the paired server, sees it
     /// listed, and revokes it; a library SA does not serve is refused, and
     /// unpairing revokes whatever is still shared.
@@ -1508,6 +1628,11 @@ mod admin {
                 .key_reject("x".into(), "y".into())
                 .await
                 .map(|_| ()),
+            sa.admin
+                .key_expect("x".into(), Some("QAJ7-XQG9-2MDW-AN9H".into()))
+                .await
+                .map(|_| ()),
+            sa.admin.key_expect("x".into(), None).await.map(|_| ()),
             sa.admin
                 .peer_grant_add("x".into(), "plex:1".into())
                 .await
@@ -5161,6 +5286,96 @@ mod replica {
             assert!(
                 connection(&pair, &next.endpoint).await.is_err(),
                 "Carol's server's share is the first device's too"
+            );
+            carol_s.stop().await;
+            pair.stop().await;
+        }
+
+        /// W4: a device held under SB's session that redeems Carol's
+        /// server's token takes a place of Carol's share, so where it is
+        /// full its connection is closed `BUSY` once answered, as a new one
+        /// is, and Carol's share is not spent past.
+        #[tokio::test]
+        async fn a_device_joining_a_full_pair_s_session_is_closed_busy() {
+            let pair = Pair::start_both(
+                "fed-media-remote-join-full",
+                ServerOptions {
+                    admission: Admission {
+                        max_pair_remote_connections: 2,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let (carol_s, _) = sb_on(
+                fresh_dir("fed-media-remote-join-full-carol").await,
+                ServerOptions::default(),
+                quiet_plex().await,
+            )
+            .await;
+            let sa_on_carol = federation(&carol_s)
+                .redeem_link(&pairing_link(&pair.sa, None).await, "carol")
+                .await
+                .unwrap();
+            let carol_on_sa = pair
+                .sa
+                .store
+                .live_peer_by_endpoint(&carol_s.server.id().to_string())
+                .await
+                .unwrap()
+                .unwrap();
+            federation(&pair.sa)
+                .share(&carol_on_sa.id, &["plex:1".parse().unwrap()], "alice")
+                .await
+                .unwrap();
+            federation(&carol_s).refresh(&sa_on_carol.id).await.unwrap();
+            carol_s.add_user("carol", "correct horse", None).await;
+            let carol = carol_s
+                .store
+                .user_by_name("carol")
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            let carol_s_token = |device: &TestClient| {
+                let carol_s = &carol_s;
+                let pair = &pair;
+                let endpoint = device.endpoint.id();
+                async move {
+                    federation(carol_s)
+                        .assert_play(carol, &pair.fed(movie().id()), endpoint)
+                        .await
+                        .unwrap()
+                        .token
+                }
+            };
+            // Carol's share is full with two devices'.
+            let mut full = Vec::new();
+            for _ in 0..2 {
+                let device = device(&pair).await;
+                redeemed(&device, &carol_s_token(&device).await).await;
+                full.push(device);
+            }
+            let both = device(&pair).await;
+            redeemed(&both, &token(&pair, bob, &both).await).await;
+            redeemed(&both, &carol_s_token(&both).await).await;
+            let closed = tokio::time::timeout(Duration::from_secs(5), both.conn.closed())
+                .await
+                .expect("closed once answered");
+            assert!(
+                matches!(
+                    &closed,
+                    ConnectionError::ApplicationClosed(c) if c.error_code == close::BUSY.into()
+                ),
+                "{closed:?}"
+            );
+            assert_eq!(
+                full[0].call(None, Request::Ping).await,
+                Response::Ok(Reply::Pong),
+                "the ones in Carol's share are held"
             );
             carol_s.stop().await;
             pair.stop().await;

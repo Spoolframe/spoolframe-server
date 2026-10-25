@@ -1788,6 +1788,42 @@ async fn a_keeping_whose_wait_ends_with_the_row_written_keeps_the_file() {
     assert_eq!(f.site_calls("/api/v1/download").await, 1);
 }
 
+/// A keeping whose wait is up as its row's commit is in flight, with the
+/// row unreadable after, does not know whether the row landed: the
+/// download is told failed, and the file stays for the next start to give
+/// its media file or remove, where it was removed with the row it may
+/// have named.
+#[tokio::test]
+async fn a_keeping_whose_row_cannot_be_read_after_its_wait_keeps_the_file() {
+    let f = fixture("cancel-unknown", 1).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let holds = f.downloads.holds.clone();
+    holds.recorded.hold();
+    let (item, asker) = (film(), alice());
+    let download = f.downloads.download(&item, "opensubtitles:103", &asker);
+    tokio::pin!(download);
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the hold: {done:?}"),
+        () = holds.recorded.until_at_it(1) => {}
+    }
+    f.store.lose_subtitle_downloads().await;
+    tokio::time::pause();
+    tokio::time::advance(FINISH_WAIT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    holds.recorded.until_at_it(0).await;
+    assert!(
+        matches!(download.await, Err(DownloadError::Io(_))),
+        "not known to be kept"
+    );
+    assert_eq!(kept_files(&f).len(), 1, "the file may be a record's");
+}
+
 /// A paired server, as its users download.
 fn pair_of(server_id: &str) -> PairAsker {
     PairAsker {
