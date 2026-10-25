@@ -65,6 +65,10 @@ pub struct FakeCatalog {
     posters: Mutex<bool>,
     /// What its images say they are, when they are not images.
     bogus: Mutex<Option<String>>,
+    /// Whether it cannot fetch an image, as a PMS that fails one.
+    failing_images: Mutex<bool>,
+    /// How many images it was asked for.
+    artwork_asks: std::sync::atomic::AtomicUsize,
     /// Agents' ids an item has besides its `test://` one (PX-02:
     /// `imdb://tt…`).
     more_ids: Mutex<HashMap<MediaId, Vec<String>>>,
@@ -102,6 +106,8 @@ impl FakeCatalog {
             music: Mutex::default(),
             posters: Mutex::default(),
             bogus: Mutex::default(),
+            failing_images: Mutex::default(),
+            artwork_asks: std::sync::atomic::AtomicUsize::default(),
             more_ids: Mutex::default(),
             moved: Mutex::default(),
         }
@@ -140,6 +146,17 @@ impl FakeCatalog {
     /// `content_type`: what a paired server's cache refuses (L7).
     pub fn bogus_images(&self, content_type: &str) {
         *self.bogus.lock() = Some(content_type.to_owned());
+    }
+
+    /// Fail every image from now, as a PMS that cannot fetch one (a
+    /// redirect it is not followed to): a backend error.
+    pub fn fail_images(&self) {
+        *self.failing_images.lock() = true;
+    }
+
+    /// How many images it was asked for, failed or not.
+    pub fn artwork_asks(&self) -> usize {
+        self.artwork_asks.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Serve its music as a second library, `plex:library:2`, holding
@@ -756,6 +773,16 @@ impl Catalog for FakeCatalog {
     }
 
     async fn artwork(&self, id: &ArtworkId) -> Result<Image, CatalogError> {
+        self.artwork_asks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if *self.failing_images.lock() {
+            return Err(CatalogError::Backend {
+                url: "the fake PMS".into(),
+                call: format!("GET {}", id.key()),
+                item: Some(id.to_string()),
+                message: "unexpected HTTP 302 Found".into(),
+            });
+        }
         if let Some(content_type) = self.bogus.lock().clone() {
             return Ok(Image {
                 bytes: b"<!doctype html><script>alert(1)</script>".to_vec(),

@@ -310,7 +310,10 @@ impl Federation {
 
     /// Fetch some of `peer`'s posters that have no file yet, a few at
     /// a time; when it says to wait, the rest wait for the next tick. One
-    /// that fails is not asked for again until the origin's next sync.
+    /// that fails, `unavailable` too, waits before it is asked for again,
+    /// longer each time ([`FIRST_POSTER_RETRY`](super::cache::FIRST_POSTER_RETRY)
+    /// doubled, to [`MAX_POSTER_RETRY`](super::cache::MAX_POSTER_RETRY)),
+    /// and is asked for after the origin's next sync.
     async fn sweep_posters(&self, peer: &PeerRecord) {
         #[cfg(test)]
         self.holds.sweeping.here().await;
@@ -335,13 +338,21 @@ impl Federation {
             })
             .buffer_unordered(POSTER_FETCHES);
         while let Some((poster, fetched)) = fetched.next().await {
-            match fetched {
-                Ok(_) => {}
-                Err(DialError::Unavailable) => return,
-                Err(e) => {
-                    tracing::debug!(origin, error = %e, "a paired server's poster was not fetched");
-                    self.cache.missed(origin, poster);
-                }
+            let Err(e) = fetched else {
+                continue;
+            };
+            // `unavailable` is the origin past the pair's pace, or failing
+            // this image (its PMS could not fetch it): one the origin
+            // cannot answer would otherwise be asked for at every tick.
+            let wait = self.cache.missed(origin, poster);
+            tracing::debug!(
+                origin,
+                error = %e,
+                retry_in_secs = wait.as_secs(),
+                "a paired server's poster was not fetched"
+            );
+            if matches!(e, DialError::Unavailable) {
+                return;
             }
         }
     }

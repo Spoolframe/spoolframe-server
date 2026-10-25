@@ -2425,7 +2425,17 @@ mod replica {
         /// SA's `id` as SB serves it.
         /// SB's replica woken, and its posters fetched: `count` files.
         async fn posters_fetched(&self, count: usize) {
-            // A setting applied wakes the replica before its tick.
+            self.wake_replica();
+            let files = self.files();
+            until(|| {
+                let files = files.clone();
+                async move { kept(&files) == count }
+            })
+            .await;
+        }
+
+        /// SB's replica woken before its tick: a setting applied does it.
+        fn wake_replica(&self) {
             federation(&self.sb).set_replica(
                 std::time::Duration::from_secs(3600),
                 spoolframe_server::store::federation_cache::FileLimits {
@@ -2433,10 +2443,22 @@ mod replica {
                     total: 1 << 30,
                 },
             );
-            let files = self.files();
-            until(|| {
-                let files = files.clone();
-                async move { kept(&files) == count }
+        }
+
+        /// SB's replica woken: SA is asked for no image meanwhile, of the
+        /// `asked` it was asked for so far. A sweep asks within a few
+        /// milliseconds of the wake; a second is far past it.
+        async fn not_asked_again(&self, asked: usize) {
+            self.wake_replica();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(self.sa.catalog.artwork_asks(), asked, "asked again");
+        }
+
+        /// SB's replica woken until SA was asked for `asked` images.
+        async fn asked(&self, asked: usize) {
+            until(|| async {
+                self.wake_replica();
+                self.sa.catalog.artwork_asks() == asked
             })
             .await;
         }
@@ -2895,6 +2917,44 @@ mod replica {
         pair.share("plex:1").await;
         pair.refresh().await;
         pair.posters_fetched(1).await;
+        pair.stop().await;
+    }
+
+    /// SA cannot answer for a poster (its PMS fails it: `unavailable`).
+    /// SB does not ask for it again at each tick, as it did every 15 s:
+    /// it waits 30 s, then twice as long after each failure in a row, and
+    /// asks for it again once it waited.
+    #[tokio::test]
+    async fn a_poster_sa_cannot_answer_is_asked_for_less_and_less_often() {
+        let pair = Pair::start("fed-replica-poster-backoff").await;
+        pair.sa.catalog.show_posters();
+        pair.sa.catalog.fail_images();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        // A sync the share set off may come before the refresh's, and a
+        // sync asks for a poster that failed again: once the asks after
+        // both are in, they stop.
+        until(|| async {
+            pair.wake_replica();
+            pair.sa.catalog.artwork_asks() > 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let asked = pair.sa.catalog.artwork_asks();
+        pair.not_asked_again(asked).await;
+
+        // Each ask failed: the wait after the last is 30 s doubled for
+        // each failure before it. Half of it is not enough, all of it is.
+        let clock = pair.sb.store.clock();
+        let mut wait = Duration::from_secs(30 << (asked - 1));
+        for asked in asked..asked + 2 {
+            clock.advance(wait / 2);
+            pair.not_asked_again(asked).await;
+            clock.advance(wait / 2);
+            pair.asked(asked + 1).await;
+            wait *= 2;
+        }
+        assert_eq!(kept(&pair.files()), 0);
         pair.stop().await;
     }
 

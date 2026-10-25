@@ -18,6 +18,12 @@
   local one and resolves only to public addresses, checked as it is
   dialled), and never with the token: not as `X-Plex-Token`, and a URL
   that names it is refused. Other PMS requests still follow none.
+- Fixed: a paired server's poster that it cannot answer for
+  (`unavailable`) is no longer asked for at each of the replica's 15 s
+  ticks without end. A poster that fails, whatever the answer, waits
+  30 s before it is asked for again, doubled at each failure in a row
+  to at most an hour; after the pair's next sync it is asked for again,
+  and a fetch of it that goes through starts its wait afresh.
 
 ## 0.15.0 (2026-10-25)
 

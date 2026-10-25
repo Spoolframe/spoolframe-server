@@ -3370,14 +3370,20 @@ dials the pair and writes the cache):
   most 16 MiB, and the reply at most 64 KiB more: SB refuses one that
   says it is longer before it holds any of it), `not_shared` or
   `not_found`; `unavailable` past the
-  pair's pace (a burst of 200, then 100 a second). SB keeps only a JPEG,
+  pair's pace (a burst of 200, then 100 a second), or when SA cannot
+  fetch the image now (its PMS failed it). SB keeps only a JPEG,
   PNG or WebP that says it is an `image/` type, fetches the posters of
   what it synced a few at a time after the sync, and holds the images to
   `federation.cache_max_mb` per origin and `cache_total_mb` in all. Each
   image SB keeps is a file of its own, written and accounted for on work
   a cancelled fetch does not stop, at most four at a time; one replaced
   goes with its record, and a file no record names (a process stopped
-  part way) is swept every ten minutes.
+  part way) is swept every ten minutes. A poster SB could not fetch,
+  whatever the answer (`unavailable` too), is not asked for again for
+  30 s, doubled at each failure in a row to at most an hour; it is asked
+  for again after SA's next sync, its wait still growing, and a fetch
+  of it that goes through starts its wait afresh. An `unavailable`
+  also ends that sweep: the rest wait for the replica's next tick.
 
 A connection answers at most 16 streams at once: one past them is reset
 `BUSY` (3), and not counted against its endpoint. One pair's connections

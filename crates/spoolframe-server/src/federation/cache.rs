@@ -143,9 +143,9 @@ pub struct PeerCache {
     max_bytes: AtomicU64,
     total_bytes: AtomicU64,
     links: Arc<Links>,
-    /// Each origin's posters that failed since its last sync: not asked
-    /// for again until the next.
-    misses: parking_lot::Mutex<HashMap<String, HashSet<String>>>,
+    /// Each origin's posters that failed, by id: each is not asked for
+    /// again until its wait is over, a longer one each time it fails.
+    misses: parking_lot::Mutex<HashMap<String, HashMap<String, Miss>>>,
     /// The most of a hierarchy browsed at once; the default but in tests.
     browse: BrowseLimits,
     /// Held while an image is written and accounted for (M8-05), by work
@@ -162,6 +162,28 @@ pub struct PeerCache {
 /// past the limits at worst. An image fetched past them is served, not
 /// kept, and fetched again when next asked for.
 const MAX_KEEPING: usize = 4;
+
+/// The first wait before a poster that failed is asked for again,
+/// doubled at each failure, to at most [`MAX_POSTER_RETRY`]. Without it
+/// a poster the origin cannot answer `unavailable` was asked for at each
+/// of the replica's 15 s ticks.
+pub(super) const FIRST_POSTER_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const MAX_POSTER_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// A poster that failed: how many times in a row, and when it is asked
+/// for again. The times are the store's clock's.
+#[derive(Debug, Clone, Copy)]
+struct Miss {
+    failures: u32,
+    retry_at: std::time::Instant,
+}
+
+/// The wait after a poster's `failures`th failure in a row.
+fn poster_retry_after(failures: u32) -> std::time::Duration {
+    FIRST_POSTER_RETRY
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(MAX_POSTER_RETRY)
+}
 
 /// How often the files no row names are swept (Z8-03): those a process
 /// stopped part way left, or a part whose rename failed.
@@ -266,38 +288,74 @@ impl PeerCache {
     }
 
     /// At most `limit` of `origin`'s posters to fetch: an available
-    /// item's, with no file yet, and not failed since the last sync.
+    /// item's, with no file yet, and not waiting after a failure.
     pub(crate) async fn missing_posters(
         &self,
         origin: &str,
         limit: u32,
     ) -> Result<Vec<String>, StoreError> {
-        let missed = self.misses.lock().get(origin).map_or(0, HashSet::len);
+        let now = self.store.clock().now();
+        let waiting = |misses: &HashMap<String, HashMap<String, Miss>>| -> HashSet<String> {
+            misses.get(origin).map_or_else(HashSet::new, |m| {
+                m.iter()
+                    .filter(|(_, miss)| now < miss.retry_at)
+                    .map(|(poster, _)| poster.clone())
+                    .collect()
+            })
+        };
+        let waiting = waiting(&self.misses.lock());
         let posters = self
             .store
-            .missing_posters(origin, limit.saturating_add(missed as u32))
+            .missing_posters(origin, limit.saturating_add(waiting.len() as u32))
             .await?;
-        let misses = self.misses.lock();
-        let missed = misses.get(origin);
         Ok(posters
             .into_iter()
-            .filter(|p| missed.is_none_or(|m| !m.contains(p)))
+            .filter(|p| !waiting.contains(p))
             .take(limit as usize)
             .collect())
     }
 
-    /// `origin`'s `poster` could not be fetched.
-    pub(crate) fn missed(&self, origin: &str, poster: String) {
-        self.misses
-            .lock()
+    /// `origin`'s `poster` could not be fetched, again: how long it waits
+    /// before it is asked for again.
+    pub(crate) fn missed(&self, origin: &str, poster: String) -> std::time::Duration {
+        let now = self.store.clock().now();
+        let mut misses = self.misses.lock();
+        let miss = misses
             .entry(origin.to_owned())
             .or_default()
-            .insert(poster);
+            .entry(poster)
+            .or_insert(Miss {
+                failures: 0,
+                retry_at: now,
+            });
+        miss.failures = miss.failures.saturating_add(1);
+        let wait = poster_retry_after(miss.failures);
+        miss.retry_at = now + wait;
+        wait
     }
 
-    /// `origin` syncs: its posters that failed are asked for again.
+    /// `origin`'s `artwork` was fetched: a wait of its after failures
+    /// starts afresh.
+    fn fetched(&self, origin: &str, artwork: &str) {
+        let mut misses = self.misses.lock();
+        if let Some(missed) = misses.get_mut(origin) {
+            missed.remove(artwork);
+            if missed.is_empty() {
+                misses.remove(origin);
+            }
+        }
+    }
+
+    /// `origin` syncs: its posters that failed are asked for again after
+    /// it, what the sync brought maybe new. Their failures are kept, so
+    /// one that fails again waits longer still.
     pub(crate) fn sync_began(&self, origin: &str) {
-        self.misses.lock().remove(origin);
+        let now = self.store.clock().now();
+        if let Some(missed) = self.misses.lock().get_mut(origin) {
+            for miss in missed.values_mut() {
+                miss.retry_at = now;
+            }
+        }
     }
 
     /// New limits on the artwork files: a live setting. Files past them
@@ -444,6 +502,7 @@ impl PeerCache {
             tracing::warn!(origin, content_type, "a paired server's image is not one");
             return Err(DialError::NotFound);
         }
+        self.fetched(origin, artwork);
         if let Err(e) = self.keep_file(origin, artwork, &content_type, &bytes).await {
             tracing::warn!(origin, error = %e, "cannot keep a paired server's image");
         }
