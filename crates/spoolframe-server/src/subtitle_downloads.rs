@@ -112,6 +112,13 @@ struct Site {
     /// The account's count, as the site said it at the last download:
     /// none until then, and never from SubDL, which does not say.
     account: Mutex<Option<AccountSaid>>,
+    /// When each download was asked of the site whose answer never came
+    /// (Z8-05), and by whom (a principal, or a pair's key): the request
+    /// was cancelled in flight, or the site failed on it or took too long,
+    /// so it may have spent the download, and nothing says so. Kept a day,
+    /// or until the site next says what the account has left, which counts
+    /// them; counted as spent by pairs' downloads.
+    uncertain: Mutex<Vec<(i64, String)>>,
 }
 
 /// A site account's downloads, as the site counts them: every app's that
@@ -181,6 +188,22 @@ enum Client {
 }
 
 impl Site {
+    /// The site said `said` of the account: the downloads asked of it by
+    /// then are in its count, those whose answers never came among them.
+    fn said(&self, said: AccountSaid) {
+        *self.account.lock() = Some(said);
+        self.uncertain.lock().retain(|(t, _)| *t > said.at);
+    }
+
+    /// How many downloads asked of it in the day to `now` are uncertain:
+    /// everyone's, and `key`'s.
+    fn uncertain(&self, key: &str, now: i64) -> (usize, usize) {
+        let mut uncertain = self.uncertain.lock();
+        uncertain.retain(|(t, _)| now - t < DAY_SECS);
+        let mine = uncertain.iter().filter(|(_, by)| by == key).count();
+        (uncertain.len(), mine)
+    }
+
     fn of(kind: &SiteKind) -> Arc<Site> {
         let client = match kind {
             SiteKind::OpenSubtitles(account) => {
@@ -192,6 +215,7 @@ impl Site {
             client,
             downloading: tokio::sync::Mutex::new(()),
             account: Mutex::new(None),
+            uncertain: Mutex::new(Vec::new()),
         })
     }
 }
@@ -232,6 +256,95 @@ pub const DEFAULT_DAILY_LIMIT_PER_PEER: u32 = 40;
 
 /// What a pair's downloads are kept under, in place of a principal.
 const PAIR_KEY: &str = "pair:";
+
+/// A pair's searches that reach a site, a day, for each download of its
+/// daily limit (G8-03): every one asks a site with this server's key, as a
+/// download does. A search answered from the day's kept results is not
+/// counted. 0 for no limit, as the limit per pair is.
+const SEARCHES_PER_DOWNLOAD: u32 = 10;
+
+/// What a pair never takes a site account's day below (M8-01): half of
+/// it, kept for this server's own users, and never fewer than this many
+/// downloads; just this many where the site does not say how many were
+/// made.
+const KEPT_FOR_OWN_USERS: u32 = 5;
+
+/// Whether `account`, as a site last said it at `now`, has no more for a
+/// pair than what is kept for this server's own users (M8-01), counting
+/// `uncertain` downloads asked of it since whose answers never came as
+/// spent (Z8-05). What the site said is taken until its day resets, or for
+/// a day without a reset time; before it said anything, nothing is known.
+/// [`KEPT_FOR_OWN_USERS`] of them the pair's own (`mine`) keep the pair
+/// back either way: a pair's, not every pair's, so one dropping its
+/// requests keeps no other back.
+fn kept_for_own_users(
+    account: Option<AccountSaid>,
+    uncertain: usize,
+    mine: usize,
+    now: i64,
+) -> bool {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    if count(mine) >= KEPT_FOR_OWN_USERS {
+        return true;
+    }
+    let uncertain = count(uncertain);
+    let Some(said) = account else {
+        return false;
+    };
+    let current = match said.resets_at {
+        Some(resets_at) => now < resets_at,
+        None => now < said.at + DAY_SECS,
+    };
+    let day = said.used.unwrap_or(0).saturating_add(said.remaining);
+    current && said.remaining.saturating_sub(uncertain) <= KEPT_FOR_OWN_USERS.max(day / 2)
+}
+
+/// A download asked of a site by `by`, uncertain until
+/// [`Asking::answered`]: one dropped before it is, its request cancelled
+/// in flight or the site failing on it, stays counted in the site's
+/// `uncertain` for a day, or until the site says what is left (Z8-05).
+struct Asking<'a> {
+    site: &'a Site,
+    at: i64,
+    by: String,
+    answered: bool,
+}
+
+impl<'a> Asking<'a> {
+    fn new(site: &'a Site, by: &str, now: i64) -> Self {
+        let mut uncertain = site.uncertain.lock();
+        uncertain.retain(|(t, _)| now - t < DAY_SECS);
+        uncertain.push((now, by.to_owned()));
+        Self {
+            site,
+            at: now,
+            by: by.to_owned(),
+            answered: false,
+        }
+    }
+
+    /// The site answered: what it spent, it says, or it refused.
+    fn answered(mut self) {
+        self.answered = true;
+        let mut uncertain = self.site.uncertain.lock();
+        if let Some(at) = uncertain
+            .iter()
+            .position(|(t, by)| *t == self.at && *by == self.by)
+        {
+            uncertain.remove(at);
+        }
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            tracing::info!(
+                "a subtitle download got no answer from the site: counted as spent for a day"
+            );
+        }
+    }
+}
 
 impl PairAsker {
     /// What its downloads are counted and recorded under.
@@ -533,6 +646,13 @@ pub struct SubtitleDownloads {
     /// at once never both take the last one. A download's keeping carries
     /// the hold ([`finish`]).
     limits: crate::keyed_locks::KeyedLocks,
+    /// The downloads a site spent that are not kept as rows yet, by
+    /// downloader: counted against its day as the rows are.
+    spent: Arc<Spent>,
+    /// Each pair's searches that reached a site in the last day, by its
+    /// key, as Unix seconds (G8-03). Held here, not in the store: a
+    /// restart forgets them, as it forgets the kept searches.
+    pair_searches: Mutex<HashMap<String, Vec<i64>>>,
     /// Where a test holds a download's keeping.
     #[cfg(any(test, feature = "test-support"))]
     pub holds: Arc<KeepHolds>,
@@ -546,6 +666,52 @@ pub struct KeepHolds {
     pub writing: crate::test_holds::Held,
     pub recording: crate::test_holds::Held,
     pub recorded: crate::test_holds::Held,
+}
+
+/// Each downloader's downloads a site spent that are not kept as rows yet,
+/// by its key (a principal, or a pair's), with when and the row id each
+/// would be kept as: the site counts a download as it grants it, so one
+/// whose request is cancelled as its file is fetched, or whose keeping
+/// fails, still takes one of the downloader's day. Until its row is
+/// written, which counts it from then on, or for a day. Held here, not in
+/// the store: a restart forgets them, as it forgets the pairs' searches.
+#[derive(Debug, Default)]
+struct Spent(Mutex<HashMap<String, Vec<(i64, String)>>>);
+
+impl Spent {
+    /// `key`'s download, to be kept as row `id`, spent at the site at `at`.
+    fn add(&self, key: &str, id: &str, at: i64) {
+        let mut spent = self.0.lock();
+        spent.retain(|_, of| {
+            of.retain(|(t, _)| at - t < DAY_SECS);
+            !of.is_empty()
+        });
+        spent
+            .entry(key.to_owned())
+            .or_default()
+            .push((at, id.to_owned()));
+    }
+
+    /// `key`'s download `id` is kept: its row counts it.
+    fn kept(&self, key: &str, id: &str) {
+        let mut spent = self.0.lock();
+        if let Some(of) = spent.get_mut(key) {
+            of.retain(|(_, kept)| kept != id);
+            if of.is_empty() {
+                spent.remove(key);
+            }
+        }
+    }
+
+    /// When each of `key`'s spent in the day to `now` was.
+    fn of(&self, key: &str, now: i64) -> Vec<i64> {
+        self.0.lock().get(key).map_or_else(Vec::new, |of| {
+            of.iter()
+                .map(|(t, _)| *t)
+                .filter(|t| now - t < DAY_SECS)
+                .collect()
+        })
+    }
 }
 
 /// How long keeping a downloaded file and its row may take: a local write
@@ -563,6 +729,8 @@ struct Finishing {
     row: DownloadRow,
     bytes: Vec<u8>,
     limit: crate::keyed_locks::Guard,
+    /// Where the download is counted until its row is.
+    spent: Arc<Spent>,
     #[cfg(any(test, feature = "test-support"))]
     holds: Arc<KeepHolds>,
 }
@@ -580,6 +748,7 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
         row,
         bytes,
         limit,
+        spent,
         #[cfg(any(test, feature = "test-support"))]
         holds,
     } = finishing;
@@ -617,6 +786,8 @@ async fn finish(finishing: Finishing) -> Result<(), DownloadError> {
         }
         return Err(e);
     }
+    // Counted by its row from now on, the limit still held.
+    spent.kept(&row.downloaded_by, &row.id);
     attach(&store, &prober, &dir, &media).await?;
     Ok(())
 }
@@ -698,6 +869,8 @@ impl SubtitleDownloads {
             searches: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
             limits: Default::default(),
+            spent: Arc::default(),
+            pair_searches: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             holds: Arc::default(),
         };
@@ -798,7 +971,7 @@ impl SubtitleDownloads {
     ) -> Result<SubtitleSearch, DownloadError> {
         let live = self.live()?;
         let wanted = self.store.track_preferences(who.principal).await?.subtitles;
-        self.search_with(live, id, language, &wanted).await
+        self.search_with(live, id, language, &wanted, None).await
     }
 
     /// [`SubtitleDownloads::search`] for a paired server's user (P8-07),
@@ -810,19 +983,38 @@ impl SubtitleDownloads {
         who: &PairAsker,
     ) -> Result<SubtitleSearch, DownloadError> {
         let live = self.live()?;
-        self.search_with(live, id, language, &who.subtitles).await
+        let budget = live
+            .daily_limit_per_peer
+            .saturating_mul(SEARCHES_PER_DOWNLOAD);
+        let key = who.key();
+        self.search_with(live, id, language, &who.subtitles, Some((&key, budget)))
+            .await
     }
 
     /// [`SubtitleDownloads::search`] with the sites `live`, ordered by
-    /// `wanted`.
+    /// `wanted`; a pair's, by its key, held to its day's searches.
     async fn search_with(
         &self,
         live: Live,
         id: &MediaId,
         language: Option<&str>,
         wanted: &SubtitlePreferences,
+        pair: Option<(&str, u32)>,
     ) -> Result<SubtitleSearch, DownloadError> {
         let asked = language.map(language_code).transpose()?;
+        if let Some((key, budget)) = pair {
+            let asks_a_site = live.sites.iter().any(|(_, settings)| {
+                let languages = match &asked {
+                    Some(language) => vec![language.clone()],
+                    None => settings.languages.clone(),
+                };
+                self.kept(&(settings.source(), id.to_string(), languages))
+                    .is_none()
+            });
+            if asks_a_site {
+                self.count_pair_search(key, budget)?;
+            }
+        }
         // The item is read, and the file hashed, only when a site is asked
         // (not all it found is kept from the last day).
         let subject = tokio::sync::OnceCell::new();
@@ -929,6 +1121,28 @@ impl SubtitleDownloads {
             results,
             sources,
         })
+    }
+
+    /// Count a search of pair `key`'s that asks a site, under its day's
+    /// `budget` (0 for none): refused past it, as its downloads are past
+    /// their limit (G8-03). Every pair's searches older than a day go.
+    fn count_pair_search(&self, key: &str, budget: u32) -> Result<(), DownloadError> {
+        let now = self.store.now();
+        let mut searches = self.pair_searches.lock();
+        searches.retain(|_, at| {
+            at.retain(|t| now - t < DAY_SECS);
+            !at.is_empty()
+        });
+        let at = searches.entry(key.to_owned()).or_default();
+        if budget > 0 && at.len() >= budget as usize {
+            return Err(DownloadError::QuotaExhausted {
+                whose: QuotaOf::User,
+                resets_at: at.first().map(|t| t + DAY_SECS),
+                site: None,
+            });
+        }
+        at.push(now);
+        Ok(())
     }
 
     /// One site's results for the item, kept a day under `key`.
@@ -1120,7 +1334,20 @@ impl SubtitleDownloads {
         }
         let offer = self.offered(id, source, site_id).ok_or_else(not_offered)?;
         let used = self.check_may_download(&who, limit).await?;
+        let account = *site.account.lock();
+        let now = self.store.now();
+        let (uncertain, mine) = site.uncertain(&who.key, now);
+        if who.pair && kept_for_own_users(account, uncertain, mine, now) {
+            return Err(DownloadError::QuotaExhausted {
+                whose: who.quota_of(),
+                resets_at: account.and_then(|a| a.resets_at),
+                site: None,
+            });
+        }
         let media = self.catalog.media_path(id).await?;
+        // The row's id, chosen before the site is asked: what the download
+        // is counted as until its row is written.
+        let download_id = uuid::Uuid::new_v4().simple().to_string();
         let (got, account_remaining) = match &site.client {
             Client::OpenSubtitles(client) => {
                 let file_id = offer.fetch.parse().map_err(|_| not_offered())?;
@@ -1130,11 +1357,25 @@ impl SubtitleDownloads {
                     .format
                     .as_deref()
                     .is_some_and(|f| matches!(f, "srt" | "ass" | "ssa" | "vtt"));
-                let got = match client.download(file_id, as_srt.then_some("srt")).await {
-                    Ok(got) => got,
+                // The grant spends the download: what the site says of the
+                // account is kept as it answers, before the file is
+                // fetched (Z8-05), and a request cancelled before it
+                // answers is counted as spent; so is one the site failed
+                // on or did not answer in time, or answered with what does
+                // not read, which it may have processed all the same.
+                let asking = Asking::new(site, &who.key, self.store.now());
+                let granted = client.grant(file_id, as_srt.then_some("srt")).await;
+                if !matches!(
+                    granted,
+                    Err(SiteError::Unreachable(_) | SiteError::Unreadable(_))
+                ) {
+                    asking.answered();
+                }
+                let granted = match granted {
+                    Ok(granted) => granted,
                     Err(e) => {
                         if let SiteError::QuotaExhausted { resets_at } = e {
-                            *site.account.lock() = Some(AccountSaid {
+                            site.said(AccountSaid {
                                 used: None,
                                 remaining: 0,
                                 resets_at,
@@ -1144,21 +1385,28 @@ impl SubtitleDownloads {
                         return Err(DownloadError::of_site(source, e));
                     }
                 };
-                if let Some(remaining) = got.remaining {
-                    *site.account.lock() = Some(AccountSaid {
-                        used: got.requests,
+                if let Some(remaining) = granted.remaining {
+                    site.said(AccountSaid {
+                        used: granted.requests,
                         remaining,
-                        resets_at: got.resets_at,
+                        resets_at: granted.resets_at,
                         at: self.store.now(),
                     });
                 }
-                (got.bytes, got.remaining)
+                // Spent, though its file never comes.
+                self.spent.add(&who.key, &download_id, self.store.now());
+                let bytes = client
+                    .fetch_granted(&granted)
+                    .await
+                    .map_err(|e| DownloadError::of_site(source, e))?;
+                (bytes, granted.remaining)
             }
             Client::SubDl(site) => {
                 let got = site
                     .download(&offer.fetch)
                     .await
                     .map_err(|e| DownloadError::of_site(source, e))?;
+                self.spent.add(&who.key, &download_id, self.store.now());
                 (got, None)
             }
         };
@@ -1177,7 +1425,7 @@ impl SubtitleDownloads {
         .map_err(|e| DownloadError::Io(format!("cannot read the downloaded file: {e}")))?
         .map_err(not_kept)?;
         let row = DownloadRow {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: download_id,
             media_id: id.to_string(),
             media_path: media.display().to_string(),
             source: source.id().into(),
@@ -1204,6 +1452,7 @@ impl SubtitleDownloads {
             row: row.clone(),
             bytes: kept.bytes,
             limit: held_limit,
+            spent: self.spent.clone(),
             #[cfg(any(test, feature = "test-support"))]
             holds: self.holds.clone(),
         };
@@ -1238,7 +1487,7 @@ impl SubtitleDownloads {
         if !self.store.may_download_subtitles(&who.key).await? {
             return Err(DownloadError::NotAllowed(who.denied()));
         }
-        let today = self.store.subtitle_downloads_today(&who.key).await?;
+        let today = self.today(&who.key).await?;
         if limit > 0 && today.len() >= limit as usize {
             return Err(DownloadError::QuotaExhausted {
                 whose: who.quota_of(),
@@ -1356,8 +1605,17 @@ impl SubtitleDownloads {
         if limit == 0 {
             return Ok(None);
         }
-        let today = self.store.subtitle_downloads_today(principal).await?.len();
+        let today = self.today(principal).await?.len();
         Ok(Some(limit.saturating_sub(today as u32)))
+    }
+
+    /// When each of `key`'s downloads of the day was: those kept, and
+    /// those the site spent that are not kept ([`Spent`]), oldest first.
+    async fn today(&self, key: &str) -> Result<Vec<i64>, StoreError> {
+        let mut today = self.store.subtitle_downloads_today(key).await?;
+        today.extend(self.spent.of(key, self.store.now()));
+        today.sort_unstable();
+        Ok(today)
     }
 
     /// Sync the download at `file`, in the background (PX-03): it was not

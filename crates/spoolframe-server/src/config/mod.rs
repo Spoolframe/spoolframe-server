@@ -2285,7 +2285,7 @@ impl NetworkConfig {
     }
 }
 
-/// `wan { static = ["203.0.113.7:7420"]; mapped_port { port = 7420;
+/// `wan { static = ["1.2.3.4:7420"]; mapped_port { port = 7420;
 /// mode = "auto"; public_ip = "lookup"; lookup_via = "wtfismyip"; } }`:
 /// what a device off the LAN dials (P6-02). Each part is optional;
 /// `mapped_port` is on with its defaults unless set to `false`. The host's
@@ -4587,7 +4587,7 @@ mod tests {
         let config = plex(
             r#"plex { url = "http://nas:32400"; }
             network { announce {
-                add = ["203.0.113.7", "203.0.113.8:443"];
+                add = ["203.0.114.7", "203.0.114.8:443"];
                 ignore = ["172.17.0.0/16", "10.0.0.9"];
                 ignore_interfaces = [];
                 interfaces = ["enp*", "wg0"];
@@ -4598,8 +4598,8 @@ mod tests {
         assert_eq!(
             announce.add,
             [
-                "203.0.113.7".parse().unwrap(),
-                "203.0.113.8:443".parse().unwrap()
+                "203.0.114.7".parse().unwrap(),
+                "203.0.114.8:443".parse().unwrap()
             ]
         );
         assert_eq!(
@@ -4620,7 +4620,7 @@ mod tests {
     fn a_bad_announce_setting_names_its_key() {
         for (setting, key) in [
             (r#"add = ["nas.local"]"#, "network.announce.add"),
-            (r#"add = ["203.0.113.7:0"]"#, "network.announce.add"),
+            (r#"add = ["203.0.114.7:0"]"#, "network.announce.add"),
             (r#"ignore = ["172.17.0.0/33"]"#, "network.announce.ignore"),
             (r#"ignore = ["docker0"]"#, "network.announce.ignore"),
             (
@@ -4654,7 +4654,7 @@ mod tests {
     #[test]
     fn wan_static_addresses_are_read_as_written() {
         let wan =
-            wan(r#"wan { static = ["1.2.3.4:7420", "[2001:db8::1]:7420"]; mapped_port = false; }"#)
+            wan(r#"wan { static = ["1.2.3.4:7420", "[2001:db9::1]:7420"]; mapped_port = false; }"#)
                 .unwrap()
                 .unwrap();
         assert_eq!(
@@ -4662,7 +4662,7 @@ mod tests {
             crate::wan::Wan {
                 statics: vec![
                     "1.2.3.4:7420".parse().unwrap(),
-                    "[2001:db8::1]:7420".parse().unwrap()
+                    "[2001:db9::1]:7420".parse().unwrap()
                 ],
                 mapped_port: None,
             }
@@ -4689,7 +4689,7 @@ mod tests {
     fn a_manual_mapped_port_with_its_public_ip_is_read() {
         use crate::wan::{MappedPort, Mode, PublicIp};
         let wan = wan(
-            r#"wan { mapped_port { port = 443; mode = "manual"; public_ip = "203.0.113.7";
+            r#"wan { mapped_port { port = 443; mode = "manual"; public_ip = "203.0.114.7";
                      lookup_via = false; } }"#,
         )
         .unwrap()
@@ -4699,7 +4699,7 @@ mod tests {
             Some(MappedPort {
                 port: Some(443),
                 mode: Mode::Manual,
-                public_ip: PublicIp::Fixed("203.0.113.7".parse().unwrap()),
+                public_ip: PublicIp::Fixed("203.0.114.7".parse().unwrap()),
                 lookup_via: None,
             })
         );

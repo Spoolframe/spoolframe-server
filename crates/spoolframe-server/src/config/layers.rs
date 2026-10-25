@@ -1109,15 +1109,15 @@ mod tests {
         // out stays out.
         let layers = layers(
             Some(
-                r#"network { port = 7420; wan { static = ["203.0.113.7:7420"];
+                r#"network { port = 7420; wan { static = ["203.0.114.7:7420"];
                    mapped_port { port = 7420; } } }"#,
             ),
-            Some(r#"network { wan { static = ["198.51.100.7:7420"]; } }"#),
+            Some(r#"network { wan { static = ["198.51.101.7:7420"]; } }"#),
         )
         .unwrap();
         let config = layers.config().unwrap();
         let wan = config.network.wan.unwrap();
-        assert_eq!(wan.statics, Some(vec!["198.51.100.7:7420".to_owned()]));
+        assert_eq!(wan.statics, Some(vec!["198.51.101.7:7420".to_owned()]));
         assert!(wan.mapped_port.is_none());
         // The table's neighbours still merge key by key.
         assert_eq!(config.network.port, Some(7420));
@@ -1487,12 +1487,12 @@ mod tests {
     fn host_ipv6_the_web_ui_saved_is_dropped_from_the_runtime_layer() {
         let layers = layers(
             None,
-            Some(r#"network { wan { static = ["203.0.113.7:7420"]; host_ipv6 = false; } }"#),
+            Some(r#"network { wan { static = ["203.0.114.7:7420"]; host_ipv6 = false; } }"#),
         )
         .unwrap();
         assert_eq!(tree::get(&layers.runtime, "network.wan.host_ipv6"), None);
         let wan = layers.config().unwrap().network.wan.unwrap();
-        assert_eq!(wan.statics, Some(vec!["203.0.113.7:7420".to_owned()]));
+        assert_eq!(wan.statics, Some(vec!["203.0.114.7:7420".to_owned()]));
     }
 
     #[test]

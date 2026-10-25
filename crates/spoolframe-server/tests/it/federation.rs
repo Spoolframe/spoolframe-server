@@ -4517,7 +4517,7 @@ mod replica {
                 ServerOptions {
                     real_media: true,
                     admission: Admission {
-                        max_all_remote_connections: 1,
+                        max_all_remote_connections: 2,
                         remote_requests_each: 1,
                         ..Admission::default()
                     },
@@ -4533,10 +4533,15 @@ mod replica {
                 .session;
             let held = &pair.sa.subtitle_timings.held;
             held.hold();
+            // Two connections' worth, the one redeemed on among them
+            // (Z8-01), asked on the other.
             let asking = timing_connection(&pair, &device).await;
             in_hand(&pair, 0).await;
-            let first = ask_unread(&asking, &session, offset()).await;
-            held.until_at_it(1).await;
+            let first = [
+                ask_unread(&asking, &session, offset()).await,
+                ask_unread(&asking, &session, offset()).await,
+            ];
+            held.until_at_it(2).await;
             assert!(
                 reset_busy(ask_unread(&asking, &session, offset()).await).await,
                 "past every pair's budget"
@@ -4711,7 +4716,17 @@ mod replica {
                 .unwrap();
             let home = iroh::RelayUrl::from(url.clone());
             until(|| async { sa.server.addr().relay_urls().any(|u| *u == home) }).await;
-            let pair = Pair::with_sa("fed-media-relay", sa, ServerOptions::default()).await;
+            // The relay is on loopback, which no pair's may be (M8-07):
+            // SB, which keeps and dials it, allows it.
+            let pair = Pair::with_sa(
+                "fed-media-relay",
+                sa,
+                ServerOptions {
+                    inner_relays: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
             let (file, bob) = shared(&pair).await;
             // SB knows SA by its relay alone, as a phone on cellular would.
             let pool = sqlx::SqlitePool::connect_with(
@@ -4941,10 +4956,10 @@ mod replica {
             let (_, bob) = shared(&pair).await;
             let device = device(&pair).await;
             redeemed(&device, &token(&pair, bob, &device).await).await;
-            // The connection it redeemed on came as a stranger's, and is
-            // counted as one; those after are the remote session's.
+            // The connection it redeemed on came as a stranger's and is
+            // the remote session's now (Z8-01), counted as those after.
             let mut held = vec![device.clone()];
-            for _ in 0..Admission::DEFAULT_MAX_REMOTE_CONNECTIONS {
+            for _ in 1..Admission::DEFAULT_MAX_REMOTE_CONNECTIONS {
                 held.push(connection(&pair, &device.endpoint).await.expect("let in"));
             }
             assert!(connection(&pair, &device.endpoint).await.is_err());
@@ -4973,6 +4988,74 @@ mod replica {
             pair.stop().await;
         }
 
+        /// Z8-01: redeeming another token on a device at its cap keeps its
+        /// connections counted, the one it redeemed on among them: one
+        /// more is still closed `BUSY`, where the redemption let every one
+        /// of them go uncounted.
+        #[tokio::test]
+        async fn redeeming_again_keeps_a_device_s_connections_counted() {
+            let pair = Pair::start("fed-media-remote-redeem-again").await;
+            let (_, bob) = shared(&pair).await;
+            let device = device(&pair).await;
+            redeemed(&device, &token(&pair, bob, &device).await).await;
+            let mut held = vec![device.clone()];
+            for _ in 1..Admission::DEFAULT_MAX_REMOTE_CONNECTIONS {
+                held.push(connection(&pair, &device.endpoint).await.expect("let in"));
+            }
+            assert!(connection(&pair, &device.endpoint).await.is_err());
+            redeemed(&device, &token(&pair, bob, &device).await).await;
+            assert!(
+                connection(&pair, &device.endpoint).await.is_err(),
+                "still at its cap"
+            );
+            drop(held);
+            pair.stop().await;
+        }
+
+        /// The review of Z8-01: a token redeemed on a stranger's connection
+        /// the remote caps have no room for is answered, then the
+        /// connection is closed `BUSY`, as one more past the caps is, where
+        /// it stayed a stranger's holding the session, outside the remote
+        /// requests' budget. The device's next connection is refused too,
+        /// and one with room is not closed.
+        #[tokio::test]
+        async fn a_token_redeemed_past_the_remote_caps_closes_its_connection_busy() {
+            let pair = Pair::start_both(
+                "fed-media-remote-redeem-past",
+                ServerOptions {
+                    admission: Admission {
+                        max_all_remote_connections: 1,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let first = device(&pair).await;
+            redeemed(&first, &token(&pair, bob, &first).await).await;
+            let second = device(&pair).await;
+            redeemed(&second, &token(&pair, bob, &second).await).await;
+            let closed = tokio::time::timeout(Duration::from_secs(5), second.conn.closed())
+                .await
+                .expect("closed once answered");
+            assert!(
+                matches!(
+                    &closed,
+                    ConnectionError::ApplicationClosed(c) if c.error_code == close::BUSY.into()
+                ),
+                "{closed:?}"
+            );
+            assert!(connection(&pair, &second.endpoint).await.is_err());
+            assert_eq!(
+                first.call(None, Request::Ping).await,
+                Response::Ok(Reply::Pong),
+                "the one with room is held"
+            );
+            pair.stop().await;
+        }
+
         /// C8-04: every such device's connections together are capped too:
         /// with room for two, two devices' fill it, and a third device's is
         /// closed `BUSY` though its own key has room; a local device still
@@ -4992,21 +5075,94 @@ mod replica {
             )
             .await;
             let (_, bob) = shared(&pair).await;
+            // Each device's connection it redeemed on is counted (Z8-01):
+            // the first two fill the room, and the third's is closed
+            // `BUSY` once answered.
             let mut devices = Vec::new();
             for _ in 0..3 {
                 let device = device(&pair).await;
                 redeemed(&device, &token(&pair, bob, &device).await).await;
                 devices.push(device);
             }
-            let _first = connection(&pair, &devices[0].endpoint)
-                .await
-                .expect("let in");
-            let _second = connection(&pair, &devices[1].endpoint)
-                .await
-                .expect("let in");
+            assert!(connection(&pair, &devices[0].endpoint).await.is_err());
             assert!(connection(&pair, &devices[2].endpoint).await.is_err());
             let local = pair.sa.client().await;
             local.hello().await;
+            pair.stop().await;
+        }
+
+        /// Z8-01, D8-02: a device in a session of SB's, then of Carol's
+        /// server's too, counts in both pairs' shares: with a share of two
+        /// each, Carol's server's next device has room for the connection
+        /// it redeemed on alone, and one more is closed `BUSY`, where the
+        /// second redemption left the first device counted in neither.
+        #[tokio::test]
+        async fn a_device_in_two_pairs_sessions_counts_in_both_shares() {
+            let pair = Pair::start_both(
+                "fed-media-remote-two-pairs",
+                ServerOptions {
+                    admission: Admission {
+                        max_pair_remote_connections: 2,
+                        ..Admission::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let (carol_s, _) = sb_on(
+                fresh_dir("fed-media-remote-two-pairs-carol").await,
+                ServerOptions::default(),
+                quiet_plex().await,
+            )
+            .await;
+            let sa_on_carol = federation(&carol_s)
+                .redeem_link(&pairing_link(&pair.sa, None).await, "carol")
+                .await
+                .unwrap();
+            let carol_on_sa = pair
+                .sa
+                .store
+                .live_peer_by_endpoint(&carol_s.server.id().to_string())
+                .await
+                .unwrap()
+                .unwrap();
+            federation(&pair.sa)
+                .share(&carol_on_sa.id, &["plex:1".parse().unwrap()], "alice")
+                .await
+                .unwrap();
+            federation(&carol_s).refresh(&sa_on_carol.id).await.unwrap();
+            carol_s.add_user("carol", "correct horse", None).await;
+            let carol = carol_s
+                .store
+                .user_by_name("carol")
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            let carol_s_token = |device: &TestClient| {
+                let carol_s = &carol_s;
+                let pair = &pair;
+                let endpoint = device.endpoint.id();
+                async move {
+                    federation(carol_s)
+                        .assert_play(carol, &pair.fed(movie().id()), endpoint)
+                        .await
+                        .unwrap()
+                        .token
+                }
+            };
+            let both = device(&pair).await;
+            redeemed(&both, &token(&pair, bob, &both).await).await;
+            redeemed(&both, &carol_s_token(&both).await).await;
+            let next = device(&pair).await;
+            redeemed(&next, &carol_s_token(&next).await).await;
+            assert!(
+                connection(&pair, &next.endpoint).await.is_err(),
+                "Carol's server's share is the first device's too"
+            );
+            carol_s.stop().await;
             pair.stop().await;
         }
 
@@ -5029,18 +5185,14 @@ mod replica {
             )
             .await;
             let (_, bob) = shared(&pair).await;
+            // The connections the first two redeemed on fill the share
+            // (Z8-01).
             let mut devices = Vec::new();
             for _ in 0..3 {
                 let device = device(&pair).await;
                 redeemed(&device, &token(&pair, bob, &device).await).await;
                 devices.push(device);
             }
-            let _first = connection(&pair, &devices[0].endpoint)
-                .await
-                .expect("let in");
-            let _second = connection(&pair, &devices[1].endpoint)
-                .await
-                .expect("let in");
             assert!(connection(&pair, &devices[2].endpoint).await.is_err());
             // Carol's server, paired with SA too, and its user's device.
             let (carol_s, _) = sb_on(

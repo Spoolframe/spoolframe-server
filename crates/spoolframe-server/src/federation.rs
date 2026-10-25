@@ -142,6 +142,8 @@ pub struct Federation {
     /// its new one is confirmed, and an unpaired server's
     /// ([`crate::relay_access`] tells the relays at once).
     revoked: tokio::sync::broadcast::Sender<EndpointId>,
+    /// Which hosts the pairs' relays may be on (M8-07).
+    relay_hosts: RelayHosts,
     /// Where a test holds the federation mid-way through a race.
     #[cfg(test)]
     holds: test_holds::Holds,
@@ -225,6 +227,13 @@ impl std::fmt::Debug for Federation {
     }
 }
 
+/// Text a peer sent, as the log takes it when nothing has checked it
+/// (Z8-07): cut to 64 characters, and logged `?`, so a control character
+/// in it is escaped and forges no line.
+fn logged(text: &str) -> String {
+    text.chars().take(64).collect()
+}
+
 impl Federation {
     /// Federation for server `server_id`, called `name`, over `auth`'s
     /// store and limits, sharing from `catalog`, and caching what its pairs
@@ -268,9 +277,19 @@ impl Federation {
             downloads: OnceLock::new(),
             subtitle_downloads: OnceLock::new(),
             revoked: tokio::sync::broadcast::Sender::new(REVOKED_KEPT),
+            relay_hosts: RelayHosts::default(),
             #[cfg(test)]
             holds: test_holds::Holds::default(),
         }
+    }
+
+    /// The pairs' relays on any host are kept and dialled, for a test
+    /// whose own relay is on loopback (M8-07 holds every other to a public
+    /// host): this server's alone.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_inner_relays(mut self, inner: bool) -> Self {
+        self.relay_hosts.inner = inner;
+        self
     }
 
     /// This server's downloads (P8-07): what it cancels for a pair's users
@@ -494,13 +513,13 @@ impl Federation {
             return Err(PairError::AlreadyPaired);
         }
         let dial_at = kept_addrs(invite.addrs.iter().copied());
-        let relays = kept_relays(invite.relays.iter().cloned());
+        let relays = kept_relays(self.relay_hosts, invite.relays.iter().cloned());
         Ok(Aim {
             attached,
             code,
             server,
             hex: invite.server,
-            addr: endpoint_addr(server, dial_at.iter().copied(), &relays),
+            addr: endpoint_addr(self.relay_hosts, server, dial_at.iter().copied(), &relays),
             addrs: dial_at.iter().map(ToString::to_string).collect(),
             relays,
         })
@@ -682,7 +701,7 @@ impl Federation {
         tracing::warn!(
             peer = %peer.endpoint_id,
             name = %peer.display_name,
-            server_id = %answered_as,
+            server_id = ?logged(answered_as),
             "a paired server's key answered under another server id: refused"
         );
         self.note_identity_refused(&peer.endpoint_id).await;
@@ -755,7 +774,9 @@ impl Federation {
         );
         self.pair_ended(&peer).await;
         self.close_key(&peer.endpoint_id, "unpaired");
-        if let (Some(attached), Some(addr)) = (self.attached.get(), peer_addr(&peer)) {
+        if let (Some(attached), Some(addr)) =
+            (self.attached.get(), peer_addr(self.relay_hosts, &peer))
+        {
             tokio::spawn(tell_unpaired(attached.endpoint.clone(), addr, self.hello()));
         }
         Ok(Some(peer))
@@ -863,8 +884,10 @@ async fn tell_unpaired(endpoint: Endpoint, addr: EndpointAddr, hello: PeerHello)
     }
 }
 
-/// Where server `id` may be dialled: its `addrs` and `relays` hints.
+/// Where server `id` may be dialled: its `addrs` and `relays` hints, the
+/// relays on the hosts `hosts` allow.
 fn endpoint_addr(
+    hosts: RelayHosts,
     id: EndpointId,
     addrs: impl IntoIterator<Item = SocketAddr>,
     relays: &[String],
@@ -874,6 +897,8 @@ fn endpoint_addr(
         addrs.into_iter().map(TransportAddr::Ip).chain(
             relays
                 .iter()
+                // A pair's kept before M8-07 is held to it here too.
+                .filter(|r| hosts.allow(r))
                 .filter_map(|r| r.parse::<RelayUrl>().ok())
                 .map(TransportAddr::Relay),
         ),
@@ -881,10 +906,11 @@ fn endpoint_addr(
 }
 
 /// Where pair `peer` may be dialled: its key with its `addrs` and
-/// `relays` hints; `None` for a key that does not read.
-fn peer_addr(peer: &PeerRecord) -> Option<EndpointAddr> {
+/// `relays` hints, as [`endpoint_addr`] takes them; `None` for a key that
+/// does not read.
+fn peer_addr(hosts: RelayHosts, peer: &PeerRecord) -> Option<EndpointAddr> {
     let id = peer.endpoint_id.parse::<EndpointId>().ok()?;
-    Some(endpoint_addr(id, parsed(&peer.addrs), &peer.relays))
+    Some(endpoint_addr(hosts, id, parsed(&peer.addrs), &peer.relays))
 }
 
 /// Whether `addr` may be dialled as another server's: not loopback,
@@ -930,24 +956,71 @@ fn kept_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
         .collect()
 }
 
-/// The `relays` that are HTTPS relay URLs, at most [`MAX_HINTS`]: what
-/// another server's relays are kept as.
-fn kept_relays(relays: impl IntoIterator<Item = String>) -> Vec<String> {
+/// Which hosts another server's relays may be on: public ones
+/// ([`public_relay`]), or any for a test whose own relay is on loopback.
+#[derive(Debug, Clone, Copy, Default)]
+struct RelayHosts {
+    #[cfg(any(test, feature = "test-support"))]
+    inner: bool,
+}
+
+impl RelayHosts {
+    /// Whether relay URL `relay` is on a host allowed.
+    fn allow(self, relay: &str) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.inner {
+            return true;
+        }
+        public_relay(relay)
+    }
+}
+
+/// The `relays` that are HTTPS relay URLs on a host `hosts` allow, at most
+/// [`MAX_HINTS`]: what another server's relays are kept as.
+fn kept_relays(hosts: RelayHosts, relays: impl IntoIterator<Item = String>) -> Vec<String> {
     relays
         .into_iter()
-        .filter(|r| r.starts_with("https://") && is_relay_url(r))
+        .filter(|r| r.starts_with("https://") && is_relay_url(r) && hosts.allow(r))
         .take(MAX_HINTS)
         .collect()
 }
 
+/// Whether relay URL `relay`, another server's, names a public host
+/// (M8-07): this server dials it, and hands it to its devices to dial, so
+/// a pair must not point either at a host inside their networks (the
+/// cloud's metadata address, a router, a service on loopback). An address
+/// that is not public by [`crate::wan::not_public`] is refused, as are
+/// `localhost` and names that only a local network resolves (one label,
+/// `.local`, `.localhost`, `.internal`, `.lan`, `.home.arpa`). Two servers
+/// on one LAN pair over their addresses, which keep private ones; a relay
+/// is for reaching across the internet. A public name that resolves to an
+/// inner address is not caught here: its TLS must still prove the name.
+fn public_relay(relay: &str) -> bool {
+    let Ok(url) = url::Url::parse(relay) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => crate::wan::not_public(ip.into()).is_none(),
+        Some(url::Host::Ipv6(ip)) => crate::wan::not_public(ip.into()).is_none(),
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            let local = [".local", ".localhost", ".internal", ".lan", ".home.arpa"];
+            name.contains('.')
+                && name != "localhost"
+                && !local.iter().any(|suffix| name.ends_with(suffix))
+        }
+        None => false,
+    }
+}
+
 /// A redemption's hints, as [`kept_addrs`] and [`kept_relays`] keep
 /// them, written for the store.
-fn hints(redeem: &RedeemPairing) -> (Vec<String>, Vec<String>) {
+fn hints(hosts: RelayHosts, redeem: &RedeemPairing) -> (Vec<String>, Vec<String>) {
     let addrs = kept_addrs(parsed(&redeem.addrs))
         .iter()
         .map(ToString::to_string)
         .collect();
-    (addrs, kept_relays(redeem.relays.iter().cloned()))
+    (addrs, kept_relays(hosts, redeem.relays.iter().cloned()))
 }
 
 /// A redemption's refusal, for the server that asked.
@@ -1063,7 +1136,7 @@ impl Peers for Federation {
             crate::invites::usable_code(&self.auth, &hex, &redeem.code, InviteKind::Federation)
                 .await
                 .map_err(refusal)?;
-        let (addrs, relays) = hints(redeem);
+        let (addrs, relays) = hints(self.relay_hosts, redeem);
         let paired = self
             .store()
             .pair_by_invite(
@@ -1182,7 +1255,7 @@ mod tests {
                 "https://relay.example.org".into(),
             ],
         };
-        let (addrs, relays) = hints(&redeem);
+        let (addrs, relays) = hints(RelayHosts::default(), &redeem);
         assert_eq!(addrs.len(), MAX_HINTS);
         assert_eq!(addrs[0], "203.0.113.7:7420");
         assert_eq!(relays, ["https://relay.example.org"]);
@@ -1215,6 +1288,7 @@ mod tests {
         ];
         let addrs = kept_addrs(refused.iter().chain(&kept).map(|a| a.parse().unwrap()));
         let relays = kept_relays(
+            RelayHosts::default(),
             [
                 "http://relay.example.org",
                 "https://relay.example.org",
@@ -1227,6 +1301,35 @@ mod tests {
             kept.map(|a| a.parse::<SocketAddr>().unwrap()).to_vec()
         );
         assert_eq!(relays, ["https://relay.example.org"]);
+    }
+
+    /// M8-07: another server's relay on a host that is not public is not
+    /// kept, nor dialled, a pair's kept from before among them.
+    #[test]
+    fn a_relay_on_a_host_that_is_not_public_is_dropped() {
+        let inner = [
+            "https://169.254.169.254/",
+            "https://127.0.0.1",
+            "https://10.0.0.1:443",
+            "https://[::1]",
+            "https://[fe80::1]",
+            "https://localhost",
+            "https://relay.internal",
+            "https://printer.local.",
+            "https://router",
+        ];
+        let public = ["https://relay.example.org", "https://1.1.1.1"];
+        let all = || inner.iter().chain(&public).map(|r| (*r).to_owned());
+        assert_eq!(kept_relays(RelayHosts::default(), all()), public);
+        let id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let stored: Vec<String> = all().collect();
+        let dialled = |hosts| endpoint_addr(hosts, id, [], &stored).relay_urls().count();
+        assert_eq!(dialled(RelayHosts::default()), public.len());
+        // A test's server that allows inner relays dials every one, and
+        // only that one does.
+        let inner = RelayHosts { inner: true };
+        assert_eq!(dialled(inner), stored.len());
+        assert_eq!(kept_relays(inner, all()).len(), stored.len());
     }
 
     #[test]

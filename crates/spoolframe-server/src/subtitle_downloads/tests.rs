@@ -38,6 +38,45 @@ fn alice() -> Asker {
     asker(1, false, "Alice")
 }
 
+/// M8-01: half a site account's day, and never fewer than five, is kept
+/// for this server's own users; what the site said holds until its day
+/// resets, and nothing is kept back before it said anything.
+#[test]
+fn a_pair_takes_no_more_than_half_an_account_s_day() {
+    let said = |used: Option<u32>, remaining: u32| AccountSaid {
+        used,
+        remaining,
+        resets_at: Some(2_000),
+        at: 1_000,
+    };
+    assert!(!kept_for_own_users(None, 0, 0, 1_000));
+    assert!(!kept_for_own_users(Some(said(Some(400), 600)), 0, 0, 1_500));
+    assert!(kept_for_own_users(Some(said(Some(500), 500)), 0, 0, 1_500));
+    assert!(!kept_for_own_users(Some(said(None, 6)), 0, 0, 1_500));
+    assert!(kept_for_own_users(Some(said(None, 5)), 0, 0, 1_500));
+    assert!(kept_for_own_users(Some(said(Some(18), 2)), 0, 0, 1_500));
+    // The site's day reset: what it said no longer holds.
+    assert!(!kept_for_own_users(Some(said(Some(500), 0)), 0, 0, 2_000));
+    let unreset = AccountSaid {
+        resets_at: None,
+        ..said(None, 0)
+    };
+    assert!(kept_for_own_users(
+        Some(unreset),
+        0,
+        0,
+        1_000 + DAY_SECS - 1
+    ));
+    assert!(!kept_for_own_users(Some(unreset), 0, 0, 1_000 + DAY_SECS));
+    // Z8-05: downloads asked whose answers never came count as spent,
+    // everyone's; five of the pair's own keep it back with nothing said
+    // (W2), every pair's together do not.
+    assert!(kept_for_own_users(Some(said(None, 6)), 1, 0, 1_500));
+    assert!(!kept_for_own_users(None, 4, 4, 1_000));
+    assert!(kept_for_own_users(None, 5, 5, 1_000));
+    assert!(!kept_for_own_users(None, 5, 0, 1_000));
+}
+
 fn bob() -> Asker {
     asker(2, false, "Bob")
 }
@@ -1657,10 +1696,12 @@ async fn a_cancelled_download_s_limit_is_held_until_it_is_counted() {
 }
 
 /// Y8-03: a keeping that outlasts its wait leaves no file, partial or
-/// whole, no row and no charge, and gives the limit back: the same result
-/// is downloaded afresh after. Paused time once the keeping is held.
+/// whole, and no row, and gives the limit back; the site spent the
+/// download all the same, so it is the day's one (W1): the same result
+/// asked again is refused at the limit, not fetched afresh. Paused time
+/// once the keeping is held.
 #[tokio::test]
-async fn a_download_whose_keeping_outlasts_its_wait_leaves_no_file_and_no_charge() {
+async fn a_download_whose_keeping_outlasts_its_wait_leaves_no_file_and_counts_as_spent() {
     let f = fixture("cancel-late", 1).await;
     f.answers_search().await;
     f.serves(103, RUSSIAN.into(), 19).await;
@@ -1697,18 +1738,22 @@ async fn a_download_whose_keeping_outlasts_its_wait_leaves_no_file_and_no_charge
             .await
             .unwrap()
             .is_empty(),
-        "no charge"
+        "no row counts it"
     );
-    // The limit given back, and the hold off: asked again, it is fetched
-    // and kept.
+    // The limit given back, and the hold off: asked again, it is refused,
+    // as the site's spent one is the day's.
     holds.recording.let_go();
-    f.downloads
-        .download(&film(), "opensubtitles:103", &alice())
-        .await
-        .unwrap();
-    assert_eq!(f.site_calls("/api/v1/download").await, 2);
-    assert_eq!(kept_files(&f).len(), 1);
-    assert_eq!(f.store.all_subtitle_downloads().await.unwrap().len(), 1);
+    assert!(matches!(
+        f.downloads
+            .download(&film(), "opensubtitles:103", &alice())
+            .await,
+        Err(DownloadError::QuotaExhausted {
+            whose: QuotaOf::User,
+            ..
+        })
+    ));
+    assert_eq!(f.site_calls("/api/v1/download").await, 1);
+    assert!(kept_files(&f).is_empty());
 }
 
 /// The review of Y8-03: a keeping whose wait is up as its row's commit is
@@ -1741,4 +1786,233 @@ async fn a_keeping_whose_wait_ends_with_the_row_written_keeps_the_file() {
     assert_eq!(kept_files(&f).len(), 1);
     assert_eq!(f.store.all_subtitle_downloads().await.unwrap().len(), 1);
     assert_eq!(f.site_calls("/api/v1/download").await, 1);
+}
+
+/// A paired server, as its users download.
+fn pair_of(server_id: &str) -> PairAsker {
+    PairAsker {
+        server_id: server_id.into(),
+        name: format!("{server_id}'s server"),
+        subtitles: Default::default(),
+    }
+}
+
+impl Fixture {
+    /// Grants file `file_id`, the account then having `remaining`
+    /// downloads, and sends its file only after a minute: a download
+    /// cancelled meanwhile was spent at the site.
+    async fn grants_and_stalls(&self, file_id: u64, remaining: i64) {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/download"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "file_id": file_id }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "link": format!("{}/files/{file_id}", self.site.uri()),
+                "requests": 20 - remaining,
+                "remaining": remaining,
+                "reset_time_utc": "2030-01-01T00:00:00.000Z"
+            })))
+            .mount(&self.site)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/files/{file_id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(RUSSIAN)
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .mount(&self.site)
+            .await;
+    }
+}
+
+/// `pair`'s download of `result`, run until the site was asked at `to`
+/// once more, then cancelled, its future dropped, as a pair's request is
+/// with its connection's close.
+async fn pair_cancelled_once_asked(f: &Fixture, result: &str, pair: &PairAsker, to: &str) {
+    let asked = f.site_calls(to).await;
+    let item = film();
+    let mut download = Box::pin(f.downloads.download_for_pair(&item, result, pair));
+    tokio::select! {
+        biased;
+        done = &mut download => panic!("done before the site was asked: {done:?}"),
+        () = async {
+            while f.site_calls(to).await <= asked {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } => {}
+    }
+    drop(download);
+}
+
+/// The review of Z8-05 (W1): a pair's download is counted against its day
+/// as the site grants it, not as it is kept: one cancelled as its file is
+/// fetched, which the site spent, takes the last of a limit of two after
+/// one kept, which is counted once, and the pair's next is refused. A
+/// user here still downloads.
+#[tokio::test]
+async fn a_pair_s_download_counts_against_its_day_once_the_site_grants_it() {
+    let f = fixture("pair-granted", 2).await;
+    f.answers_search().await;
+    f.serves(103, RUSSIAN.into(), 19).await;
+    f.grants_and_stalls(101, 18).await;
+    f.serves(102, RUSSIAN.into(), 17).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let pair = pair_of("mzxw6ytbojtg633c");
+    f.downloads
+        .download_for_pair(&film(), "opensubtitles:103", &pair)
+        .await
+        .unwrap();
+    pair_cancelled_once_asked(&f, "opensubtitles:101", &pair, "/files/101").await;
+    assert!(
+        matches!(
+            f.downloads
+                .download_for_pair(&film(), "opensubtitles:102", &pair)
+                .await,
+            Err(DownloadError::QuotaExhausted {
+                whose: QuotaOf::User,
+                site: None,
+                ..
+            })
+        ),
+        "the granted one is the day's second"
+    );
+    assert_eq!(f.site_calls("/api/v1/download").await, 2);
+    f.downloads
+        .download(&film(), "opensubtitles:102", &alice())
+        .await
+        .unwrap();
+}
+
+impl Fixture {
+    /// Answers the download of file `file_id` only after a minute: a
+    /// request cancelled meanwhile may have been spent, and nothing says.
+    async fn stalls_grant(&self, file_id: u64) {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/download"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "file_id": file_id }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&self.site)
+            .await;
+    }
+}
+
+/// The review of Z8-05 (S4, W2): five downloads of a pair's cancelled as
+/// the site is asked, with nothing said of the account, keep that pair's
+/// next back, asked through the download itself; another pair's, and a
+/// user's here, are not kept back by them.
+#[tokio::test]
+async fn five_grants_a_pair_cancelled_keep_that_pair_back_alone() {
+    let f = fixture("pair-uncertain", 0).await;
+    f.answers_search().await;
+    f.stalls_grant(104).await;
+    f.serves(101, RUSSIAN.into(), 19).await;
+    f.serves(102, RUSSIAN.into(), 18).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let hostile = pair_of("mzxw6ytbojtg633c");
+    for _ in 0..KEPT_FOR_OWN_USERS {
+        pair_cancelled_once_asked(&f, "opensubtitles:104", &hostile, "/api/v1/download").await;
+    }
+    assert!(
+        matches!(
+            f.downloads
+                .download_for_pair(&film(), "opensubtitles:101", &hostile)
+                .await,
+            Err(DownloadError::QuotaExhausted {
+                whose: QuotaOf::User,
+                site: None,
+                ..
+            })
+        ),
+        "kept back"
+    );
+    assert_eq!(f.site_calls("/api/v1/download").await, 5, "not asked");
+    f.downloads
+        .download_for_pair(&film(), "opensubtitles:101", &pair_of("nbswy3dpeb3w64tm"))
+        .await
+        .expect("another pair's is its own");
+    f.downloads
+        .download(&film(), "opensubtitles:102", &alice())
+        .await
+        .expect("a user's here is not kept back");
+}
+
+/// W2: what the site says of the account counts the downloads asked of it
+/// before, those whose answers never came among them: they are no longer
+/// counted apart once it says, where they were taken off its remaining a
+/// second time. With 12 of 20 left and 10 kept for this server's users,
+/// four cancelled before do not keep a pair's next back.
+#[tokio::test]
+async fn what_the_site_says_counts_the_downloads_whose_answers_never_came() {
+    let f = fixture("pair-said", 0).await;
+    f.answers_search().await;
+    f.stalls_grant(104).await;
+    f.serves(101, RUSSIAN.into(), 12).await;
+    f.serves(102, RUSSIAN.into(), 11).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let pair = pair_of("mzxw6ytbojtg633c");
+    for _ in 0..4 {
+        pair_cancelled_once_asked(&f, "opensubtitles:104", &pair, "/api/v1/download").await;
+    }
+    f.downloads
+        .download(&film(), "opensubtitles:101", &alice())
+        .await
+        .unwrap();
+    f.downloads
+        .download_for_pair(&film(), "opensubtitles:102", &pair)
+        .await
+        .expect("12 left, as the site said after the four");
+}
+
+/// W2: a download the site failed on (a 500, a timeout) may have been
+/// processed: it is uncertain as one cancelled is, and five keep the pair
+/// back.
+#[tokio::test]
+async fn a_grant_the_site_failed_on_is_uncertain() {
+    let f = fixture("pair-failed", 0).await;
+    f.answers_search().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/download"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "file_id": 104 }),
+        ))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&f.site)
+        .await;
+    f.serves(101, RUSSIAN.into(), 19).await;
+    f.downloads
+        .search(&film(), None, &alice().actor)
+        .await
+        .unwrap();
+    let pair = pair_of("mzxw6ytbojtg633c");
+    for _ in 0..KEPT_FOR_OWN_USERS {
+        assert!(matches!(
+            f.downloads
+                .download_for_pair(&film(), "opensubtitles:104", &pair)
+                .await,
+            Err(DownloadError::Site { .. })
+        ));
+    }
+    assert!(matches!(
+        f.downloads
+            .download_for_pair(&film(), "opensubtitles:101", &pair)
+            .await,
+        Err(DownloadError::QuotaExhausted {
+            whose: QuotaOf::User,
+            site: None,
+            ..
+        })
+    ));
 }

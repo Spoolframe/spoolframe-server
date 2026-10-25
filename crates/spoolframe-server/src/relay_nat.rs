@@ -283,7 +283,7 @@ mod tests {
     /// A relay on this very host, at a public address of its own.
     #[test]
     fn a_relay_at_one_of_this_host_s_addresses_is_ours() {
-        let side = side(&ips(&["203.0.113.9"]), &ips(&["203.0.113.9"]), &[]);
+        let side = side(&ips(&["203.0.114.9"]), &ips(&["203.0.114.9"]), &[]);
         assert!(matches!(side, Side::Ours(why) if why.contains("this host")));
     }
 
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn a_relay_at_another_public_address_is_theirs() {
         assert_eq!(
-            side(&ips(&["198.51.100.4"]), &[], &ips(&["76.50.95.40"])),
+            side(&ips(&["198.51.101.4"]), &[], &ips(&["76.50.95.40"])),
             Side::Theirs
         );
     }
@@ -339,9 +339,9 @@ mod tests {
     /// own: asked, since nothing else would answer.
     #[tokio::test]
     async fn a_public_relay_alone_is_asked_until_placed() {
-        let relay = Relay::Custom("https://198.51.100.4".parse().unwrap());
+        let relay = Relay::Custom("https://198.51.101.4".parse().unwrap());
         let (map, _) = initial(&[relay], &[]).await;
-        let url: RelayUrl = "https://198.51.100.4".parse().unwrap();
+        let url: RelayUrl = "https://198.51.101.4".parse().unwrap();
         assert!(map.get(&url).unwrap().quic.is_some());
     }
 

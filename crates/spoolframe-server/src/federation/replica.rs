@@ -240,8 +240,10 @@ impl Federation {
             tracing::warn!(error = %e, "cannot prune the days' play counts");
         }
         // The walks past their reuse (H2), of libraries no pair asks for
-        // again: a whole library's items each.
+        // again: a whole library's items each; and the pairs' buckets full
+        // again.
         self.answering.prune_walks(self.limits().walk_reuse);
+        self.answering.prune_asks(std::time::Instant::now());
         // Downloads of the pairs' items that ended a while ago (P8-07), and
         // the sessions for reads relayed here that no read uses now.
         if let Err(e) = self
@@ -254,6 +256,7 @@ impl Federation {
         self.end_idle_sessions().await;
         // Outside the sync lock: images never hold a sync up.
         self.cache.evict().await;
+        self.cache.sweep_orphans_if_due().await;
     }
 
     /// Look at each pair: dial it if it is not connected (and its wait is
@@ -440,7 +443,7 @@ impl Federation {
             .attached
             .get()
             .ok_or_else(|| DialError::Unreachable("this server is starting".into()))?;
-        let addr = peer_addr(peer)
+        let addr = peer_addr(self.relay_hosts, peer)
             .ok_or_else(|| DialError::Unreachable("a pair's key does not read".into()))?;
         let (dialed, info) = Dialed::connect(&attached.endpoint, addr, self.hello()).await?;
         if info.server_id != peer.server_id {
@@ -668,8 +671,15 @@ impl Federation {
                         limit: limits.items,
                     });
                 }
+                // An item whose id is not the origin's own is not kept
+                // (G8-06).
+                let kept: Vec<spoolframe_protocol::federation::RemoteItem> = page
+                    .items
+                    .into_iter()
+                    .filter(super::items::keepable)
+                    .collect();
                 bytes += store
-                    .stage_cache_page(origin, library, &page.items, &page.removed)
+                    .stage_cache_page(origin, library, &kept, &page.removed)
                     .await?;
                 if bytes > limits.bytes {
                     return Err(ReplicaError::TooLarge {

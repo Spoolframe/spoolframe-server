@@ -251,7 +251,7 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
             outcome(
                 root.setting_set(
                     "network.wan".into(),
-                    json!({ "static": ["203.0.113.7:7420"], "mapped_port": false }),
+                    json!({ "static": ["203.0.114.7:7420"], "mapped_port": false }),
                 )
                 .await,
             ),
@@ -263,7 +263,7 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
         (
             "settingSet(network.announce.add)",
             outcome(
-                root.setting_set("network.announce.add".into(), json!(["203.0.113.7"]))
+                root.setting_set("network.announce.add".into(), json!(["203.0.114.7"]))
                     .await,
             ),
         ),

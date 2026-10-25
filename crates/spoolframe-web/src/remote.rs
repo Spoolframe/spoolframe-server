@@ -472,20 +472,20 @@ mod tests {
             port: "443".into(),
             opened: Opened::Forwarded,
             ip: Ip::Typed,
-            typed_ip: "203.0.113.24".into(),
+            typed_ip: "203.0.114.24".into(),
             lookup_service: false,
-            statics: vec!["198.51.100.7:7420".into()],
+            statics: vec!["198.51.101.7:7420".into()],
             ..WanForm::default()
         };
         let saved = form.to_setting().unwrap().unwrap();
         assert_eq!(
             saved,
             json!({
-                "static": ["198.51.100.7:7420"],
+                "static": ["198.51.101.7:7420"],
                 "mapped_port": {
                     "port": 443,
                     "mode": "manual",
-                    "public_ip": "203.0.113.24",
+                    "public_ip": "203.0.114.24",
                     "lookup_via": false
                 }
             })
@@ -505,7 +505,7 @@ mod tests {
         let form = WanForm {
             on: true,
             mapped: false,
-            statics: vec!["198.51.100.7:7420".into()],
+            statics: vec!["198.51.101.7:7420".into()],
             ..WanForm::default()
         };
         let saved = form.to_setting().unwrap().unwrap();
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(form.to_setting(), Err(LOOKUP_WITHOUT_SERVICE.to_owned()));
         let typed = WanForm {
             ip: Ip::Typed,
-            typed_ip: "203.0.113.24".into(),
+            typed_ip: "203.0.114.24".into(),
             ..form
         };
         assert_eq!(typed.blocked(), None);
@@ -553,8 +553,8 @@ mod tests {
     #[test]
     fn a_static_address_must_be_public_and_new() {
         assert_eq!(
-            add_static(" 198.51.100.7:7420 ", &[]),
-            Ok("198.51.100.7:7420".into())
+            add_static(" 198.51.101.7:7420 ", &[]),
+            Ok("198.51.101.7:7420".into())
         );
         for (typed, says) in [
             ("192.168.1.20:7420", "(192.168.0.0/16)"),
@@ -565,13 +565,13 @@ mod tests {
             ("[::1]:7420", "loopback"),
             ("[fe80::1]:7420", "link-local"),
             ("[fd00::5]:7420", "(fc00::/7)"),
-            ("198.51.100.7", "not an address and a port"),
+            ("198.51.101.7", "not an address and a port"),
         ] {
             let err = add_static(typed, &[]).unwrap_err();
             assert!(err.contains(says), "{typed}: {err}");
         }
         assert!(
-            add_static("198.51.100.7:7420", &["198.51.100.7:7420".into()])
+            add_static("198.51.101.7:7420", &["198.51.101.7:7420".into()])
                 .unwrap_err()
                 .contains("listed already")
         );
@@ -593,21 +593,21 @@ mod tests {
         assert_eq!(forwarded["mapped_port"]["mode"], json!("manual"));
         assert_eq!(forwarded["mapped_port"]["port"], json!(7420));
         assert_eq!(forwarded["mapped_port"]["public_ip"], json!("lookup"));
-        let typed = wizard_setting(Choice::Forwarded, "", Ip::Typed, "203.0.113.24", &[])
+        let typed = wizard_setting(Choice::Forwarded, "", Ip::Typed, "203.0.114.24", &[])
             .unwrap()
             .unwrap();
-        assert_eq!(typed["mapped_port"]["public_ip"], json!("203.0.113.24"));
+        assert_eq!(typed["mapped_port"]["public_ip"], json!("203.0.114.24"));
         let fixed = wizard_setting(
             Choice::Static,
             "",
             Ip::LookUp,
             "",
-            &["198.51.100.7:7420".into()],
+            &["198.51.101.7:7420".into()],
         )
         .unwrap()
         .unwrap();
         assert_eq!(fixed["mapped_port"], json!(false));
-        assert_eq!(fixed["static"], json!(["198.51.100.7:7420"]));
+        assert_eq!(fixed["static"], json!(["198.51.101.7:7420"]));
         assert!(wizard_setting(Choice::Static, "", Ip::LookUp, "", &[]).is_err());
         for setting in [&auto, &forwarded, &fixed] {
             assert_ne!(choice_of(Some(setting)), Choice::NotNow);
@@ -629,12 +629,12 @@ mod tests {
     fn the_status_card_says_how_each_address_was_found() {
         let granted = MappingStatus::Granted {
             local_port: 7420,
-            external: "203.0.113.24:7420".into(),
+            external: "203.0.114.24:7420".into(),
         };
         assert_eq!(
             source_detail(
                 AddressSource::MappedPort,
-                "203.0.113.24:7420",
+                "203.0.114.24:7420",
                 &granted,
                 &LookupStatus::NotNeeded,
                 at
@@ -642,14 +642,14 @@ mod tests {
             "Granted by the router; it reported this address."
         );
         let found = LookupStatus::Found {
-            ip: "203.0.113.24".into(),
+            ip: "203.0.114.24".into(),
             via: "wtfismyip".into(),
             at: 0,
         };
         assert_eq!(
             source_detail(
                 AddressSource::Lookup,
-                "203.0.113.24:7420",
+                "203.0.114.24:7420",
                 &MappingStatus::NotUsed,
                 &found,
                 at
@@ -674,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             lookup_line(&found, at).text,
-            "203.0.113.24 from wtfismyip.com · 18:02"
+            "203.0.114.24 from wtfismyip.com · 18:02"
         );
         let failed = lookup_line(
             &LookupStatus::Failed {
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(failed.sub.as_deref(), Some("Retrying with backoff."));
         assert_eq!(
             tried_line(&granted).sub.as_deref(),
-            Some("203.0.113.24:7420")
+            Some("203.0.114.24:7420")
         );
     }
 }

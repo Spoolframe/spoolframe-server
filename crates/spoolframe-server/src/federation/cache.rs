@@ -148,7 +148,24 @@ pub struct PeerCache {
     misses: parking_lot::Mutex<HashMap<String, HashSet<String>>>,
     /// The most of a hierarchy browsed at once; the default but in tests.
     browse: BrowseLimits,
+    /// Held while an image is written and accounted for (M8-05), by work
+    /// of its own that a cancelled fetch does not stop (Z8-03): a file is
+    /// on disk before its bytes count against the limits, so at most
+    /// [`MAX_KEEPING`] images at once are past them. All of it is taken
+    /// to sweep the files no row names.
+    keeping: Arc<tokio::sync::Semaphore>,
+    /// When the files no row names were last swept.
+    swept: parking_lot::Mutex<Option<std::time::Instant>>,
 }
+
+/// The most images written at once, not yet accounted for: four of 16 MiB
+/// past the limits at worst. An image fetched past them is served, not
+/// kept, and fetched again when next asked for.
+const MAX_KEEPING: usize = 4;
+
+/// How often the files no row names are swept (Z8-03): those a process
+/// stopped part way left, or a part whose rename failed.
+const ORPHAN_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// `browsed`, the items under `what` of `origin`'s: a hierarchy past what
 /// is browsed at once is refused as too large, nothing of it read.
@@ -235,6 +252,8 @@ impl PeerCache {
             links,
             misses: parking_lot::Mutex::default(),
             browse: BrowseLimits::default(),
+            keeping: Arc::new(tokio::sync::Semaphore::new(MAX_KEEPING)),
+            swept: parking_lot::Mutex::default(),
         }
     }
 
@@ -318,14 +337,66 @@ impl PeerCache {
 
     /// Delete `files` of `origin`'s; one already gone is no matter.
     pub(crate) async fn delete_files(&self, origin: &str, files: &[String]) {
-        let dir = self.origin_dir(origin);
-        for file in files {
-            if let Err(e) = tokio::fs::remove_file(dir.join(file)).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(origin, error = %e, "cannot delete a cached image");
+        remove_files(&self.dir, origin, files).await;
+    }
+
+    /// Sweep the files no row names, once [`ORPHAN_SWEEP_EVERY`] has
+    /// passed since the last sweep: at the replica's tick.
+    pub(crate) async fn sweep_orphans_if_due(&self) {
+        {
+            let mut swept = self.swept.lock();
+            if swept.is_some_and(|at| at.elapsed() < ORPHAN_SWEEP_EVERY) {
+                return;
             }
+            *swept = Some(std::time::Instant::now());
         }
+        self.sweep_orphans().await;
+    }
+
+    /// Delete every file under an origin's directory that no row of that
+    /// origin's names (Z8-03): a part a stopped process or a failed rename
+    /// left, or an image written and never accounted for. Every image's
+    /// keeping is held off meanwhile, so none being written is taken for
+    /// one. How many went.
+    pub(crate) async fn sweep_orphans(&self) -> usize {
+        let Ok(_all) = self
+            .keeping
+            .clone()
+            .acquire_many_owned(MAX_KEEPING as u32)
+            .await
+        else {
+            return 0;
+        };
+        let Ok(mut origins) = tokio::fs::read_dir(&self.dir).await else {
+            return 0;
+        };
+        let mut gone = 0;
+        while let Ok(Some(origin)) = origins.next_entry().await {
+            let origin = origin.file_name().to_string_lossy().into_owned();
+            let named: HashSet<String> = match self.store.cached_file_names(&origin).await {
+                Ok(named) => named.into_iter().collect(),
+                Err(e) => {
+                    tracing::warn!(origin, error = %e, "cannot list a paired server's cached images");
+                    continue;
+                }
+            };
+            let Ok(mut files) = tokio::fs::read_dir(self.origin_dir(&origin)).await else {
+                continue;
+            };
+            let mut orphans = Vec::new();
+            while let Ok(Some(file)) = files.next_entry().await {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if !named.contains(&name) {
+                    orphans.push(name);
+                }
+            }
+            gone += orphans.len();
+            remove_files(&self.dir, &origin, &orphans).await;
+        }
+        if gone > 0 {
+            tracing::info!(gone, "deleted cached images no record names");
+        }
+        gone
     }
 
     /// Delete every file of `origin`'s, and its directory.
@@ -394,30 +465,30 @@ impl PeerCache {
         if bytes.len() as u64 > limits.per_origin.min(limits.total) {
             return Ok(());
         }
-        let dir = self.origin_dir(origin);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| e.to_string())?;
-        let file = file_name(artwork);
-        write_atomically(&dir, &file, bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        let gone = self
-            .store
-            .keep_cached_file(
+        let Ok(permit) = self.keeping.clone().try_acquire_owned() else {
+            tracing::debug!(
                 origin,
-                artwork,
-                &CachedFile {
-                    file,
-                    content_type: content_type.to_owned(),
-                },
-                bytes.len() as u64,
-                limits,
-            )
+                "images are being kept: one more is served, not kept"
+            );
+            return Ok(());
+        };
+        let keeping = Keeping {
+            store: self.store.clone(),
+            root: self.dir.clone(),
+            origin: origin.to_owned(),
+            artwork: artwork.to_owned(),
+            content_type: content_type.to_owned(),
+            bytes: bytes.to_vec(),
+            limits,
+            _permit: permit,
+        };
+        // On work of its own (Z8-03): a fetch dropped part way, a sweep's
+        // sibling failing or a request's wait running out, leaves the file
+        // accounted for or gone, and its place among the keepings held
+        // until then.
+        tokio::spawn(keep(keeping))
             .await
-            .map_err(|e| e.to_string())?;
-        self.delete_gone(&gone).await;
-        Ok(())
+            .map_err(|e| format!("the image was not kept: {e}"))?
     }
 
     /// Cached item `id`, available: `NotServed` once its library or pair
@@ -475,11 +546,95 @@ impl PeerCache {
     }
 }
 
-/// Write `bytes` as `file` in `dir`, whole or not at all.
+/// Delete `files` of `origin`'s under `root`; one already gone is no
+/// matter.
+async fn remove_files(root: &Path, origin: &str, files: &[String]) {
+    let dir = root.join(origin);
+    for file in files {
+        if let Err(e) = tokio::fs::remove_file(dir.join(file)).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(origin, error = %e, "cannot delete a cached image");
+        }
+    }
+}
+
+/// An image to keep, and its place among the keepings, held to the end.
+struct Keeping {
+    store: Store,
+    /// Where every origin's directory is.
+    root: PathBuf,
+    origin: String,
+    artwork: String,
+    content_type: String,
+    bytes: Vec<u8>,
+    limits: FileLimits,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Keep `keeping`'s image as a file of its own, then account for it; the
+/// files past the limits, and the one it replaced, go. Each write is its
+/// own file (Z8-04): two of one image at once never share a name, so what
+/// the row counts is the file it names, and a delete takes only the file
+/// its own write made or its row gave up. Not accounted for, its file
+/// goes; none is kept that the limits do not count (M8-05).
+async fn keep(keeping: Keeping) -> Result<(), String> {
+    let Keeping {
+        store,
+        root,
+        origin,
+        artwork,
+        content_type,
+        bytes,
+        limits,
+        _permit,
+    } = keeping;
+    let dir = root.join(&origin);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let file = format!("{}-{}", file_name(&artwork), uuid::Uuid::now_v7().simple());
+    write_atomically(&dir, &file, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    let kept = store
+        .keep_cached_file(
+            &origin,
+            &artwork,
+            &CachedFile {
+                file: file.clone(),
+                content_type,
+            },
+            bytes.len() as u64,
+            limits,
+        )
+        .await;
+    match kept {
+        Ok(gone) => {
+            for (of, gone) in gone {
+                remove_files(&root, &of, std::slice::from_ref(&gone)).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            remove_files(&root, &origin, &[file]).await;
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Write `bytes` as `file` in `dir`, whole or not at all: a part named for
+/// this write alone, renamed into place; a part not renamed goes.
 async fn write_atomically(dir: &Path, file: &str, bytes: &[u8]) -> std::io::Result<()> {
     let part = dir.join(format!("{file}.part"));
-    tokio::fs::write(&part, bytes).await?;
-    tokio::fs::rename(&part, dir.join(file)).await
+    let written = match tokio::fs::write(&part, bytes).await {
+        Ok(()) => tokio::fs::rename(&part, dir.join(file)).await,
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    written
 }
 
 #[async_trait]
@@ -890,6 +1045,132 @@ mod tests {
 
     fn fed(id: &str) -> MediaId {
         MediaId::federated(ORIGIN, &id.parse().unwrap()).unwrap()
+    }
+
+    /// The files in `origin`'s directory of `cache`'s, by name.
+    async fn files_of(cache: &PeerCache, origin: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(mut dir) = tokio::fs::read_dir(cache.origin_dir(origin)).await else {
+            return names;
+        };
+        while let Some(entry) = dir.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names
+    }
+
+    /// M8-05: with [`MAX_KEEPING`] images being written, one more is not
+    /// written at all; once they are done it is kept as its file alone,
+    /// no part left beside it.
+    #[tokio::test]
+    async fn past_the_images_being_kept_one_more_is_not_written() {
+        let (store, _) = cached_hierarchies("fed-cache-keeping").await;
+        let cache = cache("fed-cache-keeping", &store, BrowseLimits::default()).await;
+        let held = cache
+            .keeping
+            .acquire_many(MAX_KEEPING as u32)
+            .await
+            .unwrap();
+        cache
+            .keep_file(ORIGIN, "image:poster:1", "image/png", b"png")
+            .await
+            .unwrap();
+        assert!(files_of(&cache, ORIGIN).await.is_empty());
+        assert_eq!(
+            store.cached_file(ORIGIN, "image:poster:1").await.unwrap(),
+            None
+        );
+        drop(held);
+        cache
+            .keep_file(ORIGIN, "image:poster:1", "image/png", b"png")
+            .await
+            .unwrap();
+        let kept = store
+            .cached_file(ORIGIN, "image:poster:1")
+            .await
+            .unwrap()
+            .expect("kept");
+        assert_eq!(files_of(&cache, ORIGIN).await, [kept.file]);
+    }
+
+    /// Z8-04: an image kept again is a file of its own, and the one it
+    /// replaced goes: the file left is the one the row names, of the
+    /// bytes kept last.
+    #[tokio::test]
+    async fn an_image_kept_again_replaces_its_file() {
+        let (store, _) = cached_hierarchies("fed-cache-again").await;
+        let cache = cache("fed-cache-again", &store, BrowseLimits::default()).await;
+        let small = vec![1u8; 10];
+        let large = vec![2u8; 1000];
+        for body in [&small, &large] {
+            cache
+                .keep_file(ORIGIN, "image:poster:1", "image/png", body)
+                .await
+                .unwrap();
+        }
+        let kept = store
+            .cached_file(ORIGIN, "image:poster:1")
+            .await
+            .unwrap()
+            .expect("kept");
+        assert_eq!(
+            files_of(&cache, ORIGIN).await,
+            std::slice::from_ref(&kept.file)
+        );
+        let on_disk = tokio::fs::read(cache.origin_dir(ORIGIN).join(&kept.file))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, large);
+    }
+
+    /// Z8-03: a fetch dropped as its image is being kept leaves the image
+    /// accounted for, its keeping run to its end on work of its own.
+    #[tokio::test]
+    async fn an_image_whose_fetch_is_dropped_is_kept_whole() {
+        let (store, _) = cached_hierarchies("fed-cache-dropped").await;
+        let cache = cache("fed-cache-dropped", &store, BrowseLimits::default()).await;
+        // Polled once, so its keeping has begun, then dropped: on a slow
+        // machine it may have ended within that poll, kept all the same.
+        let mut keeping = Box::pin(cache.keep_file(ORIGIN, "image:poster:1", "image/png", b"png"));
+        let _ = futures_util::poll!(keeping.as_mut());
+        drop(keeping);
+        // Every keeping ended.
+        drop(
+            cache
+                .keeping
+                .acquire_many(MAX_KEEPING as u32)
+                .await
+                .unwrap(),
+        );
+        let kept = store
+            .cached_file(ORIGIN, "image:poster:1")
+            .await
+            .unwrap()
+            .expect("kept whole");
+        assert_eq!(files_of(&cache, ORIGIN).await, [kept.file]);
+    }
+
+    /// Z8-03: the sweep deletes what no row names, a part and a file
+    /// never accounted for, and leaves the files kept.
+    #[tokio::test]
+    async fn the_sweep_deletes_the_files_no_row_names() {
+        let (store, _) = cached_hierarchies("fed-cache-orphans").await;
+        let cache = cache("fed-cache-orphans", &store, BrowseLimits::default()).await;
+        cache
+            .keep_file(ORIGIN, "image:poster:1", "image/png", b"png")
+            .await
+            .unwrap();
+        let dir = cache.origin_dir(ORIGIN);
+        for stray in ["abc-1.part", "abc-2"] {
+            tokio::fs::write(dir.join(stray), b"x").await.unwrap();
+        }
+        assert_eq!(cache.sweep_orphans().await, 2);
+        let kept = store
+            .cached_file(ORIGIN, "image:poster:1")
+            .await
+            .unwrap()
+            .expect("kept");
+        assert_eq!(files_of(&cache, ORIGIN).await, [kept.file]);
     }
 
     fn fed_library(id: &str) -> LibraryId {

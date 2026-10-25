@@ -517,6 +517,9 @@ pub struct ServerOptions {
     pub detect_encoders: bool,
     /// `experimental.federation` (P8-01).
     pub federation: bool,
+    /// The pairs' relays on any host are kept and dialled, for a test
+    /// whose own relay is on loopback (M8-07); off, as on a real server.
+    pub inner_relays: bool,
     /// `federation.sync_interval_secs` and `federation.cache_max_mb`
     /// (P8-02): an hour and 2 GiB, unless a test is about them.
     pub federation_sync_every: Duration,
@@ -590,6 +593,7 @@ impl Default for ServerOptions {
             optimized_max_size: 1 << 30,
             detect_encoders: false,
             federation: false,
+            inner_relays: false,
             federation_sync_every: spoolframe_server::federation::DEFAULT_SYNC_EVERY,
             federation_cache_max_bytes: 2 << 30,
         }
@@ -994,19 +998,22 @@ impl TestServer {
         );
         let name = ServerName::new(options.name.clone());
         let federation = options.federation.then(|| {
-            Arc::new(spoolframe_server::federation::Federation::new(
-                auth.clone(),
-                catalog.clone(),
-                server_id.clone(),
-                name.clone(),
-                spoolframe_server::federation::ReplicaSettings {
-                    sync_every: options.federation_sync_every,
-                    cache_max_bytes: options.federation_cache_max_bytes,
-                    ..spoolframe_server::federation::ReplicaSettings::in_dir(
-                        dir.join("cache").join("federation"),
-                    )
-                },
-            ))
+            Arc::new(
+                spoolframe_server::federation::Federation::new(
+                    auth.clone(),
+                    catalog.clone(),
+                    server_id.clone(),
+                    name.clone(),
+                    spoolframe_server::federation::ReplicaSettings {
+                        sync_every: options.federation_sync_every,
+                        cache_max_bytes: options.federation_cache_max_bytes,
+                        ..spoolframe_server::federation::ReplicaSettings::in_dir(
+                            dir.join("cache").join("federation"),
+                        )
+                    },
+                )
+                .with_inner_relays(options.inner_relays),
+            )
         });
         if let Some(federation) = &federation {
             federation.attach_downloads(downloads.clone());

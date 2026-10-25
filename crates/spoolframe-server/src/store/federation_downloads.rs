@@ -51,16 +51,24 @@ fn size(n: Option<u64>) -> Option<i64> {
     n.map(|n| i64::try_from(n).unwrap_or(i64::MAX))
 }
 
+/// The most downloads one user keeps here of one paired server's items
+/// (G8-02): each SA id is a row, and a paired server could answer each
+/// preparation with a new one. Past it, the user's of that server's
+/// updated longest ago go.
+pub const MAX_REMOTE_DOWNLOADS: u32 = 1_000;
+
 impl Store {
     /// Keep `new`: the user's same download of SA's (by SA's id, which
     /// names it on that origin alone) keeps its id here, and is available
-    /// again.
+    /// again. Past [`MAX_REMOTE_DOWNLOADS`] of the user's from that origin,
+    /// those updated longest ago go, in the same write.
     pub async fn put_remote_download(
         &self,
         new: NewRemoteDownload<'_>,
     ) -> Result<RemoteDownloadRow, StoreError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        Ok(sqlx::query_as(concat!(
+        let mut tx = self.begin_write().await?;
+        let kept: RemoteDownloadRow = sqlx::query_as(concat!(
             "INSERT INTO federation_downloads \
                  (id, principal, origin, library, item, remote_id, state, file, expected_size, \
                   created_at, updated_at) \
@@ -83,8 +91,22 @@ impl Store {
         .bind(new.file)
         .bind(size(new.expected_size))
         .bind(self.now())
-        .fetch_one(&self.pool)
-        .await?)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM federation_downloads WHERE id IN ( \
+                 SELECT id FROM federation_downloads \
+                 WHERE principal = ?1 AND origin = ?2 AND id != ?3 \
+                 ORDER BY updated_at DESC, id LIMIT -1 OFFSET ?4)",
+        )
+        .bind(new.principal)
+        .bind(new.origin)
+        .bind(&kept.id)
+        .bind(MAX_REMOTE_DOWNLOADS - 1)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(kept)
     }
 
     /// `principal`'s downloads of paired servers' items among `ids`.
@@ -239,6 +261,98 @@ mod tests {
             file: None,
             expected_size: Some(10),
         }
+    }
+
+    /// G8-02: past [`MAX_REMOTE_DOWNLOADS`] of a user's from one paired
+    /// server, the one updated longest ago goes as another is kept; the
+    /// user's from another server stay.
+    #[tokio::test]
+    async fn past_the_most_of_one_origin_the_oldest_download_goes() {
+        let store = test_store("fed-downloads-most").await;
+        let other = store
+            .put_remote_download(NewRemoteDownload {
+                origin: "cccccccccccccccc",
+                item: "fed:movie:cccccccccccccccc:plex:9",
+                ..new("c1", "plex:9")
+            })
+            .await
+            .unwrap();
+        let ids: Vec<String> = (0..MAX_REMOTE_DOWNLOADS).map(|n| format!("r{n}")).collect();
+        let mut kept = Vec::new();
+        for id in &ids {
+            store.clock().advance(std::time::Duration::from_secs(1));
+            kept.push(store.put_remote_download(new(id, "plex:1")).await.unwrap());
+        }
+        let principal = &kept[0].principal;
+        assert!(
+            store
+                .remote_download(principal, &kept[0].id)
+                .await
+                .unwrap()
+                .is_some(),
+            "at the most, none goes"
+        );
+        store.clock().advance(std::time::Duration::from_secs(1));
+        let last = store
+            .put_remote_download(new("one-more", "plex:1"))
+            .await
+            .unwrap();
+        for (id, there) in [
+            (&kept[0].id, false),
+            (&kept[1].id, true),
+            (&last.id, true),
+            (&other.id, true),
+        ] {
+            assert_eq!(
+                store
+                    .remote_download(principal, id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                there,
+                "{id}"
+            );
+        }
+    }
+
+    /// G8-02, as the fourth Codex pass asked: with every download kept at
+    /// one time, the one kept last stays and exactly the most are kept;
+    /// one asked for again at the most is the same row, and nothing goes.
+    #[tokio::test]
+    async fn at_one_time_the_most_still_holds_and_a_repeat_takes_no_room() {
+        let store = test_store("fed-downloads-most-tied").await;
+        let ids: Vec<String> = (0..MAX_REMOTE_DOWNLOADS).map(|n| format!("r{n}")).collect();
+        let mut kept = Vec::new();
+        for id in &ids {
+            kept.push(store.put_remote_download(new(id, "plex:1")).await.unwrap());
+        }
+        let principal = kept[0].principal.clone();
+        let count = || async {
+            let ids: Vec<String> = kept.iter().map(|r| r.id.clone()).collect();
+            store
+                .remote_downloads(&principal, &ids)
+                .await
+                .unwrap()
+                .len()
+        };
+        let again = store
+            .put_remote_download(new("r0", "plex:1"))
+            .await
+            .unwrap();
+        assert_eq!(again.id, kept[0].id);
+        assert_eq!(count().await, MAX_REMOTE_DOWNLOADS as usize);
+        let last = store
+            .put_remote_download(new("one-more", "plex:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .remote_download(&principal, &last.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(count().await, MAX_REMOTE_DOWNLOADS as usize - 1);
     }
 
     /// Downloads that ended a while ago are forgotten: no longer available,

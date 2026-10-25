@@ -35,7 +35,14 @@ impl Federation {
             server_id: peer.server_id.clone(),
             endpoint_id: peer.endpoint_id.clone(),
             addrs: peer.addrs.clone(),
-            relays: peer.relays.clone(),
+            // A device dials these: none on a host that is not public
+            // (M8-07), a pair's kept before that check among them.
+            relays: peer
+                .relays
+                .iter()
+                .filter(|r| self.relay_hosts.allow(r))
+                .cloned()
+                .collect(),
             online: self.online(&peer.server_id),
         }
     }

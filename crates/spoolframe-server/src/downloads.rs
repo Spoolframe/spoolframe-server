@@ -56,7 +56,7 @@ use crate::optimized::mux::{DefaultSubtitle, MuxFormat, MuxPicks};
 use crate::optimized::{CopyFiles, Pool};
 use crate::principal::Principal;
 pub use crate::store::downloads::FailureCause;
-use crate::store::downloads::{DownloadRow, NewDownload, Of, StoredState};
+use crate::store::downloads::{DownloadCap, DownloadRow, NewDownload, Of, StoredState};
 use crate::store::optimized::{CopyState, NewCopy};
 use crate::store::{Store, StoreError};
 use crate::subtitle_sync::SubtitleTimings;
@@ -357,6 +357,10 @@ impl Drop for Reading {
     }
 }
 
+/// The most downloads a paired server's users keep here together (G8-01):
+/// as many as the download tokens a pair holds at once by default.
+pub const MAX_PAIR_DOWNLOADS: u32 = 2_000;
+
 /// Why a download cannot be prepared, read or cancelled.
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
@@ -431,6 +435,8 @@ struct Inner {
     hashes: Mutex<HashMap<(PathBuf, String), Hashing>>,
     /// Bytes of download files handed to reads since start.
     sent: std::sync::atomic::AtomicU64,
+    /// [`MAX_PAIR_DOWNLOADS`], but in tests.
+    pair_downloads: std::sync::atomic::AtomicU32,
     stop: watch::Sender<bool>,
 }
 
@@ -611,6 +617,7 @@ impl Downloads {
             changes: broadcast::Sender::new(256),
             hashes: Mutex::default(),
             sent: Default::default(),
+            pair_downloads: std::sync::atomic::AtomicU32::new(MAX_PAIR_DOWNLOADS),
             stop: watch::Sender::new(false),
         });
         inner.sweep().await?;
@@ -956,20 +963,47 @@ impl Downloads {
     /// the file: what [`Downloads::prepare`] and
     /// [`Downloads::prepare_music`] end with.
     async fn register(&self, asked: Asked<'_>, job: Job) -> Result<Prepared, DownloadError> {
+        // A paired server's users keep at most [`MAX_PAIR_DOWNLOADS`]
+        // together (G8-01): each download asked another way is a row of
+        // its own, and a pair's users, which it names, could keep asking.
+        // Those used least recently go, as a revoked grant's do, to make
+        // room.
+        // Room is made in the same write as the new row (Z8-06): one asked
+        // for again takes none, and two at once never pass the cap.
+        let prefix = match asked.principal {
+            Principal::RemoteUser { server, .. } => Some(format!("remote:{server}:")),
+            _ => None,
+        };
         let carried = serde_json::to_string(&asked.carried).expect("tracks are JSON");
-        let row = self
+        let (row, displaced) = self
             .inner
             .store
-            .put_download(NewDownload {
-                principal: &asked.principal.to_string(),
-                media_id: asked.media_id,
-                request: &asked.request,
-                content_key: &job.key,
-                carried: &carried,
-                stamp: &job.stamp,
-                expected_size: asked.expected_size,
-            })
+            .put_download_held(
+                NewDownload {
+                    principal: &asked.principal.to_string(),
+                    media_id: asked.media_id,
+                    request: &asked.request,
+                    content_key: &job.key,
+                    carried: &carried,
+                    stamp: &job.stamp,
+                    expected_size: asked.expected_size,
+                },
+                prefix.as_deref().map(|prefix| DownloadCap {
+                    prefix,
+                    most: self
+                        .inner
+                        .pair_downloads
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                }),
+            )
             .await?;
+        if !displaced.is_empty() {
+            tracing::info!(
+                gone = displaced.len(),
+                "a paired server's users' downloads past their most went"
+            );
+            self.released(&displaced).await?;
+        }
         let (content_key, decision) = (job.key.clone(), job.decision.clone());
         let state = self.begin(&row, job).await?;
         Ok(Prepared {
@@ -1190,18 +1224,36 @@ impl Downloads {
         let Some(row) = self.inner.store.delete_download(id).await? else {
             return Ok(false);
         };
-        let left = self
-            .inner
-            .store
-            .downloads_of_content(&row.content_key)
-            .await?;
-        if left.is_empty()
-            && let Some(making) = self.inner.state.lock().making.get(&row.content_key)
-        {
-            making.cancel.send_replace(true);
+        self.released(std::slice::from_ref(&row)).await?;
+        Ok(true)
+    }
+
+    /// `rows` are gone from the store: the making of a file no download
+    /// is left of stops, and the files no download names go.
+    async fn released(&self, rows: &[DownloadRow]) -> Result<(), DownloadError> {
+        for row in rows {
+            let left = self
+                .inner
+                .store
+                .downloads_of_content(&row.content_key)
+                .await?;
+            if left.is_empty()
+                && let Some(making) = self.inner.state.lock().making.get(&row.content_key)
+            {
+                making.cancel.send_replace(true);
+            }
         }
         self.inner.sweep().await?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Hold a paired server's users to `most` downloads together, in
+    /// place of [`MAX_PAIR_DOWNLOADS`]: for tests, which fill it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_pair_downloads(&self, most: u32) {
+        self.inner
+            .pair_downloads
+            .store(most, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Tell `change` as one of this server's own downloads' (P8-07): a

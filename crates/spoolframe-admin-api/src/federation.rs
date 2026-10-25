@@ -39,8 +39,8 @@ pub struct PeerEntry {
     pub revoked_at: Option<i64>,
     /// New keys that say they are this server, first seen first: those
     /// held wait for `keyConfirm` or `keyReject`; a rejected one is shown
-    /// until it expires, a day after. At most four, the rejected among
-    /// them: a key past them is not held.
+    /// until it expires, a day after. At most four held, the rejected
+    /// apart: a key past them is not held.
     pub held_keys: Vec<PeerKey>,
     /// Whether it has a federation connection open to this server now.
     pub connected: bool,
@@ -227,7 +227,9 @@ pub trait FederationApi {
     /// reached; `PAIRING_REFUSED` when it refuses or the two are paired
     /// already, `data.reason` saying why (`invite_invalid`,
     /// `invite_expired`, `invite_exhausted`, `wrong_invite_kind`,
-    /// `rate_limited`, `already_paired`, `key_held`).
+    /// `already_paired`, `key_held`, `key_refused`, `server_id_changed`,
+    /// `same_server_id`); `RATE_LIMITED`, with `data.retryAfterMs`, when
+    /// it refuses as rate limited.
     #[method(name = "redeem", with_extensions)]
     async fn redeem(&self, link: String) -> jsonrpsee::core::RpcResult<PeerEntry>;
 

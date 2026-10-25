@@ -149,6 +149,19 @@ pub struct Found {
     pub hash_match: bool,
 }
 
+/// A download the site granted: where its file is, and the account's
+/// count as the site said it in granting it (Z8-05), which is spent by
+/// then, whether the file is fetched or not.
+#[derive(Debug, Clone)]
+pub struct Granted {
+    link: url::Url,
+    /// The account's downloads in its current day, this one too.
+    pub requests: Option<u32>,
+    pub remaining: Option<u32>,
+    /// When the account's count starts again, Unix seconds.
+    pub resets_at: Option<i64>,
+}
+
 /// What a download got: the file, and the account's downloads made and
 /// left.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,12 +276,38 @@ impl Site {
     }
 
     /// Download file `file_id`, as `sub_format` (`srt`) when given, else
-    /// as it is on the site.
+    /// as it is on the site: [`Site::grant`], then [`Site::fetch_granted`].
     pub async fn download(
         &self,
         file_id: u64,
         sub_format: Option<&str>,
     ) -> Result<Downloaded, SiteError> {
+        let granted = self.grant(file_id, sub_format).await?;
+        let bytes = self.fetch_granted(&granted).await?;
+        Ok(Downloaded {
+            bytes,
+            requests: granted.requests,
+            remaining: granted.remaining,
+            resets_at: granted.resets_at,
+        })
+    }
+
+    /// The file of a download the site granted.
+    pub async fn fetch_granted(&self, granted: &Granted) -> Result<Vec<u8>, SiteError> {
+        self.fetch(
+            granted.link.clone(),
+            spoolframe_media::subtitle_file::MAX_DOWNLOAD_BYTES,
+        )
+        .await
+    }
+
+    /// Ask the site for file `file_id`, as `sub_format` when given: where
+    /// to fetch it, and the account's count, the download spent by then.
+    pub async fn grant(
+        &self,
+        file_id: u64,
+        sub_format: Option<&str>,
+    ) -> Result<Granted, SiteError> {
         let mut retried = false;
         loop {
             let session = self.session().await?;
@@ -303,11 +342,8 @@ impl Site {
                     "the download link leads away from the site".into(),
                 ));
             }
-            let bytes = self
-                .fetch(link, spoolframe_media::subtitle_file::MAX_DOWNLOAD_BYTES)
-                .await?;
-            return Ok(Downloaded {
-                bytes,
+            return Ok(Granted {
+                link,
                 requests: answer.requests.and_then(|n| u32::try_from(n).ok()),
                 remaining: answer.remaining.and_then(|n| u32::try_from(n).ok()),
                 resets_at: answer.reset_time_utc.as_deref().and_then(utc_seconds),

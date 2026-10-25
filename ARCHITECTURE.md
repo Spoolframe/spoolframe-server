@@ -349,7 +349,7 @@ Names the Spoolframe protocol spoken on an Iroh connection:
 spoolframe/client/1         apps to a server
 spoolframe/pair/1           a phone to a device, for pairing a portable user
 spoolframe/relay-access/1   a server's own relay to that server
-spoolframe/federation/1     server to server (reserved; refused until federation exists)
+spoolframe/federation/1     server to server (experimental; refused while experimental.federation is off)
 ```
 
 The client protocol carries a revision number inside `/1`. See
@@ -744,7 +744,9 @@ endpoint `X` is rejected. The effective credential is
 Federation is server-to-server. It is for sharing library metadata,
 grants, remote-library discovery, metadata updates, reconciliation and
 remote playback authorization. It does not proxy media through the
-recipient's server.
+recipient's server, but as a fallback for a device that cannot reach
+the origin or a player that cannot present a token (PROTOCOL.md, "Proxy
+mode").
 
 ## 27. Federation Identity
 

@@ -5266,9 +5266,11 @@ impl ClientProtocol {
         {
             Ok((session, user)) => {
                 self.services.auth.guessed_right(guess);
-                // The normal limits for its reads, as a portable guest's
-                // device gets; its sign-ins stay on the strangers' budget.
-                self.guest_signed_in(connection);
+                // The normal limits for its reads, but held to the remote
+                // sessions' caps and budget as every connection let in by
+                // a pair's session is (Z8-01), never a session of this
+                // server's own; its sign-ins stay on the strangers' budget.
+                self.remote_signed_in(connection);
                 Ok(Reply::PlayTokenRedeemed(
                     spoolframe_protocol::federation::PlayTokenRedeemed {
                         session: SessionId(session.0),
@@ -6952,6 +6954,21 @@ impl ClientProtocol {
         }
     }
 
+    /// `connection`'s device redeemed a paired server's token: its
+    /// connections are held as the pairs' sessions' (Z8-01), and those
+    /// raised are told the server's addresses.
+    fn remote_signed_in(&self, connection: &Connection) {
+        let endpoint = connection.remote_id();
+        let pairs = self
+            .services
+            .auth
+            .remote_sessions()
+            .endpoint_pairs(&endpoint.to_string());
+        for id in self.connections.remote_signed_in(&endpoint, &pairs) {
+            self.addresses.tell(id);
+        }
+    }
+
     /// Open the server→client events stream for `connection`.
     async fn open_events(&self, connection: &Connection) {
         let opened = async {
@@ -7008,16 +7025,20 @@ impl ProtocolHandler for ClientProtocol {
         // a stranger, but its connections are capped (C8-04), as a paired
         // server holding one session could open them without end.
         let remote = if known {
-            None
+            Vec::new()
         } else {
-            self.services.auth.remote_sessions().endpoint_pair(&id_text)
+            self.services
+                .auth
+                .remote_sessions()
+                .endpoint_pairs(&id_text)
         };
-        let admitted = match remote.clone() {
-            Some(pair) => self.connections.admit_remote(&connection, pair),
-            None => self.connections.admit(&connection, known, local),
+        let admitted = if remote.is_empty() {
+            self.connections.admit(&connection, known, local)
+        } else {
+            self.connections.admit_remote(&connection, remote.clone())
         };
         let Some(peer) = admitted else {
-            let why: &[u8] = if remote.is_some() {
+            let why: &[u8] = if !remote.is_empty() {
                 tracing::info!(
                     endpoint = %endpoint.fmt_short(),
                     "refusing a connection: too many in a paired server's sessions"
@@ -7037,7 +7058,7 @@ impl ProtocolHandler for ClientProtocol {
         };
         // Every connection starts anonymous, and most that stay so are an
         // app checking in: INFO is for the sign-in, and the disconnect.
-        tracing::debug!(endpoint = %endpoint.fmt_short(), known, remote = remote.is_some(), "client connected");
+        tracing::debug!(endpoint = %endpoint.fmt_short(), known, remote = !remote.is_empty(), "client connected");
         let state = Arc::new(ConnectionState {
             number: self.services.playbacks.connection_opened(),
             peer,
@@ -7088,19 +7109,27 @@ impl ProtocolHandler for ClientProtocol {
             };
             match accepted {
                 Ok((send, recv)) => {
+                    // Past the remote caps once a token was redeemed on it
+                    // (Z8-01): closing, and answering nothing more.
+                    if state.peer.refused() {
+                        reset_busy(send, recv, &endpoint);
+                        continue;
+                    }
                     // A remote session's stream takes its pair's place among
                     // the requests in hand before anything of it is read,
                     // resource streams included; past the budget it is
                     // reset `BUSY`. The place also says whose the stream is.
-                    let place = match state.peer.remote_pair() {
-                        Some(pair) => match self.connections.take_remote_request(&pair) {
+                    let pairs = state.peer.remote_pairs();
+                    let place = if pairs.is_empty() {
+                        None
+                    } else {
+                        match self.connections.take_remote_request(&pairs) {
                             Some(place) => Some(place),
                             None => {
                                 reset_busy(send, recv, &endpoint);
                                 continue;
                             }
-                        },
-                        None => None,
+                        }
                     };
                     let owned = place.is_some();
                     let this = self.clone();

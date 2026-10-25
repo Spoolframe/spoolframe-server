@@ -455,7 +455,7 @@ fn RemoteFields(
                                 "Add"
                             }
                         }
-                        span { class: "text-xs text-ctp-subtext0", "A public IPv4 or IPv6 with its port, such as 1.2.3.4:7420 or [2001:db8::1]:7420. Forwarding it is up to you." }
+                        span { class: "text-xs text-ctp-subtext0", "A public IPv4 or IPv6 with its port, such as 1.2.3.4:7420 or [2a01:4f8::1]:7420. Forwarding it is up to you." }
                     }
                 }
             }
@@ -1420,7 +1420,7 @@ pub fn RemoteChoice(state: Signal<WizardRemote>, server_port: String) -> Element
                                 "Add"
                             }
                         }
-                        span { class: "text-xs text-ctp-subtext0", "A public IPv4 or IPv6 with its port, such as 1.2.3.4:7420 or [2001:db8::1]:7420. Forwarding it is up to you." }
+                        span { class: "text-xs text-ctp-subtext0", "A public IPv4 or IPv6 with its port, such as 1.2.3.4:7420 or [2a01:4f8::1]:7420. Forwarding it is up to you." }
                     }
                 }
             }

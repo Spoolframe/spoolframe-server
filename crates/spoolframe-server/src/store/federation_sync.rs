@@ -64,6 +64,23 @@ impl Store {
         Ok(Some(rows.into_iter().collect()))
     }
 
+    /// The cursor of pair `peer`'s state of `library` made last, if any
+    /// is kept: the one its latest answer gave it (Z8-02).
+    pub async fn newest_sync_cursor(
+        &self,
+        peer: &str,
+        library: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT cursor FROM federation_sync_states WHERE peer = ?1 AND library = ?2 \
+             ORDER BY made_at DESC, cursor DESC LIMIT 1",
+        )
+        .bind(peer)
+        .bind(library)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// Keep `items` as pair `peer`'s state `cursor` of `library`, beside
     /// `since` if the pair named one this server keeps; every other state
     /// of the pair's library goes. With `cursor` equal to `since`, nothing

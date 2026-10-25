@@ -115,6 +115,14 @@ pub struct DownloadRow {
     pub expected_size: Option<u64>,
 }
 
+/// The most downloads the principals a prefix begins keep together
+/// (G8-01): a paired server's users' (`remote:<server id>:`).
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadCap<'a> {
+    pub prefix: &'a str,
+    pub most: u32,
+}
+
 /// A download asked for.
 #[derive(Debug, Clone, Copy)]
 pub struct NewDownload<'a> {
@@ -204,6 +212,21 @@ impl Store {
     /// no longer the request's (its media file changed, a track it reads
     /// was made again) takes the new key and waits again.
     pub async fn put_download(&self, new: NewDownload<'_>) -> Result<DownloadRow, StoreError> {
+        Ok(self.put_download_held(new, None).await?.0)
+    }
+
+    /// [`Store::put_download`], held to `cap`: a new download past it
+    /// makes room in the same write, the cap's downloads used least
+    /// recently (read, or else made) going (G8-01, Z8-06). One asked for
+    /// again is found as it was and takes no room, and two at once never
+    /// pass the cap. The download, and those that went, for their files
+    /// and their making to be let go.
+    pub async fn put_download_held(
+        &self,
+        new: NewDownload<'_>,
+        cap: Option<DownloadCap<'_>>,
+    ) -> Result<(DownloadRow, Vec<DownloadRow>), StoreError> {
+        let mut displaced = Vec::new();
         let mut tx = self.begin_write().await?;
         let found: Option<(String, String)> = sqlx::query_as(
             "SELECT id, content_key FROM downloads \
@@ -246,6 +269,21 @@ impl Store {
                 id
             }
             None => {
+                if let Some(cap) = cap {
+                    let gone = sqlx::query(concat!(
+                        "DELETE FROM downloads WHERE id IN ( \
+                             SELECT id FROM downloads WHERE principal >= ?1 AND principal < ?2 \
+                             ORDER BY COALESCE(last_read_at, created_at) DESC, created_at DESC, id \
+                             LIMIT -1 OFFSET ?3) RETURNING ",
+                        columns!()
+                    ))
+                    .bind(cap.prefix)
+                    .bind(past(cap.prefix))
+                    .bind(cap.most.saturating_sub(1))
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    displaced = gone.iter().map(row).collect::<Result<_, _>>()?;
+                }
                 let id = new_id();
                 sqlx::query(
                     "INSERT INTO downloads (id, principal, media_id, request, content_key, \
@@ -270,9 +308,11 @@ impl Store {
             }
         };
         tx.commit().await?;
-        self.download(&id)
+        let row = self
+            .download(&id)
             .await?
-            .ok_or(StoreError::Db(sqlx::Error::RowNotFound))
+            .ok_or(StoreError::Db(sqlx::Error::RowNotFound))?;
+        Ok((row, displaced))
     }
 
     /// Download `id`, if there is one.
@@ -569,6 +609,59 @@ mod tests {
             ),
             (Some("ab".to_owned()), None)
         );
+    }
+
+    /// G8-01: past a pair's users' `keep` most recently used downloads, the
+    /// rest, read or made longest ago; no other pair's, nor a local user's.
+    #[tokio::test]
+    async fn a_pair_s_downloads_past_the_most_recently_used_make_room() {
+        let store = test_store("downloads-pair-past").await;
+        let bob = "remote:aaaaaaaaaaaaaaaa:00000000-0000-0000-0000-000000000001";
+        let carol = "remote:aaaaaaaaaaaaaaaa:00000000-0000-0000-0000-000000000002";
+        let cap = DownloadCap {
+            prefix: "remote:aaaaaaaaaaaaaaaa:",
+            most: 3,
+        };
+        let mut made = Vec::new();
+        for (who, request) in [(bob, "r1"), (carol, "r2"), (bob, "r3")] {
+            let (row, gone) = store
+                .put_download_held(asked(who, request, request), Some(cap))
+                .await
+                .unwrap();
+            assert!(gone.is_empty(), "within the cap");
+            made.push(row);
+            store.clock().advance(std::time::Duration::from_secs(10));
+        }
+        store
+            .put_download(asked(
+                "remote:bbbbbbbbbbbbbbbb:00000000-0000-0000-0000-000000000001",
+                "r4",
+                "r4",
+            ))
+            .await
+            .unwrap();
+        store
+            .put_download(asked("local:a", "r5", "r5"))
+            .await
+            .unwrap();
+        // The first one read now is the most recently used.
+        store.download_read(&made[0].id).await.unwrap();
+        // Z8-06: one asked for again at the cap takes no room: it is
+        // found as it was, and nothing goes.
+        let (again, gone) = store
+            .put_download_held(asked(bob, "r1", "r1"), Some(cap))
+            .await
+            .unwrap();
+        assert_eq!((again.id.as_str(), gone.len()), (made[0].id.as_str(), 0));
+        // A new one makes room: Carol's, used longest ago, goes, and no
+        // other pair's nor a local user's.
+        let (_, gone) = store
+            .put_download_held(asked(bob, "r6", "r6"), Some(cap))
+            .await
+            .unwrap();
+        let gone: Vec<String> = gone.into_iter().map(|row| row.id).collect();
+        assert_eq!(gone, [made[1].id.clone()]);
+        assert_eq!(store.downloads().await.unwrap().len(), 5);
     }
 
     #[tokio::test]

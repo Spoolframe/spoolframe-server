@@ -124,15 +124,15 @@ async fn admin_of(server: &TestServer, finders: Finders) -> jsonrpsee::ws_client
 async fn a_static_address_is_told_to_a_signed_in_device() {
     let server = server_with(
         "wan-static-told",
-        Some(statics(&["203.0.113.7:7420", "[2001:db8::7]:7420"])),
+        Some(statics(&["203.0.114.7:7420", "[2001:db9::7]:7420"])),
     )
     .await;
     let client = server.client().await;
     let addrs = told(&client).await;
     assert!(
         addrs.ends_with(&[
-            "203.0.113.7:7420".parse().unwrap(),
-            "[2001:db8::7]:7420".parse().unwrap()
+            "203.0.114.7:7420".parse().unwrap(),
+            "[2001:db9::7]:7420".parse().unwrap()
         ]),
         "{addrs:?}"
     );
@@ -143,7 +143,7 @@ async fn a_static_address_is_told_to_a_signed_in_device() {
 /// addresses, the static one with them.
 #[tokio::test]
 async fn the_sdk_saves_a_static_address_as_advertised() {
-    let server = server_with("wan-static-sdk", Some(statics(&["203.0.113.7:7420"]))).await;
+    let server = server_with("wan-static-sdk", Some(statics(&["203.0.114.7:7420"]))).await;
     let first = *server
         .server
         .addr()
@@ -165,7 +165,7 @@ async fn the_sdk_saves_a_static_address_as_advertised() {
     client.pin(&id, true).await.unwrap();
     client.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
 
-    let static_addr: SocketAddr = "203.0.113.7:7420".parse().unwrap();
+    let static_addr: SocketAddr = "203.0.114.7:7420".parse().unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let saved = client
@@ -194,13 +194,13 @@ async fn the_sdk_saves_a_static_address_as_advertised() {
 /// are among the addresses told.
 #[tokio::test]
 async fn the_status_lists_a_static_address_with_its_source() {
-    let server = server_with("wan-static-status", Some(statics(&["203.0.113.7:7420"]))).await;
+    let server = server_with("wan-static-status", Some(statics(&["203.0.114.7:7420"]))).await;
     let status = status(&server).await;
     assert!(status.wan);
     assert_eq!(
         status.public_addresses,
         [PublicAddress {
-            address: "203.0.113.7:7420".into(),
+            address: "203.0.114.7:7420".into(),
             source: AddressSource::Static,
         }]
     );
@@ -208,7 +208,7 @@ async fn the_status_lists_a_static_address_with_its_source() {
     assert!(
         status
             .told_addresses
-            .contains(&"203.0.113.7:7420".to_owned()),
+            .contains(&"203.0.114.7:7420".to_owned()),
         "{:?}",
         status.told_addresses
     );
@@ -265,11 +265,11 @@ fn text_url(service: &wiremock::MockServer) -> String {
 
 #[tokio::test]
 async fn a_lookup_reads_the_public_ipv4_address() {
-    let service = lookup_service(200, "203.0.113.9\n").await;
+    let service = lookup_service(200, "203.0.114.9\n").await;
     let lookup = support::lookup_at(&text_url(&service), &[]);
     assert_eq!(
         lookup.once(LookupVia::Wtfismyip).await,
-        Ok("203.0.113.9".parse().unwrap())
+        Ok("203.0.114.9".parse().unwrap())
     );
 }
 
@@ -280,7 +280,7 @@ async fn a_lookup_answer_that_is_not_a_public_ipv4_address_is_refused() {
         ("10.0.0.1", "(10.0.0.0/8)"),
         ("100.64.3.4", "a carrier-grade NAT address (100.64.0.0/10)"),
         ("192.168.0.2\n", "(192.168.0.0/16)"),
-        ("2001:db8::1", "not an IPv4 address"),
+        ("2001:db9::1", "not an IPv4 address"),
         ("<html>blocked</html>", "not an IPv4 address"),
         ("", "not an IPv4 address"),
     ] {
@@ -289,7 +289,7 @@ async fn a_lookup_answer_that_is_not_a_public_ipv4_address_is_refused() {
         let err = lookup.once(LookupVia::Wtfismyip).await.unwrap_err();
         assert!(err.contains(says), "{answer:?}: {err}");
     }
-    let service = lookup_service(503, "203.0.113.9").await;
+    let service = lookup_service(503, "203.0.114.9").await;
     let lookup = support::lookup_at(&text_url(&service), &[]);
     let err = lookup.once(LookupVia::Wtfismyip).await.unwrap_err();
     assert!(err.contains("503"), "{err}");
@@ -309,7 +309,7 @@ async fn a_lookup_that_does_not_answer_in_time_fails() {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
-                .set_body_string("203.0.113.9")
+                .set_body_string("203.0.114.9")
                 .set_delay(Duration::from_secs(5)),
         )
         .mount(&service)
@@ -334,7 +334,7 @@ async fn a_failed_lookup_is_asked_again_until_it_answers() {
         .mount(&service)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.113.9"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.114.9"))
         .with_priority(2)
         .expect(1)
         .mount(&service)
@@ -343,7 +343,7 @@ async fn a_failed_lookup_is_asked_again_until_it_answers() {
     let lookup = support::lookup_at(&text_url(&service), &[wait, wait, wait]);
     assert_eq!(
         lookup.retried(LookupVia::Wtfismyip).await,
-        Ok("203.0.113.9".parse().unwrap())
+        Ok("203.0.114.9".parse().unwrap())
     );
     service.verify().await;
 }
@@ -375,7 +375,7 @@ async fn server_finding(test: &str, wan: Wan, lookup: Lookup) -> TestServer {
 
 #[tokio::test]
 async fn a_forwarded_port_with_its_public_ip_written_is_advertised() {
-    let ip = PublicIp::Fixed("198.51.100.4".parse().unwrap());
+    let ip = PublicIp::Fixed("198.51.101.4".parse().unwrap());
     let server = server_finding(
         "wan-manual-fixed",
         forwarded(ip, None),
@@ -386,7 +386,7 @@ async fn a_forwarded_port_with_its_public_ip_written_is_advertised() {
     assert_eq!(
         found,
         [PublicAddr {
-            addr: "198.51.100.4:7420".parse().unwrap(),
+            addr: "198.51.101.4:7420".parse().unwrap(),
             source: Source::MappedPort,
         }]
     );
@@ -406,7 +406,7 @@ async fn a_failed_public_ip_lookup_is_tried_again_later() {
         .mount(&service)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.113.7"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.114.7"))
         .with_priority(2)
         .mount(&service)
         .await;
@@ -424,7 +424,7 @@ async fn a_failed_public_ip_lookup_is_tried_again_later() {
     assert_eq!(
         found,
         [PublicAddr {
-            addr: "203.0.113.7:7420".parse().unwrap(),
+            addr: "203.0.114.7:7420".parse().unwrap(),
             source: Source::Lookup,
         }]
     );
@@ -433,7 +433,7 @@ async fn a_failed_public_ip_lookup_is_tried_again_later() {
 
 #[tokio::test]
 async fn a_forwarded_port_with_its_public_ip_looked_up_is_advertised() {
-    let service = lookup_service(200, "203.0.113.9\n").await;
+    let service = lookup_service(200, "203.0.114.9\n").await;
     let server = server_finding(
         "wan-manual-lookup",
         forwarded(PublicIp::Lookup, Some(LookupVia::Wtfismyip)),
@@ -444,7 +444,7 @@ async fn a_forwarded_port_with_its_public_ip_looked_up_is_advertised() {
     assert_eq!(
         found,
         [PublicAddr {
-            addr: "203.0.113.9:7420".parse().unwrap(),
+            addr: "203.0.114.9:7420".parse().unwrap(),
             source: Source::Lookup,
         }]
     );
@@ -452,7 +452,7 @@ async fn a_forwarded_port_with_its_public_ip_looked_up_is_advertised() {
     assert_eq!(
         status.public_addresses,
         [PublicAddress {
-            address: "203.0.113.9:7420".into(),
+            address: "203.0.114.9:7420".into(),
             source: AddressSource::Lookup,
         }]
     );
@@ -460,7 +460,7 @@ async fn a_forwarded_port_with_its_public_ip_looked_up_is_advertised() {
     assert!(
         matches!(
             &status.wan_lookup,
-            LookupStatus::Found { ip, via, at } if ip == "203.0.113.9" && via == "wtfismyip" && *at > 0
+            LookupStatus::Found { ip, via, at } if ip == "203.0.114.9" && via == "wtfismyip" && *at > 0
         ),
         "{:?}",
         status.wan_lookup
@@ -474,7 +474,7 @@ async fn a_forwarded_port_with_its_public_ip_looked_up_is_advertised() {
 async fn a_failed_lookup_is_a_status_note_and_the_server_runs_on() {
     let service = lookup_service(500, "").await;
     let wan = Wan {
-        statics: vec!["198.51.100.7:7420".parse().unwrap()],
+        statics: vec!["198.51.101.7:7420".parse().unwrap()],
         ..forwarded(PublicIp::Lookup, Some(LookupVia::Wtfismyip))
     };
     let wait = Duration::from_millis(10);
@@ -498,7 +498,7 @@ async fn a_failed_lookup_is_a_status_note_and_the_server_runs_on() {
     assert_eq!(
         status.public_addresses,
         [PublicAddress {
-            address: "198.51.100.7:7420".into(),
+            address: "198.51.101.7:7420".into(),
             source: AddressSource::Static,
         }]
     );
@@ -573,15 +573,15 @@ async fn a_mapping_the_router_grants_is_advertised() {
         .find(|a| a.is_ipv4())
         .expect("an IPv4 address")
         .port();
-    router.answer(Mapping::Granted("198.51.100.20:40000".parse().unwrap()));
+    router.answer(Mapping::Granted("198.51.101.20:40000".parse().unwrap()));
     let found = public_once(&server, |found| !found.is_empty()).await;
-    assert_eq!(found, [mapped("198.51.100.20:40000", Source::MappedPort)]);
+    assert_eq!(found, [mapped("198.51.101.20:40000", Source::MappedPort)]);
     assert_eq!(router.asked(), [own_port]);
     let status = status(&server).await;
     assert_eq!(
         status.public_addresses,
         [PublicAddress {
-            address: "198.51.100.20:40000".into(),
+            address: "198.51.101.20:40000".into(),
             source: AddressSource::MappedPort,
         }]
     );
@@ -589,7 +589,7 @@ async fn a_mapping_the_router_grants_is_advertised() {
         status.wan_mapping,
         MappingStatus::Granted {
             local_port: own_port,
-            external: "198.51.100.20:40000".into(),
+            external: "198.51.101.20:40000".into(),
         }
     );
     assert_eq!(status.wan_lookup, LookupStatus::NotNeeded);
@@ -643,7 +643,7 @@ async fn a_refused_mapping_is_a_note_and_the_server_runs_on() {
 /// mapped port.
 #[tokio::test]
 async fn a_mapping_without_a_public_address_falls_back_to_the_public_ip() {
-    let service = lookup_service(200, "203.0.113.9").await;
+    let service = lookup_service(200, "203.0.114.9").await;
     let router = FakeRouter::new();
     router.answer(Mapping::Granted("100.64.7.7:40000".parse().unwrap()));
     let server = server_asking(
@@ -654,20 +654,20 @@ async fn a_mapping_without_a_public_address_falls_back_to_the_public_ip() {
     )
     .await;
     let found = public_once(&server, |found| !found.is_empty()).await;
-    assert_eq!(found, [mapped("203.0.113.9:40000", Source::Lookup)]);
+    assert_eq!(found, [mapped("203.0.114.9:40000", Source::Lookup)]);
     server.stop().await;
 
     let router = FakeRouter::new();
     router.answer(Mapping::Granted("192.168.0.1:40000".parse().unwrap()));
     let server = server_asking(
         "wan-auto-private-fixed",
-        auto(PublicIp::Fixed("198.51.100.4".parse().unwrap())),
+        auto(PublicIp::Fixed("198.51.101.4".parse().unwrap())),
         router,
         support::offline_finders().lookup,
     )
     .await;
     let found = public_once(&server, |found| !found.is_empty()).await;
-    assert_eq!(found, [mapped("198.51.100.4:40000", Source::MappedPort)]);
+    assert_eq!(found, [mapped("198.51.101.4:40000", Source::MappedPort)]);
     server.stop().await;
 }
 
@@ -684,13 +684,13 @@ async fn a_renewed_mapping_is_followed() {
         support::offline_finders().lookup,
     )
     .await;
-    router.answer(Mapping::Granted("198.51.100.20:40000".parse().unwrap()));
+    router.answer(Mapping::Granted("198.51.101.20:40000".parse().unwrap()));
     let first = public_once(&server, |found| !found.is_empty()).await;
-    assert_eq!(first, [mapped("198.51.100.20:40000", Source::MappedPort)]);
+    assert_eq!(first, [mapped("198.51.101.20:40000", Source::MappedPort)]);
 
-    router.answer(Mapping::Granted("198.51.100.21:40002".parse().unwrap()));
+    router.answer(Mapping::Granted("198.51.101.21:40002".parse().unwrap()));
     let renewed = public_once(&server, |found| found != first.as_slice()).await;
-    assert_eq!(renewed, [mapped("198.51.100.21:40002", Source::MappedPort)]);
+    assert_eq!(renewed, [mapped("198.51.101.21:40002", Source::MappedPort)]);
 
     router.answer(Mapping::Asking);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -744,10 +744,10 @@ async fn a_mapping_granted_later_is_pushed_to_signed_in_devices() {
     server.add_user("alice", PASSWORD, None).await;
     let client = server.client().await;
     let (mut events, first) = signed_in(&client).await;
-    let external: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+    let external: SocketAddr = "198.51.101.20:40000".parse().unwrap();
     assert!(!first.contains(&external), "{first:?}");
 
-    router.answer(Mapping::Granted("198.51.100.20:40000".parse().unwrap()));
+    router.answer(Mapping::Granted("198.51.101.20:40000".parse().unwrap()));
     let pushed = next_addresses(&mut events).await.expect("a second push");
     assert_eq!(pushed.last(), Some(&external), "{pushed:?}");
     server.stop().await;
@@ -772,12 +772,12 @@ async fn a_lookup_that_succeeds_later_is_pushed_to_signed_in_devices() {
     server.add_user("alice", PASSWORD, None).await;
     let client = server.client().await;
     let (mut events, first) = signed_in(&client).await;
-    let looked_up: SocketAddr = "203.0.113.9:7420".parse().unwrap();
+    let looked_up: SocketAddr = "203.0.114.9:7420".parse().unwrap();
     assert!(!first.contains(&looked_up), "{first:?}");
 
     // The service answers from now on.
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.113.9"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("203.0.114.9"))
         .with_priority(1)
         .mount(&service)
         .await;
@@ -799,7 +799,7 @@ async fn the_wizard_tries_the_router_and_hears_its_answer() {
         .expect("an IPv4 address")
         .port();
     let router = FakeRouter::new();
-    router.answer(Mapping::Granted("203.0.113.24:7420".parse().unwrap()));
+    router.answer(Mapping::Granted("203.0.114.24:7420".parse().unwrap()));
     let finders = Finders {
         mapper: router.clone(),
         ..support::offline_finders()
@@ -809,7 +809,7 @@ async fn the_wizard_tries_the_router_and_hears_its_answer() {
         admin.wan_try_mapping().await.unwrap(),
         MappingStatus::Granted {
             local_port: own_port,
-            external: "203.0.113.24:7420".into(),
+            external: "203.0.114.24:7420".into(),
         }
     );
     assert_eq!(router.asked(), [own_port]);
@@ -828,13 +828,13 @@ async fn the_wizard_tries_the_router_and_hears_its_answer() {
 #[tokio::test]
 async fn the_wizard_looks_the_ip_up() {
     let server = server_with("wan-try-lookup", None).await;
-    let service = lookup_service(200, "203.0.113.24\n").await;
+    let service = lookup_service(200, "203.0.114.24\n").await;
     let finders = Finders {
         lookup: support::lookup_at(&text_url(&service), &[]),
         ..support::offline_finders()
     };
     let admin = admin_of(&server, finders).await;
-    assert_eq!(admin.wan_lookup().await.unwrap(), "203.0.113.24");
+    assert_eq!(admin.wan_lookup().await.unwrap(), "203.0.114.24");
 
     let failing = lookup_service(200, "10.0.0.1").await;
     let finders = Finders {
@@ -866,14 +866,14 @@ async fn network_wan_is_one_setting_set_and_unset_whole() {
     let entry = root
         .setting_set(
             "network.wan".into(),
-            serde_json::json!({ "static": ["203.0.113.7:7420"], "mapped_port": false }),
+            serde_json::json!({ "static": ["203.0.114.7:7420"], "mapped_port": false }),
         )
         .await
         .unwrap();
     assert_eq!(entry.apply, spoolframe_admin_api::SettingApply::Restart);
     assert_eq!(
         entry.value,
-        Some(serde_json::json!({ "static": ["203.0.113.7:7420"], "mapped_port": false }))
+        Some(serde_json::json!({ "static": ["203.0.114.7:7420"], "mapped_port": false }))
     );
 
     for (wan, says) in [

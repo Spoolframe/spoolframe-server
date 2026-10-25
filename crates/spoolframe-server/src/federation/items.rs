@@ -13,7 +13,7 @@ use std::time::Duration;
 use spoolframe_protocol::federation::{RemoteArtwork, RemoteArtworkKind, RemoteItem, RemoteKind};
 use spoolframe_types::{
     Album, Artist, Artwork, ArtworkId, ArtworkKind, CalendarDate, Episode, Item, MediaId,
-    MediaKind, Movie, PlaybackState, Season, Show, Track,
+    MediaKind, Movie, Namespace, PlaybackState, Season, Show, Track,
 };
 
 fn artwork(artwork: &[Artwork]) -> Vec<RemoteArtwork> {
@@ -150,17 +150,33 @@ pub fn kind(kind: RemoteKind) -> Option<MediaKind> {
     })
 }
 
-/// Origin `origin`'s item `id`, of `kind`, as this server names it.
+/// Origin `origin`'s item `id`, of `kind`, as this server names it. An id
+/// in the federated namespace (`fed:`), well formed or not, is no item of
+/// the origin's own, and is refused (G8-06): a server shares only what it
+/// serves.
 pub fn media_id(origin: &str, kind: MediaKind, id: &str) -> Option<MediaId> {
     let remote: MediaId = id.parse().ok()?;
-    (remote.kind() == kind)
+    (remote.kind() == kind && remote.namespace() != Namespace::Federated)
         .then(|| MediaId::federated(origin, &remote).ok())
         .flatten()
 }
 
-/// Origin `origin`'s artwork `id`, as this server names it.
+/// Origin `origin`'s artwork `id`, as this server names it; a `fed:` one
+/// is refused, as [`media_id`] refuses one.
 pub fn artwork_id(origin: &str, id: &str) -> Option<ArtworkId> {
-    ArtworkId::federated(origin, &id.parse().ok()?).ok()
+    let remote: ArtworkId = id.parse().ok()?;
+    (remote.namespace() != Namespace::Federated)
+        .then(|| ArtworkId::federated(origin, &remote).ok())
+        .flatten()
+}
+
+/// Whether `item`, as a sync page gave it, is one to keep: an item of a
+/// kind this build reads must have an id of the origin's own, as
+/// [`media_id`] reads one (G8-06), checked before it is stored, not only
+/// as it is shown. One of a kind this build does not read is kept, and
+/// left out as it is shown, as before.
+pub fn keepable(item: &RemoteItem) -> bool {
+    kind(item.kind).is_none_or(|kind| media_id("origin", kind, &item.id).is_some())
 }
 
 fn local_artwork(origin: &str, artwork: &[RemoteArtwork]) -> Vec<Artwork> {
@@ -369,6 +385,40 @@ mod tests {
             assert_eq!(sent.external_ids, ["tmdb://348"]);
             assert_eq!(sent.hash, sent.digest());
             assert_eq!(local(ORIGIN, &sent), Some(federated(item)));
+        }
+    }
+
+    /// G8-06: an id that is itself another server's names nothing of the
+    /// origin's own, and is left out, an image's as an item's.
+    #[test]
+    fn an_id_of_a_paired_server_s_own_is_left_out() {
+        let own = movie().id().clone();
+        let nested = MediaId::federated("aaaaaaaaaaaaaaaa", &own).unwrap();
+        assert_eq!(
+            media_id(ORIGIN, MediaKind::Movie, &nested.to_string()),
+            None
+        );
+        assert!(media_id(ORIGIN, MediaKind::Movie, &own.to_string()).is_some());
+        let poster = crate::test_support::poster();
+        let nested = ArtworkId::federated("aaaaaaaaaaaaaaaa", &poster).unwrap();
+        assert_eq!(artwork_id(ORIGIN, &nested.to_string()), None);
+        assert!(artwork_id(ORIGIN, &poster.to_string()).is_some());
+    }
+
+    /// The fourth Codex pass on G8-06: an id in the federated namespace
+    /// that names no origin (`fed:movie:x`) is refused too, an image's as
+    /// an item's, and such an item is not kept from a sync page.
+    #[test]
+    fn a_malformed_federated_id_is_left_out_and_not_kept() {
+        assert_eq!(media_id(ORIGIN, MediaKind::Movie, "fed:movie:x"), None);
+        assert_eq!(artwork_id(ORIGIN, "fed:x"), None);
+        let sent = remote(&movie(), Vec::new());
+        assert!(keepable(&sent));
+        for id in ["fed:movie:x", "fed:movie:aaaaaaaaaaaaaaaa:plex:1"] {
+            assert!(!keepable(&RemoteItem {
+                id: id.into(),
+                ..sent.clone()
+            }));
         }
     }
 

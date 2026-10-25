@@ -369,20 +369,23 @@ impl RemoteSessions {
         })
     }
 
-    /// The pair of a live session `endpoint` (hex) holds, the first by its
-    /// row if it holds several: what its connections are counted under
-    /// (C8-04).
-    pub fn endpoint_pair(&self, endpoint: &str) -> Option<String> {
+    /// The pairs of the live sessions `endpoint` (hex) holds, by row,
+    /// each once; empty for none: what its connections are counted under
+    /// (C8-04), every one of them (D8-02), so a device in two pairs'
+    /// sessions never spends one pair's share as the other's.
+    pub fn endpoint_pairs(&self, endpoint: &str) -> Vec<String> {
         let now = self.clock.now();
         let open = self.open.lock();
-        open.by_endpoint
-            .get(endpoint)?
+        let Some(held) = open.by_endpoint.get(endpoint) else {
+            return Vec::new();
+        };
+        let pairs: std::collections::BTreeSet<&String> = held
             .iter()
             .filter_map(|h| open.by_token.get(h))
             .filter(|o| o.until > now && !o.pending)
             .map(|o| &o.user.peer)
-            .min()
-            .cloned()
+            .collect();
+        pairs.into_iter().cloned().collect()
     }
 
     /// End session `token`: whether it was open.

@@ -199,10 +199,15 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         for id in external_ids {
+            // As `watch_state_ids`: a paired server's item never takes an
+            // id from this server's own (M8-04), so a hide here still
+            // follows the local item to a new key.
             sqlx::query(
                 "INSERT INTO continue_hidden_ids (principal, media_id, external_id) \
                  VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id",
+                 ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id \
+                 WHERE excluded.media_id NOT LIKE 'fed:%' \
+                    OR continue_hidden_ids.media_id LIKE 'fed:%'",
             )
             .bind(&principal)
             .bind(media_id)
@@ -802,6 +807,27 @@ mod tests {
             .unwrap();
         let hidden = store.hidden(ALICE).await.unwrap();
         assert!(hidden.contains("plex:movie:99") && !hidden.contains("plex:movie:1"));
+    }
+
+    /// M8-04: a paired server's item hidden under a local title's id does
+    /// not take the id: the local hide still follows its item.
+    #[tokio::test]
+    async fn a_paired_server_s_item_takes_no_hide_s_id_from_a_local_one() {
+        let store = store("hidden-fed").await;
+        let ids = vec!["imdb://tt0078748".to_owned()];
+        store
+            .hide_continue(ALICE, "plex:movie:1", &ids)
+            .await
+            .unwrap();
+        store
+            .hide_continue(ALICE, "fed:movie:aaaaaaaaaaaaaaaa:plex:movie:1", &ids)
+            .await
+            .unwrap();
+        let old = store
+            .hidden_under_another_key(ALICE, "plex:movie:99", &ids)
+            .await
+            .unwrap();
+        assert_eq!(old.as_deref(), Some("plex:movie:1"));
     }
 
     async fn store(test: &str) -> TestStore {

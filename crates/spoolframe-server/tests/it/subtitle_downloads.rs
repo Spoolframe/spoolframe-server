@@ -66,6 +66,26 @@ fn srt(cues: &[Span], shift_ms: i64) -> String {
 /// A stand-in site answering the recorded search, and serving every file
 /// as the CP-1251 SRT.
 pub(crate) async fn site() -> MockServer {
+    site_with_remaining(17).await
+}
+
+/// [`site`], whose account has `remaining` downloads left after each.
+pub(crate) async fn site_with_remaining(remaining: u32) -> MockServer {
+    site_serving(remaining, 200).await
+}
+
+/// How many downloads `site` was asked to grant.
+pub(crate) async fn grants_asked(site: &MockServer) -> usize {
+    site.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == "/api/v1/download")
+        .count()
+}
+
+/// [`site_with_remaining`], whose files are answered `file_status`.
+pub(crate) async fn site_serving(remaining: u32, file_status: u16) -> MockServer {
     let site = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/subtitles"))
@@ -76,7 +96,7 @@ pub(crate) async fn site() -> MockServer {
         .and(path("/api/v1/download"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "link": format!("{}/files/one.srt", site.uri()),
-            "remaining": 17,
+            "remaining": remaining,
             "reset_time_utc": "2030-01-01T00:00:00.000Z"
         })))
         .mount(&site)
@@ -84,7 +104,7 @@ pub(crate) async fn site() -> MockServer {
     let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode(RUSSIAN);
     Mock::given(method("GET"))
         .and(path("/files/one.srt"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(cp1251.into_owned()))
+        .respond_with(ResponseTemplate::new(file_status).set_body_bytes(cp1251.into_owned()))
         .mount(&site)
         .await;
     site

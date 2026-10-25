@@ -200,6 +200,99 @@ async fn sa_s_usage_shows_the_pair_as_one_row_with_no_user_names() {
     }
 }
 
+/// M8-01: SA's site account has five downloads left after Bob's first,
+/// which are kept for SA's own users: Bob's next is refused within the
+/// pair's limit, and never asked of the site, while SA's Dave downloads.
+#[tokio::test]
+async fn a_pair_leaves_what_is_kept_of_the_site_account_for_sa_s_own_users() {
+    let site = subtitles_it::site_with_remaining(5).await;
+    let pair = sharing_a_film("fed-subs-kept-back", &site, 40, 0).await;
+    let alien = pair.fed(movie().id());
+    let (bob_app, bob) = on_sb(&pair, "bob").await;
+    search(&bob_app, &bob, &alien).await;
+    let first = download(&bob_app, &bob, &alien, "opensubtitles:101")
+        .await
+        .unwrap();
+    assert_eq!(first.user_remaining, Some(39));
+    assert!(over_the_limit(
+        &download(&bob_app, &bob, &alien, "opensubtitles:102").await
+    ));
+    assert_eq!(
+        subtitles_it::grants_asked(&site).await,
+        1,
+        "the site was not asked"
+    );
+    pair.sa.add_user("dave", "correct horse", None).await;
+    let (dave_app, dave) = subtitles_it::app(&pair.sa, "dave", &[SUBTITLE_SEARCH]).await;
+    search(&dave_app, &dave, movie().id()).await;
+    download(&dave_app, &dave, movie().id(), "opensubtitles:102")
+        .await
+        .unwrap();
+}
+
+/// Z8-05: the site grants Bob's download, saying five are left, and its
+/// file then fails: the count is kept though no file is, so Bob's next
+/// download is refused without asking the site again.
+#[tokio::test]
+async fn what_the_site_says_in_granting_is_kept_though_the_file_fails() {
+    let site = subtitles_it::site_serving(5, 500).await;
+    let pair = sharing_a_film("fed-subs-grant-kept", &site, 40, 0).await;
+    let alien = pair.fed(movie().id());
+    let (bob_app, bob) = on_sb(&pair, "bob").await;
+    search(&bob_app, &bob, &alien).await;
+    assert!(
+        download(&bob_app, &bob, &alien, "opensubtitles:101")
+            .await
+            .is_err()
+    );
+    assert_eq!(subtitles_it::grants_asked(&site).await, 1);
+    assert!(over_the_limit(
+        &download(&bob_app, &bob, &alien, "opensubtitles:102").await
+    ));
+    assert_eq!(
+        subtitles_it::grants_asked(&site).await,
+        1,
+        "not asked again"
+    );
+}
+
+/// G8-03: a pair's searches that ask SA's site are held to ten for each
+/// download of its daily limit; one SA answers from the day's kept
+/// results is not counted.
+#[tokio::test]
+async fn a_pair_s_searches_of_the_site_are_held_to_a_day_s_budget() {
+    let site = subtitles_it::site().await;
+    let pair = sharing_a_film("fed-subs-searches", &site, 1, 0).await;
+    let alien = pair.fed(movie().id());
+    let (bob_app, bob) = on_sb(&pair, "bob").await;
+    let in_language = |language: &str| Request::SearchSubtitles {
+        id: alien.clone(),
+        language: Some(language.into()),
+    };
+    let languages = ["en", "fr", "de", "es", "it", "pt", "nl", "sv", "da", "fi"];
+    for language in languages {
+        assert!(
+            matches!(
+                bob_app.call(Some(&bob), in_language(language)).await,
+                Response::Ok(Reply::SubtitleResults(_))
+            ),
+            "{language}"
+        );
+    }
+    assert!(matches!(
+        bob_app.call(Some(&bob), in_language("en")).await,
+        Response::Ok(Reply::SubtitleResults(_))
+    ));
+    assert!(matches!(
+        bob_app.call(Some(&bob), in_language("pl")).await,
+        Response::Err(Error::QuotaExhausted {
+            whose: QuotaOf::User,
+            site: None,
+            ..
+        })
+    ));
+}
+
 /// SB's own limit per user applies first: Bob's second download is
 /// refused by SB, never asked of SA, and Carol still has hers.
 #[tokio::test]

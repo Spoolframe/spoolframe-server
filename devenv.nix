@@ -80,6 +80,7 @@ in {
   # server crates need these at build/link time.
   packages = with pkgs; [
     cargo-deny
+    cargo-outdated
     jq
     pkg-config
     libucl

@@ -1056,6 +1056,15 @@ impl Store {
         limits: FileLimits,
     ) -> Result<Vec<(String, String)>, StoreError> {
         let mut tx = self.begin_write().await?;
+        // The file this one replaces goes with it (Z8-04): each write is a
+        // file of its own.
+        let replaced: Option<String> = sqlx::query_scalar(
+            "SELECT file FROM federation_cache_files WHERE origin = ?1 AND artwork = ?2",
+        )
+        .bind(origin)
+        .bind(artwork)
+        .fetch_optional(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO federation_cache_files \
                  (origin, artwork, file, content_type, bytes, last_used) \
@@ -1071,9 +1080,23 @@ impl Store {
         .bind(self.now())
         .execute(&mut *tx)
         .await?;
-        let gone = evict(&mut tx, limits).await?;
+        let mut gone = evict(&mut tx, limits).await?;
         tx.commit().await?;
+        if let Some(replaced) = replaced.filter(|r| *r != file.file) {
+            gone.push((origin.to_owned(), replaced));
+        }
         Ok(gone)
+    }
+
+    /// The names of the files kept of `origin`'s: what its directory may
+    /// hold (Z8-03).
+    pub async fn cached_file_names(&self, origin: &str) -> Result<Vec<String>, StoreError> {
+        Ok(
+            sqlx::query_scalar("SELECT file FROM federation_cache_files WHERE origin = ?1")
+                .bind(origin)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     /// The least recently used files past `limits` go, as when one is

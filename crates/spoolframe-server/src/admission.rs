@@ -179,14 +179,18 @@ pub(crate) struct Peer {
     users: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     /// Signed out: closing once its streams are answered.
     closing: AtomicBool,
+    /// Past the remote sessions' caps: closing `BUSY` once its streams are
+    /// answered, and taking no new one.
+    refused: AtomicBool,
     /// How many of its streams are being answered.
     streams: watch::Sender<usize>,
     /// A device's, or a server's on `spoolframe/federation/1`.
     kind: PeerKind,
-    /// Let in by a paired server's session alone (C8-04), that pair's row:
-    /// counted under [`Admission::max_remote_connections`] and its pair's
-    /// share until its device signs in here.
-    remote: parking_lot::Mutex<Option<String>>,
+    /// Let in by paired servers' sessions alone (C8-04), those pairs'
+    /// rows, sorted; empty for any other: counted under
+    /// [`Admission::max_remote_connections`] and each of its pairs' shares
+    /// until its device signs in here.
+    remote: parking_lot::Mutex<Vec<String>>,
 }
 
 /// Whose connection a [`Peer`] is.
@@ -219,30 +223,37 @@ impl Peer {
             signed_in_here: AtomicBool::new(false),
             users: parking_lot::Mutex::default(),
             closing: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
             streams: watch::Sender::new(0),
             kind: PeerKind::Device,
             remote: parking_lot::Mutex::default(),
         }
     }
 
-    /// A device's connection let in by pair `pair`'s session alone
+    /// A device's connection let in by pairs `pairs`' sessions alone
     /// (C8-04): one in a remote play, or that server's own.
-    pub(crate) fn remote(connection: &Connection, pair: String) -> Self {
+    pub(crate) fn remote(connection: &Connection, pairs: Vec<String>) -> Self {
         let peer = Self::new(connection);
-        *peer.remote.lock() = Some(pair);
+        *peer.remote.lock() = pairs;
         peer
     }
 
-    /// The pair whose session it is held under, by the remote sessions'
-    /// caps; `None` for any other.
-    pub(crate) fn remote_pair(&self) -> Option<String> {
+    /// The pairs whose sessions it is held under, by the remote sessions'
+    /// caps; empty for any other.
+    pub(crate) fn remote_pairs(&self) -> Vec<String> {
         self.remote.lock().clone()
+    }
+
+    /// Held by pairs `pairs`' sessions from now on: those its endpoint
+    /// holds now (Z8-01).
+    pub(crate) fn set_remote_pairs(&self, pairs: Vec<String>) {
+        *self.remote.lock() = pairs;
     }
 
     /// Its device signed in here: a session of this server's own, no
     /// longer only a paired server's.
     pub(crate) fn note_own_session(&self) {
-        *self.remote.lock() = None;
+        self.remote.lock().clear();
     }
 
     /// A server's connection on `spoolframe/federation/1` (P8-01), from a
@@ -367,5 +378,36 @@ impl Peer {
                 b"signed out",
             );
         });
+    }
+
+    /// Its device redeemed a paired server's token on it, a stranger's
+    /// connection, and the remote sessions' caps have no room for it
+    /// (Z8-01): it takes no new stream, and once those being answered are
+    /// (the redemption's reply among them), for at most `drain`, it is
+    /// closed [`spoolframe_protocol::close::BUSY`], as a connection past
+    /// those caps is. Held on, it would hold the session outside them.
+    pub(crate) fn refuse(self: &Arc<Self>, drain: Duration) {
+        if self.refused.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let peer = self.clone();
+        tokio::spawn(async move {
+            let mut streams = peer.streams.subscribe();
+            let _ = tokio::time::timeout(drain, streams.wait_for(|n| *n == 0)).await;
+            tracing::info!(
+                endpoint = %peer.endpoint.fmt_short(),
+                "closing a connection a paired server's token was redeemed on: too many in its sessions"
+            );
+            peer.connection.close(
+                VarInt::from_u32(spoolframe_protocol::close::BUSY),
+                b"too many connections in a paired server's sessions; try again later",
+            );
+        });
+    }
+
+    /// Whether it is refused past the remote sessions' caps
+    /// ([`Peer::refuse`]).
+    pub(crate) fn refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
     }
 }

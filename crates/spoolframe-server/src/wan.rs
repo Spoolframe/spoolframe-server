@@ -105,8 +105,8 @@ pub struct PublicAddr {
 /// says.
 pub use spoolframe_admin_api::wan::not_public;
 
-/// A `static` entry: a public address with its port, `"203.0.113.7:7420"`
-/// or `"[2001:db8::1]:7420"`.
+/// A `static` entry: a public address with its port, `"1.2.3.4:7420"` or
+/// `"[2a01:4f8::1]:7420"`.
 pub fn parse_static(text: &str) -> Result<SocketAddr, String> {
     spoolframe_admin_api::wan::check_static(text)
 }
@@ -767,9 +767,12 @@ mod tests {
             "100.63.255.255",
             "100.128.0.1",
             "172.32.0.1",
-            "203.0.113.7",
+            "192.0.1.1",
+            "198.20.0.1",
+            "203.0.114.7",
             "8.8.8.8",
-            "2001:db8::1",
+            "2001:db9::1",
+            "64:ff9b:1::1",
             "2a01:4f8::1",
             "::ffff:1.2.3.4",
         ] {
@@ -790,6 +793,14 @@ mod tests {
             ("0.0.0.0", "an unspecified address (0.0.0.0/8)"),
             ("224.0.0.1", "a multicast address (224.0.0.0/4)"),
             ("255.255.255.255", "a reserved address (240.0.0.0/4)"),
+            ("192.0.0.9", "a protocol assignment address (192.0.0.0/24)"),
+            ("192.0.2.1", "a documentation address (192.0.2.0/24)"),
+            ("198.51.100.7", "a documentation address (198.51.100.0/24)"),
+            ("203.0.113.7", "a documentation address (203.0.113.0/24)"),
+            ("198.18.0.1", "a benchmarking address (198.18.0.0/15)"),
+            ("198.19.255.254", "a benchmarking address (198.18.0.0/15)"),
+            ("2001:db8::1", "a documentation address (2001:db8::/32)"),
+            ("64:ff9b::808:808", "a NAT64 address (64:ff9b::/96)"),
             ("::1", "a loopback address (::1)"),
             ("::", "an unspecified address (::)"),
             ("fe80::1", "a link-local address (fe80::/10)"),
@@ -812,8 +823,8 @@ mod tests {
             Ok("1.2.3.4:7420".parse().unwrap())
         );
         assert_eq!(
-            parse_static(" [2001:db8::1]:7420 "),
-            Ok("[2001:db8::1]:7420".parse().unwrap())
+            parse_static(" [2a01:4f8::1]:7420 "),
+            Ok("[2a01:4f8::1]:7420".parse().unwrap())
         );
         assert!(
             parse_static("1.2.3.4")

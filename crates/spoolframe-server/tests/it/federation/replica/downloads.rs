@@ -137,6 +137,46 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// G8-01, Z8-06: SA holds SB's users to their most downloads together,
+/// in the same write as a new one. Bob's download asked for again at the
+/// most takes no room, and keeps its id; one asked another way makes room,
+/// the one used longest ago going.
+#[tokio::test]
+async fn sa_holds_sb_s_users_to_their_most_downloads() {
+    let pair = sharing_a_film("fed-dl-most").await;
+    pair.sa.downloads.set_pair_downloads(1);
+    let (app, bob) = bob_s_app(&pair).await;
+    let alien = pair.fed(movie().id());
+    let first = prepared(&app, &bob, &alien).await;
+    // By id: a row's state moves on as its file is made.
+    let on_sa = || async {
+        let rows = pair.sa.store.downloads().await.unwrap();
+        rows.into_iter().map(|row| row.id).collect::<Vec<_>>()
+    };
+    let kept = on_sa().await;
+    assert_eq!(kept.len(), 1);
+    let again = prepared(&app, &bob, &alien).await;
+    assert_eq!(again.id, first.id, "the same download on SB");
+    assert_eq!(on_sa().await, kept, "asked again, it takes no room");
+    let chosen = Request::PrepareDownload {
+        id: alien.clone(),
+        source: DownloadSource::Original,
+        tracks: DownloadTracks::Chosen {
+            audio: vec![0],
+            subtitles: Vec::new(),
+        },
+        device: None,
+    };
+    assert!(matches!(
+        app.call(Some(&bob), chosen).await,
+        Response::Ok(Reply::Download(_))
+    ));
+    let now = on_sa().await;
+    assert_eq!(now.len(), 1, "held to its most");
+    assert_ne!(now[0], kept[0], "the older went");
+    pair.stop().await;
+}
+
 /// Bob downloads SA's film from SB: the options are SA's planner's for his
 /// device, the file is SA's, read whole through SB (proxied) and straight
 /// from SA with a download token (direct), the same bytes both ways. SB

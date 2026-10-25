@@ -568,6 +568,46 @@ async fn a_pair_s_key_answering_as_another_server_is_refused() {
     assert!(refused_at.is_some());
 }
 
+/// Z8-07: a pair's key answering under an id with a newline in it is
+/// refused, and the log's line for it stays one line: the id is escaped.
+#[tokio::test]
+async fn a_refused_server_id_forges_no_log_line() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Buffer::default();
+    let written = buffer.clone();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || written.clone()),
+    );
+    let _logged = tracing::subscriber::set_default(subscriber);
+    let forged = Answering::start(30, "bad\nWARN forged: an admin paired a stranger").await;
+    let (_, federation, peer, _) = bob_s("fed-pin-forged", &forged).await;
+    assert!(federation.refresh(&peer.id).await.is_err());
+    let text = String::from_utf8(buffer.0.lock().clone()).unwrap();
+    let refused: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("answered under another server id"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{text}");
+    assert!(refused[0].contains(r"bad\nWARN forged"), "{text}");
+    assert!(
+        !text.lines().any(|l| l.starts_with("WARN forged")),
+        "{text}"
+    );
+}
+
 /// Bob's server says hello to Alice's as `server_id`.
 fn bob_s_hello(server_id: &ServerId) -> PeerHello {
     PeerHello {

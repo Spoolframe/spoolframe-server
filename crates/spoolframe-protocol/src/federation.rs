@@ -125,8 +125,10 @@ pub fn federated_id(text: &str) -> bool {
 
 /// A server's `name` cut to [`crate::MAX_HELLO_TEXT`] characters, as a
 /// [`PeerHello`]'s is: what a server keeps of another's name, from
-/// wherever it came.
+/// wherever it came. Control characters go first (M8-03): the name is
+/// logged, and a newline in it would forge a line of the log.
 pub fn server_name(mut name: String) -> String {
+    name.retain(|c| !c.is_control());
     crate::messages::cut(&mut name);
     name
 }
@@ -986,6 +988,19 @@ mod tests {
                 id: alien,
                 download: None
             }
+        );
+    }
+
+    /// M8-03: a name with a newline in it would forge a log line.
+    #[test]
+    fn a_name_keeps_no_control_character() {
+        let forged = PeerHello {
+            name: "Bob\n2026-10-23T00:00:00Z ERROR forged\u{1b}[0m".into(),
+            ..hello()
+        };
+        assert_eq!(
+            forged.within_bounds().name,
+            "Bob2026-10-23T00:00:00Z ERROR forged[0m"
         );
     }
 

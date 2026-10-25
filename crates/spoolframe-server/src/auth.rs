@@ -603,6 +603,15 @@ impl TokenBucket {
         *tokens -= 1;
         Ok(())
     }
+
+    /// Whether the bucket is full at `now`: as one made anew would be, so
+    /// that it may be let go.
+    pub fn full(&self, now: Instant) -> bool {
+        let (tokens, since) = *self.state.lock();
+        let every = self.bucket.refill_every.max(Duration::from_nanos(1));
+        let missing = self.bucket.capacity.saturating_sub(tokens);
+        now.saturating_duration_since(since) >= every * missing
+    }
 }
 
 /// Why a PIN did not unlock a profile (P2-08).

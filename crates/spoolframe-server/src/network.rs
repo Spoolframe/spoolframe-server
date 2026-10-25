@@ -275,22 +275,24 @@ impl Default for RemoteRequests {
     }
 }
 
-/// One request's place among a pair's [`RemoteRequests`], given back when
-/// dropped.
+/// One request's place among its pairs' [`RemoteRequests`], given back
+/// when dropped.
 #[derive(Debug)]
 pub(crate) struct RemotePlace {
     requests: Arc<Mutex<RemoteRequests>>,
-    pair: String,
+    pairs: Vec<String>,
 }
 
 impl Drop for RemotePlace {
     fn drop(&mut self) {
         let mut requests = self.requests.lock();
         requests.all.send_modify(|n| *n = n.saturating_sub(1));
-        if let Some(mine) = requests.by_pair.get_mut(&self.pair) {
-            *mine = mine.saturating_sub(1);
-            if *mine == 0 {
-                requests.by_pair.remove(&self.pair);
+        for pair in &self.pairs {
+            if let Some(mine) = requests.by_pair.get_mut(pair) {
+                *mine = mine.saturating_sub(1);
+                if *mine == 0 {
+                    requests.by_pair.remove(pair);
+                }
             }
         }
     }
@@ -313,25 +315,32 @@ impl Connections {
         }
     }
 
-    /// A place for a request of pair `pair`'s sessions, if there is one:
-    /// the pair's together hold [`Admission::max_pair_remote_connections`]
+    /// A place for a request of pairs `pairs`' sessions, if there is one:
+    /// each pair's together hold [`Admission::max_pair_remote_connections`]
     /// connections' worth of [`Admission::remote_requests_each`], every
     /// pair's [`Admission::max_all_remote_connections`] connections' worth.
-    /// Held while it is kept.
-    pub(crate) fn take_remote_request(&self, pair: &str) -> Option<RemotePlace> {
+    /// A connection held under several pairs' sessions takes a place of
+    /// each of them (D8-02), so it never spends one pair's share as
+    /// another's. Held while it is kept.
+    pub(crate) fn take_remote_request(&self, pairs: &[String]) -> Option<RemotePlace> {
         let each = self.admission.remote_requests_each;
         let mut requests = self.remote_requests.lock();
-        let mine = requests.by_pair.get(pair).copied().unwrap_or(0);
+        let full = |pair: &String| {
+            requests.by_pair.get(pair).copied().unwrap_or(0)
+                >= self.admission.max_pair_remote_connections * each
+        };
         if *requests.all.borrow() >= self.admission.max_all_remote_connections * each
-            || mine >= self.admission.max_pair_remote_connections * each
+            || pairs.iter().any(full)
         {
             return None;
         }
         requests.all.send_modify(|n| *n += 1);
-        requests.by_pair.insert(pair.to_owned(), mine + 1);
+        for pair in pairs {
+            *requests.by_pair.entry(pair.clone()).or_insert(0) += 1;
+        }
         Some(RemotePlace {
             requests: self.remote_requests.clone(),
-            pair: pair.to_owned(),
+            pairs: pairs.to_vec(),
         })
     }
 
@@ -393,16 +402,21 @@ impl Connections {
         self.hold(Peer::new(connection), connection, known, local)
     }
 
-    /// Hold the connection of a device known here by pair `pair`'s
-    /// session alone (C8-04), with the normal limits, while its endpoint
-    /// holds fewer than [`Admission::max_remote_connections`] such, the
-    /// pair's endpoints fewer than [`Admission::max_pair_remote_connections`]
-    /// and every endpoint's fewer than
-    /// [`Admission::max_all_remote_connections`]. "Known" is not a local
-    /// user here: a paired server holding one session must not hold
-    /// connections without end.
-    pub(crate) fn admit_remote(&self, connection: &Connection, pair: String) -> Option<Arc<Peer>> {
-        self.hold(Peer::remote(connection, pair), connection, true, false)
+    /// Hold the connection of a device known here by pairs `pairs`'
+    /// sessions alone (C8-04), with the normal limits, while its endpoint
+    /// holds fewer than [`Admission::max_remote_connections`] such, each
+    /// of its pairs' endpoints fewer than
+    /// [`Admission::max_pair_remote_connections`] and every endpoint's
+    /// fewer than [`Admission::max_all_remote_connections`]. A device in
+    /// several pairs' sessions counts in each pair's share (D8-02). "Known"
+    /// is not a local user here: a paired server holding one session must
+    /// not hold connections without end.
+    pub(crate) fn admit_remote(
+        &self,
+        connection: &Connection,
+        pairs: Vec<String>,
+    ) -> Option<Arc<Peer>> {
+        self.hold(Peer::remote(connection, pairs), connection, true, false)
     }
 
     /// Hold a server's `spoolframe/federation/1` connection (P8-01) as
@@ -448,23 +462,9 @@ impl Connections {
                 return None;
             }
         }
-        if let Some(pair) = peer.remote_pair() {
-            let (all, this_pair, this_key) = peers
-                .values()
-                .filter_map(|held| Some((held, held.remote_pair()?)))
-                .fold((0, 0, 0), |(all, of_pair, mine), (held, of)| {
-                    (
-                        all + 1,
-                        of_pair + usize::from(of == pair),
-                        mine + usize::from(held.endpoint == peer.endpoint),
-                    )
-                });
-            if all >= self.admission.max_all_remote_connections
-                || this_pair >= self.admission.max_pair_remote_connections
-                || this_key >= self.admission.max_remote_connections
-            {
-                return None;
-            }
+        let pairs = peer.remote_pairs();
+        if !pairs.is_empty() && !self.remote_room(&peers, &peer.endpoint, &pairs) {
+            return None;
         }
         let peer = Arc::new(peer);
         if known {
@@ -475,6 +475,65 @@ impl Connections {
         }
         peers.insert(connection.stable_id(), peer.clone());
         Some(peer)
+    }
+
+    /// Whether `peers` leave room for one more connection of `endpoint`'s
+    /// held by pairs `pairs`' sessions alone: under the endpoint's cap,
+    /// each of those pairs' shares, and every pair's together.
+    fn remote_room(
+        &self,
+        peers: &HashMap<usize, Arc<Peer>>,
+        endpoint: &EndpointId,
+        pairs: &[String],
+    ) -> bool {
+        let held: Vec<(EndpointId, Vec<String>)> = peers
+            .values()
+            .map(|held| (held.endpoint, held.remote_pairs()))
+            .filter(|(_, of)| !of.is_empty())
+            .collect();
+        let this_key = held.iter().filter(|(e, _)| e == endpoint).count();
+        let pair_full = |pair: &String| {
+            held.iter().filter(|(_, of)| of.contains(pair)).count()
+                >= self.admission.max_pair_remote_connections
+        };
+        held.len() < self.admission.max_all_remote_connections
+            && !pairs.iter().any(pair_full)
+            && this_key < self.admission.max_remote_connections
+    }
+
+    /// `endpoint` redeemed a paired server's token (Z8-01): its sessions
+    /// here are pairs `pairs`' alone. Each of its connections that holds
+    /// no session of this server's own counts under every one of those
+    /// pairs from now on, as one let in by them would: one held so
+    /// already takes the pairs as they are now; a stranger's gets the
+    /// normal limits only while the remote caps have room for it, and is
+    /// closed `BUSY` once its streams are answered otherwise
+    /// ([`Peer::refuse`]), as one more past the caps is. A device signed
+    /// in here is left as it is. The ids raised.
+    pub(crate) fn remote_signed_in(&self, endpoint: &EndpointId, pairs: &[String]) -> Vec<usize> {
+        let mut raised = Vec::new();
+        if pairs.is_empty() {
+            return raised;
+        }
+        let peers = self.lock();
+        let mine: Vec<(usize, Arc<Peer>)> = devices(&peers)
+            .filter(|(_, p)| &p.endpoint == endpoint)
+            .map(|(id, p)| (*id, p.clone()))
+            .collect();
+        for (id, peer) in mine {
+            if !peer.remote_pairs().is_empty() {
+                peer.set_remote_pairs(pairs.to_vec());
+            } else if !peer.known() {
+                if self.remote_room(&peers, endpoint, pairs) {
+                    peer.set_remote_pairs(pairs.to_vec());
+                    peer.raise();
+                    raised.push(id);
+                } else {
+                    peer.refuse(self.admission.sign_out_drain);
+                }
+            }
+        }
+        raised
     }
 
     pub(crate) fn remove(&self, id: usize) {
@@ -1106,12 +1165,34 @@ mod tests {
             ip("192.168.1.10:7420"),
             ip("127.0.0.1:7420"),
             ip("[fe80::1]:7420"),
-            ip("203.0.113.7:7420"),
+            ip("203.0.114.7:7420"),
         ];
         assert_eq!(
             published().apply(&addrs).into_owned(),
-            [iroh::TransportAddr::Relay(relay), ip("203.0.113.7:7420")]
+            [iroh::TransportAddr::Relay(relay), ip("203.0.114.7:7420")]
         );
+    }
+
+    /// D8-02: a request of a connection held under two pairs' sessions
+    /// takes a place of each pair's, so it spends neither's share as the
+    /// other's; each place comes back when it goes.
+    #[test]
+    fn a_request_under_two_pairs_takes_a_place_of_each() {
+        let connections = Connections::new(Admission {
+            max_pair_remote_connections: 1,
+            remote_requests_each: 1,
+            ..Admission::default()
+        });
+        let pairs = |p: &[&str]| p.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+        let both = connections
+            .take_remote_request(&pairs(&["a", "b"]))
+            .expect("room for one");
+        assert!(connections.take_remote_request(&pairs(&["a"])).is_none());
+        assert!(connections.take_remote_request(&pairs(&["b"])).is_none());
+        let other = connections.take_remote_request(&pairs(&["c"]));
+        assert!(other.is_some());
+        drop(both);
+        assert!(connections.take_remote_request(&pairs(&["b"])).is_some());
     }
 
     /// A device of Bob's with a play token's session open on a server

@@ -637,7 +637,7 @@ impl Federation {
         if let Some(held) = self.plays.held(peer) {
             return Ok(held);
         }
-        let addr = peer_addr(peer).ok_or_else(not_paired)?;
+        let addr = peer_addr(self.relay_hosts, peer).ok_or_else(not_paired)?;
         // SA sees this server as the device; what each play plans for is
         // its start's, and each download its own device's (P8-07), whose
         // news this connection hears.

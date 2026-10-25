@@ -66,9 +66,12 @@ pub struct HeldKey {
     pub rejected_at: Option<i64>,
 }
 
-/// The most new keys kept for one pair, held and rejected together. A
-/// key past them is dropped, never swapped in: what the admin is looking
-/// at cannot change under them.
+/// The most new keys held for one pair. A key past them is dropped,
+/// never swapped in: what the admin is looking at cannot change under
+/// them. A rejected key is not one of them: rejecting one frees its
+/// place at once, so four keys a stranger had held, once rejected, keep
+/// the pair's own new key out no longer (M8-06). The rejected are bounded
+/// by the admin's own rejections.
 pub const MAX_HELD_KEYS: i64 = 4;
 
 /// A held key not seen for this long is forgotten, seconds.
@@ -281,7 +284,8 @@ async fn hold_without_writing(
         Some(_) => None,
         None => {
             let kept: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM federation_peer_held_keys WHERE peer = ?1",
+                "SELECT COUNT(*) FROM federation_peer_held_keys \
+                 WHERE peer = ?1 AND rejected_at IS NULL",
             )
             .bind(id)
             .fetch_one(&mut *conn)
@@ -534,7 +538,8 @@ impl Store {
             }
             None => {
                 let kept: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM federation_peer_held_keys WHERE peer = ?1",
+                    "SELECT COUNT(*) FROM federation_peer_held_keys \
+                     WHERE peer = ?1 AND rejected_at IS NULL",
                 )
                 .bind(id)
                 .fetch_one(&mut *tx)
@@ -1040,8 +1045,8 @@ mod tests {
         );
     }
 
-    /// With [`MAX_HELD_KEYS`] kept, a new key is dropped, and the keys the
-    /// admin sees stay; a rejected one counts until it expires.
+    /// With [`MAX_HELD_KEYS`] held, a new key is dropped, and the keys the
+    /// admin sees stay; a rejected one frees its place at once.
     #[tokio::test]
     async fn with_the_held_keys_full_a_new_key_is_not_held() {
         let store = test_store("fed-key-full").await;
@@ -1053,7 +1058,6 @@ mod tests {
                 KeyHold::New
             );
         }
-        store.reject_peer_key(&peer.id, &keys[0]).await.unwrap();
         let late = key(0xee);
         assert_eq!(
             store.hold_peer_key(&peer.id, &late).await.unwrap(),
@@ -1068,6 +1072,31 @@ mod tests {
             store.hold_peer_key(&peer.id, &keys[1]).await.unwrap(),
             KeyHold::Held
         );
+    }
+
+    /// M8-06: four keys a stranger had held for a pair, rejected, keep the
+    /// pair's own new key out no longer; they stay refused for their day.
+    #[tokio::test]
+    async fn a_rejected_key_frees_its_place_at_once() {
+        let store = test_store("fed-key-reject-frees").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        let strangers: Vec<String> = (1..=MAX_HELD_KEYS as u8).map(key).collect();
+        for k in &strangers {
+            store.hold_peer_key(&peer.id, k).await.unwrap();
+        }
+        for k in &strangers {
+            store.reject_peer_key(&peer.id, k).await.unwrap();
+        }
+        let own = key(0xee);
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &own).await.unwrap(),
+            KeyHold::New
+        );
+        assert_eq!(
+            store.hold_peer_key(&peer.id, &strangers[0]).await.unwrap(),
+            KeyHold::Rejected
+        );
+        store.confirm_peer_key(&peer.id, &own).await.unwrap();
     }
 
     /// A key held already is seen again without a write, but once per

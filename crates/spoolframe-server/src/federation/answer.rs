@@ -48,6 +48,18 @@ const ASSERTION_REFILL: Duration = Duration::from_secs(1);
 /// [`Limits::subtitle_burst`], then one every ten seconds.
 const SUBTITLE_REFILL: Duration = Duration::from_secs(10);
 
+/// Each pair's dear answers (M8-02, Z8-02): a sync naming no cursor this
+/// server keeps is answered with the whole library, and one naming a
+/// cursor kept but older than the last it was given with everything
+/// since, its state written whole again; a pair could ask for either
+/// again and again. A pair's first syncs, a cache it lost, or a reply it
+/// lost, take a burst of sixteen; then one every ten minutes. A sync
+/// naming the cursor it was given last is not held to it.
+const SNAPSHOTS: Bucket = Bucket {
+    capacity: 16,
+    refill_every: Duration::from_secs(600),
+};
+
 /// The external ids a walk knows: those kept, by item, with the hash of
 /// the rest of it then; and those it read anew.
 struct Ids {
@@ -86,6 +98,7 @@ struct PairBuckets {
     artwork: TokenBucket,
     assertions: TokenBucket,
     subtitles: TokenBucket,
+    snapshots: TokenBucket,
 }
 
 /// The buckets `limits` make a pair's: images, assertions, then subtitle
@@ -114,6 +127,7 @@ fn fresh(made: (Bucket, Bucket, Bucket)) -> Arc<PairBuckets> {
         artwork: TokenBucket::new(made.0),
         assertions: TokenBucket::new(made.1),
         subtitles: TokenBucket::new(made.2),
+        snapshots: TokenBucket::new(SNAPSHOTS),
     })
 }
 
@@ -124,6 +138,8 @@ pub(super) enum Ask {
     Assertion,
     /// A subtitle search or download (P8-07).
     Subtitles,
+    /// A sync answered with the whole library (M8-02).
+    Snapshot,
 }
 
 impl Answering {
@@ -131,18 +147,19 @@ impl Answering {
     /// are made again, full, when a burst changed.
     pub(super) fn allowed(&self, peer: &str, ask: Ask, limits: &Limits) -> bool {
         let made = buckets(limits);
-        let buckets = {
-            let mut asks = self.asks.lock();
-            let entry = asks.entry(peer.to_owned()).or_insert_with(|| fresh(made));
-            if entry.made != made {
-                *entry = fresh(made);
-            }
-            entry.clone()
-        };
+        // Taken under the map's lock: the tick's pruning never lets a
+        // bucket go between its lookup and the take, which would give the
+        // pair a full one again (the fourth Codex pass on G8-05).
+        let mut asks = self.asks.lock();
+        let buckets = asks.entry(peer.to_owned()).or_insert_with(|| fresh(made));
+        if buckets.made != made {
+            *buckets = fresh(made);
+        }
         let bucket = match ask {
             Ask::Artwork => &buckets.artwork,
             Ask::Assertion => &buckets.assertions,
             Ask::Subtitles => &buckets.subtitles,
+            Ask::Snapshot => &buckets.snapshots,
         };
         bucket.take(Instant::now()).is_ok()
     }
@@ -160,6 +177,17 @@ impl Answering {
     /// library no pair asks for again is not held.
     pub(super) fn prune_walks(&self, reuse: Duration) {
         self.walks.lock().retain(|_, (at, _)| at.elapsed() < reuse);
+    }
+
+    /// Let the pairs' buckets that are full again go, at the same tick: a
+    /// full one is what a pair's next ask would make anew, so nothing is
+    /// lost, and a pair unpaired leaves none behind (G8-05).
+    pub(super) fn prune_asks(&self, now: Instant) {
+        self.asks.lock().retain(|_, b| {
+            ![&b.artwork, &b.assertions, &b.subtitles, &b.snapshots]
+                .iter()
+                .all(|bucket| bucket.full(now))
+        });
     }
 }
 
@@ -331,19 +359,16 @@ impl Federation {
     }
 
     /// Answer pair `peer`'s `sync` of `library`, walked as `walked`: what
-    /// changed since its cursor, or the whole library for a cursor not
-    /// kept, and keep what is sent.
+    /// changed since its cursor's state `base`, or the whole library for
+    /// a cursor not kept, and keep what is sent.
     async fn diff(
         &self,
         peer: &PeerRecord,
         sync: &SyncLibrary,
+        base: Option<HashMap<String, String>>,
         walked: &Walk,
     ) -> Result<SyncAnswer, StoreError> {
         let store = self.store();
-        let base = match &sync.since {
-            Some(since) => store.sync_state(&peer.id, &sync.library, since).await?,
-            None => None,
-        };
         let since = base.as_ref().and(sync.since.as_deref());
         let sent: Vec<SentItem> = walked
             .iter()
@@ -441,6 +466,41 @@ impl Shares for Federation {
             .syncing
             .lock(&format!("{}\n{}", peer.id, sync.library))
             .await;
+        // Read under the lock, before the walk: a whole library past the
+        // pair's pace is refused before anything is walked (M8-02).
+        let base = match &sync.since {
+            Some(since) => self
+                .store()
+                .sync_state(&peer.id, &sync.library, since)
+                .await
+                .map_err(|e| unavailable("sync", e))?,
+            None => None,
+        };
+        // A kept cursor older than the last one given: a reply lost, or
+        // a pair asking for the same changes again (Z8-02).
+        let replay = match (&base, &sync.since) {
+            (Some(_), Some(since)) => {
+                self.store()
+                    .newest_sync_cursor(&peer.id, &sync.library)
+                    .await
+                    .map_err(|e| unavailable("sync", e))?
+                    .as_deref()
+                    != Some(since.as_str())
+            }
+            _ => false,
+        };
+        if (base.is_none() || replay)
+            && !self
+                .answering
+                .allowed(server_id.as_str(), Ask::Snapshot, &self.limits())
+        {
+            tracing::info!(
+                server_id = %server_id,
+                replay,
+                "a paired server asks for whole libraries, or old cursors, too often"
+            );
+            return Err(Unshared::Unavailable);
+        }
         let walked = self
             .walked(&library.id)
             .await
@@ -455,7 +515,7 @@ impl Shares for Federation {
         // cursor it never saw.
         let peer = self.pair(server_id, endpoint).await?;
         self.shared_library(&peer, &sync.library).await?;
-        self.diff(&peer, sync, &walked)
+        self.diff(&peer, sync, base, &walked)
             .await
             .map_err(|e| unavailable("sync", e))
     }
@@ -571,6 +631,112 @@ mod tests {
         assert!(answering.allowed("sc", Ask::Subtitles, &limits));
     }
 
+    /// A pair's whole-library answers (M8-02) come in a burst of their
+    /// own, apart from its other asks and from another pair's.
+    #[test]
+    fn a_pair_s_whole_libraries_are_paced_apart() {
+        let answering = Answering::default();
+        let limits = Limits::default();
+        for _ in 0..SNAPSHOTS.capacity {
+            assert!(answering.allowed("sb", Ask::Snapshot, &limits));
+        }
+        assert!(!answering.allowed("sb", Ask::Snapshot, &limits));
+        assert!(answering.allowed("sb", Ask::Artwork, &limits));
+        assert!(answering.allowed("sc", Ask::Snapshot, &limits));
+    }
+
+    /// M8-02: a pair that names no cursor kept, again and again, is
+    /// refused the whole library past its burst, before any walk; a sync
+    /// naming the cursor it was given is still answered with the changes.
+    #[tokio::test]
+    async fn a_pair_s_whole_library_syncs_past_the_burst_are_refused() {
+        use super::super::tokens::tests::{bob_s_key, sharing};
+        let (_store, federation, bob_s) = sharing("fed-sync-snapshots").await;
+        let unknown = SyncLibrary {
+            library: "plex:1".into(),
+            since: Some("not-a-kept-cursor".into()),
+        };
+        let mut cursor = String::new();
+        for _ in 0..SNAPSHOTS.capacity {
+            let answer = Shares::sync(&federation, &bob_s, bob_s_key(), &unknown)
+                .await
+                .unwrap();
+            assert_eq!(answer.mode, SyncMode::Snapshot);
+            cursor = answer.cursor;
+        }
+        assert_eq!(
+            Shares::sync(&federation, &bob_s, bob_s_key(), &unknown)
+                .await
+                .map(|a| a.mode),
+            Err(Unshared::Unavailable)
+        );
+        let kept = SyncLibrary {
+            library: "plex:1".into(),
+            since: Some(cursor),
+        };
+        assert_eq!(
+            Shares::sync(&federation, &bob_s, bob_s_key(), &kept)
+                .await
+                .map(|a| a.mode),
+            Ok(SyncMode::Changes)
+        );
+    }
+
+    /// Z8-02: a pair that keeps naming a cursor older than the last it was
+    /// given is answered the changes since it, each time a new state,
+    /// paced as whole libraries are; the cursor it was given last is
+    /// answered as ever.
+    #[tokio::test]
+    async fn a_pair_replaying_an_old_cursor_is_paced() {
+        use super::super::tokens::tests::{bob_s_key, sharing_from};
+        use crate::test_support::{FakeCatalog, movie};
+        let catalog = Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into()));
+        let (store, federation, bob_s) = sharing_from("fed-sync-replay", catalog.clone()).await;
+        federation.set_limits(Limits {
+            walk_reuse: Duration::ZERO,
+            ..Limits::default()
+        });
+        let sync = |since: Option<String>| SyncLibrary {
+            library: "plex:1".into(),
+            since,
+        };
+        let asked = |s: SyncLibrary| {
+            let federation = &federation;
+            let bob_s = &bob_s;
+            async move { Shares::sync(federation, bob_s, bob_s_key(), &s).await }
+        };
+        let old = asked(sync(None)).await.unwrap().cursor;
+        catalog.remove(movie().id());
+        let newest = asked(sync(Some(old.clone()))).await.unwrap();
+        assert_eq!(newest.mode, SyncMode::Changes);
+        assert_ne!(newest.cursor, old);
+        // The snapshot took one of sixteen; fifteen replays take the rest.
+        for _ in 1..SNAPSHOTS.capacity {
+            assert_eq!(
+                asked(sync(Some(old.clone()))).await.map(|a| a.mode),
+                Ok(SyncMode::Changes)
+            );
+        }
+        assert_eq!(
+            asked(sync(Some(old.clone()))).await.map(|a| a.mode),
+            Err(Unshared::Unavailable)
+        );
+        let peer = store
+            .live_peer_by_server_id(bob_s.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let last = store
+            .newest_sync_cursor(&peer.id, "plex:1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            asked(sync(Some(last))).await.map(|a| a.mode),
+            Ok(SyncMode::Changes)
+        );
+    }
+
     /// A walk past its reuse goes at the tick, though no pair asks for
     /// its library again; one within it stays.
     #[test]
@@ -590,6 +756,22 @@ mod tests {
         answering.prune_walks(Limits::default().walk_reuse);
         let left: Vec<String> = answering.walks.lock().keys().cloned().collect();
         assert_eq!(left, ["plex:2"]);
+    }
+
+    /// G8-05: a pair's buckets go at the tick once they are full again,
+    /// and stay while any is not.
+    #[test]
+    fn a_pair_s_buckets_go_once_full_again() {
+        let answering = Answering::default();
+        let limits = Limits::default();
+        assert!(answering.allowed("sb", Ask::Snapshot, &limits));
+        assert!(answering.allowed("sc", Ask::Subtitles, &limits));
+        answering.prune_asks(Instant::now());
+        assert_eq!(answering.asks.lock().len(), 2);
+        answering.prune_asks(Instant::now() + SNAPSHOTS.refill_every);
+        let left: Vec<String> = answering.asks.lock().keys().cloned().collect();
+        assert_eq!(left, Vec::<String>::new());
+        assert!(answering.allowed("sb", Ask::Snapshot, &limits));
     }
 
     /// A burst raised by the settings (P8-04) holds at once, for a pair

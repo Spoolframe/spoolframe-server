@@ -94,8 +94,9 @@ pub struct PlaySummary {
 }
 
 /// Note `play`'s external ids as its item's, for `principal`. An id names
-/// one item: if it was another key's, it is this one's now. One already
-/// this item's is left unwritten.
+/// one item: if it was another key's, it is this one's now, but a paired
+/// server's item never takes one from this server's own (M8-04), as with
+/// `watch_state_ids`. One already this item's is left unwritten.
 async fn note_play_ids(
     tx: &mut sqlx::SqliteConnection,
     principal: &str,
@@ -105,7 +106,8 @@ async fn note_play_ids(
         sqlx::query(
             "INSERT INTO play_ids (principal, media_id, external_id) VALUES (?1, ?2, ?3) \
              ON CONFLICT (principal, external_id) DO UPDATE SET media_id = excluded.media_id \
-             WHERE play_ids.media_id != excluded.media_id",
+             WHERE play_ids.media_id != excluded.media_id \
+               AND (excluded.media_id NOT LIKE 'fed:%' OR play_ids.media_id LIKE 'fed:%')",
         )
         .bind(principal)
         .bind(play.media_id)
@@ -505,6 +507,27 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+        // M8-04: a paired server's track played under the same id does
+        // not take it from the local one.
+        store
+            .open_play(
+                ALICE,
+                play(
+                    "fed:track:aaaaaaaaaaaaaaaa:plex:track:1",
+                    PlayedKind::Track,
+                    &ids,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .plays_under_another_key(ALICE, "plex:track:99", &ids)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("plex:track:1")
         );
         store
             .move_plays(ALICE, "plex:track:1", "plex:track:99")

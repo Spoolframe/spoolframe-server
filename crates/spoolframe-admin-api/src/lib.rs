@@ -49,8 +49,9 @@ pub mod wan {
 
     /// Why `ip` cannot be reached from the Internet, if it cannot: the
     /// range it is in, named (`"a private address (192.168.0.0/16)"`).
-    /// Documentation ranges (192.0.2.0/24, 2001:db8::/32 and the like)
-    /// are let through: they are what examples are written with.
+    /// Documentation ranges (192.0.2.0/24, 2001:db8::/32 and the like) are
+    /// refused too: no device reaches them, and a paired server's relay on
+    /// one is no relay (M8-07).
     pub fn not_public(ip: IpAddr) -> Option<&'static str> {
         match ip.to_canonical() {
             IpAddr::V4(v4) => not_public_v4(v4),
@@ -59,23 +60,29 @@ pub mod wan {
     }
 
     fn not_public_v4(ip: Ipv4Addr) -> Option<&'static str> {
-        let [a, b, ..] = ip.octets();
-        Some(match (a, b) {
-            (0, _) => "an unspecified address (0.0.0.0/8)",
-            (127, _) => "a loopback address (127.0.0.0/8)",
-            (10, _) => "a private address (10.0.0.0/8)",
-            (172, 16..=31) => "a private address (172.16.0.0/12)",
-            (192, 168) => "a private address (192.168.0.0/16)",
-            (100, 64..=127) => "a carrier-grade NAT address (100.64.0.0/10)",
-            (169, 254) => "a link-local address (169.254.0.0/16)",
-            (224..=239, _) => "a multicast address (224.0.0.0/4)",
-            (240.., _) => "a reserved address (240.0.0.0/4)",
+        let [a, b, c, _] = ip.octets();
+        Some(match (a, b, c) {
+            (0, ..) => "an unspecified address (0.0.0.0/8)",
+            (127, ..) => "a loopback address (127.0.0.0/8)",
+            (10, ..) => "a private address (10.0.0.0/8)",
+            (172, 16..=31, _) => "a private address (172.16.0.0/12)",
+            (192, 168, _) => "a private address (192.168.0.0/16)",
+            (100, 64..=127, _) => "a carrier-grade NAT address (100.64.0.0/10)",
+            (169, 254, _) => "a link-local address (169.254.0.0/16)",
+            (192, 0, 0) => "a protocol assignment address (192.0.0.0/24)",
+            (192, 0, 2) => "a documentation address (192.0.2.0/24)",
+            (198, 51, 100) => "a documentation address (198.51.100.0/24)",
+            (203, 0, 113) => "a documentation address (203.0.113.0/24)",
+            (198, 18..=19, _) => "a benchmarking address (198.18.0.0/15)",
+            (224..=239, ..) => "a multicast address (224.0.0.0/4)",
+            (240.., ..) => "a reserved address (240.0.0.0/4)",
             _ => return None,
         })
     }
 
     fn not_public_v6(ip: Ipv6Addr) -> Option<&'static str> {
-        let first = ip.segments()[0];
+        let segments = ip.segments();
+        let first = segments[0];
         if ip.is_unspecified() {
             Some("an unspecified address (::)")
         } else if ip.is_loopback() {
@@ -88,13 +95,17 @@ pub mod wan {
             Some("a unique local address (fc00::/7)")
         } else if first & 0xff00 == 0xff00 {
             Some("a multicast address (ff00::/8)")
+        } else if segments[..2] == [0x2001, 0xdb8] {
+            Some("a documentation address (2001:db8::/32)")
+        } else if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+            Some("a NAT64 address (64:ff9b::/96)")
         } else {
             None
         }
     }
 
     /// A `static` entry: a public address with its port,
-    /// `"203.0.113.7:7420"` or `"[2001:db8::1]:7420"`.
+    /// `"1.2.3.4:7420"` or `"[2a01:4f8::1]:7420"`.
     pub fn check_static(text: &str) -> Result<SocketAddr, String> {
         let text = text.trim();
         let addr: SocketAddr = text
@@ -144,8 +155,13 @@ pub mod wan {
                  Internet reaches"
             );
             assert_eq!(
-                check_static("[2001:db8::1]:7420"),
-                Ok("[2001:db8::1]:7420".parse().unwrap())
+                check_static("[2a01:4f8::1]:7420"),
+                Ok("[2a01:4f8::1]:7420".parse().unwrap())
+            );
+            assert_eq!(
+                check_static("[2001:db8::1]:7420").unwrap_err(),
+                "\"[2001:db8::1]:7420\" is a documentation address (2001:db8::/32), which no \
+                 device on the Internet reaches"
             );
         }
     }
