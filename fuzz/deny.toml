@@ -19,6 +19,8 @@ exceptions = [
   { crate = "spoolframe-media", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-catalog", allow = ["AGPL-3.0-or-later"] },
   { crate = "spoolframe-plex", allow = ["AGPL-3.0-or-later"] },
+  # wan::not_public, through spoolframe-plex: where a redirected image may go.
+  { crate = "spoolframe-admin-api", allow = ["AGPL-3.0-or-later"] },
   # Subtitle sync's aligner (PX-03), through spoolframe-media.
   { crate = "alass-core", allow = ["GPL-3.0-only"] },
   { crate = "spoolframe-fuzz", allow = ["AGPL-3.0-or-later"] },
