@@ -24,6 +24,16 @@
   30 s before it is asked for again, doubled at each failure in a row
   to at most an hour; after the pair's next sync it is asked for again,
   and a fetch of it that goes through starts its wait afresh.
+- Fixed: an app sometimes never listed a server on its network, however
+  long it waited. The SDK's mDNS lookup listens as soon as it is made,
+  but the SDK subscribed to it only once the client's endpoint was
+  bound. A server heard in between was never reported, and each later
+  answer, the same record again, was skipped as a repeat. A loaded host
+  can take a second to bind, so a server already announcing was not
+  listed. The SDK now subscribes at once. Also, a pinned server that was
+  dialled while it was down was not listed as on the network when it
+  came up during that dial: the lookup gave the record only to the dial.
+  What the lookup finds for a dial is now listed too.
 
 ## 0.15.0 (2026-10-25)
 

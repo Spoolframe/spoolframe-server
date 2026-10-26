@@ -345,7 +345,13 @@ impl Client {
                 .service_name(lan::MDNS_SERVICE)
                 .build(key.public())
                 .map_err(|e| cannot_bind(e.to_string()))?;
-            Some(mdns)
+            // Subscribed at once, before anything else awaits: the lookup
+            // listens from `build`, and what it hears before a subscription
+            // is never reported, nor are its repeats. A client subscribed
+            // only after binding its endpoint, which a loaded host can take
+            // over a second to do, never listed a server it heard meanwhile.
+            let discovery = Discovery::start(&mdns).await;
+            Some((mdns, discovery))
         } else {
             None
         };
@@ -374,19 +380,19 @@ impl Client {
             .await
             .map_err(|e| cannot_bind(e.to_string()))?;
         let discovery = match mdns {
-            Some(mdns) => {
+            Some((mdns, discovery)) => {
                 // The same lookup finds the addresses of servers being
-                // dialled.
+                // dialled, and what it finds for a dial is heard too.
                 endpoint
                     .address_lookup()
                     .map_err(|e| cannot_bind(e.to_string()))?
                     .add(RelayFiltered::new(
-                        mdns.clone(),
+                        discovery.overhearing(mdns),
                         relay_policy.clone(),
                         MDNS_LOOKUP,
                         reach.clone(),
                     ));
-                Discovery::start(&mdns).await
+                discovery
             }
             None => Discovery::off(),
         };

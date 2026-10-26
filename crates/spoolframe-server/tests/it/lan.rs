@@ -29,11 +29,12 @@ use spoolframe_protocol::lan;
 use spoolframe_types::ClientCapabilities;
 use support::{ServerOptions, TestServer, fresh_dir};
 
-/// How long a record may take to be heard. mDNS answers within a second
-/// or two on a quiet host; this is the bound, not the expected time. A
-/// browser asks again on a doubling backoff (1, 2, 4, 8, 16 s ...), so one
-/// answer lost on a loaded CI host can put the next one past 20 s: the
-/// bound leaves room for two more.
+/// How long a record may take to be heard: the bound, not the expected
+/// time. A browser asks every 0.7 s or so (swarm-discovery's interactive
+/// cadence) and the server answers each, so a record is heard within a
+/// second or two, and a lost answer costs one cadence. A record heard
+/// but not listed is never listed at all: past a few seconds, waiting
+/// longer does not help.
 const HEAR_WITHIN: Duration = Duration::from_secs(60);
 
 /// A listen-only mDNS browser on one service name, recording the user data
@@ -643,4 +644,67 @@ async fn a_server_on_the_network_says_who_it_is_before_sign_in() {
     client.close().await;
     elsewhere.stop().await;
     heard_here.stop().await;
+}
+
+/// How long a server already on the air may take to be listed by a
+/// client opened after it: a query and its answer, a cadence (0.7 s)
+/// apart, with room for a loaded host.
+const LISTED_WITHIN: Duration = Duration::from_secs(10);
+
+/// Whether `client` lists `id` as on the network within [`LISTED_WITHIN`].
+async fn listed_on_network(client: &Client, id: &str) -> Option<ServerEntry> {
+    tokio::time::timeout(LISTED_WITHIN, async {
+        loop {
+            let servers = client.servers().await.unwrap();
+            if let Some(e) = servers
+                .into_iter()
+                .find(|e| e.endpoint_id == id && e.on_network)
+            {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
+/// A pinned server is dialled while it is down, and comes up while the
+/// dial is still looking for it: it is listed as on the network too. The
+/// mDNS lookup gives what it hears to the dial that asked for it and not
+/// to the client's list, and skips every later answer as a repeat.
+#[tokio::test]
+async fn a_server_found_by_a_dial_is_listed_as_on_the_network() {
+    if !private_lan("a_server_found_by_a_dial_is_listed_as_on_the_network") {
+        return;
+    }
+    let dir = fresh_dir("dialled").await;
+    let server = TestServer::start_with(dir.clone(), on_lan("Den")).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = open(&storage).await;
+    let heard = entry(&client, &server, |e| e.on_network).await;
+    client.connect(&heard.endpoint_id).await.unwrap();
+    client.pin(&heard.endpoint_id, true).await.unwrap();
+    client.close().await;
+    server.stop().await;
+
+    // The app starts again while the server is down, and dials it.
+    let client = open(&storage).await;
+    let dialling = {
+        let client = client.clone();
+        let id = heard.endpoint_id.clone();
+        tokio::spawn(async move { while client.connect(&id).await.is_err() {} })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let server = TestServer::start_with(dir, on_lan("Den")).await;
+    tokio::time::timeout(HEAR_WITHIN, dialling)
+        .await
+        .expect("the dial never reached the server")
+        .unwrap();
+    let listed = listed_on_network(&client, &heard.endpoint_id)
+        .await
+        .expect("reached, but never listed as on the network");
+    assert!(listed.pinned, "{listed:?}");
+    client.close().await;
+    server.stop().await;
 }

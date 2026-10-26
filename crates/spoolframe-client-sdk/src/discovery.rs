@@ -1,10 +1,13 @@
 //! Servers heard on the LAN (P1-13).
 //!
 //! The mDNS lookup only reports what it hears after a subscription, and
-//! skips repeats of what it has already reported, so the SDK subscribes
-//! once, when the client opens, and keeps its own map for the life of the
-//! client. Records are untrusted hints: where to dial and which key to
-//! expect. Iroh proves the key on connect.
+//! skips repeats of what it has already heard, so the SDK subscribes once,
+//! as soon as the lookup is built, and keeps its own map for the life of
+//! the client. Nor does it report a server that a dial is looking up when
+//! it is heard: that record goes to the dial alone. So what the lookup
+//! answers a dial is heard too ([`Discovery::overhearing`]). Records are
+//! untrusted hints: where to dial and which key to expect. Iroh proves the
+//! key on connect.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -12,7 +15,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use iroh::EndpointId;
+use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use spoolframe_protocol::lan;
 use tokio::sync::watch;
@@ -50,18 +55,7 @@ impl Discovery {
                 let mut map = map.lock();
                 let changed = match event {
                     DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                        let Some(advert) = endpoint_info
-                            .user_data()
-                            .and_then(|data| lan::parse_advert(data.as_ref()))
-                        else {
-                            continue;
-                        };
-                        tracing::debug!(id = %endpoint_info.endpoint_id, name = advert.name, "heard a server");
-                        let heard = Heard {
-                            name: advert.name,
-                            addrs: endpoint_info.data.ip_addrs().copied().collect(),
-                        };
-                        map.insert(endpoint_info.endpoint_id, heard.clone()) != Some(heard)
+                        record(&mut map, &endpoint_info)
                     }
                     DiscoveryEvent::Expired { endpoint_id } => map.remove(&endpoint_id).is_some(),
                     _ => false,
@@ -76,6 +70,16 @@ impl Discovery {
             heard,
             changes,
             task: Some(task),
+        }
+    }
+
+    /// `mdns`, as the endpoint's lookup: what it answers a dial is heard
+    /// here as well, as if it had been reported.
+    pub fn overhearing(&self, mdns: MdnsAddressLookup) -> Overheard {
+        Overheard {
+            inner: mdns,
+            heard: self.heard.clone(),
+            changes: self.changes.clone(),
         }
     }
 
@@ -111,6 +115,50 @@ impl Discovery {
 
     pub fn get(&self, id: &EndpointId) -> Option<Heard> {
         self.heard.lock().get(id).cloned()
+    }
+}
+
+/// `info` in `map`, if it is a Spoolframe server's record. Whether that
+/// changed what is heard.
+fn record(map: &mut HashMap<EndpointId, Heard>, info: &EndpointInfo) -> bool {
+    let Some(advert) = info
+        .user_data()
+        .and_then(|data| lan::parse_advert(data.as_ref()))
+    else {
+        return false;
+    };
+    tracing::debug!(id = %info.endpoint_id, name = advert.name, "heard a server");
+    let heard = Heard {
+        name: advert.name,
+        addrs: info.data.ip_addrs().copied().collect(),
+    };
+    map.insert(info.endpoint_id, heard.clone()) != Some(heard)
+}
+
+/// The mDNS lookup, with what it answers a dial recorded as heard
+/// ([`Discovery::overhearing`]).
+#[derive(Debug)]
+pub(crate) struct Overheard {
+    inner: MdnsAddressLookup,
+    heard: HeardMap,
+    changes: watch::Sender<u64>,
+}
+
+impl AddressLookup for Overheard {
+    fn publish(&self, data: &EndpointData) {
+        self.inner.publish(data);
+    }
+
+    fn resolve(&self, id: EndpointId) -> Option<BoxStream<'static, Result<Item, Error>>> {
+        let (heard, changes) = (self.heard.clone(), self.changes.clone());
+        let items = self.inner.resolve(id)?.inspect(move |item| {
+            if let Ok(item) = item
+                && record(&mut heard.lock(), item.endpoint_info())
+            {
+                changes.send_modify(|n| *n += 1);
+            }
+        });
+        Some(Box::pin(items))
     }
 }
 
