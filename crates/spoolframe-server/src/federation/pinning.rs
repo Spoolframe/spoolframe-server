@@ -625,8 +625,13 @@ async fn a_refused_server_id_forges_no_log_line() {
     let _logged = tracing::subscriber::set_default(subscriber);
     let forged = Answering::start(30, "bad\nWARN forged: an admin paired a stranger").await;
     let (_, federation, peer, _) = bob_s("fed-pin-forged", &forged).await;
-    assert!(federation.refresh(&peer.id).await.is_err());
+    let refreshed = federation.refresh(&peer.id).await;
     let text = String::from_utf8(buffer.0.lock().clone()).unwrap();
+    // Failed once on CI with no refusal logged: say how, if it fails so.
+    assert!(
+        matches!(refreshed, Err(ReplicaError::OtherServer(_))),
+        "{refreshed:?}\n{text}"
+    );
     let refused: Vec<&str> = text
         .lines()
         .filter(|l| l.contains("answered under another server id"))
