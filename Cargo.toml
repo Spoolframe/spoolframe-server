@@ -293,11 +293,15 @@ debug = "line-tables-only"
 # symbols stripped, no debug info, and one codegen unit with LTO for a
 # small download. Its own profile, so the server's release build keeps its
 # usual settings (scribe met the abort first, and put these on release).
+# Strip debug info only, not symbols: since LLVM 23 (rust-overlay's 1.99.1)
+# `strip = "symbols"` also drops the `__wasm_bindgen_unstable` custom
+# section, and wasm-bindgen then fails ("doesn't have an adapter listed").
+# wasm-opt, run after wasm-bindgen, still shrinks the module.
 [profile.wasm-release]
 inherits = "release"
 lto = true
 codegen-units = 1
-strip = "symbols"
+strip = "debuginfo"
 debug = false
 opt-level = "z"
 
