@@ -58,6 +58,30 @@
   while the paired server is offline. Admin API: `catalogPairedLibraries`,
   `catalogPairedItems`, `catalogPairedItem`, and `catalogFilterValues`
   for a `fed:` library; `NOT_CONFIGURED` with federation off.
+- Changed: `federation.refresh` (Refresh on a paired server's page) no
+  longer needs a recent sign-in, as `peerDetail` and `grantList` do not.
+  It only syncs again with a server paired already: it reaches no
+  stranger and spends no stranger's budget, as `lookUp` and `redeem`
+  do. There is no cooldown; a sync already runs one at a time per pair.
+- Fixed: on the setup page, saving the first password more than ten
+  minutes after the passkey was made said "Confirm it is you first."
+  and offered no way to do it. It now opens "Confirm it's you", and the
+  password is saved once the admin confirms. Every other web action
+  that needs a recent sign-in already did this.
+- Changed: in the web UI, Federation is a section of the sidebar (and
+  the phone's menu) of its own, after Users and devices, rather than a
+  page under it. It is still shown only while `experimental.federation`
+  is on, and a paired server's page marks it as the current section.
+  The URLs (`/federation`, `/federation/<id>`) are as they were.
+- Changed: a library shared with a paired server, or no longer shared,
+  reaches that server within seconds, not at its next hourly sync. On
+  `grantAdd`, `grantRevoke` or an app's `share_libraries`, the server
+  sends a new `shares_changed` notice (federation/1) on the connection
+  it holds to the pair; the pair syncs it soon, at most once per 30 s,
+  and coalesces notices within that time into one sync. A pair that is
+  offline is not told and syncs on connecting. An older server refuses
+  the notice, which changes nothing, and syncs at its interval as
+  before.
 
 ## 0.15.1 (2026-10-25)
 

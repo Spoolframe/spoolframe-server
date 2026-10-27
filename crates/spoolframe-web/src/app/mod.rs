@@ -64,7 +64,7 @@ use settings::{Settings, SettingsHome};
 use wizard::{Mode, Steps, WizardLayout};
 
 use crate::logic::{ApiError, Landing, avatar_class, landing, setup_without_passkeys};
-use crate::setup;
+use crate::{nav, setup};
 
 const STYLES: Asset = asset!("/assets/tailwind.css");
 /// The design's fonts, carried with the bundle (the build copies them in
@@ -118,8 +118,9 @@ enum Route {
             // Invites (P6-01): under Users and devices in the sidebar.
             #[route("/invites")]
             Invites {},
-            // Federation (P8-01, experimental): under Users and devices,
-            // in the sidebar while the server has it on.
+            // Federation (P8-01, experimental): a section of the sidebar
+            // of its own while the server has it on. Its URLs were
+            // top-level already, under Users and devices too.
             #[route("/federation")]
             Federation {},
             // A paired server's own page, linked from its card.
@@ -1119,6 +1120,24 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
             busy.set(false);
         });
     };
+    // A first password needs a recent sign-in: the passkey made one, but
+    // an admin who waits past it before saving is asked to confirm it is
+    // them, and the password is saved again once they have.
+    let confirming = use_signal(|| None::<String>);
+    let mut set_first_password = move || {
+        busy.set(true);
+        spawn(async move {
+            match first_password(password()).await {
+                Ok(()) => {
+                    has_password.set(true);
+                    typing.set(false);
+                }
+                Err(e) if profile::asks_to_confirm(&e, confirming, "setting your password") => {}
+                Err(e) => error.set(Some(e.explain())),
+            }
+            busy.set(false);
+        });
+    };
     let save_password = move |_| {
         if password() != again() {
             error.set(Some("The passwords are not the same.".into()));
@@ -1130,17 +1149,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
             typing.set(false);
             return;
         }
-        busy.set(true);
-        spawn(async move {
-            match first_password(password()).await {
-                Ok(()) => {
-                    has_password.set(true);
-                    typing.set(false);
-                }
-                Err(e) => error.set(Some(e.explain())),
-            }
-            busy.set(false);
-        });
+        set_first_password();
     };
     let finish = move |_| {
         let shown = match crate::setup::display_name(&display()) {
@@ -1240,6 +1249,7 @@ fn MethodsSetup(name: String, setup_code: String) -> Element {
                 }
             }
         }
+        profile::ConfirmItsYou { asking: confirming, on_confirmed: move |_| set_first_password() }
     }
 }
 
@@ -1439,6 +1449,7 @@ fn SignedIn(user: UserInfo) -> Element {
         let here = match (&route, &to) {
             (Route::UserSessions { .. }, Route::Users {}) => true,
             (Route::PlaylistView { .. }, Route::MyPlaylists {}) => true,
+            (Route::FederationPeer { .. }, Route::Federation {}) => true,
             (a, b) => a == b,
         };
         let class = match (here, divider) {
@@ -1479,10 +1490,37 @@ fn SignedIn(user: UserInfo) -> Element {
         _ => title.to_owned(),
     };
     let site = use_resource(site);
-    // Federation's page is in the sidebar while the server has it on
+    // Federation is a section of the sidebar while the server has it on
     // (P8-01, experimental).
     let federation = use_resource(move || async move { admin && federation_on().await });
     let federation = federation.read().unwrap_or(false);
+    // The sidebar's sections, each with its sub-pages under it: drawn the
+    // same in the sidebar and in the phone's drawer.
+    let sections = || -> Vec<Element> {
+        nav::sections(federation)
+            .into_iter()
+            .map(|section| {
+                let to = match section {
+                    nav::Section::Overview => Route::AdminHome {},
+                    nav::Section::UsersAndDevices => Route::Users {},
+                    nav::Section::Federation => Route::Federation {},
+                    nav::Section::Server => Route::Server {},
+                    nav::Section::Plex => plex_page(),
+                    nav::Section::MyProfile => Route::Profile {},
+                    nav::Section::MyPlaylists => Route::MyPlaylists {},
+                };
+                let under = match section {
+                    nav::Section::UsersAndDevices => users_links(&route),
+                    nav::Section::Server => server_links(&route),
+                    _ => rsx! {},
+                };
+                rsx! {
+                    {link(to, section.label(), section.divided())}
+                    {under}
+                }
+            })
+            .collect()
+    };
     let insecure = admin && site.read().as_ref().is_some_and(|s| s.insecure_cookies);
     // Plain HTTP across the network (PX-23) says more than insecure
     // cookies do, and takes that banner's place: turning them off there
@@ -1548,14 +1586,7 @@ fn SignedIn(user: UserInfo) -> Element {
                     }
                 }
                 nav { class: "flex flex-col gap-0.5",
-                    {link(Route::AdminHome {}, "Overview", false)}
-                    {link(Route::Users {}, "Users and devices", false)}
-                    {users_links(&route, federation)}
-                    {link(Route::Server {}, "Server", false)}
-                    {server_links(&route)}
-                    {link(plex_page(), "Plex", false)}
-                    {link(Route::Profile {}, "My profile", true)}
-                    {link(Route::MyPlaylists {}, "My playlists", false)}
+                    {sections().into_iter()}
                 }
                 div { class: "mt-auto flex items-center gap-2.5 rounded-[10px] bg-ctp-base p-2",
                     span { class: avatar, "{initial(&name)}" }
@@ -1591,14 +1622,7 @@ fn SignedIn(user: UserInfo) -> Element {
                 div { class: "drawer-scrim md:hidden", aria_hidden: "true", onclick: move |_| menu.set(false) }
                 // A link's click comes up here once it has navigated.
                 nav { class: "drawer md:hidden", aria_label: "Admin", onclick: move |_| menu.set(false),
-                    {link(Route::AdminHome {}, "Overview", false)}
-                    {link(Route::Users {}, "Users and devices", false)}
-                    {users_links(&route, federation)}
-                    {link(Route::Server {}, "Server", false)}
-                    {server_links(&route)}
-                    {link(plex_page(), "Plex", false)}
-                    {link(Route::Profile {}, "My profile", true)}
-                    {link(Route::MyPlaylists {}, "My playlists", false)}
+                    {sections().into_iter()}
                 }
             }
             main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1600px] p-3.5 md:px-10 md:py-8",
@@ -1633,24 +1657,15 @@ fn plex_page() -> Route {
 }
 
 /// Users and devices' sub-page in the sidebar, one step in: Invites
-/// (P6-01).
-fn users_links(route: &Route, federation: bool) -> Element {
-    let class = |here: bool| {
-        if here {
-            "nav-link nav-link-here nav-sub"
-        } else {
-            "nav-link nav-sub"
-        }
+/// (P6-01). Federation is a section of its own ([`nav::sections`]).
+fn users_links(route: &Route) -> Element {
+    let class = if matches!(route, Route::Invites {}) {
+        "nav-link nav-link-here nav-sub"
+    } else {
+        "nav-link nav-sub"
     };
     rsx! {
-        Link { class: class(matches!(route, Route::Invites {})), to: Route::Invites {}, "Invites" }
-        if federation {
-            Link {
-                class: class(matches!(route, Route::Federation {} | Route::FederationPeer { .. })),
-                to: Route::Federation {},
-                "Federation"
-            }
-        }
+        Link { class, to: Route::Invites {}, "Invites" }
     }
 }
 

@@ -546,6 +546,24 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 }
             }
             (
+                PeerRequest::SharesChanged,
+                Some(Said {
+                    server_id,
+                    standing: Standing::Paired,
+                    ..
+                }),
+            ) => {
+                within(
+                    &server_id,
+                    "shares changed",
+                    by,
+                    self.shares.shares_changed(&server_id, endpoint),
+                    (),
+                )
+                .await;
+                (PeerReply::Done, After::Next)
+            }
+            (
                 PeerRequest::Sync(sync),
                 Some(Said {
                     server_id,

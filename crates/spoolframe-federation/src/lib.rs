@@ -170,6 +170,14 @@ pub trait Shares: Send + Sync + 'static {
         assertion: &AssertUser,
     ) -> Result<TokenGranted, AssertionRefused>;
 
+    /// `peer` says what it shares with this server changed (a grant added
+    /// or revoked): sync it soon, at most once per
+    /// [`SHARES_CHANGED_EVERY`](spoolframe_protocol::federation::SHARES_CHANGED_EVERY),
+    /// notices meanwhile coalesced. Nothing is read from the notice: the
+    /// sync asks what it shares as ever. Ignored unless the server says
+    /// otherwise.
+    async fn shares_changed(&self, _peer: &ServerId, _endpoint: EndpointId) {}
+
     /// One of `peer`'s users searches subtitles for an item of this
     /// server's (P8-07): its results, or the client protocol's refusal.
     /// Not answered unless the server says otherwise.

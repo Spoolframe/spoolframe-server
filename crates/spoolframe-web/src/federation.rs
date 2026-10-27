@@ -1,4 +1,4 @@
-//! Users and devices › Federation (P8-01), apart from the page: the
+//! Federation (P8-01), apart from the page: the
 //! servers paired with this one in words, what a refused pairing says,
 //! the check before pairing, and a paired server's own page (the
 //! WebFederationPeer, WebFederationPair and WebFederationStates boards). Experimental: the page is in the sidebar only while the server

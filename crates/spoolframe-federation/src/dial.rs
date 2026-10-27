@@ -189,6 +189,16 @@ impl Dialed {
         }
     }
 
+    /// Tell the other server what this one shares with it changed: it
+    /// syncs this one soon. One that does not know the notice resets its
+    /// stream, an error here the sender can let go.
+    pub async fn shares_changed(&self) -> Result<(), DialError> {
+        match self.ask(&PeerRequest::SharesChanged).await? {
+            PeerReply::Done => Ok(()),
+            _ => Err(DialError::OutOfTurn),
+        }
+    }
+
     /// The libraries the other server shares with this one now (P8-02),
     /// cut to the bounds.
     pub async fn libraries(&self) -> Result<Vec<SharedLibrary>, DialError> {

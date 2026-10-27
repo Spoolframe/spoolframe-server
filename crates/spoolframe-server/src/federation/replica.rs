@@ -4,8 +4,10 @@
 //!
 //! It syncs on connecting (at start, and each time the connection is made
 //! again), then every `federation.sync_interval_secs` (an hour by
-//! default, a live setting), and when an admin asks
-//! ([`Federation::refresh`]). An origin is online while a connection to
+//! default, a live setting), when an admin asks
+//! ([`Federation::refresh`]), and when the origin says what it shares
+//! with this server changed ([`Notices`]: at most once per
+//! [`SHARES_CHANGED_EVERY`]). An origin is online while a connection to
 //! it is open; one that cannot be dialled is tried again later, less
 //! often each time. A library the origin no longer lists, or refuses as
 //! not shared, is dropped from the cache, keeping the items a user here
@@ -17,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, stream};
 use spoolframe_federation::{DialError, Dialed, Pages};
-use spoolframe_protocol::federation::{SharedLibrary, Standing, SyncLibrary, SyncMode, SyncPage};
+use spoolframe_protocol::federation::{
+    SHARES_CHANGED_EVERY, SharedLibrary, Standing, SyncLibrary, SyncMode, SyncPage,
+};
 use spoolframe_types::MediaId;
 
 use super::exposure::WEEK_DAYS;
@@ -159,6 +163,62 @@ impl Tended {
     }
 }
 
+/// The pairs that said what they share with this server changed
+/// ([`SharesChanged`](spoolframe_protocol::federation::PeerRequest::SharesChanged)),
+/// by pair id: each sets off a sync at the replica's next look, at most one
+/// per [`SHARES_CHANGED_EVERY`] per pair. Notices within it wait for its
+/// end and are one sync then, so a pair that sends them without end makes
+/// this server sync it no more often than that.
+#[derive(Debug, Default)]
+pub(super) struct Notices(parking_lot::Mutex<HashMap<String, Noticed>>);
+
+#[derive(Debug, Default)]
+struct Noticed {
+    /// A notice came that no sync has answered yet.
+    waiting: bool,
+    /// When a notice last set off a sync.
+    synced: Option<Instant>,
+}
+
+impl Notices {
+    /// Pair `peer` sent a notice.
+    pub(super) fn noticed(&self, peer: &str) {
+        self.0.lock().entry(peer.to_owned()).or_default().waiting = true;
+    }
+
+    /// Whether a notice of `peer`'s sets off a sync at `now`: one waits,
+    /// and the last sync a notice set off was [`SHARES_CHANGED_EVERY`] ago
+    /// or more. Taken if so.
+    fn take(&self, peer: &str, now: Instant) -> bool {
+        let mut notices = self.0.lock();
+        let Some(noticed) = notices.get_mut(peer) else {
+            return false;
+        };
+        let soon = noticed
+            .synced
+            .is_some_and(|at| now.saturating_duration_since(at) < SHARES_CHANGED_EVERY);
+        if !noticed.waiting || soon {
+            return false;
+        }
+        noticed.waiting = false;
+        noticed.synced = Some(now);
+        true
+    }
+
+    /// A sync of `peer` begins for another reason: it answers the notices
+    /// that came before it, as it asks what the pair shares afresh.
+    fn answered(&self, peer: &str) {
+        if let Some(noticed) = self.0.lock().get_mut(peer) {
+            noticed.waiting = false;
+        }
+    }
+
+    /// Only the pairs `live` keeps.
+    fn retain(&self, live: impl Fn(&str) -> bool) {
+        self.0.lock().retain(|peer, _| live(peer));
+    }
+}
+
 fn retry_after(failures: u32) -> Duration {
     FIRST_RETRY
         .saturating_mul(1 << failures.saturating_sub(1).min(16))
@@ -276,6 +336,7 @@ impl Federation {
             }
         };
         tended.retain(|id, _| peers.iter().any(|p| &p.id == id));
+        self.notices.retain(|id| peers.iter().any(|p| p.id == id));
         let now = self.store().clock().now();
         for peer in peers {
             let state = tended
@@ -414,7 +475,13 @@ impl Federation {
         let due = state
             .last_sync
             .is_none_or(|at| now.duration_since(at) >= self.sync_every());
-        if !connected || due {
+        // The pair said what it shares changed: sooner than its interval,
+        // but at most once per SHARES_CHANGED_EVERY.
+        let noticed = self.notices.take(&peer.id, now);
+        if !connected || due || noticed {
+            if !noticed {
+                self.notices.answered(&peer.id);
+            }
             match self.sync_live(peer).await {
                 Ok(()) => {
                     state.last_sync = Some(clock.now());
@@ -1452,5 +1519,38 @@ mod tests {
         assert_eq!(retry_after(1), FIRST_RETRY);
         assert_eq!(retry_after(2), FIRST_RETRY * 2);
         assert_eq!(retry_after(40), MAX_RETRY);
+    }
+
+    /// A pair's notices: the first sets off a sync, those within
+    /// SHARES_CHANGED_EVERY after it are one sync at its end, and a sync
+    /// for another reason answers those that wait. Another pair's are its
+    /// own.
+    #[test]
+    fn a_pair_s_notices_are_one_sync_per_interval_at_most() {
+        let notices = Notices::default();
+        let start = Instant::now();
+        assert!(!notices.take("a", start), "none came");
+        notices.noticed("a");
+        assert!(notices.take("a", start));
+        assert!(!notices.take("a", start), "taken");
+        for _ in 0..3 {
+            notices.noticed("a");
+        }
+        notices.noticed("b");
+        assert!(notices.take("b", start));
+        let soon = start + SHARES_CHANGED_EVERY - Duration::from_secs(1);
+        assert!(!notices.take("a", soon));
+        let then = start + SHARES_CHANGED_EVERY;
+        assert!(notices.take("a", then));
+        assert!(
+            !notices.take("a", then + SHARES_CHANGED_EVERY),
+            "the three were one"
+        );
+        notices.noticed("a");
+        notices.answered("a");
+        assert!(!notices.take("a", then + SHARES_CHANGED_EVERY));
+        notices.retain(|peer| peer == "b");
+        notices.noticed("b");
+        assert!(!notices.take("b", start + Duration::from_secs(1)));
     }
 }

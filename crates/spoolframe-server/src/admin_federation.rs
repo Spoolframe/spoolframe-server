@@ -1,4 +1,4 @@
-//! Users and devices › Federation (P8-01): the `federation_*` methods,
+//! Federation (P8-01): the `federation_*` methods,
 //! over [`crate::federation::Federation`]. Experimental: without it
 //! (`experimental.federation` off) each is `NOT_CONFIGURED`.
 
@@ -383,8 +383,11 @@ impl FederationApiServer for AdminApi {
     }
 
     async fn peer_refresh(&self, ext: &Extensions, id: String) -> RpcResult<()> {
-        // As `look_up`: it dials the pair, and writes the cache (F8-09).
-        self.recent_admin(ext).await?;
+        // Unlike `look_up` and `redeem`, no recent sign-in: it syncs again
+        // with a server paired already, as the replica does each hour. It
+        // reaches no stranger and spends no stranger's budget, and its
+        // sync runs one at a time per pair, under the replica's lock.
+        self.admin(ext).await?;
         self.federation()?.refresh(&id).await.map_err(replica_error)
     }
 }

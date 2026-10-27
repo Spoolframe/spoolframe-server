@@ -3370,8 +3370,10 @@ and server id, paired by the invite's maker; SB keeps SA's as the link
 and `info` gave them, paired by the admin who redeemed.
 
 The admin API's `federation` methods are admins'. `peerList`,
-`peerDetail` and `grantList` need nothing more; every other needs a
-recent sign-in, checked first. They are `NOT_CONFIGURED` while the
+`peerDetail`, `grantList` and `refresh` need nothing more; every other
+needs a recent sign-in, checked first. `refresh` only syncs again with a
+server paired already: it reaches no stranger, and spends no stranger's
+budget, as `lookUp` and `redeem` do. They are `NOT_CONFIGURED` while the
 switch is off. `redeem` refused by the other server is
 `PAIRING_REFUSED`, `data.reason` its reason (`invite_invalid`,
 `already_paired`, `key_held`, `key_refused`, `server_id_changed`,
@@ -3459,9 +3461,9 @@ for a library not shared). A grant revoked, or the pair unpaired, also
 deletes the play tokens SA minted for that library's items.
 
 SA keeps no change feed. SB asks, on a live pair's connection, on
-connecting, every `federation.sync_interval_secs` (an hour by default)
-and on `federation.refresh { id }` (an admin's, signed in recently: it
-dials the pair and writes the cache):
+connecting, every `federation.sync_interval_secs` (an hour by default),
+when SA says its grants changed (below) and on `federation.refresh { id }` (an admin's, with no recent sign-in:
+it dials only the pair, and writes only its cache):
 
 - `libraries` `{}`: `libraries { libraries }`, each `{id, title, kind}`,
   at most 256. A library SB has cached and that is no longer listed is
@@ -3509,6 +3511,25 @@ dials the pair and writes the cache):
   for again after SA's next sync, its wait still growing, and a fetch
   of it that goes through starts its wait afresh. An `unavailable`
   also ends that sweep: the rest wait for the replica's next tick.
+
+When a grant is added or revoked (`grantAdd`, `grantRevoke`, or an
+app's `share_libraries`), SA tells SB at once, on the connection SA
+holds to SB as SB's own replica, without waiting for the answer:
+
+- `shares_changed` `{}`: what the sender shares with the receiver
+  changed; it carries nothing, and is answered `done`. The receiver syncs
+  the sender soon, as it would at its interval (`libraries`, then
+  `sync`), at most once per 30 s per pair: a notice within 30 s of the
+  last sync a notice set off waits for the 30 s to end, and any number
+  of them are one sync then. A sync for another reason answers the
+  notices before it. Only a live pair's notice is heard; a stranger's is
+  reset and counted as any other request of a stranger's past `hello`.
+
+It is best effort. SA holds no connection to SB while SB is offline, or
+SA cannot dial it: SB is not told, and syncs on connecting or at its
+interval. A server older than this request resets its stream
+`NOT_ALLOWED`, which counts nothing against a pair, and SA lets it go:
+the older server syncs at its interval, as before.
 
 A connection answers at most 16 streams at once: one past them is reset
 `BUSY` (3), and not counted against its endpoint. One pair's connections

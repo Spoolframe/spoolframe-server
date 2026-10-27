@@ -1546,7 +1546,12 @@ mod admin {
                 .unwrap()
                 .is_empty()
         );
-        // SB's admin syncs what SA shares now (P8-02).
+        // SB's admin syncs what SA shares now (P8-02), signed in long
+        // ago: a refresh syncs with a server paired already, and reaches
+        // no stranger.
+        sb.server
+            .clock
+            .advance(spoolframe_server::auth::RECENT_SIGN_IN + Duration::from_secs(1));
         sb.admin.peer_refresh(sa_on_sb).await.unwrap();
         assert_eq!(
             code(sb.admin.peer_refresh("no-such".into()).await.unwrap_err()),
@@ -1589,7 +1594,7 @@ mod admin {
     }
 
     /// What changes a pair needs an admin who signed in recently; a
-    /// consumer is told no; listing needs neither recency nor change.
+    /// consumer is told no; listing and a refresh need no recency.
     #[tokio::test]
     async fn changes_need_a_recent_admin_and_a_consumer_gets_nothing() {
         let sa = Site::start("fed-admin-recent", "Alice's server", "alice", true).await;
@@ -1640,14 +1645,18 @@ mod admin {
             sa.admin
                 .peer_grant_revoke("x".into(), "plex:1".into())
                 .await,
-            // It dials the pair and writes the cache (F8-09).
-            sa.admin.peer_refresh("x".into()).await,
         ] {
             assert_eq!(
                 code(refused.unwrap_err()),
                 error_code::RECENT_SIGN_IN_REQUIRED
             );
         }
+        // A refresh only syncs again with a server paired already: past
+        // the admin check, to the pair it names.
+        assert_eq!(
+            code(sa.admin.peer_refresh("x".into()).await.unwrap_err()),
+            error_code::NO_SUCH_PEER
+        );
         sa.server.stop().await;
     }
 
@@ -2191,6 +2200,7 @@ mod replica {
 
     use spoolframe_catalog::{Catalog, CatalogError, Page};
     use spoolframe_plex::PlexCatalog;
+    use spoolframe_protocol::federation::SHARES_CHANGED_EVERY;
     use spoolframe_protocol::{Reply, SessionId};
     use spoolframe_server::catalog::{Composite, LiveCatalog, PlexSource};
     use spoolframe_server::store::watch::WatchUpdate;
@@ -4194,6 +4204,110 @@ mod replica {
         ));
         pair.refresh().await;
         assert_eq!(pair.titles("plex:1").await.unwrap(), ["Alien"]);
+        pair.stop().await;
+    }
+
+    impl Pair {
+        /// SA shares Movies and SB synced it; each holds its connection
+        /// to the other, and SB's own sync on connecting is over: from
+        /// here SB syncs again only when it is told to, or in an hour.
+        async fn settled(&self) {
+            self.share("plex:1").await;
+            self.refresh().await;
+            let sb = self.sb.server_id.as_str();
+            // SA dials SB at its replica's next tick: woken, at once.
+            federation(&self.sa).set_replica(
+                std::time::Duration::from_secs(3600),
+                spoolframe_server::store::federation_cache::FileLimits {
+                    per_origin: 1 << 30,
+                    total: 1 << 30,
+                },
+            );
+            until(|| async {
+                federation(&self.sa).online(sb) && federation(&self.sb).online(self.origin())
+            })
+            .await;
+            // The replica's sync on connecting, a few milliseconds after
+            // the pairing: a second is far past it.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        /// When SB last synced SA's `library` whole, by SB's clock; `None`
+        /// while it is not cached.
+        async fn synced_at(&self, library: &str) -> Option<i64> {
+            self.sb
+                .store
+                .cached_libraries(Some(self.origin()))
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|l| l.library == library)
+                .and_then(|l| l.synced_at)
+        }
+
+        /// SB's clock moved on by `by`.
+        fn later(&self, by: Duration) {
+            self.sb.clock.advance(by);
+        }
+    }
+
+    /// A grant added on SA reaches SB at once: SA tells SB on the
+    /// connection it holds, and SB syncs SA without waiting for its hour
+    /// or a Refresh. A grant revoked takes the library away as soon.
+    #[tokio::test]
+    async fn a_grant_added_or_revoked_reaches_the_paired_server_at_once() {
+        let pair = Pair::start("fed-replica-grant-notice").await;
+        pair.sa.catalog.serve_music();
+        pair.settled().await;
+        assert_eq!(pair.synced_at("plex:2").await, None);
+
+        pair.share("plex:2").await;
+        until(|| async { pair.synced_at("plex:2").await.is_some() }).await;
+
+        // Past the least time between two syncs a notice sets off.
+        pair.later(SHARES_CHANGED_EVERY + Duration::from_secs(1));
+        federation(&pair.sa)
+            .unshare(&pair.sb_on_sa, "plex:2", "alice")
+            .await
+            .unwrap()
+            .unwrap();
+        until(|| async { pair.synced_at("plex:2").await.is_none() }).await;
+        assert!(pair.synced_at("plex:1").await.is_some());
+        pair.stop().await;
+    }
+
+    /// Notices are coalesced: one sets off a sync at once, those within
+    /// [`SHARES_CHANGED_EVERY`] after it wait for its end and are one
+    /// sync then, however many came.
+    #[tokio::test]
+    async fn notices_of_grants_changed_are_coalesced() {
+        let pair = Pair::start("fed-replica-grant-notices").await;
+        pair.settled().await;
+        let first = pair.synced_at("plex:1").await.unwrap();
+
+        // Shared again, the grant is kept, and SB is told all the same.
+        pair.later(Duration::from_secs(2));
+        pair.share("plex:1").await;
+        until(|| async { pair.synced_at("plex:1").await > Some(first) }).await;
+        let second = pair.synced_at("plex:1").await.unwrap();
+
+        pair.later(Duration::from_secs(2));
+        for _ in 0..3 {
+            pair.share("plex:1").await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(pair.synced_at("plex:1").await, Some(second), "not yet");
+
+        pair.later(SHARES_CHANGED_EVERY);
+        pair.wake_replica();
+        until(|| async { pair.synced_at("plex:1").await > Some(second) }).await;
+        let third = pair.synced_at("plex:1").await.unwrap();
+
+        // The three were one sync: none follows.
+        pair.later(SHARES_CHANGED_EVERY + Duration::from_secs(1));
+        pair.wake_replica();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(pair.synced_at("plex:1").await, Some(third));
         pair.stop().await;
     }
 

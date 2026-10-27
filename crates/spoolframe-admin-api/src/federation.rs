@@ -1,4 +1,4 @@
-//! Users and devices › Federation (P8-01): the servers paired with this
+//! Federation (P8-01): the servers paired with this
 //! one, pairing with another by its invite link, unpairing, and the new
 //! keys held for a paired server until the admin confirms one; the
 //! libraries shared with each (P8-03), and syncing what each shares with
@@ -6,7 +6,8 @@
 //! `NOT_CONFIGURED` while `experimental.federation` is off.
 //!
 //! Admins only (`FORBIDDEN`). What changes a pair needs a recent sign-in
-//! (`RECENT_SIGN_IN_REQUIRED`), as `inviteCreate` does; listing does not.
+//! (`RECENT_SIGN_IN_REQUIRED`), as `inviteCreate` does; listing, and a
+//! `refresh` of a server paired already, do not.
 
 use serde::{Deserialize, Serialize};
 
@@ -324,7 +325,9 @@ pub trait FederationApi {
 
     /// Share `library`, one of this server's, with paired server `peer`:
     /// its users may browse and watch it from now on. Shared already, the
-    /// grant is kept as it was. The grant. `NO_SUCH_PEER` for a server
+    /// grant is kept as it was. A connected server is told to sync this
+    /// one soon (`shares_changed`), so it lists the library within
+    /// seconds, not at its interval. The grant. `NO_SUCH_PEER` for a server
     /// that is not paired; `INVALID_INPUT` for a library this server does
     /// not serve.
     #[method(name = "grantAdd", with_extensions)]
@@ -335,7 +338,8 @@ pub trait FederationApi {
     ) -> jsonrpsee::core::RpcResult<GrantEntry>;
 
     /// Stop sharing `library` with paired server `peer`. Its cached copy
-    /// on that server goes at that server's next sync. `NO_SUCH_GRANT`
+    /// on that server goes at that server's next sync, which a connected
+    /// server is told to make soon (`shares_changed`). `NO_SUCH_GRANT`
     /// for a library not shared with it.
     #[method(name = "grantRevoke", with_extensions)]
     async fn peer_grant_revoke(
@@ -348,9 +352,10 @@ pub trait FederationApi {
     /// the replica does on connecting and every
     /// `federation.sync_interval_secs`: dial it if it is offline, drop
     /// the libraries it no longer shares, and sync the others. Admins
-    /// only, signed in recently, as for any change of a pair's
-    /// (`RECENT_SIGN_IN_REQUIRED`). `NO_SUCH_PEER` for one that is not paired; `UNAVAILABLE` when
-    /// it cannot be reached, or does not pair with this server now.
+    /// only, with no recent sign-in: it syncs again with a server paired
+    /// already, and reaches no stranger, as `lookUp` and `redeem` do.
+    /// `NO_SUCH_PEER` for one that is not paired; `UNAVAILABLE` when it
+    /// cannot be reached, or does not pair with this server now.
     #[method(name = "refresh", with_extensions)]
     async fn peer_refresh(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 }

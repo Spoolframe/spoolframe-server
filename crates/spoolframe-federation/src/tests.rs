@@ -103,6 +103,8 @@ impl Strangers for FakeStrangers {
 #[derive(Default)]
 struct FakeShares {
     held: Held,
+    /// The servers that said what they share changed, in order.
+    noticed: parking_lot::Mutex<Vec<String>>,
 }
 
 /// Where a test holds the fake's syncs: how many are at it now, how many
@@ -197,6 +199,10 @@ fn film(n: usize) -> RemoteItem {
 
 #[async_trait::async_trait]
 impl Shares for FakeShares {
+    async fn shares_changed(&self, peer: &ServerId, _endpoint: EndpointId) {
+        self.noticed.lock().push(peer.to_string());
+    }
+
     async fn libraries(
         &self,
         peer: &ServerId,
@@ -912,6 +918,30 @@ async fn a_stranger_is_reset_on_replication() {
         Err(DialError::Broken(_))
     ));
     assert_eq!(sa.strays(), 3);
+}
+
+/// A pair's notice that its shares changed is answered `Done` and handed
+/// to the server; a stranger's is reset and counted, as anything else of
+/// a stranger's past `Hello`.
+#[tokio::test]
+async fn a_pair_s_notice_of_shares_changed_is_heard_and_a_stranger_s_is_reset() {
+    let sa = Sa::start().await;
+    let sb = endpoint(Vec::new()).await;
+    let (stranger, _) = dial(&sa, &sb, SB_ID).await;
+    assert!(matches!(
+        stranger.shares_changed().await,
+        Err(DialError::Broken(_))
+    ));
+    assert_eq!(sa.strays(), 1);
+    assert!(sa.shares.noticed.lock().is_empty());
+    sa.peers
+        .paired
+        .lock()
+        .insert(sb.id(), ServerId::parse(SB_ID).unwrap());
+    let (dialed, _) = dial(&sa, &sb, SB_ID).await;
+    dialed.shares_changed().await.unwrap();
+    assert_eq!(*sa.shares.noticed.lock(), [SB_ID]);
+    assert_eq!(sa.strays(), 1);
 }
 
 /// An endpoint on the federation ALPN that holds every connection made to

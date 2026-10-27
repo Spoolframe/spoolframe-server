@@ -35,6 +35,8 @@ mod logic;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod logs;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod nav;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod network;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod optimized;

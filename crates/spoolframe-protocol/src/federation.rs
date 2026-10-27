@@ -41,6 +41,11 @@ use serde::{Deserialize, Serialize};
 /// protocol's [`crate::PROTOCOL_VERSION`].
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The least time between two syncs a pair's [`PeerRequest::SharesChanged`]
+/// sets off: a pair that sends notices without end makes the receiver
+/// sync it at most this often.
+pub const SHARES_CHANGED_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The longest request frame a server reads on this ALPN. A pairing is a
 /// code, a name and some address hints.
 pub const MAX_REQUEST: u32 = 16 << 10;
@@ -353,6 +358,17 @@ pub enum PeerRequest {
     Unpaired(Unpaired),
     /// A pair's: the libraries shared with it now (P8-02): `Libraries`.
     Libraries,
+    /// A pair's: what the sender shares with the server it is sent to
+    /// changed (a grant added or revoked), so that one syncs the sender
+    /// soon rather than at its next interval. It carries nothing: the
+    /// receiver asks `Libraries` and `Sync` as ever, at most once per
+    /// [`SHARES_CHANGED_EVERY`] per pair, a notice within it waiting
+    /// for its end and coalesced with any others. `Done`. Sent best
+    /// effort, on the connection the sender holds to the pair: a pair
+    /// not connected is not told, and syncs on connecting. A server that
+    /// does not know it resets the stream `NOT_ALLOWED`, which changes
+    /// nothing.
+    SharesChanged,
     /// A pair's: one shared library's changes (P8-02): `Page`s on the
     /// same stream, the last with `more: false`; `NotShared` for a
     /// library that is not shared with it, `Unavailable` when it cannot
@@ -526,6 +542,7 @@ mod tests {
     #[test]
     fn replication_goes_both_ways() {
         round_trip(PeerRequest::Libraries);
+        round_trip(PeerRequest::SharesChanged);
         round_trip(PeerRequest::Sync(SyncLibrary {
             library: "plex:2".into(),
             since: None,
@@ -806,6 +823,18 @@ mod tests {
                 reason: PairingRefused::Unknown
             }
         );
+    }
+
+    /// A grant's notice is a tag and nothing else: what an older server
+    /// reads as a request it does not know, and refuses.
+    #[test]
+    fn a_notice_of_shares_changed_is_its_tag_alone() {
+        let wire = codec::encode(&serde_json::json!({ "type": "shares_changed" })).unwrap();
+        assert_eq!(
+            codec::decode::<PeerRequest>(&wire).unwrap(),
+            PeerRequest::SharesChanged
+        );
+        assert_eq!(codec::encode(&PeerRequest::SharesChanged).unwrap(), wire);
     }
 
     /// A redemption from a server that sends no hints reads as one with

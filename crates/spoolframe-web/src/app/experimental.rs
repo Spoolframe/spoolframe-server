@@ -202,7 +202,7 @@ fn ExperimentalFields(
                 }
                 span { class: "choice-what",
                     b { "Pair with other servers" }
-                    "Another Spoolframe server pairs with this one by an invite of its own kind, made and redeemed under Users and devices › Federation. Not reviewed yet: pair only with servers you run. Applies after a restart."
+                    "Another Spoolframe server pairs with this one by an invite of its own kind, made and redeemed on the Federation page. Not reviewed yet: pair only with servers you run. Applies after a restart."
                 }
             }
             Note { settings: settings.clone(), setting: crate::federation::SETTING, on_changed: move |_| on_reload.call(()) }

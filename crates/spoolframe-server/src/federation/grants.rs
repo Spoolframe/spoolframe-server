@@ -4,7 +4,9 @@
 //! Revoking a grant ends what hangs on it ([`Federation::grant_revoked`]):
 //! the play tokens minted for its items go at once (P8-03), and the pair
 //! learns at its next sync that the library is gone and drops its cache
-//! of it (P8-02).
+//! of it (P8-02). A grant added or revoked tells the pair at once, on the
+//! connection held to it, so that next sync is soon
+//! ([`Federation::tell_shares_changed`]).
 
 use spoolframe_catalog::CatalogError;
 use spoolframe_types::{Library, LibraryId, MediaId, Namespace};
@@ -80,7 +82,36 @@ impl Federation {
             );
             grants.push(grant);
         }
+        self.tell_shares_changed(peer).await;
         Ok(grants)
+    }
+
+    /// Tell live pair `peer` that what this server shares with it changed,
+    /// on the connection this server holds to it, without waiting for its
+    /// answer: it syncs this server soon. A pair not connected is not
+    /// told: it syncs on connecting. Best effort: a pair that does not
+    /// know the notice, or misses it, syncs at its own interval.
+    pub(crate) async fn tell_shares_changed(&self, peer: &str) {
+        let record = match self.store().federation_peer(peer).await {
+            Ok(Some(record)) if record.live() => record,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(peer, error = %e, "cannot look a pair up to tell it its shares changed");
+                return;
+            }
+        };
+        let Some(dialed) = self.links.pinned(&record) else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = dialed.shares_changed().await {
+                tracing::debug!(
+                    peer = %record.server_id,
+                    error = %e,
+                    "a paired server was not told its shares changed: it syncs at its interval"
+                );
+            }
+        });
     }
 
     /// Stop sharing `library` with pair `peer`, as admin `by`: the grant
@@ -101,6 +132,7 @@ impl Federation {
             "a library is no longer shared with a paired server"
         );
         self.grant_revoked(&grant).await?;
+        self.tell_shares_changed(peer).await;
         Ok(Some(grant))
     }
 

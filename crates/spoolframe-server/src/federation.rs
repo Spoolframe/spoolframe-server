@@ -123,6 +123,9 @@ pub struct Federation {
     /// Wakes the replica before its next tick: a pair made, a setting
     /// changed.
     wake: Arc<tokio::sync::Notify>,
+    /// The pairs that said what they share with this server changed, and
+    /// when each last set off a sync ([`replica::Notices`]).
+    notices: replica::Notices,
     /// The connections this server plays its pairs' items through
     /// (proxy mode, P8-04).
     plays: Arc<proxy::PlayClients>,
@@ -273,6 +276,7 @@ impl Federation {
             limits: parking_lot::Mutex::new(replica.limits),
             max_streams: Arc::new(AtomicUsize::new(replica.limits.max_streams)),
             wake: Arc::default(),
+            notices: replica::Notices::default(),
             plays: Arc::default(),
             device_grants: parking_lot::Mutex::default(),
             download_sessions: Arc::default(),

@@ -1,4 +1,4 @@
-//! Users and devices › Federation (P8-01, experimental): the servers
+//! Federation (P8-01, experimental): the servers
 //! paired with this one, each with its key's fingerprint to compare with
 //! what that server's admin sees, and Unpair; a paired server's new key,
 //! held until it is confirmed or rejected; inviting a server (a

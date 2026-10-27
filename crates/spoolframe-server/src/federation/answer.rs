@@ -500,6 +500,20 @@ impl Federation {
 
 #[async_trait::async_trait]
 impl Shares for Federation {
+    async fn shares_changed(&self, server_id: &ServerId, endpoint: iroh::EndpointId) {
+        // Only from the pair's key now (X8-01), as every request.
+        let Ok(peer) = self.pair(server_id, endpoint).await else {
+            return;
+        };
+        tracing::debug!(
+            peer = %peer.id,
+            server_id = %server_id,
+            "a paired server's shares changed: it is synced soon"
+        );
+        self.notices.noticed(&peer.id);
+        self.wake.notify_one();
+    }
+
     async fn libraries(
         &self,
         server_id: &ServerId,
