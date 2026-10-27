@@ -190,9 +190,9 @@ network {
   #     # out.
   #     # port = 7420;
   #     # This network's public IP, or "lookup": asked of `lookup_via`
-  #     # once at start. In "auto" mode it is used only when the router
-  #     # reports an address that is not a public one (a router behind
-  #     # carrier-grade NAT).
+  #     # at start and then every hour. In "auto" mode it is used only
+  #     # when the router reports an address that is not a public one (a
+  #     # router behind carrier-grade NAT).
   #     public_ip = "lookup";
   #     # Where "lookup" asks: "wtfismyip" (https://ipv4.wtfismyip.com/text),
   #     # or false: never ask, and public_ip must be an address.
@@ -600,7 +600,7 @@ telemetry {
 # as Claude: they connect by the web UI's URL and sign the user in with
 # OAuth, as the web UI does, then act with that user's rights and only
 # the scopes the user allowed. Off, /mcp and the OAuth endpoints are not
-# found. A live setting; the web UI sets it in Settings › Remote. Over the
+# found. A live setting; the web UI sets it in Settings › MCP. Over the
 # Internet it needs admin.public_url, with TLS.
 mcp {
   enabled = false;
@@ -640,8 +640,9 @@ experimental {
   # Pair this server with another (P8): serve spoolframe/federation/1,
   # make `federation` invites, and pair by redeeming another server's.
   # Off, the ALPN is closed at once and a `federation` invite refused.
-  # Not reviewed yet: pair only with servers you run. Applies after a
-  # restart.
+  # Reviewed, but not tested enough yet: the protocol (the federation
+  # ALPN) may still change in ways that break pairings. Pair only with
+  # servers you trust. Applies after a restart.
   federation = false;
 }
 
