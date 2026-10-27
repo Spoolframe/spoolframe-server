@@ -76,9 +76,7 @@ pub(super) async fn run(client: Weak<Inner>, shared: Arc<Shared>) {
                     if let Err(e) = sync(&shared, &session).await {
                         tracing::info!(%server, error = %e, "offline watch not sent; sent with the next session");
                     }
-                    if session.music_offered().is_ok()
-                        && let Err(e) = music::sync(&shared, &session).await
-                    {
+                    if let Err(e) = music::sync(&shared, &session).await {
                         tracing::info!(%server, error = %e, "music not synced; synced with the next session");
                     }
                 }
@@ -222,7 +220,7 @@ async fn session_for(
         .profiles(server)
         .await?
         .into_iter()
-        .find(|s| s.user().user_id == user_id && s.features.downloads)
+        .find(|s| s.user().user_id == user_id)
         .ok_or(SdkError::SignInRequired)
 }
 

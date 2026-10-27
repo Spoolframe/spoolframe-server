@@ -294,6 +294,16 @@ async fn hello_version(probe: &Probe) -> Result<Outcome, Problem> {
         |e| matches!(e, Error::Unsupported { .. }),
     )
     .await?;
+    // An app from before the protocol's reset to 1 (SDK 0.15) says 15.
+    f.expect_error(
+        probe,
+        &conn,
+        "Hello with protocol_version 15, an app from before the reset",
+        None,
+        hello_for(15, None),
+        |e| matches!(e, Error::Unsupported { .. }),
+    )
+    .await?;
     f.expect_error(
         probe,
         &conn,

@@ -75,7 +75,7 @@ pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities (P7-01) and their device credentials (P7-02).
 pub use federation::{DIRECT_DIAL, LibrariesChanged, RemoteDownload, RemoteMode, RemotePlayback};
 pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
-pub use playlists::{Features, PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
+pub use playlists::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
 pub use portable::{
     CredentialError, DevicePublicKey, GuestPairing, GuestServer, HANDLE_LEN, IdentityGenesis,
     IdentityRecord, KeyAssertion, MAX_IDENTITY_NAME, PORTABLE_RP, PhraseError, Portable,

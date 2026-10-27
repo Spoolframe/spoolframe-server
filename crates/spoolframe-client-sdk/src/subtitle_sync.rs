@@ -1,4 +1,4 @@
-//! Subtitle sync and offset (PX-03, feature `spoolframe:subtitle-sync`):
+//! Subtitle sync and offset (PX-03):
 //! an external text subtitle (SRT, WebVTT, ASS beside the film) synced to
 //! the file, or moved by a manual offset, for everyone who plays the item.
 //!
@@ -11,10 +11,8 @@
 //! changes, by anyone, a device that asked for the item's tracks or plays
 //! it is told ([`crate::Client::subtitle_timing_events`]): a player
 //! showing the track reads it again ([`Session::read_subtitle`]), with
-//! no restart. A session without the feature gets no timing, and the
-//! calls are [`SdkError::Unsupported`], unsent.
+//! no restart.
 
-use spoolframe_protocol::features::SUBTITLE_SYNC;
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::{MediaId, SubtitleTiming};
 
@@ -33,11 +31,6 @@ pub struct SubtitleTimingEvent {
 
 impl Session {
     async fn timing_call(&self, request: Request) -> Result<SubtitleTiming, SdkError> {
-        if !self.features.subtitle_sync {
-            return Err(SdkError::Unsupported {
-                feature: SUBTITLE_SYNC.into(),
-            });
-        }
         match self.call(request).await? {
             Reply::SubtitleTiming(timing) => Ok(timing),
             other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),

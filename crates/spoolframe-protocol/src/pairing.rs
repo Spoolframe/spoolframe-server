@@ -256,12 +256,10 @@ pub enum PhoneFrame {
     /// The root's credential for the key [`DeviceFrame::Key`] gave, the
     /// identity's newest state if the phone has one, and the servers the
     /// identity signs in to (P7-06), for the device to save and sign in
-    /// to. A phone from before P7-06 sends none: absent is empty.
+    /// to.
     Credential {
         credential: Box<UserDeviceCredential>,
         state: Option<Box<PortableIdentityState>>,
-        // compat(v1): required at the protocol reset
-        #[serde(default)]
         servers: Vec<PairedServer>,
     },
     /// The person on the phone said no.
@@ -677,16 +675,17 @@ mod tests {
         assert_eq!(json["servers"][0]["addrs"][1], "[2001:db8::1]:7420");
     }
 
-    /// A phone from before P7-06 sends no servers: none, not an error.
+    /// A credential frame without its servers, as a phone before P7-06
+    /// sent it, is refused: an empty list is sent as one.
     #[test]
-    fn a_credential_frame_without_servers_reads_as_none() {
+    fn a_credential_frame_without_servers_is_refused() {
         let mut json = serde_json::to_value(credential_frame(vec![home()])).unwrap();
         json.as_object_mut().unwrap().remove("servers");
-        let read: PhoneFrame = serde_json::from_value(json).unwrap();
-        let PhoneFrame::Credential { servers, .. } = read else {
-            panic!("not a credential frame");
-        };
-        assert!(servers.is_empty());
+        let error = serde_json::from_value::<PhoneFrame>(json).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `servers`"),
+            "{error}"
+        );
     }
 
     #[test]

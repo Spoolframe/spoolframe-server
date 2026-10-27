@@ -19,7 +19,6 @@ use spoolframe_protocol::codec::{self, write_frame};
 use spoolframe_protocol::device_sign_in::{
     normalize as device_sign_in_code, web_link as device_sign_in_web_link,
 };
-use spoolframe_protocol::features;
 use spoolframe_protocol::invite_admin::{InviteCreated, InviteCreator, InviteSummary};
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::rpc::{
@@ -110,16 +109,14 @@ pub(crate) struct ClientProtocol {
     /// Who each connection acts as, by session: what every feature's
     /// listeners ask.
     users: crate::connection_users::ConnectionUsers,
-    /// The connections that take playlist events (PX-40).
+    /// The connections told of playlist changes (PX-40).
     playlist_listeners: crate::events::PlaylistListeners,
-    /// The items each connection that takes subtitle timing events asked
-    /// about (PX-03).
+    /// The items each connection asked the tracks of or plays, told of
+    /// their subtitle timings (PX-03).
     subtitle_listeners: crate::events::SubtitleListeners,
-    /// The connections that take download events (PX-38).
+    /// The connections told of their users' downloads (PX-38) and likes
+    /// (PX-51).
     download_listeners: crate::events::DownloadListeners,
-    /// The connections that listed music downloads (PX-51): told of
-    /// their users' likes.
-    music_listeners: crate::events::DownloadListeners,
     /// The connections that named the experimental `federation` feature
     /// (P8-02): told `LibrariesChanged`.
     federation_listeners: crate::events::FederationListeners,
@@ -556,10 +553,9 @@ impl ClientProtocol {
             download_listeners.clone(),
             addresses.streams.clone(),
         ));
-        let music_listeners = crate::events::DownloadListeners::new(users.clone());
         tokio::spawn(crate::events::tell_liked_news(
             services.playlists.news(),
-            music_listeners.clone(),
+            download_listeners.clone(),
             addresses.streams.clone(),
         ));
         let federation_listeners = crate::events::FederationListeners::default();
@@ -612,7 +608,6 @@ impl ClientProtocol {
             playlist_listeners,
             subtitle_listeners,
             download_listeners,
-            music_listeners,
             federation_listeners,
             plays,
             remote_plays,
@@ -761,9 +756,20 @@ impl ClientProtocol {
                                 known,
                             )
                         }
+                        // A Hello of another revision need not decode as
+                        // this one's: it is refused for its revision, which
+                        // an app shows, not as malformed.
                         Err(e) => (
-                            Response::Err(Error::Malformed {
-                                message: e.to_string(),
+                            Response::Err(match SaidHello::of(bytes).protocol_version {
+                                Some(said)
+                                    if name == "hello"
+                                        && said != spoolframe_protocol::PROTOCOL_VERSION =>
+                                {
+                                    wrong_revision(said)
+                                }
+                                _ => Error::Malformed {
+                                    message: e.to_string(),
+                                },
                             })
                             .into(),
                             false,
@@ -1093,9 +1099,7 @@ impl ClientProtocol {
         // (PX-10, finding 17).
         let hello = hello.within_bounds();
         if hello.protocol_version != spoolframe_protocol::PROTOCOL_VERSION {
-            return Response::Err(Error::Unsupported {
-                request: "protocol revision; update the SDK".into(),
-            });
+            return Response::Err(wrong_revision(hello.protocol_version));
         }
         tracing::debug!(?hello, "hello");
         let platform = hello.platform;
@@ -1156,15 +1160,6 @@ impl ClientProtocol {
         let Some(hello) = state.hello.get() else {
             return Response::Err(Error::HandshakeRequired);
         };
-        // A pre-auth feature's request from a client that did not list it
-        // is refused before it costs a token of the budget below.
-        if matches!(request, Request::LookupInvite(_))
-            && !features::has(&hello.features, features::INVITE_LOOKUP)
-        {
-            return Response::Err(Error::Unsupported {
-                request: format!("invite lookup without {}", features::INVITE_LOOKUP),
-            });
-        }
         // The sign-ins a stranger makes, and what is guessed only at that
         // rate, draw on the strangers' sign-in budget first (PX-10).
         if crate::operations::on_strangers_budget(&request)
@@ -1648,7 +1643,7 @@ impl ClientProtocol {
                 length,
             } => {
                 let artwork = self
-                    .set_playlist_art(connection, state, hello, session, &id, length, recv)
+                    .set_playlist_art(connection, state, session, &id, length, recv)
                     .await?;
                 Ok((
                     ResourceMetadata::PlaylistArt { artwork },
@@ -1850,7 +1845,6 @@ impl ClientProtocol {
         offset: u64,
         length: u64,
     ) -> Result<(ResourceMetadata, u64, ResourceBody), Error> {
-        downloads_listed(hello)?;
         let (session, who) = self
             .authenticate_unrestricted_or_remote(connection, state, Some(session))
             .await?;
@@ -1946,35 +1940,17 @@ impl ClientProtocol {
         &self,
         connection: &Connection,
         state: &ConnectionState,
-        hello: &spoolframe_protocol::Hello,
         session: SessionId,
         id: &str,
         length: u64,
         mut recv: RecvStream,
     ) -> Result<ArtworkId, Error> {
-        if !(features::has(&hello.features, features::PLAYLISTS)
-            && features::has(&hello.features, features::PLAYLIST_ART))
-        {
-            return Err(Error::Unsupported {
-                request: format!("playlist art without {}", features::PLAYLIST_ART),
-            });
-        }
         let (session, who) = self
             .authenticate_unrestricted(connection, state, Some(session))
             .await?;
         state.locks.lock().use_session(&session)?;
         let actor = who.actor();
         let playlists = &self.services.playlists;
-        // Liked and All are not there for a client that does not take them.
-        if !features::has(&hello.features, features::LIKED)
-            && playlists
-                .builtin_of(id)
-                .await
-                .map_err(playlists_error)?
-                .is_some()
-        {
-            return Err(playlists_error(crate::playlists::PlaylistsError::NotFound));
-        }
         playlists
             .may_set_art(&actor, id)
             .await
@@ -2464,84 +2440,22 @@ impl ClientProtocol {
             federated: federation.is_some(),
             ..who.actor()
         };
-        // PX-40: a connection that takes playlist events is told of the
-        // changes to what each user it acts as sees.
-        let playlists_listed = features::has(&hello.features, features::PLAYLISTS);
-        // PX-43: Liked and All, and hearts, only for a client that knows
-        // them; one that does not would offer to rename or delete them.
-        let liked_listed = playlists_listed && features::has(&hello.features, features::LIKED);
-        // When each item was last viewed, only for a client that takes it.
-        let last_viewed_listed = features::has(&hello.features, features::LAST_VIEWED);
-        // PX-52: play counts and Recently played, only for a client that
-        // takes them.
-        let play_history_listed = features::has(&hello.features, features::PLAY_HISTORY);
-        if !play_history_listed && matches!(request, Request::RecentlyPlayed { .. }) {
-            return Err(Error::Unsupported {
-                request: format!("recently played without {}", features::PLAY_HISTORY),
-            });
-        }
-        // Sharing by name: whom to share with, and the names of owners and
-        // shares, only for a client that takes them.
-        let sharing_listed =
-            playlists_listed && features::has(&hello.features, features::PLAYLIST_SHARING);
-        if !sharing_listed && matches!(request, Request::ListShareCandidates { .. }) {
-            return Err(Error::Unsupported {
-                request: format!("share candidates without {}", features::PLAYLIST_SHARING),
-            });
-        }
-        // PX-53: playlists' pictures, only for a client that takes them.
-        let art_listed = playlists_listed && features::has(&hello.features, features::PLAYLIST_ART);
-        if !art_listed && matches!(request, Request::RemovePlaylistArt { .. }) {
-            return Err(Error::Unsupported {
-                request: format!("playlist art without {}", features::PLAYLIST_ART),
-            });
-        }
-        // What comes up, and settings saved alone, only for a client that
-        // takes them.
-        let upcoming_listed =
-            playlists_listed && features::has(&hello.features, features::PLAYLIST_UPCOMING);
-        if !upcoming_listed
-            && matches!(
-                request,
-                Request::UpcomingInPlaylist { .. } | Request::SetPlaylistSettings { .. }
-            )
+        // Every connection is told of the changes to the playlists each
+        // user it acts as sees, of their downloads and likes, and of the
+        // subtitle timings of the items whose tracks it asks for or plays.
+        self.playlist_listeners.note(connection.stable_id());
+        self.download_listeners.note(connection.stable_id());
+        if let Request::Tracks { id }
+        | Request::StartPlayback { id, .. }
+        | Request::SyncSubtitle { id, .. }
+        | Request::UseOriginalSubtitleTiming { id, .. }
+        | Request::SetSubtitleOffset { id, .. } = &request
         {
-            return Err(Error::Unsupported {
-                request: format!("playlist upcoming without {}", features::PLAYLIST_UPCOMING),
-            });
+            self.subtitle_listeners.note(connection.stable_id(), id);
         }
-        if playlists_listed {
-            self.playlist_listeners
-                .note(connection.stable_id(), liked_listed);
-        }
-        // PX-03: subtitle timing, only for a client that takes it; it is
-        // told of the items whose tracks it asks for or plays.
-        let subtitle_sync_listed = features::has(&hello.features, features::SUBTITLE_SYNC);
-        match &request {
-            Request::SyncSubtitle { .. }
-            | Request::UseOriginalSubtitleTiming { .. }
-            | Request::SetSubtitleOffset { .. }
-                if !subtitle_sync_listed =>
-            {
-                return Err(Error::Unsupported {
-                    request: format!("subtitle timing without {}", features::SUBTITLE_SYNC),
-                });
-            }
-            Request::Tracks { id }
-            | Request::StartPlayback { id, .. }
-            | Request::SyncSubtitle { id, .. }
-            | Request::UseOriginalSubtitleTiming { id, .. }
-            | Request::SetSubtitleOffset { id, .. }
-                if subtitle_sync_listed =>
-            {
-                self.subtitle_listeners.note(connection.stable_id(), id);
-            }
-            _ => {}
-        }
-        // PX-38: downloads, only for a client that takes them, on a
-        // platform that has them; it is told of its user's downloads. A
-        // paired server downloading for its user's device (P8-07) names
-        // the device's platform with each request instead.
+        // PX-38: downloads only on a platform that has them. A paired
+        // server downloading for its user's device (P8-07) names the
+        // device's platform with each request instead.
         if matches!(
             request,
             Request::DownloadOptions { .. }
@@ -2549,26 +2463,16 @@ impl ClientProtocol {
                 | Request::DownloadStatus { .. }
                 | Request::CancelDownload { .. }
                 | Request::SyncOfflineWatch { .. }
-        ) {
-            match &who {
-                Who::Remote(_) => downloads_listed(hello)?,
-                _ => {
-                    downloads_offered(hello)?;
-                }
-            }
+        ) && !matches!(who, Who::Remote(_))
+        {
+            downloads_offered(hello)?;
         }
-        // PX-51: music offline, on top of downloads.
+        // PX-51: music offline, on the same platforms.
         if matches!(
             request,
             Request::MusicDownloadChanges { .. } | Request::SyncOfflinePlays { .. }
         ) {
-            music_offered(hello)?;
-        }
-        if features::has(&hello.features, features::DOWNLOADS) {
-            self.download_listeners.note(connection.stable_id());
-        }
-        if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
-            self.music_listeners.note(connection.stable_id());
+            downloads_offered(hello)?;
         }
         if federation.is_some() {
             self.federation_listeners.note(connection.stable_id());
@@ -2587,53 +2491,6 @@ impl ClientProtocol {
                     spoolframe_protocol::experimental::FEDERATION
                 ),
             });
-        }
-        // PX-02: subtitle downloads, only for a client that takes them.
-        let subtitle_search_listed = features::has(&hello.features, features::SUBTITLE_SEARCH);
-        if !subtitle_search_listed
-            && matches!(
-                request,
-                Request::SearchSubtitles { .. }
-                    | Request::DownloadSubtitle { .. }
-                    | Request::RemoveSubtitleDownload { .. }
-            )
-        {
-            return Err(Error::Unsupported {
-                request: format!("subtitle downloads without {}", features::SUBTITLE_SEARCH),
-            });
-        }
-        if !liked_listed {
-            match &request {
-                Request::Like { .. } | Request::Unlike { .. } => {
-                    return Err(Error::Unsupported {
-                        request: format!("a like without {}", features::LIKED),
-                    });
-                }
-                // Liked and All are not there for it.
-                Request::GetPlaylist { id, .. }
-                | Request::UpdatePlaylist { id, .. }
-                | Request::EditPlaylist { id, .. }
-                | Request::DeletePlaylist { id }
-                | Request::PinPlaylist { id, .. }
-                | Request::UnpinPlaylist { id }
-                | Request::PlayPlaylist { id, .. }
-                | Request::NextInPlaylist { id, .. }
-                | Request::UpcomingInPlaylist { id, .. }
-                | Request::SetPlaylistSettings { id, .. }
-                | Request::ListShareCandidates { id, .. }
-                | Request::RemovePlaylistArt { id }
-                    if self
-                        .services
-                        .playlists
-                        .builtin_of(id)
-                        .await
-                        .map_err(playlists_error)?
-                        .is_some() =>
-                {
-                    return Err(playlists_error(crate::playlists::PlaylistsError::NotFound));
-                }
-                _ => {}
-            }
         }
         // A request about a playback says which in its span, and links to
         // the playback's start.
@@ -2792,7 +2649,6 @@ impl ClientProtocol {
                                 portable: Vec::new(),
                             },
                             can_leave: true,
-                            features: features::names(features::ALL),
                         }));
                     }
                 };
@@ -2820,7 +2676,6 @@ impl ClientProtocol {
                             .collect(),
                     },
                     can_leave,
-                    features: features::names(features::ALL),
                 }))
             }
             Request::BeginPasskeyRegistration => {
@@ -3299,7 +3154,7 @@ impl ClientProtocol {
                         .await
                         .map_err(watch_error)?;
                 }
-                if last_viewed_listed {
+                {
                     let mut items: Vec<&mut spoolframe_types::Item> =
                         std::iter::once(&mut found.item)
                             .chain(found.children.iter_mut())
@@ -3309,43 +3164,25 @@ impl ClientProtocol {
                         .fill_last_viewed(principal, &mut items)
                         .await
                         .map_err(watch_error)?;
-                }
-                if play_history_listed {
-                    let mut items: Vec<&mut spoolframe_types::Item> =
-                        std::iter::once(&mut found.item)
-                            .chain(found.children.iter_mut())
-                            .collect();
                     self.services
                         .watch
                         .fill_plays(principal, &mut items)
                         .await
                         .map_err(watch_error)?;
                 }
-                // PX-40: only for a client that takes them.
-                let playlists = if playlists_listed {
-                    Some(
-                        self.services
-                            .playlists
-                            .holding(&actor, &found.item, &found.children, liked_listed)
-                            .await
-                            .map_err(playlists_error)?
-                            .into_iter()
-                            .map(|held| named_ref(held, sharing_listed, art_listed))
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
-                // PX-43: the hearts, for a client that takes them.
-                let (liked, liked_children) = if liked_listed {
-                    self.services
-                        .playlists
-                        .liked(&actor, &found.item, &found.children)
-                        .await
-                        .map_err(playlists_error)?
-                } else {
-                    (None, None)
-                };
+                let playlists = self
+                    .services
+                    .playlists
+                    .holding(&actor, &found.item, &found.children)
+                    .await
+                    .map_err(playlists_error)?;
+                // PX-43: the hearts.
+                let (liked, liked_children) = self
+                    .services
+                    .playlists
+                    .liked(&actor, &found.item, &found.children)
+                    .await
+                    .map_err(playlists_error)?;
                 // P8-05: the title's copies, for a client that takes them.
                 let copies = match federation {
                     Some(federation) => Some(
@@ -3365,7 +3202,7 @@ impl ClientProtocol {
                     markers: found.markers,
                     playlists,
                     liked,
-                    liked_children,
+                    liked_children: liked_children.unwrap_or_default(),
                     copies,
                 })
             }
@@ -3373,14 +3210,11 @@ impl ClientProtocol {
                 let (playlists, pin_notes) = self
                     .services
                     .playlists
-                    .list(&actor, liked_listed)
+                    .list(&actor)
                     .await
                     .map_err(playlists_error)?;
                 Ok(Reply::Playlists {
-                    playlists: playlists
-                        .into_iter()
-                        .map(|p| named(p, sharing_listed, art_listed))
-                        .collect(),
+                    playlists,
                     pin_notes,
                 })
             }
@@ -3389,13 +3223,7 @@ impl ClientProtocol {
                 .playlists
                 .get(&actor, &id, offset, limit)
                 .await
-                .map(|mut page| {
-                    if !liked_listed {
-                        page.entries.iter_mut().for_each(|e| e.liked = false);
-                    }
-                    page.playlist = named(page.playlist, sharing_listed, art_listed);
-                    Reply::Playlist(page)
-                })
+                .map(Reply::Playlist)
                 .map_err(playlists_error),
             Request::CreatePlaylist {
                 name,
@@ -3406,7 +3234,7 @@ impl ClientProtocol {
                 .playlists
                 .create(&actor, &name, kinds, visibility)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
+                .map(Reply::PlaylistInfo)
                 .map_err(playlists_error),
             Request::UpdatePlaylist {
                 id,
@@ -3426,7 +3254,7 @@ impl ClientProtocol {
                     },
                 )
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
+                .map(Reply::PlaylistInfo)
                 .map_err(playlists_error),
             Request::EditPlaylist {
                 id,
@@ -3444,7 +3272,7 @@ impl ClientProtocol {
                 .playlists
                 .remove_art(&actor, &id)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
+                .map(Reply::PlaylistInfo)
                 .map_err(playlists_error),
             Request::DeletePlaylist { id } => self
                 .services
@@ -3487,26 +3315,21 @@ impl ClientProtocol {
                     },
                 )
                 .await
-                .map(|next| playing(next, liked_listed))
+                .map(playing)
                 .map_err(playlists_error),
             Request::NextInPlaylist { id, after } => self
                 .services
                 .playlists
                 .next(&actor, &id, after)
                 .await
-                .map(|next| playing(next, liked_listed))
+                .map(playing)
                 .map_err(playlists_error),
             Request::UpcomingInPlaylist { id, limit } => self
                 .services
                 .playlists
                 .upcoming(&actor, &id, limit)
                 .await
-                .map(|mut entries| {
-                    if !liked_listed {
-                        entries.iter_mut().for_each(|e| e.liked = false);
-                    }
-                    Reply::PlaylistUpcoming { entries }
-                })
+                .map(|entries| Reply::PlaylistUpcoming { entries })
                 .map_err(playlists_error),
             Request::SetPlaylistSettings {
                 id,
@@ -3569,14 +3392,14 @@ impl ClientProtocol {
                 .playlists
                 .like(&actor, &items)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
+                .map(Reply::PlaylistInfo)
                 .map_err(playlists_error),
             Request::Unlike { items } => self
                 .services
                 .playlists
                 .unlike(&actor, &items)
                 .await
-                .map(|p| Reply::PlaylistInfo(named(p, sharing_listed, art_listed)))
+                .map(Reply::PlaylistInfo)
                 .map_err(playlists_error),
             Request::ListShareCandidates {
                 id,
@@ -3835,7 +3658,7 @@ impl ClientProtocol {
                     let rows = home.servers.iter_mut().flat_map(|row| row.items.iter_mut());
                     self.fill(principal, rows).await?;
                 }
-                if last_viewed_listed {
+                {
                     let mut rows: Vec<&mut spoolframe_types::Item> = home
                         .continue_watching
                         .iter_mut()
@@ -3852,22 +3675,18 @@ impl ClientProtocol {
             Request::Tracks { id } => {
                 let (_, descriptor) = self.describe(&id).await?;
                 let mut tracks = descriptor.tracks();
-                if subtitle_sync_listed {
-                    let timings = self.services.subtitle_timings.timings(&descriptor).await;
-                    for (track, timing) in tracks.subtitles.iter_mut().zip(timings) {
-                        track.timing = timing;
-                    }
+                let timings = self.services.subtitle_timings.timings(&descriptor).await;
+                for (track, timing) in tracks.subtitles.iter_mut().zip(timings) {
+                    track.timing = timing;
                 }
-                if subtitle_search_listed {
-                    let downloads = self
-                        .services
-                        .subtitle_downloads
-                        .downloads(&id, &descriptor, &who.actor())
-                        .await
-                        .map_err(internal)?;
-                    for (track, download) in tracks.subtitles.iter_mut().zip(downloads) {
-                        track.download = download;
-                    }
+                let downloads = self
+                    .services
+                    .subtitle_downloads
+                    .downloads(&id, &descriptor, &who.actor())
+                    .await
+                    .map_err(internal)?;
+                for (track, download) in tracks.subtitles.iter_mut().zip(downloads) {
+                    track.download = download;
                 }
                 Ok(Reply::Tracks(tracks))
             }
@@ -4909,7 +4728,7 @@ impl ClientProtocol {
             Request::DownloadOptions { id, .. }
                 if let Some(federation) = origin_of(federation, &id) =>
             {
-                downloadable(hello, &id)?;
+                downloadable(&id)?;
                 catalog.item(&id).await.map_err(catalog_error)?;
                 federation
                     .download_options(&who, &id, device_of(hello))
@@ -4920,7 +4739,7 @@ impl ClientProtocol {
             Request::PrepareDownload {
                 id, source, tracks, ..
             } if let Some(federation) = origin_of(federation, &id) => {
-                downloadable(hello, &id)?;
+                downloadable(&id)?;
                 catalog.item(&id).await.map_err(catalog_error)?;
                 federation
                     .prepare_download(&who, &id, source, tracks, device_of(hello))
@@ -5089,11 +4908,6 @@ impl ClientProtocol {
                         ),
                     });
                 }
-                if liked && !liked_listed {
-                    return Err(Error::Unsupported {
-                        request: format!("Liked without {}", features::LIKED),
-                    });
-                }
                 let followed: Vec<Followed> = artists
                     .into_iter()
                     .map(Followed::Artist)
@@ -5119,11 +4933,6 @@ impl ClientProtocol {
                 if plays.len() + liked.len() > MAX_ASKED {
                     return Err(Error::InvalidInput {
                         message: format!("at most {MAX_ASKED} plays and likes are synced at once"),
-                    });
-                }
-                if !liked.is_empty() && !liked_listed {
-                    return Err(Error::Unsupported {
-                        request: format!("Liked without {}", features::LIKED),
                     });
                 }
                 let endpoint = connection.remote_id().to_string();
@@ -5720,7 +5529,6 @@ impl ClientProtocol {
             session: SessionId(token.0),
             remembered: false,
             password_change_required: false,
-            features: features::names(features::ALL),
         })
     }
 
@@ -6490,7 +6298,7 @@ impl ClientProtocol {
         };
         let principal = who.principal();
         let (class, device_caps) = download_class(hello, who, device)?;
-        let kind = downloadable(hello, id)?;
+        let kind = downloadable(id)?;
         let (path, descriptor) = self.describe(id).await?;
         if kind == Downloadable::Track {
             return music_download_options(&descriptor, class);
@@ -6588,7 +6396,7 @@ impl ClientProtocol {
         use spoolframe_protocol::downloads::DownloadSource;
         let principal = who.principal();
         let (class, device_caps) = download_class(hello, who, device)?;
-        if downloadable(hello, id)? == Downloadable::Track {
+        if downloadable(id)? == Downloadable::Track {
             return self
                 .prepare_track_download(principal, id, class, source)
                 .await;
@@ -6971,7 +6779,6 @@ impl ClientProtocol {
             session: SessionId(token.0),
             remembered,
             password_change_required,
-            features: features::names(features::ALL),
         }
     }
 
@@ -7209,7 +7016,6 @@ impl ProtocolHandler for ClientProtocol {
         self.playlist_listeners.remove(id);
         self.subtitle_listeners.remove(id);
         self.download_listeners.remove(id);
-        self.music_listeners.remove(id);
         self.federation_listeners.remove(id);
         self.users.remove(id);
         self.connections.remove(id);
@@ -7522,6 +7328,28 @@ enum Frame<'a> {
     Resource(&'a [u8]),
 }
 
+/// The last client protocol revision before the reset to 1 (0.16.0): what
+/// an app built with SDK 0.15 says.
+const LAST_BEFORE_RESET: u32 = 15;
+
+/// The refusal of a `Hello` of revision `said`, which is not this
+/// server's. `Unsupported`, as servers have always refused one: an SDK of
+/// any release reads it as its `UpdateRequired`, where a new error would
+/// read as an unknown one. The text says which side is older: a revision
+/// up to [`LAST_BEFORE_RESET`] is an app from before the reset, older than
+/// this server whatever its number; a higher one is newer than it.
+fn wrong_revision(said: u32) -> Error {
+    let ours = spoolframe_protocol::PROTOCOL_VERSION;
+    let which = if said > LAST_BEFORE_RESET {
+        "update the server"
+    } else {
+        "this server needs a newer app"
+    };
+    Error::Unsupported {
+        request: format!("client protocol {said}; this server speaks {ours}: {which}"),
+    }
+}
+
 /// What a refused `Hello` said of the device, as far as it could be read:
 /// a `Hello` from another protocol revision, or one missing a field, may
 /// not decode as this build's `Hello`, and still say these.
@@ -7656,17 +7484,11 @@ impl Asked {
     }
 }
 
-/// The class a client downloads for (PX-38), if it listed
-/// `spoolframe:downloads` and its platform has downloads; else
-/// `Unsupported`, saying which.
+/// The class a client downloads for (PX-38), if its platform has
+/// downloads; else `Unsupported`, saying which.
 fn downloads_offered(
     hello: &spoolframe_protocol::Hello,
 ) -> Result<crate::downloads::DeviceClass, Error> {
-    if !features::has(&hello.features, features::DOWNLOADS) {
-        return Err(Error::Unsupported {
-            request: format!("downloads without {}", features::DOWNLOADS),
-        });
-    }
     crate::downloads::DeviceClass::of(hello.platform).ok_or_else(|| Error::Unsupported {
         request: format!(
             "downloads on {}: only an iPhone, iPad, Mac or Linux client downloads",
@@ -7700,19 +7522,6 @@ fn origin_of<'f>(
     federation.filter(|_| id.remote().is_some())
 }
 
-/// That a client listed `spoolframe:downloads`, whatever its platform: a
-/// paired server downloading for its user's device (P8-07), which names
-/// the device's platform with each request.
-fn downloads_listed(hello: &spoolframe_protocol::Hello) -> Result<(), Error> {
-    if features::has(&hello.features, features::DOWNLOADS) {
-        Ok(())
-    } else {
-        Err(Error::Unsupported {
-            request: format!("downloads without {}", features::DOWNLOADS),
-        })
-    }
-}
-
 /// The class `who`'s download is made for, and what its device plays when
 /// it says: the device `device` names, for a paired server's user (P8-07),
 /// else the connection's, as [`downloads_offered`] says.
@@ -7730,7 +7539,6 @@ fn download_class(
     let (Who::Remote(_), Some(device)) = (who, device) else {
         return Ok((downloads_offered(hello)?, None));
     };
-    downloads_listed(hello)?;
     let class =
         crate::downloads::DeviceClass::of(device.platform).ok_or_else(|| Error::Unsupported {
             request: format!(
@@ -7792,9 +7600,9 @@ enum Downloadable {
     Track,
 }
 
-/// Films and episodes are downloaded (PX-38), and tracks for a client
-/// that listed `spoolframe:music-downloads` (PX-51); nothing else.
-fn downloadable(hello: &spoolframe_protocol::Hello, id: &MediaId) -> Result<Downloadable, Error> {
+/// Films and episodes are downloaded (PX-38), and tracks (PX-51);
+/// nothing else.
+fn downloadable(id: &MediaId) -> Result<Downloadable, Error> {
     if crate::watch::tracked(id) {
         return Ok(Downloadable::Film);
     }
@@ -7803,32 +7611,7 @@ fn downloadable(hello: &spoolframe_protocol::Hello, id: &MediaId) -> Result<Down
             message: "only films, episodes and tracks are downloaded".into(),
         });
     }
-    if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
-        Ok(Downloadable::Track)
-    } else {
-        Err(Error::InvalidInput {
-            message: format!(
-                "a track is downloaded only with {}",
-                features::MUSIC_DOWNLOADS
-            ),
-        })
-    }
-}
-
-/// The class a client keeps music for (PX-51), if it listed
-/// `spoolframe:music-downloads` besides what [`downloads_offered`]
-/// needs; else `Unsupported`.
-fn music_offered(
-    hello: &spoolframe_protocol::Hello,
-) -> Result<crate::downloads::DeviceClass, Error> {
-    let class = downloads_offered(hello)?;
-    if features::has(&hello.features, features::MUSIC_DOWNLOADS) {
-        Ok(class)
-    } else {
-        Err(Error::Unsupported {
-            request: format!("music downloads without {}", features::MUSIC_DOWNLOADS),
-        })
-    }
+    Ok(Downloadable::Track)
 }
 
 fn no_such_download() -> Error {
@@ -8909,59 +8692,12 @@ pub(crate) fn unserved(e: &CatalogError) -> bool {
     )
 }
 
-/// What plays next, as a client is told it: its heart only for one that
-/// takes hearts (PX-43).
-fn playing(next: Option<spoolframe_protocol::playlists::PlaylistNext>, liked: bool) -> Reply {
+/// What plays next, as a client is told it.
+fn playing(next: Option<spoolframe_protocol::playlists::PlaylistNext>) -> Reply {
     match next {
-        Some(mut next) => {
-            next.liked &= liked;
-            Reply::PlaylistItem(next)
-        }
+        Some(next) => Reply::PlaylistItem(next),
         None => Reply::PlaylistFinished,
     }
-}
-
-/// `summary` as a session sees it: without its owner's and shares'
-/// names unless its client listed `spoolframe:playlist-sharing`.
-fn named(
-    mut summary: spoolframe_protocol::playlists::PlaylistSummary,
-    sharing: bool,
-    art: bool,
-) -> spoolframe_protocol::playlists::PlaylistSummary {
-    // A picture only for a client that takes it (PX-53).
-    if !art {
-        summary.artwork = None;
-        summary.custom_art = false;
-    }
-    if !sharing {
-        summary.owner_name = None;
-        if let spoolframe_protocol::playlists::Visibility::Shared { with } = &mut summary.visibility
-        {
-            for share in with {
-                share.display_name = None;
-                share.kind = None;
-            }
-        }
-    }
-    summary
-}
-
-/// An item's playlist reference as a session sees it: whose it is only
-/// for a client that listed `spoolframe:playlist-sharing`, its picture
-/// only for one that listed `spoolframe:playlist-art`, as `named` does
-/// for a summary.
-fn named_ref(
-    mut held: spoolframe_protocol::playlists::PlaylistRef,
-    sharing: bool,
-    art: bool,
-) -> spoolframe_protocol::playlists::PlaylistRef {
-    if !sharing {
-        held.owner_name = None;
-    }
-    if !art {
-        held.artwork = None;
-    }
-    held
 }
 
 /// A playlist failure as the client sees it (PX-40).

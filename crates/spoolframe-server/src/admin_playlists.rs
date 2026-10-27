@@ -44,7 +44,7 @@ impl AdminApi {
     pub(super) async fn my_playlists(&self, user: ApiSessionUser) -> RpcResult<Vec<PlaylistInfo>> {
         let (mut list, _notes) = self
             .playlists_service()?
-            .list(&actor(&user), true)
+            .list(&actor(&user))
             .await
             .map_err(playlists_error)?;
         // Pin notes are the apps' to show (Pinned is theirs): the web UI

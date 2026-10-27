@@ -281,7 +281,7 @@ impl StatusSource {
         self
     }
 
-    /// The client protocol's version and this server's features.
+    /// The client protocol's version and the experimental features on.
     pub fn protocol(&self) -> crate::protocol_info::ProtocolInfo {
         crate::protocol_info::ProtocolInfo::new(self.experimental.clone())
     }
@@ -453,8 +453,6 @@ impl StatusSource {
             web_urls: self.web_urls.get().cloned().unwrap_or_default(),
             preview_workers_default: preview_workers_default(),
             protocol_version: protocol.version,
-            features: names(&protocol.features),
-            pre_auth_features: names(&protocol.pre_auth),
             experimental_features: names(&protocol.experimental),
         }
     }
@@ -963,8 +961,8 @@ impl AdminApi {
         }
     }
 
-    /// The client protocol's version and this server's features, as MCP's
-    /// server info says them.
+    /// The client protocol's version and the experimental features on, as
+    /// MCP's server info says them.
     pub(crate) fn protocol(&self) -> crate::protocol_info::ProtocolInfo {
         self.status.protocol()
     }

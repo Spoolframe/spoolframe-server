@@ -684,7 +684,6 @@ fn hello_of(revision: u32) -> Request {
         device_name: Some("what the app says".into()),
         capabilities: None,
         experimental: Vec::new(),
-        features: Vec::new(),
     })
 }
 
@@ -786,7 +785,8 @@ async fn a_refused_hello_names_a_known_device() {
     ipad.hello_as(Some("Kitchen iPad")).await;
     ipad.login("alice", ALICE_PASSWORD).await;
     let (capture, _guard) = LogCapture::start();
-    let older = SERVER_PROTOCOL - 1;
+    // An app from before the reset to 1.
+    let older = 15;
     refused_hello(&ipad, older).await;
     let lines = hellos(&capture);
     assert_eq!(lines.len(), 1, "{lines:#?}");
@@ -828,7 +828,7 @@ async fn a_malformed_hello_is_logged() {
             session: None,
             request: Partial {
                 kind: "hello",
-                protocol_version: 99,
+                protocol_version: SERVER_PROTOCOL,
             },
         })
         .await;
@@ -838,7 +838,7 @@ async fn a_malformed_hello_is_logged() {
     );
     let lines = hellos(&capture);
     assert_eq!(lines.len(), 1, "{lines:#?}");
-    assert_fields(&lines[0], &[("client_protocol", "99")]);
+    assert_fields(&lines[0], &[("client_protocol", "1")]);
     let reason = lines[0].field("reason").unwrap();
     assert!(reason.starts_with("malformed: "), "{reason}");
     phone.close().await;

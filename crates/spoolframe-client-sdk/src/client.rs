@@ -151,15 +151,6 @@ pub struct ClientOptions {
     /// connection's `Hello` (PX-49); none by default. Whether a server
     /// turned one on is [`crate::Session::experimental`].
     pub experimental: crate::Experimental,
-    /// The regular features (PX-16) this app handles, listed in each
-    /// connection's `Hello`; none by default. A server sends a feature's
-    /// reply fields, events and rows (Liked and All among a user's
-    /// playlists, for one) only when the app lists it, and the SDK's
-    /// calls of a feature not listed are [`SdkError::Unsupported`],
-    /// unsent. An app lists only what its code handles: a newer SDK
-    /// knowing a feature does not turn it on. What a session has is
-    /// [`crate::Session::features`].
-    pub features: crate::Features,
     /// Where downloads are kept (PX-38, [`Client::downloads`]); none by
     /// default, and then nothing is downloaded. The client's download
     /// manager runs with one. iOS: a directory in Application Support,
@@ -175,7 +166,6 @@ impl Default for ClientOptions {
             lan_discovery: true,
             relays: true,
             experimental: crate::Experimental::default(),
-            features: crate::Features::default(),
             downloads_dir: None,
         }
     }
@@ -194,8 +184,6 @@ pub(crate) struct Inner {
     pub(crate) timeouts: Timeouts,
     /// What every Hello asks for (PX-49).
     pub(crate) experimental: crate::Experimental,
-    /// [`ClientOptions::features`]: what every Hello lists (PX-16).
-    pub(crate) features: crate::Features,
     pub(crate) discovery: Discovery,
     /// Addresses the app gave for servers, and invites' hints (P6-01).
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
@@ -328,7 +316,6 @@ impl Client {
             lan_discovery,
             relays,
             experimental,
-            features,
             downloads_dir,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
@@ -403,7 +390,6 @@ impl Client {
                 device,
                 timeouts,
                 experimental,
-                features,
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
@@ -1386,11 +1372,7 @@ impl Client {
         remembered: bool,
         portable: Option<PortableUserId>,
     ) -> Result<Session, SdkError> {
-        let spoolframe_protocol::WhoAmIReply {
-            user,
-            can_leave,
-            features,
-        } = who;
+        let spoolframe_protocol::WhoAmIReply { user, can_leave } = who;
         let storage = self.inner.storage.as_ref();
         let _saving = self.inner.saving.lock().await;
         let pinned = servers::load(storage)
@@ -1440,8 +1422,6 @@ impl Client {
             can_leave,
             remembered: Some(remembered),
             password_change_required: Arc::default(),
-            features: self.inner.features.both(&features),
-            server_features: Arc::new(features),
         };
         self.inner.downloads.session_made(&session);
         Ok(session)
@@ -1498,7 +1478,6 @@ impl Client {
                 Response::Ok(Reply::WhoAmI(spoolframe_protocol::WhoAmIReply {
                     user,
                     can_leave,
-                    features,
                 })) => {
                     let session = Session {
                         client: self.clone(),
@@ -1508,8 +1487,6 @@ impl Client {
                         can_leave,
                         remembered: None,
                         password_change_required: Arc::default(),
-                        features: self.inner.features.both(&features),
-                        server_features: Arc::new(features),
                     };
                     self.inner.downloads.session_made(&session);
                     profiles.push(session);
@@ -2055,7 +2032,6 @@ impl Client {
             endpoint_addr(id, &addrs, &relays),
             &self.inner.device,
             self.inner.experimental,
-            self.inner.features,
             &self.inner.timeouts,
         )
         .await;
@@ -2780,7 +2756,6 @@ mod tests {
                 spoolframe_protocol::WhoAmIReply {
                     user,
                     can_leave: true,
-                    features: Vec::new(),
                 },
                 Some(SignInMethod::Password),
                 false,

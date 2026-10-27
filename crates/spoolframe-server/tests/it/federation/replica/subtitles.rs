@@ -4,7 +4,6 @@
 //! together gets one daily limit on SA, after SB's own limit per user.
 
 use spoolframe_admin_api::{AdminApiClient, SubtitlePairUsage};
-use spoolframe_protocol::features::SUBTITLE_SEARCH;
 use spoolframe_protocol::{Hello, PROTOCOL_VERSION, Request, Response, SessionId};
 use spoolframe_server::subtitle_downloads::Settings;
 use spoolframe_types::{Platform, QuotaOf, SubtitleDownloaded, SubtitleSearch};
@@ -64,7 +63,6 @@ async fn on_sb(pair: &Pair, user: &str) -> (TestClient, SessionId) {
         device_name: None,
         capabilities: None,
         experimental: vec![FEDERATION.into()],
-        features: vec![SUBTITLE_SEARCH.into()],
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -144,7 +142,7 @@ async fn two_of_sb_s_users_share_sb_s_one_subtitle_limit_on_sa() {
     ));
     // SA's own users are held to their own limit, not the pair's.
     pair.sa.add_user("dave", "correct horse", None).await;
-    let (dave_app, dave) = subtitles_it::app(&pair.sa, "dave", &[SUBTITLE_SEARCH]).await;
+    let (dave_app, dave) = subtitles_it::app(&pair.sa, "dave").await;
     search(&dave_app, &dave, movie().id()).await;
     download(&dave_app, &dave, movie().id(), "opensubtitles:103")
         .await
@@ -223,7 +221,7 @@ async fn a_pair_leaves_what_is_kept_of_the_site_account_for_sa_s_own_users() {
         "the site was not asked"
     );
     pair.sa.add_user("dave", "correct horse", None).await;
-    let (dave_app, dave) = subtitles_it::app(&pair.sa, "dave", &[SUBTITLE_SEARCH]).await;
+    let (dave_app, dave) = subtitles_it::app(&pair.sa, "dave").await;
     search(&dave_app, &dave, movie().id()).await;
     download(&dave_app, &dave, movie().id(), "opensubtitles:102")
         .await

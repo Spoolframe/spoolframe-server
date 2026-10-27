@@ -1,38 +1,24 @@
-//! Playlists (PX-40, feature `spoolframe:playlists`): a user's playlists,
-//! the ones shared with them and the server-wide ones; editing, pinning
-//! and playing them.
+//! Playlists (PX-40): a user's playlists, the ones shared with them and
+//! the server-wide ones; editing, pinning and playing them. Changes made
+//! elsewhere (another device, another user) come as [`PlaylistEvent`]s
+//! from [`crate::Client::playlist_events`].
 //!
-//! Every call needs the feature on the session's server
-//! ([`Session::features`]); without it the call is
-//! [`SdkError::Unsupported`] and nothing is sent. Changes made elsewhere
-//! (another device, another user) come as [`PlaylistEvent`]s from
-//! [`crate::Client::playlist_events`].
+//! Liked and All (PX-43): hearts on tracks and albums, and the two
+//! built-in playlists, listed first while the server has a music
+//! library, each summary's `builtin` saying which.
 //!
-//! Liked and All (PX-43, feature `spoolframe:liked`): hearts on tracks and
-//! albums, and the two built-in playlists, listed first, each summary's
-//! `builtin` saying which. A server without the feature lists neither and
-//! [`Session::like`] is [`SdkError::Unsupported`].
+//! Sharing by name: whom a playlist can be shared with
+//! ([`Session::share_candidates`]), and the names of a playlist's owner
+//! (`PlaylistSummary::owner_name`, and an item's
+//! `PlaylistRef::owner_name`) and of who it is shared with
+//! (`PlaylistShare::display_name`, `kind`).
 //!
-//! Sharing by name (feature `spoolframe:playlist-sharing`): whom a
-//! playlist can be shared with ([`Session::share_candidates`]), and the
-//! names of a playlist's owner (`PlaylistSummary::owner_name`, and an
-//! item's `PlaylistRef::owner_name`) and of who it is shared with
-//! (`PlaylistShare::display_name`, `kind`). A server
-//! without the feature sends no names, and the call is
-//! [`SdkError::Unsupported`].
-//!
-//! Covers (PX-53, feature `spoolframe:playlist-art`): each summary's
-//! `artwork`, fetched with [`Session::artwork`] as any artwork is (the
-//! uploaded cover, else a mosaic of its first four covers, else a
-//! placeholder; Liked's and All's fixed tiles), and `custom_art`;
-//! [`Session::set_playlist_art`] uploads a cover, and
-//! [`Session::remove_playlist_art`] takes it away. Without the feature
-//! neither field is sent and both calls are [`SdkError::Unsupported`].
+//! Covers (PX-53): each summary's `artwork`, fetched with
+//! [`Session::artwork`] as any artwork is (the uploaded cover, else a
+//! mosaic of its first four covers, else a placeholder; Liked's and All's
+//! fixed tiles), and `custom_art`; [`Session::set_playlist_art`] uploads
+//! a cover, and [`Session::remove_playlist_art`] takes it away.
 
-use spoolframe_protocol::features::{
-    DOWNLOADS, INVITE_LOOKUP, LAST_VIEWED, LIKED, MUSIC_DOWNLOADS, PLAY_HISTORY, PLAYLIST_ART,
-    PLAYLIST_SHARING, PLAYLIST_UPCOMING, PLAYLISTS, SUBTITLE_SEARCH, SUBTITLE_SYNC,
-};
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
     PlaylistSummary, ShareCandidatePage, Visibility,
@@ -44,142 +30,6 @@ use spoolframe_types::MediaId;
 
 use crate::session::unexpected;
 use crate::{SdkError, Session};
-
-/// Regular features (PX-16) this SDK knows: those an app handles
-/// ([`crate::ClientOptions::features`], none by default), and those a
-/// session has ([`Session::features`]), which are the ones both the app
-/// and the session's server list.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct Features {
-    /// Playlists (PX-40).
-    pub playlists: bool,
-    /// Liked and All, and hearts (PX-43).
-    pub liked: bool,
-    /// When each item was last viewed: `PlaybackState::last_viewed_at` on
-    /// Home's rows and an item's details. Data only, nothing to call.
-    pub last_viewed: bool,
-    /// Sharing by name: [`Session::share_candidates`], and the names of a
-    /// playlist's owner and of who it is shared with.
-    pub playlist_sharing: bool,
-    /// Play history (PX-52): [`Session::recently_played`], and
-    /// `PlaybackState::play_count` and `last_played_at` on an item's
-    /// details and on Recently played's items.
-    pub play_history: bool,
-    /// Playlist covers (PX-53): a summary's `artwork` and `custom_art`,
-    /// [`Session::set_playlist_art`] and [`Session::remove_playlist_art`].
-    pub playlist_art: bool,
-    /// Subtitle sync and offset (PX-03): `SubtitleTrack::timing` on an
-    /// item's tracks, [`Session::sync_subtitle`],
-    /// [`Session::use_original_subtitle_timing`],
-    /// [`Session::set_subtitle_offset`], and
-    /// [`crate::Client::subtitle_timing_events`].
-    pub subtitle_sync: bool,
-    /// Subtitles from OpenSubtitles on demand (PX-02):
-    /// [`Session::search_subtitles`], [`Session::download_subtitle`],
-    /// [`Session::remove_subtitle_download`], and `SubtitleTrack::download`
-    /// on an item's tracks.
-    pub subtitle_search: bool,
-    /// What comes up in a playlist, and its settings saved alone:
-    /// [`Session::upcoming_in_playlist`] and
-    /// [`Session::set_playlist_settings`].
-    pub playlist_upcoming: bool,
-    /// Downloads for offline viewing (PX-38): [`crate::Client::downloads`],
-    /// [`Session::download_options`] and [`crate::Client::download_events`].
-    /// Only an iPhone, iPad, Mac or Linux app downloads.
-    pub downloads: bool,
-    /// Music offline (PX-51): tracks, albums, artists, playlists and
-    /// Liked downloaded ([`crate::Downloads::start_music`]), tracks kept
-    /// from listening, the offline library, and plays and likes made with
-    /// no server sent later. Needs `downloads` too.
-    pub music_downloads: bool,
-    /// Looking an invite up before joining with it, without using it up.
-    /// Pre-auth: a server says it has it in its answer to `Hello`.
-    pub invite_lookup: bool,
-}
-
-impl Features {
-    /// The names a `Hello` carries, each once.
-    pub(crate) fn names(self) -> Vec<String> {
-        [
-            (self.playlists, PLAYLISTS),
-            (self.liked, LIKED),
-            (self.last_viewed, LAST_VIEWED),
-            (self.playlist_sharing, PLAYLIST_SHARING),
-            (self.play_history, PLAY_HISTORY),
-            (self.playlist_art, PLAYLIST_ART),
-            (self.subtitle_sync, SUBTITLE_SYNC),
-            (self.subtitle_search, SUBTITLE_SEARCH),
-            (self.playlist_upcoming, PLAYLIST_UPCOMING),
-            (self.downloads, DOWNLOADS),
-            (self.music_downloads, MUSIC_DOWNLOADS),
-            (self.invite_lookup, INVITE_LOOKUP),
-        ]
-        .into_iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, name)| name.to_owned())
-        .collect()
-    }
-
-    /// What a session has: those of `server`, a server's list, that the
-    /// app (`self`) listed too. One the app did not list is off even when
-    /// the server has it, so its calls are refused here, unsent.
-    pub(crate) fn both(self, server: &[String]) -> Self {
-        self.and(Self::of(server))
-    }
-
-    /// What `self` and `other` both have.
-    fn and(self, other: Self) -> Self {
-        Self {
-            playlists: self.playlists && other.playlists,
-            liked: self.liked && other.liked,
-            last_viewed: self.last_viewed && other.last_viewed,
-            playlist_sharing: self.playlist_sharing && other.playlist_sharing,
-            play_history: self.play_history && other.play_history,
-            playlist_art: self.playlist_art && other.playlist_art,
-            subtitle_sync: self.subtitle_sync && other.subtitle_sync,
-            subtitle_search: self.subtitle_search && other.subtitle_search,
-            playlist_upcoming: self.playlist_upcoming && other.playlist_upcoming,
-            downloads: self.downloads && other.downloads,
-            music_downloads: self.music_downloads && other.music_downloads,
-            invite_lookup: self.invite_lookup && other.invite_lookup,
-        }
-        .needing_playlists()
-    }
-
-    /// What `names`, a server's list, has. A name this SDK does not know
-    /// is ignored.
-    pub(crate) fn of(names: &[String]) -> Self {
-        let has = |name| spoolframe_protocol::features::has(names, name);
-        Self {
-            playlists: has(PLAYLISTS),
-            liked: has(LIKED),
-            last_viewed: has(LAST_VIEWED),
-            playlist_sharing: has(PLAYLIST_SHARING),
-            play_history: has(PLAY_HISTORY),
-            playlist_art: has(PLAYLIST_ART),
-            subtitle_sync: has(SUBTITLE_SYNC),
-            subtitle_search: has(SUBTITLE_SEARCH),
-            playlist_upcoming: has(PLAYLIST_UPCOMING),
-            downloads: has(DOWNLOADS),
-            music_downloads: has(MUSIC_DOWNLOADS),
-            invite_lookup: has(INVITE_LOOKUP),
-        }
-        .needing_playlists()
-    }
-
-    /// Off what needs playlists, without them: Liked and sharing; and
-    /// music downloads without downloads.
-    fn needing_playlists(self) -> Self {
-        Self {
-            music_downloads: self.music_downloads && self.downloads,
-            liked: self.liked && self.playlists,
-            playlist_sharing: self.playlist_sharing && self.playlists,
-            playlist_art: self.playlist_art && self.playlists,
-            playlist_upcoming: self.playlist_upcoming && self.playlists,
-            ..self
-        }
-    }
-}
 
 /// Every playlist the user sees ([`Session::playlists`]), and the notes of
 /// pinned ones that left their Pinned: show each once, then
@@ -219,37 +69,10 @@ pub enum PlaylistChange {
 }
 
 impl Session {
-    /// The regular features this session has: those the app listed
-    /// ([`crate::ClientOptions::features`]) that the server listed too
-    /// when this session was made or found. One the app did not list is
-    /// off here even when the server has it.
-    pub fn features(&self) -> Features {
-        self.features
-    }
-
-    /// Every regular feature the server listed when this session was made
-    /// or found (`LoggedIn`, `WhoAmI`), by name, in its order: those this
-    /// SDK knows and those it does not, whether the app listed them or
-    /// not. For showing what a server has against what the app has; what
-    /// the session may use is [`Session::features`].
-    pub fn server_features(&self) -> Vec<String> {
-        self.server_features.to_vec()
-    }
-
-    /// Send `request` if the server has playlists.
-    async fn playlist_call(&self, request: Request) -> Result<Reply, SdkError> {
-        if !self.features.playlists {
-            return Err(SdkError::Unsupported {
-                feature: PLAYLISTS.into(),
-            });
-        }
-        self.call(request).await
-    }
-
     /// Every playlist the user sees: theirs, shared with them, and
     /// server-wide, with whether and where each is pinned.
     pub async fn playlists(&self) -> Result<PlaylistList, SdkError> {
-        match self.playlist_call(Request::ListPlaylists).await? {
+        match self.call(Request::ListPlaylists).await? {
             Reply::Playlists {
                 playlists,
                 pin_notes,
@@ -274,7 +97,7 @@ impl Session {
             offset,
             limit,
         };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::Playlist(page) => Ok(page),
             other => Err(unexpected(other)),
         }
@@ -293,7 +116,7 @@ impl Session {
             kinds,
             visibility,
         };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::PlaylistInfo(summary) => Ok(summary),
             other => Err(unexpected(other)),
         }
@@ -313,7 +136,7 @@ impl Session {
             kinds: update.kinds,
             visibility: update.visibility,
         };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::PlaylistInfo(summary) => Ok(summary),
             other => Err(unexpected(other)),
         }
@@ -333,7 +156,7 @@ impl Session {
             revision,
             edits,
         };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::PlaylistEdited { revision } => Ok(revision),
             other => Err(unexpected(other)),
         }
@@ -350,11 +173,6 @@ impl Session {
     /// decode [`SdkError::ImageUnreadable`]. Every user who sees the
     /// playlist is told it changed.
     pub async fn set_playlist_art(&self, id: &str, bytes: Vec<u8>) -> Result<ArtworkId, SdkError> {
-        if !self.features.playlist_art {
-            return Err(SdkError::Unsupported {
-                feature: PLAYLIST_ART.into(),
-            });
-        }
         let request = ResourceRequest::SetPlaylistArt {
             session: self.token.clone(),
             id: id.into(),
@@ -385,13 +203,8 @@ impl Session {
     /// after, its `artwork` the mosaic again. Who may is as for
     /// [`Session::set_playlist_art`].
     pub async fn remove_playlist_art(&self, id: &str) -> Result<PlaylistSummary, SdkError> {
-        if !self.features.playlist_art {
-            return Err(SdkError::Unsupported {
-                feature: PLAYLIST_ART.into(),
-            });
-        }
         let request = Request::RemovePlaylistArt { id: id.into() };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::PlaylistInfo(summary) => Ok(summary),
             other => Err(unexpected(other)),
         }
@@ -399,7 +212,7 @@ impl Session {
 
     pub async fn delete_playlist(&self, id: &str) -> Result<(), SdkError> {
         let request = Request::DeletePlaylist { id: id.into() };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::Done => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -412,7 +225,7 @@ impl Session {
             id: id.into(),
             position,
         };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::Done => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -420,7 +233,7 @@ impl Session {
 
     pub async fn unpin_playlist(&self, id: &str) -> Result<(), SdkError> {
         let request = Request::UnpinPlaylist { id: id.into() };
-        match self.playlist_call(request).await? {
+        match self.call(request).await? {
             Reply::Done => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -428,7 +241,7 @@ impl Session {
 
     /// Forget the pin notes [`Session::playlists`] gave: they were shown.
     pub async fn dismiss_pin_notes(&self) -> Result<(), SdkError> {
-        match self.playlist_call(Request::DismissPinNotes).await? {
+        match self.call(Request::DismissPinNotes).await? {
             Reply::Done => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -451,7 +264,7 @@ impl Session {
             repeat: settings.repeat,
             skip_watched: settings.skip_watched,
         };
-        next_of(self.playlist_call(request).await?)
+        next_of(self.call(request).await?)
     }
 
     /// What plays after entry `after` ended or was skipped: `None` at the
@@ -465,18 +278,13 @@ impl Session {
             id: id.into(),
             after,
         };
-        next_of(self.playlist_call(request).await?)
+        next_of(self.call(request).await?)
     }
 }
 
 impl Session {
     /// Send `request` if the server has what comes up in a playlist.
     async fn upcoming_call(&self, request: Request) -> Result<Reply, SdkError> {
-        if !self.features.playlist_upcoming {
-            return Err(SdkError::Unsupported {
-                feature: PLAYLIST_UPCOMING.into(),
-            });
-        }
         self.call(request).await
     }
 
@@ -527,11 +335,6 @@ impl Session {
 impl Session {
     /// Send `request` if the server has Liked (PX-43).
     async fn liked_call(&self, request: Request) -> Result<Reply, SdkError> {
-        if !self.features.liked {
-            return Err(SdkError::Unsupported {
-                feature: LIKED.into(),
-            });
-        }
         self.call(request).await
     }
 
@@ -576,11 +379,6 @@ impl Session {
         offset: u32,
         limit: u32,
     ) -> Result<ShareCandidatePage, SdkError> {
-        if !self.features.playlist_sharing {
-            return Err(SdkError::Unsupported {
-                feature: PLAYLIST_SHARING.into(),
-            });
-        }
         let request = Request::ListShareCandidates {
             id: id.into(),
             query: query.into(),
@@ -602,10 +400,7 @@ impl Session {
         &self,
         dry_run: bool,
     ) -> Result<spoolframe_protocol::playlists::PlexImport, SdkError> {
-        match self
-            .playlist_call(Request::ImportPlexPlaylists { dry_run })
-            .await?
-        {
+        match self.call(Request::ImportPlexPlaylists { dry_run }).await? {
             Reply::PlexImport(import) => Ok(import),
             other => Err(unexpected(other)),
         }
@@ -617,79 +412,5 @@ fn next_of(reply: Reply) -> Result<Option<PlaylistNext>, SdkError> {
         Reply::PlaylistItem(next) => Ok(Some(next)),
         Reply::PlaylistFinished => Ok(None),
         other => Err(unexpected(other)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_server_s_list_names_the_features_this_sdk_uses() {
-        assert!(Features::of(&[PLAYLISTS.to_owned()]).playlists);
-        assert!(!Features::of(&[PLAYLISTS.to_owned()]).liked);
-        assert!(Features::of(&[PLAYLISTS.to_owned(), LIKED.to_owned()]).liked);
-        // Liked is a part of playlists: without them, none.
-        assert!(!Features::of(&[LIKED.to_owned()]).liked);
-        assert!(Features::of(&[LAST_VIEWED.to_owned()]).last_viewed);
-        assert!(
-            Features::of(&[PLAYLISTS.to_owned(), PLAYLIST_SHARING.to_owned()]).playlist_sharing
-        );
-        assert!(!Features::of(&[PLAYLIST_SHARING.to_owned()]).playlist_sharing);
-        // Play history stands alone: no playlists needed.
-        assert!(Features::of(&[PLAY_HISTORY.to_owned()]).play_history);
-        assert!(
-            Features::of(&[PLAYLISTS.to_owned(), PLAYLIST_UPCOMING.to_owned()]).playlist_upcoming
-        );
-        assert!(!Features::of(&[PLAYLIST_UPCOMING.to_owned()]).playlist_upcoming);
-        // Downloads stand alone too.
-        assert!(Features::of(&[DOWNLOADS.to_owned()]).downloads);
-        assert!(!Features::of(&[PLAYLISTS.to_owned()]).downloads);
-        // Music downloads are downloads too: alone, none.
-        assert!(Features::of(&[DOWNLOADS.to_owned(), MUSIC_DOWNLOADS.to_owned()]).music_downloads);
-        assert!(!Features::of(&[MUSIC_DOWNLOADS.to_owned()]).music_downloads);
-        assert!(!Features::of(&["spoolframe:other".to_owned()]).playlists);
-        assert_eq!(Features::of(&[]), Features::default());
-    }
-
-    #[test]
-    fn an_app_lists_only_what_it_set_and_has_only_what_both_list() {
-        assert!(Features::default().names().is_empty());
-        // Every feature but music downloads, which this SDK takes up with
-        // PX-51's SDK stage.
-        let all: Vec<String> =
-            spoolframe_protocol::features::names(spoolframe_protocol::features::ALL);
-        let every = Features::of(&all);
-        assert_eq!(every.names(), all);
-        assert_eq!(Features::of(&every.names()), every);
-        assert_eq!(Features::default().both(&all), Features::default());
-        let app = Features {
-            playlists: true,
-            liked: true,
-            ..Features::default()
-        };
-        assert_eq!(app.both(&all), app);
-        // Liked still needs playlists, the app's or the server's.
-        let liked_only = Features {
-            liked: true,
-            ..Features::default()
-        };
-        assert_eq!(liked_only.both(&all), Features::default());
-        assert!(!app.both(&[LIKED.to_owned()]).liked);
-        // Covers need playlists too.
-        let art_only = Features {
-            playlist_art: true,
-            ..Features::default()
-        };
-        assert_eq!(art_only.both(&all), Features::default());
-        assert!(
-            Features {
-                playlists: true,
-                playlist_art: true,
-                ..Features::default()
-            }
-            .both(&all)
-            .playlist_art
-        );
     }
 }

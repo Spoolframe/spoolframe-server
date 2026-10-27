@@ -1,5 +1,4 @@
-//! Who a playlist is or can be shared with, by name
-//! (`spoolframe:playlist-sharing`): the one list the admin API's
+//! Who a playlist is or can be shared with, by name: the one list the admin API's
 //! `me.playlistShareCandidates` and the client protocol's
 //! `ListShareCandidates` both read, and the names a summary gives its
 //! owner and its shares.

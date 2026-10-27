@@ -1,4 +1,4 @@
-//! Music offline (PX-51, `spoolframe:music-downloads`): tracks downloaded
+//! Music offline (PX-51): tracks downloaded
 //! in original quality or as AAC 256, what an artist, a playlist or Liked
 //! holds against a cursor, and plays and likes made with no server.
 //! Against a server with real ffmpeg and ffprobe, on tracks made at test
@@ -12,7 +12,6 @@ use spoolframe_protocol::downloads::{
     DownloadInfo, DownloadSource, DownloadState, DownloadTracks, Followed, FollowedChange,
     FollowedTracks, OfflineLike, OfflinePlay, OfflineWatchOutcome,
 };
-use spoolframe_protocol::features::{DOWNLOADS, LIKED, MUSIC_DOWNLOADS, PLAYLISTS};
 use spoolframe_protocol::playlists::{Kinds, PlaylistEdit, Visibility};
 use spoolframe_protocol::{Error, Event, Reply, Request, Response, SessionId};
 use spoolframe_server::principal::{Actor, Principal};
@@ -20,17 +19,14 @@ use spoolframe_server::test_support::{album, artist, episode_media, track};
 use spoolframe_types::{Container, MediaId, Platform};
 
 use crate::downloads_wire::{
-    PASSWORD, events, hello, probe, read_from, ready, server, settled, sha256, unsupported,
+    PASSWORD, events, hello, probe, read_from, ready, server, settled, sha256,
 };
 use crate::support::{ServerOptions, TestClient, TestServer};
-
-/// The features a music app lists.
-const MUSIC_APP: [&str; 4] = [DOWNLOADS, MUSIC_DOWNLOADS, PLAYLISTS, LIKED];
 
 /// A connection from a music app on `platform`, signed in as `user`.
 async fn device(server: &TestServer, platform: Platform, user: &str) -> (TestClient, SessionId) {
     let client = server.client().await;
-    hello(&client, platform, &MUSIC_APP).await;
+    hello(&client, platform).await;
     let session = client.login(user, PASSWORD).await;
     (client, session)
 }
@@ -577,11 +573,10 @@ async fn liked_changes(
     told
 }
 
-/// A like and an unlike are told to the user's connections that listed
-/// music downloads: not to another user's, nor to the user's own that
-/// did not list them (the laptop, which made them).
+/// A like and an unlike are told to each of the user's connections, the
+/// one that made them too, and not to another user's.
 #[tokio::test]
-async fn liked_changed_is_told_only_to_the_user_s_music_apps() {
+async fn liked_changed_is_told_to_each_of_the_user_s_apps() {
     let server = TestServer::start("music-liked-changed").await;
     for name in ["alice", "bob"] {
         server.add_user(name, PASSWORD, None).await;
@@ -589,7 +584,7 @@ async fn liked_changed_is_told_only_to_the_user_s_music_apps() {
     let (phone, phone_session) = device(&server, Platform::Ios, "alice").await;
     let (bobs, bobs_session) = device(&server, Platform::Ios, "bob").await;
     let laptop = server.client().await;
-    hello(&laptop, Platform::Linux, &[DOWNLOADS, PLAYLISTS, LIKED]).await;
+    hello(&laptop, Platform::Linux).await;
     let session = laptop.login("alice", PASSWORD).await;
     // Each acts as its user once: from then on it is told.
     changes(&phone, &phone_session, vec![], vec![], true, None).await;
@@ -618,9 +613,9 @@ async fn liked_changed_is_told_only_to_the_user_s_music_apps() {
             matches!(unliked, Response::Ok(Reply::PlaylistInfo(_))),
             to_phone,
             liked_changes(&mut bobs_events, 1, wait).await,
-            liked_changes(&mut laptop_events, 1, wait).await,
+            liked_changes(&mut laptop_events, 2, wait).await,
         ),
-        (true, true, 2, 0, 0)
+        (true, true, 2, 0, 2)
     );
     server.stop().await;
 }
@@ -804,47 +799,6 @@ async fn the_newest_liked_change_wins_whichever_device_made_it() {
             vec![OfflineWatchOutcome::Older],
             false
         )
-    );
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn without_the_feature_music_is_refused() {
-    let server = server("music-unlisted", ServerOptions::default()).await;
-    write_flac(&server, "32");
-    let laptop = server.client().await;
-    hello(&laptop, Platform::Linux, &[DOWNLOADS, PLAYLISTS, LIKED]).await;
-    let session = laptop.login("alice", PASSWORD).await;
-    let prepare = prepare(&laptop, &session, "32", DownloadSource::Original).await;
-    let changes = laptop
-        .call(
-            Some(&session),
-            Request::MusicDownloadChanges {
-                artists: vec![artist().id().clone()],
-                playlists: vec![],
-                liked: false,
-                since: None,
-            },
-        )
-        .await;
-    let plays = laptop
-        .call(
-            Some(&session),
-            Request::SyncOfflinePlays {
-                device_now: 0,
-                plays: vec![],
-                liked: vec![],
-            },
-        )
-        .await;
-    assert_eq!(
-        (
-            matches!(prepare, Response::Err(Error::InvalidInput { .. })),
-            unsupported(&changes),
-            unsupported(&plays),
-        ),
-        (true, true, true),
-        "{prepare:?} {changes:?} {plays:?}"
     );
     server.stop().await;
 }

@@ -136,9 +136,7 @@ impl Client {
     /// else. A key added to a phrase identity carries the identity's id as
     /// its handle, and that finds it too. The record is checked to be the
     /// one the handle names. [`SdkError::NotFound`] where no identity
-    /// known there has it; a server before this answers
-    /// [`SdkError::Unavailable`] or a protocol error, as for any request it
-    /// does not know.
+    /// known there has it.
     pub async fn fetch_identity_record_by_handle(
         &self,
         endpoint_id: &str,

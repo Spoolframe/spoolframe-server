@@ -265,7 +265,7 @@ async fn harness(test: &str) -> Harness {
 impl Harness {
     /// `who`'s built-in playlist `builtin`, from their list.
     async fn builtin(&self, who: &Actor, builtin: Builtin) -> PlaylistSummary {
-        let (list, _) = self.playlists.list(who, true).await.unwrap();
+        let (list, _) = self.playlists.list(who).await.unwrap();
         list.into_iter()
             .find(|p| p.builtin == Some(builtin))
             .expect("listed")
@@ -523,7 +523,7 @@ async fn all_is_every_track_one_may_see_and_follows_a_scan() {
 }
 
 #[tokio::test]
-async fn liked_and_all_are_listed_first_and_only_to_who_takes_them() {
+async fn liked_and_all_are_listed_first() {
     let h = harness("listed").await;
     h.playlists
         .create(
@@ -537,12 +537,9 @@ async fn liked_and_all_are_listed_first_and_only_to_who_takes_them() {
         )
         .await
         .unwrap();
-    let (list, _) = h.playlists.list(&h.alice, true).await.unwrap();
+    let (list, _) = h.playlists.list(&h.alice).await.unwrap();
     let order: Vec<_> = list.iter().map(|p| p.builtin).collect();
     assert_eq!(order, [Some(Builtin::Liked), Some(Builtin::All), None]);
-    let (older, _) = h.playlists.list(&h.alice, false).await.unwrap();
-    assert_eq!(older.len(), 1);
-    assert_eq!(older[0].builtin, None);
 }
 
 /// Liked shows on an album's and its artist's screens as any playlist
@@ -552,19 +549,9 @@ async fn liked_is_among_the_playlists_holding_an_album_and_all_is_not() {
     let h = harness("holding").await;
     h.playlists.like(&h.alice, &[track(104)]).await.unwrap();
     for screen in [Music::album(100), Music::artist()] {
-        let held = h
-            .playlists
-            .holding(&h.alice, &screen, &[], true)
-            .await
-            .unwrap();
+        let held = h.playlists.holding(&h.alice, &screen, &[]).await.unwrap();
         let builtins: Vec<_> = held.iter().map(|r| r.builtin).collect();
         assert_eq!(builtins, [Some(Builtin::Liked)], "{screen:?}");
-        let older = h
-            .playlists
-            .holding(&h.alice, &screen, &[], false)
-            .await
-            .unwrap();
-        assert!(older.is_empty());
     }
 }
 

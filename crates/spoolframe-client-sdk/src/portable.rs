@@ -277,7 +277,8 @@ pub struct PortableIdentity {
     /// Unix seconds: when [`Self::name`] was last set by a rename, here or
     /// on another synced device. 0 for the name it was made, recovered or
     /// adopted with, so any rename beats that one.
-    // compat(v1): required at the protocol reset
+    // Read as the default when left out: a stored record, not a message of
+    // the client protocol, and one written by an SDK before it lacks the key.
     #[serde(default)]
     pub name_set_at: u64,
     /// Unix seconds: made, or first recovered, here.
@@ -294,7 +295,8 @@ pub struct PortableIdentity {
     /// Rooted in security keys (P7-08): its genesis is kept here, and its
     /// root actions take a key ([`RootSigner::Key`]). A phrase identity
     /// that added a key is not one: its phrase is still a root.
-    // compat(v1): required at the protocol reset
+    // Read as the default when left out: a stored record, not a message of
+    // the client protocol, and one written by an SDK before it lacks the key.
     #[serde(default)]
     pub key_rooted: bool,
 }

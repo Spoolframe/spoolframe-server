@@ -38,7 +38,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointId, RelayConfig, RelayUrl};
-use spoolframe_protocol::features::INVITE_LOOKUP;
 use spoolframe_protocol::invite::{Invite, InviteLinkKind, MAX_HINTS, normalize_code, parse_link};
 use spoolframe_protocol::relay_access::invite_token;
 use spoolframe_protocol::{
@@ -162,12 +161,6 @@ fn outcome_of(outcome: InviteLookupOutcome) -> InviteOutcome {
     }
 }
 
-fn lookup_unsupported() -> SdkError {
-    SdkError::Unsupported {
-        feature: INVITE_LOOKUP.to_owned(),
-    }
-}
-
 /// `link` read, and the key it names.
 fn parsed(link: &str) -> Result<(Invite, EndpointId), SdkError> {
     let invite = parse_link(link).ok_or(SdkError::NotAnInvite)?;
@@ -230,11 +223,9 @@ impl Client {
     /// code is. Nothing is saved, and nothing used up.
     ///
     /// Refusals: [`SdkError::NotAnInvite`]; [`SdkError::InvalidInput`] for
-    /// a link with no code (it only finds the server); [`SdkError::Unsupported`]
-    /// when the app did not list [`crate::Features::invite_lookup`]
-    /// (nothing is sent) or the server does not have it (show the join
-    /// form instead); [`SdkError::RateLimited`] after too many codes that
-    /// match nothing; and `connect_invite`'s.
+    /// a link with no code (it only finds the server);
+    /// [`SdkError::RateLimited`] after too many codes that match nothing;
+    /// and `connect_invite`'s.
     pub async fn look_up_invite(&self, link: &str) -> Result<InviteLookup, SdkError> {
         let (invite, id) = parsed(link)?;
         let Some(code) = invite.code.clone() else {
@@ -242,11 +233,8 @@ impl Client {
                 "this invite has no code: it only finds the server".into(),
             ));
         };
-        if !self.inner.features.invite_lookup {
-            return Err(lookup_unsupported());
-        }
-        let (server, conn) = self.connect_invited(&invite, id).await?;
-        let outcome = self.look_up(id, &conn.info.features, code).await?;
+        let (server, _) = self.connect_invited(&invite, id).await?;
+        let outcome = self.look_up(id, code).await?;
         Ok(InviteLookup { server, outcome })
     }
 
@@ -266,37 +254,21 @@ impl Client {
         typed: &str,
     ) -> Result<InviteLookup, SdkError> {
         let code = parse_code(typed)?;
-        if !self.inner.features.invite_lookup {
-            return Err(lookup_unsupported());
-        }
         let id = parse_id(endpoint_id)?;
         self.hint_addrs(id, &addrs);
         let server = self.connect(&id.to_string()).await?;
-        let features = self.hello(id).map(|info| info.features).unwrap_or_default();
-        let outcome = self.look_up(id, &features, code).await?;
+        let outcome = self.look_up(id, code).await?;
         Ok(InviteLookup { server, outcome })
     }
 
-    /// Ask server `id`, whose answer to `Hello` listed `features`, what
-    /// invite `code` is.
-    async fn look_up(
-        &self,
-        id: EndpointId,
-        features: &[String],
-        code: String,
-    ) -> Result<InviteOutcome, SdkError> {
-        if !spoolframe_protocol::features::has(features, INVITE_LOOKUP) {
-            return Err(lookup_unsupported());
-        }
+    /// Ask server `id` what invite `code` is.
+    async fn look_up(&self, id: EndpointId, code: String) -> Result<InviteOutcome, SdkError> {
         let request = Request::LookupInvite(LookupInvite { code });
         match self.call(id, None, request).await? {
             Response::Ok(Reply::InviteLookup { outcome }) => Ok(outcome_of(outcome)),
             Response::Ok(other) => Err(SdkError::Protocol(format!(
                 "LookupInvite answered {other:?}"
             ))),
-            Response::Err(spoolframe_protocol::Error::Unsupported { .. }) => {
-                Err(lookup_unsupported())
-            }
             Response::Err(e) => Err(SdkError::from_server(e)),
         }
     }

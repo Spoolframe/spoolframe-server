@@ -544,9 +544,9 @@ async fn an_item_page_shows_what_a_client_would_get() {
         item: found.item,
         children: found.children,
         markers: found.markers,
-        playlists: None,
+        playlists: Vec::new(),
         liked: None,
-        liked_children: None,
+        liked_children: Vec::new(),
         copies: None,
     };
     assert_eq!(seen.reply, serde_json::to_value(&client).unwrap());

@@ -1,5 +1,4 @@
-//! Music offline (PX-51, feature `spoolframe:music-downloads`): tracks
-//! downloaded on purpose, and tracks kept from listening.
+//! Music offline (PX-51): tracks downloaded on purpose, and tracks kept from listening.
 //!
 //! A download is of a track, an album, an artist, a playlist or Liked
 //! ([`MusicTarget`]). Each track is one stored file per quality, held by
@@ -49,7 +48,6 @@ use spoolframe_protocol::downloads::{
     DownloadSource, DownloadTracks, Followed, FollowedTracks, MAX_ASKED, MAX_FOLLOWED, OfflineLike,
     OfflinePlay, OfflineWatchOutcome,
 };
-use spoolframe_protocol::features::{LIKED, MUSIC_DOWNLOADS};
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::{Item, MediaId, MediaKind, MediaTracks};
 
@@ -436,19 +434,6 @@ struct PendingPlays {
     liked: Vec<OfflineLike>,
 }
 
-impl Session {
-    /// [`SdkError::Unsupported`] unless the session has music downloads.
-    pub(crate) fn music_offered(&self) -> Result<(), SdkError> {
-        if self.features.downloads && self.features.music_downloads {
-            Ok(())
-        } else {
-            Err(SdkError::Unsupported {
-                feature: MUSIC_DOWNLOADS.into(),
-            })
-        }
-    }
-}
-
 impl Downloads {
     /// Download `target` as `session`'s user, in
     /// [`DownloadSettings::music_quality`]: its tracks are listed now
@@ -462,14 +447,8 @@ impl Downloads {
     ) -> Result<MusicDownload, SdkError> {
         let shared = self.shared();
         let store = shared.store()?;
-        session.music_offered()?;
         if let Some((id, kind)) = target.media_kind() {
             expect_kind(id, kind)?;
-        }
-        if target == MusicTarget::Liked && !session.features.liked {
-            return Err(SdkError::Unsupported {
-                feature: LIKED.into(),
-            });
         }
         shared.session_made(session);
         let server = session.server();
@@ -745,7 +724,6 @@ impl Downloads {
     /// now, fetching what was added and letting go of what was removed.
     /// The manager does this by itself when a session is made or found.
     pub async fn sync_music(&self, session: &Session) -> Result<MusicSynced, SdkError> {
-        session.music_offered()?;
         sync(self.shared(), session).await
     }
 }
@@ -1294,12 +1272,7 @@ async fn send_plays(shared: &Shared, session: &Session) -> Result<MusicSynced, S
     let user_id = session.user().user_id.clone();
     let path = store.offline_plays_path(&server, &user_id);
     let pending: PendingPlays = read_json(&path);
-    // Likes wait for a server with Liked.
-    let likes = if session.features.liked {
-        pending.liked.clone()
-    } else {
-        Vec::new()
-    };
+    let likes = pending.liked.clone();
     let mut synced = MusicSynced::default();
     let mut sent_plays: HashSet<(MediaId, i64)> = HashSet::new();
     let mut sent_likes: HashSet<(MediaId, i64)> = HashSet::new();
@@ -1379,7 +1352,6 @@ async fn refresh(
         .downloads
         .iter()
         .filter_map(|d| d.target.followed().map(|f| (f, d.clone())))
-        .filter(|(f, _)| *f != Followed::Liked || session.features.liked)
         .filter(|(f, _)| only.is_none_or(|only| only.contains(f)))
         .collect();
     if followed.is_empty() {
@@ -1587,9 +1559,6 @@ pub(super) async fn follow_while_connected(client: Weak<Inner>, shared: Arc<Shar
                 continue;
             };
             let session = parts.attach(client);
-            if session.music_offered().is_err() {
-                continue;
-            }
             if let Err(e) = refresh(&shared, &session, asked.as_deref()).await {
                 tracing::info!(%server, error = %e, "followed music not brought up to date; asked again later");
             }

@@ -68,7 +68,7 @@ impl Keeper {
         id: &MediaId,
         options: &PlaybackOptions,
     ) -> Option<Arc<Self>> {
-        if id.kind() != spoolframe_types::MediaKind::Track || session.music_offered().is_err() {
+        if id.kind() != spoolframe_types::MediaKind::Track {
             return None;
         }
         let shared = session.client.inner.downloads.clone();

@@ -976,22 +976,20 @@ async fn a_redemption_refused_for_its_username_or_password_is_logged() {
 // tells loopback besides its LAN addresses, so the link reaches it on a
 // machine with no network.
 
-// Looking an invite up before joining (spoolframe:invite-lookup): what a
-// code is, from a device with no session, and nothing used up.
+// Looking an invite up before joining: what a code is, from a device with
+// no session, and nothing used up.
 
 mod lookup {
-    use spoolframe_protocol::features::INVITE_LOOKUP;
     use spoolframe_protocol::invite_admin::InviteKind as WireKind;
     use spoolframe_protocol::{InviteLookupOutcome as Outcome, LookupInvite};
 
     use super::*;
 
-    /// A device the server has never seen, its `Hello` listing the
-    /// feature.
+    /// A device the server has never seen, its `Hello` naming no feature:
+    /// the lookup is base protocol.
     async fn looker(invites: &Invites) -> TestClient {
         let device = invites.server.client().await;
-        let info = device.hello_listing(&[INVITE_LOOKUP]).await;
-        assert!(info.features.iter().any(|f| f == INVITE_LOOKUP), "{info:?}");
+        device.hello_info().await;
         device
     }
 
@@ -1250,40 +1248,6 @@ mod lookup {
         ));
         invites.server.stop().await;
     }
-
-    /// PX-16: only a client that listed the feature is answered; one
-    /// that did not is told so, as an older server would, and nothing is
-    /// counted, neither as a guess nor on the strangers' budget.
-    #[tokio::test]
-    async fn a_client_that_did_not_list_the_feature_is_unsupported() {
-        let invites = Invites::start_with(
-            "invite-lookup-unlisted",
-            ServerOptions {
-                stranger_attempts: Bucket {
-                    capacity: 1,
-                    refill_every: Duration::from_secs(3600),
-                },
-                ..ServerOptions::default()
-            },
-        )
-        .await;
-        let created = invites.create(create_user()).await;
-        let older = invites.server.client().await;
-        let info = older.hello_listing(&[]).await;
-        // The server lists it before a session all the same.
-        assert_eq!(info.features, [INVITE_LOOKUP]);
-        for _ in 0..6 {
-            assert!(
-                matches!(
-                    older.call(None, look_up(WRONG)).await,
-                    Response::Err(Error::Unsupported { .. })
-                ),
-                "answered without the feature"
-            );
-        }
-        logged_in(older.call(None, redeem(&created.code, "mum")).await);
-        invites.server.stop().await;
-    }
 }
 
 mod sdk {
@@ -1292,8 +1256,7 @@ mod sdk {
 
     use spoolframe_admin_api::{AdminApiClient, NewInvite, Role};
     use spoolframe_client_sdk::{
-        Client, ClientOptions, Device, InviteKind, InviteOutcome, MemoryStorage, SdkError,
-        Selection,
+        Client, Device, InviteKind, InviteOutcome, MemoryStorage, SdkError, Selection,
     };
     use spoolframe_server::announce::{Added, Announce};
 
@@ -2127,22 +2090,7 @@ mod sdk {
             client.look_up_invite("not a link").await.unwrap_err(),
             SdkError::NotAnInvite
         );
-        let unlisted = Client::open_with_options(
-            Arc::new(MemoryStorage::default()),
-            device(),
-            ClientOptions {
-                lan_discovery: false,
-                ..ClientOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            unlisted.look_up_invite(&created.link).await,
-            Err(SdkError::Unsupported { .. })
-        ));
         client.close().await;
-        unlisted.close().await;
         invites.server.stop().await;
     }
 }

@@ -975,8 +975,6 @@ impl Server {
             web_url: services.public_url.clone(),
             // Per connection, from its Hello (PX-49).
             experimental: Vec::new(),
-            // PX-16: only the pre-auth ones before a session.
-            features: spoolframe_protocol::features::names(spoolframe_protocol::features::PRE_AUTH),
             // An account is made only by `RedeemInvite`: there is no open
             // sign-up, and no setting for one.
             invite_only: true,

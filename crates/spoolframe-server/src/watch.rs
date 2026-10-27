@@ -836,8 +836,8 @@ impl Watch {
     /// Set `last_viewed_at` on `items` from `principal`'s watch state:
     /// when it was last saved, by a progress report from any device of
     /// theirs, a mark as watched or unwatched, or a Plex sync with Plex's
-    /// own time. Asked for only where a reply carries it to a client that
-    /// takes it (`spoolframe:last-viewed`); [`Watch::fill`] leaves it out.
+    /// own time. Asked for only where a reply carries it; [`Watch::fill`]
+    /// leaves it out.
     pub async fn fill_last_viewed(
         &self,
         principal: Principal,

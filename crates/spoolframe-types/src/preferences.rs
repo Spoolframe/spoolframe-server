@@ -48,9 +48,6 @@ pub struct SubtitlePreferences {
     pub bitmap: BitmapPreference,
     /// Forced subtitles (only the parts in another language) among a
     /// subtitle search's results (PX-02). Playback follows `mode`.
-    // compat(v1): required at the protocol reset. Until then a peer from
-    // before it leaves it out, and it reads as the default.
-    #[serde(default)]
     pub forced: ForcedPreference,
 }
 
@@ -201,18 +198,18 @@ mod tests {
         }
     }
 
-    /// A peer from before the forced preference leaves it out: the
-    /// preferences still read, with the default.
+    /// Preferences without the forced preference, as a peer before the
+    /// reset to revision 1 could send them, are refused.
     #[test]
-    fn preferences_without_the_forced_preference_read_with_the_default() {
-        let mut wanted = TrackPreferences::default();
-        wanted.subtitles.sdh = SdhPreference::Prefer;
-        let p: TrackPreferences = serde_json::from_value(full(|j| {
-            j["subtitles"]["sdh"] = "prefer".into();
+    fn preferences_without_the_forced_preference_are_refused() {
+        let error = serde_json::from_value::<TrackPreferences>(full(|j| {
             j["subtitles"].as_object_mut().unwrap().remove("forced");
         }))
-        .unwrap();
-        assert_eq!(p, wanted);
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `forced`"),
+            "{error}"
+        );
     }
 
     /// Each field in turn, by its JSON path, left out of the defaults.

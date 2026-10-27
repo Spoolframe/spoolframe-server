@@ -1,21 +1,15 @@
-//! What this server speaks of the client protocol: its version and its
-//! features, as the Server page (`ServerStatus`), `spoolframe-server
-//! --version` and MCP's server info show them. New wire capability comes
-//! as a regular feature rather than a new version (PX-43 on), so the
-//! version alone no longer says what a server can do.
+//! What this server speaks of the client protocol: its version and the
+//! experimental features on, as the Server page (`ServerStatus`),
+//! `spoolframe-server --version` and MCP's server info show them. Every
+//! other capability is the version's own: the regular features were
+//! folded into revision 1.
 
-use spoolframe_protocol::{PROTOCOL_VERSION, experimental, features};
+use spoolframe_protocol::{PROTOCOL_VERSION, experimental};
 
-/// The protocol's version, and the features this server has, each list
-/// named for what it is.
+/// The protocol's version, and the experimental features on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolInfo {
     pub version: u32,
-    /// Every regular feature (`features::ALL`): always on in this build.
-    pub features: Vec<&'static str>,
-    /// Those of them a client sees before it signs in
-    /// (`features::PRE_AUTH`).
-    pub pre_auth: Vec<&'static str>,
     /// The experimental features turned on here, each by its setting.
     pub experimental: Vec<&'static str>,
 }
@@ -25,20 +19,16 @@ impl ProtocolInfo {
     pub fn new(experimental: Vec<&'static str>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
-            features: features::ALL.to_vec(),
-            pre_auth: features::PRE_AUTH.to_vec(),
             experimental,
         }
     }
 
-    /// One line each, for `--version` and MCP: "features: a, b", and
-    /// "none" for an empty list, which is shown, not left out.
-    /// `experimental` names the experimental lines' heading.
+    /// One line each, for `--version` and MCP: "client protocol: 1", then
+    /// the experimental features under the heading `experimental`, "none"
+    /// for an empty list, which is shown, not left out.
     pub fn lines(&self, experimental: &str) -> Vec<String> {
         vec![
             format!("client protocol: {}", self.version),
-            format!("features: {}", listed(&self.features)),
-            format!("pre-auth features: {}", listed(&self.pre_auth)),
             format!("{experimental}: {}", listed(&self.experimental)),
         ]
     }
@@ -94,16 +84,16 @@ mod tests {
         assert_eq!(listed(&["a", "b"]), "a, b");
         let info = ProtocolInfo::new(Vec::new());
         let lines = info.lines("experimental features on");
-        assert_eq!(lines[2], "pre-auth features: spoolframe:invite-lookup");
-        assert_eq!(lines[3], "experimental features on: none");
+        assert_eq!(
+            lines,
+            ["client protocol: 1", "experimental features on: none"]
+        );
     }
 
     #[test]
-    fn the_features_are_this_build_s() {
+    fn the_experimental_features_are_those_on() {
         let info = ProtocolInfo::new(experimental_on(true, false));
         assert_eq!(info.version, PROTOCOL_VERSION);
-        assert!(info.features.contains(&features::LIKED));
-        assert!(info.features.contains(&features::PLAYLISTS));
         assert_eq!(info.experimental, [experimental::HTTP_PLAYBACK]);
         assert!(experimental_on(false, false).is_empty());
         assert_eq!(experimental_on(false, true), [experimental::FEDERATION]);
@@ -122,6 +112,10 @@ mod tests {
             lines.next(),
             Some(format!("client protocol: {PROTOCOL_VERSION}").as_str())
         );
-        assert!(text.contains("spoolframe:liked"), "{text}");
+        assert_eq!(
+            lines.next(),
+            Some("experimental features (each on by its setting): http-playback, federation")
+        );
+        assert_eq!(lines.next(), None);
     }
 }

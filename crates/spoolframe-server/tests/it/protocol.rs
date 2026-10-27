@@ -52,6 +52,101 @@ async fn hello_is_answered_with_server_info() {
     close(server, client).await;
 }
 
+/// The protocol was reset to 1 in 0.16.0, a clean break.
+#[test]
+fn the_client_protocol_is_revision_1() {
+    assert_eq!(PROTOCOL_VERSION, 1);
+}
+
+/// The refusal text of a `Hello` of revision `said`.
+async fn refusal_of(client: &TestClient, said: u32) -> String {
+    let hello = spoolframe_protocol::Hello {
+        protocol_version: said,
+        client_name: "spoolframe-ios".into(),
+        client_version: "0.15.0".into(),
+        platform: spoolframe_types::Platform::Ios,
+        device_name: None,
+        capabilities: None,
+        experimental: Vec::new(),
+    };
+    match client.call(None, Request::Hello(hello)).await {
+        Response::Err(Error::Unsupported { request }) => request,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An app built with SDK 0.15 says revision 15: from before the reset, so
+/// older than this server whatever the number. It is refused with the
+/// error every SDK reads as "update", saying which.
+#[tokio::test]
+async fn a_hello_from_before_the_reset_is_told_the_app_is_too_old() {
+    let (server, client) = connect("hello-before-reset").await;
+    assert_eq!(
+        refusal_of(&client, 15).await,
+        "client protocol 15; this server speaks 1: this server needs a newer app"
+    );
+    assert_eq!(
+        refusal_of(&client, 2).await,
+        "client protocol 2; this server speaks 1: this server needs a newer app"
+    );
+    // Refused, it is not this connection's Hello.
+    assert!(matches!(
+        client.call(None, Request::AuthMethods).await,
+        Response::Err(Error::HandshakeRequired)
+    ));
+    close(server, client).await;
+}
+
+#[tokio::test]
+async fn a_hello_from_a_newer_app_is_told_to_update_the_server() {
+    let (server, client) = connect("hello-newer").await;
+    assert_eq!(
+        refusal_of(&client, 16).await,
+        "client protocol 16; this server speaks 1: update the server"
+    );
+    close(server, client).await;
+}
+
+/// A `Hello` from before the reset need not decode as this revision's:
+/// it is still refused for its revision, not as malformed, as the app
+/// shows "update" only for the one.
+#[tokio::test]
+async fn a_hello_from_before_the_reset_that_does_not_decode_is_refused_for_its_revision() {
+    #[derive(Serialize)]
+    struct Partial {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        protocol_version: u32,
+        client_name: &'static str,
+        features: Vec<&'static str>,
+    }
+    #[derive(Serialize)]
+    struct Envelope {
+        session: Option<String>,
+        request: Partial,
+    }
+    let (server, client) = connect("hello-before-reset-partial").await;
+    let response = client
+        .send(&Envelope {
+            session: None,
+            request: Partial {
+                kind: "hello",
+                protocol_version: 15,
+                client_name: "spoolframe-ios",
+                features: vec!["spoolframe:playlists"],
+            },
+        })
+        .await;
+    let Response::Err(Error::Unsupported { request }) = response else {
+        panic!("{response:?}");
+    };
+    assert_eq!(
+        request,
+        "client protocol 15; this server speaks 1: this server needs a newer app"
+    );
+    close(server, client).await;
+}
+
 /// An account is made only from an invite, and Hello says so, for a
 /// "servers on my network" list.
 #[tokio::test]
@@ -381,7 +476,6 @@ async fn hello_strings_are_cut_to_their_bound() {
         device_name: Some(long.clone()),
         capabilities: None,
         experimental: Vec::new(),
-        features: Vec::new(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

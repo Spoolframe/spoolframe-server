@@ -314,8 +314,6 @@ async fn a_client_initializes_and_lists_the_tools_of_its_scopes_only() {
         lines,
         [
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
-            "features: spoolframe:playlists, spoolframe:liked, spoolframe:last-viewed, spoolframe:playlist-sharing, spoolframe:play-history, spoolframe:playlist-art, spoolframe:subtitle-sync, spoolframe:subtitle-search, spoolframe:playlist-upcoming, spoolframe:downloads, spoolframe:music-downloads, spoolframe:invite-lookup",
-            "pre-auth features: spoolframe:invite-lookup",
             "experimental features on: http-playback",
         ]
     );
@@ -564,7 +562,7 @@ async fn a_playlist_of_every_heist_episode_is_made_through_search_and_add_to_pla
         admin: false,
         federated: false,
     };
-    let (theirs, _) = server.playlists.list(&actor, true).await.unwrap();
+    let (theirs, _) = server.playlists.list(&actor).await.unwrap();
     assert_eq!(theirs.len(), 1);
     assert_eq!(theirs[0].name, "Heists");
 }
@@ -591,15 +589,7 @@ async fn without_the_scope_the_playlist_tools_are_absent_and_refused() {
         federated: false,
     };
     // Nothing was made, for anyone.
-    assert!(
-        server
-            .playlists
-            .list(&actor, true)
-            .await
-            .unwrap()
-            .0
-            .is_empty()
-    );
+    assert!(server.playlists.list(&actor).await.unwrap().0.is_empty());
 }
 
 /// With playlists:read alone an app reads playlists and changes none:
@@ -646,7 +636,7 @@ async fn with_playlists_read_the_playlists_are_read_and_not_changed() {
         .await
         .unwrap_err();
     assert!(refused.contains("playlists:write"), "{refused}");
-    let (mine, _) = server.playlists.list(&actor, true).await.unwrap();
+    let (mine, _) = server.playlists.list(&actor).await.unwrap();
     assert_eq!(mine.len(), 1);
     assert_eq!(mine[0].id, made.id);
 }

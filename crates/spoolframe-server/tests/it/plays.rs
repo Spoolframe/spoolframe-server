@@ -1,4 +1,4 @@
-//! Play history (PX-52, `spoolframe:play-history`) over a real Iroh
+//! Play history (PX-52) over a real Iroh
 //! connection: each play a row, tracks included, counted by the rule in
 //! `spoolframe_policy::plays`, with time played measured on the server's
 //! clock; play counts on an item's details, and Recently played.
@@ -11,7 +11,6 @@ use crate::support;
 
 use std::time::Duration;
 
-use spoolframe_protocol::features::PLAY_HISTORY;
 use spoolframe_protocol::playlists::Kinds;
 use spoolframe_protocol::{
     Error, Hello, PROTOCOL_VERSION, PlaybackHandle, Reply, Request, Response, SessionId,
@@ -37,8 +36,8 @@ fn episode() -> MediaId {
     id(MediaKind::Episode, "12")
 }
 
-/// A client that plays MKV with H.264, listing `features`.
-async fn device(server: &TestServer, features: &[&str]) -> TestClient {
+/// A client that plays MKV with H.264.
+async fn device(server: &TestServer) -> TestClient {
     let client = server.client().await;
     let mut capabilities = support::mkv_capabilities();
     capabilities
@@ -52,7 +51,6 @@ async fn device(server: &TestServer, features: &[&str]) -> TestClient {
         device_name: Some("Living room".into()),
         capabilities: Some(capabilities),
         experimental: Vec::new(),
-        features: features.iter().map(|n| n.to_string()).collect(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -66,7 +64,7 @@ async fn household(test: &str) -> (TestServer, TestClient, SessionId, SessionId)
     let server = TestServer::start(test).await;
     server.add_user("alice", PASSWORD, None).await;
     server.add_user("bob", "battery staple", None).await;
-    let tv = device(&server, &[PLAY_HISTORY]).await;
+    let tv = device(&server).await;
     let alice = tv.login("alice", PASSWORD).await;
     let bob = tv.login("bob", "battery staple").await;
     (server, tv, alice, bob)
@@ -417,22 +415,25 @@ async fn plays_are_per_user_and_recently_played_is_one_s_own() {
     server.stop().await;
 }
 
-/// A client that did not list the feature gets no play counts, and its
-/// Recently played is refused.
+/// Play history is base protocol: every app of the user's sees the play
+/// counts, and Recently played, without naming a feature.
 #[tokio::test]
-async fn a_client_without_the_feature_gets_none_of_it() {
-    let (server, tv, alice, _) = household("plays-unlisted").await;
+async fn every_app_sees_the_play_history() {
+    let (server, tv, alice, _) = household("plays-base").await;
     play_for(&server, &tv, &alice, &track(), 300).await;
     closed_plays(&server, principal(&server, "alice").await, 1).await;
     assert_eq!(state_of(&tv, &alice, &track()).await.play_count, 1);
 
-    let phone = device(&server, &[]).await;
+    let phone = device(&server).await;
     let on_phone = phone.login("alice", PASSWORD).await;
     let state = state_of(&phone, &on_phone, &track()).await;
-    assert_eq!((state.play_count, state.last_played_at), (0, None));
+    assert_eq!(
+        (state.play_count, state.last_played_at.is_some()),
+        (1, true)
+    );
     assert!(matches!(
         recently_played(&phone, &on_phone, None).await,
-        Response::Err(Error::Unsupported { .. })
+        Response::Ok(_)
     ));
     phone.close().await;
     tv.close().await;

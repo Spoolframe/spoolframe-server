@@ -452,8 +452,7 @@ impl Watch {
 
     /// Set `play_count` and `last_played_at` on the films, episodes and
     /// tracks in `items`, from `principal`'s counted plays, with one
-    /// lookup. Asked for only where a reply carries them to a client that
-    /// takes them (`spoolframe:play-history`).
+    /// lookup. Asked for only where a reply carries them.
     pub async fn fill_plays(
         &self,
         principal: Principal,

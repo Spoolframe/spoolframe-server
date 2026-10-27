@@ -1,13 +1,11 @@
-//! Play history (PX-52, feature `spoolframe:play-history`): what the
+//! Play history (PX-52): what the
 //! user played lately, tracks included, and how often.
 //!
 //! An item's details ([`Session::item`]) carry each item's
 //! `PlaybackState::play_count` and `last_played_at`, its own and its
 //! children's (an album's tracks); [`Session::recently_played`] lists the
-//! user's items by their latest play. A session without the feature gets
-//! neither field, and the call is [`SdkError::Unsupported`], unsent.
+//! user's items by their latest play.
 
-use spoolframe_protocol::features::PLAY_HISTORY;
 use spoolframe_protocol::playlists::Kinds;
 use spoolframe_protocol::{Reply, Request};
 
@@ -26,11 +24,6 @@ impl Session {
         offset: u32,
         limit: u32,
     ) -> Result<ItemsPage, SdkError> {
-        if !self.features.play_history {
-            return Err(SdkError::Unsupported {
-                feature: PLAY_HISTORY.into(),
-            });
-        }
         let request = Request::RecentlyPlayed {
             kinds,
             offset,

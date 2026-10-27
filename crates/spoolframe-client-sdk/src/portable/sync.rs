@@ -96,7 +96,8 @@ pub enum RootSyncRefused {
 struct SyncRecord {
     name: String,
     /// When `name` was set by a rename ([`super::PortableIdentity::name_set_at`]).
-    // compat(v1): required at the protocol reset
+    // Read as the default when left out: a stored record, not a message of
+    // the client protocol, and one written by an SDK before it lacks the key.
     #[serde(default)]
     name_set_at: u64,
     created_at: u64,

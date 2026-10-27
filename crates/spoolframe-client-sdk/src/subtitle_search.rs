@@ -1,5 +1,5 @@
-//! Subtitles from subtitle sites on demand (PX-02, feature
-//! `spoolframe:subtitle-search`): OpenSubtitles, SubDL or both, as the
+//! Subtitles from subtitle sites on demand (PX-02): OpenSubtitles, SubDL
+//! or both, as the
 //! server's admin set, searched and downloaded by the server, with its own
 //! key for each, only when someone asks.
 //!
@@ -20,27 +20,14 @@
 //! came from, who downloaded it, and whether this user may remove it
 //! ([`Session::remove_subtitle_download`]). A server with no site set up
 //! answers `NoSubtitleSource` (hide "Find subtitles…"); a quota used up,
-//! `QuotaExhausted` with whose it is and, for an account, its `site`. A
-//! session without the feature gets no `download`, and the calls are
-//! [`SdkError::Unsupported`], unsent.
+//! `QuotaExhausted` with whose it is and, for an account, its `site`.
 
-use spoolframe_protocol::features::SUBTITLE_SEARCH;
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::{MediaId, SubtitleDownloaded, SubtitleSearch};
 
 use crate::{SdkError, Session};
 
 impl Session {
-    fn subtitle_search_listed(&self) -> Result<(), SdkError> {
-        if self.features.subtitle_search {
-            Ok(())
-        } else {
-            Err(SdkError::Unsupported {
-                feature: SUBTITLE_SEARCH.into(),
-            })
-        }
-    }
-
     /// Search for item `id`'s subtitles in `language` (`en`, `pt-BR`), or
     /// with `None` in the languages the server offers first. Kept a day
     /// on the server: asking again costs nothing.
@@ -49,7 +36,6 @@ impl Session {
         id: &MediaId,
         language: Option<&str>,
     ) -> Result<SubtitleSearch, SdkError> {
-        self.subtitle_search_listed()?;
         match self
             .call(Request::SearchSubtitles {
                 id: id.clone(),
@@ -71,7 +57,6 @@ impl Session {
         id: &MediaId,
         result: &str,
     ) -> Result<SubtitleDownloaded, SdkError> {
-        self.subtitle_search_listed()?;
         match self
             .call(Request::DownloadSubtitle {
                 id: id.clone(),
@@ -92,7 +77,6 @@ impl Session {
         id: &MediaId,
         download: &str,
     ) -> Result<(), SdkError> {
-        self.subtitle_search_listed()?;
         match self
             .call(Request::RemoveSubtitleDownload {
                 id: id.clone(),

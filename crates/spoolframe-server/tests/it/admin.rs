@@ -277,30 +277,12 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
     assert_eq!(status.endpoint_id.as_deref(), Some(VECTOR.0));
     assert_eq!(status.fingerprint.as_deref(), Some(VECTOR.1));
     assert_eq!(status.server_id, SERVER_ID);
-    // What it speaks: the protocol's version and every feature list, an
-    // empty one too.
+    // What it speaks: the protocol's version and the experimental
+    // features on.
     assert_eq!(
         status.protocol_version,
         spoolframe_protocol::PROTOCOL_VERSION
     );
-    assert_eq!(
-        status.features,
-        [
-            "spoolframe:playlists",
-            "spoolframe:liked",
-            "spoolframe:last-viewed",
-            "spoolframe:playlist-sharing",
-            "spoolframe:play-history",
-            "spoolframe:playlist-art",
-            "spoolframe:subtitle-sync",
-            "spoolframe:subtitle-search",
-            "spoolframe:playlist-upcoming",
-            "spoolframe:downloads",
-            "spoolframe:music-downloads",
-            "spoolframe:invite-lookup"
-        ]
-    );
-    assert_eq!(status.pre_auth_features, ["spoolframe:invite-lookup"]);
     assert_eq!(status.experimental_features, ["http-playback"]);
     // Nothing detected in tests: the software baseline.
     assert_eq!(status.transcoding.video_encoders, ["libx264"]);

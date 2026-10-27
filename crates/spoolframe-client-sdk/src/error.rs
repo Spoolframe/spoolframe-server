@@ -321,10 +321,11 @@ pub enum SdkError {
     /// server is still saved here.
     #[error("you are the only admin; make someone else an admin first")]
     LastAdmin,
-    /// The session does not have this feature (PX-16): the server does
-    /// not have it, or the app did not list it
-    /// ([`crate::ClientOptions::features`]). Nothing was sent. Hide what
-    /// needs it ([`crate::Session::features`]).
+    /// An experimental feature this call needs (PX-49) is not on for the
+    /// session: the app did not ask for it
+    /// ([`crate::ClientOptions::experimental`]), or the server did not
+    /// turn it on ([`crate::Session::experimental`]). Nothing was sent.
+    /// Hide what needs it.
     #[error("{feature} is not on for this session")]
     Unsupported { feature: String },
     /// The user sees the playlist and may not make this change (PX-40):

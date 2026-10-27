@@ -1,11 +1,9 @@
-//! Sharing a playlist by name (`spoolframe:playlist-sharing`) over a real
-//! Iroh connection: whom a manager may share with, a page at a time and
-//! by a query; the names of a playlist's owner and of who it is shared
-//! with; and none of it for a client that did not list the feature.
+//! Sharing a playlist by name over a real Iroh connection: whom a manager
+//! may share with, a page at a time and by a query; and the names of a
+//! playlist's owner and of who it is shared with.
 
 use crate::support;
 
-use spoolframe_protocol::features::{PLAYLIST_SHARING, PLAYLISTS};
 use spoolframe_protocol::playlists::{
     Kinds, PlaylistShare, PlaylistSummary, ShareCandidatePage, UserKind, Visibility,
 };
@@ -19,8 +17,8 @@ const EPISODES: Kinds = Kinds {
 };
 
 /// A server with alice (shown as "Alice Liddell"), bob, carol and dave,
-/// dave disabled, and a client that lists `features`.
-async fn four_users(test: &str, features: &[&str]) -> (TestServer, TestClient) {
+/// dave disabled, and a client.
+async fn four_users(test: &str) -> (TestServer, TestClient) {
     let server = TestServer::start(test).await;
     server
         .add_user("alice", "correct horse", Some("Alice Liddell"))
@@ -30,7 +28,7 @@ async fn four_users(test: &str, features: &[&str]) -> (TestServer, TestClient) {
     server.add_user("dave", "correct horse", None).await;
     server.store.disable_user("dave").await.unwrap();
     let client = server.client().await;
-    client.hello_listing(features).await;
+    client.hello_info().await;
     (server, client)
 }
 
@@ -108,7 +106,7 @@ fn shares(summary: &PlaylistSummary) -> &[PlaylistShare] {
 
 #[tokio::test]
 async fn a_manager_lists_whom_to_share_with_by_name_and_not_themselves() {
-    let (_server, tv) = four_users("sharing-candidates", &[PLAYLISTS, PLAYLIST_SHARING]).await;
+    let (_server, tv) = four_users("sharing-candidates").await;
     let alice = tv.login("alice", "correct horse").await;
     let mine = shared(&tv, &alice, Vec::new()).await;
 
@@ -137,7 +135,7 @@ async fn a_manager_lists_whom_to_share_with_by_name_and_not_themselves() {
 
 #[tokio::test]
 async fn whoever_does_not_manage_the_playlist_is_refused() {
-    let (_server, tv) = four_users("sharing-refused", &[PLAYLISTS, PLAYLIST_SHARING]).await;
+    let (_server, tv) = four_users("sharing-refused").await;
     let alice = tv.login("alice", "correct horse").await;
     let bob = tv.login("bob", "correct horse").await;
     let carol = tv.login("carol", "correct horse").await;
@@ -157,7 +155,7 @@ async fn whoever_does_not_manage_the_playlist_is_refused() {
 
 #[tokio::test]
 async fn shares_and_the_owner_carry_names() {
-    let (server, tv) = four_users("sharing-names", &[PLAYLISTS, PLAYLIST_SHARING]).await;
+    let (server, tv) = four_users("sharing-names").await;
     let alice = tv.login("alice", "correct horse").await;
     let bob = tv.login("bob", "correct horse").await;
     let bob_id = user_id(&tv, &bob).await;
@@ -199,40 +197,12 @@ async fn shares_and_the_owner_carry_names() {
     assert_eq!(opened.playlist.owner_name.as_deref(), Some("Alice Liddell"));
 }
 
-/// The features-over-version rule: an app built before
-/// `spoolframe:playlist-sharing` gets no names, and its
-/// `ListShareCandidates` is refused.
+/// The playlists holding an item, on its page, say whose each is: a row
+/// of someone else's playlist reads "Alice's", not "Shared with you".
+/// Every app is sent the name, naming no feature.
 #[tokio::test]
-async fn a_client_without_the_feature_gets_no_names_and_cannot_list_candidates() {
-    let (_server, older) = four_users("sharing-older-client", &[PLAYLISTS]).await;
-    let alice = older.login("alice", "correct horse").await;
-    let bob = older.login("bob", "correct horse").await;
-    let hers = shared(&older, &alice, vec![user_id(&older, &bob).await]).await;
-    assert_eq!(hers.owner_name, None);
-    assert!(
-        shares(&hers)
-            .iter()
-            .all(|s| s.display_name.is_none() && s.kind.is_none()),
-        "{hers:?}"
-    );
-    let listed = match older.call(Some(&bob), Request::ListPlaylists).await {
-        Response::Ok(Reply::Playlists { playlists, .. }) => playlists,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(listed[0].owner_name, None);
-    assert!(matches!(
-        candidates(&older, &alice, &hers.id, "", 0, 50).await,
-        Response::Err(Error::Unsupported { .. })
-    ));
-}
-
-/// The playlists holding an item, on its page, say whose each is, for a
-/// client that listed the feature: a row of someone else's playlist
-/// reads "Alice's", not "Shared with you". Another client is sent no
-/// name.
-#[tokio::test]
-async fn an_item_s_playlists_are_named_only_for_a_client_that_takes_names() {
-    let (server, named_client) = four_users("named-refs", &[PLAYLISTS, PLAYLIST_SHARING]).await;
+async fn an_item_s_playlists_are_named() {
+    let (server, named_client) = four_users("named-refs").await;
     let alice = named_client.login("alice", "correct horse").await;
     let bob = named_client.login("bob", "correct horse").await;
     let made = shared(
@@ -265,7 +235,7 @@ async fn an_item_s_playlists_are_named_only_for_a_client_that_takes_names() {
         "{added:?}"
     );
     let held = |reply: Response| match reply {
-        Response::Ok(Reply::Item { playlists, .. }) => playlists.expect("its playlists"),
+        Response::Ok(Reply::Item { playlists, .. }) => playlists,
         other => panic!("{other:?}"),
     };
     let item = || Request::Item {
@@ -276,10 +246,10 @@ async fn an_item_s_playlists_are_named_only_for_a_client_that_takes_names() {
     assert_eq!(named[0].owner_name.as_deref(), Some("Alice Liddell"));
 
     let plain = server.client().await;
-    plain.hello_listing(&[PLAYLISTS]).await;
+    plain.hello_info().await;
     let bob_plain = plain.login("bob", "correct horse").await;
-    let unnamed = held(plain.call(Some(&bob_plain), item()).await);
-    assert_eq!(unnamed.len(), 1);
-    assert_eq!(unnamed[0].owner_name, None);
+    let also = held(plain.call(Some(&bob_plain), item()).await);
+    assert_eq!(also.len(), 1);
+    assert_eq!(also[0].owner_name.as_deref(), Some("Alice Liddell"));
     server.stop().await;
 }

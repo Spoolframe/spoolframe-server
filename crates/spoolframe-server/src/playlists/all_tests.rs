@@ -218,7 +218,7 @@ async fn harness(test: &str, music: Big, kept: impl FnOnce(Playlists) -> Playlis
         federated: false,
     };
     let playlists = kept(Playlists::new(store, music.clone(), watch));
-    let (list, _) = playlists.list(&alice, true).await.unwrap();
+    let (list, _) = playlists.list(&alice).await.unwrap();
     let all = list
         .into_iter()
         .find(|p| p.builtin == Some(Builtin::All))

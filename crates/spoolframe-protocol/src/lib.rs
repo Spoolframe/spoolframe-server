@@ -13,7 +13,6 @@ pub mod codec;
 pub mod device_sign_in;
 pub mod downloads;
 pub mod experimental;
-pub mod features;
 pub mod federation;
 pub mod fingerprint;
 pub mod invite;

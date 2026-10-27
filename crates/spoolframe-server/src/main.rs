@@ -362,7 +362,8 @@ fn main() -> Result<()> {
     // before anything else: the program as it was started.
     let exe = std::env::current_exe();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    // `--version` names the client protocol's version and features after
+    // `--version` names the client protocol's version and experimental
+    // features after
     // the crate's (`-V`, the crate's alone); its first line stays
     // `spoolframe-server X.Y.Z`, which the image's smoke test reads.
     let long_version: &'static str =

@@ -25,11 +25,10 @@ pub struct MediaTracks {
     /// "42 Mbit/s": what the container says, else its size over its
     /// length. `None` where the server knows neither.
     ///
-    /// This and `VideoTrack::bit_rate` were added without a
-    /// PROTOCOL_VERSION bump, so they are not `required::option`: a
-    /// server from before them leaves the keys out, and that reads as
-    /// `None`.
-    // compat(v1): required at the protocol reset
+    /// This and `VideoTrack::bit_rate` are not `required::option`, though
+    /// every server sends them: the SDK keeps an item's file and tracks
+    /// with a download, and one kept before them lacks the keys, which
+    /// read as `None`.
     pub bit_rate: Option<u64>,
     /// The main picture; `None` for audio only (music).
     pub video: Option<VideoTrack>,
@@ -54,8 +53,7 @@ pub struct VideoTrack {
     pub hdr: Option<HdrFormat>,
     /// The picture's own average bits per second, where the file says:
     /// MP4 does for each stream, Matroska where its muxer wrote
-    /// statistics tags (mkvmerge does).
-    // compat(v1): required at the protocol reset
+    /// statistics tags (mkvmerge does). As [`MediaFile::bit_rate`].
     pub bit_rate: Option<u64>,
 }
 
@@ -102,19 +100,17 @@ pub struct SubtitleTrack {
     /// What the track is for, whatever its title says (P1-20).
     pub role: SubtitleRole,
     /// How the track is timed (PX-03): an external text track's sync and
-    /// offset, the same for every user. Sent only to a client that listed
-    /// the `spoolframe:subtitle-sync` feature, and only for an external
-    /// text track (SRT, WebVTT, ASS); `None` for every other track, whose
-    /// timing is the file's.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// offset, the same for every user. Only for an external text track
+    /// (SRT, WebVTT, ASS), in an item's tracks; `None` for every other
+    /// track, whose timing is the file's. Read as `None` when left out,
+    /// as a download's tracks kept by an SDK before it lack it.
+    #[serde(default)]
     pub timing: Option<SubtitleTiming>,
     /// Where a track someone downloaded came from (PX-02): its source,
-    /// who downloaded it and when. Sent only to a client that listed the
-    /// `spoolframe:subtitle-search` feature; `None` for every track that
-    /// was not downloaded, which is every track for any other client.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// who downloaded it and when, in an item's tracks; `None` for every
+    /// track that was not downloaded. Read as `None` when left out, as
+    /// `timing` is.
+    #[serde(default)]
     pub download: Option<SubtitleDownload>,
 }
 
@@ -208,7 +204,6 @@ pub enum SubtitleOrigin {
 
 /// One subtitle a search found (PX-02), to download by its `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "SubtitleResultWire")]
 pub struct SubtitleResult {
     /// What `DownloadSubtitle` names: the site's id and its file's,
     /// `opensubtitles:5338574`, `subdl:3172974-3188291`. Opaque to a
@@ -216,8 +211,6 @@ pub struct SubtitleResult {
     pub id: String,
     /// The site it was found on: `opensubtitles` (OpenSubtitles) or
     /// `subdl` (SubDL); a client shows another as it is.
-    // compat(v1): required at the protocol reset
-    #[serde(default = "opensubtitles")]
     pub source: String,
     /// The release it was made for, as its uploader named it.
     pub release: String,
@@ -236,8 +229,7 @@ pub struct SubtitleResult {
     pub hearing_impaired: bool,
     /// Only the parts in another language than the rest (signs, a
     /// foreign line): a forced subtitle, not the whole dialogue. False
-    /// where the site does not say (SubDL), and from a server before it.
-    #[serde(default)]
+    /// where the site does not say (SubDL).
     pub forced: bool,
     pub origin: SubtitleOrigin,
     /// Found by the file's hash: made for this very release, and played
@@ -247,61 +239,6 @@ pub struct SubtitleResult {
     pub rejected: bool,
     /// Downloaded already: a download gives the same track.
     pub downloaded: bool,
-}
-
-/// [`SubtitleResult`] as it is read: from a server before SubDL too,
-/// which named a result by OpenSubtitles' `file_id`, a number, and had no
-/// `id` nor `source`. Such a result is OpenSubtitles' `opensubtitles:<n>`.
-// compat(v1): `id` required, `file_id` gone, at the protocol reset
-#[derive(Deserialize)]
-struct SubtitleResultWire {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    file_id: Option<u64>,
-    #[serde(default = "opensubtitles")]
-    source: String,
-    release: String,
-    language: String,
-    format: Option<String>,
-    fps_milli: Option<u32>,
-    downloads: u64,
-    rating: Option<u8>,
-    hearing_impaired: bool,
-    #[serde(default)]
-    forced: bool,
-    origin: SubtitleOrigin,
-    hash_match: bool,
-    rejected: bool,
-    downloaded: bool,
-}
-
-impl TryFrom<SubtitleResultWire> for SubtitleResult {
-    type Error = &'static str;
-
-    fn try_from(w: SubtitleResultWire) -> Result<Self, Self::Error> {
-        let id = match (w.id, w.file_id) {
-            (Some(id), _) => id,
-            (None, Some(n)) => format!("{}:{n}", SubtitleSource::OpenSubtitles.id()),
-            (None, None) => return Err("a subtitle result has neither `id` nor `file_id`"),
-        };
-        Ok(SubtitleResult {
-            id,
-            source: w.source,
-            release: w.release,
-            language: w.language,
-            format: w.format,
-            fps_milli: w.fps_milli,
-            downloads: w.downloads,
-            rating: w.rating,
-            hearing_impaired: w.hearing_impaired,
-            forced: w.forced,
-            origin: w.origin,
-            hash_match: w.hash_match,
-            rejected: w.rejected,
-            downloaded: w.downloaded,
-        })
-    }
 }
 
 /// What a subtitle search found for an item (PX-02), best first: hash
@@ -315,8 +252,6 @@ pub struct SubtitleSearch {
     pub results: Vec<SubtitleResult>,
     /// How each site's search went, in the order the server asks them:
     /// one that failed or is out of quota leaves the others' results.
-    // compat(v1): required at the protocol reset
-    #[serde(default)]
     pub sources: Vec<SubtitleSourceStatus>,
 }
 
@@ -347,10 +282,6 @@ pub enum SubtitleSourceState {
     /// One this build does not know.
     #[serde(other)]
     Unknown,
-}
-
-fn opensubtitles() -> String {
-    SubtitleSource::OpenSubtitles.id().into()
 }
 
 /// A subtitle downloaded (PX-02): the item's new track, at once, and the
@@ -490,11 +421,16 @@ mod tests {
     }
 
     /// PX-02: a downloaded track says so, and where from; any other track
-    /// leaves the field out, as a client from before it reads it.
+    /// says `null`, and one kept without the key reads as none.
     #[test]
-    fn a_track_s_download_is_sent_only_for_a_downloaded_one() {
-        let json = serde_json::to_value(sidecar(None)).unwrap();
-        assert!(json.get("download").is_none(), "{json}");
+    fn a_track_s_download_is_null_for_one_not_downloaded() {
+        let mut json = serde_json::to_value(sidecar(None)).unwrap();
+        assert!(json["download"].is_null(), "{json}");
+        json.as_object_mut().unwrap().remove("download");
+        assert_eq!(
+            serde_json::from_value::<SubtitleTrack>(json).unwrap(),
+            sidecar(None)
+        );
         let mut track = sidecar(None);
         track.download = Some(SubtitleDownload {
             id: "d1".into(),
@@ -522,10 +458,6 @@ mod tests {
         assert_eq!(whose, QuotaOf::Unknown);
     }
 
-    /// A result from a server before SubDL, as it sent one: named by
-    /// OpenSubtitles' `file_id`, no `id`, no `source`. It is
-    /// OpenSubtitles' `opensubtitles:<file_id>`; a search names no sites'
-    /// states. One with neither id is refused.
     #[test]
     fn a_source_is_named_by_its_id() {
         for source in SubtitleSource::ALL {
@@ -536,36 +468,42 @@ mod tests {
         assert_eq!(SubtitleSource::name_of("podnapisi"), "podnapisi");
     }
 
+    /// A result as a server before SubDL sent one, named by
+    /// OpenSubtitles' `file_id` with no `id`, `source` or `forced`, is
+    /// refused, as is a search without `sources`: each is required.
     #[test]
-    fn a_result_from_a_server_before_subdl_is_opensubtitles() {
-        let search: SubtitleSearch = serde_json::from_value(serde_json::json!({
-            "languages": ["en"],
-            "results": [{
-                "file_id": 7, "release": "R", "language": "en",
-                "format": null, "fps_milli": null, "downloads": 1,
-                "rating": null, "hearing_impaired": false, "origin": "human",
-                "hash_match": false, "rejected": false, "downloaded": false,
-            }],
-        }))
-        .unwrap();
-        assert_eq!(search.results[0].id, "opensubtitles:7");
-        assert_eq!(search.results[0].source, "opensubtitles");
-        assert!(!search.results[0].forced);
-        assert!(search.sources.is_empty());
-        // Written again, it is the new shape, and reads back the same.
-        let again = serde_json::to_value(&search.results[0]).unwrap();
-        assert!(again.get("file_id").is_none(), "{again}");
-        assert_eq!(
-            serde_json::from_value::<SubtitleResult>(again).unwrap(),
-            search.results[0]
-        );
-        let neither = serde_json::json!({
-            "release": "R", "language": "en", "format": null, "fps_milli": null,
-            "downloads": 1, "rating": null, "hearing_impaired": false,
+    fn a_result_or_a_search_missing_a_field_is_refused() {
+        let result = serde_json::json!({
+            "id": "opensubtitles:7", "source": "opensubtitles", "release": "R",
+            "language": "en", "format": null, "fps_milli": null, "downloads": 1,
+            "rating": null, "hearing_impaired": false, "forced": false,
             "origin": "human", "hash_match": false, "rejected": false,
             "downloaded": false,
         });
-        assert!(serde_json::from_value::<SubtitleResult>(neither).is_err());
+        let read: SubtitleResult = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(read.id, "opensubtitles:7");
+        for field in ["id", "source", "forced"] {
+            let mut without = result.clone();
+            without.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<SubtitleResult>(without).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{field}`")),
+                "{field}: {error}"
+            );
+        }
+        let mut before_subdl = result.clone();
+        let fields = before_subdl.as_object_mut().unwrap();
+        fields.remove("id");
+        fields.insert("file_id".into(), 7.into());
+        assert!(serde_json::from_value::<SubtitleResult>(before_subdl).is_err());
+        let search = serde_json::json!({"languages": ["en"], "results": [result]});
+        let error = serde_json::from_value::<SubtitleSearch>(search).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `sources`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -582,13 +520,18 @@ mod tests {
         );
     }
 
-    /// PX-03: a track's timing is left out when there is none, so a
-    /// client from before it reads the track as it did; one sent reads
-    /// back as it was, its state by name.
+    /// PX-03: a track's timing is `null` when there is none, and one kept
+    /// without the key reads as none; one sent reads back as it was, its
+    /// state by name.
     #[test]
-    fn a_track_s_timing_is_sent_only_when_there_is_one() {
-        let json = serde_json::to_value(sidecar(None)).unwrap();
-        assert!(json.get("timing").is_none(), "{json}");
+    fn a_track_s_timing_is_null_when_there_is_none() {
+        let mut json = serde_json::to_value(sidecar(None)).unwrap();
+        assert!(json["timing"].is_null(), "{json}");
+        json.as_object_mut().unwrap().remove("timing");
+        assert_eq!(
+            serde_json::from_value::<SubtitleTrack>(json).unwrap(),
+            sidecar(None)
+        );
         let timing = SubtitleTiming {
             sync: SubtitleSync::Synced {
                 offset_ms: -3_200,

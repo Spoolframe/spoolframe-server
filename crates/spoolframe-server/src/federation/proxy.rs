@@ -641,10 +641,7 @@ impl Federation {
         // SA sees this server as the device; what each play plans for is
         // its start's, and each download its own device's (P8-07), whose
         // news this connection hears.
-        let hello = self.client_hello(vec![
-            spoolframe_protocol::features::DOWNLOADS.into(),
-            spoolframe_protocol::features::MUSIC_DOWNLOADS.into(),
-        ]);
+        let hello = self.client_hello();
         let (client, info) = PlayClient::connect(endpoint, addr, hello).await?;
         if info.server_id != peer.server_id {
             client.close();

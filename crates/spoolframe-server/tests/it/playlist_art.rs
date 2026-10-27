@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use spoolframe_client_sdk::{ArtworkSize, Client, Device, MemoryStorage, SdkError, Session};
 use spoolframe_protocol::codec::{read_frame, write_frame};
-use spoolframe_protocol::features::{LIKED, PLAYLIST_ART, PLAYLISTS};
 use spoolframe_protocol::playlists::{Kinds, PlaylistEdit, PlaylistShare, Visibility};
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::streams::bi;
@@ -75,10 +74,10 @@ async fn signed_in(server: &TestServer, name: &str) -> (Client, Session) {
     (client, session)
 }
 
-/// A raw client listing `features`.
-async fn raw(server: &TestServer, features: &[&str]) -> TestClient {
+/// A raw client.
+async fn raw(server: &TestServer) -> TestClient {
     let client = server.client().await;
-    client.hello_listing(features).await;
+    client.hello_info().await;
     client
 }
 
@@ -200,7 +199,7 @@ async fn a_cover_round_trips_through_the_sdk() {
 async fn refusals_come_before_the_picture_is_read() {
     let server = server("art-refused", ServerOptions::default()).await;
     server.catalog.serve_music();
-    let tv = raw(&server, &[PLAYLISTS, LIKED, PLAYLIST_ART]).await;
+    let tv = raw(&server).await;
     let alice = tv.login("alice", "correct horse").await;
     let bob = tv.login("bob", "correct horse").await;
     let carol = tv.login("carol", "correct horse").await;
@@ -278,7 +277,7 @@ async fn a_decompression_bomb_is_stopped_and_the_server_keeps_serving() {
         ..ServerOptions::default()
     };
     let server = server("art-bomb", options).await;
-    let tv = raw(&server, &[PLAYLISTS, PLAYLIST_ART]).await;
+    let tv = raw(&server).await;
     let alice = tv.login("alice", "correct horse").await;
     let playlist = create(&tv, &alice, Visibility::Personal).await;
     let dir = fresh_dir("art-bomb-file").await;
@@ -319,17 +318,16 @@ async fn a_decompression_bomb_is_stopped_and_the_server_keeps_serving() {
     server.stop().await;
 }
 
-/// A session that did not list `spoolframe:playlist-art` is sent no
-/// picture, on a playlist or on an item's list of them, and may neither upload nor remove one; one that did is sent
-/// both fields. An uploaded cover is fetched only by who sees a playlist
-/// that has it.
+/// Every session of the user's is sent the picture, on a playlist and on
+/// an item's list of them, and may remove it, naming no feature. An
+/// uploaded cover is fetched only by who sees a playlist that has it.
 #[tokio::test]
-async fn the_feature_gates_the_fields_and_the_requests() {
-    let server = server("art-gate", ServerOptions::default()).await;
-    let with = raw(&server, &[PLAYLISTS, PLAYLIST_ART]).await;
-    let without = raw(&server, &[PLAYLISTS]).await;
+async fn every_app_gets_the_cover_and_only_who_sees_it_fetches_it() {
+    let server = server("art-base", ServerOptions::default()).await;
+    let with = raw(&server).await;
+    let other = raw(&server).await;
     let alice = with.login("alice", "correct horse").await;
-    let alice_old = without.login("alice", "correct horse").await;
+    let alice_other = other.login("alice", "correct horse").await;
     let playlist = create(&with, &alice, Visibility::Personal).await;
     let photo = picture("tall.png");
     let ResourceResponse::Ready {
@@ -347,9 +345,9 @@ async fn the_feature_gates_the_fields_and_the_requests() {
     let new = summary(with.call(Some(&alice), Request::ListPlaylists).await);
     assert_eq!(new.artwork.as_ref(), Some(&artwork));
     assert!(new.custom_art);
-    let old = summary(without.call(Some(&alice_old), Request::ListPlaylists).await);
-    assert_eq!(old.artwork, None);
-    assert!(!old.custom_art);
+    let also = summary(other.call(Some(&alice_other), Request::ListPlaylists).await);
+    assert_eq!(also.artwork.as_ref(), Some(&artwork));
+    assert!(also.custom_art);
     // A film's page lists the playlist with its cover, to the same.
     let film = media(MediaKind::Movie, "1");
     assert!(matches!(
@@ -368,10 +366,7 @@ async fn the_feature_gates_the_fields_and_the_requests() {
         Response::Ok(_)
     ));
     let held = |reply: Response| match reply {
-        Response::Ok(Reply::Item {
-            playlists: Some(mut playlists),
-            ..
-        }) => playlists.remove(0),
+        Response::Ok(Reply::Item { mut playlists, .. }) => playlists.remove(0),
         other => panic!("{other:?}"),
     };
     let on_page = held(
@@ -379,28 +374,13 @@ async fn the_feature_gates_the_fields_and_the_requests() {
             .await,
     );
     assert_eq!(on_page.artwork.as_ref(), Some(&artwork));
-    let old_page = held(
-        without
-            .call(Some(&alice_old), Request::Item { id: film })
+    let other_page = held(
+        other
+            .call(Some(&alice_other), Request::Item { id: film })
             .await,
     );
-    assert_eq!(old_page.id, playlist);
-    assert_eq!(old_page.artwork, None);
-    assert!(matches!(
-        refused(upload(&without, &alice_old, &playlist, photo.len() as u64, &photo).await),
-        Error::Unsupported { .. }
-    ));
-    assert!(matches!(
-        without
-            .call(
-                Some(&alice_old),
-                Request::RemovePlaylistArt {
-                    id: playlist.clone()
-                }
-            )
-            .await,
-        Response::Err(Error::Unsupported { .. })
-    ));
+    assert_eq!(other_page.id, playlist);
+    assert_eq!(other_page.artwork.as_ref(), Some(&artwork));
 
     // Alice fetches her cover; carol, who does not see the playlist, may
     // not, though she has its id.
@@ -429,6 +409,19 @@ async fn the_feature_gates_the_fields_and_the_requests() {
         none,
         spoolframe_protocol::ArtworkResponse::Err(Error::NotFound { .. })
     ));
+    // The other app removes it.
+    let removed = other
+        .call(
+            Some(&alice_other),
+            Request::RemovePlaylistArt {
+                id: playlist.clone(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(&removed, Response::Ok(Reply::PlaylistInfo(p)) if !p.custom_art),
+        "{removed:?}"
+    );
     server.stop().await;
 }
 

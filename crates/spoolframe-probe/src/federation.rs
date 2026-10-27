@@ -318,10 +318,6 @@ pub async fn run_federation(run: &FederationRun, mut emit: impl FnMut(Event)) ->
             federation: true,
             ..Experimental::default()
         },
-        features: spoolframe_client_sdk::Features {
-            downloads: run.download.is_some(),
-            ..spoolframe_client_sdk::Features::default()
-        },
         downloads_dir: run.download.as_ref().map(|d| d.dir.clone()),
         ..ClientOptions::default()
     };
@@ -574,10 +570,9 @@ async fn download_status(run: &FederationRun, emit: &mut impl FnMut(Event)) -> R
         .map_err(|e| Failed::other("download_status", e.to_string()))?;
     let outcome = async {
         let conn = probe
-            .connect_hello_naming(
-                vec![spoolframe_protocol::experimental::FEDERATION.to_owned()],
-                vec![spoolframe_protocol::features::DOWNLOADS.to_owned()],
-            )
+            .connect_hello_naming(vec![
+                spoolframe_protocol::experimental::FEDERATION.to_owned(),
+            ])
             .await
             .map_err(failed)?;
         let login = Request::LoginPassword(LoginPassword {

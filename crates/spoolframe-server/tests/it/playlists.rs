@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use iroh::endpoint::RecvStream;
 use spoolframe_protocol::codec::read_frame;
-use spoolframe_protocol::features::{PLAYLIST_UPCOMING, PLAYLISTS};
 use spoolframe_protocol::playlists::{
     ItemKind, Kinds, PinNoteReason, PlaylistEdit, PlaylistOwnerKind, PlaylistShare,
     PlaylistSummary, Visibility,
@@ -34,15 +33,14 @@ fn season(key: &str) -> MediaId {
     MediaId::new(Namespace::Plex, MediaKind::Season, key).unwrap()
 }
 
-/// A server with alice, bob and carol, and a client that lists the
-/// playlists feature.
+/// A server with alice, bob and carol, and a client.
 async fn three_users(test: &str) -> (TestServer, TestClient) {
     let server = TestServer::start(test).await;
     for name in ["alice", "bob", "carol"] {
         server.add_user(name, "correct horse", None).await;
     }
     let tv = server.client().await;
-    tv.hello_listing(&[PLAYLISTS]).await;
+    tv.hello_info().await;
     (server, tv)
 }
 
@@ -225,11 +223,10 @@ async fn a_playlist_is_made_filled_read_and_refused_over_the_wire() {
     );
 }
 
-/// The ticket's last check: a client without the feature shows no
-/// playlists, as the server gives it none on an item; a client with it
-/// gets the item's playlists, and the session's whole feature list.
+/// An item's page lists the playlists holding it, for an app that names
+/// no feature.
 #[tokio::test]
-async fn a_client_without_the_feature_gets_no_playlists_on_an_item() {
+async fn an_item_s_page_lists_the_playlists_holding_it() {
     let (server, tv) = three_users("playlists-feature").await;
     let alice = tv.login("alice", "correct horse").await;
     let made = create(&tv, &alice, EPISODES, Visibility::Personal).await;
@@ -241,35 +238,9 @@ async fn a_client_without_the_feature_gets_no_playlists_on_an_item() {
     else {
         panic!("no item");
     };
-    let playlists = playlists.expect("a client with the feature gets them");
     assert_eq!(playlists.len(), 1);
     assert_eq!(playlists[0].id, made.id);
-
-    let older = server.client().await;
-    let info = older.hello_listing(&[]).await;
-    // No playlists before a session: they are not pre-auth.
-    assert_eq!(
-        info.features,
-        [spoolframe_protocol::features::INVITE_LOOKUP]
-    );
-    let request = Request::LoginPassword(spoolframe_protocol::LoginPassword {
-        username: "alice".into(),
-        password: "correct horse".into(),
-        remember: false,
-    });
-    let Response::Ok(Reply::LoggedIn {
-        session, features, ..
-    }) = older.call(None, request).await
-    else {
-        panic!("not signed in");
-    };
-    assert!(features.iter().any(|f| f == PLAYLISTS), "{features:?}");
-    let Response::Ok(Reply::Item { playlists, .. }) =
-        older.call(Some(&session), Request::Item { id: show }).await
-    else {
-        panic!("no item");
-    };
-    assert_eq!(playlists, None);
+    server.stop().await;
 }
 
 /// The ticket's pins: pinning on one device shows the pin, in its order,
@@ -280,10 +251,10 @@ async fn a_pin_shows_on_another_device_and_an_unshare_takes_it_away_with_a_note(
     let (server, tv) = three_users("playlists-pins").await;
     let alice = tv.login("alice", "correct horse").await;
     let phone = server.client().await;
-    phone.hello_listing(&[PLAYLISTS]).await;
+    phone.hello_info().await;
     let mut phone_events = events(&phone).await;
     let laptop = server.client().await;
-    laptop.hello_listing(&[PLAYLISTS]).await;
+    laptop.hello_info().await;
     let mut laptop_events = events(&laptop).await;
     let bob_on_phone = phone.login("bob", "correct horse").await;
     let bob_on_laptop = laptop.login("bob", "correct horse").await;
@@ -451,14 +422,13 @@ async fn a_playlist_plays_over_the_wire_to_its_end() {
     );
 }
 
-/// `spoolframe:playlist-upcoming`: what comes up after the place, and the
-/// settings saved alone, which keep the place and change what comes up.
+/// What comes up after the place, and the settings saved alone, which keep the place and change what comes up.
 #[tokio::test]
 async fn upcoming_and_settings_alone_reach_the_server_over_the_wire() {
     let server = TestServer::start("playlists-upcoming").await;
     server.add_user("alice", "correct horse", None).await;
     let tv = server.client().await;
-    tv.hello_listing(&[PLAYLISTS, PLAYLIST_UPCOMING]).await;
+    tv.hello_info().await;
     server.write_media(1000);
     for key in ["12", "13"] {
         server.write_episode(key);
@@ -494,30 +464,4 @@ async fn upcoming_and_settings_alone_reach_the_server_over_the_wire() {
     let keys: Vec<&str> = entries.iter().map(|e| e.item.id().key()).collect();
     // After 12, which plays on: 13, then round again with repeat all.
     assert_eq!(keys, ["13", "12", "13"], "after {:?}", first.item.id());
-}
-
-/// A client that did not list the feature gets neither request.
-#[tokio::test]
-async fn a_client_without_playlist_upcoming_is_refused_both_requests() {
-    let (_server, tv) = three_users("playlists-upcoming-unlisted").await;
-    let alice = tv.login("alice", "correct horse").await;
-    let made = create(&tv, &alice, EPISODES, Visibility::Personal).await;
-    for request in [
-        Request::UpcomingInPlaylist {
-            id: made.id.clone(),
-            limit: 3,
-        },
-        Request::SetPlaylistSettings {
-            id: made.id.clone(),
-            shuffle: true,
-            repeat: spoolframe_protocol::playlists::Repeat::Off,
-            skip_watched: false,
-        },
-    ] {
-        let answer = tv.call(Some(&alice), request).await;
-        assert!(
-            matches!(answer, Response::Err(Error::Unsupported { .. })),
-            "{answer:?}"
-        );
-    }
 }

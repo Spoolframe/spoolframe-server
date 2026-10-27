@@ -1,4 +1,4 @@
-//! When each item was last viewed (`spoolframe:last-viewed`) over a real
+//! When each item was last viewed, over a real
 //! Iroh connection: what the Apple TV's Top Shelf needs to show only what
 //! was watched in the last two days, from any device of the user's.
 
@@ -6,15 +6,14 @@ use crate::support;
 
 use std::time::Duration;
 
-use spoolframe_protocol::features::LAST_VIEWED;
 use spoolframe_protocol::{Hello, PROTOCOL_VERSION, Reply, Request, Response, SessionId};
 use spoolframe_types::{Item, MediaId};
 use support::{TestClient, TestServer, movie};
 
 use crate::watch::{home, progress, state_of};
 
-/// A client that plays MKV with H.264, listing `features`.
-async fn device(server: &TestServer, features: &[&str]) -> TestClient {
+/// A client that plays MKV with H.264.
+async fn device(server: &TestServer) -> TestClient {
     let client = server.client().await;
     let mut capabilities = support::mkv_capabilities();
     capabilities
@@ -28,7 +27,6 @@ async fn device(server: &TestServer, features: &[&str]) -> TestClient {
         device_name: None,
         capabilities: Some(capabilities),
         experimental: Vec::new(),
-        features: features.iter().map(|n| n.to_string()).collect(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -46,16 +44,16 @@ async fn on_home(tv: &TestClient, who: &SessionId) -> Option<i64> {
     }
 }
 
-/// A TV that listed the feature sees when the film was last viewed, on
-/// Home and on its details; it moves when the same user's phone reports
-/// progress an hour later, and not when another user's does.
+/// A TV sees when the film was last viewed, on Home and on its details;
+/// it moves when the same user's phone reports progress an hour later,
+/// and not when another user's does. Neither names a feature.
 #[tokio::test]
 async fn the_last_view_is_any_device_s_and_the_user_s_own() {
     let server = TestServer::start("last-viewed").await;
     server.add_user("alice", "correct horse", None).await;
     server.add_user("bob", "battery staple", None).await;
-    let tv = device(&server, &[LAST_VIEWED]).await;
-    let phone = device(&server, &[]).await;
+    let tv = device(&server).await;
+    let phone = device(&server).await;
     let on_tv = tv.login("alice", "correct horse").await;
     let on_phone = phone.login("alice", "correct horse").await;
     let bob = phone.login("bob", "battery staple").await;
@@ -77,11 +75,11 @@ async fn the_last_view_is_any_device_s_and_the_user_s_own() {
     progress(&server, &phone, &bob, &film, 300).await;
     assert_eq!(on_home(&tv, &on_tv).await, Some(later));
 
-    // The phone did not list the feature: it is never sent the field.
-    assert_eq!(on_home(&phone, &on_phone).await, None);
+    // The phone is sent the same.
+    assert_eq!(on_home(&phone, &on_phone).await, Some(later));
     assert_eq!(
         state_of(&phone, &on_phone, &film).await.last_viewed_at,
-        None
+        Some(later)
     );
     tv.close().await;
     phone.close().await;

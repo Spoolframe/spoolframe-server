@@ -156,9 +156,7 @@ pub struct DownloadOptionsInfo {
     /// item's, with why: leave them unticked.
     pub left_out: Vec<LeftOutSubtitle>,
     /// About each option: `Original` first, then each of `profiles` in
-    /// its order. Films and episodes only; empty from a server before
-    /// 0.14.2.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// its order. Films and episodes only: empty for a track.
     pub estimates: Vec<DownloadEstimate>,
 }
 

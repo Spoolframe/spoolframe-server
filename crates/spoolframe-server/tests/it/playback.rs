@@ -274,12 +274,14 @@ async fn progress_reports_while_paused_keep_a_playback_past_the_idle_limit() {
     else {
         panic!("no movie: {item:?}");
     };
+    // Viewed while it played: the reports were views.
+    assert!(movie.playback.last_viewed_at.is_some());
     assert_eq!(
         movie.playback,
         spoolframe_types::PlaybackState {
             position: Some(paused_at),
             watched: false,
-            last_viewed_at: None,
+            last_viewed_at: movie.playback.last_viewed_at,
             play_count: 0,
             last_played_at: None,
         }

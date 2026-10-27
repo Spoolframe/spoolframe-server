@@ -812,8 +812,8 @@ mod tests {
     fn a_feature_list_says_none_when_empty() {
         assert_eq!(feature_list(&[]), "none");
         assert_eq!(
-            feature_list(&["spoolframe:playlists".into(), "spoolframe:liked".into()]),
-            "spoolframe:playlists, spoolframe:liked"
+            feature_list(&["http-playback".into(), "federation".into()]),
+            "http-playback, federation"
         );
     }
 

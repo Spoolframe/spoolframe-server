@@ -7,7 +7,6 @@ use spoolframe_protocol::downloads::{
     DownloadDevice, DownloadInfo, DownloadSource, DownloadState, DownloadTracks, OfflineWatch,
     OfflineWatchOutcome,
 };
-use spoolframe_protocol::features::{DOWNLOADS, LIKED, MUSIC_DOWNLOADS, PLAYLISTS};
 use spoolframe_protocol::federation::{PlayTokenRedeemed, RedeemPlayToken, TokenScope};
 use spoolframe_protocol::resource::ResourceResponse;
 use spoolframe_protocol::{Hello, PROTOCOL_VERSION, Request, Response, SessionId};
@@ -273,7 +272,6 @@ async fn app_from(server: &TestServer, app: &TestClient) -> TestClient {
         device_name: None,
         capabilities: None,
         experimental: vec![FEDERATION.into()],
-        features: vec![DOWNLOADS.into()],
     };
     assert!(matches!(
         device.call(None, Request::Hello(hello)).await,
@@ -695,7 +693,6 @@ async fn sa_plans_the_download_for_the_device_sb_names() {
         device_name: None,
         capabilities: None,
         experimental: vec![FEDERATION.into()],
-        features: vec![DOWNLOADS.into()],
     };
     assert!(matches!(
         iphone.call(None, Request::Hello(hello)).await,
@@ -853,9 +850,6 @@ async fn say_hello(client: &TestClient) {
         device_name: None,
         capabilities: None,
         experimental: vec![FEDERATION.into()],
-        features: [DOWNLOADS, MUSIC_DOWNLOADS, PLAYLISTS, LIKED]
-            .map(String::from)
-            .to_vec(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -906,7 +900,7 @@ async fn sdk_app(
     spoolframe_client_sdk::Client,
     spoolframe_client_sdk::Session,
 ) {
-    use spoolframe_client_sdk::{Client, ClientOptions, Device, Features, MemoryStorage};
+    use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage};
     let device = Device {
         name: "Den PC".into(),
         client_name: "sdk-test".into(),
@@ -918,10 +912,6 @@ async fn sdk_app(
         lan_discovery: false,
         relays: false,
         experimental: super::super::app::FEDERATION,
-        features: Features {
-            downloads: true,
-            ..Features::default()
-        },
         downloads_dir: Some(dir.to_path_buf()),
         ..ClientOptions::default()
     };

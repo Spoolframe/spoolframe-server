@@ -74,7 +74,7 @@ use spoolframe_protocol::invite::{InviteLinkKind, is_relay_url, parse_link};
 use spoolframe_protocol::invite_admin::InviteKind as LinkedKind;
 use spoolframe_protocol::{
     Error as ProtocolError, Hello, InviteLookupOutcome, LookupInvite, Reply, Request, Response,
-    ServerId, close, features, fingerprint,
+    ServerId, close, fingerprint,
 };
 use spoolframe_types::Platform;
 
@@ -574,7 +574,7 @@ impl Federation {
             Dialed::connect(&attached.endpoint, addr.clone(), self.hello()).await?;
         dialed.close();
         let theirs = self.pairable(&info).await?;
-        let hello = self.client_hello(vec![features::INVITE_LOOKUP.into()]);
+        let hello = self.client_hello();
         let (client, _) = PlayClient::connect(&attached.endpoint, addr, hello).await?;
         let answered = client
             .call(None, Request::LookupInvite(LookupInvite { code }), None)
@@ -616,9 +616,9 @@ impl Federation {
     }
 
     /// This server's hello as a client of another server's client
-    /// protocol, naming `features`: the other sees it as a device, called
-    /// by this server's name.
-    fn client_hello(&self, features: Vec<String>) -> Hello {
+    /// protocol: the other sees it as a device, called by this server's
+    /// name.
+    fn client_hello(&self) -> Hello {
         Hello {
             protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
             client_name: "spoolframe-server".into(),
@@ -627,7 +627,6 @@ impl Federation {
             device_name: Some(self.name.get()),
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
-            features,
         }
     }
 

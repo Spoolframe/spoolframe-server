@@ -784,7 +784,7 @@ impl AdminApi {
                 };
                 let playlists = library
                     .playlists
-                    .holding(&actor, &found.item, &found.children, true)
+                    .holding(&actor, &found.item, &found.children)
                     .await
                     .map_err(|e| {
                         tracing::warn!(%id, error = %e, "cannot list the playlists holding an item");
@@ -800,9 +800,9 @@ impl AdminApi {
                         e
                     })
                     .unwrap_or_default();
-                (Some(playlists), liked, children)
+                (playlists, liked, children.unwrap_or_default())
             }
-            None => (None, None, None),
+            None => (Vec::new(), None, Vec::new()),
         };
         let reply = spoolframe_protocol::Reply::Item {
             item: found.item,

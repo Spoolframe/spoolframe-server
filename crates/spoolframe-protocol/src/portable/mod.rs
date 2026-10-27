@@ -326,13 +326,15 @@ pub struct UserDeviceCredential {
     /// user's id is, as every credential before P7-08. Whether it is one
     /// of the user's roots is the verifier's to check, against the
     /// identity's [`RootSet`].
-    // compat(v1): required at the protocol reset
+    // Left out when none, not for older peers: a server and a device keep
+    // these as JSON, and records written before P7-08 have no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<RootKey>,
     /// The identity's genesis, carried for a verifier that has not seen
     /// it: an identity with a security key root cannot be checked
     /// without it. Not signed: it proves itself, its hash being the id.
-    // compat(v1): required at the protocol reset
+    // Left out when none, not for older peers: a server and a device keep
+    // these as JSON, and records written before P7-08 have no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis: Option<Box<IdentityGenesis>>,
 }
@@ -575,15 +577,18 @@ pub struct PortableIdentityState {
     pub signature: RootSignature,
     /// The root that signed it (P7-08); absent, the phrase root the
     /// user's id is.
-    // compat(v1): required at the protocol reset
+    // Left out when none, not for older peers: a server and a device keep
+    // these as JSON, and records written before P7-08 have no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<RootKey>,
     /// Every root added so far, each with its proof that it is held.
-    // compat(v1): required at the protocol reset
+    // Left out when none, not for older peers: a server and a device keep
+    // these as JSON, and records written before P7-08 have no key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots_added: Vec<AddedRoot>,
     /// Every root removed so far.
-    // compat(v1): required at the protocol reset
+    // Left out when none, not for older peers: a server and a device keep
+    // these as JSON, and records written before P7-08 have no key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots_removed: Vec<RemovedRoot>,
 }
@@ -923,12 +928,14 @@ pub enum TieProof {
     /// the root it names, which the verifier checks is one of the user's.
     Root {
         signature: RootSignature,
-        // compat(v1): required at the protocol reset
+        // Left out when none, not for older peers: a server and a device keep
+        // these as JSON, and records written before P7-08 have no key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         root: Option<RootKey>,
         /// The identity's genesis, for a verifier that has not seen it
         /// (P7-08, as [`UserDeviceCredential::genesis`]).
-        // compat(v1): required at the protocol reset
+        // Left out when none, not for older peers: a server and a device keep
+        // these as JSON, and records written before P7-08 have no key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         genesis: Option<Box<IdentityGenesis>>,
     },

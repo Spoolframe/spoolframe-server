@@ -136,9 +136,9 @@ fn an_item_s_copies_are_left_out_when_there_are_none() {
         item: movie(),
         children: Vec::new(),
         markers: Vec::new(),
-        playlists: None,
+        playlists: Vec::new(),
         liked: None,
-        liked_children: None,
+        liked_children: Vec::new(),
         copies,
     };
     let json = serde_json::to_value(item(None)).unwrap();
@@ -186,7 +186,6 @@ fn hello() -> Hello {
             ..ClientCapabilities::default()
         }),
         experimental: Vec::new(),
-        features: vec![crate::features::PLAYLISTS.to_owned()],
     }
 }
 
@@ -454,7 +453,6 @@ fn every_reply_round_trips() {
             auth_methods: vec![AuthMethod::Password],
             web_url: Some("https://media.example.org".into()),
             experimental: Vec::new(),
-            features: Vec::new(),
             invite_only: true,
         }),
         Reply::AuthMethods {
@@ -542,7 +540,6 @@ fn every_reply_round_trips() {
             session: SessionId("s".into()),
             remembered: false,
             password_change_required: true,
-            features: vec![crate::features::PLAYLISTS.to_owned()],
         },
         Reply::TrustedProfiles {
             profiles: vec![crate::TrustedProfile {
@@ -571,25 +568,25 @@ fn every_reply_round_trips() {
             item: movie(),
             children: Vec::new(),
             markers: markers(),
-            playlists: None,
+            playlists: Vec::new(),
             liked: None,
-            liked_children: None,
+            liked_children: Vec::new(),
             copies: None,
         },
         Reply::Item {
             item: movie(),
             children: Vec::new(),
             markers: Vec::new(),
-            playlists: Some(vec![crate::playlists::PlaylistRef {
+            playlists: vec![crate::playlists::PlaylistRef {
                 id: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
                 name: "Heists".into(),
                 owner_kind: crate::playlists::PlaylistOwnerKind::SharedWithMe,
                 builtin: None,
                 owner_name: None,
                 artwork: None,
-            }]),
+            }],
             liked: None,
-            liked_children: None,
+            liked_children: Vec::new(),
             copies: None,
         },
         Reply::Search(search_results()),
@@ -606,7 +603,6 @@ fn every_reply_round_trips() {
                 portable: ties(),
             },
             can_leave: true,
-            features: vec![crate::features::PLAYLISTS.to_owned()],
         }),
         Reply::Devices {
             devices: vec![crate::DeviceInfo {
@@ -859,16 +855,30 @@ fn plan_parts_from_a_newer_peer_decode_as_unknown() {
     assert_eq!(delivery, Delivery::Unknown);
 }
 
-/// A rung from a server before the remux ladder (PX-21) has no `video`:
-/// the plan's, as before. A remux ladder's lower rung names its own.
+/// A rung's `video` is `null` for the plan's own (a ladder of encodes),
+/// and a remux ladder's lower rung names its own. It is sent either way.
 #[test]
-fn a_rung_without_a_video_is_the_plan_s() {
-    fn wire<T: DeserializeOwned>(value: serde_json::Value) -> T {
-        codec::decode(&codec::encode(&value).unwrap()).unwrap()
-    }
-    let rung: crate::playback::Rung =
-        wire(serde_json::json!({"height": 720, "max_bitrate": 3_000_000}));
-    assert_eq!(rung.video, None);
+fn a_rung_says_its_video_or_null() {
+    assert_each_required(
+        &crate::playback::Rung {
+            height: 720,
+            max_bitrate: 3_000_000,
+            video: None,
+        },
+        &["video"],
+    );
+    assert_each_required(
+        &ConvertedVideo::Copy {
+            codec: spoolframe_types::VideoCodec::Hevc,
+            dolby_vision: false,
+        },
+        &["dolby_vision"],
+    );
+    round_trip(crate::playback::Rung {
+        height: 720,
+        max_bitrate: 3_000_000,
+        video: None,
+    });
     round_trip(crate::playback::Rung {
         height: 720,
         max_bitrate: 3_000_000,
@@ -1114,7 +1124,6 @@ fn server_info_without_a_server_id_does_not_decode() {
         auth_methods: vec![AuthMethod::Password],
         web_url: None,
         experimental: Vec::new(),
-        features: Vec::new(),
         invite_only: true,
     })
     .unwrap();
@@ -1136,7 +1145,6 @@ fn invite_only_info(invite_only: bool) -> ServerInfo {
         auth_methods: vec![AuthMethod::Password],
         web_url: None,
         experimental: Vec::new(),
-        features: Vec::new(),
         invite_only,
     }
 }
@@ -1149,17 +1157,11 @@ fn server_info_round_trips_whether_or_not_it_is_invite_only() {
     round_trip(Reply::ServerInfo(invite_only_info(false)));
 }
 
-/// A server before `invite_only` leaves it out. Every such server makes
-/// accounts only from invites, so it decodes as invite-only.
+/// `ServerInfo` without `invite_only`, as a server before the reset to
+/// revision 1 could send it, is refused: nothing is assumed.
 #[test]
-fn an_older_server_s_info_decodes_as_invite_only() {
-    let mut value = ciborium::Value::serialized(&invite_only_info(false)).unwrap();
-    let ciborium::Value::Map(fields) = &mut value else {
-        panic!("{value:?}");
-    };
-    fields.retain(|(key, _)| key.as_text() != Some("invite_only"));
-    let older = codec::decode::<ServerInfo>(&codec::encode(&value).unwrap()).unwrap();
-    assert!(older.invite_only);
+fn a_server_info_without_invite_only_is_refused() {
+    assert_each_required(&invite_only_info(false), &["invite_only"]);
 }
 
 /// An older client's empty handle is `Some` of nothing, for the server
@@ -1795,9 +1797,9 @@ fn an_older_client_reads_an_item_that_has_markers() {
         item: movie(),
         children: Vec::new(),
         markers: markers(),
-        playlists: None,
+        playlists: Vec::new(),
         liked: None,
-        liked_children: None,
+        liked_children: Vec::new(),
         copies: None,
     })
     .unwrap();
@@ -1848,11 +1850,17 @@ fn a_marker_kind_from_a_newer_server_is_unknown() {
         item: Item,
         children: Vec<Item>,
         markers: Vec<NewerMarker>,
+        playlists: Vec<crate::playlists::PlaylistRef>,
+        liked: Option<crate::playlists::Liked>,
+        liked_children: Vec<MediaId>,
     }
     let bytes = codec::encode(&NewerItem {
         kind: "item",
         item: movie(),
         children: Vec::new(),
+        playlists: Vec::new(),
+        liked: None,
+        liked_children: Vec::new(),
         markers: vec![
             NewerMarker {
                 kind: "recap",
@@ -2066,9 +2074,9 @@ fn a_reply_missing_a_field_is_refused() {
             item: movie(),
             children: Vec::new(),
             markers: Vec::new(),
-            playlists: None,
+            playlists: Vec::new(),
             liked: None,
-            liked_children: None,
+            liked_children: Vec::new(),
             copies: None,
         },
         &["markers"],
@@ -2590,10 +2598,10 @@ fn an_identity_record_by_handle_is_its_hex() {
     );
 }
 
-/// A server from before one-time passwords sends `LoggedIn` without
-/// `password_change_required`: read as false, not refused.
+/// `LoggedIn` without `password_change_required`, as a server before the
+/// reset to revision 1 could send it, is refused: nothing is assumed.
 #[test]
-fn a_logged_in_without_password_change_required_decodes_as_false() {
+fn a_logged_in_without_password_change_required_is_refused() {
     #[derive(Serialize)]
     struct LoggedIn {
         #[serde(rename = "type")]
@@ -2612,17 +2620,12 @@ fn a_logged_in_without_password_change_required_decodes_as_false() {
         remembered: true,
     }))
     .unwrap();
-    let decoded = codec::decode::<crate::Response>(&bytes).unwrap();
+    let error = codec::decode::<crate::Response>(&bytes).unwrap_err();
     assert!(
-        matches!(
-            decoded,
-            crate::Response::Ok(Reply::LoggedIn {
-                remembered: true,
-                password_change_required: false,
-                ..
-            })
-        ),
-        "{decoded:?}"
+        error
+            .to_string()
+            .contains("missing field `password_change_required`"),
+        "{error}"
     );
 }
 
@@ -2665,7 +2668,6 @@ fn admin_who_am_i(can_leave: bool) -> WhoAmIReply {
             portable: ties(),
         },
         can_leave,
-        features: Vec::new(),
     }
 }
 
@@ -2682,10 +2684,10 @@ fn who_am_i_carries_whether_the_user_can_leave() {
     assert_eq!(older, reply.user);
 }
 
-/// A server before `can_leave` leaves it out: the app offers leaving,
-/// and that server's `LastAdmin` refusal is what stops the last admin.
+/// `WhoAmI` without `can_leave`, as a server before the reset to
+/// revision 1 could send it, is refused: nothing is assumed.
 #[test]
-fn a_who_am_i_without_can_leave_lets_the_user_leave() {
+fn a_who_am_i_without_can_leave_is_refused() {
     let full: ciborium::Value = ciborium::from_reader(
         codec::encode(&Reply::WhoAmI(admin_who_am_i(false)))
             .unwrap()
@@ -2697,9 +2699,10 @@ fn a_who_am_i_without_can_leave_lets_the_user_leave() {
     };
     entries.retain(|(key, _)| key.as_text() != Some("can_leave"));
     let older = codec::encode(&ciborium::Value::Map(entries)).unwrap();
-    assert_eq!(
-        codec::decode::<Reply>(&older).unwrap(),
-        Reply::WhoAmI(admin_who_am_i(true))
+    let error = codec::decode::<Reply>(&older).unwrap_err();
+    assert!(
+        error.to_string().contains("missing field `can_leave`"),
+        "{error}"
     );
 }
 
@@ -2738,7 +2741,6 @@ mod experimental_features {
     fn asking(names: &[&str]) -> Hello {
         Hello {
             experimental: names.iter().map(|n| n.to_string()).collect(),
-            features: Vec::new(),
             ..hello()
         }
     }
@@ -2781,7 +2783,6 @@ mod experimental_features {
             auth_methods: vec![AuthMethod::Password],
             web_url: None,
             experimental,
-            features: Vec::new(),
             invite_only: true,
         }
     }
@@ -2939,11 +2940,11 @@ mod playlists {
         }
     }
 
-    /// `spoolframe:playlist-art` (PX-53): a summary's picture, and the two
-    /// requests; the fields are left out when not given, and an older
-    /// peer's summary, without them, reads as none.
+    /// Playlist covers (PX-53): a summary's picture, and the two requests;
+    /// the fields are sent when not given, `null` and false, and refused
+    /// when left out.
     #[test]
-    fn playlist_art_round_trips_and_is_left_out_when_not_given() {
+    fn playlist_art_round_trips_and_is_sent_when_not_given() {
         let cover: spoolframe_types::ArtworkId = "image:playlist/0f3a".parse().unwrap();
         let with = PlaylistSummary {
             artwork: Some(cover.clone()),
@@ -2955,8 +2956,12 @@ mod playlists {
         assert_eq!(json["custom_art"], true);
         round_trip(Response::Ok(Reply::PlaylistInfo(with)));
         let json = serde_json::to_value(summary()).unwrap();
-        assert!(json.get("artwork").is_none(), "{json}");
-        assert!(json.get("custom_art").is_none(), "{json}");
+        assert!(json["artwork"].is_null(), "{json}");
+        assert_eq!(json["custom_art"], false, "{json}");
+        assert_each_required(
+            &summary(),
+            &["builtin", "owner_name", "artwork", "custom_art"],
+        );
         let remove = Request::RemovePlaylistArt { id: "x".into() };
         round_trip(RequestEnvelope {
             session: Some(SessionId("s".into())),
@@ -3148,10 +3153,10 @@ mod playlists {
         assert!(retry_safe(&Request::Unlike { items: Vec::new() }));
     }
 
-    /// `spoolframe:last-viewed`: a playback state carries when it was
-    /// last viewed, and leaves the key out when it does not say.
+    /// A playback state carries when it was last viewed, and `null` when
+    /// it does not say.
     #[test]
-    fn a_last_view_round_trips_and_is_left_out_when_unknown() {
+    fn a_last_view_round_trips_and_is_null_when_unknown() {
         let mut seen = movie();
         if let spoolframe_types::Item::Movie(m) = &mut seen {
             m.playback.last_viewed_at = Some(1_791_000_000);
@@ -3165,8 +3170,13 @@ mod playlists {
             unavailable: Vec::new(),
             servers: Vec::new(),
         })));
-        let json = serde_json::to_value(movie()).unwrap();
-        assert!(json["playback"].get("last_viewed_at").is_none(), "{json}");
+        let mut json = serde_json::to_value(movie()).unwrap();
+        assert!(json["playback"]["last_viewed_at"].is_null(), "{json}");
+        // Kept by an SDK before it, with a download: read as none.
+        json["playback"]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_viewed_at");
         let read: spoolframe_types::Item = serde_json::from_value(json).unwrap();
         assert_eq!(read, movie());
     }
@@ -3195,9 +3205,9 @@ mod playlists {
             item: movie(),
             children: Vec::new(),
             markers: Vec::new(),
-            playlists: Some(Vec::new()),
+            playlists: Vec::new(),
             liked: Some(crate::playlists::Liked::Some),
-            liked_children: Some(vec![track.clone()]),
+            liked_children: vec![track.clone()],
             copies: None,
         };
         let json = serde_json::to_value(&item).unwrap();
@@ -3212,9 +3222,9 @@ mod playlists {
         });
     }
 
-    /// `spoolframe:playlist-sharing`: whom a playlist can be shared
-    /// with, a page at a time; and the names of who it is shared with
-    /// and of its owner, left out when not given.
+    /// Whom a playlist can be shared with, a page at a time; and the
+    /// names of who it is shared with and of its owner, `null` when not
+    /// given.
     #[test]
     fn share_candidates_and_names_round_trip() {
         round_trip(RequestEnvelope {
@@ -3272,9 +3282,9 @@ mod playlists {
         assert_eq!(json["visibility"]["with"][0]["kind"], "local");
         round_trip(Response::Ok(Reply::PlaylistInfo(named)));
         let json = serde_json::to_value(summary()).unwrap();
-        assert!(json.get("owner_name").is_none(), "{json}");
+        assert!(json["owner_name"].is_null(), "{json}");
         // An item's reference to a playlist names its owner too, and
-        // leaves the name out when it has none.
+        // says `null` when it has none.
         let held = crate::playlists::PlaylistRef {
             id: "x".into(),
             name: "Heists".into(),
@@ -3290,57 +3300,35 @@ mod playlists {
             ..held
         };
         let json = serde_json::to_value(&unnamed).unwrap();
-        assert!(json.get("owner_name").is_none(), "{json}");
-        round_trip(unnamed);
-        assert!(
-            json["visibility"]["with"][0].get("display_name").is_none(),
-            "{json}"
+        assert!(json["owner_name"].is_null(), "{json}");
+        round_trip(unnamed.clone());
+        assert_each_required(&unnamed, &["builtin", "owner_name", "artwork"]);
+        assert_each_required(
+            &PlaylistShare::new("local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c", true),
+            &["display_name", "kind"],
         );
     }
 
-    /// A client without the feature never gets `playlists`; one with it
-    /// reads an older server's `Item`, which has none, as `None`.
+    /// An item's playlists and hearts are base protocol: always sent,
+    /// empty or `null` when it has none, and refused when left out.
     #[test]
-    fn an_item_s_playlists_are_left_out_when_not_given() {
+    fn an_item_s_playlists_and_hearts_are_always_sent() {
         let without = Reply::Item {
             item: movie(),
             children: Vec::new(),
             markers: Vec::new(),
-            playlists: None,
+            playlists: Vec::new(),
             liked: None,
-            liked_children: None,
+            liked_children: Vec::new(),
             copies: None,
         };
         let json = serde_json::to_value(&without).unwrap();
-        assert!(json.get("playlists").is_none(), "{json}");
+        assert_eq!(json["playlists"], serde_json::json!([]), "{json}");
+        assert!(json["liked"].is_null(), "{json}");
+        assert_eq!(json["liked_children"], serde_json::json!([]), "{json}");
         let read: Reply = serde_json::from_value(json).unwrap();
         assert_eq!(read, without);
-    }
-
-    #[test]
-    fn a_hello_or_a_session_without_features_reads_as_none() {
-        let mut older = hello();
-        older.features = Vec::new();
-        let json = serde_json::to_value(&older).unwrap();
-        assert!(json.get("features").is_none(), "{json}");
-        let read: Hello = serde_json::from_value(json).unwrap();
-        assert!(read.features.is_empty());
-        let logged_in: Reply = serde_json::from_value(serde_json::json!({
-            "type": "logged_in",
-            "session": "s",
-            "remembered": false,
-        }))
-        .unwrap();
-        assert!(matches!(logged_in, Reply::LoggedIn { features, .. } if features.is_empty()));
-    }
-
-    #[test]
-    fn a_hello_keeps_a_bounded_list_of_features() {
-        let mut long = hello();
-        long.features = vec!["x".repeat(1_000); 100];
-        let kept = long.within_bounds();
-        assert_eq!(kept.features.len(), crate::features::MAX_LISTED);
-        assert_eq!(kept.features[0].chars().count(), crate::MAX_HELLO_TEXT);
+        assert_each_required(&without, &["playlists", "liked", "liked_children"]);
     }
 
     #[test]
@@ -3390,7 +3378,7 @@ mod play_history {
     }
 
     #[test]
-    fn a_play_count_round_trips_and_is_left_out_when_none() {
+    fn a_play_count_round_trips_and_is_sent_when_none() {
         let mut played = movie();
         if let Item::Movie(m) = &mut played {
             m.playback.play_count = 2;
@@ -3404,9 +3392,13 @@ mod play_history {
             total: 1,
             unavailable: Vec::new(),
         }));
-        let json = serde_json::to_value(movie()).unwrap();
-        assert!(json["playback"].get("play_count").is_none(), "{json}");
-        assert!(json["playback"].get("last_played_at").is_none(), "{json}");
+        let mut json = serde_json::to_value(movie()).unwrap();
+        assert_eq!(json["playback"]["play_count"], 0, "{json}");
+        assert!(json["playback"]["last_played_at"].is_null(), "{json}");
+        // Kept by an SDK before them, with a download: read as none.
+        let playback = json["playback"].as_object_mut().unwrap();
+        playback.remove("play_count");
+        playback.remove("last_played_at");
         let read: Item = serde_json::from_value(json).unwrap();
         assert_eq!(read, movie());
     }
@@ -3646,10 +3638,10 @@ mod downloads {
     };
     use crate::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 
-    /// A server before 0.14.2 sends no `estimates`: the reply still
-    /// decodes, with none.
+    /// Download options without `estimates`, as a server before 0.14.2
+    /// sent them, are refused: an empty list is sent as one.
     #[test]
-    fn options_without_estimates_decode_with_none() {
+    fn options_without_estimates_are_refused() {
         let old = serde_json::json!({
             "tracks": MediaTracks::default(),
             "preferred": {"type": "chosen", "audio": [0], "subtitles": []},
@@ -3659,8 +3651,11 @@ mod downloads {
         });
         let mut bytes = Vec::new();
         ciborium::into_writer(&old, &mut bytes).unwrap();
-        let options: DownloadOptionsInfo = ciborium::from_reader(bytes.as_slice()).unwrap();
-        assert_eq!(options.estimates, []);
+        let error = ciborium::from_reader::<DownloadOptionsInfo, _>(bytes.as_slice()).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `estimates`"),
+            "{error}"
+        );
     }
 
     /// A server before the cause was sent says only why in words: the

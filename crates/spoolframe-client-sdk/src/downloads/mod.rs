@@ -1,5 +1,4 @@
-//! Downloads for offline viewing (PX-38, feature `spoolframe:downloads`):
-//! films and episodes kept on this device to play with no server.
+//! Downloads for offline viewing (PX-38): films and episodes kept on this device to play with no server.
 //!
 //! [`Downloads::start`] asks the server to prepare the file
 //! (`PrepareDownload`) and keeps the item's details, markers, tracks and
@@ -30,7 +29,7 @@
 //! or found, and when it starts. The server decides what counts as
 //! watched; what is kept here is for showing.
 //!
-//! Music (PX-51, `spoolframe:music-downloads`) rides the same entries
+//! Music (PX-51) rides the same entries
 //! and manager: see the `music` module for downloads of albums, artists,
 //! playlists and Liked, and `listening` for tracks kept as they play.
 //! On a mobile network ([`Downloads::set_network`]) nothing moves unless
@@ -69,7 +68,6 @@ use spoolframe_protocol::downloads::{
     DownloadFailure, DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState,
     DownloadTracks, OfflineWatch, OfflineWatchOutcome,
 };
-use spoolframe_protocol::features::DOWNLOADS;
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::{ArtworkKind, Item, Marker, MediaId, MediaTracks};
 use tokio::sync::{Notify, broadcast, watch};
@@ -287,22 +285,10 @@ impl Client {
 }
 
 impl Session {
-    /// [`SdkError::Unsupported`] unless the session has downloads.
-    fn downloads_offered(&self) -> Result<(), SdkError> {
-        if self.features.downloads {
-            Ok(())
-        } else {
-            Err(SdkError::Unsupported {
-                feature: DOWNLOADS.into(),
-            })
-        }
-    }
-
     /// What this device may download of `id`, a film or an episode: its
     /// tracks, the choice to tick first, the profiles, what original
     /// quality would be, and the subtitles a download would leave out.
     pub async fn download_options(&self, id: &MediaId) -> Result<DownloadOptionsInfo, SdkError> {
-        self.downloads_offered()?;
         match self
             .call(Request::DownloadOptions {
                 id: id.clone(),
@@ -334,7 +320,6 @@ impl Downloads {
     ) -> Result<LocalDownload, SdkError> {
         let shared = self.shared();
         let store = shared.store()?;
-        session.downloads_offered()?;
         let kind = EntryKind::of(id)
             .filter(|kind| *kind != EntryKind::Track)
             .ok_or_else(|| {
@@ -662,7 +647,6 @@ impl Downloads {
     /// each item. Newest wins on the server; one it has newer (`Older`)
     /// takes the server's state here. Nothing to send asks nothing.
     pub async fn sync_watch(&self, session: &Session) -> Result<Vec<SyncedWatch>, SdkError> {
-        session.downloads_offered()?;
         manager::sync(self.shared(), session).await
     }
 
@@ -861,7 +845,7 @@ impl Shared {
     /// A session was made or found: the manager may use it, and sends its
     /// user's offline watch.
     pub(crate) fn session_made(&self, session: &Session) {
-        if self.store.is_none() || !session.features.downloads {
+        if self.store.is_none() {
             return;
         }
         self.locks.session_locked(

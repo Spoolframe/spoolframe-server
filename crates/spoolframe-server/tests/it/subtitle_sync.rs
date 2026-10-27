@@ -13,7 +13,6 @@ use std::time::Duration;
 use iroh::endpoint::RecvStream;
 use spoolframe_media::subsync::{self, Span, TextFormat};
 use spoolframe_protocol::codec::read_frame;
-use spoolframe_protocol::features::SUBTITLE_SYNC;
 use spoolframe_protocol::streams::uni;
 use spoolframe_protocol::{
     BitmapSubtitles, Error, Event, Hello, PROTOCOL_VERSION, PlaybackHandle, Reply, Request,
@@ -80,16 +79,15 @@ async fn ready(test: &str) -> (TestServer, String) {
 }
 
 /// A Linux app that plays the film directly with SubRip beside it,
-/// listing `features`, signed in as `user`.
-async fn app(server: &TestServer, user: &str, features: &[&str]) -> (TestClient, SessionId) {
-    app_showing(server, user, features, SubtitleFormat::Srt).await
+/// signed in as `user`.
+async fn app(server: &TestServer, user: &str) -> (TestClient, SessionId) {
+    app_showing(server, user, SubtitleFormat::Srt).await
 }
 
 /// An app that shows subtitles in `format` only.
 async fn app_showing(
     server: &TestServer,
     user: &str,
-    features: &[&str],
     format: SubtitleFormat,
 ) -> (TestClient, SessionId) {
     let client = server.client().await;
@@ -107,7 +105,6 @@ async fn app_showing(
             ..ClientCapabilities::default()
         }),
         experimental: Vec::new(),
-        features: features.iter().map(|f| f.to_string()).collect(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -226,9 +223,9 @@ fn starts(text: &str) -> Vec<i64> {
 #[tokio::test]
 async fn an_offset_one_user_sets_is_what_another_plays() {
     let (server, text) = ready("subsync-offset").await;
-    let (alice, alice_session) = app(&server, "alice", &[SUBTITLE_SYNC]).await;
+    let (alice, alice_session) = app(&server, "alice").await;
     let mut told = events(&alice).await;
-    let (bob, bob_session) = app(&server, "bob", &[SUBTITLE_SYNC]).await;
+    let (bob, bob_session) = app(&server, "bob").await;
     let before = tracks(&alice, &alice_session).await;
     let timing = before.subtitles[0]
         .timing
@@ -289,7 +286,7 @@ async fn an_offset_one_user_sets_is_what_another_plays() {
 #[tokio::test]
 async fn a_synced_subtitle_reads_synced_after_its_sync() {
     let (server, text) = ready("subsync-sync").await;
-    let (alice, session) = app(&server, "alice", &[SUBTITLE_SYNC]).await;
+    let (alice, session) = app(&server, "alice").await;
     let mut told = events(&alice).await;
     let handle = play(&alice, &session).await;
     let syncing = timing_call(
@@ -326,7 +323,7 @@ async fn a_synced_subtitle_reads_synced_after_its_sync() {
 #[tokio::test]
 async fn a_converted_subtitle_has_its_timing() {
     let (server, text) = ready("subsync-converted").await;
-    let (bob, bob_session) = app(&server, "bob", &[SUBTITLE_SYNC]).await;
+    let (bob, bob_session) = app(&server, "bob").await;
     timing_call(
         &bob,
         &bob_session,
@@ -337,7 +334,7 @@ async fn a_converted_subtitle_has_its_timing() {
         },
     )
     .await;
-    let (web, session) = app_showing(&server, "alice", &[], SubtitleFormat::WebVtt).await;
+    let (web, session) = app_showing(&server, "alice", SubtitleFormat::WebVtt).await;
     let handle = play(&web, &session).await;
     let vtt = loop {
         match read(&web, &session, &handle, None).await {
@@ -357,14 +354,14 @@ async fn a_converted_subtitle_has_its_timing() {
     assert_eq!(got, expected);
 }
 
-/// A client that did not list the feature is sent no timing, and its
-/// requests are refused.
+/// Subtitle timing is base protocol: an app that names no feature is
+/// sent a subtitle's timing, and changes it.
 #[tokio::test]
-async fn a_client_without_the_feature_gets_no_timing() {
-    let (server, _) = ready("subsync-unlisted").await;
-    let (older, session) = app(&server, "alice", &[]).await;
-    assert_eq!(tracks(&older, &session).await.subtitles[0].timing, None);
-    let refused = older
+async fn an_app_naming_no_feature_gets_the_timing_and_changes_it() {
+    let (server, _) = ready("subsync-base").await;
+    let (app, session) = app(&server, "alice").await;
+    assert!(tracks(&app, &session).await.subtitles[0].timing.is_some());
+    let changed = app
         .call(
             Some(&session),
             Request::SetSubtitleOffset {
@@ -374,8 +371,5 @@ async fn a_client_without_the_feature_gets_no_timing() {
             },
         )
         .await;
-    assert!(
-        matches!(refused, Response::Err(Error::Unsupported { .. })),
-        "{refused:?}"
-    );
+    assert!(matches!(changed, Response::Ok(_)), "{changed:?}");
 }

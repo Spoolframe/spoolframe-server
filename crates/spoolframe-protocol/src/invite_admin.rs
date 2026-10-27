@@ -124,9 +124,7 @@ pub struct InviteCreated {
     pub link: String,
     /// The same invite as an https link on spoolframe.app
     /// ([`crate::invite::Invite::share_link`], PX-45): what the share
-    /// sheet sends and Copy copies. Empty from a server before it.
-    // compat(v1): required at the protocol reset
-    #[serde(default)]
+    /// sheet sends and Copy copies.
     pub share_link: String,
 }
 
@@ -199,19 +197,16 @@ mod tests {
         assert!(!shown.contains("QW7K"), "{shown}");
     }
 
-    /// PX-45: a server before share links sends none; it reads as empty,
-    /// and the SDK makes it from `link`.
+    /// PX-45: a created invite without its share link, as a server
+    /// before the reset to revision 1 could send it, is refused.
     #[test]
-    fn a_created_invite_without_a_share_link_reads_as_empty() {
+    fn a_created_invite_without_a_share_link_is_refused() {
         let mut sent = serde_json::to_value(created()).unwrap();
         sent.as_object_mut().unwrap().remove("share_link").unwrap();
-        let read: InviteCreated = serde_json::from_value(sent).unwrap();
-        assert_eq!(
-            read,
-            InviteCreated {
-                share_link: String::new(),
-                ..created()
-            }
+        let error = serde_json::from_value::<InviteCreated>(sent).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `share_link`"),
+            "{error}"
         );
     }
 }

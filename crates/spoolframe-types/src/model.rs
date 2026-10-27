@@ -32,8 +32,7 @@ pub struct Library {
     /// The paired server a library is shared from (experimental
     /// `federation`, P8-02): only on a library of another server's, and
     /// only to a client that named the feature. `None` for the server's
-    /// own libraries.
-    // compat(v1): required at the protocol reset
+    /// own libraries, and left out then, as experimental fields are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<LibraryServer>,
 }
@@ -77,30 +76,24 @@ pub struct PlaybackState {
     pub watched: bool,
     /// When the user last viewed it, Unix seconds: their last progress
     /// report on it from any device, or its last mark as watched or
-    /// unwatched. Sent only to a client that listed the
-    /// `spoolframe:last-viewed` feature, and only where its reply says
-    /// so (Home's rows, an item's details); `None` elsewhere, and for an
-    /// item never viewed.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// unwatched. Filled where its reply says so (Home's rows, an item's
+    /// details); `None` elsewhere, and for an item never viewed.
+    ///
+    /// This and the two below are read as none when left out: the SDK
+    /// keeps an item with its download, and one kept by an SDK before
+    /// them lacks the keys.
+    #[serde(default)]
     pub last_viewed_at: Option<i64>,
     /// How many times the user played it through: their counted plays
-    /// from any device (PX-52). Sent only to a client that listed the
-    /// `spoolframe:play-history` feature, and only where its reply says
-    /// so (an item's details, Recently played); left out when 0.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "is_zero")]
+    /// from any device (PX-52). Filled where its reply says so (an
+    /// item's details, Recently played); 0 elsewhere.
+    #[serde(default)]
     pub play_count: u32,
     /// When the user last played it, Unix seconds: the end of their
-    /// latest counted play. Sent where `play_count` is; `None` for an
+    /// latest counted play. Filled where `play_count` is; `None` for an
     /// item never played.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub last_played_at: Option<i64>,
-}
-
-fn is_zero(n: &u32) -> bool {
-    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,10 +104,9 @@ pub struct Movie {
     pub year: Option<u16>,
     /// The day it came out, `"YYYY-MM-DD"`.
     ///
-    /// This and `cast` were added without a PROTOCOL_VERSION bump, as
-    /// `Episode::air_date` was: a server from before them leaves the keys
-    /// out, and that reads as `None` and no one.
-    // compat(v1): required at the protocol reset
+    /// This and `cast` are read as `None` and no one when left out, though
+    /// every server sends them: the SDK keeps an item with its download,
+    /// and one kept by an SDK before them lacks the keys.
     pub release_date: Option<CalendarDate>,
     pub summary: Option<String>,
     /// The age rating as the catalog has it ("R", "TV-MA"), shown as
@@ -123,7 +115,6 @@ pub struct Movie {
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
     /// Who is in it and who directed it (see [`CastMember`]).
-    // compat(v1): required at the protocol reset
     #[serde(default)]
     pub cast: Vec<CastMember>,
     pub artwork: Vec<Artwork>,
@@ -154,13 +145,10 @@ pub struct Show {
     /// not) still sets it on a running show: a client that shows a run
     /// from it may show one that has not ended.
     ///
-    /// This and `cast` were added without a PROTOCOL_VERSION bump, so a
-    /// server from before them leaves the keys out, and that reads as
-    /// `None` and no one.
-    // compat(v1): required at the protocol reset
+    /// This and `cast` are read as `None` and no one when left out, as
+    /// [`Movie::release_date`] is.
     pub last_aired: Option<CalendarDate>,
     /// Who is in it and who directed it (see [`CastMember`]).
-    // compat(v1): required at the protocol reset
     #[serde(default)]
     pub cast: Vec<CastMember>,
     pub artwork: Vec<Artwork>,
@@ -198,20 +186,16 @@ pub struct Episode {
     /// The year it first aired, for "2019" on its page: the catalog's
     /// own, else `air_date`'s.
     ///
-    /// This and `air_date` were added without a PROTOCOL_VERSION bump,
-    /// so they are not `required::option`: a server from before them
-    /// leaves the keys out, and that reads as `None`.
-    // compat(v1): required at the protocol reset
+    /// This and `air_date` are not `required::option`, as
+    /// [`Movie::release_date`] is not.
     pub year: Option<u16>,
     /// The day it first aired, `"YYYY-MM-DD"`.
-    // compat(v1): required at the protocol reset
     pub air_date: Option<CalendarDate>,
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
     /// Who is in it and who directed it (see [`CastMember`]): the
-    /// episode's own, which may leave out the show's regulars. Added
-    /// without a PROTOCOL_VERSION bump; left out, no one.
-    // compat(v1): required at the protocol reset
+    /// episode's own, which may leave out the show's regulars. Left out,
+    /// no one, as [`Movie::cast`].
     #[serde(default)]
     pub cast: Vec<CastMember>,
     pub artwork: Vec<Artwork>,

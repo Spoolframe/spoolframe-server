@@ -11,7 +11,7 @@ use std::time::Duration;
 use spoolframe_client_sdk::types::{ClientCapabilities, Item, Platform};
 use spoolframe_client_sdk::{
     Client, ClientOptions, Device, DownloadEvent, DownloadPhase, DownloadSource, DownloadTracks,
-    Features, LocalDownload, MemoryStorage, OfflineWatchOutcome, Session,
+    LocalDownload, MemoryStorage, OfflineWatchOutcome, Session,
 };
 use spoolframe_protocol::{Hello, PROTOCOL_VERSION, Reply, Request, Response};
 use spoolframe_test_dir::TestDir;
@@ -81,10 +81,6 @@ fn options(downloads: &Path, relays: bool) -> ClientOptions {
     ClientOptions {
         lan_discovery: false,
         relays,
-        features: Features {
-            downloads: true,
-            ..Features::default()
-        },
         downloads_dir: Some(downloads.to_path_buf()),
         ..ClientOptions::default()
     }
@@ -425,7 +421,6 @@ async fn an_older_offline_watch_loses_to_the_newer_one_on_the_server() {
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
-        features: Vec::new(),
     };
     other.call(None, Request::Hello(hello)).await;
     let token = other.login("alice", PASSWORD).await;

@@ -121,8 +121,8 @@ pub struct Paired {
     /// vouches for them and not this device's owner: a password sign-in
     /// there shows "Not verified" as for any pin no one confirmed. A
     /// server this device had saved already is left as it was. Empty from
-    /// a phone that has none, or is from before P7-06. One whose server
-    /// id a saved server has under another key is left out.
+    /// a phone that has none. One whose server id a saved server has
+    /// under another key is left out.
     pub servers: Vec<PairedServer>,
 }
 

@@ -1012,7 +1012,7 @@ impl McpServer {
         library.watch.fill(caller.principal(), &mut items).await?;
         let playlists = library
             .playlists
-            .holding(&caller.actor(), &found.item, &found.children, true)
+            .holding(&caller.actor(), &found.item, &found.children)
             .await?;
         let (liked, liked_children) = library
             .playlists
@@ -1073,7 +1073,7 @@ impl McpServer {
 impl McpServer {
     async fn list_playlists(&self, caller: &McpCaller) -> ToolResult {
         let library = self.library()?;
-        let (playlists, _) = library.playlists.list(&caller.actor(), true).await?;
+        let (playlists, _) = library.playlists.list(&caller.actor()).await?;
         Ok(json!({ "playlists": playlists.iter().map(playlist_json).collect::<Vec<_>>() }))
     }
 
@@ -1447,8 +1447,9 @@ fn caller(context: &RequestContext<RoleServer>) -> Result<McpCaller, ErrorData> 
 
 impl ServerHandler for McpServer {
     /// The server's name and version, and in its description the client
-    /// protocol's version and features, one per line, as the Server page
-    /// lists them: for an agent asked what this server speaks.
+    /// protocol's version and the experimental features on, one per line,
+    /// as the Server page lists them: for an agent asked what this server
+    /// speaks.
     fn get_info(&self) -> ServerConfig {
         let protocol = self
             .api

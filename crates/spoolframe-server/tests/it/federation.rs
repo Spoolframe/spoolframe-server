@@ -1178,9 +1178,7 @@ mod admin {
         let sa = Site::start("fed-admin-lookup", "Alice's server", "alice", true).await;
         let link = sa.invite().await;
         let device = sa.server.client().await;
-        device
-            .hello_listing(&[spoolframe_protocol::features::INVITE_LOOKUP])
-            .await;
+        device.hello_info().await;
         let looked = device
             .call(
                 None,
@@ -1730,8 +1728,8 @@ mod app {
 
     pub(super) const PASSWORD: &str = "correct horse";
 
-    /// An app on loopback that asks for `experimental` (and lists invite
-    /// lookup), signed in to `server` as `username`.
+    /// An app on loopback that asks for `experimental`, signed in to
+    /// `server` as `username`.
     pub(super) async fn signed_in(
         server: &TestServer,
         username: &str,
@@ -1740,10 +1738,6 @@ mod app {
         let options = ClientOptions {
             lan_discovery: false,
             experimental,
-            features: spoolframe_client_sdk::Features {
-                invite_lookup: true,
-                ..Default::default()
-            },
             ..ClientOptions::default()
         };
         let device = Device {
@@ -2568,7 +2562,6 @@ mod replica {
             device_name: None,
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
-            features: Vec::new(),
         };
         app.call(None, Request::Hello(hello)).await;
         pair.sb.add_user("bob", "correct horse", None).await;
@@ -3937,7 +3930,6 @@ mod replica {
             device_name: None,
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
-            features: vec![spoolframe_protocol::features::PLAY_HISTORY.into()],
         };
         app.call(None, Request::Hello(hello)).await;
         let bob = app.login("bob", "correct horse").await;
@@ -4621,7 +4613,6 @@ mod replica {
         /// the offset is set and the timing row written.
         #[tokio::test]
         async fn a_moved_film_s_session_changes_no_subtitle_timing() {
-            use spoolframe_protocol::features::SUBTITLE_SYNC;
             let pair = Pair::start_both(
                 "fed-media-moved-subtitles",
                 ServerOptions {
@@ -4647,7 +4638,6 @@ mod replica {
                 device_name: None,
                 capabilities: Some(mkv_capabilities()),
                 experimental: experimental.iter().map(|n| (*n).to_owned()).collect(),
-                features: vec![SUBTITLE_SYNC.into()],
             };
             let timing = [
                 (
@@ -4742,7 +4732,6 @@ mod replica {
         /// A new connection from `device`'s endpoint, let in by its remote
         /// session, saying hello with the feature and subtitle sync.
         async fn timing_connection(pair: &Pair, device: &TestClient) -> TestClient {
-            use spoolframe_protocol::features::SUBTITLE_SYNC;
             let asking = pair.sa.client_from(&device.endpoint).await;
             let hello = spoolframe_protocol::Hello {
                 protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
@@ -4752,7 +4741,6 @@ mod replica {
                 device_name: None,
                 capabilities: Some(mkv_capabilities()),
                 experimental: vec![FEDERATION.into()],
-                features: vec![SUBTITLE_SYNC.into()],
             };
             assert!(matches!(
                 asking.call(None, Request::Hello(hello)).await,

@@ -11,11 +11,13 @@ models in `spoolframe-types`. `spoolframe-client-sdk` is the supported
 client and handles most of what follows; the SDK notes in each section
 say what it does for an app.
 
-**Current revision: 15.** The client ALPN is `spoolframe/client/1`, and
+**Current revision: 1.** The client ALPN is `spoolframe/client/1`, and
 `PROTOCOL_VERSION` (in `spoolframe_protocol::messages`) names the
-revision inside it. Until the protocol is declared stable, a breaking
-change raises the revision and keeps the ALPN, so the server and the SDK
-must be updated together. The changes per revision are in
+revision inside it. 0.16.0 reset it to 1, a clean break: the revisions
+2 to 15 of the releases before it are refused, and an app needs SDK 0.16
+or later. Until the protocol is declared stable, a breaking change
+raises the revision and keeps the ALPN, so the server and the SDK must
+be updated together. The changes per revision are in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Contents
@@ -94,25 +96,21 @@ still read as `null` when absent, but senders must not leave them out.
 The admin API (JSON-RPC) follows the same rule, except for an error
 object's `data`, which JSON-RPC 2.0 lets an error leave out.
 
-A few fields may be left out until the protocol is reset to revision 1
-for a stable release. Each is marked `compat(v1): required at the
-protocol reset` in the code:
+Revision 1 has no fields left lenient for older peers: the reset ended
+them. A few fields may still be left out, each for a reason of its own:
 
-| Field | Read as, when left out |
-|---|---|
-| `ClientCapabilities.hardware_video` | `null` |
-| `ClientCapabilities.video_codecs`, `DisplayCapabilities.video_codecs` | `null` |
-| `display` on `PlaybackPlan`, `StartPlayback`, `ChangeSubtitle`, `ChangeQuality` | `null` |
-| `LoggedIn.password_change_required` | `false` |
-| `can_leave` in the `WhoAmI` reply | `true` |
-| `Rung.video` | `null` |
-| `ConvertedVideo::Copy.dolby_vision` | `false` |
-| `source_codec` on a `direct` or `converted` plan | `null` |
-| `servers` in pairing's `credential` frame | none |
-| `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent (these are also left out when empty) |
-| `year`, `air_date` on an item; `bit_rate` on a file's tracks and its video | `null` |
-| `release_date` on a movie, `last_aired` on a show | `null` |
-| `cast` on a movie, show and episode | `[]` |
+| Field | Read as, when left out | Why |
+|---|---|---|
+| `ClientCapabilities.hardware_video` | `null` | "does not say" is its meaning |
+| `ClientCapabilities.video_codecs`, `DisplayCapabilities.video_codecs` | `null` | as `hardware_video` |
+| `display` on `PlaybackPlan`, `StartPlayback`, `ChangeSubtitle`, `ChangeQuality` | `null` | `null` keeps `Hello`'s |
+| `source_codec` on a `direct` or `converted` plan | `null` | for a client's log |
+| `year`, `air_date` on an item; `release_date` on a movie; `last_aired` on a show; `bit_rate` on a file and its video | `null` | the SDK keeps items with a download, and reads back what it kept before |
+| `cast` on a movie, show and episode | `[]` | as `year` |
+| `last_viewed_at`, `play_count`, `last_played_at` on a playback state; `timing`, `download` on a subtitle track | `null`, 0 | as `year`; a server sends them always |
+| `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent | stored as JSON by servers and devices; left out when empty |
+| `expected_size` on a download, `cause` on a failed one | `null`, `other` | the SDK keeps them with a download |
+| the experimental features' fields (`federation`'s `unavailable`, `servers`, a library's `server`, `copies`) | none | left out for a client without the feature |
 
 ## Connections and streams
 
@@ -132,7 +130,19 @@ A stream with an unknown first byte is reset with
 
 The first request on a connection is `Hello`. Its `protocol_version`
 must equal the server's `PROTOCOL_VERSION`; otherwise the reply is
-`Unsupported`, and the SDK reports a revision mismatch. The reply is
+`Unsupported`, and the connection has not said `Hello`. Its `request`
+text says which side is older:
+
+| `Hello` says | `request` |
+|---|---|
+| 2 to 15: an app from before the reset (SDK 0.15 or older) | `client protocol 15; this server speaks 1: this server needs a newer app` |
+| 16 or higher: an app newer than the server | `client protocol 16; this server speaks 1: update the server` |
+
+The `Hello` need not decode as this revision's: one whose
+`protocol_version` can be read, and is another, is refused this way,
+not as `Malformed`. Every SDK, the ones before the reset included, reads
+this `Unsupported` as `SdkError::UpdateRequired { server_protocol: None
+}`: show "Update the app" (or the server), and stop dialling. The reply is
 `ServerInfo`: the server's name, `endpoint_id`, `server_id`,
 `protocol_version`, `server_version`, `auth_methods` and `web_url`.
 The server keeps at most 128 characters (`MAX_HELLO_TEXT`) of each of
@@ -828,9 +838,8 @@ connection.
 ### Looking an invite up
 
 Before joining, a device may ask what a code is, for the "Got an invite?"
-screen, without using it up. It needs `spoolframe:invite-lookup` in its
-`Hello`; the answer to `Hello` lists it before any session (`unsupported`
-for a device that did not list it, with nothing counted).
+screen, without using it up. It is pre-auth: a device with no session
+asks, after `Hello`.
 
 ```json
 {"type": "lookup_invite", "code": "qw7k 2mfp xr4t"}
@@ -917,8 +926,8 @@ lists and revokes the other's.
 Each `null` is the default (one use, 7 days, `consumer`). The answer is
 `invite_created { invite, code, link, share_link }`: the code
 (`QW7K-2MFP-XR4T`) and the link with it in both forms (`link`, the
-`spoolframe://` one for a QR code; `share_link`, the https one to send,
-absent from a server before PX-45), shown this once, and `invite`, as
+`spoolframe://` one for a QR code; `share_link`, the https one to send),
+shown this once, and `invite`, as
 `list_invites` lists it:
 
 ```json
@@ -982,10 +991,7 @@ link as the user pasted or opened it:
   `NotAnInviteCode`, a link included; both lookups check it before
   anything is sent.
 
-Both need `Features::invite_lookup` in `ClientOptions::features`, and a
-server that lists the feature in its answer to `Hello`; otherwise they are
-`Unsupported` and send no lookup. Too many `NoMatch` lookups end in
-`RateLimited`.
+Too many `NoMatch` lookups end in `RateLimited`.
 
 An admin's `Session` makes them: `create_invite(InviteSpec) ->
 MintedInvite` (`link` is the `spoolframe://` form, for its QR code;
@@ -1615,41 +1621,25 @@ still refuses. It sits beside the user's fields in the same map.
 
 ## Features
 
-A regular feature (PX-16) is a namespaced name, `spoolframe:playlists`,
-for a set of requests, replies and events. Both sides list the ones they
-are built with, and each uses only what both list. This build has the
-slice of PX-16 that playlists need; the update advisory and a test
-server's mask come later.
+Revision 1 has no regular features. Playlists, Liked and All, sharing
+by name, playlist covers, up next in a playlist, when an item was last
+viewed, play history, subtitle sync and search, downloads, music
+offline and looking an invite up were the `spoolframe:` features of
+revisions up to 15 (PX-16), which a client and a server each listed and
+used only when both did. They are base protocol now: a client names
+none, a server lists none, and every request, reply field and event
+below is there for every client. `Hello`, `ServerInfo`, `LoggedIn` and
+`WhoAmI` carry no `features`.
 
-- `Hello.features`: the regular features the client handles. An SDK
-  lists only those its app said it handles, not every one it knows: an
-  app that moves to a newer SDK must not be sent what its code would
-  misread.
-- `ServerInfo.features`: only the server's pre-auth features
-  (`spoolframe:invite-lookup`).
-- `LoggedIn.features` and `WhoAmI`'s `features`: all of the server's.
-  `WhoAmI` carries them for a client holding a session from before, or
-  from before the server was upgraded.
-
-The server never sends a reply field or event of a feature the client
-did not list in its `Hello` on that connection, and a client sends no
-request of one the server did not list. A name either side does not
-know is ignored; no feature is required. All three fields are left out
-when empty, so an older peer sends and reads what it did before.
-
-Regular features differ from experimental ones (PX-49,
-`Hello.experimental`): a server that has one always lists it, where an
-operator turns an experimental one on. A client lists either kind only
-when its code handles it.
-
-New wire capability comes as a regular feature, not a new protocol
-version: an app built before a feature keeps working against a server
-that has it, and is sent nothing of it. `spoolframe:liked` (PX-43) is
-the first added so.
+The only opt-ins are the experimental features (PX-49):
+`http-playback` and `federation`. A client names those it wants in
+`Hello.experimental`; the server's answer, `ServerInfo.experimental`,
+names those it turned on, each by its setting. They are outside the
+protocol's stability.
 
 ## Playlists
 
-Feature `spoolframe:playlists` (PX-40). A playlist is a name, an owner,
+PX-40. A playlist is a name, an owner,
 the kinds of item it may hold (`Kinds { movies, episodes, tracks }`,
 ticked when it is made and only ever widened), and an ordered list of
 entries. An entry is one place in the list (`EntryId`), so an item may be
@@ -1808,18 +1798,15 @@ playlist gets no note for it.
 
 ### Item details
 
-`Item` carries `playlists: Some([PlaylistRef { id, name, owner_kind }])`
-(with `builtin` and, for `spoolframe:playlist-sharing`, `owner_name`)
-for a client that listed the feature: the playlists the user sees that
-hold a movie, episode or track itself, any of a season's or show's
-episodes, or any of an album's or artist's tracks. For any other client
-the field is left out.
+`Item` carries `playlists: [PlaylistRef { id, name, owner_kind,
+builtin, owner_name, artwork }]`: the playlists the user sees that hold
+a movie, episode or track itself, any of a season's or show's episodes,
+or any of an album's or artist's tracks; empty when none does.
 
 ### Events
 
-To a connection that listed the feature, for each user it has made a
-request as on that connection (from the first such request until it
-closes):
+To a connection, for each user it has made a request as on that
+connection (from the first such request until it closes):
 
 - `PlaylistChanged { id, revision }`: a playlist the user sees was made
   or changed (entries, name, kinds, sharing). Read it again if shown.
@@ -1828,8 +1815,7 @@ closes):
 - `PinsChanged`: the user's Pinned or its notes changed, here, on
   another device, or by another user's change. `ListPlaylists` again.
 
-With `spoolframe:music-downloads` (see "Music offline"), whether or not
-this feature is listed, a connection is also sent:
+For music offline (see "Music offline"), a connection is also sent:
 
 - `LikedChanged` (no fields): the user liked or unliked a track, here
   or on another device (PX-51). Only to the user's own connections,
@@ -1843,18 +1829,11 @@ again on connecting.
 
 ### SDK
 
-The SDK lists in its `Hello` the features the app gives in
-`ClientOptions::features` (a `Features`; none by default), and no other.
-`Session::features()` says which the session has: those the app listed
-that the server listed too (from `WhoAmI`). One the app did not list is
-false even when the server has it.
-`Features::playlists` gates every playlist call: without it the call is
-`SdkError::Unsupported { feature }` and nothing is sent. The calls are
-`Session::playlists`, `playlist`, `create_playlist`, `update_playlist`
+The calls are `Session::playlists`, `playlist`, `create_playlist`, `update_playlist`
 (`PlaylistUpdate`), `edit_playlist`, `delete_playlist`, `pin_playlist`,
 `unpin_playlist`, `dismiss_pin_notes`, `play_playlist`,
-`next_in_playlist` and `import_plex_playlists`; `ItemDetail::playlists` lists an item's playlists
-(empty from a server without them). Refusals are typed:
+`next_in_playlist` and `import_plex_playlists`; `ItemDetail::playlists`
+lists an item's playlists. Refusals are typed:
 `SdkError::PlaylistReadOnly`, `KindNotAllowed { kind }` and
 `PlaylistConflict { revision }`. `Client::playlist_events()` gives every
 `PlaylistEvent { server, change }` the servers tell, `change` one of
@@ -1862,9 +1841,8 @@ false even when the server has it.
 
 ## Sharing by name
 
-Feature `spoolframe:playlist-sharing`, on top of `spoolframe:playlists`.
-It lets an app share a playlist by picking a person, not by typing a
-user id, and show who it is shared with and whose it is.
+An app shares a playlist by picking a person, not by typing a user id,
+and shows who it is shared with and whose it is.
 
 - `ListShareCandidates { id, query, offset, limit }` answers
   `ShareCandidates(ShareCandidatePage { candidates, offset, total })`:
@@ -1886,34 +1864,29 @@ user id, and show who it is shared with and whose it is.
   does each `PlaylistRef` in an item's `playlists`, so an item's page
   can say whose a playlist holding it is.
 
-A request reads only `user_id` and `can_edit` of a share; the names are
-the server's to say. A session whose client did not list the feature is
-sent none of these fields, and its `ListShareCandidates` is
-`Unsupported`.
+A request reads only `user_id` and `can_edit` of a share, and sends
+`display_name` and `kind` as `null`; the names are the server's to say.
 
-SDK: `Features::playlist_sharing`; `Session::share_candidates(id, query,
-offset, limit)` returns the `ShareCandidatePage` (`SdkError::Unsupported`
-without the feature, `PlaylistReadOnly` for a non-manager);
+SDK: `Session::share_candidates(id, query, offset, limit)` returns the
+`ShareCandidatePage` (`PlaylistReadOnly` for a non-manager);
 `PlaylistShare::new(user_id, can_edit)` makes a share to send.
 
 ## When an item was last viewed
 
-Feature `spoolframe:last-viewed`. A client that lists it gets
-`last_viewed_at`, Unix seconds, in an item's `PlaybackState`: on Home's
-`continue_watching` and `next_up` items, and on `Item`'s item and
-children. It is when the user's watch state on the item was last saved:
+`last_viewed_at`, Unix seconds, is in an item's `PlaybackState`, filled
+on Home's `continue_watching` and `next_up` items, and on `Item`'s item
+and children. It is when the user's watch state on the item was last saved:
 a progress report from any device of theirs, a mark as watched or
 unwatched, or a view synced from Plex at Plex's time. Another user's
-viewing never moves it. The key is left out for an item never viewed,
-everywhere else, and always for a client that did not list the feature.
+viewing never moves it. It is `null` for an item never viewed, and
+everywhere else.
 What it is for: showing only what was watched lately (the Apple TV's
 Top Shelf, the last 48 hours), across the user's devices.
 
 ## Play history
 
-Feature `spoolframe:play-history` (PX-52). The server keeps every play,
-whichever client made it and whether or not it listed the feature: a
-play opens at `StartPlayback`, moves on with each
+PX-52. The server keeps every play, whichever client made it: a play
+opens at `StartPlayback`, moves on with each
 `UpdatePlaybackProgress`, and closes at `StopPlayback`, or when the
 playback ends otherwise (it expires, an admin stops it, its session
 ends). Tracks are played like films: a track's `UpdatePlaybackProgress`
@@ -1945,14 +1918,13 @@ report after a longer silence is credited at most 30 s, whatever the
 position moved by. A play that does not
 count is kept as history, and counts nowhere below.
 
-A client that lists the feature gets, in an item's `PlaybackState` on
-`Item`'s item and children (an album's tracks) and on Recently played's
-items:
+An item's `PlaybackState` carries, filled on `Item`'s item and
+children (an album's tracks) and on Recently played's items:
 
-- `play_count`: the user's counted plays of it, from any device; left
-  out when 0;
-- `last_played_at`: Unix seconds, when the latest of them ended; left
-  out when never.
+- `play_count`: the user's counted plays of it, from any device; 0 when
+  none, and elsewhere;
+- `last_played_at`: Unix seconds, when the latest of them ended; `null`
+  when never, and elsewhere.
 
 `RecentlyPlayed { kinds, offset, limit }` answers `Items { items, total
 }`: the session user's items, each once, by their latest counted play,
@@ -1960,18 +1932,15 @@ newest first, a page from `offset` of at most `limit` (500), and how
 many there are. `kinds` (the `Kinds` playlists use: `movies`,
 `episodes`, `tracks`) keeps only those ticked; `null` keeps every kind,
 and kinds that tick none list nothing. An item gone from the library is
-left out of the page. Another user's plays never show or count. A
-session whose client did not list the feature is sent neither field,
-and its `RecentlyPlayed` is `Unsupported`.
+left out of the page. Another user's plays never show or count.
 
 Plays are per user and follow an item to a new id by its external ids,
 as watch state does. A portable user's plays go when they leave the
 server; a local user who leaves is set aside with their plays, as with
 the rest of their data.
 
-SDK: `Features::play_history`; `Session::recently_played(kinds, offset,
-limit)` returns an `ItemsPage` (`SdkError::Unsupported` without the
-feature); the fields arrive on `ItemDetail.item` and `children`.
+SDK: `Session::recently_played(kinds, offset, limit)` returns an
+`ItemsPage`; the fields arrive on `ItemDetail.item` and `children`.
 
 ## Sorting and filtering a library
 
@@ -1990,8 +1959,8 @@ used:
 ```
 
 Without either, a library is ordered as it always was, by title, and
-every item is listed. They are part of the base protocol, with no
-feature to list; what each library can be sorted and filtered by is
+every item is listed. They are part of the base protocol; what each
+library can be sorted and filtered by is
 the library's to say (`ItemFilterValues`, below).
 
 `sort.key` is one of:
@@ -2099,8 +2068,7 @@ returns an `ItemsPage`, and `Session::item_filter_values(library)` the
 
 ## Liked and All
 
-Feature `spoolframe:liked` (PX-43), on top of `spoolframe:playlists`.
-Every user has two built-in music playlists, made the first time they
+PX-43. Every user has two built-in music playlists, made the first time they
 are needed, and listed first by `ListPlaylists`, Liked then All, while
 a music library is served. Each `PlaylistSummary` (and each item's
 `PlaylistRef`) says which with `builtin: liked | all`; one a user made
@@ -2138,15 +2106,11 @@ the entry playing (`PlaylistNext`) carry `liked: true` for a liked
 track. Liked is among an album's or artist's `playlists` when it holds
 one of its tracks; All never is.
 
-A session whose client did not list `spoolframe:liked` gets none of
-this: no `liked` fields, no `builtin`, neither playlist in
-`ListPlaylists`, an item's playlists, or events; asking for either by id
-is `NotFound`, and `Like` or `Unlike` is `Unsupported`. An older app
-would not know them for built-ins and would offer to rename or delete
-them.
+An app shows Liked and All by their `builtin`, and offers no rename,
+share or delete for them.
 
-The SDK: `Features::liked` gates `Session::like` and `Session::unlike`
-(both answer Liked's `PlaylistSummary`); `ItemDetail::liked` and
+The SDK: `Session::like` and `Session::unlike` (both answer Liked's
+`PlaylistSummary`); `ItemDetail::liked` and
 `ItemDetail::liked_children` carry the hearts.
 
 Plex's import (`ImportPlexPlaylists`) likes the tracks the user rated in
@@ -2156,8 +2120,7 @@ tracks newly liked.
 
 ## Playlist covers
 
-Feature `spoolframe:playlist-art` (PX-53), on top of
-`spoolframe:playlists`. Every playlist has a picture, which
+PX-53. Every playlist has a picture, which
 `PlaylistSummary` carries as `artwork`, an `ArtworkId` fetched on a
 resource stream as any artwork is, at any `ArtworkSize`:
 
@@ -2188,7 +2151,6 @@ Its editors are who may `EditPlaylist`: its owner, users it is shared
 with to edit, admins for a server-wide one. In order, before a byte of
 the picture is read:
 
-- a session whose client did not list the feature: `Unsupported`;
 - a playlist the user does not see: `NotFound`;
 - one they see and may not edit, or Liked or All: `NotAllowed`;
 - `length` over 20 MiB (`MAX_ART_BYTES`): `ImageTooLarge { max_bytes,
@@ -2210,25 +2172,19 @@ without a cover is no change, and it is sent again on a new connection.
 A cover's file goes when no playlist has it, also when its playlist is
 deleted.
 
-A session whose client did not list the feature is sent neither
-`artwork` nor `custom_art`, and both requests are `Unsupported`.
-
 Plex's import brings a Plex playlist's own picture (its `thumb`), fetched
 through the PMS's photo transcoder and taken as an upload; Plex's
 composite of what a playlist holds is left, and the playlist gets the
 mosaic.
 
-The SDK: `Features::playlist_art`; `Session::set_playlist_art(id,
-bytes)` uploads (`SdkError::NotAllowed`, `ImageTooLarge { max_bytes,
+The SDK: `Session::set_playlist_art(id, bytes)` uploads (`SdkError::NotAllowed`, `ImageTooLarge { max_bytes,
 max_pixels }`, `ImageUnreadable`) and answers the new `ArtworkId`;
-`Session::remove_playlist_art(id)` answers the `PlaylistSummary`. Both
-are `SdkError::Unsupported`, unsent, without the feature.
+`Session::remove_playlist_art(id)` answers the `PlaylistSummary`.
 
 ## Up next in a playlist
 
-Feature `spoolframe:playlist-upcoming`, on top of
-`spoolframe:playlists`. What plays next in a playlist, without playing
-it, and the play settings saved alone.
+What plays next in a playlist, without playing it, and the play
+settings saved alone.
 
 | Request | Reply | Who |
 |---|---|---|
@@ -2258,26 +2214,22 @@ playlist's order, from the place. A client uses it for its shuffle and
 repeat buttons, where `PlayPlaylist` would start playing.
 
 Both are sent again on a new connection: the first is a read, the
-second saves the same settings twice as once. A session whose client did
-not list the feature gets `Unsupported` for both. A client without it
-uses `PlayPlaylist` as before.
+second saves the same settings twice as once.
 
-The SDK: `Features::playlist_upcoming`;
-`Session::upcoming_in_playlist(id, limit)` answers the
+The SDK: `Session::upcoming_in_playlist(id, limit)` answers the
 `Vec<PlaylistEntry>`, and `Session::set_playlist_settings(id,
-settings)` takes a `PlaySettings`. Both are `SdkError::Unsupported`,
-unsent, without the feature.
+settings)` takes a `PlaySettings`.
 
 ## Subtitle sync and offset
 
-Feature `spoolframe:subtitle-sync` (PX-03). An external text subtitle
+PX-03. An external text subtitle
 (SRT, WebVTT, ASS or SSA beside the film) may be synced to the file, or
 moved by a manual offset, for every user who plays the item. Embedded
 tracks and picture subtitles (PGS, VobSub) are timed by the file and
 are neither.
 
 `Tracks` carries each such track's `timing`, a `SubtitleTiming`; every
-other track has none:
+other track's is `null`:
 
 - `sync`, tagged by `state`: `original` (as the file has it: never
   synced, or put back), `syncing` (being synced or waiting its turn;
@@ -2327,27 +2279,22 @@ whenever the playback began. A playback that converts the subtitle (to
 WebVTT, or into its HLS rendition) has its text made when it starts: it
 gets the new timing with `ChangeSubtitle` to the same track.
 
-A session whose client did not list the feature is sent no `timing` and
-no event, and the requests are `Unsupported`.
-
-The SDK: `Features::subtitle_sync`; `Session::sync_subtitle(id,
-track)`, `Session::use_original_subtitle_timing(id, track)` and
+The SDK: `Session::sync_subtitle(id, track)`, `Session::use_original_subtitle_timing(id, track)` and
 `Session::set_subtitle_offset(id, track, offset_ms)`, each answering the
 `SubtitleTiming`; `Client::subtitle_timing_events()`, a
-`SubtitleTimingEvent { server, id, track, timing }` per event. The calls
-are `SdkError::Unsupported`, unsent, without the feature.
+`SubtitleTimingEvent { server, id, track, timing }` per event.
 
 ## Subtitles from OpenSubtitles and SubDL
 
-Feature `spoolframe:subtitle-search` (PX-02). The server searches the
+PX-02. The server searches the
 subtitle sites its admin turned on, OpenSubtitles (opensubtitles.com),
 SubDL (subdl.com) or both, for an item's subtitles and downloads one,
 only when someone asks (OpenSubtitles with Spoolframe's built-in key,
 SubDL with the admin's). Viewers do not pick the site: the admin does,
 per server. A download becomes an external text track of the item for
 every user on the server, and stays when its site is later turned off.
-A server with no site turned on still has the feature and answers each
-request `NoSubtitleSource`: hide "Find subtitles…".
+A server with no site turned on answers each request
+`NoSubtitleSource`: hide "Find subtitles…".
 
 | Request | Reply |
 |---|---|
@@ -2390,14 +2337,13 @@ the site's 0 to 10; `null` while unrated, and always from SubDL),
 `hearing_impaired` (always `false` from SubDL, whose own flag is set on
 nearly every file), `forced` (only the parts in another language, signs
 and foreign lines: OpenSubtitles' `foreign_parts_only`; always `false`
-from SubDL, which does not say, and left out by a server before it),
+from SubDL, which does not say),
 and `downloaded` (downloading it again gives the same track).
 
 The user's preferences order the results by `forced` first, then by
 `hearing_impaired`. `subtitles.forced` is one of `prefer` (forced ones
 first), `accept` (the default: forced ones after the rest), `avoid`
-(none forced listed) or `only` (only forced ones listed); it is
-optional on the wire, and a peer before it leaves it out. Playback
+(none forced listed) or `only` (only forced ones listed). Playback
 does not use it: `subtitles.mode` says when forced subtitles show.
 `subtitles.sdh` works the same way for `hearing_impaired`: `prefer`,
 `accept` (the default: plain ones first), `avoid` (no SDH listed) and
@@ -2422,7 +2368,7 @@ site, when the site says (OpenSubtitles does, SubDL does not), and
 every site, `null` without one. The track is usable at once, delivered
 as any external subtitle (`ReadSubtitle`, WebVTT, the HLS rendition).
 One not found by the file's hash (every SubDL one) is synced in the
-background (`spoolframe:subtitle-sync`: `timing` says `syncing`, then
+background (see "Subtitle sync and offset": `timing` says `syncing`, then
 `synced` or `uncertain`), and a player showing it gets the synced
 timing without a restart. The same result is never downloaded twice:
 asking again answers the same track, at no cost (a paired server's
@@ -2453,26 +2399,22 @@ may still search); `RateLimited { retry_after_ms }` when the site asks
 to wait; `Unavailable` when it cannot be reached. Searching and
 downloading may be sent again on a new connection.
 
-A session whose client did not list the feature is sent no `download`
-(a downloaded track is an external subtitle like any other), and the
-requests are `Unsupported`.
+Every other track's `download` is `null`.
 
-The SDK: `Features::subtitle_search`; `Session::search_subtitles(id,
-language)`, `Session::download_subtitle(id, result)` and
-`Session::remove_subtitle_download(id, download)`. The calls are
-`SdkError::Unsupported`, unsent, without the feature.
+The SDK: `Session::search_subtitles(id, language)`,
+`Session::download_subtitle(id, result)` and
+`Session::remove_subtitle_download(id, download)`.
 
 ## Downloads
 
-Feature `spoolframe:downloads` (PX-38). A film or an episode is written
+PX-38. A film or an episode is written
 as one file for the device to keep and play with no server: in original
 quality or in an optimized profile, with the tracks the user picks. An
 iPhone, iPad or Mac (`Hello.platform` `ios` or `macos`) gets MP4, its
 text subtitles as `mov_text`; the Linux app and the CLI (`linux`,
 `cli`) get Matroska. Any other platform (`tvos`, `web`, a platform the
 server does not know) gets `Unsupported` for every request and the
-read, saying why, as does a client that did not list the feature;
-such a client is sent no event. Anyone who can play the item may
+read, saying why. Anyone who can play the item may
 download it; nothing expires, and no admin lists who downloaded what.
 
 Tracks are named by their place in the item's `Tracks`: `audio[i]`,
@@ -2527,8 +2469,8 @@ left out is not there). `expected_size`, in `PrepareDownload`'s reply
 alone, is about how many bytes the file will be, to show while it waits:
 a film's or an episode's as `DownloadOptions`' estimate of its source
 says, a track's its file's size, or the AAC rate over its length. It is
-left out when the server cannot tell, in `DownloadStatus`' replies, and
-by a server before it; `ready`'s `size` is the exact one.
+left out when the server cannot tell, and in `DownloadStatus`' replies;
+`ready`'s `size` is the exact one.
 
 What the device cannot play is converted in the server's copy pool,
 which runs for downloads even with optimized versions off, and is kept
@@ -2555,13 +2497,14 @@ A `DownloadState` is tagged by `type`:
   the app to choose what to show: `server_stopped_converting` (the
   conversion failed, or the server stopped while preparing it),
   `source_missing` (the media file is gone or changed), `other`, or
-  `unknown` for a cause this build does not know. A server before it
-  sends none: read as `other`. `no_space { needed_bytes }` and
+  `unknown` for a cause this build does not know; read as `other` when
+  left out, as a download the SDK kept before it has it.
+  `no_space { needed_bytes }` and
   `network` are a device's own, never sent by a server;
 - `unknown`: a state this build does not know.
 
 `DownloadChanged { id, state }` tells each of the user's connections
-that listed the feature as the state moves: once per percent of
+as the state moves: once per percent of
 progress or every 2 s, and at each change of `type`; no progress comes
 after `ready` or `failed`. A connection is told while a session of the
 user's on it is live: signed out there, or revoked, it is told no more. A conversion made
@@ -2617,20 +2560,16 @@ new or newer: show it), `not_tracked` (not a film or an episode, or not
 on the server any more), or `unknown`. At most 500 entries; an entry
 with neither a position nor `watched` is `InvalidInput`. Sent again, an
 entry written once is `older`, so the request may be sent again on a new
-connection. As the other requests, it needs the feature and a platform
-that downloads.
+connection. As the other requests, it needs a platform that downloads.
 
 All five requests may be sent again on a new connection; a cancel sent
 again answers `NotFound`.
 
 ### Music offline
 
-Feature `spoolframe:music-downloads` (PX-51), on top of
-`spoolframe:downloads`: a client lists both. A track is downloaded with
-the same requests as a film, and two more requests keep a device's
-music in step. A client without this feature is refused a track
-(`InvalidInput`) and the two requests (`Unsupported`), and keeps
-nothing from listening; the platforms are the downloads' own.
+PX-51. A track is downloaded with the same requests as a film, and two
+more requests keep a device's music in step. The platforms are the
+downloads' own.
 
 | Request | Reply |
 |---|---|
@@ -2675,8 +2614,7 @@ chosen, audio: [0], subtitles: [] }`, no `profiles`, its `original`
 `MusicDownloadChanges` asks what each thing the device follows holds
 now: the `artists` (every album, those the library gains later
 included), the `playlists` (by id; not All, which is `InvalidInput`)
-and, with `liked`, the user's Liked (which needs `spoolframe:liked`
-too). The reply has one `FollowedChange { followed, tracks }` per
+and, with `liked`, the user's Liked. The reply has one `FollowedChange { followed, tracks }` per
 artist, then per playlist, then Liked, in the order asked; `followed`
 is `{ type: artist, id }`, `{ type: playlist, id }` or `{ type: liked
 }`, and `tracks`:
@@ -2721,8 +2659,7 @@ than now.
 - Each like is an `OfflineLike { track, liked, at }`: a heart set
   (`true`) or taken off (`false`) on the device. It is made only when
   newer than the track's last like or unlike on the server, from any
-  device: newest wins. Likes need `spoolframe:liked` too
-  (`Unsupported` without).
+  device: newest wins.
 
 The outcomes, one per play and one per like, in order, are as
 `OfflineWatchSynced`'s: `applied`, `older` (a like the server has a
@@ -4034,8 +3971,8 @@ file is whole.
 
 ### Subtitles for a paired server's item
 
-Experimental (P8-07), for an app that names the `federation` and
-`spoolframe:subtitle-search` features, and no `PROTOCOL_VERSION` change. SA plans
+Experimental (P8-07), for an app that names the `federation` feature.
+SA plans
 the play and burns subtitles in, so the subtitle file must be on SA.
 `SearchSubtitles`, `DownloadSubtitle` and `RemoveSubtitleDownload` of a
 `fed:` id are sent to SB as for any item; SB passes them to SA on the

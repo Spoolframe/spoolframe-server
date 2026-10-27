@@ -12,9 +12,8 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Item, MediaId, Platform};
 use spoolframe_client_sdk::{
-    Client, ClientOptions, ConnectionState, Device, DownloadPhase, DownloadSettings, Features,
-    MAX_READ, MemoryStorage, MusicTarget, NetworkKind, OfflineMark, OfflineMusic, PlaybackOptions,
-    SdkError, Session,
+    Client, ClientOptions, ConnectionState, Device, DownloadPhase, DownloadSettings, MAX_READ,
+    MemoryStorage, MusicTarget, NetworkKind, OfflineMark, OfflineMusic, PlaybackOptions, Session,
 };
 use spoolframe_protocol::playlists::{Kinds, PlaylistEdit, Visibility};
 use spoolframe_server::test_support::{album, artist};
@@ -53,17 +52,10 @@ fn linux() -> Device {
     }
 }
 
-fn options(downloads: &Path, music: bool) -> ClientOptions {
+fn options(downloads: &Path) -> ClientOptions {
     ClientOptions {
         lan_discovery: false,
         relays: false,
-        features: Features {
-            downloads: true,
-            music_downloads: music,
-            playlists: true,
-            liked: true,
-            ..Features::default()
-        },
         downloads_dir: Some(downloads.to_path_buf()),
         ..ClientOptions::default()
     }
@@ -75,9 +67,8 @@ async fn device_with(
     server: &TestServer,
     storage: &Arc<MemoryStorage>,
     downloads: &Path,
-    music: bool,
 ) -> Client {
-    let client = Client::open_with_options(storage.clone(), linux(), options(downloads, music))
+    let client = Client::open_with_options(storage.clone(), linux(), options(downloads))
         .await
         .unwrap();
     let id = server.server.id().to_string();
@@ -89,7 +80,7 @@ async fn device_with(
 }
 
 async fn device(server: &TestServer, storage: &Arc<MemoryStorage>, downloads: &Path) -> Client {
-    device_with(server, storage, downloads, true).await
+    device_with(server, storage, downloads).await
 }
 
 async fn alice(server: &TestServer, client: &Client) -> Session {
@@ -193,7 +184,7 @@ async fn an_album_downloaded_plays_offline_with_its_art() {
     client.close().await;
     server.stop().await;
 
-    let away = Client::open_with_options(storage.clone(), linux(), options(&dir, true))
+    let away = Client::open_with_options(storage.clone(), linux(), options(&dir))
         .await
         .unwrap();
     let music = away.downloads().offline_music(&server_key, &user);
@@ -333,7 +324,7 @@ async fn a_converted_track_streamed_to_its_end_is_kept_as_streamed() {
         },
         ..linux()
     };
-    let client = Client::open_with_options(storage.clone(), aac_only, options(&dir, true))
+    let client = Client::open_with_options(storage.clone(), aac_only, options(&dir))
         .await
         .unwrap();
     let id = server.server.id().to_string();
@@ -740,13 +731,10 @@ async fn plays_and_likes_made_offline_reach_the_server_on_reconnect() {
 
     // No server (a device that knows of none): the app plays the file and
     // unlikes the track.
-    let away = Client::open_with_options(
-        Arc::new(MemoryStorage::default()),
-        linux(),
-        options(&dir, true),
-    )
-    .await
-    .unwrap();
+    let away =
+        Client::open_with_options(Arc::new(MemoryStorage::default()), linux(), options(&dir))
+            .await
+            .unwrap();
     away.downloads()
         .record_play(&key, Duration::from_secs(200))
         .await
@@ -791,33 +779,6 @@ async fn plays_and_likes_made_offline_reach_the_server_on_reconnect() {
         )
     );
     again.close().await;
-    server.stop().await;
-}
-
-/// Without `spoolframe:music-downloads` listed, no music downloads and
-/// nothing played is kept.
-#[tokio::test]
-async fn without_the_feature_there_are_no_music_downloads_and_nothing_is_kept() {
-    let server = music_server("sdk-music-unlisted").await;
-    let dir = TestDir::new("spoolframe-sdk-music-unlisted").await;
-    let storage = Arc::new(MemoryStorage::default());
-    let client = device_with(&server, &storage, &dir, false).await;
-    let session = alice(&server, &client).await;
-    let started = client
-        .downloads()
-        .start_music(&session, MusicTarget::Track { id: track_id("32") })
-        .await;
-    play(&session, "32", true).await;
-    assert_eq!(
-        (
-            matches!(started, Err(SdkError::Unsupported { .. })),
-            client.downloads().music_tracks().len(),
-            client.downloads().cache().used,
-            dir.join("listening").exists(),
-        ),
-        (true, 0, 0, false)
-    );
-    client.close().await;
     server.stop().await;
 }
 

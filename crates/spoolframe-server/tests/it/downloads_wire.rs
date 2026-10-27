@@ -1,4 +1,4 @@
-//! Downloads over the wire (PX-38, `spoolframe:downloads`): the requests,
+//! Downloads over the wire (PX-38): the requests,
 //! the `DownloadChanged` event and the `Download` resource read, against
 //! a server with real ffmpeg and ffprobe, on films made at test time.
 
@@ -11,7 +11,6 @@ use spoolframe_protocol::downloads::{
     DownloadFailure, DownloadInfo, DownloadOptionsInfo, DownloadSource, DownloadState,
     DownloadTracks, OriginalDownload,
 };
-use spoolframe_protocol::features::DOWNLOADS;
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::streams::uni;
 use spoolframe_protocol::{
@@ -41,9 +40,8 @@ pub(crate) async fn server(test: &str, options: ServerOptions) -> TestServer {
     server
 }
 
-/// `Hello` from an app on `platform` listing `features`, saying nothing
-/// of what it plays.
-pub(crate) async fn hello(client: &TestClient, platform: Platform, features: &[&str]) {
+/// `Hello` from an app on `platform`, saying nothing of what it plays.
+pub(crate) async fn hello(client: &TestClient, platform: Platform) {
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         client_name: "test".into(),
@@ -52,7 +50,6 @@ pub(crate) async fn hello(client: &TestClient, platform: Platform, features: &[&
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
-        features: features.iter().map(|n| n.to_string()).collect(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -64,7 +61,7 @@ pub(crate) async fn hello(client: &TestClient, platform: Platform, features: &[&
 /// as `user`.
 async fn device(server: &TestServer, platform: Platform, user: &str) -> (TestClient, SessionId) {
     let client = server.client().await;
-    hello(&client, platform, &[DOWNLOADS]).await;
+    hello(&client, platform).await;
     let session = client.login(user, PASSWORD).await;
     (client, session)
 }
@@ -312,70 +309,6 @@ fn first_audio() -> DownloadTracks {
         audio: vec![0],
         subtitles: Vec::new(),
     }
-}
-
-pub(crate) fn unsupported(response: &Response) -> bool {
-    matches!(response, Response::Err(Error::Unsupported { .. }))
-}
-
-#[tokio::test]
-async fn a_client_that_did_not_list_downloads_is_refused_them_and_told_nothing() {
-    let server = server("downloads-wire-unlisted", ServerOptions::default()).await;
-    write_film(&server);
-    let old = server.client().await;
-    hello(&old, Platform::Linux, &[]).await;
-    let old_session = old.login("alice", PASSWORD).await;
-    let mut old_events = events(&old).await;
-    let options = old
-        .call(
-            Some(&old_session),
-            Request::DownloadOptions {
-                id: movie().id().clone(),
-                device: None,
-            },
-        )
-        .await;
-    let refused_prepare = prepare(
-        &old,
-        &old_session,
-        DownloadSource::Original,
-        DownloadTracks::All,
-    )
-    .await;
-
-    // The same user, on an app that lists them, downloads meanwhile.
-    let (new, session) = device(&server, Platform::Linux, "alice").await;
-    let mut new_events = events(&new).await;
-    let info = prepared(&new, &session, DownloadSource::Original, first_audio()).await;
-    moves_until_settled(&mut new_events, &info.id).await;
-    let (read_refused, _) = read(&old, &old_session, &info.id, 0, 1 << 20).await;
-    // Every event the server queued for the old app is out by now: the
-    // read above went after them on the same connection.
-    let told = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            if let Event::DownloadChanged { .. } =
-                read_frame::<_, Event>(&mut old_events).await.unwrap()
-            {
-                return;
-            }
-        }
-    })
-    .await;
-    assert_eq!(
-        (
-            unsupported(&options),
-            unsupported(&refused_prepare),
-            matches!(
-                read_refused,
-                ResourceResponse::Error {
-                    error: Error::Unsupported { .. }
-                }
-            ),
-            told.is_ok()
-        ),
-        (true, true, true, false)
-    );
-    server.stop().await;
 }
 
 /// Review 2026-10-20, finding 6: a connection that signed in as bob and
@@ -894,7 +827,7 @@ async fn a_download_reads_whole_over_a_relay_alone() {
     assert!(home.is_ok(), "the server never homed on the relay");
     write_film(&server);
     let linux = relayed_client(&server, &url).await;
-    hello(&linux, Platform::Linux, &[DOWNLOADS]).await;
+    hello(&linux, Platform::Linux).await;
     let session = linux.login("alice", PASSWORD).await;
     let info = prepared(
         &linux,
@@ -931,7 +864,6 @@ async fn h264_only(server: &TestServer) -> (TestClient, SessionId) {
         device_name: None,
         capabilities: Some(caps),
         experimental: Vec::new(),
-        features: vec![DOWNLOADS.to_owned()],
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

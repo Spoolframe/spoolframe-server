@@ -53,29 +53,12 @@ use tokio::io::AsyncWriteExt;
 /// in `Client::servers`, so a test's result would depend on the network.
 /// The test servers are dialled at the addresses a test gives. Only the
 /// LAN tests, in their private network namespace, listen.
-///
-/// It lists every regular feature, as an app handling them all would: the
-/// server's side of each is what these tests check.
 pub async fn sdk_client(
     storage: Arc<dyn spoolframe_client_sdk::Storage>,
     device: spoolframe_client_sdk::Device,
 ) -> Result<spoolframe_client_sdk::Client, spoolframe_client_sdk::SdkError> {
     let options = spoolframe_client_sdk::ClientOptions {
         lan_discovery: false,
-        features: spoolframe_client_sdk::Features {
-            playlists: true,
-            liked: true,
-            last_viewed: true,
-            playlist_sharing: true,
-            play_history: true,
-            playlist_art: true,
-            subtitle_sync: true,
-            subtitle_search: true,
-            playlist_upcoming: true,
-            downloads: true,
-            music_downloads: true,
-            invite_lookup: true,
-        },
         ..spoolframe_client_sdk::ClientOptions::default()
     };
     spoolframe_client_sdk::Client::open_with_options(storage, device, options).await
@@ -1842,7 +1825,6 @@ impl TestClient {
             device_name: None,
             capabilities: Some(capabilities),
             experimental: experimental.iter().map(|n| n.to_string()).collect(),
-            features: Vec::new(),
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -1850,9 +1832,9 @@ impl TestClient {
         }
     }
 
-    /// `Hello` from a Linux app listing the regular features `features`
-    /// (PX-16): the server's info.
-    pub async fn hello_listing(&self, features: &[&str]) -> ServerInfo {
+    /// `Hello` from a Linux app that names no experimental feature: the
+    /// server's info.
+    pub async fn hello_info(&self) -> ServerInfo {
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "test".into(),
@@ -1861,7 +1843,6 @@ impl TestClient {
             device_name: None,
             capabilities: None,
             experimental: Vec::new(),
-            features: features.iter().map(|n| n.to_string()).collect(),
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -1895,7 +1876,6 @@ impl TestClient {
                 device_name: device_name.map(str::to_owned),
                 capabilities,
                 experimental: Vec::new(),
-                features: Vec::new(),
             }),
         )
         .await

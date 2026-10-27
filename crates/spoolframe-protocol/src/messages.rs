@@ -36,7 +36,9 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-pub const PROTOCOL_VERSION: u32 = 15;
+/// Reset to 1 in 0.16.0, a clean break: a server refuses every other
+/// revision at `Hello`, the 2 to 15 of the releases before it included.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
@@ -151,9 +153,7 @@ pub enum Request {
     /// taken as `RedeemInvite` takes it, and counted as it counts one: a
     /// code no invite has (or that cannot be one) is `no_match`, a wrong
     /// guess (then `RateLimited`); a revoked, expired or used-up one is
-    /// not counted. On the strangers' budget, as redeeming is. Only for a
-    /// client that listed `spoolframe:invite-lookup`
-    /// ([`crate::features::INVITE_LOOKUP`]); `Unsupported` otherwise.
+    /// not counted. On the strangers' budget, as redeeming is.
     LookupInvite(LookupInvite),
     /// Begin signing in as a portable user with a device credential
     /// (P7-06): `PortableSignInBegun`, a nonce for the device key to sign
@@ -297,8 +297,7 @@ pub enum Request {
         /// How a picked bitmap subtitle is shown (P2-07).
         bitmap: BitmapSubtitles,
         /// What the screen shows now (PGPU-06): its HDR formats and bit
-        /// depth, over Hello's, for this plan. Left out, Hello's.
-        // compat(v1): required at the protocol reset
+        /// depth, over Hello's, for this plan. `None` or left out, Hello's.
         #[serde(default)]
         display: Option<DisplayCapabilities>,
     },
@@ -319,8 +318,7 @@ pub enum Request {
         quality: Quality,
         /// What the screen shows now (PGPU-06): its HDR formats and bit
         /// depth, over Hello's, for this plan and the playback it starts;
-        /// a re-plan without one keeps it. Left out, Hello's.
-        // compat(v1): required at the protocol reset
+        /// a re-plan without one keeps it. `None` or left out, Hello's.
         #[serde(default)]
         display: Option<DisplayCapabilities>,
         /// What the device that will show it plays (P8-04), in place of
@@ -525,9 +523,8 @@ pub enum Request {
         bitmap: BitmapSubtitles,
         position_ms: u64,
         /// What the screen shows now (PGPU-06), over Hello's, for this
-        /// plan and the playback from then on. Left out, what the playback
-        /// started with.
-        // compat(v1): required at the protocol reset
+        /// plan and the playback from then on. `None` or left out, what the
+        /// playback started with.
         #[serde(default)]
         display: Option<DisplayCapabilities>,
         /// The share of an uplink the playback goes on over, bits per
@@ -551,9 +548,8 @@ pub enum Request {
         bitmap: BitmapSubtitles,
         position_ms: u64,
         /// What the screen shows now (PGPU-06), over Hello's, for this
-        /// plan and the playback from then on. Left out, what the playback
-        /// started with.
-        // compat(v1): required at the protocol reset
+        /// plan and the playback from then on. `None` or left out, what the
+        /// playback started with.
         #[serde(default)]
         display: Option<DisplayCapabilities>,
         /// The share of an uplink the playback goes on over, bits per
@@ -1285,11 +1281,6 @@ pub struct Hello {
     /// what an older one did; an older server ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental: Vec<String>,
-    /// Every regular feature this client is built with (PX-16), by name
-    /// ([`crate::features`]). The server uses only what both list.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<String>,
 }
 
 /// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
@@ -1311,10 +1302,6 @@ impl Hello {
         }
         self.experimental.truncate(crate::experimental::MAX_ASKED);
         for name in &mut self.experimental {
-            cut(name);
-        }
-        self.features.truncate(crate::features::MAX_LISTED);
-        for name in &mut self.features {
             cut(name);
         }
         self
@@ -1592,14 +1579,7 @@ pub enum Reply {
         /// is the one-time one). Until then the session gets
         /// `PasswordChangeRequired` for anything else but `Logout` and
         /// `WhoAmI`, and the device is not trusted.
-        // compat(v1): required at the protocol reset
-        #[serde(default)]
         password_change_required: bool,
-        /// Every regular feature this server has (PX-16,
-        /// [`crate::features`]), pre-auth or not.
-        // compat(v1): required at the protocol reset
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        features: Vec<String>,
     },
     /// The users this device is trusted for (`TrustedProfiles`), by
     /// username.
@@ -1639,8 +1619,8 @@ pub enum Reply {
         /// Experimental (`federation`, P8-03): the items listed that are
         /// no longer available, their paired server unpaired or their
         /// library no longer shared (`RecentlyPlayed`): shown as such, and
-        /// not played. Only to a client that named the feature.
-        // compat(v1): required at the protocol reset
+        /// not played. Only to a client that named the feature; left out
+        /// when empty, as experimental fields are.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         unavailable: Vec<MediaId>,
     },
@@ -1652,22 +1632,17 @@ pub enum Reply {
         markers: Vec<Marker>,
         /// The playlists the user sees that hold it (PX-40): a movie,
         /// episode or track itself; any of a season's or a show's
-        /// episodes; any of an album's or an artist's tracks. Only for a
-        /// client that listed `spoolframe:playlists`; left out otherwise.
-        // compat(v1): required at the protocol reset
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        playlists: Option<Vec<PlaylistRef>>,
+        /// episodes; any of an album's or an artist's tracks. Empty when
+        /// none does.
+        playlists: Vec<PlaylistRef>,
         /// Its heart (PX-43): a track's `all` or `none`; an album's
         /// `all`, `some` or `none` by the tracks it has now. `None` for
-        /// any other item, and for a client without `spoolframe:liked`.
-        // compat(v1): required at the protocol reset
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// any other item.
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
         liked: Option<crate::playlists::Liked>,
         /// An album's tracks among `children` that are liked (PX-43),
-        /// for their hearts. `None` as `liked` is.
-        // compat(v1): required at the protocol reset
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        liked_children: Option<Vec<MediaId>>,
+        /// for their hearts. Empty for any other item.
+        liked_children: Vec<MediaId>,
         /// Experimental (`federation`, P8-05): where the item is from, its
         /// title's copies on other servers and the one that plays, as a
         /// `SearchHit` has them. Only to a client that named the feature.
@@ -1931,14 +1906,14 @@ pub struct HomeScreen {
     /// Experimental (`federation`, P8-02): the items of these rows that
     /// are no longer available: their paired server unpaired, or stopped
     /// sharing their library. Shown as such, and not played. Only to a
-    /// client that named the feature, as every `fed:` id is.
-    // compat(v1): required at the protocol reset
+    /// client that named the feature, as every `fed:` id is; left out when
+    /// empty, as experimental fields are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable: Vec<MediaId>,
     /// Experimental (`federation`, P8-02): each paired server's own row,
     /// what it shared lately, by the server's name. A row the user turned
-    /// off (`SetServerRow`) is listed with no items, for the setting.
-    // compat(v1): required at the protocol reset
+    /// off (`SetServerRow`) is listed with no items, for the setting. Left
+    /// out when empty, as experimental fields are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<ServerRow>,
 }
@@ -2004,24 +1979,8 @@ pub struct WhoAmIReply {
     /// false for the last enabled admin, or the last enabled admin with a
     /// password, so an app can grey out "Leave this server" before it is
     /// asked. As of this answer: an admin made or demoted later changes
-    /// it. Left out by an older server, true; its refusal still stands.
-    // compat(v1): required at the protocol reset
-    #[serde(default = "WhoAmIReply::can_leave_by_default")]
+    /// it.
     pub can_leave: bool,
-    /// Every regular feature this server has (PX-16), as `LoggedIn` gives
-    /// them: for a client holding a session from before, or from before
-    /// the server was upgraded.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<String>,
-}
-
-impl WhoAmIReply {
-    /// An older server says nothing about leaving: let the app offer it,
-    /// and the server's `LastAdmin` refuse it if it must.
-    fn can_leave_by_default() -> bool {
-        true
-    }
 }
 
 /// A user's PIN as clients may know it.
@@ -2170,27 +2129,10 @@ pub struct ServerInfo {
     /// out when none, as an older server does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental: Vec<String>,
-    /// The pre-auth regular features this server has (PX-16,
-    /// [`crate::features`]); the rest come with a session (`LoggedIn`,
-    /// `WhoAmI`). Left out when none.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<String>,
     /// An account is made only from an invite (`RedeemInvite`); there is
     /// no open sign-up. For a "servers on my network" list, before
-    /// signing in. Left out by an older server, true: no server so far
-    /// has had open sign-up.
-    // compat(v1): required at the protocol reset
-    #[serde(default = "ServerInfo::invite_only_by_default")]
+    /// signing in.
     pub invite_only: bool,
-}
-
-impl ServerInfo {
-    /// An older server says nothing, and every one so far makes accounts
-    /// only from invites.
-    fn invite_only_by_default() -> bool {
-        true
-    }
 }
 
 /// Why a request failed. Typed, so clients act on the kind, not on text.
@@ -2416,7 +2358,6 @@ pub enum Error {
         whose: spoolframe_types::QuotaOf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resets_at: Option<i64>,
-        // compat(v1): required at the protocol reset
         #[serde(default, skip_serializing_if = "Option::is_none")]
         site: Option<String>,
     },

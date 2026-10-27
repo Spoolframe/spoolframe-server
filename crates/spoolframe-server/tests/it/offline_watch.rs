@@ -1,20 +1,18 @@
-//! Offline watch sync (PX-38, `spoolframe:downloads`): where a device got
+//! Offline watch sync (PX-38): where a device got
 //! to while it had no server, sent when it reaches it again. Newest wins,
 //! by the server's clock once the device's is set right.
 
 use std::time::Duration;
 
 use spoolframe_protocol::downloads::{OfflineWatch, OfflineWatchOutcome};
-use spoolframe_protocol::features::DOWNLOADS;
 use spoolframe_protocol::{Error, Hello, PROTOCOL_VERSION, Reply, Request, Response, SessionId};
 use spoolframe_types::{MediaId, MediaKind, Namespace, Platform};
 
 use crate::support::{TestClient, TestServer, movie};
 use crate::watch::state_of;
 
-/// A server with alice, and a Linux app signed in as her that lists
-/// downloads, or not.
-async fn signed_in(test: &str, listed: bool) -> (TestServer, TestClient, SessionId) {
+/// A server with alice, and a Linux app signed in as her.
+async fn signed_in(test: &str) -> (TestServer, TestClient, SessionId) {
     let server = TestServer::start(test).await;
     server.add_user("alice", "correct horse", None).await;
     let laptop = server.client().await;
@@ -26,11 +24,6 @@ async fn signed_in(test: &str, listed: bool) -> (TestServer, TestClient, Session
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
-        features: if listed {
-            vec![DOWNLOADS.to_owned()]
-        } else {
-            Vec::new()
-        },
     };
     assert!(matches!(
         laptop.call(None, Request::Hello(hello)).await,
@@ -88,7 +81,7 @@ async fn synced(
 /// first or last, and the throttle holds back neither.
 #[tokio::test]
 async fn the_newest_offline_state_wins_whichever_is_sent_last() {
-    let (server, laptop, session) = signed_in("offline-newest", true).await;
+    let (server, laptop, session) = signed_in("offline-newest").await;
     let id = movie().id().clone();
     let now = server.clock.unix_secs();
     let outcomes = synced(
@@ -117,7 +110,7 @@ async fn the_newest_offline_state_wins_whichever_is_sent_last() {
 /// The server's state, marked after the device played, stays.
 #[tokio::test]
 async fn an_offline_state_older_than_the_server_s_is_older() {
-    let (server, laptop, session) = signed_in("offline-older", true).await;
+    let (server, laptop, session) = signed_in("offline-older").await;
     let id = movie().id().clone();
     let marked = laptop
         .call(Some(&session), Request::MarkWatched { id: id.clone() })
@@ -138,7 +131,7 @@ async fn an_offline_state_older_than_the_server_s_is_older() {
 /// ago newer. Taken by its own clock, both would be "now".
 #[tokio::test]
 async fn a_device_clock_an_hour_ahead_is_set_right() {
-    let (server, laptop, session) = signed_in("offline-skew", true).await;
+    let (server, laptop, session) = signed_in("offline-skew").await;
     let id = movie().id().clone();
     let marked = laptop
         .call(Some(&session), Request::MarkWatched { id: id.clone() })
@@ -167,7 +160,7 @@ async fn a_device_clock_an_hour_ahead_is_set_right() {
 /// its 44 minutes; just before them it is not.
 #[tokio::test]
 async fn watched_is_judged_from_the_position_and_the_credits() {
-    let (server, laptop, session) = signed_in("offline-credits", true).await;
+    let (server, laptop, session) = signed_in("offline-credits").await;
     let id = with_credits();
     let now = server.clock.unix_secs();
     synced(&laptop, &session, now, vec![at(&id, 2390, now, 200)]).await;
@@ -182,7 +175,7 @@ async fn watched_is_judged_from_the_position_and_the_credits() {
 /// show), are not tracked.
 #[tokio::test]
 async fn an_entry_for_an_item_without_watch_state_is_not_tracked() {
-    let (server, laptop, session) = signed_in("offline-untracked", true).await;
+    let (server, laptop, session) = signed_in("offline-untracked").await;
     let now = server.clock.unix_secs();
     let gone = MediaId::new(Namespace::Plex, MediaKind::Movie, "999").unwrap();
     let show = MediaId::new(Namespace::Plex, MediaKind::Show, "10").unwrap();
@@ -201,7 +194,7 @@ async fn an_entry_for_an_item_without_watch_state_is_not_tracked() {
 /// not tracked, and the rest of the batch is taken in.
 #[tokio::test]
 async fn an_entry_for_another_catalog_s_item_does_not_fail_the_batch() {
-    let (server, laptop, session) = signed_in("offline-foreign", true).await;
+    let (server, laptop, session) = signed_in("offline-foreign").await;
     let now = server.clock.unix_secs();
     let foreign = MediaId::new(Namespace::Plex, MediaKind::Movie, "77").unwrap();
     server
@@ -227,7 +220,7 @@ async fn an_entry_for_another_catalog_s_item_does_not_fail_the_batch() {
 
 #[tokio::test]
 async fn an_entry_with_nothing_in_it_is_refused() {
-    let (server, laptop, session) = signed_in("offline-empty", true).await;
+    let (server, laptop, session) = signed_in("offline-empty").await;
     let now = server.clock.unix_secs();
     let empty = OfflineWatch {
         id: movie().id().clone(),
@@ -239,21 +232,5 @@ async fn an_entry_with_nothing_in_it_is_refused() {
         sync(&laptop, &session, now, vec![empty]).await,
         Response::Err(Error::InvalidInput { .. })
     ));
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn a_client_that_did_not_list_downloads_syncs_nothing() {
-    let (server, laptop, session) = signed_in("offline-unlisted", false).await;
-    let id = movie().id().clone();
-    let now = server.clock.unix_secs();
-    let refused = sync(&laptop, &session, now, vec![at(&id, 600, now, 10)]).await;
-    assert_eq!(
-        (
-            matches!(refused, Response::Err(Error::Unsupported { .. })),
-            state_of(&laptop, &session, &id).await.position
-        ),
-        (true, None)
-    );
     server.stop().await;
 }

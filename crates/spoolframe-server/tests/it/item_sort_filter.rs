@@ -25,7 +25,6 @@ async fn device(server: &TestServer) -> TestClient {
         device_name: Some("Living room".into()),
         capabilities: Some(capabilities),
         experimental: Vec::new(),
-        features: Vec::new(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

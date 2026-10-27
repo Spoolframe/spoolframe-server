@@ -352,7 +352,12 @@ spoolframe/relay-access/1   a server's own relay to that server
 spoolframe/federation/1     server to server (experimental; refused while experimental.federation is off)
 ```
 
-The client protocol carries a revision number inside `/1`. See
+The client protocol carries a revision number inside `/1`, reset to 1
+in 0.16.0: a server answers only the revision it speaks, and refuses
+any other at `Hello`. Everything a revision has is there for every
+client: there are no regular features to negotiate. The only opt-ins
+are the experimental features (`http-playback`, `federation`), which a
+client names in its `Hello` and a server turns on by its settings. See
 [PROTOCOL.md](PROTOCOL.md) for the framing, resource streams, replay
 rules and the current revision.
 

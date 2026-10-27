@@ -1,11 +1,9 @@
 //! Liked and All (PX-43) over a real Iroh connection: `Like` and `Unlike`
-//! reach `Playlists`, an item's details carry its hearts, and all of it,
-//! the built-in playlists too, only for a client that listed
-//! `spoolframe:liked`. The rules are tested in `playlists::builtin_tests`.
+//! reach `Playlists`, and an item's details carry its hearts. The rules
+//! are tested in `playlists::builtin_tests`.
 
 use crate::support;
 
-use spoolframe_protocol::features::{LIKED, PLAYLISTS};
 use spoolframe_protocol::playlists::{Builtin, ItemKind, Liked, PlaylistSummary};
 use spoolframe_protocol::{Error, Reply, Request, Response, SessionId};
 use spoolframe_types::{MediaId, MediaKind, Namespace};
@@ -16,13 +14,13 @@ fn id(kind: MediaKind, key: &str) -> MediaId {
 }
 
 /// A server whose fake catalog serves its music, with alice, and a client
-/// that lists `features`, signed in as her.
-async fn alice_listing(test: &str, features: &[&str]) -> (TestServer, TestClient, SessionId) {
+/// signed in as her.
+async fn signed_in_alice(test: &str) -> (TestServer, TestClient, SessionId) {
     let server = TestServer::start(test).await;
     server.catalog.serve_music();
     server.add_user("alice", "correct horse", None).await;
     let client = server.client().await;
-    client.hello_listing(features).await;
+    client.hello_info().await;
     let session = client.login("alice", "correct horse").await;
     (server, client, session)
 }
@@ -39,7 +37,7 @@ async fn hearts(
     client: &TestClient,
     session: &SessionId,
     item: MediaId,
-) -> (Option<Liked>, Option<Vec<MediaId>>, Vec<Option<Builtin>>) {
+) -> (Option<Liked>, Vec<MediaId>, Vec<Option<Builtin>>) {
     match client.call(Some(session), Request::Item { id: item }).await {
         Response::Ok(Reply::Item {
             liked,
@@ -49,19 +47,15 @@ async fn hearts(
         }) => (
             liked,
             liked_children,
-            playlists
-                .unwrap_or_default()
-                .iter()
-                .map(|p| p.builtin)
-                .collect(),
+            playlists.iter().map(|p| p.builtin).collect(),
         ),
         other => panic!("{other:?}"),
     }
 }
 
 #[tokio::test]
-async fn a_client_with_the_feature_likes_an_album_and_sees_its_hearts() {
-    let (_server, tv, alice) = alice_listing("liked-wire", &[PLAYLISTS, LIKED]).await;
+async fn an_app_likes_an_album_and_sees_its_hearts() {
+    let (_server, tv, alice) = signed_in_alice("liked-wire").await;
     let listed = playlists(&tv, &alice).await;
     let builtins: Vec<_> = listed.iter().map(|p| p.builtin).collect();
     assert_eq!(builtins, [Some(Builtin::Liked), Some(Builtin::All)]);
@@ -84,7 +78,7 @@ async fn a_client_with_the_feature_likes_an_album_and_sees_its_hearts() {
     assert_eq!(liked.builtin, Some(Builtin::Liked));
     let (heart, children, holding) = hearts(&tv, &alice, album.clone()).await;
     assert_eq!(heart, Some(Liked::All));
-    assert_eq!(children.map(|c| c.len()), Some(2));
+    assert_eq!(children.len(), 2);
     assert_eq!(holding, [Some(Builtin::Liked)]);
     let page = match tv
         .call(
@@ -125,12 +119,11 @@ async fn a_client_with_the_feature_likes_an_album_and_sees_its_hearts() {
     );
 }
 
-/// The features-over-version rule: an app built before `spoolframe:liked`
-/// sees neither Liked nor All, nor a heart, and its `Like` is refused,
-/// even when the user liked something on a newer one.
+/// Liked and All are base protocol: another app of the user's, naming no
+/// feature, sees them and the hearts liked on the first, and likes too.
 #[tokio::test]
-async fn a_client_without_the_feature_sees_no_builtins_or_hearts_and_cannot_like() {
-    let (server, newer, alice) = alice_listing("liked-older-client", &[PLAYLISTS, LIKED]).await;
+async fn another_app_sees_the_builtins_and_hearts_and_likes() {
+    let (server, newer, alice) = signed_in_alice("liked-another-app").await;
     let album = id(MediaKind::Album, "31");
     let liked = match newer
         .call(
@@ -145,20 +138,30 @@ async fn a_client_without_the_feature_sees_no_builtins_or_hearts_and_cannot_like
         other => panic!("{other:?}"),
     };
 
-    let older = server.client().await;
-    older.hello_listing(&[PLAYLISTS]).await;
-    let session = older.login("alice", "correct horse").await;
-    assert!(playlists(&older, &session).await.is_empty());
-    let (heart, children, holding) = hearts(&older, &session, album.clone()).await;
-    assert_eq!((heart, children), (None, None));
-    assert!(holding.is_empty(), "{holding:?}");
+    let other = server.client().await;
+    other.hello_info().await;
+    let session = other.login("alice", "correct horse").await;
+    let builtins: Vec<_> = playlists(&other, &session)
+        .await
+        .iter()
+        .map(|p| p.builtin)
+        .collect();
+    assert_eq!(builtins, [Some(Builtin::Liked), Some(Builtin::All)]);
+    let (heart, _, holding) = hearts(&other, &session, album.clone()).await;
+    assert_eq!(heart, Some(Liked::All));
+    assert_eq!(holding, [Some(Builtin::Liked)]);
     assert!(matches!(
-        older
-            .call(Some(&session), Request::Like { items: vec![album] })
+        other
+            .call(
+                Some(&session),
+                Request::Like {
+                    items: vec![id(MediaKind::Track, "32")]
+                }
+            )
             .await,
-        Response::Err(Error::Unsupported { .. })
+        Response::Ok(Reply::PlaylistInfo(_))
     ));
-    let opened = older
+    let opened = other
         .call(
             Some(&session),
             Request::GetPlaylist {
@@ -169,7 +172,7 @@ async fn a_client_without_the_feature_sees_no_builtins_or_hearts_and_cannot_like
         )
         .await;
     assert!(
-        matches!(opened, Response::Err(Error::NotFound { .. })),
+        matches!(opened, Response::Ok(Reply::Playlist(_))),
         "{opened:?}"
     );
 }

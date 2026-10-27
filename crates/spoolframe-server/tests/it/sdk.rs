@@ -2400,7 +2400,6 @@ async fn two_devices_see_each_other_s_playlist_changes() {
     let laptop = client_on(&server, &Arc::new(MemoryStorage::default())).await;
     let on_phone = alice(&server, &phone).await;
     let on_laptop = alice(&server, &laptop).await;
-    assert!(on_phone.features().playlists);
     let episodes = Kinds {
         movies: false,
         episodes: true,
@@ -2481,8 +2480,7 @@ async fn two_devices_see_each_other_s_playlist_changes() {
     server.stop().await;
 }
 
-/// PX-43: the SDK lists `spoolframe:liked`, so a session has Liked and
-/// All, first; `like` and `unlike` change Liked, and an album's details
+/// PX-43: a session has Liked and All, first; `like` and `unlike` change Liked, and an album's details
 /// carry its heart and its liked tracks.
 #[tokio::test]
 async fn the_sdk_likes_an_album_and_reads_its_hearts() {
@@ -2491,7 +2489,6 @@ async fn the_sdk_likes_an_album_and_reads_its_hearts() {
     let (server, phone, _) = ready("liked-sdk").await;
     server.catalog.serve_music();
     let session = alice(&server, &phone).await;
-    assert!(session.features().liked);
     let album = MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap();
     let track = MediaId::new(Namespace::Plex, MediaKind::Track, "32").unwrap();
     let liked = session.like(std::slice::from_ref(&album)).await.unwrap();
@@ -2509,12 +2506,12 @@ async fn the_sdk_likes_an_album_and_reads_its_hearts() {
     server.stop().await;
 }
 
-/// PX-16: an app that lists no regular feature, as `ClientOptions`
-/// default to, has none on a server that has them all, and its playlist
-/// calls are refused before they are sent.
+/// An app with `ClientOptions`' defaults, which name no feature, has
+/// playlists and Liked: they are base protocol.
 #[tokio::test]
-async fn an_app_listing_no_feature_has_none() {
-    let server = TestServer::start("no-features").await;
+async fn an_app_with_the_default_options_has_playlists_and_liked() {
+    let server = TestServer::start("default-options").await;
+    server.catalog.serve_music();
     server
         .add_user("alice", "correct horse", Some("Alice"))
         .await;
@@ -2533,14 +2530,21 @@ async fn an_app_listing_no_feature_has_none() {
     client.add_address(&id(&server), addrs).unwrap();
     pin(&client, &server).await;
     let session = alice(&server, &client).await;
+    let builtins: Vec<_> = session
+        .playlists()
+        .await
+        .unwrap()
+        .playlists
+        .iter()
+        .map(|p| p.builtin)
+        .collect();
     assert_eq!(
-        session.features(),
-        spoolframe_client_sdk::Features::default()
+        builtins,
+        [
+            Some(spoolframe_client_sdk::Builtin::Liked),
+            Some(spoolframe_client_sdk::Builtin::All)
+        ]
     );
-    assert!(matches!(
-        session.playlists().await,
-        Err(SdkError::Unsupported { .. })
-    ));
     client.close().await;
     server.stop().await;
 }

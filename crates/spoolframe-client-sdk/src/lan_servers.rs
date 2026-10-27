@@ -27,8 +27,7 @@ pub struct LanServerInfo {
     pub server_version: String,
     /// The protocol revision it speaks.
     pub protocol_version: u32,
-    /// An account there is made only from an invite: "Invite only". True
-    /// for a server too old to say.
+    /// An account there is made only from an invite: "Invite only".
     pub invite_only: bool,
 }
 

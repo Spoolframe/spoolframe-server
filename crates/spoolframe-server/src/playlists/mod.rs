@@ -21,8 +21,7 @@
 //! within that and no edit is made (`ALL_KEPT_FOR`). All has a row all
 //! the same, for the user's place, settings and pin. Neither is renamed,
 //! shared or deleted, and All is not edited: `spoolframe_policy`'s
-//! `builtin_*`. They are listed only while a music library is served, and
-//! only to callers that take them (a client listing `spoolframe:liked`).
+//! `builtin_*`. They are listed only while a music library is served.
 
 use std::sync::Arc;
 
@@ -545,17 +544,14 @@ impl Playlists {
     }
 
     /// Every playlist `actor` sees, and the notes of pinned ones that left
-    /// their Pinned.
-    /// With `builtins`, Liked and All first, made now if they are not
-    /// yet, while a music library is served; without, they are left out,
-    /// for a client that would not know them for what they are.
+    /// their Pinned. Liked and All first, made now if they are not yet,
+    /// while a music library is served; without one, they are left out.
     pub async fn list(
         &self,
         actor: &Actor,
-        builtins: bool,
     ) -> Result<(Vec<PlaylistSummary>, Vec<PinNote>), PlaylistsError> {
         let principal = actor.principal.to_string();
-        let builtins = builtins && self.serves_music().await;
+        let builtins = self.serves_music().await;
         if builtins {
             for builtin in [Builtin::Liked, Builtin::All] {
                 self.store.builtin_playlist(&principal, builtin).await?;
@@ -1696,14 +1692,13 @@ impl Playlists {
     /// season's episodes; any of a show's episodes, an album's or an
     /// artist's tracks.
     ///
-    /// Liked is among them with `builtins`; All never is, as it holds
-    /// every track and saying so tells nothing.
+    /// Liked is among them; All never is, as it holds every track and
+    /// saying so tells nothing.
     pub async fn holding(
         &self,
         actor: &Actor,
         item: &Item,
         children: &[Item],
-        builtins: bool,
     ) -> Result<Vec<PlaylistRef>, PlaylistsError> {
         let id = item.id().to_string();
         let (by, values) = match item {
@@ -1726,7 +1721,7 @@ impl Playlists {
         // Read once for every reference: whose each is, as a summary says.
         let names = Names::of(&self.store).await?;
         let mut held = Vec::with_capacity(rows.len());
-        for row in rows.iter().filter(|row| builtins || row.builtin.is_none()) {
+        for row in &rows {
             // Its picture as its own page has it (PX-53); a mosaic is kept
             // per revision and viewer, so a page opened again asks the
             // catalog nothing.
@@ -1744,7 +1739,7 @@ impl Playlists {
     }
 }
 
-/// Sharing by name (`spoolframe:playlist-sharing`).
+/// Sharing by name.
 impl Playlists {
     /// Whom playlist `id` can be shared with, those whose name holds
     /// `query` (empty: everyone), a page from `offset` of at most `limit`

@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- BREAKING: the client protocol is reset to revision 1
+  (`PROTOCOL_VERSION` 15 -> 1), a clean break. A server refuses every
+  other revision at `Hello`: an app built with SDK 0.15 or older gets
+  `Unsupported` ("client protocol 15; this server speaks 1: this server
+  needs a newer app"), which every SDK reads as `UpdateRequired`, and an
+  SDK 0.16 app dialling an older server gets the same from it. Apps need
+  SDK 0.16, and the server and the apps are updated together. A paired
+  server's client-protocol calls (pairing, playing and downloading a
+  paired server's item) need both servers on 0.16 too.
+- BREAKING: the regular features are base protocol. `spoolframe:playlists`,
+  `liked`, `last-viewed`, `playlist-sharing`, `play-history`,
+  `playlist-art`, `subtitle-sync`, `subtitle-search`, `playlist-upcoming`,
+  `downloads`, `music-downloads` and `invite-lookup` (pre-auth) are no
+  longer named: every client gets every request, reply field and event
+  of them without listing anything, and the server refuses none for a
+  feature not listed (downloads still need a platform that downloads).
+  `Hello`, `ServerInfo`, `LoggedIn` and `WhoAmI` lose `features`, and
+  `spoolframe_protocol::features` is gone. The experimental features
+  stay as they were: `http-playback` and `federation`, named in
+  `Hello.experimental` and on by the server's settings.
+- BREAKING (SDK): `Features`, `ClientOptions::features`,
+  `Session::features()` and `Session::server_features()` are gone, and
+  the SDK refuses no call itself for a feature: playlists, Liked and
+  All, sharing by name, covers, up next, subtitle sync and search, play
+  history, downloads, music offline and invite lookup are sent to any
+  server. `SdkError::Unsupported` is now only for an experimental
+  feature not on.
+- BREAKING: the fields that stayed lenient for peers before the reset
+  are required (sent always, a message without one refused):
+  `LoggedIn.password_change_required`, `WhoAmI`'s `can_leave`,
+  `ServerInfo.invite_only`, `InviteCreated.share_link`, `Rung.video`,
+  `ConvertedVideo::Copy.dolby_vision`, `DownloadOptionsInfo.estimates`,
+  pairing's credential `servers`, `TrackPreferences` subtitles'
+  `forced`, `SubtitleResult`'s `id`, `source` and `forced` (a
+  `file_id` is no longer read), `SubtitleSearch.sources`;
+  `PlaylistSummary`'s `builtin`, `owner_name`, `artwork`, `custom_art`;
+  `PlaylistRef`'s `builtin`, `owner_name`, `artwork`; `PlaylistShare`'s
+  `display_name` and `kind` (a request sends them as `null`); the
+  `liked` of a playlist entry and of `PlaylistNext`. `Reply::Item`'s
+  `playlists` and `liked_children` are lists, empty when none (they
+  were optional), and its `liked` is sent as `null` for no heart.
+  `PlaybackState`'s `last_viewed_at`, `play_count`, `last_played_at`
+  and a subtitle track's `timing` and `download` are sent always, as
+  `null` or 0, and still read when left out, as the SDK keeps them
+  with a download. The Server page, `--version` and MCP's server info
+  show the client protocol and the experimental features on; the admin
+  API's `ServerStatus` loses `features` and `preAuthFeatures`.
 - New: a library's items sorted and filtered. `Items` takes an optional
   `sort` (`{key, descending}`: `title`, `released`, `added`,
   `last_played`, `rating`, `audience_rating`, `duration`, `size`) and

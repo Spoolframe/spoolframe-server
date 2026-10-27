@@ -21,10 +21,8 @@ pub struct Rung {
     /// This variant's own video, where it is not the plan's resized: the
     /// encodes under a copied original (PX-21's remux ladder), whose plan
     /// `video` is the copy, the top variant. `None` for a ladder of
-    /// encodes, and the copy's own rung. Unlike the rest of a plan it may
-    /// be left out, as a server before it does, and is `None` then.
-    // compat(v1): required at the protocol reset
-    #[serde(default)]
+    /// encodes, and the copy's own rung.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub video: Option<ConvertedVideo>,
 }
 
@@ -144,9 +142,8 @@ pub enum PlaybackPlan {
         /// it against `ClientCapabilities::video_codecs`
         /// (`hvc1.2.4.L153.B0`; `dvh1.08.06` for Dolby Vision shown as
         /// such): for a client's log. `None` where the server did not read
-        /// it, or there is no video. Unlike the rest of a plan it may be
-        /// left out, as a server before it does, and is `None` then.
-        // compat(v1): required at the protocol reset
+        /// it, or there is no video. It may be left out, and is `None`
+        /// then.
         #[serde(default)]
         source_codec: Option<String>,
     },
@@ -170,7 +167,6 @@ pub enum PlaybackPlan {
         /// the video". A client can offer to avoid them (subtitles off).
         reasons: Vec<String>,
         /// As in `Direct`.
-        // compat(v1): required at the protocol reset
         #[serde(default)]
         source_codec: Option<String>,
     },
@@ -206,10 +202,7 @@ pub enum ConvertedVideo {
         /// the stream is Dolby Vision profile 5 or 8, so the output says
         /// so (`dvcC`/`dvvC`, `dvh1`, HLS's `SUPPLEMENTAL-CODECS`). `false`: a
         /// Dolby Vision stream copied as its base layer, HDR10 or HLG, or
-        /// any other stream. Unlike the rest of a plan it may be left
-        /// out, as a server before it does, and is `false` then.
-        // compat(v1): required at the protocol reset
-        #[serde(default)]
+        /// any other stream.
         dolby_vision: bool,
     },
     Encode {

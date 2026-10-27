@@ -168,9 +168,7 @@ pub struct ClientCapabilities {
     /// only if the device decodes it in hardware, so AV1 is not sent to a
     /// device that would decode it in software, draining its battery.
     /// `None`: it does not say, and every codec it plays counts. Unlike
-    /// the fields above it may be left out (a revision 14 client does not
-    /// send it), and is `None` then.
-    // compat(v1): required at the protocol reset
+    /// the fields above it may be left out, and is `None` then.
     #[serde(default)]
     pub hardware_video: Option<BTreeSet<VideoCodec>>,
     /// The RFC 6381 codec strings it plays (`hvc1.2.4.L153.B0`,
@@ -179,8 +177,7 @@ pub struct ClientCapabilities {
     /// string (its profile, tier and level, its Dolby Vision profile).
     /// One the server does not read is passed over. `None`: it does not
     /// say, and [`ClientCapabilities::video`] and `max_video` alone
-    /// decide, as before. It may be left out, and is `None` then.
-    // compat(v1): required at the protocol reset
+    /// decide. It may be left out, and is `None` then.
     #[serde(default)]
     pub video_codecs: Option<BTreeSet<String>>,
 }
@@ -205,7 +202,6 @@ pub struct DisplayCapabilities {
     /// display: a Dolby Vision string may be played on one mode and not
     /// on another. `None` keeps Hello's. It may be left out, and is
     /// `None` then.
-    // compat(v1): required at the protocol reset
     #[serde(default)]
     pub video_codecs: Option<BTreeSet<String>>,
 }

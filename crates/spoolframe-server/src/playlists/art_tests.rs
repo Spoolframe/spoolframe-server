@@ -191,9 +191,13 @@ async fn fewer_than_four_covers_show_the_first_and_none_the_placeholder() {
     assert_eq!(h.art(&h.alice, &album).await, poster_of("31"));
     let empty = h.made(&[], Visibility::Personal).await;
     assert_eq!(h.art(&h.alice, &empty).await, covers::tile_id(Tile::Empty));
-    // The listing says the same.
-    let (listed, _) = h.playlists.list(&h.alice, false).await.unwrap();
-    let art: Vec<_> = listed.iter().map(|p| p.artwork.clone().unwrap()).collect();
+    // The listing says the same, after Liked's and All's own.
+    let (listed, _) = h.playlists.list(&h.alice).await.unwrap();
+    let art: Vec<_> = listed
+        .iter()
+        .filter(|p| p.builtin.is_none())
+        .map(|p| p.artwork.clone().unwrap())
+        .collect();
     assert_eq!(
         art,
         [
@@ -298,7 +302,7 @@ async fn a_viewer_and_liked_and_all_are_not_allowed() {
         Err(PlaylistsError::NotFound)
     ));
     h.catalog.serve_music();
-    let (listed, _) = h.playlists.list(&h.alice, true).await.unwrap();
+    let (listed, _) = h.playlists.list(&h.alice).await.unwrap();
     for (builtin, tile) in [(Builtin::Liked, Tile::Liked), (Builtin::All, Tile::All)] {
         let p = listed.iter().find(|p| p.builtin == Some(builtin)).unwrap();
         assert_eq!(p.artwork, Some(covers::tile_id(tile)));
@@ -374,18 +378,10 @@ async fn an_item_s_playlists_carry_their_covers() {
             .collect::<std::collections::HashMap<_, _>>()
     };
     let screen = crate::test_support::movie();
-    let alice = art(h
-        .playlists
-        .holding(&h.alice, &screen, &[], true)
-        .await
-        .unwrap());
+    let alice = art(h.playlists.holding(&h.alice, &screen, &[]).await.unwrap());
     assert_eq!(alice[&plain], Some(h.art(&h.alice, &plain).await));
     assert_eq!(alice[&covered], Some(cover.clone()));
-    let bob = art(h
-        .playlists
-        .holding(&h.bob, &screen, &[], true)
-        .await
-        .unwrap());
+    let bob = art(h.playlists.holding(&h.bob, &screen, &[]).await.unwrap());
     assert_eq!(bob.len(), 1);
     assert_eq!(bob[&covered], Some(cover));
 }

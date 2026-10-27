@@ -89,16 +89,6 @@ impl std::fmt::Debug for MintedInvite {
     }
 }
 
-/// `created`'s https link; made from its `link` when the server is from
-/// before PX-45 and sends none.
-fn share_link(created: &wire::InviteCreated) -> String {
-    if !created.share_link.is_empty() {
-        return created.share_link.clone();
-    }
-    spoolframe_protocol::invite::parse_link(&created.link)
-        .map_or_else(|| created.link.clone(), |invite| invite.share_link())
-}
-
 /// Who made an invite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteCreator {
@@ -168,8 +158,8 @@ impl Session {
         });
         match self.call(request).await? {
             Reply::InviteCreated(created) => Ok(MintedInvite {
-                share_link: share_link(&created),
-                copy_string: share_link(&created),
+                share_link: created.share_link.clone(),
+                copy_string: created.share_link.clone(),
                 id: created.invite.id,
                 kind: created.invite.kind.into(),
                 code: created.code,
@@ -342,25 +332,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    /// PX-45: a server before share links sends none, and the SDK makes
-    /// it from the link; one that sends it is taken as it is.
-    #[test]
-    fn a_share_link_is_made_from_the_link_when_the_server_sends_none() {
-        let server = "ab".repeat(32);
-        let mut created = wire::InviteCreated {
-            invite: listed(wire::InviteOrigin::WebAdmin),
-            code: "QW7K-2MFP-XR4T".into(),
-            link: format!("spoolframe://invite?server={server}&cap=QW7K-2MFP-XR4T"),
-            share_link: String::new(),
-        };
-        assert_eq!(
-            share_link(&created),
-            format!("https://spoolframe.app/i#server={server}&cap=QW7K-2MFP-XR4T")
-        );
-        created.share_link = "https://spoolframe.app/i#as-sent".into();
-        assert_eq!(share_link(&created), "https://spoolframe.app/i#as-sent");
     }
 
     #[test]

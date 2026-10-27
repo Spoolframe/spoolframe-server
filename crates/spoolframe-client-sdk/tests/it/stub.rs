@@ -60,11 +60,6 @@ struct State {
     protocol: Mutex<Option<u32>>,
     /// The server id `ServerInfo` says, when not the one made from the key.
     server_id: Mutex<Option<String>>,
-    /// `LoggedIn` and `WhoAmI` list every regular feature (PX-16), as a
-    /// server that has them all; otherwise none.
-    all_features: AtomicBool,
-    /// Names `LoggedIn` and `WhoAmI` list after those.
-    more_features: Mutex<Vec<String>>,
     /// `ServerInfo` says accounts are made without an invite, as no
     /// server does yet.
     open_sign_up: AtomicBool,
@@ -150,28 +145,6 @@ impl Stub {
     /// another protocol revision.
     pub fn refuse_hellos(&self) {
         self.state.refuse_hellos.store(true, Ordering::SeqCst);
-    }
-
-    /// List every regular feature from now on, as a server that has them.
-    pub fn have_all_features(&self) {
-        self.state.all_features.store(true, Ordering::SeqCst);
-    }
-
-    /// List `names` too, after every regular feature if those are listed:
-    /// a newer server's features, unknown to this SDK.
-    pub fn also_list(&self, names: &[&str]) {
-        *self.state.more_features.lock() = names.iter().map(|n| n.to_string()).collect();
-    }
-
-    /// The regular features each `Hello` listed, in the order received.
-    pub fn hello_features(&self) -> Vec<Vec<String>> {
-        self.invocations("hello")
-            .into_iter()
-            .map(|wire| match wire.envelope.request {
-                Request::Hello(hello) => hello.features,
-                other => panic!("not a Hello: {other:?}"),
-            })
-            .collect()
     }
 
     /// Answer `Hello` with protocol revision `revision` from now on.
@@ -526,17 +499,12 @@ fn answer(
         )
         .to_string()
     });
-    let mut features = if state.all_features.load(Ordering::SeqCst) {
-        spoolframe_protocol::features::names(spoolframe_protocol::features::ALL)
-    } else {
-        Vec::new()
-    };
-    features.extend(state.more_features.lock().iter().cloned());
     let reply = match envelope.request {
         // What the server answers a Hello of another revision.
         Request::Hello(_) if state.refuse_hellos.load(Ordering::SeqCst) => {
             return Response::Err(Error::Unsupported {
-                request: "protocol revision; update the SDK".into(),
+                request: "client protocol 15; this server speaks 1: this server needs a newer app"
+                    .into(),
             });
         }
         Request::Hello(_) => Reply::ServerInfo(ServerInfo {
@@ -548,7 +516,6 @@ fn answer(
             auth_methods: vec![AuthMethod::Password],
             web_url,
             experimental: Vec::new(),
-            features: Vec::new(),
             invite_only: !state.open_sign_up.load(Ordering::SeqCst),
         }),
         Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
@@ -568,8 +535,6 @@ fn answer(
             }),
             remembered: false,
             password_change_required: login.password == "one-time",
-            // A server without playlists (PX-40), unless it has them all.
-            features: features.clone(),
         },
         Request::ChangePassword(_) => Reply::Done,
         Request::LeaveServer if state.last_admin.load(Ordering::SeqCst) => {
@@ -587,7 +552,6 @@ fn answer(
                 portable: Vec::new(),
             },
             can_leave: !state.last_admin.load(Ordering::SeqCst),
-            features,
         }),
         Request::Libraries => Reply::Libraries {
             libraries: Vec::new(),

@@ -155,14 +155,12 @@ pub struct ItemDetail {
     pub item: Item,
     pub children: Vec<Item>,
     /// The item's intro and credits (P2-10), in order of start. Empty when
-    /// it has none, or the server is too old to send them.
+    /// it has none.
     pub markers: Vec<Marker>,
-    /// The playlists the user sees that hold it (PX-40). Empty when none,
-    /// or the server has no playlists.
+    /// The playlists the user sees that hold it (PX-40). Empty when none.
     pub playlists: Vec<spoolframe_protocol::playlists::PlaylistRef>,
     /// Its heart (PX-43): a track's `All` or `None`, an album's `All`,
-    /// `Some` or `None`. `None` for anything else, or when the server has
-    /// no Liked.
+    /// `Some` or `None`. `None` for anything else.
     pub liked: Option<spoolframe_protocol::playlists::Liked>,
     /// An album's tracks among `children` that are liked (PX-43). Empty
     /// otherwise.
@@ -479,10 +477,6 @@ pub struct Session {
     /// may only change the password or sign out until it does. Shared by
     /// every clone, so a change made through one is seen by all (C5).
     pub(crate) password_change_required: Arc<AtomicBool>,
-    /// The regular features the server listed in this session's `WhoAmI`.
-    pub(crate) features: crate::playlists::Features,
-    /// Every name in that list, known here or not.
-    pub(crate) server_features: Arc<Vec<String>>,
 }
 
 /// A [`Session`] without its client, for what the client itself keeps
@@ -494,8 +488,6 @@ pub(crate) struct SessionParts {
     token: SessionId,
     user: UserSummary,
     can_leave: bool,
-    features: crate::playlists::Features,
-    server_features: Arc<Vec<String>>,
 }
 
 impl SessionParts {
@@ -509,8 +501,6 @@ impl SessionParts {
             can_leave: self.can_leave,
             remembered: None,
             password_change_required: Arc::default(),
-            features: self.features,
-            server_features: self.server_features,
         }
     }
 }
@@ -522,8 +512,6 @@ impl Session {
             token: self.token.clone(),
             user: self.user.clone(),
             can_leave: self.can_leave,
-            features: self.features,
-            server_features: self.server_features.clone(),
         }
     }
 }
@@ -858,9 +846,9 @@ impl Session {
                 item,
                 children,
                 markers,
-                playlists: playlists.unwrap_or_default(),
+                playlists,
                 liked,
-                liked_children: liked_children.unwrap_or_default(),
+                liked_children,
                 copies,
             }),
             other => Err(unexpected(other)),

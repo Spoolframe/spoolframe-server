@@ -150,17 +150,13 @@ pub struct PlaylistShare {
     /// They may add, remove and move its entries; never rename it, change
     /// its kinds or sharing, or delete it.
     pub can_edit: bool,
-    /// What they are shown as, for a client that listed
-    /// `spoolframe:playlist-sharing`; `None` for someone no longer here
-    /// (shown by `user_id`). Read by no request: a share is named by
-    /// `user_id` alone.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// What they are shown as; `None` for someone no longer here (shown
+    /// by `user_id`). Read by no request: a share is named by `user_id`
+    /// alone, and a client sends `null`.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub display_name: Option<String>,
-    /// Whose account they are, for a client that listed
-    /// `spoolframe:playlist-sharing`. Read by no request.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whose account they are. Read by no request: a client sends `null`.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub kind: Option<UserKind>,
 }
 
@@ -284,30 +280,21 @@ pub struct PlaylistSummary {
     /// Which built-in playlist it is (PX-43), or `None` for one a user
     /// made: what a client lists Liked and All first by, and hides
     /// rename, share and delete for.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub builtin: Option<Builtin>,
-    /// What its owner is shown as, for a client that listed
-    /// `spoolframe:playlist-sharing`: what a row says "Alice's" by. `None`
+    /// What its owner is shown as: what a row says "Alice's" by. `None`
     /// for an owner no longer here.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub owner_name: Option<String>,
-    /// Its picture, for a client that listed `spoolframe:playlist-art`
-    /// (PX-53), fetched as any artwork is: the cover an editor uploaded;
+    /// Its picture (PX-53), fetched as any artwork is: the cover an editor uploaded;
     /// else a 2×2 mosaic of the first four different album covers or
     /// posters in it; one alone when it has fewer; a placeholder when it
     /// has none. Liked's and All's are fixed tiles. Changes when any of
     /// that does.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub artwork: Option<ArtworkId>,
     /// `artwork` is a cover an editor uploaded, which `RemovePlaylistArt`
     /// takes away; false for a mosaic, a placeholder or a built-in tile.
-    /// Sent only when true, and only to a client that listed
-    /// `spoolframe:playlist-art`.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub custom_art: bool,
 }
 
@@ -319,22 +306,17 @@ pub struct PlaylistRef {
     pub owner_kind: PlaylistOwnerKind,
     /// As [`PlaylistSummary::builtin`]. All is never listed here: it
     /// holds every track.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub builtin: Option<Builtin>,
-    /// What its owner is shown as, for a client that listed
-    /// `spoolframe:playlist-sharing`, as [`PlaylistSummary::owner_name`]:
+    /// What its owner is shown as, as [`PlaylistSummary::owner_name`]:
     /// what an item's row says "Alice's" by. `None` for an owner no
     /// longer here.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub owner_name: Option<String>,
     /// Its picture, as [`PlaylistSummary::artwork`]: an uploaded cover,
     /// else the mosaic of its first four, so an item's page can show the
-    /// playlists holding it as it shows seasons. Only for a client that
-    /// listed `spoolframe:playlist-art`.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// playlists holding it as it shows seasons.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub artwork: Option<ArtworkId>,
 }
 
@@ -347,10 +329,7 @@ pub struct PlaylistEntry {
     /// Still in the library, but its file cannot be read now (a drive
     /// offline, a file moved): shown, counted, skipped when playing.
     pub unavailable: bool,
-    /// A track in the user's Liked (PX-43): its heart. Sent only when
-    /// true, and only to a client that listed `spoolframe:liked`.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// A track in the user's Liked (PX-43): its heart.
     pub liked: bool,
 }
 
@@ -412,11 +391,7 @@ pub struct PlaylistNext {
     pub entry: EntryId,
     pub item: spoolframe_types::Item,
     pub markers: Vec<spoolframe_types::Marker>,
-    /// A track in the user's Liked (PX-43): the now-playing heart. Sent
-    /// only when true, and only to a client that listed
-    /// `spoolframe:liked`.
-    // compat(v1): required at the protocol reset
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// A track in the user's Liked (PX-43): the now-playing heart.
     pub liked: bool,
 }
 
@@ -517,32 +492,38 @@ mod tests {
         assert_eq!(serde_json::to_string(&Liked::Some).unwrap(), r#""some""#);
     }
 
+    /// A summary without `builtin` and the rest, as a server before the
+    /// reset to revision 1 could send it, is refused.
     #[test]
-    fn an_older_server_s_summary_is_no_builtin() {
+    fn a_summary_without_builtin_is_refused() {
         let json = serde_json::json!({
             "id": "x", "name": "Heists",
             "kinds": { "movies": false, "episodes": true, "tracks": false },
             "owner_kind": "mine", "visibility": { "type": "personal" },
             "can_edit": true, "can_manage": true, "revision": 1, "pinned": null,
         });
-        let summary: PlaylistSummary = serde_json::from_value(json).unwrap();
-        assert_eq!(summary.builtin, None);
+        let error = serde_json::from_value::<PlaylistSummary>(json).unwrap_err();
         assert!(
-            serde_json::to_value(&summary)
-                .unwrap()
-                .get("builtin")
-                .is_none()
+            error.to_string().contains("missing field `builtin`"),
+            "{error}"
         );
     }
 
+    /// A share without its name and kind keys is refused; a request's
+    /// share, which names neither, sends both as `null`.
     #[test]
-    fn an_older_server_s_share_has_no_name_and_a_request_s_share_sends_none() {
-        let share: PlaylistShare =
-            serde_json::from_str(r#"{"user_id":"local:x","can_edit":true}"#).unwrap();
-        assert_eq!(share, PlaylistShare::new("local:x", true));
+    fn a_share_names_its_name_and_kind_or_null() {
+        assert!(
+            serde_json::from_str::<PlaylistShare>(r#"{"user_id":"local:x","can_edit":true}"#)
+                .is_err()
+        );
         let sent = serde_json::to_value(PlaylistShare::new("local:x", false)).unwrap();
-        assert!(sent.get("display_name").is_none());
-        assert!(sent.get("kind").is_none());
+        assert!(sent["display_name"].is_null(), "{sent}");
+        assert!(sent["kind"].is_null(), "{sent}");
+        assert_eq!(
+            serde_json::from_value::<PlaylistShare>(sent).unwrap(),
+            PlaylistShare::new("local:x", false)
+        );
         let kind: UserKind = serde_json::from_str(r#""federated""#).unwrap();
         assert_eq!(kind, UserKind::Unknown);
     }
