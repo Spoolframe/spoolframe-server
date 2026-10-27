@@ -304,6 +304,37 @@ impl Inspect for PlexCatalog {
             .total)
     }
 
+    async fn rows_by_id(&self, ids: &[MediaId]) -> Result<Vec<Row>, CatalogError> {
+        let mut found: std::collections::HashMap<MediaId, Row> =
+            std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::browse::BY_ID) {
+            let keys: Vec<&str> = chunk
+                .iter()
+                .filter_map(|id| plex_key(id.namespace(), id.key(), id).ok())
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let mut call = Call::get(format!("/library/metadata/{}", keys.join(",")));
+            call.query = vec![("includeGuids", "1")];
+            let container = match self.fetch(&call).await {
+                Ok(container) => container,
+                Err(CatalogError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            let section = container.library_section_id.clone();
+            let title = container.library_section_title.clone();
+            for m in &container.metadata {
+                if !self.serves(m.library_section_id.as_ref().or(section.as_ref())) {
+                    continue;
+                }
+                let row = self.row(&call, m, title.as_deref())?;
+                found.insert(row.item.id().clone(), row);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
+    }
+
     async fn child_rows(&self, id: &MediaId) -> Result<Vec<Row>, CatalogError> {
         if !has_children(id.kind()) {
             return Ok(Vec::new());

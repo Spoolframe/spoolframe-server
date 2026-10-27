@@ -133,18 +133,21 @@ pub(crate) async fn serve_syncing_with(
         std::mem::forget(never);
     }
     let store = auth.store().clone();
+    // Watch state, as a server has it: what a library sorted and
+    // filtered as clients ask it is read through.
+    let watch = Arc::new(spoolframe_server::watch::Watch::new(
+        store.clone(),
+        catalog.clone(),
+        // Nothing these tests call probes a file.
+        Arc::new(spoolframe_media::Prober::new(
+            spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
+            spoolframe_media::Prober::DEFAULT_TIMEOUT,
+        )),
+        spoolframe_server::watch::WatchRules::default(),
+    ));
     let library = library.then(|| {
         let catalog: Arc<dyn spoolframe_catalog::Catalog> = catalog.clone();
-        let watch = Arc::new(spoolframe_server::watch::Watch::new(
-            store.clone(),
-            catalog.clone(),
-            // Nothing these tests call probes a file.
-            Arc::new(spoolframe_media::Prober::new(
-                spoolframe_media::sandbox::Tool::unconfined("ffprobe"),
-                spoolframe_media::Prober::DEFAULT_TIMEOUT,
-            )),
-            spoolframe_server::watch::WatchRules::default(),
-        ));
+        let watch = watch.clone();
         spoolframe_server::mcp::Library {
             playlists: Arc::new(
                 spoolframe_server::playlists::Playlists::new(
@@ -170,6 +173,7 @@ pub(crate) async fn serve_syncing_with(
             settings: Some(Arc::new(settings)),
             accounts: Some(accounts),
             plex_sync: Some(sync),
+            watch: Some(watch),
             wizard,
             ..admin(auth, Some(SetupCode::new(CODE)))
         },

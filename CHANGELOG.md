@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+- New: a library's items sorted and filtered. `Items` takes an optional
+  `sort` (`{key, descending}`: `title`, `released`, `added`,
+  `last_played`, `rating`, `audience_rating`, `duration`, `size`) and
+  `filter` (`watched`, `genres`, `year_from`, `year_to`, `resolutions`,
+  `dynamic_ranges`, `content_ratings`; parts combine with AND, values
+  within one with OR), and the new `ItemFilterValues` request says what
+  a library's items have to filter by and which keys and parts it
+  applies. Both fields are left out when not used, and a request without
+  them is answered in the order it always was. Part of the base
+  protocol, with no feature flag.
+- New: this server's own libraries are sorted and filtered by Plex
+  itself, with its own parameters, so a listing is as live as Plex is.
+  What a library offers is what its PMS lists for the section: no PMS
+  sorts by file size, and one from before the `dovi` filter offers no
+  Dolby Vision filter. Items without a value for the sort (no rating, no
+  release date) come last both ways, though Plex lists them first when
+  ascending. The `watched` filter and the `last_played` sort go by the
+  session user's own watch state: the server reads the library's order
+  from Plex (each item's key only, a thousand a request) and keeps it a
+  minute per user, library, sort and filter, at most a million ids in
+  all, or until that user's watch state changes.
+- New: a paired server's library is sorted and filtered in its cache,
+  by every key and filter part for movies, while that server is offline
+  too. federation/1's `RemoteItem` carries what it is sorted and
+  filtered by (`sort_title`, `released`, `added_at`, `rating_tenths`,
+  `audience_rating_tenths`, `size`, `resolution`, `dynamic_range`),
+  each left out when unknown, so an item without them hashes as before;
+  the server that shares reads a film's own record once for every genre
+  and its range, and keeps it with its external ids. Migration 0060
+  adds the cache's columns, a genre table and an index per sort key,
+  and fills what the cached bodies already have; the rest comes with
+  each paired server's next sync after it is upgraded, which sends every
+  item once more.
+- New: the SDK's `Session::items_sorted(library, offset, limit, sort,
+  filter)` and `Session::item_filter_values(library)`. `Session::items`
+  is `items_sorted` with neither. An empty filter is left out of the
+  request.
+- New: the web UI's library page has a sort select and a Filters panel
+  (watched by you, genre, year, resolution, dynamic range, content
+  rating), built from what the library offers. They go in the address,
+  `sort=added-desc` and the filter's parts in `filter`
+  (`filter=watched:unwatched;genre:Drama;year:1990-1999`), so a link
+  opens the same rows; a link from before opens as it did, and a
+  search, a kind or a quick filter (Missing files, Unmatched, No
+  artwork) is listed apart from them. The admin API's `catalogRows`
+  takes `sort` and `itemFilter`, answered by the same query clients
+  get, as rows, and `catalogFilterValues` says what a library offers.
+- Experimental (`federation`): Server › Libraries lists what paired
+  servers share with this one under "Shared with this server", by
+  server, each marked online or offline. A library opens from this
+  server's cache with the same paging, sort and filters as its own
+  (`/paired/<library>`), and an item as far as the cache has it: what
+  clients get, its children and external ids. Read-only, and browsable
+  while the paired server is offline. Admin API: `catalogPairedLibraries`,
+  `catalogPairedItems`, `catalogPairedItem`, and `catalogFilterValues`
+  for a `fed:` library; `NOT_CONFIGURED` with federation off.
+
 ## 0.15.1 (2026-10-25)
 
 - Security: the SDK verifies security-key signatures with p256 0.14

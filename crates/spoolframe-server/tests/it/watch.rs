@@ -118,6 +118,8 @@ async fn pages_and_searches_carry_the_user_s_state() {
                 library: library.clone(),
                 offset: 0,
                 limit: 10,
+                sort: None,
+                filter: None,
             },
         )
         .await

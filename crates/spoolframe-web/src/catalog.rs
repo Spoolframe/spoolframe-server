@@ -4,10 +4,11 @@
 //! item, WebCatalogItem).
 
 use spoolframe_admin_api::{
-    CatalogFilter, CatalogKind, CatalogLibrary, CatalogRow, FileState, Item, KindCount,
-    LibraryKind, Marker, MarkerKind, MediaVersion, PathsChecked,
+    CatalogFilter, CatalogKind, CatalogLibrary, CatalogRow, FileState, Item, ItemFilter, ItemSort,
+    KindCount, LibraryKind, Marker, MarkerKind, MediaVersion, PathsChecked,
 };
 
+use crate::browse;
 use crate::logic::{ago, count, thousands};
 
 /// The rows a page can hold, the first the default.
@@ -22,6 +23,12 @@ pub struct View {
     pub filter: Option<CatalogFilter>,
     pub kind: Option<CatalogKind>,
     pub text: String,
+    /// The top level in this order, as clients sort it (`sort` in the
+    /// address); `None`, Plex's own.
+    pub sort: Option<ItemSort>,
+    /// The top level filtered as clients filter it: in the address's
+    /// `filter`, in place of a quick filter's name.
+    pub items: ItemFilter,
 }
 
 pub fn filter_name(filter: CatalogFilter) -> &'static str {
@@ -124,17 +131,67 @@ impl View {
     /// The view an address names, anything it does not say at its
     /// default.
     pub fn parse(page: &str, per: &str, filter: &str, kind: &str, text: &str) -> Self {
+        Self::parse_sorted(page, per, filter, kind, text, "")
+    }
+
+    /// [`View::parse`], with the address's `sort`. A link from before
+    /// sorting (no `sort`, a quick filter's name in `filter`) opens as it
+    /// did. A sort or an item filter goes with none of a kind, a search
+    /// or a quick filter, which the server lists apart: those win.
+    pub fn parse_sorted(
+        page: &str,
+        per: &str,
+        filter: &str,
+        kind: &str,
+        text: &str,
+        sort: &str,
+    ) -> Self {
         let per = per
             .parse()
             .ok()
             .filter(|p| PER_PAGE.contains(p))
             .unwrap_or(PER_PAGE[0]);
-        Self {
+        let mut view = Self {
             page: page.parse().ok().filter(|p| *p >= 1).unwrap_or(1),
             per,
             filter: FILTERS.into_iter().find(|f| filter_name(*f) == filter),
             kind: kind_from_name(kind),
             text: text.to_owned(),
+            sort: browse::sort_from_name(sort),
+            items: browse::filter_from(filter),
+        };
+        if view.filter.is_some() || view.kind.is_some() || !view.text.trim().is_empty() {
+            view.sort = None;
+            view.items = ItemFilter::default();
+        }
+        view
+    }
+
+    /// The address's `filter`: a quick filter's name, or the item
+    /// filter's parts.
+    pub fn filter_param(&self) -> String {
+        match self.filter {
+            Some(f) => filter_name(f).to_owned(),
+            None => browse::filter_param(&self.items),
+        }
+    }
+
+    /// The address's `sort`.
+    pub fn sort_param(&self) -> String {
+        self.sort.map(browse::sort_name).unwrap_or_default()
+    }
+
+    /// This view under a sort or an item filter: the first page, of the
+    /// top level, without a search or a quick filter.
+    pub fn browsing(&self, sort: Option<ItemSort>, items: ItemFilter) -> Self {
+        Self {
+            page: 1,
+            filter: None,
+            kind: None,
+            text: String::new(),
+            sort,
+            items,
+            ..self.clone()
         }
     }
 
@@ -188,7 +245,11 @@ pub fn pager_text(view: &View, shown: usize, total: u32, all: u32, unit: &str) -
             thousands(u64::from(last))
         )
     };
-    if view.filter.is_some() || !view.text.trim().is_empty() || total != all {
+    if view.filter.is_some()
+        || !view.items.is_empty()
+        || !view.text.trim().is_empty()
+        || total != all
+    {
         format!("{range} of {}", thousands(u64::from(total)))
     } else {
         format!("{range} of {} {unit}", thousands(u64::from(total)))
@@ -867,6 +928,49 @@ mod tests {
         assert_eq!(view.kind, Some(CatalogKind::Episode));
         // Only the sizes the select offers.
         assert_eq!(View::parse("1", "7", "", "", "").per, 50);
+    }
+
+    /// A link from before sorting opens as it did; a sorted and filtered
+    /// one reads back; a search, a kind or a quick filter wins over them.
+    #[test]
+    fn an_address_says_its_sort_and_item_filter_and_old_links_still_open() {
+        use spoolframe_admin_api::{SortKey, WatchedState};
+        let old = View::parse_sorted("2", "100", "unmatched", "", "", "");
+        assert_eq!(
+            (old.page, old.filter, old.sort, old.items.is_empty()),
+            (2, Some(CatalogFilter::Unmatched), None, true)
+        );
+        assert_eq!(old.filter_param(), "unmatched");
+        let sorted = View::parse_sorted(
+            "",
+            "",
+            "watched:unwatched;year:1990-1999",
+            "",
+            "",
+            "added-desc",
+        );
+        assert_eq!(
+            sorted.sort,
+            Some(ItemSort {
+                key: SortKey::Added,
+                descending: true
+            })
+        );
+        assert_eq!(sorted.items.watched, [WatchedState::Unwatched]);
+        assert_eq!(sorted.filter, None);
+        assert_eq!(sorted.filter_param(), "watched:unwatched;year:1990-1999");
+        assert_eq!(sorted.sort_param(), "added-desc");
+        let searched = View::parse_sorted("", "", "watched:unwatched", "", "dune", "added-desc");
+        assert_eq!((searched.sort, searched.items.is_empty()), (None, true));
+        // Choosing a sort leaves a search and a quick filter behind.
+        let quick = View::parse_sorted("3", "", "missing", "", "dune", "");
+        let chosen = quick.browsing(sorted.sort, ItemFilter::default());
+        assert_eq!(
+            (chosen.page, chosen.filter, chosen.text.as_str()),
+            (1, None, "")
+        );
+        let filtered = View::parse_sorted("", "", "genre:Drama", "", "", "");
+        assert_eq!(pager_text(&filtered, 3, 3, 412, "movies"), "1–3 of 3");
     }
 
     #[test]

@@ -620,6 +620,35 @@ impl ClientProtocol {
     }
 
     /// Federation (P8-01), if this server has it on and `hello` named it.
+    /// Library `id` as the client sees it listed: this server's, or, with
+    /// `federation`, a paired server's from the cache. Not listed is
+    /// `NotFound`, as `Items` of it is.
+    async fn library_named(
+        &self,
+        federation: Option<&Arc<crate::federation::Federation>>,
+        id: &spoolframe_types::LibraryId,
+    ) -> Result<spoolframe_types::Library, Error> {
+        let mut libraries = if id.namespace() == spoolframe_types::Namespace::Federated {
+            match federation {
+                Some(federation) => federation.libraries().await.map_err(catalog_error)?,
+                None => Vec::new(),
+            }
+        } else {
+            self.services
+                .catalog
+                .libraries()
+                .await
+                .map_err(catalog_error)?
+        };
+        let at = libraries
+            .iter()
+            .position(|l| l.id == *id)
+            .ok_or_else(|| Error::NotFound {
+                what: id.to_string(),
+            })?;
+        Ok(libraries.swap_remove(at))
+    }
+
     fn federation_for(&self, hello: &Hello) -> Option<&Arc<crate::federation::Federation>> {
         let asked = hello
             .experimental
@@ -3213,18 +3242,39 @@ impl ClientProtocol {
                 library,
                 offset,
                 limit,
+                sort,
+                filter,
             } => {
                 let page = Page {
                     offset,
                     limit: limit.min(MAX_PAGE),
                 };
-                let mut page = catalog.items(&library, page).await.map_err(catalog_error)?;
+                let mut page = if sort.is_none() && filter.is_none() {
+                    catalog.items(&library, page).await.map_err(catalog_error)?
+                } else {
+                    let library = self.library_named(federation, &library).await?;
+                    self.services
+                        .watch
+                        .browse(principal, &library, sort, filter, page)
+                        .await
+                        .map_err(watch_error)?
+                };
                 self.fill(principal, page.items.iter_mut()).await?;
                 Ok(Reply::Items {
                     items: page.items,
                     total: page.total,
                     unavailable: Vec::new(),
                 })
+            }
+            Request::ItemFilterValues { library } => {
+                let library = self.library_named(federation, &library).await?;
+                let values = self
+                    .services
+                    .watch
+                    .filter_values(&library)
+                    .await
+                    .map_err(watch_error)?;
+                Ok(Reply::ItemFilterValues { values })
             }
             Request::Item { id } => {
                 let mut found = catalog.item(&id).await.map_err(catalog_error)?;
@@ -8840,6 +8890,9 @@ fn catalog_error(e: CatalogError) -> Error {
             tracing::warn!(error = %e, "a paired server's hierarchy is too large to browse");
             Error::ReplyTooLarge { bytes }
         }
+        // A sort or filter the library does not offer: the client asked
+        // for what `ItemFilterValues` did not list.
+        CatalogError::CannotBrowse(message) => Error::InvalidInput { message },
     }
 }
 

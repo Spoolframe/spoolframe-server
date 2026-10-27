@@ -30,6 +30,7 @@ mod hwdec;
 mod index_ahead;
 mod invite_admin;
 mod invites;
+mod item_sort_filter;
 mod lan;
 mod last_viewed;
 mod leave;

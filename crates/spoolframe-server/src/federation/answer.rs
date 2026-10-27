@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use spoolframe_catalog::{CatalogError, Page};
+use spoolframe_catalog::{CatalogError, Facts, Page};
 use spoolframe_federation::{Shares, SyncAnswer, Unshared};
 use spoolframe_protocol::ServerId;
 use spoolframe_protocol::federation::{
@@ -30,7 +30,7 @@ use crate::auth::{Bucket, TokenBucket};
 use crate::keyed_locks::KeyedLocks;
 use crate::store::StoreError;
 use crate::store::federation::PeerRecord;
-use crate::store::federation_sync::{KeptIds, SentItem};
+use crate::store::federation_sync::{Kept, KeptIds, SentItem};
 
 /// How many top-level items a walk asks the catalog for at once.
 const WALK_PAGE: u32 = 200;
@@ -65,8 +65,19 @@ const SNAPSHOTS: Bucket = Bucket {
 struct Ids {
     /// The library walked.
     library: String,
-    kept: HashMap<String, (String, Vec<String>)>,
+    kept: HashMap<String, Kept>,
     read: Vec<KeptIds>,
+}
+
+/// What a film's own record says beyond its listing, kept with its
+/// external ids: every genre (a listing has the first few) and its
+/// dynamic range (a listing has no streams).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Details {
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    dynamic_range: Option<spoolframe_types::DynamicRange>,
 }
 
 /// A library's items, walked: shared by the pairs it answers.
@@ -301,11 +312,13 @@ impl Federation {
         library: &LibraryId,
         ids: &mut Ids,
     ) -> Result<Vec<RemoteItem>, CatalogError> {
+        // The top of the library, with what its listing says of each to
+        // sort and filter by.
         let mut top = Vec::new();
         loop {
-            let page = self
+            let (page, facts) = self
                 .catalog
-                .items(
+                .items_with_facts(
                     library,
                     Page {
                         offset: u32::try_from(top.len()).unwrap_or(u32::MAX),
@@ -314,36 +327,42 @@ impl Federation {
                 )
                 .await?;
             let got = page.items.len();
-            top.extend(page.items);
+            let mut facts = facts.into_iter();
+            top.extend(
+                page.items
+                    .into_iter()
+                    .map(|item| (item, facts.next().unwrap_or_default())),
+            );
             if got == 0 || top.len() >= page.total as usize {
                 break;
             }
         }
+        let none = Facts::default();
         let mut walked = Vec::new();
-        for item in top {
+        for (item, facts) in top {
             match item {
                 Item::Show(_) => {
                     let show = self.catalog.item(item.id()).await?;
-                    walked.push(remote(&show.item, show.external_ids));
+                    walked.push(remote(&show.item, show.external_ids, &facts));
                     for season in show.children {
-                        walked.push(remote(&season, Vec::new()));
+                        walked.push(remote(&season, Vec::new(), &none));
                     }
                     for episode in self.catalog.episodes(item.id()).await? {
-                        walked.push(self.leaf(&episode, ids).await?);
+                        walked.push(self.leaf(&episode, &none, ids).await?);
                     }
                 }
                 Item::Artist(_) => {
                     let artist = self.catalog.item(item.id()).await?;
-                    walked.push(remote(&artist.item, artist.external_ids));
+                    walked.push(remote(&artist.item, artist.external_ids, &facts));
                     for album in artist.children {
                         let album = self.catalog.item(album.id()).await?;
-                        walked.push(remote(&album.item, album.external_ids));
+                        walked.push(remote(&album.item, album.external_ids, &none));
                         for track in album.children {
-                            walked.push(self.leaf(&track, ids).await?);
+                            walked.push(self.leaf(&track, &none, ids).await?);
                         }
                     }
                 }
-                _ => walked.push(self.leaf(&item, ids).await?),
+                _ => walked.push(self.leaf(&item, &facts, ids).await?),
             }
         }
         Ok(walked)
@@ -352,12 +371,45 @@ impl Federation {
     /// A film, episode or track as sent, with its external ids: the ones
     /// kept while the rest of it is unchanged, else the catalog's now. A
     /// listing has none, and asking for each at every sync would cost a
-    /// request per item.
-    async fn leaf(&self, item: &Item, ids: &mut Ids) -> Result<RemoteItem, CatalogError> {
+    /// request per item. A film's own record also says what its listing
+    /// does not (every genre, its dynamic range), read and kept with them;
+    /// one kept from before that is read once more.
+    async fn leaf(
+        &self,
+        item: &Item,
+        listed: &Facts,
+        ids: &mut Ids,
+    ) -> Result<RemoteItem, CatalogError> {
+        let film = matches!(item, Item::Movie(_));
         let id = item.id().to_string();
-        let shallow = remote(item, Vec::new()).hash;
-        let external_ids = match ids.kept.get(&id).filter(|(was, _)| *was == shallow) {
-            Some((_, kept)) => kept.clone(),
+        let shallow = remote(item, Vec::new(), listed).hash;
+        let kept = ids
+            .kept
+            .get(&id)
+            .filter(|(was, _, details)| *was == shallow && (!film || details.is_some()));
+        let (external_ids, details) = match kept {
+            Some((_, kept, details)) => (
+                kept.clone(),
+                details
+                    .as_deref()
+                    .and_then(|d| serde_json::from_str::<Details>(d).ok())
+                    .unwrap_or_default(),
+            ),
+            None if film => {
+                let (read, record) = self.catalog.details(item.id()).await?;
+                let details = Details {
+                    genres: record.genres,
+                    dynamic_range: record.dynamic_range,
+                };
+                ids.read.push(KeptIds {
+                    item: id,
+                    library: ids.library.clone(),
+                    shallow,
+                    external_ids: read.clone(),
+                    details: Some(serde_json::to_string(&details).expect("details serialize")),
+                });
+                (read, details)
+            }
             None => {
                 let read = self.catalog.external_ids(item.id()).await?;
                 ids.read.push(KeptIds {
@@ -365,11 +417,21 @@ impl Federation {
                     library: ids.library.clone(),
                     shallow,
                     external_ids: read.clone(),
+                    details: None,
                 });
-                read
+                (read, Details::default())
             }
         };
-        Ok(remote(item, external_ids))
+        let facts = Facts {
+            genres: if details.genres.is_empty() {
+                listed.genres.clone()
+            } else {
+                details.genres
+            },
+            dynamic_range: details.dynamic_range.or(listed.dynamic_range),
+            ..listed.clone()
+        };
+        Ok(remote(item, external_ids, &facts))
     }
 
     /// Answer pair `peer`'s `sync` of `library`, walked as `walked`: what
@@ -669,6 +731,55 @@ mod tests {
         assert!(!answering.allowed("sb", Ask::Snapshot, &limits));
         assert!(answering.allowed("sb", Ask::Artwork, &limits));
         assert!(answering.allowed("sc", Ask::Snapshot, &limits));
+    }
+
+    /// A film's own record (every genre, its range) is read once, kept
+    /// with its external ids and sent from there at the next walk; one
+    /// kept from before it had them is read once more.
+    #[tokio::test]
+    async fn a_film_s_details_are_read_once_and_kept() {
+        use super::super::tokens::tests::sharing_from;
+        use crate::test_support::FakeCatalog;
+        let catalog = Arc::new(FakeCatalog::new("/nowhere/movie.mkv".into()));
+        let (store, federation, _) = sharing_from("fed-walk-details", catalog.clone()).await;
+        let library: LibraryId = "plex:1".parse().unwrap();
+        let film: spoolframe_types::MediaId = "plex:movie:1".parse().unwrap();
+        let sent = |walked: &[RemoteItem]| {
+            let item = walked
+                .iter()
+                .find(|i| i.id == film.to_string())
+                .expect("the film is walked")
+                .clone();
+            (item.genres, item.dynamic_range)
+        };
+        let expected = (
+            vec!["Horror".to_owned(), "Science Fiction".to_owned()],
+            Some(spoolframe_types::DynamicRange::Hdr),
+        );
+        catalog.take_calls(&film);
+        let first = federation.walk(&library).await.unwrap();
+        assert_eq!(sent(&first), expected);
+        assert_eq!(catalog.take_calls(&film), ["details"]);
+        let again = federation.walk(&library).await.unwrap();
+        assert_eq!(sent(&again), expected);
+        assert_eq!(catalog.take_calls(&film), Vec::<&str>::new());
+        // Kept before details were: read again, once.
+        let kept = store.external_ids_of("plex:1").await.unwrap();
+        let (shallow, ids, _) = kept[&film.to_string()].clone();
+        store
+            .keep_all_external_ids(&[KeptIds {
+                item: film.to_string(),
+                library: "plex:1".into(),
+                shallow,
+                external_ids: ids,
+                details: None,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(sent(&federation.walk(&library).await.unwrap()), expected);
+        assert_eq!(catalog.take_calls(&film), ["details"]);
+        federation.walk(&library).await.unwrap();
+        assert_eq!(catalog.take_calls(&film), Vec::<&str>::new());
     }
 
     /// M8-02: a pair that names no cursor kept, again and again, is

@@ -268,6 +268,9 @@ pub fn Libraries() -> Element {
                             super::plex::SyncPanel { toast }
                             super::plex::SyncExplained {}
                         }
+                        // What paired servers share (P8-02): nothing with
+                        // federation off.
+                        super::paired::PairedServers {}
                     }
                     if let Some(library) = mapping() {
                         if let Some(server) = o.servers.iter().find(|s| s.id == library.server).cloned() {
@@ -448,6 +451,7 @@ fn LibraryRow(
                         filter: String::new(),
                         kind: String::new(),
                         q: String::new(),
+                        sort: String::new(),
                     },
                     "{library.name}"
                 }

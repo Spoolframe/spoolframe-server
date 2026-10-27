@@ -2541,6 +2541,201 @@ mod replica {
         panic!("not in ten seconds");
     }
 
+    /// A shared library is sorted and filtered on SB, in its cache, by
+    /// what SA sent: the film's own record's genres and range among it.
+    #[tokio::test]
+    async fn a_shared_library_is_sorted_and_filtered_in_the_cache() {
+        use spoolframe_types::{DynamicRange, ItemFilter, ItemSort, SortKey};
+        let pair = Pair::start("fed-replica-browse").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let app = pair.sb.client().await;
+        let hello = spoolframe_protocol::Hello {
+            protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+            client_name: "test".into(),
+            client_version: "0".into(),
+            platform: spoolframe_types::Platform::Linux,
+            device_name: None,
+            capabilities: None,
+            experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features: Vec::new(),
+        };
+        app.call(None, Request::Hello(hello)).await;
+        pair.sb.add_user("bob", "correct horse", None).await;
+        let bob = app.login("bob", "correct horse").await;
+        let library = pair.fed_library("plex:1");
+        let values = app
+            .call(
+                Some(&bob),
+                Request::ItemFilterValues {
+                    library: library.clone(),
+                },
+            )
+            .await;
+        let Response::Ok(Reply::ItemFilterValues { values }) = values else {
+            panic!("{values:?}");
+        };
+        let genres: Vec<&str> = values.genres.iter().map(|g| g.value.as_str()).collect();
+        assert_eq!(genres, ["Horror", "Science Fiction"]);
+        assert!(values.sorts.contains(&SortKey::Size));
+        let page = |filter: ItemFilter| Request::Items {
+            library: library.clone(),
+            offset: 0,
+            limit: 10,
+            sort: Some(ItemSort {
+                key: SortKey::Added,
+                descending: true,
+            }),
+            filter: Some(filter),
+        };
+        let hdr = app
+            .call(
+                Some(&bob),
+                page(ItemFilter {
+                    dynamic_ranges: vec![DynamicRange::Hdr],
+                    watched: vec![spoolframe_types::WatchedState::Unwatched],
+                    ..ItemFilter::default()
+                }),
+            )
+            .await;
+        let Response::Ok(Reply::Items { items, total, .. }) = hdr else {
+            panic!("{hdr:?}");
+        };
+        assert_eq!(
+            (
+                items.iter().map(|i| i.id().clone()).collect::<Vec<_>>(),
+                total
+            ),
+            (vec![pair.fed(movie().id())], 1)
+        );
+        let comedy = app
+            .call(
+                Some(&bob),
+                page(ItemFilter {
+                    genres: vec!["Comedy".into()],
+                    ..ItemFilter::default()
+                }),
+            )
+            .await;
+        let Response::Ok(Reply::Items { items, total, .. }) = comedy else {
+            panic!("{comedy:?}");
+        };
+        assert_eq!((items.len(), total), (0, 0));
+        pair.stop().await;
+    }
+
+    /// SB's admin browses what SA shares from the web UI: the library
+    /// under SA's name, online; its page sorted and filtered by the same
+    /// query; the film as cached; and still all of it once SA is gone
+    /// offline, marked so.
+    #[tokio::test]
+    async fn an_admin_browses_a_paired_server_s_libraries_from_the_cache() {
+        use spoolframe_admin_api::{
+            AdminApiClient, DynamicRange, ItemFilter, ItemSort, MeApiClient, PairedQuery, SortKey,
+            error_code,
+        };
+        use spoolframe_server::admin::{Admin, Origins, TrustedProxies};
+        let pair = Pair::start("fed-admin-browse").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        pair.sb.add_user("bob", "correct horse", None).await;
+        pair.sb
+            .store
+            .set_role("bob", spoolframe_types::Role::Admin)
+            .await
+            .unwrap();
+        let (addr, handle) = spoolframe_server::admin::serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Admin {
+                federation: pair.sb.federation.clone(),
+                watch: Some(pair.sb.watch.clone()),
+                plex: pair.cache.clone(),
+                ..crate::admin::admin(pair.sb.auth.clone(), None)
+            },
+            Origins::default(),
+            TrustedProxies::default(),
+        )
+        .await
+        .unwrap();
+        std::mem::forget(handle);
+        let token = crate::admin::anonymous(addr)
+            .await
+            .login(crate::admin::creds("bob", "correct horse"))
+            .await
+            .unwrap()
+            .token;
+        let bob = crate::admin::with_token(addr, &token).await;
+
+        let servers = bob.catalog_paired_libraries().await.unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            (servers[0].name.as_str(), servers[0].online),
+            ("Alice's server", true)
+        );
+        let library = pair.fed_library("plex:1").to_string();
+        assert_eq!(servers[0].libraries[0].id, library);
+        let values = bob.catalog_filter_values(library.clone()).await.unwrap();
+        assert!(values.sorts.contains(&SortKey::Size));
+        let hdr = PairedQuery {
+            library: library.clone(),
+            offset: 0,
+            limit: 50,
+            sort: Some(ItemSort {
+                key: SortKey::Added,
+                descending: true,
+            }),
+            item_filter: Some(ItemFilter {
+                dynamic_ranges: vec![DynamicRange::Hdr],
+                ..ItemFilter::default()
+            }),
+        };
+        let page = bob.catalog_paired_items(hdr.clone()).await.unwrap();
+        let alien = pair.fed(movie().id());
+        assert_eq!(
+            (
+                page.items
+                    .iter()
+                    .map(|i| i.id().clone())
+                    .collect::<Vec<_>>(),
+                page.total
+            ),
+            (vec![alien.clone()], 1)
+        );
+        let item = bob.catalog_paired_item(alien.to_string()).await.unwrap();
+        assert_eq!(item.item.id(), &alien);
+        assert_eq!(item.server_name, "Alice's server");
+        assert_eq!(item.library.map(|l| l.id), Some(library.clone()));
+        // A page asked past the limit, and an id of this server's own.
+        let too_many = PairedQuery {
+            limit: 201,
+            ..hdr.clone()
+        };
+        assert_eq!(
+            crate::admin::code(bob.catalog_paired_items(too_many).await.unwrap_err()),
+            error_code::INVALID_INPUT
+        );
+        assert_eq!(
+            crate::admin::code(
+                bob.catalog_paired_item(movie().id().to_string())
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::INVALID_INPUT
+        );
+        // SA gone offline: the cache still answers, marked offline.
+        let origin = pair.origin().to_owned();
+        pair.sa.stop().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while federation(&pair.sb).online(&origin) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let servers = bob.catalog_paired_libraries().await.unwrap();
+        assert!(!servers[0].online);
+        let page = bob.catalog_paired_items(hdr).await.unwrap();
+        assert_eq!((page.total, page.online), (1, false));
+        pair.sb.stop().await;
+    }
+
     /// The whole of it: SA shares Movies, SB syncs and serves the film
     /// from its cache under its `fed:` id, with its external ids and the
     /// poster fetched as it came. Nothing of it is in SB's own libraries.
@@ -2765,6 +2960,8 @@ mod replica {
                 library: pair.fed_library("plex:1"),
                 offset: 0,
                 limit: 10,
+                sort: None,
+                filter: None,
             },
         ] {
             assert!(

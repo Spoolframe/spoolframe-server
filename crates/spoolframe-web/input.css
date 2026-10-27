@@ -2943,6 +2943,85 @@
     background: var(--ctp-teal);
     color: var(--ctp-crust);
   }
+  /* Server › Libraries' "Shared with this server" (P8-02): a paired
+     server's libraries under its name, read-only, so a plain row each. */
+  .paired-head {
+    display: flex;
+    align-items: center;
+    padding: 10px 16px;
+  }
+  .paired-row {
+    display: grid;
+    grid-template-columns: 36px minmax(0, 1fr);
+    gap: 12px;
+    align-items: center;
+    padding: 12px 16px;
+    border-top: 1px solid var(--ctp-surface0);
+  }
+  .paired-row .lib-what {
+    line-height: 1.3;
+    gap: 1px;
+  }
+  /* Whether a paired server is online now: green, or grey. */
+  .reach-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ctp-overlay0);
+    flex-shrink: 0;
+  }
+  .reach-on {
+    background: var(--ctp-green);
+  }
+  /* The library's filter panel: the columns menu's surface, wider, its
+     parts one under another. */
+  .cat-filters {
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    max-height: 70vh;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  @media (max-width: 767px) {
+    .cat-filters {
+      right: auto;
+      left: 0;
+    }
+  }
+  .cat-filter-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .cat-filter-label {
+    font: 600 12px var(--font-sans);
+    color: var(--ctp-subtext0);
+  }
+  .cat-filter-values {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-height: 168px;
+    overflow-y: auto;
+  }
+  .cat-year {
+    width: 88px;
+    height: 32px;
+    box-sizing: border-box;
+    border-radius: 8px;
+    border: 1px solid var(--ctp-surface1);
+    background: var(--ctp-crust);
+    color: var(--ctp-text);
+    padding: 0 8px;
+    font: 14px var(--font-sans);
+  }
+  .cat-year:focus {
+    border-color: var(--ctp-teal);
+    outline: none;
+  }
   .cat-banner {
     font-size: 13px;
     color: var(--ctp-subtext0);

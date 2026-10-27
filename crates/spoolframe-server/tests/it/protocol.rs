@@ -168,6 +168,8 @@ async fn every_other_request_needs_a_session() {
             library: LibraryId::new(Namespace::Plex, "1").unwrap(),
             offset: 0,
             limit: 10,
+            sort: None,
+            filter: None,
         },
         Request::Item { id: id.clone() },
         Request::Search(support::search("alien")),

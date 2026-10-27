@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use spoolframe_catalog::Facts;
 use spoolframe_protocol::federation::{RemoteArtwork, RemoteArtworkKind, RemoteItem, RemoteKind};
 use spoolframe_types::{
     Album, Artist, Artwork, ArtworkId, ArtworkKind, CalendarDate, Episode, Item, MediaId,
@@ -38,8 +39,9 @@ fn date(date: Option<CalendarDate>) -> Option<String> {
     date.map(|d| d.to_string())
 }
 
-/// `item` as federation/1 carries it, with `external_ids`, and hashed.
-pub fn remote(item: &Item, external_ids: Vec<String>) -> RemoteItem {
+/// `item` as federation/1 carries it, with `external_ids` and what `facts`
+/// says of it to sort and filter by, and hashed.
+pub fn remote(item: &Item, external_ids: Vec<String>, facts: &Facts) -> RemoteItem {
     let blank = |id: &MediaId, kind, title: &str| RemoteItem {
         id: id.to_string(),
         kind,
@@ -59,6 +61,14 @@ pub fn remote(item: &Item, external_ids: Vec<String>) -> RemoteItem {
         genres: Vec::new(),
         artwork: Vec::new(),
         external_ids: Vec::new(),
+        sort_title: None,
+        released: None,
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        size: None,
+        resolution: None,
+        dynamic_range: None,
         hash: String::new(),
     };
     let remote = match item {
@@ -127,6 +137,33 @@ pub fn remote(item: &Item, external_ids: Vec<String>) -> RemoteItem {
             artwork: artwork(&t.artwork),
             ..blank(&t.id, RemoteKind::Track, &t.title)
         },
+    };
+    // What a library is sorted and filtered by: a film's, a show's or an
+    // artist's, the top of a library; a show's genres are its own item's.
+    let remote = match item {
+        Item::Movie(_) | Item::Show(_) | Item::Artist(_) => RemoteItem {
+            sort_title: facts.sort_title.clone(),
+            released: facts.released.clone(),
+            added_at: facts.added_at,
+            rating_tenths: facts.rating_tenths,
+            audience_rating_tenths: facts.audience_rating_tenths,
+            genres: if remote.genres.is_empty() {
+                facts.genres.clone()
+            } else {
+                remote.genres
+            },
+            ..remote
+        },
+        _ => remote,
+    };
+    let remote = match item {
+        Item::Movie(_) => RemoteItem {
+            size: facts.size,
+            resolution: facts.resolution,
+            dynamic_range: facts.dynamic_range,
+            ..remote
+        },
+        _ => remote,
     };
     RemoteItem {
         external_ids,
@@ -381,7 +418,7 @@ mod tests {
             album("31"),
             track("33", "31", 2),
         ] {
-            let sent = remote(&item, vec!["tmdb://348".into()]);
+            let sent = remote(&item, vec!["tmdb://348".into()], &Facts::default());
             assert_eq!(sent.external_ids, ["tmdb://348"]);
             assert_eq!(sent.hash, sent.digest());
             assert_eq!(local(ORIGIN, &sent), Some(federated(item)));
@@ -412,7 +449,7 @@ mod tests {
     fn a_malformed_federated_id_is_left_out_and_not_kept() {
         assert_eq!(media_id(ORIGIN, MediaKind::Movie, "fed:movie:x"), None);
         assert_eq!(artwork_id(ORIGIN, "fed:x"), None);
-        let sent = remote(&movie(), Vec::new());
+        let sent = remote(&movie(), Vec::new(), &Facts::default());
         assert!(keepable(&sent));
         for id in ["fed:movie:x", "fed:movie:aaaaaaaaaaaaaaaa:plex:1"] {
             assert!(!keepable(&RemoteItem {
@@ -422,10 +459,92 @@ mod tests {
         }
     }
 
+    /// What a library is sorted and filtered by goes with the top of it:
+    /// all of it with a film, all but its quality with a show, none with
+    /// an episode; and a show's own genres are kept over the listing's.
+    #[test]
+    fn the_browse_facts_go_with_a_library_s_top_items() {
+        let facts = Facts {
+            sort_title: Some("Alien (1979)".into()),
+            released: Some("1979-05-25".into()),
+            added_at: Some(1_700_000_000),
+            rating_tenths: Some(98),
+            audience_rating_tenths: Some(94),
+            size: Some(50 << 30),
+            resolution: Some(spoolframe_types::Resolution::Uhd),
+            dynamic_range: Some(spoolframe_types::DynamicRange::Hdr),
+            genres: vec!["Horror".into(), "Science Fiction".into()],
+        };
+        let film = remote(&movie(), Vec::new(), &facts);
+        assert_eq!(
+            (
+                film.sort_title.as_deref(),
+                film.released.as_deref(),
+                film.added_at,
+                film.rating_tenths,
+                film.audience_rating_tenths,
+                film.size,
+                film.resolution,
+                film.dynamic_range,
+                film.genres.clone(),
+            ),
+            (
+                Some("Alien (1979)"),
+                Some("1979-05-25"),
+                Some(1_700_000_000),
+                Some(98),
+                Some(94),
+                Some(50 << 30),
+                Some(spoolframe_types::Resolution::Uhd),
+                Some(spoolframe_types::DynamicRange::Hdr),
+                facts.genres.clone(),
+            )
+        );
+        assert_eq!(film.hash, film.digest());
+        let tv = remote(&show(), Vec::new(), &facts);
+        assert_eq!(
+            (tv.added_at, tv.size, tv.resolution, tv.dynamic_range),
+            (Some(1_700_000_000), None, None, None)
+        );
+        // A listing's few genres fill in for a show without its own.
+        assert_eq!(tv.genres, facts.genres);
+        let Item::Show(own) = show() else {
+            unreachable!()
+        };
+        let own = Item::Show(Show {
+            genres: vec!["Drama".into()],
+            ..own
+        });
+        assert_eq!(remote(&own, Vec::new(), &facts).genres, ["Drama"]);
+        let leaf = remote(&episode("12", "11", 1, 1), Vec::new(), &facts);
+        assert_eq!(
+            (leaf.added_at, leaf.sort_title, leaf.genres),
+            (None, None, Vec::<String>::new())
+        );
+        // Without any, a film is sent as before them.
+        let plain = remote(&movie(), Vec::new(), &Facts::default());
+        assert_eq!(
+            plain,
+            RemoteItem {
+                sort_title: None,
+                released: None,
+                added_at: None,
+                rating_tenths: None,
+                audience_rating_tenths: None,
+                size: None,
+                resolution: None,
+                dynamic_range: None,
+                genres: Vec::new(),
+                ..film
+            }
+            .hashed()
+        );
+    }
+
     /// What this build cannot read is left out, not guessed at.
     #[test]
     fn an_item_this_build_cannot_read_is_left_out() {
-        let sent = remote(&episode("12", "11", 1, 1), Vec::new());
+        let sent = remote(&episode("12", "11", 1, 1), Vec::new(), &Facts::default());
         assert_eq!(
             local(
                 ORIGIN,

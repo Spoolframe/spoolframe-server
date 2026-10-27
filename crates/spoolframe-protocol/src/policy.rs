@@ -68,6 +68,7 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::Ping
         | Request::Libraries
         | Request::Items { .. }
+        | Request::ItemFilterValues { .. }
         | Request::Item { .. }
         | Request::Search(_)
         | Request::PersonItems { .. }

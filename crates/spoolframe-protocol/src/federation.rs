@@ -509,6 +509,14 @@ mod tests {
                 kind: RemoteArtworkKind::Poster,
             }],
             external_ids: vec!["mbid://5e4b7b2c".into()],
+            sort_title: None,
+            released: None,
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            resolution: None,
+            dynamic_range: None,
             hash: String::new(),
         }
         .hashed()
@@ -566,6 +574,66 @@ mod tests {
             ..a.clone()
         };
         assert_ne!(renamed.digest(), a.hash);
+    }
+
+    /// What a library is sorted and filtered by is sent only when there
+    /// is some: an item without it encodes with the fields it had before
+    /// them, so its hash is as an older server makes it and nothing is
+    /// sent again for them alone; one with them crosses whole.
+    #[test]
+    fn the_browse_facts_are_sent_only_when_known() {
+        let bytes = crate::codec::encode(&item()).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let keys: Vec<String> = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "id",
+                "kind",
+                "title",
+                "parent",
+                "grandparent",
+                "parent_title",
+                "grandparent_title",
+                "index",
+                "parent_index",
+                "year",
+                "date",
+                "summary",
+                "content_rating",
+                "duration_ms",
+                "count",
+                "genres",
+                "artwork",
+                "external_ids",
+                "hash",
+            ]
+        );
+        let known = RemoteItem {
+            sort_title: Some("Something".into()),
+            released: Some("2001-03-12".into()),
+            added_at: Some(1_700_000_000),
+            rating_tenths: Some(87),
+            audience_rating_tenths: Some(91),
+            size: Some(30 << 30),
+            resolution: Some(spoolframe_types::Resolution::FullHd),
+            dynamic_range: Some(spoolframe_types::DynamicRange::DolbyVision),
+            ..item()
+        }
+        .hashed();
+        assert_ne!(known.hash, item().hash);
+        round_trip(PeerReply::Page(SyncPage {
+            mode: SyncMode::Snapshot,
+            cursor: "c".into(),
+            items: vec![known],
+            removed: Vec::new(),
+            more: false,
+        }));
     }
 
     /// A page past the bounds is cut to them as it is read: items,

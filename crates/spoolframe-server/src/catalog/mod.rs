@@ -14,12 +14,12 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
-    Catalog, CatalogError, Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames, Reach,
-    SearchQuery,
+    Browsing, Catalog, CatalogError, Facts, Found, Image, ItemPage, ItemQuery, ItemWithChildren,
+    Listed, Page, PreviewFrames, Reach, SearchQuery,
 };
 use spoolframe_plex::PlexCatalog;
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, Namespace, PersonId,
+    ArtworkId, Item, ItemFilterValues, Library, LibraryId, MediaId, MediaKind, Namespace, PersonId,
 };
 
 pub use composite::{Composite, PlexSource, Served, Synced};
@@ -181,6 +181,50 @@ impl Catalog for LiveCatalog {
                 async { self.current()?.items(library, page).await },
             )
             .await
+    }
+
+    /// Sorted and filtered listings are not kept: a walk by watch state
+    /// keeps its own, and each is as live as Plex.
+    /// Not kept: a paired server's sync walks a library at its own pace.
+    async fn items_with_facts(
+        &self,
+        library: &LibraryId,
+        page: Page,
+    ) -> Result<(ItemPage, Vec<Facts>), CatalogError> {
+        self.current()?.items_with_facts(library, page).await
+    }
+
+    async fn details(&self, id: &MediaId) -> Result<(Vec<String>, Facts), CatalogError> {
+        self.current()?.details(id).await
+    }
+
+    async fn browsing(&self, library: &Library) -> Result<Browsing, CatalogError> {
+        self.current()?.browsing(library).await
+    }
+
+    async fn filter_values(&self, library: &Library) -> Result<ItemFilterValues, CatalogError> {
+        self.current()?.filter_values(library).await
+    }
+
+    async fn query_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+        page: Page,
+    ) -> Result<ItemPage, CatalogError> {
+        self.current()?.query_items(library, query, page).await
+    }
+
+    async fn walk_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+    ) -> Result<Vec<Listed>, CatalogError> {
+        self.current()?.walk_items(library, query).await
+    }
+
+    async fn items_by_id(&self, ids: &[MediaId]) -> Result<Vec<Item>, CatalogError> {
+        self.current()?.items_by_id(ids).await
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {

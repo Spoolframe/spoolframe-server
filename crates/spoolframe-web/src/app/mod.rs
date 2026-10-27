@@ -21,6 +21,7 @@ mod licenses;
 mod logs;
 mod optimized;
 mod overview;
+mod paired;
 mod playback;
 mod playlists;
 mod plex;
@@ -54,6 +55,7 @@ use licenses::LicensesPage;
 use logs::LogsPage;
 use optimized::OptimizedPage;
 use overview::AdminHome;
+use paired::{PairedItem, PairedLibrary};
 use playback::{PlaybackDetail, PlaybackPage};
 use playlists::{MyPlaylists, PlaylistView, ServerPlaylists};
 use plex::PlexSignedIn;
@@ -152,11 +154,19 @@ enum Route {
             #[route("/libraries/add?:back")]
             AddLibrary { back: String },
             // A library's items (P3-16): where the table is is in the
-            // address, so a reload or a link opens the same rows.
-            #[route("/libraries/:library?:page&:per&:filter&:kind&:q")]
-            CatalogLibrary { library: String, page: String, per: String, filter: String, kind: String, q: String },
+            // address, so a reload or a link opens the same rows. `sort`,
+            // and an item filter in `filter`, sort and filter it as clients
+            // do (crate::browse); a link without them opens as before.
+            #[route("/libraries/:library?:page&:per&:filter&:kind&:q&:sort")]
+            CatalogLibrary { library: String, page: String, per: String, filter: String, kind: String, q: String, sort: String },
             #[route("/libraries/:library/:id?:tab")]
             CatalogItem { library: String, id: String, tab: String },
+            // A paired server's library (experimental federation, P8-02),
+            // from the cache: the same paging, sort and filters.
+            #[route("/paired/:library?:page&:per&:filter&:sort")]
+            PairedLibrary { library: String, page: String, per: String, filter: String, sort: String },
+            #[route("/paired/:library/:id")]
+            PairedItem { library: String, id: String },
             #[route("/settings")]
             SettingsHome {},
             // What the server and this web app are built from, and their
@@ -1453,7 +1463,10 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::OptimizedPage {} => "Optimized",
         Route::Libraries {} | Route::AddLibrary { .. } => "Libraries",
-        Route::CatalogLibrary { .. } | Route::CatalogItem { .. } => "Libraries",
+        Route::CatalogLibrary { .. }
+        | Route::CatalogItem { .. }
+        | Route::PairedLibrary { .. }
+        | Route::PairedItem { .. } => "Libraries",
         Route::ServerPlaylists {} => "Libraries",
         Route::MyPlaylists {} | Route::PlaylistView { .. } => "Playlists",
         Route::LicensesPage { .. } => "Licenses",
@@ -1693,6 +1706,8 @@ fn server_links(route: &Route) -> Element {
                     | Route::AddLibrary { .. }
                     | Route::CatalogLibrary { .. }
                     | Route::CatalogItem { .. }
+                    | Route::PairedLibrary { .. }
+                    | Route::PairedItem { .. }
                     | Route::ServerPlaylists {}
             ),
         ),

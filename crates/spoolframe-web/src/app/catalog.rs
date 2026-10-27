@@ -12,11 +12,13 @@ use std::collections::HashSet;
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
     AdminApiClient, ArtworkKind, CatalogFilter, CatalogLibrary as LibraryView, CatalogPage,
-    CatalogQuery, CatalogRow, Item, LibraryKind, PathsChecked, error_code,
+    CatalogQuery, CatalogRow, FilterPart, Item, ItemFilter, ItemFilterValues, LibraryKind,
+    PathsChecked, error_code,
 };
 
 use super::admin::sleep;
 use super::{Route, icons, now, rpc};
+use crate::browse;
 use crate::catalog::{
     Columns, FILTERS, FileCell, PER_PAGE, View, agent_names, file_cell, file_text, filter_banner,
     filter_count, filter_label, filter_name, first_file, header_line, item_kind, kind_label,
@@ -76,8 +78,10 @@ pub(super) fn thumb_of(item: &Item) -> Option<String> {
         .map(|a| a.id.to_string())
 }
 
-/// The route to `view` of `library`.
+/// The route to `view` of `library`. A sort or an item filter goes only
+/// where it applies: the top level, without a search or a quick filter.
 fn route_to(library: &str, view: &View) -> Route {
+    let sortable = view.filter.is_none() && view.kind.is_none() && view.text.trim().is_empty();
     Route::CatalogLibrary {
         library: library.to_owned(),
         page: if view.page > 1 {
@@ -90,15 +94,30 @@ fn route_to(library: &str, view: &View) -> Route {
         } else {
             String::new()
         },
-        filter: view.filter.map(filter_name).unwrap_or_default().to_owned(),
+        filter: match view.filter {
+            Some(f) => filter_name(f).to_owned(),
+            None if sortable => view.filter_param(),
+            None => String::new(),
+        },
         kind: view.kind.map(kind_name).unwrap_or_default().to_owned(),
         q: view.text.clone(),
+        sort: if sortable {
+            view.sort_param()
+        } else {
+            String::new()
+        },
     }
 }
 
 async fn load_library(id: String) -> Result<LibraryView, ApiError> {
     let client = rpc::client().await?;
     client.catalog_library(id).await.map_err(rpc::error)
+}
+
+/// What the library can be sorted and filtered by, as clients are told.
+async fn load_values(id: String) -> Result<ItemFilterValues, ApiError> {
+    let client = rpc::client().await?;
+    client.catalog_filter_values(id).await.map_err(rpc::error)
 }
 
 async fn load_rows(library: String, view: View) -> Result<CatalogPage, ApiError> {
@@ -112,6 +131,8 @@ async fn load_rows(library: String, view: View) -> Result<CatalogPage, ApiError>
             filter: view.filter,
             offset: view.offset(),
             limit: view.per,
+            sort: view.sort,
+            item_filter: (!view.items.is_empty()).then(|| view.items.clone()),
         })
         .await
         .map_err(rpc::error)
@@ -197,12 +218,17 @@ pub fn CatalogLibrary(
     filter: String,
     kind: String,
     q: String,
+    sort: String,
 ) -> Element {
-    let view = View::parse(&page, &per, &filter, &kind, &q);
+    let view = View::parse_sorted(&page, &per, &filter, &kind, &q, &sort);
     let nav = navigator();
     let mut header = use_resource(use_reactive((&library,), |(library,)| {
         load_library(library)
     }));
+    // Without it (an older server, or none of its own watch state), the
+    // sort and filter controls are left out.
+    let values = use_resource(use_reactive((&library,), |(library,)| load_values(library)));
+    let mut filters_open = use_signal(|| false);
     let mut rows = use_resource(use_reactive((&library, &view), |(library, view)| {
         load_rows(library, view)
     }));
@@ -237,6 +263,10 @@ pub fn CatalogLibrary(
     };
     let current_header = header.read().clone();
     let current_rows = rows.read().clone();
+    let offered = match &*values.read() {
+        Some(Ok(values)) => Some(values.clone()),
+        _ => None,
+    };
     let shown_columns = columns().for_filter(view.filter);
 
     let Some(found) = current_header else {
@@ -335,6 +365,40 @@ pub fn CatalogLibrary(
                         }
                     }
                 }
+                if let Some(offered) = offered.clone() {
+                    if !offered.sorts.is_empty() {
+                        SortSelect {
+                            view: view.clone(),
+                            offered: offered.clone(),
+                            on_go: {
+                                let go = go.clone();
+                                move |v: View| go(v)
+                            },
+                        }
+                    }
+                    if !offered.filters.is_empty() {
+                        div { class: "relative",
+                            button {
+                                class: if view.items.is_empty() { "btn" } else { "btn cat-chip-on" },
+                                aria_haspopup: "dialog",
+                                aria_expanded: "{filters_open()}",
+                                onclick: move |_| filters_open.toggle(),
+                                icons::Sliders { size: 14 }
+                                "Filters"
+                            }
+                            if filters_open() {
+                                Filters {
+                                    view: view.clone(),
+                                    offered,
+                                    on_go: {
+                                        let go = go.clone();
+                                        move |v: View| go(v)
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
                 span { class: "flex-grow" }
                 div { class: "relative hidden md:block",
                     button {
@@ -378,6 +442,24 @@ pub fn CatalogLibrary(
                     }
                 }
             }
+            if !view.items.is_empty() {
+                div { class: "cat-banner flex flex-wrap items-center gap-2",
+                    "Only {browse::filter_text(&view.items)}"
+                    if !view.items.watched.is_empty() {
+                        " · by your own watch state"
+                    }
+                    button {
+                        class: "cat-chip",
+                        onclick: {
+                            let go = go.clone();
+                            let view = view.clone();
+                            move |_| go(view.browsing(view.sort, ItemFilter::default()))
+                        },
+                        icons::X { size: 12 }
+                        "Clear filters"
+                    }
+                }
+            }
             if let Some(f) = view.filter {
                 div { class: "cat-banner",
                     "{filter_banner(f, &lib.paths, now)}"
@@ -400,6 +482,22 @@ pub fn CatalogLibrary(
                     rsx! {
                         if waiting {
                             Skeleton { rows: 3 }
+                        } else if empty && !view.items.is_empty() {
+                            section { class: "card empty",
+                                b { "Nothing here with these filters" }
+                                span { "{browse::filter_text(&view.items)}" }
+                                span {
+                                    button {
+                                        class: "btn",
+                                        onclick: {
+                                            let go = go.clone();
+                                            let view = view.clone();
+                                            move |_| go(view.browsing(view.sort, ItemFilter::default()))
+                                        },
+                                        "Clear filters"
+                                    }
+                                }
+                            }
                         } else if empty {
                             Nothing {
                                 text: view.text.clone(),
@@ -468,6 +566,224 @@ pub fn CatalogLibrary(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The order of the top level: Plex's own, or a sort the library offers
+/// as clients sort it. Choosing one leaves a search, a kind or a quick
+/// filter behind; they list apart.
+#[component]
+pub(super) fn SortSelect(
+    view: View,
+    offered: ItemFilterValues,
+    on_go: EventHandler<View>,
+) -> Element {
+    let choices = browse::sort_choices(&offered.sorts);
+    let current = view.sort_param();
+    rsx! {
+        select {
+            class: "cat-select",
+            aria_label: "Sort",
+            onchange: move |e: FormEvent| {
+                on_go.call(view.browsing(browse::sort_from_name(&e.value()), view.items.clone()))
+            },
+            option { value: "", selected: current.is_empty(), "Plex's order" }
+            for sort in choices {
+                {
+                    let name = browse::sort_name(sort);
+                    rsx! {
+                        option { key: "{name}", value: "{name}", selected: current == name, "{browse::sort_label(sort)}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One value of a filter part as a chip: on when the filter has it.
+#[component]
+fn FilterChip(label: String, count: Option<u32>, on: bool, on_toggle: EventHandler<()>) -> Element {
+    rsx! {
+        button {
+            class: if on { "cat-chip cat-chip-on" } else { "cat-chip" },
+            aria_pressed: "{on}",
+            onclick: move |_| on_toggle.call(()),
+            "{label}"
+            if let Some(n) = count {
+                span { class: "cat-chip-count", "{thousands(u64::from(n))}" }
+            }
+        }
+    }
+}
+
+/// The filter panel: each part the library offers, its values as chips.
+/// Values within a part are any of them; parts are all of them. Each
+/// change goes to the address at once.
+#[component]
+pub(super) fn Filters(view: View, offered: ItemFilterValues, on_go: EventHandler<View>) -> Element {
+    let offers = |part: FilterPart| offered.filters.contains(&part);
+    let set = {
+        let view = view.clone();
+        move |items: ItemFilter| on_go.call(view.browsing(view.sort, items))
+    };
+    let items = view.items.clone();
+    let (first, last) = (
+        offered.years.iter().map(|y| y.value).min(),
+        offered.years.iter().map(|y| y.value).max(),
+    );
+    let year_hint = match (first, last) {
+        (Some(first), Some(last)) => format!("{first} to {last}"),
+        _ => String::new(),
+    };
+    rsx! {
+        div { class: "cat-menu cat-filters", role: "dialog", aria_label: "Filters",
+            if offers(FilterPart::Watched) {
+                div { class: "cat-filter-group",
+                    span { class: "cat-filter-label", "Watched by you" }
+                    div { class: "cat-filter-values",
+                        for state in browse::WATCHED {
+                            FilterChip {
+                                key: "{browse::watched_name(state)}",
+                                label: browse::watched_label(state).to_owned(),
+                                count: None,
+                                on: items.watched.contains(&state),
+                                on_toggle: {
+                                    let set = set.clone();
+                                    let items = items.clone();
+                                    move |_| set(ItemFilter { watched: browse::toggled(&items.watched, &state), ..items.clone() })
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            if offers(FilterPart::Genres) && !offered.genres.is_empty() {
+                div { class: "cat-filter-group",
+                    span { class: "cat-filter-label", "Genre" }
+                    div { class: "cat-filter-values",
+                        for genre in offered.genres.iter().cloned() {
+                            FilterChip {
+                                key: "{genre.value}",
+                                label: genre.value.clone(),
+                                count: genre.count,
+                                on: items.genres.iter().any(|g| g.eq_ignore_ascii_case(&genre.value)),
+                                on_toggle: {
+                                    let set = set.clone();
+                                    let items = items.clone();
+                                    move |_| set(ItemFilter { genres: browse::toggled(&items.genres, &genre.value), ..items.clone() })
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            if offers(FilterPart::Years) {
+                div { class: "cat-filter-group",
+                    span { class: "cat-filter-label", "Year" }
+                    div { class: "flex items-center gap-2",
+                        input {
+                            class: "cat-year",
+                            r#type: "number",
+                            aria_label: "From year",
+                            placeholder: "From",
+                            value: items.year_from.map(|y| y.to_string()).unwrap_or_default(),
+                            onchange: {
+                                let set = set.clone();
+                                let items = items.clone();
+                                move |e: FormEvent| set(ItemFilter { year_from: browse::typed_year(&e.value()), ..items.clone() })
+                            },
+                        }
+                        span { "to" }
+                        input {
+                            class: "cat-year",
+                            r#type: "number",
+                            aria_label: "To year",
+                            placeholder: "To",
+                            value: items.year_to.map(|y| y.to_string()).unwrap_or_default(),
+                            onchange: {
+                                let set = set.clone();
+                                let items = items.clone();
+                                move |e: FormEvent| set(ItemFilter { year_to: browse::typed_year(&e.value()), ..items.clone() })
+                            },
+                        }
+                        if !year_hint.is_empty() {
+                            span { class: "cat-menu-note", "{year_hint}" }
+                        }
+                    }
+                }
+            }
+            if offers(FilterPart::Resolutions) {
+                div { class: "cat-filter-group",
+                    span { class: "cat-filter-label", "Resolution" }
+                    div { class: "cat-filter-values",
+                        for resolution in offered.resolutions.iter().cloned() {
+                            FilterChip {
+                                key: "{resolution.value.as_str()}",
+                                label: browse::resolution_label(resolution.value).to_owned(),
+                                count: resolution.count,
+                                on: items.resolutions.contains(&resolution.value),
+                                on_toggle: {
+                                    let set = set.clone();
+                                    let items = items.clone();
+                                    move |_| set(ItemFilter { resolutions: browse::toggled(&items.resolutions, &resolution.value), ..items.clone() })
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            if offers(FilterPart::DynamicRanges) {
+                div { class: "cat-filter-group",
+                    span { class: "cat-filter-label", "Dynamic range" }
+                    div { class: "cat-filter-values",
+                        for range in offered.dynamic_ranges.iter().cloned() {
+                            FilterChip {
+                                key: "{browse::range_name(range.value)}",
+                                label: browse::range_label(range.value).to_owned(),
+                                count: range.count,
+                                on: items.dynamic_ranges.contains(&range.value),
+                                on_toggle: {
+                                    let set = set.clone();
+                                    let items = items.clone();
+                                    move |_| set(ItemFilter { dynamic_ranges: browse::toggled(&items.dynamic_ranges, &range.value), ..items.clone() })
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            if offers(FilterPart::ContentRatings) && !offered.content_ratings.is_empty() {
+                div { class: "cat-filter-group",
+                    span { class: "cat-filter-label", "Content rating" }
+                    div { class: "cat-filter-values",
+                        for rating in offered.content_ratings.iter().cloned() {
+                            FilterChip {
+                                key: "{rating.value}",
+                                label: rating.value.clone(),
+                                count: rating.count,
+                                on: items.content_ratings.iter().any(|r| r.eq_ignore_ascii_case(&rating.value)),
+                                on_toggle: {
+                                    let set = set.clone();
+                                    let items = items.clone();
+                                    move |_| set(ItemFilter { content_ratings: browse::toggled(&items.content_ratings, &rating.value), ..items.clone() })
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            if !items.is_empty() {
+                button {
+                    class: "btn self-start",
+                    onclick: {
+                        let set = set.clone();
+                        move |_| set(ItemFilter::default())
+                    },
+                    icons::X { size: 12 }
+                    "Clear filters"
                 }
             }
         }
@@ -750,7 +1066,7 @@ fn Nothing(
 
 /// Numbered pages and the page size, or on a phone, back and next.
 #[component]
-fn Pager(
+pub(super) fn Pager(
     view: View,
     total: u32,
     shown: usize,

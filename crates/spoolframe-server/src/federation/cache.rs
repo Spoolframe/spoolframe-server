@@ -19,18 +19,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
-    Catalog, CatalogError, Found, FoundGroup, Image, ItemPage, ItemWithChildren, Page, Reach,
-    SearchQuery, episode_ids,
+    Browsing, Catalog, CatalogError, Found, FoundGroup, Image, ItemPage, ItemQuery,
+    ItemWithChildren, Page, Reach, SearchQuery, Viewer, episode_ids,
 };
 use spoolframe_federation::{DialError, Dialed};
 use spoolframe_protocol::federation::{RemoteItem, RemoteKind};
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, PersonId, SearchKind,
+    ArtworkId, FilterPart, Item, ItemFilterValues, Library, LibraryId, LibraryKind, MediaId,
+    MediaKind, PersonId, SearchKind,
 };
 
 use super::items::{self, local};
 use crate::store::federation::PeerRecord;
+use crate::store::federation_browse::{CachedLibraryOf, SeenCached};
 use crate::store::federation_cache::{BrowseLimits, Browsed, CachedFile, FileLimits};
+use crate::store::watch::Seen;
 use crate::store::{Store, StoreError};
 
 /// The default limit on each origin's artwork files: 2 GiB.
@@ -263,6 +266,57 @@ fn file_name(artwork: &str) -> String {
 }
 
 impl PeerCache {
+    /// The cached library `library` names: its origin, its id there, and
+    /// the kind of its top-level items.
+    async fn cached_of<'a>(
+        &self,
+        library: &'a LibraryId,
+    ) -> Result<(&'a str, String, &'static str), CatalogError> {
+        let (origin, remote) = library.remote().ok_or_else(|| foreign(library))?;
+        let cached = self
+            .store
+            .cached_library(origin, &remote.to_string())
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(library.to_string()))?;
+        let kind =
+            top_kind(&cached.kind).ok_or_else(|| CatalogError::NotFound(library.to_string()))?;
+        Ok((origin, cached.library, kind))
+    }
+
+    /// `viewer`'s state of each of `origin`'s top-level items they have
+    /// one of, by its id there: from their rows, as this server's own
+    /// libraries' ([`Seen::of_rows`]), a show judged by its episodes
+    /// cached.
+    async fn seen(&self, origin: &str, viewer: &Viewer) -> Result<Vec<SeenCached>, CatalogError> {
+        let Ok(principal) = viewer.principal.parse::<crate::principal::Principal>() else {
+            return Ok(Vec::new());
+        };
+        let rows = self.store.all_watch(principal).await?;
+        let started_ms = i64::try_from(viewer.started_after_ms).unwrap_or(i64::MAX);
+        let seen: Vec<(String, MediaKind, Seen)> = Seen::of_rows(&rows, started_ms)
+            .into_iter()
+            .filter_map(|(id, seen)| {
+                let id: MediaId = id.parse().ok()?;
+                let (of, remote) = id.remote()?;
+                (of == origin).then(|| (remote.to_string(), id.kind(), seen))
+            })
+            .collect();
+        let shows: Vec<&str> = seen
+            .iter()
+            .filter(|(_, kind, _)| *kind == MediaKind::Show)
+            .map(|(item, _, _)| item.as_str())
+            .collect();
+        let leaves = self.store.cached_episode_counts(origin, &shows).await?;
+        Ok(seen
+            .iter()
+            .map(|(item, kind, seen)| SeenCached {
+                item: item.clone(),
+                state: seen.state(leaves.get(item).copied(), *kind == MediaKind::Show),
+                last: seen.last,
+            })
+            .collect())
+    }
+
     /// The cache over `store`, its artwork files under `dir` within
     /// `limits`, fetched over `links`.
     pub fn new(store: Store, dir: PathBuf, limits: FileLimits, links: Arc<Links>) -> Self {
@@ -732,6 +786,72 @@ impl Catalog for PeerCache {
         })
     }
 
+    /// Whatever its items carry, and the user's watch state, both in
+    /// this server's own database.
+    async fn browsing(&self, library: &Library) -> Result<Browsing, CatalogError> {
+        Ok(Browsing::cached(library.kind))
+    }
+
+    async fn filter_values(&self, library: &Library) -> Result<ItemFilterValues, CatalogError> {
+        let (origin, cached, kind) = self.cached_of(&library.id).await?;
+        let of = CachedLibraryOf {
+            origin,
+            library: &cached,
+            kind,
+        };
+        let browsing = Browsing::cached(library.kind);
+        let mut values = self.store.cached_values(of).await?;
+        let offered = |part| browsing.filters.contains(&part);
+        if !offered(FilterPart::Resolutions) {
+            values.resolutions.clear();
+        }
+        if !offered(FilterPart::Years) {
+            values.years.clear();
+        }
+        if !offered(FilterPart::ContentRatings) {
+            values.content_ratings.clear();
+        }
+        values
+            .dynamic_ranges
+            .retain(|r| browsing.dynamic_ranges.contains(&r.value));
+        values.sorts = browsing.sorts;
+        values.filters = browsing.filters;
+        Ok(values)
+    }
+
+    async fn query_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+        page: Page,
+    ) -> Result<ItemPage, CatalogError> {
+        let (origin, cached, kind) = self.cached_of(library).await?;
+        let of = CachedLibraryOf {
+            origin,
+            library: &cached,
+            kind,
+        };
+        let seen = match &query.viewer {
+            Some(viewer) if query.needs_viewer() => self.seen(origin, viewer).await?,
+            _ => Vec::new(),
+        };
+        let (items, total) = self
+            .store
+            .cached_sorted(
+                of,
+                query.sort,
+                &query.filter,
+                &seen,
+                page.offset,
+                page.limit,
+            )
+            .await?;
+        Ok(ItemPage {
+            items: locals(origin, &items),
+            total,
+        })
+    }
+
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
         let (origin, remote, _) = self.available(id).await?;
         let item = local(&origin, &remote).ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
@@ -941,6 +1061,9 @@ impl Catalog for PeerCache {
 }
 
 #[cfg(test)]
+mod browse_tests;
+
+#[cfg(test)]
 mod tests {
     use spoolframe_protocol::federation::{RemoteKind, RemoteLibraryKind, SharedLibrary};
 
@@ -978,6 +1101,14 @@ mod tests {
             genres: Vec::new(),
             artwork: Vec::new(),
             external_ids: Vec::new(),
+            sort_title: None,
+            released: None,
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            resolution: None,
+            dynamic_range: None,
             hash: String::new(),
         }
         .hashed()
@@ -1429,6 +1560,14 @@ mod tests {
                     kind: spoolframe_protocol::federation::RemoteArtworkKind::Poster,
                 }],
                 external_ids: vec![format!("mbid://a1b2c3d4-e5f6-7890-abcd-ef12345{n:05}")],
+                sort_title: None,
+                released: None,
+                added_at: None,
+                rating_tenths: None,
+                audience_rating_tenths: None,
+                size: None,
+                resolution: None,
+                dynamic_range: None,
                 hash: String::new(),
             }
             .hashed()

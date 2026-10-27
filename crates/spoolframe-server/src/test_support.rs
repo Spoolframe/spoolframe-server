@@ -573,6 +573,25 @@ impl Catalog for FakeCatalog {
         Ok(ItemPage { items, total })
     }
 
+    /// Movies is sorted by title or by when the user last watched it, and
+    /// filtered by their watch state, which the server applies, as it
+    /// does Plex's; Music only by title.
+    async fn browsing(
+        &self,
+        library: &Library,
+    ) -> Result<spoolframe_catalog::Browsing, CatalogError> {
+        use spoolframe_types::{FilterPart, SortKey};
+        if library.id.key() != "1" {
+            return Ok(spoolframe_catalog::Browsing::plain());
+        }
+        Ok(spoolframe_catalog::Browsing {
+            sorts: vec![SortKey::Title, SortKey::LastPlayed],
+            filters: vec![FilterPart::Watched],
+            dynamic_ranges: Vec::new(),
+            watch: spoolframe_catalog::WatchParts::ByServer,
+        })
+    }
+
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
         self.called("item", id);
         match self.old_key(id) {
@@ -623,6 +642,33 @@ impl Catalog for FakeCatalog {
                 }
             })
             .ok_or_else(|| CatalogError::NotFound(id.to_string()))
+    }
+
+    /// A film's record says every genre and its range, beyond its
+    /// listing: Horror and Science Fiction, in HDR.
+    async fn details(
+        &self,
+        id: &MediaId,
+    ) -> Result<(Vec<String>, spoolframe_catalog::Facts), CatalogError> {
+        self.called("details", id);
+        if self.old_key(id).is_some() {
+            return Ok((
+                self.external_ids(id).await?,
+                spoolframe_catalog::Facts::default(),
+            ));
+        }
+        let (item, _) = self
+            .current(id)
+            .ok_or_else(|| CatalogError::NotFound(id.to_string()))?;
+        let facts = match item {
+            Item::Movie(_) => spoolframe_catalog::Facts {
+                genres: vec!["Horror".into(), "Science Fiction".into()],
+                dynamic_range: Some(spoolframe_types::DynamicRange::Hdr),
+                ..spoolframe_catalog::Facts::default()
+            },
+            _ => spoolframe_catalog::Facts::default(),
+        };
+        Ok((self.ids_of(&item), facts))
     }
 
     async fn external_ids(&self, id: &MediaId) -> Result<Vec<String>, CatalogError> {

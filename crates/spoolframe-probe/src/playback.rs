@@ -639,6 +639,8 @@ async fn pick(
             library: library.id.clone(),
             offset: 0,
             limit: 1,
+            sort: None,
+            filter: None,
         };
         let mut item = match probe.request(conn, session, items).await? {
             Response::Ok(Reply::Items { mut items, .. }) if !items.is_empty() => items.remove(0),

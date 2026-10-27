@@ -237,10 +237,29 @@ pub enum Request {
 
     // Need a session.
     Libraries,
+    /// A page of a library's top-level items: `Items`. Without `sort` and
+    /// `filter`, every item by title, as before them. With either: ordered
+    /// by `sort`, then by sort title and id, and only the items `filter`
+    /// keeps, `total` counting those. A key or filter part the library
+    /// does not have (`ItemFilterValues` lists what it has), or a value
+    /// this build does not know, is `InvalidInput`.
     Items {
         library: LibraryId,
         offset: u32,
         limit: u32,
+        /// Optional for good: left out, the plain order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sort: Option<spoolframe_types::ItemSort>,
+        /// Optional for good: left out, every item.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<spoolframe_types::ItemFilter>,
+    },
+    /// What library `library`'s items can be sorted and filtered by:
+    /// `ItemFilterValues`, the genres, years, content ratings, resolutions
+    /// and ranges its items have, and the sort keys and filter parts it
+    /// applies.
+    ItemFilterValues {
+        library: LibraryId,
     },
     Item {
         id: MediaId,
@@ -1609,6 +1628,10 @@ pub enum Reply {
     DeviceSignInRequest(DeviceSignInRequest),
     Libraries {
         libraries: Vec<Library>,
+    },
+    /// What a library can be sorted and filtered by (`ItemFilterValues`).
+    ItemFilterValues {
+        values: spoolframe_types::ItemFilterValues,
     },
     Items {
         items: Vec<Item>,

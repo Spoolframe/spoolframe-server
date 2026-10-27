@@ -225,6 +225,11 @@ pub trait Inspect: Send + Sync {
     /// episodes, an album's tracks.
     async fn child_rows(&self, id: &MediaId) -> Result<Vec<Row>, CatalogError>;
 
+    /// The rows of `ids`, in that order; one gone since is left out. A
+    /// page of a library sorted and filtered as clients ask
+    /// ([`Catalog::query_items`](crate::Catalog::query_items)) as rows.
+    async fn rows_by_id(&self, ids: &[MediaId]) -> Result<Vec<Row>, CatalogError>;
+
     /// One item, with its match, files and children.
     async fn inspect(&self, id: &MediaId) -> Result<Inspected, CatalogError>;
 

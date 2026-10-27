@@ -21,6 +21,7 @@ macro_rules! own_item {
 pub mod audit;
 pub mod downloads;
 pub mod federation;
+pub mod federation_browse;
 pub mod federation_cache;
 pub mod federation_downloads;
 pub mod federation_grants;

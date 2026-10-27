@@ -21,6 +21,7 @@ use crate::store::{Store, StoreError};
 pub use spoolframe_policy::watch::WatchRules;
 use spoolframe_policy::watch::credits_to_end;
 
+mod browse;
 mod plays;
 pub use plays::{OfflinePlay, Plays};
 
@@ -74,6 +75,9 @@ pub struct Watch {
     /// Whose state was saved, for whoever mirrors it elsewhere (PX-04):
     /// each one, since every linked user's state syncs (P3-12).
     changed: tokio::sync::broadcast::Sender<Principal>,
+    /// Libraries walked for a filter or sort by watch state, kept for the
+    /// pages after the first ([`browse`]).
+    walks: browse::Walks,
 }
 
 /// Where a device got to in an item while it had no server (PX-38).
@@ -193,6 +197,7 @@ impl Watch {
             copies: Mutex::default(),
             show_ids: Mutex::default(),
             changed: tokio::sync::broadcast::Sender::new(CHANGES),
+            walks: browse::Walks::default(),
         }
     }
 
@@ -545,10 +550,12 @@ impl Watch {
         {
             return Ok(None);
         }
-        // What is next up may have changed.
+        // What is next up may have changed, and what a filter by watch
+        // state keeps.
         self.next_up
             .lock()
             .retain(|(cached, _), _| *cached != principal);
+        self.walks.forget(principal);
         // Nobody listening is fine: nothing syncs.
         let _ = self.changed.send(principal);
         Ok(Some(into))

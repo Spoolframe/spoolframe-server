@@ -372,8 +372,27 @@ pub fn catalog_error(e: CatalogError) -> ErrorObjectOwned {
             format!("{what} is in a library this server does not serve"),
         ),
         CatalogError::NotSetUp => error(error_code::NOT_CONFIGURED, e.to_string()),
+        // A sort key or filter part the library does not offer.
+        CatalogError::CannotBrowse(why) => error(error_code::INVALID_INPUT, why),
         other => error(error_code::UNAVAILABLE, other.to_string()),
     }
+}
+
+/// A sorted or filtered page could not be made of `library`.
+pub(super) fn watch_error(e: crate::watch::WatchError, library: &str) -> ErrorObjectOwned {
+    match e {
+        crate::watch::WatchError::Catalog(e) => catalog_error(e),
+        other => super::internal(format!("sorting or filtering {library}: {other}")),
+    }
+}
+
+/// This server runs without watch state (a catalog-only test server):
+/// nothing is sorted or filtered as clients ask.
+pub(super) fn not_browsed() -> ErrorObjectOwned {
+    error(
+        error_code::NOT_CONFIGURED,
+        "this server does not sort or filter libraries",
+    )
 }
 
 pub fn file_state(f: &FileCheck) -> FileState {
@@ -562,7 +581,75 @@ impl AdminApi {
         })
     }
 
-    pub(super) async fn catalog_rows_of(&self, query: CatalogQuery) -> RpcResult<CatalogPage> {
+    /// What library `id` can be sorted and filtered by, as clients are
+    /// told it.
+    pub(super) async fn catalog_filter_values_of(
+        &self,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::ItemFilterValues> {
+        // A paired server's, from the cache; else this server's own.
+        let found = if id.starts_with("fed:") {
+            self.paired_library(&id).await?.0
+        } else {
+            let composite = self.composite()?;
+            Self::library(&composite, &id).await?.1
+        };
+        let watch = self.watch.as_ref().ok_or_else(not_browsed)?;
+        watch
+            .filter_values(&found)
+            .await
+            .map_err(|e| watch_error(e, &id))
+    }
+
+    /// A page of `found`'s top level sorted and filtered as clients ask
+    /// it, through the same query ([`crate::watch::Watch::browse`]), as
+    /// rows: `user`'s own watch state where it is asked for.
+    async fn sorted_rows(
+        &self,
+        composite: &Arc<Composite>,
+        user: crate::store::users::LocalUserId,
+        found: &Library,
+        query: CatalogQuery,
+    ) -> RpcResult<CatalogPage> {
+        if query.kind.is_some() || query.filter.is_some() || query.text.is_some() {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "a sort or item filter is of the library's top level, \
+                 without a kind, a search or a quick filter",
+            ));
+        }
+        let watch = self.watch.as_ref().ok_or_else(not_browsed)?;
+        let page = watch
+            .browse(
+                Principal::LocalUser(user),
+                found,
+                query.sort,
+                query.item_filter,
+                Page {
+                    offset: query.offset,
+                    limit: query.limit,
+                },
+            )
+            .await
+            .map_err(|e| watch_error(e, &query.library))?;
+        let ids: Vec<MediaId> = page.items.iter().map(|i| i.id().clone()).collect();
+        let rows = composite.rows_by_id(&ids).await.map_err(catalog_error)?;
+        let (paths, check) = self.checks.state(composite, &found.id.to_string());
+        Ok(CatalogPage {
+            rows: rows
+                .into_iter()
+                .map(|r| catalog_row(r, check.as_deref()))
+                .collect(),
+            total: page.total,
+            paths,
+        })
+    }
+
+    pub(super) async fn catalog_rows_of(
+        &self,
+        user: crate::store::users::LocalUserId,
+        query: CatalogQuery,
+    ) -> RpcResult<CatalogPage> {
         let composite = self.composite()?;
         let (library, found) = Self::library(&composite, &query.library).await?;
         if query.limit > MAX_ROWS {
@@ -570,6 +657,9 @@ impl AdminApi {
                 error_code::INVALID_INPUT,
                 format!("at most {MAX_ROWS} rows a page"),
             ));
+        }
+        if query.sort.is_some() || query.item_filter.is_some() {
+            return self.sorted_rows(&composite, user, &found, query).await;
         }
         if let Some(kind) = query.kind
             && !kinds(found.kind).contains(&kind_of(kind))

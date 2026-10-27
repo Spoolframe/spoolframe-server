@@ -23,6 +23,12 @@ pub use spoolframe_types::{
     SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSource,
     SubtitleSourceState, SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
 };
+// A library sorted and filtered as clients ask it (`catalogRows`,
+// `catalogFilterValues`).
+pub use spoolframe_types::{
+    Counted, DynamicRange, FilterPart, ItemFilter, ItemFilterValues, ItemSort, Resolution, SortKey,
+    WatchedState,
+};
 
 mod federation;
 #[cfg(feature = "client")]
@@ -2093,6 +2099,17 @@ pub struct CatalogQuery {
     pub offset: u32,
     /// At most 200.
     pub limit: u32,
+    /// The library's top level in this order, as clients sort it
+    /// (`Items`' `sort`, PROTOCOL.md "Sorting and filtering a library"):
+    /// the same query, the caller's own watch state for `last_played`.
+    /// Not with `kind`, `text` or `filter` (`INVALID_INPUT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<ItemSort>,
+    /// Only the top-level items this keeps, as `Items`' `filter`; the
+    /// caller's own watch state for `watched`. Not with `kind`, `text` or
+    /// `filter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_filter: Option<ItemFilter>,
 }
 
 /// One page of a library's rows.
@@ -2193,6 +2210,77 @@ pub struct CatalogItem {
 pub struct CatalogCrumb {
     pub id: String,
     pub title: String,
+}
+
+/// A paired server and the libraries it shares with this one
+/// (`catalogPairedLibraries`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedServer {
+    pub server_id: String,
+    /// What it called itself when paired.
+    pub name: String,
+    /// This server holds a connection to it now. Offline, its libraries
+    /// are still browsed from the cache.
+    pub online: bool,
+    pub libraries: Vec<PairedLibrary>,
+}
+
+/// One library a paired server shares, as cached here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedLibrary {
+    /// Its `fed:` id here.
+    pub id: String,
+    pub title: String,
+    pub kind: LibraryKind,
+}
+
+/// What `catalogPairedItems` lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedQuery {
+    /// A `fed:` library id.
+    pub library: String,
+    pub offset: u32,
+    /// At most 200.
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<ItemSort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_filter: Option<ItemFilter>,
+}
+
+/// One page of a paired server's library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedPage {
+    pub library: PairedLibrary,
+    pub server_id: String,
+    pub server_name: String,
+    pub online: bool,
+    /// As clients get them, with the caller's own playback state.
+    pub items: Vec<Item>,
+    /// How many the sort and filter keep.
+    pub total: u32,
+}
+
+/// One item of a paired server's, as cached (`catalogPairedItem`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedItem {
+    /// The library it is in, when it is one still shared.
+    pub library: Option<CatalogCrumb>,
+    pub server_id: String,
+    pub server_name: String,
+    pub online: bool,
+    /// As clients get it, with the caller's own playback state.
+    pub item: Item,
+    /// A show's seasons, a season's episodes, an artist's albums, an
+    /// album's tracks.
+    pub children: Vec<Item>,
+    /// What the paired server sent: watch state is linked by them.
+    pub external_ids: Vec<String>,
 }
 
 /// One version of an item's media, as Plex describes it.
@@ -4356,6 +4444,38 @@ pub trait AdminApi {
     /// until a check is done.
     #[method(name = "catalogRows", with_extensions)]
     async fn catalog_rows(&self, query: CatalogQuery) -> jsonrpsee::core::RpcResult<CatalogPage>;
+
+    /// What library `id` can be sorted and filtered by (`catalogRows`'
+    /// `sort` and `itemFilter`), and the values its items have: what
+    /// clients' `ItemFilterValues` answers. A paired server's library
+    /// (`fed:`, `catalogPairedLibraries`) too.
+    #[method(name = "catalogFilterValues", with_extensions)]
+    async fn catalog_filter_values(
+        &self,
+        id: String,
+    ) -> jsonrpsee::core::RpcResult<ItemFilterValues>;
+
+    /// The libraries paired servers share with this one, by server, each
+    /// server with whether it is online now: browsed from this server's
+    /// cache of them, online or not. Experimental `federation` only
+    /// (`NOT_CONFIGURED` with it off). Read-only.
+    #[method(name = "catalogPairedLibraries", with_extensions)]
+    async fn catalog_paired_libraries(&self) -> jsonrpsee::core::RpcResult<Vec<PairedServer>>;
+
+    /// One page of a paired server's library, from the cache, sorted and
+    /// filtered as clients ask it (the same query); the caller's own
+    /// watch state for `watched` and `last_played`.
+    #[method(name = "catalogPairedItems", with_extensions)]
+    async fn catalog_paired_items(
+        &self,
+        query: PairedQuery,
+    ) -> jsonrpsee::core::RpcResult<PairedPage>;
+
+    /// One item of a paired server's, as far as the cache has it: what a
+    /// client gets, with its children and external ids. Nothing of its
+    /// files: those are on the paired server.
+    #[method(name = "catalogPairedItem", with_extensions)]
+    async fn catalog_paired_item(&self, id: String) -> jsonrpsee::core::RpcResult<PairedItem>;
 
     /// The rows of an item's children in library `library`: a show's
     /// seasons, a season's episodes, an album's tracks.

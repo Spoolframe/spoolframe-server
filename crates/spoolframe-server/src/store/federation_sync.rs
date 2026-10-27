@@ -20,7 +20,14 @@ pub struct KeptIds {
     pub library: String,
     pub shallow: String,
     pub external_ids: Vec<String>,
+    /// What else its own record said, as JSON (a film's every genre and
+    /// dynamic range); `None` where none was read with them.
+    pub details: Option<String>,
 }
+
+/// What [`Store::external_ids_of`] kept of an item: the hash of the rest
+/// of it when they were read, its external ids, and its details.
+pub type Kept = (String, Vec<String>, Option<String>);
 
 /// One item of a state: its id, its hash, and the images it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,17 +213,18 @@ impl Store {
     pub async fn external_ids_of(
         &self,
         library: &str,
-    ) -> Result<HashMap<String, (String, Vec<String>)>, StoreError> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT item, shallow, external_ids FROM federation_external_ids WHERE library = ?1",
+    ) -> Result<HashMap<String, Kept>, StoreError> {
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT item, shallow, external_ids, details FROM federation_external_ids \
+             WHERE library = ?1",
         )
         .bind(library)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(item, shallow, ids)| {
-                Some((item, (shallow, serde_json::from_str(&ids).ok()?)))
+            .filter_map(|(item, shallow, ids, details)| {
+                Some((item, (shallow, serde_json::from_str(&ids).ok()?, details)))
             })
             .collect())
     }
@@ -227,19 +235,28 @@ impl Store {
         if read.is_empty() {
             return Ok(());
         }
-        let rows: Vec<(&str, &str, &str, String)> = read
+        let rows: Vec<(&str, &str, &str, String, Option<&str>)> = read
             .iter()
             .map(|k| {
                 let ids = serde_json::to_string(&k.external_ids).expect("strings serialize");
-                (k.item.as_str(), k.library.as_str(), k.shallow.as_str(), ids)
+                (
+                    k.item.as_str(),
+                    k.library.as_str(),
+                    k.shallow.as_str(),
+                    ids,
+                    k.details.as_deref(),
+                )
             })
             .collect();
         sqlx::query(
-            "INSERT INTO federation_external_ids (item, library, shallow, external_ids) \
-             SELECT value ->> 0, value ->> 1, value ->> 2, value ->> 3 FROM json_each(?1) \
+            "INSERT INTO federation_external_ids \
+                 (item, library, shallow, external_ids, details) \
+             SELECT value ->> 0, value ->> 1, value ->> 2, value ->> 3, value ->> 4 \
+             FROM json_each(?1) \
              WHERE true \
              ON CONFLICT (item) DO UPDATE SET library = excluded.library, \
-                 shallow = excluded.shallow, external_ids = excluded.external_ids",
+                 shallow = excluded.shallow, external_ids = excluded.external_ids, \
+                 details = excluded.details",
         )
         .bind(serde_json::to_string(&rows).expect("strings serialize"))
         .execute(&self.pool)
@@ -365,6 +382,7 @@ mod tests {
             library: "plex:1".into(),
             shallow: shallow.into(),
             external_ids: ids.iter().map(|&i| i.to_owned()).collect(),
+            details: None,
         };
         store
             .keep_all_external_ids(&[
@@ -378,7 +396,10 @@ mod tests {
             .await
             .unwrap();
         store
-            .keep_all_external_ids(&[kept("plex:movie:1", "s2", &["tmdb://348", "imdb://tt1"])])
+            .keep_all_external_ids(&[KeptIds {
+                details: Some(r#"{"genres":["Drama"]}"#.into()),
+                ..kept("plex:movie:1", "s2", &["tmdb://348", "imdb://tt1"])
+            }])
             .await
             .unwrap();
         let all = store.external_ids_of("plex:1").await.unwrap();
@@ -387,9 +408,10 @@ mod tests {
             all["plex:movie:1"],
             (
                 "s2".to_owned(),
-                vec!["tmdb://348".to_owned(), "imdb://tt1".to_owned()]
+                vec!["tmdb://348".to_owned(), "imdb://tt1".to_owned()],
+                Some(r#"{"genres":["Drama"]}"#.to_owned())
             )
         );
-        assert_eq!(all["plex:movie:2"], ("s1".to_owned(), Vec::new()));
+        assert_eq!(all["plex:movie:2"], ("s1".to_owned(), Vec::new(), None));
     }
 }

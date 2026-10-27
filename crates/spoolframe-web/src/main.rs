@@ -13,6 +13,8 @@ mod advanced;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod approve;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod browse;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod connect;

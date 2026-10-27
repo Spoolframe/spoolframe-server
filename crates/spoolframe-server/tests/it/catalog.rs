@@ -59,12 +59,22 @@ impl Respond for Pms {
                 { "key": "2", "type": "movie", "title": "Movies" },
                 { "key": "1", "type": "show", "title": "TV Shows" },
             ] })),
+            // What a section sorts by (title and the date added) and
+            // filters by (nothing), for the clients' sort and filter.
+            ["library", "sections", _, "sorts"] => container(json!({ "Directory": [
+                { "key": "titleSort", "title": "Title" },
+                { "key": "addedAt", "title": "Date Added" },
+            ] })),
+            ["library", "sections", _, "filters"] => container(json!({ "Directory": [] })),
             ["library", "sections", section, what @ ("all" | "search")] => {
                 let kind = match param("type").as_deref() {
                     Some("1") => "movie",
                     Some("2") => "show",
                     Some("3") => "season",
                     Some("4") => "episode",
+                    // Without one, the section's top level.
+                    None if *section == "2" => "movie",
+                    None => "show",
                     _ => "none",
                 };
                 let text = param("query").map(|q| q.to_lowercase());
@@ -80,6 +90,18 @@ impl Respond for Pms {
                     })
                     .cloned()
                     .collect();
+                // `addedAt` or `addedAt:desc`, ties by title: what the
+                // date added sort sends.
+                let mut all = all;
+                if let Some(sort) = param("sort")
+                    && sort.starts_with("addedAt")
+                {
+                    let added = |i: &Value| i["addedAt"].as_i64().unwrap_or(0);
+                    all.sort_by_key(|i| (added(i), i["title"].as_str().unwrap_or("").to_owned()));
+                    if sort.starts_with("addedAt:desc") {
+                        all.sort_by_key(|i| std::cmp::Reverse(added(i)));
+                    }
+                }
                 let start = header(req, "X-Plex-Container-Start").unwrap_or(0);
                 let size = header(req, "X-Plex-Container-Size").unwrap_or(usize::MAX);
                 let page: Vec<Value> = all.iter().skip(start).take(size).cloned().collect();
@@ -100,6 +122,20 @@ impl Respond for Pms {
                 container(json!({
                     "librarySectionTitle": title_of(section),
                     "Metadata": children,
+                }))
+            }
+            // Several at once, as a sorted page's rows are read.
+            ["library", "metadata", keys] if keys.contains(',') => {
+                let found: Vec<Value> = keys
+                    .split(',')
+                    .filter_map(|k| self.items.iter().find(|i| i["ratingKey"] == k))
+                    .cloned()
+                    .collect();
+                let section = found.first().map(section_of).unwrap_or("2");
+                container(json!({
+                    "librarySectionID": section,
+                    "librarySectionTitle": title_of(section),
+                    "Metadata": found,
                 }))
             }
             ["library", "metadata", key] => {
@@ -183,9 +219,14 @@ fn catalog() -> Vec<Value> {
     bear["grandparentRatingKey"] = json!("200");
     bear["grandparentTitle"] = json!("The Bear");
     bear["Media"] = media("/data/tv/The Bear/S01E01.mkv");
+    unmatched["addedAt"] = json!(200);
+    let added = |mut movie: Value, at: i64| {
+        movie["addedAt"] = json!(at);
+        movie
+    };
     vec![
-        movie("1", "6 Below", "plex://movie/a"),
-        movie("2", "24 Days", "plex://movie/b"),
+        added(movie("1", "6 Below", "plex://movie/a"), 100),
+        added(movie("2", "24 Days", "plex://movie/b"), 300),
         unmatched,
         show("100", "Severance", 2, 3),
         season("101", "100", "Severance", 1),
@@ -253,6 +294,8 @@ fn query(library: &str) -> CatalogQuery {
         filter: None,
         offset: 0,
         limit: 50,
+        sort: None,
+        item_filter: None,
     }
 }
 
@@ -548,6 +591,112 @@ async fn an_id_spelled_with_the_first_server_s_name_is_not_found() {
     assert_eq!(code(alias.unwrap_err()), error_code::INVALID_INPUT);
 }
 
+/// The page sorted and filtered as clients ask it, through the same
+/// query, as rows: what the library offers said first, the rest refused,
+/// and not together with a search, a kind or a quick filter.
+#[tokio::test]
+async fn a_library_page_is_sorted_as_clients_sort_it() {
+    use spoolframe_admin_api::{ItemFilter, ItemSort, SortKey, WatchedState};
+    let s = setup("sorted").await;
+    let values = s.root.catalog_filter_values("plex:2".into()).await.unwrap();
+    assert_eq!(
+        values.sorts,
+        [SortKey::Title, SortKey::Added, SortKey::LastPlayed]
+    );
+    let added = |descending| CatalogQuery {
+        sort: Some(ItemSort {
+            key: SortKey::Added,
+            descending,
+        }),
+        ..query("plex:2")
+    };
+    let newest = s.root.catalog_rows(added(true)).await.unwrap();
+    assert_eq!(
+        (newest.total, ids(&newest)),
+        (
+            3,
+            vec![
+                "plex:movie:2".to_owned(),
+                "plex:movie:3".to_owned(),
+                "plex:movie:1".to_owned()
+            ]
+        )
+    );
+    // Rows as ever: files looked for, the match.
+    assert!(newest.rows[0].matched && !newest.rows[1].matched);
+    assert_eq!(
+        newest.rows[0].files[0].plex_path,
+        "/data/movies/24 Days.mkv"
+    );
+    let second = s
+        .root
+        .catalog_rows(CatalogQuery {
+            offset: 1,
+            limit: 1,
+            ..added(false)
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(&second), ["plex:movie:3"]);
+    // The caller's own watch state: nothing watched yet.
+    let unwatched = s
+        .root
+        .catalog_rows(CatalogQuery {
+            item_filter: Some(ItemFilter {
+                watched: vec![WatchedState::Unwatched],
+                ..ItemFilter::default()
+            }),
+            ..query("plex:2")
+        })
+        .await
+        .unwrap();
+    assert_eq!(unwatched.total, 3);
+    let refused = |q: CatalogQuery| {
+        let root = &s.root;
+        async move { code(root.catalog_rows(q).await.unwrap_err()) }
+    };
+    let size = CatalogQuery {
+        sort: Some(ItemSort {
+            key: SortKey::Size,
+            descending: false,
+        }),
+        ..query("plex:2")
+    };
+    assert_eq!(refused(size).await, error_code::INVALID_INPUT);
+    let genre = CatalogQuery {
+        item_filter: Some(ItemFilter {
+            genres: vec!["Drama".into()],
+            ..ItemFilter::default()
+        }),
+        ..query("plex:2")
+    };
+    assert_eq!(refused(genre).await, error_code::INVALID_INPUT);
+    let searched = CatalogQuery {
+        text: Some("days".into()),
+        ..added(true)
+    };
+    assert_eq!(refused(searched).await, error_code::INVALID_INPUT);
+    let quick = CatalogQuery {
+        filter: Some(CatalogFilter::Unmatched),
+        ..added(true)
+    };
+    assert_eq!(refused(quick).await, error_code::INVALID_INPUT);
+}
+
+/// With federation off there are no paired servers' libraries to browse.
+#[tokio::test]
+async fn paired_libraries_need_federation() {
+    let s = setup("paired-off").await;
+    let off = s.root.catalog_paired_libraries().await.unwrap_err();
+    assert_eq!(code(off), error_code::NOT_CONFIGURED);
+    let item = s
+        .root
+        .catalog_paired_item("fed:movie:aaaaaaaaaaaaaaaa:plex:1".into())
+        .await
+        .unwrap_err();
+    assert_eq!(code(item), error_code::NOT_CONFIGURED);
+}
+
 #[tokio::test]
 async fn a_consumer_gets_forbidden() {
     let s = setup("consumer").await;
@@ -571,6 +720,13 @@ async fn a_consumer_gets_forbidden() {
     };
     forbidden(alice_api.catalog_library("plex:1".into()).await.map(drop));
     forbidden(alice_api.catalog_rows(query("plex:1")).await.map(drop));
+    forbidden(
+        alice_api
+            .catalog_filter_values("plex:2".into())
+            .await
+            .map(drop),
+    );
+    forbidden(alice_api.catalog_paired_libraries().await.map(drop));
     forbidden(
         alice_api
             .catalog_children("plex:1".into(), "plex:show:100".into())

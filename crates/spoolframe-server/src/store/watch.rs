@@ -19,6 +19,58 @@ pub struct WatchRow {
     pub updated_at: i64,
 }
 
+/// What a user's watch state says of one top-level item (a movie, or a
+/// show by its episodes): what a library is filtered and ordered by
+/// (`watched`, `last_played`), whichever catalog it is in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// Its episodes watched, or 1 for a watched movie.
+    pub watched: u32,
+    /// Whether any is in progress.
+    pub started: bool,
+    /// When its state last changed (Unix seconds): a show's latest
+    /// episode's.
+    pub last: Option<i64>,
+}
+
+impl Seen {
+    /// Its state: a show of `leaves` episodes is watched once that many
+    /// are; one with some watched or started is in progress.
+    pub fn state(&self, leaves: Option<u32>, show: bool) -> spoolframe_types::WatchedState {
+        use spoolframe_types::WatchedState;
+        let all = if show {
+            leaves.is_some_and(|l| l > 0 && self.watched >= l)
+        } else {
+            self.watched > 0
+        };
+        if all {
+            WatchedState::Watched
+        } else if self.watched > 0 || self.started {
+            WatchedState::InProgress
+        } else {
+            WatchedState::Unwatched
+        }
+    }
+
+    /// Each top-level item's of `rows`, a user's: by a movie's id, or by
+    /// the show's on each of its episodes' rows. One played less than
+    /// `started_after_ms` and not watched has a time, and is not started.
+    pub fn of_rows(rows: &[WatchRow], started_after_ms: i64) -> HashMap<String, Seen> {
+        let mut seen: HashMap<String, Seen> = HashMap::new();
+        for row in rows {
+            let top = row.show_id.as_ref().unwrap_or(&row.media_id);
+            let entry = seen.entry(top.clone()).or_default();
+            if row.watched {
+                entry.watched += 1;
+            } else if row.position_ms.is_some_and(|p| p >= started_after_ms) {
+                entry.started = true;
+            }
+            entry.last = entry.last.max(Some(row.updated_at));
+        }
+        seen
+    }
+}
+
 /// A state to save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchUpdate<'a> {

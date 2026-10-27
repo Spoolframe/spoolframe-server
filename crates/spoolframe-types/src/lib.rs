@@ -8,6 +8,7 @@
 //! Permissively licensed (MIT OR Apache-2.0) so that any client, open or
 //! proprietary, can link it. It never depends on an AGPL server crate.
 
+pub mod browse;
 pub mod codec;
 pub mod codec_string;
 pub mod date;
@@ -24,6 +25,10 @@ pub mod search;
 #[cfg(test)]
 mod test_support;
 
+pub use browse::{
+    Counted, DynamicRange, FilterPart, ItemFilter, ItemFilterValues, ItemSort, Resolution, SortKey,
+    WatchedState,
+};
 pub use codec::{
     AudioCodec, ClientCapabilities, Container, Delivery, DisplayCapabilities, HdrFormat,
     SubtitleFormat, VideoCodec, VideoLimits,

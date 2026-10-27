@@ -588,6 +588,7 @@ mod tests {
             kind: Some("movie".into()),
             title: "Movies".into(),
             locations: Vec::new(),
+            filter: None,
         };
         assert!(library(&dir).is_err());
     }
@@ -599,6 +600,7 @@ mod tests {
             kind: Some("photo".into()),
             title: "Photos".into(),
             locations: Vec::new(),
+            filter: None,
         };
         assert_eq!(library(&dir), Ok(None));
     }

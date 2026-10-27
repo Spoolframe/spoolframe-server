@@ -616,6 +616,8 @@ pub(crate) async fn visibility(
             library,
             offset: 0,
             limit: 1,
+            sort: None,
+            filter: None,
         },
         |e| matches!(e, Error::NotFound { .. }),
     )

@@ -146,3 +146,160 @@ async fn the_account_s_watch_state_is_read() {
     assert!(!states.is_empty());
     assert!(states.iter().all(|w| w.watched || w.position_ms.is_some()));
 }
+
+/// Read-only: each sort and filter a section offers
+/// as the PMS itself applies them. Every
+/// key both ways pages without a repeat and walks in the same order; the
+/// dates and lengths a movie carries are in order with none last; a year
+/// range keeps only its years; and the quality classes count about every
+/// item. Prints how long a whole walk of each section takes.
+#[tokio::test]
+async fn every_sort_and_filter_is_the_pms_s_own() {
+    use spoolframe_catalog::ItemQuery;
+    use spoolframe_types::{FilterPart, ItemFilter, ItemSort, SortKey};
+    let Some(catalog) = live_catalog() else {
+        return;
+    };
+    let asked = |key, descending, filter| ItemQuery {
+        sort: ItemSort { key, descending },
+        filter,
+        viewer: None,
+    };
+    for library in catalog.libraries().await.unwrap() {
+        let browsing = catalog.browsing(&library).await.unwrap();
+        let started = std::time::Instant::now();
+        let walked = catalog
+            .walk_items(
+                &library.id,
+                &asked(SortKey::Title, false, ItemFilter::default()),
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "{} ({:?}): {} items walked in {:?}; sorts {:?}, filters {:?}",
+            library.title,
+            library.kind,
+            walked.len(),
+            started.elapsed(),
+            browsing.sorts,
+            browsing.filters
+        );
+        for key in browsing
+            .sorts
+            .iter()
+            .copied()
+            .filter(|k| *k != SortKey::LastPlayed)
+        {
+            for descending in [false, true] {
+                let query = asked(key, descending, ItemFilter::default());
+                let mut paged = Vec::new();
+                let mut total = 0;
+                for offset in (0..400).step_by(100) {
+                    let page = catalog
+                        .query_items(&library.id, &query, Page { offset, limit: 100 })
+                        .await
+                        .unwrap();
+                    total = page.total;
+                    paged.extend(page.items);
+                }
+                assert_eq!(total as usize, walked.len(), "{key:?}");
+                let ids: Vec<MediaId> = paged.iter().map(|i| i.id().clone()).collect();
+                let unique: std::collections::HashSet<&MediaId> = ids.iter().collect();
+                assert_eq!(unique.len(), ids.len(), "{key:?} {descending}: a repeat");
+                let walk: Vec<MediaId> = catalog
+                    .walk_items(&library.id, &query)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|l| l.id)
+                    .take(ids.len())
+                    .collect();
+                assert_eq!(walk, ids, "{key:?} {descending}: the walk's order");
+                if !matches!(key, SortKey::Released | SortKey::Duration)
+                    || library.kind != LibraryKind::Movies
+                {
+                    continue;
+                }
+                let values: Vec<Option<String>> = paged
+                    .iter()
+                    .map(|item| match (key, item) {
+                        (SortKey::Released, Item::Movie(m)) => {
+                            m.release_date.map(|d| d.to_string())
+                        }
+                        (SortKey::Duration, Item::Movie(m)) => {
+                            m.duration.map(|d| format!("{:015}", d.as_millis()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let first_none = values
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or(values.len());
+                assert!(
+                    values[first_none..].iter().all(Option::is_none),
+                    "{key:?} {descending}: none last"
+                );
+                let some: Vec<&String> = values[..first_none].iter().flatten().collect();
+                let inversions = some
+                    .windows(2)
+                    .filter(|w| if descending { w[0] < w[1] } else { w[0] > w[1] })
+                    .count();
+                // Plex sorts by its own column, which for a few films is
+                // not the length it lists (a film with several versions):
+                // its order is what a client gets, so only report it.
+                eprintln!("  {key:?} descending {descending}: {inversions} out of order");
+                if key == SortKey::Released {
+                    assert_eq!(inversions, 0, "{key:?} {descending}: out of order");
+                }
+            }
+        }
+        if browsing.filters.contains(&FilterPart::Years) {
+            let decade = ItemFilter {
+                year_from: Some(1990),
+                year_to: Some(1999),
+                ..ItemFilter::default()
+            };
+            let page = catalog
+                .query_items(
+                    &library.id,
+                    &asked(SortKey::Title, false, decade),
+                    Page {
+                        offset: 0,
+                        limit: 500,
+                    },
+                )
+                .await
+                .unwrap();
+            for item in &page.items {
+                let year = match item {
+                    Item::Movie(m) => m.year,
+                    Item::Show(s) => s.year,
+                    _ => None,
+                };
+                assert!(
+                    year.is_some_and(|y| (1990..=1999).contains(&y)),
+                    "{} is from {year:?}",
+                    item.id()
+                );
+            }
+            eprintln!("  the 1990s: {}", page.total);
+        }
+        let started = std::time::Instant::now();
+        let values = catalog.filter_values(&library).await.unwrap();
+        eprintln!(
+            "  values in {:?}: {} genres, {} years, {} ratings, resolutions {:?}, ranges {:?}",
+            started.elapsed(),
+            values.genres.len(),
+            values.years.len(),
+            values.content_ratings.len(),
+            values.resolutions,
+            values.dynamic_ranges
+        );
+        if !values.resolutions.is_empty() {
+            // An item with two versions is in two classes.
+            let classes: u32 = values.resolutions.iter().filter_map(|r| r.count).sum();
+            assert!(classes as usize >= walked.len() * 9 / 10, "{classes}");
+        }
+    }
+}

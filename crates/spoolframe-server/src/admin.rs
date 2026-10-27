@@ -83,6 +83,8 @@ mod catalog;
 mod federation;
 #[path = "admin_optimized.rs"]
 mod optimized;
+#[path = "admin_paired.rs"]
+mod paired;
 #[path = "admin_playlists.rs"]
 mod playlists;
 
@@ -3980,8 +3982,43 @@ impl AdminApiServer for AdminApi {
     }
 
     async fn catalog_rows(&self, ext: &Extensions, query: CatalogQuery) -> RpcResult<CatalogPage> {
+        let user = self.admin(ext).await?;
+        self.catalog_rows_of(user.user, query).await
+    }
+
+    async fn catalog_filter_values(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::ItemFilterValues> {
         self.admin(ext).await?;
-        self.catalog_rows_of(query).await
+        self.catalog_filter_values_of(id).await
+    }
+
+    async fn catalog_paired_libraries(
+        &self,
+        ext: &Extensions,
+    ) -> RpcResult<Vec<spoolframe_admin_api::PairedServer>> {
+        self.admin(ext).await?;
+        self.catalog_paired_libraries_of().await
+    }
+
+    async fn catalog_paired_items(
+        &self,
+        ext: &Extensions,
+        query: spoolframe_admin_api::PairedQuery,
+    ) -> RpcResult<spoolframe_admin_api::PairedPage> {
+        let user = self.admin(ext).await?;
+        self.catalog_paired_items_of(user.user, query).await
+    }
+
+    async fn catalog_paired_item(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::PairedItem> {
+        let user = self.admin(ext).await?;
+        self.catalog_paired_item_of(user.user, id).await
     }
 
     async fn catalog_children(

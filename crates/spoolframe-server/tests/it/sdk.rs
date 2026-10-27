@@ -104,6 +104,50 @@ async fn sign_in_and_browse() {
     server.stop().await;
 }
 
+/// An app builds its controls from what a library offers, pages it in
+/// that order, and is told the rest is invalid; no feature to name.
+#[tokio::test]
+async fn an_app_sorts_and_filters_a_library_by_what_it_offers() {
+    use spoolframe_client_sdk::types::{ItemFilter, ItemSort, SortKey, WatchedState};
+    let (server, client, _) = ready("sdk-sort-filter").await;
+    let alice = alice(&server, &client).await;
+    let library = library().id;
+    let values = alice.item_filter_values(&library).await.unwrap();
+    assert_eq!(values.sorts, [SortKey::Title, SortKey::LastPlayed]);
+    let unwatched = ItemFilter {
+        watched: vec![WatchedState::Unwatched],
+        ..ItemFilter::default()
+    };
+    let last = ItemSort {
+        key: SortKey::LastPlayed,
+        descending: true,
+    };
+    let page = alice
+        .items_sorted(&library, 0, 50, Some(last), Some(unwatched))
+        .await
+        .unwrap();
+    assert_eq!((page.items, page.total), (vec![movie()], 1));
+    // An empty filter and no sort: the plain listing.
+    let plain = alice
+        .items_sorted(&library, 0, 50, None, Some(ItemFilter::default()))
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.items,
+        alice.items(&library, 0, 50).await.unwrap().items
+    );
+    let size = ItemSort {
+        key: SortKey::Size,
+        descending: false,
+    };
+    assert!(matches!(
+        alice.items_sorted(&library, 0, 50, Some(size), None).await,
+        Err(SdkError::InvalidInput(_))
+    ));
+    client.close().await;
+    server.stop().await;
+}
+
 /// `session`'s connection path once a direct path is selected, or whatever it is
 /// after `within`: right after a sign-in iroh may not have selected a
 /// path yet.

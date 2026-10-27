@@ -20,13 +20,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
-    Browse, Catalog, CatalogError, Found, FoundGroup, Image, Inspect, Inspected, ItemPage,
-    ItemWithChildren, LibraryCheck, MissingFile, Page, PreviewFrames, Reach, Row, RowPage,
-    SearchQuery,
+    Browse, Browsing, Catalog, CatalogError, Facts, Found, FoundGroup, Image, Inspect, Inspected,
+    ItemPage, ItemQuery, ItemWithChildren, LibraryCheck, Listed, MissingFile, Page, PreviewFrames,
+    Reach, Row, RowPage, SearchQuery,
 };
 use spoolframe_plex::{Dated, PlexCatalog};
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, MediaId, MediaKind, Namespace, PersonId,
+    ArtworkId, Item, ItemFilterValues, Library, LibraryId, MediaId, MediaKind, Namespace, PersonId,
 };
 
 use spoolframe_admin_api::SyncDirection;
@@ -347,6 +347,169 @@ impl Catalog for Composite {
         })
     }
 
+    async fn items_with_facts(
+        &self,
+        library: &LibraryId,
+        page: Page,
+    ) -> Result<(ItemPage, Vec<Facts>), CatalogError> {
+        if let Some(peers) = self.federated(library.namespace(), library) {
+            return peers?.items_with_facts(library, page).await;
+        }
+        let (server, local) = ids::library_local(library);
+        let (page, facts) = self
+            .source(server, library)?
+            .catalog
+            .items_with_facts(&local, page)
+            .await
+            .map_err(|e| named(e, &local, library))?;
+        Ok((
+            ItemPage {
+                items: page
+                    .items
+                    .into_iter()
+                    .map(|i| ids::item(server, i))
+                    .collect(),
+                total: page.total,
+            },
+            facts,
+        ))
+    }
+
+    async fn details(&self, id: &MediaId) -> Result<(Vec<String>, Facts), CatalogError> {
+        if let Some(peers) = self.federated(id.namespace(), id) {
+            return peers?.details(id).await;
+        }
+        let (server, local) = ids::media_local(id);
+        self.source(server, id)?
+            .catalog
+            .details(&local)
+            .await
+            .map_err(|e| named(e, &local, id))
+    }
+
+    async fn browsing(&self, library: &Library) -> Result<Browsing, CatalogError> {
+        if let Some(peers) = self.federated(library.id.namespace(), &library.id) {
+            return peers?.browsing(library).await;
+        }
+        let (server, local) = ids::library_local(&library.id);
+        let local = Library {
+            id: local,
+            ..library.clone()
+        };
+        self.source(server, &library.id)?
+            .catalog
+            .browsing(&local)
+            .await
+            .map_err(|e| named(e, &local.id, &library.id))
+    }
+
+    async fn filter_values(&self, library: &Library) -> Result<ItemFilterValues, CatalogError> {
+        if let Some(peers) = self.federated(library.id.namespace(), &library.id) {
+            return peers?.filter_values(library).await;
+        }
+        let (server, local) = ids::library_local(&library.id);
+        let local = Library {
+            id: local,
+            ..library.clone()
+        };
+        self.source(server, &library.id)?
+            .catalog
+            .filter_values(&local)
+            .await
+            .map_err(|e| named(e, &local.id, &library.id))
+    }
+
+    async fn query_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+        page: Page,
+    ) -> Result<ItemPage, CatalogError> {
+        if let Some(peers) = self.federated(library.namespace(), library) {
+            return peers?.query_items(library, query, page).await;
+        }
+        let (server, local) = ids::library_local(library);
+        let page = self
+            .source(server, library)?
+            .catalog
+            .query_items(&local, query, page)
+            .await
+            .map_err(|e| named(e, &local, library))?;
+        Ok(ItemPage {
+            items: page
+                .items
+                .into_iter()
+                .map(|i| ids::item(server, i))
+                .collect(),
+            total: page.total,
+        })
+    }
+
+    async fn walk_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+    ) -> Result<Vec<Listed>, CatalogError> {
+        if let Some(peers) = self.federated(library.namespace(), library) {
+            return peers?.walk_items(library, query).await;
+        }
+        let (server, local) = ids::library_local(library);
+        let walked = self
+            .source(server, library)?
+            .catalog
+            .walk_items(&local, query)
+            .await
+            .map_err(|e| named(e, &local, library))?;
+        Ok(walked
+            .into_iter()
+            .map(|l| Listed {
+                id: ids::media(server, l.id),
+                ..l
+            })
+            .collect())
+    }
+
+    /// Each server's asked at once for its own; in the order asked.
+    async fn items_by_id(&self, wanted: &[MediaId]) -> Result<Vec<Item>, CatalogError> {
+        let mut by_server: Vec<(&str, Vec<MediaId>)> = Vec::new();
+        let mut federated = Vec::new();
+        for id in wanted {
+            if id.namespace() == Namespace::Federated {
+                federated.push(id.clone());
+                continue;
+            }
+            let (server, local) = ids::media_local(id);
+            match by_server.iter_mut().find(|(s, _)| *s == server) {
+                Some((_, local_ids)) => local_ids.push(local),
+                None => by_server.push((server, vec![local])),
+            }
+        }
+        let mut found: std::collections::HashMap<MediaId, Item> = std::collections::HashMap::new();
+        if !federated.is_empty()
+            && let Some(peers) = self.federated(Namespace::Federated, &"a paired server's item")
+        {
+            for item in peers?.items_by_id(&federated).await? {
+                found.insert(item.id().clone(), item);
+            }
+        }
+        let asked = by_server.into_iter().map(|(server, local_ids)| async move {
+            let source = self.source(server, &server)?;
+            let items = source.catalog.items_by_id(&local_ids).await?;
+            Ok::<_, CatalogError>(
+                items
+                    .into_iter()
+                    .map(|i| ids::item(server, i))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        for items in futures_util::future::try_join_all(asked).await? {
+            for item in items {
+                found.insert(item.id().clone(), item);
+            }
+        }
+        Ok(wanted.iter().filter_map(|id| found.remove(id)).collect())
+    }
+
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
         if let Some(peers) = self.federated(id.namespace(), id) {
             return peers?.item(id).await;
@@ -622,6 +785,34 @@ impl Inspect for Composite {
             .count(&local, kind)
             .await
             .map_err(|e| named(e, &local, library))
+    }
+
+    async fn rows_by_id(&self, ids: &[MediaId]) -> Result<Vec<Row>, CatalogError> {
+        // Each server's asked of together, then all in the order asked.
+        let mut by_server: Vec<(&str, Vec<MediaId>)> = Vec::new();
+        for id in ids {
+            let (server, local) = ids::media_local(id);
+            match by_server.iter_mut().find(|(s, _)| *s == server) {
+                Some((_, locals)) => locals.push(local),
+                None => by_server.push((server, vec![local])),
+            }
+        }
+        let mut found: std::collections::HashMap<MediaId, Row> =
+            std::collections::HashMap::with_capacity(ids.len());
+        for (server, locals) in by_server {
+            let Some(first) = locals.first() else {
+                continue;
+            };
+            let got = self
+                .source(server, first)?
+                .catalog
+                .rows_by_id(&locals)
+                .await?;
+            for r in rows(server, got) {
+                found.insert(r.item.id().clone(), r);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
     }
 
     async fn child_rows(&self, id: &MediaId) -> Result<Vec<Row>, CatalogError> {

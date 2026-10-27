@@ -266,6 +266,8 @@ fn every_request_round_trips() {
             library: LibraryId::new(Namespace::Plex, "2").unwrap(),
             offset: 40,
             limit: 20,
+            sort: None,
+            filter: None,
         },
         Request::Item { id: id.clone() },
         Request::Search(SearchRequest {
@@ -4238,4 +4240,149 @@ fn a_playback_ended_event_goes_both_ways() {
         handle: crate::PlaybackHandle("h".into()),
         error: Error::PlaybackStopped,
     });
+}
+
+/// A library sorted and filtered: `Items` takes a sort and a filter, each
+/// left out when not asked, so a request without them is the one a plain
+/// listing always was.
+mod item_sort_filter {
+    use super::*;
+    use spoolframe_types::{
+        Counted, DynamicRange, FilterPart, ItemFilter, ItemFilterValues, ItemSort, Resolution,
+        SortKey, WatchedState,
+    };
+
+    fn library() -> LibraryId {
+        LibraryId::new(Namespace::Plex, "1").unwrap()
+    }
+
+    #[test]
+    fn items_without_a_sort_or_filter_is_the_request_an_older_peer_knew() {
+        let plain = Request::Items {
+            library: library(),
+            offset: 0,
+            limit: 50,
+            sort: None,
+            filter: None,
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "items", "library": "plex:1", "offset": 0, "limit": 50})
+        );
+        let old: Request = serde_json::from_value(serde_json::json!({
+            "type": "items", "library": "plex:1", "offset": 0, "limit": 50,
+        }))
+        .unwrap();
+        assert_eq!(old, plain);
+    }
+
+    #[test]
+    fn items_with_a_sort_and_filter_round_trips_and_is_safe_to_retry() {
+        let sorted = Request::Items {
+            library: library(),
+            offset: 100,
+            limit: 50,
+            sort: Some(ItemSort {
+                key: SortKey::Added,
+                descending: true,
+            }),
+            filter: Some(ItemFilter {
+                watched: vec![WatchedState::Unwatched, WatchedState::InProgress],
+                genres: vec!["Drama".into()],
+                year_from: Some(1990),
+                year_to: Some(1999),
+                resolutions: vec![Resolution::Uhd],
+                dynamic_ranges: vec![DynamicRange::Hdr],
+                content_ratings: vec!["PG-13".into()],
+            }),
+        };
+        let json = serde_json::to_value(&sorted).unwrap();
+        assert_eq!(
+            json["sort"],
+            serde_json::json!({"key": "added", "descending": true})
+        );
+        assert_eq!(
+            json["filter"]["watched"],
+            serde_json::json!(["unwatched", "in_progress"])
+        );
+        assert_eq!(json["filter"]["resolutions"], serde_json::json!(["4k"]));
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: sorted.clone(),
+        });
+        assert!(crate::policy::retry_safe(&sorted));
+    }
+
+    #[test]
+    fn filter_values_round_trip_and_are_safe_to_retry() {
+        let ask = Request::ItemFilterValues { library: library() };
+        assert_eq!(
+            serde_json::to_value(&ask).unwrap(),
+            serde_json::json!({"type": "item_filter_values", "library": "plex:1"})
+        );
+        round_trip(RequestEnvelope {
+            session: Some(SessionId("s".into())),
+            request: ask.clone(),
+        });
+        assert!(crate::policy::retry_safe(&ask));
+        let values = ItemFilterValues {
+            genres: vec![Counted {
+                value: "Drama".into(),
+                count: Some(12),
+            }],
+            years: vec![Counted {
+                value: 1999,
+                count: None,
+            }],
+            content_ratings: Vec::new(),
+            resolutions: vec![Counted {
+                value: Resolution::FullHd,
+                count: Some(3),
+            }],
+            dynamic_ranges: vec![Counted {
+                value: DynamicRange::Sdr,
+                count: Some(3),
+            }],
+            sorts: vec![SortKey::Title, SortKey::LastPlayed],
+            filters: vec![FilterPart::Watched, FilterPart::Genres],
+        };
+        let reply = Reply::ItemFilterValues {
+            values: values.clone(),
+        };
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(
+            json["values"]["years"],
+            serde_json::json!([{"value": 1999}])
+        );
+        assert_eq!(
+            json["values"]["sorts"],
+            serde_json::json!(["title", "last_played"])
+        );
+        round_trip(Response::Ok(reply));
+    }
+
+    /// What a newer server lists that this build does not know reads as
+    /// unknown, not as a failure to read the reply.
+    #[test]
+    fn filter_values_from_a_newer_server_read_as_unknown() {
+        let read: Reply = serde_json::from_value(serde_json::json!({
+            "type": "item_filter_values",
+            "values": {
+                "sorts": ["title", "loudness"],
+                "filters": ["genres", "mood"],
+                "resolutions": [{"value": "8k", "count": 1}],
+            },
+        }))
+        .unwrap();
+        let Reply::ItemFilterValues { values } = read else {
+            panic!("not filter values");
+        };
+        assert_eq!(values.sorts, vec![SortKey::Title, SortKey::Unknown]);
+        assert_eq!(
+            values.filters,
+            vec![FilterPart::Genres, FilterPart::Unknown]
+        );
+        assert_eq!(values.resolutions[0].value, Resolution::Unknown);
+    }
 }

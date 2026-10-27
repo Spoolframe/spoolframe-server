@@ -6,9 +6,11 @@
 //! can implement it and the server can hold either, without the server and
 //! a catalog depending on each other.
 
+pub mod browse;
 pub mod inspect;
 mod search;
 
+pub use browse::{Browsing, Facts, ItemQuery, Listed, Viewer, WatchParts};
 pub use inspect::{
     Browse, FileCheck, Inspect, Inspected, LibraryCheck, MappingUsed, MissingFile, Row, RowFilter,
     RowPage, Version, VersionPart,
@@ -20,7 +22,11 @@ use std::fmt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use spoolframe_types::{ArtworkId, Item, Library, LibraryId, Marker, MediaId, MediaKind, PersonId};
+use spoolframe_types::{
+    ArtworkId, Item, ItemFilterValues, Library, LibraryId, Marker, MediaId, MediaKind, PersonId,
+};
+
+use CatalogError::CannotBrowse;
 
 /// Which slice of a library to list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +124,11 @@ pub enum CatalogError {
         items: u64,
         bytes: u64,
     },
+    /// The library cannot be sorted or filtered so: a key or a filter
+    /// part it does not have ([`Catalog::browsing`]). The client asked
+    /// for what it was not offered.
+    #[error("{0}")]
+    CannotBrowse(String),
 }
 
 /// A media file that cannot be read on this host. Names the path the
@@ -158,6 +169,105 @@ pub trait Catalog: Send + Sync {
     /// The top-level items of a library (movies, shows or artists), one
     /// page at a time.
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError>;
+
+    /// [`Catalog::items`], with what the listing says of each item to sort
+    /// and filter by, in the same order: what a paired server is sent of
+    /// a library (P8-02). By default, nothing more.
+    async fn items_with_facts(
+        &self,
+        library: &LibraryId,
+        page: Page,
+    ) -> Result<(ItemPage, Vec<Facts>), CatalogError> {
+        let page = self.items(library, page).await?;
+        let facts = vec![Facts::default(); page.items.len()];
+        Ok((page, facts))
+    }
+
+    /// Item `id`'s external ids, as [`Catalog::external_ids`], and what its
+    /// own record says of it to sort and filter by: every genre, and its
+    /// dynamic range, which a listing does not say. By default, no more
+    /// than the external ids.
+    async fn details(&self, id: &MediaId) -> Result<(Vec<String>, Facts), CatalogError> {
+        Ok((self.external_ids(id).await?, Facts::default()))
+    }
+
+    /// What library `library` can be sorted and filtered by: only by
+    /// title, unless the catalog says more.
+    async fn browsing(&self, _library: &Library) -> Result<Browsing, CatalogError> {
+        Ok(Browsing::plain())
+    }
+
+    /// What `library`'s top-level items have to filter by, and what
+    /// [`Catalog::browsing`] says of it. By default, no values.
+    async fn filter_values(&self, library: &Library) -> Result<ItemFilterValues, CatalogError> {
+        Ok(self.browsing(library).await?.values())
+    }
+
+    /// The top-level items of a library that `query` keeps, in its order,
+    /// one page at a time, and how many it keeps. Asked only what
+    /// [`Catalog::browsing`] offers, and the user's watch state only of a
+    /// catalog that applies it ([`WatchParts::InCatalog`]). By default
+    /// only the plain order, [`Catalog::items`]'.
+    async fn query_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+        page: Page,
+    ) -> Result<ItemPage, CatalogError> {
+        if *query == ItemQuery::plain() {
+            return self.items(library, page).await;
+        }
+        Err(CannotBrowse(format!(
+            "{library} cannot be sorted or filtered"
+        )))
+    }
+
+    /// Every top-level item `query` keeps, in its order, as ids: what the
+    /// server orders and filters by the user's watch state itself
+    /// ([`WatchParts::ByServer`]). By default, [`Catalog::query_items`]
+    /// page by page.
+    async fn walk_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+    ) -> Result<Vec<Listed>, CatalogError> {
+        const PAGE: u32 = 500;
+        let mut walked = Vec::new();
+        loop {
+            let page = self
+                .query_items(
+                    library,
+                    query,
+                    Page {
+                        offset: u32::try_from(walked.len()).unwrap_or(u32::MAX),
+                        limit: PAGE,
+                    },
+                )
+                .await?;
+            let got = page.items.len();
+            walked.extend(page.items.into_iter().map(|item| Listed {
+                id: item.id().clone(),
+                leaves: None,
+            }));
+            if got == 0 || walked.len() >= page.total as usize {
+                return Ok(walked);
+            }
+        }
+    }
+
+    /// The items `ids` name, in that order, as a listing has them: one
+    /// gone since is left out. By default, [`Catalog::item`] for each.
+    async fn items_by_id(&self, ids: &[MediaId]) -> Result<Vec<Item>, CatalogError> {
+        let mut items = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.item(id).await {
+                Ok(found) => items.push(found.item),
+                Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(items)
+    }
 
     /// One item, with its direct children.
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError>;

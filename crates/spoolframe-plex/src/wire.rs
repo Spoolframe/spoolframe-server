@@ -81,6 +81,10 @@ pub struct Directory {
     /// A library section's folders, as Plex sees them.
     #[serde(rename = "Location", default)]
     pub locations: Vec<Location>,
+    /// The field a section's filter (`/library/sections/{key}/filters`)
+    /// filters by: `genre`, `hdr`, `dovi`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub filter: Option<String>,
 }
 
 /// One folder of a library section.
@@ -166,6 +170,16 @@ pub struct Metadata {
     /// liked on import), and when it was last rated (Unix s).
     #[serde(default, deserialize_with = "lenient")]
     pub user_rating: Option<f64>,
+    /// What Plex sorts by title by: the title with a leading article set
+    /// aside; sent only where it differs from the title.
+    #[serde(default, deserialize_with = "lenient")]
+    pub title_sort: Option<String>,
+    /// The critic rating, 0 to 10.
+    #[serde(default, deserialize_with = "lenient")]
+    pub rating: Option<f64>,
+    /// The audience rating, 0 to 10.
+    #[serde(default, deserialize_with = "lenient")]
+    pub audience_rating: Option<f64>,
     #[serde(default, deserialize_with = "lenient")]
     pub last_rated_at: Option<i64>,
     /// A playlist's: `video`, `audio` or `photo` (PX-40).
@@ -288,6 +302,10 @@ pub struct Media {
     #[serde(default, deserialize_with = "lenient")]
     pub video_resolution: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
+    pub width: Option<u32>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub height: Option<u32>,
+    #[serde(default, deserialize_with = "lenient")]
     pub video_profile: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub audio_codec: Option<String>,
@@ -333,6 +351,13 @@ pub struct Stream {
     /// Hz.
     #[serde(default, deserialize_with = "lenient")]
     pub sampling_rate: Option<u32>,
+    /// A video stream's Dolby Vision.
+    #[serde(rename = "DOVIPresent", default, deserialize_with = "lenient")]
+    pub dovi_present: Option<bool>,
+    /// A video stream's transfer: `smpte2084` (PQ) and `arib-std-b67`
+    /// (HLG) are HDR.
+    #[serde(default, deserialize_with = "lenient")]
+    pub color_trc: Option<String>,
 }
 
 impl Stream {

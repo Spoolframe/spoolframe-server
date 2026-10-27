@@ -259,6 +259,8 @@ impl Served {
             library: library.parse().unwrap(),
             offset: 0,
             limit: 50,
+            sort: None,
+            filter: None,
         };
         match self.call(request).await {
             Response::Ok(Reply::Items { items, .. }) => Ok(ids(&items)),

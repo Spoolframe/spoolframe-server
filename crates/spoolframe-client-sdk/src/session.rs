@@ -17,8 +17,8 @@ use spoolframe_protocol::{
     SessionId, SessionInfo, TrackPreferencesInfo, UserSummary,
 };
 use spoolframe_types::{
-    ArtworkId, DisplayCapabilities, Item, Library, LibraryId, Marker, MediaId, MediaTracks,
-    PersonId, SubtitleFormat, TrackPreferences,
+    ArtworkId, DisplayCapabilities, Item, ItemFilter, ItemFilterValues, ItemSort, Library,
+    LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat, TrackPreferences,
 };
 
 use crate::client::Client;
@@ -795,10 +795,29 @@ impl Session {
         offset: u32,
         limit: u32,
     ) -> Result<ItemsPage, SdkError> {
+        self.items_sorted(library, offset, limit, None, None).await
+    }
+
+    /// [`Session::items`] in `sort`'s order (title A to Z when `None`),
+    /// only those `filter` keeps; `total` counts those. A key or filter
+    /// part the library does not list in [`Session::item_filter_values`]
+    /// is [`SdkError::InvalidInput`]. With neither, the library's plain
+    /// listing, as [`Session::items`].
+    pub async fn items_sorted(
+        &self,
+        library: &LibraryId,
+        offset: u32,
+        limit: u32,
+        sort: Option<ItemSort>,
+        filter: Option<ItemFilter>,
+    ) -> Result<ItemsPage, SdkError> {
         let request = Request::Items {
             library: library.clone(),
             offset,
             limit,
+            sort,
+            // An empty filter keeps everything: left out.
+            filter: filter.filter(|f| !f.is_empty()),
         };
         match self.call(request).await? {
             Reply::Items { items, total, .. } => Ok(ItemsPage {
@@ -806,6 +825,21 @@ impl Session {
                 total,
                 unavailable: Vec::new(),
             }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// What `library` can be sorted and filtered by, and the values its
+    /// items have: what an app builds its controls from.
+    pub async fn item_filter_values(
+        &self,
+        library: &LibraryId,
+    ) -> Result<ItemFilterValues, SdkError> {
+        let request = Request::ItemFilterValues {
+            library: library.clone(),
+        };
+        match self.call(request).await? {
+            Reply::ItemFilterValues { values } => Ok(values),
             other => Err(unexpected(other)),
         }
     }

@@ -222,6 +222,35 @@ pub struct RemoteItem {
     /// title (P8-03) and merged search (P8-05) match on.
     #[serde(default)]
     pub external_ids: Vec<String>,
+    /// What a library is sorted and filtered by
+    /// ([`spoolframe_types::browse`]), each left out when the sharing
+    /// server has none: one from before them sends none, and the item
+    /// hashes as it did. A film's, a show's or an artist's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_title: Option<String>,
+    /// The day it first came out, `YYYY-MM-DD`: a film's release, a
+    /// show's first airing (where `date` is its last).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<String>,
+    /// When it was added to the sharing server's catalog, Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<i64>,
+    /// The critic rating, in tenths: 0 to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating_tenths: Option<u16>,
+    /// The audience rating, in tenths: 0 to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience_rating_tenths: Option<u16>,
+    /// A film's file size, its first version's, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// A film's resolution class, its first version's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<spoolframe_types::Resolution>,
+    /// A film's dynamic range, its first version's: `sdr`, `hdr` (not
+    /// Dolby Vision) or `dolby_vision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_range: Option<spoolframe_types::DynamicRange>,
     /// The content hash ([`RemoteItem::digest`]) the sharing server
     /// diffed by: unchanged, unchanged item.
     pub hash: String,
@@ -270,6 +299,8 @@ impl RemoteItem {
             &mut self.grandparent_title,
             &mut self.date,
             &mut self.content_rating,
+            &mut self.sort_title,
+            &mut self.released,
         ] {
             cut_option(text, MAX_ITEM_TEXT);
         }

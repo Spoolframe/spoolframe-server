@@ -94,6 +94,14 @@ fn padded(n: usize) -> RemoteItem {
         genres: Vec::new(),
         artwork: Vec::new(),
         external_ids: Vec::new(),
+        sort_title: None,
+        released: None,
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        size: None,
+        resolution: None,
+        dynamic_range: None,
         hash: String::new(),
     }
     .hashed()

@@ -255,7 +255,7 @@ fn like_pattern(text: &str) -> String {
     pattern
 }
 
-fn bodies(rows: Vec<String>) -> Vec<RemoteItem> {
+pub(super) fn bodies(rows: Vec<String>) -> Vec<RemoteItem> {
     rows.iter().filter_map(|b| body(b)).collect()
 }
 
@@ -569,15 +569,43 @@ impl Store {
         let Some(kind) = item.kind.as_str() else {
             return Ok(());
         };
+        // What it is sorted and filtered by: its own sort title, else its
+        // title with a leading article set aside, as this server's own
+        // libraries are sorted.
+        let sort_title = item
+            .sort_title
+            .clone()
+            .unwrap_or_else(|| spoolframe_types::browse::sort_title(&item.title).to_owned());
+        // A film's release, else its date; a show's first airing only (its
+        // date is its last).
+        let released = item.released.clone().or_else(|| match item.kind {
+            spoolframe_protocol::federation::RemoteKind::Movie => item.date.clone(),
+            _ => None,
+        });
+        let dynamic_range = item.dynamic_range.and_then(|r| match r {
+            spoolframe_types::DynamicRange::Sdr => Some("sdr"),
+            spoolframe_types::DynamicRange::Hdr => Some("hdr"),
+            spoolframe_types::DynamicRange::DolbyVision => Some("dolby_vision"),
+            spoolframe_types::DynamicRange::Unknown => None,
+        });
+        let resolution = item
+            .resolution
+            .filter(|r| *r != spoolframe_types::Resolution::Unknown)
+            .map(|r| r.as_str());
         sqlx::query(
             "INSERT INTO federation_cache_items \
                  (origin, item, library, kind, parent, grandparent, title, position, year, \
-                  body, hash, unavailable, cached_at, peer) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13) \
+                  body, hash, unavailable, cached_at, peer, sort_title, released, added_at, \
+                  rating, audience_rating, duration_ms, size, resolution, dynamic_range, \
+                  content_rating) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23) \
              ON CONFLICT (origin, item) DO UPDATE SET \
                  library = ?3, kind = ?4, parent = ?5, grandparent = ?6, title = ?7, \
                  position = ?8, year = ?9, body = ?10, hash = ?11, unavailable = 0, \
-                 peer = ?13",
+                 peer = ?13, sort_title = ?14, released = ?15, added_at = ?16, \
+                 rating = ?17, audience_rating = ?18, duration_ms = ?19, size = ?20, \
+                 resolution = ?21, dynamic_range = ?22, content_rating = ?23",
         )
         .bind(origin)
         .bind(&item.id)
@@ -592,6 +620,16 @@ impl Store {
         .bind(&item.hash)
         .bind(self.now())
         .bind(peer)
+        .bind(sort_title)
+        .bind(released)
+        .bind(item.added_at)
+        .bind(item.rating_tenths.map(i64::from))
+        .bind(item.audience_rating_tenths.map(i64::from))
+        .bind(item.duration_ms.and_then(|d| i64::try_from(d).ok()))
+        .bind(item.size.and_then(|s| i64::try_from(s).ok()))
+        .bind(resolution)
+        .bind(dynamic_range)
+        .bind(&item.content_rating)
         .execute(&mut **tx)
         .await?;
         // A new row has nothing of its own yet to replace.
@@ -599,6 +637,7 @@ impl Store {
             for table in [
                 "DELETE FROM federation_cache_external_ids WHERE origin = ?1 AND item = ?2",
                 "DELETE FROM federation_cache_item_artwork WHERE origin = ?1 AND item = ?2",
+                "DELETE FROM federation_cache_genres WHERE origin = ?1 AND item = ?2",
             ] {
                 sqlx::query(table)
                     .bind(origin)
@@ -615,6 +654,19 @@ impl Store {
             .bind(origin)
             .bind(&item.id)
             .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        for genre in &item.genres {
+            sqlx::query(
+                "INSERT OR IGNORE INTO federation_cache_genres \
+                     (origin, item, genre, library, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(origin)
+            .bind(&item.id)
+            .bind(genre)
+            .bind(library_id)
+            .bind(kind)
             .execute(&mut **tx)
             .await?;
         }
@@ -655,6 +707,11 @@ impl Store {
              WHERE origin = ?1 AND (?2 IS NULL OR library = ?2) \
                AND item IN (SELECT value FROM json_each(?3))",
             "DELETE FROM federation_cache_item_artwork WHERE origin = ?1 \
+               AND item IN (SELECT item FROM federation_cache_items \
+                            WHERE origin = ?1 AND (?2 IS NULL OR library = ?2) \
+                              AND item IN (SELECT value FROM json_each(?3)))",
+            // Nor genres: those are a browsed library's (migration 0060).
+            "DELETE FROM federation_cache_genres WHERE origin = ?1 \
                AND item IN (SELECT item FROM federation_cache_items \
                             WHERE origin = ?1 AND (?2 IS NULL OR library = ?2) \
                               AND item IN (SELECT value FROM json_each(?3)))",
@@ -1299,7 +1356,7 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use spoolframe_protocol::federation::{
         RemoteArtwork, RemoteArtworkKind, RemoteKind, RemoteLibraryKind,
     };
@@ -1308,9 +1365,9 @@ mod tests {
     use super::super::tests::{TestStore, test_store};
     use super::*;
 
-    const ORIGIN: &str = "aaaaaaaaaaaaaaaa";
+    pub(in crate::store) const ORIGIN: &str = "aaaaaaaaaaaaaaaa";
 
-    async fn paired(test: &str) -> (TestStore, String) {
+    pub(in crate::store) async fn paired(test: &str) -> (TestStore, String) {
         let store = test_store(test).await;
         let peer = store
             .add_peer(
@@ -1328,7 +1385,7 @@ mod tests {
         (store, peer.id)
     }
 
-    fn film(key: &str, title: &str) -> RemoteItem {
+    pub(in crate::store) fn film(key: &str, title: &str) -> RemoteItem {
         RemoteItem {
             id: format!("plex:movie:{key}"),
             kind: RemoteKind::Movie,
@@ -1351,12 +1408,20 @@ mod tests {
                 kind: RemoteArtworkKind::Poster,
             }],
             external_ids: vec![format!("tmdb://{key}")],
+            sort_title: None,
+            released: None,
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            resolution: None,
+            dynamic_range: None,
             hash: String::new(),
         }
         .hashed()
     }
 
-    async fn movies(store: &Store, peer: &str) {
+    pub(in crate::store) async fn movies(store: &Store, peer: &str) {
         store
             .cache_library(
                 ORIGIN,
@@ -1383,7 +1448,7 @@ mod tests {
     }
 
     /// One whole sync of Movies under `cursor`, staged and written.
-    async fn synced(
+    pub(in crate::store) async fn synced(
         store: &Store,
         peer: &str,
         cursor: &str,

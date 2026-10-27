@@ -10,6 +10,7 @@
 
 pub mod account;
 mod bif;
+mod browse;
 pub mod check;
 mod convert;
 pub mod gdm;
@@ -31,12 +32,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use spoolframe_catalog::{
-    Catalog, CatalogError, Found, Image, ItemPage, ItemWithChildren, Page, PreviewFrames,
-    SearchQuery, UnavailableFile,
+    Browsing, Catalog, CatalogError, Facts, Found, Image, ItemPage, ItemQuery, ItemWithChildren,
+    Listed, Page, PreviewFrames, SearchQuery, UnavailableFile,
 };
 use spoolframe_types::{
-    ArtworkId, CalendarDate, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, Namespace,
-    PersonId,
+    ArtworkId, CalendarDate, Item, ItemFilterValues, Library, LibraryId, LibraryKind, MediaId,
+    MediaKind, Namespace, PersonId,
 };
 use url::Url;
 
@@ -109,6 +110,9 @@ pub struct PlexCatalog {
     /// Every request to this PMS, from this catalog and the views of it
     /// made from it (P3-14).
     stats: Arc<RequestStats>,
+    /// What each section sorts and filters by, as the PMS last said
+    /// ([`browse`]): shared with the views of it, as `stats` is.
+    sorting: Arc<browse::Sorting>,
 }
 
 /// An item fetched by ID: as Plex sent it, converted, and the library it
@@ -184,6 +188,7 @@ impl PlexCatalog {
             paths: PathMap::default(),
             sections: None,
             stats: Arc::default(),
+            sorting: Arc::default(),
         })
     }
 
@@ -217,6 +222,7 @@ impl PlexCatalog {
             paths,
             sections: self.sections.clone(),
             stats: self.stats.clone(),
+            sorting: self.sorting.clone(),
         }
     }
 
@@ -817,6 +823,14 @@ impl Catalog for PlexCatalog {
     }
 
     async fn items(&self, library: &LibraryId, page: Page) -> Result<ItemPage, CatalogError> {
+        Ok(self.items_with_facts(library, page).await?.0)
+    }
+
+    async fn items_with_facts(
+        &self,
+        library: &LibraryId,
+        page: Page,
+    ) -> Result<(ItemPage, Vec<Facts>), CatalogError> {
         let key = plex_key(library.namespace(), library.key(), library)?;
         if !self.serves(Some(&SectionKey(key.to_owned()))) {
             return Err(CatalogError::NotServed(library.to_string()));
@@ -831,7 +845,60 @@ impl Catalog for PlexCatalog {
             .total_size
             .ok_or_else(|| self.backend(&call, None, "listing has no totalSize".into()))?;
         let items = self.items_of(&call, &container.metadata)?;
-        Ok(ItemPage { items, total })
+        let facts = container.metadata.iter().map(browse::facts).collect();
+        Ok((ItemPage { items, total }, facts))
+    }
+
+    /// From the item's own record, as [`Catalog::external_ids`]: one
+    /// request, which also has every genre and its streams.
+    async fn details(&self, id: &MediaId) -> Result<(Vec<String>, Facts), CatalogError> {
+        let key = plex_key(id.namespace(), id.key(), id)?;
+        let call = Call::get(format!("/library/metadata/{key}")).about(id);
+        let container = self.fetch(&call).await?;
+        match container.metadata.first() {
+            Some(m)
+                if !self.serves(
+                    m.library_section_id
+                        .as_ref()
+                        .or(container.library_section_id.as_ref()),
+                ) =>
+            {
+                Err(CatalogError::NotServed(id.to_string()))
+            }
+            Some(m) if convert::media_kind(&m.kind) == Some(id.kind()) => {
+                Ok((convert::external_ids(m), browse::facts(m)))
+            }
+            _ => Err(CatalogError::NotFound(id.to_string())),
+        }
+    }
+
+    async fn browsing(&self, library: &Library) -> Result<Browsing, CatalogError> {
+        self.browsing_of(library).await
+    }
+
+    async fn filter_values(&self, library: &Library) -> Result<ItemFilterValues, CatalogError> {
+        self.values(library).await
+    }
+
+    async fn query_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+        page: Page,
+    ) -> Result<ItemPage, CatalogError> {
+        self.query(library, query, page).await
+    }
+
+    async fn walk_items(
+        &self,
+        library: &LibraryId,
+        query: &ItemQuery,
+    ) -> Result<Vec<Listed>, CatalogError> {
+        self.walk(library, query).await
+    }
+
+    async fn items_by_id(&self, ids: &[MediaId]) -> Result<Vec<Item>, CatalogError> {
+        self.by_id(ids).await
     }
 
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {

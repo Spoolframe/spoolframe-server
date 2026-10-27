@@ -46,6 +46,7 @@ must be updated together. The changes per revision are in
   [sharing by name](#sharing-by-name), [Liked and All](#liked-and-all),
   [playlist covers](#playlist-covers) and
   [up next in a playlist](#up-next-in-a-playlist)
+- [Sorting and filtering a library](#sorting-and-filtering-a-library)
 - [Downloads](#downloads)
 - [Portable identities](#portable-identities)
 - [Federation](#federation) (experimental):
@@ -1971,6 +1972,130 @@ the rest of their data.
 SDK: `Features::play_history`; `Session::recently_played(kinds, offset,
 limit)` returns an `ItemsPage` (`SdkError::Unsupported` without the
 feature); the fields arrive on `ItemDetail.item` and `children`.
+
+## Sorting and filtering a library
+
+`Items` takes two more fields, both optional and left out when not
+used:
+
+```json
+{"type": "items", "library": "plex:1", "offset": 0, "limit": 50,
+ "sort": {"key": "added", "descending": true},
+ "filter": {"watched": ["unwatched", "in_progress"],
+            "genres": ["Drama", "Comedy"],
+            "year_from": 1990, "year_to": 1999,
+            "resolutions": ["4k", "1080p"],
+            "dynamic_ranges": ["hdr"],
+            "content_ratings": ["PG-13", "R"]}}
+```
+
+Without either, a library is ordered as it always was, by title, and
+every item is listed. They are part of the base protocol, with no
+feature to list; what each library can be sorted and filtered by is
+the library's to say (`ItemFilterValues`, below).
+
+`sort.key` is one of:
+
+- `title`: the sort title, a leading "The", "A" or "An" set aside, as
+  Plex's `titleSort`;
+- `released`: the day it came out;
+- `added`: when this server's catalog got it; a show, when its latest
+  episode was;
+- `last_played`: the session user's own watch state, when it last
+  changed (`last_viewed_at`); a show by its latest episode's;
+- `rating`: the critic rating; `audience_rating`: the audience rating;
+- `duration`: a movie's running time;
+- `size`: a movie's file size.
+
+`descending` is `false` when left out. An item with no value for the
+key (never played, no rating, no release date) comes last both ways.
+Items equal by the key are ordered by sort title A to Z, then by id,
+so a page never repeats or skips one.
+
+Each part of `filter` is optional; the parts combine with AND, and the
+values within one part with OR. An empty list keeps everything:
+
+- `watched`: `unwatched`, `in_progress`, `watched`, by the session
+  user's watch state, never another user's. A movie is watched once
+  marked or played to the end, in progress once played past its first
+  minutes. A show is watched when every episode is, in progress when
+  some episode is watched or in progress, unwatched when none is.
+- `genres`: by name, case aside, as `ItemFilterValues` lists them.
+- `year_from`, `year_to`: inclusive; a decade is `1990` to `1999`.
+- `resolutions`: `4k`, `1080p`, `720p`, `sd`.
+- `dynamic_ranges`: `sdr`, `hdr` (any HDR, Dolby Vision included),
+  `dolby_vision`.
+- `content_ratings`: as the catalog has them, case aside.
+
+An item with no value for a part asked for (no year, no resolution) is
+not kept. `total` counts the items the filter keeps.
+
+`ItemFilterValues { library }` answers `ItemFilterValues { values }`:
+what the library's top-level items have to filter by, and what it
+applies. Each list holds `{"value": …, "count": …}`; `count` is left out
+where it is not cheap to say.
+
+```json
+{"genres": [{"value": "Drama", "count": 412}],
+ "years": [{"value": 2024, "count": 31}],
+ "content_ratings": [{"value": "PG-13", "count": 120}],
+ "resolutions": [{"value": "4k", "count": 80}],
+ "dynamic_ranges": [{"value": "sdr", "count": 900}, {"value": "hdr", "count": 75}],
+ "sorts": ["title", "released", "added", "last_played", "rating", "audience_rating", "duration"],
+ "filters": ["watched", "genres", "years", "content_ratings", "resolutions", "dynamic_ranges"]}
+```
+
+`sorts` are the keys the library orders by, `filters` the parts it
+applies, and `dynamic_ranges` the ranges it can be filtered by. An app
+builds its controls from them and offers nothing else: a key, a part or
+a range not listed is `InvalidInput` in `Items`, as is a value this
+build does not know (a newer client's key), a list of more than 64
+values, a text of more than 128 characters, or `year_from` after
+`year_to`. Values a newer server lists that the app does not know read
+as `unknown`; an app leaves them out.
+
+What each library has:
+
+| | Movies | TV | Music |
+|---|---|---|---|
+| This server's own (Plex) | every sort but `size`; every filter part; ranges `sdr`, `hdr`, and `dolby_vision` where the PMS filters by it | sorts `title`, `released`, `added`, `last_played`, `rating`, `audience_rating`; `watched`, `genres`, `years`, `content_ratings` | sorts `title`, `added`; `genres` |
+| A paired server's (`fed:`) | every sort; every filter part and range | as this server's | as this server's |
+
+This server's own libraries are read from Plex at each request, as a
+plain `Items` is: they are as live as Plex is, and Plex sorts and
+filters them by its own parameters. What a library offers is what its
+PMS lists for the section (`/library/sections/{key}/sorts` and
+`/filters`), so a PMS from before the `dovi` filter offers no
+`dolby_vision`: a PMS ignores a filter it does not know and would answer
+every item. No PMS sorts by file size. Plex orders a few films by a
+length other than the one it lists (one with several versions); that
+order is what is listed. Genres, years and content ratings come without
+counts. The `watched` filter and the `last_played` sort are the
+server's own: it reads the library's whole order from Plex (only each
+item's key) and keeps it for a minute per user, library, sort and
+filter, or until that user's watch state changes, so the first page of
+such a listing of a large library takes longer than the next: about
+0.15 ms an item against a PMS on the LAN.
+
+A paired server's library is sorted and filtered in its cache here,
+including while that server is offline, and is as fresh as its last
+sync. The sort title, release day, added date, ratings, file size,
+resolution, range and every genre of a movie come from the paired
+server with each item; one running an older build sends none of them,
+and its items have no value for them until its next sync after it is
+upgraded (that sync sends every item once more): they are listed last
+by them and not kept by those filters. What the cache had before this
+server was upgraded keeps its title, length, content rating, year,
+genres and a movie's release day. On a paired server's TV library,
+`added` is when the show was added there, not its latest episode; a
+show is watched when every episode cached here is. The `watched` filter
+and `last_played` sort are joined in the same query as the rest: no
+walk, no first-page cost. A page of a 300,000-film cache takes about
+25 ms by any key, and about 200 ms with a genre and a decade asked for.
+
+SDK: `Session::items_sorted(library, offset, limit, sort, filter)`
+returns an `ItemsPage`, and `Session::item_filter_values(library)` the
+`ItemFilterValues`.
 
 ## Liked and All
 
