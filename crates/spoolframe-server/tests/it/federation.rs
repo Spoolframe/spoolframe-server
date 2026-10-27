@@ -1118,6 +1118,48 @@ mod admin {
         sb.server.stop().await;
     }
 
+    /// "Invite a server" in the web UI opens Invites' form: a server's
+    /// invite keeps the note, uses and expiry typed there, and is listed
+    /// with them. A role is refused, as the form sends none.
+    #[tokio::test]
+    async fn the_web_ui_s_server_invite_keeps_its_note_uses_and_expiry() {
+        const DAY: u64 = 24 * 3600;
+        let sa = Site::start("fed-admin-invite-form", "Alice's server", "alice", true).await;
+        let made = sa
+            .admin
+            .invite_create(NewInvite {
+                kind: ApiKind::Federation,
+                note: Some("Bob's server".into()),
+                uses: Some(2),
+                expires: Some(DAY),
+                role: None,
+            })
+            .await
+            .unwrap()
+            .invite;
+        let listed = sa.admin.invite_list().await.unwrap();
+        assert_eq!(listed, std::slice::from_ref(&made));
+        assert_eq!(
+            (made.kind, made.note.as_deref(), made.uses, made.uses_left),
+            (ApiKind::Federation, Some("Bob's server"), 2, 2)
+        );
+        assert_eq!(made.expires_at - made.created_at, DAY as i64);
+        let refused = sa
+            .admin
+            .invite_create(NewInvite {
+                kind: ApiKind::Federation,
+                note: None,
+                uses: None,
+                expires: None,
+                role: Some(Role::Consumer),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(refused), error_code::INVALID_INPUT);
+        assert_eq!(sa.admin.invite_list().await.unwrap().len(), 1);
+        sa.server.stop().await;
+    }
+
     /// The web UI's check before pairing: SB's admin looks SA's invite up
     /// and reads SA's name and fingerprint, and the invite keeps its use;
     /// one used by another server, or a server paired already, is refused

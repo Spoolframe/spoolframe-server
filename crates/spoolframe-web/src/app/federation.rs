@@ -2,7 +2,8 @@
 //! paired with this one, each with its key's fingerprint to compare with
 //! what that server's admin sees, and Unpair; a paired server's new key,
 //! held until it is confirmed or rejected; inviting a server (a
-//! `federation` invite, shown as Invites shows one) and pairing with
+//! `federation` invite, made with Invites' form and shown as Invites
+//! shows one) and pairing with
 //! another by its invite link, after checking its fingerprint, then
 //! choosing what to share with it. Each live pair says whether it is
 //! online, when what it shares was last synced, with Refresh (P8-02), and
@@ -16,11 +17,11 @@
 use dioxus::prelude::*;
 use spoolframe_admin_api::{
     AdminApiClient, FederationApiClient, GrantEntry, InviteCreated, InviteKind, LibraryEntry,
-    NewInvite, PairLookup, PeerDetail, PeerEntry, PeerKey,
+    PairLookup, PeerDetail, PeerEntry, PeerKey,
 };
 
 use super::admin::{Said, Toast, say};
-use super::invites::InviteResult;
+use super::invites::{CreateInvite, InviteResult};
 use super::optimized::DangerDialog;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, Route, icons, now, rpc};
@@ -79,36 +80,14 @@ pub fn Federation() -> Element {
     let mut list = use_resource(peers);
     let toast = use_signal(|| None::<Said>);
     let mut pairing = use_signal(|| false);
+    // "Invite a server" opens Invites' form on a `federation` invite, and
+    // shows what is made as Invites shows it.
+    let mut inviting = use_signal(|| false);
     let mut made = use_signal(|| None::<InviteCreated>);
     let mut asking = use_signal(|| None::<Change>);
     let mut busy = use_signal(|| false);
     // Each change may ask "Confirm it's you" first, then is tried again.
     let confirming = use_signal(|| None::<String>);
-    let confirming_invite = use_signal(|| None::<String>);
-    // "Invite a server" makes a `federation` invite, as Invites makes one.
-    let invite = use_callback(move |()| {
-        spawn(async move {
-            let made_now = async {
-                let client = rpc::client().await?;
-                client
-                    .invite_create(NewInvite {
-                        kind: InviteKind::Federation,
-                        note: None,
-                        uses: None,
-                        expires: None,
-                        role: None,
-                    })
-                    .await
-                    .map_err(rpc::error)
-            }
-            .await;
-            match made_now {
-                Ok(created) => made.set(Some(created)),
-                Err(e) if asks_to_confirm(&e, confirming_invite, CONFIRM_ABOUT) => {}
-                Err(e) => say(toast, false, e.explain()),
-            }
-        });
-    });
     let go = use_callback(move |()| {
         let Some(asked) = asking() else {
             return;
@@ -146,8 +125,8 @@ pub fn Federation() -> Element {
                         "Servers paired with this one. Experimental: pair only with servers you run. Compare each key's fingerprint with what its admin sees as their own."
                     }
                 }
-                div { class: "flex gap-2",
-                    button { class: "btn", onclick: move |_| invite.call(()),
+                div { class: "flex flex-wrap gap-2",
+                    button { class: "btn-add btn-add-outline", onclick: move |_| inviting.set(true),
                         icons::Ticket { size: 16 }
                         "Invite a server"
                     }
@@ -194,6 +173,16 @@ pub fn Federation() -> Element {
                 },
             }
         }
+        if inviting() {
+            CreateInvite {
+                federation: true,
+                kind: InviteKind::Federation,
+                on_done: move |created: Option<InviteCreated>| {
+                    inviting.set(false);
+                    made.set(created);
+                },
+            }
+        }
         if let Some(created) = made() {
             InviteResult { created, on_done: move |_| made.set(None) }
         }
@@ -201,7 +190,6 @@ pub fn Federation() -> Element {
             ChangeDialog { change: asked, busy: busy(), on_go: move |_| go.call(()), on_cancel: move |_| asking.set(None) }
         }
         ConfirmItsYou { asking: confirming, on_confirmed: move |_| go.call(()) }
-        ConfirmItsYou { asking: confirming_invite, on_confirmed: move |_| invite.call(()) }
         Toast { said: toast }
     }
 }
@@ -247,7 +235,7 @@ fn PeerRow(
             span { class: "tie-icon", icons::Server { size: 20 } }
             span { class: "tie-what",
                 Link { class: "font-bold hover:underline", to: Route::FederationPeer { id: peer.id.clone() }, "{peer.name}" }
-                span { class: "tie-fp", title: "Key {peer.endpoint_id}", "{peer.fingerprint}" }
+                span { class: "tie-sub mono", title: "Key {peer.endpoint_id}", "{peer.fingerprint}" }
                 span { class: "tie-sub", {peer_line(now, &peer)} }
                 if live {
                     span { class: "tie-sub", {state_line(now, &peer)} }
@@ -397,45 +385,53 @@ fn Shares(peer: PeerEntry, toast: Signal<Option<Said>>) -> Element {
                     .cloned()
                     .collect();
                 rsx! {
-                    if grants.is_empty() {
-                        span { class: "tie-sub", "Nothing shared with this server." }
-                    }
-                    for grant in grants.clone() {
-                        span { key: "{grant.library}", class: "flex items-center gap-2",
-                            span { class: "tie-sub", "Shared: " {name(&grant.library)} }
-                            button {
-                                class: "btn btn-sever",
-                                onclick: {
-                                    let named = (grant.library.clone(), name(&grant.library));
-                                    move |_| revoking.set(Some(named.clone()))
-                                },
-                                "Revoke…"
-                            }
-                        }
-                    }
-                    if !unshared.is_empty() {
-                        span { class: "flex items-center gap-2",
-                            select {
-                                class: "pref-select",
-                                onchange: move |e| chosen.set(e.value()),
-                                option { value: "", selected: chosen().is_empty(), "Choose a library…" }
-                                for library in unshared {
-                                    option {
-                                        key: "{library.id}",
-                                        value: "{library.id}",
-                                        selected: library.id == chosen(),
-                                        "{library.name}"
+                    div { class: "peer-shares",
+                        span { class: "peer-shares-label", "Shared with this server" }
+                        if grants.is_empty() {
+                            span { class: "tie-sub", "Nothing yet." }
+                        } else {
+                            ul { class: "peer-share-list",
+                                for grant in grants.clone() {
+                                    li { key: "{grant.library}", class: "peer-share",
+                                        span { class: "min-w-0 truncate", {name(&grant.library)} }
+                                        button {
+                                            class: "btn-unshare",
+                                            aria_label: "Stop sharing {name(&grant.library)}",
+                                            onclick: {
+                                                let named = (grant.library.clone(), name(&grant.library));
+                                                move |_| revoking.set(Some(named.clone()))
+                                            },
+                                            "Revoke…"
+                                        }
                                     }
                                 }
                             }
-                            button {
-                                class: "btn",
-                                disabled: chosen().is_empty(),
-                                onclick: move |_| {
-                                    asked.set(Some(Share::Add(chosen())));
-                                    go.call(());
-                                },
-                                "Share"
+                        }
+                        if !unshared.is_empty() {
+                            span { class: "flex flex-wrap items-center gap-2",
+                                select {
+                                    class: "pref-select",
+                                    aria_label: "Library to share with {peer.name}",
+                                    onchange: move |e| chosen.set(e.value()),
+                                    option { value: "", selected: chosen().is_empty(), "Choose a library…" }
+                                    for library in unshared {
+                                        option {
+                                            key: "{library.id}",
+                                            value: "{library.id}",
+                                            selected: library.id == chosen(),
+                                            "{library.name}"
+                                        }
+                                    }
+                                }
+                                button {
+                                    class: "btn",
+                                    disabled: chosen().is_empty(),
+                                    onclick: move |_| {
+                                        asked.set(Some(Share::Add(chosen())));
+                                        go.call(());
+                                    },
+                                    "Share"
+                                }
                             }
                         }
                     }

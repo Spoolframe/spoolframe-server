@@ -1671,7 +1671,7 @@ fn users_links(route: &Route) -> Element {
 
 /// Whether the server has federation on (P8-01), as its status names its
 /// experimental features; off when it cannot be told.
-async fn federation_on() -> bool {
+pub(super) async fn federation_on() -> bool {
     use spoolframe_admin_api::AdminApiClient;
     let Ok(client) = rpc::client().await else {
         return false;

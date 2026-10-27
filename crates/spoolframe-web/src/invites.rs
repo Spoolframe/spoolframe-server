@@ -31,7 +31,8 @@ pub struct InviteForm {
     pub expires: u64,
     /// For an account here; a portable guest's is always a consumer's.
     pub role: Role,
-    /// An account here, or a guest with their own identity (P7-05).
+    /// An account here, a guest with their own identity (P7-05), or a
+    /// server to pair (P8-01).
     pub kind: InviteKind,
 }
 
@@ -160,12 +161,15 @@ pub fn card_line(entry: &InviteEntry, now: i64) -> String {
     )
 }
 
-/// What a list row calls the invite: its note, or who made it when.
+/// What a list row calls the invite: its note, else what kind it is.
 pub fn name(entry: &InviteEntry) -> String {
-    entry
-        .note
-        .clone()
-        .unwrap_or_else(|| "Invite without a note".into())
+    entry.note.clone().unwrap_or_else(|| {
+        if entry.kind == InviteKind::Federation {
+            "Server invite".into()
+        } else {
+            "Invite without a note".into()
+        }
+    })
 }
 
 /// "Revoke the Book club invite?" and what it does.
@@ -301,6 +305,29 @@ mod tests {
         assert_eq!(made.role, None);
     }
 
+    /// P8-01: a server's invite keeps its note, uses and expiry, and
+    /// sends no role, as the server refuses one.
+    #[test]
+    fn a_server_s_invite_keeps_its_note_and_expiry_and_has_no_role() {
+        let form = InviteForm {
+            note: " Bob's server ".into(),
+            uses: "2".into(),
+            expires: DAY,
+            role: Role::Admin,
+            kind: InviteKind::Federation,
+        };
+        assert_eq!(
+            new_invite(&form),
+            Ok(NewInvite {
+                kind: InviteKind::Federation,
+                note: Some("Bob's server".into()),
+                uses: Some(2),
+                expires: Some(DAY),
+                role: None,
+            })
+        );
+    }
+
     #[test]
     fn uses_out_of_range_or_a_long_note_are_refused_in_the_form() {
         for uses in ["0", "101", "two", ""] {
@@ -362,6 +389,21 @@ mod tests {
         assert_eq!(uses_chip(4), "4 uses");
         assert_eq!(title(Some("Mum's iPad")), "Invite for Mum's iPad");
         assert_eq!(title(None), "New invite");
+    }
+
+    #[test]
+    fn an_invite_without_a_note_is_named_by_its_kind() {
+        let unnamed = InviteEntry {
+            note: None,
+            ..entry(1, 1)
+        };
+        assert_eq!(name(&unnamed), "Invite without a note");
+        let server = InviteEntry {
+            kind: InviteKind::Federation,
+            ..unnamed
+        };
+        assert_eq!(name(&server), "Server invite");
+        assert_eq!(name(&entry(1, 1)), "Book club");
     }
 
     /// WebInvitesPhone 5.

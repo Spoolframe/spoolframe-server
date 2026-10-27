@@ -14,6 +14,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use super::admin::{Said, Toast, say};
 use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, Notice, icons, now, role_name, rpc};
+use crate::federation::CONFIRM_ABOUT;
 use crate::invites::{
     EXPIRY_CHOICES, InviteForm, card_line, day_month, day_month_time, expires_in, expires_soon,
     name, new_invite, qr, revoke_error, revoke_question, title, uses_chip, uses_left,
@@ -76,6 +77,8 @@ pub fn Invites() -> Element {
     let mut made = use_signal(|| None::<InviteCreated>);
     let mut revoking = use_signal(|| None::<InviteEntry>);
     let mut showing = use_signal(|| None::<ServerLink>);
+    // Whether the form offers a server's invite (P8-01, experimental).
+    let federation = use_resource(super::federation_on);
     let now = now();
     let current = list.read().clone();
     rsx! {
@@ -132,6 +135,7 @@ pub fn Invites() -> Element {
         }
         if creating() {
             CreateInvite {
+                federation: federation().unwrap_or(false),
                 on_done: move |created: Option<InviteCreated>| {
                     creating.set(false);
                     if let Some(created) = created {
@@ -492,13 +496,20 @@ fn QrCard(data: String, px: u32) -> Element {
 /// WebInviteCreate: who it is for, how many accounts, how long, which
 /// role. From a session signed in long ago the server asks to confirm it
 /// is the admin first (WebInviteReauth), and the invite is then made.
+/// `federation` offers a server's invite too (P8-01), and `kind` is the
+/// kind first chosen: the Federation page's "Invite a server" opens it on
+/// a server's.
 #[component]
-fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
+pub(super) fn CreateInvite(
+    #[props(default)] federation: bool,
+    #[props(default = InviteKind::CreateUser)] kind: InviteKind,
+    on_done: EventHandler<Option<InviteCreated>>,
+) -> Element {
     let note = use_signal(String::new);
     let uses = use_signal(|| "1".to_owned());
     let mut expires = use_signal(|| InviteForm::default().expires);
     let mut admin = use_signal(|| false);
-    let mut guest = use_signal(|| false);
+    let mut kind = use_signal(|| kind);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let confirming = use_signal(|| None::<String>);
@@ -508,11 +519,7 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
             uses: uses(),
             expires: expires(),
             role: if admin() { Role::Admin } else { Role::Consumer },
-            kind: if guest() {
-                InviteKind::PortableAccount
-            } else {
-                InviteKind::CreateUser
-            },
+            kind: kind(),
         };
         let invite = match new_invite(&form) {
             Ok(invite) => invite,
@@ -520,6 +527,11 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
                 error.set(Some(text));
                 return;
             }
+        };
+        let about = if form.kind == InviteKind::Federation {
+            CONFIRM_ABOUT
+        } else {
+            CONFIRMING
         };
         busy.set(true);
         spawn(async move {
@@ -529,7 +541,7 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
             };
             match made.await {
                 Ok(created) => on_done.call(Some(created)),
-                Err(e) if asks_to_confirm(&e, confirming, CONFIRMING) => {}
+                Err(e) if asks_to_confirm(&e, confirming, about) => {}
                 Err(e) => error.set(Some(e.explain())),
             }
             busy.set(false);
@@ -539,14 +551,20 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
         e.prevent_default();
         attempt.call(());
     };
+    let server = kind() == InviteKind::Federation;
     rsx! {
         div { class: "scrim scrim-sheet",
             form { class: "dialog dialog-wide", role: "dialog", onsubmit: submit,
                 div { class: "dialog-head",
                     icons::Ticket { size: 22 }
-                    h1 { "Create invite" }
+                    h1 { if server { "Invite a server" } else { "Create invite" } }
                 }
-                Field { label: "Note", value: note, autocomplete: "off", placeholder: "Who it is for" }
+                Field {
+                    label: "Note",
+                    value: note,
+                    autocomplete: "off",
+                    placeholder: if server { "Which server it is for" } else { "Who it is for" },
+                }
                 span { class: "hint", "Only admins see it. It says who the invite is for." }
                 div { class: "grid grid-cols-2 gap-3",
                     label { class: "field",
@@ -561,7 +579,9 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
                                 move |e: FormEvent| uses.set(e.value())
                             },
                         }
-                        span { class: "text-xs font-normal text-ctp-subtext0", "Accounts it can make" }
+                        span { class: "text-xs font-normal text-ctp-subtext0",
+                            if server { "Servers it can pair" } else { "Accounts it can make" }
+                        }
                     }
                     label { class: "field",
                         "Expires after"
@@ -580,24 +600,43 @@ fn CreateInvite(on_done: EventHandler<Option<InviteCreated>>) -> Element {
                 }
                 label { class: "field",
                     "For"
-                    select { onchange: move |e| guest.set(e.value() == "guest"),
-                        option { value: "account", selected: !guest(), "An account on this server" }
-                        option { value: "guest", selected: guest(), "A guest with their own identity" }
-                    }
-                }
-                if guest() {
-                    span { class: "hint",
-                        "They join from their phone with their own Spoolframe identity, and watch here as themselves. No account is made; they show under Guests."
-                    }
-                } else {
-                    label { class: "field",
-                        "Role"
-                        select { onchange: move |e| admin.set(e.value() == "admin"),
-                            option { value: "consumer", selected: !admin(), "Consumer" }
-                            option { value: "admin", selected: admin(), "Admin" }
+                    select {
+                        onchange: move |e| {
+                            kind.set(match e.value().as_str() {
+                                "guest" => InviteKind::PortableAccount,
+                                "server" => InviteKind::Federation,
+                                _ => InviteKind::CreateUser,
+                            });
+                        },
+                        option { value: "account", selected: kind() == InviteKind::CreateUser, "An account on this server" }
+                        option { value: "guest", selected: kind() == InviteKind::PortableAccount, "A guest with their own identity" }
+                        // Only while the server makes them (experimental).
+                        if federation || server {
+                            option { value: "server", selected: server, "A server (federation)" }
                         }
                     }
-                    span { class: "hint", "Consumers watch and listen. Admins can change the server." }
+                }
+                match kind() {
+                    InviteKind::PortableAccount => rsx! {
+                        span { class: "hint",
+                            "They join from their phone with their own Spoolframe identity, and watch here as themselves. No account is made; they show under Guests."
+                        }
+                    },
+                    InviteKind::Federation => rsx! {
+                        span { class: "hint",
+                            "Its admin pastes the link on their Federation page to pair their server with this one. No account is made; you choose what to share once it is paired."
+                        }
+                    },
+                    _ => rsx! {
+                        label { class: "field",
+                            "Role"
+                            select { onchange: move |e| admin.set(e.value() == "admin"),
+                                option { value: "consumer", selected: !admin(), "Consumer" }
+                                option { value: "admin", selected: admin(), "Admin" }
+                            }
+                        }
+                        span { class: "hint", "Consumers watch and listen. Admins can change the server." }
+                    },
                 }
                 if let Some(text) = error() {
                     Alert { text }
