@@ -157,7 +157,7 @@ impl Probe {
         }
         let limit = self.limit;
         self.spent
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
                 (spent < limit).then_some(spent + 1)
             })
             .map(|_| ())

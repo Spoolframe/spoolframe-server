@@ -100,9 +100,9 @@ TAILWIND = "4.3.3"
 # GPL-3.0-or-later as built, which its meta.license lists and the built
 # `ffmpeg -L` says. libplacebo (pkgs/by-name/li/libplacebo, what FFmpeg
 # 6.1 and later take) is lgpl21Plus. Tesseract (tesseract5.nix) is asl20.
-PROGRAMS_NIXPKGS = "b6c8664de9b6cc07fe5666a29f91884ba81197c4"
+PROGRAMS_NIXPKGS = "5adc50831c259f87faeb09ddf930d43597197473"
 PROGRAMS = [
-    ("FFmpeg", "9.0.1", "GPL-3.0-or-later", ["Copyright (c) 2000-2026 the FFmpeg developers"]),
+    ("FFmpeg", "9.0.2", "GPL-3.0-or-later", ["Copyright (c) 2000-2026 the FFmpeg developers"]),
     ("libplacebo", "7.360.1", "LGPL-2.1-or-later", []),
     ("Tesseract", "5.5.3", "Apache-2.0", []),
 ]

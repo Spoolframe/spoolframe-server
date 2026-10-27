@@ -698,7 +698,7 @@ pub(super) fn reader_ms(
 
 /// `bytes` taken off what the jobs counted, never below nothing.
 pub(super) fn uncount(used: &AtomicU64, bytes: u64) {
-    let _ = used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
+    let _ = used.try_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
         Some(now.saturating_sub(bytes))
     });
 }

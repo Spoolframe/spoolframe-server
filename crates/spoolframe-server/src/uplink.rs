@@ -356,7 +356,7 @@ impl Uplink {
     pub fn reserve_download(self: &Arc<Self>) -> Result<DownloadSlot, Full> {
         use std::sync::atomic::Ordering;
         self.download_reads
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < MAX_DOWNLOAD_READS).then_some(n + 1)
             })
             .map_err(|_| Full {

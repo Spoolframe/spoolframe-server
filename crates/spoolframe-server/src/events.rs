@@ -52,7 +52,7 @@ impl Backlog {
     fn enter(self: &Arc<Self>) -> Option<Waiting> {
         use std::sync::atomic::Ordering;
         self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_WAITING).then_some(n + 1)
             })
             .ok()
