@@ -367,14 +367,42 @@ in {
   };
 
   profiles.ci.extends = ["coldsteel"];
-  profiles.ci.module = {pkgs, ...}: {
+  profiles.ci.module = {
+    pkgs,
+    inputs,
+    ...
+  }: let
+    # Same pairing as molds' rust module: nixpkgs' Rust 1.99 mixes an older
+    # LLVM backend with a newer profiler runtime, and its cargo-llvm-cov pins
+    # LLVM 22, so that package's tests fail and no cache serves it. Build it,
+    # checks on, with one upstream Rust distribution and that distribution's tools.
+    rustBin = inputs.rust-overlay.lib.mkRustBin {} pkgs.buildPackages;
+    coverageRust = rustBin.stable.${pkgs.rustc.version}.minimal.override {
+      extensions = ["llvm-tools-preview"];
+    };
+    llvmBin = "${coverageRust}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
+    cargoLlvmCov =
+      (pkgs.cargo-llvm-cov.override {
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = coverageRust;
+          rustc = coverageRust;
+        };
+      }).overrideAttrs (old: {
+        env =
+          old.env
+          // {
+            LLVM_COV = "${llvmBin}/llvm-cov";
+            LLVM_PROFDATA = "${llvmBin}/llvm-profdata";
+          };
+      });
+  in {
     # devenv's automatic cachix setup fails under a pure flake eval and an
     # untrusted runner user; substituters are configured on the runner host.
     cachix.enable = lib.mkForce false;
 
     packages = with pkgs; [
       cargo-nextest
-      cargo-llvm-cov
+      cargoLlvmCov
       cargo-audit
     ];
 
