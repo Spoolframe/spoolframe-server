@@ -122,7 +122,7 @@ pub fn Federation() -> Element {
                 div { class: "flex flex-col gap-1.5",
                     h1 { class: "page-title page-title-admin hidden md:block", "Federation" }
                     span { class: "hidden max-w-[680px] text-sm leading-normal text-ctp-subtext0 md:inline",
-                        "Servers paired with this one. Experimental: pair only with servers you run. Compare each key's fingerprint with what its admin sees as their own."
+                        "Servers paired with this one. Experimental: reviewed, but not tested enough yet, and its protocol may still change in ways that break pairings. Pair only with servers you trust, and compare each key's fingerprint with what its admin sees as their own."
                     }
                 }
                 div { class: "flex flex-wrap gap-2",

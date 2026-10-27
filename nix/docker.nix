@@ -22,6 +22,7 @@
 #   nix build .#docker && ./result | docker load
 {
   lib,
+  stdenv,
   dockerTools,
   cacert,
   tzdata,
@@ -46,10 +47,13 @@
   rev ? null,
 }: let
   mesaDrivers = variant != "nvidia";
+  # Intel's VA-API drivers are x86-only (nixpkgs marks them so): an arm64
+  # image has Mesa's alone, which covers an AMD GPU in an arm64 host.
+  intel = lib.optionals stdenv.hostPlatform.isx86_64;
   vaapiDrivers =
     {
-      full = [mesa intel-media-driver intel-vaapi-driver];
-      slim = [mesa intel-media-driver];
+      full = [mesa] ++ intel [intel-media-driver intel-vaapi-driver];
+      slim = [mesa] ++ intel [intel-media-driver];
       nvidia = [];
     }
     .${
@@ -164,7 +168,8 @@ in
           # directory, nor does nixpkgs' glibc look in any system one: where
           # the toolkit puts NVIDIA's libraries, legacy (/usr/lib64, through
           # the link above) or CDI at the host's paths (Debian and Ubuntu
-          # /usr/lib/x86_64-linux-gnu, Fedora /usr/lib64, Arch /usr/lib). The
+          # /usr/lib/x86_64-linux-gnu or aarch64-linux-gnu, Fedora /usr/lib64,
+          # Arch /usr/lib). The
           # image has nothing else in any of them, so nothing of its own is
           # shadowed: Mesa's drivers are found by absolute paths (the
           # manifests, LIBVA_DRIVERS_PATH) and their RUNPATHs. Kept in the
@@ -175,6 +180,7 @@ in
           "LD_LIBRARY_PATH=${lib.concatStringsSep ":" [
             "/run/opengl-driver/lib"
             "/usr/lib/x86_64-linux-gnu"
+            "/usr/lib/aarch64-linux-gnu"
             "/usr/lib64"
             "/usr/lib"
             "${lib.getLib libx11}/lib"
