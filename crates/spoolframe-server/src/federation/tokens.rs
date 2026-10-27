@@ -28,6 +28,7 @@ use spoolframe_protocol::federation::{AssertUser, AssertionRefused, TokenGranted
 use spoolframe_types::MediaId;
 
 use super::Federation;
+use super::stats::Items;
 use crate::auth::SessionToken;
 use crate::principal::{Principal, RemoteServerId, Who};
 use crate::store::StoreError;
@@ -67,6 +68,32 @@ pub enum AssertError {
     Store(#[from] StoreError),
 }
 
+impl AssertError {
+    /// What went wrong, as a span's `outcome` says it.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            AssertError::NotFederated(_) => "not_federated",
+            AssertError::NotPaired(_) => "not_paired",
+            AssertError::Offline => "offline",
+            AssertError::NotALocalUser => "not_a_local_user",
+            AssertError::Dial(e) => super::dial_kind(e),
+            AssertError::Store(_) => "store",
+        }
+    }
+}
+
+/// An assertion refused, as a span's `outcome` says it.
+fn refused_kind(refused: &AssertionRefused) -> &'static str {
+    match refused {
+        AssertionRefused::NotShared => "not_shared",
+        AssertionRefused::InvalidUser => "invalid_user",
+        AssertionRefused::InvalidDevice => "invalid_device",
+        AssertionRefused::InvalidScope => "invalid_scope",
+        AssertionRefused::Unavailable => "unavailable",
+        AssertionRefused::Unknown => "unknown",
+    }
+}
+
 impl Federation {
     /// Vouch for `user`, who wants `item` (a paired server's) on the
     /// device `device`, to the paired server it is from: its token, which
@@ -84,8 +111,41 @@ impl Federation {
     }
 
     /// [`Federation::assert_play`] to `peer`, the live pair `item` is from,
-    /// as the caller found it, for the token `wanted` says.
+    /// as the caller found it, for the token `wanted` says. In a
+    /// `federation token assert` span, which names the pair and the
+    /// token's scope, never the user.
+    #[tracing::instrument(
+        name = "federation token assert",
+        skip_all,
+        fields(
+            peer.server_id = %peer.server_id,
+            token.scope = wanted.scope.name(),
+            outcome = tracing::field::Empty,
+        )
+    )]
     async fn assert_to(
+        &self,
+        peer: &PeerRecord,
+        user: LocalUserId,
+        item: &MediaId,
+        device: EndpointId,
+        wanted: Wanted,
+    ) -> Result<TokenGranted, AssertError> {
+        let (scope, counted) = (wanted.scope, wanted.counted);
+        let asserted = self.vouch(peer, user, item, device, wanted).await;
+        if asserted.is_ok() {
+            match scope {
+                TokenScope::Play if counted => self.stats.played(Items::Theirs),
+                TokenScope::Download => self.stats.downloaded(Items::Theirs),
+                _ => {}
+            }
+        }
+        super::record_outcome(&asserted, AssertError::kind);
+        asserted
+    }
+
+    /// [`Federation::assert_to`], in its span.
+    async fn vouch(
         &self,
         peer: &PeerRecord,
         user: LocalUserId,
@@ -239,7 +299,28 @@ impl Federation {
     /// Pair `server_id` vouches for `assertion`'s user (P8-03): a token
     /// for its item, minted and kept hashed, or why not. A refusal is
     /// counted here; the play, once the token is redeemed (P8-04).
+    #[tracing::instrument(
+        name = "federation token mint",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            token.scope = assertion.scope.name(),
+            outcome = tracing::field::Empty,
+        )
+    )]
     pub(crate) async fn mint(
+        &self,
+        server_id: &ServerId,
+        endpoint: EndpointId,
+        assertion: &AssertUser,
+    ) -> Result<TokenGranted, AssertionRefused> {
+        let minted = self.mint_checked(server_id, endpoint, assertion).await;
+        super::record_outcome(&minted, refused_kind);
+        minted
+    }
+
+    /// [`Federation::mint`], in its span.
+    async fn mint_checked(
         &self,
         server_id: &ServerId,
         endpoint: EndpointId,

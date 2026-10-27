@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+- Federation in the metrics (experimental, P8-01), on `/metrics` and in
+  the OTLP export: `spoolframe_federation_peers` and
+  `spoolframe_federation_peers_online` (live pairs, and those connected
+  now), `spoolframe_federation_syncs_total{outcome}`,
+  `spoolframe_federation_sync_duration_seconds{outcome}` and
+  `spoolframe_federation_last_sync_timestamp_seconds` (syncs of a pair's
+  shared libraries, `ok` or `failed`),
+  `spoolframe_federation_requests_total{request,outcome}` (the pairs'
+  requests answered: `libraries`, `sync`, `artwork`, `assertion`,
+  `subtitles`, `shares_changed`; `ok`, `refused` or `unavailable`),
+  `spoolframe_federation_plays_total{items}` and
+  `spoolframe_federation_downloads_total{items}` (`ours`: this server's
+  items by a pair's users; `theirs`: a pair's items by this server's
+  users), `spoolframe_federation_proxied_playbacks` and
+  `spoolframe_federation_proxied_bytes_total` (what this server plays on
+  to its own devices), and `spoolframe_federation_cache_bytes` (the
+  pairs' artwork kept here). No label names a pair, a user or an item.
+  The families are there with zeros while federation is off.
+- Federation in the traces: `federation sync`, `federation dial`,
+  `federation answer` (one per pair's request, with `request`),
+  `federation proxy`, `federation download`, `federation token assert`,
+  `federation token mint`, `federation token redeem`, `federation hello`,
+  `federation pair`, `federation pair redeem`, `federation unpaired`,
+  `federation unpair`, `federation key confirm`, `federation key reject`
+  and `federation shares changed`, each with the pair's server id (or its
+  row's id) and an `outcome`. None names a user.
+- Server › Activity has a Federation card while `experimental.federation`
+  is on: the pairs and those online, the proxied throughput over the last
+  hour, syncs and failures, the last sync, the pairs' requests served and
+  refused per minute, the streams played on, plays each way, and the
+  cache's size. The admin API's `Activity` has `federation` (`null` while
+  it is off), and `ActivityPoint` has `federationProxiedBytesPerSec`,
+  `federationRequestsPerSec` and `federationRefusedPerSec`.
+
 ## 0.16.0 (2026-10-26)
 
 - BREAKING: the client protocol is reset to revision 1

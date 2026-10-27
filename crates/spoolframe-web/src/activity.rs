@@ -2,7 +2,9 @@
 //! graphs' lines and how its numbers read. Host-compiled, so `cargo test`
 //! covers it.
 
-use spoolframe_admin_api::{ActivityPoint, MemoryParts, PlexServerActivity, UserSessionCount};
+use spoolframe_admin_api::{
+    ActivityPoint, FederationActivity, MemoryParts, PlexServerActivity, UserSessionCount,
+};
 
 use crate::logic::thousands;
 
@@ -189,6 +191,39 @@ pub fn session_rows(sessions: &[UserSessionCount]) -> Vec<(String, u64)> {
     rows.into_iter()
         .map(|(name, n)| (format!("Sessions · {name}"), n))
         .collect()
+}
+
+/// The Federation card's big number and its unit: "3" and "paired · 2
+/// online".
+pub fn paired(federation: &FederationActivity) -> (String, String) {
+    (
+        thousands(federation.peers),
+        format!("paired · {} online", thousands(federation.online)),
+    )
+}
+
+/// When a pair was last synced: "4 min ago", or "never" before one.
+pub fn last_sync(now_ms: i64, at_ms: Option<i64>) -> String {
+    at_ms.map_or_else(|| "never".to_owned(), |at| since(now_ms, at))
+}
+
+/// The pairs' requests per minute: "12 served · 0.5 refused /min".
+pub fn peer_requests_line(point: &ActivityPoint) -> String {
+    format!(
+        "{} served · {} refused /min",
+        rate(point.federation_requests_per_sec * 60.0),
+        rate(point.federation_refused_per_sec * 60.0)
+    )
+}
+
+/// The streams played on through this server, and what they carry now:
+/// "2 · 1.4 MB/s"; the count alone with none.
+pub fn proxied_line(active: u64, relayed_per_sec: f64) -> String {
+    if active == 0 && relayed_per_sec <= 0.0 {
+        return "0".to_owned();
+    }
+    let (value, unit) = bytes_per_sec(relayed_per_sec);
+    format!("{} · {value} {unit}", thousands(active))
 }
 
 /// How long ago `at_ms` was at `now_ms`, in the unit that fits: "2 s
@@ -396,6 +431,51 @@ mod tests {
                 ("Sessions · zed".to_owned(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn the_federation_card_reads_its_pairs_requests_and_streams() {
+        let federation = FederationActivity {
+            peers: 3,
+            online: 2,
+            ..FederationActivity::default()
+        };
+        assert_eq!(
+            paired(&federation),
+            ("3".to_owned(), "paired · 2 online".to_owned())
+        );
+        assert_eq!(last_sync(NOW, None), "never");
+        assert_eq!(last_sync(NOW, Some(NOW - 240_000)), "4 min ago");
+        let point = ActivityPoint {
+            federation_requests_per_sec: 0.2,
+            federation_refused_per_sec: 0.0,
+            ..ActivityPoint::default()
+        };
+        assert_eq!(peer_requests_line(&point), "12 served · 0 refused /min");
+        assert_eq!(proxied_line(0, 0.0), "0");
+        assert_eq!(proxied_line(2, 1_400_000.0), "2 · 1.4 MB/s");
+    }
+
+    /// The card's graph is the proxied throughput over the hour, from
+    /// the same history as every other card's.
+    #[test]
+    fn the_federation_graph_follows_the_proxied_throughput() {
+        let at = |at, bytes| ActivityPoint {
+            at,
+            federation_proxied_bytes_per_sec: bytes,
+            ..ActivityPoint::default()
+        };
+        let history = [at(NOW - 20_000, 0.0), at(NOW - 10_000, 4_000.0)];
+        let points = series(&history, &at(NOW, 2_000.0), |p| {
+            p.federation_proxied_bytes_per_sec
+        });
+        assert_eq!(
+            points,
+            vec![(NOW - 20_000, 0.0), (NOW - 10_000, 4_000.0), (NOW, 2_000.0)]
+        );
+        let spark = sparkline(&points, NOW, 220.0, 44.0).unwrap();
+        // The peak is the middle point, near the top.
+        assert!(spark.line.contains(",2.0 "), "{}", spark.line);
     }
 
     #[test]

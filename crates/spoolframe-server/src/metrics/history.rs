@@ -6,7 +6,9 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use spoolframe_admin_api::{ActivityPoint, ActivityTotals, MemoryPart, MemoryParts};
+use spoolframe_admin_api::{
+    ActivityPoint, ActivityTotals, FederationActivity, MemoryPart, MemoryParts,
+};
 
 use super::Family;
 
@@ -37,6 +39,49 @@ pub struct Reading {
     pub plex_requests: u64,
     pub plex_errors: u64,
     pub totals: ActivityTotals,
+    /// The pairs' requests answered, and refused or not answered now.
+    pub federation_requests: u64,
+    pub federation_refused: u64,
+    pub federation: FederationActivity,
+}
+
+/// Federation's counts, as its families say them.
+fn federation(f: &[Family]) -> FederationActivity {
+    let items = |name, items| whole(f, name, &[("items", items)]);
+    FederationActivity {
+        peers: whole(f, "spoolframe_federation_peers", &[]),
+        online: whole(f, "spoolframe_federation_peers_online", &[]),
+        syncs_ok: whole(f, "spoolframe_federation_syncs_total", &[("outcome", "ok")]),
+        syncs_failed: whole(
+            f,
+            "spoolframe_federation_syncs_total",
+            &[("outcome", "failed")],
+        ),
+        last_sync_at: number(f, "spoolframe_federation_last_sync_timestamp_seconds", &[])
+            .map(|secs| (secs * 1000.0).round() as i64),
+        proxied_playbacks: whole(f, "spoolframe_federation_proxied_playbacks", &[]),
+        proxied_bytes: whole(f, "spoolframe_federation_proxied_bytes_total", &[]),
+        plays_ours: items("spoolframe_federation_plays_total", "ours"),
+        plays_theirs: items("spoolframe_federation_plays_total", "theirs"),
+        cache_bytes: whole(f, "spoolframe_federation_cache_bytes", &[]),
+    }
+}
+
+/// The pairs' requests by how they went: those answered, and the rest.
+fn federation_requests(f: &[Family]) -> (u64, u64) {
+    find(f, "spoolframe_federation_requests_total").map_or((0, 0), |family| {
+        family.samples.iter().fold((0, 0), |(ok, other), s| {
+            let super::Value::Number(n) = s.value else {
+                return (ok, other);
+            };
+            let answered = s.labels.iter().any(|(k, v)| *k == "outcome" && v == "ok");
+            if answered {
+                (ok + n as u64, other)
+            } else {
+                (ok, other + n as u64)
+            }
+        })
+    })
 }
 
 fn find<'a>(families: &'a [Family], name: &str) -> Option<&'a Family> {
@@ -103,7 +148,11 @@ impl Reading {
     /// What `families` say, at `at`.
     pub fn of(families: &[Family], at: i64) -> Self {
         let f = families;
+        let (federation_requests, federation_refused) = federation_requests(f);
         Reading {
+            federation_requests,
+            federation_refused,
+            federation: federation(f),
             at,
             connections_app: whole(f, "spoolframe_connections_open", &[("kind", "app")]),
             connections_web: whole(f, "spoolframe_connections_open", &[("kind", "web")]),
@@ -204,6 +253,11 @@ impl Reading {
             memory_bytes: self.memory_bytes,
             memory: self.memory.clone(),
             open_files: self.open_files,
+            federation_proxied_bytes_per_sec: rate(self.federation.proxied_bytes, |r| {
+                r.federation.proxied_bytes
+            }),
+            federation_requests_per_sec: rate(self.federation_requests, |r| r.federation_requests),
+            federation_refused_per_sec: rate(self.federation_refused, |r| r.federation_refused),
         }
     }
 }
@@ -336,6 +390,65 @@ mod tests {
         assert_eq!(memory.other_heap_bytes(), 150);
         // Without the kinds (not Linux), no parts at all.
         assert_eq!(Reading::of(&families[1..], 0).memory, None);
+    }
+
+    /// The Federation card's numbers come from the federation's families,
+    /// and its rates from two readings: requests answered apart from the
+    /// rest, whatever request they were.
+    #[test]
+    fn the_federation_is_read_and_its_rates_are_per_second() {
+        use super::super::{Kind, Sample};
+        let families = |ok: f64, refused: f64, unavailable: f64, bytes: f64| {
+            vec![
+                Family::single("spoolframe_federation_peers", "", Kind::Gauge, 3.0),
+                Family::single("spoolframe_federation_peers_online", "", Kind::Gauge, 2.0),
+                Family {
+                    name: "spoolframe_federation_requests_total",
+                    help: "",
+                    kind: Kind::Counter,
+                    samples: vec![
+                        Sample::labelled(&[("request", "sync"), ("outcome", "ok")], ok),
+                        Sample::labelled(&[("request", "artwork"), ("outcome", "ok")], ok),
+                        Sample::labelled(
+                            &[("request", "artwork"), ("outcome", "refused")],
+                            refused,
+                        ),
+                        Sample::labelled(
+                            &[("request", "assertion"), ("outcome", "unavailable")],
+                            unavailable,
+                        ),
+                    ],
+                },
+                Family::single(
+                    "spoolframe_federation_proxied_bytes_total",
+                    "",
+                    Kind::Counter,
+                    bytes,
+                ),
+                Family::single(
+                    "spoolframe_federation_last_sync_timestamp_seconds",
+                    "",
+                    Kind::Gauge,
+                    1_790_000_000.5,
+                ),
+            ]
+        };
+        let before = Reading::of(&families(1.0, 0.0, 0.0, 0.0), 0);
+        let after = Reading::of(&families(6.0, 4.0, 6.0, 50_000.0), 10_000);
+        assert_eq!(
+            (
+                after.federation.peers,
+                after.federation.online,
+                after.federation.last_sync_at
+            ),
+            (3, 2, Some(1_790_000_000_500))
+        );
+        let point = after.point(Some(&before));
+        assert_eq!(point.federation_requests_per_sec, 1.0);
+        assert_eq!(point.federation_refused_per_sec, 1.0);
+        assert_eq!(point.federation_proxied_bytes_per_sec, 5_000.0);
+        // Before any sync, no time of one.
+        assert_eq!(Reading::of(&[], 0).federation.last_sync_at, None);
     }
 
     #[test]

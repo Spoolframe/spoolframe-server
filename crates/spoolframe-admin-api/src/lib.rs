@@ -2369,6 +2369,37 @@ pub struct ActivityPoint {
     pub memory: Option<MemoryParts>,
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub open_files: Option<u64>,
+    /// Bytes of paired servers' media relayed to this server's devices
+    /// per second (proxy mode, P8-04).
+    pub federation_proxied_bytes_per_sec: f64,
+    /// Paired servers' requests answered per second, and refused or not
+    /// answered now.
+    pub federation_requests_per_sec: f64,
+    pub federation_refused_per_sec: f64,
+}
+
+/// Federation's counts (P8-01), on a server that has it on.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationActivity {
+    /// Live pairs, and of them those this server holds a connection to.
+    pub peers: u64,
+    pub online: u64,
+    /// Syncs of a pair's shared libraries since the server started.
+    pub syncs_ok: u64,
+    pub syncs_failed: u64,
+    /// When a sync last went through, Unix ms; `None` before one.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub last_sync_at: Option<i64>,
+    /// Pairs' items played on to this server's devices now.
+    pub proxied_playbacks: u64,
+    pub proxied_bytes: u64,
+    /// Plays across a pair: of this server's items by the pairs' users,
+    /// and of the pairs' items by this server's users.
+    pub plays_ours: u64,
+    pub plays_theirs: u64,
+    /// The pairs' artwork kept here, in bytes.
+    pub cache_bytes: u64,
 }
 
 /// The server's resident memory by what it is. `heapBytes`, `filesBytes`
@@ -2471,6 +2502,10 @@ pub struct Activity {
     pub plex: Vec<PlexServerActivity>,
     /// Read from the database every `sampleSecs`.
     pub sessions: Vec<UserSessionCount>,
+    /// `None` while `experimental.federation` is off: the page shows no
+    /// Federation card.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub federation: Option<FederationActivity>,
 }
 
 /// How severe a log line is (P3-14).
@@ -5126,6 +5161,7 @@ mod required_field_tests {
             },
             &["meanLatencyMs"],
         );
+        assert_each_required(&FederationActivity::default(), &["lastSyncAt"]);
         assert_each_required(&LogQuery::default(), &["after", "level", "text", "limit"]);
         let otlp = OtlpStatus {
             endpoint: "http://collector:4318".into(),

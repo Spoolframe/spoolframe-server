@@ -9,8 +9,9 @@ use spoolframe_admin_api::{Activity, ActivityPoint, AdminApiClient, TelemetrySta
 use super::admin::sleep;
 use super::{Alert, Route, icons, now_ms, rpc};
 use crate::activity::{
-    Spark, bytes_per_sec, megabytes, memory_rows, output_speed, percent, plex_line, rate, series,
-    session_rows, sparkline, updated_line, uptime, work_line,
+    Spark, bytes_per_sec, last_sync, megabytes, memory_rows, output_speed, paired,
+    peer_requests_line, percent, plex_line, proxied_line, rate, series, session_rows, sparkline,
+    updated_line, uptime, work_line,
 };
 use crate::logic::{ApiError, thousands};
 use crate::telemetry::{export_state, export_summary};
@@ -218,6 +219,31 @@ fn Cards(seen: Seen, now: i64, version: Option<String>) -> Element {
                 Line { label: rsx! { "Watch sync" },
                     "{thousands(t.sync_runs_ok)} runs · "
                     span { class: if t.sync_runs_failed > 0 { "text-ctp-red" } else { "" }, "{thousands(t.sync_runs_failed)} failed" }
+                }
+            }
+            // Only while the server has federation on (P8-01): the
+            // snapshot carries none otherwise.
+            if let Some(f) = &a.federation {
+                {
+                    let (value, unit) = paired(f);
+                    rsx! {
+                        Card {
+                            title: "Federation",
+                            value,
+                            unit,
+                            tone: "act-blue",
+                            spark: spark(a, now, |p| p.federation_proxied_bytes_per_sec),
+                            Line { label: rsx! { "Syncs" },
+                                "{thousands(f.syncs_ok)} runs · "
+                                span { class: if f.syncs_failed > 0 { "text-ctp-red" } else { "" }, "{thousands(f.syncs_failed)} failed" }
+                            }
+                            Line { label: rsx! { "Last sync" }, "{last_sync(now, f.last_sync_at)}" }
+                            Line { label: rsx! { "Requests from pairs" }, "{peer_requests_line(p)}" }
+                            Line { label: rsx! { "Proxied streams" }, "{proxied_line(f.proxied_playbacks, p.federation_proxied_bytes_per_sec)}" }
+                            Line { label: rsx! { "Plays · ours · theirs" }, "{thousands(f.plays_ours)} · {thousands(f.plays_theirs)}" }
+                            Line { label: rsx! { "Cache" }, "{megabytes(f.cache_bytes)} MB" }
+                        }
+                    }
                 }
             }
             Card {

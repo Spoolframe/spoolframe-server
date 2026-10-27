@@ -94,8 +94,18 @@ pub const PLEX_SYNC_DURATION: Spec = Spec {
     ],
 };
 
+pub const FEDERATION_SYNC_DURATION: Spec = Spec {
+    name: "spoolframe_federation_sync_duration_seconds",
+    help: "How long each sync of a paired server's shared libraries took, by outcome (ok, \
+           failed), from when it holds the pair's sync lock: the replica's and an admin's \
+           Refresh.",
+    bounds: &[
+        0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ],
+};
+
 /// Every histogram the server has.
-pub const ALL: [&Spec; 7] = [
+pub const ALL: [&Spec; 8] = [
     &PLEX_REQUEST_DURATION,
     &CLIENT_REQUEST_DURATION,
     &PLAYBACK_FIRST_SEGMENT,
@@ -103,17 +113,19 @@ pub const ALL: [&Spec; 7] = [
     &CONVERSION_SPEED,
     &CONNECTION_RTT,
     &PLEX_SYNC_DURATION,
+    &FEDERATION_SYNC_DURATION,
 ];
 
 /// The histograms whose values are kept here for `/metrics`
 /// ([`Histograms::observe`]): every one but those a part counts itself.
-pub const KEPT: [&Spec; 6] = [
+pub const KEPT: [&Spec; 7] = [
     &CLIENT_REQUEST_DURATION,
     &PLAYBACK_FIRST_SEGMENT,
     &SEGMENT_READ_WAIT,
     &CONVERSION_SPEED,
     &CONNECTION_RTT,
     &PLEX_SYNC_DURATION,
+    &FEDERATION_SYNC_DURATION,
 ];
 
 /// A series' labels, in the order they were given.

@@ -448,6 +448,59 @@ async fn the_activity_is_the_last_samples_and_now_for_admins_only() {
             .iter()
             .all(|s| s.user_id.starts_with("local:"))
     );
+    // No federation here: no Federation card.
+    assert_eq!(activity.federation, None);
+}
+
+/// Federation's families are on `/metrics` (and so in the OTLP export,
+/// which reads the same families), and the Activity page has its card's
+/// numbers, on a server with federation on.
+#[tokio::test]
+async fn federation_is_scraped_and_on_the_activity_page() {
+    let server = TestServer::start_with(
+        fresh_dir("metrics-federation").await,
+        ServerOptions {
+            federation: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    let metrics = server.metrics.clone();
+    metrics.access().set(
+        true,
+        admin::AddressRanges::new(&["127.0.0.0/8", "::1"]).unwrap(),
+    );
+    let (addr, _dir) = serve("metrics-federation-admin", Some(metrics.clone()), false).await;
+    let text = get(addr, None).await.text().await.unwrap();
+    for (family, kind) in [
+        ("spoolframe_federation_peers", "gauge"),
+        ("spoolframe_federation_peers_online", "gauge"),
+        ("spoolframe_federation_syncs_total", "counter"),
+        ("spoolframe_federation_last_sync_timestamp_seconds", "gauge"),
+        ("spoolframe_federation_requests_total", "counter"),
+        ("spoolframe_federation_plays_total", "counter"),
+        ("spoolframe_federation_downloads_total", "counter"),
+        ("spoolframe_federation_proxied_playbacks", "gauge"),
+        ("spoolframe_federation_proxied_bytes_total", "counter"),
+        ("spoolframe_federation_cache_bytes", "gauge"),
+        ("spoolframe_federation_sync_duration_seconds", "histogram"),
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {family} {kind}\n")),
+            "no {family} in {text}"
+        );
+    }
+    assert!(
+        text.contains("spoolframe_federation_syncs_total{outcome=\"ok\"} 0\n"),
+        "{text}"
+    );
+    let (root, _) = root_and_consumer(addr).await;
+    metrics.sample().await;
+    let activity = root.activity().await.unwrap();
+    let federation = activity.federation.expect("federation is on");
+    assert_eq!((federation.peers, federation.online), (0, 0));
+    assert_eq!(federation.last_sync_at, None);
+    server.stop().await;
 }
 
 /// The Logs page (P3-14): a WARN raised here is there, the page filters

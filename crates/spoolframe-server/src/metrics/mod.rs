@@ -253,6 +253,7 @@ struct Sources {
     plex_sync: Option<Arc<WatchSync>>,
     catalog: Option<Arc<LiveCatalog>>,
     auth: Option<crate::auth::Auth>,
+    federation: Option<Arc<crate::federation::Federation>>,
 }
 
 /// One user's live sessions, by binding.
@@ -410,6 +411,16 @@ impl Metrics {
             sync.record_into(self.histograms.clone());
             sources.plex_sync = Some(sync.clone());
         }
+        if let Some(federation) = &services.federation {
+            federation.stats().record_into(self.histograms.clone());
+            sources.federation = Some(federation.clone());
+        }
+    }
+
+    /// Whether this server has federation on (P8-01): the Activity page
+    /// shows its card only then.
+    pub fn federation_on(&self) -> bool {
+        self.sources.read().federation.is_some()
     }
 
     /// Read each Plex server's requests from the catalog, as its settings
@@ -448,8 +459,13 @@ impl Metrics {
         WebConnection(self.web_connections.clone())
     }
 
-    /// Read what is too slow to read at a scrape: the live sessions.
+    /// Read what is too slow to read at a scrape: the live sessions, and
+    /// the paired servers and their cache.
     pub async fn refresh(&self) {
+        let federation = self.sources.read().federation.clone();
+        if let Some(federation) = federation {
+            federation.take_census().await;
+        }
         let store = self.store.read().clone();
         let Some(store) = store else {
             return;
@@ -804,8 +820,120 @@ impl Metrics {
         self.telemetry(&mut families);
         self.process(&mut families);
         self.caches(&mut families);
+        self.federation(&mut families);
         self.observed(&mut families);
         families
+    }
+
+    /// Federation's families (P8-01): there with zeros while it is off,
+    /// as the OTLP export makes its instruments of the families there are
+    /// when it starts. No label names a pair, a user or an item.
+    fn federation(&self, families: &mut Vec<Family>) {
+        use crate::federation::stats::Items;
+        let counts = self
+            .sources
+            .read()
+            .federation
+            .as_ref()
+            .map(|f| f.stats().counts())
+            .unwrap_or_default();
+        let census = counts.census;
+        families.push(Family::single(
+            "spoolframe_federation_peers",
+            "Servers paired with this one (live pairs). Read every 10 s.",
+            Kind::Gauge,
+            census.peers as f64,
+        ));
+        families.push(Family::single(
+            "spoolframe_federation_peers_online",
+            "Of the paired servers, those this server holds a connection to now. Read every 10 s.",
+            Kind::Gauge,
+            census.online as f64,
+        ));
+        families.push(Family {
+            name: "spoolframe_federation_syncs_total",
+            help: "Syncs of a paired server's shared libraries, the replica's and an admin's \
+                   Refresh, by outcome (ok, failed). One cut short by an unpairing or a new \
+                   key is not counted.",
+            kind: Kind::Counter,
+            samples: vec![
+                Sample::labelled(&[("outcome", "ok")], counts.syncs_ok as f64),
+                Sample::labelled(&[("outcome", "failed")], counts.syncs_failed as f64),
+            ],
+        });
+        families.push(Family {
+            name: "spoolframe_federation_last_sync_timestamp_seconds",
+            help: "When a sync of a paired server last went through, Unix seconds. No sample \
+                   before the first.",
+            kind: Kind::Gauge,
+            samples: counts
+                .last_sync_ms
+                .map(|ms| vec![Sample::labelled(&[], ms as f64 / 1000.0)])
+                .unwrap_or_default(),
+        });
+        families.push(Family {
+            name: "spoolframe_federation_requests_total",
+            help: "Paired servers' requests this server answered, by request (libraries, sync, \
+                   artwork, assertion, subtitles, shares_changed) and outcome: ok, refused (not \
+                   shared, not there, not allowed) or unavailable (past the pair's pace, or \
+                   this server could not answer).",
+            kind: Kind::Counter,
+            samples: counts
+                .requests
+                .iter()
+                .map(|(request, answered, n)| {
+                    Sample::labelled(
+                        &[
+                            ("request", request.as_str()),
+                            ("outcome", answered.as_str()),
+                        ],
+                        *n as f64,
+                    )
+                })
+                .collect(),
+        });
+        let by_items = |n: [u64; 2]| -> Vec<Sample> {
+            Items::ALL
+                .iter()
+                .map(|&items| {
+                    Sample::labelled(&[("items", items.as_str())], n[items as usize] as f64)
+                })
+                .collect()
+        };
+        families.push(Family {
+            name: "spoolframe_federation_plays_total",
+            help: "Plays across a pair, by whose items: ours (this server's, by a pair's users, \
+                   counted as the token is redeemed) or theirs (a pair's, by this server's \
+                   users, counted as the pair mints the token).",
+            kind: Kind::Counter,
+            samples: by_items(counts.plays),
+        });
+        families.push(Family {
+            name: "spoolframe_federation_downloads_total",
+            help: "Download tokens across a pair, by whose items: ours (redeemed here by a \
+                   pair's server or its users' devices) or theirs (minted by a pair for this \
+                   server's users).",
+            kind: Kind::Counter,
+            samples: by_items(counts.downloads),
+        });
+        families.push(Family::single(
+            "spoolframe_federation_proxied_playbacks",
+            "Paired servers' items this server plays on to its own devices now (proxy mode).",
+            Kind::Gauge,
+            counts.proxied_active as f64,
+        ));
+        families.push(Family::single(
+            "spoolframe_federation_proxied_bytes_total",
+            "Bytes of paired servers' media this server relayed to its own devices (proxy mode).",
+            Kind::Counter,
+            counts.proxied_bytes as f64,
+        ));
+        families.push(Family::single(
+            "spoolframe_federation_cache_bytes",
+            "Bytes of the paired servers' artwork this server keeps. Read every 10 s.",
+            Kind::Gauge,
+            census.cache_bytes as f64,
+        ));
     }
 
     fn connections(&self, families: &mut Vec<Family>) {

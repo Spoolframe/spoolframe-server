@@ -26,6 +26,7 @@ use spoolframe_protocol::federation::TokenScope;
 use spoolframe_types::MediaId;
 
 use super::Federation;
+use super::stats::Items;
 use crate::auth::SessionToken;
 use crate::principal::Principal;
 use crate::remote_sessions::{MAX_PLAY_SESSIONS, PlayRoom, RemoteSessionUser};
@@ -50,10 +51,56 @@ pub enum PlayTokenError {
     Store(#[from] StoreError),
 }
 
+impl PlayTokenError {
+    /// What went wrong, as a span's `outcome` says it.
+    fn kind(&self) -> &'static str {
+        match self {
+            PlayTokenError::Invalid => "invalid",
+            PlayTokenError::Unavailable => "unavailable",
+            PlayTokenError::Busy => "busy",
+            PlayTokenError::Store(_) => "store",
+        }
+    }
+}
+
 impl Federation {
     /// Redeem play token `token` from `endpoint` (hex): the session it
-    /// opens, and whose it is.
+    /// opens, and whose it is. In a `federation token redeem` span, which
+    /// names the pair's row and the token's scope once it is read, and
+    /// whether the pair's server plays it on (proxied): never the user.
+    #[tracing::instrument(
+        name = "federation token redeem",
+        skip_all,
+        fields(
+            peer.id = tracing::field::Empty,
+            token.scope = tracing::field::Empty,
+            proxied = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        )
+    )]
     pub async fn redeem_play_token(
+        &self,
+        token: &str,
+        endpoint: &str,
+    ) -> Result<(SessionToken, RemoteSessionUser), PlayTokenError> {
+        let redeemed = self.redeem_token(token, endpoint).await;
+        if let Ok((_, user)) = &redeemed {
+            let span = tracing::Span::current();
+            span.record("peer.id", user.peer.as_str());
+            span.record("token.scope", user.scope.name());
+            span.record("proxied", user.proxied);
+            match user.scope {
+                TokenScope::Play => self.stats.played(Items::Ours),
+                TokenScope::Download => self.stats.downloaded(Items::Ours),
+                TokenScope::Unknown => {}
+            }
+        }
+        super::record_outcome(&redeemed, PlayTokenError::kind);
+        redeemed
+    }
+
+    /// [`Federation::redeem_play_token`], in its span.
+    async fn redeem_token(
         &self,
         token: &str,
         endpoint: &str,

@@ -4053,6 +4053,7 @@ impl AdminApiServer for AdminApi {
             ));
         };
         let (history, now) = metrics.activity();
+        let federation = metrics.federation_on().then(|| now.federation.clone());
         let names: std::collections::HashMap<_, _> = self
             .auth
             .store()
@@ -4088,6 +4089,7 @@ impl AdminApiServer for AdminApi {
                     web: s.web,
                 })
                 .collect(),
+            federation,
         })
     }
 

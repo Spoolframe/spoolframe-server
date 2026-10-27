@@ -811,6 +811,17 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// The bytes of every origin's artwork kept here.
+    pub async fn cached_bytes_total(&self) -> Result<u64, StoreError> {
+        let bytes: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(bytes) FROM federation_cache_bytes")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(bytes
+            .and_then(|b| u64::try_from(b).ok())
+            .unwrap_or_default())
+    }
+
     /// Every `fed:` id a user of this server holds: in their watch state,
     /// plays, likes, playlists or downloads. What a dropped cache keeps.
     pub async fn held_federated_ids(&self) -> Result<Vec<String>, StoreError> {

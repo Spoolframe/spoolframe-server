@@ -33,6 +33,7 @@ mod pinning;
 mod proxy;
 mod redeem;
 mod replica;
+pub mod stats;
 mod subtitles;
 #[cfg(test)]
 mod test_holds;
@@ -149,6 +150,8 @@ pub struct Federation {
     revoked: tokio::sync::broadcast::Sender<EndpointId>,
     /// Which hosts the pairs' relays may be on (M8-07).
     relay_hosts: RelayHosts,
+    /// What the metrics read of it (P3-14).
+    stats: stats::Stats,
     /// Where a test holds the federation mid-way through a race.
     #[cfg(test)]
     holds: test_holds::Holds,
@@ -223,6 +226,40 @@ pub enum PairError {
     Store(#[from] StoreError),
 }
 
+impl PairError {
+    /// What went wrong, as a span's `outcome` says it.
+    fn kind(&self) -> &'static str {
+        match self {
+            PairError::NotALink => "not_a_link",
+            PairError::NoCode => "no_code",
+            PairError::WrongKind => "wrong_kind",
+            PairError::Itself => "itself",
+            PairError::Starting => "starting",
+            PairError::AlreadyPaired => "already_paired",
+            PairError::KeyHeld => "key_held",
+            PairError::Dial(e) => dial_kind(e),
+            PairError::Unexpected(_) => "unexpected",
+            PairError::Store(_) => "store",
+        }
+    }
+}
+
+/// A pairing refusal, as a span's `outcome` says it.
+fn refused_kind(refused: &PairingRefused) -> &'static str {
+    match refused {
+        PairingRefused::RateLimited { .. } => "rate_limited",
+        PairingRefused::ServerIdChanged => "server_id_changed",
+        PairingRefused::KeyRefused => "key_refused",
+        PairingRefused::AlreadyPaired => "already_paired",
+        PairingRefused::InviteExpired => "invite_expired",
+        PairingRefused::InviteExhausted => "invite_exhausted",
+        PairingRefused::WrongInviteKind => "wrong_invite_kind",
+        PairingRefused::InviteInvalid => "invite_invalid",
+        PairingRefused::SameServerId => "same_server_id",
+        _ => "refused",
+    }
+}
+
 impl std::fmt::Debug for Federation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Federation")
@@ -230,6 +267,35 @@ impl std::fmt::Debug for Federation {
             .field("live", &self.live)
             .finish_non_exhaustive()
     }
+}
+
+/// What went wrong with a dial or a pair's answer, as a span's `outcome`
+/// says it: a fixed word, never what the other server sent.
+pub(crate) fn dial_kind(e: &DialError) -> &'static str {
+    match e {
+        DialError::Unreachable(_) => "unreachable",
+        DialError::Broken(_) => "broken",
+        DialError::Refused(_) => "refused",
+        DialError::OutOfTurn => "out_of_turn",
+        DialError::NotShared => "not_shared",
+        DialError::NotFound => "not_found",
+        DialError::Unavailable => "unavailable",
+        DialError::NotGranted(_) => "not_granted",
+        DialError::Failed(_) => "failed",
+    }
+}
+
+/// `outcome` recorded on the span this runs in: `ok`, or `kind` of the
+/// error.
+pub(crate) fn record_outcome<T, E, K: AsRef<str>>(
+    result: &Result<T, E>,
+    kind: impl FnOnce(&E) -> K,
+) {
+    let span = tracing::Span::current();
+    match result {
+        Ok(_) => span.record("outcome", "ok"),
+        Err(e) => span.record("outcome", kind(e).as_ref()),
+    };
 }
 
 /// Text a peer sent, as the log takes it when nothing has checked it
@@ -284,9 +350,42 @@ impl Federation {
             subtitle_downloads: OnceLock::new(),
             revoked: tokio::sync::broadcast::Sender::new(REVOKED_KEPT),
             relay_hosts: RelayHosts::default(),
+            stats: stats::Stats::default(),
             #[cfg(test)]
             holds: test_holds::Holds::default(),
         }
+    }
+
+    /// What it counts, for the metrics (P3-14).
+    pub fn stats(&self) -> &stats::Stats {
+        &self.stats
+    }
+
+    /// Count the live pairs, those online, and the cache's bytes, for the
+    /// metrics: a few reads of the store, made every few seconds rather
+    /// than at each scrape. A read that fails keeps the last count.
+    pub async fn take_census(&self) {
+        let peers = match self.store().federation_peers().await {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot count the paired servers");
+                return;
+            }
+        };
+        let live: Vec<PeerRecord> = peers.into_iter().filter(PeerRecord::live).collect();
+        let online = live.iter().filter(|p| self.online(&p.server_id)).count();
+        let cache_bytes = match self.store().cached_bytes_total().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the federation cache's size");
+                self.stats.counts().census.cache_bytes
+            }
+        };
+        self.stats.set_census(stats::Census {
+            peers: live.len() as u64,
+            online: online as u64,
+            cache_bytes,
+        });
     }
 
     /// The pairs' relays on any host are kept and dialled, for a test
@@ -386,7 +485,22 @@ impl Federation {
     /// Pair with the server whose `federation` invite `link` is, as admin
     /// `by` (SB's side, P8-01): dial it, check it is not paired here
     /// already, redeem the code, and keep its row.
+    #[tracing::instrument(
+        name = "federation pair",
+        skip_all,
+        fields(peer.server_id = tracing::field::Empty, outcome = tracing::field::Empty)
+    )]
     pub async fn redeem_link(&self, link: &str, by: &str) -> Result<PeerRecord, PairError> {
+        let paired = self.pair_by_link(link, by).await;
+        if let Ok(peer) = &paired {
+            tracing::Span::current().record("peer.server_id", peer.server_id.as_str());
+        }
+        record_outcome(&paired, PairError::kind);
+        paired
+    }
+
+    /// [`Federation::redeem_link`], in its span.
+    async fn pair_by_link(&self, link: &str, by: &str) -> Result<PeerRecord, PairError> {
         let Aim {
             attached,
             code,
@@ -771,6 +885,7 @@ impl Federation {
     /// (P8-03), clean up after it ([`Federation::pair_ended`]), close the
     /// other's connections, and tell it, best effort, so it revokes its
     /// own. The row as it was; `None` for no live pair.
+    #[tracing::instrument(name = "federation unpair", skip_all, fields(peer.id = id))]
     pub async fn unpair(&self, id: &str, by: &str) -> Result<Option<PeerRecord>, StoreError> {
         let Some(peer) = self.store().revoke_peer(id).await? else {
             return Ok(None);
@@ -800,6 +915,7 @@ impl Federation {
     /// the replica's and its users' plays' (C8-01), the replica dialling
     /// the new key at once; and its friend tier on the relays. A device's
     /// own tokens and sessions are not the key's, and stay.
+    #[tracing::instrument(name = "federation key confirm", skip_all, fields(peer.id = id))]
     pub async fn confirm_key(
         &self,
         id: &str,
@@ -849,6 +965,7 @@ impl Federation {
 
     /// Reject `endpoint_id`, a key held for pair `id`: its connections
     /// are closed, and it is refused, not held again, for a day.
+    #[tracing::instrument(name = "federation key reject", skip_all, fields(peer.id = id))]
     pub async fn reject_key(
         &self,
         id: &str,
@@ -1101,7 +1218,75 @@ impl Peers for Federation {
         known
     }
 
+    /// In a `federation hello` span: the identity check of a server that
+    /// dials this one, against the pair pinned to its key or its id.
+    #[tracing::instrument(
+        name = "federation hello",
+        skip_all,
+        fields(peer.server_id = %server_id, outcome = tracing::field::Empty)
+    )]
     async fn hello(
+        &self,
+        endpoint: EndpointId,
+        known: Option<&ServerId>,
+        server_id: &ServerId,
+    ) -> Result<Standing, PairingRefused> {
+        let standing = self.standing(endpoint, known, server_id).await;
+        tracing::Span::current().record(
+            "outcome",
+            match &standing {
+                Ok(Standing::Paired) => "paired",
+                Ok(Standing::KeyHeld) => "key_held",
+                Ok(Standing::Stranger) => "stranger",
+                Ok(Standing::Unknown) => "unknown",
+                Err(refused) => refused_kind(refused),
+            },
+        );
+        standing
+    }
+
+    #[tracing::instrument(
+        name = "federation pair redeem",
+        skip_all,
+        fields(peer.server_id = %server_id, outcome = tracing::field::Empty)
+    )]
+    async fn redeem(
+        &self,
+        endpoint: EndpointId,
+        server_id: &ServerId,
+        hello: &PeerHello,
+        redeem: &RedeemPairing,
+    ) -> Result<(), PairingRefused> {
+        let redeemed = self.redeemed(endpoint, server_id, hello, redeem).await;
+        record_outcome(&redeemed, refused_kind);
+        redeemed
+    }
+
+    #[tracing::instrument(name = "federation unpaired", skip_all)]
+    async fn unpaired(&self, endpoint: EndpointId) {
+        match self
+            .store()
+            .revoke_peer_by_endpoint(&endpoint.to_string())
+            .await
+        {
+            Ok(Some(peer)) => {
+                tracing::info!(
+                    peer = %endpoint.fmt_short(),
+                    server_id = %peer.server_id,
+                    name = %peer.display_name,
+                    "a paired server unpaired: its pair is revoked here too"
+                );
+                self.pair_ended(&peer).await;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "cannot revoke a pair the other server ended"),
+        }
+    }
+}
+
+impl Federation {
+    /// [`Peers::hello`], in its span.
+    async fn standing(
         &self,
         endpoint: EndpointId,
         known: Option<&ServerId>,
@@ -1160,7 +1345,8 @@ impl Peers for Federation {
         })
     }
 
-    async fn redeem(
+    /// [`Peers::redeem`], in its span.
+    async fn redeemed(
         &self,
         endpoint: EndpointId,
         server_id: &ServerId,
@@ -1205,26 +1391,6 @@ impl Peers for Federation {
             PairRedeemed::Refused(InviteState::Expired) => Err(PairingRefused::InviteExpired),
             PairRedeemed::Refused(InviteState::Exhausted) => Err(PairingRefused::InviteExhausted),
             PairRedeemed::Refused(_) => Err(PairingRefused::InviteInvalid),
-        }
-    }
-
-    async fn unpaired(&self, endpoint: EndpointId) {
-        match self
-            .store()
-            .revoke_peer_by_endpoint(&endpoint.to_string())
-            .await
-        {
-            Ok(Some(peer)) => {
-                tracing::info!(
-                    peer = %endpoint.fmt_short(),
-                    server_id = %peer.server_id,
-                    name = %peer.display_name,
-                    "a paired server unpaired: its pair is revoked here too"
-                );
-                self.pair_ended(&peer).await;
-            }
-            Ok(None) => {}
-            Err(e) => tracing::error!(error = %e, "cannot revoke a pair the other server ended"),
         }
     }
 }

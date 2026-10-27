@@ -37,8 +37,10 @@ use spoolframe_types::{ClientCapabilities, DisplayCapabilities, Marker, MediaId}
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
 
+use super::stats::Proxying;
 use super::{AssertError, Federation, peer_addr};
 use crate::keyed_locks::KeyedLocks;
+use crate::metrics::Counter;
 use crate::principal::Who;
 use crate::store::federation::PeerRecord;
 
@@ -83,6 +85,17 @@ pub enum ProxyError {
     /// stopped answering.
     #[error("the paired server: {0}")]
     Origin(Error),
+}
+
+impl ProxyError {
+    /// What went wrong, as a span's `outcome` says it: the client
+    /// protocol's error type for SA's refusal.
+    pub(crate) fn kind(&self) -> String {
+        match self {
+            ProxyError::Assert(e) => e.kind().to_owned(),
+            ProxyError::Origin(e) => crate::telemetry::error_kind(e),
+        }
+    }
 }
 
 impl From<DialError> for ProxyError {
@@ -252,6 +265,12 @@ pub struct RemotePlay {
     ended: Arc<Notify>,
     /// Its hold on the connection, let go of after its session's end.
     held: Option<Held>,
+    /// Counted as a proxied playback for the metrics once SA started it,
+    /// until it is dropped.
+    proxying: Option<Proxying>,
+    /// Where the bytes it relays are counted, with every other proxied
+    /// playback's ([`super::stats::Stats::proxied_bytes`]).
+    relayed: Arc<Counter>,
 }
 
 /// How long SA's bytes may stop coming before a relayed read fails: a
@@ -436,6 +455,9 @@ impl RemotePlay {
                         },
                 } => {
                     let length = within_read(&request, length, size)?;
+                    // Counted as SA answers it: the relay sends this much
+                    // on, or fails part-way.
+                    self.relayed.add(length);
                     return Ok(RelayedRead {
                         length,
                         size,
@@ -514,12 +536,35 @@ impl Drop for RemotePlay {
 impl Federation {
     /// Play `start` from the paired server whose item it is, for `who`:
     /// SA's playback, and its answer to the start.
+    /// In a `federation proxy` span, which names the pair and how the
+    /// start went, never the user.
+    #[tracing::instrument(
+        name = "federation proxy",
+        skip_all,
+        fields(
+            peer.server_id = tracing::field::Empty,
+            playback.plan = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        )
+    )]
     pub async fn start_proxy(
         &self,
         who: &Who,
         start: ProxyStart,
     ) -> Result<ProxyStarted, ProxyError> {
+        let started = self.proxy(who, start).await;
+        if let Ok(started) = &started {
+            tracing::Span::current()
+                .record("playback.plan", crate::planner::summary(&started.plan).kind);
+        }
+        super::record_outcome(&started, ProxyError::kind);
+        started
+    }
+
+    /// [`Federation::start_proxy`], in its span.
+    async fn proxy(&self, who: &Who, start: ProxyStart) -> Result<ProxyStarted, ProxyError> {
         let (peer, remote) = self.remote_peer(&start.item).await?;
+        tracing::Span::current().record("peer.server_id", peer.server_id.as_str());
         let endpoint = self
             .attached
             .get()
@@ -547,6 +592,8 @@ impl Federation {
                 peer: peer.id.clone(),
                 ended: Arc::default(),
                 held: Some(held),
+                proxying: None,
+                relayed: self.stats.proxied_bytes(),
             };
             let answered = client
                 .call(
@@ -576,6 +623,7 @@ impl Federation {
                 }) => {
                     play.handle = handle;
                     play.revision = AtomicU64::new(revision);
+                    play.proxying = Some(self.stats.proxying());
                     Ok(ProxyStarted {
                         remote: Arc::new(play),
                         plan,

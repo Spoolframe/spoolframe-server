@@ -91,27 +91,44 @@ impl Federation {
     /// answer: it syncs this server soon. A pair not connected is not
     /// told: it syncs on connecting. Best effort: a pair that does not
     /// know the notice, or misses it, syncs at its own interval.
+    #[tracing::instrument(
+        name = "federation shares changed",
+        skip_all,
+        fields(peer.id = peer, outcome = tracing::field::Empty)
+    )]
     pub(crate) async fn tell_shares_changed(&self, peer: &str) {
+        use tracing::Instrument as _;
+        let span = tracing::Span::current();
         let record = match self.store().federation_peer(peer).await {
             Ok(Some(record)) if record.live() => record,
-            Ok(_) => return,
+            Ok(_) => {
+                span.record("outcome", "unpaired");
+                return;
+            }
             Err(e) => {
+                span.record("outcome", "store");
                 tracing::warn!(peer, error = %e, "cannot look a pair up to tell it its shares changed");
                 return;
             }
         };
         let Some(dialed) = self.links.pinned(&record) else {
+            span.record("outcome", "offline");
             return;
         };
-        tokio::spawn(async move {
-            if let Err(e) = dialed.shares_changed().await {
-                tracing::debug!(
-                    peer = %record.server_id,
-                    error = %e,
-                    "a paired server was not told its shares changed: it syncs at its interval"
-                );
+        // Sent without waiting for it: a failure is logged in this span.
+        span.record("outcome", "sent");
+        tokio::spawn(
+            async move {
+                if let Err(e) = dialed.shares_changed().await {
+                    tracing::debug!(
+                        peer = %record.server_id,
+                        error = %e,
+                        "a paired server was not told its shares changed: it syncs at its interval"
+                    );
+                }
             }
-        });
+            .in_current_span(),
+        );
     }
 
     /// Stop sharing `library` with pair `peer`, as admin `by`: the grant

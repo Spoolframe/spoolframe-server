@@ -125,6 +125,22 @@ pub enum ReplicaError {
     Store(#[from] StoreError),
 }
 
+impl ReplicaError {
+    /// What went wrong, as a span's `outcome` says it: a fixed word.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            ReplicaError::NoSuchPeer(_) => "unpaired",
+            ReplicaError::Dial(e) => super::dial_kind(e),
+            ReplicaError::NotPaired(_) => "not_paired",
+            ReplicaError::OtherServer(_) => "other_server",
+            ReplicaError::Moved => "moved",
+            ReplicaError::TooLarge { .. } => "too_large",
+            ReplicaError::TooSlow(_) => "too_slow",
+            ReplicaError::Store(_) => "store",
+        }
+    }
+}
+
 /// What the replica keeps of each pair between ticks: of the key it was
 /// last tended at, as a new key starts afresh. Its times are the server's
 /// [`Clock`](crate::clock::Clock)'s, read as each attempt ends, not as it
@@ -523,7 +539,20 @@ impl Federation {
     /// libraries go. One that answers under another server id is not the
     /// pair (C8-06): refused, and kept for the Federation page, as an
     /// incoming hello under another id is.
+    #[tracing::instrument(
+        name = "federation dial",
+        skip_all,
+        fields(peer.server_id = %peer.server_id, outcome = tracing::field::Empty)
+    )]
     async fn dial(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
+        let dialed = self.dial_pinned(peer).await;
+        super::record_outcome(&dialed, ReplicaError::kind);
+        dialed
+    }
+
+    /// [`Federation::dial`], in its span: the pin checked against what
+    /// the key answers as.
+    async fn dial_pinned(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
         let attached = self
             .attached
             .get()
@@ -577,16 +606,43 @@ impl Federation {
     /// Sync `peer` under its origin's sync lock, within [`SYNC_BUDGET`], if
     /// it is a live pair still: one unpaired while it was dialled is not
     /// written again, and its connection goes.
+    ///
+    /// Counted for the metrics as it went: a sync of a pair that moved to
+    /// another key, or ended, meanwhile is neither one that went through
+    /// nor one that failed, and is not counted.
+    #[tracing::instrument(
+        name = "federation sync",
+        skip_all,
+        fields(peer.server_id = %peer.server_id, outcome = tracing::field::Empty)
+    )]
     async fn sync_live(&self, peer: &PeerRecord) -> Result<(), ReplicaError> {
         let _syncing = self.syncing.lock(&peer.server_id).await;
+        let began = std::time::Instant::now();
         // The pair as it is now, under the lock: what the sync goes by.
         // Gone: its unpairing closes its connection, and one made after,
         // to a server paired again under its id, is not this pair's.
-        let Some(now) = self.pair_now(peer).await? else {
-            return Err(ReplicaError::NoSuchPeer(peer.id.clone()));
+        let synced = match self.pair_now(peer).await {
+            Ok(Some(now)) => {
+                self.sync_peer(&now, tokio::time::Instant::now() + SYNC_BUDGET)
+                    .await
+            }
+            Ok(None) => Err(ReplicaError::NoSuchPeer(peer.id.clone())),
+            Err(e) => Err(e.into()),
         };
-        self.sync_peer(&now, tokio::time::Instant::now() + SYNC_BUDGET)
-            .await
+        let outcome = match &synced {
+            Ok(()) => Some(true),
+            Err(ReplicaError::Moved | ReplicaError::NoSuchPeer(_)) => None,
+            Err(_) => Some(false),
+        };
+        if let Some(ok) = outcome {
+            self.stats
+                .synced(ok, began.elapsed(), crate::metrics::history::unix_ms());
+        }
+        tracing::Span::current().record(
+            "outcome",
+            synced.as_ref().map_or_else(ReplicaError::kind, |()| "ok"),
+        );
+        synced
     }
 
     /// Sync every library `peer` shares with this one, over the

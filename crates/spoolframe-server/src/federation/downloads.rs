@@ -212,7 +212,34 @@ impl Federation {
     /// Prepare `who`'s download of `item`, a paired server's, from
     /// `source` with `tracks`, for `device`: SA makes the file, and this
     /// server keeps the record, under its own id.
+    /// In a `federation download` span, which names the pair, never the
+    /// user.
+    #[tracing::instrument(
+        name = "federation download",
+        skip_all,
+        fields(
+            request = "prepare",
+            peer.server_id = item.remote().map(|(origin, _)| origin.to_owned()),
+            outcome = tracing::field::Empty,
+        )
+    )]
     pub async fn prepare_download(
+        &self,
+        who: &Who,
+        item: &MediaId,
+        source: DownloadSource,
+        tracks: DownloadTracks,
+        device: DownloadDevice,
+    ) -> Result<DownloadInfo, ProxyError> {
+        let prepared = self
+            .prepare_remote_download(who, item, source, tracks, device)
+            .await;
+        super::record_outcome(&prepared, ProxyError::kind);
+        prepared
+    }
+
+    /// [`Federation::prepare_download`], in its span.
+    async fn prepare_remote_download(
         &self,
         who: &Who,
         item: &MediaId,
@@ -376,7 +403,36 @@ impl Federation {
     /// paired server's item, read from SA through this server's session
     /// there: for a device that cannot reach SA. Relayed as it comes.
     /// `None` when `id` is no such download of `who`'s.
+    #[tracing::instrument(
+        name = "federation download",
+        skip_all,
+        fields(
+            request = "read",
+            peer.server_id = tracing::field::Empty,
+            read.offset = offset as i64,
+            read.length = length as i64,
+            outcome = tracing::field::Empty,
+        )
+    )]
     pub async fn read_download(
+        &self,
+        who: &Who,
+        id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<RemoteDownloadRead>, ProxyError> {
+        let read = self.read_remote_download(who, id, offset, length).await;
+        let span = tracing::Span::current();
+        match &read {
+            Ok(Some(_)) => span.record("outcome", "ok"),
+            Ok(None) => span.record("outcome", "not_found"),
+            Err(e) => span.record("outcome", e.kind().as_str()),
+        };
+        read
+    }
+
+    /// [`Federation::read_download`], in its span.
+    async fn read_remote_download(
         &self,
         who: &Who,
         id: &str,
@@ -399,6 +455,7 @@ impl Federation {
             .parse()
             .map_err(|_| ProxyError::Origin(not_found("download")))?;
         let (peer, remote) = self.remote_peer(&item).await?;
+        tracing::Span::current().record("peer.server_id", peer.server_id.as_str());
         for again in [true, false] {
             let (held, session) = self
                 .download_session(who, &peer, &item, &remote, true)
@@ -474,7 +531,29 @@ impl Federation {
     /// A download token for the device `device`, of `who`'s download `id`
     /// of `item` alone, which it reads on SA itself (`RemoteGrant` with a
     /// `download`). `OriginOffline` with SA offline.
+    #[tracing::instrument(
+        name = "federation download",
+        skip_all,
+        fields(
+            request = "grant",
+            peer.server_id = item.remote().map(|(origin, _)| origin.to_owned()),
+            outcome = tracing::field::Empty,
+        )
+    )]
     pub async fn grant_download(
+        &self,
+        who: &Who,
+        item: &MediaId,
+        id: &str,
+        device: iroh::EndpointId,
+    ) -> Result<RemoteGranted, ProxyError> {
+        let granted = self.grant_remote_download(who, item, id, device).await;
+        super::record_outcome(&granted, ProxyError::kind);
+        granted
+    }
+
+    /// [`Federation::grant_download`], in its span.
+    async fn grant_remote_download(
         &self,
         who: &Who,
         item: &MediaId,

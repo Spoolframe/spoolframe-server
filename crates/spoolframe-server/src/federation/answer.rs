@@ -25,6 +25,7 @@ use spoolframe_types::{
 use uuid::Uuid;
 
 use super::items::remote;
+use super::stats::{Answered, PeerRequest};
 use super::{Federation, Limits};
 use crate::auth::{Bucket, TokenBucket};
 use crate::keyed_locks::KeyedLocks;
@@ -227,6 +228,46 @@ fn library_kind(kind: LibraryKind) -> RemoteLibraryKind {
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Unshared {
     tracing::warn!(error = %e, "cannot answer a paired server's {what}");
     Unshared::Unavailable
+}
+
+/// How a request answered with `result` went, for the metrics.
+fn unshared_as<T>(result: &Result<T, Unshared>) -> Answered {
+    match result {
+        Ok(_) => Answered::Ok,
+        Err(Unshared::NotShared | Unshared::NotFound) => Answered::Refused,
+        Err(Unshared::Unavailable) => Answered::Unavailable,
+    }
+}
+
+/// An assertion's answer, for the metrics.
+fn asserted_as<T>(result: &Result<T, AssertionRefused>) -> Answered {
+    match result {
+        Ok(_) => Answered::Ok,
+        Err(AssertionRefused::Unavailable) => Answered::Unavailable,
+        Err(_) => Answered::Refused,
+    }
+}
+
+/// A subtitle ask's answer, for the metrics: the client protocol's
+/// refusals that mean "not now" are the pace's, the rest refusals.
+fn protocol_as<T>(result: &Result<T, spoolframe_protocol::Error>) -> Answered {
+    use spoolframe_protocol::Error;
+    match result {
+        Ok(_) => Answered::Ok,
+        Err(Error::RateLimited { .. } | Error::Unavailable { .. } | Error::Busy) => {
+            Answered::Unavailable
+        }
+        Err(_) => Answered::Refused,
+    }
+}
+
+impl Federation {
+    /// A pair's `request` answered as `answered`: counted, and the
+    /// `federation answer` span's outcome.
+    fn answered(&self, request: PeerRequest, answered: Answered) {
+        self.stats.answered(request, answered);
+        tracing::Span::current().record("outcome", answered.as_str());
+    }
 }
 
 impl Federation {
@@ -500,9 +541,20 @@ impl Federation {
 
 #[async_trait::async_trait]
 impl Shares for Federation {
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = PeerRequest::SharesChanged.as_str(),
+            outcome = tracing::field::Empty,
+        )
+    )]
     async fn shares_changed(&self, server_id: &ServerId, endpoint: iroh::EndpointId) {
         // Only from the pair's key now (X8-01), as every request.
-        let Ok(peer) = self.pair(server_id, endpoint).await else {
+        let peer = self.pair(server_id, endpoint).await;
+        self.answered(PeerRequest::SharesChanged, unshared_as(&peer));
+        let Ok(peer) = peer else {
             return;
         };
         tracing::debug!(
@@ -514,7 +566,157 @@ impl Shares for Federation {
         self.wake.notify_one();
     }
 
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = PeerRequest::Libraries.as_str(),
+            outcome = tracing::field::Empty,
+        )
+    )]
     async fn libraries(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+    ) -> Result<Vec<SharedLibrary>, Unshared> {
+        let answered = self.answer_libraries(server_id, endpoint).await;
+        self.answered(PeerRequest::Libraries, unshared_as(&answered));
+        answered
+    }
+
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = PeerRequest::Sync.as_str(),
+            outcome = tracing::field::Empty,
+        )
+    )]
+    async fn sync(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        sync: &SyncLibrary,
+    ) -> Result<SyncAnswer, Unshared> {
+        let answered = self.answer_sync(server_id, endpoint, sync).await;
+        self.answered(PeerRequest::Sync, unshared_as(&answered));
+        answered
+    }
+
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = PeerRequest::Artwork.as_str(),
+            outcome = tracing::field::Empty,
+        )
+    )]
+    async fn artwork(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), Unshared> {
+        let answered = self.answer_artwork(server_id, endpoint, id).await;
+        self.answered(PeerRequest::Artwork, unshared_as(&answered));
+        answered
+    }
+
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = PeerRequest::Assertion.as_str(),
+            outcome = tracing::field::Empty,
+        )
+    )]
+    async fn assert_user(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        assertion: &AssertUser,
+    ) -> Result<TokenGranted, AssertionRefused> {
+        let answered = if self
+            .answering
+            .allowed(server_id.as_str(), Ask::Assertion, &self.limits())
+        {
+            self.mint(server_id, endpoint, assertion).await
+        } else {
+            tracing::info!(server_id = %server_id, "a paired server vouches too fast");
+            Err(AssertionRefused::Unavailable)
+        };
+        self.answered(PeerRequest::Assertion, asserted_as(&answered));
+        answered
+    }
+
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = "subtitle_search",
+            outcome = tracing::field::Empty,
+        )
+    )]
+    async fn search_subtitles(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        ask: &SubtitleSearchAsk,
+    ) -> Result<SubtitleSearch, spoolframe_protocol::Error> {
+        let answered = self.answer_search(server_id, endpoint, ask).await;
+        self.answered(PeerRequest::Subtitles, protocol_as(&answered));
+        answered
+    }
+
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = "subtitle_download",
+            outcome = tracing::field::Empty,
+        )
+    )]
+    async fn download_subtitle(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        ask: &SubtitleDownloadAsk,
+    ) -> Result<SubtitleDownloaded, spoolframe_protocol::Error> {
+        let answered = self.answer_download(server_id, endpoint, ask).await;
+        self.answered(PeerRequest::Subtitles, protocol_as(&answered));
+        answered
+    }
+
+    #[tracing::instrument(
+        name = "federation answer",
+        skip_all,
+        fields(
+            peer.server_id = %server_id,
+            request = "subtitle_removal",
+            outcome = tracing::field::Empty,
+        )
+    )]
+    async fn remove_subtitle_download(
+        &self,
+        server_id: &ServerId,
+        endpoint: iroh::EndpointId,
+        ask: &SubtitleRemovalAsk,
+    ) -> Result<(), spoolframe_protocol::Error> {
+        let answered = self.answer_removal(server_id, endpoint, ask).await;
+        self.answered(PeerRequest::Subtitles, protocol_as(&answered));
+        answered
+    }
+}
+
+impl Federation {
+    /// [`Shares::libraries`], in its span.
+    async fn answer_libraries(
         &self,
         server_id: &ServerId,
         endpoint: iroh::EndpointId,
@@ -541,7 +743,8 @@ impl Shares for Federation {
             .collect())
     }
 
-    async fn sync(
+    /// [`Shares::sync`], in its span.
+    async fn answer_sync(
         &self,
         server_id: &ServerId,
         endpoint: iroh::EndpointId,
@@ -620,7 +823,8 @@ impl Shares for Federation {
         answered
     }
 
-    async fn artwork(
+    /// [`Shares::artwork`], in its span.
+    async fn answer_artwork(
         &self,
         server_id: &ServerId,
         endpoint: iroh::EndpointId,
@@ -652,49 +856,6 @@ impl Shares for Federation {
             Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => Err(Unshared::NotFound),
             Err(e) => Err(unavailable("artwork", e)),
         }
-    }
-
-    async fn assert_user(
-        &self,
-        server_id: &ServerId,
-        endpoint: iroh::EndpointId,
-        assertion: &AssertUser,
-    ) -> Result<TokenGranted, AssertionRefused> {
-        if !self
-            .answering
-            .allowed(server_id.as_str(), Ask::Assertion, &self.limits())
-        {
-            tracing::info!(server_id = %server_id, "a paired server vouches too fast");
-            return Err(AssertionRefused::Unavailable);
-        }
-        self.mint(server_id, endpoint, assertion).await
-    }
-
-    async fn search_subtitles(
-        &self,
-        server_id: &ServerId,
-        endpoint: iroh::EndpointId,
-        ask: &SubtitleSearchAsk,
-    ) -> Result<SubtitleSearch, spoolframe_protocol::Error> {
-        self.answer_search(server_id, endpoint, ask).await
-    }
-
-    async fn download_subtitle(
-        &self,
-        server_id: &ServerId,
-        endpoint: iroh::EndpointId,
-        ask: &SubtitleDownloadAsk,
-    ) -> Result<SubtitleDownloaded, spoolframe_protocol::Error> {
-        self.answer_download(server_id, endpoint, ask).await
-    }
-
-    async fn remove_subtitle_download(
-        &self,
-        server_id: &ServerId,
-        endpoint: iroh::EndpointId,
-        ask: &SubtitleRemovalAsk,
-    ) -> Result<(), spoolframe_protocol::Error> {
-        self.answer_removal(server_id, endpoint, ask).await
     }
 }
 

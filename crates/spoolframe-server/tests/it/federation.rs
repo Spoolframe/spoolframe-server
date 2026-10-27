@@ -196,6 +196,60 @@ async fn assertions_sa_may_not_answer_are_refused_and_counted() {
     sa.stop().await;
 }
 
+/// `server`'s count of the pairs' `request`s answered as `outcome`.
+fn requests(server: &TestServer, request: &str, outcome: &str) -> f64 {
+    server
+        .metrics
+        .families()
+        .into_iter()
+        .find(|f| f.name == "spoolframe_federation_requests_total")
+        .and_then(|f| f.value(&[("request", request), ("outcome", outcome)]))
+        .unwrap_or_else(|| panic!("no requests {request} {outcome}"))
+}
+
+/// A pair's requests are counted for the metrics by what they asked and
+/// how they went: answered, or refused for what is not shared with it.
+#[tokio::test]
+async fn a_pair_s_requests_are_counted_answered_and_refused() {
+    use spoolframe_protocol::federation::AssertionRefused;
+    let sa = server("fed-requests-counted", "Alice's server").await;
+    let paired = endpoint().await;
+    let (dialed, _) = Dialed::connect(&paired, sa.server.addr(), hello("bbbbbbbbbbbbbbbb"))
+        .await
+        .unwrap();
+    let link = pairing_link(&sa, None).await;
+    dialed.redeem(redeem(&code_of(&link))).await.unwrap();
+    let peer = sa
+        .store
+        .live_peer_by_endpoint(&paired.id().to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    federation(&sa)
+        .share(&peer.id, &["plex:1".parse().unwrap()], "alice")
+        .await
+        .unwrap();
+    assert_eq!(requests(&sa, "libraries", "ok"), 0.0);
+    assert_eq!(dialed.libraries().await.unwrap().len(), 1);
+    assert_eq!(requests(&sa, "libraries", "ok"), 1.0);
+    // An image of nothing SA sent it.
+    assert!(matches!(
+        dialed.artwork("plex:art:404").await,
+        Err(DialError::NotShared)
+    ));
+    assert_eq!(requests(&sa, "artwork", "refused"), 1.0);
+    assert_eq!(requests(&sa, "artwork", "ok"), 0.0);
+    // A track of a library not shared with it.
+    let bob = "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c";
+    assert!(matches!(
+        dialed.assert_user(assertion(bob, "plex:track:32")).await,
+        Err(DialError::NotGranted(AssertionRefused::NotShared))
+    ));
+    assert_eq!(requests(&sa, "assertion", "refused"), 1.0);
+    dialed.close();
+    sa.stop().await;
+}
+
 /// The full dance: SA's invite, redeemed by SB, and both keep the pair
 /// with the other's key and server id, so both admins see the same
 /// fingerprints.
@@ -2817,6 +2871,69 @@ mod replica {
         // SB's own libraries are as they were: none. The client protocol
         // adds the cache's, and only for an app that names the feature.
         assert!(pair.cache.libraries().await.unwrap().is_empty());
+        pair.stop().await;
+    }
+
+    /// A sync is measured on both sides: SB counts it, with its time and
+    /// when, and SA counts the requests it answered for it; SB's census
+    /// finds SA paired and online.
+    #[tokio::test]
+    async fn a_sync_moves_the_federation_s_metrics() {
+        let pair = Pair::start("fed-replica-metrics").await;
+        pair.share("plex:1").await;
+        let number = |server: &TestServer, name: &str, labels: &[(&str, &str)]| {
+            server
+                .metrics
+                .families()
+                .into_iter()
+                .find(|f| f.name == name)
+                .and_then(|f| f.value(labels))
+                .unwrap_or(0.0)
+        };
+        let ok = [("outcome", "ok")];
+        let synced = number(&pair.sb, "spoolframe_federation_syncs_total", &ok);
+        let answered = number(
+            &pair.sa,
+            "spoolframe_federation_requests_total",
+            &[("request", "sync"), ("outcome", "ok")],
+        );
+        pair.refresh().await;
+        // The replica may sync too meanwhile: at least the one asked for.
+        assert!(number(&pair.sb, "spoolframe_federation_syncs_total", &ok) > synced);
+        assert!(
+            number(
+                &pair.sa,
+                "spoolframe_federation_requests_total",
+                &[("request", "sync"), ("outcome", "ok")],
+            ) > answered
+        );
+        assert!(
+            number(
+                &pair.sb,
+                "spoolframe_federation_last_sync_timestamp_seconds",
+                &[]
+            ) > 0.0
+        );
+        let timed = pair
+            .sb
+            .metrics
+            .families()
+            .into_iter()
+            .find(|f| f.name == "spoolframe_federation_sync_duration_seconds")
+            .unwrap();
+        assert!(
+            timed
+                .samples
+                .iter()
+                .any(|s| s.labels == [("outcome", "ok".to_owned())]),
+            "{timed:?}"
+        );
+        pair.sb.metrics.refresh().await;
+        assert_eq!(number(&pair.sb, "spoolframe_federation_peers", &[]), 1.0);
+        assert_eq!(
+            number(&pair.sb, "spoolframe_federation_peers_online", &[]),
+            1.0
+        );
         pair.stop().await;
     }
 
@@ -6035,12 +6152,49 @@ mod replica {
                 .await
                 .unwrap();
             assert_eq!((asserted.plays, asserted.proxied), (1, 1), "SB carried it");
+            // The metrics: SB plays one on, has relayed the read's bytes,
+            // and counts a play of SA's items; SA counts one of its own.
+            let number = |server: &TestServer, name: &str, labels: &[(&str, &str)]| {
+                server
+                    .metrics
+                    .families()
+                    .into_iter()
+                    .find(|f| f.name == name)
+                    .and_then(|f| f.value(labels))
+                    .unwrap()
+            };
+            assert_eq!(
+                number(&pair.sb, "spoolframe_federation_proxied_playbacks", &[]),
+                1.0
+            );
+            assert!(number(&pair.sb, "spoolframe_federation_proxied_bytes_total", &[]) >= 4096.0);
+            assert_eq!(
+                number(
+                    &pair.sb,
+                    "spoolframe_federation_plays_total",
+                    &[("items", "theirs")]
+                ),
+                1.0
+            );
+            assert_eq!(
+                number(
+                    &pair.sa,
+                    "spoolframe_federation_plays_total",
+                    &[("items", "ours")]
+                ),
+                1.0
+            );
             remote
                 .session
                 .stop_playback(&remote.playback.handle)
                 .await
                 .unwrap();
             until(|| async { pair.sa.debug.list().open.is_empty() }).await;
+            // Stopped, it is no longer played on.
+            until(|| async {
+                number(&pair.sb, "spoolframe_federation_proxied_playbacks", &[]) == 0.0
+            })
+            .await;
             client.close().await;
             pair.stop().await;
         }
