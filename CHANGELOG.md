@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 (2026-10-26)
 
 - BREAKING: the client protocol is reset to revision 1
   (`PROTOCOL_VERSION` 15 -> 1), a clean break. A server refuses every
