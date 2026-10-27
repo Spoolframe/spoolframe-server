@@ -1,7 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.16.1 (2026-10-27)
 
+- Invites › New invite makes a server invite too ("A server
+  (federation)", while `experimental.federation` is on), with a note,
+  uses and an expiry, and no role. Federation › Invite a server opens the
+  same form. An unnamed server invite is listed as "Server invite".
+- A paired server's card lists what it is shared as one list, with a
+  quiet Revoke… in one column, and its fingerprint muted. Federation's
+  two header buttons are one size.
+- Federation's description in the web UI and in `defaults.ucl`: reviewed,
+  but not tested enough yet; its protocol may still change in ways that
+  break pairings; pair only with servers you trust.
+- The images build for arm64 too: the default and `-slim` images leave
+  out Intel's VA-API drivers there (x86 only), and look for NVIDIA's
+  libraries in `/usr/lib/aarch64-linux-gnu` as well.
+  `scripts/push-images.sh` pushes each architecture under its own tag and
+  makes `<ver>` and `<ver>-slim` manifest lists over them; `-nvidia` and
+  `-cpu` stay amd64.
+- The web UI bundles again in the devenv shell: its wasm keeps the
+  section wasm-bindgen reads (`strip = "debuginfo"`), which LLVM 23's
+  strip removed with the symbols.
 - Federation in the metrics (experimental, P8-01), on `/metrics` and in
   the OTLP export: `spoolframe_federation_peers` and
   `spoolframe_federation_peers_online` (live pairs, and those connected

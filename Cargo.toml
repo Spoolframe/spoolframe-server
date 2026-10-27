@@ -10,7 +10,7 @@ exclude = ["vendor"]
 # (ARCHITECTURE §56). Each crate states its own, and
 # `spoolframe-server/tests/it/license_boundary.rs` keeps the two sides apart.
 [workspace.package]
-version = "0.16.0"
+version = "0.16.1"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 repository = "https://git.coldsteel.casa/Spoolframe/spoolframe-server"
@@ -39,18 +39,18 @@ foyer = "0.22.5"
 # types, protocol, policy, client-sdk, test-dir, hls-bridge) carry the
 # workspace version as well, which `cargo publish` needs to turn the path
 # into a registry dependency; bump it with `workspace.package.version`.
-spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.0", registry = "coldsteel" }
-spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.0", registry = "coldsteel" }
+spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.1", registry = "coldsteel" }
+spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.1", registry = "coldsteel" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
 spoolframe-federation = { path = "crates/spoolframe-federation" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
-spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.0", registry = "coldsteel" }
+spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.1", registry = "coldsteel" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
-spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.0", registry = "coldsteel" }
+spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.1", registry = "coldsteel" }
 spoolframe-probe = { path = "crates/spoolframe-probe" }
-spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.0", registry = "coldsteel" }
-spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.0", registry = "coldsteel" }
+spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.1", registry = "coldsteel" }
+spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.1", registry = "coldsteel" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
