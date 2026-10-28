@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="crates/spoolframe-web/public/favicon.svg" alt="Spoolframe" width="96" height="96">
+  <img src="docs/spoolframe.svg" alt="Spoolframe" width="128" height="128">
 </p>
 
 <h1 align="center">Spoolframe</h1>
