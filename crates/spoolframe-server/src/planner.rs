@@ -218,6 +218,13 @@ pub fn with_quality(
 /// any film's, and well inside the arithmetic an encode does with it.
 pub const MAX_BITRATE: u64 = 1_000_000_000;
 
+/// The highest bitrate an encode is given, bits per second, whatever its
+/// source's: over a UHD Blu-ray's peak (128 Mbit/s), and under what the
+/// GPU encoders take. hevc_nvenc on a GTX 1060 refuses 400 Mbit/s and
+/// more at any size ("InitializeEncoder failed: invalid param"), and
+/// HEVC's own Main tier tops out at 240.
+pub const MAX_ENCODE_BITRATE: u64 = 200_000_000;
+
 /// The plan for a client that sent no capabilities: nothing can be
 /// promised to play.
 pub fn plan_without_capabilities() -> PlaybackPlan {
@@ -749,7 +756,13 @@ fn converted(
             codec: codecs::video_codec(&v.codec),
             dolby_vision: hdr_shown(v, caps) == Showing::DolbyVision,
         }),
-        Some(v) => Some(encode_video(v, caps, encoders, audio.as_ref())?),
+        Some(v) => Some(encode_video(
+            v,
+            descriptor.bit_rate,
+            caps,
+            encoders,
+            audio.as_ref(),
+        )?),
     };
 
     if reasons.is_empty() {
@@ -896,7 +909,7 @@ fn remux_ladder(
         height: tallest,
         tone_map,
         ..
-    }) = encode_video(source, caps, encoders, audio.as_ref())
+    }) = encode_video(source, descriptor.bit_rate, caps, encoders, audio.as_ref())
     else {
         return plan;
     };
@@ -1020,9 +1033,11 @@ fn audio_bits(audio: Option<&ConvertedAudio>) -> u64 {
 /// only as H.264, the one software codec the server encodes. An HDR film
 /// for a client that shows its HDR, with 10 bits allowed, takes the first
 /// that keeps it: HEVC or AV1 on a GPU encoder that took a 10-bit test
-/// frame. Anything else HDR is tone mapped to SDR.
+/// frame. Anything else HDR is tone mapped to SDR. `bit_rate` is the
+/// file's, which the encode is held under.
 fn encode_video(
     video: &VideoStream,
+    bit_rate: Option<u64>,
     caps: &ClientCapabilities,
     encoders: &Encoders,
     audio: Option<&ConvertedAudio>,
@@ -1062,11 +1077,20 @@ fn encode_video(
         .ok_or("video: the server can encode no codec this client plays")?;
     let codec = chosen.codec;
     let tone_map = video.hdr.is_some() && !keeps(chosen);
-    // Leave room for the audio inside the client's limit.
+    // Leave room for the audio inside the client's limit. No more than the
+    // source's own rate, as a ladder's top rung, whatever delivery and
+    // even with no limit (Original): a fast LAN's share is up to a gigabit,
+    // which no encoder needs and hevc_nvenc refuses, and an encoder left
+    // to its own rate made 33 Mbit/s of a 17 Mbit/s file.
     let audio_bits = audio_bits(audio);
-    let max_bitrate = caps
-        .max_bitrate
-        .map(|max| max.saturating_sub(audio_bits).max(500_000));
+    let source_bits = bit_rate
+        .map(|bits| bits.saturating_sub(audio_bits))
+        .unwrap_or_else(|| worth(video.height, codec))
+        .min(MAX_ENCODE_BITRATE);
+    let max_bitrate = caps.max_bitrate.map_or(source_bits, |max| {
+        max.saturating_sub(audio_bits).min(source_bits)
+    });
+    let max_bitrate = Some(max_bitrate.max(500_000));
     // A low cap is spent on fewer pixels, not on a blurred large picture.
     let height = max_bitrate.map_or(height, |bits| height.min(height_for(bits, codec)));
     Ok(ConvertedVideo::Encode {
@@ -2101,6 +2125,90 @@ mod tests {
         )));
     }
 
+    /// The encode's cap for a 4K HEVC file of `bit_rate`, played over
+    /// progressive delivery on a 2.5 Gbit/s LAN by a client that takes
+    /// H.264 only, so its video is encoded.
+    fn progressive_encode_cap_on_a_fast_lan(bit_rate: Option<u64>) -> u64 {
+        let mut source = hevc_dts();
+        source.bit_rate = bit_rate;
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        };
+        let plan = super::plan_for(
+            &source,
+            Some(&caps),
+            on_link(2_515_827_660),
+            None,
+            false,
+            picked(0, None),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &dev_encoders(),
+            &Ocr::disabled(),
+        );
+        let (delivery, _, video, _, _, _) = converted(plan);
+        assert_eq!(delivery, Delivery::Progressive);
+        let ConvertedVideo::Encode { max_bitrate, .. } = video else {
+            panic!("not encoded: {video:?}");
+        };
+        max_bitrate.expect("a capped encode")
+    }
+
+    /// A fast link is no reason to encode at more than the file has: a
+    /// 17 Mbit/s episode on a 2.5 Gbit/s LAN was given 999.36 Mbit/s (the
+    /// client's ceiling less its audio), which hevc_nvenc refuses
+    /// ("InitializeEncoder failed: invalid param").
+    #[test]
+    fn a_progressive_encode_is_held_to_the_file_s_bitrate() {
+        let cap = progressive_encode_cap_on_a_fast_lan(Some(17_000_000));
+        assert!((500_000..17_000_000).contains(&cap), "{cap}");
+    }
+
+    /// A file that does not say its rate is held to what its height is
+    /// worth.
+    #[test]
+    fn an_encode_of_a_file_of_unknown_bitrate_is_held_to_its_height_s_worth() {
+        let cap = progressive_encode_cap_on_a_fast_lan(None);
+        assert_eq!(cap, worth(2160, VideoCodec::H264));
+    }
+
+    /// Original sets no limit, but an encode it needs (Dolby Vision
+    /// profile 5 for a client without it) is still held to the file's
+    /// rate, not left to the encoder's own: 33 Mbit/s of a 17 Mbit/s file.
+    #[test]
+    fn an_original_encode_is_held_to_the_file_s_bitrate() {
+        let mut source = hevc_dts();
+        source.bit_rate = Some(17_000_000);
+        let caps = ClientCapabilities {
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..caps()
+        };
+        let plan = super::plan_for(
+            &source,
+            Some(&caps),
+            Quality::Original,
+            None,
+            false,
+            picked(0, None),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &dev_encoders(),
+            &Ocr::disabled(),
+        );
+        let (_, _, video, _, _, _) = converted(plan);
+        let ConvertedVideo::Encode { max_bitrate, .. } = video else {
+            panic!("not encoded: {video:?}");
+        };
+        let cap = max_bitrate.expect("a capped encode");
+        assert!((500_000..17_000_000).contains(&cap), "{cap}");
+    }
+
+    /// A file over what any encoder takes is held to the ceiling.
+    #[test]
+    fn an_encode_is_never_over_the_ceiling() {
+        let cap = progressive_encode_cap_on_a_fast_lan(Some(900_000_000));
+        assert_eq!(cap, MAX_ENCODE_BITRATE);
+    }
+
     fn plan_for_quality(caps: &ClientCapabilities, quality: Quality) -> PlaybackPlan {
         plan_for_share(caps, quality, None)
     }
@@ -2479,7 +2587,9 @@ mod tests {
                 // The server's first choice the client plays: h264_vaapi.
                 codec: VideoCodec::H264,
                 height: 1080,
-                max_bitrate: None,
+                // No limit from the app: the file's 40 Mbit/s less the
+                // copied audio.
+                max_bitrate: Some(40_000_000 - COPIED_AUDIO_BITS),
                 tone_map: true,
             }
         );

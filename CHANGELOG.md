@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- An encode is held to its file's own bitrate, whatever the delivery.
+  Before, only an HLS ladder's top rung was: a progressive or single
+  encode on a fast LAN was given the link's share, up to 999 Mbit/s for
+  a 17 Mbit/s episode, which hevc_nvenc refuses ("InitializeEncoder
+  failed: invalid param"), so the playback failed. No encode is given
+  more than 200 Mbit/s; hevc_nvenc refuses 400 and more.
+
 - `spoolframe_process_allocated_bytes`: the bytes the server's
   allocations hold, as asked for, counted by its allocator. Resident or
   not, so it can be above the heap. A heap
