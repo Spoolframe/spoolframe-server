@@ -87,20 +87,27 @@ impl Federation {
     /// The live pairs, by server id, as each is shown to a client.
     pub(super) async fn servers(&self) -> Result<HashMap<String, LibraryServer>, StoreError> {
         Ok(self
-            .store()
-            .federation_peers()
+            .live_peers()
             .await?
-            .into_iter()
-            .filter(PeerRecord::live)
-            .map(|p| {
-                let server = LibraryServer {
-                    online: self.links.online(&p.server_id),
-                    server_id: p.server_id.clone(),
-                    name: p.display_name,
-                };
-                (p.server_id, server)
-            })
+            .iter()
+            .map(|p| (p.server_id.clone(), self.server(p)))
             .collect())
+    }
+
+    async fn live_peers(&self) -> Result<Vec<PeerRecord>, StoreError> {
+        let mut peers = self.store().federation_peers().await?;
+        peers.retain(PeerRecord::live);
+        Ok(peers)
+    }
+
+    /// Pair `peer` as it is shown to a client: by the name this server's
+    /// admin gave it, if any.
+    fn server(&self, peer: &PeerRecord) -> LibraryServer {
+        LibraryServer {
+            online: self.links.online(&peer.server_id),
+            server_id: peer.server_id.clone(),
+            name: peer.name().to_owned(),
+        }
     }
 
     /// The libraries the paired servers share with this one, as cached,
@@ -124,9 +131,16 @@ impl Federation {
     /// Each paired server's own Home row for `principal` (by its text):
     /// the servers that share something with this one, by name, each with
     /// what it shared most recently, or with nothing when the user turned
-    /// its row off.
+    /// its row off. A server whose row this server's admin turned off has
+    /// none, for every user.
     pub async fn home_rows(&self, principal: &str) -> Result<Vec<ServerRow>, StoreError> {
-        let servers = self.servers().await?;
+        let servers: HashMap<String, LibraryServer> = self
+            .live_peers()
+            .await?
+            .iter()
+            .filter(|p| p.home_row)
+            .map(|p| (p.server_id.clone(), self.server(p)))
+            .collect();
         let hidden = self.store().hidden_server_rows(principal).await?;
         let mut sharing: Vec<&LibraryServer> = Vec::new();
         for library in self.store().cached_libraries(None).await? {

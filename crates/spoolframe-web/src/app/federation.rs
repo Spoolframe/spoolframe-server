@@ -10,8 +10,9 @@
 //! its plays, one number each way and no user named; and lists the
 //! libraries shared with it, with Share and Revoke (P8-03). Each pair's
 //! name opens its own page: what is shared each way, the week's plays,
-//! what state it is in, the new key its admin said to expect (M8-06),
-//! and Unpair (the WebFederationPeer board). Every
+//! what state it is in, its name here and whether Home shows its row,
+//! the new key its admin said to expect (M8-06), and Unpair (the
+//! WebFederationPeer board). Every
 //! change asks "Confirm it's you" when the sign-in is old.
 
 use dioxus::prelude::*;
@@ -26,10 +27,10 @@ use super::optimized::DangerDialog;
 use super::profile::{ConfirmItsYou, asks_to_confirm};
 use super::{Alert, Field, Route, icons, now, rpc};
 use crate::federation::{
-    CONFIRM_ABOUT, CONFIRM_EXPECT, CONFIRM_SHARE, INVITE_SPENT, ask_to_compare, expected_line,
-    freshness, from_line, is_spent, key_change_error, new_key_line, paired_line, pairing_means,
-    peer_line, presence, received_line, refusal, revoke_question, shared, state_line, states,
-    unpair_means, unpair_question, unpaired, week,
+    CONFIRM_ABOUT, CONFIRM_EXPECT, CONFIRM_SHARE, INVITE_SPENT, ask_to_compare, calls_itself,
+    expected_line, freshness, from_line, home_row_turned, is_spent, key_change_error, new_key_line,
+    paired_line, pairing_means, peer_line, presence, received_line, refusal, renamed,
+    revoke_question, shared, state_line, states, unpair_means, unpair_question, unpaired, week,
 };
 use crate::libraries::items_line;
 use crate::logic::ApiError;
@@ -922,6 +923,57 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
             });
         })
     };
+    // The name typed under Name here; what it calls itself is kept apart.
+    let mut alias_typed = use_signal(|| peer.alias.clone().unwrap_or_default());
+    let mut rename_error = use_signal(|| None::<String>);
+    let go_rename = {
+        let peer = peer.clone();
+        use_callback(move |alias: Option<String>| {
+            let peer = peer.clone();
+            busy.set(true);
+            rename_error.set(None);
+            spawn(async move {
+                let done = match rpc::client().await {
+                    Ok(c) => c
+                        .peer_rename(peer.id.clone(), alias)
+                        .await
+                        .map_err(rpc::error),
+                    Err(e) => Err(e),
+                };
+                match done {
+                    Ok(renamed_to) => {
+                        alias_typed.set(renamed_to.alias.clone().unwrap_or_default());
+                        say(toast, true, renamed(&renamed_to));
+                    }
+                    Err(e) => rename_error.set(Some(e.explain())),
+                }
+                busy.set(false);
+                on_changed.call(());
+            });
+        })
+    };
+    let go_home_row = {
+        let peer = peer.clone();
+        use_callback(move |shown: bool| {
+            let peer = peer.clone();
+            busy.set(true);
+            spawn(async move {
+                let done = match rpc::client().await {
+                    Ok(c) => c
+                        .peer_home_row(peer.id.clone(), shown)
+                        .await
+                        .map_err(rpc::error),
+                    Err(e) => Err(e),
+                };
+                match done {
+                    Ok(turned) => say(toast, true, home_row_turned(&turned)),
+                    Err(e) => say(toast, false, e.explain()),
+                }
+                busy.set(false);
+                on_changed.call(());
+            });
+        })
+    };
     let name_of = |id: &str| {
         libraries
             .iter()
@@ -939,6 +991,10 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
                     span { {paired_line(now, &peer)} }
                     "·"
                     span { class: "mono", title: "Key {peer.endpoint_id}", "{peer.fingerprint}" }
+                    if let Some(remote) = calls_itself(&peer) {
+                        "·"
+                        span { "{remote}" }
+                    }
                     if live {
                         "·"
                         span { class: "live",
@@ -972,6 +1028,44 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
             }
         }
         if live {
+            section { class: "flex flex-col gap-2.5",
+                div { class: "section-head",
+                    h2 { "Name here" }
+                    span { "What your users' apps and these pages call {peer.remote_name}. Clear it to use the name it gives itself." }
+                }
+                form {
+                    class: "flex flex-wrap items-end gap-2.5",
+                    onsubmit: move |e| {
+                        e.prevent_default();
+                        go_rename.call(Some(alias_typed()));
+                    },
+                    Field { label: "Nickname", value: alias_typed, placeholder: "{peer.remote_name}", error: rename_error() }
+                    button { class: "btn", r#type: "submit", disabled: busy(), "Save" }
+                    if peer.alias.is_some() {
+                        button { class: "btn", r#type: "button", disabled: busy(), onclick: move |_| go_rename.call(None), "Clear" }
+                    }
+                }
+                div { class: "card tie-list",
+                    div { class: "tie-row",
+                        span { class: "tie-what",
+                            b { "Show on Home" }
+                            span { class: "tie-sub", "A New on {peer.name} row on every user's Home. Its libraries stay in the sidebar, in search and in Recently added either way." }
+                        }
+                        button {
+                            class: "switch",
+                            r#type: "button",
+                            role: "switch",
+                            aria_checked: "{peer.home_row}",
+                            aria_label: "Show {peer.name} on Home",
+                            disabled: busy(),
+                            onclick: {
+                                let shown = peer.home_row;
+                                move |_| go_home_row.call(!shown)
+                            },
+                        }
+                    }
+                }
+            }
             section { class: "flex flex-col gap-2.5",
                 div { class: "section-head",
                     h2 { "Expected new key" }

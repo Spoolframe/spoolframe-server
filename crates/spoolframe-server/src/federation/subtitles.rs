@@ -165,8 +165,8 @@ impl Federation {
         Ok(PairAsk {
             item,
             asker: PairAsker {
+                name: peer.name().to_owned(),
                 server_id: peer.server_id,
-                name: peer.display_name,
                 subtitles: SubtitlePreferences::default(),
             },
             subtitles,

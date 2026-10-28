@@ -241,7 +241,7 @@ pub struct Asker {
 pub struct PairAsker {
     /// The pair's server id.
     pub server_id: String,
-    /// What the pair calls itself: shown as who downloaded.
+    /// What the pair is called here: shown as who downloaded.
     pub name: String,
     /// The user's subtitle choices on their own server: what results are
     /// ordered by.

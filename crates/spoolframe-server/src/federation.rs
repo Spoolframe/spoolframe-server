@@ -1011,6 +1011,46 @@ impl Federation {
         }
         Ok(peer)
     }
+
+    /// Call live pair `id` `alias` here, or by what it called itself
+    /// (`None`), by admin `by`: what its libraries' server is named to
+    /// clients from now.
+    pub async fn rename(
+        &self,
+        id: &str,
+        alias: Option<&str>,
+        by: &str,
+    ) -> Result<PeerRecord, PeerError> {
+        let peer = self.store().set_peer_alias(id, alias).await?;
+        tracing::info!(
+            server_id = %peer.server_id,
+            name = %peer.display_name,
+            alias = peer.alias.as_deref().unwrap_or(""),
+            by,
+            "a paired server was renamed here"
+        );
+        self.links.told();
+        Ok(peer)
+    }
+
+    /// Show live pair `id`'s own Home row to this server's users, or not,
+    /// by admin `by`.
+    pub async fn show_home_row(
+        &self,
+        id: &str,
+        shown: bool,
+        by: &str,
+    ) -> Result<PeerRecord, PeerError> {
+        let peer = self.store().set_peer_home_row(id, shown).await?;
+        tracing::info!(
+            server_id = %peer.server_id,
+            name = %peer.display_name,
+            shown,
+            by,
+            "a paired server's Home row was turned on or off"
+        );
+        Ok(peer)
+    }
 }
 
 /// Tell the server at `addr` that this one, saying `hello`, unpaired:

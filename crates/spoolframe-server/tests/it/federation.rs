@@ -1579,6 +1579,108 @@ mod admin {
         sb.server.stop().await;
     }
 
+    /// An admin renames a paired server, signed in long ago: its name is
+    /// the alias, what it called itself is kept, and blank calls it that
+    /// again. Too long, or with a control character, is refused; so is an
+    /// unpaired server, and a consumer.
+    #[tokio::test]
+    async fn an_admin_renames_a_paired_server_and_turns_its_home_row_off() {
+        let sa = Site::start("fed-admin-rename", "Alice's server", "alice", true).await;
+        let sb = Site::start("fed-admin-rename-sb", "Bob's server", "bob", true).await;
+        let on_sb = pair(&sa, &sb).await;
+        assert_eq!(
+            (
+                on_sb.alias.as_deref(),
+                on_sb.remote_name.as_str(),
+                on_sb.home_row
+            ),
+            (None, "Alice's server", true)
+        );
+        sb.server
+            .clock
+            .advance(spoolframe_server::auth::RECENT_SIGN_IN + Duration::from_secs(1));
+        let named = sb
+            .admin
+            .peer_rename(on_sb.id.clone(), Some("  Mum's  ".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                named.name.as_str(),
+                named.alias.as_deref(),
+                named.remote_name.as_str()
+            ),
+            ("Mum's", Some("Mum's"), "Alice's server")
+        );
+        assert_eq!(sb.peers().await, [named]);
+        for bad in ["x".repeat(129), "Mum's\nserver".into()] {
+            assert_eq!(
+                code(
+                    sb.admin
+                        .peer_rename(on_sb.id.clone(), Some(bad))
+                        .await
+                        .unwrap_err()
+                ),
+                error_code::INVALID_INPUT
+            );
+        }
+        let cleared = sb
+            .admin
+            .peer_rename(on_sb.id.clone(), Some("   ".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (cleared.name.as_str(), cleared.alias),
+            ("Alice's server", None)
+        );
+        let off = sb
+            .admin
+            .peer_home_row(on_sb.id.clone(), false)
+            .await
+            .unwrap();
+        assert!(!off.home_row);
+        let guest = Site::page(sb.addr, "guest").await;
+        assert_eq!(
+            code(
+                guest
+                    .peer_rename(on_sb.id.clone(), Some("Mine".into()))
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::FORBIDDEN
+        );
+        assert_eq!(
+            code(
+                guest
+                    .peer_home_row(on_sb.id.clone(), true)
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::FORBIDDEN
+        );
+        sb.server
+            .store
+            .revoke_peer(&on_sb.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            code(
+                sb.admin
+                    .peer_rename(on_sb.id.clone(), Some("Mum's".into()))
+                    .await
+                    .unwrap_err()
+            ),
+            error_code::NO_SUCH_PEER
+        );
+        assert_eq!(
+            code(sb.admin.peer_home_row(on_sb.id, true).await.unwrap_err()),
+            error_code::NO_SUCH_PEER
+        );
+        sa.server.stop().await;
+        sb.server.stop().await;
+    }
+
     /// P8-03: SA's admin shares Movies with the paired server, sees it
     /// listed, and revokes it; a library SA does not serve is refused, and
     /// unpairing revokes whatever is still shared.
@@ -3085,6 +3187,45 @@ mod replica {
             .await,
             Response::Err(Error::NotFound { .. })
         ));
+        pair.stop().await;
+    }
+
+    /// SB's admin's name for SA is what Bob's app calls it, in the list
+    /// and on Home; with SA's row turned off for everyone, Home has none,
+    /// and SA's library is still listed.
+    #[tokio::test]
+    async fn an_admin_s_name_and_home_switch_for_sa_reach_the_app() {
+        let pair = Pair::start("fed-exposure-alias").await;
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let (app, bob) = bob_on(&pair, true).await;
+        let federation = pair.sb.federation.as_ref().unwrap();
+        federation
+            .rename(&pair.sa_on_sb, Some("Mum's"), "bob")
+            .await
+            .unwrap();
+        let listed = libraries(&app, &bob).await;
+        assert_eq!(listed[0].server.as_ref().unwrap().name, "Mum's");
+        let screen = home(&app, &bob).await;
+        assert_eq!(screen.servers.len(), 1);
+        assert_eq!(screen.servers[0].server.name, "Mum's");
+        federation
+            .show_home_row(&pair.sa_on_sb, false, "bob")
+            .await
+            .unwrap();
+        assert!(home(&app, &bob).await.servers.is_empty());
+        assert_eq!(libraries(&app, &bob).await.len(), 1);
+        federation
+            .show_home_row(&pair.sa_on_sb, true, "bob")
+            .await
+            .unwrap();
+        federation
+            .rename(&pair.sa_on_sb, None, "bob")
+            .await
+            .unwrap();
+        let screen = home(&app, &bob).await;
+        assert_eq!(screen.servers.len(), 1);
+        assert_eq!(screen.servers[0].server.name, "Alice's server");
         pair.stop().await;
     }
 

@@ -3307,10 +3307,11 @@ and server id, paired by the invite's maker; SB keeps SA's as the link
 and `info` gave them, paired by the admin who redeemed.
 
 The admin API's `federation` methods are admins'. `peerList`,
-`peerDetail`, `grantList` and `refresh` need nothing more; every other
-needs a recent sign-in, checked first. `refresh` only syncs again with a
-server paired already: it reaches no stranger, and spends no stranger's
-budget, as `lookUp` and `redeem` do. They are `NOT_CONFIGURED` while the
+`peerDetail`, `grantList`, `refresh`, `peerRename` and `peerHomeRow`
+need nothing more; every other needs a recent sign-in, checked first.
+`refresh` only syncs again with a server paired already: it reaches no
+stranger, and spends no stranger's budget, as `lookUp` and `redeem` do.
+`peerRename` and `peerHomeRow` change only what this server shows. They are `NOT_CONFIGURED` while the
 switch is off. `redeem` refused by the other server is
 `PAIRING_REFUSED`, `data.reason` its reason (`invite_invalid`,
 `already_paired`, `key_held`, `key_refused`, `server_id_changed`,
@@ -3355,6 +3356,18 @@ the pair is unpaired. A key with that fingerprint is held past the four,
 but is not confirmed by it: the admin still confirms it with
 `keyConfirm`. The pin moves in one place only, and to the full key the
 admin sees, not to a fingerprint.
+
+`peerRename { id, alias }` gives a pair a name on this server: its
+`name` everywhere this server shows it, to its users' apps
+(`LibraryServer.name`) and its admins, from then on. The pair's
+`remoteName` stays what it called itself when the pair was made, and
+its `alias` is the name given. The alias is trimmed; `null` or a blank
+one clears it. One over 128 characters, or with a control character, is
+`INVALID_INPUT`. `peerHomeRow { id, shown }` shows the pair's own Home
+row (`HomeScreen.servers`) to this server's users, or leaves it out for
+every one of them; its libraries are still listed, searched and in
+Recently added. `homeRow` is true for a new pair. Both answer the pair
+as `peerList` gives it, and `NO_SUCH_PEER` for one that is not paired.
 
 When SA has paired but SB cannot keep its side (its store fails), SB
 sends `unpaired` on the same connection, best effort, so SA does not
@@ -3543,7 +3556,9 @@ refuse a `fed:` item id as one not in the library, and its watch
 history leaves them out. `PROTOCOL_VERSION` does not change.
 
 - `Libraries` lists the paired servers' shared libraries after the
-  server's own, each with `server {server_id, name, online}`. An offline
+  server's own, each with `server {server_id, name, online}`. `name` is
+  what SB's admin calls the server (`federation.peerRename`), else what
+  it called itself when the pair was made. An offline
   server's libraries are still browsed, from SB's cache, and its items
   do not play. `libraries_changed` is sent when a pair comes online or
   goes offline, or a sync finds a library shared or no longer shared:
@@ -3562,8 +3577,10 @@ history leaves them out. `PROTOCOL_VERSION` does not change.
 - `HomeScreen.servers` is each paired server's own row: `{server,
   shown, items}`, what it shared most recently first, by when SB cached
   it. `set_server_row {server_id, shown}` shows or hides one, per user:
-  `done`, or `not_found` for a server not paired. A paired server's
-  items stay in Continue watching either way.
+  `done`, or `not_found` for a server not paired. A server whose row SB's
+  admin turned off (`federation.peerHomeRow`) has no row at all, for
+  every user. A paired server's items stay in Continue watching either
+  way.
 - `HomeScreen.unavailable`, and `items`' `unavailable` from
   `recently_played`, list the `fed:` items shown that are no longer
   available: their pair unpaired, or their library no longer shared.

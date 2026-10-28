@@ -458,6 +458,32 @@ pub fn paired_line(now: i64, peer: &PeerEntry) -> String {
     }
 }
 
+/// Under a pair's header, when this server's admin gave it a name: what
+/// it calls itself.
+pub fn calls_itself(peer: &PeerEntry) -> Option<String> {
+    peer.alias
+        .as_ref()
+        .map(|_| format!("Calls itself: {}", peer.remote_name))
+}
+
+/// What the page says once `peer` is renamed, as `peerRename` answered.
+pub fn renamed(peer: &PeerEntry) -> String {
+    match &peer.alias {
+        Some(alias) => format!("{} is called {alias} here", peer.remote_name),
+        None => format!("{} is called by its own name again", peer.remote_name),
+    }
+}
+
+/// What the page says once `peer`'s Home row is turned on or off, as
+/// `peerHomeRow` answered.
+pub fn home_row_turned(peer: &PeerEntry) -> String {
+    if peer.home_row {
+        format!("Your users' Home shows New on {} again", peer.name)
+    } else {
+        format!("Your users' Home no longer shows New on {}", peer.name)
+    }
+}
+
 /// Online, or offline since when it was last seen.
 pub fn presence(now: i64, detail: &PeerDetail) -> String {
     match (detail.peer.connected, detail.last_seen) {
@@ -668,6 +694,9 @@ mod tests {
         PeerEntry {
             id: "id".into(),
             name: "Alice's server".into(),
+            remote_name: "Alice's server".into(),
+            alias: None,
+            home_row: true,
             server_id: "mzxw6ytbojtg633c".into(),
             endpoint_id: "ab".repeat(32),
             fingerprint: "PGJA-BHZ1-F68M-DFSE".into(),
@@ -688,6 +717,42 @@ mod tests {
             proxied_here: 0,
             proxied_there: 0,
         }
+    }
+
+    /// The name it calls itself is shown, and said, only beside an alias.
+    #[test]
+    fn a_renamed_pair_says_what_it_calls_itself() {
+        assert_eq!(calls_itself(&peer()), None);
+        let named = PeerEntry {
+            name: "Mum's".into(),
+            alias: Some("Mum's".into()),
+            ..peer()
+        };
+        assert_eq!(
+            calls_itself(&named).as_deref(),
+            Some("Calls itself: Alice's server")
+        );
+        assert_eq!(renamed(&named), "Alice's server is called Mum's here");
+        assert_eq!(
+            renamed(&peer()),
+            "Alice's server is called by its own name again"
+        );
+    }
+
+    #[test]
+    fn turning_a_pair_s_home_row_says_which_way() {
+        let off = PeerEntry {
+            home_row: false,
+            ..peer()
+        };
+        assert_eq!(
+            home_row_turned(&off),
+            "Your users' Home no longer shows New on Alice's server"
+        );
+        assert_eq!(
+            home_row_turned(&peer()),
+            "Your users' Home shows New on Alice's server again"
+        );
     }
 
     #[test]

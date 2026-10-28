@@ -23,7 +23,12 @@ pub struct PeerRecord {
     pub server_id: String,
     /// Its `EndpointId`, hex: the key its connections prove.
     pub endpoint_id: String,
+    /// What it called itself when the pair was made.
     pub display_name: String,
+    /// What this server's admin calls it instead; `None` for none.
+    pub alias: Option<String>,
+    /// Whether its own Home row is shown to this server's users.
+    pub home_row: bool,
     /// Where it may be dialled: `ip:port` hints.
     pub addrs: Vec<String>,
     /// Relay URLs it may be reached through: hints.
@@ -43,6 +48,12 @@ impl PeerRecord {
     /// Not unpaired.
     pub fn live(&self) -> bool {
         self.revoked_at.is_none()
+    }
+
+    /// What this server shows it as: its alias, else what it called
+    /// itself.
+    pub fn name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.display_name)
     }
 
     /// Whether `key` is the key this pair is pinned to (C8-01): what a
@@ -165,8 +176,8 @@ pub enum PairRedeemed {
 /// is one `concat!`ed literal.
 macro_rules! columns {
     () => {
-        "id, server_id, endpoint_id, display_name, addrs, relays, paired_by, invite_id, \
-         paired_at, revoked_at"
+        "id, server_id, endpoint_id, display_name, alias, home_row, addrs, relays, paired_by, \
+         invite_id, paired_at, revoked_at"
     };
 }
 
@@ -184,6 +195,8 @@ fn record(row: &sqlx::sqlite::SqliteRow) -> Result<PeerRecord, sqlx::Error> {
         server_id: row.try_get("server_id")?,
         endpoint_id: row.try_get("endpoint_id")?,
         display_name: row.try_get("display_name")?,
+        alias: row.try_get("alias")?,
+        home_row: row.try_get("home_row")?,
         addrs: hints(row, "addrs")?,
         relays: hints(row, "relays")?,
         paired_by: row.try_get("paired_by")?,
@@ -809,6 +822,46 @@ impl Store {
         Ok(peer)
     }
 
+    /// Call live pair `id` `alias` here, or by what it called itself
+    /// (`None`). The pair's row. [`PeerError::NoSuchPeer`] for a pair that
+    /// is not live.
+    pub async fn set_peer_alias(
+        &self,
+        id: &str,
+        alias: Option<&str>,
+    ) -> Result<PeerRecord, PeerError> {
+        let mut tx = self.begin_write().await?;
+        if !peer_is_live(&mut tx, id).await? {
+            return Err(PeerError::NoSuchPeer(id.to_owned()));
+        }
+        sqlx::query("UPDATE federation_peers SET alias = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(alias)
+            .execute(&mut *tx)
+            .await?;
+        let peer = fetch_peer(&mut tx, id).await?;
+        tx.commit().await?;
+        peer.ok_or_else(|| PeerError::NoSuchPeer(id.to_owned()))
+    }
+
+    /// Show live pair `id`'s own Home row to this server's users, or not.
+    /// The pair's row. [`PeerError::NoSuchPeer`] for a pair that is not
+    /// live.
+    pub async fn set_peer_home_row(&self, id: &str, shown: bool) -> Result<PeerRecord, PeerError> {
+        let mut tx = self.begin_write().await?;
+        if !peer_is_live(&mut tx, id).await? {
+            return Err(PeerError::NoSuchPeer(id.to_owned()));
+        }
+        sqlx::query("UPDATE federation_peers SET home_row = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(shown)
+            .execute(&mut *tx)
+            .await?;
+        let peer = fetch_peer(&mut tx, id).await?;
+        tx.commit().await?;
+        peer.ok_or_else(|| PeerError::NoSuchPeer(id.to_owned()))
+    }
+
     /// The new key live pair `id`'s admin said to expect, in its time.
     pub async fn expected_peer_key(&self, id: &str) -> Result<Option<ExpectedKey>, StoreError> {
         let row: Option<(Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
@@ -1371,6 +1424,89 @@ mod tests {
                 .await,
             Err(PeerError::NoSuchPeer(_))
         ));
+    }
+
+    /// An alias is shown in place of what the pair called itself, which
+    /// is kept, and cleared shows that again.
+    #[tokio::test]
+    async fn an_alias_is_the_pair_s_name_until_cleared() {
+        let store = test_store("fed-peer-alias").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        assert_eq!((peer.alias.as_deref(), peer.name()), (None, "Bob's server"));
+        let named = store.set_peer_alias(&peer.id, Some("Mum's")).await.unwrap();
+        assert_eq!(
+            (named.name(), named.display_name.as_str()),
+            ("Mum's", "Bob's server")
+        );
+        assert_eq!(store.federation_peer(&peer.id).await.unwrap(), Some(named));
+        let cleared = store.set_peer_alias(&peer.id, None).await.unwrap();
+        assert_eq!(
+            (cleared.alias, cleared.display_name),
+            (None, "Bob's server".to_owned())
+        );
+    }
+
+    /// A pair's Home row is on until turned off, and that pair's alone.
+    #[tokio::test]
+    async fn a_pair_s_home_row_is_turned_off_and_on_alone() {
+        let store = test_store("fed-peer-home-row").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        let other = store
+            .add_peer(
+                NewPeer {
+                    server_id: "nfxgq4lpmvzhizlo",
+                    endpoint_id: SB_NEW_KEY,
+                    display_name: "Carol's server",
+                    addrs: &[],
+                    relays: &[],
+                },
+                "bob",
+            )
+            .await
+            .unwrap();
+        assert!(peer.home_row);
+        assert!(
+            !store
+                .set_peer_home_row(&peer.id, false)
+                .await
+                .unwrap()
+                .home_row
+        );
+        let rows = |peers: Vec<PeerRecord>| {
+            peers
+                .into_iter()
+                .map(|p| (p.id, p.home_row))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(store.federation_peers().await.unwrap()),
+            [(other.id.clone(), true), (peer.id.clone(), false)]
+        );
+        assert!(
+            store
+                .set_peer_home_row(&peer.id, true)
+                .await
+                .unwrap()
+                .home_row
+        );
+    }
+
+    /// An unpaired server is neither renamed nor has its row turned off.
+    #[tokio::test]
+    async fn an_unpaired_server_is_neither_renamed_nor_its_row_turned_off() {
+        let store = test_store("fed-peer-alias-revoked").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        store.revoke_peer(&peer.id).await.unwrap();
+        assert!(matches!(
+            store.set_peer_alias(&peer.id, Some("Mum's")).await,
+            Err(PeerError::NoSuchPeer(_))
+        ));
+        assert!(matches!(
+            store.set_peer_home_row(&peer.id, false).await,
+            Err(PeerError::NoSuchPeer(_))
+        ));
+        let kept = store.federation_peer(&peer.id).await.unwrap().unwrap();
+        assert_eq!((kept.alias, kept.home_row), (None, true));
     }
 
     /// A key held already is seen again without a write, but once per

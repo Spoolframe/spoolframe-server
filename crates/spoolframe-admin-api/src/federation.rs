@@ -15,10 +15,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerEntry {
-    /// What `peerRevoke`, `keyConfirm`, `keyReject` and `keyExpect` take.
+    /// What `peerRevoke`, `keyConfirm`, `keyReject`, `keyExpect`,
+    /// `peerRename` and `peerHomeRow` take.
     pub id: String,
-    /// What it called itself when the pair was made.
+    /// What it is called here: `alias`, else `remoteName`.
     pub name: String,
+    /// What it called itself when the pair was made.
+    #[serde(default)]
+    pub remote_name: String,
+    /// What this server's admin calls it (`peerRename`); `None` for none.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Whether its own Home row ("New on …") is shown to this server's
+    /// users (`peerHomeRow`).
+    #[serde(default = "shown")]
+    pub home_row: bool,
     /// Its `ServerId`.
     pub server_id: String,
     /// Its `EndpointId`, hex: the key pinned.
@@ -85,6 +96,11 @@ pub struct PeerEntry {
     /// played on to their devices (P8-04): its own uplink carried them.
     #[serde(default)]
     pub proxied_there: u64,
+}
+
+/// A pair from a server before `homeRow`: its row was shown.
+fn shown() -> bool {
+    true
 }
 
 /// A key held for a paired server (P8-01's key rotation).
@@ -318,6 +334,30 @@ pub trait FederationApi {
         fingerprint: Option<String>,
     ) -> jsonrpsee::core::RpcResult<PeerEntry>;
 
+    /// Call paired server `id` `alias` on this server, in place of what it
+    /// called itself: its users' apps and these pages name it so. `None`,
+    /// or only spaces, calls it what it called itself again. Trimmed; at
+    /// most 128 characters, none of them a control character. The pair,
+    /// as `peerList` gives it. Admins only, with no recent sign-in: it
+    /// changes only what this server shows. `NO_SUCH_PEER` for one that is
+    /// not paired; `INVALID_INPUT` for an alias too long or with a control
+    /// character.
+    #[method(name = "peerRename", with_extensions)]
+    async fn peer_rename(
+        &self,
+        id: String,
+        alias: Option<String>,
+    ) -> jsonrpsee::core::RpcResult<PeerEntry>;
+
+    /// Show paired server `id`'s own Home row ("New on …") to this
+    /// server's users, or leave it out for every one of them. Its
+    /// libraries are listed, searched and in Recently added either way.
+    /// On for a new pair. The pair, as `peerList` gives it. Admins only,
+    /// with no recent sign-in. `NO_SUCH_PEER` for one that is not paired.
+    #[method(name = "peerHomeRow", with_extensions)]
+    async fn peer_home_row(&self, id: String, shown: bool)
+    -> jsonrpsee::core::RpcResult<PeerEntry>;
+
     /// The libraries shared with paired server `peer` now (P8-03), the
     /// first shared first. `NO_SUCH_PEER` for one that is not paired.
     #[method(name = "grantList", with_extensions)]
@@ -368,6 +408,9 @@ mod tests {
         PeerEntry {
             id: "id".into(),
             name: "Alice's server".into(),
+            remote_name: "Alice's server".into(),
+            alias: None,
+            home_row: true,
             server_id: "mzxw6ytbojtg633c".into(),
             endpoint_id: "ab".repeat(32),
             fingerprint: "PGJA-BHZ1-F68M-DFSE".into(),
@@ -414,6 +457,24 @@ mod tests {
         assert!(json["heldKeys"][0]["rejectedAt"].is_null(), "{json}");
         assert!(json.get("revokedAt").unwrap().is_null(), "{json}");
         assert_eq!(serde_json::from_value::<PeerEntry>(json).unwrap(), held);
+    }
+
+    /// A pair from a server before aliases has none, and its Home row on.
+    #[test]
+    fn an_entry_without_an_alias_or_home_row_has_none_and_its_row_on() {
+        let mut json = serde_json::to_value(PeerEntry {
+            alias: Some("Mum's".into()),
+            home_row: false,
+            ..entry()
+        })
+        .unwrap();
+        assert_eq!(json["remoteName"], "Alice's server");
+        assert_eq!(json["homeRow"], false);
+        for field in ["remoteName", "alias", "homeRow"] {
+            json.as_object_mut().unwrap().remove(field);
+        }
+        let read = serde_json::from_value::<PeerEntry>(json).unwrap();
+        assert_eq!((read.alias, read.home_row), (None, true));
     }
 
     #[test]

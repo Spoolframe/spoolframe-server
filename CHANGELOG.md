@@ -8,13 +8,23 @@
   a 17 Mbit/s episode, which hevc_nvenc refuses ("InitializeEncoder
   failed: invalid param"), so the playback failed. No encode is given
   more than 200 Mbit/s; hevc_nvenc refuses 400 and more.
-
 - `spoolframe_process_allocated_bytes`: the bytes the server's
   allocations hold, as asked for, counted by its allocator. Resident or
   not, so it can be above the heap. A heap
   (`spoolframe_process_memory_bytes{kind="heap"}`) that stays high after
   a burst of artwork resizes while this falls back is memory the
   allocator keeps for reuse, not a leak.
+- Federation (experimental): an admin can give a paired server a name
+  on this server, on its page under Name here or with the admin API's
+  new `federation_peerRename`. Users' apps show it as the server's name
+  in the sidebar, on its Home row and on its items; the Federation page
+  shows it too, with what the server calls itself beside it. Clearing
+  it shows that name again. Show on Home, or
+  `federation_peerHomeRow`, turns the server's own Home row off for
+  every user; its libraries stay in the sidebar, in search and in
+  Recently added. Neither needs a recent sign-in. A pair now shows
+  `remoteName`, `alias` and `homeRow`. Migration 0061 adds `alias` and
+  `home_row` to `federation_peers`.
 
 ## 0.16.2 (2026-10-28)
 

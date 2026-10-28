@@ -62,7 +62,8 @@ pub struct RedeemedToken {
     /// The pair's endpoint, hex: a token it redeemed itself is a proxied
     /// play's.
     pub peer_endpoint: String,
-    /// What the pair calls itself.
+    /// What the pair is called here: its alias, else what it calls
+    /// itself.
     pub peer_name: String,
     /// A device's download token's one download (P8-07).
     pub download: Option<String>,
@@ -223,8 +224,8 @@ impl Store {
              RETURNING peer, principal, item, library, scope, preferences, download, \
                  (SELECT endpoint_id FROM federation_peers WHERE id = federation_tokens.peer) \
                      AS peer_endpoint, \
-                 (SELECT display_name FROM federation_peers WHERE id = federation_tokens.peer) \
-                     AS peer_name",
+                 (SELECT coalesce(alias, display_name) FROM federation_peers \
+                  WHERE id = federation_tokens.peer) AS peer_name",
         )
         .bind(token_hash)
         .bind(device)

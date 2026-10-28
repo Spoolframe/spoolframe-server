@@ -11,7 +11,7 @@ use spoolframe_admin_api::{
     PlayDay, ReceivedLibrary, WithdrawnLibrary, error_code,
 };
 use spoolframe_federation::DialError;
-use spoolframe_protocol::federation::PairingRefused;
+use spoolframe_protocol::federation::{PairingRefused, server_name};
 use spoolframe_protocol::fingerprint;
 
 use super::{AdminApi, error, internal};
@@ -39,6 +39,17 @@ impl AdminApi {
     /// it ([`AdminApi::maker`]).
     async fn pair_change(&self, ext: &Extensions) -> RpcResult<(&Federation, String)> {
         let caller = self.recent_admin(ext).await?;
+        let federation = self.federation()?;
+        let (by, _) = self.maker(ext, caller).await?;
+        Ok((federation, by))
+    }
+
+    /// What changes only what this server shows of a pair asks first: an
+    /// admin, signed in at any time, federation on, and who the change is
+    /// by. No recent sign-in: it reaches no other server and opens
+    /// nothing, as `peer_refresh`.
+    async fn pair_setting(&self, ext: &Extensions) -> RpcResult<(&Federation, String)> {
+        let caller = self.admin(ext).await?;
         let federation = self.federation()?;
         let (by, _) = self.maker(ext, caller).await?;
         Ok((federation, by))
@@ -87,8 +98,11 @@ impl AdminApi {
                 expected_at: e.expected_at,
                 expected_by: e.expected_by,
             }),
+            name: peer.name().to_owned(),
             id: peer.id,
-            name: peer.display_name,
+            remote_name: peer.display_name,
+            alias: peer.alias,
+            home_row: peer.home_row,
             server_id: peer.server_id,
             endpoint_id: peer.endpoint_id,
             paired_by: peer.paired_by,
@@ -128,6 +142,23 @@ fn pair_error(e: PairError) -> ErrorObjectOwned {
         PairError::Dial(_) | PairError::Unexpected(_) => error(error_code::UNAVAILABLE, message),
         PairError::Store(e) => internal(e),
     }
+}
+
+/// `typed` as a pair's alias: trimmed, `None` when blank. One that
+/// [`server_name`] would change, as too long or with a control character,
+/// is refused, not cut: the admin sees what they typed kept or refused.
+fn alias(typed: Option<String>) -> RpcResult<Option<String>> {
+    let Some(typed) = typed.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if server_name(typed.to_owned()) != typed {
+        return Err(error(
+            error_code::INVALID_INPUT,
+            "a server's name here is at most 128 characters, none of them a line break or \
+             other control character",
+        ));
+    }
+    Ok(Some(typed.to_owned()))
 }
 
 fn grant_entry(grant: GrantRecord) -> GrantEntry {
@@ -337,6 +368,35 @@ impl FederationApiServer for AdminApi {
         self.peer_entry(federation, peer).await
     }
 
+    async fn peer_rename(
+        &self,
+        ext: &Extensions,
+        id: String,
+        alias: Option<String>,
+    ) -> RpcResult<PeerEntry> {
+        let (federation, by) = self.pair_setting(ext).await?;
+        let alias = self::alias(alias)?;
+        let peer = federation
+            .rename(&id, alias.as_deref(), &by)
+            .await
+            .map_err(peer_error)?;
+        self.peer_entry(federation, peer).await
+    }
+
+    async fn peer_home_row(
+        &self,
+        ext: &Extensions,
+        id: String,
+        shown: bool,
+    ) -> RpcResult<PeerEntry> {
+        let (federation, by) = self.pair_setting(ext).await?;
+        let peer = federation
+            .show_home_row(&id, shown, &by)
+            .await
+            .map_err(peer_error)?;
+        self.peer_entry(federation, peer).await
+    }
+
     async fn peer_grant_list(&self, ext: &Extensions, peer: String) -> RpcResult<Vec<GrantEntry>> {
         self.admin(ext).await?;
         let federation = self.federation()?;
@@ -419,5 +479,27 @@ mod tests {
         assert_eq!(data(&e)["retryAfterMs"], 3000);
         let e = pair_error(PairError::Dial(DialError::Unreachable("x".into())));
         assert_eq!(e.code(), error_code::UNAVAILABLE);
+    }
+
+    /// An alias is trimmed and blank clears it; one too long or with a
+    /// control character is refused, not cut.
+    #[test]
+    fn an_alias_is_trimmed_blank_clears_and_a_bad_one_is_refused() {
+        assert_eq!(
+            alias(Some("  Mum's  ".into())).unwrap().as_deref(),
+            Some("Mum's")
+        );
+        assert_eq!(alias(Some("   ".into())).unwrap(), None);
+        assert_eq!(alias(None).unwrap(), None);
+        assert_eq!(
+            alias(Some("x".repeat(128))).unwrap().map(|a| a.len()),
+            Some(128)
+        );
+        for bad in ["x".repeat(129), "Mum's\nserver".into(), "Mum's\u{7}".into()] {
+            assert_eq!(
+                alias(Some(bad)).unwrap_err().code(),
+                error_code::INVALID_INPUT
+            );
+        }
     }
 }
