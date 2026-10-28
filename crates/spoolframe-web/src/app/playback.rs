@@ -517,7 +517,10 @@ fn Start(row: PlaybackRow) -> Element {
 fn LinkCard(link: spoolframe_admin_api::PlaybackLink) -> Element {
     rsx! {
         section { class: "card",
-            div { class: "card-head", h2 { "Link" } }
+            div { class: "card-head",
+                h2 { "Link" }
+                span { class: "text-xs text-ctp-subtext0", "The last 10 s; under each, this playback" }
+            }
             div { class: "card-body",
                 div { class: "pb-stats",
                     for (label, value, note) in link_parts(&link) {

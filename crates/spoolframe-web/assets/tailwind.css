@@ -4814,6 +4814,7 @@
     border: 1px solid var(--ctp-surface0);
     border-radius: 12px;
     min-width: 0;
+    overflow-wrap: anywhere;
   }
   .pb-stat b {
     font: 600 20px var(--font-display);

@@ -275,32 +275,65 @@ pub fn start_parts(start: &PlaybackStart) -> [(&'static str, String, String); 3]
 }
 
 /// Its device's link (the server's "link" lines): each part's name, the
-/// last 10 s, and the playback so far.
+/// last 10 s, and under it this playback's (the path's kind, and its
+/// address and changes).
 pub fn link_parts(link: &PlaybackLink) -> [(&'static str, String, String); 4] {
     let pct = |h: u32| format!("{}.{:02} %", h / 100, h % 100);
+    let (kind, address) = path_parts(&link.path);
+    let changes = match (link.total_switches, link.switches) {
+        (0, _) => String::new(),
+        (total, 0) => format!(" · changed {} this playback", times(total)),
+        (total, last) => format!(
+            " · changed {} this playback, {} in the last 10 s",
+            times(total),
+            last
+        ),
+    };
     [
-        ("Path", link.path.clone(), String::new()),
+        ("Path", kind, format!("{address}{changes}")),
         (
             "Round trip",
             ms_text(link.rtt_ms),
-            format!("at most {} so far", ms_text(link.max_rtt_ms)),
+            format!("at most {} this playback", ms_text(link.max_rtt_ms)),
         ),
         (
             "Sent",
             bitrate_text(link.send_bps),
-            format!("{} on average", bitrate_text(link.average_bps)),
+            format!(
+                "{} on average this playback",
+                bitrate_text(link.average_bps)
+            ),
         ),
         (
             "Lost",
             pct(link.lost_hundredths),
-            format!(
-                "{} so far · path changed {} times ({} so far)",
-                pct(link.total_lost_hundredths),
-                link.switches,
-                link.total_switches
-            ),
+            format!("{} this playback", pct(link.total_lost_hundredths)),
         ),
     ]
+}
+
+/// `n` times, in words for one.
+fn times(n: u64) -> String {
+    match n {
+        1 => "once".to_owned(),
+        n => format!("{n} times"),
+    }
+}
+
+/// The server's path (`lan [2603:8000::1]:34336`) as its kind, the
+/// tile's large figure, and its address under it: an IPv6 address as the
+/// figure is wider than the tile.
+fn path_parts(path: &str) -> (String, String) {
+    let Some((kind, address)) = path.split_once(' ') else {
+        return (path.to_owned(), String::new());
+    };
+    let kind = match kind {
+        "lan" => "LAN",
+        "direct" => "Direct",
+        "relay" => "Relay",
+        other => other,
+    };
+    (kind.to_owned(), address.to_owned())
 }
 
 /// A playback's making in one line, for the list (PX-24): its decoder
@@ -701,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn a_link_reads_as_its_last_ten_seconds_and_so_far() {
+    fn a_link_reads_as_its_last_ten_seconds_and_this_playback() {
         let link = PlaybackLink {
             path: "direct [2607:fb90::1]:51454".into(),
             rtt_ms: 84,
@@ -714,14 +747,46 @@ mod tests {
             total_switches: 412,
         };
         let parts = link_parts(&link);
-        assert_eq!(parts[0].1, "direct [2607:fb90::1]:51454");
-        assert_eq!(parts[3].1, "2.50 %");
-        assert!(parts[3].2.starts_with("1.05 % so far"), "{}", parts[3].2);
-        assert!(
-            parts[3].2.contains("37 times (412 so far)"),
-            "{}",
-            parts[3].2
+        assert_eq!(
+            (parts[0].1.as_str(), parts[0].2.as_str()),
+            (
+                "Direct",
+                "[2607:fb90::1]:51454 · changed 412 times this playback, 37 in the last 10 s"
+            )
         );
-        assert_eq!(parts[1].2, format!("at most {} so far", ms_text(410)));
+        assert_eq!(
+            (parts[3].1.as_str(), parts[3].2.as_str()),
+            ("2.50 %", "1.05 % this playback")
+        );
+        assert_eq!(
+            parts[1].2,
+            format!("at most {} this playback", ms_text(410))
+        );
+    }
+
+    /// The tile that read "path changed 0 times (1 so far)": one change,
+    /// none lately.
+    #[test]
+    fn a_path_that_changed_once_says_so_beside_its_address() {
+        let link = PlaybackLink {
+            path: "lan [2603:8000:c33e:6ac6:2cbb:6d8f:465f:a30a]:34336".into(),
+            rtt_ms: 0,
+            send_bps: 29_400_000,
+            lost_hundredths: 0,
+            switches: 0,
+            average_bps: 33_700_000,
+            max_rtt_ms: 2,
+            total_lost_hundredths: 3,
+            total_switches: 1,
+        };
+        assert_eq!(
+            link_parts(&link)[0],
+            (
+                "Path",
+                "LAN".to_owned(),
+                "[2603:8000:c33e:6ac6:2cbb:6d8f:465f:a30a]:34336 · changed once this playback"
+                    .to_owned()
+            )
+        );
     }
 }
