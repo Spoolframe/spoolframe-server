@@ -66,20 +66,11 @@
     buildInputs = [libucl openssl];
   };
 
-  # Build dependencies separately for caching. Crane's dummy source stubs
-  # every path crate, but vendor/noq-proto is a dependency of a registry
-  # crate (noq, through [patch.crates-io]), not a workspace member: it
-  # stays whole, or noq is built against an empty noq-proto.
-  cargoArtifacts = craneLib.buildDepsOnly (commonArgs
-    // {
-      dummySrc = craneLib.mkDummySrc {
-        inherit src;
-        extraDummyScript = ''
-          rm -rf $out/vendor/noq-proto
-          cp -r ${src}/vendor/noq-proto $out/vendor/noq-proto
-        '';
-      };
-    });
+  # Build dependencies separately for caching. noq-proto comes from git
+  # (the root Cargo.toml's [patch.crates-io], PX-62): crane vendors it
+  # with builtins.fetchGit at the rev Cargo.lock pins, so it needs no
+  # hash here.
+  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 in
   craneLib.buildPackage (commonArgs
     // {

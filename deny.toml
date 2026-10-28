@@ -69,3 +69,12 @@ ignore = [
 # warning for each would bury a real finding. `cargo tree -d` lists them.
 [bans]
 multiple-versions = "allow"
+
+# Every crate from crates.io, but for noq-proto, pinned to a commit of
+# noq's main until a release carries the stream-assembler fix (the root
+# Cargo.toml's [patch.crates-io], PX-62). Anything else from git, or from
+# another registry, is a mistake.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/n0-computer/noq"]

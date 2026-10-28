@@ -10,7 +10,8 @@
 //! closed the connection with `INTERNAL_ERROR` ("too many gaps in stream
 //! buffer") once it held more than 2,048 of them: any window above about
 //! 2.4 MiB failed this test, and the 8 MiB case fails against it still.
-//! The workspace's noq-proto (vendor/noq-proto) merges them, as quinn does.
+//! noq#866, which the workspace takes from git (the root Cargo.toml's
+//! `[patch.crates-io]`), merges them, as quinn does.
 //!
 //! In-process a lost packet comes again within a millisecond, so the loss
 //! alone cannot pile a window's worth behind it as a 300 ms path did: the

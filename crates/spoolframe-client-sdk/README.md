@@ -69,3 +69,30 @@ while the client is open, one at a time, and `Client::close` stops it where it
 got to. `list` reads the disk alone. On iOS, call `run_until_done` from a
 background task, give the free space the system counts with `set_free_space`,
 and exclude the directory from backup.
+
+## noq-proto: add the patch to your app
+
+iroh's QUIC state machine, noq-proto 1.4.0, closes a connection with "too
+many gaps in stream buffer" when a stream holds more than 2,048 packets after
+a lost packet or ahead of a slow reader. No data is missing when this occurs
+(PX-62). The fix is n0-computer/noq#866. It is merged but not released: 1.4.0
+is the newest noq-proto on crates.io, and iroh 1.4.1 uses it.
+
+This repository's workspace takes noq-proto from git at the merge of #866.
+crates.io ignores the `[patch]` of a published crate, so an app that takes
+this SDK from crates.io builds against the unfixed 1.4.0.
+
+The SDK works without the fix: it keeps the receive window of a stream at
+2 MiB (`STREAM_WINDOW`), below the limit of 1.4.0. To get the fix, add the
+same patch to your workspace's `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+noq-proto = { git = "https://github.com/n0-computer/noq", rev = "3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a" }
+```
+
+That commit is noq-proto 1.5.0 from noq's `main`. It also contains #867
+(unordered streams keep unread data when compacted), the deprecation of
+`send_fairness` (#835) and `SendStream::set_affinity` (#836). The patch does
+not stop you from publishing your own crate: cargo drops `[patch]` when it
+publishes. Remove the patch when a noq-proto release contains #866.

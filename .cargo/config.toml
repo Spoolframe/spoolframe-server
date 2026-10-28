@@ -1,8 +1,0 @@
-# The registry the SDK crates publish to (`publish = ["coldsteel"]`, and the
-# `registry = "coldsteel"` on their workspace dependencies, which `cargo
-# publish` needs to point a published crate's dependencies at the same
-# registry). A name only: every one of those dependencies is also a path,
-# so building or testing never reads this index. Publishing is
-# .forgejo/workflows/publish.yaml.
-[registries.coldsteel]
-index = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"

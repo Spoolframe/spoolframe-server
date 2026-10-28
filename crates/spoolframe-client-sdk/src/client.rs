@@ -55,18 +55,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// and closed the connection when it held more than about 2,048 ("too
 /// many gaps in stream buffer"): at 8 MiB a stream could have some 7,000
 /// in flight, and a 16 MiB read played through a paired server lost its
-/// connection about one time in two (PX-62). The workspace's noq-proto
-/// (vendor/noq-proto) merges them as quinn does, so a window is no longer
-/// bounded by a packet count, and `tests/it/stream_window.rs` holds 8 MiB
-/// through a lost packet. But a `[patch]` reaches only this workspace: the
-/// Linux app and the tvOS bridge take the SDK from the registry and build
-/// against the unpatched release. So 2 MiB, under 1,900 packets of the
-/// smallest QUIC allows, stays until they carry the patch, either as
-/// `[patch.crates-io] noq-proto = { version = "=1.4.0+spoolframe.1",
-/// registry = "coldsteel" }` once the vendored crate is published to
-/// kellnr under that version, or as a copy of vendor/noq-proto with a
-/// `path` patch (PX-62). Then 8 MiB, the 0.14.4 value, about four times
-/// the throughput.
+/// connection about one time in two (PX-62). The workspace takes noq-proto
+/// from noq's main at the merge of noq#866 (the root Cargo.toml's
+/// `[patch.crates-io]`), which merges them as quinn does, so a window is
+/// no longer bounded by a packet count, and `tests/it/stream_window.rs`
+/// holds 8 MiB through a lost packet. But a `[patch]` reaches only this
+/// workspace: the Linux app and the tvOS bridge take the SDK from
+/// crates.io and build against the unfixed 1.4.0 unless they carry the
+/// same patch (the SDK's README). So 2 MiB, under 1,900 packets of the
+/// smallest QUIC allows, stays until they do, or until a noq-proto
+/// release has #866. Then 8 MiB, the 0.14.4 value, about four times the
+/// throughput.
 pub const STREAM_WINDOW: u32 = 2 << 20;
 
 type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;

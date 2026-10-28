@@ -54,6 +54,25 @@
   cache's size. The admin API's `Activity` has `federation` (`null` while
   it is off), and `ActivityPoint` has `federationProxiedBytesPerSec`,
   `federationRequestsPerSec` and `federationRefusedPerSec`.
+- The SDK crates (spoolframe-types, -protocol, -policy, -client-sdk,
+  -test-dir, -hls-bridge) are published on crates.io from 0.16.1, and no
+  longer on the Coldsteel registry: apps take them from crates.io.
+  `scripts/publish-changed.sh` compares with crates.io's index, waits out
+  its rate limit for new crates and its index lag, and publishes with
+  the `CARGO_REGISTRY_TOKEN` secret; every publishable crate must say
+  `publish = ["crates-io"]`. `.cargo/config.toml`, which only named the
+  Coldsteel registry for publishing, is gone.
+- The noq-proto fix for "too many gaps in stream buffer" (PX-62) comes
+  from noq itself: it merged as n0-computer/noq#866 but is not released,
+  so the workspace takes noq-proto from git at that merge
+  (`[patch.crates-io]`, rev `3ff2822f`) in place of `vendor/noq-proto`,
+  which is gone. That is noq-proto 1.5.0 from noq's `main`: besides #866
+  it brings #867 (an unordered stream keeps its unread data when
+  compacted), `send_fairness` deprecated with unfair scheduling removed
+  (#835), and `SendStream::set_affinity` (#836). Apps that take the SDK
+  from crates.io add the same one-line patch to get the fix (the SDK's
+  README); without it they build against 1.4.0, and the SDK's 2 MiB
+  stream window keeps them under its limit.
 
 ## 0.16.0 (2026-10-26)
 

@@ -24,17 +24,21 @@ unprivileged user namespaces (`unshare`).
 `om ci run` (every flake output, NixOS VM test included) on pull requests
 to `master` and on pushes to it. `.forgejo/workflows/publish.yaml` runs
 `scripts/publish-changed.sh` on every push to `master`: each crate with
-`publish = ["coldsteel"]` (types, protocol, policy, client-sdk, test-dir,
-hls-bridge) whose version is not on the Coldsteel registry yet is
-published, in dependency order. To see what it would do:
+`publish = ["crates-io"]` (types, protocol, policy, client-sdk, test-dir,
+hls-bridge) whose version is not on crates.io yet is published, in
+dependency order. test-dir is only the SDK's dev-dependency, but cargo
+will not publish a crate whose versioned dev-dependency is missing from
+the registry. To see what it would do:
 
 ```bash
 devenv shell -- scripts/publish-changed.sh .
 ```
 
-A crate published there names its workspace dependencies with
-`registry = "coldsteel"` (Cargo.toml), which is why `.cargo/config.toml`
-declares the registry; building never reads it.
+crates.io limits how fast new crates are published, so a run that
+publishes several for the first time waits between them (the script logs
+each wait). Apps take the crates from crates.io; the noq-proto fix the
+workspace patches in does not come with them
+(`crates/spoolframe-client-sdk/README.md`).
 
 `dev.ucl` is your own config and is not tracked: write one for your Plex
 server, paths and listeners (`cargo run -p spoolframe-server -- config

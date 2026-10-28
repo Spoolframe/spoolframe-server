@@ -35,22 +35,24 @@ bytes = "1.12"
 # The artwork and previews caches (a memory tier in front of a disk tier)
 # and the Plex replies' memory cache. Apache-2.0.
 foyer = "0.22.5"
-# Internal crates. The ones the SDK publishes (`publish = ["coldsteel"]`:
+# Internal crates. The ones the SDK publishes (`publish = ["crates-io"]`:
 # types, protocol, policy, client-sdk, test-dir, hls-bridge) carry the
 # workspace version as well, which `cargo publish` needs to turn the path
-# into a registry dependency; bump it with `workspace.package.version`.
-spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.1", registry = "coldsteel" }
-spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.1", registry = "coldsteel" }
+# into a crates.io dependency; bump it with `workspace.package.version`.
+# No `registry`: crates.io is the default, and a published crate's
+# dependencies must come from crates.io too.
+spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.1" }
+spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.1" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
 spoolframe-federation = { path = "crates/spoolframe-federation" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
-spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.1", registry = "coldsteel" }
+spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.1" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
-spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.1", registry = "coldsteel" }
+spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.1" }
 spoolframe-probe = { path = "crates/spoolframe-probe" }
-spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.1", registry = "coldsteel" }
-spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.1", registry = "coldsteel" }
+spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.1" }
+spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.1" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -305,11 +307,17 @@ strip = "debuginfo"
 debug = false
 opt-level = "z"
 
-# iroh's QUIC state machine, with one fix of its stream assembler
-# (vendor/noq-proto/VENDORED.md, PX-62): crates.io's latest, 1.4.0,
-# closes a connection past a lost packet or ahead of a slow reader once a
-# stream holds more than 2,048 packets. This reaches only this workspace:
-# the published SDK's users must carry the same line, or build against
-# the unfixed release. Drop it once noq#828 ships.
+# iroh's QUIC state machine from noq's main, at the merge of noq#866
+# (PX-62): crates.io's latest, 1.4.0, closes a connection past a lost
+# packet or ahead of a slow reader once a stream holds more than 2,048
+# packets ("too many gaps in stream buffer"); #866 merges contiguous
+# chunks so it no longer does. Unreleased, so a git pin: main is 1.5.0,
+# which iroh's `^1.4.0` accepts, and brings #867 (unordered streams keep
+# unread data when compacted), `send_fairness` deprecated (#835) and
+# `SendStream::set_affinity` (#836) with it. This reaches only this
+# workspace (crates.io ignores a published crate's `[patch]`): the SDK's
+# users carry the same line, or build against the unfixed release
+# (crates/spoolframe-client-sdk/README.md). Drop it for the first
+# noq-proto release that has #866.
 [patch.crates-io]
-noq-proto = { path = "vendor/noq-proto" }
+noq-proto = { git = "https://github.com/n0-computer/noq", rev = "3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a" }

@@ -2,15 +2,18 @@ name: Publish
 
 # The SDK and the crates it needs (spoolframe-types, -protocol, -policy,
 # -client-sdk, -test-dir, -hls-bridge: every crate with
-# `publish = ["coldsteel"]`) go to the Coldsteel cargo registry, where the
-# Linux and Apple clients take them from. Adapted from foundry's publish.yaml.
+# `publish = ["crates-io"]`) go to crates.io, where the Linux and Apple
+# clients take them from; since 0.16.1, no longer to the Coldsteel
+# registry. Adapted from foundry's publish.yaml.
 #
 # Publishing is a consequence of landing on master, never of proposing to
 # it: no pull_request trigger. It runs on every master push, not only on a
 # version bump: scripts/publish-changed.sh compares each crate's version
-# with the registry index and publishes only what is missing, in dependency
-# order, so a missed publish (a failed run, the registry down) heals on the
-# next push.
+# with crates.io's index and publishes only what is missing, in dependency
+# order, so a missed publish (a failed run, crates.io down) heals on the
+# next push. A run that publishes new crates waits out crates.io's rate
+# limit for them (about one every 10 minutes after a small burst), so the
+# first one, with all six new, takes some 10 to 20 minutes.
 on:
   push:
     branches:
@@ -20,8 +23,8 @@ env:
   CI: "true"
   TERM: dumb
   NO_COLOR: "1"
-  # The registry itself is named in .cargo/config.toml; reads are anonymous.
-  # The write token is scoped to the publish step alone, below.
+  # Reading crates.io's index is anonymous. The write token is scoped to
+  # the publish step alone, below.
 
 jobs:
   publish:
@@ -44,13 +47,16 @@ jobs:
       # Inside the ci profile's shell, as CI's tasks run: `cargo publish`
       # verify-builds each crate and needs the pinned toolchain.
       #
-      # CARGO_REGISTRIES_COLDSTEEL_TOKEN: an API token from the kellnr web
-      # UI at https://cargo.coldsteel.casa. Org-level secret in foundry's
-      # org; this repo needs it at its own org or repo level.
+      # CARGO_REGISTRY_TOKEN, a secret of this repository: a crates.io API
+      # token (crates.io › Account Settings › API Tokens › New Token) with
+      # the publish-new and publish-update scopes, limited to the crate
+      # pattern `spoolframe-*`, so it can publish nothing else. One with an
+      # expiry date needs replacing when it runs out: publishing then fails
+      # to authenticate.
       - name: publish-changed
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         env:
-          CARGO_REGISTRIES_COLDSTEEL_TOKEN: ${{ secrets.CARGO_REGISTRIES_COLDSTEEL_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: scripts/publish-changed.sh --publish .
 
       # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,

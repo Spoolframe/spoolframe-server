@@ -2,61 +2,82 @@
 # publish-changed: publish-on-version-change for cargo workspaces.
 #
 # For each given workspace root: read the workspace's publishable crates
-# from `cargo metadata` (respecting each crate's `publish` field and
-# `registry` fields — never a hand-maintained list), compute their
-# topological dependency order (deps before dependents — the coldsteel
-# registry rejects a crate whose in-workspace dep versions aren't present
-# yet), and for each crate compare its Cargo.toml version against the
-# coldsteel kellnr sparse index. A version already on the index is skipped;
-# an absent version is reported (dry run, the default) or published
-# (--publish).
+# from `cargo metadata` (respecting each crate's `publish` field — never a
+# hand-maintained list), compute their topological dependency order (deps
+# before dependents — crates.io rejects a crate whose in-workspace dep
+# versions aren't present yet), and for each crate compare its Cargo.toml
+# version against crates.io's sparse index (https://index.crates.io/). A
+# version already on the index is skipped; an absent version is reported
+# (dry run, the default) or published (--publish).
 #
 # This is the version-diff mechanism, not a path/tag trigger: it is safe to
 # run on every push to master, including pushes that touch nothing
 # publishable, and a missed or failed publish self-heals on the next run
 # instead of being lost.
 #
-# Publishing must be opted into explicitly, and only to this registry: every
-# crate whose manifest is not `publish = false` must say
-# `publish = ["coldsteel"]` exactly. An absent `publish` field — and the
-# equivalent `publish = true` — means "publishable to crates.io", so a
-# workspace root added to this job would carry every such crate onto the
-# registry by default. That is a hard error here, not a skip.
+# Publishing must be opted into explicitly: every crate whose manifest is
+# not `publish = false` must say `publish = ["crates-io"]` exactly. An
+# absent `publish` field — and the equivalent `publish = true` — also
+# means crates.io to cargo, but a crate that never said so would go public
+# by default the moment it joined the workspace. That is a hard error
+# here, not a skip.
+#
+# crates.io is slower to take a crate than the private registry was, in
+# three ways this script waits out, each bounded and logged:
+#   - it rate-limits NEW crates (a small burst, then about one every 10
+#     minutes): a publish refused with HTTP 429 or "rate limit" waits the
+#     time crates.io names (or 10 minutes) and tries again;
+#   - its index lags a publish by seconds: the next crate in order waits
+#     until the version it depends on shows on the index;
+#   - `cargo publish` resolves a crate's dependencies through whatever
+#     replaces crates-io in cargo's config (the coldsteel devenv profile's
+#     kellnr proxy, devenv.nix), which may lag crates.io in turn: a publish
+#     refused because a just-published dependency is not found yet waits
+#     and tries again.
 #
 # Copied from foundry's scripts/publish-changed.sh when spoolframe left the
 # monorepo; .forgejo/workflows/publish.yaml runs it on every master push.
 #
 # Requires on PATH: cargo (the workspace's own toolchain — run this inside
 # that workspace's devenv shell so `cargo publish`'s verify build has the
-# right native deps), curl, jq.
+# right native deps), curl, jq, date (GNU, to read crates.io's retry time).
 #
 # Usage:
 #   publish-changed.sh [--publish] [--] <workspace-root> [<workspace-root> ...]
 #
 # Options:
 #   --publish   Actually run `cargo publish` for crates found absent from
-#               the index. Requires CARGO_REGISTRIES_COLDSTEEL_TOKEN.
-#               Without this flag the script only reports what it would do
-#               (dry run) and never touches the registry beyond reading
-#               the sparse index.
+#               the index. Requires CARGO_REGISTRY_TOKEN (a crates.io API
+#               token). Without this flag the script only reports what it
+#               would do (dry run) and never touches crates.io beyond
+#               reading the sparse index.
 #   -h, --help  Show this help.
 #
 # A publish failure aborts the script immediately (no silent skip) — the
 # job that runs this must go red, because a red publish job means every
-# downstream CI build resolving these crates is about to be wrong.
+# app resolving these crates is about to be wrong.
 #
 # Exit status: 0 if every configured workspace was processed without a
-# publish error; 1 on any hard failure (bad workspace, registry
-# unreachable, publish failed, dependency cycle among publishable crates,
-# a crate that is publishable without an explicit `publish = ["coldsteel"]`).
+# publish error; 1 on any hard failure (bad workspace, index unreachable,
+# publish failed or still rate-limited after its retries, dependency cycle
+# among publishable crates, a crate that is publishable without an
+# explicit `publish = ["crates-io"]`).
 
 set -euo pipefail
 
-REGISTRY_NAME="coldsteel"
-INDEX_BASE="https://cargo.coldsteel.casa/api/v1/crates"
+REGISTRY_NAME="crates-io"
+INDEX_BASE="https://index.crates.io"
+# A refused publish is tried this many times in all.
+PUBLISH_ATTEMPTS=8
+# Without a time in crates.io's answer: its rate for new crates.
+RATE_LIMIT_WAIT=600
+# Never wait longer than this for one rate limit, whatever crates.io says.
+RATE_LIMIT_WAIT_MAX=1800
+# A dependency cargo cannot find yet is looked for again after this long.
+DEP_WAIT=30
 
 usage() {
-    sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 publish=0
@@ -95,12 +116,12 @@ if [[ ${#roots[@]} -eq 0 ]]; then
     exit 1
 fi
 
-if [[ "$publish" -eq 1 && -z "${CARGO_REGISTRIES_COLDSTEEL_TOKEN:-}" ]]; then
-    echo "Error: --publish requires CARGO_REGISTRIES_COLDSTEEL_TOKEN to be set." >&2
+if [[ "$publish" -eq 1 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+    echo "Error: --publish requires CARGO_REGISTRY_TOKEN to be set." >&2
     exit 1
 fi
 
-for bin in cargo curl jq; do
+for bin in cargo curl jq date; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         echo "Error: '$bin' not found on PATH." >&2
         exit 1
@@ -157,17 +178,81 @@ version_published() {
 # wait_for_index NAME VERSION
 # Poll the index after a publish until the new version is visible, so the
 # next crate in topological order doesn't try to resolve it too early.
-# Hard-exits if it never shows up — a publish that "succeeded" but never
-# reached the index is exactly the failure mode this job exists to catch.
+# crates.io's index trails a publish by seconds, sometimes more: five
+# minutes before giving up. Hard-exits if it never shows up — a publish
+# that "succeeded" but never reached the index is exactly the failure mode
+# this job exists to catch.
 wait_for_index() {
     local name="$1" version="$2" attempt
-    for ((attempt = 0; attempt < 12; attempt++)); do
+    for ((attempt = 0; attempt < 60; attempt++)); do
         if version_published "$name" "$version"; then
             return 0
         fi
+        [[ "$attempt" -eq 0 ]] && echo "  [wait]    $name $version: not on the index yet, polling every 5 s"
         sleep 5
     done
-    echo "Error: $name $version did not appear on the registry index after publishing (timed out)." >&2
+    echo "Error: $name $version did not appear on crates.io's index after publishing (timed out after 5 minutes)." >&2
+    exit 1
+}
+
+# rate_limit_wait LOG
+# Seconds to wait before publishing again, from a refusal crates.io
+# rate-limited ("Please try again after Tue, 27 Oct 2026 15:20:00 GMT"):
+# until that time and a few seconds more, at least 1 s and at most
+# RATE_LIMIT_WAIT_MAX; RATE_LIMIT_WAIT when it names no time this can read.
+rate_limit_wait() {
+    local log="$1" when until now
+    when=$(grep -o -i -E 'try again after [^.]*GMT' "$log" | head -1 | sed -E 's/^[Tt]ry again after //') || true
+    if [[ -n "$when" ]] && until=$(date -d "$when" +%s 2>/dev/null); then
+        now=$(date +%s)
+        local secs=$((until - now + 5))
+        ((secs < 1)) && secs=1
+        ((secs > RATE_LIMIT_WAIT_MAX)) && secs=$RATE_LIMIT_WAIT_MAX
+        echo "$secs"
+    else
+        echo "$RATE_LIMIT_WAIT"
+    fi
+}
+
+# publish_crate ROOT NAME VERSION
+# `cargo publish` to crates.io, tried again — up to PUBLISH_ATTEMPTS in
+# all — when crates.io rate-limits it, or when the dependency it was just
+# preceded by is not found yet through the source cargo resolves with.
+# Any other failure, or one of those past the last attempt, hard-exits.
+#
+# `--registry crates-io`, not the default: where a cargo config replaces
+# crates-io (the coldsteel devenv profile's kellnr proxy), naming it makes
+# the upload go to crates.io itself rather than to the replacement.
+publish_crate() {
+    local root="$1" name="$2" version="$3" attempt log wait
+    log=$(mktemp)
+    for ((attempt = 1; attempt <= PUBLISH_ATTEMPTS; attempt++)); do
+        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked) 2>&1 | tee "$log"; then
+            rm -f "$log"
+            return 0
+        fi
+        # Uploaded after all: a retry whose first try timed out after the
+        # upload, or a crate published by hand meanwhile.
+        if version_published "$name" "$version"; then
+            rm -f "$log"
+            return 0
+        fi
+        if ((attempt == PUBLISH_ATTEMPTS)); then
+            break
+        fi
+        if grep -q -i -E '429|too many requests|rate limit|too many new crates|try again after' "$log"; then
+            wait=$(rate_limit_wait "$log")
+            echo "  [rate-limited] $name $version: crates.io refused it (attempt $attempt of $PUBLISH_ATTEMPTS); waiting ${wait}s"
+            sleep "$wait"
+        elif grep -q -E 'no matching package named `spoolframe-|failed to select a version for the requirement `spoolframe-' "$log"; then
+            echo "  [wait]    $name $version: cargo does not see a dependency it was published after yet (attempt $attempt of $PUBLISH_ATTEMPTS); waiting ${DEP_WAIT}s"
+            sleep "$DEP_WAIT"
+        else
+            break
+        fi
+    done
+    rm -f "$log"
+    echo "Error: cargo publish failed for $name $version in $root" >&2
     exit 1
 }
 
@@ -189,22 +274,21 @@ process_workspace() {
         exit 1
     fi
 
-    # Opt-in gate. Publishing is a deliberate, per-crate, single-registry
-    # decision, so the only two manifest states this script accepts are
-    # `publish = false` (an unpublishable crate — `[]` in cargo metadata)
-    # and `publish = ["coldsteel"]` exactly. Everything else is a hard
-    # error:
+    # Opt-in gate. Publishing is a deliberate, per-crate decision, so the
+    # only two manifest states this script accepts are `publish = false`
+    # (an unpublishable crate — `[]` in cargo metadata) and
+    # `publish = ["crates-io"]` exactly. Everything else is a hard error:
     #
     #   - an absent `publish` field, and the identical-in-metadata
-    #     `publish = true`, both mean "publishable to crates.io". That is
-    #     cargo's default, which makes the dangerous state the one you get
-    #     by writing nothing — a new crate in a configured workspace would
-    #     publish itself on the next master push, and a human running a
-    #     bare `cargo publish` would send it to the public registry;
-    #   - an array naming any other registry, or naming coldsteel among
-    #     others, is a crate whose blast radius is wider than this job.
+    #     `publish = true`, both mean "publishable to crates.io" too, but
+    #     by cargo's default, which makes the dangerous state the one you
+    #     get by writing nothing — a new crate in a configured workspace
+    #     would publish itself on the next master push, and nobody decided
+    #     it should be public;
+    #   - an array naming any other registry, or crates-io among others,
+    #     is a crate whose blast radius is wider than this job.
     #
-    # No skip, no "publish the coldsteel ones and ignore the rest": a
+    # No skip, no "publish the crates.io ones and ignore the rest": a
     # manifest this script cannot vouch for stops the whole workspace rather
     # than falling back to a guess. The fix is always
     # one line in the named crate's Cargo.toml.
@@ -219,7 +303,7 @@ process_workspace() {
     if [[ -n "$unvetted" ]]; then
         echo "Error: crate(s) in $root are publishable without an explicit \`publish = [\"$REGISTRY_NAME\"]\`:" >&2
         echo "$unvetted" >&2
-        echo "Set \`publish = [\"$REGISTRY_NAME\"]\` to publish it here, or \`publish = false\` to keep it out of every registry." >&2
+        echo "Set \`publish = [\"$REGISTRY_NAME\"]\` to publish it to crates.io, or \`publish = false\` to keep it out of every registry." >&2
         exit 1
     fi
 
@@ -314,20 +398,17 @@ process_workspace() {
     for n in "${order[@]}"; do
         v="${version[$n]}"
         if version_published "$n" "$v"; then
-            echo "  [skip]    $n $v (already on registry)"
+            echo "  [skip]    $n $v (already on crates.io)"
             continue
         fi
 
         if [[ "$publish" -eq 0 ]]; then
-            echo "  [would publish] $n $v"
+            echo "  [would publish] $n $v (not on crates.io)"
             continue
         fi
 
         echo "  [publish] $n $v"
-        if ! (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$n" --locked); then
-            echo "Error: cargo publish failed for $n $v in $root" >&2
-            exit 1
-        fi
+        publish_crate "$root" "$n" "$v"
         wait_for_index "$n" "$v"
     done
 }

@@ -4744,7 +4744,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.4.0"
+version = "1.5.0"
+source = "git+https://github.com/n0-computer/noq?rev=3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a#3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",

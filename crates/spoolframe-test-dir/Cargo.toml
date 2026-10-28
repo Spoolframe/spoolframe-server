@@ -4,8 +4,9 @@ description = "A test's own directory: tmpdir's random name, removed for certain
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+repository.workspace = true
 license = "MIT OR Apache-2.0"
-publish = ["coldsteel"]
+publish = ["crates-io"]
 
 [dependencies]
 tmpdir = { workspace = true }
