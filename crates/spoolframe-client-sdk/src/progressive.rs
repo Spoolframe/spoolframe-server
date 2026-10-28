@@ -8,7 +8,7 @@
 //! the demuxer. A seek is a new encode and a new reader, from offset 0.
 //!
 //! When the demuxer catches up with the encode mid-stream, the read
-//! reports buffering and waits until [`RESUME_BYTES`] are ready (or the
+//! reports buffering and waits until [`resume_bytes`] are ready (or the
 //! encode ends), so playback resumes smoothly rather than frame by frame.
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
@@ -21,18 +21,23 @@ use crate::{ManagedPlayback, SdkError as BackendError};
 
 /// How much one fetch asks for.
 pub const CHUNK: u64 = 4 * 1024 * 1024;
-/// The most fetched ahead of the demuxer.
-pub const MAX_BUFFERED: u64 = 128 * 1024 * 1024;
-/// After the demuxer caught up with the encode, how much must be ready
-/// before playback goes on, when the output's bitrate is not known.
-pub const RESUME_BYTES: u64 = 4 * 1024 * 1024;
-/// With a known bitrate, the margin is this much playback...
-const RESUME_SECONDS: u64 = 4;
-/// ...but never less than this.
+/// The most fetched ahead of the demuxer: room for the largest margin.
+pub const MAX_BUFFERED: u64 = 256 * 1024 * 1024;
+/// After the demuxer caught up with the encode, the margin is this much
+/// playback ready before it goes on: a shorter one ran dry again within
+/// a second of a 33 Mbit/s 4K encode, buffering 0 to 100 % on repeat.
+const RESUME_SECONDS: u64 = 10;
+/// The margin when the output's bitrate is not known: RESUME_SECONDS of
+/// 20 Mbit/s, a 4K encode's.
+pub const RESUME_BYTES: u64 = RESUME_SECONDS * 20_000_000 / 8;
+/// The most a margin is: RESUME_SECONDS of a UHD Blu-ray's peak,
+/// 128 Mbit/s.
+pub const MAX_RESUME_BYTES: u64 = RESUME_SECONDS * 128_000_000 / 8;
+/// ...and the least.
 const MIN_RESUME_BYTES: u64 = 256 * 1024;
 // A read waiting for its margin needs the fetch to get there: the cap
 // must leave room for it.
-const _: () = assert!(RESUME_BYTES < MAX_BUFFERED);
+const _: () = assert!(MAX_RESUME_BYTES + CHUNK < MAX_BUFFERED);
 /// Kept behind the last read, for the demuxer's small steps back.
 const KEEP_BEHIND: u64 = 1024 * 1024;
 /// How often a waiting read reports progress while buffering.
@@ -101,10 +106,10 @@ impl ProgressiveReader {
 
 /// The margin to wait for after running dry: RESUME_SECONDS of an output
 /// of `bitrate` bits per second, within MIN_RESUME_BYTES and
-/// RESUME_BYTES; RESUME_BYTES when the bitrate is unknown.
+/// MAX_RESUME_BYTES; RESUME_BYTES when the bitrate is unknown.
 pub fn resume_bytes(bitrate: Option<u64>) -> u64 {
     bitrate.map_or(RESUME_BYTES, |bits| {
-        (bits / 8 * RESUME_SECONDS).clamp(MIN_RESUME_BYTES, RESUME_BYTES)
+        (bits / 8 * RESUME_SECONDS).clamp(MIN_RESUME_BYTES, MAX_RESUME_BYTES)
     })
 }
 
@@ -468,18 +473,13 @@ mod tests {
     #[test]
     fn running_dry_mid_stream_reports_buffering_until_a_margin_is_ready() {
         // The cap holds fetching at 5 MiB, so a read at 10 MiB finds
-        // nothing there: it reports, waits for RESUME_BYTES, then says 100.
+        // nothing there: it reports, waits for its 4 MiB margin, then
+        // says 100.
         let mib = 1024 * 1024;
         let (_dir, path, _) = media_file("progressive-buffering", 16 * mib as usize);
         let (session, handle, _) = converted(path, 256 * 1024);
-        let reader = ProgressiveReader::cap_for_test(
-            session,
-            handle,
-            0,
-            thread_spawn(),
-            5 * mib,
-            RESUME_BYTES,
-        );
+        let reader =
+            ProgressiveReader::cap_for_test(session, handle, 0, thread_spawn(), 5 * mib, 4 * mib);
         let mut reports = Vec::new();
         reader
             .read_reporting(10 * mib, 10, &mut |p| reports.push(p))
@@ -535,8 +535,15 @@ mod tests {
 
     #[test]
     fn a_low_bitrate_waits_for_seconds_of_it() {
-        // 2 Mbit/s: four seconds is 1 MB, not 4 MiB.
-        assert_eq!(resume_bytes(Some(2_000_000)), 1_000_000);
+        // 2 Mbit/s: ten seconds is 2.5 MB.
+        assert_eq!(resume_bytes(Some(2_000_000)), 2_500_000);
+    }
+
+    /// A 4K encode at 33 Mbit/s waited for 4 MiB, about one second of
+    /// it, and ran dry again at once: buffering 0 to 100 % on repeat.
+    #[test]
+    fn a_fast_encode_waits_for_ten_seconds_of_it() {
+        assert_eq!(resume_bytes(Some(33_000_000)), 41_250_000);
     }
 
     #[test]
@@ -544,10 +551,10 @@ mod tests {
         assert_eq!(
             (
                 resume_bytes(Some(64_000)),
-                resume_bytes(Some(100_000_000)),
+                resume_bytes(Some(1_000_000_000)),
                 resume_bytes(None)
             ),
-            (MIN_RESUME_BYTES, RESUME_BYTES, RESUME_BYTES)
+            (MIN_RESUME_BYTES, MAX_RESUME_BYTES, RESUME_BYTES)
         );
     }
 }
