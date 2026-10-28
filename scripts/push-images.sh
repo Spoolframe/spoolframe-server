@@ -30,7 +30,10 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 version=$(nix eval --raw .#packages.x86_64-linux.default.version)
 rev=$(git rev-parse --short=8 HEAD)
-skopeo=(nix run nixpkgs#skopeo --)
+# skopeo refuses to copy without a trust policy (containers' policy.json),
+# which a host without podman doesn't have. The source is the image this
+# script just built, so there is nothing to verify: accept it.
+skopeo=(nix run nixpkgs#skopeo -- --insecure-policy)
 
 system_of() {
   case "$1" in
