@@ -85,6 +85,14 @@ script that streams an OCI image. `scripts/push-images.sh` pushes them to
 `ghcr.io/spoolframe/spoolframe-server`, each architecture under its own tag,
 with `<ver>` and `<ver>-slim` as manifest lists over amd64 and arm64.
 
+On the GitHub mirror, Actions › Images › Run workflow
+(`.github/workflows/images.yaml`) does the same on native amd64 and arm64
+runners, and skips an architecture whose `<ver>-<arch>` is already
+published. Its Nix builds go to the `spoolframe` Cachix cache
+(`CACHIX_AUTH_TOKEN`, an organization secret). It needs the repository to
+be public (GitHub's arm64 runners). The ghcr package is linked to the
+repository, so the workflow's token can push to it.
+
 The image reads `/etc/spoolframe/server.ucl`. Media tools run confined as
 on any host: Docker 29's default seccomp profile allows Landlock. In the
 `-nvidia` image, the toolkit's Vulkan manifest is found in
