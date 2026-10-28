@@ -23,6 +23,7 @@
 {
   lib,
   stdenv,
+  buildPackages,
   dockerTools,
   cacert,
   tzdata,
@@ -95,8 +96,32 @@
     ]
     ["flatten"]
   ];
+  # The tool that splits the layers (flatten-references-graph) needs python's
+  # igraph, whose tests pull in plotly, whose tests start Chromium through
+  # Kaleido. Chromium does not start under qemu, so an arm64 image built on
+  # an emulated builder failed there, and cache.nixos.org has no arm64
+  # plotly for this nixpkgs. igraph's tests say nothing about our layers: on
+  # aarch64 they are skipped, and plotly drops out of the build. x86's
+  # image is untouched, the cached tool and all.
+  layerTools =
+    if stdenv.buildPlatform.isAarch64
+    then
+      dockerTools.override {
+        buildPackages =
+          buildPackages
+          // {
+            dockerMakeLayers = buildPackages.dockerMakeLayers.override {
+              flatten-references-graph = buildPackages.flatten-references-graph.override {
+                python3Packages = buildPackages.python3Packages.overrideScope (_: prev: {
+                  igraph = prev.igraph.overridePythonAttrs {doCheck = false;};
+                });
+              };
+            };
+          };
+      }
+    else dockerTools;
 in
-  dockerTools.streamLayeredImage {
+  layerTools.streamLayeredImage {
     inherit layeringPipeline;
     name = "ghcr.io/spoolframe/spoolframe-server";
     tag =
