@@ -1,59 +1,15 @@
-# spoolframe
+<p align="center">
+  <img src="crates/spoolframe-web/public/favicon.svg" alt="Spoolframe" width="96" height="96">
+</p>
 
-Self-hosted media server: Plex metadata, own playback, Iroh transport.
+<h1 align="center">Spoolframe</h1>
 
-## Development
+<p align="center">
+  A self-hosted media server. It reads your library from Plex, plays and
+  converts the files itself, and reaches devices over Iroh.
+</p>
 
-```bash
-devenv shell
-cargo run -p spoolframe-server -- --config dev.ucl --state-dir .dev-state
-devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
-```
-
-Everything comes from public sources: the Nix inputs from GitHub (pinned in
-`flake.lock` and `devenv.lock`; keep both on one nixpkgs revision), crates
-from crates.io. `ci:static` runs the license check
-(`scripts/check-licenses.sh`) and clippy for the host and for wasm32;
-`ci:style` checks rustfmt and that the committed Tailwind stylesheet is
-fresh; `ci:test` runs nextest under llvm-cov. The LAN tests need
-unprivileged user namespaces (`unshare`).
-
-### CI and publishing
-
-`.forgejo/workflows/ci.yaml` runs the three `ci:*` tasks and
-`om ci run` (every flake output, NixOS VM test included) on pull requests
-to `master` and on pushes to it. `.forgejo/workflows/publish.yaml` runs
-`scripts/publish-changed.sh` on every push to `master`: each crate with
-`publish = ["crates-io"]` (types, protocol, policy, client-sdk, test-dir,
-hls-bridge) whose version is not on crates.io yet is published, in
-dependency order. test-dir is only the SDK's dev-dependency, but cargo
-will not publish a crate whose versioned dev-dependency is missing from
-the registry. To see what it would do:
-
-```bash
-devenv shell -- scripts/publish-changed.sh .
-```
-
-crates.io limits how fast new crates are published, so a run that
-publishes several for the first time waits between them (the script logs
-each wait). Apps take the crates from crates.io; the noq-proto fix the
-workspace patches in does not come with them
-(`crates/spoolframe-client-sdk/README.md`).
-
-`dev.ucl` is your own config and is not tracked: write one for your Plex
-server, paths and listeners (`cargo run -p spoolframe-server -- config
-defaults` prints every key). Without one, or without its `plex`, the server
-starts "not set up": clients are told so until Plex is configured, and the
-log names the web UI's addresses and the setup code, which opens the setup
-wizard there. Every step is a tab of Server › Settings afterwards. The state directory
-(`--state-dir`) holds the key, the database, the caches and the settings
-changed at run time (`config show` lists every setting and where it comes
-from; `config set` and `config unset` change one on the running server).
-
-### Container
-
-`nix build .#docker` makes a script that streams an OCI image of the server,
-with ffmpeg and tesseract, tagged `ghcr.io/spoolframe/spoolframe-server`:
+## Run it in Docker
 
 ```bash
 nix build .#docker && ./result | docker load
@@ -64,86 +20,86 @@ docker run -d --name spoolframe \
 docker logs spoolframe   # the web UI's address and the setup code
 ```
 
-It runs as uid 1000 with its state in `/var/lib/spoolframe`, and reads
-`/etc/spoolframe/server.ucl` (UDP 7420, admin on 7421); mount your own
-config there to replace it. Media tools run confined as on any host: Docker
-29's default seccomp profile allows Landlock. With `--network host`, mDNS
-and Plex discovery reach the LAN too. After editing the mounted config,
-`docker kill -s HUP spoolframe` has the server read it again: live
-settings apply at once, the others at the next `docker restart`.
+Open the address from the log and enter the setup code to start the setup
+wizard.
 
-Pick a tag by the GPU it runs on. They share every layer but the GPU
-drivers':
+- The server runs as uid 1000 and keeps its state in `/var/lib/spoolframe`.
+- Clients connect on UDP 7420. The web UI and admin API are on 7421.
+- The config is `/etc/spoolframe/server.ucl`. Mount your own file there to
+  replace it, then `docker kill -s HUP spoolframe` to reload it. Live
+  settings apply at once; the rest apply at the next restart.
+- With `--network host`, mDNS and Plex discovery also reach the LAN.
 
-| tag | for | size |
+### Pick a tag for your GPU
+
+The tags share every layer except the GPU drivers.
+
+| Tag | For | Size |
 |---|---|---|
-| `:0.16.0` (`.#docker`), the default | any GPU, or not sure: AMD (old and new), Intel (old and new), NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2, d3d12) | about 1.5 GiB |
-| `:0.16.0-slim` (`.#docker-slim`) | a recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | about 640 MiB |
-| `:0.16.0-nvidia` (`.#docker-nvidia`) | NVIDIA | about 500 MiB |
-| `:0.16.0-cpu` | no GPU: the `-nvidia` image under a second tag | about 500 MiB |
+| `:0.16.0` (`.#docker`) | Any GPU, or if you are not sure: AMD, Intel, NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2) | ~1.5 GiB |
+| `:0.16.0-slim` (`.#docker-slim`) | A recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | ~640 MiB |
+| `:0.16.0-nvidia` (`.#docker-nvidia`) | NVIDIA | ~500 MiB |
+| `:0.16.0-cpu` | No GPU. The same image as `-nvidia`. | ~500 MiB |
 
-Pass an AMD or Intel GPU's render node in with `--device
-/dev/dri/renderD128` and `--group-add` its group (often `render`). With no
-GPU everything is encoded on the CPU, which for a 4K HDR film to 1080p
-takes roughly 6 cores per stream at real time.
+**AMD or Intel:** pass the render node with `--device /dev/dri/renderD128`
+and add its group with `--group-add` (often `render`).
 
-An NVIDIA GPU needs the NVIDIA Container Toolkit (`--gpus all`, or CDI's
-`--device nvidia.com/gpu=all`); every tag runs it. `NVIDIA_DRIVER_CAPABILITIES`
-must include `graphics` as well as `compute,video,utility` for libplacebo's
-tone map, which runs on NVIDIA's Vulkan driver: the images set
-`compute,video,utility,graphics`, so set it again only if you override it.
-The toolkit's Vulkan manifest is found in `/usr/share/vulkan/icd.d`,
-`/etc/vulkan/icd.d` or a NixOS host's `/run/opengl-driver`, and its
-libraries in `/usr/lib64`, `/usr/lib/x86_64-linux-gnu` or `/usr/lib`
-(`LD_LIBRARY_PATH`); the images carry the libX11, libXext and glvnd
-`libEGL` that NVIDIA's Vulkan driver loads.
+**NVIDIA:** install the NVIDIA Container Toolkit and pass `--gpus all` (or
+`--device nvidia.com/gpu=all` with CDI). Every tag works.
+`NVIDIA_DRIVER_CAPABILITIES` must include `graphics`, because the HDR tone
+map runs on NVIDIA's Vulkan driver. The images already set
+`compute,video,utility,graphics`.
 
-### Web UI
+**No GPU:** the CPU encodes everything. A 4K HDR film to 1080p at real time
+takes about 6 cores per stream.
 
-`crates/spoolframe-web` is a Dioxus app, bundled to wasm and embedded in the
-server by the `embed-web` feature (`nix build` does both).
+## Configuration
 
-To work on it, run `dx serve` and a debug server without `embed-web`:
+The server reads one UCL file. To print every key with its default:
 
 ```bash
-devenv up                                            # dx serve on 127.0.0.1:8080, Tailwind --watch
-devenv shell -- cargo run -p spoolframe-server -- --config dev.ucl --state-dir .dev-state
+docker run --rm ghcr.io/spoolframe/spoolframe-server:0.16.0 config defaults
 ```
 
-Then open the admin listener (`admin.listen`) in a browser, not port 8080.
-The debug server sends every page and asset to `dx serve`, and its
-hot-reload WebSocket (`/_dioxus`) too, so the browser talks only to the
-server. Sign-in, the cookie and the origin check are then the real ones.
-When `dx serve` is not running, each page says so.
+Without a config, or without a `plex` section, the server starts "not set
+up". Its log shows the web UI's addresses and a setup code that opens the
+setup wizard. After setup, every step is a tab under Server › Settings.
 
-To serve a bundle instead (what a release has):
+The state directory (`--state-dir`) holds the server's key, its database,
+its caches and the settings changed at run time. `config show` lists each
+setting and where it comes from. `config set` and `config unset` change a
+setting on the running server.
 
-```bash
-devenv --no-tui tasks run spoolframe:web   # Tailwind + dx bundle
-SPOOLFRAME_WEB_DIST=$PWD/target/dx/spoolframe-web/release/web/public \
-  cargo run -p spoolframe-server --features embed-web -- --config dev.ucl --state-dir .dev-state
-```
+## AI agents (MCP)
 
-A debug server with `embed-web` reads the bundle directory as it is, so
-after a change: bundle, reload.
-`crates/spoolframe-web/assets/tailwind.css` is generated but committed;
-`ci:style` fails when it is stale.
+The admin listener serves MCP at `/mcp`. It is off until you turn on
+`mcp.enabled` (Settings › MCP).
 
-### MCP (AI agents)
+To connect Claude, add a custom connector with the web UI's address plus
+`/mcp`, for example `https://media.example.org/mcp`. Claude registers
+itself, the user signs in and approves the scopes, and Claude gets a token.
 
-The server has an MCP server at `/mcp` on the admin listener (PX-42), off
-until `mcp.enabled` is on (Settings › MCP, or the config file).
-To connect Claude, add a custom connector with the web UI's address and
-`/mcp`, e.g. `https://media.example.org/mcp`: Claude registers itself,
-opens the server's sign-in and consent page, and gets a token for the
-scopes the user allows. Over the Internet that needs `admin.public_url`
-with TLS; without it, only a client that reaches the server at its own
-address (an IP or `localhost`) can connect. Users see and disconnect
-their apps in My profile › Connected apps; admins see what was done in
-Server › Audit.
+- Over the Internet this needs `admin.public_url` with TLS. Without it, only
+  a client that reaches the server at its own address (an IP or
+  `localhost`) can connect.
+- Only apps whose redirect URI is in `mcp.allowed_redirects` can sign in.
+  The default list has Claude Code, Claude (claude.ai and desktop) and
+  Codex. Add other agents in Settings › MCP › Allowed redirects.
+- Users see and disconnect their apps in My profile › Connected apps.
+  Admins see what the apps did in Server › Audit.
 
-Only the apps in `mcp.allowed_redirects` may sign in, matched by the
-redirect URI each returns to: Claude Code, Claude (claude.ai and
-desktop) and Codex until an admin changes the list in Settings › MCP ›
-Allowed redirects. Another agent needs its redirect URI added there
-first.
+## Building apps
+
+The client SDK is on crates.io as
+[`spoolframe-client-sdk`](https://crates.io/crates/spoolframe-client-sdk).
+Read its [README](crates/spoolframe-client-sdk/README.md) first: it
+explains one `[patch]` line an app should add.
+
+## License
+
+The server crates are AGPL-3.0-or-later. The protocol, types, client SDK and
+their helper crates are MIT OR Apache-2.0, so any client can link them.
+spoolframe-policy is GPL-3.0-or-later. Each crate's `Cargo.toml` states its
+license.
+
+Building or changing the server: [MAINTAINER.md](MAINTAINER.md).
