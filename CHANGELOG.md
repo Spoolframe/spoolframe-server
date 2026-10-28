@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A GPU encode that fails before its first segment (ffmpeg exits
+  non-zero, stalls, or is aborted by its driver, as amdgpu does when the
+  video engine hangs) runs again on the next encoder of its codec:
+  another card's, then software's where software encodes the codec. Each
+  is tried once; the playback stays on the encoder it moved to, seeks
+  too. Before, an abort failed the playback outright.
 - `transcode.video_codecs` defaults to `["hevc", "h264"]`: AV1 is off
   unless listed. Settings › Playback still shows it first, unticked; GPUs'
   support for it is spotty (a Radeon 890M's video engine hung converting
