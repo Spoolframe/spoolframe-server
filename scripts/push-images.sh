@@ -14,6 +14,9 @@
 # `-cpu` alias are amd64 only: NVIDIA's container toolkit image is built
 # for x86-64 here. Every tag also gets its exact-build twin, the commit's
 # first 8 hex digits after it (`<ver>-slim-0fc3bbeb`), which never moves.
+# The lists also make `<major>.<minor>` (`0.16`, `0.16-slim`, …) and
+# `latest` follow the version pushed; --no-latest keeps `latest` where it
+# is, for a patch to an older line.
 #
 # --if-missing skips an architecture whose `<ver>-<arch>` is already on
 # ghcr, so a run for a version that is out does not build it again.
@@ -32,12 +35,14 @@ repo=ghcr.io/spoolframe/spoolframe-server
 if_missing=false
 do_push=true
 do_list=true
+move_latest=true
 archs=()
 for arg in "$@"; do
   case "$arg" in
     --if-missing) if_missing=true ;;
     --no-list) do_list=false ;;
     --list-only) do_push=false ;;
+    --no-latest) move_latest=false ;;
     -*) echo "push-images: unknown option $arg" >&2; exit 1 ;;
     *) archs+=("$arg") ;;
   esac
@@ -80,12 +85,24 @@ push() {
 
 # list <tag> <arch>...: <tag> becomes a manifest list over <tag>-<arch>.
 list() {
-  local tag=$1
-  shift
-  docker manifest rm "$repo:$tag" >/dev/null 2>&1 || true
-  docker manifest create "$repo:$tag" "${@/#/$repo:$tag-}" >/dev/null
-  docker manifest push --purge "$repo:$tag" >/dev/null
-  echo "listed $repo:$tag over $*"
+  list_as "$1" "$@"
+}
+
+# list_as <name> <tag> <arch>...: <name> becomes a manifest list over
+# <tag>-<arch>.
+list_as() {
+  local name=$1 tag=$2
+  shift 2
+  docker manifest rm "$repo:$name" >/dev/null 2>&1 || true
+  docker manifest create "$repo:$name" "${@/#/$repo:$tag-}" >/dev/null
+  docker manifest push --purge "$repo:$name" >/dev/null
+  echo "listed $repo:$name over $tag: $*"
+}
+
+# retag <tag> <name>: <name> points at what <tag> does, copied inside ghcr.
+retag() {
+  "${skopeo[@]}" copy --quiet --all "docker://$repo:$1" "docker://$repo:$2"
+  echo "tagged $repo:$2 as $1"
 }
 
 if $do_push; then
@@ -122,5 +139,19 @@ if $do_list; then
       fi
     done
     list "$tag" "${archs[@]}"
+  done
+  # The release lines' tags: `<major>.<minor>` and `latest` (with -slim,
+  # -nvidia and -cpu) move to this version. Pushing an older line's patch
+  # would move `latest` back, so --no-latest leaves it alone.
+  minor=${version%.*}
+  lines=("$minor")
+  $move_latest && lines+=(latest)
+  for line in "${lines[@]}"; do
+    list_as "$line" "$version" "${archs[@]}"
+    list_as "$line-slim" "$version-slim" "${archs[@]}"
+    if [[ " ${archs[*]} " == *" amd64 "* ]]; then
+      retag "$version-nvidia" "$line-nvidia"
+      retag "$version-cpu" "$line-cpu"
+    fi
   done
 fi

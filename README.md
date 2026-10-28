@@ -35,6 +35,8 @@ wizard.
 The tags share every layer except the GPU drivers. `:0.16.2` and
 `:0.16.2-slim` are for x86-64 and arm64 (Docker picks the host's);
 `-nvidia` and `-cpu` are x86-64 only.
+`:0.16` and `:latest` (each also with `-slim`, `-nvidia` and `-cpu`)
+follow the newest release; pin `:0.16.2` to stay on one.
 
 | Tag | For | Size |
 |---|---|---|
