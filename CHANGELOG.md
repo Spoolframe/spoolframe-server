@@ -2,6 +2,12 @@
 
 ## 0.16.3 (2026-10-28)
 
+- A paired server's new name reaches the servers it is paired with.
+  Before, each kept the name it had at pairing. Its name is taken
+  whenever the two connect, and a rename while connected is passed on
+  with the next sync (a `Libraries` reply now carries the sender's name;
+  a 0.16.2 peer ignores it and sends none). An alias set here still
+  wins.
 - A GPU encode that fails before its first segment (ffmpeg exits
   non-zero, stalls, or is aborted by its driver, as amdgpu does when the
   video engine hangs) runs again on the next encoder of its codec:
@@ -17,7 +23,8 @@
 - `transcode.video_codecs` defaults to `["hevc", "h264"]`: AV1 is off
   unless listed. Settings › Playback still shows it first, unticked; GPUs'
   support for it is spotty (a Radeon 890M's video engine hung converting
-  4K Dolby Vision to AV1).
+  4K Dolby Vision to AV1). A server whose admin saved Settings › Playback
+  before 0.16.3 has AV1 stored explicitly and keeps it: untick it there.
 - `Platform::Android` (`"android"`, "Android app") and `Platform::Xbox`
   (`"xbox"`, "Xbox app"); `Platform::Web` may now be a browser client's
   `Hello`, not only the web UI's admin sessions. None of the three has

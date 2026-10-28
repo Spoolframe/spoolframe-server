@@ -1681,6 +1681,81 @@ mod admin {
         sb.server.stop().await;
     }
 
+    /// SB renames itself: SA's next sync of it shows the new name, in its
+    /// row and the admin's list. An alias SA's admin gave it still wins,
+    /// and what SB calls itself is kept under it.
+    #[tokio::test]
+    async fn a_paired_server_that_renamed_itself_is_shown_by_its_new_name() {
+        let sa = Site::start("fed-admin-renamed-itself", "Alice's server", "alice", true).await;
+        let sb = Site::start("fed-admin-renamed-itself-sb", "Bob's server", "bob", true).await;
+        pair(&sa, &sb).await;
+        let sb_on_sa = sa.peers().await.remove(0);
+        assert_eq!(sb_on_sa.name, "Bob's server");
+        sb.server.name.set("Bob's den");
+        sa.admin.peer_refresh(sb_on_sa.id.clone()).await.unwrap();
+        let renamed = sa.peers().await.remove(0);
+        assert_eq!(
+            (renamed.name.as_str(), renamed.remote_name.as_str()),
+            ("Bob's den", "Bob's den")
+        );
+        let record = sa
+            .server
+            .store
+            .federation_peer(&sb_on_sa.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.display_name, "Bob's den");
+        sa.admin
+            .peer_rename(sb_on_sa.id.clone(), Some("Mum's".into()))
+            .await
+            .unwrap();
+        sb.server.name.set("Bob's attic");
+        sa.admin.peer_refresh(sb_on_sa.id.clone()).await.unwrap();
+        let aliased = sa.peers().await.remove(0);
+        assert_eq!(
+            (aliased.name.as_str(), aliased.remote_name.as_str()),
+            ("Mum's", "Bob's attic")
+        );
+        sa.server.stop().await;
+        sb.server.stop().await;
+    }
+
+    /// SB renames itself while both are connected: SA shows the new name
+    /// without dialling it again or an admin's refresh, as SB tells it
+    /// its shares changed and SA's sync is answered with the name.
+    #[tokio::test]
+    async fn a_paired_server_renamed_while_connected_is_shown_without_a_reconnect() {
+        let sa = Site::start("fed-admin-renamed-live", "Alice's server", "alice", true).await;
+        let sb = Site::start("fed-admin-renamed-live-sb", "Bob's server", "bob", true).await;
+        pair(&sa, &sb).await;
+        let (on_sa, on_sb) = (federation(&sa.server), federation(&sb.server));
+        let (sa_id, sb_id) = (sa.server.server_id.as_str(), sb.server.server_id.as_str());
+        let connected = || on_sa.online(sb_id) && on_sb.online(sa_id);
+        for _ in 0..300 {
+            if connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected(), "the pair is not connected both ways");
+        sb.server.name.set("Bob's den");
+        // Past the replica's tick, in case a look at the pairs was under
+        // way when the notice woke it.
+        let mut shown = String::new();
+        for _ in 0..300 {
+            shown = sa.peers().await.remove(0).name;
+            if shown == "Bob's den" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(shown, "Bob's den");
+        assert!(connected(), "the pair was not left connected");
+        sa.server.stop().await;
+        sb.server.stop().await;
+    }
+
     /// P8-03: SA's admin shares Movies with the paired server, sees it
     /// listed, and revokes it; a library SA does not serve is refused, and
     /// unpairing revokes whatever is still shared.

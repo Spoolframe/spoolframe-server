@@ -153,6 +153,7 @@ async fn answer(connection: Connection, server_id: &'static str, lists: bool, he
                     "libraries",
                     PeerReply::Libraries {
                         libraries: Vec::new(),
+                        name: None,
                     },
                 ),
                 PeerRequest::Libraries => ("libraries", PeerReply::Unavailable),

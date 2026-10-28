@@ -844,6 +844,21 @@ impl Store {
         peer.ok_or_else(|| PeerError::NoSuchPeer(id.to_owned()))
     }
 
+    /// Live pair `id` now calls itself `name`. Whether that changed what it
+    /// was called here: a pair that kept its name, or is not live, is left
+    /// as it was. An alias still wins over it in [`PeerRecord::name`].
+    pub async fn set_peer_display_name(&self, id: &str, name: &str) -> Result<bool, StoreError> {
+        let done = sqlx::query(
+            "UPDATE federation_peers SET display_name = ?2 \
+             WHERE id = ?1 AND revoked_at IS NULL AND display_name <> ?2",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Show live pair `id`'s own Home row to this server's users, or not.
     /// The pair's row. [`PeerError::NoSuchPeer`] for a pair that is not
     /// live.
@@ -1443,6 +1458,40 @@ mod tests {
         assert_eq!(
             (cleared.alias, cleared.display_name),
             (None, "Bob's server".to_owned())
+        );
+    }
+
+    /// A pair that renamed itself is called the new name, unless it has an
+    /// alias here; the same name, or a revoked pair, changes nothing.
+    #[tokio::test]
+    async fn a_pair_that_renamed_itself_is_called_the_new_name() {
+        let store = test_store("fed-peer-display-name").await;
+        let peer = store.add_peer(sb(&[]), "bob").await.unwrap();
+        assert!(
+            !store
+                .set_peer_display_name(&peer.id, "Bob's server")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_peer_display_name(&peer.id, "Bob's den")
+                .await
+                .unwrap()
+        );
+        let renamed = store.federation_peer(&peer.id).await.unwrap().unwrap();
+        assert_eq!(renamed.name(), "Bob's den");
+        let named = store.set_peer_alias(&peer.id, Some("Mum's")).await.unwrap();
+        assert_eq!(
+            (named.name(), named.display_name.as_str()),
+            ("Mum's", "Bob's den")
+        );
+        store.revoke_peer(&peer.id).await.unwrap();
+        assert!(
+            !store
+                .set_peer_display_name(&peer.id, "Bob's attic")
+                .await
+                .unwrap()
         );
     }
 

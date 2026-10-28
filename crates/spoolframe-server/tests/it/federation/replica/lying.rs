@@ -50,6 +50,7 @@ impl Peers for AnyPeer {
         _endpoint: iroh::EndpointId,
         _known: Option<&ServerId>,
         _server_id: &ServerId,
+        _name: &str,
     ) -> Result<Standing, PairingRefused> {
         Ok(Standing::Paired)
     }

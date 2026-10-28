@@ -46,6 +46,7 @@ impl Peers for FakePeers {
         endpoint: EndpointId,
         known: Option<&ServerId>,
         server_id: &ServerId,
+        _name: &str,
     ) -> Result<Standing, PairingRefused> {
         let paired = self.paired.lock();
         match known {
@@ -519,9 +520,15 @@ async fn a_reply_is_read_within_its_request_s_bound() {
                     kind: RemoteLibraryKind::Movies,
                 })
                 .collect();
-            write_frame(&mut send, &PeerReply::Libraries { libraries })
-                .await
-                .unwrap();
+            write_frame(
+                &mut send,
+                &PeerReply::Libraries {
+                    libraries,
+                    name: None,
+                },
+            )
+            .await
+            .unwrap();
             send.finish().unwrap();
         }
     });

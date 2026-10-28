@@ -190,12 +190,20 @@ impl ServerName {
         self.0.borrow().clone()
     }
 
-    /// Call the server `name` from now on.
+    /// Call the server `name` from now on. Its watchers are woken only if
+    /// that is a new name: any setting's change sets it again.
     pub fn set(&self, name: impl Into<String>) {
-        self.0.send_replace(name.into());
+        let name = name.into();
+        self.0.send_if_modified(|now| {
+            if *now == name {
+                return false;
+            }
+            *now = name;
+            true
+        });
     }
 
-    fn changes(&self) -> tokio::sync::watch::Receiver<String> {
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<String> {
         self.0.subscribe()
     }
 }

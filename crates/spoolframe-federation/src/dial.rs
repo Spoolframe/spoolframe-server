@@ -202,8 +202,16 @@ impl Dialed {
     /// The libraries the other server shares with this one now (P8-02),
     /// cut to the bounds.
     pub async fn libraries(&self) -> Result<Vec<SharedLibrary>, DialError> {
+        Ok(self.libraries_named().await?.0)
+    }
+
+    /// [`Dialed::libraries`], and what the other server calls itself now,
+    /// if it said: one before 0.16.3 does not.
+    pub async fn libraries_named(&self) -> Result<(Vec<SharedLibrary>, Option<String>), DialError> {
         match self.ask_within(&PeerRequest::Libraries, MAX_FRAME).await? {
-            PeerReply::Libraries { libraries } => Ok(libraries_within_bounds(libraries)),
+            PeerReply::Libraries { libraries, name } => {
+                Ok((libraries_within_bounds(libraries), name))
+            }
             PeerReply::Unavailable => Err(DialError::Unavailable),
             _ => Err(DialError::OutOfTurn),
         }

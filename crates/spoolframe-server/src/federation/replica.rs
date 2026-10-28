@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use futures_util::{StreamExt, stream};
 use spoolframe_federation::{DialError, Dialed, Pages};
 use spoolframe_protocol::federation::{
-    SHARES_CHANGED_EVERY, SharedLibrary, Standing, SyncLibrary, SyncMode, SyncPage,
+    SHARES_CHANGED_EVERY, SharedLibrary, Standing, SyncLibrary, SyncMode, SyncPage, server_name,
 };
 use spoolframe_types::MediaId;
 
@@ -248,6 +248,36 @@ impl Federation {
     pub(crate) fn start_replica(self: &Arc<Self>) {
         self.spawn_upkeep();
         self.spawn_tending();
+        self.spawn_renaming();
+    }
+
+    /// Each rename of this server, told to the pairs connected now as
+    /// [`SharesChanged`](spoolframe_protocol::federation::PeerRequest::SharesChanged):
+    /// each syncs this server soon, and its `Libraries` answer names it
+    /// anew. The rest learn it on connecting, from its `PeerInfo`.
+    fn spawn_renaming(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let mut changes = self.name.changes();
+        tokio::spawn(async move {
+            while changes.changed().await.is_ok() {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                if !this.endpoint_open() {
+                    return;
+                }
+                let peers = match this.store().federation_peers().await {
+                    Ok(peers) => peers,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot list the pairs to tell of a rename");
+                        continue;
+                    }
+                };
+                for peer in peers.iter().filter(|p| p.live()) {
+                    this.tell_shares_changed(&peer.id).await;
+                }
+            }
+        });
     }
 
     /// The upkeep, each tick.
@@ -595,11 +625,36 @@ impl Federation {
             self.links.forget(&peer.server_id, &dialed);
             return Err(ReplicaError::Moved);
         }
+        self.renamed_itself(peer, info.name).await?;
         tracing::info!(
             peer = %peer.endpoint_id,
             name = %peer.display_name,
             "connected to a paired server"
         );
+        Ok(())
+    }
+
+    /// Live pair `peer` calls itself `name` now, as it said on a
+    /// connection to its pinned key: kept, if that is not what it was
+    /// called here, and the clients told its libraries' server is named
+    /// anew. An alias here still wins.
+    pub(super) async fn renamed_itself(
+        &self,
+        peer: &PeerRecord,
+        name: String,
+    ) -> Result<(), StoreError> {
+        let name = server_name(name);
+        if name == peer.display_name || !self.store().set_peer_display_name(&peer.id, &name).await?
+        {
+            return Ok(());
+        }
+        tracing::info!(
+            peer = %peer.endpoint_id,
+            was = %peer.display_name,
+            name = %name,
+            "a paired server renamed itself"
+        );
+        self.links.told();
         Ok(())
     }
 
@@ -659,7 +714,7 @@ impl Federation {
             .links
             .pinned(peer)
             .ok_or_else(|| DialError::Unreachable("not connected".into()))?;
-        let listed = match dialed.libraries().await {
+        let (listed, name) = match dialed.libraries_named().await {
             Ok(listed) => listed,
             Err(e) => {
                 self.links.drop_origin(origin);
@@ -671,6 +726,11 @@ impl Federation {
         if !self.still_pinned(peer).await? {
             self.links.forget(origin, &dialed);
             return Err(ReplicaError::Moved);
+        }
+        // A rename while connected comes this way: the pair says
+        // SharesChanged, and its answer here names it.
+        if let Some(name) = name {
+            self.renamed_itself(peer, name).await?;
         }
         let listed: Vec<(SharedLibrary, &str)> = listed
             .into_iter()

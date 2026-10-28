@@ -413,6 +413,12 @@ pub enum PeerReply {
     /// [`MAX_SHARED_LIBRARIES`].
     Libraries {
         libraries: Vec<SharedLibrary>,
+        /// What the answering server calls itself now, as its
+        /// [`PeerInfo`]'s `name`: so a pair learns of a rename at its next
+        /// sync, without dialling again. Absent from a server before
+        /// 0.16.3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// A page of a [`SyncLibrary`]'s answer.
     Page(SyncPage),
@@ -564,6 +570,7 @@ mod tests {
                 title: "Music".into(),
                 kind: RemoteLibraryKind::Music,
             }],
+            name: Some("Bob's server".into()),
         });
         for mode in [SyncMode::Changes, SyncMode::Snapshot] {
             round_trip(PeerReply::Page(SyncPage {
@@ -729,12 +736,13 @@ mod tests {
             "type": "libraries",
             "libraries": [{ "id": "plex:4", "title": "Photos", "kind": "photos" }],
         });
-        let PeerReply::Libraries { libraries } =
+        let PeerReply::Libraries { libraries, name } =
             codec::decode::<PeerReply>(&decode(libraries)).unwrap()
         else {
             panic!("not libraries");
         };
         assert_eq!(libraries[0].kind, RemoteLibraryKind::Unknown);
+        assert_eq!(name, None);
     }
 
     #[test]

@@ -416,7 +416,7 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                     Err(PairingRefused::SameServerId)
                 } else {
                     self.peers
-                        .hello(endpoint, state.known.as_ref(), &server_id)
+                        .hello(endpoint, state.known.as_ref(), &server_id, &hello.name)
                         .await
                 };
                 match standing {
@@ -541,7 +541,13 @@ impl<P: Peers, S: Strangers, H: Shares> FederationProtocol<P, S, H> {
                 )
                 .await;
                 match libraries {
-                    Ok(libraries) => (PeerReply::Libraries { libraries }, After::Next),
+                    Ok(libraries) => (
+                        PeerReply::Libraries {
+                            libraries,
+                            name: Some((self.name)()),
+                        },
+                        After::Next,
+                    ),
                     Err(unshared) => (refusal(unshared), After::Next),
                 }
             }

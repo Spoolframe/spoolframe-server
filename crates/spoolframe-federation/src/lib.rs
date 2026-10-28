@@ -82,12 +82,14 @@ pub trait Peers: Send + Sync + 'static {
     /// live pair's endpoint under another server id is
     /// [`PairingRefused::ServerIdChanged`], every time. A live pair's
     /// server id from a new endpoint is [`Standing::KeyHeld`], and the key
-    /// is held for an admin to confirm.
+    /// is held for an admin to confirm. `name` is what it calls itself now,
+    /// as [`PeerHello::within_bounds`] keeps it: a live pair's is kept.
     async fn hello(
         &self,
         endpoint: EndpointId,
         known: Option<&ServerId>,
         server_id: &ServerId,
+        name: &str,
     ) -> Result<Standing, PairingRefused>;
 
     /// Pair stranger `endpoint`, which said `hello` as `server_id`, by

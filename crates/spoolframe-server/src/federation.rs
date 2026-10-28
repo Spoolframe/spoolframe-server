@@ -1270,8 +1270,12 @@ impl Peers for Federation {
         endpoint: EndpointId,
         known: Option<&ServerId>,
         server_id: &ServerId,
+        name: &str,
     ) -> Result<Standing, PairingRefused> {
         let standing = self.standing(endpoint, known, server_id).await;
+        if matches!(standing, Ok(Standing::Paired)) {
+            self.hello_named(endpoint, name).await;
+        }
         tracing::Span::current().record(
             "outcome",
             match &standing {
@@ -1325,6 +1329,24 @@ impl Peers for Federation {
 }
 
 impl Federation {
+    /// Live pair `endpoint` said hello as `name`: what it is called here,
+    /// if it renamed itself. Best effort: the hello stands either way.
+    async fn hello_named(&self, endpoint: EndpointId, name: &str) {
+        let renamed = async {
+            match self
+                .store()
+                .live_peer_by_endpoint(&endpoint.to_string())
+                .await?
+            {
+                Some(peer) => self.renamed_itself(&peer, name.to_owned()).await,
+                None => Ok(()),
+            }
+        };
+        if let Err(e) = renamed.await {
+            tracing::warn!(error = %e, "cannot keep a paired server's new name");
+        }
+    }
+
     /// [`Peers::hello`], in its span.
     async fn standing(
         &self,
