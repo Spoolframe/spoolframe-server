@@ -16,7 +16,8 @@
 # first 8 hex digits after it (`<ver>-slim-0fc3bbeb`), which never moves.
 # The lists also make `<major>.<minor>` (`0.16`, `0.16-slim`, …) and
 # `latest` follow the version pushed; --no-latest keeps `latest` where it
-# is, for a patch to an older line.
+# is, for a patch to an older line. A prerelease (`0.16.3-rc.1`) gets its
+# own tags only.
 #
 # --if-missing skips an architecture whose `<ver>-<arch>` is already on
 # ghcr, so a run for a version that is out does not build it again.
@@ -142,10 +143,16 @@ if $do_list; then
   done
   # The release lines' tags: `<major>.<minor>` and `latest` (with -slim,
   # -nvidia and -cpu) move to this version. Pushing an older line's patch
-  # would move `latest` back, so --no-latest leaves it alone.
-  minor=${version%.*}
-  lines=("$minor")
-  $move_latest && lines+=(latest)
+  # would move `latest` back, so --no-latest leaves it alone. A release
+  # candidate (`0.16.3-rc.1`) moves neither: it is pulled by its own tag,
+  # and `0.16` stays on the line's last release.
+  lines=()
+  if [[ $version == *-* ]]; then
+    echo "not moved $repo:${version%.*} and latest: $version is a prerelease"
+  else
+    lines+=("${version%.*}")
+    $move_latest && lines+=(latest)
+  fi
   for line in "${lines[@]}"; do
     list_as "$line" "$version" "${archs[@]}"
     list_as "$line-slim" "$version-slim" "${archs[@]}"

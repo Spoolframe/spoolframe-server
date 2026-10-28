@@ -1,13 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.16.3-rc.1 (2026-10-28)
 
-- An encode is held to its file's own bitrate, whatever the delivery.
-  Before, only an HLS ladder's top rung was: a progressive or single
-  encode on a fast LAN was given the link's share, up to 999 Mbit/s for
-  a 17 Mbit/s episode, which hevc_nvenc refuses ("InitializeEncoder
-  failed: invalid param"), so the playback failed. No encode is given
-  more than 200 Mbit/s; hevc_nvenc refuses 400 and more.
+A release candidate: its images are tagged `0.16.3-rc.1` (and `-slim`,
+`-nvidia`, `-cpu`) only; `0.16` and `latest` stay on 0.16.2.
+
+- An encode is held to its file's own bitrate, whatever the delivery and
+  quality. Before, only an HLS ladder's top rung was: a progressive or
+  single encode on a fast LAN was given the link's share, up to 999
+  Mbit/s for a 17 Mbit/s episode, which hevc_nvenc refuses
+  ("InitializeEncoder failed: invalid param"), so the playback failed;
+  and Original left the encoder to its own rate, 33 Mbit/s of the same
+  episode. No encode is given more than 200 Mbit/s; hevc_nvenc refuses
+  400 and more.
+- SDK: a progressive playback that runs dry waits for 10 s of its
+  bitrate before going on, at most 160 MB (10 s of 128 Mbit/s), 25 MB
+  when the bitrate is unknown. It waited for 4 s held to 4 MiB, about one
+  second of a 33 Mbit/s 4K encode, and buffered 0 to 100 % on repeat.
+  `MAX_BUFFERED` is 256 MiB (was 128), `RESUME_BYTES` 25 MB (was 4 MiB),
+  and `MAX_RESUME_BYTES` is new.
+- Playback › Link: the path's kind (LAN, Direct, Relay) is the figure,
+  its address under it, so an IPv6 address no longer runs out of the
+  tile. Each note says it is this playback's, and the path's changes sit
+  with the path.
 - `spoolframe_process_allocated_bytes`: the bytes the server's
   allocations hold, as asked for, counted by its allocator. Resident or
   not, so it can be above the heap. A heap
