@@ -10,7 +10,7 @@ exclude = ["vendor"]
 # (ARCHITECTURE §56). Each crate states its own, and
 # `spoolframe-server/tests/it/license_boundary.rs` keeps the two sides apart.
 [workspace.package]
-version = "0.16.1"
+version = "0.16.2"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 repository = "https://github.com/Spoolframe/spoolframe-server"
@@ -41,18 +41,18 @@ foyer = "0.22.5"
 # into a crates.io dependency; bump it with `workspace.package.version`.
 # No `registry`: crates.io is the default, and a published crate's
 # dependencies must come from crates.io too.
-spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.1" }
-spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.1" }
+spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.2" }
+spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.2" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
 spoolframe-federation = { path = "crates/spoolframe-federation" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
-spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.1" }
+spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.2" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
-spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.1" }
+spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.2" }
 spoolframe-probe = { path = "crates/spoolframe-probe" }
-spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.1" }
-spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.1" }
+spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.2" }
+spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.2" }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.

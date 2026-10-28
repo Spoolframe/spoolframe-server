@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.16.2 (2026-10-28)
+
+- The repository carries its licenses' texts: `LICENSE` (AGPL-3.0, the
+  server), `LICENSE-MIT` and `LICENSE-APACHE` (the protocol, types, SDK
+  and their helpers), and the GPL-3.0 in `spoolframe-policy`. Each
+  published crate now includes its license texts.
+- The SDK's documentation (spoolframe-client-sdk, -protocol, -types and
+  -hls-bridge) is written for app developers: no plan or ticket ids, no
+  notes on earlier designs. No API, type or wire change.
+- The images carry `org.opencontainers.image.source`, naming the GitHub
+  repository, and GitHub's images workflow builds and pushes them on
+  native amd64 and arm64 runners, skipping an architecture already
+  published.
+- The README shows the app icon.
+
 ## 0.16.1 (2026-10-27)
 
 - A portable account sees nothing federated, even in an app that names
