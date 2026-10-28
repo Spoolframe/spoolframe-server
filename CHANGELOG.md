@@ -1,9 +1,6 @@
 # Changelog
 
-## 0.16.3-rc.2 (2026-10-28)
-
-A release candidate, tagged as rc.1 was: `0.16` and `latest` stay on
-0.16.2.
+## 0.16.3 (2026-10-28)
 
 - A GPU encode that fails before its first segment (ffmpeg exits
   non-zero, stalls, or is aborted by its driver, as amdgpu does when the
@@ -19,11 +16,6 @@ A release candidate, tagged as rc.1 was: `0.16` and `latest` stay on
   (`"xbox"`, "Xbox app"); `Platform::Web` may now be a browser client's
   `Hello`, not only the web UI's admin sessions. None of the three has
   downloads yet. An older server reads them as `unknown`.
-
-## 0.16.3-rc.1 (2026-10-28)
-
-A release candidate: its images are tagged `0.16.3-rc.1` (and `-slim`,
-`-nvidia`, `-cpu`) only; `0.16` and `latest` stay on 0.16.2.
 
 - An encode is held to its file's own bitrate, whatever the delivery and
   quality. Before, only an HLS ladder's top rung was: a progressive or
