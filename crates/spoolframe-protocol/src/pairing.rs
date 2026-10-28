@@ -1,4 +1,4 @@
-//! Pairing a device with a portable identity (P7-03, ARCHITECTURE §47):
+//! Pairing a device with a portable identity:
 //! the link a device shows as a QR code, and the frames the identity's
 //! phone and the device then exchange over a direct Iroh connection on
 //! [`PAIR_ALPN`]. No Spoolframe server takes part.
@@ -31,7 +31,7 @@
 //!    identity and its name, or [`DeviceFrame::Refused`];
 //! 3. phone → device: [`PhoneFrame::Credential`], the root's credential
 //!    for that key, the identity's newest state and the servers it signs
-//!    in to (P7-06), or [`PhoneFrame::Declined`];
+//!    in to, or [`PhoneFrame::Declined`];
 //! 4. device → phone: [`DeviceFrame::Done`], or [`DeviceFrame::Refused`].
 
 use std::fmt;
@@ -255,7 +255,7 @@ pub enum PhoneFrame {
     },
     /// The root's credential for the key [`DeviceFrame::Key`] gave, the
     /// identity's newest state if the phone has one, and the servers the
-    /// identity signs in to (P7-06), for the device to save and sign in
+    /// identity signs in to, for the device to save and sign in
     /// to.
     Credential {
         credential: Box<UserDeviceCredential>,
@@ -270,15 +270,15 @@ pub enum PhoneFrame {
 /// no more.
 pub const MAX_PAIRED_SERVERS: usize = 16;
 
-/// A server the paired identity signs in to, as the phone has it saved
-/// (P7-06): enough for the device to pin and reach it. The phone vouches
+/// A server the paired identity signs in to, as the phone has it saved:
+/// enough for the device to pin and reach it. The phone vouches
 /// for it as the invite that brought it there did; the device dials the
 /// key and nothing else, and Iroh proves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedServer {
     /// Its `EndpointId`, 64 hex digits.
     pub endpoint_id: String,
-    /// The server id pinned with the key (PX-14).
+    /// The server id pinned with the key.
     pub server_id: String,
     pub name: String,
     /// Where it may be reached, at most [`MAX_ADDRS`]: hints. As text,
@@ -373,14 +373,14 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
 /// a stranger try, against a code that lives [`RELAY_TTL_SECS`].
 pub const RELAY_CODE_LEN: usize = 10;
 
-/// How long a server holds a relayed pairing (P7-08), from its offer.
+/// How long a server holds a relayed pairing, from its offer.
 pub const RELAY_TTL_SECS: u64 = 5 * 60;
 
 /// Crockford's base32 alphabet: no I, L, O or U.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// The short code a device shows beside its QR code, for a root terminal
-/// with no camera to pair it through a server both reach (P7-08): 10
+/// with no camera to pair it through a server both reach: 10
 /// characters of Crockford's base32, written in two groups of five.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -445,7 +445,7 @@ impl From<RelayCode> for String {
 }
 
 /// A device's pairing request, held on a server under a [`RelayCode`]
-/// for a root terminal to fetch (P7-08): the key the root is to vouch for
+/// for a root terminal to fetch: the key the root is to vouch for
 /// and the device's name. Public data: whoever has the code may read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingOffer {

@@ -1,4 +1,4 @@
-//! Who a relay of the server's own lets through (P6-04).
+//! Who a relay of the server's own lets through.
 //!
 //! The relay runs as a process of its own (`spoolframe-server relay`),
 //! with no users of its own: it asks the main server, over an Iroh
@@ -8,9 +8,9 @@
 //! [`AccessQuery`] frame, answered by an [`AccessAnswer`] frame.
 //!
 //! A device redeeming an invite is no one's yet: it proves it holds the
-//! code with an [`invite_token`] (P6-08), which the relay reads from the
+//! code with an [`invite_token`], which the relay reads from the
 //! `Authorization` header of its connection and passes in the question.
-//! A device about to play a paired server's item (P8-04) proves it holds
+//! A device about to play a paired server's item proves it holds
 //! that server's play token the same way, with a [`play_relay_token`].
 //!
 //! The main server tells its relays when an answer no longer holds: on a
@@ -28,7 +28,7 @@ pub const RELAY_ACCESS_ALPN: &[u8] = b"spoolframe/relay-access/1";
 /// What an invite holder's token starts with: its scheme and version.
 pub const INVITE_TOKEN_PREFIX: &str = "sf-invite.1.";
 
-/// What a play token holder's relay token starts with (P8-04).
+/// What a play token holder's relay token starts with.
 pub const PLAY_TOKEN_PREFIX: &str = "sf-play.1.";
 
 /// Which tier `endpoint` is in.
@@ -36,9 +36,9 @@ pub const PLAY_TOKEN_PREFIX: &str = "sf-play.1.";
 pub struct AccessQuery {
     /// The endpoint's key, hex.
     pub endpoint: String,
-    /// The invite holder's token it connected to the relay with (P6-08),
-    /// or a play token holder's (P8-04), if it is one. Left out without
-    /// one; a server from before it ignores it, and answers as without it.
+    /// The invite holder's token it connected to the relay with,
+    /// or a play token holder's, if it is one. Left out without
+    /// one; an older server ignores it, and answers as without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite: Option<String>,
 }
@@ -55,7 +55,7 @@ pub struct AccessAnswer {
 pub const MAX_FRAME: u32 = 1024;
 
 /// The main server's word that what it answered for `endpoint` no longer
-/// holds: a paired server unpaired, or moved to a new key (C8-01).
+/// holds: a paired server unpaired, or moved to a new key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessRevoked {
     /// The endpoint's key, hex.
@@ -67,13 +67,13 @@ pub struct AccessRevoked {
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// The server itself, a device of its users (one with a live session
-    /// or trusted for a user, P4-01), or the holder of an invite that
-    /// makes an account here (`create-user`, any role; P6-08).
+    /// or trusted for a user), or the holder of an invite that
+    /// makes an account here (`create-user`, any role).
     Owner,
-    /// The holder of an invite for a portable user (P7) or a server (P8),
+    /// The holder of an invite for a portable user or a server,
     /// and later those users and servers themselves; a paired server's
     /// user's device holding a play token, and while the session it opened
-    /// lives (P8-04).
+    /// lives.
     Friend,
     /// Anyone else.
     Stranger,
@@ -111,7 +111,7 @@ pub fn parse_invite_token(token: &str) -> Option<[u8; 32]> {
 }
 
 /// The token whoever holds paired-server play token `token` connects to
-/// that server's relay with, as `endpoint` (P8-04): `sf-play.1.` and the
+/// that server's relay with, as `endpoint`: `sf-play.1.` and the
 /// base64url of BLAKE3 keyed with the play token's hash, over the key, as
 /// an invite holder's is made with the code's. The server keeps only the
 /// play token's hash, and checks with it.

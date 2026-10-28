@@ -1,4 +1,4 @@
-//! This device: its identity and its endpoint (ARCHITECTURE §13–17).
+//! This device: its identity and its endpoint.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -41,31 +41,22 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// closes it: six keep-alives unanswered. 30 s, iroh's default and its
 /// limit for a path through a relay, so a connection that has only a
 /// relay left, or an app suspended a little while, is not dropped before
-/// its path is (review 2026-10-11 L43). The lower of this and the
+/// its path is. The lower of this and the
 /// server's own limit applies.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much the server may send on one stream before this device reads
-/// it (P6-06): 2 MiB, about 56 Mbit/s per stream at 300 ms, a relay's or
+/// it: 2 MiB, about 56 Mbit/s per stream at 300 ms, a relay's or
 /// another continent's; more than QUIC's default, 1.25 MB (about 33
 /// Mbit/s).
 ///
 /// Past a lost packet, or ahead of a reader that has fallen behind, QUIC
-/// holds what follows until it can be read. The noq-proto release iroh
-/// builds on (1.4.0) kept each full-size packet of it as its own buffer
-/// and closed the connection when it held more than about 2,048 ("too
-/// many gaps in stream buffer"): at 8 MiB a stream could have some 7,000
-/// in flight, and a 16 MiB read played through a paired server lost its
-/// connection about one time in two (PX-62). The workspace takes noq-proto
-/// from noq's main at the merge of noq#866 (the root Cargo.toml's
-/// `[patch.crates-io]`), which merges them as quinn does, so a window is
-/// no longer bounded by a packet count, and `tests/it/stream_window.rs`
-/// holds 8 MiB through a lost packet. But a `[patch]` reaches only this
-/// workspace: the Linux app and the tvOS bridge take the SDK from
-/// crates.io and build against the unfixed 1.4.0 unless they carry the
-/// same patch (the SDK's README). So 2 MiB, under 1,900 packets of the
-/// smallest QUIC allows, stays until they do, or until a noq-proto
-/// release has #866. Then 8 MiB, the 0.14.4 value, about four times the
-/// throughput.
+/// holds what follows until it can be read. noq-proto 1.4.0, the release
+/// iroh builds on, keeps each full-size packet of it as its own buffer
+/// and closes the connection when it holds more than about 2,048 ("too
+/// many gaps in stream buffer"). 2 MiB stays under 1,900 packets of the
+/// smallest size QUIC allows, so the SDK works with 1.4.0. The fix is
+/// noq#866, not yet in a noq-proto release; the README tells how to
+/// patch an app's build with it.
 pub const STREAM_WINDOW: u32 = 2 << 20;
 
 type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;
@@ -83,11 +74,11 @@ pub struct Device {
     /// What kind of client the app is: the server shows it in device and
     /// session lists ("Linux app", "Apple TV app").
     pub platform: Platform,
-    /// What this device can play, from its decoders (P1-07).
+    /// What this device can play, from its decoders.
     pub capabilities: ClientCapabilities,
 }
 
-/// A sign-in of this device waiting for approval on another (P3-07).
+/// A sign-in of this device waiting for approval on another.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceSignIn {
     /// The server's key.
@@ -107,7 +98,7 @@ pub struct DeviceSignIn {
     pub web_url: Option<String>,
     /// How long it can be approved, from when it began.
     pub expires_in: Duration,
-    /// It asked to be remembered (P4-01): the approver decides, and the
+    /// It asked to be remembered: the approver decides, and the
     /// session it brings says what they chose ([`Session::remembered`]).
     pub remember: bool,
     /// Only this device can collect the session with it.
@@ -137,7 +128,7 @@ pub struct ClientOptions {
     /// depend on what else is on the network.
     pub lan_discovery: bool,
     /// Reach a server through the relays it told this device of, in an
-    /// invite or its addresses (P6-03), when it cannot be dialled
+    /// invite or its addresses, when it cannot be dialled
     /// directly. On by default. Off, a server is reached only at its
     /// addresses and no relay is contacted for it, unless the server has a
     /// choice of its own ([`Client::set_server_relays`]; redeeming or
@@ -147,10 +138,10 @@ pub struct ClientOptions {
     /// one.
     pub relays: bool,
     /// The experimental features to ask every server for, in each
-    /// connection's `Hello` (PX-49); none by default. Whether a server
+    /// connection's `Hello`; none by default. Whether a server
     /// turned one on is [`crate::Session::experimental`].
     pub experimental: crate::Experimental,
-    /// Where downloads are kept (PX-38, [`Client::downloads`]); none by
+    /// Where downloads are kept ([`Client::downloads`]); none by
     /// default, and then nothing is downloaded. The client's download
     /// manager runs with one. iOS: a directory in Application Support,
     /// excluded from backup by the app; Linux:
@@ -181,17 +172,17 @@ pub(crate) struct Inner {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) device: Device,
     pub(crate) timeouts: Timeouts,
-    /// What every Hello asks for (PX-49).
+    /// What every Hello asks for.
     pub(crate) experimental: crate::Experimental,
     pub(crate) discovery: Discovery,
-    /// Addresses the app gave for servers, and invites' hints (P6-01).
+    /// Addresses the app gave for servers, and invites' hints.
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
-    /// Invites' relays, for a server not saved yet (P6-03).
+    /// Invites' relays, for a server not saved yet.
     pub(crate) invite_relays: Mutex<HashMap<EndpointId, Vec<String>>>,
-    /// The plays holding each paired server's relays with a play token
-    /// (P8-04): its relays leave the relay map once none does.
+    /// The plays holding each paired server's relays with a play token:
+    /// its relays leave the relay map once none does.
     play_relays: Mutex<HashMap<EndpointId, usize>>,
-    /// The pkarr relays servers are looked up at (P6-05).
+    /// The pkarr relays servers are looked up at.
     lookups: Mutex<std::collections::HashSet<String>>,
     /// [`ClientOptions::relays`].
     pub(crate) relays: bool,
@@ -216,20 +207,20 @@ pub(crate) struct Inner {
     activating: tokio::sync::Mutex<()>,
     /// The portable identities on this device, over the same storage.
     portable: Portable,
-    /// A pairing code is shown (P7-03): one at a time.
+    /// A pairing code is shown: one at a time.
     pub(crate) pairing: Arc<std::sync::atomic::AtomicBool>,
-    /// Refusals on this device, as logged (finding 46).
+    /// Refusals on this device, as logged.
     pub(crate) refusals: Arc<crate::refusals::Refusals>,
-    /// Playbacks whose share of a server's uplink changed (PX-46), as the
+    /// Playbacks whose share of a server's uplink changed, as the
     /// servers told: each managed playback in Auto follows its own.
     pub(crate) shares: tokio::sync::broadcast::Sender<crate::PlaybackShare>,
-    /// Playlist changes the servers told (PX-40).
+    /// Playlist changes the servers told.
     pub(crate) playlist_events: tokio::sync::broadcast::Sender<crate::PlaylistEvent>,
-    /// Subtitle timing changes the servers told (PX-03).
+    /// Subtitle timing changes the servers told.
     pub(crate) subtitle_events: tokio::sync::broadcast::Sender<crate::SubtitleTimingEvent>,
-    /// Library changes the servers told (P8-02).
+    /// Library changes the servers told.
     pub(crate) library_events: tokio::sync::broadcast::Sender<crate::LibrariesChanged>,
-    /// This device's downloads and their manager (PX-38).
+    /// This device's downloads and their manager.
     pub(crate) downloads: Arc<crate::downloads::Shared>,
 }
 
@@ -281,7 +272,7 @@ impl Drop for PlayRelays {
 impl Client {
     /// Open this device: its key from `storage` (made on first start), and
     /// an endpoint that listens for servers on the LAN, never announces
-    /// itself, and reaches a server through the relays it told (P6-03).
+    /// itself, and reaches a server through the relays it told.
     /// Requests wait for answers as [`Timeouts::default`] says.
     /// [`Client::open_with_options`] can turn the listening or the relays
     /// off.
@@ -322,7 +313,7 @@ impl Client {
         let key = load_or_create_key(storage.as_ref()).await?;
         // Minimal: no pkarr or DNS lookup, so a LAN client never tries the
         // Internet. mDNS only listens: a laptop or a TV must not announce
-        // itself to the network (P1-13).
+        // itself to the network.
         let cannot_bind =
             |e: String| SdkError::Unreachable(format!("cannot bind the endpoint: {e}"));
         let mdns = if lan_discovery {
@@ -414,7 +405,7 @@ impl Client {
                 downloads: crate::downloads::Shared::new(downloads_dir),
             }),
         };
-        // Where saved servers publish (P6-05): looked up there from the
+        // Where saved servers publish: looked up there from the
         // start; and each one's relay choice.
         for server in servers::load(client.inner.storage.as_ref()).await? {
             if let Some(url) = &server.lookup {
@@ -440,12 +431,12 @@ impl Client {
     ///
     /// A server heard under a saved server's name, with another key, while
     /// the saved key is not heard, is not listed apart: it is that server's
-    /// entry, whose connect says [`SdkError::IdentityChanged`] (P1-13).
+    /// entry, whose connect says [`SdkError::IdentityChanged`].
     pub async fn servers(&self) -> Result<Vec<ServerEntry>, SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let mut heard = self.inner.discovery.heard();
         // Only a pin with no server id yet is matched by name: one with an
-        // id is matched by that (PX-14), and a name may change freely.
+        // id is matched by that, and a name may change freely.
         let away: Vec<String> = saved
             .iter()
             .filter(|s| s.server_id.is_none())
@@ -519,7 +510,7 @@ impl Client {
     }
 
     /// Every change of a playback's share of its server's uplink, from
-    /// every server this device is connected to (PX-46), as the server
+    /// every server this device is connected to, as the server
     /// tells it: the handle and the most it may take now, bits/s. A
     /// managed playback in Auto plans itself again on its own; this is for
     /// showing it ([`crate::ManagedPlayback::share`] holds a playback's
@@ -529,7 +520,7 @@ impl Client {
     }
 
     /// Every playlist change a server this device is connected to tells
-    /// it of (PX-40): a playlist made, changed or gone, or the pins
+    /// it of: a playlist made, changed or gone, or the pins
     /// changed, for a user signed in there. Changes before the call, or
     /// while not connected, are not seen: read what is shown again on
     /// connecting.
@@ -538,7 +529,7 @@ impl Client {
     }
 
     /// Every subtitle timing change a server this device is connected to
-    /// tells it of (PX-03): a track of an item this device asked the
+    /// tells it of: a track of an item this device asked the
     /// tracks of, or plays, synced, set back to its original timing, or
     /// offset, by anyone. A player showing the track reads it again.
     pub fn subtitle_timing_events(
@@ -548,14 +539,14 @@ impl Client {
     }
 
     /// Every time a server this device is connected to says its libraries
-    /// changed (experimental `federation`, P8-02): a paired server came
+    /// changed (experimental `federation`): a paired server came
     /// online or went offline, or shared or stopped sharing a library. A
     /// screen listing that server's libraries lists them again.
     pub fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<crate::LibrariesChanged> {
         self.inner.library_events.subscribe()
     }
 
-    /// Where a paired server of server `home`'s may be dialled (P8-04): its
+    /// Where a paired server of server `home`'s may be dialled: its
     /// `addrs` and `relays` as its pair keeps them, for a dial that is not
     /// saved. What does not read is left out. Its relays are used as
     /// `home`'s are: a device that reaches its own server through relays
@@ -580,8 +571,8 @@ impl Client {
         self.relays_of(id, None)
     }
 
-    /// Reach paired server `id`'s relays with `token`'s relay token
-    /// (P8-04): its relay lets this device through as the token's holder,
+    /// Reach paired server `id`'s relays with `token`'s relay token:
+    /// its relay lets this device through as the token's holder,
     /// and, once the token is redeemed, as long as the session it opened
     /// lives. In the endpoint's relay map, as an invite's token is
     /// ([`crate::invites`]), for as long as the hold lives: dropped, by
@@ -613,7 +604,7 @@ impl Client {
     }
 
     /// Where to find server `endpoint_id`, from outside the LAN's records:
-    /// typed in, or from an invite (P6-01). A hint like any other: the key is
+    /// typed in, or from an invite. A hint like any other: the key is
     /// still proven on connect.
     pub fn add_address(&self, endpoint_id: &str, addrs: Vec<SocketAddr>) -> Result<(), SdkError> {
         let id = parse_id(endpoint_id)?;
@@ -625,16 +616,16 @@ impl Client {
     /// who answered: its name and its key's fingerprint. A server not saved
     /// yet must have been heard on the LAN or given an address, and is not
     /// saved by this: the app shows the fingerprint, then calls
-    /// [`Client::pin`] (P1-21). Until then only `Hello` is sent to it.
+    /// [`Client::pin`]. Until then only `Hello` is sent to it.
     ///
-    /// The pin is the pair of the key and the server id (PX-14): a saved
+    /// The pin is the pair of the key and the server id: a saved
     /// server connects only when both answer as pinned, and the name it
     /// answers with is saved, whatever it is.
     ///
     /// [`SdkError::IdentityChanged`] when a saved server seems to answer
-    /// with another key (P1-13): `endpoint_id` answers with a saved
-    /// server's server id. For a server saved before the SDK kept ids,
-    /// also when `endpoint_id` is heard under its name while its own key
+    /// with another key: `endpoint_id` answers with a saved
+    /// server's server id. For a saved server with no server id pinned
+    /// yet, also when `endpoint_id` is heard under its name while its own key
     /// is not, or when it cannot be reached and another key is heard
     /// under its name. Nothing is saved; [`Client::trust_new_identity`]
     /// replaces the pin if the user says so.
@@ -686,7 +677,7 @@ impl Client {
     }
 
     /// Save server `endpoint_id`, which [`Client::connect`] reached, with
-    /// `verified` saying whether the user confirmed its fingerprint (P1-21).
+    /// `verified` saying whether the user confirmed its fingerprint.
     /// A saved server keeps its pin and only has `verified` set: "Verify
     /// now", with no reconnect.
     pub async fn pin(&self, endpoint_id: &str, verified: bool) -> Result<ServerEntry, SdkError> {
@@ -763,13 +754,13 @@ impl Client {
     }
 
     /// Replace saved server `saved_id`'s pin with `new_id`, which answered in
-    /// its place (P1-13), after the user checked `new_id`'s fingerprint.
+    /// its place, after the user checked `new_id`'s fingerprint.
     /// The old key's sessions are forgotten: they belonged to the server
     /// that key was, so everyone signs in again.
     ///
     /// The new pin is `new_id` with the server id it answers with. When
-    /// the server only replaced its key, that is the id pinned before
-    /// (PX-14), so its app passkeys, made for that id, still sign in: the
+    /// the server only replaced its key, that is the id pinned before,
+    /// so its app passkeys, made for that id, still sign in: the
     /// SDK makes their challenges with the new key from now on.
     pub async fn trust_new_identity(
         &self,
@@ -827,7 +818,7 @@ impl Client {
 
     /// Another key heard under saved server `server`'s name while its own is
     /// not heard, if `server` has no server id pinned yet: a name says
-    /// nothing about one that has (PX-14).
+    /// nothing about one that has.
     fn replacement(&self, server: &SavedServer) -> Option<EndpointId> {
         if server.server_id.is_some() {
             return None;
@@ -891,7 +882,7 @@ impl Client {
             .unwrap_or_default()
     }
 
-    /// The server id pinned with saved server `id`'s key (PX-14), which
+    /// The server id pinned with saved server `id`'s key, which
     /// names its app passkeys' relying party. Every connection to a saved
     /// server pins it, or refuses one that differs, so after a call to it
     /// there is one.
@@ -905,7 +896,7 @@ impl Client {
         ServerId::parse(&server_id).map_err(|e| SdkError::Protocol(e.to_string()))
     }
 
-    /// Requests other than `Hello` go only to a pinned server (P1-21).
+    /// Requests other than `Hello` go only to a pinned server.
     pub(crate) async fn require_pinned(&self, id: EndpointId) -> Result<(), SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         if saved.iter().any(|s| s.endpoint_id == id.to_string()) {
@@ -926,8 +917,8 @@ impl Client {
         self.forget_saved(id).await
     }
 
-    /// The user of session `token`, `username`, left server `server`
-    /// (PX-47): take their profile off this device, and forget the server
+    /// The user of session `token`, `username`, left server `server`:
+    /// take their profile off this device, and forget the server
     /// as [`Client::forget`] does once no other profile is kept for it.
     /// One step under `saving`, so a sign-in meanwhile is either kept, and
     /// the server with it, or comes after and finds it forgotten.
@@ -1044,15 +1035,17 @@ impl Client {
         Ok(())
     }
 
-    /// Sign `username` in on server `endpoint_id` with a password (§22),
-    /// and keep the session. A one-time password an admin reset to gives a
+    /// Sign `username` in on server `endpoint_id` with a password, and
+    /// keep the session. A one-time password an admin reset to gives a
     /// session whose [`Session::password_change_required`] is true: show
     /// "Choose a new password" and call [`Session::change_password`] with
-    /// the one-time password as the current one; until then every other
-    /// request of the session's is [`SdkError::PasswordChangeRequired`]. With `remember` ("Remember this device",
-    /// never ticked by default), the server trusts this device for them
-    /// (P4-01): once the session ends, [`Client::resume_profile`] opens
-    /// it again without a password, until they sign out here.
+    /// the one-time password as the current one. Until then every other
+    /// request of the session's is [`SdkError::PasswordChangeRequired`].
+    ///
+    /// With `remember` ("Remember this device", never ticked by default),
+    /// the server trusts this device for them: once the session ends,
+    /// [`Client::resume_profile`] opens it again without a password, until
+    /// they sign out here.
     pub async fn sign_in(
         &self,
         endpoint_id: &str,
@@ -1090,8 +1083,8 @@ impl Client {
         Ok(session)
     }
 
-    /// The users this device is trusted for on server `endpoint_id`
-    /// (P4-01), by username: for "Who's watching" once their sessions have
+    /// The users this device is trusted for on server `endpoint_id`,
+    /// by username: for "Who's watching" once their sessions have
     /// ended. One with `auto_login` is the profile to open at start.
     /// Trust that lapsed or was removed is not listed.
     pub async fn trusted_profiles(
@@ -1103,7 +1096,7 @@ impl Client {
         match self.call(server, None, Request::TrustedProfiles).await? {
             Response::Ok(Reply::TrustedProfiles { profiles }) => {
                 // Whether each asks for their PIN here: what locks them
-                // offline (PX-60).
+                // offline.
                 for p in &profiles {
                     self.inner.downloads.locks.seen(
                         &server.to_string(),
@@ -1122,7 +1115,7 @@ impl Client {
 
     /// Open a session for `user_id` (a [`TrustedProfile::user_id`]) on
     /// server `endpoint_id` without a password, on a device trusted for
-    /// them (P4-01), and keep it as a sign-in does. Its profile may start
+    /// them, and keep it as a sign-in does. Its profile may start
     /// locked, as after any sign-in, when the device asks for their PIN.
     /// [`SdkError::SignInRequired`], whatever the reason, when the device
     /// is no longer trusted for them (removed, lapsed, or the user
@@ -1155,11 +1148,11 @@ impl Client {
     }
 
     /// Begin signing in on server `endpoint_id` with a passkey made in the
-    /// app (P3-19): what the platform's passkey API signs, for the relying
+    /// app: what the platform's passkey API signs, for the relying
     /// party in [`PasskeyRequest::rp_id`], from [`PasskeyRequest::origin`]
     /// where the platform takes one. That is the server's own,
-    /// `<server id>.spoolframe.app`, from the server id pinned with its key
-    /// (PX-14): pass it to the platform as it is, never a fixed one. No
+    /// `<server id>.spoolframe.app`, from the server id pinned with its key:
+    /// pass it to the platform as it is, never a fixed one. No
     /// passkeys are listed: the platform offers whichever it has for this
     /// relying party, which are only this server's. With `username`, only
     /// that user's finish it. The challenge is this device's, for 5
@@ -1167,7 +1160,7 @@ impl Client {
     ///
     /// The server sends a nonce; the challenge is
     /// [`spoolframe_protocol::app_passkey_challenge`] of `endpoint_id`, the
-    /// pinned server dialled, and that nonce (PX-10). A server that claims
+    /// pinned server dialled, and that nonce. A server that claims
     /// another's server id and hands on its nonce gets a signature the
     /// other refuses.
     pub async fn begin_passkey_sign_in(
@@ -1236,11 +1229,11 @@ impl Client {
     }
 
     /// Ask server `endpoint_id` to sign this device in by someone approving
-    /// it on another device they are signed in on (P3-07): show the code
+    /// it on another device they are signed in on: show the code
     /// and a QR code of the link, then [`Client::await_device_sign_in`].
     /// For a device without a keyboard (a TV).
     ///
-    /// `remember` asks for this device to be trusted (P4-01), as
+    /// `remember` asks for this device to be trusted, as
     /// [`Client::sign_in`]'s does; the approver sees the request and
     /// decides.
     pub async fn begin_device_sign_in(
@@ -1333,7 +1326,7 @@ impl Client {
     }
 
     /// [`Client::keep_session`], signed in with portable identity
-    /// `portable` if `Some` (P7-06): kept with it, to sign in again.
+    /// `portable` if `Some`: kept with it, to sign in again.
     pub(crate) async fn keep_session_as(
         &self,
         server: EndpointId,
@@ -2012,7 +2005,7 @@ impl Client {
         let pinned = saved.iter().find(|s| s.endpoint_id == id.to_string());
         let heard = self.inner.discovery.get(&id);
         let manual = self.inner.manual.lock().get(&id).cloned();
-        // An invite with only relays names a server too (P6-03), dialled
+        // An invite with only relays names a server too, dialled
         // through them whatever the client's relays (see `reach`).
         let invited = self.inner.invite_relays.lock().contains_key(&id);
         if pinned.is_none() && heard.is_none() && manual.is_none() && !invited {
@@ -2108,8 +2101,8 @@ impl Client {
     ///
     /// `server_id` is the server id it answered with: one pinned before
     /// must be it, or nothing is kept and the answer is
-    /// [`SdkError::ServerIdChanged`]. A pin from before the SDK kept ids
-    /// takes it now, as a first connect does.
+    /// [`SdkError::ServerIdChanged`]. A pin with no server id yet takes
+    /// it now, as a first connect does.
     async fn refresh(
         &self,
         id: EndpointId,
@@ -2177,10 +2170,10 @@ impl Client {
         self.sighted(id, |server, now| server.saw(addrs, now)).await
     }
 
-    /// Saved server `id` told this device just now where it is (PX-12,
-    /// the `ServerAddresses` event): `addrs` replace the addresses it told
-    /// before, `relays` the relays, and `lookup` where it publishes
-    /// (P6-05), which this device looks servers up at from now on. Nothing
+    /// Saved server `id` told this device just now where it is (the
+    /// `ServerAddresses` event): `addrs` replace the addresses it told
+    /// before, `relays` the relays, and `lookup` where it publishes,
+    /// which this device looks servers up at from now on. Nothing
     /// for a server not saved.
     pub(crate) async fn told(
         &self,
@@ -2200,7 +2193,7 @@ impl Client {
         .await
     }
 
-    /// Look servers up at the pkarr relay `url` (P6-05) from now on, once:
+    /// Look servers up at the pkarr relay `url` from now on, once:
     /// iroh asks it for a server's record by its key when what this device
     /// knows does not reach the server. A record is a hint only: the
     /// connection still proves the key.
@@ -2362,7 +2355,7 @@ impl Client {
         Ok(())
     }
 
-    /// The portable identities this device holds the roots of (P7-01).
+    /// The portable identities this device holds the roots of.
     /// Every call shares one lock, so take them from here rather than
     /// making another [`Portable`] over the same storage.
     pub fn portable(&self) -> Portable {
@@ -2404,7 +2397,7 @@ impl Client {
 }
 
 /// The saved server, under another key than `id`, whose pinned server id is
-/// `server_id`: the server `id` says it is, with its key replaced (PX-14).
+/// `server_id`: the server `id` says it is, with its key replaced.
 pub(crate) fn same_server<'a>(
     saved: &'a [SavedServer],
     id: EndpointId,
@@ -2471,7 +2464,7 @@ fn live_paths(conn: &iroh::endpoint::Connection) -> Vec<LivePath> {
     live
 }
 
-/// The most pkarr relays a client looks servers up at (P6-07, glm E-3).
+/// The most pkarr relays a client looks servers up at.
 /// iroh cannot take a lookup service back once added, so each distinct URL
 /// a server or invite names would otherwise add one for the client's life.
 /// A household names one or two.
@@ -2493,8 +2486,8 @@ fn admit_lookup(lookups: &mut std::collections::HashSet<String>, url: &str) -> b
     lookups.insert(url.to_owned())
 }
 
-/// `new` then `known`, each once, at most `max`: the newest hints win
-/// (P6-07, glm E-3), so pasting link after link cannot grow them.
+/// `new` then `known`, each once, at most `max`: the newest hints win,
+/// so pasting link after link cannot grow them.
 pub(crate) fn newest_first<T: PartialEq + Clone>(new: &[T], known: &[T], max: usize) -> Vec<T> {
     let mut kept: Vec<T> = Vec::new();
     for item in new.iter().chain(known) {
@@ -2569,7 +2562,7 @@ async fn load_or_create_key(storage: &dyn Storage) -> Result<SecretKey, SdkError
 /// `url`, if it is a web page an app may open or show as a QR code: an
 /// `http` or `https` URL with a host. A server sends it (`ServerInfo`,
 /// `DeviceSignInStarted`), and a malicious one could send a `file:` or an
-/// app's own scheme instead (PX-11, PX-09 finding 18); that is dropped,
+/// app's own scheme instead; that is dropped,
 /// as if the server had no web UI.
 pub(crate) fn web_page(url: Option<String>) -> Option<String> {
     let url = url?;

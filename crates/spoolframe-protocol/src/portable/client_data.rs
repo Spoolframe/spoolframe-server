@@ -1,4 +1,4 @@
-//! A bounded reader for a WebAuthn `clientDataJSON` (P7-08): just the
+//! A bounded reader for a WebAuthn `clientDataJSON`: just the
 //! members a root signature is checked by, from a strict JSON object.
 //!
 //! Hand-written rather than serde_json, so the protocol crate takes no new

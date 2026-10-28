@@ -1,6 +1,5 @@
-//! Pairing a device with a portable identity by QR code (P7-03,
-//! ARCHITECTURE §47), over a direct Iroh connection: no Spoolframe server
-//! takes part.
+//! Pairing a device with a portable identity by QR code, over a direct
+//! Iroh connection: no Spoolframe server takes part.
 //!
 //! The device (a TV: no camera) shows a QR code; the identity's phone, the
 //! one that holds its root, scans it, dials the device, and names the
@@ -12,9 +11,9 @@
 //! The device side: [`crate::Client::start_pairing`] gives a [`Pairing`]:
 //! its [`Pairing::link`] to show as a QR code, [`Pairing::connected`] for
 //! the phone that scanned it and the fingerprint to show beside the
-//! phone's, and [`Pairing::wait`] for how it ended. Only while one is live does the device's endpoint accept
-//! the pairing ALPN, and only when its owner allows guests
-//! ([`crate::Portable::allow_guests`]).
+//! phone's, and [`Pairing::wait`] for how it ended. Only while one is
+//! live does the device's endpoint accept the pairing ALPN, and only when
+//! its owner allows guests ([`crate::Portable::allow_guests`]).
 //!
 //! The phone side: [`crate::Client::scan_pairing`] gives a
 //! [`PairingOffer`]: the device's name and its key's fingerprint, to show,
@@ -115,7 +114,7 @@ pub struct Paired {
     pub device_key: DevicePublicKey,
     /// `device_key`'s fingerprint: [`Connected::fingerprint`].
     pub fingerprint: String,
-    /// The servers the phone signs in to as `identity` (P7-06), and has
+    /// The servers the phone signs in to as `identity`, and has
     /// verified, saved on this device now: [`Client::sign_in_portable`] on
     /// each. Saved pinned but not verified, since the guest's phone
     /// vouches for them and not this device's owner: a password sign-in
@@ -340,7 +339,7 @@ impl Shared {
 }
 
 impl Client {
-    /// Show a pairing code on this device (the device side, P7-03): for a
+    /// Show a pairing code on this device (the device side): for a
     /// guest's phone to scan and authorize this device as their portable
     /// identity. `name` is what the phone shows ("Authorize Living room
     /// TV?").
@@ -458,7 +457,7 @@ impl Client {
         addrs
     }
 
-    /// Scan a device's pairing code (the phone side, P7-03): dial the
+    /// Scan a device's pairing code (the phone side): dial the
     /// device it names, prove the code, and name `identity`, whose root
     /// this device must hold ([`PairingError::NoRoot`], checked before
     /// anything is sent). The device answers with its key for the
@@ -612,7 +611,7 @@ impl PairingOffer {
     /// recorded as `label` ([`crate::Portable::issued`]; the device's
     /// name if `None`), and the device installs it with the identity's
     /// newest state. With them go the servers this phone signs in to as
-    /// the identity (P7-06), for the device to save and sign in to. Done
+    /// the identity, for the device to save and sign in to. Done
     /// once the device says so. Refused, with nothing sent, if this
     /// device no longer holds the root ([`PairingError::NoRoot`]). Once
     /// only.
@@ -839,7 +838,7 @@ async fn pair(
                 return Err(refused(SdkError::DeviceKeyRevoked));
             }
         }
-        // The state first (P7-08): a root it adds may have signed the
+        // The state first: a root it adds may have signed the
         // credential. Nothing half done: a refused credential leaves no
         // state this device did not have.
         portable

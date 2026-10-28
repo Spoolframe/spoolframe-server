@@ -1,6 +1,5 @@
-//! Subtitles from subtitle sites on demand (PX-02): OpenSubtitles, SubDL
-//! or both, as the
-//! server's admin set, searched and downloaded by the server, with its own
+//! Subtitles from subtitle sites on demand: OpenSubtitles, SubDL or both,
+//! as the server's admin set, searched and downloaded by the server, with its own
 //! key for each, only when someone asks.
 //!
 //! [`Session::search_subtitles`] lists what the sites have for an item, in
@@ -14,7 +13,7 @@
 //! [`Session::download_subtitle`] makes one a track of the item, for
 //! everyone on the server, at once: the reply has its place in the
 //! item's subtitles and the track itself, and the downloads left today.
-//! One not found by the hash is synced in the background (PX-03's
+//! One not found by the hash is synced in the background (its
 //! `SubtitleTrack::timing` says "Syncing" until then). A downloaded track
 //! has `SubtitleTrack::download` on [`Session::tracks`]: which site it
 //! came from, who downloaded it, and whether this user may remove it

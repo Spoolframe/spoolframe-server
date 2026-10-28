@@ -1,11 +1,11 @@
-//! An identity's roots (P7-08): the keys that may act for it. A phrase
-//! root is P7-01's Ed25519 key; a security key root is a FIDO2 key's
-//! P-256 credential, which signs only CTAP2 assertions. An identity has
+//! An identity's roots: the keys that may act for it. A phrase root is
+//! an Ed25519 key from a recovery phrase; a security key root is a FIDO2
+//! key's P-256 credential, which signs only CTAP2 assertions. An identity has
 //! one or more, any one of which is enough, and its genesis
 //! ([`IdentityGenesis`]) names the first.
 //!
-//! What a root signs keeps the layouts of P7-02: a domain string with its
-//! NUL, then fixed-width fields. A phrase root signs those bytes; a
+//! What a root signs is a domain string with its NUL, then fixed-width
+//! fields. A phrase root signs those bytes; a
 //! security key is given their SHA-256 as `clientDataHash`, as raw CTAP2
 //! lets the client choose, and signs `authenticatorData ‖ clientDataHash`
 //! under [`PORTABLE_RP`].
@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use super::{PortableUserId, Signature, parse_hex, write_hex};
 
 /// The relying party a security key root signs under. Domain-shaped and
-/// under PX-14's `*.spoolframe.app`, so no server's passkey sign-in
+/// under `*.spoolframe.app`, so no server's passkey sign-in
 /// (under that server's own RP) can pass as a root's signature.
 pub const PORTABLE_RP: &str = "portable.spoolframe.app";
 
@@ -106,7 +106,7 @@ pub fn portable_rp_id_hash() -> [u8; 32] {
 /// A key that may act for an identity.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RootKey {
-    /// P7-01's root: an Ed25519 key derived from a recovery phrase.
+    /// An Ed25519 key derived from a recovery phrase.
     Phrase([u8; 32]),
     /// A FIDO2 security key's credential: its P-256 public key (SEC1
     /// uncompressed) and its credential id, at most
@@ -404,7 +404,7 @@ pub(crate) fn verify_webauthn(
         .map_err(|_| WebAuthnError::BadSignature)
 }
 
-/// How a security key made a root's credential (P7-08), as a device's
+/// How a security key made a root's credential, as a device's
 /// key API returns it: what [`Self::root`] reads the root from.
 ///
 /// A registration is not a proof that the key is held, and is not sent
@@ -583,11 +583,10 @@ fn cose_es256_key(cose: ciborium::Value) -> Result<[u8; P256_PUBLIC_KEY_LEN], We
 /// signature), or WebAuthn (the same, and the `clientDataJSON` the
 /// platform wrote and the key signed the hash of).
 ///
-/// In serde, an Ed25519 signature is 128 hex digits, as P7-02 wrote it,
-/// so a phrase root's credential and state read as they always did; a
-/// CTAP2 assertion is `{"authenticator_data": hex, "signature": hex}`; a
-/// WebAuthn one is `{"authenticator_data": hex, "client_data_json": hex,
-/// "signature": hex}` (wire revision 14, additive: no struct grows).
+/// In serde, an Ed25519 signature is 128 hex digits; a CTAP2 assertion
+/// is `{"authenticator_data": hex, "signature": hex}`; a WebAuthn one is
+/// `{"authenticator_data": hex, "client_data_json": hex, "signature":
+/// hex}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootSignature {
     Ed25519(Signature),
@@ -840,7 +839,7 @@ pub enum GenesisError {
 /// Bytes in an identity's handle.
 pub const HANDLE_LEN: usize = 32;
 
-/// How an identity begins (P7-08): its handle, its first roots, and each
+/// How an identity begins: its handle, its first roots, and each
 /// root's signature over both, so every root proves it is held. For a
 /// security key identity the handle is random and is also the key's
 /// resident credential's `user.id`, so a key put into a device that has
@@ -857,7 +856,7 @@ pub struct IdentityGenesis {
     pub signatures: Vec<RootSignature>,
 }
 
-/// Hex for serde, over a genesis handle (P7-08).
+/// Hex for serde, over a genesis handle.
 pub(crate) mod handle_hex {
     use super::*;
 
@@ -918,9 +917,9 @@ impl IdentityGenesis {
         }
     }
 
-    /// The identity's id. A genesis of one phrase root keeps P7-01's id,
-    /// that root's public key (the user's decision, 2026-10-11: no phrase
-    /// identity moves); any other's is
+    /// The identity's id. A genesis of one phrase root keeps that root's
+    /// public key as its id, so a phrase identity's id never changes; any
+    /// other's is
     /// `blake3::derive_key(`[`USER_ID_CONTEXT`]`, message)`. Signatures
     /// are left out, since an ECDSA one differs each time it is made.
     pub fn user(&self) -> PortableUserId {
@@ -994,7 +993,7 @@ pub struct RemovedRoot {
 }
 
 /// The roots that may act for an identity, as a verifier works them out
-/// from its genesis and every valid state it holds (P7-08):
+/// from its genesis and every valid state it holds:
 ///
 /// - `ever`: the genesis's roots, and every root added by one in `ever`,
 ///   until nothing more is added. A state counts only if one of these
@@ -1013,10 +1012,9 @@ pub struct RemovedRoot {
 /// key adds after its removal does not. Times are the roots' own word:
 /// a stolen key that backdates an addition is stopped where its removal
 /// arrived first, by the verifier refusing the state that brings it
-/// (`spoolframe_server`'s store, the SDK's `accept_state`). A removed
+/// (the server, and the SDK's `accept_state`). A removed
 /// root's removals still count, so two roots that remove each other are
-/// both gone: the identity is locked rather than taken (P7-07 reviews
-/// this).
+/// both gone: the identity is locked rather than taken.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RootSet {
     pub ever: Vec<RootKey>,

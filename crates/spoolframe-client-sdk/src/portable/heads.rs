@@ -1,8 +1,8 @@
-//! Rival identity states (2026-10-12). Two holders of one root (a phone
-//! with the phrase and a security key, or two devices the phrase root is
-//! synced to) can each sign a state from the same revision. Keeping only
-//! the higher one, and signing the next from it, dropped what the other
-//! said: a security key removed on the losing branch came back as a root.
+//! Rival identity states. Two holders of one root (a phone with the phrase
+//! and a security key, or two devices the phrase root is synced to) can
+//! each sign a state from the same revision. Keeping only the higher one,
+//! and signing the next from it, would drop what the other said: a
+//! security key removed on the losing branch would come back as a root.
 //!
 //! So a device keeps **heads**: the newest state (the highest revision,
 //! then the lower [`PortableIdentityState::digest`], as servers pick it),
@@ -15,7 +15,7 @@
 //!
 //! The next state a holder signs is over the **merge** of all heads, at
 //! one past the highest revision: every revocation (each at its earliest,
-//! lapsed ones left out, as before), every root added and every root
+//! lapsed ones left out), every root added and every root
 //! removed (each at its earliest). All three only grow, so the merge is
 //! the same in any order, and it loses nothing; a holder of the phrase
 //! root signs it as soon as a rival arrives ([`Portable::accept_state`]),
@@ -197,7 +197,7 @@ pub(super) fn merged_changes(
     }
 }
 
-/// `portable-state/<id>` as stored: one state (as before heads), or more.
+/// `portable-state/<id>` as stored: one state, or more.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Stored {
@@ -229,9 +229,8 @@ pub(super) async fn load_heads(
     Ok(heads)
 }
 
-/// Keep `heads` as those of `id`: one as a single state, as before, so
-/// what an identity with no rival stores does not change; none removes
-/// them.
+/// Keep `heads` as those of `id`: one as a single state, so an identity
+/// with no rival stores one state; none removes them.
 pub(super) async fn save_heads(
     storage: &dyn Storage,
     id: PortableUserId,

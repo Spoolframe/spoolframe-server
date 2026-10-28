@@ -1,4 +1,4 @@
-//! Playlists (PX-40, feature `spoolframe:playlists`): ordered
+//! Playlists (feature `spoolframe:playlists`): ordered
 //! lists of movies, episodes and tracks a user makes, shares, pins and
 //! plays.
 //!
@@ -13,11 +13,11 @@ use spoolframe_types::{ArtworkId, MediaId, MediaKind};
 /// One place in a playlist. Never reused, in any playlist.
 pub type EntryId = u64;
 
-/// The largest cover a `SetPlaylistArt` takes, in bytes (PX-53): past it,
+/// The largest cover a `SetPlaylistArt` takes, in bytes: past it,
 /// `ImageTooLarge`, and the bytes are not read.
 pub const MAX_ART_BYTES: u64 = 20 << 20;
 
-/// The most pixels a cover may have (PX-53): past it, `ImageTooLarge`,
+/// The most pixels a cover may have: past it, `ImageTooLarge`,
 /// from the picture's header, before it is decoded.
 pub const MAX_ART_PIXELS: u64 = 40_000_000;
 
@@ -228,7 +228,7 @@ pub enum PlaylistOwnerKind {
     Unknown,
 }
 
-/// A built-in playlist (PX-43): every user has one of each, made by the
+/// A built-in playlist: every user has one of each, made by the
 /// server, never renamed, re-kinded, shared or deleted. Music only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,7 +245,7 @@ pub enum Builtin {
     Unknown,
 }
 
-/// A heart (PX-43): whether an item is in the user's Liked. A track's is
+/// A heart: whether an item is in the user's Liked. A track's is
 /// `All` or `None`; an album's is `All` when every track it has now is
 /// liked, `Some` when some are, `None` when none are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -277,7 +277,7 @@ pub struct PlaylistSummary {
     /// Its place in their Pinned (0 first), or `None` when not pinned.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub pinned: Option<u32>,
-    /// Which built-in playlist it is (PX-43), or `None` for one a user
+    /// Which built-in playlist it is, or `None` for one a user
     /// made: what a client lists Liked and All first by, and hides
     /// rename, share and delete for.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
@@ -286,7 +286,7 @@ pub struct PlaylistSummary {
     /// for an owner no longer here.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub owner_name: Option<String>,
-    /// Its picture (PX-53), fetched as any artwork is: the cover an editor uploaded;
+    /// Its picture, fetched as any artwork is: the cover an editor uploaded;
     /// else a 2×2 mosaic of the first four different album covers or
     /// posters in it; one alone when it has fewer; a placeholder when it
     /// has none. Liked's and All's are fixed tiles. Changes when any of
@@ -329,7 +329,7 @@ pub struct PlaylistEntry {
     /// Still in the library, but its file cannot be read now (a drive
     /// offline, a file moved): shown, counted, skipped when playing.
     pub unavailable: bool,
-    /// A track in the user's Liked (PX-43): its heart.
+    /// A track in the user's Liked: its heart.
     pub liked: bool,
 }
 
@@ -344,7 +344,7 @@ pub struct PlaylistPage {
     /// How many entries the whole list has.
     pub total: u32,
     /// How many of them can be played now: `total` less the unavailable.
-    /// All's (PX-43) is `total`: its files are looked at only as they
+    /// All's is `total`: its files are looked at only as they
     /// are listed and played, not all at every read.
     pub playable: u32,
     /// The user's place: the entry playing or last played, which
@@ -385,13 +385,13 @@ pub enum Repeat {
 
 /// The entry to play now (`PlayPlaylist`, `NextInPlaylist`), with its
 /// item, the user's watch state on it (to resume where they were) and its
-/// intro and credits markers (to skip the credits, PX-06).
+/// intro and credits markers (to skip the credits).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaylistNext {
     pub entry: EntryId,
     pub item: spoolframe_types::Item,
     pub markers: Vec<spoolframe_types::Marker>,
-    /// A track in the user's Liked (PX-43): the now-playing heart.
+    /// A track in the user's Liked: the now-playing heart.
     pub liked: bool,
 }
 
@@ -400,8 +400,8 @@ pub struct PlaylistNext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlexImport {
     /// One per Plex playlist with at least one item found here; and one
-    /// named "Liked" for the tracks rated in Plex that were liked here
-    /// (PX-43), its `entries` those newly liked.
+    /// named "Liked" for the tracks rated in Plex that were liked here,
+    /// its `entries` those newly liked.
     pub made: Vec<PlexImported>,
     /// The items, or whole playlists, not found here, and why.
     pub unmapped: Vec<PlexUnmapped>,

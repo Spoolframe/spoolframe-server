@@ -178,7 +178,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
 
 /// The most characters of a request's `type` that [`request_type`] and
 /// [`rpc_request_type`] read: a client chooses it, up to a whole frame of
-/// it, and every type the protocol has is far shorter (C-12).
+/// it, and every type the protocol has is far shorter.
 pub const MAX_REQUEST_TYPE: usize = 64;
 
 /// The `type` of a request payload, even one this build cannot decode, so
@@ -191,8 +191,8 @@ pub fn request_type(envelope: &[u8]) -> Option<String> {
 ///
 /// The server names every request with this before it is authenticated, so
 /// it reads the frame only as far as the tag and keeps nothing of what it
-/// steps over (finding 50): decoding the frame whole cost about 50 times
-/// its size in heap.
+/// steps over: decoding the frame whole would cost about 50 times its
+/// size in heap.
 pub fn rpc_request_type(bytes: &[u8]) -> Option<String> {
     scan::text_at(bytes, &["envelope", "request", "type"])
 }

@@ -1,4 +1,4 @@
-//! How a server announces itself on the LAN (P1-13, ARCHITECTURE §18).
+//! How a server announces itself on the LAN.
 //!
 //! Servers publish an mDNS record under their own service name, so the
 //! records of other Iroh apps on the network (`irohv1`) are never heard at

@@ -1,4 +1,4 @@
-//! Scoped, grouped search (P3-09): `Request::Search` and its reply.
+//! Scoped, grouped search: `Request::Search` and its reply.
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{Item, LibraryId, LibraryServer, MediaId, Person, SearchKind, SearchScope};
@@ -24,7 +24,7 @@ pub struct SearchRequest {
 }
 
 /// What a search found: `Item`s, or for a client that names the
-/// experimental `federation` feature [`SearchHit`]s (P8-05).
+/// experimental `federation` feature [`SearchHit`]s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResults<T = Item> {
     /// The single best match: an exact title, else a title that starts
@@ -88,7 +88,7 @@ impl<T> SearchResults<T> {
     }
 }
 
-/// Experimental (`federation`, P8-05): a search's item for a client that
+/// Experimental (`federation`): a search's item for a client that
 /// names the feature. A title on several servers (the same TMDB, IMDb,
 /// TVDB, MusicBrainz or Plex id; an episode by its show's, season and
 /// number) is one hit: this server's copy when it has one, else the copy
@@ -120,7 +120,7 @@ impl SearchHit {
     }
 }
 
-/// Experimental (`federation`, P8-05): where an item is from, and its
+/// Experimental (`federation`): where an item is from, and its
 /// title's copies on other servers, as a [`SearchHit`] and an `Item`
 /// reply have them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub struct Copies {
     pub play_from: MediaId,
 }
 
-/// One copy of a title, on one server (P8-05).
+/// One copy of a title, on one server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TitleCopy {
     /// The copy's id here: a `fed:` id for a paired server's.

@@ -1,8 +1,8 @@
-//! A portable user's identity (P7-01, ARCHITECTURE §42–§43): the public
+//! A portable user's identity: the public
 //! half of a root signing key the user owns, not an account any server
-//! hosts; and what that root signs (P7-02, §45, §48): a credential for
+//! hosts; and what that root signs: a credential for
 //! each of the user's devices, and the state that revokes them; and the
-//! proof that ties a local account to the identity (P7-04).
+//! proof that ties a local account to the identity.
 //!
 //! Only public things live here. The root's secret, and the recovery
 //! phrase it comes from, are the client SDK's (`spoolframe_client_sdk::
@@ -38,8 +38,8 @@ pub use roots::{
 pub const PORTABLE_USER_ID_LEN: usize = 32;
 
 /// Who a portable user is. For an identity begun with one phrase root, its
-/// root's Ed25519 public key (P7-01); for any other, derived from its
-/// genesis ([`IdentityGenesis::user`], P7-08). Written as 64 lowercase hex
+/// root's Ed25519 public key; for any other, derived from its
+/// genesis ([`IdentityGenesis::user`]). Written as 64 lowercase hex
 /// digits, as iroh writes an `EndpointId`; serialized the same way.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortableUserId([u8; PORTABLE_USER_ID_LEN]);
@@ -51,7 +51,7 @@ pub struct InvalidPortableUserId(&'static str);
 
 impl PortableUserId {
     /// The id `bytes` are. Any 32 bytes: an id derived from a genesis
-    /// (P7-08) is a hash, not a curve point. A phrase identity's is its
+    /// is a hash, not a curve point. A phrase identity's is its
     /// root's public key, and [`Self::verify`] fails for one that is not
     /// a point.
     pub fn from_bytes(bytes: [u8; PORTABLE_USER_ID_LEN]) -> Result<Self, InvalidPortableUserId> {
@@ -136,7 +136,7 @@ fn parse_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
 /// Bytes in a [`DevicePublicKey`]: an Ed25519 public key.
 pub const DEVICE_PUBLIC_KEY_LEN: usize = 32;
 
-/// One device's key for acting as a portable user (§45): its own Ed25519
+/// One device's key for acting as a portable user: its own Ed25519
 /// keypair, apart from both the user's root and the device's Iroh
 /// endpoint key. Written, and serialized, as 64 lowercase hex digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -160,7 +160,7 @@ impl DevicePublicKey {
     }
 
     /// The short code a person compares between the device and the phone
-    /// that authorizes it (P7-03), in the same format as an identity's
+    /// that authorizes it, in the same format as an identity's
     /// ([`PortableUserId::fingerprint`]).
     pub fn fingerprint(&self) -> String {
         fingerprint::fingerprint(&self.0)
@@ -236,8 +236,8 @@ pub(crate) mod signature_hex {
 const DAY: i64 = 24 * 60 * 60;
 
 /// The longest a credential may be good for: 90 days from its
-/// `issued_at` (the user's choice, 2026-10-09). A stale device ages out
-/// within that, even where no revocation ever reaches (§45, §48).
+/// `issued_at`. A stale device ages out
+/// within that, even where no revocation ever reaches.
 pub const MAX_CREDENTIAL_VALIDITY: i64 = 90 * DAY;
 
 /// How far ahead of a verifier's clock a credential's `issued_at` may be:
@@ -298,7 +298,7 @@ pub enum CredentialError {
     BadDeviceProof,
 }
 
-/// A user's root's word that a device key may act as them (§45), until
+/// A user's root's word that a device key may act as them, until
 /// `expires_at`. The server checks it alone, with no account server: the
 /// root signed it, it is in date, the device holds its key
 /// ([`verify_device_proof`]) and no state the server has seen revokes the
@@ -315,26 +315,24 @@ pub struct UserDeviceCredential {
     /// issue time in milliseconds, or one past its last if that is larger.
     pub serial: u64,
     pub issued_at: i64,
-    /// Required: every credential expires (§45 allowed none; P7-02 does
-    /// not).
+    /// Required: every credential expires.
     pub expires_at: i64,
-    /// The root's, over [`Self::message`]: Ed25519 from a phrase root,
-    /// written as P7-02 wrote it; a CTAP2 assertion from a security key
-    /// (P7-08).
+    /// The root's, over [`Self::message`]: Ed25519 from a phrase root; a
+    /// CTAP2 assertion from a security key.
     pub signature: RootSignature,
-    /// The root that signed it (P7-08); absent, the phrase root the
-    /// user's id is, as every credential before P7-08. Whether it is one
+    /// The root that signed it; absent, the phrase root the
+    /// user's id is. Whether it is one
     /// of the user's roots is the verifier's to check, against the
     /// identity's [`RootSet`].
     // Left out when none, not for older peers: a server and a device keep
-    // these as JSON, and records written before P7-08 have no key.
+    // these as JSON, and older records have no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<RootKey>,
     /// The identity's genesis, carried for a verifier that has not seen
     /// it: an identity with a security key root cannot be checked
     /// without it. Not signed: it proves itself, its hash being the id.
     // Left out when none, not for older peers: a server and a device keep
-    // these as JSON, and records written before P7-08 have no key.
+    // these as JSON, and older records have no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis: Option<Box<IdentityGenesis>>,
 }
@@ -369,7 +367,7 @@ impl UserDeviceCredential {
         }
     }
 
-    /// A credential `root` signs with `sign` (P7-08), any kind of root.
+    /// A credential `root` signs with `sign`, any kind of root.
     /// A phrase identity's own phrase root is left unnamed, as before.
     #[allow(clippy::too_many_arguments)]
     pub fn signed_by(
@@ -548,16 +546,16 @@ fn canonical_removed(removed: &[RemovedRoot]) -> Vec<RemovedRoot> {
     removed
 }
 
-/// The domain of a state that names its signer or changes roots (P7-08).
+/// The domain of a state that names its signer or changes roots.
 /// One that does neither signs [`STATE_DOMAIN`]'s layout, as before.
 pub const STATE_V3_DOMAIN: &[u8] = b"spoolframe identity state v3\0";
 
-/// A user's root's list of revoked device keys, at a revision (§48), and
-/// (P7-08) the roots it has added and removed. Revocation only grows: a
+/// A user's root's list of revoked device keys, at a revision, and
+/// the roots it has added and removed. Revocation only grows: a
 /// verifier checks credentials against the union of every valid state it
 /// has seen for the user, and keeps the newest (by revision) to hand on.
 /// A credential is good unless that union revokes its device key: adding
-/// a device needs no new state (the user's choice, 2026-10-09), so it
+/// a device needs no new state, so it
 /// lists no authorized keys.
 ///
 /// Root changes are cumulative too: a state lists every root added and
@@ -575,20 +573,20 @@ pub struct PortableIdentityState {
     pub issued_at: i64,
     /// The signer's, over [`Self::message`].
     pub signature: RootSignature,
-    /// The root that signed it (P7-08); absent, the phrase root the
+    /// The root that signed it; absent, the phrase root the
     /// user's id is.
     // Left out when none, not for older peers: a server and a device keep
-    // these as JSON, and records written before P7-08 have no key.
+    // these as JSON, and older records have no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<RootKey>,
     /// Every root added so far, each with its proof that it is held.
     // Left out when none, not for older peers: a server and a device keep
-    // these as JSON, and records written before P7-08 have no key.
+    // these as JSON, and older records have no key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots_added: Vec<AddedRoot>,
     /// Every root removed so far.
     // Left out when none, not for older peers: a server and a device keep
-    // these as JSON, and records written before P7-08 have no key.
+    // these as JSON, and older records have no key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots_removed: Vec<RemovedRoot>,
 }
@@ -627,10 +625,10 @@ impl PortableIdentityState {
         )
     }
 
-    /// A state `signer` signs with `sign` (P7-08): any kind of root, and
+    /// A state `signer` signs with `sign`: any kind of root, and
     /// any root changes. Lists are put in [`Self::message`]'s order, one
     /// entry each; over the limits is refused. A phrase identity's own
-    /// phrase root, changing no roots, signs P7-02's layout.
+    /// phrase root, changing no roots, signs the [`STATE_DOMAIN`] layout.
     pub fn signed_by(
         user: PortableUserId,
         signer: RootKey,
@@ -677,7 +675,7 @@ impl PortableIdentityState {
         (self.signer(), &self.roots_added, &self.roots_removed)
     }
 
-    /// What the root signs, P7-02's layout: [`STATE_DOMAIN`], then user
+    /// What the root signs: [`STATE_DOMAIN`], then user
     /// (32 bytes), revision (u64), issued_at (i64), the count of entries
     /// (u32), then the entries sorted ascending by key, one per key, each
     /// the key (32 bytes) and its revoked_at (i64); the integers
@@ -723,9 +721,9 @@ impl PortableIdentityState {
         }
     }
 
-    /// What its signer signed. P7-02's [`Self::message`] for a state of
+    /// What its signer signed. [`Self::message`] for a state of
     /// the phrase root its user's id is that changes no roots; else
-    /// (P7-08) [`STATE_V3_DOMAIN`], the same fields, then the signer
+    /// [`STATE_V3_DOMAIN`], the same fields, then the signer
     /// ([`RootKey::bytes`]), the count of roots added (u8) and each sorted
     /// ascending by root, as the root, its adder and its added_at (i64),
     /// and the count of roots removed (u8) and each root sorted ascending
@@ -875,7 +873,7 @@ pub fn root_set(
 }
 
 /// What a device or server keeps of an identity to check it, and hands
-/// on so another can (P7-08): its genesis, absent for a phrase identity
+/// on so another can: its genesis, absent for a phrase identity
 /// (its one root is its id), and its newest state, if any. Recovery with
 /// a root needs it from anywhere that has it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,12 +886,12 @@ pub struct IdentityRecord {
 }
 
 /// The domain of the signature that ties a local account to a portable
-/// identity (P7-04).
+/// identity.
 pub const TIE_DOMAIN: &[u8] = b"spoolframe tie v1\0";
 
 /// What a portable user signs to tie their identity to the local account
 /// `username` on the server whose endpoint id is `server`, answering the
-/// server's `nonce` (P7-04): [`TIE_DOMAIN`], the server's id (32 bytes),
+/// server's `nonce`: [`TIE_DOMAIN`], the server's id (32 bytes),
 /// the nonce (32), the user (32), then the username's length in bytes
 /// (u16, big-endian) and its UTF-8. Each part keeps a proof from being
 /// used elsewhere: on another server, again on this one, for another
@@ -920,22 +918,22 @@ pub fn tie_message(
 
 /// Who signed a [`tie_message`] for a portable user: their root, on the
 /// phone that holds it, or one of their device keys, with the credential
-/// the root gave it (P7-04). Either way the root itself never travels.
+/// the root gave it. Either way the root itself never travels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TieProof {
-    /// A root's signature: the phrase root the user's id is, or (P7-08)
+    /// A root's signature: the phrase root the user's id is, or
     /// the root it names, which the verifier checks is one of the user's.
     Root {
         signature: RootSignature,
         // Left out when none, not for older peers: a server and a device keep
-        // these as JSON, and records written before P7-08 have no key.
+        // these as JSON, and older records have no key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         root: Option<RootKey>,
         /// The identity's genesis, for a verifier that has not seen it
-        /// (P7-08, as [`UserDeviceCredential::genesis`]).
+        /// (as [`UserDeviceCredential::genesis`]).
         // Left out when none, not for older peers: a server and a device keep
-        // these as JSON, and records written before P7-08 have no key.
+        // these as JSON, and older records have no key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         genesis: Option<Box<IdentityGenesis>>,
     },

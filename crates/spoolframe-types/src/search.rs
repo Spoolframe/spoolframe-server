@@ -1,4 +1,4 @@
-//! What a search covers and how its results are grouped (P3-09), and the
+//! What a search covers and how its results are grouped, and the
 //! people it finds.
 
 use serde::{Deserialize, Serialize};

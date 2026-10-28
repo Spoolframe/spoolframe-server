@@ -1,5 +1,4 @@
-//! The source over the client SDK's `ManagedPlayback`, as the Apple app's
-//! bridge read it (feature `sdk`).
+//! The source over the client SDK's `ManagedPlayback` (feature `sdk`).
 
 use spoolframe_client_sdk::{self as sdk, SdkError};
 use tokio::sync::watch;
@@ -13,7 +12,7 @@ use crate::source::{Chunk, ManifestKind, Segment, Source, Subtitle};
 pub struct SdkSource {
     playback: sdk::ManagedPlayback,
     /// The plan this source serves. The SDK plans an Auto playback again
-    /// behind it (PX-46: a slow link, a share of the uplink that moved);
+    /// behind it (a slow link, a share of the uplink that moved);
     /// one that differs is served under a new path for the player.
     plan: sdk::PlaybackPlan,
 }

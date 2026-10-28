@@ -1,4 +1,4 @@
-//! How a viewer wants tracks chosen (P1-20). Kept per user on the server,
+//! How a viewer wants tracks chosen. Kept per user on the server,
 //! so a TV and a laptop choose the same.
 
 use serde::{Deserialize, Serialize};
@@ -9,9 +9,8 @@ use crate::media::AudioRole;
 /// language of the file's default audio track.
 pub const ORIGINAL_LANGUAGE: &str = "original";
 
-/// Every field is required on the wire (PX-15): a peer that leaves one out
-/// is refused, not filled in. The server keeps these as JSON and reads its
-/// older rows with the defaults filled in itself (`store::tracks`).
+/// Every field is required on the wire: a peer that leaves one out
+/// is refused, not filled in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackPreferences {
     pub audio: AudioPreferences,
@@ -47,7 +46,7 @@ pub struct SubtitlePreferences {
     /// read them as text.
     pub bitmap: BitmapPreference,
     /// Forced subtitles (only the parts in another language) among a
-    /// subtitle search's results (PX-02). Playback follows `mode`.
+    /// subtitle search's results. Playback follows `mode`.
     pub forced: ForcedPreference,
 }
 
@@ -69,7 +68,7 @@ pub enum SubtitleMode {
 }
 
 /// What to do with subtitles for the deaf and hard of hearing: in
-/// playback, which track is chosen; in a subtitle search (PX-02), the
+/// playback, which track is chosen; in a subtitle search, the
 /// results' order, or which are listed at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +78,8 @@ pub enum SdhPreference {
     /// Never SDH: a search lists none.
     Avoid,
     /// Only SDH: no subtitles where there is none, and a search lists no
-    /// plain ones. A build before it reads it as `Accept`.
+    /// plain ones. An older peer that does not know it reads it as
+    /// `Accept`.
     Only,
     /// Plain subtitles first, SDH when there are none. Also any value this
     /// build does not know. (Last, as serde wants of `other`.)
@@ -89,7 +89,7 @@ pub enum SdhPreference {
 }
 
 /// What to do with forced subtitles (only the parts in another language:
-/// signs, a foreign line) in a subtitle search's results (PX-02): the
+/// signs, a foreign line) in a subtitle search's results: the
 /// same four ways as [`SdhPreference`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

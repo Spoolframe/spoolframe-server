@@ -1,6 +1,11 @@
-//! Server-to-server federation on `spoolframe/federation/1` (P8-01,
-//! ARCHITECTURE §26–§28): pairing two servers, and replicating what one
-//! shares with the other ([`SyncLibrary`] and the rest, P8-02).
+//! Server-to-server federation on `spoolframe/federation/1`: pairing two
+//! servers, and replicating what one shares with the other
+//! ([`SyncLibrary`] and the rest).
+//!
+//! An app does not speak this ALPN. It sees a paired server's libraries
+//! and items through its own server, as `fed:` ids. The client protocol's
+//! types for playing them directly are here too: [`RemoteHints`],
+//! [`RemoteGranted`], [`RedeemPlayToken`] and [`PlayTokenRedeemed`].
 //!
 //! Experimental ([`crate::experimental::FEDERATION`]): a server serves the
 //! ALPN only while its `experimental { federation = true; }` is on, and
@@ -37,8 +42,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// The version of `spoolframe/federation/1`'s messages this build speaks:
-/// the ALPN versions itself (P8-01, 2026-10-22), apart from the client
-/// protocol's [`crate::PROTOCOL_VERSION`].
+/// the ALPN versions itself, apart from the client protocol's
+/// [`crate::PROTOCOL_VERSION`].
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The least time between two syncs a pair's [`PeerRequest::SharesChanged`]
@@ -94,12 +99,11 @@ impl PeerHello {
 }
 
 /// Whether `request` names a paired server's item, library or image
-/// anywhere, in any field (a `fed:` id, P8-02): what a server refuses from
+/// anywhere, in any field (a `fed:` id): what a server refuses from
 /// a client that did not name the experimental `federation` feature, at
-/// one boundary rather than in each request's handler (L1). A
-/// [`crate::Request`], or a resource's request, as an image's is
-/// (F8-11). Text that only starts like one, a search's or a name, is not
-/// an id.
+/// one boundary rather than in each request's handler. A
+/// [`crate::Request`], or a resource's request, as an image's is. Text
+/// that only starts like one, a search's or a name, is not an id.
 pub fn names_federated<T: Serialize + ?Sized>(request: &T) -> bool {
     fn names(value: &ciborium::Value) -> bool {
         match value {
@@ -130,8 +134,8 @@ pub fn federated_id(text: &str) -> bool {
 
 /// A server's `name` cut to [`crate::MAX_HELLO_TEXT`] characters, as a
 /// [`PeerHello`]'s is: what a server keeps of another's name, from
-/// wherever it came. Control characters go first (M8-03): the name is
-/// logged, and a newline in it would forge a line of the log.
+/// wherever it came. Control characters go first: the name is logged,
+/// and a newline in it would forge a line of the log.
 pub fn server_name(mut name: String) -> String {
     name.retain(|c| !c.is_control());
     crate::messages::cut(&mut name);
@@ -295,7 +299,7 @@ impl fmt::Display for PairingRefused {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unpaired {}
 
-/// An admin's `PairServer` (client protocol, P8-01): the other server's
+/// An admin's `PairServer` (client protocol): the other server's
 /// `federation` invite link, with its code.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairServer {
@@ -312,7 +316,7 @@ impl fmt::Debug for PairServer {
 /// The most libraries one `ShareLibraries` names; the rest are left out.
 pub const MAX_SHARED: usize = 64;
 
-/// An admin's `ShareLibraries` (client protocol, P8-03): share libraries
+/// An admin's `ShareLibraries` (client protocol): share libraries
 /// of this server with a paired one, as the QR flow offers once the pair
 /// is made. Every user of the paired server may browse and watch them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,7 +336,7 @@ impl ShareLibraries {
     }
 }
 
-/// A server paired by `PairServer` (client protocol, P8-01), as the app
+/// A server paired by `PairServer` (client protocol), as the app
 /// shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerServer {
@@ -356,7 +360,7 @@ pub enum PeerRequest {
     /// A paired server unpaired: `Done`, then the connection is closed
     /// with [`crate::close::UNPAIRED`].
     Unpaired(Unpaired),
-    /// A pair's: the libraries shared with it now (P8-02): `Libraries`.
+    /// A pair's: the libraries shared with it now: `Libraries`.
     Libraries,
     /// A pair's: what the sender shares with the server it is sent to
     /// changed (a grant added or revoked), so that one syncs the sender
@@ -369,25 +373,25 @@ pub enum PeerRequest {
     /// does not know it resets the stream `NOT_ALLOWED`, which changes
     /// nothing.
     SharesChanged,
-    /// A pair's: one shared library's changes (P8-02): `Page`s on the
+    /// A pair's: one shared library's changes: `Page`s on the
     /// same stream, the last with `more: false`; `NotShared` for a
     /// library that is not shared with it, `Unavailable` when it cannot
     /// be walked now.
     Sync(SyncLibrary),
-    /// A pair's: one image of an item in a library shared with it
-    /// (P8-02): `Artwork`, `NotShared` or `NotFound`, written as a reply
+    /// A pair's: one image of an item in a library shared with it:
+    /// `Artwork`, `NotShared` or `NotFound`, written as a reply
     /// ([`crate::codec::write_reply`]), not a frame.
     Artwork(ArtworkFetch),
     /// A pair's: it vouches for one of its users, who wants an item of
-    /// this server's (P8-03): `Token`, or `AssertionRefused`.
+    /// this server's: `Token`, or `AssertionRefused`.
     AssertUser(AssertUser),
     /// A pair's: one of its users searches subtitles for an item of this
-    /// server's (P8-07): `SubtitleResults`, or `Failed`.
+    /// server's: `SubtitleResults`, or `Failed`.
     SearchSubtitles(SubtitleSearchAsk),
-    /// A pair's: one of its users downloads a result (P8-07), counted
+    /// A pair's: one of its users downloads a result, counted
     /// under the pair: `SubtitleDownloaded`, or `Failed`.
     DownloadSubtitle(SubtitleDownloadAsk),
-    /// A pair's: one of its users removes a downloaded subtitle (P8-07):
+    /// A pair's: one of its users removes a downloaded subtitle:
     /// `Done`, or `Failed`.
     RemoveSubtitleDownload(SubtitleRemovalAsk),
     /// A request this build does not know: not allowed.
@@ -427,22 +431,22 @@ pub enum PeerReply {
     /// The sharing server cannot answer now (its catalog is down): the
     /// asker keeps what it has and asks again later.
     Unavailable,
-    /// The token for an [`AssertUser`] (P8-03).
+    /// The token for an [`AssertUser`].
     Token(TokenGranted),
     /// No token for an [`AssertUser`], and why.
     AssertionRefused {
         reason: AssertionRefused,
     },
-    /// A subtitle search's results (P8-07).
+    /// A subtitle search's results.
     SubtitleResults {
         search: spoolframe_types::SubtitleSearch,
     },
-    /// A subtitle downloaded (P8-07).
+    /// A subtitle downloaded.
     SubtitleDownloaded {
         downloaded: spoolframe_types::SubtitleDownloaded,
     },
-    /// A subtitle ask refused (P8-07), as the client protocol would refuse
-    /// it: SB passes it on to its device as it is.
+    /// A subtitle ask refused, as the client protocol would refuse
+    /// it: the home server passes it on to its device as it is.
     Failed {
         error: crate::Error,
     },

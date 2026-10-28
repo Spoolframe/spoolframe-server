@@ -1,4 +1,4 @@
-//! Music offline (PX-51): tracks downloaded on purpose, and tracks kept from listening.
+//! Music offline: tracks downloaded on purpose, and tracks kept from listening.
 //!
 //! A download is of a track, an album, an artist, a playlist or Liked
 //! ([`MusicTarget`]). Each track is one stored file per quality, held by
@@ -146,12 +146,12 @@ pub enum MusicTarget {
     Artist {
         id: MediaId,
     },
-    /// A playlist (PX-40), in sync: tracks added come down, tracks
+    /// A playlist, in sync: tracks added come down, tracks
     /// removed go unless another download holds them.
     Playlist {
         id: String,
     },
-    /// The user's Liked (PX-43), in sync as a playlist.
+    /// The user's Liked, in sync as a playlist.
     Liked,
 }
 
@@ -414,7 +414,7 @@ struct MusicState {
     downloads: Vec<StoredMusic>,
     /// The tracklists of the albums with tracks here, as the server had
     /// them when a download last read them: for showing the songs not on
-    /// the device. None in a `music.json` from before.
+    /// the device. Absent from the file: none.
     #[serde(default)]
     albums: Vec<StoredAlbum>,
 }

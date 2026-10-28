@@ -1,5 +1,5 @@
-//! Passkeys in the apps (P3-19), each server through a relying party of
-//! its own under `spoolframe.app` (PX-14): [`ServerId::rp_id`].
+//! Passkeys in the apps, each server through a relying party of
+//! its own under `spoolframe.app`: [`ServerId::rp_id`].
 //!
 //! A platform's passkey API works only for a domain the app is associated
 //! with when it is built; a self-hosted server's own domain is not known
@@ -9,11 +9,10 @@
 //! and the server over this protocol; the server never contacts
 //! `spoolframe.app`.
 //!
-//! Every server once shared `spoolframe.app` itself ([`LEGACY_APP_RP_ID`]).
-//! A security key with passkeys for two servers then offered both to a
-//! sign-in that listed none, the platform took one, and the other server
-//! refused it. With a relying party per server, a key offers only that
-//! server's. Passkeys made for the shared one sign in nowhere now.
+//! Because each server has its own relying party, a security key with
+//! passkeys for two servers offers only the right server's at a sign-in.
+//! A passkey made for `spoolframe.app` itself ([`LEGACY_APP_RP_ID`]) signs
+//! in nowhere: its user adds it again.
 //!
 //! Every server keeps its own passkeys, so a passkey made on one is
 //! refused by another. Each user has a random user handle per server, so
@@ -21,7 +20,7 @@
 //!
 //! The relying party comes from the server id the server names in
 //! `ServerInfo`, and a server may name another's. So the challenge still
-//! names the server by its key (PX-09, finding 2): a server sends a random
+//! names the server by its key: a server sends a random
 //! nonce, never a challenge, and the challenge is [`app_passkey_challenge`]
 //! of the server's endpoint id and that nonce. The server computes it with
 //! its own id; the client with the id it pinned and dialled, never one the
@@ -39,9 +38,8 @@ use sha2::{Digest, Sha256};
 
 use crate::server_id::{APP_RP_DOMAIN, ServerId};
 
-/// The relying party every server's app passkeys were made for before
-/// each server had its own (PX-14). A passkey stored with it signs in
-/// nowhere now: its user adds it again.
+/// The relying party shared by all servers, with no server id. A passkey
+/// stored with it signs in nowhere: its user adds it again.
 pub const LEGACY_APP_RP_ID: &str = APP_RP_DOMAIN;
 
 /// Whether a passkey made for `rp_id` was made in an app: for a server's

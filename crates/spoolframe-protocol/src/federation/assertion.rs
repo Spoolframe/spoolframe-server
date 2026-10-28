@@ -1,31 +1,34 @@
-//! Delegated authentication (P8-03): the server a user is at home on (SB)
-//! vouches for that user to the server whose item they want to play (SA),
-//! and SA answers with a short-lived token for that one item.
+//! Delegated authentication: the user's home server vouches for the user
+//! to the item's server (the paired server whose item they want to play),
+//! and the item's server answers with a short-lived token for that one
+//! item.
 //!
-//! [`AssertUser`] arriving on SB's connection is the proof: the connection
-//! proves SB's endpoint key, and only a live pair's connection reaches it.
-//! There is no signature, and an assertion cannot be replayed on another
-//! connection. SB asserts only its own local accounts, never a portable
-//! guest of its, and names each by its stable user id, so a rename on SB
-//! changes nothing on SA.
+//! [`AssertUser`] arriving on the home server's connection is the proof:
+//! the connection proves the home server's endpoint key, and only a live
+//! pair's connection reaches it. There is no signature, and an assertion
+//! cannot be replayed on another connection. The home server asserts only
+//! its own local accounts, never a portable guest of its, and names each
+//! by its stable user id, so a rename on the home server changes nothing
+//! on the item's server.
 //!
-//! SA checks that the item is in a library shared with SB, and mints a
-//! random bearer token, bound to the device's endpoint id: a token that
-//! leaks is useless from another device. P8-04 redeems it on SA's client
-//! protocol.
+//! The item's server checks that the item is in a library shared with the
+//! home server, and mints a random bearer token, bound to the device's
+//! endpoint id: a token that leaks is useless from another device. The
+//! token is redeemed on the item's server's client protocol
+//! (`Request::RedeemPlayToken`).
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 /// What a token opens. A play token opens one item's playback; a
-/// download token (P8-07) opens one item's download.
+/// download token opens one item's download.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenScope {
     #[default]
     Play,
-    /// One item's download (P8-07): preparing it, asking how it goes,
+    /// One item's download: preparing it, asking how it goes,
     /// cancelling it, reading its file and hearing `DownloadChanged`. The
     /// session it opens lives while the download is made and read, not
     /// minutes as a play's.
@@ -36,7 +39,7 @@ pub enum TokenScope {
 }
 
 impl TokenScope {
-    /// Its name on the wire, and in the store.
+    /// Its name on the wire.
     pub fn name(self) -> &'static str {
         match self {
             TokenScope::Play => "play",
@@ -46,32 +49,36 @@ impl TokenScope {
     }
 }
 
-/// SB vouches for its local `user`, who wants `item` of SA's on the
-/// device `client_endpoint`: `Token`, or `AssertionRefused`.
+/// The home server vouches for its local `user`, who wants `item` of the
+/// item's server on the device `client_endpoint`. Answered with `Token`, or
+/// `AssertionRefused`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertUser {
-    /// The user's stable id on SB: a UUID, never a portable user's id.
+    /// The user's stable id on the home server: a UUID, never a portable
+    /// user's id.
     pub user: String,
-    /// Always empty (F8-08): a server never sends its users' names to
-    /// another, which knows them by `user` alone. Kept for the wire, to
-    /// go in the federation protocol's next version; what a server reads
-    /// of it is cut to [`crate::MAX_HELLO_TEXT`] characters.
+    /// Always empty: a server never sends its users' names to another,
+    /// which knows them by `user` alone. Kept for the wire; what a server
+    /// reads of it is cut to [`crate::MAX_HELLO_TEXT`] characters.
     pub display_name: String,
     /// The device's endpoint id, hex: the only one the token works from.
     pub client_endpoint: String,
-    /// The item, by SA's own id (what SB's `fed:` id carries).
+    /// The item, by the item's server's own id (what the home server's
+    /// `fed:` id carries).
     pub item: String,
     /// What the token is for; a play when left out.
     #[serde(default)]
     pub scope: TokenScope,
-    /// The user's track preferences on SB (P8-04): what SA chooses the
-    /// audio and subtitles by when the play sends no selection, as SB
-    /// would. Left out, SA's defaults.
+    /// The user's track preferences on the home server: what the item's
+    /// server chooses the audio and subtitles by when the play sends no
+    /// selection, as the home server would. Left out, the item's server
+    /// uses its defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferences: Option<spoolframe_types::TrackPreferences>,
-    /// A download token's one download, by SA's id (P8-07): what the
-    /// device's own token reads. Left out, the token's session prepares
-    /// the item's download itself (SB's own, which keeps the record).
+    /// A download token's one download, by the item's server's id: what
+    /// the device's own token reads. Left out, the token's session
+    /// prepares the item's download itself (the home server's own
+    /// download, which keeps the record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download: Option<String>,
 }
@@ -85,7 +92,7 @@ impl AssertUser {
     }
 }
 
-/// SA's token for an [`AssertUser`].
+/// The item's server's token for an [`AssertUser`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenGranted {
     /// The bearer token: whoever holds it, from the device it is bound to,
@@ -107,20 +114,23 @@ impl fmt::Debug for TokenGranted {
     }
 }
 
-/// Why SA minted no token. Each is counted against the pair.
+/// Why the item's server minted no token. Each is counted against the
+/// pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssertionRefused {
-    /// The item is in no library shared with the pair, or is not SA's own.
+    /// The item is in no library shared with the pair, or is not the
+    /// item's server's own.
     NotShared,
     /// The user is not named by a stable user id: a portable guest, or
     /// nothing that reads.
     InvalidUser,
     /// The device's endpoint id does not read.
     InvalidDevice,
-    /// A scope SA does not know.
+    /// A scope the item's server does not know.
     InvalidScope,
-    /// SA cannot say now (its catalog or store failed): try again later.
+    /// The item's server cannot say now (its catalog or store failed):
+    /// try again later.
     Unavailable,
     /// A reason this build does not know.
     #[serde(other)]

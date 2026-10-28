@@ -1,8 +1,8 @@
-//! Refusals on this device in the log, as the server logs its own
-//! (finding 46): one WARN line on [`TARGET`] per refusal, naming what was
+//! Refusals on this device in the log, as the server logs its own: one
+//! WARN line on [`TARGET`] per refusal, naming what was
 //! asked, from where, for whom if known, and why; never a code, key or
 //! credential. The first is a guest's pairing refused under the device's
-//! policy or for a wrong code (P7-03).
+//! policy or for a wrong code.
 //!
 //! Whoever can reach the device can make a refused attempt, so the lines
 //! are limited as the server's are: per source and reason, [`PER_WINDOW`]

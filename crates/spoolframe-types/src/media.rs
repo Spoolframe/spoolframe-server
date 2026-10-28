@@ -1,6 +1,6 @@
 //! What a client learns about a media file before it plays it: its length,
 //! what it is (container and picture, to show), and the tracks it can
-//! choose between (ARCHITECTURE §6).
+//! choose between.
 //!
 //! Audio and subtitle codecs stay on the server, where the playback
 //! planner uses them; a client chooses an audio language, not a codec.
@@ -27,8 +27,8 @@ pub struct MediaTracks {
     ///
     /// This and `VideoTrack::bit_rate` are not `required::option`, though
     /// every server sends them: the SDK keeps an item's file and tracks
-    /// with a download, and one kept before them lacks the keys, which
-    /// read as `None`.
+    /// with a download, and a download kept by an older SDK lacks the
+    /// keys, which read as `None`.
     pub bit_rate: Option<u64>,
     /// The main picture; `None` for audio only (music).
     pub video: Option<VideoTrack>,
@@ -53,7 +53,7 @@ pub struct VideoTrack {
     pub hdr: Option<HdrFormat>,
     /// The picture's own average bits per second, where the file says:
     /// MP4 does for each stream, Matroska where its muxer wrote
-    /// statistics tags (mkvmerge does). As [`MediaFile::bit_rate`].
+    /// statistics tags (mkvmerge does). As [`MediaTracks::bit_rate`].
     pub bit_rate: Option<u64>,
 }
 
@@ -65,7 +65,7 @@ pub struct AudioTrack {
     pub channels: Option<u32>,
     /// The file marks it as the one to play by default.
     pub default: bool,
-    /// What the track is for, whatever its title says (P1-20).
+    /// What the track is for, whatever its title says.
     pub role: AudioRole,
 }
 
@@ -97,16 +97,16 @@ pub struct SubtitleTrack {
     pub default: bool,
     /// From a separate file next to the media, not inside it.
     pub external: bool,
-    /// What the track is for, whatever its title says (P1-20).
+    /// What the track is for, whatever its title says.
     pub role: SubtitleRole,
-    /// How the track is timed (PX-03): an external text track's sync and
+    /// How the track is timed: an external text track's sync and
     /// offset, the same for every user. Only for an external text track
     /// (SRT, WebVTT, ASS), in an item's tracks; `None` for every other
     /// track, whose timing is the file's. Read as `None` when left out,
-    /// as a download's tracks kept by an SDK before it lack it.
+    /// as a download's tracks kept by an older SDK lack it.
     #[serde(default)]
     pub timing: Option<SubtitleTiming>,
-    /// Where a track someone downloaded came from (PX-02): its source,
+    /// Where a track someone downloaded came from: its source,
     /// who downloaded it and when, in an item's tracks; `None` for every
     /// track that was not downloaded. Read as `None` when left out, as
     /// `timing` is.
@@ -114,10 +114,9 @@ pub struct SubtitleTrack {
     pub download: Option<SubtitleDownload>,
 }
 
-/// A subtitle site the server searches and downloads from (PX-02). On
-/// the wire, in the database and in `subtitles.sources` it is its
-/// [`id`](SubtitleSource::id), a string: a client shows a site this build
-/// does not know as that id.
+/// A subtitle site the server searches and downloads from. On the wire
+/// it is its [`id`](SubtitleSource::id), a string: a client shows a site
+/// this build does not know as that id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SubtitleSource {
     OpenSubtitles,
@@ -163,7 +162,7 @@ impl std::fmt::Display for SubtitleSource {
     }
 }
 
-/// A subtitle track downloaded from a subtitle site (PX-02), for everyone
+/// A subtitle track downloaded from a subtitle site, for everyone
 /// on the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleDownload {
@@ -187,7 +186,7 @@ pub struct SubtitleDownload {
     pub can_remove: bool,
 }
 
-/// Who made a subtitle (PX-02).
+/// Who made a subtitle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubtitleOrigin {
@@ -202,7 +201,7 @@ pub enum SubtitleOrigin {
     Human,
 }
 
-/// One subtitle a search found (PX-02), to download by its `id`.
+/// One subtitle a search found, to download by its `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleResult {
     /// What `DownloadSubtitle` names: the site's id and its file's,
@@ -241,7 +240,7 @@ pub struct SubtitleResult {
     pub downloaded: bool,
 }
 
-/// What a subtitle search found for an item (PX-02), best first: hash
+/// What a subtitle search found for an item, best first: hash
 /// matches, then the rest by rating and downloads; machine-translated and
 /// AI-made after people's; rejected ones last. Every site the server
 /// searches is asked at once, and their results are one list.
@@ -255,7 +254,7 @@ pub struct SubtitleSearch {
     pub sources: Vec<SubtitleSourceStatus>,
 }
 
-/// How one site's part of a search went (PX-02).
+/// How one site's part of a search went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleSourceStatus {
     /// `opensubtitles` or `subdl`, as [`SubtitleResult::source`].
@@ -265,7 +264,7 @@ pub struct SubtitleSourceStatus {
     pub state: SubtitleSourceState,
 }
 
-/// Whether a site answered a search (PX-02).
+/// Whether a site answered a search.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubtitleSourceState {
@@ -284,7 +283,7 @@ pub enum SubtitleSourceState {
     Unknown,
 }
 
-/// A subtitle downloaded (PX-02): the item's new track, at once, and the
+/// A subtitle downloaded: the item's new track, at once, and the
 /// downloads left today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleDownloaded {
@@ -299,7 +298,7 @@ pub struct SubtitleDownloaded {
     pub user_remaining: Option<u32>,
 }
 
-/// Whose downloads ran out (PX-02).
+/// Whose downloads ran out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaOf {
@@ -313,7 +312,7 @@ pub enum QuotaOf {
     Unknown,
 }
 
-/// How an external text subtitle is timed (PX-03): synced to the file or
+/// How an external text subtitle is timed: synced to the file or
 /// as it came, and moved by a manual offset on top. Set for everyone who
 /// plays the item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,7 +330,7 @@ pub struct SubtitleTiming {
     pub offset_at: Option<i64>,
 }
 
-/// Where a subtitle's sync is (PX-03).
+/// Where a subtitle's sync is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubtitleSync {

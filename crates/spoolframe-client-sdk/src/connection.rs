@@ -1,5 +1,5 @@
-//! One connection to one server, shared by every session on it (§15),
-//! and how long its requests may take (P1-15).
+//! One connection to one server, shared by every session on it,
+//! and how long its requests may take.
 //!
 //! Every request has a time limit. A connection can die without closing:
 //! iOS suspends an app, the server side drops it, and when the app comes
@@ -42,8 +42,8 @@ use crate::reachability::DialStage;
 /// How long a dial may take before the server counts as unreachable.
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Local SDK allocation policy, not a new wire restriction. Even an
-/// original image must fit this budget before the SDK buffers it.
+/// The most artwork bytes the SDK buffers: a limit of the SDK, not of the
+/// protocol. Even an original image must fit it.
 const MAX_ARTWORK_BYTES: u64 = 64 << 20;
 
 /// How long the SDK waits for a server's answers.
@@ -163,7 +163,7 @@ impl ServerConnection {
             platform: device.platform,
             device_name: Some(device.name.clone()),
             capabilities: Some(device.capabilities.clone()),
-            // What the app asked for (PX-49); the answer names what the
+            // What the app asked for; the answer names what the
             // server turned on.
             experimental: experimental.names(),
         });
@@ -214,7 +214,7 @@ impl ServerConnection {
                 actual: info.endpoint_id,
             }));
         }
-        // It names the relying party of the server's app passkeys (PX-14):
+        // It names the relying party of the server's app passkeys:
         // one that is not an id is never pinned or used.
         if let Err(e) = spoolframe_protocol::ServerId::parse(&info.server_id) {
             conn.close(0u32.into(), b"not a server id");
@@ -359,7 +359,7 @@ impl ServerConnection {
     }
 
     /// [`Self::resource`], its time and bytes counted as `metering`
-    /// says (P6-06, PX-46).
+    /// says.
     async fn resource_metered(
         &self,
         request: &ResourceRequest,
@@ -424,7 +424,7 @@ impl ServerConnection {
         Ok((response, body))
     }
 
-    /// `request`, then `body` on the same stream (PX-53's cover upload):
+    /// `request`, then `body` on the same stream (a cover upload):
     /// the response, which has no body of its own. A refusal the server
     /// sends before reading the body (it then stops the stream, so the
     /// body's write fails) is the answer, not the failed write.
@@ -494,7 +494,7 @@ impl ServerConnection {
     }
 
     /// One media read, counted as `metering` says: a direct read whole, a
-    /// converted one from its first byte (P6-06, PX-46).
+    /// converted one from its first byte.
     pub async fn read(
         &self,
         request: &MediaRead,
@@ -513,7 +513,7 @@ impl ServerConnection {
         Ok((response, bytes))
     }
 
-    /// [`Self::read`]'s answer, its body to read as it arrives (PX-46): a
+    /// [`Self::read`]'s answer, its body to read as it arrives: a
     /// bridge hands a player the first bytes of a segment while the rest
     /// is on its way. `None` for a refusal, which has no body.
     pub async fn read_open(
@@ -761,7 +761,7 @@ impl Drop for Metered {
     }
 }
 
-/// The body of a resource read, as it arrives (PX-46): its announced
+/// The body of a resource read, as it arrives: its announced
 /// `length`, then pieces of it until it is all there. No pause between
 /// pieces may be longer than the read's stall limit. The link meter is
 /// fed as pieces arrive, the same as for a read gathered whole; dropping

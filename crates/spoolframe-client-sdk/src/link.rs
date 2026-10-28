@@ -1,4 +1,4 @@
-//! Keeping one server connected (P1-15).
+//! Keeping one server connected.
 //!
 //! A link holds a server's current connection and its state. Once
 //! connected, a supervisor task watches the connection; when it is lost,
@@ -87,7 +87,7 @@ pub enum ConnectionPath {
     /// port or a hole punched in NAT.
     Direct { addr: SocketAddr },
     /// Through a relay server: one the server told this device of, with
-    /// [`crate::ClientOptions::relays`] on (P6-03).
+    /// [`crate::ClientOptions::relays`] on.
     Relay,
     /// Not connected now, or no path selected yet.
     Unknown,
@@ -211,9 +211,9 @@ pub(crate) struct Link {
     /// nothing, and no supervisor starts or goes on. A watch, so the
     /// supervisor's waits end on it ([`Link::closing`]): it stops between
     /// steps, never inside one, so a write to storage it began is
-    /// finished (C6).
+    /// finished.
     closed: watch::Sender<bool>,
-    /// How fast media comes from the server (P6-06), across connections.
+    /// How fast media comes from the server, across connections.
     meter: Arc<LinkMeter>,
     /// How many [`Link::check`]s of the open connection are under way.
     checks: watch::Sender<u32>,
@@ -248,7 +248,7 @@ impl Link {
         })
     }
 
-    /// How fast media comes from the server (P6-06).
+    /// How fast media comes from the server.
     pub fn meter(&self) -> Arc<LinkMeter> {
         self.meter.clone()
     }
@@ -465,7 +465,7 @@ impl Link {
     /// Stop: no more reconnects, and the connection closed. For good: a
     /// dial on the way keeps nothing.
     ///
-    /// The supervisor is not aborted (C6): aborting it in the middle of
+    /// The supervisor is not aborted: aborting it in the middle of
     /// saving what the server told could cut a storage write short. It
     /// sees the link closed at its next wait, which ends on it, and
     /// returns. Every step between two waits ends by itself: a dial
@@ -626,13 +626,13 @@ async fn signed_out(link: &Link, client: &Weak<Inner>) {
 
 /// Returns when `conn` closes, the server says it is shutting down (then
 /// it is about to close, and dialling can start), or the link is closed.
-/// Meanwhile the server's other events on it are applied. Its addresses
-/// (PX-12), pushed once the device is signed in and when they change,
+/// Meanwhile the server's other events on it are applied. Its addresses,
+/// pushed once the device is signed in and when they change,
 /// replace those it told before.
 ///
 /// Only reading the next event is cut short by a close: an event read is
 /// applied in full first, so saving the addresses is never stopped
-/// halfway (C6). If the events stream cannot be read, waits for the
+/// halfway. If the events stream cannot be read, waits for the
 /// connection to close instead.
 async fn until_lost(link: &Link, conn: &Connection, client: &Weak<Inner>) {
     let stop = async {
@@ -690,8 +690,8 @@ fn tell_music(client: &Weak<Inner>, id: EndpointId, followed: Followed) {
 async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::ControlFlow<()> {
     match event {
         Event::ShuttingDown => return std::ops::ControlFlow::Break(()),
-        // PX-40: for whoever shows playlists; PX-51: a playlist
-        // downloaded is asked about again.
+        // For whoever shows playlists; a playlist downloaded is asked
+        // about again.
         Event::PlaylistChanged {
             id: playlist,
             revision,
@@ -723,7 +723,7 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
             tell_playlists(client, id, crate::PlaylistChange::Gone { id: playlist });
         }
         Event::PinsChanged => tell_playlists(client, id, crate::PlaylistChange::PinsChanged),
-        // PX-51: Liked downloaded is asked about again.
+        // Liked downloaded is asked about again.
         Event::LikedChanged => tell_music(client, id, Followed::Liked),
         Event::ServerAddresses {
             addrs,
@@ -736,7 +736,7 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 tracing::warn!(server = %id, error = %e, "cannot save the addresses the server told");
             }
         }
-        // Followed by the managed playback of `handle` (PX-46).
+        // Followed by the managed playback of `handle`.
         Event::PlaybackShare {
             handle,
             max_bitrate,
@@ -749,12 +749,12 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 });
             }
         }
-        // P8-04: a paired server's item's playback ended where it plays;
+        // A paired server's item's playback ended where it plays;
         // the next use of it says so, as it would without this.
         Event::PlaybackEnded { error, .. } => {
             tracing::info!(server = %id, %error, "a paired server's item's playback ended");
         }
-        // PX-03: for whoever shows or plays the track.
+        // For whoever shows or plays the track.
         Event::SubtitleTimingChanged {
             id: item,
             track,
@@ -769,13 +769,13 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                 });
             }
         }
-        // PX-38: the download manager asks again at once.
+        // The download manager asks again at once.
         Event::DownloadChanged { id: download, .. } => {
             if let Some(inner) = client.upgrade() {
                 inner.downloads.server_event(id, download);
             }
         }
-        // Experimental (P8-02): for whoever lists the libraries.
+        // Experimental: for whoever lists the libraries.
         Event::LibrariesChanged => {
             if let Some(inner) = client.upgrade() {
                 let _ = inner.library_events.send(crate::LibrariesChanged {

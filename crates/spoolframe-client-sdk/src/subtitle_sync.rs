@@ -1,6 +1,6 @@
-//! Subtitle sync and offset (PX-03):
-//! an external text subtitle (SRT, WebVTT, ASS beside the film) synced to
-//! the file, or moved by a manual offset, for everyone who plays the item.
+//! Subtitle sync and offset: an external text subtitle (SRT, WebVTT, ASS
+//! beside the film) synced to the file, or moved by a manual offset, for
+//! everyone who plays the item.
 //!
 //! Each such track's `SubtitleTrack::timing` (from [`Session::tracks`])
 //! says how it is timed. [`Session::sync_subtitle`] starts a sync in the
@@ -18,7 +18,7 @@ use spoolframe_types::{MediaId, SubtitleTiming};
 
 use crate::{SdkError, Session};
 
-/// A subtitle track's timing changed (PX-03), as a server told.
+/// A subtitle track's timing changed, as a server told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTimingEvent {
     /// The server's key.

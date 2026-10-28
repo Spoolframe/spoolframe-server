@@ -1,5 +1,5 @@
-//! Syncing a phrase identity's root between the user's own devices
-//! (2026-10-12): opt-in per identity, off unless the user turns it on, and
+//! Syncing a phrase identity's root between the user's own devices:
+//! opt-in per identity, off unless the user turns it on, and
 //! only for a phrase root. The app does the syncing (iCloud Keychain on
 //! Apple platforms); the SDK gives it the keys to sync and merges what
 //! arrives. The SDK itself never sends a root anywhere, nor logs one.
@@ -18,8 +18,8 @@
 //! taken as it comes: the SDK merges it with what is on this device, by
 //! union (a revoked key at its earliest, a device at its newest
 //! credential, states by [`super::heads`]; the name, the newest rename),
-//! and writes the union back to both. A write from one device that overwrites another's loses nothing
-//! for good: the other writes the union back the next time it merges.
+//! and writes the union back to both. A write from one device that
+//! overwrites another's loses nothing for good: the other writes the union back the next time it merges.
 //! It merges before and after every root action, and on
 //! [`Portable::merge_synced`], which the app calls when the keychain says
 //! a synced item changed, and at launch.

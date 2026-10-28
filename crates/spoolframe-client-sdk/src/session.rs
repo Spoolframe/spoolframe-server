@@ -1,4 +1,4 @@
-//! One user signed in on one server from this device (§15–16). Several
+//! One user signed in on one server from this device. Several
 //! sessions share the device's connection to that server; every call says
 //! which session it is made in.
 
@@ -36,11 +36,11 @@ pub(crate) struct StoredSession {
     pub token: Option<String>,
     pub username: String,
     pub display_name: String,
-    /// How they last signed in on this device. Stores written before it
-    /// was kept have no such field: `None`.
+    /// How they last signed in on this device. Absent from the store:
+    /// `None`.
     #[serde(default)]
     pub method: Option<SignInMethod>,
-    /// The portable identity it signed in with (P7-06), whether the
+    /// The portable identity it signed in with, whether the
     /// session is that identity's own or the account it is tied to here:
     /// what signs it in again. `None` for any other sign-in.
     #[serde(default)]
@@ -58,7 +58,7 @@ pub struct SavedProfile {
     pub sign_in: ProfileSignIn,
     /// How their last successful sign-in on this device was made, so
     /// "Who's watching" can offer the same again once their session has
-    /// ended. `None` for a profile kept before the SDK remembered it.
+    /// ended. `None` when none is recorded for the profile.
     pub method: Option<SignInMethod>,
     /// With [`SignInMethod::Portable`], the identity to sign in again
     /// with: [`crate::Client::sign_in_portable`], no password asked.
@@ -74,11 +74,11 @@ pub enum SignInMethod {
     /// [`crate::Client::finish_passkey_sign_in`], with a passkey.
     Passkey,
     /// [`crate::Client::await_device_sign_in`]: approved on another device
-    /// they were signed in on (P3-07).
+    /// they were signed in on.
     Device,
     /// [`crate::Client::sign_in_portable`] or
     /// [`crate::Client::redeem_invite_portable`]: this device's credential
-    /// for a portable identity (P7-06). Signing in again asks nothing:
+    /// for a portable identity. Signing in again asks nothing:
     /// call [`crate::Client::sign_in_portable`] with
     /// [`SavedProfile::portable`].
     Portable,
@@ -142,7 +142,7 @@ pub struct ItemsPage {
     pub items: Vec<Item>,
     /// How many items the library has in all.
     pub total: u32,
-    /// Experimental (`federation`, P8-03): the items listed that are no
+    /// Experimental (`federation`): the items listed that are no
     /// longer available, their paired server unpaired or their library
     /// no longer shared ([`Session::recently_played`]): shown as such, and
     /// not played. Empty elsewhere.
@@ -154,18 +154,18 @@ pub struct ItemsPage {
 pub struct ItemDetail {
     pub item: Item,
     pub children: Vec<Item>,
-    /// The item's intro and credits (P2-10), in order of start. Empty when
+    /// The item's intro and credits, in order of start. Empty when
     /// it has none.
     pub markers: Vec<Marker>,
-    /// The playlists the user sees that hold it (PX-40). Empty when none.
+    /// The playlists the user sees that hold it. Empty when none.
     pub playlists: Vec<spoolframe_protocol::playlists::PlaylistRef>,
-    /// Its heart (PX-43): a track's `All` or `None`, an album's `All`,
+    /// Its heart: a track's `All` or `None`, an album's `All`,
     /// `Some` or `None`. `None` for anything else.
     pub liked: Option<spoolframe_protocol::playlists::Liked>,
-    /// An album's tracks among `children` that are liked (PX-43). Empty
+    /// An album's tracks among `children` that are liked. Empty
     /// otherwise.
     pub liked_children: Vec<MediaId>,
-    /// Experimental (P8-05): where the item is from, its title's copies on
+    /// Experimental: where the item is from, its title's copies on
     /// other servers in Play from order, and the copy that plays. Only
     /// with [`crate::Experimental::federation`], and from a server that
     /// sends them.
@@ -211,12 +211,12 @@ pub struct PlaybackChange {
 /// How to start a playback, beyond its tracks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlaybackOptions {
-    /// Where a converted playback's encode begins (P2-03). Direct play
+    /// Where a converted playback's encode begins. Direct play
     /// reads from wherever the app likes.
     pub start: Option<Duration>,
-    /// How a picked bitmap subtitle (PGS) is shown (P2-07).
+    /// How a picked bitmap subtitle (PGS) is shown.
     pub bitmap: BitmapSubtitles,
-    /// The quality the viewer chose for it (P6-06).
+    /// The quality the viewer chose for it.
     pub quality: PlaybackQuality,
     /// What the screen shows as it starts (PGPU-06): its HDR formats and
     /// bit depth, over the device's capabilities, for this playback and
@@ -226,7 +226,7 @@ pub struct PlaybackOptions {
     pub display: Option<DisplayCapabilities>,
 }
 
-/// The quality a viewer chooses for a playback (P6-06). The app's own
+/// The quality a viewer chooses for a playback. The app's own
 /// limit (`ClientCapabilities::max_bitrate`) stays a ceiling over each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaybackQuality {
@@ -242,7 +242,7 @@ pub enum PlaybackQuality {
     Original,
 }
 
-/// Part of a converted playback's output (P2-04, P2-05).
+/// Part of a converted playback's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub bytes: Vec<u8>,
@@ -254,7 +254,7 @@ pub struct Chunk {
     pub epoch: u32,
 }
 
-/// A converted read's answer with its bytes still arriving (PX-46): what
+/// A converted read's answer with its bytes still arriving: what
 /// a [`Chunk`] holds, handed on piece by piece, so a player gets the first
 /// bytes of a segment while the rest is on the link. The link meter is fed
 /// as they arrive, as for a [`Chunk`].
@@ -335,7 +335,7 @@ pub struct Subtitle {
     pub bytes: Vec<u8>,
 }
 
-/// One chunk of a subtitle, as the server answered it (P2-11).
+/// One chunk of a subtitle, as the server answered it.
 struct SubtitleChunk {
     format: SubtitleFormat,
     bytes: Vec<u8>,
@@ -343,7 +343,7 @@ struct SubtitleChunk {
     version: u64,
 }
 
-/// A subtitle as its chunks arrive (P2-11): `bytes` of the `total` the
+/// A subtitle as its chunks arrive: `bytes` of the `total` the
 /// first chunk named, of the file with the `version` it named.
 struct Chunks {
     format: SubtitleFormat,
@@ -467,20 +467,20 @@ pub struct Session {
     pub(crate) token: SessionId,
     pub(crate) user: UserSummary,
     /// Whether `WhoAmI` said the user may leave the server, when this
-    /// session was made (PX-47).
+    /// session was made.
     pub(crate) can_leave: bool,
     /// Whether the server trusted this device for the user when the
-    /// session was made (P4-01); `None` for a session found again rather
+    /// session was made; `None` for a session found again rather
     /// than made ([`crate::Client::profiles`]).
     pub(crate) remembered: Option<bool>,
     /// Signed in with a one-time password an admin reset to: the session
     /// may only change the password or sign out until it does. Shared by
-    /// every clone, so a change made through one is seen by all (C5).
+    /// every clone, so a change made through one is seen by all.
     pub(crate) password_change_required: Arc<AtomicBool>,
 }
 
 /// A [`Session`] without its client, for what the client itself keeps
-/// (the download manager's sessions, PX-38): a session holds the client,
+/// (the download manager's sessions): a session holds the client,
 /// so the client holding sessions would never be dropped.
 #[derive(Clone)]
 pub(crate) struct SessionParts {
@@ -558,8 +558,8 @@ impl Session {
         self.client.server_info(self.server)?.web_url
     }
 
-    /// The experimental features the server turned on for this device
-    /// (PX-49), as the Hello of the connection this session is on said:
+    /// The experimental features the server turned on for this device,
+    /// as the Hello of the connection this session is on said:
     /// those [`crate::ClientOptions::experimental`] asked for that the
     /// server knows and has on. None before a connection, or from a server
     /// that knows none. Read it when it matters: a reconnect may change it.
@@ -570,7 +570,7 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// Experimental (`http-playback`, PX-49): where a player with no Iroh
+    /// Experimental (`http-playback`): where a player with no Iroh
     /// (an AirPlay receiver) fetches playback `handle` over plain HTTP from
     /// the server's own port, or why not. Without the feature turned on
     /// ([`Session::experimental`]) it is [`HttpPlaybackRefusal::Off`] and
@@ -604,7 +604,7 @@ impl Session {
     }
 
     /// How fast the link to the server carried direct play lately, in bits
-    /// per second (P6-06): over the last few seconds of fetching, or the
+    /// per second: over the last few seconds of fetching, or the
     /// last such reading if it is no more than ten minutes old. `None`
     /// until enough was read directly to tell.
     pub fn link_rate(&self) -> Option<u64> {
@@ -621,7 +621,7 @@ impl Session {
     }
 
     /// Whether this device was trusted for the user once the sign-in that
-    /// made this session was done (P4-01): for "Approved and remembered" or
+    /// made this session was done: for "Approved and remembered" or
     /// "Approved, not remembered" after a device sign-in, where the
     /// approver decides. `None` for a session found again by
     /// [`crate::Client::profiles`]; ask [`crate::Client::trusted_profiles`]
@@ -855,7 +855,7 @@ impl Session {
         }
     }
 
-    /// A scoped, grouped search (P3-09): the top match and a group per
+    /// A scoped, grouped search: the top match and a group per
     /// kind, or, with `request.kind`, one kind's page for "See all". With
     /// [`crate::Experimental::federation`] the server answers with hits
     /// ([`Session::search_hits`]); this gives their items.
@@ -953,12 +953,12 @@ impl Session {
     }
 
     /// [`Session::start_playback`], with `options`. A converted plan
-    /// (P2-03) starts the server's encode: read it with
+    /// starts the server's encode: read it with
     /// [`Session::read_chunk`] (progressive) or [`Session::manifest`] and
     /// [`Session::read_segment`] (HLS). [`SdkError::Busy`] means the
     /// server is converting all it may. The link's measured rate
     /// ([`Session::link_rate`]) goes with it: a slow link starts as a
-    /// conversion sized to it (P6-06).
+    /// conversion sized to it.
     pub async fn start_playback_with(
         &self,
         id: &MediaId,
@@ -995,7 +995,7 @@ impl Session {
         }
     }
 
-    /// Restart a converted playback's encode at `position` (P2-04). Reads
+    /// Restart a converted playback's encode at `position`. Reads
     /// go on with the returned epoch, from offset 0 (or from the segment
     /// at `position`).
     pub async fn seek_playback(
@@ -1013,7 +1013,7 @@ impl Session {
         }
     }
 
-    /// Unlock this profile on this device with its PIN (P2-08). A wrong
+    /// Unlock this profile on this device with its PIN. A wrong
     /// PIN is [`SdkError::InvalidCredentials`], too many in a while
     /// [`SdkError::RateLimited`]; after 10 wrong in a row the session here
     /// is ended ([`SdkError::SignInRequired`]) and the user signs in with
@@ -1021,7 +1021,7 @@ impl Session {
     /// again.
     ///
     /// The PIN that unlocks it is kept here, hashed, to unlock its
-    /// downloads offline ([`crate::Downloads::unlock_offline`], PX-60),
+    /// downloads offline ([`crate::Downloads::unlock_offline`]),
     /// and the profile is unlocked for them too if it is
     /// [`crate::Downloads::set_profile`]'s.
     pub async fn unlock(&self, pin: &str) -> Result<(), SdkError> {
@@ -1092,7 +1092,7 @@ impl Session {
         }
     }
 
-    /// This user's Plex account link (P3-12): `None` when not linked. Read
+    /// This user's Plex account link: `None` when not linked. Read
     /// only: to link or unlink, open `<web_url>/profile`
     /// ([`Session::web_url`]) in a browser.
     pub async fn plex_link(&self) -> Result<Option<PlexLink>, SdkError> {
@@ -1103,7 +1103,7 @@ impl Session {
     }
 
     /// Trust `device` (an endpoint id from [`Session::devices`]; this
-    /// device for `None`) for this user, or stop (P4-01), and say whether
+    /// device for `None`) for this user, or stop, and say whether
     /// it opens their profile at start (`auto_login`, which needs trust).
     ///
     /// - Trust and auto-login can be turned on for this device only
@@ -1142,7 +1142,7 @@ impl Session {
     }
 
     /// Delete another of this user's devices (an endpoint id from
-    /// [`Session::devices`]; P4-03): their sessions there end and are
+    /// [`Session::devices`]): their sessions there end and are
     /// forgotten, with its trust and PIN requirement, and it leaves
     /// [`Session::devices`]. If it signs in again it is listed as new.
     /// Other profiles on that device are kept.
@@ -1180,10 +1180,10 @@ impl Session {
         Ok(())
     }
 
-    /// Begin making a passkey for this user in the app (P3-19): what the
+    /// Begin making a passkey for this user in the app: what the
     /// platform's passkey API makes one with, for the relying party in
     /// [`PasskeyCreation::rp_id`] (this server's, from the server id
-    /// pinned with its key, PX-14), from [`PasskeyCreation::origin`], with
+    /// pinned with its key), from [`PasskeyCreation::origin`], with
     /// user verification. The account's name in it is
     /// `<username> @ <server name>`. Only soon after
     /// signing in: a session older than 10 minutes gets
@@ -1248,12 +1248,12 @@ impl Session {
     }
 
     /// Tie this user's account on this server to portable identity
-    /// `identity` (P7-04), proved by this device: with the identity's root
+    /// `identity`, proved by this device: with the identity's root
     /// if it holds it (the phone), else with its device credential for it
     /// ([`crate::Portable::tie_proof`]). The root is never sent. The
     /// account then lists the identity among its ties
     /// ([`UserSummary::portable`], [`Session::tie_info`]); no second
-    /// account is made. An account ties any number of identities (P7-09):
+    /// account is made. An account ties any number of identities:
     /// its other ties stay.
     ///
     /// Only soon after signing in ([`SdkError::RecentSignInRequired`]:
@@ -1292,7 +1292,7 @@ impl Session {
         .await
     }
 
-    /// Sever this account's tie to `identity` (P7-04, P7-09). Only that
+    /// Sever this account's tie to `identity`. Only that
     /// link goes: the account's other ties, its sessions and its watch
     /// state stay. Only soon after signing in, as for [`Session::tie`]; no
     /// tie to `identity` on this account is [`SdkError::NotFound`].
@@ -1300,7 +1300,7 @@ impl Session {
         self.done(Request::Untie { user: identity }).await
     }
 
-    /// Leave this server (PX-47). Once the server says it is done, this
+    /// Leave this server. Once the server says it is done, this
     /// device removes this profile, and forgets the server when no other
     /// profile is kept for it ([`crate::Client::forget`]: its pin too).
     /// On a shared device, another user's profile and session on the
@@ -1349,14 +1349,14 @@ impl Session {
     }
 
     /// The portable identities this account is tied to, as the server
-    /// says now (P7-04, P7-09): each with when it was tied and last signed
+    /// says now: each with when it was tied and last signed
     /// in, the oldest tie first. Which is this device's own is the app's
     /// to mark, from [`crate::Portable::list`].
     pub async fn tie_info(&self) -> Result<Vec<PortableTie>, SdkError> {
         Ok(self.whoami().await?.portable)
     }
 
-    /// Confirm it is this user with their account password (P3-07), when
+    /// Confirm it is this user with their account password, when
     /// a change answers [`SdkError::RecentSignInRequired`]: approving a
     /// device, adding or removing a passkey, no longer asking for the PIN.
     /// This session then counts as signed in now, for 10 minutes; ask
@@ -1440,13 +1440,13 @@ impl Session {
         self.confirmed(Request::FinishConfirmPasskey(signed)).await
     }
 
-    /// The device showing sign-in code `code` (P3-07; typed any way, or
+    /// The device showing sign-in code `code` (typed any way, or
     /// from a scanned [`crate::device_sign_in::parse_link`]), to ask "Sign
     /// in on 'Living room TV'?". A code that is not pending is
     /// [`SdkError::NotFound`]; too many of those [`SdkError::RateLimited`].
     ///
     /// The approval also shows where the device asked from
-    /// ([`DeviceSignInRequest::requested_from`], PX-09 finding 27): "The
+    /// ([`DeviceSignInRequest::requested_from`]): "The
     /// TV asked from 192.168.86.20.", or, for an address on the
     /// [`crate::AddressNetwork::Internet`] (or one this build does not
     /// know), a warning that the device is not on this network, so approve
@@ -1469,7 +1469,7 @@ impl Session {
     /// then ask).
     ///
     /// `remember` is the approver's answer to the device's request to be
-    /// remembered ([`DeviceSignInRequest::remember`], P4-01): shown as
+    /// remembered ([`DeviceSignInRequest::remember`]): shown as
     /// "This device will be remembered", ticked, and untickable. The device
     /// is trusted only if it asked and this is true.
     pub async fn approve_device_sign_in(&self, code: &str, remember: bool) -> Result<(), SdkError> {
@@ -1489,7 +1489,7 @@ impl Session {
     }
 
     /// Pick another subtitle (`None`: none) for a playing playback, shown
-    /// as `bitmap` says (P2-07). Direct play only changes what
+    /// as `bitmap` says. Direct play only changes what
     /// [`Session::read_subtitle`] gives; a converted playback restarts its
     /// encode at `position`: read the returned plan's epoch from offset 0.
     pub async fn change_subtitle(
@@ -1528,7 +1528,7 @@ impl Session {
     }
 
     /// Plan a playing playback again for the quality the viewer chose
-    /// now (P6-06). A plan that changes restarts at `position` as a new
+    /// now. A plan that changes restarts at `position` as a new
     /// epoch: read it from offset 0, as after [`Session::change_subtitle`].
     /// One that is the same comes back as it is.
     pub async fn change_quality(
@@ -1543,7 +1543,7 @@ impl Session {
     }
 
     /// Tell the server the link carries only `link_bitrate` bits per
-    /// second now (P6-06): an `Auto` playback is planned again for it, as
+    /// second now: an `Auto` playback is planned again for it, as
     /// [`Session::change_quality`] plans one.
     pub async fn limit_playback(
         &self,
@@ -1592,9 +1592,9 @@ impl Session {
         .await
     }
 
-    /// An HLS playback's playlist (P2-05). The media playlist's segment
+    /// An HLS playback's playlist. The media playlist's segment
     /// URIs (`seg3.m4s`, `init.mp4`) name what [`Session::read_segment`]
-    /// reads: 3, and 0. A ladder's multivariant playlist (PX-21) names
+    /// reads: 3, and 0. A ladder's multivariant playlist names
     /// each rung's media playlist `v{n}/media.m3u8`: `variant` is that `n`
     /// for a media playlist, 0 for one encode and the other kinds; under
     /// `v{n}/` the segments are rung `n`'s.
@@ -1631,7 +1631,7 @@ impl Session {
     }
 
     /// As [`Session::read_chunk`], within HLS segment `n` (0 is the init
-    /// segment) of rung `variant` (PX-21; 0 for one encode). A segment far
+    /// segment) of rung `variant` (0 for one encode). A segment far
     /// from what is encoded, or of a rung not being encoded, restarts the
     /// encode there; the chunk's epoch says so.
     pub async fn read_segment(
@@ -1647,7 +1647,7 @@ impl Session {
             .await
     }
 
-    /// [`Session::read_chunk`], its bytes handed on as they arrive (PX-46).
+    /// [`Session::read_chunk`], its bytes handed on as they arrive.
     pub async fn read_chunk_stream(
         &self,
         handle: &PlaybackHandle,
@@ -1659,8 +1659,8 @@ impl Session {
             .await
     }
 
-    /// [`Session::read_segment`], its bytes handed on as they arrive
-    /// (PX-46): the answer (`sent`, `size`, `complete`) comes first, and a
+    /// [`Session::read_segment`], its bytes handed on as they arrive:
+    /// the answer (`sent`, `size`, `complete`) comes first, and a
     /// bridge can promise a player the length and start the body at once.
     pub async fn read_segment_stream(
         &self,
@@ -1768,8 +1768,8 @@ impl Session {
             .await
     }
 
-    /// [`Self::read_media`]'s answer, with its body to read as it arrives
-    /// (PX-46). Asked again on a new connection if the first one died
+    /// [`Self::read_media`]'s answer, with its body to read as it arrives.
+    /// Asked again on a new connection if the first one died
     /// before the answer; once the body is under way, a lost connection is
     /// the body's error, and the caller reads on from where it stopped.
     async fn read_media_open(
@@ -1800,8 +1800,7 @@ impl Session {
     }
 
     /// How a read is metered: a direct read whole; a converted one (an HLS
-    /// segment, a chunk) from its first byte, the encode's time left out
-    /// (PX-46).
+    /// segment, a chunk) from its first byte, the encode's time left out.
     fn metering(&self, direct: bool) -> crate::connection::Metering {
         let meter = self.client.link(self.server).meter();
         if direct {
@@ -1872,7 +1871,7 @@ impl Session {
             variant: 0,
         };
         // Direct reads are timed whole; converted ones from their first
-        // byte, as they wait on the encode (P6-06, PX-46).
+        // byte, as they wait on the encode.
         match self.read_media(&request, true).await? {
             (MediaReadResponse::Ok(_), bytes) => Ok(bytes),
             (MediaReadResponse::Err(e), _) => Err(self.failed(e).await),
@@ -1880,10 +1879,10 @@ impl Session {
     }
 
     /// The selected external subtitle of a playback, whole. One the server
-    /// reads as text (P2-07) is [`SdkError::SubtitleNotReady`] until it is
+    /// reads as text is [`SdkError::SubtitleNotReady`] until it is
     /// done: play on, and ask again in a few seconds.
     ///
-    /// The file is read in chunks (P2-11), so one larger than a frame
+    /// The file is read in chunks, so one larger than a frame
     /// arrives too. The result is never a mix of two files: when the file
     /// is written again or replaced on the server while it is read, the
     /// read starts again, once, and gives the new file. If it changes
@@ -1894,7 +1893,7 @@ impl Session {
         read_whole(&PlaybackSubtitle { session, handle }).await
     }
 
-    /// Segment `n` (from 1) of an HLS playback's subtitle rendition (P2-07):
+    /// Segment `n` (from 1) of an HLS playback's subtitle rendition:
     /// WebVTT, its URI `subs<n>.vtt` in [`ManifestKind::Subtitles`]'s
     /// playlist. [`SdkError::SubtitleNotReady`] while the server makes it.
     pub async fn read_subtitle_segment(
@@ -1912,7 +1911,7 @@ impl Session {
         }
     }
 
-    /// The frame previews of a movie or episode, for scrubbing (P3-13).
+    /// The frame previews of a movie or episode, for scrubbing.
     /// [`SdkError::PreviewsNotReady`] while the server makes them: show
     /// the time alone and ask again in a few seconds. [`SdkError::NoPreviews`]
     /// for an item that will have none. Fetch each of `sheets` once with
@@ -1976,7 +1975,7 @@ impl Session {
         self.done(Request::MarkUnwatched { id: id.clone() }).await
     }
 
-    /// "Remove from Continue watching" or "Next up" (P1-22): the card
+    /// "Remove from Continue watching" or "Next up": the card
     /// `id`, a movie or an episode, leaves this user's Home, and its
     /// progress and watched state stay. Only that card: the show's other
     /// episodes stay. Pass the card's own id, not its show's. Playing or

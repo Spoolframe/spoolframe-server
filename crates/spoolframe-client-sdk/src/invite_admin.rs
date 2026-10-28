@@ -1,5 +1,5 @@
-//! Making invites in the app (PX-44): an admin's "Invites" screen, with
-//! the web UI's fields, limits and list. The web UI and the apps make the
+//! Making invites in the app: an admin's "Invites" screen, with the web
+//! UI's fields, limits and list. The web UI and the apps make the
 //! same invites, and each lists and revokes the other's.
 //!
 //! Only an admin's session may ([`SdkError::AdminRequired`] otherwise;
@@ -21,12 +21,11 @@ use crate::{SdkError, Session};
 /// What redeeming an invite does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InviteKind {
-    /// Makes an account on the server (P6-01).
+    /// Makes an account on the server.
     CreateUser,
-    /// Lets someone with a portable identity watch, with no account made
-    /// (P7-05).
+    /// Lets someone with a portable identity watch, with no account made.
     PortableAccount,
-    /// Pairs another server with this one (P8-01, experimental): made
+    /// Pairs another server with this one (experimental): made
     /// only with [`crate::Experimental::federation`] on for the session
     /// ([`SdkError::InvalidInput`] otherwise). That server's admin redeems
     /// it ([`Session::pair_server`]).
@@ -64,7 +63,7 @@ pub struct MintedInvite {
     pub code: String,
     /// `spoolframe://invite?…` with the code: what the QR code shows.
     pub link: String,
-    /// The same invite as `https://spoolframe.app/i#…` (PX-45), the
+    /// The same invite as `https://spoolframe.app/i#…`, the
     /// invite in its fragment: what the share sheet sends. The apps open
     /// it as a universal link, and every `parse_link` reads it.
     pub share_link: String,
@@ -102,8 +101,8 @@ pub struct InviteCreator {
 /// Where an invite was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InviteOrigin {
-    /// The web UI's admin pages; also every invite from before PX-44
-    /// other than the CLI's.
+    /// The web UI's admin pages. Also an invite the server has no app
+    /// origin recorded for, unless the CLI made it.
     WebAdmin,
     /// The server's command line.
     Cli,

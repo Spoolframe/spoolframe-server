@@ -1,4 +1,4 @@
-//! Experimental features (PX-49): messages a client and server use only
+//! Experimental features: messages a client and server use only
 //! when both said so in `Hello`.
 //!
 //! A client names the features it wants in [`Hello::experimental`]; the
@@ -10,7 +10,7 @@
 //!
 //! An experimental feature's messages are outside the protocol's
 //! stability: they may change or go away without [`PROTOCOL_VERSION`]
-//! moving, and PX-16's version 1 does not promise them. One graduates by
+//! moving, and protocol version 1 does not promise them. One graduates by
 //! becoming an ordinary message of a protocol version, and its name goes.
 //!
 //! [`Hello::experimental`]: crate::Hello::experimental
@@ -23,14 +23,14 @@ use serde::{Deserialize, Serialize};
 /// player with no Iroh (AirPlay first): `Request::HttpPlaybackUrl`.
 pub const HTTP_PLAYBACK: &str = "http-playback";
 
-/// Server-to-server federation (P8): the client protocol's `PairServer`
+/// Server-to-server federation: the client protocol's `PairServer`
 /// and a `federation` invite. The server's own side, the
 /// `spoolframe/federation/1` ALPN ([`crate::federation`]), is open only
 /// while its `experimental.federation` is on.
 pub const FEDERATION: &str = "federation";
 
 /// The most feature names a server keeps of a `Hello`; the rest are
-/// dropped, as each name is cut to `MAX_HELLO_TEXT` characters (PX-10).
+/// dropped, as each name is cut to `MAX_HELLO_TEXT` characters.
 pub const MAX_ASKED: usize = 16;
 
 /// The features of `asked` that are among `on`, each once, in `asked`'s

@@ -1,7 +1,7 @@
-//! Making and managing invites from an app (PX-44): the client protocol's
-//! admin requests `CreateInvite`, `ListInvites` and `RevokeInvite`, with
-//! P6-01's semantics, limits and store; the web UI's `inviteCreate` and
-//! the apps make the same invites and see each other's.
+//! Making and managing invites from an app: the client protocol's
+//! admin requests `CreateInvite`, `ListInvites` and `RevokeInvite`. These
+//! are the same invites, with the same limits, as the web UI makes; the
+//! web UI and the apps see each other's.
 //!
 //! Only an admin's session may ask (`AdminRequired` otherwise), and only
 //! for an account here (`NotForPortableUsers` for a portable guest).
@@ -19,11 +19,11 @@ use spoolframe_types::{Platform, Role};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InviteKind {
-    /// Makes an account here (P6-01).
+    /// Makes an account here.
     CreateUser,
-    /// Lets a portable identity watch here, with no account made (P7-05).
+    /// Lets a portable identity watch here, with no account made.
     PortableAccount,
-    /// Pairs another server with this one (P8-01, experimental): made
+    /// Pairs another server with this one (experimental): made
     /// only for a client that named the `federation` feature, on a
     /// server that has it on.
     Federation,
@@ -71,8 +71,8 @@ pub struct InviteCreator {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InviteOrigin {
-    /// The web UI's admin pages; also every invite made before PX-44
-    /// other than the CLI's, as nothing else could make one.
+    /// The web UI's admin pages. Also any invite made before the server
+    /// recorded where invites come from, except the CLI's.
     WebAdmin,
     /// `spoolframe-server invite create`.
     Cli,
@@ -123,7 +123,7 @@ pub struct InviteCreated {
     /// `spoolframe://` form, what the QR code shows.
     pub link: String,
     /// The same invite as an https link on spoolframe.app
-    /// ([`crate::invite::Invite::share_link`], PX-45): what the share
+    /// ([`crate::invite::Invite::share_link`]): what the share
     /// sheet sends and Copy copies.
     pub share_link: String,
 }

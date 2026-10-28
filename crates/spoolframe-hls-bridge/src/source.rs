@@ -1,7 +1,6 @@
-//! What a playback reads, as the bridge asks for it (PX-49): the part of
-//! the client SDK's `ManagedPlayback` the bridge used, with no SDK types.
-//! The apps read over the SDK (`sdk` feature); the server reads its own
-//! segments.
+//! What the bridge reads a playback through, with no SDK types. An app
+//! reads over the client SDK (the `sdk` feature gives
+//! `SdkSource`); the server reads its own segments.
 
 use std::future::Future;
 
@@ -50,8 +49,8 @@ pub trait Source: Send + Sync + 'static {
     /// change is not continued after it.
     fn changes(&self) -> watch::Receiver<Self::Snapshot>;
 
-    /// Whether the playback was planned again since it was served (PX-46):
-    /// the app serves the new plan under a new token.
+    /// Whether the playback was planned again since it was served. The app
+    /// then serves the new plan under a new token.
     fn replanned(&self) -> bool;
 
     /// Up to `length` bytes of a direct playback's file from `offset`; none
@@ -59,8 +58,8 @@ pub trait Source: Send + Sync + 'static {
     fn read(&self, offset: u64, length: u64)
     -> impl Future<Output = Result<Vec<u8>, Error>> + Send;
 
-    /// An HLS playlist; a media playlist of rung `variant` (PX-21; 0 for
-    /// one encode, and for the other kinds).
+    /// An HLS playlist. For a media playlist, `variant` is the ladder rung
+    /// (0 when there is one encode). It is 0 for the other kinds.
     fn manifest(
         &self,
         kind: ManifestKind,

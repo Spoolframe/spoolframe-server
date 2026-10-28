@@ -1,5 +1,5 @@
-//! Play history (PX-52): what the
-//! user played lately, tracks included, and how often.
+//! Play history: what the user played lately, tracks included, and how
+//! often.
 //!
 //! An item's details ([`Session::item`]) carry each item's
 //! `PlaybackState::play_count` and `last_played_at`, its own and its

@@ -44,19 +44,19 @@ pub enum SdkError {
     #[error("no server {0} is known")]
     UnknownServer(String),
     /// A server must be pinned ([`crate::Client::pin`]) before anything but
-    /// `Hello` is sent to it (P1-21).
+    /// `Hello` is sent to it.
     #[error("server {0} is not saved yet; pin it first")]
     NotPinned(String),
-    /// Saved server `saved` seems to answer with another key, `now` (P1-13):
-    /// its key was replaced, or this is a different server. Since PX-14 it
-    /// is said when `now` answers with `saved`'s pinned server id; for a
-    /// server saved before the SDK kept ids, when `now` is heard under its
+    /// Saved server `saved` seems to answer with another key, `now`:
+    /// its key was replaced, or this is a different server. It is said
+    /// when `now` answers with `saved`'s pinned server id; for a saved
+    /// server with no server id pinned yet, when `now` is heard under its
     /// name. Show both fingerprints; [`crate::Client::trust_new_identity`]
     /// if the user says so, which keeps the server id.
     #[error("server {saved} answered with another key, {now}")]
     IdentityChanged { saved: String, now: String },
     /// Saved server `endpoint_id` answered under its pinned key with
-    /// another server id, `now`, than the one pinned, `saved` (PX-14). A
+    /// another server id, `now`, than the one pinned, `saved`. A
     /// server never changes its id, and its app passkeys are bound to it,
     /// so this is refused, every time, and nothing is kept: unlike
     /// [`SdkError::IdentityChanged`] it cannot be accepted in place. Tell
@@ -93,7 +93,7 @@ pub enum SdkError {
     SignInRequired,
     #[error("the username or password is wrong")]
     InvalidCredentials,
-    /// The text is not a Spoolframe invite link (P6-01): checked before
+    /// The text is not a Spoolframe invite link: checked before
     /// anything is sent. Say so under the paste field.
     #[error("this isn't a Spoolframe invite")]
     NotAnInvite,
@@ -129,24 +129,24 @@ pub enum SdkError {
     /// [`crate::ManagedPlayback::RESUME_WINDOW`].
     #[error("the playback has expired")]
     PlaybackExpired,
-    /// The server's admin stopped the playback (P3-15): it is over, and
+    /// The server's admin stopped the playback: it is over, and
     /// [`crate::ManagedPlayback`] does not start it again. Say it ended.
     #[error("the playback was stopped on the server")]
     PlaybackStopped,
     #[error("{0} not found")]
     NotFound(String),
-    /// The server is converting as many files as it may (P2-03); try
+    /// The server is converting as many files as it may; try
     /// again later, or pick tracks that play without converting.
     #[error("the server is busy converting other files")]
     Busy,
-    /// The server plays at most `max` playbacks outside its home at once
-    /// (PX-46), and that many are playing: say so, and let the user try
+    /// The server plays at most `max` playbacks outside its home at once,
+    /// and that many are playing: say so, and let the user try
     /// again when one ends. At home this never happens.
     #[error("the server plays at most {max} playbacks outside its home at once")]
     WanStreamsFull { max: u32 },
     /// The server holds as many devices with no session as it takes, and
-    /// closed this connection ([`spoolframe_protocol::close::BUSY`],
-    /// PX-10). Nothing is wrong with the network or the server: say it is
+    /// closed this connection ([`spoolframe_protocol::close::BUSY`]).
+    /// Nothing is wrong with the network or the server: say it is
     /// busy, and let the user try again in a while; the SDK does not dial
     /// again by itself. A device that is signed in is always let in, so
     /// this comes before a sign-in, or once every session here has ended.
@@ -173,15 +173,15 @@ pub enum SdkError {
     /// playlists, whole segments and controls go on with no error.
     #[error("the playback was started again at {} s", at.as_secs())]
     PlaybackResumed { at: Duration },
-    /// This profile is locked on this device (P2-08): ask for its PIN and
+    /// This profile is locked on this device: ask for its PIN and
     /// [`crate::Session::unlock`]. The profile's [`crate::Session::user`]
     /// from [`crate::Client::profiles`] says `locked` before anything is
     /// shown.
     #[error("this profile is locked; enter its PIN")]
     ProfileLocked,
-    /// Offline, this profile's PIN cannot be checked: no PIN has unlocked
-    /// it online on this device since 0.14.1 (PX-60). Offer the device
-    /// owner's unlock ([`crate::Downloads::unlock_offline_by_owner`]), or
+    /// Offline, this profile's PIN cannot be checked: this device keeps no
+    /// hash of it, because no PIN has unlocked it online here with SDK
+    /// 0.14.1 or newer. Offer the device owner's unlock ([`crate::Downloads::unlock_offline_by_owner`]), or
     /// unlock it online.
     #[error("this profile's PIN cannot be checked offline here yet")]
     NoOfflinePin,
@@ -196,11 +196,11 @@ pub enum SdkError {
     /// ([`crate::Session::web_url`], when the server has one).
     #[error("this account has no password; use the PIN or the web UI")]
     NoPassword,
-    /// The subtitle is still being read as text (P2-07): ask again in a
+    /// The subtitle is still being read as text: ask again in a
     /// few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
     SubtitleNotReady { done_percent: u8 },
-    /// The item's frame previews are being made (P3-13): show the time
+    /// The item's frame previews are being made: show the time
     /// alone, and ask again in a few seconds.
     #[error("the previews are being made ({done_percent}% done)")]
     PreviewsNotReady { done_percent: u8 },
@@ -209,18 +209,17 @@ pub enum SdkError {
     #[error("this item has no previews")]
     NoPreviews,
     /// The subtitle was written again or replaced on the server while it
-    /// was read, and again while it was read a second time (P2-11). No
+    /// was read, and again while it was read a second time. No
     /// part of it is returned: read it again.
     #[error("the subtitle changed while it was read")]
     SubtitleChanged,
-    /// The server has no library yet (P3-10): it is to be set up in its
+    /// The server has no library yet: it is to be set up in its
     /// web UI. Show "This server is not set up yet" where the library
     /// would be; signing in works.
     #[error("this server is not set up yet")]
     NotSetUp,
-    /// The session signed in too long ago for this: approving a device
-    /// (P3-07), adding or removing a passkey (P3-19), no longer asking for
-    /// the PIN. Confirm it is the user ([`crate::Session::confirm_password`]
+    /// The session signed in too long ago for this: approving a device,
+    /// adding or removing a passkey, no longer asking for the PIN. Confirm it is the user ([`crate::Session::confirm_password`]
     /// or [`crate::Session::begin_confirm_passkey`]), or sign in again,
     /// then ask again.
     #[error("sign in again first")]
@@ -230,36 +229,36 @@ pub enum SdkError {
     /// password in the web UI, first.
     #[error("that is the last way to sign in to this account")]
     LastSignInMethod,
-    /// The device sign-in was refused on the approving device (P3-07).
+    /// The device sign-in was refused on the approving device.
     #[error("the sign-in was denied")]
     SignInDenied,
     /// The device sign-in is over (it timed out): begin another.
     #[error("the sign-in code has expired")]
     SignInExpired,
-    /// The recovery phrase is not one (P7-01): back to the entry, the
+    /// The recovery phrase is not one: back to the entry, the
     /// reason under it.
     #[error(transparent)]
     Phrase(#[from] PhraseError),
-    /// This device holds no portable identity with that id (P7-01).
+    /// This device holds no portable identity with that id.
     #[error("no portable identity {0} on this device")]
     UnknownIdentity(String),
-    /// A device credential that does not hold (P7-02): not signed by the
+    /// A device credential that does not hold: not signed by the
     /// identity it names, out of date, or with a proof that fails.
     #[error(transparent)]
     Credential(#[from] CredentialError),
-    /// An identity state that is not one (P7-02).
+    /// An identity state that is not one.
     #[error(transparent)]
     IdentityState(#[from] StateError),
     /// The credential is for a device key this device does not hold for
-    /// that identity (P7-02): another device's.
+    /// that identity: another device's.
     #[error("the credential is for another device")]
     NotThisDevice,
-    /// The newest identity state this device has revokes the device key
-    /// (P7-02): it no longer acts as that identity.
+    /// The newest identity state this device has revokes the device key:
+    /// it no longer acts as that identity.
     #[error("this device's key for the identity is revoked")]
     DeviceKeyRevoked,
     /// The security key (or the phrase root) asked to act is not one of
-    /// the identity's roots now (P7-08): never added, or removed. For a
+    /// the identity's roots now: never added, or removed. For a
     /// root action with a key, a key that holds none of the identity's
     /// credentials is this, not [`SecurityKeyError::NoCredential`]; so is
     /// [`Client::recover_with_key`]'s key that is not among the roots of
@@ -282,31 +281,31 @@ pub enum SdkError {
     /// [`Portable::enable_root_sync`]: crate::Portable::enable_root_sync
     #[error(transparent)]
     RootSync(#[from] crate::portable::RootSyncRefused),
-    /// A security key did not do what was asked (P7-08); which way, so
+    /// A security key did not do what was asked; which way, so
     /// the app says the right thing.
     #[error(transparent)]
     SecurityKey(#[from] crate::portable::SecurityKeyError),
-    /// The tie's challenge is used or over (P7-04): tie again from the
+    /// The tie's challenge is used or over: tie again from the
     /// start ([`crate::Session::tie`]).
     #[error("the tie took too long; try again")]
     TieChallengeExpired,
-    /// Another account on the server is tied to that identity (P7-04):
+    /// Another account on the server is tied to that identity:
     /// one identity, one account per server. Sever that tie first.
     #[error("that identity is tied to another account on this server")]
     PortableIdTaken,
-    /// The invite's code is right and of the other kind (P7-05): a guest
+    /// The invite's code is right and of the other kind: a guest
     /// invite redeemed for an account ([`crate::Client::redeem_invite`]),
     /// or an account's redeemed as a guest
     /// ([`crate::Client::redeem_invite_portable`]). Nothing was used up:
     /// redeem it the other way ([`crate::InviteInfo::kind`] says which).
     #[error("this invite is of another kind")]
     WrongInviteKind,
-    /// Signed in as a portable user (P7-06), who has no account on this
+    /// Signed in as a portable user, who has no account on this
     /// server: its password, PIN, passkeys, devices and sessions are an
     /// account's. Hide what asks for them.
     #[error("not available to a guest from another identity")]
     NotForPortableUsers,
-    /// Only an admin may do this (PX-44: making and revoking invites), and
+    /// Only an admin may do this (making and revoking invites, for one), and
     /// the session's user is not one. Hide what asks for it.
     #[error("only an admin can do that")]
     AdminRequired,
@@ -316,49 +315,49 @@ pub enum SdkError {
     #[error("choose a new password first")]
     PasswordChangeRequired,
     /// [`crate::Session::leave_server`] from the last enabled admin, or
-    /// the last enabled admin with a password (PX-47): make someone else
+    /// the last enabled admin with a password: make someone else
     /// an admin, or give one a password, first. Nothing changed, and the
     /// server is still saved here.
     #[error("you are the only admin; make someone else an admin first")]
     LastAdmin,
-    /// An experimental feature this call needs (PX-49) is not on for the
+    /// An experimental feature this call needs is not on for the
     /// session: the app did not ask for it
     /// ([`crate::ClientOptions::experimental`]), or the server did not
     /// turn it on ([`crate::Session::experimental`]). Nothing was sent.
     /// Hide what needs it.
     #[error("{feature} is not on for this session")]
     Unsupported { feature: String },
-    /// The user sees the playlist and may not make this change (PX-40):
+    /// The user sees the playlist and may not make this change:
     /// an edit on a read-only share, or a rename, sharing change or
     /// delete by anyone but its owner (or an admin, for a server-wide
     /// one).
     #[error("you cannot change this playlist")]
     PlaylistReadOnly,
-    /// The playlist does not take items of this kind (PX-40). Offer "Add
+    /// The playlist does not take items of this kind. Offer "Add
     /// to playlist" only for playlists whose kinds take the item.
     #[error("this playlist does not take a {kind:?}")]
     KindNotAllowed {
         kind: spoolframe_protocol::playlists::ItemKind,
     },
     /// Someone changed the playlist's same entries since the revision the
-    /// edit was made on (PX-40): "Someone changed this playlist; reload".
+    /// edit was made on: "Someone changed this playlist; reload".
     /// `revision` is its revision now. Nothing changed.
     #[error("someone changed this playlist; reload")]
     PlaylistConflict { revision: u64 },
-    /// Not the user's to do (PX-53): a playlist's cover set or taken away
+    /// Not the user's to do: a playlist's cover set or taken away
     /// by someone who may not edit it, or on Liked or All. Nothing
     /// changed.
     #[error("you are not allowed to do that")]
     NotAllowed,
-    /// A cover over `max_bytes`, or over `max_pixels` by its header
-    /// (PX-53): not decoded. Nothing changed.
+    /// A cover over `max_bytes`, or over `max_pixels` by its header:
+    /// not decoded. Nothing changed.
     #[error("the picture is too large: at most {max_bytes} bytes and {max_pixels} pixels")]
     ImageTooLarge { max_bytes: u64, max_pixels: u64 },
-    /// Not a JPEG, PNG, WebP or HEIC picture the server can decode
-    /// (PX-53). Nothing changed.
+    /// Not a JPEG, PNG, WebP or HEIC picture the server can decode.
+    /// Nothing changed.
     #[error("the picture cannot be read")]
     ImageUnreadable,
-    /// The subtitle downloads of `whose` are used up for today (PX-02):
+    /// The subtitle downloads of `whose` are used up for today:
     /// the server's account at subtitle site `site` (`opensubtitles`,
     /// `subdl`, as `SubtitleResult::source`), or the user's own daily
     /// limit (no `site`). `resets_at` (Unix seconds) is when more may be
@@ -370,16 +369,15 @@ pub enum SdkError {
         site: Option<String>,
         resets_at: Option<i64>,
     },
-    /// The server has no subtitle site set up (PX-02): hide "Find
+    /// The server has no subtitle site set up: hide "Find
     /// subtitles". Nothing was asked of any site.
     #[error("this server has no subtitle source set up")]
     NoSubtitleSource,
     /// Pairing this device with a portable identity, or a phone with a
-    /// device, did not happen (P7-03); [`PairingError`] says why.
+    /// device, did not happen; [`PairingError`] says why.
     #[error(transparent)]
     Pairing(#[from] PairingError),
-    /// Any other error the server answered with.
-    /// A download's file was read before the server finished it (PX-38):
+    /// A download's file was read before the server finished it:
     /// the download manager waits and asks again.
     #[error("the download is not ready")]
     DownloadNotReady,
@@ -387,16 +385,17 @@ pub enum SdkError {
     /// could not be read or written, or none was set.
     #[error("downloads: {0}")]
     Downloads(String),
-    /// Experimental (`federation`, P8-01): the other server did not pair
+    /// Experimental (`federation`): the other server did not pair
     /// ([`crate::Session::pair_server`]), for `reason`. Nothing was kept.
     #[error("the other server did not pair: {reason}")]
     PairingRefused {
         reason: spoolframe_protocol::federation::PairingRefused,
     },
-    /// Experimental (`federation`, P8-04): the paired server a `fed:` item
+    /// Experimental (`federation`): the paired server a `fed:` item
     /// is from is offline to the user's server: it cannot be played now.
     #[error("the paired server the item is from is offline")]
     OriginOffline,
+    /// Any other error the server answered with.
     #[error("server: {0}")]
     Server(String),
     /// The server's answer made no sense to this build.

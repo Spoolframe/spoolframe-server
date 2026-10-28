@@ -1,16 +1,16 @@
-//! Playback plans (ARCHITECTURE §6, §8): how the server would play an item
+//! Playback plans: how the server would play an item
 //! for this client, given what it can decode and which tracks it picked.
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCodec};
 
-/// Of a link's measured rate, the share a playback is planned for
-/// (P6-06): the rest is room for the link's swings and for the requests,
+/// Of a link's measured rate, the share a playback is planned for:
+/// the rest is room for the link's swings and for the requests,
 /// artwork and progress reports that share it. The server plans for it,
 /// and the SDK asks for a new plan when a file needs more than it.
 pub const LINK_SHARE: f64 = 0.75;
 
-/// One variant of an HLS ladder (PX-21): its picture's height and its
+/// One variant of an HLS ladder: its picture's height and its
 /// video's bitrate, bits per second (an encode's cap; a copy's average).
 /// Its codec, range and burned-in subtitle are the plan's `video`'s, only
 /// the size and rate differing, unless `video` says otherwise.
@@ -19,14 +19,14 @@ pub struct Rung {
     pub height: u32,
     pub max_bitrate: u64,
     /// This variant's own video, where it is not the plan's resized: the
-    /// encodes under a copied original (PX-21's remux ladder), whose plan
+    /// encodes under a copied original (a remux ladder), whose plan
     /// `video` is the copy, the top variant. `None` for a ladder of
     /// encodes, and the copy's own rung.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub video: Option<ConvertedVideo>,
 }
 
-/// What quality a playback is planned for (P6-06): the viewer's choice
+/// What quality a playback is planned for: the viewer's choice
 /// for this playback. The capabilities' `max_bitrate`, the app's own
 /// limit, stays a ceiling over each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +70,7 @@ pub struct Selection {
     pub subtitle: Option<u32>,
 }
 
-/// How a picked bitmap subtitle (PGS) is shown (P2-07): drawn by the
+/// How a picked bitmap subtitle (PGS) is shown: drawn by the
 /// client, read as text by the server, or burned into the video. Text
 /// subtitles are not affected; they are never burned in. Pictures are
 /// burned in only when the client cannot draw them.
@@ -98,8 +98,8 @@ pub enum BitmapSubtitles {
     Unknown,
 }
 
-/// The tracks the server chose when the client sent no [`Selection`]
-/// (P1-20), and why, so the client can show it.
+/// The tracks the server chose when the client sent no [`Selection`],
+/// and why, so the client can show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChosenTracks {
     pub selection: Selection,
@@ -147,7 +147,7 @@ pub enum PlaybackPlan {
         #[serde(default)]
         source_codec: Option<String>,
     },
-    /// The server converts the file for this client (P2): copies the
+    /// The server converts the file for this client: copies the
     /// streams that fit, encodes the ones that do not, and delivers the
     /// result as `delivery` says. A remux is a plan whose streams are all
     /// `Copy`.
@@ -158,8 +158,8 @@ pub enum PlaybackPlan {
         video: Option<ConvertedVideo>,
         audio: Option<ConvertedAudio>,
         subtitle: Option<ConvertedSubtitle>,
-        /// The encodes an HLS player switches between as its link changes
-        /// (PX-21), highest first: `video` is the first of them. Empty for
+        /// The encodes an HLS player switches between as its link changes,
+        /// highest first: `video` is the first of them. Empty for
         /// one encode, as every plan but `Auto` quality over HLS is.
         ladder: Vec<Rung>,
         /// Why the file is not played as it is, one per stream that is
@@ -265,7 +265,7 @@ pub enum SubtitleAction {
     /// encode. The server never burns in a text subtitle: one the client
     /// cannot show is left out of the plan, with a reason.
     BurnIn { format: SubtitleFormat },
-    /// A bitmap subtitle read as text by the server (P2-07). It is not in
+    /// A bitmap subtitle read as text by the server. It is not in
     /// the output: the client fetches it whole with `ReadSubtitle`, which
     /// answers `SubtitleNotReady` until the reading is done.
     Ocr {
@@ -295,8 +295,8 @@ pub struct PlannedSubtitle {
 pub enum SubtitleDelivery {
     /// A stream inside the media file it plays.
     Embedded,
-    /// A separate file the client fetches whole (P1-08). A bitmap track
-    /// planned as a text format is one the server reads as text (P2-07):
+    /// A separate file the client fetches whole. A bitmap track
+    /// planned as a text format is one the server reads as text:
     /// `ReadSubtitle` answers `SubtitleNotReady` until it is done.
     External,
     #[serde(other)]

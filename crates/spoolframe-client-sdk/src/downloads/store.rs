@@ -1,4 +1,4 @@
-//! Downloads on disk (PX-38): one directory per stored file,
+//! Downloads on disk: one directory per stored file,
 //! `<dir>/<server>/%files/<kind>/<key>/`, holding `manifest.json`, the
 //! media (`media.part` while it arrives, then `media.mp4` or `media.mkv`)
 //! and the artwork (`art/*.jpg`). Everything about an entry is in its
@@ -8,11 +8,11 @@
 //! same item share one file, each holding it ([`Hold::user`]), each with
 //! its own watch state. What is per user (offline watch of deleted
 //! downloads, music followed, plays not sent) is under
-//! `<dir>/<server>/<user>/`. 0.14.0 kept files per user, under
-//! `<dir>/<server>/<user>/<kind>/<key>/`: [`Store::open`] moves them.
+//! `<dir>/<server>/<user>/`. Files found in the older per-user layout,
+//! `<dir>/<server>/<user>/<kind>/<key>/`, are moved by [`Store::open`].
 //!
-//! Entries are keyed by their item's kind ([`EntryKind`]): films and
-//! episodes now; music (PX-51) adds tracks beside them. A stored file is
+//! Entries are keyed by their item's kind ([`EntryKind`]): films,
+//! episodes and tracks. A stored file is
 //! kept while anything holds it ([`Hold`]): a film's download is its one
 //! hold, while a track may be held by an album, a playlist and the cache
 //! of what was kept from listening, and goes only when none is left.
@@ -48,12 +48,12 @@ const ART: &str = "art";
 /// Offline watch entries of downloads deleted before they were sent,
 /// per server and user: sent with the rest on the next sync.
 const CARRIED: &str = "watch.json";
-/// What a user's music downloads follow on a server (PX-51).
+/// What a user's music downloads follow on a server.
 const MUSIC: &str = "music.json";
 /// Plays and likes made with no server, per server and user, not sent
-/// yet (PX-51).
+/// yet.
 const OFFLINE_PLAYS: &str = "plays.json";
-/// This device's download settings (PX-51), at the top.
+/// This device's download settings, at the top.
 const SETTINGS: &str = "settings.json";
 /// Tracks being kept as they play, at the top: none is whole, so all are
 /// removed at start.
@@ -65,7 +65,7 @@ const LISTENING_PARTS: &str = "listening";
 pub(crate) enum EntryKind {
     Film,
     Episode,
-    /// A track (PX-51): downloaded, or kept from listening.
+    /// A track: downloaded, or kept from listening.
     Track,
     /// A kind a newer build stores: never listed, moved or removed here.
     #[serde(other)]
@@ -95,7 +95,7 @@ impl EntryKind {
 }
 
 /// What keeps a stored file: `by` what (`download`, the user's download
-/// of the item; PX-51 adds `album`, `playlist`, `listening`), and which
+/// of the item, or `album`, `playlist`, `listening`), and which
 /// one when there can be several (an album's id). Plain text, so a build
 /// that does not know a newer hold still counts it, and writes it back
 /// as it was.
@@ -120,7 +120,7 @@ impl Hold {
         }
     }
 
-    /// The cache of tracks kept from listening (PX-51): the device's.
+    /// The cache of tracks kept from listening: the device's.
     pub fn listening() -> Self {
         Self {
             by: LISTENING.into(),
@@ -188,7 +188,8 @@ pub(crate) struct Manifest {
     /// Each user's watch state of it, by user id.
     #[serde(default)]
     pub watches: BTreeMap<String, LocalWatch>,
-    /// 0.14.0's one watch state, of `user_id`: read into `watches`.
+    /// The one watch state of the older per-user layout, of `user_id`:
+    /// read into `watches`.
     #[serde(default, skip_serializing)]
     watch: Option<LocalWatch>,
     /// Why it is not moving, while it waits to try again.
@@ -199,7 +200,7 @@ pub(crate) struct Manifest {
     /// album's tracks in the album's order. They move in that order.
     #[serde(default)]
     pub place: u32,
-    /// A track's album and artist, as the server had them (PX-51).
+    /// A track's album and artist, as the server had them.
     #[serde(default)]
     pub album: Option<Item>,
     #[serde(default)]
@@ -247,7 +248,8 @@ impl Manifest {
         self.watches.entry(user_id.to_owned()).or_default()
     }
 
-    /// 0.14.0's manifest read: its one watch state is its user's.
+    /// A manifest of the older per-user layout: its one watch state is its
+    /// user's.
     fn upgrade(&mut self) {
         if let Some(watch) = self.watch.take() {
             self.watches.entry(self.user_id.clone()).or_insert(watch);
@@ -366,7 +368,7 @@ impl Store {
         &self.root
     }
 
-    /// Move 0.14.0's files, kept per user under
+    /// Move the files of the older per-user layout, under
     /// `<server>/<user>/<kind>/<key>/`, to where they are now, under the
     /// key they have now: a file two users both had becomes one, held by
     /// both, with each one's watch state. Run before anything else reads
@@ -394,7 +396,7 @@ impl Store {
         *self.active.lock() = None;
     }
 
-    /// Move one 0.14.0 file from `old`.
+    /// Move one file of the older per-user layout from `old`.
     fn migrate_one(&self, old: &Path) -> std::io::Result<()> {
         let Some(mut m) = read_manifest(&old.join(MANIFEST))? else {
             return Ok(());

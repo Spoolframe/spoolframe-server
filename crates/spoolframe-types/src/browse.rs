@@ -177,7 +177,7 @@ impl Resolution {
         })
     }
 
-    /// Its name on the wire and in the store.
+    /// Its name on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             Resolution::Uhd => "4k",
@@ -188,7 +188,7 @@ impl Resolution {
         }
     }
 
-    /// The class named `name` in the store; `None` for one this build
+    /// The class named `name` on the wire; `None` for one this build
     /// does not know.
     pub fn parse(name: &str) -> Option<Resolution> {
         [

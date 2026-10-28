@@ -1,10 +1,7 @@
-//! The HTTP side of the bridge, moved from the Apple app's
-//! `spoolframe-ffi/src/bridge.rs` (bc2eb28) with its functions as they were
-//! (PX-49): the playbacks are a [`Bridge`] value instead of globals, reads go
-//! through [`Source`], and the caller binds the listener. Not formatted by
-//! rustfmt, so it still diffs cleanly against the app's copy. Since: the
-//! crate's own [`Error`], and [`BridgeOptions`] for what the app read from
-//! its environment.
+//! The HTTP side of the bridge: it answers each request for a [`Bridge`]'s
+//! playbacks, reads through their [`Source`], and maps a failed read's
+//! [`Error`] to a status. [`BridgeOptions`] turns on its debugging aids.
+//! The caller binds the listener. Not formatted by rustfmt.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -29,7 +26,7 @@ const READ: u64 = 4 << 20;
 
 /// The most one HLS segment may hold. Several seconds of 4K at a high
 /// bitrate is well under this; a server sending more (or saying it will) is
-/// refused rather than filling memory (security/audit FFI-001).
+/// refused rather than filling memory.
 pub const SEGMENT_MAX: u64 = 256 << 20;
 
 /// How often one segment's encode may restart, and how long the whole read
@@ -98,7 +95,7 @@ pub(crate) async fn answer<S: Source, B>(bridge: Bridge<S>, request: Request<B>)
     }
     let answer = async { match (&stream.kind, name) {
         (Kind::Direct { size, mime }, "file") => direct(stream.clone(), *size, mime, range, head),
-        // A media segment streams as the server sends it (PX-46): AVPlayer
+        // A media segment streams as the server sends it: AVPlayer
         // sees its first bytes early, and times the link, not this bridge.
         (Kind::Hls { .. }, _) if media_segment(name).is_some() => {
             let (variant, n) = media_segment(name).expect("matched");
@@ -349,7 +346,7 @@ fn placeholder(media: &str) -> String {
 /// The server's playlist may only name this playback's own resources, as
 /// the bridge serves them: no scheme, host, path or `..`, in a URI line or a
 /// `URI="…"` attribute. Else AVPlayer would fetch from wherever a server
-/// pointed it, outside the pinned connection (security/audit FFI-002).
+/// pointed it, outside the pinned connection.
 fn confine(playlist: &str, log: bool) -> Result<(), Error> {
     let refuse = |what: &str| {
         // `BridgeOptions::log`: say what was refused, for debugging a
@@ -401,7 +398,7 @@ fn routable(name: &str) -> bool {
     // The bridge routes on the path: a query or fragment after a name is
     // still that resource.
     let name = name.split(['?', '#']).next().unwrap_or_default();
-    // A ladder rung's playlist and media (PX-21).
+    // A ladder rung's playlist and media.
     if let Some((rung, file)) = name.split_once('/') {
         return number(rung, "v", "").is_some()
             && (matches!(file, "media.m3u8" | "init.mp4") || number(file, "seg", ".m4s").is_some());
@@ -530,7 +527,7 @@ fn hls_failed<S: Source>(stream: &Stream<S>, name: &str, error: Error, log: bool
     match error {
         // Not ready, or rewritten while read: AVPlayer asks again.
         Error::NotReady { .. } => status(StatusCode::SERVICE_UNAVAILABLE),
-        // The playback has no such resource (PX-49: the crate's own error).
+        // The playback has no such resource.
         Error::NotFound => status(StatusCode::NOT_FOUND),
         Error::Stopped => {
             stream.stopped.store(true, std::sync::atomic::Ordering::Relaxed);

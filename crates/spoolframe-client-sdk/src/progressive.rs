@@ -1,5 +1,4 @@
-//! Reading a converted playback's output while the server encodes it
-//! (P2-04, P2-06).
+//! Reading a converted playback's output while the server encodes it.
 //!
 //! The output is one Matroska stream that grows as the encode runs. Its
 //! size is unknown until the encode ends, and a byte offset in it means
@@ -78,8 +77,8 @@ struct State {
 impl ProgressiveReader {
     /// Pins the current handle and epoch of a converted playback, reading
     /// from byte zero, for `bitrate` bits per second of output (the plan's
-    /// cap): a stall waits for seconds of it, not a fixed byte count, which
-    /// at 2 Mbit/s was 16 s of video. Fetching starts at once.
+    /// cap): a stall waits for seconds of it, not a fixed byte count.
+    /// Fetching starts at once.
     pub fn new(playback: ManagedPlayback, spawn: Spawn, bitrate: Option<u64>) -> Self {
         let resume = resume_bytes(bitrate);
         Self::with_cap(playback, spawn, MAX_BUFFERED, resume)

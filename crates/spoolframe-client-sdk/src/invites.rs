@@ -1,15 +1,15 @@
-//! Invites (P6-01): finding, saving and joining a server from its link.
+//! Invites: finding, saving and joining a server from its link.
 //!
 //! The link names the server's key, so the key is pinned as it is, with
 //! nothing trusted on first use; the server id is learned at `Hello` and
-//! pinned with it (PX-14). The link's addresses are hints: they join the
-//! addresses this device knows as told ones (PX-12), and Iroh still
+//! pinned with it. The link's addresses are hints: they join the
+//! addresses this device knows as told ones, and Iroh still
 //! proves the key whatever path it takes. A link naming a key this device
-//! does not have saved is another server, whatever its name (P1-13); one
+//! does not have saved is another server, whatever its name; one
 //! whose server id is a saved server's under another key is that server
 //! with a new key, [`SdkError::IdentityChanged`], as for any connect.
 //!
-//! An app's flow, as the design draws it:
+//! An app's flow:
 //!
 //! 1. [`Client::read_invite`] when the link is pasted or opened: nothing
 //!    is sent. [`SdkError::NotAnInvite`] goes under the paste field.
@@ -25,9 +25,9 @@
 //!    redemption is refused and the user picks "Save server only",
 //!    [`Client::save_invite_server`].
 //!
-//! Until then the device is no one's, and the server's own relay (P6-04)
+//! Until then the device is no one's, and the server's own relay
 //! carries only its owner's and friends'. A link with a code makes the
-//! device its holder (P6-08): from the first connection to the last step
+//! device its holder: from the first connection to the last step
 //! it reaches the link's relays with the code's token
 //! ([`spoolframe_protocol::relay_access::invite_token`]), which says to
 //! the relay whom the invite is for. Once redeemed, or the server saved
@@ -61,7 +61,7 @@ use crate::{SdkError, ServerEntry};
 pub struct InviteInfo {
     /// The server's key, hex: what the link pins.
     pub endpoint_id: String,
-    /// The key's fingerprint (P1-21), for "Is this the server you were
+    /// The key's fingerprint, for "Is this the server you were
     /// invited to?".
     pub fingerprint: String,
     /// What the link calls the server; `None` if it does not say.
@@ -79,10 +79,10 @@ pub struct InviteInfo {
     /// The role the account gets, as the link says; a hint, the server
     /// decides.
     pub role: Option<Role>,
-    /// What the code does, as the link says (P7-05): makes an account
+    /// What the code does, as the link says: makes an account
     /// ([`Client::redeem_invite`]), or grants a portable identity access
     /// ([`Client::redeem_invite_portable`]), or pairs another server
-    /// (P8-01: an admin of that server redeems it, with
+    /// (experimental: an admin of that server redeems it, with
     /// [`crate::Session::pair_server`] there). A hint for which form to
     /// show; the server answers the other with
     /// [`SdkError::WrongInviteKind`].
@@ -392,7 +392,7 @@ impl Client {
     }
 
     /// Join the server guest invite `link` names as portable identity
-    /// `identity` (P7-05), on the phone that holds its root: the phone
+    /// `identity`, on the phone that holds its root: the phone
     /// signs itself a credential if it has none fresh
     /// ([`crate::Portable::own_credential`]), proves it, and redeems the
     /// code. The server grants the identity access (no account is made),
@@ -511,7 +511,7 @@ impl Client {
         Some((token, urls))
     }
 
-    /// Reach `invite`'s relays with its token (P6-08): its holder relays
+    /// Reach `invite`'s relays with its token: its holder relays
     /// as the invite's tier. In the endpoint's relay map, so each
     /// connection to them made from now on carries it; the map is
     /// otherwise empty, so they may also be the device's home relay for

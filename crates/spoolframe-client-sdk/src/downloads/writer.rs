@@ -1,7 +1,7 @@
 //! Saving a file's bytes as they come, in blocks at offsets: what a
 //! download's transfer feeds (8 MiB reads, in order), and what a writer
-//! fed from playback reads would (PX-51's tracks kept from listening:
-//! blocks in any order, as the player seeks). It knows which ranges it
+//! fed from playback reads would (tracks kept from listening: blocks
+//! in any order, as the player seeks). It knows which ranges it
 //! has, is complete once it has them all, and checks the whole file's
 //! SHA-256 when one is known before the file takes its final name.
 

@@ -6,7 +6,7 @@
 //! IDs (and, with federation, IDs from another server) can be added without
 //! a format change. Only the server reads the parts, through the accessors.
 //!
-//! A paired server's item (P8-02) is in [`Namespace::Federated`]: its key
+//! A paired server's item is in [`Namespace::Federated`]: its key
 //! is the origin's server id, then the id the origin knows it by without
 //! the kind, which the federated id carries already
 //! (`fed:movie:mzxw6ytbojtg633c:plex:12`). The origin is the server id,
@@ -38,13 +38,13 @@ pub enum Namespace {
     /// An item in the Plex library; the key is its Plex `ratingKey`.
     Plex,
     /// Something the server made itself rather than a catalog: a sheet of
-    /// frame previews (P3-13), an [`ArtworkId`] like `preview:<set>/<n>`.
+    /// frame previews, an [`ArtworkId`] like `preview:<set>/<n>`.
     Preview,
-    /// An image the server keeps or draws itself (PX-53): a playlist's
+    /// An image the server keeps or draws itself: a playlist's
     /// uploaded cover (`image:playlist/<hash>`), its mosaic, a built-in
     /// playlist's tile. Only ever an [`ArtworkId`].
     Image,
-    /// A paired server's (P8-02), as this server caches it: the key is the
+    /// A paired server's, as this server caches it: the key is the
     /// origin's server id and the id the origin knows it by
     /// (`fed:movie:<origin>:plex:12`, `fed:<origin>:plex:2`).
     Federated,
@@ -199,7 +199,7 @@ impl MediaId {
     }
 
     /// `remote`, an item of the server whose server id is `origin`, as
-    /// this server names it (P8-02): `fed:<kind>:<origin>:<namespace>:<key>`.
+    /// this server names it: `fed:<kind>:<origin>:<namespace>:<key>`.
     pub fn federated(origin_id: &str, remote: &MediaId) -> Result<Self, IdError> {
         let key = format!(
             "{}:{}:{}",
@@ -292,7 +292,7 @@ macro_rules! namespaced_id {
             }
 
             /// `remote`, of the server whose server id is `origin`, as
-            /// this server names it (P8-02): `fed:<origin>:<remote>`.
+            /// this server names it: `fed:<origin>:<remote>`.
             pub fn federated(origin_id: &str, remote: &$name) -> Result<Self, IdError> {
                 Self::new(
                     Namespace::Federated,
@@ -357,7 +357,7 @@ namespaced_id!(
 );
 
 namespaced_id!(
-    /// A person a search found (P3-09), whose items can be listed:
+    /// A person a search found, whose items can be listed:
     /// `<namespace>:<key>`.
     PersonId
 );

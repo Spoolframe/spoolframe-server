@@ -1,11 +1,11 @@
-//! Invites (P6-01): the link that finds a server from anywhere, and the
+//! Invites: the link that finds a server from anywhere, and the
 //! code in it that lets someone make their own account there.
 //!
 //! An invite is one string, shown as a QR code and pasted as it is:
 //!
 //! `spoolframe://invite?server=<endpoint id>&name=<name>&addr=<ip:port>&relay=<url>&exp=<unix seconds>&role=<consumer|admin>&cap=<code>`
 //!
-//! Sent as text it has an https form (PX-45), which Messages and Mail make
+//! Sent as text it has an https form, which Messages and Mail make
 //! tappable and the apps open as a universal link, with the same query
 //! after `#`: `https://spoolframe.app/i#server=…&cap=…`. A browser never
 //! sends a fragment, so the site never sees a code, an address or a
@@ -23,11 +23,11 @@
 //! - `exp` and `role` are hints for the join form ("Joins as a consumer ·
 //!   expires Oct 14"). The server enforces its own when the code is
 //!   redeemed, and a link without them works the same.
-//! - `kind=portable-account` (P7-05): the code grants a portable identity
+//! - `kind=portable-account`: the code grants a portable identity
 //!   access (`RedeemPortableInvite`) rather than making an account. Absent,
 //!   it makes an account (`RedeemInvite`). A hint for which form to show:
 //!   the server answers the other request with `WrongInviteKind`.
-//! - `kind=federation` (P8-01, experimental): the code pairs another
+//! - `kind=federation` (experimental): the code pairs another
 //!   server with this one; that server's admin redeems it
 //!   (`PairServer`, or the admin API's `federation_redeem`).
 //!
@@ -58,7 +58,7 @@ pub const CODE_LEN: usize = 12;
 /// are left out, so a link cannot make a client keep or dial without
 /// end.
 pub const MAX_HINTS: usize = 32;
-/// The longest link read, in bytes (P6-07, glm E-4). A QR code holds a
+/// The longest link read, in bytes. A QR code holds a
 /// few hundred; a pasted link past this is not one a server wrote.
 pub const MAX_LINK: usize = 4096;
 
@@ -100,7 +100,7 @@ pub struct Invite {
     pub addrs: Vec<SocketAddr>,
     /// The URLs of relays it may be reached through.
     pub relays: Vec<String>,
-    /// The pkarr relay it publishes where it is to (P6-05): a device
+    /// The pkarr relay it publishes where it is to: a device
     /// looks it up there by its key when no hint reaches it.
     pub lookup: Option<String>,
     /// The invite's code, normalized; `None` for a link that only finds
@@ -114,7 +114,7 @@ pub struct Invite {
     pub kind: InviteLinkKind,
 }
 
-/// What an invite link's code does, as the link says (P7-05).
+/// What an invite link's code does, as the link says.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InviteLinkKind {
     /// Makes an account on the server (`RedeemInvite`): a link without
@@ -123,7 +123,7 @@ pub enum InviteLinkKind {
     CreateUser,
     /// Grants a portable identity access (`RedeemPortableInvite`).
     PortableAccount,
-    /// Pairs another server with this one (P8-01): redeemed by that
+    /// Pairs another server with this one: redeemed by that
     /// server, not a device.
     Federation,
 }
@@ -151,7 +151,7 @@ impl Invite {
         format!("{LINK_PREFIX}{}", self.query())
     }
 
-    /// The https link (PX-45): what is sent as text and copied. The invite
+    /// The https link: what is sent as text and copied. The invite
     /// is its fragment, never its path or query, so a browser that opens
     /// it sends none of it to the site.
     pub fn share_link(&self) -> String {
@@ -220,7 +220,7 @@ pub fn parse_link(text: &str) -> Option<Invite> {
             ("server", None) => return None,
             ("cap", Some(value)) => invite.code = Some(normalize_code(&value)?),
             ("cap", None) => return None,
-            // Shown in the join form: cut as a device's name is (PX-10).
+            // Shown in the join form: cut as a device's name is.
             ("name", Some(mut value)) => {
                 crate::messages::cut(&mut value);
                 invite.name = Some(value);
@@ -286,7 +286,7 @@ fn share_query(text: &str) -> Option<&str> {
 
 /// Whether `value` may be a relay's URL: `https://` or `http://` and a
 /// host, and nothing an opener could read another way. The SDK holds a
-/// server's pushed relays and lookup to it as well (P6-07, glm E-3).
+/// server's pushed relays and lookup to it as well.
 pub fn is_relay_url(value: &str) -> bool {
     let rest = value
         .strip_prefix("https://")

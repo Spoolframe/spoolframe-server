@@ -1,4 +1,4 @@
-//! Experimental features (PX-49): what an app asks a server for in its
+//! Experimental features: what an app asks a server for in its
 //! `Hello` ([`crate::ClientOptions::experimental`]), and what the server
 //! turned on for the connection ([`crate::Session::experimental`]).
 //!
@@ -18,7 +18,7 @@ pub struct Experimental {
     /// own port, for a player with no Iroh: an AirPlay receiver
     /// ([`crate::Session::http_playback_url`]).
     pub http_playback: bool,
-    /// Server-to-server federation (P8): pairing the server with another
+    /// Server-to-server federation: pairing the server with another
     /// by that one's invite ([`crate::Session::pair_server`]) and sharing
     /// libraries with it ([`crate::Session::share_libraries`]), an
     /// admin's; making `federation` invites

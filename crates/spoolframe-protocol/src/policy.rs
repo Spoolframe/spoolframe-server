@@ -21,7 +21,7 @@ pub mod wait {
     /// bounds only at 10 minutes. Two minutes is longer than a player
     /// should spin; past it the user is better told.
     pub const PLAYBACK: Duration = Duration::from_secs(120);
-    /// A request the server answers from a subtitle site (PX-02): a
+    /// A request the server answers from a subtitle site: a
     /// search, or a sign-in, a download and the file. Each call to the
     /// site has 10 seconds.
     pub const SUBTITLE_SITE: Duration = Duration::from_secs(30);
@@ -35,14 +35,14 @@ pub fn server_wait(request: &Request) -> Duration {
         Request::Tracks { .. }
         | Request::PlaybackPlan { .. }
         | Request::SetTrackOverride { .. }
-        // PX-03: each probes the file to find the track.
+        // Each probes the file to find the track.
         | Request::SyncSubtitle { .. }
         | Request::UseOriginalSubtitleTiming { .. }
         | Request::SetSubtitleOffset { .. }
-        // PX-38: each probes the file to plan the download.
+        // Each probes the file to plan the download.
         | Request::DownloadOptions { .. }
         | Request::PrepareDownload { .. }
-        // PX-51: an artist's albums are read one by one from the catalog.
+        // An artist's albums are read one by one from the catalog.
         | Request::MusicDownloadChanges { .. } => wait::PROBE,
         Request::SearchSubtitles { .. } | Request::DownloadSubtitle { .. } => wait::SUBTITLE_SITE,
         Request::StartPlayback { .. }
@@ -88,48 +88,48 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::TrustedProfiles
         | Request::GetTrackPreferences
         // A second challenge only takes the place of the first, which
-        // stays bounded per session and user (P7-04).
+        // stays bounded per session and user.
         | Request::TieBegin
-        // P7-08: public data read, and an offer that replaces itself.
+        // Public data read, and an offer that replaces itself.
         | Request::IdentityRecord { .. }
         | Request::IdentityRecordByHandle { .. }
         | Request::OfferPairing(_)
         | Request::ListInvites
-        // PX-49: asked again, the same playback's live token, or a new
+        // Asked again, the same playback's live token, or a new
         // one bound to the same playback.
         | Request::HttpPlaybackUrl { .. }
-        // PX-40: reads. A read may drop entries whose items left the
+        // Reads. A read may drop entries whose items left the
         // library, which a second read would drop too.
         | Request::ListPlaylists
         | Request::GetPlaylist { .. }
-        // PX-43: liking what is liked, or unliking what is not, changes
+        // Liking what is liked, or unliking what is not, changes
         // nothing.
         | Request::Like { .. }
         | Request::Unlike { .. }
         // A read.
         | Request::ListShareCandidates { .. }
-        // PX-52: a read.
+        // A read.
         | Request::RecentlyPlayed { .. }
-        // P8-04: where a paired server is, read.
+        // Where a paired server is, read.
         | Request::RemoteHints { .. }
         // A read; settings saved twice are saved once, and shuffle turned
         // on twice shuffles once.
         | Request::UpcomingInPlaylist { .. }
         | Request::SetPlaylistSettings { .. }
-        // Taken away twice is taken away once (PX-53).
+        // Taken away twice is taken away once.
         | Request::RemovePlaylistArt { .. }
-        // PX-03: a second sync joins the first; original timing or an
+        // A second sync joins the first; original timing or an
         // offset set twice is set once.
         | Request::SyncSubtitle { .. }
         | Request::UseOriginalSubtitleTiming { .. }
         | Request::SetSubtitleOffset { .. }
-        // PX-02: a search is a read; the same result is never downloaded
+        // A search is a read; the same result is never downloaded
         // twice (the second gets the first's track); a download removed
         // twice is removed once.
         | Request::SearchSubtitles { .. }
         | Request::DownloadSubtitle { .. }
         | Request::RemoveSubtitleDownload { .. }
-        // PX-38: reads; the same request prepared twice is one download,
+        // Reads; the same request prepared twice is one download,
         // under one id; a download cancelled twice is cancelled once (the
         // second says `NotFound`).
         | Request::DownloadOptions { .. }
@@ -138,13 +138,13 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::CancelDownload { .. }
         // Newest wins: an entry written once is older the second time.
         | Request::SyncOfflineWatch { .. }
-        // PX-51: a read; a play is recorded once by its track and time,
+        // A read; a play is recorded once by its track and time,
         // and a like is newest-wins as a watch is.
         | Request::MusicDownloadChanges { .. }
         | Request::SyncOfflinePlays { .. }
-        // P8-02: a row shown twice is shown once.
+        // A row shown twice is shown once.
         | Request::SetServerRow { .. }
-        // P8-05: a server chosen twice is chosen once.
+        // A server chosen twice is chosen once.
         | Request::SetPlayFrom { .. } => true,
         // Signing in: a failed password counts, a challenge is replaced,
         // an approved sign-in is collected once.
@@ -158,7 +158,7 @@ pub fn retry_safe(request: &Request) -> bool {
         // An invite makes an account or a grant and uses itself up.
         | Request::RedeemInvite(_)
         | Request::RedeemPortableInvite(_)
-        // P7-08: a fetch counts against the code's tries, an answer is
+        // A fetch counts against the code's tries, an answer is
         // taken once, and a collected answer is gone.
         | Request::FetchPairing { .. }
         | Request::AnswerPairing { .. }
@@ -196,7 +196,7 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ApproveDeviceSignIn { .. }
         | Request::DenyDeviceSignIn { .. }
         | Request::UpdatePlaybackProgress { .. }
-        // P8-03: as a playback's progress.
+        // As a playback's progress.
         | Request::UpdateWatchProgress { .. }
         | Request::MarkWatched { .. }
         | Request::MarkUnwatched { .. }
@@ -205,24 +205,23 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::SetTrackPreferences { .. }
         | Request::SetTrackOverride { .. }
         | Request::ClearTrackOverride { .. }
-        // A tie uses its nonce up; severing one is a change (P7-04).
+        // A tie uses its nonce up; severing one is a change.
         | Request::TieFinish { .. }
         | Request::Untie { .. }
-        // A second invite would be a second code; a revoke is a change
-        // (PX-44).
+        // A second invite would be a second code; a revoke is a change.
         | Request::CreateInvite(_)
         | Request::RevokeInvite { .. }
-        // A pairing takes the other server's use (P8-01).
+        // A pairing takes the other server's use.
         | Request::PairServer(_)
-        // Sharing is a change an admin confirmed (P8-03).
+        // Sharing is a change an admin confirmed.
         | Request::ShareLibraries(_)
-        // A play token works once (P8-04).
+        // A play token works once.
         | Request::RedeemPlayToken(_)
-        // Each mints a token and counts a play (P8-04).
+        // Each mints a token and counts a play.
         | Request::RemoteGrant { .. }
-        // Leaving ends every session; a second try finds none (PX-47).
+        // Leaving ends every session; a second try finds none.
         | Request::LeaveServer
-        // PX-40: a second create is a second playlist; an edit's adds
+        // A second create is a second playlist; an edit's adds
         // would be added twice; pins move.
         | Request::CreatePlaylist { .. }
         | Request::UpdatePlaylist { .. }

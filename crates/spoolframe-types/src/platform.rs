@@ -18,7 +18,7 @@ pub enum Platform {
     /// A command-line or scripted client of the SDK (its examples, tools),
     /// or, for an admin API session, the server's own CLI.
     Cli,
-    /// The web UI, in a browser (P3-18): never in a client's `Hello`, only
+    /// The web UI, in a browser: never in a client's `Hello`, only
     /// on the admin API's sessions the web UI signed in.
     Web,
     /// A platform this build does not know, from a newer peer.
@@ -27,7 +27,7 @@ pub enum Platform {
 }
 
 impl Platform {
-    /// The name on the wire and in the server's database.
+    /// The name on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             Platform::Linux => "linux",

@@ -1,4 +1,4 @@
-//! A software security key (P7-08): a P-256 key that answers as a FIDO2
+//! A software security key: a P-256 key that answers as a FIDO2
 //! key's resident credential does, writing real CTAP2 assertions under
 //! [`PORTABLE_RP`]. For tests, and for trying key roots with no key at
 //! hand; never a root anyone relies on, its secret being in memory.

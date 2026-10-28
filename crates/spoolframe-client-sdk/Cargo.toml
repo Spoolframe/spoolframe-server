@@ -1,6 +1,6 @@
 [package]
 name = "spoolframe-client-sdk"
-description = "Client side of Spoolframe: Iroh transport, saved servers, sessions."
+description = "SDK for Spoolframe client apps: find and connect to servers over Iroh, sign in, browse and play media."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -13,11 +13,11 @@ default = []
 media-readers = []
 
 [dependencies]
-# The PIN checked offline (PX-60), hashed as the server hashes it.
+# The PIN checked offline, hashed as the server hashes it.
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 async-trait = { workspace = true }
-# The portable identity's root and its recovery phrase (P7-01).
+# The portable identity's root and its recovery phrase.
 bip39 = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -26,11 +26,11 @@ zeroize = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-mdns-address-lookup = { workspace = true }
-# statvfs: the free space downloads have (PX-38).
+# statvfs: the free space downloads have.
 libc = { workspace = true }
-# soft-key: the software security key the SDK offers (P7-08).
+# soft-key: the software security key the SDK offers.
 spoolframe-protocol = { workspace = true, features = ["soft-key"] }
-# The clientDataHash a security key root signs (P7-08).
+# The clientDataHash a security key root signs.
 sha2 = { workspace = true }
 spoolframe-types = { workspace = true }
 serde = { workspace = true }
@@ -39,7 +39,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-# The pkarr relays servers are looked up at (P6-05).
+# The pkarr relays servers are looked up at.
 url = { workspace = true }
 uuid = { workspace = true }
 

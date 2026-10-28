@@ -104,7 +104,7 @@ pub trait PlaybackBackend: Send + Sync + 'static {
             "this playback backend cannot plan for its link".into(),
         ))
     }
-    /// Experimental (PX-49): the playback's HTTP URL
+    /// Experimental: the playback's HTTP URL
     /// ([`Session::http_playback_url`]). A backend with no server keeps
     /// the default: off.
     async fn http_playback_url(
@@ -141,7 +141,7 @@ pub trait PlaybackBackend: Send + Sync + 'static {
         Err(no_hls())
     }
     /// [`Self::read_segment`], its bytes handed on as they arrive
-    /// ([`Session::read_segment_stream`], PX-46). A backend that reads
+    /// ([`Session::read_segment_stream`]). A backend that reads
     /// whole keeps the default: its chunk, as one piece.
     async fn open_segment(
         &self,
@@ -157,7 +157,7 @@ pub trait PlaybackBackend: Send + Sync + 'static {
             .map(ChunkStream::from)
     }
     /// [`Self::read_chunk`], its bytes handed on as they arrive
-    /// ([`Session::read_chunk_stream`], PX-46). A backend that reads whole
+    /// ([`Session::read_chunk_stream`]). A backend that reads whole
     /// keeps the default: its chunk, as one piece.
     async fn open_chunk(
         &self,
@@ -170,12 +170,12 @@ pub trait PlaybackBackend: Send + Sync + 'static {
             .await
             .map(ChunkStream::from)
     }
-    /// How fast the link to the server carries media (P6-06), for the
+    /// How fast the link to the server carries media, for the
     /// direct reader to feed. A backend with no link keeps the default.
     fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
         None
     }
-    /// Playbacks whose share of the server's uplink changed (PX-46): a
+    /// Playbacks whose share of the server's uplink changed: a
     /// managed playback in Auto plans itself again on its own. A backend
     /// with no server keeps the default.
     fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
@@ -343,12 +343,12 @@ struct State {
     ended: Option<SdkError>,
     finishing: bool,
     closed: bool,
-    /// The last few whole HLS segments read: their bytes and their time
-    /// (PX-46), what the stream needs of the link.
+    /// The last few whole HLS segments read: their bytes and their time,
+    /// what the stream needs of the link.
     recent_segments: VecDeque<(u64, Duration)>,
     /// When a slow link last made this ask to be planned again for it.
     limit_asked: Option<std::time::Instant>,
-    /// The share of the server's uplink it was last told (PX-46).
+    /// The share of the server's uplink it was last told.
     share: Option<PlaybackShare>,
 }
 
@@ -389,7 +389,7 @@ struct Inner {
     /// follows the server's share events (B2). That task holds only a
     /// weak reference, so nothing else would wake it.
     gone: watch::Sender<()>,
-    /// What keeps a track's bytes as they are read (PX-51).
+    /// What keeps a track's bytes as they are read.
     keeper: std::sync::OnceLock<Arc<crate::downloads::Keeper>>,
     /// The read ahead of a kept track's file was started.
     reading_ahead: std::sync::atomic::AtomicBool,
@@ -461,8 +461,8 @@ enum Restart {
     Control { at: Duration },
 }
 
-/// A playback's share of its server's uplink changed (PX-46, the
-/// server's `PlaybackShare` event): `max_bitrate` is what it may take now,
+/// A playback's share of its server's uplink changed (the server's
+/// `PlaybackShare` event): `max_bitrate` is what it may take now,
 /// bits/s, `None` for no limit. From [`crate::Client::playback_shares`],
 /// and as a managed playback's own [`ManagedPlayback::share`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -500,7 +500,7 @@ fn continues(before: &Playback, next: &Playback) -> bool {
 /// Where each segment of an HLS media playlist starts, from its
 /// `#EXTINF` durations.
 /// Whether a link carrying `link` bit/s is too slow for a stream whose
-/// recent segments held `segments` (bytes, time) (PX-46): under
+/// recent segments held `segments` (bytes, time): under
 /// [`spoolframe_protocol::playback::LINK_SHARE`] of it is what a plan for
 /// the link takes, so it must be at least what the segments need.
 pub(crate) fn too_slow(link: f64, segments: &[(u64, Duration)]) -> bool {
@@ -606,7 +606,7 @@ impl ManagedPlayback {
             keeper: std::sync::OnceLock::new(),
             reading_ahead: std::sync::atomic::AtomicBool::new(false),
         });
-        // A share of the server's uplink that moved (PX-46): a playback in
+        // A share of the server's uplink that moved: a playback in
         // Auto plans itself again where the viewer is, as the viewer's own
         // quality change would.
         if let Some(mut shares) = inner.backend.shares() {
@@ -668,8 +668,8 @@ impl ManagedPlayback {
     pub fn changes(&self) -> watch::Receiver<Playback> {
         self.0.changed.subscribe()
     }
-    /// The share of the server's uplink this playback was last told
-    /// (PX-46): `max_bitrate` is what it may take, bits/s, `None` for no
+    /// The share of the server's uplink this playback was last told:
+    /// `max_bitrate` is what it may take, bits/s, `None` for no
     /// limit. `None` before the server said, and after the playback
     /// started again under another handle, until it says again.
     pub fn share(&self) -> Option<PlaybackShare> {
@@ -793,7 +793,7 @@ impl ManagedPlayback {
     /// Up to `length` bytes of a direct playback's file from `offset`. A
     /// playback the server ended is resumed and the read goes on.
     ///
-    /// A track kept as it plays (PX-51) is read ahead, whole, from its
+    /// A track kept as it plays is read ahead, whole, from its
     /// first read: the reads come from what is here once it is, and the
     /// track is in the cache before it has played to its end.
     pub async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
@@ -901,7 +901,7 @@ impl ManagedPlayback {
             },
         }
     }
-    /// Experimental (`http-playback`, PX-49): where a player with no Iroh
+    /// Experimental (`http-playback`): where a player with no Iroh
     /// (an AirPlay receiver) fetches this playback over plain HTTP, or why
     /// not ([`Session::http_playback_url`]). The URL is bound to the
     /// playback as it is now: one the SDK starts again behind the app (a
@@ -913,7 +913,7 @@ impl ManagedPlayback {
         })
         .await
     }
-    /// An HLS playlist; a media playlist of rung `variant` (PX-21; 0 for
+    /// An HLS playlist; a media playlist of rung `variant` (0 for
     /// one encode, and for the other kinds). One the server ended is
     /// resumed: the playlist of the same plan is the same, so the
     /// player's copy stays good.
@@ -937,7 +937,7 @@ impl ManagedPlayback {
     /// [`SdkError::PlaybackResumed`] (or [`SdkError::PlaybackRestarted`],
     /// for an encode replaced under the same handle), and the segment is
     /// read again from 0.
-    /// `variant` is a ladder's rung (PX-21), as `v{n}/` in its playlist; 0
+    /// `variant` is a ladder's rung, as `v{n}/` in its playlist; 0
     /// for one encode. The rungs share the grid and the segment numbers.
     pub async fn read_segment(
         &self,
@@ -978,7 +978,7 @@ impl ManagedPlayback {
         }
     }
 
-    /// [`Self::read_segment`], its bytes handed on as they arrive (PX-46):
+    /// [`Self::read_segment`], its bytes handed on as they arrive:
     /// the answer first (its length, the segment's size and whether it is
     /// whole), so a bridge can promise a player the length and start the
     /// body at once, then the body piece by piece. The same rules as a
@@ -1113,7 +1113,7 @@ impl ManagedPlayback {
         }
     }
 
-    /// [`Self::read_chunk`], its bytes handed on as they arrive (PX-46).
+    /// [`Self::read_chunk`], its bytes handed on as they arrive.
     pub async fn chunk_stream(
         &self,
         source: &Playback,
@@ -1144,10 +1144,10 @@ impl ManagedPlayback {
     /// The least time between two asks to be planned for the link.
     const LIMIT_EVERY: Duration = Duration::from_secs(30);
 
-    /// HLS segment `n` read from `offset` (PX-46): once it is whole, what
+    /// HLS segment `n` read from `offset`: once it is whole, what
     /// it held is noted against its time, and an Auto playback whose
     /// link carries less than its segments need asks to be planned again
-    /// for the link, as the direct reader does when it stalls (P6-06). A
+    /// for the link, as the direct reader does when it stalls. A
     /// ladder is left to the player, which moves between its rungs.
     fn segment_read(&self, n: u32, offset: u64, read: u64, size: u64, complete: bool) {
         if n == 0 || !complete || offset + read != size {
@@ -1416,7 +1416,7 @@ impl ManagedPlayback {
         self.0.changed.send_replace(next.clone());
         Ok(next)
     }
-    /// The link carries only `link_bitrate` bits per second (P6-06): the
+    /// The link carries only `link_bitrate` bits per second: the
     /// playback is planned again for it where the viewer last was. A plan
     /// that changes is swapped in for every clone, as a subtitle change's
     /// is, and readers of the old one are told to make new ones
@@ -1489,12 +1489,12 @@ impl ManagedPlayback {
         self.0.changed.send_replace(next.clone());
         Ok(next)
     }
-    /// The quality the viewer chose for this playback (P6-06).
+    /// The quality the viewer chose for this playback.
     pub fn quality(&self) -> PlaybackQuality {
         self.0.state.lock().options.quality
     }
     /// Plan the playback again for `quality`, the viewer's choice now, at
-    /// `position` (P6-06). As [`Self::change_subtitle`]: the app makes a
+    /// `position`. As [`Self::change_subtitle`]: the app makes a
     /// new reader from the result. A choice that gives the same plan
     /// changes nothing but what the next re-plan is for.
     pub async fn change_quality(
@@ -1517,7 +1517,7 @@ impl ManagedPlayback {
         let _control = self.0.control.lock().await;
         self.change_quality_locked(quality, position).await
     }
-    /// A moved share of the uplink for `handle` (PX-46): plan again in
+    /// A moved share of the uplink for `handle`: plan again in
     /// Auto where the viewer is. Whether to was seen before the control
     /// lock; a change that held it since (the viewer's own pick, or a
     /// resume under another handle) wins, and this one is dropped.
@@ -1653,7 +1653,7 @@ impl Session {
         selection: Option<Selection>,
         options: PlaybackOptions,
     ) -> Result<ManagedPlayback, SdkError> {
-        // A track is kept as it plays, with music downloads (PX-51).
+        // A track is kept as it plays, with music downloads.
         let keeper = crate::downloads::Keeper::of(self, item, &options).await;
         let playback =
             ManagedPlayback::open(Arc::new(self.clone()), item.clone(), selection, options).await?;
@@ -1664,8 +1664,8 @@ impl Session {
     }
 }
 
-/// An HLS segment read as it arrives ([`ManagedPlayback::segment_stream`],
-/// PX-46).
+/// An HLS segment read as it arrives
+/// ([`ManagedPlayback::segment_stream`]).
 #[derive(Debug)]
 pub struct SegmentStream {
     playback: ManagedPlayback,

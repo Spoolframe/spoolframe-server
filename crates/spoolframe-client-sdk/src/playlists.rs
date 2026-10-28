@@ -1,10 +1,10 @@
-//! Playlists (PX-40): a user's playlists, the ones shared with them and
-//! the server-wide ones; editing, pinning and playing them. Changes made
+//! Playlists: a user's playlists, the ones shared with them and the
+//! server-wide ones; editing, pinning and playing them. Changes made
 //! elsewhere (another device, another user) come as [`PlaylistEvent`]s
 //! from [`crate::Client::playlist_events`].
 //!
-//! Liked and All (PX-43): hearts on tracks and albums, and the two
-//! built-in playlists, listed first while the server has a music
+//! Liked and All: hearts on tracks and albums, and the two built-in
+//! playlists, listed first while the server has a music
 //! library, each summary's `builtin` saying which.
 //!
 //! Sharing by name: whom a playlist can be shared with
@@ -13,7 +13,7 @@
 //! `PlaylistRef::owner_name`) and of who it is shared with
 //! (`PlaylistShare::display_name`, `kind`).
 //!
-//! Covers (PX-53): each summary's `artwork`, fetched with
+//! Covers: each summary's `artwork`, fetched with
 //! [`Session::artwork`] as any artwork is (the uploaded cover, else a
 //! mosaic of its first four covers, else a placeholder; Liked's and All's
 //! fixed tiles), and `custom_art`; [`Session::set_playlist_art`] uploads
@@ -162,7 +162,7 @@ impl Session {
         }
     }
 
-    /// Give playlist `id` the picture in `bytes` as its cover (PX-53): a
+    /// Give playlist `id` the picture in `bytes` as its cover: a
     /// JPEG, PNG, WebP or HEIC of at most
     /// [`spoolframe_protocol::playlists::MAX_ART_BYTES`] and
     /// [`spoolframe_protocol::playlists::MAX_ART_PIXELS`]. Its new
@@ -199,7 +199,7 @@ impl Session {
         }
     }
 
-    /// Take playlist `id`'s uploaded cover away (PX-53): the playlist
+    /// Take playlist `id`'s uploaded cover away: the playlist
     /// after, its `artwork` the mosaic again. Who may is as for
     /// [`Session::set_playlist_art`].
     pub async fn remove_playlist_art(&self, id: &str) -> Result<PlaylistSummary, SdkError> {
@@ -333,7 +333,7 @@ impl Session {
 }
 
 impl Session {
-    /// Send `request` if the server has Liked (PX-43).
+    /// Send `request` if the server has Liked.
     async fn liked_call(&self, request: Request) -> Result<Reply, SdkError> {
         self.call(request).await
     }

@@ -1,12 +1,12 @@
-//! Signing in to a server as a portable identity (P7-06), with this
-//! device's credential for it; and the servers a pairing hands a device,
+//! Signing in to a server as a portable identity, with this device's
+//! credential for it; and the servers a pairing hands a device,
 //! so a TV paired with a guest signs in where the guest's phone does.
 //!
-//! An app's flow, as P7 draws it:
+//! An app's flow:
 //!
 //! 1. On the phone, which holds the root: [`crate::Portable::create`],
-//!    then [`Client::redeem_invite_portable`] with a guest invite's link
-//!    (P7-05). The phone signs itself a credential, proves it, and is
+//!    then [`Client::redeem_invite_portable`] with a guest invite's link.
+//!    The phone signs itself a credential, proves it, and is
 //!    signed in; the server is saved.
 //! 2. On the TV, guests allowed: [`Client::start_pairing`]; the phone
 //!    scans it ([`Client::scan_pairing`]) and authorizes. The phone sends
@@ -32,8 +32,8 @@ impl Client {
     /// root's phone's own), and keep the session. The server need only
     /// be pinned, not verified: one a pairing handed is pinned unverified
     /// ([`crate::Paired::servers`]), and the credential proves the
-    /// identity whichever server answers to the pinned key. Local-first, as the
-    /// server decides: the account the identity is tied to there, else
+    /// identity whichever server answers to the pinned key. Local-first,
+    /// as the server decides: the account the identity is tied to there, else
     /// the identity itself where it was granted access (a guest invite).
     ///
     /// [`SdkError::InvalidCredentials`] for every refusal the server
@@ -108,9 +108,9 @@ impl Client {
     /// The saved servers this device signs in to as `identity`: each
     /// verified here (its fingerprint confirmed, or pinned from an invite
     /// link), with a session kept for it, live or ended. What a phone
-    /// hands a device it pairs, at most [`MAX_PAIRED_SERVERS`]; a server
-    /// saved before the SDK kept server ids is left out, as the device
-    /// could not pin it whole.
+    /// hands a device it pairs, at most [`MAX_PAIRED_SERVERS`]. A saved
+    /// server with no server id pinned is left out, as the device could
+    /// not pin it whole.
     pub(crate) async fn paired_servers(
         &self,
         identity: PortableUserId,

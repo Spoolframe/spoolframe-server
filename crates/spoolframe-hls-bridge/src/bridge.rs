@@ -1,5 +1,4 @@
-//! The playbacks a bridge serves, by token: the app's global `STREAMS` and
-//! the functions over it, as a value (PX-49).
+//! The playbacks a bridge serves, by token, and the functions over them.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -47,17 +46,16 @@ impl Kind {
     }
 }
 
-/// How a bridge behaves (PX-49): what the app's bridge read from its
-/// environment. The crate reads none; `Default` turns both off.
+/// How a bridge behaves. The crate reads no environment variables: the
+/// app sets these itself. `Default` turns both off.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BridgeOptions {
     /// Log, through `tracing` at INFO, each playlist reference refused and
-    /// each failed read's name: for debugging a server's playlists. The
-    /// app's `SPOOLFRAME_BRIDGE_LOG=1`.
+    /// each failed read's name: for debugging a server's playlists.
     pub log: bool,
     /// `"from>to;from>to"`: replace text in the master playlist, to find
-    /// which attribute a player refuses. A debugging switch that nothing
-    /// shipped sets; the app's `SPOOLFRAME_MASTER_REWRITE`.
+    /// which attribute a player refuses. A debugging switch: do not set it
+    /// in a shipped app.
     pub master_rewrite: Option<String>,
 }
 
@@ -74,7 +72,7 @@ pub struct Stream<S> {
     /// The cue-less subtitle playlist the tracks not playing share, made
     /// once from the media playlist's length.
     pub(crate) placeholder: OnceCell<Vec<u8>>,
-    /// A read found the server's admin had stopped the playback (P3-15).
+    /// A read found the server's admin had stopped the playback.
     pub(crate) stopped: AtomicBool,
     /// A read found the server had ended the playback (expired, or ended
     /// for a newer connection's): the app starts it again where it was.
@@ -83,7 +81,7 @@ pub struct Stream<S> {
     /// playback log: shared by every path it's served under.
     pub(crate) notes: Arc<Mutex<Vec<String>>>,
     /// When its token was last asked for anything, or registered: what
-    /// the server expires an idle token by (PX-49).
+    /// the server expires an idle token by.
     pub(crate) last_request: Mutex<Instant>,
 }
 
@@ -124,7 +122,7 @@ impl<S> Stream<S> {
         &self.notes
     }
 
-    /// A read found the server's admin had stopped the playback (P3-15).
+    /// A read found the server's admin had stopped the playback.
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
@@ -192,7 +190,7 @@ impl<S: Source> Bridge<S> {
 
     /// This bridge calling `hook` with the token of each request for a
     /// playback it serves, as the request comes and before it is answered:
-    /// a server times its tokens by its own clock (PX-49). Set it before
+    /// a server times its tokens by its own clock. Set it before
     /// the bridge is cloned or served; clones made before do not call it.
     pub fn on_request(mut self, hook: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.on_request = Some(Arc::new(hook));
@@ -200,7 +198,7 @@ impl<S: Source> Bridge<S> {
     }
 
     /// When `token` was last asked for anything (or registered), while it
-    /// is served: a server expires a token idle too long by it (PX-49).
+    /// is served: a server expires a token idle too long by it.
     pub fn last_request(&self, token: &str) -> Option<Instant> {
         let stream = self.streams.lock().expect("never poisoned").get(token).cloned();
         stream.map(|s| *s.last_request.lock().expect("never poisoned"))
@@ -262,8 +260,8 @@ impl<S: Source> Bridge<S> {
             .is_some_and(|s| s.expired())
     }
 
-    /// Whether the server stopped `token`'s playback (its admin did, P3-15):
-    /// the player says so rather than fail as if the network had.
+    /// Whether the server's admin stopped `token`'s playback: the player
+    /// says so rather than fail as if the network had.
     pub fn stopped(&self, token: &str) -> bool {
         self.streams
             .lock()
@@ -289,9 +287,8 @@ impl<S: Source> Bridge<S> {
         token
     }
 
-    /// Serve `stream` under `token`, one the caller made (the server makes
-    /// its own as it makes session tokens, PX-49): unguessable, and a
-    /// single path segment. False, and nothing served, if `token` is
+    /// Serve `stream` under `token`, one the caller made. It must be
+    /// unguessable, and a single path segment. False, and nothing served, if `token` is
     /// served already or is not one segment of URL-safe characters.
     pub fn register_as(&self, token: &str, stream: Stream<S>) -> bool {
         let safe = !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');

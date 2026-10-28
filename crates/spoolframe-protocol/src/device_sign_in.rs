@@ -1,4 +1,4 @@
-//! Signing a device in by approving it on another (P3-07): the code a TV
+//! Signing a device in by approving it on another: the code a TV
 //! shows, and the link its QR code carries.
 //!
 //! The code is 8 letters from an alphabet without vowels (so it never
@@ -43,7 +43,7 @@ pub fn link(server: &str, code: &str) -> String {
 
 /// The page of the web UI at `origin` (`https://media.example.org`) that
 /// approves `code`: what the QR code carries for a phone with a browser
-/// and no Spoolframe app (P3-05).
+/// and no Spoolframe app.
 pub fn web_link(origin: &str, code: &str) -> String {
     format!("{origin}/auth/device?code={code}")
 }

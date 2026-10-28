@@ -1,8 +1,8 @@
 //! The media model clients browse: libraries, and the movies, shows and
-//! music in them (ARCHITECTURE §5).
+//! music in them.
 //!
 //! `playback` is filled in by the server for the session's own user; it
-//! never comes from Plex (§36).
+//! never comes from Plex.
 
 use std::time::Duration;
 
@@ -30,14 +30,14 @@ pub struct Library {
     pub title: String,
     pub kind: LibraryKind,
     /// The paired server a library is shared from (experimental
-    /// `federation`, P8-02): only on a library of another server's, and
+    /// `federation`): only on a library of another server's, and
     /// only to a client that named the feature. `None` for the server's
     /// own libraries, and left out then, as experimental fields are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<LibraryServer>,
 }
 
-/// The server a library of another server's is shared from (P8-02), so a
+/// The server a library of another server's is shared from, so a
 /// client groups libraries by server, an offline one last and greyed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LibraryServer {
@@ -80,12 +80,12 @@ pub struct PlaybackState {
     /// details); `None` elsewhere, and for an item never viewed.
     ///
     /// This and the two below are read as none when left out: the SDK
-    /// keeps an item with its download, and one kept by an SDK before
-    /// them lacks the keys.
+    /// keeps an item with its download, and a download kept by an older
+    /// SDK lacks the keys.
     #[serde(default)]
     pub last_viewed_at: Option<i64>,
     /// How many times the user played it through: their counted plays
-    /// from any device (PX-52). Filled where its reply says so (an
+    /// from any device. Filled where its reply says so (an
     /// item's details, Recently played); 0 elsewhere.
     #[serde(default)]
     pub play_count: u32,
@@ -106,7 +106,7 @@ pub struct Movie {
     ///
     /// This and `cast` are read as `None` and no one when left out, though
     /// every server sends them: the SDK keeps an item with its download,
-    /// and one kept by an SDK before them lacks the keys.
+    /// and a download kept by an older SDK lacks the keys.
     pub release_date: Option<CalendarDate>,
     pub summary: Option<String>,
     /// The age rating as the catalog has it ("R", "TV-MA"), shown as
@@ -208,8 +208,7 @@ pub struct Episode {
 /// An item's `cast` is in the catalog's billing order, actors first, then
 /// directors. Only the item's own read (`Item`) has it; it is empty in
 /// listings, search and the home rows, where Plex gives names without
-/// the ids a person is listed by. A native catalog fills it with images
-/// and people (P9-05); until then only Plex does.
+/// the ids a person is listed by.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CastMember {
     /// The id a person search gives them: their items are listed with
@@ -298,7 +297,7 @@ pub enum MarkerKind {
     Unknown,
 }
 
-/// A stretch of a movie or episode a viewer may want to skip (P2-10).
+/// A stretch of a movie or episode a viewer may want to skip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
     pub kind: MarkerKind,

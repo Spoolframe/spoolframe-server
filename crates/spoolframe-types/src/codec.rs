@@ -1,4 +1,4 @@
-//! The words server and client share for formats (ARCHITECTURE §8).
+//! The words server and client share for formats.
 //!
 //! The server knows streams by ffprobe's names (`hevc`, `hdmv_pgs_subtitle`)
 //! and a GStreamer client knows its decoders by caps (`video/x-h265`);
@@ -101,13 +101,13 @@ vocabulary!(
 );
 
 vocabulary!(
-    /// How a client takes media in (P2-01).
+    /// How a client takes media in.
     Delivery {
-        /// Range reads of the file itself (P1-08).
+        /// Range reads of the file itself.
         Range => "range",
-        /// HLS playlists and segments (P2-05).
+        /// HLS playlists and segments.
         Hls => "hls",
-        /// One stream written as it is encoded, read by range (P2-04).
+        /// One stream written as it is encoded, read by range.
         Progressive => "progressive",
     }
 );
@@ -145,7 +145,7 @@ pub struct VideoLimits {
 /// what it actually has (the Linux client from the GStreamer registry),
 /// not from a fixed list.
 ///
-/// Every field is required on the wire (PX-15): an empty set or `null`
+/// Every field is required on the wire: an empty set or `null`
 /// says "none", and a client that leaves a field out is refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCapabilities {
@@ -154,7 +154,7 @@ pub struct ClientCapabilities {
     pub containers: BTreeSet<Container>,
     pub subtitles: BTreeSet<SubtitleFormat>,
     /// How it takes media in, preferred first. Empty means range reads
-    /// only, which is what a Phase 1 client does.
+    /// only.
     pub delivery: Vec<Delivery>,
     #[serde(deserialize_with = "crate::required::option")]
     pub max_video: Option<VideoLimits>,
@@ -247,7 +247,8 @@ impl ClientCapabilities {
                 .is_none_or(|hardware| hardware.contains(&codec))
     }
 
-    /// [`ClientCapabilities::delivery`], with the Phase 1 default filled in.
+    /// [`ClientCapabilities::delivery`], with the default (range reads
+    /// only) filled in when it is empty.
     pub fn deliveries(&self) -> Vec<Delivery> {
         if self.delivery.is_empty() {
             vec![Delivery::Range]

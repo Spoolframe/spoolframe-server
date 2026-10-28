@@ -1,11 +1,15 @@
-//! The client side of Spoolframe: the Iroh transport, saved servers and
-//! sessions. The Linux client uses it directly, the tvOS client through FFI.
+//! The SDK for Spoolframe client apps: it finds and dials servers over
+//! Iroh, keeps the saved servers, signs in, and plays media.
 //!
-//! Permissively licensed (MIT OR Apache-2.0) so proprietary clients can
-//! link it; it never depends on an AGPL crate.
+//! Start with [`Client::open`], then open a [`Session`] on a saved server.
+//! A Rust app uses the SDK directly; an app in another language wraps it
+//! through FFI.
+//!
+//! Licensed MIT OR Apache-2.0, so proprietary apps can link it. It never
+//! depends on an AGPL crate.
 //!
 //! The public surface is concrete types with async methods and owned
-//! values, no generics, so a UniFFI layer can wrap it (P5). What the SDK
+//! values, no generics, so a UniFFI layer can wrap it. What the SDK
 //! needs from the platform comes in from the app: the [`Device`] and its
 //! [`Storage`].
 //!
@@ -43,12 +47,12 @@ mod subtitle_sync;
 
 pub use client::{Client, ClientOptions, Device, DeviceSignIn, STREAM_WINDOW, ServersWatch};
 pub use connection::Timeouts;
-// Downloads for offline viewing (PX-38), and their wire types.
+// Downloads for offline viewing, and their wire types.
 pub use downloads::{
     DownloadEvent, DownloadPhase, DownloadSpace, Downloads, LocalArtwork, LocalDownload,
     LocalWatch, SyncedWatch,
 };
-// Music offline (PX-51), and its wire types.
+// Music offline, and its wire types.
 pub use downloads::{
     AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
     MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
@@ -68,11 +72,11 @@ pub use spoolframe_protocol::downloads::{
     DownloadTracks, FileTracks, LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
 };
 pub use spoolframe_protocol::federation::{PairingRefused, PeerServer};
-// Pairing a guest onto this device by QR code (P7-03).
+// Pairing a guest onto this device by QR code.
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;
-// Portable identities (P7-01) and their device credentials (P7-02).
+// Portable identities and their device credentials.
 pub use federation::{DIRECT_DIAL, LibrariesChanged, RemoteDownload, RemoteMode, RemotePlayback};
 pub use pairing_relay::{RelayAnswer, RelayOffer, RelayPairing};
 pub use playlists::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
@@ -90,7 +94,7 @@ pub use reachability::{
 };
 pub use spoolframe_protocol::federation::{RemoteGranted, RemoteHints};
 pub use subtitle_sync::SubtitleTimingEvent;
-// Playlists' wire types (PX-40), as the calls take and return them.
+// Playlists' wire types, as the calls take and return them.
 pub use servers::ServerEntry;
 pub use session::{
     ActiveProfile, Chunk, ChunkStream, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange,
@@ -110,21 +114,21 @@ pub use spoolframe_protocol::{
     SearchGroup, SearchRequest, SearchResults, Selection, SessionInfo, TopResult,
     TrackPreferencesInfo, TrackReason, TrustedProfile, UserSummary,
 };
-// Experimental federation (P8-05): a search's hits and a title's copies.
+// Experimental federation: a search's hits and a title's copies.
 pub use spoolframe_protocol::{Copies, SearchHit, TitleCopy};
-// Passkeys in the app (P3-19): the raw WebAuthn bytes the platform's
-// passkey API takes and gives. The relying party is each server's own
-// (PX-14), in the request; `LEGACY_APP_RP_ID` marks passkeys made for the
-// one all servers once shared, which sign in nowhere now.
+// Passkeys in the app: the raw WebAuthn bytes the platform's
+// passkey API takes and gives. The relying party is each server's own,
+// named in the request. `LEGACY_APP_RP_ID` marks passkeys made for a
+// shared relying party; they sign in nowhere.
 pub use spoolframe_protocol::{
     FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, PasskeyCreation, PasskeyInfo,
     PasskeyRequest, ServerId,
 };
-// Fingerprints for the "Server identity changed" alert (P1-13, P1-21).
+// Fingerprints for the "Server identity changed" alert.
 pub use spoolframe_protocol::fingerprint;
-// Sign-in codes and the links their QR codes carry (P3-07).
+// Sign-in codes and the links their QR codes carry.
 pub use spoolframe_protocol::device_sign_in;
-// Invite links (P6-01): the codec, for an app that makes or checks one.
+// Invite links: the codec, for an app that makes or checks one.
 pub use spoolframe_protocol::invite;
 pub use spoolframe_types as types;
 pub use storage::{MemoryStorage, Storage, StorageError};

@@ -1,4 +1,4 @@
-//! Servers heard on the LAN (P1-13).
+//! Servers heard on the LAN.
 //!
 //! The mDNS lookup only reports what it hears after a subscription, and
 //! skips repeats of what it has already heard, so the SDK subscribes once,

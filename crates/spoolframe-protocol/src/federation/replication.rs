@@ -1,16 +1,16 @@
-//! Replication (P8-02): what a paired server asks of the one whose
+//! Replication: what a paired server asks of the one whose
 //! libraries are shared with it, and the answers. Only a live pair's
 //! connection reaches these; anyone else's stream is reset.
 //!
-//! The server that shares (SA) keeps no change feed and no poller: the
-//! one it shares with (SB) asks for each shared library with [`SyncLibrary`],
-//! and SA walks the library then. It diffs what it finds against what it
-//! last gave SB, kept per pair and library as a content hash per item
-//! ([`RemoteItem::hash`]), and answers with the changes, or with the whole
-//! library when it does not know SB's cursor. Either answer comes as
-//! [`SyncPage`]s on the request's own stream, as many frames as it takes;
-//! SB keeps none of it until the last page is read, and then names the
-//! cursor in its next `SyncLibrary`.
+//! The sharing server keeps no change feed and no poller. The server it
+//! shares with asks for each shared library with [`SyncLibrary`], and the
+//! sharing server walks the library then. It diffs what it finds against
+//! what it last gave that server, kept per pair and library as a content
+//! hash per item ([`RemoteItem::hash`]). It answers with the changes, or
+//! with the whole library when it does not know the cursor. Either answer
+//! comes as [`SyncPage`]s on the request's own stream, as many frames as it
+//! takes. The asking server keeps none of it until the last page is read,
+//! and then names the cursor in its next `SyncLibrary`.
 //!
 //! Every list here is bounded, and what a server reads of a page is cut
 //! to the bounds ([`SyncPage::within_bounds`]): a longer list loses its
@@ -44,7 +44,7 @@ pub const MAX_ARTWORK_BYTES: usize = 16 << 20;
 /// The largest reply to an [`ArtworkFetch`] a server reads, in bytes: the
 /// image's [`MAX_ARTWORK_BYTES`] and room for its media type and the
 /// reply around it. One announced longer is refused before any of it is
-/// held, not read to the reply's own 64 MiB bound first (F8-12).
+/// held, not read to the reply's own 64 MiB bound first.
 pub const MAX_ARTWORK_REPLY: usize = MAX_ARTWORK_BYTES + (64 << 10);
 
 /// Ask for one shared library's changes since `since`.
@@ -219,13 +219,13 @@ pub struct RemoteItem {
     pub artwork: Vec<RemoteArtwork>,
     /// Its stable ids outside the sharing server's keys: TMDB, IMDb,
     /// TVDB, MusicBrainz, Plex's guid (`tmdb://603`). What progress per
-    /// title (P8-03) and merged search (P8-05) match on.
+    /// title and merged search match on.
     #[serde(default)]
     pub external_ids: Vec<String>,
     /// What a library is sorted and filtered by
     /// ([`spoolframe_types::browse`]), each left out when the sharing
-    /// server has none: one from before them sends none, and the item
-    /// hashes as it did. A film's, a show's or an artist's.
+    /// server has none. An older server sends none, and the item hashes
+    /// as if they were absent. A film's, a show's or an artist's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_title: Option<String>,
     /// The day it first came out, `YYYY-MM-DD`: a film's release, a

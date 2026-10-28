@@ -1,11 +1,11 @@
-//! Portable identities (P7-01, ARCHITECTURE §42–§46): a root signing key
+//! Portable identities: a root signing key
 //! the user owns, its [`PortableUserId`], and the recovery phrase that
 //! gives the same key back on any device.
 //!
-//! The phone app holds the root (§44). It is signing-only: it authorizes
-//! device credentials (P7-02) and is never itself sent anywhere.
+//! The phone app holds the root. It is signing-only: it authorizes
+//! device credentials and is never itself sent anywhere.
 //!
-//! Device credentials (P7-02, §45, §48): each device that acts as an
+//! Device credentials: each device that acts as an
 //! identity holds its own key for it ([`Portable::device_key`]); the
 //! root signs a [`UserDeviceCredential`] for that key
 //! ([`Portable::issue_credential`]) and the device installs it
@@ -193,7 +193,7 @@ fn parse(phrase: &str) -> Result<Mnemonic, PhraseError> {
 }
 
 /// `phrase` trimmed, single-spaced and lower case, written straight into
-/// one zeroized buffer (P8): no word is copied anywhere else on the heap,
+/// one zeroized buffer: no word is copied anywhere else on the heap,
 /// and the buffer is sized first, so it never grows and leaves a freed
 /// copy behind.
 fn normalized(phrase: &str) -> Zeroizing<String> {
@@ -223,11 +223,11 @@ pub struct GuestPairing {
     pub id: PortableUserId,
     /// The server the pairing was for: the one a pairing through a server
     /// went through, or the first server a QR pairing's phone handed
-    /// ([`crate::Paired::servers`]). `None` when there was none, and for
-    /// a guest paired before the SDK kept it.
+    /// ([`crate::Paired::servers`]). `None` when there was none, or none
+    /// is recorded.
     pub server: Option<GuestServer>,
-    /// When it was last paired onto this device, Unix seconds. `None` for
-    /// a guest paired before the SDK kept it.
+    /// When it was last paired onto this device, Unix seconds. `None` when
+    /// none is recorded.
     pub paired_at: Option<u64>,
 }
 
@@ -292,7 +292,7 @@ pub struct PortableIdentity {
     /// with the root; recovering from the phrase puts it back.
     #[serde(skip)]
     pub has_root: bool,
-    /// Rooted in security keys (P7-08): its genesis is kept here, and its
+    /// Rooted in security keys: its genesis is kept here, and its
     /// root actions take a key ([`RootSigner::Key`]). A phrase identity
     /// that added a key is not one: its phrase is still a root.
     // Read as the default when left out: a stored record, not a message of
@@ -507,7 +507,7 @@ impl Portable {
         Ok(root)
     }
 
-    // Root side (P7-02): the phone that holds identity `id`'s root.
+    // Root side: the phone that holds identity `id`'s root.
 
     /// A credential from identity `id`'s root for `device_key`, good for
     /// [`MAX_CREDENTIAL_VALIDITY`] from now. Renewal is the same call: a
@@ -544,7 +544,7 @@ impl Portable {
         // A synced root acts on what its other holders did: their revoked
         // keys and root changes first.
         self.sync_data(id).await?;
-        // A phrase root the identity removed (P7-08) is kept here, but
+        // A phrase root the identity removed is kept here, but
         // signs nothing more: devices refuse what it signs.
         if !self.roots(id).await?.holds(&RootKey::phrase_of(&id)) {
             return Err(SdkError::NotARoot);
@@ -656,12 +656,12 @@ impl Portable {
         Ok(load_state(self.storage.as_ref(), id).await?)
     }
 
-    // Device side (P7-02): any device that acts as an identity, the
+    // Device side: any device that acts as an identity, the
     // root's own phone or a TV that never holds it.
 
     /// This device's key for acting as identity `id`, made and kept the
-    /// first time it is asked for. Show it to the root's phone (P7-03's
-    /// QR) to get a credential for it. A key revoked here is replaced by
+    /// first time it is asked for. Show it to the root's phone (by the
+    /// pairing QR code) to get a credential for it. A key revoked here is replaced by
     /// a new one: a revoked key never authenticates again, so the device
     /// pairs afresh with a key that can.
     pub async fn device_key(&self, id: PortableUserId) -> Result<DevicePublicKey, SdkError> {
@@ -752,7 +752,7 @@ impl Portable {
     }
 
     /// Whether `credential`'s signer is one of its identity's roots, as
-    /// this device knows them (P7-08): from the genesis it carries or the
+    /// this device knows them: from the genesis it carries or the
     /// one kept here, and the newest state here. A key identity's
     /// genesis is kept from it.
     async fn check_signer(&self, credential: &UserDeviceCredential) -> Result<(), SdkError> {
@@ -798,8 +798,8 @@ impl Portable {
         Ok(load_credentials(self.storage.as_ref()).await?.remove(&id))
     }
 
-    /// This device's credential for identity `id`, whose root it holds
-    /// (P7-06): the phone signs one for its own key, as it signs a TV's,
+    /// This device's credential for identity `id`, whose root it holds:
+    /// the phone signs one for its own key, as it signs a TV's,
     /// to sign in to servers and redeem invites as `id` with the proof
     /// any device gives. The one it has is kept while it holds for
     /// [`OWN_CREDENTIAL_RENEW`] more; else a new one is issued (recorded
@@ -856,7 +856,7 @@ impl Portable {
         state.verify()?;
         let id = state.user;
         let storage = self.storage.as_ref();
-        // Signed by one of the identity's roots, ever (P7-08).
+        // Signed by one of the identity's roots, ever.
         let genesis = key_roots::load_genesis(storage, id).await?;
         let mut held = load_heads(storage, id).await?;
         let before = spoolframe_protocol::portable::root_set(&id, genesis.as_ref(), &held);
@@ -906,7 +906,8 @@ impl Portable {
     /// What this device sends to sign in as identity `id` on the server
     /// whose endpoint id is `server`, answering its `nonce`: the
     /// credential, and the device key's signature over
-    /// [`device_proof_message`]. The request that carries them is P7-06.
+    /// [`device_proof_message`]. [`crate::Client::sign_in_portable`] sends
+    /// them.
     /// Refused if the credential no longer holds (renew it from the
     /// root) or its key is revoked here.
     pub async fn prove(
@@ -943,7 +944,7 @@ impl Portable {
     }
 
     /// What ties the local account `username` on the server whose endpoint
-    /// id is `server` to identity `id`, answering its `nonce` (P7-04): the
+    /// id is `server` to identity `id`, answering its `nonce`: the
     /// root's signature over [`tie_message`] if this device holds the
     /// root, else this device key's with its credential, checked as
     /// [`Portable::prove`] checks them. The root itself is never sent.
@@ -970,7 +971,7 @@ impl Portable {
         let message = tie_message(server, nonce, &id, username)
             .ok_or_else(|| SdkError::Protocol("the account's username is too long".into()))?;
         match self.load_root(id).await {
-            // A phrase root the identity removed (P7-08) signs no tie: the
+            // A phrase root the identity removed signs no tie: the
             // device's credential, from a root it still has, does.
             Ok(root) if self.roots(id).await?.holds(&RootKey::phrase_of(&id)) => {
                 return Ok(TieProof::Root {
@@ -1002,7 +1003,7 @@ impl Portable {
         })
     }
 
-    // Guests (P7-03): identities this device acts as without holding
+    // Guests: identities this device acts as without holding
     // their root, by the device's own leave.
 
     /// Whether this device lets people sign in on it as an account that
@@ -1012,9 +1013,8 @@ impl Portable {
     /// ([`crate::Client::start_pairing`]), before anything is sent
     /// anywhere.
     ///
-    /// The one gate for every external principal: a portable identity
-    /// paired by QR now (P7-03), a federated server's user when P8 pairs
-    /// servers. Storage that cannot be read is an error, never "on".
+    /// The one gate for every external principal, such as a portable
+    /// identity paired by QR. Storage that cannot be read is an error, never "on".
     pub async fn allow_guests(&self) -> Result<bool, SdkError> {
         match self.storage.data(keys::ALLOW_GUESTS).await? {
             None => Ok(false),
@@ -1041,7 +1041,7 @@ impl Portable {
 
     /// [`Portable::guests`], each with the server it was paired for and
     /// when: for a "Shared computer" row, "server name · date". A guest
-    /// paired before the SDK kept these has `None` for both.
+    /// with no pairing recorded has `None` for both.
     pub async fn guest_pairings(&self) -> Result<Vec<GuestPairing>, SdkError> {
         let storage = self.storage.as_ref();
         let mut listed = Vec::new();

@@ -28,7 +28,7 @@ pub enum ResourceRequest {
         revision: u64,
         segment: u32,
     },
-    /// Upload a cover for playlist `id` (PX-53, `spoolframe:playlist-art`):
+    /// Upload a cover for playlist `id` (`spoolframe:playlist-art`):
     /// the only request whose stream goes on past it, with exactly
     /// `length` bytes of a JPEG, PNG, WebP or HEIC picture. Answered
     /// `ready { length: 0, playlist_art { artwork } }`, with no body.
@@ -40,7 +40,7 @@ pub enum ResourceRequest {
         id: String,
         length: u64,
     },
-    /// Read download `id`'s file (PX-38, `spoolframe:downloads`): at most
+    /// Read download `id`'s file (`spoolframe:downloads`): at most
     /// `length` bytes from `offset`, and no more than [`crate::MAX_READ`].
     /// Any offset may be asked, so a download broken off resumes where it
     /// stopped. Answered `ready { length, download { size } }` with the

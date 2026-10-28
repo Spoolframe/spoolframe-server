@@ -1,4 +1,4 @@
-//! A required `Option` field (PX-15): the key must be on the wire, with
+//! A required `Option` field: the key must be on the wire, with
 //! `null` for none.
 //!
 //! serde fills a missing `Option` field with `None` even without

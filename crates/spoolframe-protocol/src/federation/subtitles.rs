@@ -1,40 +1,45 @@
-//! Subtitle search on a paired server's item (P8-07): the server the user
-//! is at home on (SB) passes `SearchSubtitles`, `DownloadSubtitle` and
-//! `RemoveSubtitleDownload` of a `fed:` item to the server whose item it
-//! is (SA), which plans the play and burns subtitles in, so the file must
-//! be there.
+//! Subtitle search on a paired server's item: the user's home server
+//! passes `SearchSubtitles`, `DownloadSubtitle` and
+//! `RemoveSubtitleDownload` of a `fed:` item to the item's server (the
+//! server whose item it is). That server plans the play and burns
+//! subtitles in, so the file must be there.
 //!
-//! SA searches with its own sites and ranking, ordered by the user's own
-//! SDH and forced choices on SB, and keeps what it downloads as its own,
-//! for everyone. Every user of SB's together gets one daily allowance on
-//! SA (`subtitles { daily_limit_per_peer }`), counted under the pair and
-//! never under SB's users, whom SA never names; SB holds each of its users
-//! to its own per-user limit first.
+//! The item's server searches with its own sites and ranking, ordered by
+//! the user's own SDH and forced choices on the home server, and keeps
+//! what it downloads as its own, for everyone. All the home server's users
+//! together get one daily allowance on the item's server
+//! (`subtitles { daily_limit_per_peer }`). It is counted under the pair,
+//! never under the home server's users, whom the item's server never
+//! names. The home server holds each of its users to its own per-user
+//! limit first.
 //!
 //! Each ask arrives on the pair's connection, which proves who sends it,
-//! as an assertion does (P8-03): the user is SB's local account, by its
-//! stable id.
+//! as an assertion does: the user is the home server's local account, by
+//! its stable id.
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::SubtitlePreferences;
 
-/// `SearchSubtitles` of SA's item `item` for SB's `user`: `SubtitleResults`,
-/// or `Failed`.
+/// `SearchSubtitles` of the item's server's `item` for the home server's
+/// `user`: answered with `SubtitleResults`, or `Failed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleSearchAsk {
-    /// The user's stable id on SB, as an assertion names them.
+    /// The user's stable id on the home server, as an assertion names
+    /// them.
     pub user: String,
-    /// Their subtitle choices on SB: what the results are ordered by.
+    /// Their subtitle choices on the home server: what the results are
+    /// ordered by.
     #[serde(default)]
     pub subtitles: SubtitlePreferences,
-    /// The item, by SA's own id.
+    /// The item, by the item's server's own id.
     pub item: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
 
-/// `DownloadSubtitle` of result `result` of a search for SA's `item`, for
-/// SB's `user`: `SubtitleDownloaded`, or `Failed`.
+/// `DownloadSubtitle` of result `result` of a search for the item's
+/// server's `item`, for the home server's `user`: answered with
+/// `SubtitleDownloaded`, or `Failed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleDownloadAsk {
     pub user: String,
@@ -42,8 +47,9 @@ pub struct SubtitleDownloadAsk {
     pub result: String,
 }
 
-/// `RemoveSubtitleDownload` of download `download` of SA's `item`, for SB's
-/// `user`: `Done`, or `Failed`.
+/// `RemoveSubtitleDownload` of download `download` of the item's server's
+/// `item`, for the home server's `user`: answered with `Done`, or
+/// `Failed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleRemovalAsk {
     pub user: String,

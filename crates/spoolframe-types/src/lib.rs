@@ -1,9 +1,8 @@
 //! The types every Spoolframe client sees: the media model and its
 //! identifiers.
 //!
-//! These are Spoolframe's models, never Plex's (ARCHITECTURE §5). Plex is
-//! only today's source of metadata; when a native catalog replaces it, these
-//! types stay as they are.
+//! These are Spoolframe's own models, not Plex's. Plex is a source of
+//! metadata behind the server; these types do not depend on it.
 //!
 //! Permissively licensed (MIT OR Apache-2.0) so that any client, open or
 //! proprietary, can link it. It never depends on an AGPL server crate.
@@ -57,7 +56,6 @@ pub use search::{Person, PersonRole, SearchKind, SearchScope};
 pub mod pin;
 
 /// The domain every server's app passkeys are made under: a server's
-/// relying party is `<server id>.spoolframe.app` (PX-14). Kept here, the
-/// crate every client and the admin API share, so all of them name the
-/// same one.
+/// relying party is `<server id>.spoolframe.app`. Every client and the
+/// admin API use this one value.
 pub const APP_RP_DOMAIN: &str = "spoolframe.app";

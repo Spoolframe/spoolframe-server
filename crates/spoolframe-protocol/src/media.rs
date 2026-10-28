@@ -1,5 +1,4 @@
-//! Playing media: playback sessions and range reads (ARCHITECTURE §34,
-//! P1-08).
+//! Playing media: playback sessions and range reads.
 //!
 //! `StartPlayback` (an RPC) plans the item and returns a
 //! [`PlaybackHandle`]. The client then reads the file in ranges, each on its
@@ -40,20 +39,20 @@ pub struct MediaRead {
     pub offset: u64,
     /// Capped at [`MAX_READ`].
     pub length: u64,
-    /// The encode this read is for (P2-04): byte offsets mean nothing
+    /// The encode this read is for: byte offsets mean nothing
     /// across a restart. 0 for direct play and a playback's first encode.
     pub epoch: u32,
-    /// An HLS segment to read in, 0 being the init segment (P2-05); `None`
+    /// An HLS segment to read in, 0 being the init segment; `None`
     /// reads the file itself (direct play) or the progressive output.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub segment: Option<u32>,
-    /// For HLS, the variant the segment is of (PX-21): a ladder's rung,
+    /// For HLS, the variant the segment is of: a ladder's rung,
     /// as `v{n}/` in its playlist. 0 for one encode, and for anything
     /// that is not a segment.
     pub variant: u32,
 }
 
-/// What follows on the stream. Every field is required (PX-15).
+/// What follows on the stream. Every field is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaReadReply {
     /// How many bytes follow this frame.

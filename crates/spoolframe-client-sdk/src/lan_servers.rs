@@ -1,9 +1,7 @@
-//! "Find a server on my network": the servers heard on the LAN (P1-13),
-//! and what each says of itself before anyone signs in.
+//! "Find a server on my network": the servers heard on the LAN, and what
+//! each says of itself before anyone signs in.
 //!
-//! The mDNS record carries the name alone (`lan::advert`), and an older
-//! client reads anything after it as part of the name, so the rest of a
-//! row comes from the server's `Hello` answer: one connect per row, with
+//! The mDNS record carries the name alone, so the rest of a row comes from the server's `Hello` answer: one connect per row, with
 //! only `Hello` sent, as [`Client::connect`] does. Nothing is saved.
 
 use spoolframe_protocol::fingerprint;
@@ -20,7 +18,7 @@ pub struct LanServerInfo {
     pub endpoint_id: String,
     /// The name it answers with, which may be newer than the one heard.
     pub name: String,
-    /// The key's fingerprint (P1-21), `K7QX-3MPA-9TRD-WF2H`: the code the
+    /// The key's fingerprint, `K7QX-3MPA-9TRD-WF2H`: the code the
     /// apps show beside a server ([`ServerEntry::fingerprint`]).
     pub fingerprint: String,
     /// The server's release, as it says it.

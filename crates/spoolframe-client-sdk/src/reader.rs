@@ -1,5 +1,4 @@
-//! Random access to a playback's file over the session's range reads
-//! (P1-08, P1-16).
+//! Random access to a playback's file over the session's range reads.
 //!
 //! GStreamer asks for many small reads (a few KiB, often out of order while
 //! it probes the container) on its streaming thread, and wants the bytes
@@ -51,10 +50,10 @@ const EXPECT_IN_FLIGHT: usize = 2;
 /// How often a waiting read reports progress while buffering.
 const REPORT_EVERY: Duration = Duration::from_millis(250);
 /// How long an underrun goes on before the reader asks whether the link
-/// can carry the file at all (P6-06): a short one is a swing.
+/// can carry the file at all: a short one is a swing.
 pub const LIMIT_AFTER: Duration = Duration::from_secs(3);
 
-/// How hard the reader works the link (P6-06). The defaults,
+/// How hard the reader works the link. The defaults,
 /// [`MAX_IN_FLIGHT`] and [`TARGET_AHEAD`], suit the LAN and most of the
 /// Internet. A link with a long round trip carries more with more reads
 /// in flight, each a block; one that swings needs more ahead. An app
@@ -102,7 +101,7 @@ pub struct Status {
     pub target: Option<Duration>,
     pub in_flight: usize,
     /// The link's recent rate, bytes per second: what every fetch in
-    /// flight carried together over the time any was (P6-06).
+    /// flight carried together over the time any was.
     pub throughput: Option<f64>,
 }
 
@@ -219,7 +218,7 @@ struct State {
     throughput: Option<f64>,
     /// The reader was dropped: fetches still running start no more.
     stopped: bool,
-    /// A stall made the reader ask for a plan the link can carry (P6-06).
+    /// A stall made the reader ask for a plan the link can carry.
     limit_asked: bool,
     /// The playback was planned again: reads are over, with this epoch.
     replanned: Option<u32>,
@@ -240,7 +239,7 @@ impl MediaReader {
         Self::with_tuning(playback, spawn, length, Tuning::default())
     }
 
-    /// [`MediaReader::new`], working the link as `tuning` says (P6-06).
+    /// [`MediaReader::new`], working the link as `tuning` says.
     pub fn with_tuning(
         playback: ManagedPlayback,
         spawn: Spawn,
@@ -501,8 +500,8 @@ impl Shared {
     /// soon. Only a read evicts: a fetch arriving for a block a read
     /// jumped to must stay until that read takes it.
     /// The first and last blocks stay: demuxers read the header and the
-    /// index at the end of the file again and again while they open it,
-    /// and a resume's log showed each fetched six or seven times.
+    /// index at the end of the file again and again while they open it;
+    /// evicted, each would be fetched six or seven times.
     fn evict(&self, state: &mut State, from: u64) {
         let near = |at: u64| at.saturating_sub(BEHIND)..=at + self.ahead;
         let (keep, expected) = (near(from), state.expected.map(near));
@@ -517,9 +516,9 @@ impl Shared {
 
     /// Fetches block `index` now, whatever the read-ahead has in flight:
     /// a read waits for it. Without this, a resume's read-ahead around the
-    /// saved position took every slot first, and the demuxer's reads of
-    /// the header and the index queued behind four blocks of the middle of
-    /// the file: seconds of black screen.
+    /// saved position would take every slot first, and the demuxer's reads
+    /// of the header and the index would queue behind four blocks of the
+    /// middle of the file: seconds of black screen.
     fn demand(&self, this: &Arc<Self>, state: &mut State, index: u64) {
         if index > self.last_index()
             || state.blocks.contains_key(&index)
@@ -603,8 +602,8 @@ impl Shared {
     /// Through a long underrun: when the link's measured rate cannot
     /// carry the file (its share of the link, [`LINK_SHARE`], is under
     /// the file's bitrate), ask once for the playback to be planned for
-    /// the link (P6-06); an ask that failed is made again at the stall's
-    /// next check, while it lasts. A new plan ends this reader: its reads are then
+    /// the link; an ask that failed is made again at the stall's next
+    /// check, while it lasts. A new plan ends this reader: its reads are then
     /// [`BackendError::PlaybackRestarted`], and the player makes a new
     /// one from the playback's snapshot, as after a subtitle change.
     fn limit_if_too_slow(&self, this: &Arc<Self>, state: &mut State) {

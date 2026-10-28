@@ -1,4 +1,4 @@
-//! Downloads for offline viewing (PX-38, feature `spoolframe:downloads`):
+//! Downloads for offline viewing (feature `spoolframe:downloads`):
 //! the messages of [`crate::Request::DownloadOptions`],
 //! [`crate::Request::PrepareDownload`], [`crate::Request::DownloadStatus`],
 //! [`crate::Request::CancelDownload`] and
@@ -13,7 +13,7 @@
 //! MP4, Linux ones Matroska; tvOS and the web have none. Tracks are named
 //! by their place in the item's `Tracks`: `audio[i]`, `subtitles[i]`.
 //!
-//! With `spoolframe:music-downloads` too (PX-51), a download may be a
+//! With `spoolframe:music-downloads` too, a download may be a
 //! track: in `original` quality, the file as it is when the device plays
 //! it, byte for byte; else, converted, lossless as ALAC (Apple) or FLAC
 //! (Linux) and lossy as AAC; or as AAC at 256 kbit/s (`aac256`). A
@@ -29,10 +29,11 @@ use spoolframe_types::{ClientCapabilities, Container, MediaId, MediaTracks, Plat
 /// `SyncOfflineWatch` carries.
 pub const MAX_ASKED: usize = 500;
 
-/// The device a paired server's item is downloaded for (P8-07): what the
-/// server its user is at home on (SB) sends with `DownloadOptions` and
-/// `PrepareDownload` on the paired server (SA), which plans for it in place
-/// of SB's own `Hello`, as `StartPlayback`'s `capabilities` does a play.
+/// The device a paired server's item is downloaded for. The user's home
+/// server sends it with `DownloadOptions` and `PrepareDownload` on the
+/// item's server, which plans for this device rather than for the home
+/// server's own `Hello`, as `StartPlayback`'s `capabilities` does for a
+/// play.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadDevice {
     pub platform: Platform,
@@ -48,10 +49,10 @@ pub enum DownloadSource {
     /// Original quality: the file, converted only where the device needs
     /// it, at its resolution and with its HDR.
     Original,
-    /// The copy in an optimized profile (PX-37), by name, as
+    /// The copy in an optimized profile, by name, as
     /// `DownloadOptions::profiles` lists them. A film or an episode only.
     Profile { name: String },
-    /// A track as AAC at 256 kbit/s (PX-51, `spoolframe:music-downloads`),
+    /// A track as AAC at 256 kbit/s (`spoolframe:music-downloads`),
     /// smaller than the original: for a device short of space. A lossy
     /// file at or under 256 kbit/s the device plays is sent as it is. A
     /// track only.
@@ -212,8 +213,8 @@ pub enum DownloadState {
     Failed {
         /// Said to the user as it is.
         reason: String,
-        /// Why, for the app to choose what to show and offer; `other`
-        /// from a server before it was sent.
+        /// Why, for the app to choose what to show and offer. An older
+        /// server leaves it out, and it reads as `other`.
         #[serde(default)]
         cause: DownloadFailure,
     },
@@ -239,7 +240,7 @@ pub enum DownloadFailure {
     /// Talking to the server failed: a device's own, for an answer that
     /// broke off or made no sense, or a file that arrived damaged.
     Network,
-    /// A paired server's item (P8-07) that is no longer available before
+    /// A paired server's item that is no longer available before
     /// its file was made: that server stopped sharing it, or the servers
     /// unpaired. A download made already stays `Ready`, marked
     /// [`DownloadInfo::no_longer_available`].
@@ -283,11 +284,11 @@ pub struct DownloadInfo {
     /// `DownloadEstimate::size_bytes` says, a track's its file's size, or
     /// its converted rate over its length. Sent with `PrepareDownload`'s
     /// answer and with `DownloadStatus`'s; `None` when the server cannot
-    /// tell, and from a server before it was sent (an older server
-    /// sends it only with `PrepareDownload`'s). `Ready`'s `size` is exact.
+    /// tell. An older server leaves it out, or sends it only with
+    /// `PrepareDownload`'s answer. `Ready`'s `size` is exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_size: Option<u64>,
-    /// A paired server's item's download (P8-07) whose file was made, and
+    /// A paired server's item's download whose file was made, and
     /// that is no longer available: that server stopped sharing it, or the
     /// servers unpaired. Its state stays `Ready`, so the device keeps a
     /// file it has whole; nothing more of it is read. One not made yet is
@@ -317,7 +318,7 @@ pub struct OfflineWatch {
 }
 
 /// What became of one [`OfflineWatch`], and of one [`OfflinePlay`] or
-/// [`OfflineLike`] (PX-51).
+/// [`OfflineLike`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OfflineWatchOutcome {
@@ -340,7 +341,7 @@ pub enum OfflineWatchOutcome {
 /// together.
 pub const MAX_FOLLOWED: usize = 100;
 
-/// What a device's music download follows (PX-51): it keeps every track
+/// What a device's music download follows: it keeps every track
 /// of it, as it is now.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -348,9 +349,9 @@ pub enum Followed {
     /// Every track of every album of the artist, those it gains later
     /// included.
     Artist { id: MediaId },
-    /// The tracks of a playlist (PX-40), by its id; not All.
+    /// The tracks of a playlist, by its id; not All.
     Playlist { id: String },
-    /// The tracks of the user's Liked (PX-43).
+    /// The tracks of the user's Liked.
     Liked,
     /// One this build does not know.
     #[serde(other)]

@@ -1,4 +1,4 @@
-//! A user's role on a server (P2-09): what clients and the web UI show and
+//! A user's role on a server: what clients and the web UI show and
 //! switch on.
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ pub enum Role {
 }
 
 impl Role {
-    /// The name on the wire and in the server's database.
+    /// The name on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Admin => "admin",

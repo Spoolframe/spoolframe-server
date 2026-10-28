@@ -1,5 +1,5 @@
-//! Security key roots (P7-08): a FIDO2 key as a portable identity's
-//! root, so a Linux desktop (USB) or an iPhone (NFC) acts for an identity
+//! Security key roots: a FIDO2 key as a portable identity's root, so a
+//! Linux desktop (USB) or an iPhone (NFC) acts for an identity
 //! with no root secret on the device. The key signs CTAP2 assertions
 //! under [`PORTABLE_RP`] over SHA-256 of the bytes a phrase root signs;
 //! the protocol crate checks them.
@@ -9,7 +9,7 @@
 //! and Mac (WebAuthn form), [`SoftSecurityKey`] in tests (either). The
 //! key is needed only for root actions: creating an identity, issuing,
 //! renewing and revoking credentials, adding and removing roots. Signing
-//! in and playing use the device's own credential, as before.
+//! in and playing use the device's own credential.
 //!
 //! An identity made here with keys is kept as its record: its genesis
 //! ([`IdentityGenesis`]) and newest state. Export it
@@ -59,7 +59,7 @@ pub struct KeyAssertion {
     pub user_handle: Option<[u8; HANDLE_LEN]>,
 }
 
-/// Why a security key did not do what was asked (P7-08), as the Linux
+/// Why a security key did not do what was asked, as the Linux
 /// client's libfido2 transport (`spoolframe_linux_core::fido2`) and the
 /// iPhone's Core NFC tell them apart, so the app says the right thing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -105,7 +105,7 @@ pub enum SecurityKeyError {
     Cancelled,
 }
 
-/// A FIDO2 security key, as a device reaches it (P7-08): raw CTAP2, as
+/// A FIDO2 security key, as a device reaches it: raw CTAP2, as
 /// libfido2's `make_credential` and `get_assertion` (the Linux client's
 /// `spoolframe_linux_core::fido2`), or a platform's WebAuthn API (Apple's
 /// `ASAuthorizationSecurityKeyPublicKeyCredentialProvider`). Object-safe
@@ -194,7 +194,7 @@ pub trait SecurityKey: Send + Sync {
     ) -> Result<Vec<KeyAssertion>, SdkError>;
 }
 
-/// A security key in software (P7-08): [`SoftKey`]s made by
+/// A security key in software: [`SoftKey`]s made by
 /// [`SecurityKey::register`], answering as the user's Feitian key does
 /// (32-byte credential ids, flags UP and UV, counter 0). For tests, and
 /// for trying key roots with no key; its secrets are in memory only.
@@ -315,7 +315,7 @@ impl SecurityKey for SoftSecurityKey {
     }
 }
 
-/// Who signs a root action (P7-08): the phrase root this device holds, or
+/// Who signs a root action: the phrase root this device holds, or
 /// a security key that is one of the identity's roots.
 #[derive(Clone, Copy)]
 pub enum RootSigner<'a> {
@@ -404,7 +404,7 @@ async fn assert_with(
 }
 
 impl super::Portable {
-    /// A new identity called `name`, rooted in `keys` (P7-08), one or more
+    /// A new identity called `name`, rooted in `keys`, one or more
     /// up to [`MAX_ROOTS`]: the first is the one in hand, the others its
     /// backups (one in a drawer). Each is asked twice, to make its
     /// credential and to sign the genesis: a touch and the PIN each time.
@@ -453,8 +453,8 @@ impl super::Portable {
         Ok(id)
     }
 
-    /// What this device keeps of identity `id` to check it and hand on
-    /// (P7-08): its genesis (none for a phrase identity) and newest
+    /// What this device keeps of identity `id` to check it and hand on:
+    /// its genesis (none for a phrase identity) and newest
     /// state. Export it to another device, or keep it with a backup key:
     /// with any one root, it is the identity.
     pub async fn identity_record(&self, id: PortableUserId) -> Result<IdentityRecord, SdkError> {
@@ -466,7 +466,7 @@ impl super::Portable {
         })
     }
 
-    /// Keep `record` on this device as identity `name` (P7-08): from
+    /// Keep `record` on this device as identity `name`: from
     /// another device, an export file, or a server that knows the
     /// identity. Checked first: a genesis must be the user's, a state
     /// signed by one of its roots. Then any of its keys acts for it here.
@@ -520,7 +520,7 @@ impl super::Portable {
         Ok(id)
     }
 
-    /// The roots of `id` as this device knows them (P7-08): from its
+    /// The roots of `id` as this device knows them: from its
     /// genesis, or the phrase root its id is, and every head here
     /// ([`Self::identity_states`]): a root a rival head removes is gone.
     pub async fn roots(&self, id: PortableUserId) -> Result<RootSet, SdkError> {
@@ -552,8 +552,8 @@ impl super::Portable {
         }
     }
 
-    /// A credential for `device_key` from `signer`, one of `id`'s roots
-    /// (P7-08): as [`Self::issue_credential`], with a security key or the
+    /// A credential for `device_key` from `signer`, one of `id`'s roots:
+    /// as [`Self::issue_credential`], with a security key or the
     /// phrase root. A key identity's credential carries its genesis, for
     /// servers that have not seen it.
     pub async fn issue_credential_by(
@@ -621,7 +621,7 @@ impl super::Portable {
         Ok(credential)
     }
 
-    /// A new state for `id` signed by `signer` (P7-08), one revision past
+    /// A new state for `id` signed by `signer`, one revision past
     /// the highest head here, over the merge of every head (every live
     /// revocation, every root added and removed; [`super::heads`]) with
     /// `change` applied. Kept here as the only head; carry it to servers.
@@ -745,7 +745,7 @@ impl super::Portable {
         Ok(())
     }
 
-    /// Revoke `device_key` for `id`, signed by `signer` (P7-08): as
+    /// Revoke `device_key` for `id`, signed by `signer`: as
     /// [`Self::revoke`], with a security key or the phrase root.
     pub async fn revoke_by(
         &self,
@@ -774,7 +774,7 @@ impl super::Portable {
         Ok(state)
     }
 
-    /// Add `new_key` as a root of `id` (P7-08), signed by `signer`, one of
+    /// Add `new_key` as a root of `id`, signed by `signer`, one of
     /// its roots now: `new_key` makes a credential for the identity's
     /// handle and proves it holds it, then the state lists it. A phrase
     /// identity may add a key, and keeps its id. Carry the state to
@@ -843,7 +843,7 @@ impl super::Portable {
         Ok(state)
     }
 
-    /// Remove `root` from `id`'s roots (P7-08), signed by `signer`. It
+    /// Remove `root` from `id`'s roots, signed by `signer`. It
     /// never comes back, and whatever it signs from then on is refused
     /// wherever the state reaches. Removing the last root locks the
     /// identity: refused here.
@@ -880,7 +880,7 @@ impl super::Portable {
         Ok(state)
     }
 
-    /// Pair this device itself with `id` (P7-08): the device that holds
+    /// Pair this device itself with `id`: the device that holds
     /// the key is both the device and the root terminal. Its key gets a
     /// credential from `signer` and installs it. Also how it renews its
     /// own credential, with one touch.
@@ -919,7 +919,7 @@ impl super::Portable {
     }
 
     /// Install `credential` with `state`, the identity's newest as the
-    /// root terminal sent it (a pairing, P7-03 or P7-08). The state is
+    /// root terminal sent it (in a pairing). The state is
     /// checked and kept first, so a credential a root it adds signed (a
     /// phrase identity's new key) checks out; should the credential then
     /// be refused, the state this device had before is put back. Its
@@ -1002,7 +1002,7 @@ impl super::Portable {
         Ok(())
     }
 
-    /// A device key for a pairing through a server (P7-08), made before
+    /// A device key for a pairing through a server, made before
     /// the identity is known: the same one until it is adopted.
     pub(crate) async fn pending_device_key(&self) -> Result<DevicePublicKey, SdkError> {
         let _saving = self.saving.lock().await;

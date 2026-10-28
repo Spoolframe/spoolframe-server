@@ -1,9 +1,9 @@
-//! Frame previews for scrubbing (P3-13): `Request::GetPreviews` and its
+//! Frame previews for scrubbing: `Request::GetPreviews` and its
 //! reply.
 //!
 //! An item's previews are pictures of it at even intervals, packed row by
 //! row into sheets of `columns × rows` tiles. A sheet is an image like
-//! any other: read it on the artwork stream (P1-05) by its [`ArtworkId`],
+//! any other: read it on the artwork stream by its [`ArtworkId`],
 //! at [`crate::ArtworkSize::Original`], once for the item, and draw the
 //! part of it that [`Previews::tile`] names. A smaller size scales the
 //! whole sheet: scale the tile's rectangle by the image's width over

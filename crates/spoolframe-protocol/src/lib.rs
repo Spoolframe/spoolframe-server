@@ -72,13 +72,13 @@ pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};
 /// a coordinated server/SDK update; [`PROTOCOL_VERSION`] identifies the revision.
 pub const CLIENT_ALPN: &[u8] = b"spoolframe/client/1";
 
-/// The ALPN of server-to-server federation, version 1 (ARCHITECTURE §26):
-/// [`federation`]. Experimental (P8-01): a server whose
+/// The ALPN of server-to-server federation, version 1:
+/// [`federation`]. Experimental: a server whose
 /// `experimental.federation` is off refuses it with
 /// [`close::UNSUPPORTED_PROTOCOL`].
 pub const FEDERATION_ALPN: &[u8] = b"spoolframe/federation/1";
 
-/// The ALPN a device pairs with a portable identity's phone on (P7-03),
+/// The ALPN a device pairs with a portable identity's phone on,
 /// directly, with no server: [`pairing`].
 pub use pairing::PAIR_ALPN;
 
@@ -88,17 +88,17 @@ pub mod close {
     /// The ALPN is known but this peer does not serve it.
     pub const UNSUPPORTED_PROTOCOL: u32 = 1;
     /// The server holds as many connections from devices with no session
-    /// as it takes (PX-10). A device that is signed in is always let in;
+    /// as it takes. A device that is signed in is always let in;
     /// one that is not tries again later.
     pub const BUSY: u32 = 2;
     /// The device's last live session on this server ended (signed out,
     /// revoked, or its user disabled). It may connect again, as a device
     /// that is not signed in.
     pub const SIGNED_OUT: u32 = 3;
-    /// Federation (P8-01): the dialling server's endpoint is paired under
+    /// Federation: the dialling server's endpoint is paired under
     /// another server id. Refused every time.
     pub const SERVER_ID_CHANGED: u32 = 4;
-    /// Federation (P8-01): the two servers no longer pair; the one closing
+    /// Federation: the two servers no longer pair; the one closing
     /// revoked its side.
     pub const UNPAIRED: u32 = 5;
 }

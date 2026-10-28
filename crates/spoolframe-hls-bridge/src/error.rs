@@ -1,6 +1,6 @@
-//! What a source's read can fail with: the bridge's own set (PX-49), what
-//! it answers the player by. A source maps its own errors onto it (the
-//! SDK's in `sdk.rs`, the server's in the server).
+//! What a source's read can fail with. The bridge turns each error into an
+//! HTTP status for the player. A [`Source`](crate::Source) maps its own
+//! errors onto this set (the `sdk` feature does it for SDK errors).
 
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ pub enum Error {
     /// `503`, and the player asks again.
     #[error("not ready yet ({done_percent}% done)")]
     NotReady { done_percent: u8 },
-    /// The server stopped it (its admin did, P3-15): `410`, and
+    /// The server's admin stopped the playback: `410`, and
     /// [`Bridge::stopped`](crate::Bridge::stopped) says so.
     #[error("the playback was stopped on the server")]
     Stopped,

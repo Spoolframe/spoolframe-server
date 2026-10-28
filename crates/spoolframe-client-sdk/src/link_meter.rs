@@ -1,4 +1,4 @@
-//! How fast the link to a server carries media (P6-06).
+//! How fast the link to a server carries media.
 //!
 //! Direct play fetches several blocks at once, each timed alone, so a
 //! fetch's own rate is a share of the link's, not the link's: four in

@@ -1,5 +1,5 @@
-//! The download manager (PX-38): one task per client, moving one download
-//! at a time, oldest first, and sending offline watch entries.
+//! The download manager: one task per client, moving one download at a
+//! time, oldest first, and sending offline watch entries.
 
 use crate::session::unexpected;
 use std::collections::HashMap;
@@ -593,7 +593,7 @@ async fn transferring(
             Ok(())
         })
     };
-    // A paired server's item (P8-07) is read straight from that server
+    // A paired server's item is read straight from that server
     // when this device reaches it, else through the user's own server.
     let mut direct = remote_source(session, &m, &id).await;
     while !writer.is_complete() {
@@ -653,7 +653,7 @@ async fn transferring(
         }
     }
     // Whole: the paired server's session for this download is ended, and
-    // its place under that server's token caps let go (P8-07).
+    // its place under that server's token caps let go.
     if let Some(remote) = direct.take()
         && let Err(e) = remote.session.call(Request::Logout).await
     {
@@ -687,7 +687,7 @@ async fn transferring(
 }
 
 /// Where `m`'s download `id` is read from when it is a paired server's
-/// item (P8-07) and that server is reached: its session there for that
+/// item and that server is reached: its session there for that
 /// download. `None` reads it through `session`'s server.
 async fn remote_source(session: &Session, m: &Manifest, id: &str) -> Option<crate::RemoteDownload> {
     if m.item.id().namespace() != spoolframe_types::Namespace::Federated

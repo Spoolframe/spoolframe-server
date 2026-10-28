@@ -1,4 +1,4 @@
-//! Pairing through a server (P7-08), for a root terminal with no camera:
+//! Pairing through a server, for a root terminal with no camera:
 //! the device holds its request on a server both reach, under a short
 //! code it shows; the root terminal (a Linux desktop with the identity's
 //! security key) types the code, fetches the request, signs a credential
@@ -40,7 +40,7 @@ use spoolframe_protocol::portable::{HANDLE_LEN, PORTABLE_RP, root_set};
 /// keeps or forwards it.
 const RECOVER_DOMAIN: &[u8] = b"spoolframe recover v1\0";
 
-/// A pairing request this device holds on a server (P7-08).
+/// A pairing request this device holds on a server.
 #[derive(Debug, Clone)]
 pub struct RelayPairing {
     server: EndpointId,
@@ -67,7 +67,7 @@ impl RelayPairing {
     }
 }
 
-/// A pairing request a root terminal fetched (P7-08).
+/// A pairing request a root terminal fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayOffer {
     pub server: String,
@@ -87,7 +87,7 @@ impl RelayOffer {
 }
 
 /// The root terminal's answer to this device's request, checked and not
-/// yet kept (P7-08): show whose identity it is, then accept or drop it.
+/// yet kept: show whose identity it is, then accept or drop it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayAnswer {
     pub identity: PortableUserId,
@@ -108,7 +108,7 @@ impl RelayAnswer {
 }
 
 impl Client {
-    /// What server `endpoint_id` keeps of identity `user` (P7-08): its
+    /// What server `endpoint_id` keeps of identity `user`: its
     /// genesis and newest state, for recovering it with one of its keys
     /// ([`crate::Portable::import_record`]). [`SdkError::NotFound`] where
     /// the identity is not known.
@@ -131,7 +131,7 @@ impl Client {
     }
 
     /// What server `endpoint_id` keeps of the identity whose genesis
-    /// handle is `handle` (P7-08): the user handle a security key gives
+    /// handle is `handle`: the user handle a security key gives
     /// back for its credential, on a fresh install that knows nothing
     /// else. A key added to a phrase identity carries the identity's id as
     /// its handle, and that finds it too. The record is checked to be the
@@ -156,7 +156,7 @@ impl Client {
     }
 
     /// Recover an identity on this device with only `key`, one of its
-    /// roots, from server `endpoint_id`, which knows it (P7-08), as
+    /// roots, from server `endpoint_id`, which knows it, as
     /// `name`. The key is asked once with no allow list (a touch and its
     /// PIN): each credential it holds under [`PORTABLE_RP`] names its
     /// identity by handle. The first whose record the server has, and
@@ -272,7 +272,7 @@ impl Client {
     }
 
     /// [`crate::pairing::PairingError::NotAllowed`] unless this device
-    /// allows guests now: checked at each step of a relay pairing (P5),
+    /// allows guests now: checked at each step of a relay pairing,
     /// since the person may turn guests off while one is under way.
     async fn guests_allowed(&self) -> Result<(), SdkError> {
         if self.portable().allow_guests().await? {

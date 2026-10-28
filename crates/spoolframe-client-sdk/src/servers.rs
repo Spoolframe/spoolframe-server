@@ -1,24 +1,24 @@
-//! Saved servers and their pins (P1-13, §19).
+//! Saved servers and their pins.
 //!
 //! A saved server is pinned to its `EndpointId`: that is its identity, and
 //! the client only ever connects to that key. Its addresses are hints. A
 //! server is saved only when the app pins it, after the user has seen its
-//! fingerprint (P1-21). A pin is replaced only by an explicit
-//! `trust_new_identity`, never by a connect (P1-13).
+//! fingerprint. A pin is replaced only by an explicit
+//! `trust_new_identity`, never by a connect.
 //!
-//! The pin is the key with the server id the server answered with
-//! (PX-14). A connect needs both. A new name is saved; a new key with the
+//! The pin is the key with the server id the server answered with.
+//! A connect needs both. A new name is saved; a new key with the
 //! same id is an identity change, as above; the same key with a new id
 //! is refused, as a server never changes its id.
 //!
-//! The addresses are every one the server was reached at (PX-12), each
+//! The addresses are every one the server was reached at, each
 //! with when it was last seen, not only the last connection's: a phone
 //! that reached the server over its public IPv6 last time must still know
 //! the address it once reached it at over a VPN. A sighting adds to them;
 //! one not seen for [`MAX_ADDR_AGE`] goes at the next sighting, and only
 //! the newest [`MAX_KNOWN_ADDRS`] are kept.
 //!
-//! A signed-in device is also told the server's own addresses (PX-12):
+//! A signed-in device is also told the server's own addresses:
 //! those on every interface it has, which this device may never have
 //! reached (a VPN address while the phone is off the VPN). They are kept
 //! the same way, marked [`AddrSource::Told`]. Each list the server tells
@@ -73,8 +73,7 @@ pub(crate) struct KnownAddr {
     pub addr: SocketAddr,
     /// Unix seconds.
     pub last_seen: u64,
-    /// Absent from a file written before PX-12 part 2, when every address
-    /// kept was one reached.
+    /// Absent from the file: reached.
     #[serde(default)]
     pub source: AddrSource,
 }
@@ -84,21 +83,20 @@ pub(crate) struct KnownAddr {
 pub(crate) struct SavedServer {
     pub name: String,
     pub endpoint_id: String,
-    /// The server id pinned with the key (PX-14): the pin is the pair. Taken
-    /// at the first connect; `None` in a file written before the SDK kept
-    /// it, until the next connect pins it.
+    /// The server id pinned with the key: the pin is the pair. Taken
+    /// at the first connect; `None` when the file has none, until the next
+    /// connect pins it.
     #[serde(default)]
     pub server_id: Option<String>,
     /// Where it was reached, newest first. Changed only by
     /// [`SavedServer::saw`].
     #[serde(default)]
     pub known_addrs: Vec<KnownAddr>,
-    /// What SDKs before PX-12 kept: the last connection's addresses. Read
-    /// into `known_addrs` on load, and never written.
+    /// The last connection's addresses, in a file that has only these
+    /// (`last_known_addrs`). Read into `known_addrs` on load, and never written.
     #[serde(default, rename = "last_known_addrs", skip_serializing)]
     legacy_addrs: Vec<SocketAddr>,
-    /// The user confirmed its fingerprint. Pins from before P1-21 were
-    /// never checked: false.
+    /// The user confirmed its fingerprint. Absent from the file: false.
     #[serde(default)]
     pub verified: bool,
     // Unix seconds. Each is absent from a file written before the SDK kept
@@ -115,19 +113,19 @@ pub(crate) struct SavedServer {
     pub last_connected_at: Option<u64>,
     /// The URLs of the relays the server said it uses (revision 7), as its
     /// last `ServerAddresses` event listed them, and an invite's: what
-    /// this device dials it through with relays on (P6-03). Absent from a
-    /// file written before the SDK kept them: none.
+    /// this device dials it through with relays on. Absent from the file:
+    /// none.
     #[serde(default)]
     pub relays: Vec<String>,
-    /// The pkarr relay the server publishes where it is to (P6-05), as it
+    /// The pkarr relay the server publishes where it is to, as it
     /// or an invite told: where this device looks it up by its key. Absent
-    /// from a file written before the SDK kept it: none.
+    /// from the file: none.
     #[serde(default)]
     pub lookup: Option<String>,
     /// The addresses of the server's last `ServerAddresses` event, in its
     /// order: what it advertises, for an app to show. Unlike
     /// `known_addrs`, never capped, aged or mixed with addresses reached.
-    /// Absent from a file written before the SDK kept them: none.
+    /// Absent from the file: none.
     #[serde(default)]
     pub advertised_addrs: Vec<SocketAddr>,
     /// When that event came, in Unix seconds; `None` if none has.
@@ -136,20 +134,20 @@ pub(crate) struct SavedServer {
     /// Whether this device reaches it through relays: the user's choice,
     /// or an invite's (redeeming or saving one whose link names relays
     /// chooses them); `None` follows [`crate::ClientOptions::relays`].
-    /// Absent from a file written before the SDK kept it: `None`.
+    /// Absent from the file: `None`.
     #[serde(default)]
     pub use_relays: Option<bool>,
     /// `relays` is the user's list ([`crate::Client::set_server_relay_urls`]):
-    /// what the server advertises and what invites name no longer change
-    /// it. Absent from a file written before the SDK kept it: false.
+    /// what the server advertises and what invites name do not change
+    /// it. Absent from the file: false.
     #[serde(default)]
     pub relays_edited: bool,
     /// Where the last connect reached it: the server's address on the
     /// selected path, when that was an IP path; `None` after one over a
     /// relay. The one reached address kept though the server's list
     /// leaves it out (a port forward it was not told of, `network.wan`
-    /// unset). Absent from a file written before the SDK kept it: none,
-    /// so such a file keeps no address its server's list leaves out.
+    /// unset). Absent from the file: none, so the file keeps no address
+    /// its server's list leaves out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_path: Option<SocketAddr>,
 }
@@ -159,8 +157,8 @@ pub(crate) struct SavedServer {
 pub(crate) const N0_LOOKUP: &str = "https://dns.iroh.link/pkarr";
 
 impl SavedServer {
-    /// The relays and lookup the server told (P6-03, P6-05), held to what
-    /// an invite link may carry (P6-07, glm E-3): each a plain http(s) URL,
+    /// The relays and lookup the server told, held to what
+    /// an invite link may carry: each a plain http(s) URL,
     /// once, at most [`MAX_HINTS`] relays. The rest is left out: a pinned
     /// server is trusted for its key, not to size what this device keeps.
     /// A list the user edited is kept as they left it; the lookup is
@@ -260,7 +258,7 @@ impl SavedServer {
         self.sighted(addrs, now, AddrSource::Told) || dropped
     }
 
-    /// An invite named `addrs` as where the server is (P6-01): they join
+    /// An invite named `addrs` as where the server is: they join
     /// the addresses known as told ones, as [`SavedServer::told`] keeps
     /// them, but replace nothing: an invite is not the server's whole
     /// list. The server's next list replaces them as it replaces any told
@@ -358,13 +356,13 @@ impl SavedServer {
         self.known_addrs.len() != before
     }
 
-    /// A server from a file written before PX-12: the last connection's
+    /// A server from a file with only `last_known_addrs`: the last connection's
     /// addresses become known from `now`. Not from when it last
     /// connected, which may be over [`MAX_ADDR_AGE`] ago: they would be
     /// dropped at the first sighting of any other address.
     ///
-    /// A file written by an SDK that kept every address reached loses
-    /// those its server's list leaves out, but the last path, here.
+    /// Reached addresses its server's list leaves out are dropped here,
+    /// but the last path.
     fn migrate(&mut self, now: u64) {
         let legacy = std::mem::take(&mut self.legacy_addrs);
         if !legacy.is_empty() {
@@ -422,7 +420,7 @@ pub struct ServerEntry {
     /// The server's identity, hex.
     pub endpoint_id: String,
     pub name: String,
-    /// Where it was heard, reached, or said it is once signed in (PX-12):
+    /// Where it was heard, reached, or said it is once signed in:
     /// every hint for dialing, never its identity.
     pub addrs: Vec<SocketAddr>,
     /// What the server advertises: the addresses of its latest
@@ -443,12 +441,12 @@ pub struct ServerEntry {
     /// When that event came, to the second, for "as of" text. `None` if
     /// none has.
     pub advertised_at: Option<SystemTime>,
-    /// The key's fingerprint (P1-21): what the user compares with the
+    /// The key's fingerprint: what the user compares with the
     /// server's `spoolframe-server fingerprint`.
     pub fingerprint: String,
-    /// The server id (PX-14): pinned with the key, or the one it answered
-    /// with. `None` for a server only heard on the LAN, or saved before the
-    /// SDK kept it and not connected to since. Its app passkeys are for
+    /// The server id: pinned with the key, or the one it answered
+    /// with. `None` for a server only heard on the LAN, or saved with no server
+    /// id and not connected to since. Its app passkeys are for
     /// `<server id>.spoolframe.app`.
     pub server_id: Option<String>,
     /// Saved, with this key pinned.
@@ -458,15 +456,15 @@ pub struct ServerEntry {
     pub verified: bool,
     /// Heard on this network just now.
     pub on_network: bool,
-    /// When this key was pinned. `None` for a server not saved, or saved
-    /// before the SDK kept the date.
+    /// When this key was pinned. `None` for a server not saved, or when the
+    /// date is not known.
     pub pinned_at: Option<SystemTime>,
     /// When the user last confirmed its fingerprint: at pinning, or a later
-    /// "Verify now". `None` while not verified, or verified before the SDK
-    /// kept the date.
+    /// "Verify now". `None` while not verified, or when the date
+    /// is not known.
     pub verified_at: Option<SystemTime>,
     /// When it last answered a connect as itself. `None` for a server not
-    /// saved, or not connected to since the SDK kept the date.
+    /// saved, or when the date is not known.
     pub last_connected_at: Option<SystemTime>,
     /// Whether this device reaches it through relays: `Some` its own
     /// choice ([`crate::Client::set_server_relays`], or an invite's), `None`

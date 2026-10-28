@@ -1,4 +1,5 @@
-//! Downloads for offline viewing (PX-38): films and episodes kept on this device to play with no server.
+//! Downloads for offline viewing: films and episodes kept on this device
+//! to play with no server.
 //!
 //! [`Downloads::start`] asks the server to prepare the file
 //! (`PrepareDownload`) and keeps the item's details, markers, tracks and
@@ -29,8 +30,7 @@
 //! or found, and when it starts. The server decides what counts as
 //! watched; what is kept here is for showing.
 //!
-//! Music (PX-51) rides the same entries
-//! and manager: see the `music` module for downloads of albums, artists,
+//! Music rides the same entries and manager: see the `music` module for downloads of albums, artists,
 //! playlists and Liked, and `listening` for tracks kept as they play.
 //! On a mobile network ([`Downloads::set_network`]) nothing moves unless
 //! [`DownloadSettings::allow_cellular`].
@@ -38,7 +38,7 @@
 //! A file is the device's: two profiles that download the same item share
 //! it, each holding it. [`Downloads::set_profile`] says whose downloads
 //! the views show, and locks a profile whose PIN is asked for here until
-//! [`Downloads::unlock_offline`] (PX-60, the `lock` module).
+//! [`Downloads::unlock_offline`].
 
 mod listening;
 mod lock;
@@ -268,7 +268,7 @@ impl std::fmt::Debug for Downloads {
 }
 
 impl Client {
-    /// This device's downloads (PX-38), in
+    /// This device's downloads, in
     /// [`crate::ClientOptions::downloads_dir`]. Without one, every call
     /// but [`Downloads::list`] (empty) is [`SdkError::Downloads`].
     pub fn downloads(&self) -> Downloads {
@@ -349,7 +349,7 @@ impl Downloads {
             return Ok(shared.view(&m));
         }
         let detail = session.item(id).await?;
-        // A paired server's item (P8-07) has no file on this server: its
+        // A paired server's item has no file on this server: its
         // tracks are what that server's options for the download say.
         let media_tracks = if id.namespace() == spoolframe_types::Namespace::Federated {
             session.download_options(id).await?.tracks
@@ -690,7 +690,7 @@ impl Downloads {
     ///   row each next one waits ([`SdkError::RateLimited`]), and after
     ///   10 the profile stays locked offline until it is unlocked online
     ///   ([`SdkError::SignInRequired`]).
-    /// - No PIN has unlocked it online here since 0.14.1:
+    /// - No PIN unlock online has left a hash here to check against:
     ///   [`SdkError::NoOfflinePin`].
     /// - No active profile: [`SdkError::InvalidInput`]. One not locked
     ///   stays open.
@@ -722,7 +722,7 @@ struct ServerChange {
 /// What the client keeps for its downloads, and the manager shares.
 pub(crate) struct Shared {
     store: Option<Store>,
-    /// The active profile and the profiles' locks (PX-60).
+    /// The active profile and the profiles' locks.
     pub(crate) locks: Arc<lock::Locks>,
     /// Held across each read, change and write of a manifest.
     manifests: tokio::sync::Mutex<()>,
@@ -754,8 +754,7 @@ pub(crate) struct Shared {
     settings: Mutex<Option<DownloadSettings>>,
     /// [`Downloads::set_network`].
     network: Mutex<NetworkKind>,
-    /// Followed music downloads to ask about again while connected
-    /// (PX-51).
+    /// Followed music downloads to ask about again while connected.
     follow_due: Mutex<music::FollowDue>,
     /// Something for the follower to do.
     follow_wake: Notify,

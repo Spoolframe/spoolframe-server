@@ -36,14 +36,13 @@ use crate::search::{SearchRequest, SearchResults};
 
 /// The protocol revision inside the `spoolframe/client/1` ALPN. Raised
 /// for coordinated development releases, including breaking wire changes.
-/// Reset to 1 in 0.16.0, a clean break: a server refuses every other
-/// revision at `Hello`, the 2 to 15 of the releases before it included.
+/// A server refuses every other revision at `Hello`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The maximum raw body of one subtitle chunk on a resource stream.
 pub const SUBTITLE_CHUNK: u64 = 512 << 10;
 
-/// An opaque session token from a login (P1-12). It is only valid from
+/// An opaque session token from a login. It is only valid from
 /// the endpoint that logged in.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -70,7 +69,7 @@ pub struct RequestEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    // Pre-auth: the only requests served without a session (§20).
+    // Pre-auth: the only requests served without a session.
     /// The first request on every connection.
     Hello(Hello),
     AuthMethods,
@@ -83,11 +82,11 @@ pub enum Request {
         handle: PlaybackHandle,
     },
     /// Ask to be signed in by someone approving this device on another
-    /// one they are signed in on (P3-07). Show the code (and its
+    /// one they are signed in on. Show the code (and its
     /// [`crate::device_sign_in::link`] as a QR code), then
     /// `AwaitDeviceSignIn`. `DeviceSignInStarted`.
     ///
-    /// `remember` asks for this device to be trusted (P4-01); the
+    /// `remember` asks for this device to be trusted; the
     /// approver sees the request and decides. Never true unless the user
     /// ticked "Remember this device".
     BeginDeviceSignIn {
@@ -101,7 +100,7 @@ pub enum Request {
     AwaitDeviceSignIn {
         request: String,
     },
-    /// Begin signing in with an app passkey (P3-19, [`crate::passkeys`]):
+    /// Begin signing in with an app passkey ([`crate::passkeys`]):
     /// `PasskeySignInBegun`, a nonce, listing no passkeys (any the
     /// platform finds): anyone can ask. With `username`, only that user's
     /// passkeys finish it. The nonce is this device's, for 5 minutes;
@@ -119,7 +118,7 @@ pub enum Request {
         signed: FinishPasskeySignIn,
         remember: bool,
     },
-    /// The users this device is trusted for (P4-01): `TrustedProfiles`,
+    /// The users this device is trusted for: `TrustedProfiles`,
     /// for "Who's watching" once their sessions have ended. Only this
     /// device's own; nothing about other devices. Trust that lapsed is
     /// left out.
@@ -135,7 +134,7 @@ pub enum Request {
     ResumeProfile {
         user_id: String,
     },
-    /// Make an account with an invite's code (P6-01) and sign in to it:
+    /// Make an account with an invite's code and sign in to it:
     /// `LoggedIn`, a session bound to this device as `LoginPassword`
     /// gives, `remembered: false`. The account has the invite's role.
     ///
@@ -155,24 +154,24 @@ pub enum Request {
     /// guess (then `RateLimited`); a revoked, expired or used-up one is
     /// not counted. On the strangers' budget, as redeeming is.
     LookupInvite(LookupInvite),
-    /// Begin signing in as a portable user with a device credential
-    /// (P7-06): `PortableSignInBegun`, a nonce for the device key to sign
+    /// Begin signing in as a portable user with a device credential:
+    /// `PortableSignInBegun`, a nonce for the device key to sign
     /// over ([`crate::portable::device_proof_message`] of this server's
     /// endpoint id and it). The nonce is this device's, for
     /// `expires_in_secs` (5 minutes), and is used once, whatever the
     /// finish makes of it; beginning again replaces it. Draws on the
     /// sign-in budget all devices not signed in share.
     BeginPortableSignIn,
-    /// Finish it (P7-06, §58): `LoggedIn`, `remembered: false`, a session
+    /// Finish it: `LoggedIn`, `remembered: false`, a session
     /// bound to this device. Local-first: where the identity is tied to an
-    /// account here (P7-04) the session is that account's, as any sign-in
+    /// account here the session is that account's, as any sign-in
     /// to it (its PIN is asked as usual); else, where it has a grant here,
     /// the portable user's own; else nothing. Every refusal (no grant, a
     /// credential or proof that does not hold, a revoked key, an expired
     /// or missing nonce, a disabled account) is `InvalidCredentials`,
     /// counted as a failed sign-in (then `RateLimited`).
     FinishPortableSignIn(PortableSignIn),
-    /// Redeem a `portable-account` invite (P7-05) as the portable user
+    /// Redeem a `portable-account` invite as the portable user
     /// `sign_in` proves, over the nonce `BeginPortableSignIn` gave: the
     /// server grants them access (no account is made), uses one of the
     /// invite's uses, and signs them in as `FinishPortableSignIn` does:
@@ -185,7 +184,7 @@ pub enum Request {
     /// kept. The credential is checked as `FinishPortableSignIn` checks
     /// it: `InvalidCredentials`, counted.
     RedeemPortableInvite(RedeemPortableInvite),
-    /// What this server keeps of portable identity `user` (P7-08): its
+    /// What this server keeps of portable identity `user`: its
     /// genesis and newest state, `IdentityRecord`, for a device recovering
     /// the identity with one of its roots. Only an identity known here
     /// (tied or granted) has one; any other is `NotFound`. Public data,
@@ -194,7 +193,7 @@ pub enum Request {
         user: PortableUserId,
     },
     /// The record, as `IdentityRecord` answers it, of the identity whose
-    /// genesis handle is `handle` (P7-08): what a security key gives back
+    /// genesis handle is `handle`: what a security key gives back
     /// as its credential's user handle, for a fresh install that holds a
     /// key and nothing else. A key added to a phrase identity carries the
     /// identity's id as its handle, so a handle that is the id of a phrase
@@ -206,18 +205,18 @@ pub enum Request {
         #[serde(with = "crate::portable::handle_hex")]
         handle: [u8; crate::portable::HANDLE_LEN],
     },
-    /// Hold a device's pairing request under its relay code (P7-08), for a
+    /// Hold a device's pairing request under its relay code, for a
     /// root terminal with no camera to fetch: `Done`. For
     /// [`crate::pairing::RELAY_TTL_SECS`]; offering again from the same
     /// device replaces it. A code another device holds is
     /// `InvalidInput`. On the strangers' budget.
     OfferPairing(PairingOffer),
-    /// The pairing request held under `code` (P7-08): `PairingOffered`, or
+    /// The pairing request held under `code`: `PairingOffered`, or
     /// `NotFound`. On the strangers' budget, so codes are not guessed.
     FetchPairing {
         code: RelayCode,
     },
-    /// The root terminal's answer to the request under `code` (P7-08):
+    /// The root terminal's answer to the request under `code`:
     /// `Done`. One answer only, for the key the request named; another,
     /// or no request, is `NotFound`; a credential for another key
     /// `InvalidInput`. The server carries it and checks nothing else: the
@@ -226,8 +225,8 @@ pub enum Request {
         code: RelayCode,
         answer: PairingAnswer,
     },
-    /// The answer to this device's request under `code`, if one came
-    /// (P7-08): `PairingAnswered`, taken (the request ends with it) or
+    /// The answer to this device's request under `code`, if one came:
+    /// `PairingAnswered`, taken (the request ends with it) or
     /// `None` while there is none yet. Only the device that offered it;
     /// any other, or no request, is `NotFound`. Not on the strangers'
     /// budget: the device asks every few seconds.
@@ -264,12 +263,12 @@ pub enum Request {
     Item {
         id: MediaId,
     },
-    /// Scoped, grouped search (P3-09). `Search`; for a client that names
-    /// the experimental `federation` feature, `SearchHits` (P8-05): this
+    /// Scoped, grouped search. `Search`; for a client that names
+    /// the experimental `federation` feature, `SearchHits`: this
     /// server's results and the paired servers' cache's, a title found on
     /// several servers once.
     Search(SearchRequest),
-    /// The items a person a search found is in (P3-09), one page at a
+    /// The items a person a search found is in, one page at a
     /// time. `Items`.
     PersonItems {
         person: PersonId,
@@ -282,19 +281,19 @@ pub enum Request {
     /// Who this request's session belongs to.
     WhoAmI,
     /// End this request's session (and only it). On a trusted device it
-    /// forgets the device for this user too (P4-01): the next time is a
+    /// forgets the device for this user too: the next time is a
     /// full sign-in.
     Logout,
     /// The session user's live sessions on every device.
     ListSessions,
     /// How the server would play `id` for this client with these tracks.
     /// Without a selection the server chooses them from the user's
-    /// preferences (P1-20) and says which in the reply.
+    /// preferences and says which in the reply.
     PlaybackPlan {
         id: MediaId,
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         selection: Option<Selection>,
-        /// How a picked bitmap subtitle is shown (P2-07).
+        /// How a picked bitmap subtitle is shown.
         bitmap: BitmapSubtitles,
         /// What the screen shows now (PGPU-06): its HDR formats and bit
         /// depth, over Hello's, for this plan. `None` or left out, Hello's.
@@ -307,13 +306,13 @@ pub enum Request {
         id: MediaId,
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         selection: Option<Selection>,
-        /// Where to start, for a converted playback (P2-03): the encode
+        /// Where to start, for a converted playback: the encode
         /// begins there. Direct play reads from wherever the client likes.
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         start_ms: Option<u64>,
-        /// How a picked bitmap subtitle is shown (P2-07).
+        /// How a picked bitmap subtitle is shown.
         bitmap: BitmapSubtitles,
-        /// The quality the viewer chose for it (P6-06): for the link, at
+        /// The quality the viewer chose for it: for the link, at
         /// most a bitrate, or the original.
         quality: Quality,
         /// What the screen shows now (PGPU-06): its HDR formats and bit
@@ -321,7 +320,7 @@ pub enum Request {
         /// a re-plan without one keeps it. `None` or left out, Hello's.
         #[serde(default)]
         display: Option<DisplayCapabilities>,
-        /// What the device that will show it plays (P8-04), in place of
+        /// What the device that will show it plays, in place of
         /// Hello's, for this playback and its re-plans: a server that plays
         /// on to one of its own devices (a paired server's proxy) has the
         /// plan made for that device over its one connection. `display`
@@ -329,7 +328,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<spoolframe_types::ClientCapabilities>,
         /// The share of an uplink the playback goes on over, bits per
-        /// second (P8-04): a server that plays it on to its own device
+        /// second: a server that plays it on to its own device
         /// (a paired server's proxy) sends its own, at the start and at
         /// each re-plan, and the plan keeps under it as under this
         /// server's own share. Left out, this server's share alone.
@@ -345,13 +344,13 @@ pub enum Request {
     PlaybackRevision {
         handle: PlaybackHandle,
     },
-    /// Restart a converted playback's encode at `position_ms` (P2-04):
+    /// Restart a converted playback's encode at `position_ms`:
     /// reads then name the new epoch and start at offset 0.
     SeekPlayback {
         handle: PlaybackHandle,
         position_ms: u64,
     },
-    /// Set or change the session user's PIN (P2-08): 4 to 8 digits. `Done`.
+    /// Set or change the session user's PIN: 4 to 8 digits. `Done`.
     ///
     /// A user with no PIN sets their first with no `proof`, from a session
     /// that signed in within the last 10 minutes; an older one gets
@@ -369,7 +368,7 @@ pub enum Request {
     ClearPin {
         proof: PinProof,
     },
-    /// Unlock this session on this connection with the user's PIN (P2-08).
+    /// Unlock this session on this connection with the user's PIN.
     /// Wrong PINs are rate-limited; after 10 in a row the session on this
     /// device is revoked (`Unauthenticated`): sign in with the password.
     /// `Done`.
@@ -378,7 +377,7 @@ pub enum Request {
     },
     /// The devices the session user has signed in from. `Devices`.
     ListDevices,
-    /// Begin making an app passkey for the session user (P3-19):
+    /// Begin making an app passkey for the session user:
     /// `PasskeyRegistrationBegun`, a nonce, as for `BeginPasskeySignIn`.
     /// Needs a session signed in within the last 10
     /// minutes, or `RecentSignInRequired`: confirm it is the user
@@ -433,7 +432,7 @@ pub enum Request {
     /// one in the web UI. Not for a portable user (`NotForPortableUsers`).
     ChangePassword(ChangePassword),
     /// Begin confirming it is the session user with one of their app
-    /// passkeys (P3-19): `PasskeySignInBegun`, a nonce as for
+    /// passkeys: `PasskeySignInBegun`, a nonce as for
     /// `BeginPasskeySignIn`, listing their app passkeys only. The nonce is
     /// this session's on this device, for 5
     /// minutes; beginning again replaces it. A user with no app passkey
@@ -446,7 +445,7 @@ pub enum Request {
     /// not verify is `InvalidCredentials`, counted as a failed passkey
     /// sign-in (then `RateLimited`).
     FinishConfirmPasskey(FinishPasskeySignIn),
-    /// The session user's Plex account link (P3-12): `PlexLink`. Read
+    /// The session user's Plex account link: `PlexLink`. Read
     /// only; a client links or unlinks by opening `<web_url>/profile`.
     GetPlexLink,
     /// Ask for the session user's PIN on `device` (an endpoint id from
@@ -459,7 +458,7 @@ pub enum Request {
         device: Option<String>,
         required: bool,
     },
-    /// Which device shows sign-in code `code` (P3-07), to ask the user
+    /// Which device shows sign-in code `code`, to ask the user
     /// before approving it. `DeviceSignInRequest`; `NotFound` for a code
     /// that is not pending (guesses are rate-limited).
     LookupDeviceSignIn {
@@ -469,7 +468,7 @@ pub enum Request {
     /// Requires recent authentication; an old session cannot mint a fresh one.
     ///
     /// `remember`: the approver's answer to the device's request to be
-    /// trusted (`DeviceSignInRequest::remember`, P4-01). The device is
+    /// trusted (`DeviceSignInRequest::remember`). The device is
     /// trusted only if it asked and this is true; this cannot trust a
     /// device that did not ask.
     ApproveDeviceSignIn {
@@ -477,7 +476,7 @@ pub enum Request {
         remember: bool,
     },
     /// Trust `device` (an endpoint id from `Devices`; this device if left
-    /// out) for the session user, or stop (P4-01). `Done`.
+    /// out) for the session user, or stop. `Done`.
     ///
     /// - Turning trust on, or auto-login on, works for this device only
     ///   (`InvalidInput` for another: trust another device from the web
@@ -495,7 +494,7 @@ pub enum Request {
         trusted: bool,
         auto_login: bool,
     },
-    /// Delete one of the session user's other devices (P4-03): `device`
+    /// Delete one of the session user's other devices: `device`
     /// is an endpoint id from `Devices`. `Done`. The user's sessions
     /// there are deleted, and with them its trust and PIN requirement; it
     /// leaves `Devices`, and if it signs in again it is listed as new.
@@ -511,7 +510,7 @@ pub enum Request {
     DenyDeviceSignIn {
         code: String,
     },
-    /// Pick another subtitle (or none) for a playing playback (P2-07): it
+    /// Pick another subtitle (or none) for a playing playback: it
     /// is planned again with the same audio. A plan that plays directly
     /// only changes what `ReadSubtitle` gives; a converted one restarts its
     /// encode at `position_ms` as a new epoch, from offset 0 (a burned-in
@@ -528,14 +527,14 @@ pub enum Request {
         #[serde(default)]
         display: Option<DisplayCapabilities>,
         /// The share of an uplink the playback goes on over, bits per
-        /// second (P8-04): a server that plays it on to its own device
+        /// second: a server that plays it on to its own device
         /// (a paired server's proxy) sends its own, at the start and at
         /// each re-plan, and the plan keeps under it as under this
         /// server's own share. Left out, this server's share alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         onward_share: Option<u64>,
     },
-    /// Plan a playing playback again for `quality` (P6-06): the viewer
+    /// Plan a playing playback again for `quality`: the viewer
     /// chose another, or, with `Auto`, the device found its link too slow
     /// for a direct play that stalls. The same tracks, and `bitmap` as
     /// `ChangeSubtitle` takes it. A plan that changes restarts at
@@ -553,24 +552,24 @@ pub enum Request {
         #[serde(default)]
         display: Option<DisplayCapabilities>,
         /// The share of an uplink the playback goes on over, bits per
-        /// second (P8-04): a server that plays it on to its own device
+        /// second: a server that plays it on to its own device
         /// (a paired server's proxy) sends its own, at the start and at
         /// each re-plan, and the plan keeps under it as under this
         /// server's own share. Left out, this server's share alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         onward_share: Option<u64>,
     },
-    /// A converted playback's HLS playlist (P2-05).
+    /// A converted playback's HLS playlist.
     GetManifest {
         handle: PlaybackHandle,
         kind: ManifestKind,
-        /// For a media playlist, the variant's (PX-21): a ladder's rung,
+        /// For a media playlist, the variant's: a ladder's rung,
         /// as `v{n}/media.m3u8` in the multivariant playlist. 0 for one
         /// encode, and for the other kinds.
         variant: u32,
     },
-    /// The selected external subtitle of a playback, one chunk of it
-    /// (P2-11). One the server reads as text (P2-07) answers
+    /// The selected external subtitle of a playback, one chunk of it.
+    /// One the server reads as text answers
     /// `SubtitleNotReady` until it is done: ask again.
     ///
     /// The reply is `SubtitleChunk`: at most [`SUBTITLE_CHUNK`] bytes of
@@ -587,7 +586,7 @@ pub enum Request {
         offset: u64,
         version: Option<u64>,
     },
-    /// Segment `n` (from 1) of an HLS playback's subtitle rendition (P2-07):
+    /// Segment `n` (from 1) of an HLS playback's subtitle rendition:
     /// `Subtitle { format: WebVtt, .. }`, the cues over that segment's time,
     /// timed with `X-TIMESTAMP-MAP` to the video. `SubtitleNotReady` while
     /// the subtitle is made.
@@ -595,7 +594,7 @@ pub enum Request {
         handle: PlaybackHandle,
         n: u32,
     },
-    /// The frame previews of a movie or episode, for scrubbing (P3-13):
+    /// The frame previews of a movie or episode, for scrubbing:
     /// `Previews`, `PreviewsNotReady` while the server makes them (asking
     /// puts the item first in line; ask again in a few seconds, and show
     /// the time alone meanwhile), or `NoPreviews`.
@@ -610,7 +609,7 @@ pub enum Request {
         sequence: u64,
         position_ms: u64,
     },
-    /// Experimental (`federation`, P8-03): where the user got to in `id`,
+    /// Experimental (`federation`): where the user got to in `id`,
     /// a paired server's (`fed:`) movie or episode, which plays from that
     /// server rather than from a playback of this one's: `Done`. Sent to
     /// the user's own server, as `UpdatePlaybackProgress` would be, now and
@@ -630,7 +629,7 @@ pub enum Request {
         id: MediaId,
     },
     /// Remove the card `id`, a movie or an episode, from the session
-    /// user's Continue watching or Next up (P1-22), leaving its progress
+    /// user's Continue watching or Next up, leaving its progress
     /// and watched state. Only that card: never the episode's whole show.
     /// `id` is the card's own, not its show's. Playing or marking it again
     /// brings it back. `Done`.
@@ -643,7 +642,7 @@ pub enum Request {
     },
     /// The session user's home screen.
     Home,
-    /// How the session user wants tracks chosen (P1-20).
+    /// How the session user wants tracks chosen.
     GetTrackPreferences,
     /// Replace them, for every device of the user.
     SetTrackPreferences {
@@ -660,13 +659,13 @@ pub enum Request {
     ClearTrackOverride {
         id: MediaId,
     },
-    /// Begin tying the session user's account to a portable identity
-    /// (P7-04): `TieChallenge`, a nonce for the identity to sign over
+    /// Begin tying the session user's account to a portable identity:
+    /// `TieChallenge`, a nonce for the identity to sign over
     /// ([`crate::portable::tie_message`]). The nonce is this session's,
     /// for its user, for `expires_in_secs` (5 minutes), and is used once,
     /// whatever `TieFinish` makes of it. Needs a session signed in within
     /// the last 10 minutes, or `RecentSignInRequired`. An account may be
-    /// tied already: it ties any number of identities (P7-09).
+    /// tied already: it ties any number of identities.
     TieBegin,
     /// Tie the session user's account to `user`, with `proof` that `user`
     /// signed the tie message over the nonce `TieBegin` gave: by the root,
@@ -678,13 +677,13 @@ pub enum Request {
     /// again. A proof that does not hold is `InvalidCredentials`. An
     /// identity tied to another account here is `PortableIdTaken`; one
     /// tied to this account already is `Done`, changing nothing (its
-    /// first tie date stands). The account's other ties stay (P7-09).
+    /// first tie date stands). The account's other ties stay.
     /// Nothing about the account moves: the tie is a link beside it.
     TieFinish {
         user: PortableUserId,
         proof: TieProof,
     },
-    /// Sever the session user's tie to `user` (P7-04, P7-09): `Done`.
+    /// Sever the session user's tie to `user`: `Done`.
     /// Only that link goes; the account's other ties, its sessions (those
     /// opened with `user`'s credential too), passkeys and watch state stay
     /// as they are. Needs a recent sign-in. No tie to `user` on this
@@ -693,14 +692,14 @@ pub enum Request {
         user: PortableUserId,
     },
 
-    /// Make an invite (PX-44, [`crate::invite_admin`]), as the web UI's
+    /// Make an invite ([`crate::invite_admin`]), as the web UI's
     /// `inviteCreate` does, with its limits: `InviteCreated`, the code
     /// shown this once. An admin's only (`AdminRequired`), and only after
     /// they confirmed it is them recently (`RecentSignInRequired`: confirm
     /// with `ConfirmPassword` or a passkey, then ask again). A
     /// `federation` invite is `InvalidInput` unless this connection's
     /// `Hello` named the experimental `federation` feature and the server
-    /// has it on (P8-01), as are fields out of their limits.
+    /// has it on, as are fields out of their limits.
     CreateInvite(CreateInvite),
     /// The invites that can still be redeemed, newest first, made here or
     /// in the web UI: `Invites`. An admin's only; no confirmation needed.
@@ -713,7 +712,7 @@ pub enum Request {
         id: String,
     },
 
-    /// Experimental (`http-playback`, PX-49; see [`crate::experimental`]):
+    /// Experimental (`http-playback`; see [`crate::experimental`]):
     /// an HTTP URL for one of this session's playbacks, for a player with
     /// no Iroh (AirPlay first): `HttpPlaybackUrl`, or
     /// `HttpPlaybackRefused` with why not. Refused as `Off` unless this
@@ -728,7 +727,7 @@ pub enum Request {
         handle: PlaybackHandle,
     },
 
-    /// Experimental (`federation`, P8-01; see [`crate::federation`]): pair
+    /// Experimental (`federation`; see [`crate::federation`]): pair
     /// this server with the one whose `federation` invite `link` is, as an
     /// admin pasting it in the web UI would: `ServerPaired`. Unsupported
     /// unless this connection's `Hello` named the feature and the
@@ -743,7 +742,7 @@ pub enum Request {
     /// tells the kind, the inviter and the key's fingerprint.
     PairServer(crate::federation::PairServer),
 
-    /// Experimental (`federation`, P8-03; see [`crate::federation`]):
+    /// Experimental (`federation`; see [`crate::federation`]):
     /// share libraries of this server with a paired one, as the app offers
     /// once `PairServer` paired them: `LibrariesShared`. Every user of the
     /// paired server may browse and watch them; a library shared already
@@ -755,7 +754,7 @@ pub enum Request {
     /// and then none is shared.
     ShareLibraries(crate::federation::ShareLibraries),
 
-    /// Experimental (`federation`, P8-02): show or hide paired server
+    /// Experimental (`federation`): show or hide paired server
     /// `server_id`'s own row on the user's Home (`HomeScreen::servers`):
     /// `Done`. Kept per user and server; a server's items stay in Continue
     /// watching either way. Unsupported unless this connection's `Hello`
@@ -765,7 +764,7 @@ pub enum Request {
         shown: bool,
     },
 
-    /// Experimental (`federation`, P8-04; see [`crate::federation`]):
+    /// Experimental (`federation`; see [`crate::federation`]):
     /// redeem a play token a paired server got from this one for one of
     /// its users: `PlayTokenRedeemed`, a session for that one item's
     /// playback. Pre-auth, on the strangers' budget as a sign-in is. The
@@ -774,7 +773,7 @@ pub enum Request {
     /// `Unauthenticated`, and the device asks its home server for a new
     /// token. The session reaches `StartPlayback` of that item and its own
     /// playback's controls and reads; anything else is `Unauthenticated`.
-    /// A download token (P8-07) is redeemed the same way: its session
+    /// A download token is redeemed the same way: its session
     /// reaches that item's download alone (`DownloadOptions`,
     /// `PrepareDownload`, `DownloadStatus`, `CancelDownload`, the
     /// `Download` read and `DownloadChanged`), or, for a device's token,
@@ -783,7 +782,7 @@ pub enum Request {
     /// Unsupported unless this connection's `Hello` named the feature.
     RedeemPlayToken(crate::federation::RedeemPlayToken),
 
-    /// Experimental (`federation`, P8-04): where the paired server that
+    /// Experimental (`federation`): where the paired server that
     /// `id`, a `fed:` item, is from may be dialled (`RemoteHints`), and
     /// whether this server holds a connection to it now. The device dials
     /// it with a short budget and asks `RemoteGrant` once it reached it; it
@@ -794,7 +793,7 @@ pub enum Request {
         id: MediaId,
     },
 
-    /// Experimental (`federation`, P8-04): vouch for the session's user to
+    /// Experimental (`federation`): vouch for the session's user to
     /// the paired server `id` is from, for a play token bound to this
     /// device (`RemoteGranted`), which it redeems there
     /// (`RedeemPlayToken`). Each play asks its own. With that server
@@ -805,8 +804,8 @@ pub enum Request {
     /// `StartPlayback` of `id` here. Unsupported unless this connection's
     /// `Hello` named the feature.
     ///
-    /// With `download`, the id of a download of `id` this server keeps
-    /// (P8-07): a download token instead, bound to this device and to that
+    /// With `download`, the id of a download of `id` this server keeps:
+    /// a download token instead, bound to this device and to that
     /// one download, which reads it on the paired server
     /// (`RemoteGranted::download` names it there). A download that is not
     /// the user's, or not of `id`, is `NotFound`.
@@ -816,7 +815,7 @@ pub enum Request {
         download: Option<String>,
     },
 
-    /// Experimental (`federation`, P8-05): play the title `title` (any
+    /// Experimental (`federation`): play the title `title` (any
     /// copy's id) from paired server `from`, or from this server with
     /// `None`: `Done`. Remembered for the user by the title's external
     /// ids, so every copy of it, here or on a paired server, plays from
@@ -831,10 +830,10 @@ pub enum Request {
         from: Option<String>,
     },
 
-    /// Leave this server (PX-47): `Done`, and every session of the user
+    /// Leave this server: `Done`, and every session of the user
     /// here is ended, this one too. Needs a recent sign-in
     /// (`RecentSignInRequired`): a local user confirms with
-    /// `ConfirmPassword` or a passkey; a portable user (P7-06) signs in
+    /// `ConfirmPassword` or a passkey; a portable user signs in
     /// with its credential again, which opens a new session that counts as
     /// recent. What leaving does depends on who:
     ///
@@ -849,7 +848,7 @@ pub enum Request {
     /// `LastAdmin`. Nothing was changed then.
     LeaveServer,
 
-    /// Playlists (PX-40, feature `spoolframe:playlists`): every playlist
+    /// Playlists (feature `spoolframe:playlists`): every playlist
     /// the session user sees, theirs, shared with them and server-wide,
     /// each with whether it is pinned and where; and the notes of pinned
     /// ones that left their Pinned. `Playlists`.
@@ -966,7 +965,7 @@ pub enum Request {
         repeat: crate::playlists::Repeat,
         skip_watched: bool,
     },
-    /// Import the session user's Plex playlists, once (PX-40): each video
+    /// Import the session user's Plex playlists, once: each video
     /// or music playlist of their linked Plex account, on every Plex
     /// server here, becomes a personal playlist of theirs, its items
     /// mapped to this server's: `PlexImport`, what was made and what did
@@ -979,7 +978,7 @@ pub enum Request {
     /// Forget the notes `ListPlaylists` gave: a client showed them.
     /// `Done`. Notes are per user, not per device.
     DismissPinNotes,
-    /// Like tracks or albums (PX-43): their tracks go to the top of the
+    /// Like tracks or albums: their tracks go to the top of the
     /// session user's Liked, in the order given, an album's in disc and
     /// track order; a track liked already stays where it is. An album
     /// likes the tracks it has now: one added to it later is not liked.
@@ -991,7 +990,7 @@ pub enum Request {
         items: Vec<MediaId>,
     },
     /// Take tracks, or every track of albums, out of the session user's
-    /// Liked (PX-43): `PlaylistInfo`, Liked as it is now. As `Like`
+    /// Liked: `PlaylistInfo`, Liked as it is now. As `Like`
     /// takes them; one not liked is no change.
     Unlike {
         items: Vec<MediaId>,
@@ -1011,7 +1010,7 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
-    /// What the session user played lately (PX-52): `Items`, each item
+    /// What the session user played lately: `Items`, each item
     /// once, by its latest counted play, newest first; a page from
     /// `offset`, at most `limit` (500), and how many in all. `kinds` keeps
     /// films, episodes or tracks only; `None`, every kind. An item gone
@@ -1024,7 +1023,7 @@ pub enum Request {
         offset: u32,
         limit: u32,
     },
-    /// Take away a playlist's uploaded cover (PX-53): `PlaylistInfo`, its
+    /// Take away a playlist's uploaded cover: `PlaylistInfo`, its
     /// `artwork` the mosaic again. Whoever may edit its entries may, as
     /// they may upload one (`SetPlaylistArt`, a resource request); anyone
     /// else who sees it, and anyone at all for Liked and All, gets
@@ -1035,7 +1034,7 @@ pub enum Request {
         id: String,
     },
     /// Sync item `id`'s subtitle `track` (its place in `Tracks`'
-    /// `subtitles`) to the file (PX-03), in the background: an external
+    /// `subtitles`) to the file, in the background: an external
     /// text subtitle (SRT, WebVTT, ASS) only. `SubtitleTiming`, its state
     /// `Syncing` (a track already syncing is left to it); the outcome comes
     /// as `SubtitleTimingChanged`, or in `Tracks` asked again. The track
@@ -1049,14 +1048,14 @@ pub enum Request {
         track: u32,
     },
     /// Serve item `id`'s subtitle `track` with its original timing again,
-    /// for everyone (PX-03): the sync is set aside, the offset kept.
+    /// for everyone: the sync is set aside, the offset kept.
     /// `SubtitleTiming`. As `SyncSubtitle` for who may and which tracks.
     UseOriginalSubtitleTiming {
         id: MediaId,
         track: u32,
     },
     /// Move item `id`'s subtitle `track` by `offset_ms` (positive: later)
-    /// on top of its timing, for everyone (PX-03); 0 resets it. At most
+    /// on top of its timing, for everyone; 0 resets it. At most
     /// ten minutes either way (`InvalidInput`). The track records who set
     /// it and when. `SubtitleTiming`. As `SyncSubtitle` for who may and
     /// which tracks.
@@ -1068,7 +1067,7 @@ pub enum Request {
     /// Search the subtitle sites the admin turned on (OpenSubtitles,
     /// SubDL, or both) for item `id`'s subtitles in `language` (an ISO
     /// 639-1 code such as `en`, or `pt-BR`), or, with none, in the
-    /// languages the server offers first (PX-02). Both sites are asked at
+    /// languages the server offers first. Both sites are asked at
     /// once and their results are one list, `SubtitleResults`, best
     /// first: those found by the file's hash (made for this release), then
     /// the rest by rating and downloads, machine-translated and AI-made
@@ -1086,7 +1085,7 @@ pub enum Request {
         language: Option<String>,
     },
     /// Download result `result` (`SubtitleResult::id`) of a search for
-    /// item `id` (PX-02), from the site that found it: the
+    /// item `id`, from the site that found it: the
     /// item gains an external subtitle track for everyone, usable at once
     /// (`SubtitleDownloaded`). One not found by the file's hash is synced
     /// in the background (`spoolframe:subtitle-sync`). The same result
@@ -1101,7 +1100,7 @@ pub enum Request {
         result: String,
     },
     /// Remove item `id`'s downloaded subtitle `download`
-    /// (`SubtitleDownload::id`), for everyone (PX-02): its files go, and
+    /// (`SubtitleDownload::id`), for everyone: its files go, and
     /// the result is listed last in the item's searches, marked rejected.
     /// The one who downloaded it, or an admin, may: `NotAllowed` for
     /// anyone else. `Done`; a download already removed is `Done` too.
@@ -1110,18 +1109,18 @@ pub enum Request {
         download: String,
     },
 
-    /// What the device may download of film or episode `id` (PX-38,
-    /// `spoolframe:downloads`): `DownloadOptions`, its tracks, the choice
+    /// What the device may download of film or episode `id`
+    /// (`spoolframe:downloads`): `DownloadOptions`, its tracks, the choice
     /// to show first, the profiles, what original quality would be, and
     /// the subtitles a download would leave out. Anyone who can play the
     /// item may ask. Only from an iPhone, iPad, Mac or Linux client
     /// (`Hello.platform`); from any other, and from a client that did not
     /// list the feature, `Unsupported`. With `spoolframe:music-downloads`
-    /// too, `id` may be a track (PX-51): its one audio track, no
+    /// too, `id` may be a track: its one audio track, no
     /// profiles, and what `original` would be.
     ///
     /// `device` is read only from a paired server playing its user's part
-    /// (P8-07, a download token's session): the device the download is
+    /// (a download token's session): the device the download is
     /// for, in place of the connection's `Hello`.
     DownloadOptions {
         id: MediaId,
@@ -1129,13 +1128,13 @@ pub enum Request {
         device: Option<crate::downloads::DownloadDevice>,
     },
     /// Prepare a download of film or episode `id` from `source` with
-    /// `tracks` (PX-38): `Download`, its id and state. The same user's
+    /// `tracks`: `Download`, its id and state. The same user's
     /// same request is the same id, ready at once when its file is; one
     /// that failed is tried again. The file is made in the background;
     /// `DownloadChanged` tells its state as it moves. A track the item
     /// does not have, or a source or choice this build does not know, is
     /// `InvalidInput`; a profile not there `NotFound`. As
-    /// `DownloadOptions` for who may and from where. A track (PX-51, with
+    /// `DownloadOptions` for who may and from where. A track (with
     /// `spoolframe:music-downloads`) takes `original` or `aac256`, and
     /// `tracks` is not read; a film or an episode is refused `aac256`.
     /// `device` as for `DownloadOptions`.
@@ -1146,14 +1145,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device: Option<crate::downloads::DownloadDevice>,
     },
-    /// The session user's downloads `ids` (PX-38): `Downloads`, those
+    /// The session user's downloads `ids`: `Downloads`, those
     /// they have in order, and in `gone` each id they have not (never
     /// theirs, cancelled, or no longer kept), so one such id never fails
     /// the rest; at most [`crate::downloads::MAX_ASKED`] ids.
     DownloadStatus {
         ids: Vec<String>,
     },
-    /// Cancel download `id` (PX-38), as the device also does once it has
+    /// Cancel download `id`, as the device also does once it has
     /// the file whole and its SHA-256 checked: `Done`. Its file goes once
     /// no download names it and no one reads it; one being made stops. An
     /// id that is not the session user's, or was cancelled, is `NotFound`.
@@ -1161,7 +1160,7 @@ pub enum Request {
         id: String,
     },
     /// Where the device got to in films and episodes while it had no
-    /// server (PX-38, `spoolframe:downloads`): `OfflineWatchSynced`, an
+    /// server (`spoolframe:downloads`): `OfflineWatchSynced`, an
     /// outcome per entry, in order. `device_now` is the device's clock
     /// now, in Unix seconds: each entry's `at` is moved by the difference
     /// to the server's clock, and kept no later than now. An entry is
@@ -1175,8 +1174,8 @@ pub enum Request {
         device_now: i64,
         entries: Vec<crate::downloads::OfflineWatch>,
     },
-    /// What the music downloads a device follows hold now (PX-51,
-    /// `spoolframe:music-downloads` with `spoolframe:downloads`):
+    /// What the music downloads a device follows hold now
+    /// (`spoolframe:music-downloads` with `spoolframe:downloads`):
     /// `MusicDownloadChanges`, one change per artist, per playlist, then
     /// Liked, in that order, and a cursor to ask with next time. With
     /// `since`, the cursor of the last answer, each thing that holds the
@@ -1195,8 +1194,8 @@ pub enum Request {
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         since: Option<String>,
     },
-    /// What the device played and liked while it had no server (PX-51,
-    /// `spoolframe:music-downloads`): `OfflinePlaysSynced`, an outcome per
+    /// What the device played and liked while it had no server
+    /// (`spoolframe:music-downloads`): `OfflinePlaysSynced`, an outcome per
     /// play and per like, in order. `device_now` is the device's clock
     /// now, in Unix seconds: each `at` is moved by the difference to the
     /// server's clock, and kept no later than now. Each play of a track is
@@ -1250,12 +1249,12 @@ impl Request {
     }
 }
 
-/// The most characters the server keeps of each of `Hello`'s strings
-/// (PX-10): `client_name`, `client_version` and `device_name`. It cuts a
+/// The most characters the server keeps of each of `Hello`'s strings:
+/// `client_name`, `client_version` and `device_name`. It cuts a
 /// longer one to this many, and keeps and shows only that.
 pub const MAX_HELLO_TEXT: usize = 128;
 
-/// The client introduces itself. Every field is required (PX-15). Each
+/// The client introduces itself. Every field is required. Each
 /// string is cut to [`MAX_HELLO_TEXT`] characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -1271,11 +1270,11 @@ pub struct Hello {
     /// in session lists. `None` when it has no name to give.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub device_name: Option<String>,
-    /// What this device can play (P1-07). `None`: every playback plan is
+    /// What this device can play. `None`: every playback plan is
     /// `Unsupported`.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub capabilities: Option<ClientCapabilities>,
-    /// The experimental features this client wants (PX-49), by name
+    /// The experimental features this client wants, by name
     /// ([`crate::experimental`]); the server's answer names those it
     /// turned on. Left out when empty, so a client that wants none sends
     /// what an older one did; an older server ignores it.
@@ -1312,7 +1311,7 @@ impl Hello {
 pub struct LoginPassword {
     pub username: String,
     pub password: String,
-    /// Trust this device for the user (P4-01): it may resume them later
+    /// Trust this device for the user: it may resume them later
     /// without a password (`ResumeProfile`). Never true unless the user
     /// ticked "Remember this device".
     pub remember: bool,
@@ -1328,8 +1327,8 @@ impl fmt::Debug for LoginPassword {
     }
 }
 
-/// An invite's code and the account to make with it (`RedeemInvite`,
-/// P6-01). `code` as the link carries it ([`crate::invite::Invite::code`]);
+/// An invite's code and the account to make with it (`RedeemInvite`).
+/// `code` as the link carries it ([`crate::invite::Invite::code`]);
 /// any case, dashes or spaces are taken.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedeemInvite {
@@ -1383,10 +1382,10 @@ pub enum InviteLookupOutcome {
         /// have none, or when the server's CLI made it.
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         inviter: Option<String>,
-        /// A `federation` one's (P8-01): the fingerprint of the key this
+        /// A `federation` one's: the fingerprint of the key this
         /// server pairs with, for the admin about to redeem it on another
-        /// server to compare. Left out for every other kind, and by a
-        /// server before it.
+        /// server to compare. Left out for every other kind, and by an
+        /// older server.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fingerprint: Option<String>,
     },
@@ -1406,8 +1405,8 @@ pub enum InviteLookupOutcome {
 /// The most identity states a portable sign-in carries.
 pub const MAX_SIGN_IN_STATES: usize = 2;
 
-/// A portable user's device proving itself (`FinishPortableSignIn`,
-/// P7-06): the credential their root gave the device's key, and that
+/// A portable user's device proving itself (`FinishPortableSignIn`):
+/// the credential their root gave the device's key, and that
 /// key's signature over this server's nonce.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableSignIn {
@@ -1419,17 +1418,18 @@ pub struct PortableSignIn {
     pub proof: ed25519_dalek::Signature,
     /// The identity's states the device has, newest last, at most
     /// [`MAX_SIGN_IN_STATES`]: the server takes them in before it checks
-    /// the credential (§48), so a device carries revocations to servers
+    /// the credential, so a device carries revocations to servers
     /// it signs in to.
     pub states: Vec<PortableIdentityState>,
     /// What they would be called here, for a grant made with this
-    /// sign-in (P7-05's invite); a grant there already keeps its name.
+    /// sign-in (a portable-account invite); a grant there already keeps
+    /// its name.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
     pub display_name: Option<String>,
 }
 
 /// A `portable-account` invite's code and the portable user redeeming it
-/// (`RedeemPortableInvite`, P7-05).
+/// (`RedeemPortableInvite`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedeemPortableInvite {
     pub code: String,
@@ -1474,7 +1474,7 @@ impl fmt::Debug for ChangePassword {
     }
 }
 
-/// What proves a PIN change or removal is the user's (P2-08): the PIN
+/// What proves a PIN change or removal is the user's: the PIN
 /// they have, or, when it is forgotten, their account password.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1521,7 +1521,7 @@ pub struct TrackPreferencesInfo {
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     Password,
-    /// Approval on another signed-in device (P3-07): `BeginDeviceSignIn`.
+    /// Approval on another signed-in device: `BeginDeviceSignIn`.
     DeviceApproval,
     /// A method this build does not know.
     #[serde(other)]
@@ -1570,8 +1570,8 @@ pub enum Reply {
     },
     LoggedIn {
         session: SessionId,
-        /// This device is trusted for the session's user after it
-        /// (P4-01): the sign-in asked to be remembered and it was (by the
+        /// This device is trusted for the session's user after it:
+        /// the sign-in asked to be remembered and it was (by the
         /// approver too, for a device sign-in), or the device already was.
         remembered: bool,
         /// The password was a one-time one an admin reset to: show "Choose
@@ -1587,7 +1587,7 @@ pub enum Reply {
         profiles: Vec<TrustedProfile>,
     },
     Pong,
-    /// A device sign-in is pending (P3-07). Show `code` (see
+    /// A device sign-in is pending. Show `code` (see
     /// [`crate::device_sign_in::display`]); keep `request` to await it.
     DeviceSignInStarted {
         request: String,
@@ -1616,7 +1616,7 @@ pub enum Reply {
     Items {
         items: Vec<Item>,
         total: u32,
-        /// Experimental (`federation`, P8-03): the items listed that are
+        /// Experimental (`federation`): the items listed that are
         /// no longer available, their paired server unpaired or their
         /// library no longer shared (`RecentlyPlayed`): shown as such, and
         /// not played. Only to a client that named the feature; left out
@@ -1627,30 +1627,30 @@ pub enum Reply {
     Item {
         item: Item,
         children: Vec<Item>,
-        /// The item's intro and credits (P2-10), in order of start; empty
+        /// The item's intro and credits, in order of start; empty
         /// for an item that has none.
         markers: Vec<Marker>,
-        /// The playlists the user sees that hold it (PX-40): a movie,
+        /// The playlists the user sees that hold it: a movie,
         /// episode or track itself; any of a season's or a show's
         /// episodes; any of an album's or an artist's tracks. Empty when
         /// none does.
         playlists: Vec<PlaylistRef>,
-        /// Its heart (PX-43): a track's `all` or `none`; an album's
+        /// Its heart: a track's `all` or `none`; an album's
         /// `all`, `some` or `none` by the tracks it has now. `None` for
         /// any other item.
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         liked: Option<crate::playlists::Liked>,
-        /// An album's tracks among `children` that are liked (PX-43),
+        /// An album's tracks among `children` that are liked,
         /// for their hearts. Empty for any other item.
         liked_children: Vec<MediaId>,
-        /// Experimental (`federation`, P8-05): where the item is from, its
+        /// Experimental (`federation`): where the item is from, its
         /// title's copies on other servers and the one that plays, as a
         /// `SearchHit` has them. Only to a client that named the feature.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         copies: Option<crate::search::Copies>,
     },
     Search(SearchResults),
-    /// Experimental (`federation`, P8-05): `Search`'s answer to a client
+    /// Experimental (`federation`): `Search`'s answer to a client
     /// that named the feature, each item a `SearchHit`. Counts are
     /// approximate: a title on several servers is counted once only among
     /// what is shown.
@@ -1669,7 +1669,7 @@ pub enum Reply {
     },
     PlaybackStarted {
         handle: PlaybackHandle,
-        /// Always `Direct` in Phase 1.
+        /// How the server plays it: direct, or converted.
         plan: PlaybackPlan,
         /// The size of the file the handle reads.
         size: u64,
@@ -1690,7 +1690,7 @@ pub enum Reply {
     PlaybackRevision {
         revision: u64,
     },
-    /// The session user's devices (P2-08), most recently seen first.
+    /// The session user's devices, most recently seen first.
     Devices {
         devices: Vec<DeviceInfo>,
     },
@@ -1717,7 +1717,7 @@ pub enum Reply {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
-    /// The chunk of a subtitle file that `ReadSubtitle` asked for (P2-11).
+    /// The chunk of a subtitle file that `ReadSubtitle` asked for.
     SubtitleChunk {
         format: SubtitleFormat,
         #[serde(with = "serde_bytes")]
@@ -1736,21 +1736,21 @@ pub enum Reply {
     Confirmed,
     Home(HomeScreen),
     TrackPreferences(TrackPreferencesInfo),
-    /// An item's frame previews (`GetPreviews`, P3-13).
+    /// An item's frame previews (`GetPreviews`).
     Previews(Previews),
     /// What the platform makes an app passkey with, but the challenge:
-    /// the nonce it is made from (`BeginPasskeyRegistration`, P3-19).
+    /// the nonce it is made from (`BeginPasskeyRegistration`).
     PasskeyRegistrationBegun(PasskeyRegistrationBegun),
     /// What the platform signs in with an app passkey with, but the
     /// challenge: the nonce it is made from (`BeginPasskeySignIn`,
-    /// `BeginConfirmPasskey`, P3-19).
+    /// `BeginConfirmPasskey`).
     PasskeySignInBegun(PasskeySignInBegun),
     /// The session user's passkeys (`ListPasskeys`).
     Passkeys {
         passkeys: Vec<PasskeyInfo>,
     },
     /// What a portable identity signs to tie the session user's account
-    /// to it (`TieBegin`, P7-04).
+    /// to it (`TieBegin`).
     TieChallenge {
         /// Used once, for `expires_in_secs`, by this session.
         #[serde(with = "serde_bytes")]
@@ -1763,59 +1763,58 @@ pub enum Reply {
         expires_in_secs: u64,
     },
     /// What a portable user's device signs to sign in
-    /// (`BeginPortableSignIn`, P7-06).
+    /// (`BeginPortableSignIn`).
     PortableSignInBegun {
         /// Used once, for `expires_in_secs`, by this device.
         #[serde(with = "serde_bytes")]
         nonce: [u8; 32],
         expires_in_secs: u64,
     },
-    /// A new invite, with its code (`CreateInvite`, PX-44).
+    /// A new invite, with its code (`CreateInvite`).
     InviteCreated(InviteCreated),
-    /// What the server keeps of a portable identity (`IdentityRecord`,
-    /// P7-08).
+    /// What the server keeps of a portable identity (`IdentityRecord`).
     IdentityRecord(IdentityRecord),
-    /// The pairing request held under a code (`FetchPairing`, P7-08).
+    /// The pairing request held under a code (`FetchPairing`).
     PairingOffered(PairingOffer),
     /// The answer to a device's pairing request, or `None` while none
-    /// came yet (`CollectPairing`, P7-08).
+    /// came yet (`CollectPairing`).
     PairingAnswered {
         answer: Option<PairingAnswer>,
     },
-    /// The invites that can still be redeemed (`ListInvites`, PX-44).
+    /// The invites that can still be redeemed (`ListInvites`).
     Invites {
         invites: Vec<InviteSummary>,
     },
-    /// Experimental (`http-playback`, PX-49): where a player with no Iroh
+    /// Experimental (`http-playback`): where a player with no Iroh
     /// fetches the playback (`HttpPlaybackUrl`).
     HttpPlaybackUrl {
         url: String,
     },
-    /// Experimental (`http-playback`, PX-49): why `HttpPlaybackUrl` gave
+    /// Experimental (`http-playback`): why `HttpPlaybackUrl` gave
     /// no URL.
     HttpPlaybackRefused {
         reason: crate::experimental::HttpPlaybackRefusal,
     },
-    /// Experimental (`federation`, P8-01): the server paired
+    /// Experimental (`federation`): the server paired
     /// (`PairServer`).
     ServerPaired {
         server: crate::federation::PeerServer,
     },
-    /// Experimental (`federation`, P8-03): the libraries shared with the
+    /// Experimental (`federation`): the libraries shared with the
     /// paired server (`ShareLibraries`), as asked.
     LibrariesShared {
         libraries: Vec<spoolframe_types::LibraryId>,
     },
-    /// Experimental (`federation`, P8-04): the session a play token
+    /// Experimental (`federation`): the session a play token
     /// opened (`RedeemPlayToken`).
     PlayTokenRedeemed(crate::federation::PlayTokenRedeemed),
-    /// Experimental (`federation`, P8-04): where a paired server is
+    /// Experimental (`federation`): where a paired server is
     /// (`RemoteHints`).
     RemoteHints(crate::federation::RemoteHints),
-    /// Experimental (`federation`, P8-04): a paired server's play token
+    /// Experimental (`federation`): a paired server's play token
     /// for this device (`RemoteGrant`).
     RemoteGranted(crate::federation::RemoteGranted),
-    /// The playlists the user sees (`ListPlaylists`, PX-40), oldest first,
+    /// The playlists the user sees (`ListPlaylists`), oldest first,
     /// and the notes of pinned ones that left their Pinned.
     Playlists {
         playlists: Vec<PlaylistSummary>,
@@ -1826,11 +1825,11 @@ pub enum Reply {
     /// A playlist as it is now (`CreatePlaylist`, `UpdatePlaylist`).
     PlaylistInfo(PlaylistSummary),
     /// A subtitle track's timing after `SyncSubtitle`,
-    /// `UseOriginalSubtitleTiming` or `SetSubtitleOffset` (PX-03).
+    /// `UseOriginalSubtitleTiming` or `SetSubtitleOffset`.
     SubtitleTiming(spoolframe_types::SubtitleTiming),
-    /// What `SearchSubtitles` found (PX-02).
+    /// What `SearchSubtitles` found.
     SubtitleResults(spoolframe_types::SubtitleSearch),
-    /// The track `DownloadSubtitle` added (PX-02).
+    /// The track `DownloadSubtitle` added.
     SubtitleDownloaded(spoolframe_types::SubtitleDownloaded),
     /// The playlist's revision after `EditPlaylist`.
     PlaylistEdited {
@@ -1880,7 +1879,7 @@ pub enum Reply {
     },
 }
 
-/// Which HLS playlist (P2-05).
+/// Which HLS playlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestKind {
@@ -1888,7 +1887,7 @@ pub enum ManifestKind {
     Multivariant,
     /// The variant's segments.
     Media,
-    /// The subtitle rendition's WebVTT segments (P2-07), read with
+    /// The subtitle rendition's WebVTT segments, read with
     /// `ReadSubtitleSegment`; there when the plan has a subtitle.
     Subtitles,
     #[serde(other)]
@@ -1903,14 +1902,14 @@ pub struct HomeScreen {
     /// For each recently watched show, its next unwatched episode.
     pub next_up: Vec<Item>,
     pub recently_added: Vec<Item>,
-    /// Experimental (`federation`, P8-02): the items of these rows that
+    /// Experimental (`federation`): the items of these rows that
     /// are no longer available: their paired server unpaired, or stopped
     /// sharing their library. Shown as such, and not played. Only to a
     /// client that named the feature, as every `fed:` id is; left out when
     /// empty, as experimental fields are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable: Vec<MediaId>,
-    /// Experimental (`federation`, P8-02): each paired server's own row,
+    /// Experimental (`federation`): each paired server's own row,
     /// what it shared lately, by the server's name. A row the user turned
     /// off (`SetServerRow`) is listed with no items, for the setting. Left
     /// out when empty, as experimental fields are.
@@ -1918,7 +1917,7 @@ pub struct HomeScreen {
     pub servers: Vec<ServerRow>,
 }
 
-/// A paired server's row on Home (P8-02).
+/// A paired server's row on Home.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerRow {
     pub server: spoolframe_types::LibraryServer,
@@ -1932,30 +1931,29 @@ pub struct ServerRow {
 /// A session's user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSummary {
-    /// Opaque; stable for the user on this server. Since P3-20 a
-    /// server's ids are UUIDs (`local:<uuid>` today), and one that served
-    /// `local:<number>` before changes it once: a client that kept an id
-    /// reads it again from `WhoAmI`.
+    /// Opaque; stable for the user on this server (today `local:<uuid>`).
+    /// A server that served `local:<number>` ids changes them once: a
+    /// client that kept an id reads it again from `WhoAmI`.
     pub user_id: String,
     pub username: String,
     /// What to show; the username when the user has no display name.
     pub display_name: String,
-    /// What the user may do (P2-09).
+    /// What the user may do.
     pub role: Role,
     /// The session needs the user's PIN on this connection before anything
-    /// but `WhoAmI` and `UnlockProfile` (P2-08).
+    /// but `WhoAmI` and `UnlockProfile`.
     pub locked: bool,
-    /// The user's PIN, if they have one (P2-08): for "Set · 4 digits", and
+    /// The user's PIN, if they have one: for "Set · 4 digits", and
     /// for how many boxes a PIN pad shows. Never the PIN itself.
     pub pin: Option<PinState>,
-    /// The portable identities the account is tied to (P7-04, P7-09),
+    /// The portable identities the account is tied to,
     /// the oldest tie first: shown on the account, never as other
     /// accounts. Empty for an account with none, and for a portable
-    /// user's own session (P7-06), whose identity is its `user_id`.
+    /// user's own session, whose identity is its `user_id`.
     pub portable: Vec<PortableTie>,
 }
 
-/// One of an account's ties to a portable identity (P7-09).
+/// One of an account's ties to a portable identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableTie {
     pub id: PortableUserId,
@@ -1969,13 +1967,13 @@ pub struct PortableTie {
 
 /// What `WhoAmI` answers: the session's user, and whether they may leave
 /// the server. On the wire the user's fields and `can_leave` sit in one
-/// map, as the user's alone did before, so an older client reads it as a
+/// map, so a client that does not know `can_leave` reads it as a
 /// [`UserSummary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhoAmIReply {
     #[serde(flatten)]
     pub user: UserSummary,
-    /// `LeaveServer` would be done, not refused with `LastAdmin` (PX-47):
+    /// `LeaveServer` would be done, not refused with `LastAdmin`:
     /// false for the last enabled admin, or the last enabled admin with a
     /// password, so an app can grey out "Leave this server" before it is
     /// asked. As of this answer: an admin made or demoted later changes
@@ -1991,7 +1989,7 @@ pub struct PinState {
     pub digits: Option<u8>,
 }
 
-/// A user a device is trusted for (P4-01), as that device sees them.
+/// A user a device is trusted for, as that device sees them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedProfile {
     /// What `ResumeProfile` takes: `UserSummary::user_id`.
@@ -2008,7 +2006,7 @@ pub struct TrustedProfile {
     pub auto_login: bool,
 }
 
-/// One of a user's devices (P2-08).
+/// One of a user's devices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     /// Hex `EndpointId`: what `SetPinRequired { device }` takes.
@@ -2023,15 +2021,15 @@ pub struct DeviceInfo {
     pub last_seen_at: i64,
     /// The user's PIN is asked for on it.
     pub pin_required: bool,
-    /// It may resume the user without a password (P4-01).
+    /// It may resume the user without a password.
     pub trusted: bool,
-    /// It opens the user's profile at start (P4-01).
+    /// It opens the user's profile at start.
     pub auto_login: bool,
     /// The device this request came from.
     pub this_device: bool,
 }
 
-/// A device waiting to be signed in (P3-07), as the approver sees it.
+/// A device waiting to be signed in, as the approver sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSignInRequest {
     /// What the device calls itself (from its `Hello`).
@@ -2045,11 +2043,11 @@ pub struct DeviceSignInRequest {
     pub platform: Platform,
     /// Unix seconds.
     pub requested_at: i64,
-    /// The device asked to be remembered (P4-01): the approval says "This
+    /// The device asked to be remembered: the approval says "This
     /// device will be remembered", ticked, and the approver may untick it.
     pub remember: bool,
     /// Where the device's `BeginDeviceSignIn` came from, as the server saw
-    /// it (PX-09 finding 27): the one thing on this screen an attacker who
+    /// it: the one thing on this screen an attacker who
     /// sent the approver a code cannot choose. `None` if the server could
     /// not tell. The approval shows it, "The TV asked from 192.168.86.20.",
     /// and for [`AddressNetwork::Internet`] warns instead: the device is
@@ -2058,7 +2056,7 @@ pub struct DeviceSignInRequest {
     pub requested_from: Option<DeviceAddress>,
 }
 
-/// An address a device reached the server from (PX-09 finding 27).
+/// An address a device reached the server from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceAddress {
     /// Its IP address as text: `192.168.86.20`, `fd7a:115c:a1e0::1`. An
@@ -2106,7 +2104,7 @@ pub struct SessionInfo {
     pub current: bool,
 }
 
-/// Who the server is. `endpoint_id` is what the client pins (P1-13).
+/// Who the server is. `endpoint_id` is what the client pins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub name: String,
@@ -2121,10 +2119,10 @@ pub struct ServerInfo {
     pub auth_methods: Vec<AuthMethod>,
     /// Where a browser reaches the server's web UI (`admin.public_url`),
     /// if it has one: for "open in the browser" links, such as linking a
-    /// Plex account (P3-12). Absent without a public URL, since the
+    /// Plex account. Absent without a public URL, since the
     /// listener's own address may be loopback or one no browser trusts.
     pub web_url: Option<String>,
-    /// The experimental features turned on for this connection (PX-49):
+    /// The experimental features turned on for this connection:
     /// those its `Hello` named that this server knows and has on. Left
     /// out when none, as an older server does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2177,7 +2175,7 @@ pub enum Error {
     /// `StartPlayback` again and go on from where playback was.
     #[error("the playback has expired; start it again")]
     PlaybackExpired,
-    /// An admin stopped the playback on the server (P3-15). It is over:
+    /// An admin stopped the playback on the server. It is over:
     /// tell the viewer it ended, and do not start it again on your own
     /// as after `PlaybackExpired`. Its progress is kept.
     #[error("the playback was stopped on the server")]
@@ -2186,7 +2184,7 @@ pub enum Error {
     #[error("the server is busy converting; try again later")]
     Busy,
     /// The server plays at most `max` playbacks off its LAN at once
-    /// (PX-46, `network.uplink.max_streams`), and that many are playing.
+    /// (`network.uplink.max_streams`), and that many are playing.
     /// Try again when one ends; a device on the server's LAN is not
     /// counted.
     #[error("the server plays at most {max} playbacks outside its home at once")]
@@ -2198,11 +2196,11 @@ pub enum Error {
     /// offset 0.
     #[error("the playback restarted at a seek (epoch {epoch})")]
     PlaybackRestarted { epoch: u32 },
-    /// The subtitle is still being read as text (P2-07); `done_percent` of
+    /// The subtitle is still being read as text; `done_percent` of
     /// its cues are read. Ask again in a few seconds.
     #[error("the subtitle is still being read ({done_percent}% done)")]
     SubtitleNotReady { done_percent: u8 },
-    /// The item's frame previews are being made (P3-13); `done_percent` of
+    /// The item's frame previews are being made; `done_percent` of
     /// them are. Ask again in a few seconds; show the time alone till then.
     #[error("the previews are being made ({done_percent}% done)")]
     PreviewsNotReady { done_percent: u8 },
@@ -2212,12 +2210,12 @@ pub enum Error {
     #[error("this item has no previews")]
     NoPreviews,
     /// The subtitle is not the file that `ReadSubtitle`'s `version` names:
-    /// it was written again or replaced since that chunk (P2-11). Read it
+    /// it was written again or replaced since that chunk. Read it
     /// again from offset 0.
     #[error("the subtitle changed while it was read")]
     SubtitleChanged,
     /// The session's profile is locked on this connection: `UnlockProfile`
-    /// with the user's PIN first (P2-08).
+    /// with the user's PIN first.
     #[error("this profile is locked; enter its PIN")]
     ProfileLocked,
     /// A value the request carries is not acceptable (a PIN that is not 4
@@ -2232,7 +2230,7 @@ pub enum Error {
     #[error("this account has no password; use the PIN or the web UI")]
     NoPassword,
     /// The session was signed in too long ago for this (an app passkey,
-    /// P3-19; approving a device, P3-07): confirm it is the user
+    /// approving a device): confirm it is the user
     /// (`ConfirmPassword`, or `BeginConfirmPasskey`), or sign in again,
     /// then ask again. Nothing was changed.
     #[error("sign in again first")]
@@ -2242,7 +2240,7 @@ pub enum Error {
     /// (`RemovePasskey`). Nothing was changed.
     #[error("that is the last way to sign in to this account")]
     LastSignInMethod,
-    /// The device sign-in was refused on the approving device (P3-07).
+    /// The device sign-in was refused on the approving device.
     #[error("the sign-in was denied")]
     DeviceSignInDenied,
     /// The device sign-in is over: it timed out, or is not this device's.
@@ -2258,20 +2256,20 @@ pub enum Error {
     #[error("unavailable: {message}")]
     Unavailable { message: String },
     /// The server has no library yet: it is waiting to be set up in its
-    /// web UI (P3-10). Every catalog and playback request gets this until
+    /// web UI. Every catalog and playback request gets this until
     /// it is; show "This server is not set up yet", not an error. Signing
     /// in and the rest work.
     #[error("this server is not set up yet")]
     NotSetUp,
     /// The invite's code is right, and it is of another kind than the
-    /// request redeems (P7-05): a `portable-account` invite's code to
+    /// request redeems: a `portable-account` invite's code to
     /// `RedeemInvite`, or a `create-user` one's to
     /// `RedeemPortableInvite`. Nothing was made and the invite keeps its
     /// use: redeem it the other way.
     #[error("that invite is of another kind")]
     WrongInviteKind,
     /// `RedeemInvite` with a code that is no invite's, or whose invite
-    /// was revoked (P6-01). Counted as a wrong guess. Offer "Save server
+    /// was revoked. Counted as a wrong guess. Offer "Save server
     /// only", which pins the server as a link without a code does.
     #[error("that invite code is not valid")]
     InviteInvalid,
@@ -2287,22 +2285,22 @@ pub enum Error {
     #[error("that username is taken")]
     UsernameTaken,
     /// `TieFinish` with a nonce that is not outstanding for this session:
-    /// it was used, it is over, or `TieBegin` never gave it here (P7-04).
+    /// it was used, it is over, or `TieBegin` never gave it here.
     /// Begin again.
     #[error("the tie challenge is used or has expired; begin again")]
     TieChallengeExpired,
-    /// Another account on this server is tied to that portable identity
-    /// (P7-04): one identity ties to one account per server. Sever that
+    /// Another account on this server is tied to that portable identity:
+    /// one identity ties to one account per server. Sever that
     /// tie first. Nothing was changed.
     #[error("that portable identity is tied to another account here")]
     PortableIdTaken,
-    /// The session is a portable user's (P7-06), and this is for an
+    /// The session is a portable user's, and this is for an
     /// account here only: its password, PIN, passkeys, devices, sessions,
     /// ties, approving sign-ins. Hide what asks for it while signed in as
     /// one. Nothing was changed.
     #[error("not for a guest from another identity")]
     NotForPortableUsers,
-    /// The request is an admin's (PX-44: making and revoking invites),
+    /// The request is an admin's (making and revoking invites),
     /// and the session user is not one. Nothing was changed.
     #[error("only an admin can do that")]
     AdminRequired,
@@ -2312,42 +2310,42 @@ pub enum Error {
     #[error("choose a new password first")]
     PasswordChangeRequired,
     /// `LeaveServer` from the last enabled admin, or the last enabled
-    /// admin with a password (PX-47): make someone else an admin, or give
+    /// admin with a password: make someone else an admin, or give
     /// one a password, first. Nothing was changed.
     #[error("you are the only admin; make someone else an admin first")]
     LastAdmin,
-    /// The user sees the playlist and may not make this change (PX-40): an
+    /// The user sees the playlist and may not make this change: an
     /// edit on a read-only share, or a rename, sharing change or delete by
     /// anyone but its owner (or an admin, for a server-wide one). Nothing
     /// was changed.
     #[error("you cannot change this playlist")]
     PlaylistReadOnly,
-    /// The playlist does not take items of this kind (PX-40): its kinds
+    /// The playlist does not take items of this kind: its kinds
     /// were ticked when it was made. Nothing was changed. A season or
     /// show is episodes, an album or artist tracks.
     #[error("this playlist does not take a {kind:?}")]
     KindNotAllowed { kind: crate::playlists::ItemKind },
     /// Someone changed the playlist since the revision the edit was made
-    /// on, and touched an entry the edit touches (PX-40): "Someone changed
+    /// on, and touched an entry the edit touches: "Someone changed
     /// this playlist; reload". `revision` is its revision now. Nothing was
     /// changed.
     #[error("someone changed this playlist; reload (revision {revision})")]
     PlaylistConflict { revision: u64 },
-    /// The user may not do this to what they see (PX-53): a cover set or
+    /// The user may not do this to what they see: a cover set or
     /// taken away by someone who may not edit the playlist, or on Liked
     /// or All, whose tiles are fixed. Nothing was changed.
     #[error("you are not allowed to do that")]
     NotAllowed,
     /// The picture is over `max_bytes` long, or over `max_pixels` by its
-    /// header (PX-53). Refused before it was decoded; nothing was
+    /// header. Refused before it was decoded; nothing was
     /// changed.
     #[error("the picture is too large: at most {max_bytes} bytes and {max_pixels} pixels")]
     ImageTooLarge { max_bytes: u64, max_pixels: u64 },
     /// Not a JPEG, PNG, WebP or HEIC picture the server can decode, or
-    /// one that hit the decoder's limits (PX-53). Nothing was changed.
+    /// one that hit the decoder's limits. Nothing was changed.
     #[error("the picture cannot be read: a JPEG, PNG, WebP or HEIC is taken")]
     ImageUnreadable,
-    /// The downloads of `whose` are used up for today (PX-02): the
+    /// The downloads of `whose` are used up for today: the
     /// server's account at subtitle site `site` (`opensubtitles`,
     /// `subdl`, as `SubtitleResult::source`), or the user's own daily
     /// limit on this server (no `site`). `resets_at` (Unix seconds) is when more may be
@@ -2361,21 +2359,21 @@ pub enum Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         site: Option<String>,
     },
-    /// The server has no subtitle site set up (PX-02): hide "Find
+    /// The server has no subtitle site set up: hide "Find
     /// subtitles". Nothing was asked of any site.
     #[error("this server has no subtitle source set up")]
     NoSubtitleSource,
-    /// The download's file is not whole yet (PX-38): read it once its
+    /// The download's file is not whole yet: read it once its
     /// state is `ready`. A download that failed is prepared again.
     #[error("the download is not ready")]
     DownloadNotReady,
-    /// Experimental (`federation`, P8-01): the other server did not pair
+    /// Experimental (`federation`): the other server did not pair
     /// (`PairServer`), for `reason`. Nothing was kept.
     #[error("the other server did not pair: {reason}")]
     PairingRefused {
         reason: crate::federation::PairingRefused,
     },
-    /// Experimental (`federation`, P8-04): the paired server the item is
+    /// Experimental (`federation`): the paired server the item is
     /// from is offline to this one (`RemoteGrant`): play it from this
     /// server, or later.
     #[error("the paired server the item is from is offline")]
@@ -2395,7 +2393,7 @@ pub enum Error {
 pub enum Event {
     /// The server is stopping; the connection will close.
     ShuttingDown,
-    /// Where this server can be reached (PX-12), pushed to a connection
+    /// Where this server can be reached, pushed to a connection
     /// as soon as it is signed in, and again whenever the list changes.
     /// Each one is the whole list: it replaces what was told before.
     /// Never sent to a connection that is not signed in.
@@ -2409,14 +2407,14 @@ pub enum Event {
         /// relays are off.
         relays: Vec<String>,
         /// The pkarr relay the server publishes where it is to
-        /// (`network.pkarr`, P6-05), for the device to look it up by its
+        /// (`network.pkarr`), for the device to look it up by its
         /// key when nothing else reaches it; `None` while it publishes
         /// nothing.
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         lookup: Option<String>,
     },
-    /// Playback `handle`'s share of the server's WAN uplink changed
-    /// (PX-46): another WAN playback started or ended, or the budget
+    /// Playback `handle`'s share of the server's WAN uplink changed:
+    /// another WAN playback started or ended, or the budget
     /// changed. A playback in `Quality::Auto` re-plans with
     /// `ChangeQuality` at its position (the SDK's managed playback does
     /// it by itself); `max_bitrate` is the new cap, `None` none. Sent only
@@ -2427,7 +2425,7 @@ pub enum Event {
         #[serde(deserialize_with = "spoolframe_types::required::option")]
         max_bitrate: Option<u64>,
     },
-    /// A playlist the user sees was made or changed (PX-40): its entries,
+    /// A playlist the user sees was made or changed: its entries,
     /// name, kinds or sharing. Read it again if it is shown. Only to a
     /// client that listed `spoolframe:playlists`.
     PlaylistChanged { id: String, revision: u64 },
@@ -2437,12 +2435,12 @@ pub enum Event {
     /// The user's Pinned, or its notes, changed on another device or by
     /// another user's change: `ListPlaylists` again.
     PinsChanged,
-    /// The user liked or unliked a track (PX-51), on any device: a device
+    /// The user liked or unliked a track, on any device: a device
     /// that downloaded Liked asks what it holds now
     /// (`MusicDownloadChanges`). Only to the user's own connections that
     /// listed `spoolframe:music-downloads`.
     LikedChanged,
-    /// Item `id`'s subtitle `track` is timed anew (PX-03): synced, its
+    /// Item `id`'s subtitle `track` is timed anew: synced, its
     /// sync done or set aside, or its offset changed, by anyone. What it
     /// is served with changed: a player showing it reads it again (a
     /// `ReadSubtitle` in progress answers `SubtitleChanged`), with no
@@ -2453,7 +2451,7 @@ pub enum Event {
         track: u32,
         timing: spoolframe_types::SubtitleTiming,
     },
-    /// Download `id`'s state moved (PX-38): `waiting`, then `converting`
+    /// Download `id`'s state moved: `waiting`, then `converting`
     /// (told once per percent or every 2 s), `writing`, and `ready` or
     /// `failed`. Only to the connections of the user whose it is, that
     /// listed `spoolframe:downloads`.
@@ -2461,12 +2459,12 @@ pub enum Event {
         id: String,
         state: crate::downloads::DownloadState,
     },
-    /// Experimental (`federation`, P8-02): the libraries changed: a paired
+    /// Experimental (`federation`): the libraries changed: a paired
     /// server came online or went offline, or shared or stopped sharing a
     /// library. `Libraries` again. Only to a client that named the
     /// feature.
     LibrariesChanged,
-    /// Experimental (`federation`, P8-04): playback `handle`, of a paired
+    /// Experimental (`federation`): playback `handle`, of a paired
     /// server's item, ended other than by its client's stop: stopped by an
     /// admin, idle past the limit, its session or its grant ended, or, on
     /// the user's own server playing it on, ended where it plays from.

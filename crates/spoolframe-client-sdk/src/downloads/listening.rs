@@ -1,4 +1,4 @@
-//! Tracks kept from listening (PX-51): a playback of a track writes the
+//! Tracks kept from listening: a playback of a track writes the
 //! bytes its reads bring into a [`BlockWriter`], and once the whole file
 //! is here it becomes an entry held by the cache (`listening`), with no
 //! second transfer.

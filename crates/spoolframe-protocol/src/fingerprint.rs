@@ -1,4 +1,4 @@
-//! A server key's fingerprint (P1-21, ARCHITECTURE §19): a short code a
+//! A server key's fingerprint: a short code a
 //! person can compare between the server's terminal and a client's screen
 //! before the client pins the key.
 //!

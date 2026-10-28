@@ -1,5 +1,4 @@
-//! The profile lock offline (PX-60). The PIN (P2-08) is the server's to
-//! check, and a profile whose PIN is asked for on this device opens only
+//! The profile lock offline. The PIN is the server's to check, and a profile whose PIN is asked for on this device opens only
 //! through it while the server is reached. Offline, the downloads of
 //! such a profile open only with its PIN, checked here against what the
 //! last online unlock left, or the device owner's own authentication

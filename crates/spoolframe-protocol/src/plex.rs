@@ -1,4 +1,4 @@
-//! The session user's Plex account link (P3-12), as clients may read it.
+//! The session user's Plex account link, as clients may read it.
 //! Linking and unlinking are the web UI's (`<web_url>/profile`): a client
 //! only shows the state, and never sees the account's token.
 

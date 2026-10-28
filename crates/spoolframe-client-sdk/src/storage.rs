@@ -1,7 +1,7 @@
 //! Where the SDK keeps what must outlive the app: implemented by the app,
-//! because only it knows the platform. The Linux client keeps secrets in
-//! Secret Service and data under the XDG data directory; tvOS uses the
-//! keychain (P5).
+//! because only it knows the platform. For example, keep secrets in the
+//! Secret Service and data under the XDG data directory on Linux, and both
+//! in the Keychain on Apple platforms.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 /// The storage could not be read or written. Never treated as "empty":
-/// a key that cannot be read is not replaced by a new one (§17).
+/// a key that cannot be read is not replaced by a new one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("storage: {0}")]
 pub struct StorageError(pub String);
@@ -38,22 +38,21 @@ pub mod keys {
     /// Data: the saved servers, JSON.
     pub const SERVERS: &str = "servers";
 
-    /// Data: the portable identities on this device, JSON (P7-01).
+    /// Data: the portable identities on this device, JSON.
     pub const PORTABLE_IDENTITIES: &str = "portable-identities";
 
     /// Data: the device credentials this device acts with, JSON: each
-    /// identity's id → its credential (P7-02). The identity's root need
+    /// identity's id → its credential. The identity's root need
     /// not be on this device.
     pub const PORTABLE_CREDENTIALS: &str = "portable-credentials";
 
     /// Data: whether this device lets people sign in on it with an
-    /// account that is not this device's own (P7-03), JSON `true` or
+    /// account that is not this device's own, JSON `true` or
     /// `false`; not there is `false`. The gate for every external
-    /// principal: portable identities paired by QR now, federated users
-    /// (P8) later.
+    /// principal, such as a portable identity paired by QR.
     pub const ALLOW_GUESTS: &str = "allow-guests";
 
-    /// Secret: each profile's lock offline (PX-60), JSON: whether its PIN
+    /// Secret: each profile's lock offline, JSON: whether its PIN
     /// is asked for on this device, and a hash of the PIN to check.
     pub const OFFLINE_LOCKS: &str = "offline-locks";
 
@@ -62,8 +61,8 @@ pub mod keys {
         format!("sessions/{server}")
     }
 
-    /// Secret: one portable identity's root signing key, 32 bytes
-    /// (P7-01). The most valuable secret the SDK keeps: whoever reads it
+    /// Secret: one portable identity's root signing key, 32 bytes.
+    /// The most valuable secret the SDK keeps: whoever reads it
     /// is that user everywhere, until they recover elsewhere and revoke.
     /// This device only, never synced or backed up off the device: an
     /// identity whose root the user chose to sync keeps it under
@@ -73,13 +72,13 @@ pub mod keys {
     }
 
     /// Secret: this device's own key for acting as portable identity
-    /// `id`, 32 bytes (P7-02). Its credential names the public half.
+    /// `id`, 32 bytes. Its credential names the public half.
     pub fn portable_device(id: &str) -> String {
         format!("portable-device/{id}")
     }
 
-    /// Data: the last serial the root of `id` gave a credential here, JSON
-    /// (P7-02). Saved before each credential is signed. The next is the
+    /// Data: the last serial the root of `id` gave a credential here, JSON.
+    /// Saved before each credential is signed. The next is the
     /// issue time in milliseconds, or one past this if that is larger, so
     /// no two from this device share one, and two devices that hold one
     /// root almost never do. Never synced: each holder keeps its own.
@@ -88,25 +87,25 @@ pub mod keys {
     }
 
     /// Data: the devices the root of `id` has given credentials to, JSON:
-    /// the newest credential per device key, and its label (P7-02).
+    /// the newest credential per device key, and its label.
     pub fn portable_issued(id: &str) -> String {
         format!("portable-issued/{id}")
     }
 
-    /// Data: the newest identity state of `id` this device has, JSON
-    /// (P7-02): made here by its root, or brought from elsewhere.
+    /// Data: the newest identity state of `id` this device has, JSON:
+    /// made here by its root, or brought from elsewhere.
     pub fn portable_state(id: &str) -> String {
         format!("portable-state/{id}")
     }
 
     /// Data: every device key of `id` revoked here, and when, JSON (key →
     /// Unix seconds): the union of all the states this device has made or
-    /// accepted, older revisions too (P7-02).
+    /// accepted, older revisions too.
     pub fn portable_revoked(id: &str) -> String {
         format!("portable-revoked/{id}")
     }
 
-    /// Data: the genesis of `id`, JSON (P7-08): an identity begun with a
+    /// Data: the genesis of `id`, JSON: an identity begun with a
     /// security key root. A phrase identity has none.
     pub fn portable_genesis(id: &str) -> String {
         format!("portable-genesis/{id}")
@@ -115,18 +114,18 @@ pub mod keys {
     /// Data: where and when guest `id` was last paired onto this device,
     /// JSON (the server the pairing was for, if one was known, and Unix
     /// seconds): what [`crate::Portable::guest_pairings`] lists. A guest
-    /// paired before this was kept has none.
+    /// with no pairing recorded has none.
     pub fn portable_paired(id: &str) -> String {
         format!("portable-paired/{id}")
     }
 
     /// Secret: the device key this device offered a pairing through a
-    /// server with (P7-08), before it knows the identity it will act as:
+    /// server with, before it knows the identity it will act as:
     /// taken as that identity's device key when the pairing is accepted.
     pub const PORTABLE_PENDING_DEVICE: &str = "portable-device-pending";
 
     /// What every key the app may sync between the user's devices starts
-    /// with (2026-10-12): an iOS app stores these, and only these, as
+    /// with: an iOS app stores these, and only these, as
     /// synchronizable keychain items (iCloud Keychain), secrets and data
     /// alike. Every other key stays on this device, which is also what an
     /// app that does not know this prefix does: the safe default.

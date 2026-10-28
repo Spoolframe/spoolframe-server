@@ -1,5 +1,6 @@
-//! Development revision 3 of the `/1` RPC stream. The wrapper is mandatory;
-//! old binaries fail decoding instead of silently losing the new guarantees.
+//! The RPC stream of `spoolframe/client/1`. Every request goes in this
+//! wrapper: a peer that does not know it fails to decode the request, so
+//! it never loses the wrapper's guarantees without notice.
 
 use crate::{PlaybackHandle, RequestEnvelope, Response};
 use serde::{Deserialize, Serialize};
