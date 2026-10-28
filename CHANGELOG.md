@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `transcode.video_codecs` defaults to `["hevc", "h264"]`: AV1 is off
+  unless listed. Settings › Playback still shows it first, unticked; GPUs'
+  support for it is spotty (a Radeon 890M's video engine hung converting
+  4K Dolby Vision to AV1).
+- `Platform::Android` (`"android"`, "Android app") and `Platform::Xbox`
+  (`"xbox"`, "Xbox app"); `Platform::Web` may now be a browser client's
+  `Hello`, not only the web UI's admin sessions. None of the three has
+  downloads yet. An older server reads them as `unknown`.
+
 ## 0.16.3-rc.1 (2026-10-28)
 
 A release candidate: its images are tagged `0.16.3-rc.1` (and `-slim`,

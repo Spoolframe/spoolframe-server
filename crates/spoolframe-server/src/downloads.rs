@@ -2078,12 +2078,17 @@ pub enum DeviceClass {
 
 impl DeviceClass {
     /// The class of a client on `platform`; `None` for one that has no
-    /// downloads (tvOS, the web UI, a platform this build does not know).
+    /// downloads (tvOS, Android and Xbox for now, the web, a platform this
+    /// build does not know).
     pub fn of(platform: Platform) -> Option<Self> {
         match platform {
             Platform::Ios | Platform::Macos => Some(Self::Apple),
             Platform::Linux | Platform::Cli => Some(Self::Linux),
-            Platform::Tvos | Platform::Web | Platform::Unknown => None,
+            Platform::Tvos
+            | Platform::Android
+            | Platform::Xbox
+            | Platform::Web
+            | Platform::Unknown => None,
         }
     }
 
@@ -2153,10 +2158,17 @@ mod tests {
     }
 
     #[test]
-    fn an_apple_tv_and_the_web_have_no_downloads() {
+    fn an_apple_tv_android_xbox_and_the_web_have_no_downloads() {
         assert_eq!(
-            [Platform::Tvos, Platform::Web, Platform::Unknown].map(DeviceClass::of),
-            [None; 3]
+            [
+                Platform::Tvos,
+                Platform::Android,
+                Platform::Xbox,
+                Platform::Web,
+                Platform::Unknown
+            ]
+            .map(DeviceClass::of),
+            [None; 5]
         );
     }
 

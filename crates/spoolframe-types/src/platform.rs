@@ -18,8 +18,12 @@ pub enum Platform {
     /// A command-line or scripted client of the SDK (its examples, tools),
     /// or, for an admin API session, the server's own CLI.
     Cli,
-    /// The web UI, in a browser: never in a client's `Hello`, only
-    /// on the admin API's sessions the web UI signed in.
+    /// The Android app, on phones, tablets and Android TV.
+    Android,
+    /// The Xbox app.
+    Xbox,
+    /// A client in a browser: a web player's `Hello`, or an admin API
+    /// session the web UI signed in.
     Web,
     /// A platform this build does not know, from a newer peer.
     #[serde(other)]
@@ -35,6 +39,8 @@ impl Platform {
             Platform::Ios => "ios",
             Platform::Macos => "macos",
             Platform::Cli => "cli",
+            Platform::Android => "android",
+            Platform::Xbox => "xbox",
             Platform::Web => "web",
             Platform::Unknown => "unknown",
         }
@@ -49,6 +55,8 @@ impl Platform {
             "ios" => Platform::Ios,
             "macos" => Platform::Macos,
             "cli" => Platform::Cli,
+            "android" => Platform::Android,
+            "xbox" => Platform::Xbox,
             "web" => Platform::Web,
             _ => Platform::Unknown,
         }
@@ -62,6 +70,8 @@ impl Platform {
             Platform::Ios => "iPhone or iPad app",
             Platform::Macos => "Mac app",
             Platform::Cli => "Command-line client",
+            Platform::Android => "Android app",
+            Platform::Xbox => "Xbox app",
             Platform::Web => "Web",
             Platform::Unknown => "App",
         }
@@ -72,12 +82,14 @@ impl Platform {
 mod tests {
     use super::*;
 
-    const ALL: [Platform; 7] = [
+    const ALL: [Platform; 9] = [
         Platform::Linux,
         Platform::Tvos,
         Platform::Ios,
         Platform::Macos,
         Platform::Cli,
+        Platform::Android,
+        Platform::Xbox,
         Platform::Web,
         Platform::Unknown,
     ];
