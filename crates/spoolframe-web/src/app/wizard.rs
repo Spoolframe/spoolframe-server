@@ -835,6 +835,11 @@ fn PlexFields(
         .then(|| "Plex has to answer before going on".to_owned());
     let found_list = found.read().clone();
     let choice_list = choices();
+    // A server picked, and Plex not yet answered: its libraries are coming.
+    let listing = probed().is_none()
+        && !(if typing() { typed_url() } else { chosen() })
+            .trim()
+            .is_empty();
     rsx! {
         if mode == Mode::Wizard {
             div { class: "flex flex-col gap-1.5",
@@ -1036,6 +1041,15 @@ fn PlexFields(
                             span { class: "quiet", "Not served by Spoolframe" }
                         }
                     }
+                }
+            }
+        }
+        if listing {
+            div { class: "flex flex-col gap-1",
+                h2 { "Libraries" }
+                div { class: "flex items-center gap-2 text-sm text-ctp-subtext0", role: "status",
+                    span { class: "flex animate-spin", icons::Loader {} }
+                    "Loading the libraries…"
                 }
             }
         }

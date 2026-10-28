@@ -1,7 +1,7 @@
 //! Settings › Remote access (P6-02), as the WebRemoteAccess boards draw
 //! it: what the server advertises now and how each address was found,
-//! then `network.wan`'s form, and with advanced settings shown, the relays
-//! and the addresses devices are told (PX-22); and the setup wizard's
+//! then `network.wan`'s form, the relays, and with advanced settings shown,
+//! the addresses devices are told (PX-22); and the setup wizard's
 //! "From outside your home?", in the Access step's apps card
 //! (WebWizardRemoteChoices). The form's logic is `crate::remote`, tested
 //! on the host.
@@ -64,15 +64,16 @@ fn SecurityNote() -> Element {
     }
 }
 
-/// "Most homes don't need this": relays are the other way in.
+/// A public address is optional while relays are on: they are the other
+/// way in.
 #[component]
 fn RelaysNote() -> Element {
     rsx! {
         div { class: "alert alert-info", role: "note",
             icons::Info {}
             span {
-                b { "Most homes don’t need this" }
-                "Few home connections have a public IP you can forward to. Relays, below, let people connect from anywhere without any of this. Set a public address only when your connection has one: it gives a direct, faster path."
+                b { "Optional with relays on" }
+                "With relays on (below), devices connect from anywhere without a public address. Set one only if your connection has a public IP you can forward to: it gives a direct, faster path."
             }
         }
     }
@@ -157,7 +158,7 @@ fn StatusCard(status: ServerStatus, opened: Opened) -> Element {
 /// Settings › Remote access.
 #[component]
 pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
-    let advanced = crate::advanced::shown(super::settings::show_advanced(), "network.relays");
+    let advanced = crate::advanced::shown(super::settings::show_advanced(), "network.announce.add");
     let mut generation = use_signal(|| 0u32);
     let settings = use_resource(move || async move {
         let _ = generation();
@@ -207,8 +208,6 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
                 on_reload: move |_| generation += 1,
             }
         }
-        // The relays and the addresses told are advanced (PX-22).
-        if advanced {
         for g in [generation()] {
             RelayFields {
                 key: "{g}",
@@ -217,6 +216,8 @@ pub fn RemoteAccessForm(on_done: EventHandler<()>) -> Element {
                 on_reload: move |_| generation += 1,
             }
         }
+        // The addresses told are advanced (PX-22).
+        if advanced {
         for g in [generation()] {
             AnnounceFields {
                 key: "{g}",
@@ -633,6 +634,8 @@ fn UplinkFields(
     const BUDGET: &str = "network.uplink.budget_mbps";
     const STREAMS: &str = "network.uplink.max_streams";
     const OWNER: &str = "network.uplink.owner_share_percent";
+    const PER_STREAM: &str = "network.uplink.per_stream.mbps";
+    const LOCAL: &str = "network.uplink.per_stream.applies_to_local";
     const LAN: &str = "network.lan_prefixes";
     const WAN: &str = "network.wan_prefixes";
     const CONGESTION: &str = "network.congestion_control";
@@ -647,6 +650,13 @@ fn UplinkFields(
     let mut budget = use_signal(|| text(&settings, BUDGET));
     let streams = use_signal(|| text(&settings, STREAMS));
     let owner = use_signal(|| text(&settings, OWNER));
+    let per_stream = use_signal(|| text(&settings, PER_STREAM));
+    // On unless set off.
+    let applies_to_local = use_signal(|| {
+        value(&settings, LOCAL)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    });
     let lan = use_signal(|| listed(&settings, LAN));
     let wan = use_signal(|| listed(&settings, WAN));
     let mut error = use_signal(|| None::<String>);
@@ -662,6 +672,8 @@ fn UplinkFields(
                 (BUDGET, number("The upload budget", &budget())?),
                 (STREAMS, number("The most streams", &streams())?),
                 (OWNER, number("The admins' share", &owner())?),
+                (PER_STREAM, number("The cap per stream", &per_stream())?),
+                (LOCAL, Some(serde_json::Value::Bool(applies_to_local()))),
                 (LAN, list_change(&s, LAN, &lan())),
                 (WAN, list_change(&s, WAN, &wan())),
                 (CONGESTION, Some(serde_json::Value::String(congestion()))),
@@ -699,9 +711,11 @@ fn UplinkFields(
             measuring.set(false);
         });
     };
-    let all_fixed = [BUDGET, STREAMS, OWNER, LAN, WAN, CONGESTION]
-        .iter()
-        .all(|k| locked(&settings, k));
+    let all_fixed = [
+        BUDGET, STREAMS, OWNER, PER_STREAM, LOCAL, LAN, WAN, CONGESTION,
+    ]
+    .iter()
+    .all(|k| locked(&settings, k));
     let meaning = crate::uplink::budget_meaning(&budget());
     rsx! {
         section { class: "card tele-card",
@@ -741,6 +755,20 @@ fn UplinkFields(
             div { class: "wan-part",
                 Limit { label: "Admins’ share while guests watch", value: owner, unit: "%", disabled: locked(&settings, OWNER) }
                 Note { settings: settings.clone(), setting: OWNER, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                Limit { label: "Cap per stream (Mbit/s)", value: per_stream, unit: "0 = no cap", disabled: locked(&settings, PER_STREAM) }
+                span { class: "text-[13px] text-ctp-subtext0", "Each playback off the LAN is held to this, whatever quality was picked (Original too)." }
+                Note { settings: settings.clone(), setting: PER_STREAM, on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                PartHead {
+                    title: "Applies to this server’s users",
+                    about: if applies_to_local() { "On: the cap holds for this server’s accounts too." } else { "Off: only portable guests and paired servers’ users are capped; this server’s accounts take their share of the upload budget." },
+                    on: applies_to_local,
+                    disabled: locked(&settings, LOCAL),
+                }
+                Note { settings: settings.clone(), setting: LOCAL, on_changed: move |_| on_reload.call(()) }
             }
             if advanced {
                 div { class: "wan-part",

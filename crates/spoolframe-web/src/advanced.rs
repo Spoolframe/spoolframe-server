@@ -12,9 +12,6 @@ const BY_TAB: &[(&str, &[&str])] = &[
     (
         "remote",
         &[
-            "network.relays",
-            "network.own_relays",
-            "network.pkarr",
             "network.congestion_control",
             "network.announce.add",
             "network.announce.ignore",
@@ -161,9 +158,6 @@ mod tests {
     fn the_niche_settings_are_advanced() {
         for key in [
             "network.port",
-            "network.relays",
-            "network.own_relays",
-            "network.pkarr",
             "network.congestion_control",
             "network.plex_discovery_port",
             "network.announce.add",
@@ -194,6 +188,9 @@ mod tests {
             "name",
             "network.wan",
             "network.ipv6",
+            "network.relays",
+            "network.own_relays",
+            "network.pkarr",
             "admin.public_url",
             "previews.when",
             "previews.workers",
@@ -235,15 +232,23 @@ mod tests {
     #[test]
     fn a_tab_counts_its_advanced_settings_set_or_waiting_for_a_restart() {
         let listed = settings(vec![
-            entry("network.relays", Some(SettingLayer::Runtime), false),
-            entry("network.pkarr", Some(SettingLayer::Default), false),
-            entry("network.own_relays", Some(SettingLayer::File), false),
+            entry(
+                "network.congestion_control",
+                Some(SettingLayer::Runtime),
+                false,
+            ),
+            entry(
+                "network.announce.ignore_interfaces",
+                Some(SettingLayer::File),
+                false,
+            ),
             entry("network.announce.add", Some(SettingLayer::Default), true),
             entry("network.announce.ignore", None, false),
             // Advanced, but on another tab.
             entry("network.port", Some(SettingLayer::Runtime), false),
             // Set, but not advanced.
             entry("network.wan", Some(SettingLayer::Runtime), false),
+            entry("network.relays", Some(SettingLayer::Runtime), false),
         ]);
         assert_eq!(set_on_tab(&listed, "remote"), 3);
         assert_eq!(set_on_tab(&listed, "telemetry"), 0);
