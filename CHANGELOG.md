@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.16.3-rc.2 (2026-10-28)
+
+A release candidate, tagged as rc.1 was: `0.16` and `latest` stay on
+0.16.2.
 
 - A GPU encode that fails before its first segment (ffmpeg exits
   non-zero, stalls, or is aborted by its driver, as amdgpu does when the
