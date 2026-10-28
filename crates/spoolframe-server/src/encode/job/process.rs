@@ -2,10 +2,10 @@
 //! files removed, its progress lines read, and the GPU blamed or not
 //! for how it ended.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{BufReader, Lines};
 use tokio::process::ChildStderr;
@@ -26,6 +26,46 @@ impl DecodeFailures {
 
     pub(super) fn contains(&self, file: &Path) -> bool {
         self.0.lock().contains(file)
+    }
+}
+
+/// How long a GPU whose encoder crashed gets no new conversions. A
+/// driver that hangs its video engine (amdgpu's "ring vcn_unified_0
+/// timeout") hangs it again for the next encode, and each hang costs a
+/// playback several seconds; a few minutes is long enough for the
+/// engine to reset, and short enough that a card that recovered is not
+/// left idle for long.
+pub(super) const QUARANTINE: Duration = Duration::from_secs(5 * 60);
+
+/// The cards whose encoder crashed, by `gpus::Card::key`, each until
+/// when. An entry past its time counts as gone; adding one drops them.
+#[derive(Debug, Default)]
+pub(crate) struct Quarantine(parking_lot::Mutex<HashMap<String, Instant>>);
+
+impl Quarantine {
+    /// Put `card` in quarantine from `now`, for [`QUARANTINE`].
+    pub(crate) fn add(&self, card: &str, now: Instant) {
+        let mut cards = self.0.lock();
+        cards.retain(|_, until| *until > now);
+        cards.insert(card.to_owned(), now + QUARANTINE);
+    }
+
+    /// Whether `card` is in quarantine at `now`.
+    pub(crate) fn holds(&self, card: &str, now: Instant) -> bool {
+        self.0.lock().get(card).is_some_and(|until| *until > now)
+    }
+
+    /// The cards in quarantine at `now`, and how long each has left.
+    pub(crate) fn left(&self, now: Instant) -> Vec<(String, Duration)> {
+        let mut left: Vec<_> = self
+            .0
+            .lock()
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(card, until)| (card.clone(), *until - now))
+            .collect();
+        left.sort();
+        left
     }
 }
 

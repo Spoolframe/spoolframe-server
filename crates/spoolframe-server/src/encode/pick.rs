@@ -952,6 +952,35 @@ mod tests {
         assert_eq!(names(&planning(&detected, &[], &|_| true)), ["libx264"]);
     }
 
+    /// A card in quarantine (its encoder crashed) has no room: the plan
+    /// does not offer the encoders only it has, and a run passes it over.
+    #[test]
+    fn a_card_in_quarantine_is_not_planned_with() {
+        use crate::encode::job::Quarantine;
+        let mut software = Encoders::software_baseline();
+        software.video.push(VideoEncoder {
+            codec: HEVC,
+            name: "libx265".into(),
+            hardware: None,
+        });
+        let amd = card(1, Hardware::Vaapi, Kind::Discrete, &[H264, AV1], &[H264]);
+        let nvidia = card(2, Hardware::Nvenc, Kind::Discrete, &[H264, HEVC], &[HEVC]);
+        let detected = Detected {
+            encoders: Arc::new(software.clone()),
+            gpus: vec![amd, nvidia],
+            software: Arc::new(software),
+            others: Vec::new(),
+            notes: Vec::new(),
+        };
+        let quarantine = Quarantine::default();
+        let now = std::time::Instant::now();
+        quarantine.add(&detected.gpus[0].limit().key, now);
+        let room = |gpu: &Gpu| !quarantine.holds(&gpu.limit().key, now);
+        let plan = planning(&detected, &[AV1, HEVC, H264], &room);
+        let names: Vec<_> = plan.video.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["hevc_nvenc", "h264_nvenc", "libx264"]);
+    }
+
     /// An encode that keeps HDR goes only to a card whose encoder writes
     /// 10 bits of its codec, even one later in order; tone mapped, any.
     #[test]

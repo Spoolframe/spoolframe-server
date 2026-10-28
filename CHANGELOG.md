@@ -8,6 +8,12 @@
   another card's, then software's where software encodes the codec. Each
   is tried once; the playback stays on the encoder it moved to, seeks
   too. Before, an abort failed the playback outright.
+- A card whose encoder crashes (ffmpeg aborted or faulted mid-encode)
+  is quarantined for 5 minutes: no new playback is planned with or sent
+  to it, and a failed encode does not move onto it. Encodes already on
+  it go on. A plain error exit or a stall does not quarantine, since the
+  file can cause those. With one GPU, playbacks go to software H.264
+  meanwhile, and HDR that needs that card's 10-bit encoder is refused.
 - `transcode.video_codecs` defaults to `["hevc", "h264"]`: AV1 is off
   unless listed. Settings › Playback still shows it first, unticked; GPUs'
   support for it is spotty (a Radeon 890M's video engine hung converting

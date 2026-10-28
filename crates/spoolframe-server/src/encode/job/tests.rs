@@ -966,6 +966,93 @@ async fn a_failed_gpu_encode_runs_again_on_the_next_encoder_of_its_codec() {
     assert_eq!(budget.gpu_jobs_by_card.get(AMD), None);
 }
 
+/// An abort of a GPU encode is the driver's: its card gets no new
+/// conversions for a while, the other card still does.
+#[tokio::test]
+async fn a_crashed_gpu_encoder_puts_its_card_in_quarantine() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-quarantine",
+        &aborting(CONTEXT_LOST, ":", ":"),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let job = jobs
+        .start(
+            dir,
+            amd_run(&file, None),
+            Written::Progressive { file: file.clone() },
+            Load::Gpu,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(done(&job).await, Ok(()));
+    let limit = |key: &str| CardLimit {
+        key: key.into(),
+        max_jobs: None,
+    };
+    assert!(!jobs.card_has_room(&limit(AMD)));
+    assert!(jobs.card_has_room(&limit(NVIDIA)));
+    let held: Vec<_> = jobs
+        .quarantined()
+        .into_iter()
+        .map(|(card, _)| card)
+        .collect();
+    assert_eq!(held, [AMD]);
+}
+
+/// A non-zero exit may be the file's (an encoder refusing a parameter):
+/// the card is not put in quarantine for it.
+#[tokio::test]
+async fn a_failed_gpu_encode_that_exits_does_not_quarantine_its_card() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-no-quarantine",
+        &aborting("echo 'bad parameter' >&2; exit 1", ":", ":"),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let job = jobs
+        .start(
+            dir,
+            amd_run(&file, None),
+            Written::Progressive { file: file.clone() },
+            Load::Gpu,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    let _ = done(&job).await;
+    let amd = CardLimit {
+        key: AMD.into(),
+        max_jobs: None,
+    };
+    assert!(jobs.card_has_room(&amd));
+    assert!(jobs.quarantined().is_empty());
+}
+
+/// A card is in quarantine for `QUARANTINE`, then it is gone.
+#[test]
+fn a_card_leaves_quarantine_after_its_time() {
+    let quarantine = Quarantine::default();
+    let now = std::time::Instant::now();
+    quarantine.add(AMD, now);
+    assert!(quarantine.holds(AMD, now));
+    assert!(quarantine.holds(AMD, now + QUARANTINE - Duration::from_secs(1)));
+    assert!(!quarantine.holds(AMD, now + QUARANTINE));
+    assert!(!quarantine.holds(NVIDIA, now));
+    assert!(quarantine.left(now + QUARANTINE).is_empty());
+}
+
 /// Each encoder is tried once: the AMD card's, the NVIDIA card's, then
 /// software's; with every one failing, the encode fails as it did.
 #[tokio::test]

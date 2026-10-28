@@ -26,7 +26,8 @@ pub(crate) use self::budget::Yielding;
 pub use self::budget::{BudgetUse, CardLimit, Load, Slot, Units};
 use self::budget::{Place, YieldEntry};
 pub use self::encode_job::{CaughtUp, EncodeJob};
-use self::process::DecodeFailures;
+pub(crate) use self::process::Quarantine;
+use self::process::{DecodeFailures, QUARANTINE};
 pub(crate) use self::process::{
     drain_stderr, exit_blames_gpu, jail, keep, launch, link, out_time_us, relink, remove_file,
     signal, stopped,
@@ -199,6 +200,8 @@ pub struct Jobs {
     counters: Arc<JobCounters>,
     /// Films whose GPU decode failed: they decode in software from then on.
     decode_failures: Arc<DecodeFailures>,
+    /// GPUs whose encoder crashed: they get no new conversions for a while.
+    quarantine: Arc<Quarantine>,
     /// What [`Jobs::first_note`] was told.
     notes: parking_lot::Mutex<HashSet<&'static str>>,
     /// The server's own subtitles (`state_dir/subtitles`: PX-03's served
@@ -323,6 +326,7 @@ impl Jobs {
             yielding: parking_lot::Mutex::default(),
             counters: Arc::default(),
             decode_failures: Arc::default(),
+            quarantine: Arc::default(),
             notes: parking_lot::Mutex::default(),
             limits: parking_lot::RwLock::new(limits),
             dir,
@@ -393,10 +397,18 @@ impl Jobs {
         self.budget.lock().clone()
     }
 
-    /// Whether `card` runs fewer GPU encodes than its limit now: a
-    /// conversion goes to the next card when not (PGPU-05).
+    /// Whether `card` runs fewer GPU encodes than its limit now, and its
+    /// encoder has not crashed lately ([`QUARANTINE`]): a conversion goes
+    /// to the next card when not (PGPU-05).
     pub fn card_has_room(&self, card: &CardLimit) -> bool {
-        self.budget.lock().card_has_room(Some(card))
+        !self.quarantine.holds(&card.key, std::time::Instant::now())
+            && self.budget.lock().card_has_room(Some(card))
+    }
+
+    /// The cards in quarantine now, by `gpus::Card::key`, and how long
+    /// each has left.
+    pub fn quarantined(&self) -> Vec<(String, Duration)> {
+        self.quarantine.left(std::time::Instant::now())
     }
 
     /// How many jobs that encode run now.
@@ -661,6 +673,7 @@ impl Jobs {
             budget: self.budget.clone(),
             released: self.released.clone(),
             decode_failures: self.decode_failures.clone(),
+            quarantine: self.quarantine.clone(),
             start_ms,
             dir: dir.clone(),
             written: written.clone(),
