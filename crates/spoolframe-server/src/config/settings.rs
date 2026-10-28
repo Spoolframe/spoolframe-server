@@ -98,6 +98,8 @@ pub const SETTINGS: &[Setting] = &[
     live("network.uplink.budget_mbps"),
     live("network.uplink.max_streams"),
     live("network.uplink.owner_share_percent"),
+    live("network.uplink.per_stream.mbps"),
+    live("network.uplink.per_stream.applies_to_local"),
     restart("network.congestion_control"),
     // Read once, by the endpoint's options at start (`endpoint_options`):
     // a reload that changes only these waits for a restart, and says so.

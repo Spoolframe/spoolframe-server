@@ -227,6 +227,17 @@ network {
     # While an admin plays off the LAN beside anyone else, the admins'
     # playbacks share this part of the budget and the others the rest.
     owner_share_percent = 50;
+    # A cap on each playback off the LAN, whatever quality it asked for
+    # (Original too: a file over it is converted). Applies to playbacks
+    # started after it changes.
+    per_stream {
+      # The most one playback may take, in Mbit/s; 0 is no cap.
+      mbps = 0;
+      # Whether it holds this server's own accounts too. Off, only
+      # portable guests and paired servers' users are held to it; this
+      # server's accounts take their share of the budget alone.
+      applies_to_local = true;
+    }
   }
 }
 

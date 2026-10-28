@@ -2236,6 +2236,23 @@ pub struct UplinkConfig {
     /// off the LAN beside anyone else, in percent; 50 if left out.
     #[ucl(default)]
     pub owner_share_percent: Option<u32>,
+    /// A cap on each playback off the LAN.
+    #[ucl(default)]
+    pub per_stream: PerStreamConfig,
+}
+
+/// `per_stream { mbps = 4; applies_to_local = false; }`, all optional.
+#[derive(Debug, Clone, Default, Uclicious)]
+#[ucl(skip_builder, deny_unknown_fields)]
+pub struct PerStreamConfig {
+    /// The most one playback off the LAN may take, in Mbit/s, whatever
+    /// quality it asked for; 0 or left out is no cap.
+    #[ucl(default)]
+    pub mbps: Option<u64>,
+    /// Whether the cap holds this server's own accounts too; true if left
+    /// out.
+    #[ucl(default)]
+    pub applies_to_local: Option<bool>,
 }
 
 impl NetworkConfig {
@@ -2279,6 +2296,13 @@ impl NetworkConfig {
                 .filter(|m| *m > 0)
                 .map(|m| m as usize),
             owner_share_percent: share,
+            per_stream: self
+                .uplink
+                .per_stream
+                .mbps
+                .filter(|m| *m > 0)
+                .map(|m| m.saturating_mul(1_000_000)),
+            per_stream_applies_to_local: self.uplink.per_stream.applies_to_local.unwrap_or(true),
             lan_prefixes,
             wan_prefixes,
         })
@@ -3799,6 +3823,20 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// "Off the LAN, 4 Mbit/s a stream, not for this server's accounts".
+    #[test]
+    fn the_per_stream_cap_is_read() {
+        let config = plex(
+            r#"plex { url = "http://nas:32400"; } network { uplink { per_stream { mbps = 4; applies_to_local = false; } } }"#,
+        )
+        .unwrap();
+        let set = config.network.uplink().unwrap();
+        assert_eq!(
+            (set.per_stream, set.per_stream_applies_to_local),
+            (Some(4_000_000), false)
+        );
     }
 
     /// PX-46: `network.uplink` and `network.lan_prefixes`. Left out, no

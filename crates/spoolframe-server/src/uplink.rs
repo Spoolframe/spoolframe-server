@@ -42,6 +42,12 @@ pub struct UplinkSettings {
     /// The owners' part of the budget while one of them plays off the
     /// LAN beside anyone else, 0 to 100.
     pub owner_share_percent: u8,
+    /// The most one WAN playback may take, in bit/s, whatever quality
+    /// it asked for (`network.uplink.per_stream.mbps`); `None` is no cap.
+    pub per_stream: Option<u64>,
+    /// Whether [`Self::per_stream`] holds this server's own accounts
+    /// too; off, they take their share of the budget alone.
+    pub per_stream_applies_to_local: bool,
     /// Ranges whose devices are on the LAN besides the host's own
     /// subnets.
     pub lan_prefixes: Vec<Network>,
@@ -111,8 +117,29 @@ impl Default for UplinkSettings {
             budget: None,
             max_streams: None,
             owner_share_percent: DEFAULT_OWNER_SHARE_PERCENT,
+            per_stream: None,
+            per_stream_applies_to_local: true,
             lan_prefixes: Vec::new(),
             wan_prefixes: Vec::new(),
+        }
+    }
+}
+
+/// Whose account a WAN playback is, for the per-stream cap: this server's
+/// own, or anyone else's (a portable guest, a paired server's user).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Account {
+    Local,
+    Guest,
+}
+
+impl UplinkSettings {
+    /// The most one WAN playback of `account` may take, whatever quality
+    /// it asked for; `None` is no cap.
+    pub fn stream_cap(&self, account: Account) -> Option<u64> {
+        match account {
+            Account::Local if !self.per_stream_applies_to_local => None,
+            _ => self.per_stream,
         }
     }
 }
@@ -751,6 +778,33 @@ mod tests {
             shares(20 * MBIT, 75, &[Owner, Guest, Guest]),
             [15 * MBIT, 2_500_000, 2_500_000]
         );
+    }
+
+    /// "Off the LAN, 4 Mbit/s a stream, but not for this server's own
+    /// accounts": a guest is held to it, a local account is not.
+    #[test]
+    fn the_per_stream_cap_holds_whom_it_applies_to() {
+        let settings = UplinkSettings {
+            per_stream: Some(4 * MBIT),
+            per_stream_applies_to_local: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            (
+                settings.stream_cap(Account::Guest),
+                settings.stream_cap(Account::Local)
+            ),
+            (Some(4 * MBIT), None)
+        );
+    }
+
+    #[test]
+    fn the_per_stream_cap_holds_local_accounts_when_it_applies_to_them() {
+        let settings = UplinkSettings {
+            per_stream: Some(4 * MBIT),
+            ..Default::default()
+        };
+        assert_eq!(settings.stream_cap(Account::Local), Some(4 * MBIT));
     }
 
     fn uplink(budget_mbps: u64, max_streams: Option<usize>) -> Uplink {

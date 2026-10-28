@@ -19,6 +19,17 @@ A release candidate: its images are tagged `0.16.3-rc.1` (and `-slim`,
   second of a 33 Mbit/s 4K encode, and buffered 0 to 100 % on repeat.
   `MAX_BUFFERED` is 256 MiB (was 128), `RESUME_BYTES` 25 MB (was 4 MiB),
   and `MAX_RESUME_BYTES` is new.
+- `network.uplink.per_stream { mbps; applies_to_local; }` (Settings ›
+  Remote access › Cap per stream, Applies to this server's users): each
+  playback off the LAN is held to `mbps`, whatever quality it asked for,
+  Original too. With `applies_to_local = false` only portable guests and
+  paired servers' users are; this server's accounts take their share of
+  the upload budget alone. A paired server's item played through this
+  server passes the cap on as part of its share, which that server holds
+  Auto to. Applies to playbacks started after it changes.
+- Settings › Remote access: relays are no longer under Advanced, and the
+  note beside the public address says it is optional while relays are on.
+- Settings › Plex shows a spinner while the libraries load.
 - Playback › Link: the path's kind (LAN, Direct, Relay) is the figure,
   its address under it, so an IPv6 address no longer runs out of the
   tile. Each note says it is this playback's, and the path's changes sit

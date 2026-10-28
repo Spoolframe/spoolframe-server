@@ -3939,6 +3939,7 @@ impl ClientProtocol {
                         state,
                         device.as_ref(),
                         display.as_ref(),
+                        self.stream_cap(state, &who),
                         admission.as_ref().and_then(|a| a.share()),
                         onward_share,
                     );
@@ -4180,6 +4181,7 @@ impl ClientProtocol {
                     state,
                     playback.capabilities.as_ref(),
                     display.as_ref(),
+                    self.stream_cap(state, &who),
                     self.services.uplink.share_of(&handle.0),
                     onward_share,
                 );
@@ -4248,6 +4250,7 @@ impl ClientProtocol {
                     state,
                     playback.capabilities.as_ref(),
                     display.as_ref(),
+                    self.stream_cap(state, &who),
                     self.services.uplink.share_of(&handle.0),
                     onward_share,
                 );
@@ -6546,6 +6549,20 @@ impl ClientProtocol {
             })
     }
 
+    /// The per-stream cap (`network.uplink.per_stream`) on `who`'s
+    /// playback over `state`'s connection: off the LAN, unless it spares
+    /// this server's own accounts and `who` has one.
+    fn stream_cap(&self, state: &ConnectionState, who: &Who) -> Option<u64> {
+        if on_lan(&state.path()) {
+            return None;
+        }
+        let account = match who {
+            Who::Local(_) => crate::uplink::Account::Local,
+            _ => crate::uplink::Account::Guest,
+        };
+        self.services.uplink.settings().stream_cap(account)
+    }
+
     /// `StartPlayback` of a paired server's item, played from there
     /// through this server (proxy mode, P8-04): SA plans and serves it for
     /// the device, and this server keeps a playback of its own for the
@@ -6571,7 +6588,10 @@ impl ClientProtocol {
         // The leg to the device is this server's uplink, as any play's
         // (PX-46); SA plans within this server's share as well as its own.
         let admission = self.reserve_uplink(state, who)?;
-        start.onward_share = admission.as_ref().and_then(|a| a.share());
+        // The per-stream cap goes to SA as part of the share: SA holds
+        // Auto to it, and a quality the viewer chose there is SA's to cap.
+        let share = admission.as_ref().and_then(|a| a.share());
+        start.onward_share = share.into_iter().chain(self.stream_cap(state, who)).min();
         let from = Duration::from_millis(start.start_ms.unwrap_or(0));
         let (quality, display, capabilities) = (
             start.quality,
@@ -8886,18 +8906,24 @@ struct PlayCaps {
 
 impl PlayCaps {
     /// The device's capabilities (`over`, else its Hello's) with
-    /// `display`; and `share`, or `onward`, the share a paired server
-    /// plays it on to its own device over (P8-04), if smaller: the play
-    /// fits both legs.
+    /// `display`, held to `cap`, the per-stream cap off the LAN, as the
+    /// device's own limit is: every quality, Original too. And `share`, or
+    /// `onward`, the share a paired server plays it on to its own device
+    /// over (P8-04), if smaller: the play fits both legs.
     fn resolve(
         state: &ConnectionState,
         over: Option<&spoolframe_types::ClientCapabilities>,
         display: Option<&spoolframe_types::DisplayCapabilities>,
+        cap: Option<u64>,
         share: Option<u64>,
         onward: Option<u64>,
     ) -> Self {
+        let caps = capabilities_over(state, over, display).map(|mut caps| {
+            caps.max_bitrate = caps.max_bitrate.into_iter().chain(cap).min();
+            caps
+        });
         Self {
-            caps: capabilities_over(state, over, display),
+            caps,
             share: share.into_iter().chain(onward).min(),
         }
     }
