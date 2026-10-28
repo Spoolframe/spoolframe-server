@@ -644,7 +644,27 @@ impl ClientProtocol {
         Ok(libraries.swap_remove(at))
     }
 
-    fn federation_for(&self, hello: &Hello) -> Option<&Arc<crate::federation::Federation>> {
+    /// Federation for `who`'s requests on a connection that said `hello`:
+    /// only when the Hello named the experimental feature, and only for
+    /// this server's own accounts. A portable account is a guest here, and
+    /// a paired server vouches for no guest (P8-04): shown its libraries,
+    /// it could browse what it can never play. It sees this server as if
+    /// it had no pairs. A paired server's token's session keeps what the
+    /// Hello gives it; its token limits it to its one item.
+    fn federation_for(
+        &self,
+        hello: &Hello,
+        who: &Who,
+    ) -> Option<&Arc<crate::federation::Federation>> {
+        match who {
+            Who::Portable(_) => None,
+            Who::Local(_) | Who::Remote(_) => self.federation_named(hello),
+        }
+    }
+
+    /// Federation, if the Hello named the experimental feature, whoever
+    /// asks: for what is checked before any session is known.
+    fn federation_named(&self, hello: &Hello) -> Option<&Arc<crate::federation::Federation>> {
         let asked = hello
             .experimental
             .iter()
@@ -1619,8 +1639,10 @@ impl ClientProtocol {
         };
         // The boundary requests have (L1), for a resource's too: an image
         // of a paired server's is not there for a client that did not
-        // name the feature (F8-11).
-        if self.federation_for(hello).is_none()
+        // name the feature (F8-11). Who asks is checked where the session
+        // is known: an image's in `find_artwork`, a download's in
+        // `read_download`.
+        if self.federation_named(hello).is_none()
             && spoolframe_protocol::federation::names_federated(&request)
         {
             return Err(Error::NotFound {
@@ -1652,7 +1674,7 @@ impl ClientProtocol {
                 ))
             }
             ResourceRequest::Artwork { request, max_bytes } => {
-                let image = self.find_artwork(connection, state, request).await?;
+                let image = self.find_artwork(connection, state, hello, request).await?;
                 let length = image.bytes.len() as u64;
                 if length > max_bytes {
                     return Err(Error::ReplyTooLarge { bytes: length });
@@ -1895,7 +1917,7 @@ impl ClientProtocol {
             // server's item's, read there and relayed. Asked only once this
             // server has none: its own downloads' reads cost nothing more.
             Err(crate::downloads::DownloadError::NotFound)
-                if let Some(federation) = self.federation_for(hello)
+                if let Some(federation) = self.federation_for(hello, &who)
                     && !matches!(who, Who::Remote(_)) =>
             {
                 let read = federation
@@ -1997,12 +2019,21 @@ impl ClientProtocol {
         &self,
         connection: &Connection,
         state: &ConnectionState,
+        hello: &Hello,
         request: ArtworkRequest,
     ) -> Result<Artwork, Error> {
+        let federated = spoolframe_protocol::federation::names_federated(&request);
         let (session, who) = self
             .authenticate(connection, state, Some(request.session))
             .await?;
         state.locks.lock().use_session(&session)?;
+        // A paired server's image only for who is shown its items: not a
+        // portable account (`federation_for`).
+        if federated && self.federation_for(hello, &who).is_none() {
+            return Err(Error::NotFound {
+                what: "a paired server's item".into(),
+            });
+        }
         // An uploaded cover (PX-53) is a user's photo: only for who sees a
         // playlist that has it.
         if matches!(
@@ -2411,11 +2442,12 @@ impl ClientProtocol {
         let catalog = &self.services.catalog;
         let principal = who.principal();
         // Experimental (P8-02): a paired server's libraries, items and
-        // `fed:` ids only for a client that named the feature; any other
-        // sees this server as if it had no pairs.
-        let federation = self.federation_for(hello);
+        // `fed:` ids only for a client that named the feature, and only for
+        // this server's own accounts; a portable account, or a client that
+        // did not name it, sees this server as if it had no pairs.
+        let federation = self.federation_for(hello, &who);
         // One boundary for every request (L1): a client that did not name
-        // the feature never reaches a paired server's item, library or
+        // the feature, or a portable account, never reaches a paired server's item, library or
         // image by its id either, whatever the request.
         if federation.is_none() && spoolframe_protocol::federation::names_federated(&request) {
             return Err(Error::NotFound {
@@ -4682,7 +4714,7 @@ impl ClientProtocol {
                     request,
                     &user.username,
                     &origin,
-                    self.federation_for(hello).map(|f| &**f),
+                    federation.map(|f| &**f),
                 )
                 .await
                 .map_err(create_invite_error)?;
@@ -5111,7 +5143,7 @@ impl ClientProtocol {
         hello: &Hello,
         redeem: &spoolframe_protocol::federation::RedeemPlayToken,
     ) -> Result<Reply, Error> {
-        let federation = federation_required(self.federation_for(hello), "redeem_play_token")?;
+        let federation = federation_required(self.federation_named(hello), "redeem_play_token")?;
         let endpoint_id = connection.remote_id().to_string();
         let guess = self
             .services

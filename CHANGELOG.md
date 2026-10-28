@@ -2,6 +2,11 @@
 
 ## 0.16.1 (2026-10-27)
 
+- A portable account sees nothing federated, even in an app that names
+  `federation`: no paired server's libraries, Home rows, servers, search
+  hits or images, and `NotFound` for any `fed:` id. Before, it could
+  browse a paired server's libraries but not play from them, as a paired
+  server vouches only for this server's own accounts.
 - Invites › New invite makes a server invite too ("A server
   (federation)", while `experimental.federation` is on), with a note,
   uses and an expiry, and no role. Federation › Invite a server opens the

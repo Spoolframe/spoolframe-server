@@ -3169,6 +3169,93 @@ mod replica {
         pair.stop().await;
     }
 
+    /// A portable account on SB is not SB's own: federation is for SB's
+    /// local accounts alone. Signed in on an app that names the feature,
+    /// it sees SB as if it had no pairs: no library, Home row, hit or
+    /// image of SA's, `NotFound` for any `fed:` id and no server row to
+    /// set; Bob, an account here, on the same kind of app sees all of it.
+    #[tokio::test]
+    async fn a_portable_account_sees_nothing_of_sa() {
+        use spoolframe_protocol::{ArtworkResponse, ArtworkSize, HomeScreen};
+        let pair = Pair::start("fed-exposure-portable").await;
+        pair.sa.catalog.show_posters();
+        pair.share("plex:1").await;
+        pair.refresh().await;
+        let alien = pair.fed(movie().id());
+        let library = pair.fed_library("plex:1");
+        let poster = pair.fed_artwork(&poster_of("1"));
+
+        let (app, bob) = bob_on(&pair, true).await;
+        let listed = libraries(&app, &bob).await;
+        assert_eq!(
+            listed.iter().map(|l| l.id.clone()).collect::<Vec<_>>(),
+            std::slice::from_ref(&library)
+        );
+        assert_eq!(home(&app, &bob).await.servers.len(), 1);
+        assert_eq!(
+            found(&app, &bob, "alien").await,
+            std::slice::from_ref(&alien)
+        );
+        let (response, _) = app.artwork(&bob, poster.clone(), ArtworkSize::Small).await;
+        assert!(matches!(response, ArtworkResponse::Ok(_)), "{response:?}");
+
+        pair.sb
+            .store
+            .grant_portable(crate::portable_sign_in::identity(7), Some("Sam"), None)
+            .await
+            .unwrap();
+        let tv = pair.sb.client().await;
+        tv.hello_naming(
+            crate::support::mkv_capabilities(),
+            &[spoolframe_protocol::experimental::FEDERATION],
+        )
+        .await;
+        let sam =
+            crate::portable_sign_in::session(crate::portable_sign_in::sign_in(&tv, 7, 9).await);
+        assert!(libraries(&tv, &sam).await.is_empty());
+        assert_eq!(home(&tv, &sam).await, HomeScreen::default());
+        assert!(found(&tv, &sam, "alien").await.is_empty());
+        assert!(matches!(
+            tv.call(
+                Some(&sam),
+                Request::SetServerRow {
+                    server_id: pair.origin().to_owned(),
+                    shown: false,
+                },
+            )
+            .await,
+            Response::Err(Error::Unsupported { .. })
+        ));
+        for request in [
+            Request::Item { id: alien.clone() },
+            Request::MarkWatched { id: alien.clone() },
+            Request::Items {
+                library: library.clone(),
+                offset: 0,
+                limit: 10,
+                sort: None,
+                filter: None,
+            },
+        ] {
+            assert!(
+                matches!(
+                    tv.call(Some(&sam), request.clone()).await,
+                    Response::Err(Error::NotFound { .. })
+                ),
+                "{request:?}"
+            );
+        }
+        for size in [ArtworkSize::Original, ArtworkSize::Small] {
+            let (response, bytes) = tv.artwork(&sam, poster.clone(), size).await;
+            assert!(
+                matches!(response, ArtworkResponse::Err(Error::NotFound { .. })),
+                "{size:?}: {response:?}"
+            );
+            assert!(bytes.is_empty());
+        }
+        pair.stop().await;
+    }
+
     /// Unpaired, SA's film Bob was watching stays in his Continue
     /// watching, listed as no longer available, for an app that names the
     /// feature; and SA's library and row are gone.
