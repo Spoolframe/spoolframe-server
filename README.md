@@ -100,6 +100,8 @@ explains one `[patch]` line an app should add.
 The server crates are AGPL-3.0-or-later. The protocol, types, client SDK and
 their helper crates are MIT OR Apache-2.0, so any client can link them.
 spoolframe-policy is GPL-3.0-or-later. Each crate's `Cargo.toml` states its
-license.
+license. The texts: [LICENSE](LICENSE) (AGPL-3.0),
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE), and
+[crates/spoolframe-policy/LICENSE](crates/spoolframe-policy/LICENSE) (GPL-3.0).
 
 Building or changing the server: [MAINTAINER.md](MAINTAINER.md).
