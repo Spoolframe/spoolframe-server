@@ -44,6 +44,77 @@ fn parse_status(status: &str) -> Option<ResidentParts> {
     })
 }
 
+/// The bytes the server's allocations hold now, as asked for, counted by
+/// its global allocator (`main.rs`). Not a part of the resident heap: a
+/// block never written to has no pages yet, so this can be the larger.
+/// What it tells is the heap's trend: a heap that stays high while this
+/// falls back is memory the allocator keeps for reuse, not a leak.
+pub static ALLOCATED: Allocated = Allocated::new();
+
+/// Slots of [`Allocated`]: a thread counts in one of them, so threads
+/// allocating at once seldom write the same cache line.
+const SLOTS: usize = 32;
+
+/// A count of bytes split over [`SLOTS`]. A block freed on another
+/// thread than the one that made it takes its bytes from that thread's
+/// slot, so a slot may wrap below zero; the sum does not.
+pub struct Allocated {
+    slots: [Slot; SLOTS],
+}
+
+#[repr(align(128))]
+struct Slot(std::sync::atomic::AtomicU64);
+
+impl Allocated {
+    const fn new() -> Self {
+        Self {
+            slots: [const { Slot(std::sync::atomic::AtomicU64::new(0)) }; SLOTS],
+        }
+    }
+
+    /// `bytes` more held. Called from the global allocator, so it must
+    /// not allocate: the thread's slot is a `const` thread local, which
+    /// neither allocates nor has a destructor.
+    pub fn add(&self, bytes: usize) {
+        self.slot()
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `bytes` fewer held.
+    pub fn sub(&self, bytes: usize) {
+        self.slot()
+            .fetch_sub(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bytes held; 0 where nothing counts them (the tests' allocator).
+    pub fn bytes(&self) -> u64 {
+        let sum = self.slots.iter().fold(0u64, |sum, slot| {
+            sum.wrapping_add(slot.0.load(std::sync::atomic::Ordering::Relaxed))
+        });
+        // The slots are read one at a time, so a free can be seen without
+        // the allocation it frees: below zero, read as none.
+        u64::try_from(sum as i64).unwrap_or(0)
+    }
+
+    fn slot(&self) -> &std::sync::atomic::AtomicU64 {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        }
+        // A thread being torn down has no thread locals left: slot 0.
+        let i = SLOT
+            .try_with(|slot| {
+                if slot.get() == usize::MAX {
+                    slot.set(NEXT.fetch_add(1, Ordering::Relaxed) % SLOTS);
+                }
+                slot.get()
+            })
+            .unwrap_or(0);
+        &self.slots[i].0
+    }
+}
+
 /// How many files (sockets, pipes, …) the process has open.
 pub fn open_files() -> Option<u64> {
     let entries = std::fs::read_dir("/proc/self/fd").ok()?;
@@ -69,6 +140,30 @@ mod parse_tests {
         );
         // A kernel without the split (before 4.5) has no parts.
         assert_eq!(parse_status("VmRSS:\t  61440 kB\n"), None);
+    }
+
+    #[test]
+    fn blocks_freed_on_other_threads_are_taken_off_the_sum() {
+        let allocated = Allocated::new();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| allocated.add(1000));
+            }
+        });
+        // Freed where none of them were made.
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| allocated.sub(1000));
+            }
+        });
+        assert_eq!(allocated.bytes(), 5000);
+    }
+
+    #[test]
+    fn a_free_seen_before_its_allocation_reads_as_none() {
+        let allocated = Allocated::new();
+        allocated.sub(10);
+        assert_eq!(allocated.bytes(), 0);
     }
 }
 

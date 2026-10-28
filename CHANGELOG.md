@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `spoolframe_process_allocated_bytes`: the bytes the server's
+  allocations hold, as asked for, counted by its allocator. Resident or
+  not, so it can be above the heap. A heap
+  (`spoolframe_process_memory_bytes{kind="heap"}`) that stays high after
+  a burst of artwork resizes while this falls back is memory the
+  allocator keeps for reuse, not a leak.
+
 ## 0.16.2 (2026-10-28)
 
 - The repository carries its licenses' texts: `LICENSE` (AGPL-3.0, the

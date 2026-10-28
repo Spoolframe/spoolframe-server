@@ -1335,6 +1335,19 @@ impl Metrics {
                 ]
             }),
         });
+        // Always the family, empty where nothing counts: as above.
+        let allocated = process::ALLOCATED.bytes();
+        families.push(Family {
+            name: "spoolframe_process_allocated_bytes",
+            help: "Bytes the server's allocations hold, as asked for, resident or not. A heap \
+                   that stays high while this falls is the allocator's, kept for reuse.",
+            kind: Kind::Gauge,
+            samples: if allocated == 0 {
+                Vec::new()
+            } else {
+                vec![Sample::labelled(&[], allocated as f64)]
+            },
+        });
         if let Some(files) = process::open_files() {
             families.push(Family::single(
                 "spoolframe_process_open_files",
@@ -1455,10 +1468,12 @@ mod tests {
     fn the_process_is_measured() {
         let families = Metrics::default().families();
         let names: Vec<_> = families.iter().map(|f| f.name).collect();
-        assert!(
-            names.contains(&"spoolframe_process_uptime_seconds"),
-            "{names:?}"
-        );
+        for name in [
+            "spoolframe_process_uptime_seconds",
+            "spoolframe_process_allocated_bytes",
+        ] {
+            assert!(names.contains(&name), "{names:?}");
+        }
         #[cfg(target_os = "linux")]
         for name in [
             "spoolframe_process_resident_memory_bytes",

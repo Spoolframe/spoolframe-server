@@ -30,6 +30,7 @@ use spoolframe_server::identity;
 use spoolframe_server::index_ahead::{IndexAhead, IndexAheadSources};
 use spoolframe_server::logs::{self, LogRing, RingLayer};
 use spoolframe_server::metrics::Metrics;
+use spoolframe_server::metrics::process::ALLOCATED;
 use spoolframe_server::network::{Server, ServerName, Services};
 use spoolframe_server::oauth::McpSwitch;
 use spoolframe_server::oidc::Oidc;
@@ -97,26 +98,35 @@ impl Allocator {
 
 // SAFETY: each call goes to one of two allocators, the same one for the
 // whole process (see `Allocator`), so a block is always freed or grown by
-// the allocator that made it.
+// the allocator that made it. Each block's bytes are counted in
+// `ALLOCATED`, which allocates nothing.
 unsafe impl std::alloc::GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        unsafe {
+        let ptr = unsafe {
             match Self::which() {
                 SNMALLOC => snmalloc_rs::SnMalloc.alloc(layout),
                 _ => std::alloc::System.alloc(layout),
             }
+        };
+        if !ptr.is_null() {
+            ALLOCATED.add(layout.size());
         }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        unsafe {
+        let ptr = unsafe {
             match Self::which() {
                 SNMALLOC => snmalloc_rs::SnMalloc.alloc_zeroed(layout),
                 _ => std::alloc::System.alloc_zeroed(layout),
             }
+        };
+        if !ptr.is_null() {
+            ALLOCATED.add(layout.size());
         }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
@@ -127,16 +137,23 @@ unsafe impl std::alloc::GlobalAlloc for Allocator {
                 _ => std::alloc::System.dealloc(ptr, layout),
             }
         }
+        ALLOCATED.sub(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        unsafe {
+        let grown = unsafe {
             match Self::which() {
                 SNMALLOC => snmalloc_rs::SnMalloc.realloc(ptr, layout, new),
                 _ => std::alloc::System.realloc(ptr, layout, new),
             }
+        };
+        // A failed realloc leaves the old block as it was.
+        if !grown.is_null() {
+            ALLOCATED.sub(layout.size());
+            ALLOCATED.add(new);
         }
+        grown
     }
 }
 
