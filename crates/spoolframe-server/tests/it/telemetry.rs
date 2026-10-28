@@ -642,23 +642,27 @@ async fn what_a_mutation_does_is_in_its_request_s_span() {
     let spans = traced.spans().await;
     let start = request(&spans, "start_playback");
     assert!(start.events.is_empty(), "{:?}", start.events);
-    until("the log record arrives", || {
-        !traced.received.logs.lock().is_empty()
+    // Logs go out in batches of their own, apart from the spans: an
+    // earlier batch (the sign-in's lines) may arrive before the one with
+    // the playback's, so wait for that line, not for any.
+    let started_line = |logs: &[ExportLogsServiceRequest]| {
+        logs.iter()
+            .flat_map(|r| &r.resource_logs)
+            .flat_map(|r| &r.scope_logs)
+            .flat_map(|s| &s.log_records)
+            .find(|r| {
+                matches!(
+                    r.body.as_ref().and_then(|b| b.value.as_ref()),
+                    Some(any_value::Value::StringValue(s)) if s == "playback started"
+                )
+            })
+            .cloned()
+    };
+    until("the playback's log line arrives", || {
+        started_line(&traced.received.logs.lock()).is_some()
     })
     .await;
-    let logs = traced.received.logs.lock().clone();
-    let started = logs
-        .iter()
-        .flat_map(|r| &r.resource_logs)
-        .flat_map(|r| &r.scope_logs)
-        .flat_map(|s| &s.log_records)
-        .find(|r| {
-            matches!(
-                r.body.as_ref().and_then(|b| b.value.as_ref()),
-                Some(any_value::Value::StringValue(s)) if s == "playback started"
-            )
-        })
-        .expect("the playback's log line");
+    let started = started_line(&traced.received.logs.lock()).expect("the playback's log line");
     assert_eq!(
         (&started.trace_id, &started.span_id),
         (&start.trace_id, &start.span_id)
