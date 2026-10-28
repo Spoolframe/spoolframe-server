@@ -90,8 +90,9 @@ On the GitHub mirror, Actions › Images › Run workflow
 runners, and skips an architecture whose `<ver>-<arch>` is already
 published. Its Nix builds go to the `spoolframe` Cachix cache
 (`CACHIX_AUTH_TOKEN`, an organization secret). It needs the repository to
-be public (GitHub's arm64 runners). The ghcr package is linked to the
-repository, so the workflow's token can push to it.
+be public (GitHub's arm64 runners). The ghcr package must let the
+repository write to it (Package settings › Manage Actions access, role
+Write), or the push is denied.
 
 The image reads `/etc/spoolframe/server.ucl`. Media tools run confined as
 on any host: Docker 29's default seccomp profile allows Landlock. In the

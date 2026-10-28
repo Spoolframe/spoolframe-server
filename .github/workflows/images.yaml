@@ -13,9 +13,11 @@ name: Images
 # GitHub gives the arm64 runners free to public repositories only: on a
 # private one, the arm64 job waits for a runner that never comes.
 #
-# GITHUB_TOKEN pushes to ghcr because the package is linked to this
-# repository and inherits its access (Package settings shows no "Manage
-# Actions access" while it does).
+# GITHUB_TOKEN pushes to ghcr only when the package lets this repository
+# write to it: ghcr.io/spoolframe/spoolframe-server › Package settings,
+# "Inherit access from source repository" or Manage Actions access ›
+# spoolframe-server, role Write. Without it the push is
+# `denied: permission_denied: write_package`.
 on:
   workflow_dispatch:
 
