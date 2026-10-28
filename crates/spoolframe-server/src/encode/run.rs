@@ -12,7 +12,7 @@ use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::Delivery;
 
 use super::args::{Cuts, Decode, EncodeSpec, Inputs, Output, decode, ffmpeg_args};
-use super::job::{EncodeJob, Fallback, JobError, Jobs, Run, Slot, Written};
+use super::job::{EncodeJob, Fallback, JobError, Jobs, OtherEncoder, Run, Slot, Written};
 use super::pick::RunOn;
 use crate::playback::PlaybackTrace;
 use crate::transcode::Gpu;
@@ -28,6 +28,8 @@ use super::*;
 /// Neither a spill nor a refusal is silent: a spill is logged once, as the
 /// conversion starts, with the encoder it runs on; an encode that keeps
 /// HDR and finds no 10-bit encoder with room is refused `Busy`, with why.
+/// The run has where it moves when its GPU encode fails
+/// ([`RunOn::with_others`]).
 pub(crate) fn run_on(
     jobs: &Jobs,
     source: &ConversionSource<'_>,
@@ -63,7 +65,8 @@ pub(crate) fn run_on(
                     "every GPU that encodes this codec is full: the conversion encodes in software"
                 );
             }
-            Ok(run)
+            // Where it moves when its GPU encode fails.
+            Ok(run.with_others(&source.gpus, &probe))
         }
         Err(pick::NoTenBit) => {
             tracing::warn!(
@@ -201,6 +204,7 @@ pub(super) fn spawn(
             vulkan,
             fallback,
             made,
+            other_encoders: other_encoders(&spec, run_on),
             // A GPU encode counts against its card (PGPU-05); the run may
             // open that card's nodes, its ffmpeg confined to them.
             card: run_on.gpu().filter(|_| gpu_encode).map(|g| g.limit()),
@@ -290,6 +294,34 @@ fn software_fallback(
             })
         })
         .transpose()
+}
+
+/// `spec` run on each of `run_on`'s other encoders ([`RunOn::others`]),
+/// for when its GPU encode fails before its first output. One whose
+/// arguments cannot be made is left out: the others may still run.
+fn other_encoders(spec: &EncodeSpec<'_>, run_on: &RunOn) -> Vec<OtherEncoder> {
+    run_on
+        .others()
+        .iter()
+        .filter_map(|other| {
+            let on = other.spec(spec);
+            let place = args::placement(&on)?;
+            let argv = ffmpeg_args(&on)
+                .inspect_err(|e| tracing::debug!(error = %e, "an encoder to move to is left out"))
+                .ok()?;
+            let gpu_encode = place.encoder.hardware.is_some();
+            Some(OtherEncoder {
+                key: other.key(),
+                args: argv,
+                gpu: place.gpu(),
+                vulkan: args::vulkan(&on),
+                ffmpeg: other.gpu().map(|g| g.ffmpeg.clone()),
+                load: load(on.video, on.audio, gpu_encode, args::all_on_gpu(&on)),
+                card: other.gpu().filter(|_| gpu_encode).map(|g| g.limit()),
+                made: Some(args::made(&on)),
+            })
+        })
+        .collect()
 }
 
 /// Why a run starts, for its `conversion` span.

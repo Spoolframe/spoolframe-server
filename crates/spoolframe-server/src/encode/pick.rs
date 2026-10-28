@@ -182,6 +182,42 @@ pub fn run_on(
     Ok(run)
 }
 
+/// Where `spec`'s video encode moves when its GPU encode on `run` fails
+/// before its first output (a video engine that hangs, an encoder that
+/// refuses the stream): each other card [`choose`] takes for it, in its
+/// order, then [`spill`]'s software encode, decoding on none of those
+/// cards, where software encodes the codec. [`choose`]'s rules hold, so
+/// an encode that keeps HDR moves only to a 10-bit encoder, and Dolby
+/// Vision profile 5 only to a card that runs libplacebo. None for a
+/// software encode: there is no GPU to move off.
+fn other_encoders(detected: &Detected, spec: &EncodeSpec<'_>, run: &RunOn) -> Vec<RunOn> {
+    let on = run.spec(spec);
+    if !args::placement(&on).is_some_and(|p| p.encoder.hardware.is_some()) {
+        return Vec::new();
+    }
+    let mut tried: Vec<String> = run.gpu().map(|g| g.card().key()).into_iter().collect();
+    let mut others = Vec::new();
+    loop {
+        let untried = |gpu: &Gpu| !tried.contains(&gpu.card().key());
+        // With every card that encodes it tried, `choose` gives the best
+        // of them again, or one that only decodes.
+        match choose(spec, &detected.gpus, &untried) {
+            Some(gpu) if untried(gpu) && encodes_on(spec, gpu) => {
+                tried.push(gpu.card().key());
+                others.push(RunOn::new(detected, Some(gpu.clone())));
+            }
+            _ => break,
+        }
+    }
+    let software = spill_except(detected, spec, &tried);
+    let soft = software.spec(spec);
+    if args::placement(&soft).is_some() {
+        others.push(software);
+    }
+    others.retain(|other| !keeps_hdr(spec) || other.encodes_ten_bit(spec));
+    others
+}
+
 /// [`run_on`]'s refusal of an encode that keeps HDR where no 10-bit
 /// encoder of its codec has room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +229,15 @@ pub struct NoTenBit;
 /// its own, as for a codec no card encodes; with none, all on the CPU.
 /// A GPU decode takes no card's slot: those count encodes.
 pub fn spill(detected: &Detected, spec: &EncodeSpec<'_>) -> RunOn {
+    spill_except(detected, spec, &[])
+}
+
+/// [`spill`], decoding on no card of `except` (by `Card::key`).
+fn spill_except(detected: &Detected, spec: &EncodeSpec<'_>, except: &[String]) -> RunOn {
     for gpu in &detected.gpus {
+        if except.contains(&gpu.card().key()) {
+            continue;
+        }
         let encoders = software_encode(gpu.encoders(), &detected.software);
         let node = gpu.vaapi_device();
         let on = EncodeSpec {
@@ -518,6 +562,9 @@ pub struct RunOn {
     /// [`spill`]'s: encoded in software because every card that encodes
     /// the codec was full.
     spilled: bool,
+    /// Where its video encode moves when its GPU encode fails
+    /// ([`RunOn::with_others`]), in order; none once it moved.
+    others: Vec<RunOn>,
 }
 
 impl RunOn {
@@ -528,7 +575,50 @@ impl RunOn {
             gpu,
             encoders: None,
             spilled: false,
+            others: Vec::new(),
         }
+    }
+
+    /// It, with where its video encode moves when its GPU encode fails
+    /// ([`other_encoders`]).
+    pub fn with_others(self, detected: &Detected, spec: &EncodeSpec<'_>) -> Self {
+        let others = other_encoders(detected, spec, &self);
+        Self { others, ..self }
+    }
+
+    /// Where its video encode moves when its GPU encode fails, in order.
+    pub fn others(&self) -> &[RunOn] {
+        &self.others
+    }
+
+    /// It without [`RunOn::others`]: a run that may not move its encode.
+    pub fn alone(&self) -> Self {
+        Self {
+            others: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// Which of [`RunOn::others`] it is: its card's key, or `software`
+    /// for a software encode. Unique among them: one per card, one
+    /// software encode.
+    pub fn key(&self) -> String {
+        match &self.gpu {
+            Some(gpu) if !self.spilled => gpu.card().key(),
+            _ => "software".to_owned(),
+        }
+    }
+
+    /// The one of [`RunOn::others`] that `key` names, as the conversion
+    /// goes on with once its encode moved there: with the others after
+    /// it, those before it tried or full. `None` for no such one, so a
+    /// move is taken once.
+    pub fn moved(&self, key: &str) -> Option<RunOn> {
+        let at = self.others.iter().position(|o| o.key() == key)?;
+        Some(Self {
+            others: self.others[at + 1..].to_vec(),
+            ..self.others[at].clone()
+        })
     }
 
     /// The detection a run's arguments are made from.
@@ -965,6 +1055,127 @@ mod tests {
             Some(NoTenBit),
             "an 8-bit card only"
         );
+    }
+
+    /// Two cards that encode HEVC, the AMD first.
+    fn amd_and_nvidia(software: &Encoders, ten_bit_nvidia: bool) -> Detected {
+        let ten_bit = |gpu: Arc<Gpu>, n: u8, ten: bool| {
+            let mut encoders = gpu.encoders().clone();
+            if ten {
+                encoders.ten_bit = encoders
+                    .video
+                    .iter()
+                    .filter(|e| e.hardware.is_some() && e.codec == HEVC)
+                    .cloned()
+                    .collect();
+            }
+            Arc::new(test_gpu(
+                n,
+                gpu.card().api,
+                gpu.card().host.class.kind,
+                encoders,
+            ))
+        };
+        let amd = card(1, Hardware::Vaapi, Kind::Integrated, &[H264, HEVC], &[HEVC]);
+        let nvidia = card(2, Hardware::Nvenc, Kind::Discrete, &[H264, HEVC], &[HEVC]);
+        Detected {
+            encoders: Arc::new(software.clone()),
+            gpus: vec![ten_bit(amd, 1, true), ten_bit(nvidia, 2, ten_bit_nvidia)],
+            software: Arc::new(software.clone()),
+            others: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The encoders a failed GPU encode of `probe` moves to, in order.
+    fn moves_to(detected: &Detected, probe: &EncodeSpec<'_>) -> Vec<String> {
+        let run = run_on(detected, probe, &|_| true)
+            .unwrap()
+            .with_others(detected, probe);
+        run.others()
+            .iter()
+            .map(|other| other.encoder_name(probe).unwrap())
+            .collect()
+    }
+
+    /// A GPU encode that fails moves to the next card that encodes its
+    /// codec (hevc_vaapi on the AMD card to hevc_nvenc on the NVIDIA one),
+    /// then, for H.264, to software; HEVC has no software encoder to move
+    /// to. The software encode decodes on no card already moved off.
+    #[test]
+    fn a_failed_gpu_encode_moves_to_the_next_card_of_its_codec() {
+        let software = Encoders::software_baseline();
+        let detected = amd_and_nvidia(&software, false);
+        let hevc = film("hevc", 1080);
+        let to = |codec| EncodeSpec {
+            video: Some(ConvertedVideo::Encode {
+                codec,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            ..spec(&hevc, 1080, &software)
+        };
+        assert_eq!(moves_to(&detected, &to(HEVC)), ["hevc_nvenc"]);
+        assert_eq!(moves_to(&detected, &to(H264)), ["h264_nvenc", "libx264"]);
+        let probe = to(H264);
+        let run = run_on(&detected, &probe, &|_| true)
+            .unwrap()
+            .with_others(&detected, &probe);
+        assert!(run.others()[1].gpu().is_none(), "decoded on the CPU");
+    }
+
+    /// An encode that keeps HDR moves only to another 10-bit encoder of
+    /// its codec: with the NVIDIA card 8-bit, nowhere.
+    #[test]
+    fn a_failed_encode_that_keeps_hdr_moves_only_to_a_ten_bit_encoder() {
+        let software = Encoders::software_baseline();
+        let mut hdr = film("hevc", 2160);
+        {
+            let v = hdr.video.as_mut().unwrap();
+            v.bit_depth = 10;
+            v.hdr = Some(spoolframe_types::HdrFormat::Hdr10);
+            v.color_transfer = Some("smpte2084".into());
+        }
+        let probe = EncodeSpec {
+            video: Some(ConvertedVideo::Encode {
+                codec: HEVC,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            ..spec(&hdr, 1080, &software)
+        };
+        assert!(moves_to(&amd_and_nvidia(&software, false), &probe).is_empty());
+        assert_eq!(
+            moves_to(&amd_and_nvidia(&software, true), &probe),
+            ["hevc_nvenc"]
+        );
+    }
+
+    /// A software encode has nothing to move off; a run that moved has
+    /// what is left after the encoder it moved to, once.
+    #[test]
+    fn a_software_encode_does_not_move_and_a_move_is_taken_once() {
+        let software = Encoders::software_baseline();
+        let detected = Detected {
+            gpus: vec![card(1, Hardware::Vaapi, Kind::Discrete, &[], &[HEVC])],
+            ..amd_and_nvidia(&software, false)
+        };
+        let hevc = film("hevc", 1080);
+        assert!(moves_to(&detected, &spec(&hevc, 1080, &software)).is_empty());
+
+        let detected = amd_and_nvidia(&software, false);
+        let probe = spec(&hevc, 1080, &software);
+        let run = run_on(&detected, &probe, &|_| true)
+            .unwrap()
+            .with_others(&detected, &probe);
+        let nvidia = run.others()[0].key();
+        let moved = run.moved(&nvidia).unwrap();
+        assert_eq!(moved.encoder_name(&probe).as_deref(), Some("h264_nvenc"));
+        assert_eq!(moved.others().len(), 1, "software is left");
+        assert!(moved.moved(&nvidia).is_none(), "taken once");
+        assert!(run.moved(&run.key()).is_none(), "not to itself");
     }
 
     /// Equal shares go by the cards' order: the entries', then the rank

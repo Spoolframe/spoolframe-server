@@ -839,6 +839,243 @@ async fn the_software_run_is_throttled_and_killed_as_the_first_would_be() {
     eventually(|| !alive(pid)).await;
 }
 
+/// A 1080p encode on `encoder`, decoded in software.
+fn made_on(encoder: &str, hardware: Option<spoolframe_media::encoders::Hardware>) -> Made {
+    Made {
+        encoder: Some(spoolframe_media::encoders::VideoEncoder {
+            codec: spoolframe_types::VideoCodec::Hevc,
+            name: encoder.into(),
+            hardware,
+        }),
+        ..made_by(crate::encode::Decoder::Software)
+    }
+}
+
+/// The AMD card's and the NVIDIA card's places in the budget.
+const AMD: &str = "vaapi:0000:01:00.0";
+const NVIDIA: &str = "nvenc:0000:02:00.0";
+
+fn on_card(key: &str, max_jobs: Option<usize>) -> Option<CardLimit> {
+    Some(CardLimit {
+        key: key.into(),
+        max_jobs,
+    })
+}
+
+/// An HEVC encode on the AMD card, for `file`: `amd` as its last
+/// argument, which the stand-in ffmpeg looks for. It moves to the NVIDIA
+/// card (`nvidia`, room for `nvidia_jobs`), then to software (`sw`).
+fn amd_run(file: &Path, nvidia_jobs: Option<usize>) -> Run {
+    use spoolframe_media::encoders::Hardware;
+    let file = file.display().to_string();
+    let other = |key: &str, last: &str, gpu, load, card, made| OtherEncoder {
+        key: key.into(),
+        args: vec![file.clone(), last.into()],
+        gpu,
+        vulkan: None,
+        ffmpeg: None,
+        load,
+        card,
+        made: Some(made),
+    };
+    Run {
+        args: vec![file.clone(), "amd".into()],
+        gpu: GpuUse::Vaapi,
+        card: on_card(AMD, None),
+        made: Some(made_on("hevc_vaapi", Some(Hardware::Vaapi))),
+        other_encoders: vec![
+            other(
+                NVIDIA,
+                "nvidia",
+                GpuUse::Nvidia,
+                Load::Gpu,
+                on_card(NVIDIA, nvidia_jobs),
+                made_on("hevc_nvenc", Some(Hardware::Nvenc)),
+            ),
+            other(
+                "software",
+                "sw",
+                GpuUse::None,
+                Load::Software,
+                None,
+                made_on("libx265", None),
+            ),
+        ],
+        ..Run::default()
+    }
+}
+
+/// The stand-in: `on_amd` when the last argument is `amd`, `on_nvidia`
+/// when it is `nvidia`, `on_sw` when it is `sw`; then writes `abc` to
+/// the first and reports a second encoded.
+fn aborting(on_amd: &str, on_nvidia: &str, on_sw: &str) -> String {
+    format!(
+        "for a; do last=$a; done\n\
+         if [ \"$last\" = amd ]; then {on_amd}; fi\n\
+         if [ \"$last\" = nvidia ]; then {on_nvidia}; fi\n\
+         if [ \"$last\" = sw ]; then {on_sw}; fi\n\
+         printf abc > \"$1\"; echo out_time_us=1000000"
+    )
+}
+
+/// Mesa's abort when the AMD card's video engine hangs, with no core.
+const CONTEXT_LOST: &str = "echo 'amdgpu: The CS has cancelled because the context is lost' >&2; \
+                            ulimit -c 0; kill -ABRT $$";
+
+/// The Radeon's video engine hangs (ffmpeg aborts, "the context is
+/// lost") before any output: the encode runs again on the next encoder
+/// of its codec, the NVIDIA card's, which takes a place on that card,
+/// and the AMD card's is given back. The conversion is told where it
+/// moved, to go on there.
+#[tokio::test]
+async fn a_failed_gpu_encode_runs_again_on_the_next_encoder_of_its_codec() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-moves",
+        &aborting(CONTEXT_LOST, ":", ":"),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let job = jobs
+        .start(
+            dir,
+            amd_run(&file, None),
+            Written::Progressive { file: file.clone() },
+            Load::Gpu,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(done(&job).await, Ok(()));
+    assert_eq!(job.progress().borrow().bytes, 3);
+    assert_eq!(job.moved_to().as_deref(), Some(NVIDIA));
+    assert_eq!(
+        job.made()
+            .and_then(|m| m.encoder)
+            .map(|e| e.name)
+            .as_deref(),
+        Some("hevc_nvenc")
+    );
+    assert_eq!(job.command().last().map(String::as_str), Some("nvidia"));
+    let budget = jobs.budget();
+    assert_eq!(budget.gpu_jobs_by_card.get(NVIDIA), Some(&1));
+    assert_eq!(budget.gpu_jobs_by_card.get(AMD), None);
+}
+
+/// Each encoder is tried once: the AMD card's, the NVIDIA card's, then
+/// software's; with every one failing, the encode fails as it did.
+#[tokio::test]
+async fn a_gpu_encode_tries_each_encoder_once_then_fails() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-moves-fails",
+        &aborting(CONTEXT_LOST, "exit 1", "echo 'no encoder' >&2; exit 1"),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let job = jobs
+        .start(
+            dir,
+            amd_run(&file, None),
+            Written::Progressive { file: file.clone() },
+            Load::Gpu,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(done(&job).await.unwrap_err(), "no encoder");
+    assert_eq!(job.command().last().map(String::as_str), Some("sw"));
+    assert_eq!(job.moved_to().as_deref(), Some("software"));
+}
+
+/// An encoder whose card has no room is passed over for the next.
+#[tokio::test]
+async fn a_failed_gpu_encode_passes_over_a_full_card() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-moves-full",
+        &aborting(CONTEXT_LOST, ":", ":"),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let job = jobs
+        .start(
+            dir,
+            amd_run(&file, Some(0)),
+            Written::Progressive { file: file.clone() },
+            Load::Gpu,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(done(&job).await, Ok(()));
+    assert_eq!(job.moved_to().as_deref(), Some("software"));
+    assert_eq!(job.command().last().map(String::as_str), Some("sw"));
+    assert_eq!(jobs.budget().gpu_jobs, 0);
+}
+
+/// A software encode that fails is not moved: it has no GPU to move off.
+#[tokio::test]
+async fn a_failed_software_encode_does_not_move() {
+    let (jobs, _tmp) = jobs(
+        "software-encode-stays",
+        "for a; do last=$a; done\n\
+         if [ \"$last\" = amd ]; then echo 'x265 failed' >&2; exit 1; fi\n\
+         printf abc > \"$1\"",
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let run = Run {
+        made: Some(made_on("libx265", None)),
+        card: None,
+        gpu: GpuUse::None,
+        ..amd_run(&file, None)
+    };
+    let job = jobs
+        .start(
+            dir,
+            run,
+            Written::Progressive { file: file.clone() },
+            Load::Software,
+            0,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(done(&job).await.unwrap_err(), "x265 failed");
+    assert_eq!(job.moved_to(), None);
+}
+
+/// A run killed by a signal the driver does not send (the OOM killer's,
+/// an operator's) does not move its encode; one that aborts or faults,
+/// as a driver does when the GPU hangs, does.
+#[test]
+fn only_an_abort_or_a_fault_blames_the_encoder() {
+    use std::os::unix::process::ExitStatusExt;
+    let signalled = |sig| Ended::Exited(Ok(std::process::ExitStatus::from_raw(sig)));
+    assert!(encode_failed(&signalled(libc::SIGABRT)));
+    assert!(encode_failed(&signalled(libc::SIGSEGV)));
+    assert!(!encode_failed(&signalled(libc::SIGKILL)));
+    assert!(!encode_failed(&signalled(libc::SIGTERM)));
+    assert!(encode_failed(&Ended::Stalled));
+}
+
 /// What the job runs, as it ran it: the program and its arguments.
 #[tokio::test]
 async fn a_job_knows_its_command_line() {

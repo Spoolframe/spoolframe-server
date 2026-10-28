@@ -351,6 +351,7 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
                     made: None,
                 }),
                 made: None,
+                other_encoders: Vec::new(),
                 card: None,
                 ffmpeg: None,
                 aligned_until: None,

@@ -168,6 +168,12 @@ impl EncodeJob {
         self.shared.made.lock().clone()
     }
 
+    /// The [`OtherEncoder::key`] its encode moved to after its GPU encode
+    /// failed, if it did: where its conversion's next runs go.
+    pub fn moved_to(&self) -> Option<String> {
+        self.shared.moved_to.lock().clone()
+    }
+
     /// Whether its ffmpeg decodes on the GPU: false once it fell back to
     /// software.
     pub fn decodes_in_hardware(&self) -> bool {

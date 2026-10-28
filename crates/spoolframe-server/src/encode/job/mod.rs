@@ -605,6 +605,7 @@ impl Jobs {
             vulkan,
             fallback,
             made,
+            other_encoders,
             card: _,
             ffmpeg,
             aligned_until,
@@ -643,11 +644,22 @@ impl Jobs {
             load,
             histograms: self.counters.histograms.get().cloned(),
             ended: AtomicBool::new(false),
+            moved_to: parking_lot::Mutex::default(),
         });
         let supervisor = Supervisor {
             ffmpeg: ffmpeg.clone(),
             jail,
             fallback,
+            // Each on its own ffmpeg: its card's, or the jobs' own.
+            others: other_encoders
+                .into_iter()
+                .map(|other| {
+                    let ffmpeg = other.ffmpeg.clone().unwrap_or_else(|| self.ffmpeg.clone());
+                    (ffmpeg, other)
+                })
+                .collect(),
+            budget: self.budget.clone(),
+            released: self.released.clone(),
             decode_failures: self.decode_failures.clone(),
             start_ms,
             dir: dir.clone(),
@@ -713,6 +725,9 @@ pub struct Run {
     pub fallback: Option<Fallback>,
     /// How it makes its video (PX-24).
     pub made: Option<Made>,
+    /// For a GPU video encode: the runs on the other encoders of its
+    /// codec, in order, for when it fails before the first output.
+    pub other_encoders: Vec<OtherEncoder>,
     /// For a GPU video encode, the card it counts against (PGPU-05).
     pub card: Option<CardLimit>,
     /// ffmpeg confined to the GPU card it runs on, in place of the jobs'
@@ -735,6 +750,26 @@ pub struct Fallback {
     /// The film, as remembered: later runs of it decode in software.
     pub file: PathBuf,
     /// How it makes its video (PX-24).
+    pub made: Option<Made>,
+}
+
+/// A run on another video encoder of the same codec, in place of a GPU
+/// encode that failed before its first output (a video engine that hung,
+/// an encoder that refused the stream): another card's, or software's.
+#[derive(Debug, Clone)]
+pub struct OtherEncoder {
+    /// Which it is, for its conversion to go on with
+    /// ([`EncodeJob::moved_to`]).
+    pub key: String,
+    pub args: Vec<String>,
+    pub gpu: GpuUse,
+    pub vulkan: Option<Vulkan>,
+    /// ffmpeg confined to its card; `None` for the jobs' own.
+    pub ffmpeg: Option<Tool>,
+    /// What it weighs, and the card it counts against: a place of its
+    /// own, taken as it starts, in place of the failed run's.
+    pub load: Load,
+    pub card: Option<CardLimit>,
     pub made: Option<Made>,
 }
 

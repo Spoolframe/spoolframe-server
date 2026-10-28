@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 
+use spoolframe_media::encoders::VideoEncoder;
 use spoolframe_media::sandbox::{Jail, Tool};
 
 use crate::metrics::Histograms;
@@ -61,6 +62,8 @@ pub(super) struct Shared {
     pub(super) histograms: Option<Arc<Histograms>>,
     /// [`Shared::end`] has run.
     pub(super) ended: AtomicBool,
+    /// The [`OtherEncoder::key`] its encode moved to, once it has.
+    pub(super) moved_to: parking_lot::Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -183,6 +186,12 @@ pub(super) struct Supervisor {
     pub(super) jail: Jail,
     /// The run decoding in software, while it has not run.
     pub(super) fallback: Option<Fallback>,
+    /// The runs on other encoders of its codec, each with its ffmpeg,
+    /// while they have not run.
+    pub(super) others: VecDeque<(Tool, OtherEncoder)>,
+    /// Where a run on another card takes its place.
+    pub(super) budget: Arc<parking_lot::Mutex<BudgetUse>>,
+    pub(super) released: Arc<tokio::sync::Notify>,
     pub(super) decode_failures: Arc<DecodeFailures>,
     /// Where the run started in the film, ms.
     pub(super) start_ms: u64,
@@ -215,6 +224,17 @@ pub(super) enum Ended {
     ScratchFull,
     /// ffmpeg could not be run again, decoding in software.
     NotRelaunched,
+}
+
+/// Whether a run that `ended` so may have failed for its GPU encoder: as
+/// [`decode_failed`], or ffmpeg ended by its own abort or a fault, as a
+/// driver ends it when the video engine hangs (amdgpu's "the context is
+/// lost").
+pub(super) fn encode_failed(ended: &Ended) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    decode_failed(ended)
+        || matches!(ended, Ended::Exited(Ok(status))
+            if matches!(status.signal(), Some(libc::SIGABRT | libc::SIGSEGV | libc::SIGBUS)))
 }
 
 /// Whether a run that `ended` so may have failed for decoding on the GPU:
@@ -267,7 +287,76 @@ impl Supervisor {
                 }
             }
         }
+        // A GPU encode that failed before the first output moves to the
+        // next encoder of its codec: another card's, then software's. A
+        // driver's abort says nothing of the film, so it is not
+        // remembered against it. Each runs once, then the job fails.
+        while encode_failed(&ended)
+            && let Some(from) = self.gpu_encoder()
+            && self.nothing_written().await
+            && let Some((ffmpeg, other, slot)) = self.next_encoder()
+        {
+            let to = other.made.as_ref().and_then(|m| m.encoder.as_ref());
+            tracing::warn!(
+                pid = self.pid(),
+                from = from.name,
+                to = to.map(|e| e.name.as_str()),
+                stderr = ?self.shared.stderr_tail(),
+                "a GPU encode failed: running again on another encoder"
+            );
+            // Its place in the budget is the new run's: on its card, of
+            // its weight.
+            *self.slot.lock() = Some(slot);
+            match self.move_to(&ffmpeg, &other) {
+                Ok((child, stdout, stderr)) => {
+                    ended = self.attempt(child, stdout, stderr, &mut counted_ms).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot run ffmpeg again, on another encoder");
+                    ended = Ended::NotRelaunched;
+                }
+            }
+        }
         self.conclude(ended);
+    }
+
+    /// The GPU video encoder the ffmpeg running now encodes with, if any.
+    fn gpu_encoder(&self) -> Option<VideoEncoder> {
+        self.shared
+            .made
+            .lock()
+            .as_ref()
+            .and_then(|m| m.encoder.clone())
+            .filter(|e| e.hardware.is_some())
+    }
+
+    /// The next of [`Supervisor::others`] with a place in the budget, and
+    /// that place (the failed run's counted as free); one with none is
+    /// passed over, as a full card is when a conversion starts.
+    fn next_encoder(&mut self) -> Option<(Tool, OtherEncoder, Slot)> {
+        while let Some((ffmpeg, other)) = self.others.pop_front() {
+            let replacing = self.slot.lock().clone();
+            let place = Place::take(
+                &self.budget,
+                &self.released,
+                other.load,
+                other.card.clone(),
+                replacing.as_ref(),
+            );
+            match place {
+                Some(place) => {
+                    let slot = Slot {
+                        place: Arc::new(place),
+                    };
+                    return Some((ffmpeg, other, slot));
+                }
+                None => tracing::warn!(
+                    to = other.key,
+                    "no room to move a failed GPU encode to this encoder: passed over"
+                ),
+            }
+        }
+        None
     }
 
     /// Run ffmpeg again with `fallback`'s arguments, in its place.
@@ -279,25 +368,95 @@ impl Supervisor {
         tokio::process::ChildStdout,
         tokio::process::ChildStderr,
     )> {
-        let mut child = launch(
+        let launched = self.launch_again(
             &self.ffmpeg,
             &self.jail.clone().gpu(fallback.gpu),
             &fallback.args,
+            false,
+            fallback.made.clone(),
+            "(the GPU failed: running again, decoding and filtering on the CPU)",
         )?;
-        let pid = child.id().unwrap_or(0);
-        self.shared.pid.store(pid, Ordering::Relaxed);
-        self.shared.hardware_decode.store(false, Ordering::Relaxed);
-        *self.shared.made.lock() = fallback.made.clone();
-        self.shared.set_paused(false);
-        let mut command = vec![self.ffmpeg.program().display().to_string()];
-        command.extend(fallback.args.iter().cloned());
-        *self.shared.command.lock() = command;
-        self.shared.stderr_line(
-            "(the GPU failed: running again, decoding and filtering on the CPU)".into(),
-        );
         self.shared.span.event("software decode", Vec::new());
         self.shared.span.set("conversion.decode", "sw");
-        tracing::debug!(pid, dir = %self.dir.display(), "encode running again, decoding in software");
+        tracing::debug!(pid = self.pid(), dir = %self.dir.display(), "encode running again, decoding in software");
+        Ok(launched)
+    }
+
+    /// Run ffmpeg again as `other`, on its encoder, in its place.
+    fn move_to(
+        &self,
+        ffmpeg: &Tool,
+        other: &OtherEncoder,
+    ) -> std::io::Result<(
+        tokio::process::Child,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStderr,
+    )> {
+        use crate::encode::Decoder;
+        let made = other.made.as_ref();
+        let encoder = made.and_then(|m| m.encoder.as_ref());
+        let launched = self.launch_again(
+            ffmpeg,
+            &self
+                .jail
+                .clone()
+                .gpu(other.gpu)
+                .vulkan(other.vulkan.clone()),
+            &other.args,
+            made.is_some_and(|m| matches!(m.decoder, Decoder::Hardware(_) | Decoder::Vulkan)),
+            other.made.clone(),
+            &format!(
+                "(the GPU encode failed: running again on {})",
+                encoder.map_or("another encoder", |e| e.name.as_str())
+            ),
+        )?;
+        *self.shared.moved_to.lock() = Some(other.key.clone());
+        self.shared.span.event(
+            "encoder moved",
+            vec![opentelemetry::KeyValue::new("to", other.key.clone())],
+        );
+        if let Some(encoder) = encoder {
+            self.shared
+                .span
+                .set("conversion.encoder", encoder.name.clone());
+            let hardware = if encoder.hardware.is_some() {
+                "gpu"
+            } else {
+                "cpu"
+            };
+            self.shared.span.set("conversion.hardware", hardware);
+        }
+        Ok(launched)
+    }
+
+    /// ffmpeg run again with `args` in `jail`, in place of the one that
+    /// failed: the job's pid, command, and what it makes are the new
+    /// run's, and `said` goes in its stderr between the two.
+    fn launch_again(
+        &self,
+        ffmpeg: &Tool,
+        jail: &Jail,
+        args: &[String],
+        hardware_decode: bool,
+        made: Option<Made>,
+        said: &str,
+    ) -> std::io::Result<(
+        tokio::process::Child,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStderr,
+    )> {
+        let mut child = launch(ffmpeg, jail, args)?;
+        let pid = child.id().unwrap_or(0);
+        self.shared.pid.store(pid, Ordering::Relaxed);
+        self.shared
+            .hardware_decode
+            .store(hardware_decode, Ordering::Relaxed);
+        *self.shared.made.lock() = made;
+        self.shared.set_paused(false);
+        let mut command = vec![ffmpeg.program().display().to_string()];
+        command.extend(args.iter().cloned());
+        *self.shared.command.lock() = command;
+        self.shared.stderr_line(said.into());
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         Ok((child, stdout, stderr))

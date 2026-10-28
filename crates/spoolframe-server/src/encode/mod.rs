@@ -106,8 +106,12 @@ pub struct Conversion {
     /// run encodes it, filled with silence from where the run starts.
     pad_audio: bool,
     /// The GPU its runs go to, picked once at its start (PGPU-05): a seek
-    /// or another rung stays on it, as on one encoder (PGPU-02).
-    run_on: RunOn,
+    /// or another rung stays on it, as on one encoder (PGPU-02). Its
+    /// first run alone may move to another encoder when its GPU encode
+    /// fails before any output ([`RunOn::others`]); the runs after it go
+    /// where it moved ([`Conversion::follow_move`]), so one encoder's
+    /// init segment never fronts another's segments.
+    run_on: Mutex<RunOn>,
     /// For HLS: where the segments are cut (P2-05).
     segments: Option<Segments>,
     /// For HLS under Auto (PX-21): the encodes a player switches between,
@@ -461,7 +465,7 @@ impl Conversion {
                 audio: *audio,
                 subtitle: *subtitle,
                 pad_audio,
-                run_on,
+                run_on: Mutex::new(run_on),
                 segments,
                 ladder: ladder.clone(),
                 first_rung: start_rung,
@@ -595,14 +599,15 @@ impl Conversion {
     fn written_size(&self, video: ConvertedVideo) -> Option<(u32, u32)> {
         let jobs = &self.jobs;
         let (gpu_filters, tone_map) = jobs.filters();
+        let run_on = self.run_on.lock().alone();
         args::written_size(&EncodeSpec {
             inputs: self.inputs(),
             descriptor: &self.descriptor,
             video: Some(video),
             audio: self.audio,
             subtitle: self.subtitle,
-            encoders: self.run_on.encoders(),
-            vaapi_device: self.run_on.vaapi_device(),
+            encoders: run_on.encoders(),
+            vaapi_device: run_on.vaapi_device(),
             hardware_decode: !jobs.hardware_decode_failed(&self.file),
             gpu_filters,
             tone_map,
@@ -771,6 +776,7 @@ impl Conversion {
         NextRun {
             rung,
             reason,
+            run_on: self.follow_move(&current.job),
             parts: self.parts(rung),
             epoch: self
                 .epochs
@@ -780,6 +786,18 @@ impl Conversion {
             slot: current.job.slot(),
             cuts: self.cuts(rung),
         }
+    }
+
+    /// Where the next run goes: where `job`, its first, moved its encode
+    /// when its GPU encode failed, if it did, from then on. Never moved
+    /// again: a run after the first may follow another that a reader
+    /// has the init segment of.
+    fn follow_move(&self, job: &EncodeJob) -> RunOn {
+        let mut run_on = self.run_on.lock();
+        if let Some(moved) = job.moved_to().and_then(|key| run_on.moved(&key)) {
+            *run_on = moved;
+        }
+        run_on.alone()
     }
 
     /// The run's links to what it reads.
@@ -800,7 +818,7 @@ impl Conversion {
             self.inputs(),
             &self.descriptor,
             run.parts,
-            &self.run_on,
+            &run.run_on,
             run.epoch,
             run.start,
             run.from,
@@ -1123,6 +1141,8 @@ struct NextRun {
     rung: u32,
     /// Why it starts, for its span: `seek`, `switch` or `restart`.
     reason: &'static str,
+    /// Where it goes ([`Conversion::follow_move`]).
+    run_on: RunOn,
     parts: Parts,
     epoch: u32,
     start: Option<Duration>,
@@ -1874,6 +1894,148 @@ pub(crate) mod tests {
             next.command()
         );
         assert_eq!(next.progress().borrow().done, None);
+    }
+
+    /// The Radeon's video engine hangs as a playback starts (ffmpeg
+    /// aborts on h264_vaapi): its first run moves to the NVIDIA card's
+    /// h264_nvenc, and a seek after it stays there, one encoder for the
+    /// whole playback; that run moves nowhere.
+    #[tokio::test]
+    async fn a_moved_encode_stays_on_the_encoder_it_moved_to() {
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, HardwareDecoder, VideoEncoder};
+        use spoolframe_media::gpus::Kind;
+        use spoolframe_types::{HdrFormat, VideoCodec};
+
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-encoder-moves").await;
+        let ffmpeg = job::tests::ffmpeg(
+            &tmp.as_ref().join("bin"),
+            "for a; do last=$a; done\n\
+             case \"$*\" in *h264_vaapi*) ulimit -c 0; kill -ABRT $$;; esac\n\
+             d=$(dirname \"$last\"); printf x > \"$d/seg1.m4s\"\n\
+             printf '#EXTM3U\\nseg1.m4s\\n' > \"$last\"; echo out_time_us=6000000\n\
+             exec sleep 30",
+        );
+        let jobs = Arc::new(
+            Jobs::new(
+                JobLimits {
+                    budget: Units::jobs(2),
+                    max_remux: 32,
+                    max_gpu_jobs: 3,
+                    scratch_dir: tmp.as_ref().join("scratch"),
+                    scratch_limit_bytes: 1 << 30,
+                    read_ahead: Duration::from_secs(60),
+                    copy_segment_secs: 2,
+                    stalled_after: Duration::from_secs(60),
+                    gpu_filters: false,
+                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
+                },
+                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
+            )
+            .unwrap(),
+        );
+        let film = tmp.as_ref().join("film.mkv");
+        std::fs::write(&film, b"x").unwrap();
+        let descriptor = Arc::new(MediaDescriptor {
+            container: "matroska,webm".into(),
+            duration: Some(Duration::from_secs(60)),
+            bit_rate: None,
+            video: Some(VideoStream {
+                index: 0,
+                codec: "hevc".into(),
+                profile: Some("Main".into()),
+                level: None,
+                width: 1920,
+                height: 1080,
+                pixel_format: Some("yuv420p".into()),
+                color_transfer: None,
+                frame_rate_millis: Some(24_000),
+                bit_depth: 8,
+                hdr: None::<HdrFormat>,
+                dolby_vision: None,
+                bit_rate: None,
+                parameter_sets_in_record: false,
+                codec_string: None,
+            }),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            container: spoolframe_types::Container::Mp4,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+            source_codec: None,
+        };
+        let card = |n, api: Hardware, name: &str, decodes: bool| {
+            let encoders = Encoders {
+                video: vec![VideoEncoder {
+                    codec: VideoCodec::H264,
+                    name: name.into(),
+                    hardware: Some(api),
+                }],
+                hardware_decoders: decodes
+                    .then_some(HardwareDecoder {
+                        codec: VideoCodec::Hevc,
+                        hardware: api,
+                        bit_depth: 8,
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Encoders::software_baseline()
+            };
+            Gpu {
+                ffmpeg: spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
+                ..crate::transcode::test_gpu(n, api, Kind::Integrated, encoders)
+            }
+        };
+        let gpus = Arc::new(Detected::with_gpus(vec![
+            card(1, Hardware::Vaapi, "h264_vaapi", true),
+            card(2, Hardware::Nvenc, "h264_nvenc", false),
+        ]));
+        let conversion = Conversion::start(
+            jobs.clone(),
+            ConversionSource {
+                trace: crate::playback::PlaybackTrace::untraced(),
+                handle: "h1",
+                path: &film,
+                video_from: None,
+                audio_from: None,
+                descriptor,
+                plan: &plan,
+                gpus,
+                keyframes: None,
+                first_epoch: 0,
+                audio_first_ms: None,
+                slot: None,
+                start_rung: 0,
+            },
+            None,
+        )
+        .unwrap();
+        let first = conversion.job();
+        let mut progress = first.progress();
+        progress
+            .wait_for(|p| p.last_segment.is_some())
+            .await
+            .unwrap();
+        assert_eq!(first.moved_to().as_deref(), Some("nvenc:0000:02:00.0"));
+        assert!(first.command().contains(&"h264_nvenc".to_owned()));
+        conversion.seek(Duration::from_secs(30)).unwrap();
+        let after = conversion.job();
+        assert_ne!(after.epoch, first.epoch);
+        let command = after.command();
+        assert!(command.contains(&"h264_nvenc".to_owned()), "{command:?}");
+        assert!(!command.contains(&"h264_vaapi".to_owned()), "{command:?}");
     }
 
     /// PGPU-01: an NVENC encode decoding on NVDEC whose decode fails before
