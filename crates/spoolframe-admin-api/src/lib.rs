@@ -1392,6 +1392,11 @@ pub struct GpuCard {
     pub tone_maps: Vec<ToneMapper>,
     /// What its failed tests say it lacks: `av1 encode`.
     pub lacks: Vec<String>,
+    /// Its encoder crashed lately: it gets no new conversions for this
+    /// many seconds more. `None` when it is not in quarantine, and from a
+    /// server too old to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_secs: Option<u32>,
 }
 
 /// Discrete or integrated (PGPU-05).

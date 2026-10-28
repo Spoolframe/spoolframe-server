@@ -56,6 +56,18 @@ pub fn card_lines(card: &GpuCard) -> (String, Vec<(&'static str, String)>) {
             .collect(),
     );
     add("Lacks", card.lacks.clone());
+    add(
+        "Quarantined",
+        card.quarantined_secs
+            .map(|secs| {
+                format!(
+                    "its encoder crashed: no new conversions for {} min",
+                    secs.div_ceil(60)
+                )
+            })
+            .into_iter()
+            .collect(),
+    );
     (about, lines)
 }
 
@@ -319,6 +331,7 @@ mod tests {
             filters: Vec::new(),
             tone_maps: vec![ToneMapper::LibplaceboOwn],
             lacks: vec!["VA-API tone map (tonemap_vaapi)".into()],
+            quarantined_secs: None,
         }
     }
 
@@ -374,6 +387,24 @@ mod tests {
         assert_eq!(labels, ["Encodes", "Decodes", "Tone maps", "Lacks"]);
         assert_eq!(lines[0].1, "h264_vaapi, hevc_vaapi");
         assert_eq!(lines[2].1, "libplacebo (own)");
+    }
+
+    /// A card in quarantine says so last, its time left in whole minutes,
+    /// rounded up.
+    #[test]
+    fn a_card_in_quarantine_says_for_how_long() {
+        let card = GpuCard {
+            quarantined_secs: Some(61),
+            ..card(DGPU, "AMD Radeon RX 7900 XTX")
+        };
+        let (_, lines) = card_lines(&card);
+        assert_eq!(
+            lines.last().unwrap(),
+            &(
+                "Quarantined",
+                "its encoder crashed: no new conversions for 2 min".to_owned()
+            )
+        );
     }
 
     /// The order the pick tries: the dGPU first, the iGPU next, then the

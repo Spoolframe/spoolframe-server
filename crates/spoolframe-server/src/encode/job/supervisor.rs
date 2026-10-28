@@ -189,12 +189,16 @@ pub(super) struct Supervisor {
     /// The runs on other encoders of its codec, each with its ffmpeg,
     /// while they have not run.
     pub(super) others: VecDeque<(Tool, OtherEncoder)>,
-    /// Where a run on another card takes its place.
-    pub(super) budget: Arc<parking_lot::Mutex<BudgetUse>>,
-    pub(super) released: Arc<tokio::sync::Notify>,
+    /// Its codec has no other encoder at all: a crash of its GPU encoder
+    /// quarantines the card at once, as no other encoder can show the file
+    /// is fine.
+    pub(super) sole_encoder: bool,
+    /// What its driver faults say of the cards they were on.
+    pub(super) blame: parking_lot::Mutex<Blame>,
+    /// Where a run on another encoder takes its place; and the cards
+    /// whose encoder crashed, which this run's may be added to.
+    pub(super) admission: Admission,
     pub(super) decode_failures: Arc<DecodeFailures>,
-    /// Cards whose encoder crashed: this run's is added to it.
-    pub(super) quarantine: Arc<Quarantine>,
     /// Where the run started in the film, ms.
     pub(super) start_ms: u64,
     pub(super) dir: PathBuf,
@@ -217,6 +221,22 @@ pub(super) struct Supervisor {
     pub(super) _encoding: EncodingGuard,
 }
 
+/// What a job's driver faults say of the cards they were on. ffmpeg's own
+/// asserts abort and decoders fault on a malformed file too, so a crash
+/// alone does not blame the card: another encoder writing the job's
+/// output does, as the file is fine then.
+#[derive(Debug, Default)]
+pub(super) enum Blame {
+    #[default]
+    None,
+    /// This card's encoder crashed: it is quarantined once another
+    /// encoder writes output for the job.
+    Suspect(CardLimit),
+    /// The encoder it moved to crashed too: the file may be to blame, and
+    /// no card is quarantined for it.
+    Neither,
+}
+
 /// How one ffmpeg ended.
 pub(super) enum Ended {
     Exited(std::io::Result<std::process::ExitStatus>),
@@ -228,18 +248,35 @@ pub(super) enum Ended {
     NotRelaunched,
 }
 
-/// Whether a run that `ended` so may have failed for its GPU encoder: as
-/// [`decode_failed`], or ffmpeg ended by its own abort or a fault, as a
-/// driver ends it when the video engine hangs (amdgpu's "the context is
-/// lost").
-pub(super) fn encode_failed(ended: &Ended) -> bool {
-    decode_failed(ended) || driver_fault(ended)
+/// One ffmpeg spawned, its output pipes taken: to watch.
+pub(super) struct Launched {
+    child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+}
+
+impl Launched {
+    /// `child`, as [`launch`] spawns it: its stdout and stderr piped.
+    pub(super) fn new(mut child: tokio::process::Child) -> Self {
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.child.id().unwrap_or(0)
+    }
 }
 
 /// Whether a run that `ended` so was ended by its own abort or a fault
-/// (SIGABRT, SIGSEGV, SIGBUS): a driver's, not the file's. A non-zero
-/// exit or a stall may be the file's (an encoder refusing a parameter),
-/// so it is not one.
+/// (SIGABRT, SIGSEGV, SIGBUS): a driver's, or the file's (ffmpeg's
+/// `av_assert0`, a decoder on malformed input), so it moves the encode
+/// but blames the card only with proof ([`Blame`]). A non-zero exit or a
+/// stall is not one: an encoder refusing a parameter, say.
 pub(super) fn driver_fault(ended: &Ended) -> bool {
     use std::os::unix::process::ExitStatusExt;
     matches!(ended, Ended::Exited(Ok(status))
@@ -259,16 +296,11 @@ pub(super) fn decode_failed(ended: &Ended) -> bool {
 }
 
 impl Supervisor {
-    pub(super) async fn run(
-        mut self,
-        child: tokio::process::Child,
-        stdout: tokio::process::ChildStdout,
-        stderr: tokio::process::ChildStderr,
-    ) {
+    pub(super) async fn run(mut self, launched: Launched) {
         // The furthest media time counted as output (P3-14): from where the
         // run started, never twice, whichever ffmpeg encoded it.
         let mut counted_ms = self.start_ms;
-        let mut ended = self.watch(child, stdout, stderr, &mut counted_ms).await;
+        let mut ended = self.watch(launched, &mut counted_ms).await;
         if decode_failed(&ended) && self.shared.hardware_decode.load(Ordering::Relaxed) {
             if let Some(fallback) = &self.fallback
                 && self.decode_failures.remember(&fallback.file)
@@ -285,22 +317,15 @@ impl Supervisor {
             if self.nothing_written().await
                 && let Some(fallback) = self.fallback.take()
             {
-                match self.relaunch(&fallback) {
-                    Ok((child, stdout, stderr)) => {
-                        ended = self.watch(child, stdout, stderr, &mut counted_ms).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "cannot run ffmpeg again, decoding in software");
-                        ended = Ended::NotRelaunched;
-                    }
-                }
+                let launched = self.relaunch(&fallback);
+                ended = self.watch_again(launched, &mut counted_ms).await;
             }
         }
         // A GPU encode that failed before the first output moves to the
         // next encoder of its codec: another card's, then software's. A
         // driver's abort says nothing of the film, so it is not
         // remembered against it. Each runs once, then the job fails.
-        while encode_failed(&ended)
+        while (decode_failed(&ended) || driver_fault(&ended))
             && let Some(from) = self.gpu_encoder()
             && self.nothing_written().await
             && let Some((ffmpeg, other, slot)) = self.next_encoder()
@@ -314,46 +339,109 @@ impl Supervisor {
                 "a GPU encode failed: running again on another encoder"
             );
             // Its place in the budget is the new run's: on its card, of
-            // its weight.
-            *self.slot.lock() = Some(slot);
-            match self.move_to(&ffmpeg, &other) {
-                Ok((child, stdout, stderr)) => {
-                    ended = self.watch(child, stdout, stderr, &mut counted_ms).await;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot run ffmpeg again, on another encoder");
-                    ended = Ended::NotRelaunched;
-                }
+            // its weight. Where it moved is set under the slot's lock, so
+            // the conversion's next run never sees the one without the
+            // other ([`EncodeJob::placed`]).
+            {
+                let mut held = self.slot.lock();
+                *self.shared.moved_to.lock() = Some(other.key.clone());
+                *held = Some(slot);
+            }
+            let launched = self.move_to(&ffmpeg, &other);
+            ended = self.watch_again(launched, &mut counted_ms).await;
+            if matches!(ended, Ended::NotRelaunched) {
+                // Not run there: the conversion does not go on there.
+                let mut held = self.slot.lock();
+                *self.shared.moved_to.lock() = None;
+                held.take();
             }
         }
         self.conclude(ended);
     }
 
-    /// [`Supervisor::attempt`], then the card quarantined if its encoder
-    /// crashed.
-    async fn watch(
-        &self,
-        child: tokio::process::Child,
-        stdout: tokio::process::ChildStdout,
-        stderr: tokio::process::ChildStderr,
-        counted_ms: &mut u64,
-    ) -> Ended {
-        let ended = self.attempt(child, stdout, stderr, counted_ms).await;
-        self.quarantine_crashed(&ended);
+    /// [`Supervisor::attempt`], then what a crash says of its card
+    /// ([`Supervisor::blame_crash`]).
+    async fn watch(&self, launched: Launched, counted_ms: &mut u64) -> Ended {
+        let ended = self.attempt(launched, counted_ms).await;
+        self.blame_crash(&ended);
         ended
     }
 
-    /// A GPU encode that a driver fault ended puts its card in quarantine,
-    /// whether or not it moves on and whether or not it wrote anything:
-    /// the next playback would hang the card again.
-    fn quarantine_crashed(&self, ended: &Ended) {
-        if !driver_fault(ended) || self.gpu_encoder().is_none() {
+    /// The run in place of the one that failed, [`Supervisor::watch`]ed;
+    /// [`Ended::NotRelaunched`] when it could not be run.
+    async fn watch_again(
+        &self,
+        launched: std::io::Result<Launched>,
+        counted_ms: &mut u64,
+    ) -> Ended {
+        match launched {
+            Ok(launched) => self.watch(launched, counted_ms).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot run ffmpeg again");
+                Ended::NotRelaunched
+            }
+        }
+    }
+
+    /// A GPU encode that a driver fault ended makes its card a suspect,
+    /// quarantined once another encoder writes the job's output
+    /// ([`Supervisor::proven`]); at once when its codec has no other
+    /// encoder, as the playback fails either way. A fault of the encoder
+    /// it moved to as well blames the file: no card is quarantined.
+    fn blame_crash(&self, ended: &Ended) {
+        if !driver_fault(ended) {
             return;
         }
-        let Some(card) = self.slot.lock().as_ref().and_then(|s| s.card().cloned()) else {
+        let card = self
+            .gpu_encoder()
+            .and_then(|_| self.slot.lock().as_ref().and_then(|s| s.card().cloned()));
+        let mut blame = self.blame.lock();
+        match &*blame {
+            Blame::None => {}
+            Blame::Suspect(_) | Blame::Neither => {
+                tracing::warn!(
+                    pid = self.pid(),
+                    "the encoder a crashed GPU encode moved to crashed too: the file may be to \
+                     blame, so no card is quarantined for it"
+                );
+                *blame = Blame::Neither;
+                return;
+            }
+        }
+        let Some(card) = card else {
             return;
         };
-        self.quarantine.add(&card.key, std::time::Instant::now());
+        if self.sole_encoder {
+            drop(blame);
+            self.quarantine(card);
+        } else {
+            *blame = Blame::Suspect(card);
+        }
+    }
+
+    /// The job has output from an encoder other than the one that
+    /// crashed: the file is fine, and the suspect card is quarantined.
+    fn proven(&self) {
+        let suspect = {
+            let mut blame = self.blame.lock();
+            match std::mem::take(&mut *blame) {
+                Blame::Suspect(card) => Some(card),
+                other => {
+                    *blame = other;
+                    None
+                }
+            }
+        };
+        if let Some(card) = suspect {
+            self.quarantine(card);
+        }
+    }
+
+    /// Put `card` in quarantine: the next playback would hang it again.
+    fn quarantine(&self, card: CardLimit) {
+        self.admission
+            .quarantine
+            .add(&card.key, std::time::Instant::now());
         tracing::warn!(
             card = card.key,
             pid = self.pid(),
@@ -378,39 +466,22 @@ impl Supervisor {
     }
 
     /// The next of [`Supervisor::others`] with a place in the budget, and
-    /// that place (the failed run's counted as free); one with none is
-    /// passed over, as a full card is when a conversion starts.
+    /// that place (the failed run's counted as free), taken as a start
+    /// takes one ([`Admission::admit`]): a yielding hold's if none is free.
+    /// One with none, or on a card in quarantine, is passed over, as it is
+    /// when a conversion starts.
     fn next_encoder(&mut self) -> Option<(Tool, OtherEncoder, Slot)> {
         while let Some((ffmpeg, other)) = self.others.pop_front() {
-            if other
-                .card
-                .as_ref()
-                .is_some_and(|c| self.quarantine.holds(&c.key, std::time::Instant::now()))
-            {
-                tracing::warn!(
-                    to = other.key,
-                    "this encoder's card is in quarantine: passed over"
-                );
-                continue;
-            }
             let replacing = self.slot.lock().clone();
-            let place = Place::take(
-                &self.budget,
-                &self.released,
-                other.load,
-                other.card.clone(),
-                replacing.as_ref(),
-            );
-            match place {
-                Some(place) => {
-                    let slot = Slot {
-                        place: Arc::new(place),
-                    };
-                    return Some((ffmpeg, other, slot));
-                }
+            match self
+                .admission
+                .admit(other.load, other.card.clone(), replacing)
+            {
+                Some(slot) => return Some((ffmpeg, other, slot)),
                 None => tracing::warn!(
                     to = other.key,
-                    "no room to move a failed GPU encode to this encoder: passed over"
+                    "no room to move a failed GPU encode to this encoder, or its card is in \
+                     quarantine: passed over"
                 ),
             }
         }
@@ -418,41 +489,22 @@ impl Supervisor {
     }
 
     /// Run ffmpeg again with `fallback`'s arguments, in its place.
-    fn relaunch(
-        &self,
-        fallback: &Fallback,
-    ) -> std::io::Result<(
-        tokio::process::Child,
-        tokio::process::ChildStdout,
-        tokio::process::ChildStderr,
-    )> {
+    fn relaunch(&self, fallback: &Fallback) -> std::io::Result<Launched> {
         let launched = self.launch_again(
             &self.ffmpeg,
             &self.jail.clone().gpu(fallback.gpu),
             &fallback.args,
-            false,
             fallback.made.clone(),
             "(the GPU failed: running again, decoding and filtering on the CPU)",
         )?;
         self.shared.span.event("software decode", Vec::new());
-        self.shared.span.set("conversion.decode", "sw");
         tracing::debug!(pid = self.pid(), dir = %self.dir.display(), "encode running again, decoding in software");
         Ok(launched)
     }
 
     /// Run ffmpeg again as `other`, on its encoder, in its place.
-    fn move_to(
-        &self,
-        ffmpeg: &Tool,
-        other: &OtherEncoder,
-    ) -> std::io::Result<(
-        tokio::process::Child,
-        tokio::process::ChildStdout,
-        tokio::process::ChildStderr,
-    )> {
-        use crate::encode::Decoder;
-        let made = other.made.as_ref();
-        let encoder = made.and_then(|m| m.encoder.as_ref());
+    fn move_to(&self, ffmpeg: &Tool, other: &OtherEncoder) -> std::io::Result<Launched> {
+        let encoder = other.made.as_ref().and_then(|m| m.encoder.as_ref());
         let launched = self.launch_again(
             ffmpeg,
             &self
@@ -461,63 +513,60 @@ impl Supervisor {
                 .gpu(other.gpu)
                 .vulkan(other.vulkan.clone()),
             &other.args,
-            made.is_some_and(|m| matches!(m.decoder, Decoder::Hardware(_) | Decoder::Vulkan)),
             other.made.clone(),
             &format!(
                 "(the GPU encode failed: running again on {})",
                 encoder.map_or("another encoder", |e| e.name.as_str())
             ),
         )?;
-        *self.shared.moved_to.lock() = Some(other.key.clone());
         self.shared.span.event(
             "encoder moved",
             vec![opentelemetry::KeyValue::new("to", other.key.clone())],
         );
-        if let Some(encoder) = encoder {
-            self.shared
-                .span
-                .set("conversion.encoder", encoder.name.clone());
-            let hardware = if encoder.hardware.is_some() {
-                "gpu"
-            } else {
-                "cpu"
-            };
-            self.shared.span.set("conversion.hardware", hardware);
-        }
         Ok(launched)
     }
 
     /// ffmpeg run again with `args` in `jail`, in place of the one that
     /// failed: the job's pid, command, and what it makes are the new
-    /// run's, and `said` goes in its stderr between the two.
+    /// run's, as are whether it decodes on the GPU and what its span says
+    /// it decodes and encodes with; `said` goes in its stderr between the
+    /// two.
     fn launch_again(
         &self,
         ffmpeg: &Tool,
         jail: &Jail,
         args: &[String],
-        hardware_decode: bool,
         made: Option<Made>,
         said: &str,
-    ) -> std::io::Result<(
-        tokio::process::Child,
-        tokio::process::ChildStdout,
-        tokio::process::ChildStderr,
-    )> {
-        let mut child = launch(ffmpeg, jail, args)?;
-        let pid = child.id().unwrap_or(0);
-        self.shared.pid.store(pid, Ordering::Relaxed);
+    ) -> std::io::Result<Launched> {
+        use crate::encode::Decoder;
+        let launched = Launched::new(launch(ffmpeg, jail, args)?);
+        self.shared.pid.store(launched.pid(), Ordering::Relaxed);
+        let hardware_decode = made
+            .as_ref()
+            .is_some_and(|m| matches!(m.decoder, Decoder::Hardware(_) | Decoder::Vulkan));
         self.shared
             .hardware_decode
             .store(hardware_decode, Ordering::Relaxed);
+        let span = &self.shared.span;
+        span.set(
+            "conversion.decode",
+            crate::encode::run::decode_label(made.as_ref()),
+        );
+        if let Some(encoder) = made.as_ref().and_then(|m| m.encoder.as_ref()) {
+            span.set("conversion.encoder", encoder.name.clone());
+            span.set(
+                "conversion.hardware",
+                crate::encode::run::hardware_label(Some(encoder)),
+            );
+        }
         *self.shared.made.lock() = made;
         self.shared.set_paused(false);
         let mut command = vec![ffmpeg.program().display().to_string()];
         command.extend(args.iter().cloned());
         *self.shared.command.lock() = command;
         self.shared.stderr_line(said.into());
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        Ok((child, stdout, stderr))
+        Ok(launched)
     }
 
     /// Whether the run has written nothing a reader could have: no
@@ -614,7 +663,12 @@ impl Supervisor {
             Written::Hls => last_segment.is_some(),
             Written::Progressive { .. } => bytes > 0,
         };
-        if ready && !self.shared.first_ready.swap(true, Ordering::Relaxed) {
+        if !ready {
+            return;
+        }
+        // Output from the encoder it moved to clears the file.
+        self.proven();
+        if !self.shared.first_ready.swap(true, Ordering::Relaxed) {
             self.shared.span.event(
                 "first segment ready",
                 vec![opentelemetry::KeyValue::new(
@@ -626,13 +680,12 @@ impl Supervisor {
     }
 
     /// Watch one ffmpeg until it ends, or is ended.
-    async fn attempt(
-        &self,
-        mut child: tokio::process::Child,
-        stdout: tokio::process::ChildStdout,
-        stderr: tokio::process::ChildStderr,
-        counted_ms: &mut u64,
-    ) -> Ended {
+    async fn attempt(&self, launched: Launched, counted_ms: &mut u64) -> Ended {
+        let Launched {
+            mut child,
+            stdout,
+            stderr,
+        } = launched;
         let mut out = BufReader::new(stdout).lines();
         let mut err = BufReader::new(stderr).lines();
         let mut encoded_ms = 0u64;

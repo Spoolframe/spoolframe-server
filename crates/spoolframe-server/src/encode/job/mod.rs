@@ -34,7 +34,7 @@ pub(crate) use self::process::{
 };
 #[cfg(test)]
 pub(super) use self::supervisor::listed_segments;
-use self::supervisor::{RunSpan, Shared, Supervisor};
+use self::supervisor::{Launched, RunSpan, Shared, Supervisor};
 
 /// How often a job looks at its output.
 const POLL: Duration = Duration::from_millis(200);
@@ -178,10 +178,9 @@ pub struct Jobs {
     /// [`JOBS_DIR`] in the scratch directory.
     dir: PathBuf,
     ffmpeg: Tool,
-    budget: Arc<parking_lot::Mutex<BudgetUse>>,
-    /// Told as a place in the budget is given back, or the limits change:
-    /// the copy pool (PX-37), its one waiter, tries for a place again.
-    released: Arc<tokio::sync::Notify>,
+    /// The budget, its yielding holds and the cards in quarantine: where
+    /// live work gets its place.
+    admission: Admission,
     /// Held by the job that looks at a full scratch directory and makes
     /// room in it, so the next job to look sees what the first one freed.
     scratch_check: Arc<tokio::sync::Mutex<()>>,
@@ -194,14 +193,9 @@ pub struct Jobs {
     encoding: Encoding,
     /// Every job started and not yet dropped, to count (P3-14).
     live: parking_lot::Mutex<Vec<std::sync::Weak<EncodeJob>>>,
-    /// Yielding holds (PX-37), newest last: the places live admission may
-    /// take when it finds no other.
-    yielding: parking_lot::Mutex<Vec<std::sync::Weak<YieldEntry>>>,
     counters: Arc<JobCounters>,
     /// Films whose GPU decode failed: they decode in software from then on.
     decode_failures: Arc<DecodeFailures>,
-    /// GPUs whose encoder crashed: they get no new conversions for a while.
-    quarantine: Arc<Quarantine>,
     /// What [`Jobs::first_note`] was told.
     notes: parking_lot::Mutex<HashSet<&'static str>>,
     /// The server's own subtitles (`state_dir/subtitles`: PX-03's served
@@ -316,17 +310,21 @@ impl Jobs {
         crate::files::private_dir(&dir)?;
         let mut budget = BudgetUse::default();
         budget.set_limits(&limits);
+        let counters = Arc::<JobCounters>::default();
         Ok(Self {
-            budget: Arc::new(parking_lot::Mutex::new(budget)),
-            released: Arc::default(),
+            admission: Admission {
+                budget: Arc::new(parking_lot::Mutex::new(budget)),
+                released: Arc::default(),
+                yielding: Arc::default(),
+                quarantine: Arc::default(),
+                counters: counters.clone(),
+            },
             scratch_check: Arc::default(),
             scratch_used: Arc::default(),
             encoding: Encoding::default(),
             live: parking_lot::Mutex::default(),
-            yielding: parking_lot::Mutex::default(),
-            counters: Arc::default(),
+            counters,
             decode_failures: Arc::default(),
-            quarantine: Arc::default(),
             notes: parking_lot::Mutex::default(),
             limits: parking_lot::RwLock::new(limits),
             dir,
@@ -377,9 +375,9 @@ impl Jobs {
     /// jobs end. The scratch directory stays the one the jobs started in:
     /// it changes only with a restart.
     pub fn set_limits(&self, limits: JobLimits) {
-        self.budget.lock().set_limits(&limits);
+        self.admission.budget.lock().set_limits(&limits);
         // A higher limit may have room now.
-        self.released.notify_one();
+        self.admission.released.notify_one();
         let mut now = self.limits.write();
         *now = JobLimits {
             scratch_dir: now.scratch_dir.clone(),
@@ -394,21 +392,35 @@ impl Jobs {
 
     /// The encode budget's use now, and its limits.
     pub fn budget(&self) -> BudgetUse {
-        self.budget.lock().clone()
+        self.admission.budget.lock().clone()
     }
 
     /// Whether `card` runs fewer GPU encodes than its limit now, and its
     /// encoder has not crashed lately ([`QUARANTINE`]): a conversion goes
     /// to the next card when not (PGPU-05).
     pub fn card_has_room(&self, card: &CardLimit) -> bool {
-        !self.quarantine.holds(&card.key, std::time::Instant::now())
-            && self.budget.lock().card_has_room(Some(card))
+        !self.card_in_quarantine(card) && self.admission.budget.lock().card_has_room(Some(card))
+    }
+
+    /// Whether `card`'s encoder crashed lately ([`QUARANTINE`]): it has no
+    /// room, though a conversion it would replace lets go of its place.
+    pub fn card_in_quarantine(&self, card: &CardLimit) -> bool {
+        self.admission.in_quarantine(card)
+    }
+
+    /// Put the card `key` in quarantine now, as a crash of its encoder
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn quarantine_card(&self, key: &str) {
+        self.admission
+            .quarantine
+            .add(key, std::time::Instant::now());
     }
 
     /// The cards in quarantine now, by `gpus::Card::key`, and how long
     /// each has left.
     pub fn quarantined(&self) -> Vec<(String, Duration)> {
-        self.quarantine.left(std::time::Instant::now())
+        self.admission.quarantine.left(std::time::Instant::now())
     }
 
     /// How many jobs that encode run now.
@@ -488,67 +500,22 @@ impl Jobs {
         self.decode_failures.remember(file)
     }
 
-    /// A place in the budget for live work of `load` on `card`: `slot`,
-    /// the place of the job it replaces, when that has the same load and
-    /// card; otherwise a place of its own, counting the replaced one's as
-    /// free; with none free, the place of a yielding hold
-    /// ([`Jobs::take_yielded`]). `Busy` when there is none of those; the
-    /// caller counts a refusal.
+    /// [`Admission::admit`]; `Busy` when there is no place. The caller
+    /// counts a refusal.
     fn admit(
         &self,
         load: Load,
         card: Option<CardLimit>,
         slot: Option<Slot>,
     ) -> Result<Slot, JobError> {
-        match slot {
-            Some(slot) if slot.load() == load && slot.card() == card.as_ref() => Ok(slot),
-            replacing => Place::take(
-                &self.budget,
-                &self.released,
-                load,
-                card.clone(),
-                replacing.as_ref(),
-            )
-            .or_else(|| self.take_yielded(load, card))
-            .map(|place| Slot {
-                place: Arc::new(place),
-            })
-            .ok_or(JobError::Busy),
-        }
-    }
-
-    /// Live playback wins (PX-37): a place for `load` on `card` taken from
-    /// the newest yielding hold whose place, counted as free, makes room
-    /// for it, as a seek's run takes the place of the run it replaces. The
-    /// hold is told ([`Yielding::yielded`]) and is no longer one to take;
-    /// the budget counts both places until the holder drops its hold.
-    /// `None`, and no hold told, when none makes room.
-    fn take_yielded(&self, load: Load, card: Option<CardLimit>) -> Option<Place> {
-        let mut yielding = self.yielding.lock();
-        yielding.retain(|entry| entry.strong_count() > 0);
-        let (at, entry, place) = yielding.iter().enumerate().rev().find_map(|(at, entry)| {
-            let entry = entry.upgrade()?;
-            let place = Place::take(
-                &self.budget,
-                &self.released,
-                load,
-                card.clone(),
-                Some(&entry.slot),
-            )?;
-            Some((at, entry, place))
-        })?;
-        yielding.remove(at);
-        drop(yielding);
-        entry.preempted.send_replace(true);
-        self.counters.yielded.inc();
-        Some(place)
+        self.admission.admit(load, card, slot).ok_or(JobError::Busy)
     }
 
     /// Until a place in the budget is given back or the limits change,
     /// since the last time this resolved: for the copy pool (PX-37), its
     /// one waiter, whose copy found no place.
     pub(crate) async fn place_released(&self) {
-        self.released.notified().await;
+        self.admission.released.notified().await;
     }
 
     /// A place in the budget for work of `load` on `card` that gives it up
@@ -560,15 +527,16 @@ impl Jobs {
         load: Load,
         card: Option<CardLimit>,
     ) -> Result<Yielding, JobError> {
-        let place =
-            Place::take(&self.budget, &self.released, load, card, None).ok_or(JobError::Busy)?;
+        let admission = &self.admission;
+        let place = Place::take(&admission.budget, &admission.released, load, card, None)
+            .ok_or(JobError::Busy)?;
         let entry = Arc::new(YieldEntry {
             slot: Slot {
                 place: Arc::new(place),
             },
             preempted: tokio::sync::watch::Sender::new(false),
         });
-        let mut yielding = self.yielding.lock();
+        let mut yielding = admission.yielding.lock();
         yielding.retain(|entry| entry.strong_count() > 0);
         yielding.push(Arc::downgrade(&entry));
         Ok(Yielding { entry })
@@ -618,21 +586,24 @@ impl Jobs {
             fallback,
             made,
             other_encoders,
+            alone,
             card: _,
             ffmpeg,
             aligned_until,
             span,
         } = run;
         let ffmpeg = ffmpeg.unwrap_or_else(|| self.ffmpeg.clone());
+        let other_encoders_none = other_encoders.is_empty();
         let limits = self.limits();
         let cannot_run =
             |e: std::io::Error| JobError::Spawn(format!("{}: {e}", ffmpeg.program().display()));
         let jail = jail(limits.scratch_limit_bytes, &dir, &reads, &inputs);
         // The fallback's run is `jail` with its own GPU: no Vulkan.
-        let mut child =
-            launch(&ffmpeg, &jail.clone().gpu(gpu).vulkan(vulkan), &args).map_err(cannot_run)?;
+        let launched = Launched::new(
+            launch(&ffmpeg, &jail.clone().gpu(gpu).vulkan(vulkan), &args).map_err(cannot_run)?,
+        );
         // The run's process group, which ffmpeg leads.
-        let pid = child.id().unwrap_or(0);
+        let pid = launched.pid();
         let (progress_tx, progress) = watch::channel(Progress::default());
         let progress_tx = Arc::new(progress_tx);
         let mut command = vec![ffmpeg.program().display().to_string()];
@@ -670,10 +641,10 @@ impl Jobs {
                     (ffmpeg, other)
                 })
                 .collect(),
-            budget: self.budget.clone(),
-            released: self.released.clone(),
+            sole_encoder: other_encoders_none && !alone,
+            blame: parking_lot::Mutex::default(),
+            admission: self.admission.clone(),
             decode_failures: self.decode_failures.clone(),
-            quarantine: self.quarantine.clone(),
             start_ms,
             dir: dir.clone(),
             written: written.clone(),
@@ -689,9 +660,7 @@ impl Jobs {
             counters: self.counters.clone(),
             _encoding: self.encoding.begin(),
         };
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let task = tokio::spawn(supervisor.run(child, stdout, stderr));
+        let task = tokio::spawn(supervisor.run(launched));
         tracing::debug!(pid, dir = %dir.display(), epoch, "encode started");
         let job = Arc::new(EncodeJob {
             epoch,
@@ -714,6 +683,91 @@ impl Jobs {
         live.retain(|job| job.strong_count() > 0);
         live.push(Arc::downgrade(&job));
         Ok(job)
+    }
+}
+
+/// Where live work gets its place in the budget: a start
+/// ([`Jobs::start`]), a hold, and a failed GPU encode's move to another
+/// encoder (the supervisor's) alike, so each takes a yielding hold's place
+/// when it finds no other (PX-37) and none goes to a card in quarantine.
+#[derive(Debug, Clone)]
+pub(super) struct Admission {
+    budget: Arc<parking_lot::Mutex<BudgetUse>>,
+    /// Told as a place in the budget is given back, or the limits change:
+    /// the copy pool (PX-37), its one waiter, tries for a place again.
+    released: Arc<tokio::sync::Notify>,
+    /// Yielding holds (PX-37), newest last: the places live admission may
+    /// take when it finds no other.
+    yielding: Arc<parking_lot::Mutex<Vec<std::sync::Weak<YieldEntry>>>>,
+    /// GPUs whose encoder crashed: they get no new conversions for a while.
+    pub(super) quarantine: Arc<Quarantine>,
+    /// Where a yielding hold's place taken is counted.
+    counters: Arc<JobCounters>,
+}
+
+impl Admission {
+    /// Whether `card` is in quarantine now.
+    fn in_quarantine(&self, card: &CardLimit) -> bool {
+        self.quarantine.holds(&card.key, std::time::Instant::now())
+    }
+
+    /// A place in the budget for live work of `load` on `card`: `slot`,
+    /// the place of the job it replaces, when that has the same load and
+    /// card; otherwise a place of its own, counting the replaced one's as
+    /// free; with none free, the place of a yielding hold
+    /// ([`Admission::take_yielded`]). `None` when there is none of those,
+    /// and for a GPU encode on a card in quarantine, whatever it replaces.
+    pub(super) fn admit(
+        &self,
+        load: Load,
+        card: Option<CardLimit>,
+        slot: Option<Slot>,
+    ) -> Option<Slot> {
+        let gpu_encode = matches!(load, Load::Gpu | Load::GpuOnly);
+        if gpu_encode && card.as_ref().is_some_and(|c| self.in_quarantine(c)) {
+            return None;
+        }
+        match slot {
+            Some(slot) if slot.load() == load && slot.card() == card.as_ref() => Some(slot),
+            replacing => Place::take(
+                &self.budget,
+                &self.released,
+                load,
+                card.clone(),
+                replacing.as_ref(),
+            )
+            .or_else(|| self.take_yielded(load, card))
+            .map(|place| Slot {
+                place: Arc::new(place),
+            }),
+        }
+    }
+
+    /// Live playback wins (PX-37): a place for `load` on `card` taken from
+    /// the newest yielding hold whose place, counted as free, makes room
+    /// for it, as a seek's run takes the place of the run it replaces. The
+    /// hold is told ([`Yielding::yielded`]) and is no longer one to take;
+    /// the budget counts both places until the holder drops its hold.
+    /// `None`, and no hold told, when none makes room.
+    fn take_yielded(&self, load: Load, card: Option<CardLimit>) -> Option<Place> {
+        let mut yielding = self.yielding.lock();
+        yielding.retain(|entry| entry.strong_count() > 0);
+        let (at, entry, place) = yielding.iter().enumerate().rev().find_map(|(at, entry)| {
+            let entry = entry.upgrade()?;
+            let place = Place::take(
+                &self.budget,
+                &self.released,
+                load,
+                card.clone(),
+                Some(&entry.slot),
+            )?;
+            Some((at, entry, place))
+        })?;
+        yielding.remove(at);
+        drop(yielding);
+        entry.preempted.send_replace(true);
+        self.counters.yielded.inc();
+        Some(place)
     }
 }
 
@@ -741,6 +795,11 @@ pub struct Run {
     /// For a GPU video encode: the runs on the other encoders of its
     /// codec, in order, for when it fails before the first output.
     pub other_encoders: Vec<OtherEncoder>,
+    /// It may not move, though its codec has other encoders: a run after
+    /// its conversion's first ([`crate::encode::pick::RunOn::alone`]). With
+    /// no other encoders and not alone, its codec has no other encoder at
+    /// all, and a crash of its GPU encoder quarantines the card at once.
+    pub alone: bool,
     /// For a GPU video encode, the card it counts against (PGPU-05).
     pub card: Option<CardLimit>,
     /// ffmpeg confined to the GPU card it runs on, in place of the jobs'

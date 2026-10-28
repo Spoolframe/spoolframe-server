@@ -8,10 +8,12 @@ use spoolframe_admin_api::{Platform, error_code};
 use crate::logic::ApiError;
 
 /// What the page calls the device that shows the code: "the TV" for an
-/// Apple TV, "the computer" for a desktop app, else "the device".
+/// Apple TV, "the console" for an Xbox, "the computer" for a desktop app,
+/// else "the device" (an Android app may be a phone or a TV).
 pub fn device_word(platform: Platform) -> &'static str {
     match platform {
         Platform::Tvos => "TV",
+        Platform::Xbox => "console",
         Platform::Linux | Platform::Macos => "computer",
         _ => "device",
     }
@@ -175,6 +177,11 @@ mod tests {
     #[test]
     fn a_tv_is_called_the_tv() {
         assert_eq!(device_word(Platform::Tvos), "TV");
+    }
+
+    #[test]
+    fn an_xbox_is_called_the_console() {
+        assert_eq!(device_word(Platform::Xbox), "console");
     }
 
     #[test]

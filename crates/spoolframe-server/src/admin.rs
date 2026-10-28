@@ -370,6 +370,11 @@ impl StatusSource {
                         .map(|now| now.gpu_jobs_by_card.clone())
                         .unwrap_or_default(),
                     budget_now.as_ref().map_or(0, |now| now.max_gpu_jobs),
+                    &self
+                        .jobs
+                        .as_ref()
+                        .map(|jobs| jobs.quarantined())
+                        .unwrap_or_default(),
                 ),
                 other_gpus: crate::gpu_status::others(&detected),
                 gpu_notes: detected.notes.clone(),

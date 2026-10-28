@@ -16,18 +16,28 @@ use crate::playback_debug::{encoder_used, filter_place, gpu_api, tone_mapper, vi
 use crate::transcode::{Detected, Gpu, OtherWhy};
 
 /// The cards encodes run on, in the order jobs try them, with the GPU
-/// video encodes running on each now (`running`, by card key) and the
-/// limit each is held to (`max_gpu_jobs` where its entry sets none).
+/// video encodes running on each now (`running`, by card key), the limit
+/// each is held to (`max_gpu_jobs` where its entry sets none), and how
+/// long each in quarantine has left (`quarantined`, by card key:
+/// `Jobs::quarantined`).
 pub fn cards(
     detected: &Detected,
     entries: &[spoolframe_media::gpus::GpuEntry],
     running: &HashMap<String, usize>,
     max_gpu_jobs: usize,
+    quarantined: &[(String, std::time::Duration)],
 ) -> Vec<api::GpuCard> {
     detected
         .gpus
         .iter()
-        .map(|gpu| card(gpu, entries, running, max_gpu_jobs))
+        .map(|gpu| {
+            let key = gpu.card().key();
+            let left = quarantined
+                .iter()
+                .find(|(card, _)| *card == key)
+                .map(|(_, left)| *left);
+            card(gpu, entries, running, max_gpu_jobs, left)
+        })
         .collect()
 }
 
@@ -36,6 +46,7 @@ fn card(
     entries: &[spoolframe_media::gpus::GpuEntry],
     running: &HashMap<String, usize>,
     max_gpu_jobs: usize,
+    quarantined: Option<std::time::Duration>,
 ) -> api::GpuCard {
     let found = &gpu.found;
     let card = &found.card;
@@ -60,6 +71,15 @@ fn card(
         filters: does.filters.into_iter().map(str::to_owned).collect(),
         tone_maps: does.tone_mappers.into_iter().map(tone_mapper).collect(),
         lacks: lacks(encoders, api),
+        // A part of a second left is a second.
+        quarantined_secs: quarantined.map(|left| {
+            count(
+                left.as_secs()
+                    .saturating_add(1)
+                    .try_into()
+                    .unwrap_or(usize::MAX),
+            )
+        }),
     }
 }
 
@@ -332,7 +352,7 @@ mod tests {
         let key = gpu.card().key();
         let detected = Detected::with_gpus(vec![gpu]);
         let running = HashMap::from([(key.clone(), 2)]);
-        let cards = cards(&detected, &[], &running, 3);
+        let cards = cards(&detected, &[], &running, 3, &[]);
         assert_eq!(cards.len(), 1);
         let card = &cards[0];
         assert_eq!(card.key, key);
@@ -342,6 +362,24 @@ mod tests {
         assert_eq!(card.decodes, ["h264 (nvdec)", "hevc (nvdec)"]);
         assert_eq!((card.jobs, card.max_jobs, card.own_limit), (2, 3, false));
         assert_eq!(card.entry, "transcode.gpus entry 1");
+        assert_eq!(card.quarantined_secs, None);
+    }
+
+    /// A card whose encoder crashed says so, with the time it has left,
+    /// rounded up to the second.
+    #[test]
+    fn a_card_in_quarantine_says_how_long_it_has_left() {
+        let gpu = test_gpu(
+            1,
+            Hardware::Nvenc,
+            spoolframe_media::gpus::Kind::Discrete,
+            pascal(),
+        );
+        let key = gpu.card().key();
+        let detected = Detected::with_gpus(vec![gpu]);
+        let left = std::time::Duration::from_millis(119_400);
+        let cards = cards(&detected, &[], &HashMap::new(), 3, &[(key, left)]);
+        assert_eq!(cards[0].quarantined_secs, Some(120));
     }
 
     /// A filter a card lacks is named as its API's own, so it does not

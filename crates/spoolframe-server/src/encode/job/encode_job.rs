@@ -174,6 +174,14 @@ impl EncodeJob {
         self.shared.moved_to.lock().clone()
     }
 
+    /// Its slot and [`EncodeJob::moved_to`], read together: a move sets
+    /// both under the slot's lock, so the run that replaces it never
+    /// follows the one without the other.
+    pub fn placed(&self) -> (Option<Slot>, Option<String>) {
+        let slot = self.slot.lock();
+        (slot.clone(), self.shared.moved_to.lock().clone())
+    }
+
     /// Whether its ffmpeg decodes on the GPU: false once it fell back to
     /// software.
     pub fn decodes_in_hardware(&self) -> bool {

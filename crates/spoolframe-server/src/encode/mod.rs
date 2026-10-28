@@ -110,7 +110,8 @@ pub struct Conversion {
     /// first run alone may move to another encoder when its GPU encode
     /// fails before any output ([`RunOn::others`]); the runs after it go
     /// where it moved ([`Conversion::follow_move`]), so one encoder's
-    /// init segment never fronts another's segments.
+    /// init segment never fronts another's segments. A run after it whose
+    /// card is in quarantine goes to the next encoder all the same.
     run_on: Mutex<RunOn>,
     /// For HLS: where the segments are cut (P2-05).
     segments: Option<Segments>,
@@ -773,31 +774,66 @@ impl Conversion {
         from: u32,
         reason: &'static str,
     ) -> NextRun {
+        // Read together: a move sets both at once.
+        let (slot, moved_to) = current.job.placed();
         NextRun {
             rung,
             reason,
-            run_on: self.follow_move(&current.job),
+            run_on: self.follow_move(moved_to.as_deref()),
             parts: self.parts(rung),
             epoch: self
                 .epochs
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             start,
             from,
-            slot: current.job.slot(),
+            slot,
             cuts: self.cuts(rung),
         }
     }
 
-    /// Where the next run goes: where `job`, its first, moved its encode
-    /// when its GPU encode failed, if it did, from then on. Never moved
-    /// again: a run after the first may follow another that a reader
-    /// has the init segment of.
-    fn follow_move(&self, job: &EncodeJob) -> RunOn {
+    /// Where the next run goes: where the run it replaces, its first,
+    /// moved its encode when its GPU encode failed (`moved_to`), if it
+    /// did, from then on. A run after the first does not move when it
+    /// fails: it may follow another that a reader has the init segment
+    /// of. But one whose card is in quarantine goes to the first of the
+    /// other encoders whose card is not, from then on, as a move does:
+    /// that card would crash it again.
+    fn follow_move(&self, moved_to: Option<&str>) -> RunOn {
         let mut run_on = self.run_on.lock();
-        if let Some(moved) = job.moved_to().and_then(|key| run_on.moved(&key)) {
+        if let Some(moved) = moved_to.and_then(|key| run_on.moved(key)) {
             *run_on = moved;
         }
+        if let Some(moved) = run_on.off_quarantine(|card| self.jobs.card_in_quarantine(card)) {
+            tracing::warn!(
+                from = run_on.key(),
+                to = moved.key(),
+                "this conversion's card is in quarantine: its runs go to another encoder"
+            );
+            *run_on = moved;
+            self.forget_kept_inits();
+        }
         run_on.alone()
+    }
+
+    /// Remove every rung's kept init: they are the encoder's this
+    /// conversion left, whose parameter sets the next encoder's segments
+    /// do not share. A player that reads the init again gets the new
+    /// run's; one holding the old may fail to decode, which beats a card
+    /// that would crash the run.
+    fn forget_kept_inits(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("init-v")
+                && name.ends_with(".mp4")
+                && let Err(e) = std::fs::remove_file(entry.path())
+            {
+                tracing::debug!(error = %e, "a kept init segment was not removed");
+            }
+        }
     }
 
     /// The run's links to what it reads.
@@ -1896,138 +1932,187 @@ pub(crate) mod tests {
         assert_eq!(next.progress().borrow().done, None);
     }
 
+    /// A 60 s HEVC film converted to H.264 over HLS on two cards: a
+    /// Radeon (h264_vaapi, decoding HEVC) and an NVIDIA card (h264_nvenc),
+    /// each run made by `script` in ffmpeg's place.
+    struct TwoCards {
+        jobs: Arc<Jobs>,
+        gpus: Arc<Detected>,
+        film: PathBuf,
+        descriptor: Arc<MediaDescriptor>,
+        plan: PlaybackPlan,
+        _tmp: spoolframe_test_dir::TestDir,
+    }
+
+    const RADEON: &str = "vaapi:0000:01:00.0";
+
+    impl TwoCards {
+        async fn new(test: &str, script: &str) -> Self {
+            use spoolframe_media::VideoStream;
+            use spoolframe_media::encoders::{Hardware, HardwareDecoder, VideoEncoder};
+            use spoolframe_media::gpus::Kind;
+            use spoolframe_types::{HdrFormat, VideoCodec};
+
+            let tmp = spoolframe_test_dir::TestDir::new(test).await;
+            let ffmpeg = job::tests::ffmpeg(&tmp.as_ref().join("bin"), script);
+            let jobs = Arc::new(
+                Jobs::new(
+                    JobLimits {
+                        budget: Units::jobs(2),
+                        max_remux: 32,
+                        max_gpu_jobs: 3,
+                        scratch_dir: tmp.as_ref().join("scratch"),
+                        scratch_limit_bytes: 1 << 30,
+                        read_ahead: Duration::from_secs(60),
+                        copy_segment_secs: 2,
+                        stalled_after: Duration::from_secs(60),
+                        gpu_filters: false,
+                        tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+                        video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
+                    },
+                    spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
+                )
+                .unwrap(),
+            );
+            let film = tmp.as_ref().join("film.mkv");
+            std::fs::write(&film, b"x").unwrap();
+            let descriptor = Arc::new(MediaDescriptor {
+                container: "matroska,webm".into(),
+                duration: Some(Duration::from_secs(60)),
+                bit_rate: None,
+                video: Some(VideoStream {
+                    index: 0,
+                    codec: "hevc".into(),
+                    profile: Some("Main".into()),
+                    level: None,
+                    width: 1920,
+                    height: 1080,
+                    pixel_format: Some("yuv420p".into()),
+                    color_transfer: None,
+                    frame_rate_millis: Some(24_000),
+                    bit_depth: 8,
+                    hdr: None::<HdrFormat>,
+                    dolby_vision: None,
+                    bit_rate: None,
+                    parameter_sets_in_record: false,
+                    codec_string: None,
+                }),
+                audio: Vec::new(),
+                subtitles: Vec::new(),
+            });
+            let plan = PlaybackPlan::Converted {
+                delivery: Delivery::Hls,
+                container: spoolframe_types::Container::Mp4,
+                video: Some(ConvertedVideo::Encode {
+                    codec: VideoCodec::H264,
+                    height: 1080,
+                    max_bitrate: None,
+                    tone_map: false,
+                }),
+                audio: None,
+                subtitle: None,
+                ladder: Vec::new(),
+                reasons: Vec::new(),
+                source_codec: None,
+            };
+            let card = |n, api: Hardware, name: &str, decodes: bool| {
+                let encoders = Encoders {
+                    video: vec![VideoEncoder {
+                        codec: VideoCodec::H264,
+                        name: name.into(),
+                        hardware: Some(api),
+                    }],
+                    hardware_decoders: decodes
+                        .then_some(HardwareDecoder {
+                            codec: VideoCodec::Hevc,
+                            hardware: api,
+                            bit_depth: 8,
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Encoders::software_baseline()
+                };
+                Gpu {
+                    ffmpeg: spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
+                    ..crate::transcode::test_gpu(n, api, Kind::Integrated, encoders)
+                }
+            };
+            let gpus = Arc::new(Detected::with_gpus(vec![
+                card(1, Hardware::Vaapi, "h264_vaapi", true),
+                card(2, Hardware::Nvenc, "h264_nvenc", false),
+            ]));
+            assert_eq!(gpus.gpus[0].limit().key, RADEON);
+            Self {
+                jobs,
+                gpus,
+                film,
+                descriptor,
+                plan,
+                _tmp: tmp,
+            }
+        }
+
+        /// The playback `handle`'s conversion, replacing the one that
+        /// holds `slot` if any.
+        fn start(&self, handle: &str, slot: Option<Slot>) -> Result<Arc<Conversion>, JobError> {
+            Conversion::start(
+                self.jobs.clone(),
+                ConversionSource {
+                    trace: crate::playback::PlaybackTrace::untraced(),
+                    handle,
+                    path: &self.film,
+                    video_from: None,
+                    audio_from: None,
+                    descriptor: self.descriptor.clone(),
+                    plan: &self.plan,
+                    gpus: self.gpus.clone(),
+                    keyframes: None,
+                    first_epoch: 0,
+                    audio_first_ms: None,
+                    slot,
+                    start_rung: 0,
+                },
+                None,
+            )
+        }
+    }
+
+    /// Until `job` has written its first segment.
+    async fn first_segment(job: &EncodeJob) {
+        let mut progress = job.progress();
+        progress
+            .wait_for(|p| p.last_segment.is_some())
+            .await
+            .unwrap();
+    }
+
+    /// The stand-in for [`TwoCards`]: aborts when its arguments match
+    /// `crashes` (a shell `case` pattern), else writes segment 1, lists
+    /// it, and runs on.
+    fn crashing_when(crashes: &str) -> String {
+        format!(
+            "for a; do last=$a; done\n\
+             case \"$*\" in {crashes}) ulimit -c 0; kill -ABRT $$;; esac\n\
+             d=$(dirname \"$last\"); printf x > \"$d/seg1.m4s\"\n\
+             printf '#EXTM3U\\nseg1.m4s\\n' > \"$last\"; echo out_time_us=6000000\n\
+             exec sleep 30"
+        )
+    }
+
     /// The Radeon's video engine hangs as a playback starts (ffmpeg
     /// aborts on h264_vaapi): its first run moves to the NVIDIA card's
     /// h264_nvenc, and a seek after it stays there, one encoder for the
     /// whole playback; that run moves nowhere.
     #[tokio::test]
     async fn a_moved_encode_stays_on_the_encoder_it_moved_to() {
-        use spoolframe_media::VideoStream;
-        use spoolframe_media::encoders::{Hardware, HardwareDecoder, VideoEncoder};
-        use spoolframe_media::gpus::Kind;
-        use spoolframe_types::{HdrFormat, VideoCodec};
-
-        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-conversion-encoder-moves").await;
-        let ffmpeg = job::tests::ffmpeg(
-            &tmp.as_ref().join("bin"),
-            "for a; do last=$a; done\n\
-             case \"$*\" in *h264_vaapi*) ulimit -c 0; kill -ABRT $$;; esac\n\
-             d=$(dirname \"$last\"); printf x > \"$d/seg1.m4s\"\n\
-             printf '#EXTM3U\\nseg1.m4s\\n' > \"$last\"; echo out_time_us=6000000\n\
-             exec sleep 30",
-        );
-        let jobs = Arc::new(
-            Jobs::new(
-                JobLimits {
-                    budget: Units::jobs(2),
-                    max_remux: 32,
-                    max_gpu_jobs: 3,
-                    scratch_dir: tmp.as_ref().join("scratch"),
-                    scratch_limit_bytes: 1 << 30,
-                    read_ahead: Duration::from_secs(60),
-                    copy_segment_secs: 2,
-                    stalled_after: Duration::from_secs(60),
-                    gpu_filters: false,
-                    tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
-                    video_codecs: crate::config::DEFAULT_VIDEO_CODECS.to_vec(),
-                },
-                spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
-            )
-            .unwrap(),
-        );
-        let film = tmp.as_ref().join("film.mkv");
-        std::fs::write(&film, b"x").unwrap();
-        let descriptor = Arc::new(MediaDescriptor {
-            container: "matroska,webm".into(),
-            duration: Some(Duration::from_secs(60)),
-            bit_rate: None,
-            video: Some(VideoStream {
-                index: 0,
-                codec: "hevc".into(),
-                profile: Some("Main".into()),
-                level: None,
-                width: 1920,
-                height: 1080,
-                pixel_format: Some("yuv420p".into()),
-                color_transfer: None,
-                frame_rate_millis: Some(24_000),
-                bit_depth: 8,
-                hdr: None::<HdrFormat>,
-                dolby_vision: None,
-                bit_rate: None,
-                parameter_sets_in_record: false,
-                codec_string: None,
-            }),
-            audio: Vec::new(),
-            subtitles: Vec::new(),
-        });
-        let plan = PlaybackPlan::Converted {
-            delivery: Delivery::Hls,
-            container: spoolframe_types::Container::Mp4,
-            video: Some(ConvertedVideo::Encode {
-                codec: VideoCodec::H264,
-                height: 1080,
-                max_bitrate: None,
-                tone_map: false,
-            }),
-            audio: None,
-            subtitle: None,
-            ladder: Vec::new(),
-            reasons: Vec::new(),
-            source_codec: None,
-        };
-        let card = |n, api: Hardware, name: &str, decodes: bool| {
-            let encoders = Encoders {
-                video: vec![VideoEncoder {
-                    codec: VideoCodec::H264,
-                    name: name.into(),
-                    hardware: Some(api),
-                }],
-                hardware_decoders: decodes
-                    .then_some(HardwareDecoder {
-                        codec: VideoCodec::Hevc,
-                        hardware: api,
-                        bit_depth: 8,
-                    })
-                    .into_iter()
-                    .collect(),
-                ..Encoders::software_baseline()
-            };
-            Gpu {
-                ffmpeg: spoolframe_media::sandbox::Tool::unconfined(&ffmpeg),
-                ..crate::transcode::test_gpu(n, api, Kind::Integrated, encoders)
-            }
-        };
-        let gpus = Arc::new(Detected::with_gpus(vec![
-            card(1, Hardware::Vaapi, "h264_vaapi", true),
-            card(2, Hardware::Nvenc, "h264_nvenc", false),
-        ]));
-        let conversion = Conversion::start(
-            jobs.clone(),
-            ConversionSource {
-                trace: crate::playback::PlaybackTrace::untraced(),
-                handle: "h1",
-                path: &film,
-                video_from: None,
-                audio_from: None,
-                descriptor,
-                plan: &plan,
-                gpus,
-                keyframes: None,
-                first_epoch: 0,
-                audio_first_ms: None,
-                slot: None,
-                start_rung: 0,
-            },
-            None,
+        let cards = TwoCards::new(
+            "spoolframe-conversion-encoder-moves",
+            &crashing_when("*h264_vaapi*"),
         )
-        .unwrap();
+        .await;
+        let conversion = cards.start("h1", None).unwrap();
         let first = conversion.job();
-        let mut progress = first.progress();
-        progress
-            .wait_for(|p| p.last_segment.is_some())
-            .await
-            .unwrap();
+        first_segment(&first).await;
         assert_eq!(first.moved_to().as_deref(), Some("nvenc:0000:02:00.0"));
         assert!(first.command().contains(&"h264_nvenc".to_owned()));
         conversion.seek(Duration::from_secs(30)).unwrap();
@@ -2036,6 +2121,59 @@ pub(crate) mod tests {
         let command = after.command();
         assert!(command.contains(&"h264_nvenc".to_owned()), "{command:?}");
         assert!(!command.contains(&"h264_vaapi".to_owned()), "{command:?}");
+    }
+
+    /// Another playback's encode crashes the Radeon and moves to the
+    /// NVIDIA card, whose output shows the film was fine: the Radeon is
+    /// quarantined. A playback already on it that seeks goes to the
+    /// NVIDIA card too, not back to the Radeon.
+    #[tokio::test]
+    async fn a_seek_after_a_crash_and_move_stays_off_the_quarantined_card() {
+        let cards = TwoCards::new(
+            "spoolframe-conversion-seek-quarantined",
+            &crashing_when("*h264_vaapi*/h2/*"),
+        )
+        .await;
+        let one = cards.start("h1", None).unwrap();
+        first_segment(&one.job()).await;
+        assert!(one.job().command().contains(&"h264_vaapi".to_owned()));
+        let two = cards.start("h2", None).unwrap();
+        first_segment(&two.job()).await;
+        assert_eq!(two.job().moved_to().as_deref(), Some("nvenc:0000:02:00.0"));
+        let radeon = cards.gpus.gpus[0].limit();
+        assert!(cards.jobs.card_in_quarantine(&radeon));
+        // As `keep_init` keeps the Radeon run's, once the player read it.
+        std::fs::write(one.kept_init(0), b"radeon init").unwrap();
+        one.seek(Duration::from_secs(30)).unwrap();
+        let command = one.job().command();
+        assert!(command.contains(&"h264_nvenc".to_owned()), "{command:?}");
+        assert!(!command.contains(&"h264_vaapi".to_owned()), "{command:?}");
+        // The Radeon's init no longer fronts the NVIDIA card's segments.
+        assert!(!one.kept_init(0).exists());
+        // From then on: a second seek stays there.
+        one.seek(Duration::from_secs(10)).unwrap();
+        assert!(one.job().command().contains(&"h264_nvenc".to_owned()));
+    }
+
+    /// A conversion that replaces one on the Radeon (an audio or subtitle
+    /// switch) counts the Radeon's place as its own, but not once the
+    /// Radeon is in quarantine: it goes to the NVIDIA card.
+    #[tokio::test]
+    async fn a_replacing_conversion_skips_a_quarantined_card() {
+        let cards = TwoCards::new(
+            "spoolframe-conversion-replaces-quarantined",
+            &crashing_when("nothing"),
+        )
+        .await;
+        let radeon = cards.gpus.gpus[0].limit();
+        let replaced = cards
+            .jobs
+            .hold(Load::GpuOnly, Some(radeon.clone()))
+            .unwrap();
+        cards.jobs.quarantine_card(&radeon.key);
+        let conversion = cards.start("h1", Some(replaced)).unwrap();
+        let command = conversion.job().command();
+        assert!(command.contains(&"h264_nvenc".to_owned()), "{command:?}");
     }
 
     /// PGPU-01: an NVENC encode decoding on NVDEC whose decode fails before

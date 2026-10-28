@@ -582,9 +582,9 @@ mod tests {
             (budget.max, budget.max_remux, budget.max_gpu_jobs),
             (Units::jobs(1), 1, 1)
         );
-        let _taken = take(&jobs.budget, Load::Software).unwrap();
-        assert!(take(&jobs.budget, Load::Software).is_none());
-        let _remux = take(&jobs.budget, Load::Remux).unwrap();
-        assert!(take(&jobs.budget, Load::Remux).is_none());
+        let _taken = take(&jobs.admission.budget, Load::Software).unwrap();
+        assert!(take(&jobs.admission.budget, Load::Software).is_none());
+        let _remux = take(&jobs.admission.budget, Load::Remux).unwrap();
+        assert!(take(&jobs.admission.budget, Load::Remux).is_none());
     }
 }

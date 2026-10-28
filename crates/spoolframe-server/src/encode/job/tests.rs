@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use super::process::out_time_us;
 use super::supervisor::*;
 use super::*;
+use crate::encode::pick::SOFTWARE;
 
 /// PX-37: the encoded time is read from `out_time_us` alone; ffmpeg's
 /// `N/A` before the first frame, and any other key, say nothing.
@@ -893,7 +894,7 @@ fn amd_run(file: &Path, nvidia_jobs: Option<usize>) -> Run {
                 made_on("hevc_nvenc", Some(Hardware::Nvenc)),
             ),
             other(
-                "software",
+                SOFTWARE,
                 "sw",
                 GpuUse::None,
                 Load::Software,
@@ -922,6 +923,52 @@ fn aborting(on_amd: &str, on_nvidia: &str, on_sw: &str) -> String {
 const CONTEXT_LOST: &str = "echo 'amdgpu: The CS has cancelled because the context is lost' >&2; \
                             ulimit -c 0; kill -ABRT $$";
 
+/// The run `run` makes for its output file, started on `jobs` as a
+/// playback's first: a GPU encode when it has a card, else software.
+fn start_on(jobs: &Jobs, run: impl FnOnce(&Path) -> Run) -> Arc<EncodeJob> {
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let run = run(&file);
+    let load = if run.card.is_some() {
+        Load::Gpu
+    } else {
+        Load::Software
+    };
+    jobs.start(dir, run, Written::Progressive { file }, load, 0, 0, 0, None)
+        .unwrap()
+}
+
+/// A move or quarantine scenario: [`amd_run`] (room for `nvidia_jobs` on
+/// the NVIDIA card) on jobs of 2 running `script` as ffmpeg.
+async fn scenario(
+    test: &str,
+    script: &str,
+    nvidia_jobs: Option<usize>,
+) -> (Jobs, spoolframe_test_dir::TestDir, Arc<EncodeJob>) {
+    let (jobs, tmp) = jobs(test, script, 2, Duration::from_secs(60)).await;
+    let job = start_on(&jobs, |file| amd_run(file, nvidia_jobs));
+    (jobs, tmp, job)
+}
+
+fn limit(key: &str) -> CardLimit {
+    CardLimit {
+        key: key.into(),
+        max_jobs: None,
+    }
+}
+
+/// The cards in quarantine, by key.
+fn quarantined(jobs: &Jobs) -> Vec<String> {
+    jobs.quarantined()
+        .into_iter()
+        .map(|(card, _)| card)
+        .collect()
+}
+
+/// The stand-in's run on the encoder it moved to: writes `abc`, reports
+/// a second encoded, and runs on.
+const WRITES_AND_RUNS_ON: &str = "printf abc > \"$1\"; echo out_time_us=1000000; exec sleep 30";
+
 /// The Radeon's video engine hangs (ffmpeg aborts, "the context is
 /// lost") before any output: the encode runs again on the next encoder
 /// of its codec, the NVIDIA card's, which takes a place on that card,
@@ -929,27 +976,8 @@ const CONTEXT_LOST: &str = "echo 'amdgpu: The CS has cancelled because the conte
 /// moved, to go on there.
 #[tokio::test]
 async fn a_failed_gpu_encode_runs_again_on_the_next_encoder_of_its_codec() {
-    let (jobs, _tmp) = jobs(
-        "gpu-encode-moves",
-        &aborting(CONTEXT_LOST, ":", ":"),
-        2,
-        Duration::from_secs(60),
-    )
-    .await;
-    let dir = jobs.dir().join("h/0");
-    let file = dir.join("out.mkv");
-    let job = jobs
-        .start(
-            dir,
-            amd_run(&file, None),
-            Written::Progressive { file: file.clone() },
-            Load::Gpu,
-            0,
-            0,
-            0,
-            None,
-        )
-        .unwrap();
+    let (jobs, _tmp, job) =
+        scenario("gpu-encode-moves", &aborting(CONTEXT_LOST, ":", ":"), None).await;
     assert_eq!(done(&job).await, Ok(()));
     assert_eq!(job.progress().borrow().bytes, 3);
     assert_eq!(job.moved_to().as_deref(), Some(NVIDIA));
@@ -966,78 +994,115 @@ async fn a_failed_gpu_encode_runs_again_on_the_next_encoder_of_its_codec() {
     assert_eq!(budget.gpu_jobs_by_card.get(AMD), None);
 }
 
-/// An abort of a GPU encode is the driver's: its card gets no new
-/// conversions for a while, the other card still does.
+/// An abort of a GPU encode, then output from the encoder it moved to:
+/// the file is fine, so the crash was the card's. It gets no new
+/// conversions for a while, from as soon as that output is written; the
+/// other card still does.
 #[tokio::test]
-async fn a_crashed_gpu_encoder_puts_its_card_in_quarantine() {
-    let (jobs, _tmp) = jobs(
+async fn a_crash_then_output_from_the_next_encoder_quarantines_the_first_card() {
+    let (jobs, _tmp, job) = scenario(
         "gpu-encode-quarantine",
+        &aborting(CONTEXT_LOST, WRITES_AND_RUNS_ON, ":"),
+        None,
+    )
+    .await;
+    eventually(|| !jobs.card_has_room(&limit(AMD))).await;
+    assert_eq!(job.progress().borrow().done, None, "the moved run runs on");
+    assert!(jobs.card_has_room(&limit(NVIDIA)));
+    assert_eq!(quarantined(&jobs), [AMD]);
+    job.stop();
+}
+
+/// The encoder it moved to crashes too: the file may be to blame (an
+/// `av_assert0`, a decoder on malformed input), so neither card is
+/// quarantined, though software then encodes it.
+#[tokio::test]
+async fn a_crash_the_next_encoder_repeats_quarantines_no_card() {
+    let (jobs, _tmp, job) = scenario(
+        "gpu-encode-crashes-twice",
+        &aborting(CONTEXT_LOST, "ulimit -c 0; kill -SEGV $$", ":"),
+        None,
+    )
+    .await;
+    assert_eq!(done(&job).await, Ok(()));
+    assert_eq!(job.moved_to().as_deref(), Some(SOFTWARE));
+    assert!(jobs.card_has_room(&limit(AMD)));
+    assert!(jobs.card_has_room(&limit(NVIDIA)));
+}
+
+/// A crash after the first output does not move the encode, so nothing
+/// shows the file is fine: the card is not quarantined for it.
+#[tokio::test]
+async fn a_crash_after_output_quarantines_nothing() {
+    let (jobs, _tmp, job) = scenario(
+        "gpu-encode-crashes-late",
+        &aborting(
+            "printf abc > \"$1\"; sleep 0.5; ulimit -c 0; kill -ABRT $$",
+            ":",
+            ":",
+        ),
+        None,
+    )
+    .await;
+    assert!(done(&job).await.is_err());
+    assert_eq!(job.moved_to(), None);
+    assert!(jobs.card_has_room(&limit(AMD)));
+}
+
+/// With no other encoder of its codec (one GPU, no software encoder of
+/// it), nothing could show the file is fine and the playback fails
+/// anyway: a crash quarantines the card at once.
+#[tokio::test]
+async fn a_crash_with_no_other_encoder_quarantines_at_once() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-sole",
         &aborting(CONTEXT_LOST, ":", ":"),
         2,
         Duration::from_secs(60),
     )
     .await;
-    let dir = jobs.dir().join("h/0");
-    let file = dir.join("out.mkv");
-    let job = jobs
-        .start(
-            dir,
-            amd_run(&file, None),
-            Written::Progressive { file: file.clone() },
-            Load::Gpu,
-            0,
-            0,
-            0,
-            None,
-        )
-        .unwrap();
-    assert_eq!(done(&job).await, Ok(()));
-    let limit = |key: &str| CardLimit {
-        key: key.into(),
-        max_jobs: None,
-    };
+    let job = start_on(&jobs, |file| Run {
+        other_encoders: Vec::new(),
+        ..amd_run(file, None)
+    });
+    assert!(done(&job).await.is_err());
     assert!(!jobs.card_has_room(&limit(AMD)));
-    assert!(jobs.card_has_room(&limit(NVIDIA)));
-    let held: Vec<_> = jobs
-        .quarantined()
-        .into_iter()
-        .map(|(card, _)| card)
-        .collect();
-    assert_eq!(held, [AMD]);
+}
+
+/// A run after its conversion's first may not move, though its codec has
+/// other encoders: its crash shows nothing of its card, which is not
+/// quarantined for it.
+#[tokio::test]
+async fn a_later_run_s_crash_quarantines_nothing() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-alone",
+        &aborting(CONTEXT_LOST, ":", ":"),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    let job = start_on(&jobs, |file| Run {
+        other_encoders: Vec::new(),
+        alone: true,
+        ..amd_run(file, None)
+    });
+    assert!(done(&job).await.is_err());
+    assert!(jobs.card_has_room(&limit(AMD)));
 }
 
 /// A non-zero exit may be the file's (an encoder refusing a parameter):
 /// the card is not put in quarantine for it.
 #[tokio::test]
 async fn a_failed_gpu_encode_that_exits_does_not_quarantine_its_card() {
-    let (jobs, _tmp) = jobs(
+    let (jobs, _tmp, job) = scenario(
         "gpu-encode-no-quarantine",
         &aborting("echo 'bad parameter' >&2; exit 1", ":", ":"),
-        2,
-        Duration::from_secs(60),
+        None,
     )
     .await;
-    let dir = jobs.dir().join("h/0");
-    let file = dir.join("out.mkv");
-    let job = jobs
-        .start(
-            dir,
-            amd_run(&file, None),
-            Written::Progressive { file: file.clone() },
-            Load::Gpu,
-            0,
-            0,
-            0,
-            None,
-        )
-        .unwrap();
     let _ = done(&job).await;
-    let amd = CardLimit {
-        key: AMD.into(),
-        max_jobs: None,
-    };
-    assert!(jobs.card_has_room(&amd));
-    assert!(jobs.quarantined().is_empty());
+    assert!(jobs.card_has_room(&limit(AMD)));
+    assert!(quarantined(&jobs).is_empty());
 }
 
 /// A card is in quarantine for `QUARANTINE`, then it is gone.
@@ -1053,64 +1118,102 @@ fn a_card_leaves_quarantine_after_its_time() {
     assert!(quarantine.left(now + QUARANTINE).is_empty());
 }
 
-/// Each encoder is tried once: the AMD card's, the NVIDIA card's, then
-/// software's; with every one failing, the encode fails as it did.
+/// A run on a card in quarantine is refused, though the run it replaces
+/// is on that card with the same load and would hand it its place.
 #[tokio::test]
-async fn a_gpu_encode_tries_each_encoder_once_then_fails() {
+async fn a_replacing_run_on_a_card_in_quarantine_is_refused() {
     let (jobs, _tmp) = jobs(
-        "gpu-encode-moves-fails",
-        &aborting(CONTEXT_LOST, "exit 1", "echo 'no encoder' >&2; exit 1"),
+        "gpu-encode-replaced-quarantined",
+        "exec sleep 30",
         2,
         Duration::from_secs(60),
     )
     .await;
-    let dir = jobs.dir().join("h/0");
+    let replaced = jobs.hold(Load::Gpu, Some(limit(AMD))).unwrap();
+    jobs.quarantine_card(AMD);
+    let dir = jobs.dir().join("h/1");
     let file = dir.join("out.mkv");
-    let job = jobs
-        .start(
-            dir,
-            amd_run(&file, None),
-            Written::Progressive { file: file.clone() },
-            Load::Gpu,
-            0,
-            0,
-            0,
-            None,
-        )
-        .unwrap();
+    let started = jobs.start(
+        dir,
+        amd_run(&file, None),
+        Written::Progressive { file },
+        Load::Gpu,
+        1,
+        0,
+        0,
+        Some(replaced),
+    );
+    assert!(matches!(started, Err(JobError::Busy)));
+}
+
+/// Live playback wins (PX-37): a failed GPU encode's move is live
+/// playback too, so with the budget full it takes a yielding hold's
+/// place, as a start does, rather than failing the playback.
+#[tokio::test]
+async fn a_move_takes_a_yielding_hold_s_place() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-moves-yield",
+        &aborting(CONTEXT_LOST, ":", WRITES_AND_RUNS_ON),
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
+    // The budget of 2 full: a copy's 1, another playback's half, and the
+    // AMD run's half. Software's 1 does not fit in the AMD run's place
+    // (the NVIDIA card has no room): only in the copy's.
+    let copy = jobs.hold_yielding(Load::Software, None).unwrap();
+    let _other = jobs.hold(Load::Gpu, None).unwrap();
+    let job = start_on(&jobs, |file| amd_run(file, Some(0)));
+    assert!(has_yielded(&copy, Duration::from_secs(5)).await);
+    eventually(|| job.moved_to().as_deref() == Some(SOFTWARE)).await;
+    assert_eq!(jobs.counts().yielded, 1);
+    job.stop();
+}
+
+/// Each encoder is tried once: the AMD card's, the NVIDIA card's, then
+/// software's; with every one failing, the encode fails as it did.
+#[tokio::test]
+async fn a_gpu_encode_tries_each_encoder_once_then_fails() {
+    let (_jobs, _tmp, job) = scenario(
+        "gpu-encode-moves-fails",
+        &aborting(CONTEXT_LOST, "exit 1", "echo 'no encoder' >&2; exit 1"),
+        None,
+    )
+    .await;
     assert_eq!(done(&job).await.unwrap_err(), "no encoder");
     assert_eq!(job.command().last().map(String::as_str), Some("sw"));
-    assert_eq!(job.moved_to().as_deref(), Some("software"));
+    assert_eq!(job.moved_to().as_deref(), Some(SOFTWARE));
 }
 
 /// An encoder whose card has no room is passed over for the next.
 #[tokio::test]
 async fn a_failed_gpu_encode_passes_over_a_full_card() {
-    let (jobs, _tmp) = jobs(
+    let (jobs, _tmp, job) = scenario(
         "gpu-encode-moves-full",
+        &aborting(CONTEXT_LOST, ":", ":"),
+        Some(0),
+    )
+    .await;
+    assert_eq!(done(&job).await, Ok(()));
+    assert_eq!(job.moved_to().as_deref(), Some(SOFTWARE));
+    assert_eq!(job.command().last().map(String::as_str), Some("sw"));
+    assert_eq!(jobs.budget().gpu_jobs, 0);
+}
+
+/// An encoder whose card is in quarantine is passed over for the next.
+#[tokio::test]
+async fn a_failed_gpu_encode_passes_over_a_card_in_quarantine() {
+    let (jobs, _tmp) = jobs(
+        "gpu-encode-moves-quarantined",
         &aborting(CONTEXT_LOST, ":", ":"),
         2,
         Duration::from_secs(60),
     )
     .await;
-    let dir = jobs.dir().join("h/0");
-    let file = dir.join("out.mkv");
-    let job = jobs
-        .start(
-            dir,
-            amd_run(&file, Some(0)),
-            Written::Progressive { file: file.clone() },
-            Load::Gpu,
-            0,
-            0,
-            0,
-            None,
-        )
-        .unwrap();
+    jobs.quarantine_card(NVIDIA);
+    let job = start_on(&jobs, |file| amd_run(file, None));
     assert_eq!(done(&job).await, Ok(()));
-    assert_eq!(job.moved_to().as_deref(), Some("software"));
-    assert_eq!(job.command().last().map(String::as_str), Some("sw"));
-    assert_eq!(jobs.budget().gpu_jobs, 0);
+    assert_eq!(job.moved_to().as_deref(), Some(SOFTWARE));
 }
 
 /// A software encode that fails is not moved: it has no GPU to move off.
@@ -1125,26 +1228,12 @@ async fn a_failed_software_encode_does_not_move() {
         Duration::from_secs(60),
     )
     .await;
-    let dir = jobs.dir().join("h/0");
-    let file = dir.join("out.mkv");
-    let run = Run {
+    let job = start_on(&jobs, |file| Run {
         made: Some(made_on("libx265", None)),
         card: None,
         gpu: GpuUse::None,
-        ..amd_run(&file, None)
-    };
-    let job = jobs
-        .start(
-            dir,
-            run,
-            Written::Progressive { file: file.clone() },
-            Load::Software,
-            0,
-            0,
-            0,
-            None,
-        )
-        .unwrap();
+        ..amd_run(file, None)
+    });
     assert_eq!(done(&job).await.unwrap_err(), "x265 failed");
     assert_eq!(job.moved_to(), None);
 }
@@ -1156,11 +1245,13 @@ async fn a_failed_software_encode_does_not_move() {
 fn only_an_abort_or_a_fault_blames_the_encoder() {
     use std::os::unix::process::ExitStatusExt;
     let signalled = |sig| Ended::Exited(Ok(std::process::ExitStatus::from_raw(sig)));
-    assert!(encode_failed(&signalled(libc::SIGABRT)));
-    assert!(encode_failed(&signalled(libc::SIGSEGV)));
-    assert!(!encode_failed(&signalled(libc::SIGKILL)));
-    assert!(!encode_failed(&signalled(libc::SIGTERM)));
-    assert!(encode_failed(&Ended::Stalled));
+    assert!(driver_fault(&signalled(libc::SIGABRT)));
+    assert!(driver_fault(&signalled(libc::SIGSEGV)));
+    for sig in [libc::SIGKILL, libc::SIGTERM] {
+        assert!(!driver_fault(&signalled(sig)) && !decode_failed(&signalled(sig)));
+    }
+    assert!(!driver_fault(&Ended::Stalled));
+    assert!(decode_failed(&Ended::Stalled));
 }
 
 /// What the job runs, as it ran it: the program and its arguments.

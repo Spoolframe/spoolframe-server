@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_media::MediaDescriptor;
-use spoolframe_media::encoders::Hardware;
+use spoolframe_media::encoders::{Hardware, VideoEncoder};
 use spoolframe_media::sandbox::GpuUse;
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::Delivery;
@@ -23,7 +23,8 @@ use super::*;
 /// its first run (PGPU-05), passing over a card with no room for another
 /// GPU encode, and with none left a software encode ([`pick::spill`]).
 /// The card of the conversion it replaces has room: that one lets go of
-/// its place as this one starts.
+/// its place as this one starts. Unless it is in quarantine: then no
+/// conversion goes there, replacing or not.
 ///
 /// Neither a spill nor a refusal is silent: a spill is logged once, as the
 /// conversion starts, with the encoder it runs on; an encode that keeps
@@ -38,7 +39,11 @@ pub(crate) fn run_on(
     let replaced = source.slot.as_ref().and_then(Slot::card);
     let room = |gpu: &Gpu| {
         let limit = gpu.limit();
-        replaced.is_some_and(|r| r.key == limit.key) || jobs.card_has_room(&limit)
+        if replaced.is_some_and(|r| r.key == limit.key) {
+            !jobs.card_in_quarantine(&limit)
+        } else {
+            jobs.card_has_room(&limit)
+        }
     };
     let full = || {
         source
@@ -205,6 +210,7 @@ pub(super) fn spawn(
             fallback,
             made,
             other_encoders: other_encoders(&spec, run_on),
+            alone: run_on.is_alone() && run_on.has_others(),
             // A GPU encode counts against its card (PGPU-05); the run may
             // open that card's nodes, its ffmpeg confined to them.
             card: run_on.gpu().filter(|_| gpu_encode).map(|g| g.limit()),
@@ -349,11 +355,7 @@ fn conversion_span(
     (epoch, start_ms): (u32, u64),
 ) -> tracing::Span {
     let encoder = made.and_then(|m| m.encoder.as_ref());
-    let decode = match made.map(|m| m.decoder) {
-        None | Some(Decoder::None) => "none",
-        Some(Decoder::Software) => "sw",
-        Some(Decoder::Hardware(_) | Decoder::Vulkan) => "hw",
-    };
+    let decode = decode_label(made);
     let filters: Vec<String> = made
         .into_iter()
         .flat_map(|m| [("tonemap", m.tone_map), ("burn_in", m.burn_in)])
@@ -374,7 +376,7 @@ fn conversion_span(
         conversion.plan = if encodes(spec.video, spec.audio) { "transcode" } else { "remux" },
         conversion.load = load.as_str(),
         conversion.encoder = encoder.map_or("copy", |e| e.name.as_str()),
-        conversion.hardware = if encoder.is_some_and(|e| e.hardware.is_some()) { "gpu" } else { "cpu" },
+        conversion.hardware = hardware_label(encoder),
         conversion.gpu = gpu.map(|g| g.card().place()).as_deref(),
         conversion.decode = decode,
         conversion.filters = if filters.is_empty() { "none".to_owned() } else { filters.join(",") },
@@ -382,6 +384,25 @@ fn conversion_span(
     );
     why.playback.mark(&span);
     span
+}
+
+/// What a run's `conversion` span says it decodes with: `none`, `sw` or
+/// `hw`; set again when it runs again on another decoder or encoder.
+pub(super) fn decode_label(made: Option<&Made>) -> &'static str {
+    match made.map(|m| m.decoder) {
+        None | Some(Decoder::None) => "none",
+        Some(Decoder::Software) => "sw",
+        Some(Decoder::Hardware(_) | Decoder::Vulkan) => "hw",
+    }
+}
+
+/// What a run's `conversion` span says it encodes on: `gpu` or `cpu`.
+pub(super) fn hardware_label(encoder: Option<&VideoEncoder>) -> &'static str {
+    if encoder.is_some_and(|e| e.hardware.is_some()) {
+        "gpu"
+    } else {
+        "cpu"
+    }
 }
 
 /// What a conversion weighs: its video encode, on the GPU or not, and if

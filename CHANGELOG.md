@@ -14,17 +14,16 @@
   another card's, then software's where software encodes the codec. Each
   is tried once; the playback stays on the encoder it moved to, seeks
   too. Before, an abort failed the playback outright.
-- A card whose encoder crashes (ffmpeg aborted or faulted mid-encode)
-  is quarantined for 5 minutes: no new playback is planned with or sent
-  to it, and a failed encode does not move onto it. Encodes already on
-  it go on. A plain error exit or a stall does not quarantine, since the
-  file can cause those. With one GPU, playbacks go to software H.264
-  meanwhile, and HDR that needs that card's 10-bit encoder is refused.
-- `transcode.video_codecs` defaults to `["hevc", "h264"]`: AV1 is off
-  unless listed. Settings › Playback still shows it first, unticked; GPUs'
-  support for it is spotty (a Radeon 890M's video engine hung converting
-  4K Dolby Vision to AV1). A server whose admin saved Settings › Playback
-  before 0.16.3 has AV1 stored explicitly and keeps it: untick it there.
+- A card whose encoder crashes (ffmpeg aborted or faulted) is
+  quarantined for 5 minutes once another encoder then encodes the same
+  playback, which shows the file was not to blame; at once when its
+  codec has no other encoder. Meanwhile no playback is planned with or
+  sent to it, a failed encode does not move onto it, and a playback
+  already converting on it moves its next run (a seek) elsewhere.
+  Encodes running on it go on. Settings › GPUs shows a quarantined
+  card and how long it has left. A plain error exit or a stall does not
+  quarantine. With one GPU, playbacks go to software H.264 meanwhile,
+  and HDR that needs that card's 10-bit encoder is refused.
 - `Platform::Android` (`"android"`, "Android app") and `Platform::Xbox`
   (`"xbox"`, "Xbox app"); `Platform::Web` may now be a browser client's
   `Hello`, not only the web UI's admin sessions. None of the three has

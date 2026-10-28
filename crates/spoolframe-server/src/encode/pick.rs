@@ -8,6 +8,7 @@
 //! entry. The conversion's runs then use that card's detection, so
 //! everything PGPU-02 and PGPU-03 decide follows from it as before.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -173,7 +174,7 @@ pub fn run_on(
     // card encodes the codec) takes no card's slot, so its run is no
     // spill, whatever its room.
     let run = match choose(spec, &detected.gpus, room) {
-        Some(gpu) if !room(gpu) && encodes_on(spec, gpu) => spill(detected, spec),
+        Some(gpu) if !room(gpu) && encodes_on(spec, gpu) => spill(detected, spec, |_| true),
         gpu => RunOn::new(detected, gpu.cloned()),
     };
     if keeps_hdr(spec) && !run.encodes_ten_bit(spec) {
@@ -195,21 +196,23 @@ fn other_encoders(detected: &Detected, spec: &EncodeSpec<'_>, run: &RunOn) -> Ve
     if !args::placement(&on).is_some_and(|p| p.encoder.hardware.is_some()) {
         return Vec::new();
     }
-    let mut tried: Vec<String> = run.gpu().map(|g| g.card().key()).into_iter().collect();
+    let mut tried: HashSet<String> = run.gpu().map(|g| g.card().key()).into_iter().collect();
     let mut others = Vec::new();
     loop {
         let untried = |gpu: &Gpu| !tried.contains(&gpu.card().key());
         // With every card that encodes it tried, `choose` gives the best
         // of them again, or one that only decodes.
-        match choose(spec, &detected.gpus, &untried) {
-            Some(gpu) if untried(gpu) && encodes_on(spec, gpu) => {
-                tried.push(gpu.card().key());
-                others.push(RunOn::new(detected, Some(gpu.clone())));
-            }
-            _ => break,
+        let Some(gpu) = choose(spec, &detected.gpus, &untried) else {
+            break;
+        };
+        let key = gpu.card().key();
+        if tried.contains(&key) || !encodes_on(spec, gpu) {
+            break;
         }
+        tried.insert(key);
+        others.push(RunOn::new(detected, Some(gpu.clone())));
     }
-    let software = spill_except(detected, spec, &tried);
+    let software = spill(detected, spec, |gpu| !tried.contains(&gpu.card().key()));
     let soft = software.spec(spec);
     if args::placement(&soft).is_some() {
         others.push(software);
@@ -227,17 +230,15 @@ pub struct NoTenBit;
 /// is full: decoding (and filtering, where it can) on the first card in
 /// order that decodes the source, software's video encoders in place of
 /// its own, as for a codec no card encodes; with none, all on the CPU.
-/// A GPU decode takes no card's slot: those count encodes.
-pub fn spill(detected: &Detected, spec: &EncodeSpec<'_>) -> RunOn {
-    spill_except(detected, spec, &[])
-}
-
-/// [`spill`], decoding on no card of `except` (by `Card::key`).
-fn spill_except(detected: &Detected, spec: &EncodeSpec<'_>, except: &[String]) -> RunOn {
-    for gpu in &detected.gpus {
-        if except.contains(&gpu.card().key()) {
-            continue;
-        }
+/// A GPU decode takes no card's slot: those count encodes. It decodes
+/// only on a card `may_decode` lets it: not one a failed encode moved
+/// off ([`other_encoders`]).
+pub fn spill(
+    detected: &Detected,
+    spec: &EncodeSpec<'_>,
+    may_decode: impl Fn(&Gpu) -> bool,
+) -> RunOn {
+    for gpu in detected.gpus.iter().filter(|gpu| may_decode(gpu)) {
         let encoders = software_encode(gpu.encoders(), &detected.software);
         let node = gpu.vaapi_device();
         let on = EncodeSpec {
@@ -549,6 +550,10 @@ pub fn sample(job: RouteJob, codec: VideoCodec) -> MediaDescriptor {
     }
 }
 
+/// [`RunOn::key`] of a software encode: one of its codec's other
+/// encoders, as a card's key is.
+pub const SOFTWARE: &str = "software";
+
 /// Where a conversion's runs go: the GPU [`choose`] picked, its
 /// detection and its node; or none, software's detection alone.
 #[derive(Debug, Clone)]
@@ -562,9 +567,13 @@ pub struct RunOn {
     /// [`spill`]'s: encoded in software because every card that encodes
     /// the codec was full.
     spilled: bool,
-    /// Where its video encode moves when its GPU encode fails
-    /// ([`RunOn::with_others`]), in order; none once it moved.
+    /// The other encoders of its codec ([`RunOn::with_others`]), in
+    /// order: where its video encode moves when its GPU encode fails, and
+    /// where a later run goes when its card is in quarantine. Those it
+    /// moved past are gone.
     others: Vec<RunOn>,
+    /// [`RunOn::alone`]'s: its encode does not move.
+    alone: bool,
 }
 
 impl RunOn {
@@ -576,6 +585,7 @@ impl RunOn {
             encoders: None,
             spilled: false,
             others: Vec::new(),
+            alone: false,
         }
     }
 
@@ -586,17 +596,59 @@ impl RunOn {
         Self { others, ..self }
     }
 
-    /// Where its video encode moves when its GPU encode fails, in order.
+    /// Where its video encode moves when its GPU encode fails, in order:
+    /// none for one [`RunOn::alone`].
     pub fn others(&self) -> &[RunOn] {
-        &self.others
+        if self.alone { &[] } else { &self.others }
     }
 
-    /// It without [`RunOn::others`]: a run that may not move its encode.
+    /// Whether its codec has other encoders than this one, though it may
+    /// not move to them ([`RunOn::alone`]).
+    pub fn has_others(&self) -> bool {
+        !self.others.is_empty()
+    }
+
+    /// It as a run that may not move its encode: one after its
+    /// conversion's first, which may follow another a reader has the init
+    /// segment of. It knows it has other encoders still
+    /// ([`RunOn::has_others`]).
     pub fn alone(&self) -> Self {
         Self {
-            others: Vec::new(),
+            alone: true,
             ..self.clone()
         }
+    }
+
+    /// Whether it may not move its encode ([`RunOn::alone`]).
+    pub fn is_alone(&self) -> bool {
+        self.alone
+    }
+
+    /// The card its GPU video encode counts against, if it encodes on
+    /// one: not a spill's, which only decodes there.
+    pub fn encode_card(&self) -> Option<crate::encode::job::CardLimit> {
+        self.gpu
+            .as_ref()
+            .filter(|_| !self.spilled)
+            .map(|gpu| gpu.limit())
+    }
+
+    /// Where its conversion goes on when `quarantined` says its card is in
+    /// quarantine: the first of its other encoders whose card is not, with
+    /// the ones after it ([`RunOn::moved`]). `None` when its card is not,
+    /// or every other's is.
+    pub fn off_quarantine(
+        &self,
+        quarantined: impl Fn(&crate::encode::job::CardLimit) -> bool,
+    ) -> Option<RunOn> {
+        if !self.encode_card().is_some_and(|card| quarantined(&card)) {
+            return None;
+        }
+        let to = self
+            .others
+            .iter()
+            .find(|other| !other.encode_card().is_some_and(|card| quarantined(&card)))?;
+        self.moved(&to.key())
     }
 
     /// Which of [`RunOn::others`] it is: its card's key, or `software`
@@ -605,7 +657,7 @@ impl RunOn {
     pub fn key(&self) -> String {
         match &self.gpu {
             Some(gpu) if !self.spilled => gpu.card().key(),
-            _ => "software".to_owned(),
+            _ => SOFTWARE.to_owned(),
         }
     }
 
@@ -953,10 +1005,10 @@ mod tests {
     }
 
     /// A card in quarantine (its encoder crashed) has no room: the plan
-    /// does not offer the encoders only it has, and a run passes it over.
-    #[test]
-    fn a_card_in_quarantine_is_not_planned_with() {
-        use crate::encode::job::Quarantine;
+    /// the jobs make ([`crate::encode::planning_encoders`]) does not offer
+    /// the encoders only it has.
+    #[tokio::test]
+    async fn a_card_in_quarantine_is_not_planned_with() {
         let mut software = Encoders::software_baseline();
         software.video.push(VideoEncoder {
             codec: HEVC,
@@ -972,13 +1024,42 @@ mod tests {
             others: Vec::new(),
             notes: Vec::new(),
         };
-        let quarantine = Quarantine::default();
-        let now = std::time::Instant::now();
-        quarantine.add(&detected.gpus[0].limit().key, now);
-        let room = |gpu: &Gpu| !quarantine.holds(&gpu.limit().key, now);
-        let plan = planning(&detected, &[AV1, HEVC, H264], &room);
-        let names: Vec<_> = plan.video.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(names, ["hevc_nvenc", "h264_nvenc", "libx264"]);
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-pick-quarantine").await;
+        let jobs = crate::encode::job::Jobs::new(
+            crate::encode::JobLimits {
+                budget: crate::encode::Units::jobs(2),
+                max_remux: 32,
+                max_gpu_jobs: 3,
+                scratch_dir: tmp.as_ref().join("scratch"),
+                scratch_limit_bytes: 1 << 30,
+                read_ahead: Duration::from_secs(60),
+                copy_segment_secs: 2,
+                stalled_after: Duration::from_secs(60),
+                gpu_filters: false,
+                tone_map: ToneMapSetting::Auto,
+                video_codecs: vec![AV1, HEVC, H264],
+            },
+            spoolframe_media::sandbox::Tool::unconfined("ffmpeg"),
+        )
+        .unwrap();
+        let names =
+            |plan: Encoders| -> Vec<String> { plan.video.into_iter().map(|v| v.name).collect() };
+        assert_eq!(
+            names(crate::encode::planning_encoders(&jobs, &detected)),
+            [
+                "av1_vaapi",
+                "hevc_nvenc",
+                "h264_vaapi",
+                "h264_nvenc",
+                "libx264"
+            ],
+            "both cards planned with, before"
+        );
+        jobs.quarantine_card(&detected.gpus[0].limit().key);
+        assert_eq!(
+            names(crate::encode::planning_encoders(&jobs, &detected)),
+            ["hevc_nvenc", "h264_nvenc", "libx264"]
+        );
     }
 
     /// An encode that keeps HDR goes only to a card whose encoder writes
