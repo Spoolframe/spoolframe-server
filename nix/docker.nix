@@ -224,6 +224,8 @@ in
       Labels = {
         "org.opencontainers.image.description" = spoolframe.meta.description;
         "org.opencontainers.image.licenses" = "AGPL-3.0-or-later";
+        # ghcr links the package to this repository by it.
+        "org.opencontainers.image.source" = "https://github.com/Spoolframe/spoolframe-server";
         "org.opencontainers.image.version" = spoolframe.version;
       };
     };
