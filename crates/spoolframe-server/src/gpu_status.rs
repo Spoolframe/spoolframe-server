@@ -369,8 +369,9 @@ mod tests {
     /// PGPU-06: the codec the planner takes for each kind of device. A
     /// card that encodes AV1 and HEVC at 10 bits: AV1 kept for the device
     /// that decodes AV1, HEVC kept for the one that does not, AV1 tone
-    /// mapped for an SDR screen; with `video_codecs = ["h264"]`, H.264
-    /// tone mapped for all.
+    /// mapped for an SDR screen, with AV1 listed first; HEVC for all with
+    /// the default, which leaves AV1 off; with `video_codecs = ["h264"]`,
+    /// H.264 tone mapped for all.
     #[test]
     fn picks_say_the_codec_for_each_kind_of_device() {
         let mut encoders = Encoders::software_baseline();
@@ -403,11 +404,20 @@ mod tests {
         };
         let some = |c: &str| Some(c.to_owned());
         assert_eq!(
-            said(&crate::config::DEFAULT_VIDEO_CODECS),
+            said(&[VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]),
             [
                 (api::PickDevice::HdrAv1, some("av1"), true),
                 (api::PickDevice::HdrHevc, some("hevc"), true),
                 (api::PickDevice::Sdr, some("av1"), false),
+            ]
+        );
+        // The default leaves AV1 off: HEVC for every device.
+        assert_eq!(
+            said(&crate::config::DEFAULT_VIDEO_CODECS),
+            [
+                (api::PickDevice::HdrAv1, some("hevc"), true),
+                (api::PickDevice::HdrHevc, some("hevc"), true),
+                (api::PickDevice::Sdr, some("hevc"), false),
             ]
         );
         assert_eq!(

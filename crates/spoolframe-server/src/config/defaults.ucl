@@ -469,8 +469,10 @@ transcode {
   # rather than being tone mapped: the tone map is what a conversion of
   # HDR costs, not the codec. With no codec left, the conversion is
   # encoded in software, which is H.264 only (libx264). [] keeps video
-  # off the GPUs.
-  video_codecs = ["av1", "hevc", "h264"];
+  # off the GPUs. "av1" is off unless listed: GPUs' support for it is
+  # spotty (a Radeon 890M's video engine hangs converting 4K Dolby Vision
+  # to it).
+  video_codecs = ["hevc", "h264"];
 }
 
 # Offer bitmap subtitles (PGS, VobSub, DVB) as text, read with tesseract.

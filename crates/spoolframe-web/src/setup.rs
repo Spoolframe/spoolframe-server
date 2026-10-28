@@ -604,7 +604,7 @@ pub const VIDEO_CODECS: [(&str, &str, &str); 3] = [
     (
         "av1",
         "AV1",
-        "The smallest for what it shows; HDR kept. Only newer devices decode it in hardware.",
+        "The smallest for what it shows; HDR kept. Off by default: GPUs' support for it is spotty, and only newer devices decode it in hardware.",
     ),
     (
         "hevc",
@@ -626,12 +626,20 @@ pub const VIDEO_CODECS_NOTE: &str = "The codecs a GPU encodes to, the first pref
      reorder; untick to leave a codec out.";
 
 /// The rows of the setting's value, its codecs on and in its order, then
-/// the others off. Not set: AV1, HEVC, H.264, all on, the server's
-/// default.
+/// the others off. Not set: the server's default, AV1 first but off,
+/// then HEVC and H.264 on.
 pub fn codec_rows(value: Option<&serde_json::Value>) -> Vec<CodecRow> {
     let set: Vec<&str> = match value {
         Some(serde_json::Value::Array(list)) => list.iter().filter_map(|v| v.as_str()).collect(),
-        _ => VIDEO_CODECS.iter().map(|(codec, ..)| *codec).collect(),
+        _ => {
+            return VIDEO_CODECS
+                .iter()
+                .map(|(codec, ..)| CodecRow {
+                    codec,
+                    on: *codec != "av1",
+                })
+                .collect();
+        }
     };
     let mut rows: Vec<CodecRow> = set
         .iter()
@@ -1302,7 +1310,8 @@ mod tests {
     }
 
     /// PGPU-06: the codec list's rows are the setting's codecs in order,
-    /// on, then the rest off; not set is the server's default; saving
+    /// on, then the rest off; not set is the server's default (AV1 first,
+    /// off: its GPU support is spotty); saving
     /// writes the ones on in order.
     #[test]
     fn the_codec_rows_follow_the_setting() {
@@ -1311,7 +1320,12 @@ mod tests {
         };
         assert_eq!(
             order(&codec_rows(None)),
-            [("av1", true), ("hevc", true), ("h264", true)]
+            [("av1", false), ("hevc", true), ("h264", true)]
+        );
+        // The default saved as it is shows: AV1 left out.
+        assert_eq!(
+            codecs_setting(&codec_rows(None)),
+            serde_json::json!(["hevc", "h264"])
         );
         let set = serde_json::json!(["h264", "hevc"]);
         let rows = codec_rows(Some(&set));

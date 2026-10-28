@@ -1378,7 +1378,7 @@ impl DownloadsConfig {
 /// `transcode { gpus = [ { api = "nvenc"; pick = "all"; } ]; max_jobs = 2;
 /// max_remux = 32; max_gpu_jobs = 3; scratch_dir = "…"; scratch_limit_mb =
 /// 20480; read_ahead_secs = 60; copy_segment_secs = 2; gpu_filters = false;
-/// tone_map = "auto"; video_codecs = ["av1", "hevc", "h264"]; }`, all
+/// tone_map = "auto"; video_codecs = ["hevc", "h264"]; }`, all
 /// optional.
 #[derive(Debug, Clone, Default, Uclicious)]
 #[ucl(skip_builder, deny_unknown_fields)]
@@ -1440,7 +1440,7 @@ pub struct TranscodeConfig {
     pub tone_map: Option<String>,
     /// The codecs a GPU encodes to (PGPU-06), the first preferred: of
     /// `"h264"`, `"hevc"` and `"av1"`, each at most once;
-    /// `["av1", "hevc", "h264"]` if left out. A conversion takes the first
+    /// `["hevc", "h264"]` if left out: AV1 off. A conversion takes the first
     /// the client plays (in hardware, where it says) and a GPU here
     /// encodes, keeping an HDR film's HDR where it can; with none, it is
     /// encoded in software, which is H.264 only. `[]`: no GPU encodes
@@ -1554,11 +1554,11 @@ impl GpuConfig {
 /// `transcode.video_codecs`' key, for its messages.
 const VIDEO_CODECS: &str = "transcode.video_codecs";
 
-/// `transcode.video_codecs` left out (PGPU-06): AV1 first, the smallest
-/// for what it shows and as cheap as HEVC on a GPU that encodes it, then
-/// HEVC, then H.264.
-pub const DEFAULT_VIDEO_CODECS: [VideoCodec; 3] =
-    [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264];
+/// `transcode.video_codecs` left out (PGPU-06): HEVC, then H.264. AV1,
+/// the smallest for what it shows, is off unless listed: GPUs' support
+/// for it is spotty (a Radeon 890M's video engine hung converting 4K
+/// Dolby Vision to AV1, and the kernel reset it mid-playback).
+pub const DEFAULT_VIDEO_CODECS: [VideoCodec; 2] = [VideoCodec::Hevc, VideoCodec::H264];
 
 impl TranscodeConfig {
     /// `video_codecs`, in order (PGPU-06).
@@ -3905,10 +3905,7 @@ mod tests {
                     .video_codecs
             })
         };
-        assert_eq!(
-            codecs("").unwrap(),
-            [VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]
-        );
+        assert_eq!(codecs("").unwrap(), [VideoCodec::Hevc, VideoCodec::H264]);
         assert_eq!(
             codecs(r#"video_codecs = ["hevc", "h264"];"#).unwrap(),
             [VideoCodec::Hevc, VideoCodec::H264]
