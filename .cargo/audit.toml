@@ -10,6 +10,27 @@ ignore = [
   # crypto-bigint 0.5, through openidconnect's p256/p384 0.13 on the server:
   # ECDSA verification only.
   "RUSTSEC-2026-0387",
+  # block-buffer < 0.12.1, through digest 0.10 on the server: no hasher is
+  # reused after a panic.
+  "GHSA-qwgh-2vcv-g2f7",
+  # zstd 0.13 / zstd-safe 7, through foyer-storage only: its disk tier's
+  # value compression is never turned on, so no zstd stream is made or read.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0403",
+  "RUSTSEC-2026-0395",
+  "RUSTSEC-2026-0396",
+  "RUSTSEC-2026-0397",
+  "RUSTSEC-2026-0399",
+  "RUSTSEC-2026-0400",
+  "RUSTSEC-2026-0401",
+  "RUSTSEC-2026-0402",
+  "RUSTSEC-2026-0404",
+  "RUSTSEC-2026-0405",
+  "RUSTSEC-2026-0406",
+  # basic-toml: unmaintained; read only by askama's derive macro, at build
+  # time, in the FFI crate's optional bindings generator.
+  "RUSTSEC-2026-0374",
 ]
 
 [output]

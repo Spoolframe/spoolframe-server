@@ -52,7 +52,9 @@ spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
 spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.3" }
 spoolframe-probe = { path = "crates/spoolframe-probe" }
 spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.3" }
-spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.3" }
+# Without its HTTP server by default: each dependent names `http` when it
+# serves over HTTP (the server, the FFI's `hls-bridge` feature).
+spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.3", default-features = false }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -90,13 +92,12 @@ portmapper = { version = "0.19.3", default-features = false }
 # queries only; `macros` is for `migrate!`, which embeds the migrations.
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
 
-# Passwords (Argon2id, PHC strings) and session-token hashes.
-argon2 = "0.5"
-# Only for its `getrandom` feature: OsRng for salts and session tokens.
-password-hash = { version = "0.5", features = ["getrandom"] }
+# Passwords (Argon2id, PHC strings). Its default `getrandom` makes the
+# salts.
+argon2 = "0.6"
 blake3 = "1"
 # Server key fingerprints (P1-21): SHA-256, as the format specifies.
-sha2 = "0.10"
+sha2 = "0.11"
 # Tests probe a UDP port as iroh binds it: IPv6 only, which std cannot
 # ask for. The version already in the graph through tokio and netwatch.
 socket2 = "0.6"
@@ -260,9 +261,21 @@ serde_bytes = "0.11"
 # is for tests and for reading the PMS API.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The regular features a connection has on, as a set. Its own serde
+# (bits) stays off: only names cross the wire.
+enumset = { version = "1.1", default-features = false }
 
 # Error handling
 thiserror = "2"
+# The client crates' FFI (spoolframe-client-ffi), and the `uniffi`
+# feature of types, protocol and the client SDK, which derives its traits
+# on their public types. Off by default everywhere: the server never
+# builds it. MPL-2.0; deny-sdk.toml names its crates.
+uniffi = { version = "0.32.2", default-features = false }
+# The bindings generator, as a library: spoolframe-client-ffi's
+# uniffi-bindgen bin (feature `bindgen`) and its bindings smoke test.
+uniffi_bindgen = { version = "0.32.2", default-features = false }
+camino = "1"
 anyhow = "1"
 
 # Server configuration is UCL, as in kiln and steward. From crates.io, so a

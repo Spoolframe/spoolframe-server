@@ -47,6 +47,11 @@ license-files = []
 # `cargo deny --locked check advisories` passes and a new one stands out.
 [advisories]
 ignore = [
+  # basic-toml: unmaintained, not vulnerable. Read at build time by
+  # askama's derive macro, in uniffi_bindgen: only spoolframe-client-ffi's
+  # `bindgen` feature (its uniffi-bindgen bin) builds it, never the
+  # library an app links or the server.
+  { id = "RUSTSEC-2026-0374", reason = "basic-toml is read only by askama's derive macro, at build time, in the optional bindings generator" },
   # rsa: the Marvin timing attack recovers a private key from many timed
   # decryptions or signatures. Here rsa comes in only through openidconnect
   # to verify a provider's RS256 ID token signatures with its public keys;
@@ -62,6 +67,39 @@ ignore = [
   # public keys. Our own p256 is 0.14, so the SDK graph is clear. The fix
   # is crypto-bigint 0.7.6; drop this when openidconnect moves to 0.14.
   { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through p256 0.13 in openidconnect, used only to verify ECDSA signatures (public keys); no secret operations" },
+  # block-buffer below 0.12.1: a hasher reused after a panic in the middle
+  # of an update may read stale buffer state. Only in the server's graph,
+  # through digest 0.10 in openidconnect 4.0.1, oauth2 5.0.0, sqlx 0.9.0
+  # and soketto 0.8.1, each at its latest release; every block-buffer
+  # below 0.12.1 is affected. The server never reuses a hasher after a
+  # panic. Our own sha2 is 0.11, so the SDK graph is clear.
+  { id = "GHSA-qwgh-2vcv-g2f7", reason = "block-buffer < 0.12.1 comes through digest 0.10 in openidconnect, oauth2, sqlx and soketto, all at their latest; no hasher is reused after a panic" },
+  # zstd 0.13 and zstd-safe 7: stale data across a reused stream context,
+  # Seekable::decompress past the end, and uninitialized memory after a
+  # failed legacy frame. They come only through foyer-storage 0.22.6
+  # (foyer's latest), which uses zstd for its disk tier's optional value
+  # compression. The server's artwork, previews and Plex caches never
+  # turn compression on (foyer's default is none), so no zstd stream is
+  # made or read; it uses no Seekable and no legacy frame. The fixes are
+  # zstd 0.14.3 and zstd-safe 8.2.0, which foyer 0.22 cannot take: drop
+  # these when foyer moves to them.
+  { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 comes only through foyer-storage, whose value compression the server never turns on" },
+  { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 comes only through foyer-storage, which uses no Seekable; its compression is never on here" },
+  { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 comes only through foyer-storage, whose value compression the server never turns on" },
+  # zstd-safe 7's unsound safe API (use-after-free, double free, reads
+  # out of bounds in its contexts, buffers, dictionaries, Seekable and
+  # training): cargo audit reports them, as warnings. Not reachable here
+  # for the same reason: foyer's compression is never on.
+  { id = "RUSTSEC-2026-0395", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0396", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0397", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0399", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0400", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0401", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0402", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0404", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0405", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  { id = "RUSTSEC-2026-0406", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and

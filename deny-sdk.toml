@@ -8,9 +8,25 @@ confidence-threshold = 0.95
 # The licenses any public crate may bring in. Each is checked alone, and
 # a small graph uses few of them, which is no reason to warn.
 unused-allowed-license = "allow"
+# Each public crate is checked alone, and only some link UniFFI.
+unused-license-exception = "allow"
 allow = [
   "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
   "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense", "BSL-1.0", "CDLA-Permissive-2.0",
+]
+# UniFFI, behind the `uniffi` feature of types, protocol and the client
+# SDK and in spoolframe-client-ffi: MPL-2.0, whose copyleft is per file,
+# so an app links it under its own license so long as UniFFI's own files
+# stay MPL. Named crate by crate: MPL from anywhere else still fails.
+exceptions = [
+  { crate = "uniffi", allow = ["MPL-2.0"] },
+  { crate = "uniffi_bindgen", allow = ["MPL-2.0"] },
+  { crate = "uniffi_core", allow = ["MPL-2.0"] },
+  { crate = "uniffi_internal_macros", allow = ["MPL-2.0"] },
+  { crate = "uniffi_macros", allow = ["MPL-2.0"] },
+  { crate = "uniffi_meta", allow = ["MPL-2.0"] },
+  { crate = "uniffi_pipeline", allow = ["MPL-2.0"] },
+  { crate = "uniffi_udl", allow = ["MPL-2.0"] },
 ]
 
 # Accepted advisories (PX-09 C-15, written down in PX-11 finding 39), so
@@ -21,6 +37,11 @@ allow = [
 # acceptance waiting for a crate that is not there is no reason to warn.
 unused-ignored-advisory = "allow"
 ignore = [
+  # basic-toml: unmaintained, not vulnerable. Read at build time by
+  # askama's derive macro, in uniffi_bindgen: only spoolframe-client-ffi's
+  # `bindgen` feature (its uniffi-bindgen bin) builds it, never the
+  # library an app links or the server.
+  { id = "RUSTSEC-2026-0374", reason = "basic-toml is read only by askama's derive macro, at build time, in the optional bindings generator" },
   # rsa: not in the SDK's graph today. Accepted only for verification:
   # should it come in, check that nothing does an RSA private-key
   # operation with it, which the Marvin timing attack targets.
