@@ -1,5 +1,629 @@
 # Changelog
 
+## 0.16.4-beta.1 (2026-10-29)
+
+A beta, for internal testing before external testers: `0.16` and
+`latest` stay on 0.16.3.
+
+- Dependencies: sha2 0.11 and argon2 0.6 (the SDK's graph no longer has
+  digest 0.10). Passwords and offline PINs hashed before still verify.
+  zstd-sys 2.1.2 for its wasm allocator fix; the zstd advisories that
+  come through foyer's disk-tier compression, which the server never
+  turns on, are accepted in deny.toml and .cargo/audit.toml with the
+  reason.
+- `PlaylistEdited` names the entries an edit's adds made (`added`, in
+  the edits' order; `None` from an older server). The SDK's
+  `edit_playlist` returns `PlaylistEdited { revision, added }`.
+- A user's other devices are told when their watch state changes
+  (feature `spoolframe:watch-events`): `WatchChanged { items }` for a
+  mark, a card hidden from or put back on Home, an offline sync, and a
+  playback coming into progress, watched or stopped (not each progress
+  report), never to the connection that made it. The SDK passes them on as
+  `Client::watch_events()`, each a `WatchEvent { server, items }`.
+- `TrustedProfile.pin_digits`: how many digits the PIN has, when it is
+  asked for on the device and its length was kept, for a PIN pad's
+  boxes; `None` otherwise and from an older server.
+- PROTOCOL.md says what was already so: a progress report keeps a
+  playback alive while the player plays from a full buffer and reads
+  nothing, as while paused; and `MarkWatched`/`MarkUnwatched` take a
+  season or a show, marking every episode (specials included for a
+  show), unwatched starting progress over.
+- What plays after an episode, and where a show's Continue goes, are
+  asked of the server (feature `spoolframe:next-episode`):
+  `NextEpisode { item, mode, specials }`, `mode` `in_order` or
+  `first_unwatched`, and `ShowNext { show }`, the first episode in
+  progress else the first unwatched. Both answer `NextEpisode { item }`,
+  `None` at the end. The SDK has them on `On<NextEpisodes>`:
+  `next_episode(&item, NextMode, specials)` and `show_next(&show)`.
+- A config reload (SIGHUP, `config reload`) no longer waits for the
+  encoders to be detected again: they are, in the background, one
+  detection at a time. On a busy host a detection takes half a minute,
+  and the next reload, and the admin who asked, waited all of it; two
+  detections at once also wrote their samples to the same files.
+- FFI, profiles and sign-in: `SpoolClient.whos_watching(server,
+  open_last)` (the profiles with how each opens, and the `LaunchTarget`),
+  `remember_last`/`last_profile`/`forget_last`, `sign_in_paired`,
+  `redeem_invite_code` and `profile_values` (a `ProfileValues` object);
+  `SpoolSession.unlock_as_offline`, `unlocked_offline`,
+  `reauth_options` and `portable_identity`; `SpoolPortable.overview`;
+  `SpoolError.pin_failure()` and `invite_refusal()`; and free functions
+  for the rules and links (`pin_refusal`, `pin_digits_range`,
+  `password_min_chars`, `password_problem`, `address_class`,
+  `parse_app_link`, `is_invite_link`, `invite_share_link`,
+  `invite_next`, `profile_hash`) and WebAuthn's JSON
+  (`passkey_request_json`, `passkey_creation_json`,
+  `passkey_assertion_from_json`, `passkey_registration_from_json`).
+- SDK, portable identities: `Portable::overview(id)` reads an
+  identity's settings page in one call (its roots, the devices it gave
+  credentials to with this device's marked, where its root is, when this
+  device's credential is due, and `IdentityAbilities`: sign root actions
+  here, sync the root, join a guest invite). `Portable::guest_list()`
+  names the guests signed in here, leaving out this device's own key
+  identities.
+- SDK: `Client::profile_store(server, username)` keeps what an app
+  saves per profile (its queue, track choices, recent searches) in the
+  app's plain data, never its secrets: `get`/`set` and
+  `get_json`/`set_json` by name. Named by `profile_hash`, the Linux
+  app's own `sha256("<server>/<username>")`, so its files move over as
+  they are.
+- SDK, confirming and passkeys: `Session::reauth_options()` says how
+  "Confirm it's you" confirms (`Reauth::Passkey { request }` with an app
+  passkey, else `Reauth::Password`), in place of seven copies of "begin,
+  and on NotFound ask for the password". `Session::leave_server` signs a
+  portable user in again by itself when the server wants a recent
+  sign-in, and leaves from that session.
+  The `webauthn` module writes a `PasskeyRequest` and `PasskeyCreation`
+  as WebAuthn's JSON options (`request_options`, `creation_options`,
+  user verification required) and reads a platform's JSON answer back
+  (`assertion`, `registration`): what Android's Credential Manager and a
+  browser take and give.
+- SDK, "Who's watching": `Client::whos_watching(server)` merges the
+  sessions here, the profiles the server trusts this device for and the
+  saved sign-ins by username, each with how it opens (`ProfileOpens`:
+  its session, trusted, portable, or sign in again). `launch_target`
+  says where an app goes at start (`LaunchTarget`: sign in, pick, or
+  open one: the server's auto-login profile, else the last one browsed
+  unless it is locked). `remember_last`, `last_profile` and
+  `forget_last` keep the last profile in the app's plain data. A PIN
+  that unlocked a profile's downloads offline is held in memory, once:
+  `Session::unlock_as_offline` opens the profile online with it, and
+  `launch_target` opens such a locked profile. `sign_in_paired` signs a
+  portable identity in on every server a pairing brought, one failing
+  never stopping the rest.
+- SDK, invites: `InviteLookup.link` is the invite as a link, also for a
+  code typed in: made of the server that answered with its addresses,
+  relays and pkarr lookup, which the Apple app's own link left out.
+  `Client::redeem_invite_code` joins with a typed code in one call.
+  `invite_next(info, lookup, identities_here)` says what an invite's
+  check leads to (`InviteNext`: make an account, join as an identity,
+  needs an identity, save the server, pair a server, or refused), and
+  `InviteRefusal::of_outcome`/`of_error` read a refusal either way.
+- SDK, sign-in rules written once: `Pin::new` (4 to 8 digits, with
+  `PinRefusal`), `PIN_MIN_DIGITS`/`PIN_MAX_DIGITS`, `PinFailure::of`
+  (what a PIN pad says: wrong, wait, sign in again, not known here),
+  `PASSWORD_MIN` and `password_problem` (the server's own minimum, now in
+  `spoolframe-types`), and `address_class` for where a device asking to
+  be signed in is (`LocalPublicV6` for a public IPv6 address on the
+  network; warn for the internet). `Session::unlock` refuses text that
+  is no PIN before sending it, so no guess is spent. `parse_app_link`
+  reads every link an app is opened with (`AppLink`: invite, approve,
+  pair, item), `is_invite_link` and `invite_share_link`, by the
+  protocol's parsers: `www.spoolframe.app` and other hosts are not
+  invites.
+- SDK, downloads while the app is away: `Downloads::run_until_cancelled`
+  (and `run_until_done`) no longer waits for nothing on a mobile network
+  that downloads may not use: it ends with `RunEnd::Held`.
+  `Downloads::worth_background()` says a background run is worth asking
+  for; `RunTally::progress` gives a run's progress as a task scheduler
+  shows it (`RunProgress`, never going back). For a background refresh,
+  `Downloads::needs_refresh()`, `refresh_all()` (every profile with a
+  watch, play or like to send, or music followed, brought up to date;
+  one not reached never stops the others: `RefreshReport`) and
+  `refresh_hint()`. Moved from the Apple app. In the FFI,
+  `DownloadRun.wait()` returns `RunEnd` (`Done` or `Held`), and
+  `DownloadRun.progress()`.
+- SDK, downloads of a season or a show: `Downloads::plan_children` and
+  `start_children(session, id, source, only_unwatched)` start each
+  episode as its own download, by season and episode, leaving out those
+  here already and, if asked, those watched (`SkippedChild`); one
+  failing to start never stops the rest (`BatchStart { started,
+  skipped, failed }`).
+- SDK, downloads as an offline library, from disk alone:
+  `Downloads::library()` (shows with their episodes, films, and those in
+  progress), `continue_watching()` (one per show), `show_resume(show)`
+  (the episode begun, else the next not watched), `of_item(server, id)`
+  (the finished copy wins), and `profiles_here()` (each profile's
+  downloads and bytes, and the bytes only they hold; a file shared by
+  two profiles counted once in the total).
+- SDK, music downloads: `MusicDownload.phase` (`MusicPhase`: `Waiting`,
+  `Moving`, `Paused`, `Done`, `Partial { failed }`) and `failed`, over
+  its tracks; `Downloads::retry_music`, `pause_music` and
+  `resume_music`; and `DownloadEvent::MusicChanged` each time a track it
+  holds moves on.
+- SDK, downloads: a position recorded here no longer wipes what the
+  user marked (`set_watched(true)` then `record_position` lost the mark):
+  each change is merged with the watch there. A position inside the
+  credits (the download's markers), or in the last 30 s, marks the
+  download watched. `record_position`, `set_watched`, `record_play` and
+  `record_like` wake the manager, which sends them at once when a session
+  of the user is here, and `DownloadEvent::WatchSynced { server, user,
+  items }` says when the server heard them: the apps' waits before
+  reading the server again go.
+- SDK, downloads, what an app shows: `LocalDownload::watched_here`,
+  `resume_point`, `resume_from(asked)` (the place here wins while the
+  server has not heard it), `can_retry`, `actions`, `progress`,
+  `file_tracks`, `file_selection` and `pick_tracks`; `DownloadList`
+  keeps a list in step with the events; `DownloadFailure::suggested()`
+  says what to offer for a failure (`FailureRemedy`). Moved from the
+  Linux and Apple apps.
+- New crate `spoolframe-client-ffi` (MIT OR Apache-2.0, published to
+  crates.io with the other client crates, for Android to depend on):
+  the client SDK and the HLS bridge for Swift and Kotlin through UniFFI
+  0.32.2, moved here from the iOS repository and typed throughout. Every
+  call throws `SpoolError`, `SdkError` case for case with its fields as
+  values, and `kind()`; catalog, playback plans, downloads, invites,
+  reachability and the connection path cross as records and enums, not
+  JSON; event streams (profiles, playlists, libraries, downloads,
+  subtitle timing, a playback's uplink share) are objects with an async
+  `next()`. A `uniffi-bindgen` bin (feature `bindgen`) generates the
+  bindings. See its README for building the XCFramework and the AAR.
+- FFI, features: the protocol's own `Feature` crosses (no copy of it),
+  and `SpoolSession.has_feature(feature)` says whether one is on. A
+  feature's calls are an object got only with it on:
+  `SpoolSession.next_episodes()` (`NextEpisodesApi`: `next_episode`,
+  `show_next`; `None` when off) and `SpoolClient.invite_passkeys(link)`
+  (`InvitePasskeysApi`: `link`, `begin_invite_passkey`,
+  `redeem_invite_passkey`), which throws `SpoolError.FeatureOff
+  { feature }` when the invite's server does not have it. `FeatureOff`,
+  in the SDK too, is `ErrorKind::ServerTooOld`. `NextMode` crosses.
+- FFI: `edit_playlist` returns the SDK's `PlaylistEdited { revision,
+  added }`, and the SDK's playlist cursor keeps the `added` the server
+  gave. `WatchingProfile.pin_digits` says how long a profile's PIN is,
+  from its session or the server's trusted row, for a PIN pad's boxes.
+- FFI, settings: `quality_choices()`, `quality_choice_index`,
+  `quality_setting` and `quality_from_setting` (the kept form, old forms
+  too), `default_quality_for(limit, platform, at_home)`, and
+  `SpoolSession.at_home(local_addrs)` and `default_quality(limit,
+  local_addrs)` with the addresses the app reads; `screen_for_hdr(show,
+  dolby_vision)`; `probe_capabilities(player, hardware, display,
+  decoders)`, with `CodecPlayer` the app implements and
+  `PlayerDecoders`; `subtitle_offset_stepped(timing, steps)`;
+  `max_name_chars()` and `fit_name(name)`.
+- FFI, what the apps say about media and connections, so the apps stop
+  keeping their own copies: `language(code)`, `audio_track_label`,
+  `subtitle_track_label` and `track_menu(tracks, selection)` (`Language`,
+  `TrackLabel`, `MenuRow`, `TrackMenu`); `picture_class`, `audio_format`
+  (`AudioFormat`, depth and rate apart); `remaining`, `ago`, `played`,
+  `path_chip`, `filter_year_range`; `show_years`, `years_aired_text` and
+  `caption_parts(item, today)`; `SpoolError.who_updates()`;
+  `FilterValues.decades`; `reach_facts` and `reach_report(reachability,
+  now, build, device)`; `server_display_host(entry)`; and
+  `plan_encoded_height(plan)`. The SDK's describe parts and the types'
+  `YearsAired` and `Caption` take the `uniffi` derive.
+- FFI: the loopback HLS bridge is the `hls-bridge` feature, on by
+  default. Built with `--no-default-features` (Android's Media3, which
+  plays directly) it leaves out the loopback HTTP server (hls-bridge's
+  `http`), `play`, `playback_url` and `SpoolError.Bridge`; the rest of
+  playback stays.
+  `SpoolSession.open_playback` opens a playback under a token with no
+  URL, and `playback_reader(token, length)` gives a `PlaybackReader`
+  over the SDK's media readers (`read(offset, length)`, `size`,
+  `content_type`, `set_flushing`) for a `DataSource`: a direct
+  playback's file, or a progressive conversion's output. `play` is
+  `open_playback` served on the bridge, and `playback_url(token)` serves
+  an opened one. `PlaybackStart.url` is optional: `None` for a playback
+  only opened. The replans keep a playback served where it was. A
+  conversion's HLS is read by name with or without the bridge:
+  `open_playback_resource(token, path)` reads a playlist or segment whole
+  (`PlaybackResource { content_type, length }`) and
+  `read_playback_resource(token, path, offset, length)` reads ranges of
+  it, so a run of ranges in one segment is one fetch; the server's
+  playlists name their resources relatively, for Media3's
+  `HlsMediaSource` to resolve under the app's scheme.
+- SDK: `describe::Language` has `String` fields and names every
+  language `spoolframe_types::language` knows (`iso639_1`), with English
+  names for the common ones; `AudioFormat` says `bit_depth` and
+  `sample_rate` apart. `Language`, `TrackLabel`, `MenuRow`, `TrackMenu`
+  and `AudioFormat` take the `uniffi` derive, and the FFI's copies go
+  (the Swift and Kotlin fields are as they were).
+  `LibraryPager::next_page` returns how many items it added, read from
+  `items()`. A paired server's item reported here clears only that item
+  and Home from the catalog cache. `Downloads::of_item` and
+  `show_resume` read only that item's downloads, through an index that
+  reads the directory again when a download was added or removed there,
+  by this process or another (an iOS background session or share
+  extension, Android's WorkManager). `Downloads::rescan` (the FFI's
+  `rescan_downloads`) reads it all again, the downloads under way too:
+  call it on returning to the foreground and when background download
+  work completes.
+- FFI: a paired server's item plays through the SDK's
+  `Session::open_any_playback`, and each token is one registry entry with
+  its bridge stream, so a replanned playback keeps `proxied` and its
+  subtitle menu. `open_playback_resource` reads a media segment or the
+  init it already holds from that copy; a playlist or a subtitle is read
+  again. SDK: `ManagedPlayback::is_planned`, `is_converted` and
+  `is_handle`. HLS bridge: `token()`, `Bridge::register_shared`,
+  `Bridge::stream`, `Stream::menu` and `Stream::set_menu`.
+- Types: `Container::mime()`, the one MIME type of each container, which
+  the server's HTTP playback, the HLS bridge and the FFI's reader all
+  use. The bridge now types Matroska, MPEG-TS, AVI and Ogg files as the
+  server always has (`video/x-matroska`, `video/mp2t`,
+  `video/x-msvideo`, `audio/ogg`) rather than leaving the player to
+  sniff them. `CalendarDate::from_unix_days` and `of_unix`.
+- HLS bridge: the HTTP server is the `http` feature, on by default for
+  the crate and named by the server; without it, `Bridge::resource(token,
+  name)` reads what the bridge would answer `/<token>/<name>` with,
+  whole, with no hyper or socket. The workspace takes the crate without
+  default features.
+- SDK: a download's `resume_point` is `None` at position 0: a download
+  stopped at its start plays from the start, with no "Resume from 0:00".
+- SDK: `address_class` and the home network read one rule for a public
+  IPv6 address.
+- SDK: `SdkError::kind()` says what an app does about an error
+  (`ErrorKind`: `Transport`, `SessionEnded`, `NeedsPin`,
+  `NeedsNewPassword`, `NeedsRecentSignIn`, `RateLimited { retry_after }`,
+  `ServerTooOld`, `Refused`), and `SdkError::is_transport()` is public.
+- SDK: `LocalDownload`, `LocalArtwork`, `MusicDownload`, `OfflineTrack`
+  and `OfflineMark` are serde. `Downloads::run_until_cancelled` takes a
+  `RunCancel` that stops it from any thread and ends with
+  `RunEnd::Cancelled`.
+- Types, protocol and SDK: a `uniffi` feature, off by default, derives
+  UniFFI's traits on the public types an app sees. The server never
+  builds it.
+- HLS bridge: `Kind::of(&Playback)`, `Kind::entry()`, `mime(Container)`
+  and `changed(before, after)`: how a playback's plan is served, and
+  whether a replan needs a new URL, which each app worked out itself.
+
+- SDK: `SdkError::IdentityChanged` names the saved server's pinned
+  server id (`server_id`, `None` until one is pinned), so an app can say
+  which server the alert is about. The plan types (`ConvertedVideo`,
+  `ConvertedAudio`, `AudioAction`, `ConvertedSubtitle`,
+  `SubtitleAction`, `PlannedAudio`, `PlannedSubtitle`,
+  `SubtitleDelivery`, `Rung`, `Quality`) are re-exported.
+- Regular features are back, and they are how a server knows a client
+  handles something: a request, or an event. The client names those it
+  handles in `Hello.features`, and the server answers in
+  `ServerInfo.features` with those of them it has (both absent when
+  empty). A feature is on for a connection only when both named it; the
+  server sends its events and answers its requests only there, and a
+  feature's request on another connection is `Unsupported`, which the SDK
+  reports as `SdkError::NotOnServer { request }`. On the wire a feature is
+  its `spoolframe:` name; in code it is `Feature`, and a set of them
+  `Features`. The SDK names every one it knows by default
+  (`ClientOptions::features`); `Session::has_feature(feature)` says
+  whether one is on. A feature's calls are reached through it being on:
+  `Session::feature::<G>()` (`On<G>`) and, before a session,
+  `Client::invited::<G>(link)` (`Invited<G>`), each
+  `SdkError::FeatureOff { feature }` when it is off, with nothing sent.
+  The first are `spoolframe:profile-events` and
+  `spoolframe:invite-passkeys`. There is no minor revision: a new reply
+  field is `serde(default)`, an `Option` where its absence means
+  something else, and nothing is decided from a version number.
+- An admin can delete a user (`admin.userDelete`, Delete on the user's
+  page): their sessions, ways to sign in, devices'
+  trust and PIN, watch state, plays, likes, downloads, playlists and
+  Plex link go, in one transaction; server-wide playlists of theirs too.
+  Whoever saw a playlist of theirs is told it is
+  gone, and whoever pinned one gets a note. What others keep of what
+  they did stays: the audit log, and who made an invite, downloaded a
+  subtitle or timed one. An admin cannot delete themself, nor the last
+  enabled admin or the last with a password. Disable a user to keep them.
+- Profile events, sent only to a connection where the
+  `spoolframe:profile-events` feature is on (both sides named it): a
+  user's devices are told `ProfileRemoved { user }` when the user is disabled, deleted or leaves,
+  or (that device alone) when the device is forgotten for them, and
+  `PinChanged { user, required }` when the user sets, changes or removes
+  their PIN on another device, or an admin clears it, or (that device
+  alone) the user or an admin turns the PIN on or off for a device. The SDK passes
+  them on as `Client::profile_events()`, a broadcast of `ProfileEvent {
+  server, change }`, with `ProfileChange::{Removed, PinChanged,
+  SessionEnded { user, reason }, PasswordChangeRequired}`; the last two
+  come from a call's answer, so older servers give them too. On
+  `PinChanged` the SDK locks the profile shown again, where its PIN is
+  asked for, and forgets the old PIN kept for offline.
+
+- An invite can make an account whose one way to sign in is an app
+  passkey, with no password (feature `spoolframe:invite-passkeys`):
+  `BeginInvitePasskey { code, username, display_name }` begins the passkey's registration for the
+  account to be, after the invite and username are checked as
+  `RedeemInvite` checks them, and `RedeemInviteWithPasskey { code,
+  finish, remember }` makes the account, keeps the passkey and signs the
+  device in, in one transaction. Only the device that began it finishes
+  it, within 5 minutes. The SDK has
+  `Client::invited::<InvitePasskeys>(link)`, whose `begin_invite_passkey(username, display_name)` and
+  `redeem_invite_passkey(made, remember)` save the server as
+  `redeem_invite` does.
+
+- Types: `Item::title()`, `is_watched()`, `resume_position()`,
+  `resume_from()` and `progress()`, and `PlaybackState::resume_from()`
+  and `progress(duration)` (position, time left, fraction, watched).
+  `resume_from` is `None` (the start) once watched or never begun, so
+  it goes straight into `PlaybackOptions::start`.
+
+- SDK: markers. `Markers::skip_at` says which button shows (Skip
+  Intro, Skip Credits, or Next for credits that run to the end when
+  something follows), `up_next_due` when Up next shows (over 2 min, from
+  the credits, else the last 30 s), and `credits_start` where the
+  credits begin. `MarkerTracker::on_position` turns positions into
+  actions: the button when it changes, Up next, and an intro skipped by
+  itself once, which `undo()` takes back within 5 s.
+
+- SDK: `tracks::map_selection(tracks, plan, selection)` says which of
+  the player's streams carry the picked tracks: the audio stream, and
+  whether the subtitle is burned in, in the output, a file to fetch, or
+  an embedded stream (counted without the external ones).
+  `offered_but_not_in_stream` lists the subtitles a pick of which needs
+  the server; `subtitle_change` keeps the audio that plays.
+
+- `PlaybackPlan::summary()` gives a plan flat, for an info panel: its
+  kind (direct, remux, convert, unsupported), the video and audio that
+  play (codec, copied or encoded, an encode's channels and bitrate), how
+  the subtitle shows, the reasons, an encode's height, the ladder's
+  heights and whether HDR is mapped to SDR. A remux is a conversion
+  whose streams are all copied, with no encoded rung.
+
+- SDK: a managed playback reports progress by itself. The app tells it
+  what the player does with `ManagedPlayback::set_state(PlayerState::
+  Playing { pos } | Paused { pos })` from its own ticks; the SDK reports
+  every 10 s while playing, at once on a move back and on a pause, and
+  keeps an idle playback alive (a paused one reports every 60 s, a
+  progressive conversion that reads nothing reads a byte).
+  `flush_and_close()` reports the last position, then stops, after
+  every report before it. Nothing the app passes needs to be `Send`.
+- SDK: `ManagedPlayback::restart(RestartCause::Expired | TransportLost)`
+  starts a playback the app found dead again where the viewer was. It
+  shares one budget with the SDK's own resumes (3 in 5 minutes, whole
+  again after 2 minutes of play), so an app keeps none of its own.
+  `PlaybackStopped::of(&error)` and `ManagedPlayback::stopped()` say
+  why a playback is over for good (admin, signed out, gone, cannot
+  play, changed, too many restarts, closed).
+
+- SDK: `ManagedPlayback::subtitle_file()` fetches the playback's
+  subtitle file (an external one, or one read as text), asking again
+  every 5 s while the server is still reading it, and refuses an empty
+  file or one that is not UTF-8 text.
+
+- SDK: `ManagedPlayback::stalled(stalled_for, length)`: an app whose
+  own player stalls on a direct play says so, and past 3 s, on a link
+  whose share is under the file's bitrate, the playback is planned again
+  for the link once, as the SDK's direct reader already does.
+
+- SDK: `ManagedPlayback::change_tracks(selection, remember)` plays
+  other tracks from where the viewer is: a subtitle change on the
+  playback when the audio stays, else a new playback with the tracks in
+  place of this one (no restart budget spent; a refusal leaves the old
+  one playing). `remember` keeps the pick for the series or movie.
+  `PlaybackBackend` gains `set_track_override` and `read_subtitle`
+  (defaults refuse).
+
+- SDK: `ManagedPlayback::events()`: `HandleChanged` when the playback
+  runs under a new handle (a URL handed to AirPlay or Chromecast is then
+  dead), and `SubtitleRetimed` when the subtitle that shows, as a file,
+  was timed anew on any device: read it again. A retimed subtitle in a
+  converted output or burned in is planned again by the SDK itself.
+
+- SDK: `Session::open_playback_next(id, after, selection, options)`
+  (and `ManagedPlayback::open_after`) opens the item after the one
+  playing: once that one's player has read it (10 s at most), so the
+  server does not end it first, and through `Busy`, tried 4 times
+  500 ms, 1 s and 1.5 s apart.
+
+- SDK: `PlayerSession` runs one player's playbacks in order: `start`
+  (which first reports and stops what played), `restart` and `end` each
+  wait for the one before, and a start overtaken by a later start or end
+  is ended as its answer comes (`PlaybackClosed`), so a late reply never
+  plays over what the viewer picked since.
+
+- SDK: `PlaybackController` drives an app's player (its
+  `PlaybackDriver`: `load`, `play`, `pause`, `seek`, `stop_and_wait`,
+  `failed`; not `Send`) through a playback: `seek_coalesced` gathers a
+  converted stream's seeks within 250 ms into one restart and keeps a
+  paused player paused, a re-plan or a playback started again gets a new
+  reader where the viewer was, and a direct play resumed before its
+  length is known prerolls paused and seeks at `length_known()`. The app
+  gives a `LocalSpawn` for its own thread.
+
+- SDK (experimental `federation`): `Session::open_any_playback(id,
+  selection, options)` plays any item as a `ManagedPlayback`; a paired
+  server's (`fed:`) one starts from that server or through this one, and
+  the playback carries its route (`route()`, `proxied()`): reads, seeks,
+  changes and the stop go to the session that plays it, progress goes
+  home by the `fed:` id (`update_watch_progress`), across restarts and
+  re-plans.
+
+- A library id names its paired server too (`LibraryId::origin()`, as
+  `MediaId::origin()`), and `UserSummary::portable_id()` and
+  `is_guest()` read a guest's identity from its user id, so an app no
+  longer splits ids on ":".
+
+- Search and copies, worked out once: `Copies::choices(item)` lists the
+  servers a title plays from (its own first, each other once, the one
+  that plays ticked, offline ones marked), `SearchResults::only_from(
+  origin)` keeps one server's hits with counts of what is left (people
+  only for the user's own server, episodes hidden under a show only
+  while a show is left),
+  `see_all_count(kind)` is the number for "See all", and
+  `hidden_under(kind)` the episodes left under their show and the
+  shows' titles.
+
+- Home, worked out once: `HomeScreen::hero()` (the first continued,
+  else the newest added), `up_next_merged()` (Continue watching then Up
+  next, each show once) and `featured(now, limits)`, what a TV's Top
+  Shelf or Watch Next shows: what was continued in the last 48 hours,
+  then Up next of shows not already continued, then Recently added,
+  films and shows only, each show once.
+
+- SDK: `Session::search_hits` serves every server: without the
+  experimental `federation` it is the server's own search, as hits of
+  its own items, instead of `Unsupported`. Any other error is the
+  search's, never hidden by a second search.
+
+- SDK (experimental `federation`): `Session::paired_servers()` lists
+  the paired servers the user sees (`SharingServer`: the server, the
+  libraries it shares, whether its Home row shows), online first;
+  `server_of(id)` says whether an item is the user's own, a paired
+  server's, or no longer available (unpaired, unshared, or in Home's
+  `unavailable`); `library_groups()` groups the libraries by server,
+  the user's own first, then online, then offline.
+  `LibraryDiff::unshared(before, after)` names the libraries a server
+  still paired stopped sharing. `PairedServers` does the same from data
+  an app already has.
+
+- SDK: `Session::library_pager(library, sort, filter)` reads a library
+  a page at a time (`next_page`, `has_more`, `reset` for a new order or
+  filter), one page in flight at a time, and drops a page of an order
+  since reset; `Session::show(id)` gives a show with the season its
+  page opens on (the first numbered, Specials after) and how many
+  numbered seasons it has; `Session::tracks_of(id)` the tracks a track,
+  album or artist stands for, as `AlbumTracks`, an artist's albums read
+  four at once and kept in order, for Play next and Add to queue.
+
+- Types: `ItemQuery { sort, filter }`, a library's sort and filter as
+  an app keeps them: `sort_by(key)` (again flips it), `toggle(value)`,
+  `has(value)`, `set_years(from, to)` (a To before the From moves up to
+  it), `reset(part)`, `is_default()` and `to_request()`, which leaves
+  out the default order and an empty filter. `ItemFilterValues::
+  sanitize(sort, filter)` keeps of a saved choice what the library still
+  offers, and `sort_keys()` lists its Sort menu.
+
+- Types: `VideoTrack::resolution()` classes a track as the server
+  classes an item (by width and height, so a 1920×800 film is 1080p),
+  and `dynamic_range()` reads its `HdrFormat` as a filter's range.
+
+- SDK: `Session::show_tree(id)` reads a show and each season's
+  episodes (`ShowTree`); `up_next()` is the first episode part-way
+  through, else the first not watched, and `first_tab(opened)` the
+  season a page opens on. `Session::mark_watched_in(tree, scope,
+  watched)` marks the show, a season or an episode with one request and
+  updates the tree. Types: `Show::years_label(today)` gives "2019",
+  "2019–" (aired in the last twelve months) or "2019–2023".
+
+- SDK: `Session::recently_played_albums(limit)`, Home's "Recently
+  played music": the albums of the latest tracks played, each once,
+  newest first, made from the tracks' own album fields.
+
+- SDK: `queue::PlayQueue<T>`, what plays next as the apps have it: a
+  context (an album or list, with shuffle and repeat) and the items
+  added by hand (`play_next`, `add`), which shuffle and repeat never
+  touch. `next(auto)` plays an item again at its end with repeat one;
+  `previous(position)` starts the item again past 3 s, else goes back
+  through what played. Also `set_context`, `extend_context`,
+  `replace_ahead`, `remove`, `move_to`, `remove_ahead`, `move_ahead`,
+  `carry` and `rows()` for Up next. It saves as JSON, and the Linux
+  app's saved queues load: the protocol's `Repeat` reads its names too.
+
+- SDK: `Session::follow_playlist(id, PlayFrom::{Random, Entry, Place},
+  settings) -> PlaylistCursor` follows a playlist the server plays: the
+  entry playing and what comes up in the server's order, topped up below
+  20 ahead. `advance()` tells the server the place (not twice, not with
+  repeat one), `pick(entry)` starts there, `set_settings` saves shuffle
+  or repeat from the place and reads what comes up anew, and
+  `up_next(limit)` gives `UpNext { entries, note }` (plays again, ends,
+  or, from a server without `UpcomingInPlaylist`, the playlist read 50 at
+  a time). Calls run one at a time in order; of saves waiting, only the
+  latest is sent. A fresh shuffle picks again past an unavailable entry,
+  three times.
+
+- SDK: playlist edits as the apps make them.
+  `Session::edit_playlist_merging` retries once on a conflict, on the
+  revision the refusal names (`Edited { revision, added }`);
+  `add_to_playlist(id, items)` returns the entries it made, for Undo
+  with `remove_playlist_entries`; `random_playlist_entry(id)` an entry
+  that can play; `playlist_entries(id)` every entry as a stream, a page
+  of 200 at a time.
+
+- SDK: `playlists::view`, playlists as the screens show them, as data
+  an app words itself: `PlaylistList::sections()` (built in, yours,
+  shared with you, everyone's), `pinned()` and `new_pin_position()`;
+  `pin_drop` and `with_pin_at` for a drag within Pinned, `move_edit`
+  for a drag of an entry; `add_targets(list, kind)` with an `Offer`
+  saying why one is greyed (read only, admins edit, use the heart, has
+  everything); `continue_entry(page)` past watched and unavailable
+  entries and `entry_note`; `page_counts`; `album_heart`,
+  `heart_likes`; `new_playlist` checks; `editor_controls`;
+  `share_change` for the sharing editor; `PinNotesShown` so a pin note
+  shows once. Protocol: `PlaylistSummary::facts()`, whose it is and
+  what it holds.
+
+- SDK: hearts. `LikeCache` keeps what is known of each track's heart
+  (`liked(id)`, `heart(tracks)` full, half or empty, `learn(hearts)`),
+  shows a tap at once with `toggle(tracks) -> Pending` and puts it back
+  with `Pending::rollback`, and says each change on a watch.
+  `Session::toggle_like(cache, sends, tracks)` does all of it against
+  the server, `set_liked(items, liked)` likes or un-likes, and
+  `heart_of(cache, id)` asks for a heart not known yet. Offline,
+  `OfflineTrack.liked` is the like made here and not sent yet, else
+  whether Liked downloaded holds it, so the heart is right after a
+  relaunch.
+
+- SDK: `PlaybackController` follows an item's markers when given a
+  `MarkerTracker` (`with_markers`): the app feeds it positions with
+  `on_position(at)` and gets the `MarkerAction`s back, an intro skipped
+  by itself is sought by the controller and only once the playback has
+  settled, and `undo_skip()` goes back. `length_known` now takes the
+  length, which the markers need.
+
+- SDK: `PlaybackQuality::choices()` (Auto, 20 to 1 Mbit/s, Original),
+  `choice_index()` (a bitrate not offered is Auto's), and its settings
+  form: `Display`/`FromStr` and serde as `auto`, `original` or bits per
+  second, reading `"Auto"`, `"Original"`, a bare number and
+  `{"Bitrate": n}` as apps kept them before.
+  `ConnectionPath::at_home(local_addrs, heard)` counts a direct IPv6
+  path into the /64 of one of this device's global addresses as home,
+  as the LAN is; the app passes its addresses in, read with its
+  platform's API. `PlaybackQuality::default_for(limit, platform,
+  at_home)`: the device's limit, else Original on tvOS, else Original
+  at home and Auto away; `Session::at_home(local_addrs)` and
+  `default_quality(limit, local_addrs)` for the session's server.
+
+- Protocol: `PlaybackPlan::encoded_height()`, the lines a conversion
+  encodes to, for "Auto (720p)". `fit_name(name)` trims and cuts a
+  passkey's, identity's or pairing's name to `MAX_NAME_CHARS` (64).
+
+- Types: `ClientCapabilities::from_decoders(decoders, display)` builds
+  capabilities with the defaults every client set by hand (PCM always,
+  range reads then progressive when nothing else is said, no height or
+  bitrate limit, the screen's HDR as the limit).
+  `ClientCapabilities::probe(probe_codec, hardware, display, player)`
+  is the iOS probe for every platform: each of
+  `candidate_codec_strings()` asked of a `CodecProbe` (any
+  `Fn(&str) -> bool`: VideoToolbox, MediaCodecList, GStreamer), the
+  hardware decoders the platform names, 10-bit where HEVC decodes in
+  hardware, and the player's own fixed lists.
+  `DisplayCapabilities::for_hdr(show, dolby_vision)`: HDR on is HDR10
+  and HLG; Dolby Vision only when asked. `ItemFilterValues::decades()`.
+  `SubtitleTiming::offset_stepped(steps)`: the ± control's 0.1 s steps,
+  held within `MAX_OFFSET_MS`. `Show::year_range(today)` as
+  `YearsAired` parts, and `Item::caption_parts(today)`, a card's caption.
+
+- SDK: `describe`, what the apps say of media as parts each platform
+  words: `language(code)` (ISO 639-1 for the platform's names), track
+  labels (a title only where it says more than the language and role;
+  `forced`) and the audio and subtitles menus (`track_menu`, a repeated
+  label numbered from 2 for a system menu), a file's picture class,
+  music's lossless format, time left and how long ago, plays (with when
+  last), `SdkError::who_updates()`, the path chip and a filter's years
+  (`year_range`). `Reachability` prints its facts (`Display`) and
+  `report(now, build, device)` the whole Copy report, as the apps write
+  it. `ServerEntry::display_host()` picks the home-network address to
+  show.
+
+- SDK: a catalog cache, opt-in with
+  `ClientOptions::catalog_cache(CacheConfig)` (3000 reads by default).
+  Home, the libraries, a library's pages, an item's details and the
+  playlists are answered at once from memory and read again behind what
+  is shown once old (Home after 10 s, playlists after 30 s, pages after
+  2 min, items and shows after 5, libraries and music after 10);
+  `Session::catalog_changes()` says which of the session's reads came
+  back different (`CatalogChanged { key }`). Each change clears what it
+  touches (watch state: all but the libraries and the playlists list; a
+  playlist or a heart: Home, items and playlists; Pinned: the list and
+  Home; a Home row: Home; pairing, sharing, leaving: everything), as do
+  the server's playlist, heart and library events.
+  `Client::watch_changed(server, items)` forgets those items, their
+  shows and Home. `Session::forget_catalog()` and
+  `Client::forget_catalog()` forget it all.
+
 ## 0.16.3 (2026-10-28)
 
 - A paired server's new name reaches the servers it is paired with.
@@ -20,7 +644,7 @@
   codec has no other encoder. Meanwhile no playback is planned with or
   sent to it, a failed encode does not move onto it, and a playback
   already converting on it moves its next run (a seek) elsewhere.
-  Encodes running on it go on. Settings › GPUs shows a quarantined
+  Encodes running on it go on. The Server page's GPUs card shows a quarantined
   card and how long it has left. A plain error exit or a stall does not
   quarantine. With one GPU, playbacks go to software H.264 meanwhile,
   and HDR that needs that card's 10-bit encoder is refused.
