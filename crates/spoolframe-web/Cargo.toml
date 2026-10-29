@@ -20,14 +20,16 @@ spoolframe-admin-api = { workspace = true, features = ["client"] }
 # as the Linux app takes it.
 qrcode = { version = "0.14", default-features = false }
 
+# `required::option`, for the `/auth` answers' required `Option` fields;
+# its calendar dates, for the pages' dates (host-tested too).
+spoolframe-types = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 dioxus = { workspace = true }
 dioxus-logger = { workspace = true }
 gloo-net = { workspace = true }
 js-sys = "0.3"
 jsonrpsee = { workspace = true, features = ["wasm-client"] }
-# `required::option`, for the `/auth` answers' required `Option` fields.
-spoolframe-types = { workspace = true }
 tracing = { workspace = true }
 wasm-bindgen = { workspace = true }
 # Awaits the passkey prompt's promise (P3-05).

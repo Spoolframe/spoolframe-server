@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::portable::{
     CredentialError, GenesisError, PortableIdentityState, PortableUserId, Signature,
     UserDeviceCredential, root_set, verify_device_proof,
@@ -46,7 +45,7 @@ impl SignInNonces {
     pub fn begin(&self, endpoint: &str) -> Option<[u8; 32]> {
         let now = self.clock.now();
         let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
+        getrandom::fill(&mut nonce).expect("the OS gives random bytes");
         let mut pending = self.pending.lock();
         pending.retain(|_, (_, began)| now.duration_since(*began) < SIGN_IN_NONCE_LIFETIME);
         pending.remove(endpoint);

@@ -207,6 +207,7 @@ pub struct Paired {
 
 /// Why no pair was made, or a peer was turned away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PairingRefused {
     /// No invite has this code, or it was revoked: counted as a wrong
@@ -339,6 +340,7 @@ impl ShareLibraries {
 /// A server paired by `PairServer` (client protocol), as the app
 /// shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PeerServer {
     /// What it calls itself.
     pub name: String,

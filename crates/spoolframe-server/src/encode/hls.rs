@@ -22,11 +22,16 @@
 //!   measures from the first packet it gets.
 //! - A copied video can only be cut at the source's keyframes. ffmpeg
 //!   counts its 6 s from where a run starts, so a restart at a keyframe off
-//!   the grid would cut elsewhere than a run from 0. Instead every keyframe
-//!   is a cut: the segments are the source's GOPs (1 to 10 s in practice),
-//!   the same whatever a run started from. Only the first keyframe is not
-//!   one: ffmpeg never cuts at the first keyframe of a run, so the first
-//!   segment runs from 0 to the second keyframe.
+//!   the grid would cut elsewhere than a run from 0. Instead the cuts come
+//!   from the keyframes, the same whatever a run started from. Where the
+//!   segment muxer can write the header first (`plan::header_first`),
+//!   [`Segments::copied`]: from 0, each at the first keyframe at least
+//!   `transcode.copy_segment_secs` past the last, so a segment is one or
+//!   more of the source's GOPs, and the muxer is given those times.
+//!   Otherwise (AC-3 or E-AC-3 audio, which the HLS muxer writes the
+//!   header after) [`Segments::at_keyframes`]: every keyframe is a cut
+//!   but the first, as ffmpeg never cuts at a run's first keyframe, so
+//!   the first segment runs from 0 to the second keyframe.
 //! - Audio alone cuts anywhere: a 6 s grid.
 
 use std::fmt::Write as _;

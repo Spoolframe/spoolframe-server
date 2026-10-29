@@ -58,6 +58,7 @@ pub(crate) fn reservation(request: &Request) -> usize {
         | Request::SeekPlayback { .. } => MAX_OUTCOME,
         Request::BeginPasskeySignIn { .. }
         | Request::BeginPasskeyRegistration
+        | Request::BeginInvitePasskey(_)
         | Request::BeginConfirmPasskey => CEREMONY_REPLY,
         _ => SMALL_REPLY,
     }
@@ -69,7 +70,8 @@ pub(crate) fn reservation(request: &Request) -> usize {
 ///
 /// - sign-ins a stranger makes only with a token from the bucket all
 ///   strangers share (`LoginPassword`, `Begin`/`FinishPasskeySignIn`,
-///   `RedeemInvite`, `LookupInvite`, `Begin`/`FinishPortableSignIn`,
+///   `RedeemInvite`, `BeginInvitePasskey`, `RedeemInviteWithPasskey`,
+///   `LookupInvite`, `Begin`/`FinishPortableSignIn`,
 ///   `RedeemPortableInvite`, and P7-08's `IdentityRecord`,
 ///   `IdentityRecordByHandle`, `OfferPairing`,
 ///   `FetchPairing` and `AnswerPairing`, and P8-04's `RedeemPlayToken`),
@@ -113,6 +115,8 @@ pub fn on_strangers_budget(request: &Request) -> bool {
             | Request::BeginPasskeySignIn { .. }
             | Request::FinishPasskeySignIn { .. }
             | Request::RedeemInvite(_)
+            | Request::BeginInvitePasskey(_)
+            | Request::RedeemInviteWithPasskey(_)
             | Request::LookupInvite(_)
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)

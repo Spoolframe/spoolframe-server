@@ -44,6 +44,7 @@ pub struct DownloadDevice {
 
 /// What a download is made from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownloadSource {
     /// Original quality: the file, converted only where the device needs
@@ -65,6 +66,7 @@ pub enum DownloadSource {
 
 /// Which tracks a download carries. The video is always there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownloadTracks {
     /// Every track of the file: the only choice that may send the file
@@ -107,6 +109,7 @@ impl DownloadTracks {
 /// What a download in original quality with every track would be
 /// (`DownloadOptions::original`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OriginalDownload {
     /// The file itself, byte for byte: the device plays it as it is.
@@ -129,6 +132,7 @@ pub enum OriginalDownload {
 /// a picture subtitle in an Apple file when the viewer prefers pictures
 /// (MP4 carries none), or one the server cannot write to a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LeftOutSubtitle {
     /// Its place in `Tracks`' `subtitles`.
     pub subtitle: u32,
@@ -138,6 +142,7 @@ pub struct LeftOutSubtitle {
 
 /// What the device may download of an item (`DownloadOptions`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DownloadOptionsInfo {
     /// The item's tracks, as `Tracks` gives them: what `Chosen` names by
     /// place.
@@ -164,6 +169,7 @@ pub struct DownloadOptionsInfo {
 /// About one download option (`DownloadOptions`): how large it is and
 /// whether it waits for a conversion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DownloadEstimate {
     pub source: DownloadSource,
     /// About how many bytes the file is with every track: the item's
@@ -176,6 +182,7 @@ pub struct DownloadEstimate {
 
 /// Whether a download option waits for a conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadReadiness {
     /// Nothing to convert, or the server already keeps the conversion:
@@ -190,6 +197,7 @@ pub enum DownloadReadiness {
 
 /// Where a download is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownloadState {
     /// Waiting its turn: for its conversion, for room on the server, or
@@ -226,6 +234,7 @@ pub enum DownloadState {
 /// Why a download failed (`DownloadState::Failed`), beside its reason in
 /// words.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownloadFailure {
     /// The device has no room for it: `needed_bytes` more must be free.
@@ -253,9 +262,41 @@ pub enum DownloadFailure {
     Unknown,
 }
 
+/// What to offer for a download that failed, by its cause
+/// ([`DownloadFailure::suggested`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum FailureRemedy {
+    /// It needs `needed_bytes` more free: offer to manage storage, then
+    /// try again.
+    ManageStorage { needed_bytes: u64 },
+    /// It may come whole another time: offer to try again.
+    Retry,
+    /// The same request finds the same: offer only to remove it.
+    Remove,
+}
+
+impl DownloadFailure {
+    /// What to offer for this cause; `None` for one that does not say
+    /// (`Other`, or a cause this build does not know): whether to try
+    /// again then depends on the download, as the SDK's
+    /// `LocalDownload::can_retry` decides.
+    pub fn suggested(&self) -> Option<FailureRemedy> {
+        match self {
+            Self::NoSpace { needed_bytes } => Some(FailureRemedy::ManageStorage {
+                needed_bytes: *needed_bytes,
+            }),
+            Self::Network | Self::ServerStoppedConverting => Some(FailureRemedy::Retry),
+            Self::SourceMissing | Self::NoLongerAvailable => Some(FailureRemedy::Remove),
+            Self::Other | Self::Unknown => None,
+        }
+    }
+}
+
 /// The tracks a download's file carries, by their place in `Tracks`, in
 /// the file's order after its video.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileTracks {
     pub audio: Vec<u32>,
     pub subtitles: Vec<u32>,
@@ -264,6 +305,7 @@ pub struct FileTracks {
 /// What a download's file is: for a player, and for labelling its tracks
 /// offline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DownloadFile {
     pub container: Container,
     pub tracks: FileTracks,
@@ -320,6 +362,7 @@ pub struct OfflineWatch {
 /// What became of one [`OfflineWatch`], and of one [`OfflinePlay`] or
 /// [`OfflineLike`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum OfflineWatchOutcome {
     /// Written: it was newer than what the server had. A play is always

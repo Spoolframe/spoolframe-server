@@ -12,12 +12,14 @@ pub const ORIGINAL_LANGUAGE: &str = "original";
 /// Every field is required on the wire: a peer that leaves one out
 /// is refused, not filled in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TrackPreferences {
     pub audio: AudioPreferences,
     pub subtitles: SubtitlePreferences,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AudioPreferences {
     /// ISO 639 codes in order of preference, or [`ORIGINAL_LANGUAGE`].
     /// Empty: the file's default track.
@@ -36,6 +38,7 @@ impl Default for AudioPreferences {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitlePreferences {
     pub mode: SubtitleMode,
     /// ISO 639 codes in order of preference. Empty: the audio's language.
@@ -52,6 +55,7 @@ pub struct SubtitlePreferences {
 
 /// When subtitles are shown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SubtitleMode {
     /// Always, in a preferred language.
@@ -71,6 +75,7 @@ pub enum SubtitleMode {
 /// playback, which track is chosen; in a subtitle search, the
 /// results' order, or which are listed at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SdhPreference {
     /// SDH before plain subtitles.
@@ -92,6 +97,7 @@ pub enum SdhPreference {
 /// signs, a foreign line) in a subtitle search's results: the
 /// same four ways as [`SdhPreference`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum ForcedPreference {
     /// Forced ones before the rest.
@@ -111,6 +117,7 @@ pub enum ForcedPreference {
 /// server, so any device shows them styled and sized, or as the pictures
 /// they are.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum BitmapPreference {
     /// Drawn by the device if it can, else burned into the video.

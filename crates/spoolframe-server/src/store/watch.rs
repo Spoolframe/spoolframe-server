@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::{QueryBuilder, Sqlite};
 
+use spoolframe_policy::watch::WatchRules;
+use spoolframe_types::PlaybackState;
+
 use super::{Store, StoreError};
 use crate::principal::Principal;
 
@@ -17,6 +20,16 @@ pub struct WatchRow {
     pub duration_ms: Option<i64>,
     pub watched: bool,
     pub updated_at: i64,
+}
+
+impl WatchRow {
+    /// The state clients are shown of it, by `rules`.
+    pub fn state(&self, rules: &WatchRules) -> PlaybackState {
+        let position = self
+            .position_ms
+            .map(|p| std::time::Duration::from_millis(p.max(0) as u64));
+        rules.playback_state(position, self.watched)
+    }
 }
 
 /// What a user's watch state says of one top-level item (a movie, or a
@@ -141,28 +154,30 @@ impl Store {
     /// Save one title's state (P8-03): `update`, now, or as of `at` and
     /// only when newer than the state under its key; and `folded`, the
     /// title's other rows on paired servers' keys, go in the same
-    /// transaction, as this one is its newest state. Whether it was
-    /// written.
+    /// transaction, as this one is its newest state. `None` when it was
+    /// not written; else the row under its key before, read in the same
+    /// transaction, if there was one.
     pub async fn save_title_watch(
         &self,
         principal: Principal,
         update: WatchUpdate<'_>,
         folded: &[String],
         at: Option<i64>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<Option<WatchRow>>, StoreError> {
         let principal = principal.to_string();
         let mut tx = self.begin_write().await?;
-        if let Some(at) = at {
-            let stored: Option<i64> = sqlx::query_scalar(
-                "SELECT updated_at FROM watch_state WHERE principal = ?1 AND media_id = ?2",
-            )
-            .bind(&principal)
-            .bind(update.media_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if stored.is_some_and(|stored| stored >= at) {
-                return Ok(false);
-            }
+        let before: Option<WatchRow> = sqlx::query_as(
+            "SELECT media_id, show_id, position_ms, duration_ms, watched, updated_at \
+             FROM watch_state WHERE principal = ?1 AND media_id = ?2",
+        )
+        .bind(&principal)
+        .bind(update.media_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(at) = at
+            && before.as_ref().is_some_and(|row| row.updated_at >= at)
+        {
+            return Ok(None);
         }
         write_watch(
             &mut tx,
@@ -183,7 +198,7 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
-        Ok(true)
+        Ok(Some(before))
     }
 
     /// The keys `principal`'s state of a title with one of `title_ids`

@@ -13,8 +13,10 @@ pub mod codec;
 pub mod device_sign_in;
 pub mod downloads;
 pub mod experimental;
+pub mod features;
 pub mod federation;
 pub mod fingerprint;
+mod home_view;
 pub mod invite;
 pub mod invite_admin;
 pub mod lan;
@@ -22,6 +24,7 @@ pub mod media;
 pub mod messages;
 pub mod pairing;
 pub mod passkeys;
+mod plan_summary;
 pub mod playback;
 pub mod playlists;
 pub mod plex;
@@ -32,23 +35,33 @@ pub mod relay_access;
 pub mod resource;
 pub mod rpc;
 pub mod search;
+mod search_view;
 pub mod server_id;
 pub mod streams;
 
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+
 pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
+pub use features::{Feature, Features};
+pub use home_view::{Featured, FeaturedLimits, FeaturedRow};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};
 pub use messages::{
-    AddressNetwork, AuthMethod, ChangePassword, ConfirmPassword, DeviceAddress, DeviceInfo,
-    DeviceSignInRequest, Error, Event, Hello, HomeScreen, InviteLookupOutcome, LoginPassword,
-    LookupInvite, MAX_HELLO_TEXT, ManifestKind, PROTOCOL_VERSION, PinProof, PinState,
-    PortableSignIn, PortableTie, RedeemInvite, RedeemPortableInvite, Reply, Request,
-    RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo, ServerRow, SessionId, SessionInfo,
-    TrackPreferencesInfo, TrustedProfile, UserSummary, WhoAmIReply,
+    AddressNetwork, AuthMethod, BeginInvitePasskey, ChangePassword, ConfirmPassword, DeviceAddress,
+    DeviceInfo, DeviceSignInRequest, Error, Event, Hello, HomeScreen, InviteLookupOutcome,
+    LoginPassword, LookupInvite, MAX_HELLO_TEXT, ManifestKind, NextMode, PROTOCOL_VERSION,
+    PinProof, PinState, PortableSignIn, PortableTie, RedeemInvite, RedeemInviteWithPasskey,
+    RedeemPortableInvite, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo,
+    ServerRow, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary,
+    WhoAmIReply,
 };
 pub use passkeys::{
-    FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, NONCE_LEN, PasskeyCreation,
-    PasskeyInfo, PasskeyRegistrationBegun, PasskeyRequest, PasskeySignInBegun,
-    app_passkey_challenge, is_app_rp_id,
+    FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, MAX_NAME_CHARS, NONCE_LEN,
+    PasskeyCreation, PasskeyInfo, PasskeyRegistrationBegun, PasskeyRequest, PasskeySignInBegun,
+    app_passkey_challenge, fit_name, is_app_rp_id,
+};
+pub use plan_summary::{
+    AudioSummary, PlanKind, PlanSummary, SubtitleHow, SubtitleSummary, VideoSummary,
 };
 pub use playback::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
@@ -66,6 +79,7 @@ pub use search::{
     Copies, SearchCounts, SearchGroup, SearchHit, SearchRequest, SearchResults, TitleCopy,
     TopResult,
 };
+pub use search_view::{HiddenUnder, PlayFromChoice};
 pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};
 
 /// Development ALPN. Breaking revisions currently retain `/1` and require

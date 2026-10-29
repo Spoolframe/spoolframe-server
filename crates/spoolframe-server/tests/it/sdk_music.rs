@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Item, MediaId, Platform};
 use spoolframe_client_sdk::{
-    Client, ClientOptions, ConnectionState, Device, DownloadPhase, DownloadSettings, MAX_READ,
-    MemoryStorage, MusicTarget, NetworkKind, OfflineMark, OfflineMusic, PlaybackOptions, Session,
+    Client, ClientOptions, ConnectionState, Device, DownloadEvent, DownloadPhase, DownloadSettings,
+    MAX_READ, MemoryStorage, MusicPhase, MusicTarget, NetworkKind, OfflineMark, OfflineMusic,
+    PlaybackOptions, Session,
 };
 use spoolframe_protocol::playlists::{Kinds, PlaylistEdit, Visibility};
 use spoolframe_server::test_support::{album, artist};
@@ -564,7 +565,8 @@ async fn a_downloaded_playlist_s_added_track_comes_down_and_a_removed_one_goes_u
     let revision = playlists
         .edit(&actor, &made.id, made.revision, vec![add("32")])
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let dir = TestDir::new("spoolframe-sdk-music-playlist").await;
     let storage = Arc::new(MemoryStorage::default());
     let client = device(&server, &storage, &dir).await;
@@ -630,7 +632,8 @@ async fn a_downloaded_playlist_s_added_track_comes_down_and_a_removed_one_goes_u
             ],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     downloads.sync_music(&session).await.unwrap();
     settled(&client).await;
     let changed = kept();
@@ -956,7 +959,8 @@ async fn road_trip(server: &TestServer, keys: &[&str]) -> (String, u64) {
         .playlists
         .edit(&actor, &made.id, made.revision, adds)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     (made.id, revision)
 }
 
@@ -1200,6 +1204,44 @@ async fn a_track_liked_elsewhere_comes_down_while_connected() {
             true,
         )
     );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A music download says where it is over its tracks, and each track's
+/// move is told as the download's: done once every track is here.
+#[tokio::test]
+async fn a_music_download_is_told_as_its_tracks_move_and_ends_done() {
+    let server = music_server("sdk-music-phase").await;
+    let dir = TestDir::new("spoolframe-sdk-music-phase").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    session
+        .like(&[track_id("32"), track_id("33")])
+        .await
+        .unwrap();
+    let mut events = client.download_events();
+    let started = client
+        .downloads()
+        .start_music(&session, MusicTarget::Liked)
+        .await
+        .unwrap();
+    settled(&client).await;
+    let mut told = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(DownloadEvent::MusicChanged(music)) => told.push(music),
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        told.iter().any(|m| m.key == started.key),
+        "no MusicChanged for it"
+    );
+    let now = client.downloads().music_downloads().remove(0);
+    assert_eq!((now.phase, now.done, now.failed), (MusicPhase::Done, 2, 0));
     client.close().await;
     server.stop().await;
 }

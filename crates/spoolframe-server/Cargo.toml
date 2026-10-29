@@ -38,7 +38,8 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 # PKCE's S256 (PX-42): SHA-256, as RFC 7636 specifies.
 sha2 = { workspace = true }
-password-hash = { workspace = true }
+# Salts, nonces, tokens and keys: the OS's random bytes.
+getrandom = { workspace = true }
 clap = { workspace = true }
 image = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server", "ws-client"] }
@@ -57,7 +58,7 @@ spoolframe-plex = { workspace = true }
 spoolframe-protocol = { workspace = true }
 # The HTTP playback port (PX-49): the bridge the apps use, without its
 # `sdk` feature, so the server never builds the client SDK.
-spoolframe-hls-bridge = { workspace = true }
+spoolframe-hls-bridge = { workspace = true, features = ["http"] }
 # `unstable-net-report`: the net report, for whether the NAT maps ports
 # per destination (`spoolframe_nat_mapping_varies`). Only exports types;
 # outside iroh's semver, so an iroh bump may need a change there.
@@ -113,6 +114,8 @@ spoolframe-test-dir = { workspace = true }
 cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
+# The feature-gated calls as the apps make them, through the FFI's objects.
+spoolframe-client-ffi = { path = "../spoolframe-client-ffi" }
 # Signs the portable credentials and states the store tests check (P7-02).
 ed25519-dalek = { workspace = true }
 # A software security key root for the P7-08 tests.

@@ -18,6 +18,9 @@ pub struct TrustedProfile {
     pub display_name: String,
     /// The user's PIN is asked for on this device (P2-08).
     pub pin_required: bool,
+    /// How many digits that PIN has, when it is asked for and its length
+    /// was kept (a PIN set since the server kept it).
+    pub pin_digits: Option<u8>,
     pub auto_login: bool,
 }
 
@@ -190,12 +193,13 @@ impl Store {
             .execute(&self.pool)
             .await?;
         }
-        type Row = (LocalUserId, String, Option<String>, bool, bool);
+        type Row = (LocalUserId, String, Option<String>, bool, Option<i64>, bool);
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT u.id, u.username, u.display_name, \
                     EXISTS (SELECT 1 FROM pin_credentials p WHERE p.user_id = u.id) \
                     AND EXISTS (SELECT 1 FROM pin_required r \
                                 WHERE r.user_id = u.id AND r.endpoint_id = t.endpoint_id), \
+                    (SELECT p.digits FROM pin_credentials p WHERE p.user_id = u.id), \
                     t.auto_login \
              FROM trusted_endpoints t JOIN users u ON u.id = t.user_id \
              WHERE t.endpoint_id = ?1 AND t.last_used_at > ?2 AND u.disabled_at IS NULL \
@@ -208,12 +212,18 @@ impl Store {
         Ok(rows
             .into_iter()
             .map(
-                |(user, username, display_name, pin_required, auto_login)| TrustedProfile {
-                    user,
-                    display_name: display_name.unwrap_or_else(|| username.clone()),
-                    username,
-                    pin_required,
-                    auto_login,
+                |(user, username, display_name, pin_required, digits, auto_login)| {
+                    TrustedProfile {
+                        user,
+                        display_name: display_name.unwrap_or_else(|| username.clone()),
+                        username,
+                        pin_required,
+                        // Only for the device that asks for the PIN.
+                        pin_digits: digits
+                            .filter(|_| pin_required)
+                            .and_then(|d| u8::try_from(d).ok()),
+                        auto_login,
+                    }
                 },
             )
             .collect())

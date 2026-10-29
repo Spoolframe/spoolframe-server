@@ -24,6 +24,7 @@ pub const MAX_ART_PIXELS: u64 = 40_000_000;
 /// The kinds of item a playlist may hold, ticked when it is made. They
 /// can change later only to allow more.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Kinds {
     pub movies: bool,
     pub episodes: bool,
@@ -58,6 +59,7 @@ impl Kinds {
 
 /// An item's kind, as `KindNotAllowed` names the one refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     Movie,
@@ -87,6 +89,7 @@ impl From<MediaKind> for ItemKind {
 
 /// One change to a playlist's entries (`EditPlaylist`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlaylistEdit {
     /// Add `id` before entry `before`, or at the end when `None` (or when
@@ -126,6 +129,7 @@ impl PlaylistEdit {
 
 /// Who sees a playlist, as whoever manages it sets it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Visibility {
     /// Its owner alone.
@@ -143,6 +147,7 @@ pub enum Visibility {
 
 /// One user a playlist is shared with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistShare {
     /// As `WhoAmI` gives it: `local:<uuid>`, or `portable:` and 64 hex
     /// digits.
@@ -174,6 +179,7 @@ impl PlaylistShare {
 
 /// Whose account a user is (`spoolframe:playlist-sharing`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum UserKind {
     /// An account on this server: `local:<uuid>`.
@@ -216,6 +222,7 @@ pub struct ShareCandidatePage {
 /// How a playlist stands to whoever asks: what a client lists its
 /// playlists apart by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum PlaylistOwnerKind {
     /// Theirs, personal or shared by them.
@@ -231,6 +238,7 @@ pub enum PlaylistOwnerKind {
 /// A built-in playlist: every user has one of each, made by the
 /// server, never renamed, re-kinded, shared or deleted. Music only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum Builtin {
     /// The tracks the user liked (`Like`), newest first unless they
@@ -249,6 +257,7 @@ pub enum Builtin {
 /// `All` or `None`; an album's is `All` when every track it has now is
 /// liked, `Some` when some are, `None` when none are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum Liked {
     All,
@@ -261,6 +270,7 @@ pub enum Liked {
 
 /// A playlist as one user sees it, without its entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistSummary {
     pub id: String,
     pub name: String,
@@ -298,8 +308,67 @@ pub struct PlaylistSummary {
     pub custom_art: bool,
 }
 
+/// Whose a playlist is, as its card says under its name
+/// ([`PlaylistSummary::facts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistOwner {
+    /// Liked or All, the server's own.
+    BuiltIn(Builtin),
+    /// The user's, shared with `shared_with` people (none: personal).
+    Yours { shared_with: usize },
+    /// Someone else's, shared with the user: by `owner` where the server
+    /// names them.
+    SharedWithYou {
+        owner: Option<String>,
+        can_edit: bool,
+    },
+    /// Every user's; `can_edit` for an admin.
+    ServerWide { can_edit: bool },
+}
+
+/// What a playlist's card says of it, worked out once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistFacts {
+    pub owner: PlaylistOwner,
+    pub kinds: Kinds,
+    /// Tracks and nothing else: it plays as music does, with no place
+    /// kept and no watched to skip.
+    pub music_only: bool,
+    pub pinned: bool,
+}
+
+impl PlaylistSummary {
+    /// Whose it is and what it holds, for its card. A kind of owner from
+    /// a newer server reads as shared with the user: someone else's.
+    pub fn facts(&self) -> PlaylistFacts {
+        let owner = match (self.builtin, self.owner_kind, &self.visibility) {
+            (Some(builtin), _, _) => PlaylistOwner::BuiltIn(builtin),
+            (None, PlaylistOwnerKind::Mine, Visibility::Shared { with }) => PlaylistOwner::Yours {
+                shared_with: with.len(),
+            },
+            (None, PlaylistOwnerKind::Mine, _) => PlaylistOwner::Yours { shared_with: 0 },
+            (None, PlaylistOwnerKind::ServerWide, _) => PlaylistOwner::ServerWide {
+                can_edit: self.can_manage,
+            },
+            (None, PlaylistOwnerKind::SharedWithMe | PlaylistOwnerKind::Unknown, _) => {
+                PlaylistOwner::SharedWithYou {
+                    owner: self.owner_name.clone(),
+                    can_edit: self.can_edit,
+                }
+            }
+        };
+        PlaylistFacts {
+            owner,
+            kinds: self.kinds,
+            music_only: self.kinds.tracks && !self.kinds.movies && !self.kinds.episodes,
+            pinned: self.pinned.is_some(),
+        }
+    }
+}
+
 /// A playlist holding an item, as the item's details list it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistRef {
     pub id: String,
     pub name: String,
@@ -323,6 +392,7 @@ pub struct PlaylistRef {
 /// One entry of a playlist, with its item as the catalog has it now and
 /// the user's watch state on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistEntry {
     pub entry: EntryId,
     pub item: spoolframe_types::Item,
@@ -336,6 +406,7 @@ pub struct PlaylistEntry {
 /// One page of a playlist's entries (`GetPlaylist`). Items the user may
 /// not see are neither listed nor counted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistPage {
     pub playlist: PlaylistSummary,
     pub entries: Vec<PlaylistEntry>,
@@ -358,6 +429,7 @@ pub struct PlaylistPage {
 
 /// How a user plays a playlist, kept per user and playlist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaySettings {
     /// Play in a shuffled order: every playable entry once per round.
     pub shuffle: bool,
@@ -368,15 +440,20 @@ pub struct PlaySettings {
 
 /// What plays again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum Repeat {
-    /// The end of the playlist ends it.
+    /// The end of the playlist ends it. (Each takes the Linux app's own
+    /// name too, as its saved queues have it.)
     #[default]
+    #[serde(alias = "Off")]
     Off,
     /// The same entry, over and over.
+    #[serde(alias = "One")]
     One,
     /// The whole playlist again after the last entry; shuffled, the same
     /// round again.
+    #[serde(alias = "All")]
     All,
     /// A kind this build does not know: played as `Off`.
     #[serde(other)]
@@ -387,6 +464,7 @@ pub enum Repeat {
 /// item, the user's watch state on it (to resume where they were) and its
 /// intro and credits markers (to skip the credits).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistNext {
     pub entry: EntryId,
     pub item: spoolframe_types::Item,
@@ -435,6 +513,7 @@ pub struct PlexUnmapped {
 /// A pinned playlist that left the user's Pinned: say so once, then
 /// `DismissPinNotes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PinNote {
     pub playlist_id: String,
     /// Its name when it left.
@@ -443,6 +522,7 @@ pub struct PinNote {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum PinNoteReason {
     /// It is no longer shared with them.
@@ -456,6 +536,49 @@ pub enum PinNoteReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn summary(owner_kind: PlaylistOwnerKind, visibility: Visibility) -> PlaylistSummary {
+        PlaylistSummary {
+            id: "p".into(),
+            name: "Heists".into(),
+            kinds: Kinds {
+                tracks: true,
+                ..Kinds::default()
+            },
+            owner_kind,
+            visibility,
+            can_edit: false,
+            can_manage: false,
+            revision: 1,
+            pinned: None,
+            builtin: None,
+            owner_name: Some("Alice".into()),
+            artwork: None,
+            custom_art: false,
+        }
+    }
+
+    #[test]
+    fn whose_it_is_reads_from_the_summary() {
+        let shared = Visibility::Shared {
+            with: vec![PlaylistShare::new("local:b", false)],
+        };
+        let mine = summary(PlaylistOwnerKind::Mine, shared).facts();
+        assert_eq!(mine.owner, PlaylistOwner::Yours { shared_with: 1 });
+        assert!(mine.music_only);
+        let theirs = summary(PlaylistOwnerKind::SharedWithMe, Visibility::Personal).facts();
+        assert_eq!(
+            theirs.owner,
+            PlaylistOwner::SharedWithYou {
+                owner: Some("Alice".into()),
+                can_edit: false
+            }
+        );
+        let newer = summary(PlaylistOwnerKind::Unknown, Visibility::Personal).facts();
+        assert!(matches!(newer.owner, PlaylistOwner::SharedWithYou { .. }));
+        let mut liked = summary(PlaylistOwnerKind::Mine, Visibility::Personal);
+        liked.builtin = Some(Builtin::Liked);
+        assert_eq!(liked.facts().owner, PlaylistOwner::BuiltIn(Builtin::Liked));
+    }
 
     const EPISODES: Kinds = Kinds {
         movies: false,

@@ -1350,6 +1350,7 @@ async fn run(
             }),
             optimized: Some(pool.clone()),
             federation: federation.clone(),
+            downloads: Some(downloads.clone()),
         },
         admin_origins,
         admin_proxies,

@@ -16,6 +16,7 @@ use crate::search::PersonRole;
 
 /// What a library holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum LibraryKind {
     Movies,
@@ -25,6 +26,7 @@ pub enum LibraryKind {
 
 /// A library of one kind of media.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Library {
     pub id: LibraryId,
     pub title: String,
@@ -40,6 +42,7 @@ pub struct Library {
 /// The server a library of another server's is shared from, so a
 /// client groups libraries by server, an offline one last and greyed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LibraryServer {
     /// Its server id: the origin a `fed:` id names.
     pub server_id: String,
@@ -52,6 +55,7 @@ pub struct LibraryServer {
 
 /// The role a piece of artwork plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum ArtworkKind {
     Poster,
@@ -62,6 +66,7 @@ pub enum ArtworkKind {
 /// A reference to artwork. Clients fetch the image through the client
 /// protocol with the `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Artwork {
     pub id: ArtworkId,
     pub kind: ArtworkKind,
@@ -69,6 +74,7 @@ pub struct Artwork {
 
 /// The session user's progress on an item.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaybackState {
     /// Where playback stopped, or `None` if it never started.
     #[serde(with = "duration_ms::option")]
@@ -96,7 +102,46 @@ pub struct PlaybackState {
     pub last_played_at: Option<i64>,
 }
 
+impl PlaybackState {
+    /// Where a Play goes on from, as `PlaybackOptions::start` takes it:
+    /// `None`, the start, once watched or never begun; else where it
+    /// stopped.
+    pub fn resume_from(&self) -> Option<Duration> {
+        if self.watched {
+            return None;
+        }
+        self.position.filter(|p| !p.is_zero())
+    }
+
+    /// How far through an item of `duration` the user is, for a
+    /// progress bar and "20 min left".
+    pub fn progress(&self, duration: Option<Duration>) -> Progress {
+        let position = self.position.unwrap_or_default();
+        let duration = duration.filter(|d| !d.is_zero());
+        Progress {
+            position,
+            remaining: duration.map(|d| d.saturating_sub(position)),
+            fraction: duration.map(|d| (position.as_secs_f64() / d.as_secs_f64()).clamp(0.0, 1.0)),
+            watched: self.watched,
+        }
+    }
+}
+
+/// How far through an item the user is ([`PlaybackState::progress`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Progress {
+    /// Where playback stopped; zero if it never started.
+    pub position: Duration,
+    /// What is left to play; `None` with no length known.
+    pub remaining: Option<Duration>,
+    /// `position` over the length, from 0 to 1; `None` with no length
+    /// known.
+    pub fraction: Option<f64>,
+    pub watched: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Movie {
     pub id: MediaId,
     pub title: String,
@@ -122,6 +167,7 @@ pub struct Movie {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Show {
     pub id: MediaId,
     pub title: String,
@@ -155,6 +201,7 @@ pub struct Show {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Season {
     pub id: MediaId,
     pub show_id: MediaId,
@@ -168,6 +215,7 @@ pub struct Season {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Episode {
     pub id: MediaId,
     pub show_id: MediaId,
@@ -210,6 +258,7 @@ pub struct Episode {
 /// listings, search and the home rows, where Plex gives names without
 /// the ids a person is listed by.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct CastMember {
     /// The id a person search gives them: their items are listed with
     /// `PersonItems`, as a found person's are.
@@ -227,6 +276,7 @@ pub struct CastMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Artist {
     pub id: MediaId,
     pub name: String,
@@ -235,6 +285,7 @@ pub struct Artist {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Album {
     pub id: MediaId,
     pub artist_id: MediaId,
@@ -251,6 +302,7 @@ pub struct Album {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Track {
     pub id: MediaId,
     pub album_id: MediaId,
@@ -287,6 +339,7 @@ pub struct Track {
 
 /// What a marked stretch of an item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum MarkerKind {
     Intro,
@@ -299,6 +352,7 @@ pub enum MarkerKind {
 
 /// A stretch of a movie or episode a viewer may want to skip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Marker {
     pub kind: MarkerKind,
     /// Where it starts, in milliseconds from the start of the item.
@@ -314,6 +368,7 @@ pub struct Marker {
 /// Any one item a catalog returns. On the wire it is the item's own object
 /// with a `kind` field added, for example `{"kind": "movie", "id": …}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Item {
     Movie(Movie),
@@ -325,7 +380,110 @@ pub enum Item {
     Track(Track),
 }
 
+/// The years a show ran, as its card says them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum YearsAired {
+    /// "2019": it ran in one year, or only one is known.
+    One(u16),
+    /// "2019–": an episode aired in the last twelve months.
+    Running(u16),
+    /// "2019–2023".
+    Between(u16, u16),
+}
+
+/// "2019", "2019–", "2019–2023".
+impl std::fmt::Display for YearsAired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            YearsAired::One(year) => write!(f, "{year}"),
+            YearsAired::Running(first) => write!(f, "{first}\u{2013}"),
+            YearsAired::Between(first, last) => write!(f, "{first}\u{2013}{last}"),
+        }
+    }
+}
+
+impl Show {
+    /// The years it ran, from its first year and the day its latest
+    /// episode aired: one year when that was the same year, running when
+    /// it aired in the twelve months up to `today`, else both years. With
+    /// no first year, the latest episode's year alone; `None` with
+    /// neither.
+    pub fn year_range(&self, today: CalendarDate) -> Option<YearsAired> {
+        let Some(last) = self.last_aired else {
+            return self.year.map(YearsAired::One);
+        };
+        let Some(first) = self.year else {
+            return Some(YearsAired::One(last.year()));
+        };
+        if last.year() <= first {
+            return Some(YearsAired::One(first));
+        }
+        // A year back from today, compared field by field: most years have
+        // no 29 February to land on.
+        let year_ago = (today.year() - 1, today.month(), today.day());
+        if (last.year(), last.month(), last.day()) >= year_ago {
+            Some(YearsAired::Running(first))
+        } else {
+            Some(YearsAired::Between(first, last.year()))
+        }
+    }
+
+    /// [`Show::year_range`] as text: "2019", "2019–", "2019–2023".
+    pub fn years_label(&self, today: CalendarDate) -> Option<String> {
+        self.year_range(today).map(|years| years.to_string())
+    }
+}
+
+/// The line under a card's title, in parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum Caption {
+    /// A film's year.
+    Year(u16),
+    /// A show's years.
+    Years(YearsAired),
+    /// A season's show.
+    Show(String),
+    /// An episode: its show, and where it is in it ("S2 · E5").
+    Episode {
+        show: Option<String>,
+        season: u32,
+        episode: u32,
+    },
+    /// An album's artist and year.
+    Album {
+        artist: Option<String>,
+        year: Option<u16>,
+    },
+    /// A track's length.
+    Length(Duration),
+}
+
 impl Item {
+    /// What a card says under its title on `today`; `None` for an artist
+    /// or where nothing is known.
+    pub fn caption_parts(&self, today: CalendarDate) -> Option<Caption> {
+        match self {
+            Item::Movie(m) => m.year.map(Caption::Year),
+            Item::Show(s) => s.year_range(today).map(Caption::Years),
+            Item::Season(s) => s.show_title.clone().map(Caption::Show),
+            Item::Episode(e) => Some(Caption::Episode {
+                show: e.show_title.clone(),
+                season: e.season,
+                episode: e.episode,
+            }),
+            Item::Album(a) => {
+                (a.artist_name.is_some() || a.year.is_some()).then(|| Caption::Album {
+                    artist: a.artist_name.clone(),
+                    year: a.year,
+                })
+            }
+            Item::Track(t) => t.duration.map(Caption::Length),
+            Item::Artist(_) => None,
+        }
+    }
+
     pub fn id(&self) -> &MediaId {
         match self {
             Item::Movie(m) => &m.id,
@@ -336,6 +494,62 @@ impl Item {
             Item::Album(a) => &a.id,
             Item::Track(t) => &t.id,
         }
+    }
+
+    /// Its own name: a film's, an episode's or a track's title; an
+    /// artist's name.
+    pub fn title(&self) -> &str {
+        match self {
+            Item::Movie(m) => &m.title,
+            Item::Show(s) => &s.title,
+            Item::Season(s) => &s.title,
+            Item::Episode(e) => &e.title,
+            Item::Artist(a) => &a.name,
+            Item::Album(a) => &a.title,
+            Item::Track(t) => &t.title,
+        }
+    }
+
+    /// The user's progress on a film, an episode or a track; `None` for
+    /// the kinds that do not play themselves.
+    pub fn playback(&self) -> Option<&PlaybackState> {
+        match self {
+            Item::Movie(m) => Some(&m.playback),
+            Item::Episode(e) => Some(&e.playback),
+            Item::Track(t) => Some(&t.playback),
+            _ => None,
+        }
+    }
+
+    /// Its length, for the kinds that play.
+    pub fn duration(&self) -> Option<Duration> {
+        match self {
+            Item::Movie(m) => m.duration,
+            Item::Episode(e) => e.duration,
+            Item::Track(t) => t.duration,
+            _ => None,
+        }
+    }
+
+    /// The user watched it (or played it to its end).
+    pub fn is_watched(&self) -> bool {
+        self.playback().is_some_and(|p| p.watched)
+    }
+
+    /// Where the user stopped in it, watched or not.
+    pub fn resume_position(&self) -> Option<Duration> {
+        self.playback().and_then(|p| p.position)
+    }
+
+    /// Where a Play goes on from ([`PlaybackState::resume_from`]).
+    pub fn resume_from(&self) -> Option<Duration> {
+        self.playback().and_then(PlaybackState::resume_from)
+    }
+
+    /// How far through it the user is ([`PlaybackState::progress`]);
+    /// `None` for the kinds that do not play themselves.
+    pub fn progress(&self) -> Option<Progress> {
+        Some(self.playback()?.progress(self.duration()))
     }
 }
 
@@ -661,6 +875,84 @@ mod tests {
         assert_eq!((older.year, older.air_date), (None, None));
     }
 
+    /// "Today" for a show's years: 14 October 2026.
+    fn years(year: Option<u16>, last_aired: Option<(u16, u8, u8)>) -> Option<String> {
+        let show = Show {
+            id: media(MediaKind::Show, "20"),
+            title: "Andor".into(),
+            year,
+            summary: None,
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
+            last_aired: last_aired.and_then(|(y, m, d)| CalendarDate::new(y, m, d)),
+            cast: Vec::new(),
+            artwork: Vec::new(),
+        };
+        show.years_label(CalendarDate::new(2026, 10, 14).unwrap())
+    }
+
+    #[test]
+    fn a_show_s_years_come_in_parts() {
+        let show = |last: (u16, u8, u8)| Show {
+            id: media(MediaKind::Show, "20"),
+            title: "Andor".into(),
+            year: Some(2022),
+            summary: None,
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
+            last_aired: CalendarDate::new(last.0, last.1, last.2),
+            cast: Vec::new(),
+            artwork: Vec::new(),
+        };
+        let today = CalendarDate::new(2026, 10, 14).unwrap();
+        assert_eq!(
+            show((2025, 10, 14)).year_range(today),
+            Some(YearsAired::Running(2022))
+        );
+        assert_eq!(
+            show((2025, 10, 13)).year_range(today),
+            Some(YearsAired::Between(2022, 2025))
+        );
+        assert_eq!(
+            Item::Show(show((2022, 5, 1))).caption_parts(today),
+            Some(Caption::Years(YearsAired::One(2022)))
+        );
+    }
+
+    #[test]
+    fn a_show_with_no_air_date_shows_its_first_year() {
+        assert_eq!(years(Some(2022), None), Some("2022".into()));
+        assert_eq!(years(None, None), None);
+    }
+
+    #[test]
+    fn a_show_last_aired_in_its_first_year_shows_that_year() {
+        assert_eq!(years(Some(2022), Some((2022, 12, 1))), Some("2022".into()));
+    }
+
+    #[test]
+    fn a_show_aired_in_the_last_twelve_months_is_an_open_range() {
+        assert_eq!(
+            years(Some(2022), Some((2025, 10, 14))),
+            Some("2022\u{2013}".into())
+        );
+    }
+
+    #[test]
+    fn a_show_last_aired_over_a_year_ago_shows_both_years() {
+        assert_eq!(
+            years(Some(2022), Some((2025, 10, 13))),
+            Some("2022\u{2013}2025".into())
+        );
+    }
+
+    #[test]
+    fn a_show_with_no_first_year_shows_when_it_last_aired() {
+        assert_eq!(years(None, Some((2019, 3, 2))), Some("2019".into()));
+    }
+
     #[test]
     fn every_model_type_round_trips() {
         round_trip(Library {
@@ -756,5 +1048,107 @@ mod tests {
                 last_played_at: None,
             },
         });
+    }
+
+    fn alien(playback: PlaybackState, duration: Option<Duration>) -> Item {
+        Item::Movie(Movie {
+            id: media(MediaKind::Movie, "10"),
+            title: "Alien".into(),
+            year: Some(1979),
+            release_date: None,
+            summary: None,
+            content_rating: None,
+            duration,
+            cast: Vec::new(),
+            artwork: Vec::new(),
+            playback,
+        })
+    }
+
+    fn at(secs: u64, watched: bool) -> PlaybackState {
+        PlaybackState {
+            position: Some(Duration::from_secs(secs)),
+            watched,
+            ..PlaybackState::default()
+        }
+    }
+
+    #[test]
+    fn a_film_stopped_part_way_resumes_where_it_stopped() {
+        assert_eq!(at(600, false).resume_from(), Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_watched_film_plays_from_the_start() {
+        assert_eq!(at(600, true).resume_from(), None);
+    }
+
+    #[test]
+    fn a_film_never_begun_plays_from_the_start() {
+        assert_eq!(PlaybackState::default().resume_from(), None);
+        assert_eq!(at(0, false).resume_from(), None);
+    }
+
+    #[test]
+    fn progress_is_the_fraction_watched_and_the_time_left() {
+        let progress = at(1_500, false).progress(Some(Duration::from_secs(6_000)));
+        assert_eq!(
+            progress,
+            Progress {
+                position: Duration::from_secs(1_500),
+                remaining: Some(Duration::from_secs(4_500)),
+                fraction: Some(0.25),
+                watched: false,
+            }
+        );
+    }
+
+    #[test]
+    fn progress_past_the_length_is_whole_with_nothing_left() {
+        let progress = at(7_000, true).progress(Some(Duration::from_secs(6_000)));
+        assert_eq!(
+            (progress.fraction, progress.remaining, progress.watched),
+            (Some(1.0), Some(Duration::ZERO), true)
+        );
+    }
+
+    #[test]
+    fn progress_with_no_length_has_no_fraction() {
+        for length in [None, Some(Duration::ZERO)] {
+            let progress = at(60, false).progress(length);
+            assert_eq!((progress.fraction, progress.remaining), (None, None));
+        }
+    }
+
+    #[test]
+    fn an_item_answers_from_its_own_playback() {
+        let item = alien(at(600, false), Some(Duration::from_secs(1_200)));
+        assert_eq!(item.title(), "Alien");
+        assert!(!item.is_watched());
+        assert_eq!(item.resume_position(), Some(Duration::from_secs(600)));
+        assert_eq!(item.resume_from(), Some(Duration::from_secs(600)));
+        assert_eq!(item.progress().and_then(|p| p.fraction), Some(0.5));
+    }
+
+    #[test]
+    fn a_watched_item_keeps_its_position_but_resumes_from_the_start() {
+        let item = alien(at(600, true), None);
+        assert!(item.is_watched());
+        assert_eq!(item.resume_position(), Some(Duration::from_secs(600)));
+        assert_eq!(item.resume_from(), None);
+    }
+
+    #[test]
+    fn an_artist_has_a_title_but_no_progress() {
+        let show = Item::Artist(Artist {
+            id: media(MediaKind::Artist, "30"),
+            name: "Daft Punk".into(),
+            summary: None,
+            artwork: Vec::new(),
+        });
+        assert_eq!(show.title(), "Daft Punk");
+        assert_eq!(show.progress(), None);
+        assert!(!show.is_watched());
+        assert_eq!(show.resume_from(), None);
     }
 }

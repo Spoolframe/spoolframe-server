@@ -17,6 +17,7 @@ pub const MAX_FILTER_TEXT: usize = 128;
 
 /// What `Items` orders a library by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SortKey {
     /// The sort title: the title with a leading "The", "A" or "An" set
@@ -86,6 +87,7 @@ impl SortKey {
 /// then by id, so that items equal by `key` keep one order and a page
 /// never repeats or skips one. The tiebreakers go A to Z both ways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ItemSort {
     pub key: SortKey,
     /// Largest, newest or last first. Missing values stay last either way.
@@ -107,6 +109,7 @@ impl ItemSort {
 /// watched when every episode the library has is, in progress when some
 /// episode is watched or in progress, unwatched when none is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum WatchedState {
     Unwatched,
@@ -119,6 +122,7 @@ pub enum WatchedState {
 
 /// An item's picture size class, by its first version's video height.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum Resolution {
     /// 2160 lines or more.
     #[serde(rename = "4k")]
@@ -205,6 +209,7 @@ impl Resolution {
 /// What an item's picture shows of brightness and colour, by its first
 /// version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum DynamicRange {
     /// Neither HDR nor Dolby Vision.
@@ -223,6 +228,7 @@ pub enum DynamicRange {
 /// `None` keeps every item as far as that part goes. An item that has no
 /// value for a part a filter names (no year, no rating) is not kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ItemFilter {
     /// The session user's watch state of it; never another user's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -330,6 +336,7 @@ pub struct Counted<T> {
 
 /// A part of an [`ItemFilter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterPart {
     Watched,
@@ -453,6 +460,198 @@ impl ItemFilterValues {
     }
 }
 
+impl ItemFilterValues {
+    /// The keys a Sort menu lists: the library's, in its order, each
+    /// once, none this build does not know.
+    pub fn sort_keys(&self) -> Vec<SortKey> {
+        let mut keys: Vec<SortKey> = Vec::new();
+        for &key in &self.sorts {
+            if key != SortKey::Unknown && !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// The decades the library has, newest first, for the year filter:
+    /// 1990 for 1990 to 1999.
+    pub fn decades(&self) -> Vec<u16> {
+        let mut decades: Vec<u16> = self.years.iter().map(|y| y.value / 10 * 10).collect();
+        decades.sort_unstable_by(|a, b| b.cmp(a));
+        decades.dedup();
+        decades
+    }
+
+    /// A saved `sort` and `filter` as this library can use them now: a
+    /// sort key it no longer lists goes back to [`ItemSort::DEFAULT`], a
+    /// part it no longer filters by is cleared, and a resolution or range
+    /// it does not list is dropped (the server would refuse it, where a
+    /// genre it does not list only keeps nothing). Values this build does
+    /// not know go too.
+    pub fn sanitize(&self, sort: ItemSort, filter: ItemFilter) -> ItemQuery {
+        let sort = if sort.key != SortKey::Unknown && self.sorts.contains(&sort.key) {
+            sort
+        } else {
+            ItemSort::DEFAULT
+        };
+        let offers = |part| self.filters.contains(&part);
+        let mut filter = filter;
+        if !offers(FilterPart::Watched) {
+            filter.watched.clear();
+        }
+        filter.watched.retain(|w| *w != WatchedState::Unknown);
+        if !offers(FilterPart::Genres) {
+            filter.genres.clear();
+        }
+        if !offers(FilterPart::Years) {
+            filter.year_from = None;
+            filter.year_to = None;
+        }
+        if !offers(FilterPart::ContentRatings) {
+            filter.content_ratings.clear();
+        }
+        if offers(FilterPart::Resolutions) {
+            filter
+                .resolutions
+                .retain(|r| self.resolutions.iter().any(|c| c.value == *r));
+        } else {
+            filter.resolutions.clear();
+        }
+        if offers(FilterPart::DynamicRanges) {
+            filter
+                .dynamic_ranges
+                .retain(|r| self.dynamic_ranges.iter().any(|c| c.value == *r));
+        } else {
+            filter.dynamic_ranges.clear();
+        }
+        ItemQuery { sort, filter }
+    }
+}
+
+/// One value a filter keeps items by, as a check row or a chip names it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FilterValue {
+    Watched(WatchedState),
+    Genre(String),
+    ContentRating(String),
+    Resolution(Resolution),
+    DynamicRange(DynamicRange),
+}
+
+/// What the user chose for one library: its order and what it keeps.
+/// What an app saves per library, and asks `Items` with
+/// ([`ItemQuery::to_request`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ItemQuery {
+    pub sort: ItemSort,
+    pub filter: ItemFilter,
+}
+
+impl Default for ItemQuery {
+    fn default() -> Self {
+        Self {
+            sort: ItemSort::DEFAULT,
+            filter: ItemFilter::default(),
+        }
+    }
+}
+
+impl ItemQuery {
+    /// The library as `Items` gives it with neither: title A to Z, every
+    /// item.
+    pub fn is_default(&self) -> bool {
+        *self == ItemQuery::default()
+    }
+
+    /// What to ask `Items` with: the default order and an empty filter
+    /// are left out, as the server's own, so the plain listing stays the
+    /// one a cache keeps.
+    pub fn to_request(&self) -> (Option<ItemSort>, Option<ItemFilter>) {
+        let sort = (self.sort != ItemSort::DEFAULT).then_some(self.sort);
+        let filter = (!self.filter.is_empty()).then(|| self.filter.clone());
+        (sort, filter)
+    }
+
+    /// Ordered by `key`: picked again, the other way round; else title
+    /// A to Z first, any other key largest, newest or last first.
+    pub fn sort_by(&mut self, key: SortKey) {
+        self.sort = if self.sort.key == key {
+            ItemSort {
+                key,
+                descending: !self.sort.descending,
+            }
+        } else {
+            ItemSort {
+                key,
+                descending: key != SortKey::Title,
+            }
+        };
+    }
+
+    /// Whether it keeps items with `value`; names case aside.
+    pub fn has(&self, value: &FilterValue) -> bool {
+        let named =
+            |names: &[String], name: &str| names.iter().any(|n| n.eq_ignore_ascii_case(name));
+        let filter = &self.filter;
+        match value {
+            FilterValue::Watched(state) => filter.watched.contains(state),
+            FilterValue::Genre(name) => named(&filter.genres, name),
+            FilterValue::ContentRating(name) => named(&filter.content_ratings, name),
+            FilterValue::Resolution(r) => filter.resolutions.contains(r),
+            FilterValue::DynamicRange(r) => filter.dynamic_ranges.contains(r),
+        }
+    }
+
+    /// Keeps items with `value` too, or no longer if it did.
+    pub fn toggle(&mut self, value: &FilterValue) {
+        fn flip<T: PartialEq + Clone>(list: &mut Vec<T>, value: &T, same: impl Fn(&T, &T) -> bool) {
+            let before = list.len();
+            list.retain(|v| !same(v, value));
+            if list.len() == before {
+                list.push(value.clone());
+            }
+        }
+        let names = |a: &String, b: &String| a.eq_ignore_ascii_case(b);
+        let filter = &mut self.filter;
+        match value {
+            FilterValue::Watched(s) => flip(&mut filter.watched, s, PartialEq::eq),
+            FilterValue::Genre(name) => flip(&mut filter.genres, name, names),
+            FilterValue::ContentRating(name) => flip(&mut filter.content_ratings, name, names),
+            FilterValue::Resolution(r) => flip(&mut filter.resolutions, r, PartialEq::eq),
+            FilterValue::DynamicRange(r) => flip(&mut filter.dynamic_ranges, r, PartialEq::eq),
+        }
+    }
+
+    /// From `from` to `to`, either open. A To before the From is moved up
+    /// to it, so the range is never back to front (which `Items`
+    /// refuses).
+    pub fn set_years(&mut self, from: Option<u16>, to: Option<u16>) {
+        self.filter.year_from = from;
+        self.filter.year_to = match (from, to) {
+            (Some(from), Some(to)) if to < from => Some(from),
+            _ => to,
+        };
+    }
+
+    /// Without `part`: the other parts and the sort stay.
+    pub fn reset(&mut self, part: FilterPart) {
+        let filter = &mut self.filter;
+        match part {
+            FilterPart::Watched => filter.watched.clear(),
+            FilterPart::Genres => filter.genres.clear(),
+            FilterPart::Years => {
+                filter.year_from = None;
+                filter.year_to = None;
+            }
+            FilterPart::ContentRatings => filter.content_ratings.clear(),
+            FilterPart::Resolutions => filter.resolutions.clear(),
+            FilterPart::DynamicRanges => filter.dynamic_ranges.clear(),
+            FilterPart::Unknown => {}
+        }
+    }
+}
+
 /// `title` as a sort title: a leading "The", "A" or "An" and the space
 /// after it set aside, as Plex's `titleSort` does. A title that is only
 /// the article stays as it is.
@@ -475,6 +674,121 @@ pub fn sort_title(title: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn values() -> ItemFilterValues {
+        ItemFilterValues {
+            resolutions: vec![Counted {
+                value: Resolution::Uhd,
+                count: None,
+            }],
+            dynamic_ranges: vec![Counted {
+                value: DynamicRange::Hdr,
+                count: None,
+            }],
+            sorts: vec![
+                SortKey::Title,
+                SortKey::Added,
+                SortKey::Added,
+                SortKey::Unknown,
+            ],
+            filters: vec![
+                FilterPart::Genres,
+                FilterPart::Resolutions,
+                FilterPart::DynamicRanges,
+            ],
+            ..ItemFilterValues::default()
+        }
+    }
+
+    #[test]
+    fn nothing_chosen_asks_the_plain_listing() {
+        assert!(ItemQuery::default().is_default());
+        assert_eq!(ItemQuery::default().to_request(), (None, None));
+    }
+
+    #[test]
+    fn a_sort_alone_asks_for_that_order_and_no_filter() {
+        let mut query = ItemQuery::default();
+        query.sort_by(SortKey::Added);
+        let added = ItemSort {
+            key: SortKey::Added,
+            descending: true,
+        };
+        assert_eq!(query.to_request(), (Some(added), None));
+        query.sort_by(SortKey::Added);
+        assert!(!query.sort.descending, "picked again, the other way round");
+    }
+
+    #[test]
+    fn a_value_toggles_in_and_out_case_aside() {
+        let mut query = ItemQuery::default();
+        query.toggle(&FilterValue::Genre("Drama".into()));
+        assert!(query.has(&FilterValue::Genre("drama".into())));
+        query.toggle(&FilterValue::Genre("DRAMA".into()));
+        assert!(query.is_default());
+    }
+
+    #[test]
+    fn a_year_range_is_never_back_to_front() {
+        let mut query = ItemQuery::default();
+        query.set_years(Some(2000), Some(1990));
+        assert_eq!(
+            (query.filter.year_from, query.filter.year_to),
+            (Some(2000), Some(2000))
+        );
+        assert!(query.filter.check().is_ok());
+        query.set_years(None, Some(1990));
+        assert_eq!(
+            (query.filter.year_from, query.filter.year_to),
+            (None, Some(1990))
+        );
+    }
+
+    #[test]
+    fn a_saved_choice_keeps_only_what_the_library_still_offers() {
+        let saved = ItemFilter {
+            watched: vec![WatchedState::Watched],
+            genres: vec!["Drama".into()],
+            resolutions: vec![Resolution::Uhd, Resolution::Sd],
+            dynamic_ranges: vec![DynamicRange::DolbyVision],
+            year_from: Some(1990),
+            ..ItemFilter::default()
+        };
+        let rating = ItemSort {
+            key: SortKey::Rating,
+            descending: true,
+        };
+        let query = values().sanitize(rating, saved);
+        assert_eq!(query.sort, ItemSort::DEFAULT);
+        assert_eq!(
+            query.filter,
+            ItemFilter {
+                genres: vec!["Drama".into()],
+                resolutions: vec![Resolution::Uhd],
+                ..ItemFilter::default()
+            }
+        );
+        assert_eq!(
+            values().refuses(Some(&query.sort), Some(&query.filter)),
+            None
+        );
+    }
+
+    #[test]
+    fn decades_are_the_librarys_years_newest_first() {
+        let values = ItemFilterValues {
+            years: [1994, 2023, 1999, 2020]
+                .map(|value| Counted { value, count: None })
+                .to_vec(),
+            ..ItemFilterValues::default()
+        };
+        assert_eq!(values.decades(), [2020, 1990]);
+    }
+
+    #[test]
+    fn the_sort_menu_lists_the_librarys_known_keys_once() {
+        assert_eq!(values().sort_keys(), [SortKey::Title, SortKey::Added]);
+    }
 
     #[test]
     fn a_sort_and_a_filter_are_snake_case_on_the_wire() {

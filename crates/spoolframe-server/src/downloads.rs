@@ -1228,6 +1228,13 @@ impl Downloads {
         Ok(true)
     }
 
+    /// `rows` were deleted with their user: as for a cancel, the making
+    /// of a file no download is left of stops, and the files no download
+    /// names go.
+    pub async fn deleted(&self, rows: &[DownloadRow]) -> Result<(), DownloadError> {
+        self.released(rows).await
+    }
+
     /// `rows` are gone from the store: the making of a file no download
     /// is left of stops, and the files no download names go.
     async fn released(&self, rows: &[DownloadRow]) -> Result<(), DownloadError> {

@@ -68,6 +68,7 @@ async fn refusal_of(client: &TestClient, said: u32) -> String {
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     match client.call(None, Request::Hello(hello)).await {
         Response::Err(Error::Unsupported { request }) => request,
@@ -476,6 +477,7 @@ async fn hello_strings_are_cut_to_their_bound() {
         device_name: Some(long.clone()),
         capabilities: None,
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

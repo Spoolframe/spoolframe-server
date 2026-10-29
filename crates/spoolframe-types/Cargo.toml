@@ -8,9 +8,16 @@ repository.workspace = true
 license = "MIT OR Apache-2.0"
 publish = ["crates-io"]
 
+[features]
+default = []
+# UniFFI's traits on the public types, for spoolframe-client-ffi. Off by
+# default: the server never builds UniFFI.
+uniffi = ["dep:uniffi"]
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+uniffi = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

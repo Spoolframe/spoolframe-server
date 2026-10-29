@@ -277,6 +277,7 @@ pub fn revocation_lapsed(revoked_at: i64, now: i64) -> bool {
 
 /// Why a credential, or a device's proof with it, does not authenticate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CredentialError {
     /// The root it names did not sign it, as it is: tampered, or signed by
     /// another identity's root.
@@ -496,6 +497,7 @@ pub fn verify_device_proof(
 
 /// Why an identity state is not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum StateError {
     /// The root it names (or the phrase root its user's id is) did not
     /// sign it, as it is.

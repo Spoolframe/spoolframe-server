@@ -50,6 +50,7 @@ pub(crate) async fn hello(client: &TestClient, platform: Platform) {
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -864,6 +865,7 @@ async fn h264_only(server: &TestServer) -> (TestClient, SessionId) {
         device_name: None,
         capabilities: Some(caps),
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

@@ -24,7 +24,7 @@ use spoolframe_protocol::invite::{
     CODE_ALPHABET, CODE_LEN, Invite, InviteLinkKind, MAX_HINTS, display_code, normalize_code,
 };
 use spoolframe_protocol::relay_access::Tier;
-use spoolframe_protocol::{PortableUserId, RedeemInvite};
+use spoolframe_protocol::{BeginInvitePasskey, PortableUserId, RedeemInvite};
 use spoolframe_types::Role;
 
 use crate::announce::Told;
@@ -49,14 +49,13 @@ impl std::fmt::Debug for InviteCode {
 impl InviteCode {
     /// A fresh random code.
     pub fn generate() -> Self {
-        use password_hash::rand_core::{OsRng, RngCore};
         let code = (0..CODE_LEN)
             .map(|_| {
                 // 2^32 is not a multiple of 30: drawing again past the
                 // last whole multiple keeps every character as likely.
                 let limit = u32::MAX - u32::MAX % CODE_ALPHABET.len() as u32;
                 let n = loop {
-                    let n = OsRng.next_u32();
+                    let n = getrandom::u32().expect("the OS gives random bytes");
                     if n < limit {
                         break n;
                     }
@@ -302,6 +301,11 @@ pub async fn redeem(
             &phc,
         )
         .await?;
+    outcome(redeemed)
+}
+
+/// What a redemption that made an account, or did not, answers.
+fn outcome(redeemed: Redeemed) -> Result<(LocalUserId, Role), RedeemError> {
     match redeemed {
         Redeemed::User { id, role } => Ok((id, role)),
         Redeemed::UsernameTaken => Err(RedeemError::UsernameTaken),
@@ -310,6 +314,36 @@ pub async fn redeem(
         Redeemed::Refused(InviteState::Exhausted) => Err(RedeemError::Exhausted),
         Redeemed::Refused(_) => Err(RedeemError::Invalid),
     }
+}
+
+/// Check what `request` asks for, to begin making its account with a
+/// passkey (feature `spoolframe:invite-passkeys`), from a device whose
+/// guesses are counted as `endpoint`'s, as [`redeem`] checks it: the
+/// hash of its code, and the username, normalized. A username someone
+/// has is `UsernameTaken` now, and may be taken by the finish. Nothing is
+/// made or used up.
+pub async fn begin_with_passkey(
+    auth: &Auth,
+    endpoint: &str,
+    request: &BeginInvitePasskey,
+) -> Result<(String, String), RedeemError> {
+    let hash = usable_code(auth, endpoint, &request.code, InviteKind::CreateUser).await?;
+    let username = normalize_username(&request.username)?;
+    display_name(request.display_name.as_deref())?;
+    if auth.store().user_by_name(&username).await?.is_some() {
+        return Err(RedeemError::UsernameTaken);
+    }
+    Ok((hash, username))
+}
+
+/// Make the account `made` names, with its invite and its passkey: its id
+/// and role. Nothing is made, and the invite keeps its uses, unless this
+/// answers `Ok`.
+pub async fn redeem_with_passkey(
+    store: &Store,
+    made: &crate::app_passkeys::InvitePasskey,
+) -> Result<(LocalUserId, Role), RedeemError> {
+    outcome(store.redeem_invite_with_passkey(made).await?)
 }
 
 /// The hash of `typed`, a code of a live invite of `kind`, from a device

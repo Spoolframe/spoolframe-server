@@ -196,36 +196,8 @@ impl Store {
         let principal = crate::principal::Principal::PortableUser(portable).to_string();
         let mut tx = self.begin_write().await?;
         let removed = revoke_grant_in(&mut tx, portable, self.now()).await?;
-        // The `_ids` tables first: they refer to their parents' rows. Their
-        // playlists go (PX-40), and whoever pinned one is told, as for any
-        // playlist deleted; the rest of a playlist's rows go with it.
-        for delete in [
-            "DELETE FROM watch_state_ids WHERE principal = ?1",
-            "DELETE FROM watch_state WHERE principal = ?1",
-            "DELETE FROM play_ids WHERE principal = ?1",
-            "DELETE FROM plays WHERE principal = ?1",
-            "DELETE FROM continue_hidden_ids WHERE principal = ?1",
-            "DELETE FROM continue_hidden WHERE principal = ?1",
-            "DELETE FROM track_overrides WHERE principal = ?1",
-            "DELETE FROM track_preferences WHERE principal = ?1",
-            "INSERT INTO playlist_pin_notes (principal, playlist_id, name, reason, noted_at) \
-             SELECT n.principal, n.playlist_id, p.name, 'deleted', unixepoch() \
-             FROM playlist_pins n JOIN playlists p ON p.id = n.playlist_id \
-             WHERE p.owner = ?1 AND n.principal != ?1 \
-             ON CONFLICT (principal, playlist_id) DO UPDATE SET \
-               name = excluded.name, reason = excluded.reason, noted_at = excluded.noted_at",
-            "DELETE FROM playlists WHERE owner = ?1",
-            "DELETE FROM playlist_shares WHERE principal = ?1",
-            "DELETE FROM playlist_pins WHERE principal = ?1",
-            "DELETE FROM playlist_pin_notes WHERE principal = ?1",
-            "DELETE FROM playlist_places WHERE principal = ?1",
-            "DELETE FROM liked_changes WHERE principal = ?1",
-        ] {
-            sqlx::query(delete)
-                .bind(&principal)
-                .execute(&mut *tx)
-                .await?;
-        }
+        // Their playlists go too (PX-40).
+        super::users::delete_principal_rows(&mut tx, &principal, self.now()).await?;
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(removed)

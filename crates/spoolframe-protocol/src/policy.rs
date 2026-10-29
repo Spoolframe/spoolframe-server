@@ -70,6 +70,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::Items { .. }
         | Request::ItemFilterValues { .. }
         | Request::Item { .. }
+        | Request::NextEpisode { .. }
+        | Request::ShowNext { .. }
         | Request::Search(_)
         | Request::PersonItems { .. }
         | Request::Tracks { .. }
@@ -155,8 +157,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::FinishPasskeySignIn { .. }
         | Request::BeginPortableSignIn
         | Request::FinishPortableSignIn(_)
-        // An invite makes an account or a grant and uses itself up.
+        // An invite makes an account or a grant and uses itself up; a
+        // passkey's registration is replaced.
         | Request::RedeemInvite(_)
+        | Request::BeginInvitePasskey(_)
+        | Request::RedeemInviteWithPasskey(_)
         | Request::RedeemPortableInvite(_)
         // A fetch counts against the code's tries, an answer is
         // taken once, and a collected answer is gone.

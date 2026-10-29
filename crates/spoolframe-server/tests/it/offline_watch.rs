@@ -24,6 +24,7 @@ async fn signed_in(test: &str) -> (TestServer, TestClient, SessionId) {
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         laptop.call(None, Request::Hello(hello)).await,

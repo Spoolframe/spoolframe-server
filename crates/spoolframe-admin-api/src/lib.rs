@@ -4062,6 +4062,17 @@ pub trait AdminApi {
     #[method(name = "userEnable", with_extensions)]
     async fn user_enable(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
 
+    /// Delete a user and everything kept for them: their sessions, ways
+    /// to sign in, devices' trust and PIN, watch state, plays, likes,
+    /// downloads and playlists, server-wide ones too. Their devices are
+    /// told (`ProfileRemoved`), and whoever
+    /// saw a playlist of theirs is told it is gone. It cannot be undone:
+    /// disable a user to keep them. Needs a recent sign-in. Refused for the
+    /// caller themself (`INVALID_INPUT`), and for the last enabled admin
+    /// or the last with a password (`LAST_ADMIN`).
+    #[method(name = "userDelete", with_extensions)]
+    async fn user_delete(&self, username: String) -> jsonrpsee::core::RpcResult<()>;
+
     /// Remove a user's PIN, and its requirement everywhere (P2-08). An
     /// admin can clear a PIN, never set one: the user sets a new one.
     /// Needs a recent sign-in (PX-10), as
@@ -4294,9 +4305,9 @@ pub trait AdminApi {
 
     /// Read the config file and the runtime settings again, as SIGHUP
     /// does (PX-33): checked as at start, the live settings applied, the
-    /// restart ones `restartPending`, the encoders detected again. A file
-    /// the server would not start with changes nothing: `INVALID_INPUT`
-    /// with what is wrong and where. Needs a recent sign-in:
+    /// restart ones `restartPending`, the encoders detected again in the
+    /// background. A file the server would not start with changes nothing:
+    /// `INVALID_INPUT` with what is wrong and where. Needs a recent sign-in:
     /// `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "configReload", with_extensions)]
     async fn config_reload(&self) -> jsonrpsee::core::RpcResult<ConfigReload>;

@@ -708,6 +708,135 @@ fn test_module() -> String {
         .map_or_else(|| "it".to_owned(), |(module, _)| module.to_owned())
 }
 
+/// How often [`retry_on_port_race`] sets up before it gives up.
+pub const PORT_RACE_ATTEMPTS: u32 = 3;
+
+/// Why a setup that binds a port it chose beforehand failed.
+#[derive(Debug)]
+pub enum SetupFailed {
+    /// Something else took the port between choosing it and binding it.
+    PortTaken(String),
+    Other(String),
+}
+
+/// Whether TCP `addr` is held by something else now: binding it is
+/// refused as in use.
+pub fn tcp_taken(addr: std::net::SocketAddr) -> bool {
+    matches!(
+        std::net::TcpListener::bind(addr),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
+/// Whether UDP `addr` is held by something else now.
+pub fn udp_taken(addr: std::net::SocketAddr) -> bool {
+    matches!(
+        std::net::UdpSocket::bind(addr),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
+/// A free port on loopback, found by binding port 0 and letting it go:
+/// free when found, and possibly taken again before it is bound. Only
+/// for a [`retry_on_port_race`] setup.
+pub fn free_tcp_addr() -> std::net::SocketAddr {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// [`free_tcp_addr`]'s port, for UDP.
+pub fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Runs `setup` again, up to [`PORT_RACE_ATTEMPTS`] times in all, while
+/// it fails on a port taken ([`SetupFailed::PortTaken`]); any other
+/// failure is returned at once, and the last one names its attempt.
+///
+/// A server homed on a relay of its own cannot bind port 0 and be read
+/// back: each needs the other's address before it starts (the server
+/// its relay's URL in its relay list, the relay the server's address to
+/// ask about each endpoint), and neither takes it once running. So one
+/// of them is given a port found free beforehand, which something else
+/// may bind first when many tests run at once: then the whole setup is
+/// made again, on fresh ports and a fresh directory.
+pub async fn retry_on_port_race<T, F, Fut>(mut setup: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, SetupFailed>>,
+{
+    let mut attempt = 1;
+    loop {
+        match setup().await {
+            Ok(done) => return Ok(done),
+            Err(SetupFailed::PortTaken(_)) if attempt < PORT_RACE_ATTEMPTS => attempt += 1,
+            Err(SetupFailed::PortTaken(e) | SetupFailed::Other(e)) => {
+                return Err(format!(
+                    "setup attempt {attempt} of {PORT_RACE_ATTEMPTS}: {e}"
+                ));
+            }
+        }
+    }
+}
+
+/// A server on a fresh directory for `test`, run as `options` say, whose
+/// relays are one of its own on loopback over plain HTTP (behind a
+/// proxy), as `key`, letting through `access`; and the relay and its URL.
+/// Set up again on a port race ([`retry_on_port_race`]). The server may
+/// not have taken the relay as its home yet.
+pub async fn start_with_own_relay(
+    test: &str,
+    options: ServerOptions,
+    key: &iroh::SecretKey,
+    access: spoolframe_server::own_relay::Access,
+) -> (TestServer, iroh_relay::server::Server, url::Url) {
+    use spoolframe_server::own_relay::{self, RelayConfig, Serve};
+    retry_on_port_race(|| {
+        let options = options.clone();
+        async move {
+            let http = free_tcp_addr();
+            let url = url::Url::parse(&format!("http://{http}")).unwrap();
+            let server = TestServer::try_start_with(
+                fresh_dir(test).await,
+                ServerOptions {
+                    relays: vec![spoolframe_server::network::Relay::Custom(url.clone())],
+                    own_relays: vec![key.public()],
+                    ..options
+                },
+            )
+            .await
+            .map_err(|e| SetupFailed::Other(e.to_string()))?;
+            let config = RelayConfig {
+                server: server.server.addr(),
+                access,
+                serve: Serve::Proxy,
+                http,
+                quic: None,
+            };
+            match own_relay::spawn(&config, key.clone(), &std::env::temp_dir()).await {
+                Ok(relay) => Ok((server, relay, url)),
+                Err(e) => {
+                    server.stop().await;
+                    // The relay's error does not say why the bind failed:
+                    // the port being held now does.
+                    Err(match tcp_taken(http) {
+                        true => SetupFailed::PortTaken(e.to_string()),
+                        false => SetupFailed::Other(e.to_string()),
+                    })
+                }
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
 /// A running server on loopback, with its database at hand.
 pub struct TestServer {
     pub server: Server,
@@ -773,6 +902,16 @@ impl TestServer {
 
     /// A server on `dir` (its key and database), run as `options` say.
     pub async fn start_with(dir: StateDir, options: ServerOptions) -> Self {
+        Self::try_start_with(dir, options).await.unwrap()
+    }
+
+    /// [`TestServer::start_with`], its endpoint's bind failing as an
+    /// error: a fixed `port` something else took
+    /// ([`retry_on_port_race`]).
+    pub async fn try_start_with(
+        dir: StateDir,
+        options: ServerOptions,
+    ) -> Result<Self, spoolframe_server::network::NetworkError> {
         let key = identity::load_or_create(&dir).unwrap();
         let server_id = identity::load_or_create_server_id(&dir).unwrap();
         let clock = Clock::default();
@@ -1074,10 +1213,8 @@ impl TestServer {
             wan: options.wan.clone(),
             congestion: Default::default(),
         };
-        let server = Server::start(key, &endpoint, &name, services)
-            .await
-            .unwrap();
-        Self {
+        let server = Server::start(key, &endpoint, &name, services).await?;
+        Ok(Self {
             server,
             server_id,
             clock,
@@ -1099,7 +1236,7 @@ impl TestServer {
             downloads,
             federation,
             subtitle_timings,
-        }
+        })
     }
 
     /// Write the movie's file: `size` bytes of a fixed pattern, returned
@@ -1825,6 +1962,7 @@ impl TestClient {
             device_name: None,
             capabilities: Some(capabilities),
             experimental: experimental.iter().map(|n| n.to_string()).collect(),
+            features: spoolframe_protocol::Features::empty(),
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -1835,6 +1973,13 @@ impl TestClient {
     /// `Hello` from a Linux app that names no experimental feature: the
     /// server's info.
     pub async fn hello_info(&self) -> ServerInfo {
+        self.hello_with_features(spoolframe_protocol::Features::empty())
+            .await
+    }
+
+    /// `Hello` from a Linux app that names the regular features
+    /// `features`: the server's info.
+    pub async fn hello_with_features(&self, features: spoolframe_protocol::Features) -> ServerInfo {
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "test".into(),
@@ -1843,6 +1988,7 @@ impl TestClient {
             device_name: None,
             capabilities: None,
             experimental: Vec::new(),
+            features,
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -1876,6 +2022,7 @@ impl TestClient {
                 device_name: device_name.map(str::to_owned),
                 capabilities,
                 experimental: Vec::new(),
+                features: spoolframe_protocol::Features::empty(),
             }),
         )
         .await
@@ -2090,4 +2237,54 @@ pub fn private_netns(module: &str, test: &str) -> bool {
     assert!(output.status.success(), "{test} in a private LAN:\n{log}");
     assert!(log.contains("1 passed"), "{test} did not run:\n{log}");
     false
+}
+
+/// Setting up again on a port race ([`retry_on_port_race`]).
+mod port_race {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A setup that finds its port taken `taken` times, then binds.
+    async fn taken_then_bound(tries: &AtomicU32, taken: u32) -> Result<u32, SetupFailed> {
+        let attempt = tries.fetch_add(1, Ordering::SeqCst) + 1;
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        if attempt <= taken {
+            assert!(tcp_taken(addr));
+            return Err(SetupFailed::PortTaken(format!("{addr} in use")));
+        }
+        drop(held);
+        assert!(!tcp_taken(addr));
+        Ok(attempt)
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_is_set_up_again() {
+        let tries = AtomicU32::new(0);
+        let done = retry_on_port_race(|| taken_then_bound(&tries, 2)).await;
+        assert_eq!(done, Ok(3));
+    }
+
+    #[tokio::test]
+    async fn a_port_taken_every_time_gives_up_after_three_naming_the_last() {
+        let tries = AtomicU32::new(0);
+        let failed = retry_on_port_race(|| taken_then_bound(&tries, 5))
+            .await
+            .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+        assert!(failed.starts_with("setup attempt 3 of 3: "), "{failed}");
+    }
+
+    #[tokio::test]
+    async fn any_other_failure_is_returned_at_once() {
+        let tries = AtomicU32::new(0);
+        let failed = retry_on_port_race(|| async {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(SetupFailed::Other("no database".into()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert_eq!(failed, "setup attempt 1 of 3: no database");
+    }
 }

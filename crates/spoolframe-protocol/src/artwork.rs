@@ -15,6 +15,7 @@ use crate::messages::{Error, SessionId};
 /// width would let one client fill the cache with every width there is.
 /// Clients pick the smallest that covers what they draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum ArtworkSize {
     /// 160 px wide.

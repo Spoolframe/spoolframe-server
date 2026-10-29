@@ -56,6 +56,7 @@ use crate::config::layers::SettingError;
 use crate::config::settings::PLEX_TOKEN;
 use crate::config::{FIRST_PLEX_SERVER, PlexConfig};
 use crate::device_sign_in::ClaimError;
+use crate::events::ProfileNews;
 use crate::libraries::{self, LibraryError};
 use crate::network::ServerName;
 use crate::oauth::DecideError;
@@ -68,7 +69,7 @@ use crate::refusals::{Channel, Kind, Refusal};
 use crate::runtime::{ChangeError, RuntimeSettings};
 use crate::store::identities::{IdentityError, IdentityRecord};
 use crate::store::invites::InviteError;
-use crate::store::passkeys::{FirstPasskey, PasskeyError, PasskeyRecord, passkey_name};
+use crate::store::passkeys::{NewPasskey, PasskeyError, PasskeyRecord, passkey_name};
 use crate::store::pins::{DeviceRecord, PinError};
 use crate::store::sessions::{ApiSessionUser, SessionBinding, SessionRecord, SignedInWith};
 use crate::store::trust::TrustError;
@@ -550,6 +551,9 @@ pub struct Admin {
     /// `federation_*` methods, and `federation` invites. `None` otherwise,
     /// where those methods are `NOT_CONFIGURED`.
     pub federation: Option<Arc<crate::federation::Federation>>,
+    /// The downloads (PX-38): a user deleted lets go of theirs. `None` in
+    /// tests without, where the store's rows go and nothing else.
+    pub downloads: Option<Arc<crate::downloads::Downloads>>,
 }
 
 /// What the setup wizard reaches beyond the server (P3-10): plex.tv for
@@ -677,6 +681,7 @@ pub async fn serve(
         library: admin.library,
         optimized: admin.optimized,
         federation: admin.federation,
+        downloads: admin.downloads,
         optimized_titles: Arc::default(),
         checks,
         pins: Arc::default(),
@@ -720,6 +725,7 @@ pub(crate) struct AdminApi {
     library: Option<crate::mcp::Library>,
     optimized: Option<Arc<crate::optimized::Pool>>,
     federation: Option<Arc<crate::federation::Federation>>,
+    downloads: Option<Arc<crate::downloads::Downloads>>,
     /// The optimized copies' items as the catalog named them, by media
     /// id: only those still in the pool (PX-37).
     optimized_titles: Arc<parking_lot::Mutex<optimized::Titles>>,
@@ -892,7 +898,14 @@ impl AdminApi {
 
     /// Disable `username`: every session of theirs ends. How many.
     pub(crate) async fn disable(&self, username: &str) -> RpcResult<u64> {
+        let user = self.record(username).await?;
+        let told = self.auth.profile_ticket(user.id);
         let revoked = self.auth.store().disable_user(username).await?;
+        told.tell(ProfileNews::Removed {
+            user: user.id,
+            device: None,
+            except: None,
+        });
         tracing::info!(%username, revoked, "user disabled");
         Ok(revoked)
     }
@@ -2216,22 +2229,36 @@ impl MeApiServer for AdminApi {
             return Err(error(error_code::INVALID_INPUT, "a PIN is 4 to 8 digits"));
         };
         let phc = hash_pin(&pin).await?;
+        let told = self.auth.profile_ticket(me.id);
         self.auth
             .store()
             .set_pin(me.id, &phc, digits)
             .await
             .map_err(internal)?;
+        told.tell(ProfileNews::PinChanged {
+            user: me.id,
+            required: true,
+            device: None,
+            except: None,
+        });
         tracing::info!(username = %me.username, "PIN set");
         Ok(())
     }
 
     async fn pin_clear(&self, ext: &Extensions) -> RpcResult<()> {
         let (_, user) = self.recently_signed_in(ext).await?;
+        let told = self.auth.profile_ticket(user.user);
         self.auth
             .store()
             .clear_pin(user.user)
             .await
             .map_err(internal)?;
+        told.tell(ProfileNews::PinChanged {
+            user: user.user,
+            required: false,
+            device: None,
+            except: None,
+        });
         tracing::info!(user = %user.user, "PIN removed by its user");
         Ok(())
     }
@@ -2260,11 +2287,19 @@ impl MeApiServer for AdminApi {
         } else {
             self.recently_signed_in(ext).await?
         };
-        Ok(self
-            .auth
+        let told = self.auth.profile_ticket(user.user);
+        self.auth
             .store()
             .set_pin_required(user.user, &endpoint_id, required)
-            .await?)
+            .await?;
+        // That device alone, as for `admin.userSetPinRequired`.
+        told.tell(ProfileNews::PinChanged {
+            user: user.user,
+            required,
+            device: Some(endpoint_id),
+            except: None,
+        });
+        Ok(())
     }
 
     async fn set_device_trust(
@@ -2297,11 +2332,17 @@ impl MeApiServer for AdminApi {
         // An API session is on no device, so any of the caller's may go;
         // it ends sessions there and takes away trust (P4-03).
         let (_, user) = self.recently_signed_in(ext).await?;
+        let told = self.auth.profile_ticket(user.user);
         let deleted = self
             .auth
             .store()
             .delete_device(user.user, &endpoint_id)
             .await?;
+        told.tell(ProfileNews::Removed {
+            user: user.user,
+            device: Some(endpoint_id.clone()),
+            except: None,
+        });
         tracing::info!(user = %user.user, endpoint_id, deleted, "device deleted by its user");
         Ok(())
     }
@@ -2860,7 +2901,7 @@ impl AdminApiServer for AdminApi {
             .store()
             .add_first_admin_with_passkey(
                 &passkey.username,
-                FirstPasskey {
+                NewPasskey {
                     handle: &passkey.handle,
                     credential_id: &passkey.credential_id,
                     name,
@@ -2995,14 +3036,73 @@ impl AdminApiServer for AdminApi {
         Ok(self.auth.store().enable_user(&username).await?)
     }
 
+    async fn user_delete(&self, ext: &Extensions, username: String) -> RpcResult<()> {
+        let admin = self.recent_admin(ext).await?;
+        let by = self.account(admin).await?;
+        let user = self.record(&username).await?;
+        if user.id == by.id {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                "you cannot delete yourself; another admin can",
+            ));
+        }
+        // Checked again as it is deleted; here so nothing goes first.
+        self.auth
+            .store()
+            .check_admin_kept(user.id, &user.username)
+            .await?;
+        let told = self.auth.profile_ticket(user.id);
+        // Their playlists go in the same transaction, so a delete refused
+        // or failed leaves every one; whoever saw one is told once it is
+        // done.
+        let deleted = self.auth.store().delete_user(&username).await?;
+        told.tell(ProfileNews::Removed {
+            user: deleted.id,
+            device: None,
+            except: None,
+        });
+        if let Some(library) = &self.library {
+            library
+                .playlists
+                .deleted_with_owner(&deleted.playlists)
+                .await;
+        }
+        if let Some(downloads) = &self.downloads
+            && let Err(e) = downloads.deleted(&deleted.downloads).await
+        {
+            tracing::warn!(error = %e, "cannot let go of a deleted user's downloads");
+        }
+        // The config's own link is not a user's to lose.
+        if let Some(accounts) = &self.accounts
+            && let Err(e) = accounts.unlink(deleted.id, &by.username)
+            && !matches!(e, LinkError::ByConfig)
+        {
+            tracing::warn!(error = %e, "cannot unlink a deleted user's Plex account");
+        }
+        tracing::info!(
+            %username,
+            by = %by.username,
+            downloads = deleted.downloads.len(),
+            "user deleted"
+        );
+        Ok(())
+    }
+
     async fn user_clear_pin(&self, ext: &Extensions, username: String) -> RpcResult<()> {
         self.recent_admin(ext).await?;
         let user = self.record(&username).await?;
+        let told = self.auth.profile_ticket(user.id);
         self.auth
             .store()
             .clear_pin(user.id)
             .await
             .map_err(internal)?;
+        told.tell(ProfileNews::PinChanged {
+            user: user.id,
+            required: false,
+            device: None,
+            except: None,
+        });
         tracing::info!(%username, "PIN cleared by an admin");
         Ok(())
     }
@@ -3038,10 +3138,19 @@ impl AdminApiServer for AdminApi {
             self.recent_admin(ext).await?;
         }
         let user = self.record(&username).await?;
+        let told = self.auth.profile_ticket(user.id);
         self.auth
             .store()
             .set_pin_required(user.id, &endpoint_id, required)
             .await?;
+        // That device relocks, or stops asking, now; their others are as
+        // they were.
+        told.tell(ProfileNews::PinChanged {
+            user: user.id,
+            required,
+            device: Some(endpoint_id.clone()),
+            except: None,
+        });
         tracing::info!(%username, endpoint_id, required, "PIN requirement changed by an admin");
         Ok(())
     }
@@ -3080,11 +3189,17 @@ impl AdminApiServer for AdminApi {
     ) -> RpcResult<()> {
         self.recent_admin(ext).await?;
         let user = self.record(&username).await?;
+        let told = self.auth.profile_ticket(user.id);
         let deleted = self
             .auth
             .store()
             .delete_device(user.id, &endpoint_id)
             .await?;
+        told.tell(ProfileNews::Removed {
+            user: user.id,
+            device: Some(endpoint_id.clone()),
+            except: None,
+        });
         tracing::info!(%username, endpoint_id, deleted, "device deleted by an admin");
         Ok(())
     }
@@ -4851,6 +4966,7 @@ mod tests {
             library: None,
             optimized: None,
             federation: None,
+            downloads: None,
             optimized_titles: Arc::default(),
             auth,
             setup_code: None,
@@ -4942,7 +5058,7 @@ mod tests {
         let root = store
             .add_first_admin_with_passkey(
                 "root",
-                FirstPasskey {
+                NewPasskey {
                     handle: "handle-1",
                     credential_id: "cred-1",
                     name: "iPhone",

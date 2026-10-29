@@ -12,7 +12,7 @@ use spoolframe_protocol::{
     Reply, Request, Response, Selection, SessionId, WhoAmIReply,
 };
 use spoolframe_server::auth::SessionToken;
-use spoolframe_server::store::passkeys::FirstPasskey;
+use spoolframe_server::store::passkeys::NewPasskey;
 use spoolframe_server::store::sessions::SessionBinding;
 use spoolframe_types::Platform;
 use support::{ServerOptions, TestClient, TestServer, fresh_dir, mkv_capabilities, movie, poster};
@@ -671,7 +671,7 @@ async fn a_user_without_a_password_proves_it_with_the_pin() {
         .store
         .add_first_admin_with_passkey(
             "alice",
-            FirstPasskey {
+            NewPasskey {
                 handle: "handle",
                 credential_id: "credential",
                 name: "Key",

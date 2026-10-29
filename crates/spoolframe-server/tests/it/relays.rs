@@ -407,33 +407,38 @@ async fn own_relay(
     )
 }
 
-/// A free UDP port on loopback, for a server that must be known before it
-/// starts.
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A main server homed on its own relay, its key made first so the relay
-/// knows whom to ask.
+/// knows whom to ask, and its port chosen first so the relay knows where
+/// (set up again on a port race, [`support::retry_on_port_race`]).
 async fn behind_own_relay(
     test: &str,
     everyone: &str,
 ) -> (TestServer, iroh_relay::server::Server, url::Url) {
-    let dir = support::fresh_dir(test).await;
-    let server_key = spoolframe_server::identity::load_or_create(&dir).unwrap();
-    let port = free_port();
-    let (relay, url, relay_key) = own_relay(server_key.public(), port, everyone).await;
-    let options = ServerOptions {
-        port: Some(port),
-        relays: vec![Relay::Custom(url.clone())],
-        own_relays: vec![relay_key],
-        ..ServerOptions::default()
-    };
-    let server = TestServer::start_with(dir, options).await;
+    let (server, relay, url) = support::retry_on_port_race(|| async {
+        let dir = support::fresh_dir(test).await;
+        let server_key = spoolframe_server::identity::load_or_create(&dir).unwrap();
+        let port = support::free_udp_port();
+        let (relay, url, relay_key) = own_relay(server_key.public(), port, everyone).await;
+        let options = ServerOptions {
+            port: Some(port),
+            relays: vec![Relay::Custom(url.clone())],
+            own_relays: vec![relay_key],
+            ..ServerOptions::default()
+        };
+        match TestServer::try_start_with(dir, options).await {
+            Ok(server) => Ok((server, relay, url)),
+            Err(e) => {
+                drop(relay);
+                let any = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+                Err(match support::udp_taken(any) {
+                    true => support::SetupFailed::PortTaken(e.to_string()),
+                    false => support::SetupFailed::Other(e.to_string()),
+                })
+            }
+        }
+    })
+    .await
+    .unwrap();
     let home = tokio::time::timeout(Duration::from_secs(10), async {
         while !is_home(&server, &url) {
             tokio::time::sleep(Duration::from_millis(50)).await;

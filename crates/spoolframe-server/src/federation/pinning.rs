@@ -119,6 +119,7 @@ async fn answer(connection: Connection, server_id: &'static str, lists: bool, he
                         auth_methods: Vec::new(),
                         web_url: None,
                         experimental: Vec::new(),
+                        features: spoolframe_protocol::Features::empty(),
                         invite_only: true,
                     }))
                 }

@@ -1255,6 +1255,7 @@ mod sdk {
     use std::time::{Duration, UNIX_EPOCH};
 
     use spoolframe_admin_api::{AdminApiClient, NewInvite, Role};
+    use spoolframe_client_ffi::{SpoolClient, SpoolError};
     use spoolframe_client_sdk::{
         Client, Device, InviteKind, InviteOutcome, MemoryStorage, SdkError, Selection,
     };
@@ -1808,6 +1809,112 @@ mod sdk {
         invites.server.stop().await;
     }
 
+    /// A device with nothing but the link makes an account with an app
+    /// passkey, and keeps its session; the server is saved. The feature's
+    /// calls are reached through it being on; one the server does not
+    /// have is refused before anything is sent.
+    #[tokio::test]
+    async fn a_device_joins_with_a_passkey_and_no_password() {
+        let invites = invites("sdk-invite-passkey").await;
+        let created = invites.create(create_user()).await;
+        let id = invites.server.server.id().to_string();
+        let client = new_device().await;
+        let link = &created.share_link;
+        let mut app = crate::app_passkeys::App::new();
+
+        let invited = client
+            .invited::<spoolframe_client_sdk::gate::InvitePasskeys>(link)
+            .await
+            .unwrap();
+        let creation = invited
+            .begin_invite_passkey("pia", Some("Pia"))
+            .await
+            .unwrap();
+        assert_eq!(creation.user_name, "pia @ Home Media");
+        let made = app.create(&creation, "Pia's iPhone");
+        let session = invited.redeem_invite_passkey(made, false).await.unwrap();
+        assert!(session.has_feature(spoolframe_client_sdk::Feature::InvitePasskeys));
+
+        assert_eq!(
+            (
+                session.user().username.as_str(),
+                session.user().display_name.as_str()
+            ),
+            ("pia", "Pia")
+        );
+        let saved = client.servers().await.unwrap();
+        assert!(saved.iter().any(|s| s.endpoint_id == id && s.pinned));
+        assert_eq!(client.profiles(&id).await.unwrap().len(), 1);
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// The same through the FFI: the invite's calls are an object of
+    /// their own, got from the link.
+    #[tokio::test]
+    async fn an_app_joins_with_a_passkey_through_the_ffi() {
+        let invites = invites("ffi-invite-passkey").await;
+        let created = invites.create(create_user()).await;
+        let client = new_device().await;
+        let app = SpoolClient::from(client.clone());
+        let mut passkeys = crate::app_passkeys::App::new();
+
+        let invited = app
+            .invite_passkeys(created.share_link.clone())
+            .await
+            .unwrap();
+        assert_eq!(invited.link(), created.share_link);
+        let creation = invited
+            .begin_invite_passkey("pia".into(), Some("Pia".into()))
+            .await
+            .unwrap();
+        let made = passkeys.create(&creation, "Pia's iPhone");
+        let session = invited.redeem_invite_passkey(made, false).await.unwrap();
+
+        assert!(session.has_feature(spoolframe_client_sdk::Feature::InvitePasskeys));
+        assert_eq!(session.user().username, "pia");
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// An app that did not ask for the feature is told `FeatureOff`, an
+    /// older server's case, and makes nothing.
+    #[tokio::test]
+    async fn the_ffi_refuses_invite_passkeys_with_the_feature_off() {
+        let invites = invites("ffi-invite-passkey-off").await;
+        let created = invites.create(create_user()).await;
+        let client = Client::open_with_options(
+            Arc::new(MemoryStorage::default()),
+            device(),
+            spoolframe_client_sdk::ClientOptions {
+                lan_discovery: false,
+                features: spoolframe_client_sdk::Features::empty(),
+                ..spoolframe_client_sdk::ClientOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = SpoolClient::from(client.clone());
+
+        let refused = app
+            .invite_passkeys(created.share_link.clone())
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            (refused.clone(), refused.kind()),
+            (
+                SpoolError::FeatureOff {
+                    feature: spoolframe_client_sdk::Feature::InvitePasskeys
+                },
+                spoolframe_client_sdk::ErrorKind::ServerTooOld
+            )
+        );
+        client.close().await;
+        invites.server.stop().await;
+    }
+
     /// Refused, nothing is saved; "Save server only" then pins it.
     #[tokio::test]
     async fn a_refused_redemption_saves_nothing_until_save_server_only() {
@@ -2034,6 +2141,144 @@ mod sdk {
         invites.server.stop().await;
     }
 
+    /// A code typed in joins with nothing else typed: its lookup's link
+    /// names the server and the code, and redeems as a link would. Used,
+    /// it is refused as redeeming it would be.
+    #[tokio::test]
+    async fn a_typed_code_joins_by_its_lookups_link() {
+        let invites = invites("sdk-redeem-code").await;
+        let created = invites.create(create_user()).await;
+        let link = spoolframe_protocol::invite::parse_link(&created.link).unwrap();
+        let client = new_device().await;
+        let found = client
+            .look_up_invite_code(&link.server, link.addrs.clone(), &created.code)
+            .await
+            .unwrap();
+        let made = spoolframe_protocol::invite::parse_link(&found.link).unwrap();
+        assert_eq!(
+            (made.server, made.name.as_deref(), made.code.is_some()),
+            (link.server.clone(), Some("Home Media"), true)
+        );
+        let session = client
+            .redeem_invite_code(
+                &link.server,
+                link.addrs.clone(),
+                &created.code,
+                "mum",
+                None,
+                PASSWORD,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.user().username, "mum");
+        assert_eq!(
+            client
+                .redeem_invite_code(
+                    &link.server,
+                    Vec::new(),
+                    &created.code,
+                    "dad",
+                    None,
+                    PASSWORD
+                )
+                .await
+                .unwrap_err(),
+            SdkError::InviteExhausted
+        );
+        client.close().await;
+        invites.server.stop().await;
+    }
+
+    /// A guest who leaves long after signing in is not asked to confirm:
+    /// their credential signs them in again, and that session leaves. The
+    /// server goes from this device with its last profile.
+    #[tokio::test]
+    async fn a_guest_leaves_by_signing_in_again_by_itself() {
+        let invites = invites("sdk-guest-leaves").await;
+        let created = invites
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: None,
+                uses: None,
+                expires: None,
+                role: None,
+            })
+            .await;
+        let server = invites.server.server.id().to_string();
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        let session = phone
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        assert_eq!(session.user().portable_id(), Some(identity));
+        invites.server.clock.advance(Duration::from_secs(11 * 60));
+        session.leave_server().await.unwrap();
+        assert!(
+            phone
+                .servers()
+                .await
+                .unwrap()
+                .iter()
+                .all(|s| s.endpoint_id != server || !s.pinned)
+        );
+        phone.close().await;
+        invites.server.stop().await;
+    }
+
+    /// A pairing's servers are each signed in to as the guest, and one
+    /// this device cannot sign in to is said, not stopped at.
+    #[tokio::test]
+    async fn a_paired_guest_is_signed_in_on_each_server_brought() {
+        let invites = invites("sdk-sign-in-paired").await;
+        let created = invites
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: None,
+                uses: None,
+                expires: None,
+                role: None,
+            })
+            .await;
+        let server = invites.server.server.id().to_string();
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        phone
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        let tv = new_device().await;
+        tv.portable().set_allow_guests(true).await.unwrap();
+        let pairing = tv.start_pairing("Living room TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), identity).await.unwrap();
+        offer.authorize(None).await.unwrap();
+        let paired = pairing.wait().await.unwrap();
+        let mut servers: Vec<String> = paired
+            .servers
+            .iter()
+            .map(|s| s.endpoint_id.clone())
+            .collect();
+        servers.push("ab".repeat(32));
+        let guests = tv.portable().guest_list().await.unwrap();
+        assert_eq!(
+            guests
+                .iter()
+                .map(|g| (g.id, g.pairing.server.as_ref().map(|s| s.name.as_str())))
+                .collect::<Vec<_>>(),
+            [(identity, Some("Home Media"))]
+        );
+        let signed = tv.sign_in_paired(identity, &servers).await;
+        let signed_in: Vec<String> = signed.sessions.iter().map(|s| s.server()).collect();
+        let failed: Vec<&str> = signed.failed.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            (signed_in, failed),
+            (vec![server], vec!["ab".repeat(32).as_str()])
+        );
+        phone.close().await;
+        tv.close().await;
+        invites.server.stop().await;
+    }
+
     /// Guessing through the SDK ends as through the wire.
     #[tokio::test]
     async fn codes_that_match_nothing_end_in_rate_limited() {
@@ -2091,6 +2336,262 @@ mod sdk {
             SdkError::NotAnInvite
         );
         client.close().await;
+        invites.server.stop().await;
+    }
+}
+
+/// An account made with an invite and an app passkey, no password:
+/// feature `spoolframe:invite-passkeys`.
+mod with_passkey {
+    use super::*;
+    use crate::app_passkeys::App;
+    use spoolframe_protocol::{
+        BeginInvitePasskey, Feature, Features, FinishPasskeyRegistration, PasskeyCreation,
+        RedeemInviteWithPasskey,
+    };
+
+    /// A device that has not signed in, its `Hello` naming the feature.
+    async fn stranger(invites: &Invites) -> TestClient {
+        let device = invites.server.client().await;
+        let info = device
+            .hello_with_features(Features::only(Feature::InvitePasskeys))
+            .await;
+        assert!(info.features.contains(Feature::InvitePasskeys));
+        device
+    }
+
+    async fn begin(device: &TestClient, code: &str, username: &str) -> Response {
+        let request = Request::BeginInvitePasskey(BeginInvitePasskey {
+            code: code.into(),
+            username: username.into(),
+            display_name: Some("Pia".into()),
+        });
+        device.call(None, request).await
+    }
+
+    /// What the platform makes the passkey with, from `begin`'s answer.
+    async fn creation(device: &TestClient, begun: Response) -> PasskeyCreation {
+        match begun {
+            Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => begun.for_server(
+                device.conn.remote_id().as_bytes(),
+                &device.server_id().await,
+            ),
+            other => panic!("not begun: {other:?}"),
+        }
+    }
+
+    async fn made(
+        device: &TestClient,
+        app: &mut App,
+        code: &str,
+        username: &str,
+    ) -> FinishPasskeyRegistration {
+        let begun = begin(device, code, username).await;
+        app.create(&creation(device, begun).await, "Pia's iPhone")
+    }
+
+    async fn finish(device: &TestClient, code: &str, made: FinishPasskeyRegistration) -> Response {
+        let request = Request::RedeemInviteWithPasskey(RedeemInviteWithPasskey {
+            code: code.into(),
+            finish: made,
+            remember: true,
+        });
+        device.call(None, request).await
+    }
+
+    fn two_uses() -> NewInvite {
+        NewInvite {
+            uses: Some(2),
+            ..create_user()
+        }
+    }
+
+    /// The whole ceremony: the account is made with the invite's role and
+    /// its passkey alone, the device signed in and trusted, a use taken;
+    /// the passkey then signs in.
+    #[tokio::test]
+    async fn an_invite_and_a_passkey_make_an_account_with_no_password() {
+        let invites = Invites::start("invite-passkey").await;
+        let created = invites.create(two_uses()).await;
+        let phone = stranger(&invites).await;
+        let mut app = App::new();
+        let made = made(&phone, &mut app, &created.code, "pia").await;
+
+        let session = match finish(&phone, &created.code, made).await {
+            Response::Ok(Reply::LoggedIn {
+                session,
+                remembered: true,
+                password_change_required: false,
+                ..
+            }) => session,
+            other => panic!("not signed in: {other:?}"),
+        };
+        match phone.call(Some(&session), Request::WhoAmI).await {
+            Response::Ok(Reply::WhoAmI(WhoAmIReply { user, .. })) => {
+                assert_eq!(
+                    (user.username.as_str(), user.display_name.as_str()),
+                    ("pia", "Pia")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let pia = invites
+            .server
+            .store
+            .user_by_name("pia")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (pia.role, pia.has_password, pia.has_passkey),
+            (spoolframe_types::Role::Consumer, false, true)
+        );
+        assert_eq!(invites.root.invite_list().await.unwrap()[0].uses_left, 1);
+
+        let tv = stranger(&invites).await;
+        let request = match tv
+            .call(None, Request::BeginPasskeySignIn { username: None })
+            .await
+        {
+            Response::Ok(Reply::PasskeySignInBegun(begun)) => {
+                begun.for_server(tv.conn.remote_id().as_bytes(), &tv.server_id().await)
+            }
+            other => panic!("{other:?}"),
+        };
+        let signed = Request::FinishPasskeySignIn {
+            signed: app.get(&request),
+            remember: false,
+        };
+        assert!(matches!(
+            tv.call(None, signed).await,
+            Response::Ok(Reply::LoggedIn { .. })
+        ));
+        invites.server.stop().await;
+    }
+
+    /// A username someone has is refused at the beginning; one taken
+    /// between the beginning and the finish, at the finish, and the
+    /// invite keeps its use.
+    #[tokio::test]
+    async fn a_username_taken_before_the_finish_keeps_the_invite() {
+        let invites = Invites::start("invite-passkey-taken").await;
+        let created = invites.create(two_uses()).await;
+        let phone = stranger(&invites).await;
+        assert_eq!(
+            begin(&phone, &created.code, "root").await,
+            Response::Err(Error::UsernameTaken)
+        );
+        let made = made(&phone, &mut App::new(), &created.code, "pia").await;
+        logged_in(
+            invites
+                .stranger()
+                .await
+                .call(None, redeem(&created.code, "pia"))
+                .await,
+        );
+
+        assert_eq!(
+            finish(&phone, &created.code, made).await,
+            Response::Err(Error::UsernameTaken)
+        );
+        assert_eq!(invites.root.invite_list().await.unwrap()[0].uses_left, 1);
+        invites.server.stop().await;
+    }
+
+    /// An invite used up or expired between the beginning and the finish
+    /// says so at the finish, and nothing is made.
+    #[tokio::test]
+    async fn an_invite_used_up_or_expired_before_the_finish_makes_nothing() {
+        let invites = Invites::start("invite-passkey-spent").await;
+        let used = invites.create(create_user()).await;
+        let phone = stranger(&invites).await;
+        let made_for_used = made(&phone, &mut App::new(), &used.code, "pia").await;
+        logged_in(
+            invites
+                .stranger()
+                .await
+                .call(None, redeem(&used.code, "anna"))
+                .await,
+        );
+        assert_eq!(
+            finish(&phone, &used.code, made_for_used).await,
+            Response::Err(Error::InviteExhausted)
+        );
+
+        let expiring = invites
+            .create(NewInvite {
+                expires: Some(invite::MIN_EXPIRES_SECS),
+                ..create_user()
+            })
+            .await;
+        let made_for_expiring = made(&phone, &mut App::new(), &expiring.code, "pia").await;
+        invites.server.clock.advance(Duration::from_secs(3601));
+        assert_eq!(
+            finish(&phone, &expiring.code, made_for_expiring).await,
+            Response::Err(Error::InviteExpired)
+        );
+        assert!(
+            invites
+                .server
+                .store
+                .user_by_name("pia")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        invites.server.stop().await;
+    }
+
+    /// A device whose `Hello` did not name the feature is answered as one
+    /// asking what the server does not know, for either half; the invite
+    /// is not used.
+    #[tokio::test]
+    async fn a_device_that_did_not_name_the_feature_is_refused() {
+        let invites = Invites::start("invite-passkey-unnamed").await;
+        let created = invites.create(create_user()).await;
+        let phone = invites.stranger().await;
+
+        assert_eq!(
+            begin(&phone, &created.code, "pia").await,
+            Response::Err(Error::Unsupported {
+                request: "begin_invite_passkey".into()
+            })
+        );
+        let made = made(
+            &stranger(&invites).await,
+            &mut App::new(),
+            &created.code,
+            "pia",
+        )
+        .await;
+        assert_eq!(
+            finish(&phone, &created.code, made).await,
+            Response::Err(Error::Unsupported {
+                request: "redeem_invite_with_passkey".into()
+            })
+        );
+        assert_eq!(invites.root.invite_list().await.unwrap()[0].uses_left, 1);
+        invites.server.stop().await;
+    }
+
+    /// The registration is the device's that began it: another's finish is
+    /// refused and leaves it to that device, which then finishes it.
+    #[tokio::test]
+    async fn a_finish_from_another_device_is_refused() {
+        let invites = Invites::start("invite-passkey-other-device").await;
+        let created = invites.create(create_user()).await;
+        let phone = stranger(&invites).await;
+        let made = made(&phone, &mut App::new(), &created.code, "pia").await;
+        let thief = stranger(&invites).await;
+
+        assert_eq!(
+            finish(&thief, &created.code, made.clone()).await,
+            Response::Err(Error::InvalidCredentials)
+        );
+        assert!(matches!(
+            finish(&phone, &created.code, made).await,
+            Response::Ok(Reply::LoggedIn { .. })
+        ));
         invites.server.stop().await;
     }
 }

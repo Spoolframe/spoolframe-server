@@ -143,6 +143,7 @@ impl AdminApi {
         self.playlists_service()?
             .edit(&actor(&user), id, revision, edits)
             .await
+            .map(|(revision, _)| revision)
             .map_err(playlists_error)
     }
 

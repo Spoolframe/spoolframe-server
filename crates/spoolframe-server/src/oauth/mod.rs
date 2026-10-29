@@ -14,13 +14,11 @@
 //! sent to any address: a redirect there would vouch for it. The HTTP side
 //! is the admin listener's; this is the rules, with no HTTP in them.
 
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
-use password_hash::rand_core::{OsRng, RngCore};
-use sha2::Digest;
 
 use crate::store::oauth::{ClientRecord, NewGrant, NewTokens, OauthAccess, Redeemed, Refreshed};
 use crate::store::users::LocalUserId;
@@ -232,7 +230,7 @@ pub fn return_host(redirect_uri: &str) -> String {
 /// A random secret: 32 bytes, hex.
 fn secret() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS gives random bytes");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

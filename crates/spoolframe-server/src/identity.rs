@@ -11,7 +11,6 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use iroh::SecretKey;
-use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::server_id::SERVER_ID_BYTES;
 use spoolframe_protocol::{InvalidServerId, ServerId};
 
@@ -105,7 +104,7 @@ fn create_server_id(state_dir: &Path, path: &Path) -> Result<ServerId, IdentityE
         .create(state_dir)
         .map_err(failed)?;
     let mut bytes = [0; SERVER_ID_BYTES];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS gives random bytes");
     let id = ServerId::from_bytes(bytes);
     // create_new: if another process made one in the meantime, fail
     // rather than overwrite it.

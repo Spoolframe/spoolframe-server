@@ -644,14 +644,20 @@ async fn a_change_of_the_user_s_state_is_seen_at_once() {
     );
     // Saved through the watch state, as a client's mark is: the walk is
     // forgotten, and both are seen.
-    h.watch.mark(h.alice, &movie_id("2"), true).await.unwrap();
+    h.watch
+        .mark(h.alice, &movie_id("2"), true, None)
+        .await
+        .unwrap();
     assert_eq!(
         h.all(h.alice, &movies(), None, unwatched.clone()).await,
         ["3", "4", "5", "6"]
     );
     // Bob's walk is his own, and stays.
     let bob_s = h.all(h.bob, &movies(), None, unwatched.clone()).await;
-    h.watch.mark(h.alice, &movie_id("3"), true).await.unwrap();
+    h.watch
+        .mark(h.alice, &movie_id("3"), true, None)
+        .await
+        .unwrap();
     let walks = h.shelf.walks.load(Ordering::SeqCst);
     assert_eq!(h.all(h.bob, &movies(), None, unwatched).await, bob_s);
     assert_eq!(h.shelf.walks.load(Ordering::SeqCst), walks);

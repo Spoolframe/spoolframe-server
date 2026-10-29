@@ -184,6 +184,9 @@ pub(crate) struct Peer {
     refused: AtomicBool,
     /// How many of its streams are being answered.
     streams: watch::Sender<usize>,
+    /// Its events stream, once open: finished, and acknowledged, before a
+    /// sign-out closes it.
+    events: std::sync::OnceLock<crate::events::EventStream>,
     /// A device's, or a server's on `spoolframe/federation/1`.
     kind: PeerKind,
     /// Let in by paired servers' sessions alone (C8-04), those pairs'
@@ -225,6 +228,7 @@ impl Peer {
             closing: AtomicBool::new(false),
             refused: AtomicBool::new(false),
             streams: watch::Sender::new(0),
+            events: std::sync::OnceLock::new(),
             kind: PeerKind::Device,
             remote: parking_lot::Mutex::default(),
         }
@@ -360,10 +364,16 @@ impl Peer {
         Answering(self.clone())
     }
 
+    /// Its events stream is `events`.
+    pub(crate) fn events_opened(&self, events: crate::events::EventStream) {
+        let _ = self.events.set(events);
+    }
+
     /// The device has no live session left: let the streams being answered
     /// finish, for at most `drain` ([`Admission::sign_out_drain`]), then
-    /// close the connection with [`spoolframe_protocol::close::SIGNED_OUT`].
-    /// The device may connect again, as a stranger.
+    /// its events stream, for at most `drain` more, then close the
+    /// connection with [`spoolframe_protocol::close::SIGNED_OUT`]. The
+    /// device may connect again, as a stranger.
     pub(crate) fn sign_out(self: &Arc<Self>, drain: Duration) {
         if self.closing.swap(true, Ordering::AcqRel) {
             return;
@@ -372,6 +382,21 @@ impl Peer {
         tokio::spawn(async move {
             let mut streams = peer.streams.subscribe();
             let _ = tokio::time::timeout(drain, streams.wait_for(|n| *n == 0)).await;
+            // An event written just before (a `ProfileRemoved` for the
+            // change that signed it out, held as a stream being answered
+            // until written) would be lost with what the device had not
+            // acknowledged: the stream is never finished otherwise, so
+            // nothing else says when it arrived. Finished after the writes
+            // waiting for it, it is acknowledged once they are.
+            if let Some(events) = peer.events.get() {
+                let delivered = async {
+                    let mut events = events.lock().await;
+                    if events.finish().is_ok() {
+                        let _ = events.stopped().await;
+                    }
+                };
+                let _ = tokio::time::timeout(drain, delivered).await;
+            }
             tracing::info!(endpoint = %peer.endpoint.fmt_short(), "closing a signed-out device's connection");
             peer.connection.close(
                 VarInt::from_u32(spoolframe_protocol::close::SIGNED_OUT),

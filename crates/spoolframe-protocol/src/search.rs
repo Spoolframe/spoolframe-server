@@ -94,6 +94,7 @@ impl<T> SearchResults<T> {
 /// number) is one hit: this server's copy when it has one, else the copy
 /// the user plays from or last played, else the first online.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SearchHit {
     pub item: Item,
     /// The paired server `item` is from; `None` for this server's own.
@@ -124,6 +125,7 @@ impl SearchHit {
 /// title's copies on other servers, as a [`SearchHit`] and an `Item`
 /// reply have them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Copies {
     /// The paired server the item is from; `None` for this server's own.
     #[serde(default)]
@@ -140,6 +142,7 @@ pub struct Copies {
 
 /// One copy of a title, on one server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TitleCopy {
     /// The copy's id here: a `fed:` id for a paired server's.
     pub id: MediaId,
@@ -187,6 +190,7 @@ pub struct SearchGroup<T = Item> {
 /// without asking again; a search that finds nothing in its scope counts
 /// the others.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SearchCounts {
     /// Every group, people included.
     pub all: Option<u32>,

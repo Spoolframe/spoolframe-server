@@ -11,8 +11,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use password_hash::rand_core::{OsRng, RngCore};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 
 use spoolframe_types::Role;
 
@@ -48,7 +48,7 @@ pub const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub const RECENT_SIGN_IN: Duration = Duration::from_secs(10 * 60);
 
 /// The shortest password accepted when one is set.
-pub const MIN_PASSWORD_LEN: usize = 8;
+pub const MIN_PASSWORD_LEN: usize = spoolframe_types::password::MIN_CHARS;
 
 /// A session token as the client holds it. Only its hash is stored.
 #[derive(Clone, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub const ONE_TIME_PASSWORD: Duration = Duration::from_secs(7 * 24 * 3600);
 pub fn one_time_password() -> String {
     const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS gives random bytes");
     bytes
         .chunks(4)
         .map(|group| {
@@ -87,7 +87,7 @@ pub fn one_time_password() -> String {
 impl SessionToken {
     pub(crate) fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        getrandom::fill(&mut bytes).expect("the OS gives random bytes");
         Self(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 
@@ -199,10 +199,9 @@ async fn argon2<T: Send + 'static>(
 async fn hash_secret(secret: &str) -> Result<String, PasswordError> {
     let password = secret.to_owned();
     argon2(move || {
-        let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map(|hash| hash.to_string())
+            .hash_password(password.as_bytes())
+            .map(|hash: PasswordHash| hash.to_string())
             .map_err(|e| PasswordError::Hash(e.to_string()))
     })
     .await
@@ -237,11 +236,10 @@ fn decoy_hash() -> String {
     static DECOY: OnceLock<String> = OnceLock::new();
     DECOY
         .get_or_init(|| {
-            let salt = SaltString::generate(&mut OsRng);
-            Argon2::default()
-                .hash_password(b"decoy password, never valid", &salt)
-                .expect("hashing a fixed password cannot fail")
-                .to_string()
+            let hash: PasswordHash = Argon2::default()
+                .hash_password(b"decoy password, never valid")
+                .expect("hashing a fixed password cannot fail");
+            hash.to_string()
         })
         .clone()
 }
@@ -684,6 +682,9 @@ pub struct Auth {
     hellos: Arc<Refusals>,
     /// The sessions paired servers' play tokens opened (P8-04).
     remote: Arc<crate::remote_sessions::RemoteSessions>,
+    /// Who is told of a change to a user's profile: the client protocol,
+    /// which tells their connections.
+    profiles: crate::events::ProfileTellers,
 }
 
 impl Auth {
@@ -709,8 +710,22 @@ impl Auth {
                 clock.clone(),
                 crate::remote_sessions::IDLE,
             )),
+            profiles: crate::events::ProfileTellers::default(),
             clock,
         }
+    }
+
+    /// Tell connections of their users' profiles through `teller`, from
+    /// now on.
+    pub(crate) fn on_profile(&self, teller: crate::events::ProfileTeller) {
+        self.profiles.add(teller);
+    }
+
+    /// Who a change to `user`'s profile, about to be made, is to be told
+    /// to: found before it, while their sessions are known and their
+    /// devices signed in. Tell it once the change is made.
+    pub(crate) fn profile_ticket(&self, user: LocalUserId) -> crate::events::ProfileTicket {
+        self.profiles.ticket(user)
     }
 
     /// The sessions paired servers' play tokens opened (P8-04).
@@ -1419,6 +1434,22 @@ mod tests {
             false,
         )
         .await
+    }
+
+    /// A password hashed before argon2 0.6 (by 0.5.3, the PHC string a
+    /// database holds) still verifies, and a wrong one still does not.
+    #[tokio::test]
+    async fn a_password_hashed_by_argon2_0_5_still_verifies() {
+        const MADE_BY_0_5: &str = "$argon2id$v=19$m=19456,t=2,p=1$1Oq9UKzlBnqGF7SwpTKrXw$\
+                                   TVfdcOEYRpQvW6w+fbVfTKFhQC7J4lUEJtCk7ueDl38";
+        assert!(verify_password("correct horse", MADE_BY_0_5.into()).await);
+        assert!(!verify_password("battery staple", MADE_BY_0_5.into()).await);
+        let made_now = hash_secret("correct horse").await.unwrap();
+        assert!(
+            made_now.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "{made_now}"
+        );
+        assert!(verify_password("correct horse", made_now).await);
     }
 
     #[tokio::test]

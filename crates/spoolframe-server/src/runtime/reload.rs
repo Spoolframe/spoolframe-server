@@ -7,7 +7,7 @@
 //! and where. Otherwise the live settings apply through the path a change
 //! in the web UI takes (`RuntimeSettings::apply`), the restart settings
 //! wait as such a change's do, the config warnings are logged again and
-//! the encoders are detected again.
+//! the encoders are detected again, in the background.
 
 use std::sync::Arc;
 
@@ -100,7 +100,7 @@ impl RuntimeSettings {
     /// the admin who asked) says in the log. One reload at a time; a
     /// settings change waits for it, and it for a settings change.
     pub async fn reload(&self, trigger: &str) -> Result<Reloaded, ConfigError> {
-        let _one = self.reloading.lock().await;
+        let one = self.reloading.lock().await;
         let reloaded = match self.reload_layers(trigger) {
             Ok((reloaded, layers, config)) => {
                 tracing::info!("{trigger}: config reloaded: {}", reloaded.summary());
@@ -115,10 +115,13 @@ impl RuntimeSettings {
                 Err(e)
             }
         };
+        drop(one);
         // As SIGHUP always did (P2-02): a GPU may have come or gone,
-        // whatever the files say.
+        // whatever the files say. Not under the reload's lock, nor awaited:
+        // probing every encoder takes seconds, and half a minute on a busy
+        // host, which the next reload, and the admin who asked, would wait.
         if let Some(transcoding) = &self.live.transcoding {
-            transcoding.detect().await;
+            crate::transcode::spawn_detection(transcoding.clone());
         }
         reloaded
     }
@@ -444,5 +447,42 @@ mod tests {
         assert_eq!(warned(), 1);
         settings.reload("SIGHUP").await.unwrap();
         assert_eq!(warned(), 2);
+    }
+
+    /// Detecting the encoders again is not the reload's to wait for: on a
+    /// busy host it takes half a minute, and the next SIGHUP's reload, or
+    /// the admin who asked, waited all of it.
+    #[tokio::test]
+    async fn a_reload_does_not_wait_for_the_encoders() {
+        use crate::transcode::Transcoding;
+        use spoolframe_media::sandbox::Tool;
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-reload-slow-encoders").await;
+        let ffmpeg = dir.join("ffmpeg");
+        crate::test_support::write_script(&ffmpeg, "#!/bin/sh\nsleep 60\n");
+        let file = dir.join("server.ucl");
+        std::fs::write(&file, r#"name = "Nimble";"#).unwrap();
+        let layers = Layers::load(&Locations {
+            state_dir: dir.as_ref().to_owned(),
+            config: Some(file.clone()),
+        })
+        .unwrap();
+        let live = super::super::Live {
+            name: Some(ServerName::new("Nimble")),
+            transcoding: Some(Arc::new(Transcoding::new(
+                Tool::unconfined(ffmpeg),
+                Vec::new(),
+                dir.join("scratch"),
+            ))),
+            ..Default::default()
+        };
+        let settings = RuntimeSettings::new(layers, dir.as_ref(), live, RestartMode::InPlace);
+        for name in ["Den", "Attic"] {
+            std::fs::write(&file, format!("name = \"{name}\";")).unwrap();
+            let reloaded =
+                tokio::time::timeout(std::time::Duration::from_secs(10), settings.reload("test"))
+                    .await
+                    .expect("the reload waited for the encoders");
+            assert_eq!(reloaded.unwrap().applied, ["name"]);
+        }
     }
 }

@@ -30,7 +30,7 @@ use spoolframe_hls_bridge::{
 };
 use spoolframe_protocol::experimental::HttpPlaybackRefusal;
 use spoolframe_protocol::{Error, MediaRead, PlaybackHandle, PlaybackPlan, SessionId};
-use spoolframe_types::{Container, Delivery};
+use spoolframe_types::Delivery;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -442,16 +442,7 @@ impl HttpPlayback {
 /// The type of a direct playback's file, by its container.
 fn mime(plan: &PlaybackPlan) -> &'static str {
     match plan {
-        PlaybackPlan::Direct { container, .. } => match container {
-            Container::Mp4 => "video/mp4",
-            Container::Matroska => "video/x-matroska",
-            Container::MpegTs => "video/mp2t",
-            Container::Avi => "video/x-msvideo",
-            Container::Flac => "audio/flac",
-            Container::Mp3 => "audio/mpeg",
-            Container::Ogg => "audio/ogg",
-            _ => "application/octet-stream",
-        },
+        PlaybackPlan::Direct { container, .. } => container.mime(),
         _ => "application/octet-stream",
     }
 }

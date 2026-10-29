@@ -213,9 +213,8 @@ impl StandIn {
 }
 
 fn random() -> String {
-    use password_hash::rand_core::{OsRng, RngCore};
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS gives random bytes");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

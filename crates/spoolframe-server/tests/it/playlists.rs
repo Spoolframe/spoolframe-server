@@ -151,7 +151,7 @@ async fn a_playlist_is_made_filled_read_and_refused_over_the_wire() {
             kind: ItemKind::Movie
         })
     );
-    let Response::Ok(Reply::PlaylistEdited { revision }) =
+    let Response::Ok(Reply::PlaylistEdited { revision, added }) =
         edit(&tv, &alice, &made.id, 0, vec![add(season("11"))]).await
     else {
         panic!("the season was not added");
@@ -174,6 +174,9 @@ async fn a_playlist_is_made_filled_read_and_refused_over_the_wire() {
     assert_eq!(items, [episode("12"), episode("13")]);
     assert_eq!((page.total, page.playable), (2, 2));
     assert_eq!(page.playlist.owner_kind, PlaylistOwnerKind::SharedWithMe);
+    // The season's add answered the entries it made, in their order.
+    let made_entries: Vec<_> = page.entries.iter().map(|e| e.entry).collect();
+    assert_eq!(added, Some(made_entries));
 
     // Read only for Bob; not there at all for Carol.
     assert_eq!(
@@ -196,7 +199,10 @@ async fn a_playlist_is_made_filled_read_and_refused_over_the_wire() {
     // Two editors at one revision: the first removes an entry, the
     // second's move of it is refused, with the revision to reload at.
     let first = page.entries[0].entry;
-    let Response::Ok(Reply::PlaylistEdited { revision: after }) = edit(
+    let Response::Ok(Reply::PlaylistEdited {
+        revision: after,
+        added: Some(none_added),
+    }) = edit(
         &tv,
         &alice,
         &made.id,
@@ -207,6 +213,7 @@ async fn a_playlist_is_made_filled_read_and_refused_over_the_wire() {
     else {
         panic!("not removed");
     };
+    assert!(none_added.is_empty(), "a remove adds nothing");
     assert_eq!(
         edit(
             &tv,

@@ -2835,6 +2835,7 @@ mod replica {
             device_name: None,
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features: spoolframe_protocol::Features::empty(),
         };
         app.call(None, Request::Hello(hello)).await;
         pair.sb.add_user("bob", "correct horse", None).await;
@@ -4392,6 +4393,7 @@ mod replica {
             device_name: None,
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features: spoolframe_protocol::Features::empty(),
         };
         app.call(None, Request::Hello(hello)).await;
         let bob = app.login("bob", "correct horse").await;
@@ -5100,6 +5102,7 @@ mod replica {
                 device_name: None,
                 capabilities: Some(mkv_capabilities()),
                 experimental: experimental.iter().map(|n| (*n).to_owned()).collect(),
+                features: spoolframe_protocol::Features::empty(),
             };
             let timing = [
                 (
@@ -5203,6 +5206,7 @@ mod replica {
                 device_name: None,
                 capabilities: Some(mkv_capabilities()),
                 experimental: vec![FEDERATION.into()],
+                features: spoolframe_protocol::Features::empty(),
             };
             assert!(matches!(
                 asking.call(None, Request::Hello(hello)).await,
@@ -5611,6 +5615,48 @@ mod replica {
             pair.stop().await;
         }
 
+        /// The same play through the SDK's managed playback
+        /// (`open_any_playback`): it carries its route, reads from SA, and
+        /// its progress goes to SB by the `fed:` id, as Continue watching
+        /// shows.
+        #[tokio::test]
+        async fn a_managed_play_of_sa_s_film_reads_from_sa_and_reports_to_sb() {
+            use spoolframe_client_sdk::{PlaybackOptions, RemoteMode};
+            let pair = Pair::start("fed-media-sdk-managed").await;
+            let (file, _) = shared(&pair).await;
+            let (client, bob) =
+                super::super::app::signed_in(&pair.sb, "bob", super::super::app::FEDERATION).await;
+            let alien = pair.fed(movie().id());
+            let playback = bob
+                .open_any_playback(
+                    &alien,
+                    Some(Selection::default()),
+                    PlaybackOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(playback.route(), Some(RemoteMode::Direct));
+            assert!(!playback.proxied());
+            assert_eq!(playback.read(0, 4096).await.unwrap(), file[..4096]);
+            playback
+                .report_position(std::time::Duration::from_secs(600))
+                .unwrap();
+            playback.flush().await.unwrap();
+            let screen = bob.home().await.unwrap();
+            assert!(
+                screen.continue_watching.iter().any(|i| i.id() == &alien),
+                "SB keeps the place"
+            );
+            assert_eq!(pair.sa.debug.list().open.len(), 1, "SA plays it");
+            assert!(
+                pair.sb.debug.list().open.is_empty(),
+                "SB carried none of it"
+            );
+            playback.close().await.unwrap();
+            client.close().await;
+            pair.stop().await;
+        }
+
         /// SA reachable only through its own relay, which lets through its
         /// owners and friends (P8-04): Bob's app, which knows SA by that
         /// relay alone, plays SA's film directly, the play token getting it
@@ -5627,39 +5673,24 @@ mod replica {
             use spoolframe_protocol::relay_access::{
                 AccessAnswer, AccessQuery, RELAY_ACCESS_ALPN, Tier, play_relay_token,
             };
-            use spoolframe_server::own_relay::{self, Access, RelayConfig, Serve};
+            use spoolframe_server::own_relay::Access;
 
             let key = SecretKey::generate();
-            let http = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            let url = url::Url::parse(&format!("http://{http}")).unwrap();
-            let sa = TestServer::start_with(
-                fresh_dir("fed-media-relay-sa").await,
+            let (sa, relay, url) = crate::support::start_with_own_relay(
+                "fed-media-relay-sa",
                 ServerOptions {
                     name: "Alice's server".into(),
                     federation: true,
-                    relays: vec![spoolframe_server::network::Relay::Custom(url.clone())],
-                    own_relays: vec![key.public()],
                     ..ServerOptions::default()
                 },
-            )
-            .await;
-            let config = RelayConfig {
-                server: sa.server.addr(),
-                access: Access {
+                &key,
+                Access {
                     owner: true,
                     friends: true,
                     everyone: false,
                 },
-                serve: Serve::Proxy,
-                http,
-                quic: None,
-            };
-            let relay = own_relay::spawn(&config, key.clone(), &std::env::temp_dir())
-                .await
-                .unwrap();
+            )
+            .await;
             let home = iroh::RelayUrl::from(url.clone());
             until(|| async { sa.server.addr().relay_urls().any(|u| *u == home) }).await;
             // The relay is on loopback, which no pair's may be (M8-07):

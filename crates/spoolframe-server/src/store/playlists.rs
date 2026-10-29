@@ -733,6 +733,17 @@ impl Store {
         base: u64,
         edits: Vec<EntryEdit>,
     ) -> Result<u64, PlaylistError> {
+        Ok(self.edit_playlist_adding(id, base, edits).await?.0)
+    }
+
+    /// [`Store::edit_playlist`], with the entries its adds made, in the
+    /// edits' order.
+    pub async fn edit_playlist_adding(
+        &self,
+        id: &str,
+        base: u64,
+        edits: Vec<EntryEdit>,
+    ) -> Result<(u64, Vec<EntryId>), PlaylistError> {
         let now = self.now();
         let mut tx = self.begin_write().await?;
         let (current, recorded_from): (i64, i64) =
@@ -758,6 +769,7 @@ impl Store {
         let mut order = entry_order(&mut tx, id).await?;
         let mut touched_now = Vec::new();
         let mut removed = Vec::new();
+        let mut added_all = Vec::new();
         for edit in edits {
             let step = match edit {
                 EntryEdit::Add { entries, before } => {
@@ -765,6 +777,7 @@ impl Store {
                     for entry in &entries {
                         added.push(insert_entry(&mut tx, id, entry, now).await?);
                     }
+                    added_all.extend(added.iter().copied());
                     Step::Insert {
                         entries: added,
                         before,
@@ -793,7 +806,7 @@ impl Store {
         let revision = bump(&mut tx, id, now).await?;
         record(&mut tx, id, revision, &touched_now).await?;
         tx.commit().await?;
-        Ok(revision)
+        Ok((revision, added_all))
     }
 
     /// Take `entries` out of playlist `id`: their items left the library.
@@ -1194,11 +1207,72 @@ async fn write_pins(
     Ok(())
 }
 
-/// Note, for each pin of playlist `id` that `which` (a condition on
-/// `playlist_pins`, `?1` the playlist) picks, but `by`'s, that it left
-/// Pinned for `reason`. A newer note for the same playlist replaces an
-/// older one.
-async fn note_pins(
+/// A playlist deleted with its owner ([`Store::delete_user`]), as it was
+/// just before: for telling who saw it and who pinned it, once deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GonePlaylist {
+    pub row: PlaylistRow,
+    /// Who had pinned it.
+    pub pinned: HashSet<String>,
+}
+
+/// `owner`'s playlists, read in the transaction that deletes them.
+pub(super) async fn owned_by(
+    tx: &mut sqlx::SqliteConnection,
+    owner: &str,
+) -> Result<Vec<GonePlaylist>, sqlx::Error> {
+    let rows: Vec<PlaylistTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {PLAYLIST_COLUMNS} FROM playlists p WHERE p.owner = ?1 \
+         ORDER BY p.created_at, p.id"
+    )))
+    .bind(owner)
+    .fetch_all(&mut *tx)
+    .await?;
+    // Their shares and pins, each in one query, grouped here.
+    let shares: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT s.playlist_id, s.principal, s.can_edit FROM playlist_shares s \
+         JOIN playlists p ON p.id = s.playlist_id WHERE p.owner = ?1 ORDER BY s.principal",
+    )
+    .bind(owner)
+    .fetch_all(&mut *tx)
+    .await?;
+    let pins: Vec<(String, String)> = sqlx::query_as(
+        "SELECT n.playlist_id, n.principal FROM playlist_pins n \
+         JOIN playlists p ON p.id = n.playlist_id WHERE p.owner = ?1",
+    )
+    .bind(owner)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut shares_of: HashMap<String, Vec<ShareRow>> = HashMap::new();
+    for (playlist, principal, can_edit) in shares {
+        shares_of.entry(playlist).or_default().push(ShareRow {
+            principal,
+            can_edit,
+        });
+    }
+    let mut pinned_by: HashMap<String, HashSet<String>> = HashMap::new();
+    for (playlist, principal) in pins {
+        pinned_by.entry(playlist).or_default().insert(principal);
+    }
+    let gone = rows
+        .into_iter()
+        .map(|row| {
+            let pinned = pinned_by.remove(&row.0).unwrap_or_default();
+            let shares = shares_of.remove(&row.0).unwrap_or_default();
+            GonePlaylist {
+                row: playlist_of(row, shares),
+                pinned,
+            }
+        })
+        .collect();
+    Ok(gone)
+}
+
+/// Note, for each pin that `which` (a condition on `playlist_pins` and
+/// its playlist `p`, `?1` being `id`: a playlist's, or an owner's) picks,
+/// but `by`'s, that it left Pinned for `reason`. A newer note for the same
+/// playlist replaces an older one.
+pub(super) async fn note_pins(
     tx: &mut sqlx::SqliteConnection,
     id: &str,
     which: &str,

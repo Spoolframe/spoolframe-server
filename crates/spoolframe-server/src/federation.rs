@@ -741,6 +741,7 @@ impl Federation {
             device_name: Some(self.name.get()),
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
+            features: spoolframe_protocol::Features::empty(),
         }
     }
 

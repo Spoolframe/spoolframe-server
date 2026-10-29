@@ -161,11 +161,17 @@
       ${lib.optionalString (cfg.wan != null) wanConfig}
       ${lib.optionalString (cfg.lanPrefixes != []) "lan_prefixes = ${quote cfg.lanPrefixes};"}
       ${lib.optionalString (cfg.congestionControl != null) "congestion_control = ${quote cfg.congestionControl};"}
-      ${lib.optionalString (cfg.uplink.budgetMbps != null || cfg.uplink.maxStreams != null || cfg.uplink.ownerSharePercent != null) ''
+      ${lib.optionalString (cfg.uplink.budgetMbps != null || cfg.uplink.maxStreams != null || cfg.uplink.ownerSharePercent != null || cfg.uplink.perStream.mbps != null || cfg.uplink.perStream.appliesToLocal != null) ''
       uplink {
         ${lib.optionalString (cfg.uplink.budgetMbps != null) "budget_mbps = ${toString cfg.uplink.budgetMbps};"}
         ${lib.optionalString (cfg.uplink.maxStreams != null) "max_streams = ${toString cfg.uplink.maxStreams};"}
         ${lib.optionalString (cfg.uplink.ownerSharePercent != null) "owner_share_percent = ${toString cfg.uplink.ownerSharePercent};"}
+        ${lib.optionalString (cfg.uplink.perStream.mbps != null || cfg.uplink.perStream.appliesToLocal != null) ''
+        per_stream {
+          ${lib.optionalString (cfg.uplink.perStream.mbps != null) "mbps = ${toString cfg.uplink.perStream.mbps};"}
+          ${lib.optionalString (cfg.uplink.perStream.appliesToLocal != null) "applies_to_local = ${lib.boolToString cfg.uplink.perStream.appliesToLocal};"}
+        }
+      ''}
       }
     ''}
     }
@@ -408,6 +414,29 @@ in {
           the home beside guests (`network.uplink.owner_share_percent`).
           Null leaves it to the web UI (50 until set there).
         '';
+      };
+      perStream = {
+        mbps = lib.mkOption {
+          type = lib.types.nullOr lib.types.ints.unsigned;
+          default = null;
+          example = 4;
+          description = ''
+            The most one playback outside the home may take, in Mbit/s,
+            whatever quality it asked for, Original too
+            (`network.uplink.per_stream.mbps`); 0 is no cap. Null leaves
+            it to Settings › Remote access (no cap until set there).
+          '';
+        };
+        appliesToLocal = lib.mkOption {
+          type = lib.types.nullOr lib.types.bool;
+          default = null;
+          description = ''
+            Whether the cap per stream holds this server's own accounts
+            too (`network.uplink.per_stream.applies_to_local`). False
+            holds only portable guests and paired servers' users. Null
+            leaves it to the web UI (true until set there).
+          '';
+        };
       };
     };
 
@@ -828,8 +857,9 @@ in {
           10 bits rather than being tone mapped. With none left, the
           conversion is encoded in software, which is H.264 only. Each at
           most once; `[]` keeps video off the GPUs. Null leaves it to
-          Settings › Playback in the web UI (`["av1" "hevc" "h264"]` until
-          set there).
+          Settings › Playback in the web UI (`["hevc" "h264"]` until set
+          there: AV1 is off unless listed, as GPUs' support for it is
+          spotty).
         '';
       };
     };

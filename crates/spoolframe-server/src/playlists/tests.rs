@@ -131,6 +131,7 @@ impl Harness {
             .edit(who, playlist, revision, edits)
             .await
             .unwrap()
+            .0
     }
 
     async fn revision(&self, who: &Actor, playlist: &str) -> u64 {
@@ -698,7 +699,7 @@ async fn continuing_resumes_after_the_finished_one_or_at_the_one_in_progress() {
         .unwrap();
     h.playlists
         .watch
-        .mark(h.alice.principal, &episode("15"), true)
+        .mark(h.alice.principal, &episode("15"), true, None)
         .await
         .unwrap();
     let next_day = h
@@ -714,6 +715,7 @@ async fn continuing_resumes_after_the_finished_one_or_at_the_one_in_progress() {
             h.alice.principal,
             &episode("12"),
             std::time::Duration::from_secs(600),
+            None,
         )
         .await
         .unwrap();
@@ -736,7 +738,7 @@ async fn skip_watched_passes_a_watched_one() {
     let list = heists(&h).await;
     h.playlists
         .watch
-        .mark(h.alice.principal, &episode("12"), true)
+        .mark(h.alice.principal, &episode("12"), true, None)
         .await
         .unwrap();
     let skipping = PlaySettings {

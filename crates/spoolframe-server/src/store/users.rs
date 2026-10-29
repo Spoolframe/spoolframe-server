@@ -133,6 +133,17 @@ pub struct Reset {
     pub untrusted: u64,
 }
 
+/// A user [`Store::delete_user`] deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedUser {
+    pub id: LocalUserId,
+    /// Their downloads, gone from the store: what was being made for
+    /// them stops, and the files no other download names go.
+    pub downloads: Vec<super::downloads::DownloadRow>,
+    /// Their playlists, gone with them: whoever saw one is told, after.
+    pub playlists: Vec<super::playlists::GonePlaylist>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum UserError {
     #[error("user {0:?} already exists")]
@@ -429,6 +440,73 @@ impl Store {
         tx.commit().await?;
         self.note_sessions_ended();
         Ok(revoked)
+    }
+
+    /// Delete user `username` and every row kept for them, in one
+    /// transaction: their sessions and ways to sign in, their devices'
+    /// trust and PIN, their watch state, plays, likes, downloads, hidden
+    /// rows, track choices and playlists, server-wide ones too. Whoever
+    /// pinned a playlist of theirs gets a note, as for any playlist
+    /// deleted. What others keep of what they did stays: the
+    /// audit log, and who made an invite, downloaded a subtitle or timed
+    /// one. The last enabled admin, or the last with a password, cannot be
+    /// deleted. Their id, their downloads, which the caller lets go, and
+    /// their playlists as they were, whose viewers the caller tells.
+    pub async fn delete_user(&self, username: &str) -> Result<DeletedUser, UserError> {
+        let name = normalize_username(username)?;
+        let mut tx = self.begin_write().await?;
+        let id = user_id(&mut tx, &name).await?;
+        keep_an_admin(&mut tx, id, &name).await?;
+        let principal = crate::principal::Principal::LocalUser(id).to_string();
+        let downloads = super::downloads::delete_downloads_of(&mut tx, &principal).await?;
+        let playlists = super::playlists::owned_by(&mut tx, &principal).await?;
+        delete_principal_rows(&mut tx, &principal, self.now()).await?;
+        // What only a local user keeps.
+        for delete in [
+            "DELETE FROM federation_downloads WHERE principal = ?1",
+            "DELETE FROM federation_home_rows_hidden WHERE principal = ?1",
+            "DELETE FROM federation_play_from WHERE principal = ?1",
+            "DELETE FROM subtitle_download_log WHERE principal = ?1",
+            "DELETE FROM subtitle_download_denied WHERE principal = ?1",
+        ] {
+            sqlx::query(delete)
+                .bind(&principal)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Then what refers to the user's row; an app's grant takes its
+        // codes and tokens with it.
+        for delete in [
+            "DELETE FROM sessions WHERE user_id = ?1",
+            "DELETE FROM password_credentials WHERE user_id = ?1",
+            "DELETE FROM pin_required WHERE user_id = ?1",
+            "DELETE FROM pin_credentials WHERE user_id = ?1",
+            "DELETE FROM passkeys WHERE user_id = ?1",
+            "DELETE FROM passkey_users WHERE user_id = ?1",
+            "DELETE FROM external_identities WHERE user_id = ?1",
+            "DELETE FROM trusted_endpoints WHERE user_id = ?1",
+            "DELETE FROM oauth_grants WHERE user_id = ?1",
+            "DELETE FROM portable_ties WHERE local_user_id = ?1",
+            "DELETE FROM legacy_user_ids WHERE new_id = ?1",
+            "DELETE FROM users WHERE id = ?1",
+        ] {
+            sqlx::query(delete).bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        self.note_sessions_ended();
+        Ok(DeletedUser {
+            id,
+            downloads,
+            playlists,
+        })
+    }
+
+    /// Refuse taking local user `id` (`name`) out of the enabled admins
+    /// now, as [`Store::delete_user`] would: `LastAdmin` or
+    /// `LastPasswordAdmin`. Changes nothing.
+    pub async fn check_admin_kept(&self, id: LocalUserId, name: &str) -> Result<(), UserError> {
+        let mut conn = self.pool.acquire().await.map_err(StoreError::from)?;
+        keep_an_admin(&mut conn, id, name).await
     }
 
     /// Whether local user `id` may leave the server now (PX-47): false
@@ -831,6 +909,51 @@ async fn user_id(tx: &mut sqlx::SqliteConnection, name: &str) -> Result<LocalUse
     id.ok_or_else(|| UserError::NoSuchUser(name.to_owned()))
 }
 
+/// Delete what `principal` (a user, local or portable, as text) kept here,
+/// in `tx`: watch state, plays (PX-52), hidden rows, track preferences and
+/// overrides, their playlists, pins, notes and places, and when they liked
+/// what (PX-51). Whoever pinned a playlist of theirs gets a note, as for
+/// any playlist deleted.
+pub(super) async fn delete_principal_rows(
+    tx: &mut sqlx::SqliteConnection,
+    principal: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    super::playlists::note_pins(
+        tx,
+        principal,
+        "p.owner = ?1",
+        Some(principal),
+        super::playlists::PinNoteReason::Deleted,
+        now,
+    )
+    .await?;
+    // The `_ids` tables first: they refer to their parents' rows. The rest
+    // of a playlist's rows go with it.
+    for delete in [
+        "DELETE FROM watch_state_ids WHERE principal = ?1",
+        "DELETE FROM watch_state WHERE principal = ?1",
+        "DELETE FROM play_ids WHERE principal = ?1",
+        "DELETE FROM plays WHERE principal = ?1",
+        "DELETE FROM continue_hidden_ids WHERE principal = ?1",
+        "DELETE FROM continue_hidden WHERE principal = ?1",
+        "DELETE FROM track_overrides WHERE principal = ?1",
+        "DELETE FROM track_preferences WHERE principal = ?1",
+        "DELETE FROM playlists WHERE owner = ?1",
+        "DELETE FROM playlist_shares WHERE principal = ?1",
+        "DELETE FROM playlist_pins WHERE principal = ?1",
+        "DELETE FROM playlist_pin_notes WHERE principal = ?1",
+        "DELETE FROM playlist_places WHERE principal = ?1",
+        "DELETE FROM liked_changes WHERE principal = ?1",
+    ] {
+        sqlx::query(delete)
+            .bind(principal)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{TestStore, state_dir, test_store};
@@ -976,6 +1099,16 @@ mod tests {
         ));
         assert!(matches!(
             store.disable_user("root").await,
+            Err(UserError::LastPasswordAdmin(_))
+        ));
+        // Asked before a delete, it says which.
+        let root = store.user_by_name("root").await.unwrap().unwrap().id;
+        assert!(matches!(
+            store.check_admin_kept(root, "root").await,
+            Err(UserError::LastPasswordAdmin(_))
+        ));
+        assert!(matches!(
+            store.delete_user("root").await,
             Err(UserError::LastPasswordAdmin(_))
         ));
         store.set_role("alice", Role::Consumer).await.unwrap();
@@ -1201,5 +1334,325 @@ mod tests {
         .execute(&store.pool)
         .await;
         assert!(endpoint_without_id.is_err());
+    }
+
+    /// Columns that keep what a user did after they are deleted: records
+    /// that outlive what they name.
+    const KEPT: &[(&str, &str)] = &[
+        ("audit_events", "actor"),
+        ("audit_events", "target"),
+        ("invites", "created_by"),
+        ("subtitle_downloads", "downloaded_by"),
+        ("subtitle_rejections", "rejected_by"),
+        ("subtitle_timings", "offset_by"),
+        ("subtitle_download_denied", "denied_by"),
+        ("optimized_requests", "created_by"),
+        ("federation_grants", "granted_by"),
+        ("federation_peers", "paired_by"),
+        ("federation_peers", "expected_by"),
+    ];
+
+    /// Every column of every table, but [`KEPT`], that holds `id` as a
+    /// user id or a principal, and its rows.
+    async fn rows_naming(store: &Store, id: LocalUserId) -> Vec<(String, String, i64)> {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name != '_sqlx_migrations'",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let principal = crate::principal::Principal::LocalUser(id).to_string();
+        let mut naming = Vec::new();
+        for table in tables {
+            let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?1)")
+                .bind(&table)
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+            for column in columns {
+                if KEPT.contains(&(table.as_str(), column.as_str())) {
+                    continue;
+                }
+                let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT count(*) FROM \"{table}\" WHERE \"{column}\" IN (?1, ?2)"
+                )))
+                .bind(id.to_string())
+                .bind(&principal)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+                if n > 0 {
+                    naming.push((table.clone(), column, n));
+                }
+            }
+        }
+        naming
+    }
+
+    /// A row of `id`'s in every table that keeps one.
+    async fn fill(store: &Store, id: LocalUserId) {
+        let p = crate::principal::Principal::LocalUser(id).to_string();
+        let u = id.to_string();
+        for (sql, binds) in [
+            (
+                "INSERT INTO devices (endpoint_id, first_seen_at, last_seen_at) VALUES ('e', 0, 0)",
+                vec![],
+            ),
+            (
+                "INSERT INTO sessions (token_hash, user_id, kind, endpoint_id, created_at, \
+                 expires_at) VALUES ('h', ?1, 'endpoint', 'e', 0, 1)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO pin_credentials (user_id, phc, updated_at) VALUES (?1, 'pin', 0)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO pin_required (user_id, endpoint_id, set_at) VALUES (?1, 'e', 0)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO trusted_endpoints (user_id, endpoint_id, created_at, last_used_at) \
+                 VALUES (?1, 'e', 0, 0)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO passkey_users (user_id, handle) VALUES (?1, 'handle')",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO passkeys (credential_id, user_id, name, credential, rp_id, \
+                 created_at) VALUES ('c', ?1, 'Phone', '{}', 'rp', 0)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO external_identities (user_id, issuer, subject, linked_at) \
+                 VALUES (?1, 'https://idp', 'sub', 0)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO oauth_clients (id, name, redirect_uris, created_at) \
+                 VALUES ('app', 'App', '[]', 0)",
+                vec![],
+            ),
+            (
+                "INSERT INTO oauth_grants (id, client_id, user_id, scopes, redirect_uri, \
+                 created_at) VALUES ('g', 'app', ?1, 'read', 'https://app', 0)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO oauth_tokens (token_hash, grant_id, kind, expires_at) \
+                 VALUES ('t', 'g', 'access', 1)",
+                vec![],
+            ),
+            (
+                "INSERT INTO portable_ties (portable_user_id, local_user_id, tied_at, \
+                 proof_kind) VALUES ('pu', ?1, 0, 'genesis')",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO legacy_user_ids (old_id, new_id) VALUES (7, ?1)",
+                vec![&u],
+            ),
+            (
+                "INSERT INTO watch_state (principal, media_id, updated_at) VALUES (?1, 'm', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO watch_state_ids (principal, media_id, external_id) \
+                 VALUES (?1, 'm', 'x')",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO plays (principal, media_id, kind, started_at, ended_at) \
+                 VALUES (?1, 'm', 'movie', 0, 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO play_ids (principal, media_id, external_id) VALUES (?1, 'm', 'x')",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO continue_hidden (principal, media_id, hidden_at) VALUES (?1, 'm', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO continue_hidden_ids (principal, media_id, external_id) \
+                 VALUES (?1, 'm', 'x')",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO track_preferences (principal, preferences, updated_at) \
+                 VALUES (?1, '{}', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO track_overrides (principal, scope, override, updated_at) \
+                 VALUES (?1, 's', '{}', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO liked_changes (principal, media_id, liked, at) VALUES (?1, 'm', 1, 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO downloads (id, principal, media_id, request, content_key, state, \
+                 created_at, carried, stamp) \
+                 VALUES ('d', ?1, 'm', '{}', 'k', 'waiting', 0, '[]', 's')",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO federation_downloads (id, principal, origin, library, item, \
+                 remote_id, state, created_at, updated_at) \
+                 VALUES ('fd', ?1, 'o', 'l', 'i', 'r', '{}', 0, 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO federation_home_rows_hidden (principal, origin, hidden_at) \
+                 VALUES (?1, 'o', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO federation_play_from (principal, kind, external_id, server, \
+                 chosen_at) VALUES (?1, 'movie', 'x', 's', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO subtitle_download_log (principal, at) VALUES (?1, 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO subtitle_download_denied (principal, denied_by, denied_at) \
+                 VALUES (?1, 'root', 0)",
+                vec![&p],
+            ),
+            (
+                "INSERT INTO playlist_pin_notes (principal, playlist_id, name, reason, noted_at) \
+                 VALUES (?1, 'gone', 'Old', 'deleted', 0)",
+                vec![&p],
+            ),
+        ] {
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for bind in binds {
+                query = query.bind(bind.as_str());
+            }
+            query.execute(&store.pool).await.unwrap();
+        }
+    }
+
+    /// A deleted user leaves no row that names them, but the records
+    /// kept of what they did; another user's rows stay.
+    #[tokio::test]
+    async fn a_deleted_user_leaves_no_row_naming_them() {
+        use crate::store::playlists::{NewPlaylist, ShareRow};
+        let store = store("delete-user").await;
+        store.add_first_admin("root", "phc").await.unwrap();
+        let alice = store
+            .add_user("alice", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
+        let bob = store
+            .add_user("bob", None, "phc", Role::Consumer)
+            .await
+            .unwrap();
+        let (a, b) = (
+            crate::principal::Principal::LocalUser(alice).to_string(),
+            crate::principal::Principal::LocalUser(bob).to_string(),
+        );
+        fill(&store, alice).await;
+        let kinds = spoolframe_protocol::playlists::Kinds {
+            movies: true,
+            episodes: false,
+            tracks: false,
+        };
+        let playlist = |owner: &str, server_wide, shares| NewPlaylist {
+            owner: owner.into(),
+            name: "Heists".into(),
+            kinds,
+            server_wide,
+            shares,
+        };
+        let hers = store
+            .create_playlist(&playlist(
+                &a,
+                false,
+                vec![ShareRow {
+                    principal: b.clone(),
+                    can_edit: false,
+                }],
+            ))
+            .await
+            .unwrap();
+        let everyones = store
+            .create_playlist(&playlist(&a, true, vec![]))
+            .await
+            .unwrap();
+        let bobs = store
+            .create_playlist(&playlist(
+                &b,
+                false,
+                vec![ShareRow {
+                    principal: a.clone(),
+                    can_edit: true,
+                }],
+            ))
+            .await
+            .unwrap();
+        store.pin_playlist(&b, &hers.id, 0).await.unwrap();
+        store.pin_playlist(&b, &everyones.id, 1).await.unwrap();
+        store.pin_playlist(&a, &bobs.id, 0).await.unwrap();
+        sqlx::query(
+            "INSERT INTO playlist_places (principal, playlist_id, updated_at) VALUES (?1, ?2, 0)",
+        )
+        .bind(&a)
+        .bind(&bobs.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let deleted = store.delete_user("alice").await.unwrap();
+
+        assert_eq!(rows_naming(&store, alice).await, vec![]);
+        assert_eq!(
+            deleted
+                .downloads
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
+            ["d"]
+        );
+        assert!(store.user_by_id(alice).await.unwrap().is_none());
+        assert!(store.playlist(&hers.id).await.unwrap().is_none());
+        // A server-wide one of hers goes too; Bob's is his.
+        assert!(store.playlist(&everyones.id).await.unwrap().is_none());
+        assert!(
+            store
+                .playlist(&bobs.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .shares
+                .is_empty()
+        );
+        // Bob had pinned both of hers: he is told each went.
+        assert_eq!(store.pin_notes(&b).await.unwrap().len(), 2);
+        assert!(store.user_by_id(bob).await.unwrap().is_some());
+    }
+
+    /// The last enabled admin cannot be deleted; nothing of theirs goes.
+    #[tokio::test]
+    async fn the_last_enabled_admin_cannot_be_deleted() {
+        let store = store("delete-last-admin").await;
+        let root = store.add_first_admin("root", "phc").await.unwrap();
+        assert!(matches!(
+            store.delete_user("root").await,
+            Err(UserError::LastAdmin(_))
+        ));
+        assert!(store.user_by_id(root).await.unwrap().is_some());
+        assert!(matches!(
+            store.delete_user("nobody").await,
+            Err(UserError::NoSuchUser(_))
+        ));
     }
 }

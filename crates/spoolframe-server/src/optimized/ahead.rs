@@ -256,7 +256,7 @@ pub async fn next_episode(
     if played.season == 0 {
         return Ok(None);
     }
-    let run = crate::watch::show_run(catalog.episodes(&played.show_id).await?);
+    let run = crate::watch::show_run(catalog.episodes(&played.show_id).await?, false);
     let at = run.iter().position(|e| *e.id() == played.id);
     Ok(at.and_then(|at| run.get(at + 1)).map(|e| e.id().clone()))
 }

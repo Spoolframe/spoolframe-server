@@ -37,8 +37,9 @@ use tokio::sync::{Semaphore, broadcast};
 use crate::store::subtitle_timings::{SyncFindings, TimingRow};
 use crate::store::{Store, StoreError};
 
-/// The most a manual offset moves a subtitle, either way: ten minutes.
-pub const MAX_OFFSET_MS: i64 = 10 * 60 * 1000;
+/// The most a manual offset moves a subtitle, either way: ten minutes,
+/// as the apps' sliders have it.
+pub const MAX_OFFSET_MS: i64 = SubtitleTiming::MAX_OFFSET_MS;
 
 /// `subtitles.sync_at_once` and where the files go, with the defaults
 /// filled in.

@@ -8,16 +8,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_client_sdk::types::{ClientCapabilities, Item, Platform};
+use spoolframe_client_sdk::types::{ClientCapabilities, Item, MediaId, Platform};
 use spoolframe_client_sdk::{
     Client, ClientOptions, Device, DownloadEvent, DownloadPhase, DownloadSource, DownloadTracks,
-    LocalDownload, MemoryStorage, OfflineWatchOutcome, Session,
+    LaunchTarget, LocalDownload, MemoryStorage, NetworkKind, ProfileOpens, RunCancel, RunEnd,
+    SdkError, Session, SkipReason, SkippedChild,
 };
 use spoolframe_protocol::{Hello, PROTOCOL_VERSION, Reply, Request, Response};
 use spoolframe_test_dir::TestDir;
 use spoolframe_types::{AudioCodec, Container, VideoCodec};
 
-use crate::support::{ServerOptions, TestServer, fresh_dir, movie};
+use crate::support::{ServerOptions, TestServer, episode, fresh_dir, movie, show};
 
 const PASSWORD: &str = "correct horse";
 
@@ -394,7 +395,8 @@ async fn what_was_watched_offline_reaches_the_server_on_the_next_start() {
 }
 
 /// Watched offline before the user marked the film watched on another
-/// device: the server keeps the newer, and the download shows it.
+/// device: the server keeps the newer, and the download shows it once it
+/// is sent, by itself, as the device is back with a session.
 #[tokio::test]
 async fn an_older_offline_watch_loses_to_the_newer_one_on_the_server() {
     let server = server("sdk-downloads-older", ServerOptions::default()).await;
@@ -404,11 +406,18 @@ async fn an_older_offline_watch_loses_to_the_newer_one_on_the_server() {
     let session = alice(&server, &client).await;
     let key = start(&client, &session).await.key;
     settled(&client, &key).await;
-    client
-        .downloads()
-        .record_position(&key, Duration::from_secs(600))
+    client.close().await;
+
+    // A position mid-way, with the app offline: not watched here.
+    let offline = Client::open_with_options(storage.clone(), linux(), options(&dir, false))
         .await
         .unwrap();
+    offline
+        .downloads()
+        .record_position(&key, Duration::from_secs(3))
+        .await
+        .unwrap();
+    offline.close().await;
     // Seconds are what both sides count in: the mark is a whole second
     // and more later, whatever second boundary the two cross.
     tokio::time::sleep(Duration::from_millis(2100)).await;
@@ -421,6 +430,7 @@ async fn an_older_offline_watch_loses_to_the_newer_one_on_the_server() {
         device_name: None,
         capabilities: None,
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     other.call(None, Request::Hello(hello)).await;
     let token = other.login("alice", PASSWORD).await;
@@ -436,18 +446,46 @@ async fn an_older_offline_watch_loses_to_the_newer_one_on_the_server() {
         Response::Ok(Reply::Done)
     ));
 
-    let synced = client.downloads().sync_watch(&session).await.unwrap();
-    assert_eq!(
-        synced
-            .iter()
-            .map(|s| (s.item.clone(), s.outcome))
-            .collect::<Vec<_>>(),
-        [(movie().id().clone(), OfflineWatchOutcome::Older)]
-    );
+    let back = device(&server, &storage, &dir).await;
+    let mut events = back.download_events();
+    let session = alice(&server, &back).await;
+    synced(&mut events).await;
     let state = on_server(&session).await;
     assert!(state.watched, "{state:?}");
-    let watch = client.downloads().get(&key).unwrap().watch;
+    let watch = back.downloads().get(&key).unwrap().watch;
     assert_eq!((watch.watched, watch.pending), (Some(true), false));
+    back.close().await;
+    server.stop().await;
+}
+
+/// The next `WatchSynced` on `events`, within 30 s: what was sent.
+async fn synced(events: &mut tokio::sync::broadcast::Receiver<DownloadEvent>) -> Vec<MediaId> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(DownloadEvent::WatchSynced { items, .. })) => return items,
+            Ok(Ok(_)) => {}
+            other => panic!("no WatchSynced: {other:?}"),
+        }
+    }
+}
+
+/// Watched here with a session about, the watch reaches the server by
+/// itself, and the app is told: no sync of its own, no waiting.
+#[tokio::test]
+async fn a_watch_made_with_a_session_here_is_sent_by_itself() {
+    let server = server("sdk-downloads-wake", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-wake").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let key = start(&client, &session).await.key;
+    settled(&client, &key).await;
+    let mut events = client.download_events();
+    client.downloads().set_watched(&key, true).await.unwrap();
+    assert_eq!(synced(&mut events).await, [movie().id().clone()]);
+    assert!(on_server(&session).await.watched);
+    assert!(!client.downloads().get(&key).unwrap().watch.pending);
     client.close().await;
     server.stop().await;
 }
@@ -584,4 +622,288 @@ async fn offline_a_profile_whose_pin_is_asked_here_opens_only_with_it() {
     assert_eq!(downloads.list().len(), 1);
     assert!(downloads.get(&key).unwrap().file_path.is_some());
     offline.close().await;
+}
+
+/// A PIN changed on another device is told to this one as a profile
+/// event, and the profile shown here locks again, its old PIN no longer
+/// kept for offline; a call answered that the session ended is told too.
+#[tokio::test]
+async fn a_pin_changed_elsewhere_locks_the_profile_here_again() {
+    use spoolframe_client_sdk::{PinProof, ProfileChange, ProfileEvent, SdkError};
+    let server = TestServer::start("sdk-profile-events").await;
+    server.add_user("alice", PASSWORD, None).await;
+    let phone_dir = TestDir::new("spoolframe-sdk-profile-events-phone").await;
+    let laptop_dir = TestDir::new("spoolframe-sdk-profile-events-laptop").await;
+    let phone = device(&server, &Arc::new(MemoryStorage::default()), &phone_dir).await;
+    let laptop = device(&server, &Arc::new(MemoryStorage::default()), &laptop_dir).await;
+    let first = alice(&server, &phone).await;
+    first.set_pin("1234", None).await.unwrap();
+    first.set_pin_required(None, true).await.unwrap();
+    let on_phone = alice(&server, &phone).await;
+    let id = server.server.id().to_string();
+    let user = on_phone.user().user_id.clone();
+    let downloads = phone.downloads();
+    downloads.set_profile(&id, &user);
+    on_phone.unlock("1234").await.unwrap();
+    assert!(!downloads.profile_locked());
+    let mut events = phone.profile_events();
+
+    let on_laptop = alice(&server, &laptop).await;
+    let proof = PinProof::Pin { pin: "1234".into() };
+    on_laptop.set_pin("5678", Some(proof)).await.unwrap();
+
+    let told = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("the phone was not told of the PIN")
+        .unwrap();
+    assert_eq!(
+        told,
+        ProfileEvent {
+            server: id.clone(),
+            change: ProfileChange::PinChanged {
+                user: user.clone(),
+                required: true,
+            },
+        }
+    );
+    assert!(downloads.profile_locked());
+    assert!(matches!(
+        downloads.unlock_offline("1234").await,
+        Err(SdkError::NoOfflinePin)
+    ));
+
+    server.store.disable_user("alice").await.unwrap();
+    assert_eq!(
+        on_phone.libraries().await.unwrap_err(),
+        SdkError::SignInRequired
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("the phone was not told the session ended")
+        .unwrap();
+    assert!(
+        matches!(&ended.change, ProfileChange::SessionEnded { user: u, .. } if *u == user),
+        "{ended:?}"
+    );
+    phone.close().await;
+    laptop.close().await;
+    server.stop().await;
+}
+
+/// A run an app stops from elsewhere (a UniFFI binding, whose task
+/// cancellation never reaches the future) ends as cancelled with the
+/// download still moving, and a later run takes it to the end. The done
+/// download is serde, so an app keeps or passes it on as it is: it reads
+/// back the same.
+#[tokio::test]
+async fn a_cancelled_run_stops_and_the_download_goes_on_later() {
+    let server = server("sdk-downloads-run-cancel", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-run-cancel").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let started = start(&client, &session).await;
+    let cancel = RunCancel::new();
+    let run = {
+        let downloads = client.downloads();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { downloads.run_until_cancelled(&cancel).await })
+    };
+    cancel.cancel();
+    let ended = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("a cancelled run returns at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended, RunEnd::Cancelled);
+    let done = settled(&client, &started.key).await;
+    assert_eq!(done.phase, DownloadPhase::Done);
+    let json = serde_json::to_string(&done).unwrap();
+    assert_eq!(serde_json::from_str::<LocalDownload>(&json).unwrap(), done);
+    client.close().await;
+    server.stop().await;
+}
+
+/// On a mobile network downloads may not use, a run ends at once as
+/// held, not waiting for nothing, and nothing is worth a background run;
+/// on Wi-Fi again the download goes on and arrives.
+#[tokio::test]
+async fn with_cellular_held_a_run_ends_at_once_and_wi_fi_takes_it_on() {
+    let server = server("sdk-downloads-held", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-held").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let downloads = client.downloads();
+    downloads.set_network(NetworkKind::Cellular);
+    let started = start(&client, &session).await;
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        downloads.run_until_cancelled(&RunCancel::new()),
+    )
+    .await
+    .expect("a held run returns at once")
+    .unwrap();
+    let worth = downloads.worth_background();
+    downloads.set_network(NetworkKind::Unmetered);
+    let done = settled(&client, &started.key).await;
+    assert_eq!(
+        (ended, worth, done.phase),
+        (RunEnd::Held, false, DownloadPhase::Done)
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The fake show's episodes, by season and episode: the special (season
+/// 0) first.
+fn the_shows_episodes() -> [MediaId; 4] {
+    [
+        episode("21", "20", 0, 1).id().clone(),
+        episode("12", "11", 1, 1).id().clone(),
+        episode("13", "11", 1, 2).id().clone(),
+        episode("15", "14", 2, 1).id().clone(),
+    ]
+}
+
+/// A show's plan is every episode of every season, by season and
+/// episode, but one watched when only the unwatched are asked for.
+#[tokio::test]
+async fn a_show_plans_its_episodes_in_order_but_the_watched() {
+    let server = server("sdk-downloads-plan", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-plan").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let [special, e12, e13, e15] = the_shows_episodes();
+    session.mark_watched(&e13).await.unwrap();
+    let plan = client
+        .downloads()
+        .plan_children(&session, show().id(), true)
+        .await
+        .unwrap();
+    let planned: Vec<_> = plan.to_start.iter().map(|i| i.id().clone()).collect();
+    assert_eq!(
+        (planned, plan.skipped, plan.failed.len()),
+        (
+            vec![special, e12, e15],
+            vec![SkippedChild {
+                item: e13,
+                reason: SkipReason::Watched
+            }],
+            0
+        )
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_film_has_no_episodes_to_download() {
+    let server = server("sdk-downloads-plan-film", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-plan-film").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let planned = client
+        .downloads()
+        .plan_children(&session, movie().id(), false)
+        .await;
+    assert!(
+        matches!(planned, Err(SdkError::InvalidInput(_))),
+        "{planned:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// Watched offline, the watch reaches the server in a background
+/// refresh, and nothing is left for the next one.
+#[tokio::test]
+async fn a_background_refresh_sends_what_was_watched_offline() {
+    let server = server("sdk-downloads-refresh", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-refresh").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let key = start(&client, &session).await.key;
+    settled(&client, &key).await;
+    client.close().await;
+
+    let offline = Client::open_with_options(storage.clone(), linux(), options(&dir, false))
+        .await
+        .unwrap();
+    offline.downloads().set_watched(&key, true).await.unwrap();
+    offline.close().await;
+
+    let back = device(&server, &storage, &dir).await;
+    let report = back.downloads().refresh_all().await.unwrap();
+    let session = back
+        .profiles(&server.server.id().to_string())
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        (
+            report.missed,
+            on_server(&session).await.watched,
+            back.downloads().needs_refresh(),
+            back.downloads().refresh_hint(),
+        ),
+        (Vec::new(), true, false, None)
+    );
+    back.close().await;
+    server.stop().await;
+}
+
+/// The profile browsed last opens at start; locked, it waits on "Who's
+/// watching" for its PIN, unless that PIN unlocked its downloads offline a
+/// moment ago: then that PIN opens it online too, not asked for again.
+#[tokio::test]
+async fn a_pin_given_offline_opens_the_profile_once_the_server_is_back() {
+    let server = server("sdk-downloads-pin-carried", ServerOptions::default()).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-pin-carried").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let id = server.server.id().to_string();
+    let client = device(&server, &storage, &dir).await;
+    let first = alice(&server, &client).await;
+    first.set_pin("1234", None).await.unwrap();
+    first.set_pin_required(None, true).await.unwrap();
+    let session = alice(&server, &client).await;
+    session.unlock("1234").await.unwrap();
+    let user_id = session.user().user_id.clone();
+    client.remember_last(&id, "alice").await.unwrap();
+    client.close().await;
+
+    let back = device(&server, &storage, &dir).await;
+    let before = back.whos_watching(&id).await.unwrap().launch_target(true);
+    back.downloads().set_profile(&id, &user_id);
+    back.downloads().unlock_offline("1234").await.unwrap();
+    let watching = back.whos_watching(&id).await.unwrap();
+    let alice = watching.get("alice").unwrap();
+    let ProfileOpens::Session(session) = &alice.opens else {
+        panic!("not signed in: {:?}", alice.opens);
+    };
+    assert_eq!(
+        (
+            before,
+            alice.locked,
+            alice.last,
+            watching.launch_target(true)
+        ),
+        (
+            LaunchTarget::Pick,
+            true,
+            true,
+            LaunchTarget::Open {
+                username: "alice".into()
+            }
+        )
+    );
+    assert!(session.unlock_as_offline().await.unwrap());
+    session.libraries().await.unwrap();
+    // Once: the PIN is not held after.
+    assert!(!session.unlock_as_offline().await.unwrap());
+    back.close().await;
+    server.stop().await;
 }

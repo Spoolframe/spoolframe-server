@@ -186,6 +186,7 @@ fn hello() -> Hello {
             ..ClientCapabilities::default()
         }),
         experimental: Vec::new(),
+        features: crate::Features::empty(),
     }
 }
 
@@ -453,6 +454,7 @@ fn every_reply_round_trips() {
             auth_methods: vec![AuthMethod::Password],
             web_url: Some("https://media.example.org".into()),
             experimental: Vec::new(),
+            features: crate::Features::empty(),
             invite_only: true,
         }),
         Reply::AuthMethods {
@@ -547,6 +549,7 @@ fn every_reply_round_trips() {
                 username: "alice".into(),
                 display_name: "Alice".into(),
                 pin_required: true,
+                pin_digits: Some(6),
                 auto_login: false,
             }],
         },
@@ -1124,6 +1127,7 @@ fn server_info_without_a_server_id_does_not_decode() {
         auth_methods: vec![AuthMethod::Password],
         web_url: None,
         experimental: Vec::new(),
+        features: crate::Features::empty(),
         invite_only: true,
     })
     .unwrap();
@@ -1145,6 +1149,7 @@ fn invite_only_info(invite_only: bool) -> ServerInfo {
         auth_methods: vec![AuthMethod::Password],
         web_url: None,
         experimental: Vec::new(),
+        features: crate::Features::empty(),
         invite_only,
     }
 }
@@ -1332,6 +1337,28 @@ fn liked_changed_has_its_wire_name() {
     assert_eq!(
         value,
         ciborium::Value::Map(vec![("type".into(), "liked_changed".into())])
+    );
+}
+
+/// The profile events go by their wire names.
+#[test]
+fn profile_events_have_their_wire_names() {
+    let removed = Event::ProfileRemoved { user: "u1".into() };
+    let pin = Event::PinChanged {
+        user: "u1".into(),
+        required: true,
+    };
+    round_trip(removed.clone());
+    round_trip(pin.clone());
+    let value: ciborium::Value =
+        ciborium::from_reader(codec::encode(&pin).unwrap().as_slice()).unwrap();
+    assert_eq!(
+        value,
+        ciborium::Value::Map(vec![
+            ("type".into(), "pin_changed".into()),
+            ("user".into(), "u1".into()),
+            ("required".into(), true.into()),
+        ])
     );
 }
 
@@ -2264,6 +2291,45 @@ fn a_redemption_keeps_its_code_and_password_out_of_debug_output() {
     assert!(shown.contains("mum"), "{shown}");
 }
 
+/// An account made with an invite and a passkey: both halves before any
+/// session, of feature `spoolframe:invite-passkeys`, never retried, the
+/// code out of `Debug`.
+#[test]
+fn an_invite_redeemed_with_a_passkey_round_trips_and_hides_its_code() {
+    let begin = Request::BeginInvitePasskey(crate::BeginInvitePasskey {
+        code: "QW7K2MFPXR4T".into(),
+        username: "pia".into(),
+        display_name: None,
+    });
+    let finish = Request::RedeemInviteWithPasskey(crate::RedeemInviteWithPasskey {
+        code: "QW7K2MFPXR4T".into(),
+        finish: FinishPasskeyRegistration {
+            credential_id: vec![1, 2],
+            attestation_object: vec![3],
+            client_data_json: b"{}".to_vec(),
+            name: "Pia's iPhone".into(),
+        },
+        remember: true,
+    });
+    for (request, wire) in [
+        (begin, "begin_invite_passkey"),
+        (finish, "redeem_invite_with_passkey"),
+    ] {
+        round_trip(request.clone());
+        assert!(request.is_pre_auth());
+        assert_eq!(request.feature(), Some(crate::Feature::InvitePasskeys));
+        assert!(!crate::policy::retry_safe(&request));
+        let bytes = codec::encode(&RequestEnvelope {
+            session: None,
+            request: request.clone(),
+        })
+        .unwrap();
+        assert_eq!(codec::request_type(&bytes).as_deref(), Some(wire));
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("QW7K"), "{shown}");
+    }
+}
+
 fn look_up() -> crate::LookupInvite {
     crate::LookupInvite {
         code: "qw7k-2mfp-xr4t".into(),
@@ -2712,6 +2778,7 @@ mod experimental_features {
     use super::*;
     use crate::MAX_HELLO_TEXT;
     use crate::experimental::{self, HTTP_PLAYBACK, HttpPlaybackRefusal};
+    use crate::features::Feature;
 
     /// `Hello` as a server before PX-49 reads it, and as such a client
     /// sends it.
@@ -2783,6 +2850,7 @@ mod experimental_features {
             auth_methods: vec![AuthMethod::Password],
             web_url: None,
             experimental,
+            features: crate::Features::empty(),
             invite_only: true,
         }
     }
@@ -2808,6 +2876,39 @@ mod experimental_features {
                 .iter()
                 .all(|(k, _)| k.as_text() != Some("experimental"))
         );
+    }
+
+    /// Regular features go as their names; none is no field, as an older
+    /// peer sends.
+    #[test]
+    fn regular_features_go_as_names_and_none_is_no_field() {
+        let on = Feature::ProfileEvents | Feature::InvitePasskeys;
+        let listed = ServerInfo {
+            features: on,
+            ..info(Vec::new())
+        };
+        round_trip(Reply::ServerInfo(listed.clone()));
+        let value = ciborium::Value::serialized(&listed).unwrap();
+        let ciborium::Value::Map(fields) = value else {
+            panic!("{value:?}");
+        };
+        assert!(fields.iter().any(|(k, v)| k.as_text() == Some("features")
+            && *v
+                == ciborium::Value::Array(vec![
+                    "spoolframe:profile-events".into(),
+                    "spoolframe:invite-passkeys".into(),
+                ])));
+        let none: ciborium::Value =
+            ciborium::from_reader(codec::encode(&info(Vec::new())).unwrap().as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = none else {
+            panic!("{none:?}");
+        };
+        assert!(fields.iter().all(|(k, _)| k.as_text() != Some("features")));
+        let hello = Hello {
+            features: on,
+            ..hello()
+        };
+        round_trip(Request::Hello(hello));
     }
 
     #[test]
@@ -3105,7 +3206,10 @@ mod playlists {
                 notes: vec!["Cabin skipped".into()],
             }),
             Reply::PlaylistInfo(summary()),
-            Reply::PlaylistEdited { revision: 8 },
+            Reply::PlaylistEdited {
+                revision: 8,
+                added: Some(vec![3, 4]),
+            },
         ] {
             round_trip(Response::Ok(reply));
         }
@@ -4380,4 +4484,138 @@ mod item_sort_filter {
         );
         assert_eq!(values.resolutions[0].value, Resolution::Unknown);
     }
+
+    fn user(user_id: String) -> UserSummary {
+        UserSummary {
+            user_id,
+            username: "bob".into(),
+            display_name: "Bob".into(),
+            role: spoolframe_types::Role::Consumer,
+            locked: false,
+            pin: None,
+            portable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_guest_is_a_portable_identitys_session() {
+        let guest = user(format!("portable:{}", "ab".repeat(32)));
+        assert!(guest.is_guest());
+        assert_eq!(
+            guest.portable_id().map(|id| id.to_string()),
+            Some("ab".repeat(32))
+        );
+    }
+
+    #[test]
+    fn an_account_of_the_servers_own_is_no_guest() {
+        let own = user("local:0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into());
+        assert!(!own.is_guest());
+        // Not 64 hex digits: no identity.
+        assert!(!user("portable:xyz".into()).is_guest());
+    }
+}
+
+/// The next episode's names are promised to the web UI: they never
+/// change. Both requests are of feature `spoolframe:next-episode`,
+/// read-only, and answered by `next_episode`, `null` at a show's end.
+#[test]
+fn the_next_episode_s_wire_names_are_fixed() {
+    let episode = MediaId::new(Namespace::Plex, MediaKind::Episode, "7").unwrap();
+    let show = MediaId::new(Namespace::Plex, MediaKind::Show, "3").unwrap();
+    let next = Request::NextEpisode {
+        item: episode,
+        mode: crate::NextMode::FirstUnwatched,
+        specials: true,
+    };
+    assert_eq!(
+        serde_json::to_value(&next).unwrap(),
+        serde_json::json!({
+            "type": "next_episode",
+            "item": "plex:episode:7",
+            "mode": "first_unwatched",
+            "specials": true,
+        })
+    );
+    let in_order: Request = serde_json::from_value(serde_json::json!({
+        "type": "next_episode", "item": "plex:episode:7", "mode": "in_order", "specials": false,
+    }))
+    .unwrap();
+    assert!(matches!(
+        in_order,
+        Request::NextEpisode {
+            mode: crate::NextMode::InOrder,
+            specials: false,
+            ..
+        }
+    ));
+    let show_next = Request::ShowNext { show };
+    assert_eq!(
+        serde_json::to_value(&show_next).unwrap(),
+        serde_json::json!({"type": "show_next", "show": "plex:show:3"})
+    );
+    for request in [next, show_next] {
+        round_trip(request.clone());
+        assert_eq!(request.feature(), Some(crate::Feature::NextEpisodes));
+        assert!(crate::policy::retry_safe(&request));
+    }
+    let none = Reply::NextEpisode { item: None };
+    assert_eq!(
+        serde_json::to_value(&none).unwrap(),
+        serde_json::json!({"type": "next_episode", "item": null})
+    );
+    round_trip(none);
+    round_trip(Reply::NextEpisode {
+        item: Some(movie()),
+    });
+}
+
+/// `PlaylistEdited.added` from a server older than the field is absent,
+/// which reads as `None`, not as no entries added.
+#[test]
+fn an_edit_s_added_entries_are_none_from_an_older_server() {
+    let older: Reply = serde_json::from_value(serde_json::json!({
+        "type": "playlist_edited", "revision": 4,
+    }))
+    .unwrap();
+    assert_eq!(
+        older,
+        Reply::PlaylistEdited {
+            revision: 4,
+            added: None
+        }
+    );
+    let none_added = Reply::PlaylistEdited {
+        revision: 5,
+        added: Some(Vec::new()),
+    };
+    assert_eq!(
+        serde_json::to_value(&none_added).unwrap(),
+        serde_json::json!({"type": "playlist_edited", "revision": 5, "added": []})
+    );
+}
+
+/// A trusted profile from a server older than `pin_digits` reads as
+/// `None`: the length is not known.
+#[test]
+fn a_trusted_profile_s_pin_digits_are_none_from_an_older_server() {
+    let older: crate::TrustedProfile = serde_json::from_value(serde_json::json!({
+        "user_id": "local:1", "username": "alice", "display_name": "Alice",
+        "pin_required": true, "auto_login": false,
+    }))
+    .unwrap();
+    assert_eq!(older.pin_digits, None);
+}
+
+/// `WatchChanged` names the items, a peer that does not know it reads
+/// it as `Unknown`.
+#[test]
+fn watch_changed_has_its_wire_name() {
+    let film = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+    let event = Event::WatchChanged { items: vec![film] };
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        serde_json::json!({"type": "watch_changed", "items": ["plex:movie:1"]})
+    );
+    round_trip(event);
 }

@@ -150,6 +150,7 @@ async fn stream(
             auth_methods: vec![AuthMethod::Password],
             web_url: None,
             experimental: Vec::new(),
+            features: spoolframe_protocol::Features::empty(),
             invite_only: true,
         })),
         Request::Ping => Response::Ok(Reply::Pong),

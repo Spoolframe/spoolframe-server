@@ -15,6 +15,7 @@ pub const LINK_SHARE: f64 = 0.75;
 /// Its codec, range and burned-in subtitle are the plan's `video`'s, only
 /// the size and rate differing, unless `video` says otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Rung {
     pub height: u32,
     pub max_bitrate: u64,
@@ -30,6 +31,7 @@ pub struct Rung {
 /// for this playback. The capabilities' `max_bitrate`, the app's own
 /// limit, stays a ceiling over each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Quality {
     /// For the link: [`LINK_SHARE`] of what the device measured it
@@ -61,6 +63,7 @@ impl Default for Quality {
 /// lists. Only these count: a track the user did not pick never blocks
 /// playback.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Selection {
     /// `None`: the file's default audio track.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
@@ -101,6 +104,7 @@ pub enum BitmapSubtitles {
 /// The tracks the server chose when the client sent no [`Selection`],
 /// and why, so the client can show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChosenTracks {
     pub selection: Selection,
     pub audio: TrackReason,
@@ -109,6 +113,7 @@ pub struct ChosenTracks {
 
 /// Why a track was chosen, or why none was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum TrackReason {
     /// What the viewer picked for this series or movie.
@@ -130,6 +135,7 @@ pub enum TrackReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlaybackPlan {
     /// The client plays the file as it is.
@@ -193,6 +199,7 @@ impl PlaybackPlan {
 
 /// What happens to the video in a converted plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConvertedVideo {
     /// Into the output as it is.
@@ -222,12 +229,14 @@ pub enum ConvertedVideo {
 
 /// What happens to the selected audio track in a converted plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ConvertedAudio {
     pub index: u32,
     pub action: AudioAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AudioAction {
     Copy {
@@ -245,12 +254,14 @@ pub enum AudioAction {
 
 /// What happens to the selected subtitle in a converted plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ConvertedSubtitle {
     pub index: u32,
     pub action: SubtitleAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubtitleAction {
     /// Into the output as it is.
@@ -277,12 +288,14 @@ pub enum SubtitleAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlannedAudio {
     pub index: u32,
     pub codec: AudioCodec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlannedSubtitle {
     pub index: u32,
     pub format: SubtitleFormat,
@@ -291,6 +304,7 @@ pub struct PlannedSubtitle {
 
 /// Where the client gets a subtitle from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SubtitleDelivery {
     /// A stream inside the media file it plays.

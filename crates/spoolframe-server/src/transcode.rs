@@ -186,6 +186,17 @@ pub struct Transcoding {
     /// Where detection writes its test samples.
     scratch: PathBuf,
     current: RwLock<Arc<Detected>>,
+    /// One detection at a time: two would write their samples to the same
+    /// scratch files, and the one that ended last, not the one asked for
+    /// last, would stand.
+    detecting: tokio::sync::Mutex<()>,
+    /// A detection is waiting for the one running ([`spawn_detection`]):
+    /// it reads the host when it starts, so it covers whatever asks
+    /// before then.
+    waiting: std::sync::atomic::AtomicBool,
+    /// Notified as each detection begins: what a test waits on.
+    #[cfg(test)]
+    began: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for Transcoding {
@@ -208,6 +219,10 @@ impl Transcoding {
             dev: PathBuf::from("/dev"),
             scratch,
             current: RwLock::new(Arc::new(Detected::software_baseline())),
+            detecting: tokio::sync::Mutex::new(()),
+            waiting: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            began: tokio::sync::Notify::new(),
         }
     }
 
@@ -243,6 +258,14 @@ impl Transcoding {
     /// Find what works now, on each card the entries take, and use it
     /// from here on.
     pub async fn detect(&self) {
+        let _one = self.detecting.lock().await;
+        self.detect_now().await;
+    }
+
+    /// [`Transcoding::detect`], `detecting` held.
+    async fn detect_now(&self) {
+        #[cfg(test)]
+        self.began.notify_waiters();
         let (cards, missing) = gpus::select(&self.entries, &self.host);
         let notes = missing
             .iter()
@@ -576,11 +599,21 @@ fn merge(software: &Encoders, gpus: &[Arc<Gpu>]) -> Encoders {
     }
 }
 
-/// Detect now, in the background. A config reload (SIGHUP) detects again
-/// (`runtime::reload`, PX-33).
+/// Detect in the background, after any detection still running. A
+/// config reload (SIGHUP) detects again so (`runtime::reload`, PX-33).
+/// Asked again while one waits, nothing more is queued: the one waiting
+/// has not read the host yet, so it answers this too, and five SIGHUPs
+/// make at most two detections, not five back to back.
 pub fn spawn_detection(transcoding: Arc<Transcoding>) {
+    use std::sync::atomic::Ordering;
+    if transcoding.waiting.swap(true, Ordering::AcqRel) {
+        return;
+    }
     tokio::spawn(async move {
-        transcoding.detect().await;
+        let _one = transcoding.detecting.lock().await;
+        // From here, one asked for waits again: this one has begun.
+        transcoding.waiting.store(false, Ordering::Release);
+        transcoding.detect_now().await;
     });
 }
 
@@ -710,6 +743,50 @@ mod tests {
         script: &str,
     ) -> (Arc<LogRing>, Arc<Detected>) {
         detect_on_with(name, entries, host, script, TranscodeSettings::default()).await
+    }
+
+    /// Five reloads in a row, one detection running: one more waits, and
+    /// the other four are answered by it.
+    #[tokio::test]
+    async fn detections_asked_for_while_one_waits_are_one() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-transcode-coalesce").await;
+        let calls = dir.join("calls");
+        let ffmpeg = dir.join("ffmpeg");
+        crate::test_support::write_script(
+            &ffmpeg,
+            &format!("#!/bin/sh\necho x >> '{}'\nsleep 0.5\n", calls.display()),
+        );
+        let transcoding = Arc::new(Transcoding::new(
+            Tool::unconfined(ffmpeg),
+            Vec::new(),
+            dir.join("scratch"),
+        ));
+        let counted = || {
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        transcoding.detect().await;
+        let one = counted();
+        assert!(one > 0, "a detection runs ffmpeg");
+
+        let began = transcoding.began.notified();
+        spawn_detection(transcoding.clone());
+        // Running now: its first ffmpeg takes half a second.
+        began.await;
+        for _ in 0..4 {
+            spawn_detection(transcoding.clone());
+        }
+        // Each queued for the lock, before the last.
+        tokio::task::yield_now().await;
+        transcoding.detect().await;
+
+        assert_eq!(
+            counted(),
+            one * 4,
+            "the first, the one running, one waiting for it, and the last"
+        );
     }
 
     /// [`detect_on`] with `settings`' tone map and experimental switches.

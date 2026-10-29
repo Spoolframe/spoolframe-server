@@ -74,7 +74,7 @@ pub struct Watch {
     show_ids: Mutex<HashMap<MediaId, (Instant, Vec<String>)>>,
     /// Whose state was saved, for whoever mirrors it elsewhere (PX-04):
     /// each one, since every linked user's state syncs (P3-12).
-    changed: tokio::sync::broadcast::Sender<Principal>,
+    changed: tokio::sync::broadcast::Sender<WatchChange>,
     /// Libraries walked for a filter or sort by watch state, kept for the
     /// pages after the first ([`browse`]).
     walks: browse::Walks,
@@ -112,6 +112,36 @@ impl From<Synced> for spoolframe_protocol::downloads::OfflineWatchOutcome {
             Synced::NotTracked => Self::NotTracked,
         }
     }
+}
+
+/// A change to a user's watch state made through [`Watch`], as
+/// [`Watch::changes`] tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchChange {
+    pub principal: Principal,
+    /// What it was of, as asked: a season's or a show's id stands for its
+    /// episodes.
+    pub items: Vec<MediaId>,
+    /// A state was written: what Plex's mirror follows (PX-04).
+    pub written: bool,
+    /// What clients show of the items may differ now, so the user's other
+    /// devices are told: a mark, a hide or unhide, an offline sync, a
+    /// playback stopped, or progress that turned.
+    pub shown: bool,
+    /// The connection (its stable id) it came through, which is not told;
+    /// `None` from elsewhere (MCP, the web).
+    pub from: Option<usize>,
+}
+
+/// A state written by [`Watch::save_as_of`].
+#[derive(Debug, Clone)]
+struct Saved {
+    /// The row written: the item's own, or its title's copy here (P8-03).
+    row: String,
+    /// Whether the state as clients see it ([`WatchRules::playback_state`])
+    /// turned: into progress, watched, or out of either. A new position
+    /// within progress does not.
+    turned: bool,
 }
 
 /// A progress write, for judging the reports the throttle skips.
@@ -222,19 +252,32 @@ impl Watch {
         *self.rules.write() = rules;
     }
 
-    /// Fires after each state saved through [`Watch`], with its principal.
-    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<Principal> {
+    /// Fires after each change made through [`Watch`]: a state written,
+    /// or one whose items clients show otherwise now.
+    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<WatchChange> {
         self.changed.subscribe()
+    }
+
+    /// Tell `change`, when it is one. Nobody listening is fine: nothing
+    /// syncs, and no client is connected.
+    fn tell(&self, change: WatchChange) {
+        if change.written || change.shown {
+            let _ = self.changed.send(change);
+        }
     }
 
     /// Record that `principal` is at `position` in `id`. Written at most
     /// once per throttle interval per item, whatever the client sends; a
-    /// change of watched state is always written.
+    /// change of watched state is always written. Told as shown only when
+    /// the state as clients see it turned (into progress, or watched),
+    /// through connection `from`: a new position within progress is not
+    /// worth another device reading the item again.
     pub async fn progress(
         &self,
         principal: Principal,
         id: &MediaId,
         position: Duration,
+        from: Option<usize>,
     ) -> Result<(), WatchError> {
         if !tracked(id) {
             return Err(WatchError::NotTracked(id.clone()));
@@ -272,7 +315,7 @@ impl Watch {
         let duration = self.duration(id, &found.item).await;
         let credits = credits_to_end(&found.markers);
         let watched = self.rules().is_watched(position, duration, credits);
-        let row = self
+        let saved = self
             .save_as_of(
                 principal,
                 id,
@@ -282,8 +325,15 @@ impl Watch {
                 watched,
                 None,
             )
-            .await?
-            .unwrap_or_else(|| key.1.clone());
+            .await?;
+        self.tell(WatchChange {
+            principal,
+            items: vec![id.clone()],
+            written: saved.is_some(),
+            shown: saved.as_ref().is_some_and(|saved| saved.turned),
+            from,
+        });
+        let row = saved.map_or_else(|| key.1.clone(), |saved| saved.row);
         // Writes older than the throttle judge nothing more: let them go,
         // so the map holds what is being played now, not every item ever
         // played since the server started.
@@ -311,10 +361,13 @@ impl Watch {
     /// not apply. Written, it is told as any save is (PX-04's Plex
     /// mirror). Each of `entries` in turn, the items fetched a few ahead:
     /// a failure on one leaves those before it written and none after.
+    /// Those written are told, through connection `from`, though a later
+    /// one fails.
     pub async fn offline(
         &self,
         principal: Principal,
         entries: Vec<(MediaId, Offline)>,
+        from: Option<usize>,
     ) -> Result<Vec<Synced>, WatchError> {
         let mut fetched = stream::iter(entries)
             .map(|(id, offline)| async move {
@@ -327,13 +380,36 @@ impl Watch {
             })
             .buffered(CATALOG_FETCHES);
         let mut synced = Vec::new();
+        let mut applied = Vec::new();
+        let mut failed = None;
         while let Some((id, offline, found)) = fetched.next().await {
-            synced.push(match found? {
-                Some(found) => self.offline_one(principal, &id, &found, offline).await?,
-                None => Synced::NotTracked,
-            });
+            let one = match found {
+                Ok(Some(found)) => self.offline_one(principal, &id, &found, offline).await,
+                Ok(None) => Ok(Synced::NotTracked),
+                Err(e) => Err(e),
+            };
+            match one {
+                Ok(one) => {
+                    if one == Synced::Applied {
+                        applied.push(id);
+                    }
+                    synced.push(one);
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
         }
-        Ok(synced)
+        let written = !applied.is_empty();
+        self.tell(WatchChange {
+            principal,
+            items: applied,
+            written,
+            shown: written,
+            from,
+        });
+        failed.map_or(Ok(synced), Err)
     }
 
     /// [`Watch::offline`] of `offline` in `id`, `found`.
@@ -385,7 +461,12 @@ impl Watch {
     /// Continue watching or Next up (P1-22). Only that card: the show's
     /// other episodes stay. Its watch state does not change; the next one
     /// written for it clears this.
-    pub async fn hide(&self, principal: Principal, id: &MediaId) -> Result<(), WatchError> {
+    pub async fn hide(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        from: Option<usize>,
+    ) -> Result<(), WatchError> {
         if !tracked(id) {
             return Err(WatchError::NotTracked(id.clone()));
         }
@@ -394,38 +475,76 @@ impl Watch {
         self.store
             .hide_continue(principal, &id.to_string(), &title)
             .await?;
+        self.shown(principal, id, from);
         Ok(())
     }
 
     /// Undo [`Watch::hide`].
-    pub async fn unhide(&self, principal: Principal, id: &MediaId) -> Result<(), WatchError> {
+    pub async fn unhide(
+        &self,
+        principal: Principal,
+        id: &MediaId,
+        from: Option<usize>,
+    ) -> Result<(), WatchError> {
         if !tracked(id) {
             return Err(WatchError::NotTracked(id.clone()));
         }
         self.store
             .unhide_continue(principal, &id.to_string())
             .await?;
+        self.shown(principal, id, from);
         Ok(())
     }
 
+    /// `principal`'s playback of `id` stopped, through connection `from`:
+    /// where it stopped is their other devices' Resume, so it is told as
+    /// shown. An item with no watch state has nothing to tell.
+    pub fn stopped(&self, principal: Principal, id: &MediaId, from: Option<usize>) {
+        if tracked(id) {
+            self.shown(principal, id, from);
+        }
+    }
+
+    /// Tell that what clients show of `id` changed, no state written.
+    fn shown(&self, principal: Principal, id: &MediaId, from: Option<usize>) {
+        self.tell(WatchChange {
+            principal,
+            items: vec![id.clone()],
+            written: false,
+            shown: true,
+            from,
+        });
+    }
+
     /// Mark `id` watched or not. Either way its progress starts over.
+    /// Told, through connection `from`, as one change of `id`.
     pub async fn mark(
         &self,
         principal: Principal,
         id: &MediaId,
         watched: bool,
+        from: Option<usize>,
     ) -> Result<(), WatchError> {
         match id.kind() {
             MediaKind::Season | MediaKind::Show => {
-                return self.mark_episodes(principal, id, watched).await;
+                self.mark_episodes(principal, id, watched).await?;
             }
             _ if !tracked(id) => return Err(WatchError::NotTracked(id.clone())),
-            _ => {}
+            _ => {
+                let found = self.catalog.item(id).await?;
+                let duration = self.duration(id, &found.item).await;
+                self.save(principal, id, &found, None, duration, watched)
+                    .await?;
+            }
         }
-        let found = self.catalog.item(id).await?;
-        let duration = self.duration(id, &found.item).await;
-        self.save(principal, id, &found, None, duration, watched)
-            .await
+        self.tell(WatchChange {
+            principal,
+            items: vec![id.clone()],
+            written: true,
+            shown: true,
+            from,
+        });
+        Ok(())
     }
 
     /// Mark every episode of a season, or of a show's seasons (specials
@@ -496,8 +615,8 @@ impl Watch {
 
     /// [`Watch::save`], now; or, with `at` (Unix seconds), as of then and
     /// only when newer than the state there is: the row written, the
-    /// item's own or its title's copy here (P8-03), or `None` when it was
-    /// not.
+    /// item's own or its title's copy here (P8-03), and whether it
+    /// turned; or `None` when it was not written.
     #[allow(clippy::too_many_arguments)]
     async fn save_as_of(
         &self,
@@ -508,7 +627,7 @@ impl Watch {
         duration: Option<Duration>,
         watched: bool,
         at: Option<i64>,
-    ) -> Result<Option<String>, WatchError> {
+    ) -> Result<Option<Saved>, WatchError> {
         let media_id = id.to_string();
         let title = self.title_key(found).await;
         // Bring over any state this item had under an earlier key first.
@@ -543,22 +662,27 @@ impl Watch {
             watched,
             unhide: true,
         };
-        if !self
+        let Some(before) = self
             .store
             .save_title_watch(principal, update, &folded, at)
             .await?
-        {
+        else {
             return Ok(None);
-        }
+        };
         // What is next up may have changed, and what a filter by watch
         // state keeps.
         self.next_up
             .lock()
             .retain(|(cached, _), _| *cached != principal);
         self.walks.forget(principal);
-        // Nobody listening is fine: nothing syncs.
-        let _ = self.changed.send(principal);
-        Ok(Some(into))
+        let rules = self.rules();
+        let seen = |state: PlaybackState| (state.position.is_some(), state.watched);
+        let after = seen(rules.playback_state(position, watched));
+        let before = before.map_or((false, false), |row| seen(row.state(&rules)));
+        Ok(Some(Saved {
+            turned: after != before,
+            row: into,
+        }))
     }
 
     /// The duration from the server's own probe, else the catalog's; never
@@ -730,11 +854,8 @@ impl Watch {
             else {
                 continue;
             };
-            let position = newest
-                .position_ms
-                .map(|p| Duration::from_millis(p.max(0) as u64));
             if let Some(playback) = playback_mut(item) {
-                *playback = self.rules().playback_state(position, newest.watched);
+                *playback = newest.state(&self.rules());
             }
         }
         Ok(())
@@ -822,12 +943,9 @@ impl Watch {
             let Some(row) = states.get(&item.id().to_string()) else {
                 continue;
             };
-            let position = row
-                .position_ms
-                .map(|p| Duration::from_millis(p.max(0) as u64));
             // Only a movie or an episode has a row: `ids` holds no other.
             if let Some(playback) = playback_mut(item) {
-                *playback = self.rules().playback_state(position, row.watched);
+                *playback = row.state(&self.rules());
             }
         }
         Ok(())
@@ -1069,6 +1187,78 @@ impl Watch {
         Ok(next)
     }
 
+    /// The episode after episode `item` for `principal`, as
+    /// `NextEpisode` asks: the one right after it, or with `unwatched` the
+    /// first after it they have not watched. Specials are first in the
+    /// order with `specials`, as a show lists its seasons, and out of it
+    /// otherwise. `None` at the show's end, and for an episode not in the
+    /// order (a special, without them).
+    pub async fn episode_after(
+        &self,
+        principal: Principal,
+        item: &MediaId,
+        unwatched: bool,
+        specials: bool,
+    ) -> Result<Option<Item>, WatchError> {
+        let found = self.catalog.item(item).await?;
+        let Item::Episode(episode) = &found.item else {
+            return Err(WatchError::NotTracked(item.clone()));
+        };
+        let episodes = self.catalog.episodes(&episode.show_id).await?;
+        let run = show_run(episodes, specials);
+        let Some(at) = run.iter().position(|e| e.id() == item) else {
+            return Ok(None);
+        };
+        let after: Vec<Item> = run.into_iter().skip(at + 1).collect();
+        if !unwatched {
+            return Ok(after.into_iter().next());
+        }
+        let watched = self.watched_of(principal, &after).await?;
+        Ok(after
+            .into_iter()
+            .find(|e| !watched.contains(&e.id().to_string())))
+    }
+
+    /// Where show `show`'s Continue goes for `principal`, as `ShowNext`
+    /// asks: the first episode in progress, else the first they have not
+    /// watched, specials left out. `None` when every one is watched.
+    pub async fn show_next(
+        &self,
+        principal: Principal,
+        show: &MediaId,
+    ) -> Result<Option<Item>, WatchError> {
+        let run = show_run(self.catalog.episodes(show).await?, false);
+        let ids: Vec<String> = run.iter().map(|e| e.id().to_string()).collect();
+        let states = self.store.watch_states(principal, &ids).await?;
+        let rules = self.rules();
+        let started = |id: &String| {
+            states
+                .get(id)
+                .is_some_and(|row| row.state(&rules).position.is_some())
+        };
+        let watched = |id: &String| states.get(id).is_some_and(|row| row.watched);
+        let at = ids
+            .iter()
+            .position(started)
+            .or_else(|| ids.iter().position(|id| !watched(id)));
+        Ok(at.and_then(|at| run.into_iter().nth(at)))
+    }
+
+    /// Which of `items` `principal` has watched, by id.
+    async fn watched_of(
+        &self,
+        principal: Principal,
+        items: &[Item],
+    ) -> Result<HashSet<String>, WatchError> {
+        let ids: Vec<String> = items.iter().map(|e| e.id().to_string()).collect();
+        let states = self.store.watch_states(principal, &ids).await?;
+        Ok(states
+            .into_iter()
+            .filter(|(_, row)| row.watched)
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     async fn next_in_show(
         &self,
         principal: Principal,
@@ -1084,7 +1274,7 @@ impl Watch {
         }
         // All of them at once: one request to Plex, not one per season.
         let episodes = match self.catalog.episodes(show).await {
-            Ok(episodes) => show_run(episodes),
+            Ok(episodes) => show_run(episodes, false),
             Err(CatalogError::NotFound(_) | CatalogError::NotServed(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
@@ -1105,13 +1295,12 @@ impl Watch {
         };
         // Started already: it is in Continue watching, never in both rows.
         let id = next.id().to_string();
-        let min = ms(self.rules().started_after);
         let started = self
             .store
             .watch_states(principal, std::slice::from_ref(&id))
             .await?
             .get(&id)
-            .is_some_and(|row| !row.watched && row.position_ms.is_some_and(|p| p >= min));
+            .is_some_and(|row| row.state(&self.rules()).position.is_some());
         Ok((!started).then_some(next))
     }
 }
@@ -1123,11 +1312,12 @@ fn remote(key: &str) -> bool {
 
 /// The paired server `id` is from, if it is one's (P8-02): `None` for this
 /// server's own.
-/// A show's run, of its `episodes` (the catalog's): specials (season 0)
-/// are not part of it, and the rest go by season and number. Next up and
-/// binge-ahead (PX-37) both go on along it.
-pub(crate) fn show_run(mut episodes: Vec<Item>) -> Vec<Item> {
-    episodes.retain(|e| matches!(e, Item::Episode(e) if e.season > 0));
+/// A show's run, of its `episodes` (the catalog's), by season and number.
+/// With `specials`, the specials (season 0) come first, as the show lists
+/// them; without, they are not part of it. Next up and binge-ahead (PX-37)
+/// go on along the run without them.
+pub(crate) fn show_run(mut episodes: Vec<Item>, specials: bool) -> Vec<Item> {
+    episodes.retain(|e| matches!(e, Item::Episode(e) if specials || e.season > 0));
     episodes.sort_by_key(|e| match e {
         Item::Episode(e) => (e.season, e.episode),
         _ => (u32::MAX, u32::MAX),

@@ -168,6 +168,10 @@ in
   assert check "IPv6 is left at the server's default unless turned off" (!lib.hasInfix "ipv6 =" (rendered {}));
   assert check "IPv6 turned off is written as false" (lib.hasInfix "ipv6 = false;" (rendered {ipv6 = false;}));
   assert check "without wan the config has no wan table" (!lib.hasInfix "wan {" (rendered {}));
+  assert check "without a cap per stream the config has no per_stream table" (!lib.hasInfix "per_stream {" (rendered {}));
+  assert check "a cap per stream is written under uplink" (lib.hasInfix "mbps = 4;" (rendered {uplink.perStream.mbps = 4;})
+    && lib.hasInfix "per_stream {" (rendered {uplink.perStream.mbps = 4;}));
+  assert check "a cap per stream that spares local accounts is written as false" (lib.hasInfix "applies_to_local = false;" (rendered {uplink.perStream.appliesToLocal = false;}));
   assert check "wan's defaults are written out" (lib.hasInfix ''mode = "auto";'' (rendered {wan = {};}) && lib.hasInfix ''lookup_via = "wtfismyip";'' (rendered {wan = {};}));
   assert check "a static-only wan turns the mapped port off" (lib.hasInfix "mapped_port = false;" (rendered {
       wan = {

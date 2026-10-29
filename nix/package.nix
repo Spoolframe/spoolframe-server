@@ -70,7 +70,14 @@
   # (the root Cargo.toml's [patch.crates-io], PX-62): crane vendors it
   # with builtins.fetchGit at the rev Cargo.lock pins, so it needs no
   # hash here.
-  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+  # Only the server's, with the features the build below uses, so the
+  # cache matches it. The whole workspace's would check the FFI crate's
+  # dev-dependency uniffi_bindgen, whose askama templates are read by
+  # relative paths that do not exist in crane's vendored sources.
+  cargoArtifacts = craneLib.buildDepsOnly (commonArgs
+    // {
+      cargoExtraArgs = "--locked -p spoolframe-server --features embed-web";
+    });
 in
   craneLib.buildPackage (commonArgs
     // {

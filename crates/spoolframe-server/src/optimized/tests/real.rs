@@ -177,7 +177,10 @@ fn packets_md5(file: &Path, stream: &str) -> String {
 
 fn sha256(file: &Path) -> String {
     let bytes = std::fs::read(file).unwrap();
-    format!("{:x}", Sha256::digest(&bytes))
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Copy `row` of `film` muxed whole into `out` from its lease.

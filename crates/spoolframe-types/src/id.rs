@@ -310,6 +310,12 @@ macro_rules! namespaced_id {
                 let (origin, rest) = split_origin(&self.key)?;
                 Some((origin, rest.parse().ok()?))
             }
+
+            /// The server id of the paired server a federated id is
+            /// on; `None` for this server's own, as `remote` reads it.
+            pub fn origin(&self) -> Option<&str> {
+                self.remote().map(|(origin, _)| origin)
+            }
         }
 
         impl fmt::Display for $name {
@@ -379,6 +385,23 @@ impl From<MediaId> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paired_servers_library_names_its_origin() {
+        let own: LibraryId = "plex:1".parse().unwrap();
+        let fed = LibraryId::federated("sa", &own).unwrap();
+        assert_eq!(fed.to_string(), "fed:sa:plex:1");
+        assert_eq!(fed.origin(), Some("sa"));
+        assert_eq!(own.origin(), None);
+    }
+
+    #[test]
+    fn a_paired_servers_item_names_its_origin_and_kind() {
+        let own: MediaId = "plex:episode:7".parse().unwrap();
+        let fed = MediaId::federated("sa", &own).unwrap();
+        assert_eq!((fed.origin(), fed.kind()), (Some("sa"), MediaKind::Episode));
+        assert_eq!(own.origin(), None);
+    }
 
     #[test]
     fn a_media_id_prints_as_namespace_kind_key() {

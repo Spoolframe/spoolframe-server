@@ -10,11 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use std::sync::Arc;
-
-use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::{PlaybackHandle, PlaybackPlan, Quality, Selection, SessionId};
 use spoolframe_types::{Delivery, DisplayCapabilities, Item, MediaId, Platform, SubtitleFormat};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::encode::Conversion;
@@ -1010,7 +1008,10 @@ impl Playback {
 
 /// A random id for playback debug: 8 hex digits.
 fn debug_id() -> String {
-    format!("{:08x}", OsRng.next_u32())
+    format!(
+        "{:08x}",
+        getrandom::u32().expect("the OS gives random bytes")
+    )
 }
 
 /// What ties a playback's spans together: its id (playback debug's), and
@@ -1237,7 +1238,7 @@ impl Playbacks {
     /// conversion names its files after it.
     pub fn new_handle() -> PlaybackHandle {
         let mut bytes = [0u8; 16];
-        OsRng.fill_bytes(&mut bytes);
+        getrandom::fill(&mut bytes).expect("the OS gives random bytes");
         PlaybackHandle(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 

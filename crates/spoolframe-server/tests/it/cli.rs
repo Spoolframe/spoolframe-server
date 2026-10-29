@@ -1413,7 +1413,12 @@ impl Running {
     /// The lines logged once `times` of them are `wanted`, waiting up to
     /// 30 seconds.
     fn lines_once(&self, wanted: fn(&str) -> bool, times: usize) -> Vec<String> {
-        for _ in 0..600 {
+        self.lines_within(wanted, times, 600)
+    }
+
+    /// [`Running::lines_once`], waiting up to `polls` times 50 ms.
+    fn lines_within(&self, wanted: fn(&str) -> bool, times: usize, polls: u32) -> Vec<String> {
+        for _ in 0..polls {
             let lines: Vec<String> = self.log().lines().map(plain).collect();
             if lines.iter().filter(|l| wanted(l)).count() >= times {
                 return lines;
@@ -1594,13 +1599,13 @@ async fn sighup_reloads_the_config_file() {
         line.contains("SIGHUP: config reloaded: nothing changed"),
         "{line}"
     );
-    // Encoders detected again on each, as SIGHUP always did.
-    let detected = running
-        .log()
-        .lines()
-        .filter(|l| l.contains("transcoding") && l.contains("encoders"))
-        .count();
-    assert!(detected >= 2, "{}", running.log());
+    // Encoders detected again, as SIGHUP always did: in the background,
+    // one detection at a time, each half a minute on a busy host.
+    running.lines_within(
+        |l| l.contains("transcoding") && l.contains("encoders"),
+        2,
+        3600,
+    );
     running.stop_cleanly();
 }
 

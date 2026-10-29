@@ -29,9 +29,9 @@ pub struct OwnedPasskey {
 }
 
 /// A passkey just made for a user who does not exist yet: the first
-/// admin's, at setup (P3-01).
+/// admin's, at setup (P3-01), or one made with an invite.
 #[derive(Debug, Clone, Copy)]
-pub struct FirstPasskey<'a> {
+pub struct NewPasskey<'a> {
     /// The WebAuthn user handle it was made with.
     pub handle: &'a str,
     pub credential_id: &'a str,
@@ -57,8 +57,9 @@ pub enum PasskeyError {
     Store(#[from] StoreError),
 }
 
-/// The longest name a passkey can have.
-pub const MAX_NAME_LEN: usize = 64;
+/// The longest name a passkey can have: the apps' limit on any name
+/// typed for a device.
+pub const MAX_NAME_LEN: usize = spoolframe_protocol::MAX_NAME_CHARS;
 
 /// `name` as stored: trimmed, and not empty or longer than
 /// [`MAX_NAME_LEN`].
@@ -173,28 +174,12 @@ impl Store {
     pub async fn add_first_admin_with_passkey(
         &self,
         username: &str,
-        passkey: FirstPasskey<'_>,
+        passkey: NewPasskey<'_>,
     ) -> Result<LocalUserId, UserError> {
         let now = self.now();
         let mut tx = self.begin_write().await?;
         let id = add_first_user(&mut tx, username, now).await?;
-        sqlx::query("INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2)")
-            .bind(id)
-            .bind(passkey.handle)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "INSERT INTO passkeys (credential_id, user_id, name, credential, rp_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(passkey.credential_id)
-        .bind(id)
-        .bind(passkey.name)
-        .bind(passkey.credential)
-        .bind(passkey.rp_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        insert_passkey_in(&mut tx, id, passkey, now).await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -310,6 +295,34 @@ impl Store {
         .fetch_all(&self.pool)
         .await?)
     }
+}
+
+/// `user`'s first passkey, `passkey`, made at `now`, in `tx`: its handle
+/// and the credential.
+pub(super) async fn insert_passkey_in(
+    tx: &mut sqlx::SqliteConnection,
+    user: LocalUserId,
+    passkey: NewPasskey<'_>,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO passkey_users (user_id, handle) VALUES (?1, ?2)")
+        .bind(user)
+        .bind(passkey.handle)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO passkeys (credential_id, user_id, name, credential, rp_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(passkey.credential_id)
+    .bind(user)
+    .bind(passkey.name)
+    .bind(passkey.credential)
+    .bind(passkey.rp_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -433,8 +446,8 @@ mod tests {
         assert_eq!(store.list_passkeys(alice).await.unwrap().len(), 1);
     }
 
-    fn first(credential_id: &'static str) -> FirstPasskey<'static> {
-        FirstPasskey {
+    fn first(credential_id: &'static str) -> NewPasskey<'static> {
+        NewPasskey {
             handle: "handle-1",
             credential_id,
             name: "iPhone",

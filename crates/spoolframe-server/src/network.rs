@@ -363,6 +363,17 @@ impl Connections {
         self.peers.lock()
     }
 
+    /// The device of open connection `id`.
+    pub(crate) fn endpoint(&self, id: usize) -> Option<EndpointId> {
+        self.lock().get(&id).map(|peer| peer.endpoint)
+    }
+
+    /// Hold open connection `id` while the guard lives, as a stream being
+    /// answered is: a sign-out lets it finish first.
+    pub(crate) fn keep_open(&self, id: usize) -> Option<admission::Answering> {
+        self.lock().get(&id).map(Peer::answering)
+    }
+
     pub(crate) fn admission(&self) -> Admission {
         self.admission
     }
@@ -983,6 +994,8 @@ impl Server {
             web_url: services.public_url.clone(),
             // Per connection, from its Hello (PX-49).
             experimental: Vec::new(),
+            // Per connection, from its Hello.
+            features: spoolframe_protocol::Features::empty(),
             // An account is made only by `RedeemInvite`: there is no open
             // sign-up, and no setting for one.
             invite_only: true,

@@ -47,6 +47,7 @@ pub fn turned_on(asked: &[String], on: &[&str]) -> Vec<String> {
 
 /// Why the server gives no HTTP URL for a playback (`http-playback`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum HttpPlaybackRefusal {
     /// The feature is not on for this connection: the server's HTTP

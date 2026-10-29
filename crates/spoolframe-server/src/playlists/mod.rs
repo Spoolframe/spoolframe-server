@@ -43,8 +43,8 @@ use crate::covers::{CoverError, Covers, Tile};
 use crate::principal::{Actor, Principal};
 use crate::store::playlists::PlaceRow;
 use crate::store::playlists::{
-    EntryEdit, EntryRow, HeldBy, NewEntry, NewPlaylist, PinNoteReason as StoredReason,
-    PlaylistChange, PlaylistError, PlaylistRow, ShareRow,
+    EntryEdit, EntryRow, GonePlaylist, HeldBy, NewEntry, NewPlaylist,
+    PinNoteReason as StoredReason, PlaylistChange, PlaylistError, PlaylistRow, ShareRow,
 };
 use crate::store::{Store, StoreError};
 use crate::watch::Watch;
@@ -366,10 +366,7 @@ impl Playlists {
             covers: None,
             mosaics: Mosaics::default(),
             all: AllTracks::new(),
-            seeds: Arc::new(|| {
-                use password_hash::rand_core::{OsRng, RngCore};
-                OsRng.next_u64()
-            }),
+            seeds: Arc::new(|| getrandom::u64().expect("the OS gives random bytes")),
         }
     }
 
@@ -401,7 +398,7 @@ impl Playlists {
     /// Whether `actor` may see `item`: a paired server's only from a
     /// client that named the experimental `federation` feature (P8-03),
     /// and anything only as [`ItemVisibility`] says.
-    fn may_see(&self, actor: &Actor, item: &Item) -> bool {
+    pub(crate) fn may_see(&self, actor: &Actor, item: &Item) -> bool {
         (actor.federated || item.id().namespace() != Namespace::Federated)
             && self.visibility.may_see(actor, item)
     }
@@ -1084,15 +1081,15 @@ impl Playlists {
     }
 
     /// Apply `edits`, made on `revision`, to playlist `id`'s entries: its
-    /// new revision. Its owner's, an editor's, or an admin's for a
-    /// server-wide one.
+    /// new revision, and the entries its adds made, in the edits' order.
+    /// Its owner's, an editor's, or an admin's for a server-wide one.
     pub async fn edit(
         &self,
         actor: &Actor,
         id: &str,
         revision: u64,
         edits: Vec<PlaylistEdit>,
-    ) -> Result<u64, PlaylistsError> {
+    ) -> Result<(u64, Vec<EntryId>), PlaylistsError> {
         let (row, access) = self.seen(actor, id).await?;
         if !access.can_edit() {
             return Err(PlaylistsError::ReadOnly);
@@ -1125,8 +1122,12 @@ impl Playlists {
                 }
             });
         }
-        let new = match self.store.edit_playlist(id, revision, resolved).await {
-            Ok(new) => new,
+        let (new, added) = match self
+            .store
+            .edit_playlist_adding(id, revision, resolved)
+            .await
+        {
+            Ok(edited) => edited,
             Err(PlaylistError::Conflict) => {
                 let now = self.store.playlist(id).await?.map_or(0, |row| row.revision);
                 return Err(PlaylistsError::Conflict { revision: now });
@@ -1135,7 +1136,7 @@ impl Playlists {
         };
         let seen = Seen::of(&row);
         self.told_playlist(id, new, Some(seen.clone()), Some(seen));
-        Ok(new)
+        Ok((new, added))
     }
 
     /// The entries adding `item` makes, in their order: the item itself, or
@@ -1224,10 +1225,32 @@ impl Playlists {
         if !access.can_manage() {
             return Err(PlaylistsError::ReadOnly);
         }
+        self.remove(row, &actor.principal.to_string()).await
+    }
+
+    /// Tell of `gone`, deleted with their owner ([`Store::delete_user`]),
+    /// as `remove` tells of one deleted: who saw each is told it is gone,
+    /// and who pinned it of its note.
+    pub async fn deleted_with_owner(&self, gone: &[GonePlaylist]) {
+        for GonePlaylist { row, pinned } in gone {
+            self.let_go_of(row.art.as_deref()).await;
+            self.told_playlist(&row.id, row.revision + 1, Some(Seen::of(row)), None);
+            for principal in pinned
+                .iter()
+                .filter(|p| **p != row.owner)
+                .filter_map(|p| p.parse::<Principal>().ok())
+            {
+                self.tell(PlaylistNews::Pins { principal });
+            }
+        }
+    }
+
+    /// Delete `row`'s playlist for `by`: who saw it is told it is gone, and
+    /// who pinned it, but `by`, gets a note.
+    async fn remove(&self, row: PlaylistRow, by: &str) -> Result<(), PlaylistsError> {
+        let id = row.id.as_str();
         let pinned = self.store.pinned_by(id).await?;
-        self.store
-            .delete_playlist(id, &actor.principal.to_string())
-            .await?;
+        self.store.delete_playlist(id, by).await?;
         self.let_go_of(row.art.as_deref()).await;
         self.told_playlist(id, row.revision + 1, Some(Seen::of(&row)), None);
         for principal in pinned.iter().filter_map(|p| p.parse::<Principal>().ok()) {

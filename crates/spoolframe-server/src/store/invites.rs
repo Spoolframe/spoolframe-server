@@ -517,24 +517,51 @@ impl Store {
         let display = display_name(display)?;
         let now = self.now();
         let mut tx = self.begin_write().await?;
-        // The use is taken first: a write, so a second redemption waits
-        // for this one's transaction and then sees what it left.
-        let taken = match take_use(&mut tx, capability_hash, InviteKind::CreateUser, now).await? {
-            Ok(taken) => taken,
+        let id = LocalUserId::generate();
+        let role = match new_user(&mut tx, capability_hash, id, &name, display, now).await? {
+            Ok(role) => role,
             Err(refused) => {
                 tx.rollback().await?;
-                return Ok(Redeemed::Refused(refused));
+                return Ok(refused);
             }
         };
-        let role = taken.role;
-        let id = LocalUserId::generate();
-        if !insert_user(&mut tx, id, &name, display, role, now).await? {
-            tx.rollback().await?;
-            return Ok(Redeemed::UsernameTaken);
-        }
         add_password(&mut tx, id, phc, now).await?;
         tx.commit().await?;
         Ok(Redeemed::User { id, role })
+    }
+
+    /// Make the account `made` names with its invite and its app passkey
+    /// (feature `spoolframe:invite-passkeys`), and take one of the invite's
+    /// uses, in one transaction, as [`Store::redeem_invite`] does: the
+    /// passkey is the account's one way to sign in, with no password.
+    pub async fn redeem_invite_with_passkey(
+        &self,
+        made: &crate::app_passkeys::InvitePasskey,
+    ) -> Result<Redeemed, UserError> {
+        let name = normalize_username(&made.username)?;
+        let display = display_name(made.display_name.as_deref())?;
+        let now = self.now();
+        let mut tx = self.begin_write().await?;
+        let role = match new_user(&mut tx, &made.code_hash, made.user, &name, display, now).await? {
+            Ok(role) => role,
+            Err(refused) => {
+                tx.rollback().await?;
+                return Ok(refused);
+            }
+        };
+        let passkey = super::passkeys::NewPasskey {
+            handle: &made.handle,
+            credential_id: &made.credential_id,
+            name: &made.name,
+            credential: &made.credential,
+            rp_id: &made.rp_id,
+        };
+        super::passkeys::insert_passkey_in(&mut tx, made.user, passkey, now).await?;
+        tx.commit().await?;
+        Ok(Redeemed::User {
+            id: made.user,
+            role,
+        })
     }
 }
 
@@ -612,6 +639,29 @@ pub(super) struct TakenUse {
 /// write lock from here, and a redemption racing it waits, then sees what
 /// it left. `Err` with where the invite stands ([`state`]) when no use
 /// was taken; the caller rolls back.
+/// What redeeming a `create-user` invite begins with, in `tx`: one of
+/// the invite whose code hashes to `capability_hash` taken, then user `id`
+/// made with its role. The use is taken first: a write, so a second
+/// redemption waits for this one's transaction and then sees what it
+/// left. `Err` is the outcome, and the caller rolls `tx` back.
+async fn new_user(
+    tx: &mut sqlx::SqliteConnection,
+    capability_hash: &str,
+    id: LocalUserId,
+    name: &str,
+    display: Option<&str>,
+    now: i64,
+) -> Result<Result<Role, Redeemed>, UserError> {
+    let taken = match take_use(tx, capability_hash, InviteKind::CreateUser, now).await? {
+        Ok(taken) => taken,
+        Err(refused) => return Ok(Err(Redeemed::Refused(refused))),
+    };
+    if !insert_user(tx, id, name, display, taken.role, now).await? {
+        return Ok(Err(Redeemed::UsernameTaken));
+    }
+    Ok(Ok(taken.role))
+}
+
 pub(super) async fn take_use(
     conn: &mut sqlx::SqliteConnection,
     capability_hash: &str,

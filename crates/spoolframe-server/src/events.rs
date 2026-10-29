@@ -17,14 +17,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iroh::endpoint::SendStream;
-use spoolframe_protocol::Event;
 use spoolframe_protocol::codec::write_frame;
+use spoolframe_protocol::{Event, Feature, Features};
 
 use crate::announce::Told;
 use crate::connection_users::ConnectionUsers;
 use crate::network::Connections;
 use crate::playlists::PlaylistNews;
 use crate::principal::Principal;
+use crate::store::users::LocalUserId;
 use spoolframe_types::MediaId;
 
 /// One connection's events stream, and the turn to write on it.
@@ -70,11 +71,11 @@ impl Drop for Waiting {
 }
 
 impl EventStreams {
-    pub(crate) fn insert(&self, id: usize, stream: SendStream) {
-        self.0.lock().insert(
-            id,
-            (Arc::new(tokio::sync::Mutex::new(stream)), Arc::default()),
-        );
+    /// Keep connection `id`'s stream, `stream`: what is written on it.
+    pub(crate) fn insert(&self, id: usize, stream: SendStream) -> EventStream {
+        let stream = Arc::new(tokio::sync::Mutex::new(stream));
+        self.0.lock().insert(id, (stream.clone(), Arc::default()));
+        stream
     }
 
     pub(crate) fn remove(&self, id: usize) {
@@ -95,6 +96,11 @@ impl EventStreams {
     /// connection gone gets nothing.
     /// Past [`MAX_WAITING`] events waiting for it, the event is dropped.
     pub(crate) fn send(&self, id: usize, event: Event) {
+        self.send_holding(id, event, ());
+    }
+
+    /// As [`Self::send`], keeping `held` until the event is written.
+    pub(crate) fn send_holding(&self, id: usize, event: Event, held: impl Send + 'static) {
         let Some((stream, backlog)) = self.get(id) else {
             return;
         };
@@ -107,6 +113,7 @@ impl EventStreams {
         };
         tokio::spawn(async move {
             let _waiting = waiting;
+            let _held = held;
             let mut stream = stream.lock().await;
             if let Err(e) = write_frame(&mut *stream, &event).await {
                 tracing::debug!(error = %e, "cannot push an event");
@@ -202,6 +209,33 @@ async fn next_news<T: Clone>(
             Ok(told) => return Some(told),
             Err(RecvError::Lagged(missed)) => tracing::debug!(missed, "{what} went untold"),
             Err(RecvError::Closed) => return None,
+        }
+    }
+}
+
+/// Tell each change to a user's watch state that clients show
+/// ([`crate::watch::WatchChange::shown`]) to the user's connections with
+/// `spoolframe:watch-events` on, but the one it came through, until
+/// `news` ends.
+pub(crate) async fn tell_watch_news(
+    mut news: tokio::sync::broadcast::Receiver<crate::watch::WatchChange>,
+    users: ConnectionUsers,
+    features: ConnectionFeatures,
+    streams: EventStreams,
+) {
+    while let Some(told) = next_news(&mut news, "watch changes").await {
+        if !told.shown || told.items.is_empty() {
+            continue;
+        }
+        for id in users.of(&told.principal) {
+            if Some(id) != told.from && features.has(id, Feature::WatchEvents) {
+                streams.send(
+                    id,
+                    Event::WatchChanged {
+                        items: told.items.clone(),
+                    },
+                );
+            }
         }
     }
 }
@@ -343,22 +377,47 @@ pub(crate) async fn tell_subtitle_news(
     }
 }
 
-/// The connections that named the experimental `federation` feature, by
-/// stable id (P8-02): told when the paired servers' libraries change.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct FederationListeners(Arc<Mutex<HashSet<usize>>>);
+/// What each connection has on, by stable id: noted once, removed when
+/// it closes.
+#[derive(Debug, Clone)]
+pub(crate) struct ByConnection<T>(Arc<Mutex<HashMap<usize, T>>>);
 
-impl FederationListeners {
-    pub(crate) fn note(&self, id: usize) {
-        self.0.lock().insert(id);
+impl<T> Default for ByConnection<T> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<T: Copy> ByConnection<T> {
+    pub(crate) fn note(&self, id: usize, value: T) {
+        self.0.lock().insert(id, value);
     }
 
     pub(crate) fn remove(&self, id: usize) {
         self.0.lock().remove(&id);
     }
 
+    pub(crate) fn get(&self, id: usize) -> Option<T> {
+        self.0.lock().get(&id).copied()
+    }
+
     fn ids(&self) -> Vec<usize> {
-        self.0.lock().iter().copied().collect()
+        self.0.lock().keys().copied().collect()
+    }
+}
+
+/// The connections that named the experimental `federation` feature
+/// (P8-02): told when the paired servers' libraries change.
+pub(crate) type FederationListeners = ByConnection<()>;
+
+/// The regular features each connection has on: those its `Hello` named
+/// that this server has, agreed once, at the `Hello`.
+pub(crate) type ConnectionFeatures = ByConnection<Features>;
+
+impl ConnectionFeatures {
+    /// Whether `feature` is on for connection `id`.
+    pub(crate) fn has(&self, id: usize, feature: Feature) -> bool {
+        self.get(id).is_some_and(|on| on.contains(feature))
     }
 }
 
@@ -455,6 +514,143 @@ pub(crate) async fn tell_liked_news(
         for id in listeners.of(&principal) {
             streams.send(id, Event::LikedChanged);
         }
+    }
+}
+
+/// A change to a local user's profile their devices are told of
+/// (`ProfileRemoved`, `PinChanged`). Never told to connection `except`,
+/// which made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileNews {
+    /// `user` was disabled, deleted or left; with `device`, only that
+    /// device was forgotten for them.
+    Removed {
+        user: LocalUserId,
+        device: Option<String>,
+        except: Option<usize>,
+    },
+    /// `user`'s PIN was set, changed or removed: `required`, whether they
+    /// have one now; with `device`, only whether that device asks for it
+    /// changed.
+    PinChanged {
+        user: LocalUserId,
+        required: bool,
+        device: Option<String>,
+        except: Option<usize>,
+    },
+}
+
+impl ProfileNews {
+    fn user(&self) -> LocalUserId {
+        match self {
+            Self::Removed { user, .. } | Self::PinChanged { user, .. } => *user,
+        }
+    }
+
+    fn except(&self) -> Option<usize> {
+        match self {
+            Self::Removed { except, .. } | Self::PinChanged { except, .. } => *except,
+        }
+    }
+
+    /// The one device it is told to, when it is of that device alone.
+    fn device(&self) -> Option<&str> {
+        match self {
+            Self::Removed { device, .. } | Self::PinChanged { device, .. } => device.as_deref(),
+        }
+    }
+
+    fn event(&self) -> Event {
+        let user = Principal::LocalUser(self.user()).to_string();
+        match self {
+            Self::Removed { .. } => Event::ProfileRemoved { user },
+            Self::PinChanged { required, .. } => Event::PinChanged {
+                user,
+                required: *required,
+            },
+        }
+    }
+}
+
+/// What tells connections of their users' profiles: the client
+/// protocol's.
+#[derive(Debug, Clone)]
+pub(crate) struct ProfileTeller {
+    pub users: ConnectionUsers,
+    /// Told only where `spoolframe:profile-events` is on.
+    pub features: ConnectionFeatures,
+    pub connections: Connections,
+    pub streams: EventStreams,
+}
+
+/// One connection a [`ProfileTicket`] tells, held open until it is.
+struct Reached {
+    id: usize,
+    endpoint: Option<iroh::EndpointId>,
+    streams: EventStreams,
+    _open: Option<crate::admission::Answering>,
+}
+
+/// The connections a change to a user's profile is to be told to, found
+/// before the change: one that ends their sessions forgets who those
+/// connections act as, and signs a device out, closing its connection.
+/// Each is held open until told, or the ticket is dropped.
+#[must_use = "a ticket tells nobody until it is told"]
+pub(crate) struct ProfileTicket(Vec<Reached>);
+
+impl ProfileTicket {
+    /// Tell `news` to the connections found, but the one that made it;
+    /// of one device, only that device's.
+    pub(crate) fn tell(self, news: ProfileNews) {
+        let event = news.event();
+        // Of one device, its endpoint; text that names none matches no
+        // connection.
+        let only = news
+            .device()
+            .map(|device| device.parse::<iroh::EndpointId>().ok());
+        for reached in self.0 {
+            if news.except() == Some(reached.id) {
+                continue;
+            }
+            if let Some(only) = only
+                && (only.is_none() || reached.endpoint != only)
+            {
+                continue;
+            }
+            let (streams, id) = (reached.streams.clone(), reached.id);
+            streams.send_holding(id, event.clone(), reached);
+        }
+    }
+}
+
+/// The tellers [`crate::auth::Auth::profile_ticket`] asks.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProfileTellers(Arc<Mutex<Vec<ProfileTeller>>>);
+
+impl ProfileTellers {
+    pub(crate) fn add(&self, teller: ProfileTeller) {
+        self.0.lock().push(teller);
+    }
+
+    /// The connections acting as `user` now that named
+    /// `spoolframe:profile-events`, each held open.
+    pub(crate) fn ticket(&self, user: LocalUserId) -> ProfileTicket {
+        let principal = Principal::LocalUser(user);
+        let mut reached = Vec::new();
+        for teller in self.0.lock().iter() {
+            for id in teller.users.of(&principal) {
+                if !teller.features.has(id, Feature::ProfileEvents) {
+                    continue;
+                }
+                reached.push(Reached {
+                    id,
+                    endpoint: teller.connections.endpoint(id),
+                    streams: teller.streams.clone(),
+                    _open: teller.connections.keep_open(id),
+                });
+            }
+        }
+        ProfileTicket(reached)
     }
 }
 

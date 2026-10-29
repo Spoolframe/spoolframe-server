@@ -707,6 +707,8 @@ fn AddUser(on_done: EventHandler<Option<String>>) -> Element {
 enum Ask {
     Role(Role),
     Disable,
+    /// Delete the user and everything kept for them.
+    Delete,
     ClearPin,
     /// Take the user's password away: a passkey or a provider signs them
     /// in from then on.
@@ -752,6 +754,7 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
     use_effect(use_reactive((&titled,), move |(titled,)| {
         bar_title.set(Some(titled));
     }));
+    let nav = navigator();
     let toast = use_signal(|| None::<Said>);
     // Bumped by each change to a device, which may end its sessions.
     let devices_changed = use_signal(|| 0u32);
@@ -831,6 +834,14 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                         "Disable"
                     }
                 }
+                button {
+                    class: "btn btn-danger",
+                    disabled: last,
+                    title: if last { why_not } else { "" },
+                    onclick: move |_| asking.set(Some(Ask::Delete)),
+                    icons::Trash {}
+                    "Delete"
+                }
             }
         }
         UserSessionList { username: username.clone(), name: name.clone(), disabled: user.disabled, toast, devices_changed }
@@ -871,7 +882,13 @@ fn UserPage(user: UserInfo, last: bool, on_changed: EventHandler<()>) -> Element
                 ask,
                 username: username.clone(),
                 on_done: move |said: Option<(bool, String)>| {
+                    let deleted = ask == Ask::Delete && said.as_ref().is_some_and(|(ok, _)| *ok);
                     asking.set(None);
+                    // Their page is gone with them.
+                    if deleted {
+                        nav.push(Route::Users {});
+                        return;
+                    }
                     if let Some((ok, text)) = said {
                         say(toast, ok, text);
                         on_changed.call(());
@@ -909,6 +926,13 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
             ),
             "Disable",
         ),
+        Ask::Delete => (
+            format!("Delete {username}?"),
+            format!(
+                "{username} is signed out on every device, and their watch history, playlists, downloads and settings are deleted. This can't be undone: disable them to keep it all."
+            ),
+            "Delete",
+        ),
         Ask::ClearPin => (
             format!("Clear {username}'s PIN?"),
             format!("No device asks for it any more. {username} can set a new one in the app."),
@@ -926,6 +950,7 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
     let about = match ask {
         Ask::Role(_) => "making an admin",
         Ask::RemovePassword => "removing a password",
+        Ask::Delete => "deleting a user",
         _ => "clearing a PIN",
     };
     let name = username.clone();
@@ -961,6 +986,13 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
                             count(ended, "session")
                         ))
                     }
+                    Ask::Delete => {
+                        client
+                            .user_delete(username.clone())
+                            .await
+                            .map_err(rpc::error)?;
+                        Ok(format!("{username} deleted"))
+                    }
                     Ask::ClearPin => {
                         client
                             .user_clear_pin(username.clone())
@@ -993,13 +1025,14 @@ fn Confirm(ask: Ask, username: String, on_done: EventHandler<Option<(bool, Strin
             }));
         });
     });
-    let danger = matches!(ask, Ask::Disable | Ask::RemovePassword);
+    let danger = matches!(ask, Ask::Disable | Ask::Delete | Ask::RemovePassword);
     rsx! {
         div { class: "scrim",
             section { class: "dialog w-[440px]", role: "dialog",
                 div { class: if danger { "dialog-head dialog-head-danger" } else { "dialog-head" },
                     match ask {
                         Ask::Disable => rsx! { icons::CircleX { size: 22 } },
+                        Ask::Delete => rsx! { icons::Trash { size: 22 } },
                         Ask::ClearPin => rsx! { icons::Lock { size: 22 } },
                         Ask::RemovePassword => rsx! { icons::KeyRound { size: 22 } },
                         Ask::Role(_) => rsx! { icons::UserCog { size: 22 } },

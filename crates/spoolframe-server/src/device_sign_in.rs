@@ -21,8 +21,6 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::clock::Clock;
-
-use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::device_sign_in::{ALPHABET, CODE_LEN};
 use spoolframe_protocol::{AddressNetwork, DeviceAddress};
 use spoolframe_types::Platform;
@@ -516,7 +514,7 @@ fn new_code() -> String {
     let mut code = String::with_capacity(CODE_LEN);
     while code.len() < CODE_LEN {
         let mut byte = [0u8];
-        OsRng.fill_bytes(&mut byte);
+        getrandom::fill(&mut byte).expect("the OS gives random bytes");
         let b = usize::from(byte[0]);
         if b < limit {
             code.push(char::from(ALPHABET[b % ALPHABET.len()]));

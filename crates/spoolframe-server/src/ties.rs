@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use password_hash::rand_core::{OsRng, RngCore};
 use spoolframe_protocol::portable::{PortableUserId, TieProof, TieProofError, tie_message};
 
 use crate::clock::Clock;
@@ -74,7 +73,7 @@ impl TieChallenges {
     ) -> Result<([u8; 32], Duration), ChallengeError> {
         let now = self.clock.now();
         let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
+        getrandom::fill(&mut nonce).expect("the OS gives random bytes");
         let mut pending = self.pending.lock();
         pending.retain(|_, p| now.duration_since(p.began) < self.lifetime);
         pending.remove(session);

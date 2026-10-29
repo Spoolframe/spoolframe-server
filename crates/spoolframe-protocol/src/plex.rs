@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// A linked Plex account: the user's watch state syncs with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlexLink {
     /// The Plex account's username and email, as plex.tv said when it was
     /// linked; both `None` for a link the server's config file makes.
@@ -24,6 +25,7 @@ pub struct PlexLink {
 
 /// What one sync run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlexSyncSummary {
     /// When it ended, Unix seconds.
     pub at: i64,

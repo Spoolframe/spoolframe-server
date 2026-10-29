@@ -29,6 +29,7 @@ use crate::principal::Principal;
 use crate::store::StoreError;
 use crate::store::users::LocalUserId;
 use crate::store::watch::{WatchRow, WatchUpdate};
+use crate::watch::WatchChange;
 
 /// The most section lookups a sync asks one PMS at once: the user's own
 /// server, so a modest load.
@@ -804,7 +805,7 @@ impl WatchSync {
     /// Run every linked user now, every interval and soon after their
     /// state changes (`schedule`), and follow links made and removed,
     /// for as long as the server runs.
-    pub fn start(self: &Arc<Self>, changes: tokio::sync::broadcast::Receiver<Principal>) {
+    pub fn start(self: &Arc<Self>, changes: tokio::sync::broadcast::Receiver<WatchChange>) {
         let sync = self.clone();
         // Before anything else can link: none is missed.
         let mut links = self.accounts.changes();
@@ -833,7 +834,7 @@ impl WatchSync {
 
     /// Follow every user linked to Plex now and no one else: at start,
     /// and after link changes were missed.
-    async fn reconcile(self: &Arc<Self>, changes: &tokio::sync::broadcast::Receiver<Principal>) {
+    async fn reconcile(self: &Arc<Self>, changes: &tokio::sync::broadcast::Receiver<WatchChange>) {
         let users = match self.accounts.users().await {
             Ok(users) => users,
             Err(e) => {
@@ -863,7 +864,7 @@ impl WatchSync {
     fn follow(
         self: &Arc<Self>,
         user: LocalUserId,
-        changes: tokio::sync::broadcast::Receiver<Principal>,
+        changes: tokio::sync::broadcast::Receiver<WatchChange>,
     ) {
         self.forget_access(user);
         let sync = self.clone();
@@ -916,7 +917,7 @@ impl WatchSync {
 /// sooner than [`CHANGE_INTERVAL`] after the run before.
 async fn schedule<F, Fut>(
     interval: Duration,
-    mut changes: tokio::sync::broadcast::Receiver<Principal>,
+    mut changes: tokio::sync::broadcast::Receiver<WatchChange>,
     principal: Principal,
     mut run: F,
 ) where
@@ -950,13 +951,13 @@ async fn schedule<F, Fut>(
 /// Wait for a change of `principal`'s state; `false` once nothing can
 /// change any more. Falling behind counts as a change.
 async fn wait_for(
-    changes: &mut tokio::sync::broadcast::Receiver<Principal>,
+    changes: &mut tokio::sync::broadcast::Receiver<WatchChange>,
     principal: Principal,
 ) -> bool {
     use tokio::sync::broadcast::error::RecvError;
     loop {
         match changes.recv().await {
-            Ok(changed) if changed == principal => return true,
+            Ok(changed) if changed.written && changed.principal == principal => return true,
             Ok(_) => {}
             Err(RecvError::Lagged(_)) => return true,
             Err(RecvError::Closed) => return false,
@@ -1442,9 +1443,20 @@ mod tests {
         crate::store::users::LocalUserId::from_uuid(uuid::Uuid::from_u128(2)),
     );
 
+    /// A state of `principal`'s written.
+    fn written(principal: Principal) -> WatchChange {
+        WatchChange {
+            principal,
+            items: Vec::new(),
+            written: true,
+            shown: true,
+            from: None,
+        }
+    }
+
     /// Run [`schedule`] every 2 minutes; the seconds at which it ran.
     fn scheduled() -> (
-        tokio::sync::broadcast::Sender<Principal>,
+        tokio::sync::broadcast::Sender<WatchChange>,
         Arc<parking_lot::Mutex<Vec<u64>>>,
     ) {
         let changed = tokio::sync::broadcast::Sender::new(16);
@@ -1466,7 +1478,7 @@ mod tests {
         let (changed, runs) = scheduled();
         tokio::time::sleep(Duration::from_secs(3)).await;
         for _ in 0..30 {
-            changed.send(ME).unwrap();
+            changed.send(written(ME)).unwrap();
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
         assert_eq!(*runs.lock(), [0, 60, 120, 180, 240, 300]);
@@ -1478,7 +1490,7 @@ mod tests {
     async fn a_change_a_while_after_the_last_run_is_synced_within_seconds() {
         let (changed, runs) = scheduled();
         tokio::time::sleep(Duration::from_secs(70)).await;
-        changed.send(ME).unwrap();
+        changed.send(written(ME)).unwrap();
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert_eq!(*runs.lock(), [0, 75]);
     }
@@ -1489,7 +1501,7 @@ mod tests {
     async fn a_change_just_before_the_interval_s_run_does_not_put_it_off() {
         let (changed, runs) = scheduled();
         tokio::time::sleep(Duration::from_secs(117)).await;
-        changed.send(ME).unwrap();
+        changed.send(written(ME)).unwrap();
         tokio::time::sleep(Duration::from_secs(133)).await;
         assert_eq!(*runs.lock(), [0, 120, 240]);
     }
@@ -1501,7 +1513,7 @@ mod tests {
         let (changed, runs) = scheduled();
         tokio::time::sleep(Duration::from_secs(70)).await;
         for _ in 0..3 {
-            changed.send(ME).unwrap();
+            changed.send(written(ME)).unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         tokio::time::sleep(Duration::from_secs(80)).await;
@@ -1514,13 +1526,13 @@ mod tests {
     async fn another_user_s_changes_do_not_run_mine_nor_hide_mine() {
         let (changed, runs) = scheduled();
         tokio::time::sleep(Duration::from_secs(70)).await;
-        changed.send(SOMEONE_ELSE).unwrap();
+        changed.send(written(SOMEONE_ELSE)).unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
-        changed.send(ME).unwrap();
-        changed.send(SOMEONE_ELSE).unwrap();
+        changed.send(written(ME)).unwrap();
+        changed.send(written(SOMEONE_ELSE)).unwrap();
         tokio::time::sleep(Duration::from_secs(9)).await;
         assert_eq!(*runs.lock(), [0, 76]);
-        changed.send(SOMEONE_ELSE).unwrap();
+        changed.send(written(SOMEONE_ELSE)).unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert_eq!(*runs.lock(), [0, 76]);
     }

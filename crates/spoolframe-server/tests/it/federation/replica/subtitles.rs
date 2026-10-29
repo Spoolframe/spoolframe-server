@@ -63,6 +63,7 @@ async fn on_sb(pair: &Pair, user: &str) -> (TestClient, SessionId) {
         device_name: None,
         capabilities: None,
         experimental: vec![FEDERATION.into()],
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

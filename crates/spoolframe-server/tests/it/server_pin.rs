@@ -122,6 +122,7 @@ async fn a_new_key_with_the_same_server_id_is_an_identity_change() {
     let changed = SdkError::IdentityChanged {
         saved: id(&old),
         now: id(&new),
+        server_id: Some(old.server_id.to_string()),
     };
     assert_eq!(client.connect(&id(&new)).await, Err(changed.clone()));
     // A pin is not taken over by pinning.

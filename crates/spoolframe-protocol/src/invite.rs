@@ -116,6 +116,7 @@ pub struct Invite {
 
 /// What an invite link's code does, as the link says.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum InviteLinkKind {
     /// Makes an account on the server (`RedeemInvite`): a link without
     /// `kind`.

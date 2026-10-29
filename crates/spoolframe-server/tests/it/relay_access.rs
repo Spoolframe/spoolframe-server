@@ -3,7 +3,6 @@
 //! And the relay itself, letting through the tiers its `access` allows:
 //! an invite's holder by its kind's (P6-08).
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +17,7 @@ use spoolframe_protocol::relay_access::{
 };
 use spoolframe_protocol::{RedeemInvite, Reply, Request, Response};
 use spoolframe_server::invites::InviteCode;
-use spoolframe_server::network::Relay;
-use spoolframe_server::own_relay::{self, Access, RelayConfig, Serve};
+use spoolframe_server::own_relay::{self, Access};
 use spoolframe_server::store::invites::{InviteKind, InviteOrigin, NewInvite};
 use spoolframe_types::Role;
 
@@ -397,30 +395,13 @@ async fn a_named_relay_past_its_connections_is_closed_on() {
 /// plain HTTP, letting through `access`; once the server has taken it as
 /// its home relay. The relay runs until dropped.
 async fn server_with_own_relay(test: &str, access: Access) -> (TestServer, RelayServer) {
-    let key = SecretKey::generate();
-    // The relay's port is chosen first: the server is told its URL, and
-    // the relay the server's address.
-    let http = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let url = url::Url::parse(&format!("http://{http}")).unwrap();
-    let options = ServerOptions {
-        relays: vec![Relay::Custom(url.clone())],
-        own_relays: vec![key.public()],
-        ..ServerOptions::default()
-    };
-    let server = TestServer::start_with(support::fresh_dir(test).await, options).await;
-    let config = RelayConfig {
-        server: server.server.addr(),
+    let (server, relay, url) = support::start_with_own_relay(
+        test,
+        ServerOptions::default(),
+        &SecretKey::generate(),
         access,
-        serve: Serve::Proxy,
-        http,
-        quic: None,
-    };
-    let relay = own_relay::spawn(&config, key, &std::env::temp_dir())
-        .await
-        .unwrap();
+    )
+    .await;
     let home = iroh::RelayUrl::from(url);
     let homed = tokio::time::timeout(Duration::from_secs(10), async {
         while !server.server.addr().relay_urls().any(|u| *u == home) {

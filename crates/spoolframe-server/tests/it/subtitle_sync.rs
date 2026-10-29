@@ -105,6 +105,7 @@ async fn app_showing(
             ..ClientCapabilities::default()
         }),
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

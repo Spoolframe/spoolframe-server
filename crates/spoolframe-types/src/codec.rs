@@ -17,6 +17,7 @@ macro_rules! vocabulary {
     ($(#[$doc:meta])* $name:ident { $($(#[$vdoc:meta])* $variant:ident => $wire:literal,)* }) => {
         $(#[$doc])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
             $($(#[$vdoc])* $variant,)*
@@ -86,6 +87,24 @@ vocabulary!(
         Ogg => "ogg",
     }
 );
+
+impl Container {
+    /// The MIME type a file in it is served as, by HTTP or to a player
+    /// that reads bytes. One a player has no type for is
+    /// `application/octet-stream`: the player sniffs it.
+    pub fn mime(self) -> &'static str {
+        match self {
+            Container::Mp4 => "video/mp4",
+            Container::Matroska => "video/x-matroska",
+            Container::MpegTs => "video/mp2t",
+            Container::Avi => "video/x-msvideo",
+            Container::Flac => "audio/flac",
+            Container::Mp3 => "audio/mpeg",
+            Container::Ogg => "audio/ogg",
+            _ => "application/octet-stream",
+        }
+    }
+}
 
 vocabulary!(
     /// A subtitle format.

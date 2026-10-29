@@ -14,6 +14,7 @@ use spoolframe_types::ArtworkId;
 
 /// An item's previews: what `GetPreviews` answers once they are made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Previews {
     /// Tile `i` is the picture at about `i × interval_ms` (the keyframe
     /// at or just before it).

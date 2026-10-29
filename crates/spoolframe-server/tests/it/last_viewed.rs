@@ -27,6 +27,7 @@ async fn device(server: &TestServer) -> TestClient {
         device_name: None,
         capabilities: Some(capabilities),
         experimental: Vec::new(),
+        features: spoolframe_protocol::Features::empty(),
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

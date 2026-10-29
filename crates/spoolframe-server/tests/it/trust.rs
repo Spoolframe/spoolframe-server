@@ -185,6 +185,7 @@ async fn a_sign_in_that_remembers_trusts_the_device_and_one_that_does_not_does_n
             username: "alice".into(),
             display_name: "Alice".into(),
             pin_required: false,
+            pin_digits: None,
             auto_login: false,
         }]
     );
@@ -415,7 +416,10 @@ async fn a_resumed_profile_on_a_device_that_asks_for_the_pin_starts_locked() {
     expire_sessions(&server).await;
     let tv = tv.reconnect(&server).await;
     tv.hello().await;
-    assert!(trusted(&tv).await[0].pin_required);
+    let profile = &trusted(&tv).await[0];
+    assert!(profile.pin_required);
+    // As many boxes as the PIN has digits, for the device that asks.
+    assert_eq!(profile.pin_digits, Some(PIN.len() as u8));
     let session = resumed(&tv, &user_id(&server, "alice").await).await;
     match ok(&tv, &session, Request::WhoAmI).await {
         Reply::WhoAmI(WhoAmIReply { user, .. }) => assert!(user.locked),
@@ -457,6 +461,7 @@ async fn auto_login_turns_the_pin_off_and_the_pin_turns_auto_login_off() {
     let profile = &trusted(&tv).await[0];
     assert!(profile.auto_login);
     assert!(!profile.pin_required);
+    assert_eq!(profile.pin_digits, None, "not asked for here");
     ok(
         &tv,
         &session,

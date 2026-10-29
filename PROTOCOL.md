@@ -204,8 +204,42 @@ The server pushes `Event`s on the events stream, without being asked:
 | `server_addresses { addrs, relays, lookup }` | Where the server can be reached. See "Server addresses". |
 | `playback_share { handle, max_bitrate }` | A playback's share of the WAN uplink moved. See "The WAN uplink budget". |
 | `playback_ended { handle, error }` | Experimental (`federation`): a paired server's item's playback ended other than by the client's stop; `error` is what its next use is told. See "Proxy mode". |
+| `profile_removed { user }` | Sent only to a connection where the `spoolframe:profile-events` feature is on (both sides named it): local user `user` (a user id, as `WhoAmI` names it) is gone from this device. See "Profile events". |
+| `pin_changed { user, required }` | Sent only to a connection where the `spoolframe:profile-events` feature is on (both sides named it): local user `user`'s PIN was set, changed or removed. See "Profile events". |
+| `watch_changed { items }` | Sent only to a connection where the `spoolframe:watch-events` feature is on (both sides named it): the user's watch state of `items` changed on another of their connections. See "Watch events". |
 
 An event a client does not know decodes as `Unknown`; ignore it.
+
+### Profile events
+
+A server tells a user's devices when their profile changes elsewhere.
+Each event goes to the connections that act as the user (that made a
+request in one of their sessions), and is sent only to a connection
+where the `spoolframe:profile-events` feature is on (both sides named
+it).
+
+- `profile_removed { user }`: an admin disabled or deleted the user
+  (`admin.userDisable`, `admin.userDelete`), or the user left the
+  server on another device (`LeaveServer`). Each of their sessions has
+  ended; the next request in one is `Unauthenticated`, and the server
+  closes the connection with `close::SIGNED_OUT` once no session of any
+  user is left on it. A device forgotten for the user (`ForgetDevice`,
+  `me.forgetDevice`, `admin.userForgetDevice`) gets it alone: the
+  user's other devices are told nothing.
+- `pin_changed { user, required }`: the user set or changed their PIN
+  (`SetPin`, `me.pinSet`; `required` is true), or removed it
+  (`ClearPin`, `me.pinClear`), or an admin cleared it
+  (`admin.userClearPin`; `required` is false). `required` is whether
+  they have a PIN now. The PIN turned on or off for one device
+  (`SetPinRequired`, `me.setPinRequired`, `admin.userSetPinRequired`)
+  tells that device alone, `required` whether it asks for the PIN now. A device that had the profile unlocked locks it
+  again where the PIN is asked for, and one that kept the PIN to check
+  offline forgets it. The connection that made the change is not told.
+
+The server's own lock of a connection does not change: these tell an
+app to change what it shows. The SDK passes both on as
+`Client::profile_events()`, with `SessionEnded` and
+`PasswordChangeRequired`, which it learns from a call's answer.
 
 ## Mutation replay
 
@@ -406,7 +440,7 @@ These are the only requests served without a session
 | Device approval | `BeginDeviceSignIn { remember }`, `AwaitDeviceSignIn { request }` |
 | App passkey | `BeginPasskeySignIn { username }`, `FinishPasskeySignIn { signed, remember }` |
 | Trusted device | `TrustedProfiles`, `ResumeProfile { user_id }` |
-| Invite | `RedeemInvite`, `RedeemPortableInvite`, `LookupInvite { code }` |
+| Invite | `RedeemInvite`, `BeginInvitePasskey`, `RedeemInviteWithPasskey` (`spoolframe:invite-passkeys`), `RedeemPortableInvite`, `LookupInvite { code }` |
 | Portable credential | `BeginPortableSignIn`, `FinishPortableSignIn` |
 | Portable identity records | `IdentityRecord { user }`, `IdentityRecordByHandle { handle }` |
 | Pairing through a server | `OfferPairing`, `FetchPairing`, `AnswerPairing`, `CollectPairing` |
@@ -662,8 +696,11 @@ These two requests are pre-auth:
 | `{"type": "resume_profile", "user_id": "local:…"}` | `LoggedIn { session, remembered: true, … }` |
 
 `TrustedProfiles` lists only the connecting endpoint's rows, each
-`{user_id, username, display_name, pin_required, auto_login}`. It is a
-read, and the SDK may retry it.
+`{user_id, username, display_name, pin_required, pin_digits,
+auto_login}`. `pin_digits` is how many digits the PIN has, for a PIN
+pad's boxes, when `pin_required`; `null` otherwise, for a PIN set before
+the server kept its length (until it is set again), and absent from an
+older server. It is a read, and the SDK may retry it.
 
 `ResumeProfile` is a mutation, so it carries an operation id. It opens a
 normal session, bound to this endpoint as a sign-in's is. A refusal is
@@ -835,6 +872,46 @@ Of two redemptions of an invite's last use, one makes its account and
 the other is `invite_exhausted`. It is never retried on its own on a new
 connection.
 
+### Joining with a passkey
+
+With feature `spoolframe:invite-passkeys` on for the connection (both
+sides named it), an invite makes an account whose one way to sign in is
+an app passkey, with no password. On a connection without it, both
+requests are `unsupported`. The device begins, before any session:
+
+```json
+{"type": "begin_invite_passkey", "code": "QW7K-2MFP-XR4T",
+ "username": "pia", "display_name": null}
+```
+
+The code and username are checked as `redeem_invite` checks them, with
+its refusals: a username someone has is `username_taken` now. Nothing is
+made and no use is taken. The answer is `passkey_registration_begun`, as
+for an app passkey a signed-in user adds: the platform makes the passkey
+with it, for this server's app relying party (see "App passkeys: a
+relying party per server"). The account's user handle is new and random, as every user's
+is. The registration is the device's, for 5 minutes; beginning again
+replaces it. Then:
+
+```json
+{"type": "redeem_invite_with_passkey", "code": "QW7K-2MFP-XR4T",
+ "finish": {"credential_id": bytes, "attestation_object": bytes,
+            "client_data_json": bytes, "name": "Pia's iPhone"},
+ "remember": true}
+```
+
+The invite is checked again as `redeem_invite` checks it, so one revoked,
+expired or used up meanwhile says so. A finish with another code, from
+another device, after the 5 minutes, or with a passkey that does not
+verify is `invalid_credentials`: begin again. Then, in one transaction,
+a use is taken, the account is made with the invite's role, and the
+passkey kept as its own; a username taken since the beginning is
+`username_taken`, and the invite keeps its use. The answer is
+`logged_in`, the session bound to the device and signed in with the
+passkey; `remember` trusts the device for the user, as for
+`login_password`. Both draw on the sign-in budget of devices that are
+not signed in, and neither is retried on its own.
+
 ### Looking an invite up
 
 Before joining, a device may ask what a code is, for the "Got an invite?"
@@ -978,6 +1055,12 @@ link as the user pasted or opened it:
   as a password sign-in's. A refused redemption saves nothing. Its
   refusals are `InviteInvalid`, `InviteExpired`, `InviteExhausted`,
   `UsernameTaken`, `InvalidInput` and `RateLimited`.
+- `invited::<InvitePasskeys>(link) -> Invited<InvitePasskeys>`, then its
+  `begin_invite_passkey(username, display_name) -> PasskeyCreation` and
+  `redeem_invite_passkey(made, remember) -> Session`: joining with a
+  passkey, as `redeem_invite` joins, the session kept as a passkey
+  sign-in's. A server without `spoolframe:invite-passkeys` is
+  `FeatureOff` from `invited`, and nothing is sent: offer a password.
 - `look_up_invite(link) -> InviteLookup`: "Got an invite?". It connects as
   `connect_invite` does and sends `lookup_invite`: `server` is the
   `ServerEntry` that answered (name, fingerprint, server id) and
@@ -1541,6 +1624,10 @@ A playback handle lives for 30 minutes without use. These count as use:
 - a request that names the handle: `UpdatePlaybackProgress`,
   `SeekPlayback`, `ChangeSubtitle`, `ChangeQuality` or `StopPlayback`.
 
+A player that plays from a full buffer reads nothing for minutes; its
+progress reports, sent as it plays, keep the playback alive just as a
+paused player's do. It needs no read to stay alive.
+
 While the player is paused, send `UpdatePlaybackProgress { handle,
 sequence, position_ms }` once a minute, with the paused position and the
 next sequence number. This keeps the playback alive for as long as the
@@ -1561,6 +1648,31 @@ The server logs each playback it ends, at INFO, as `a playback ended`,
 with the reason (`idle`, `replaced`, `device_gone`, `signed_out`,
 `access_removed`, `stopped_by_admin` or `failed`) and how long the
 playback was unused. A client's own `StopPlayback` is not logged.
+
+## Marking watched
+
+`MarkWatched { id }` and `MarkUnwatched { id }` take a movie, an episode,
+a season or a show. A season's id marks every episode of the season; a
+show's every episode of every season, specials included. The state is
+kept per episode, as if each were marked. Marking unwatched starts each
+item's progress over. Either brings a card removed from Home back.
+
+## Watch events
+
+With feature `spoolframe:watch-events` on for the connection (both sides
+named it), a connection is told `watch_changed { items }` when the
+user's watch state changes on another of their connections: a mark
+(`items` the id marked, a season or show standing for its episodes), a
+card hidden from or put back on Home, an offline sync (`items` those it
+wrote), or a playback whose state turned. A playback's progress reports
+are told only when the item comes into progress (from a minute in),
+when it is watched, and when the playback stops: not the reports
+between, which only move it on. Never to
+the connection that made the change, nor to another user's. Read again
+what shows the items. A connection that missed events (it was not
+connected) reads Home again on connecting.
+
+SDK: `Client::watch_events()` gives each `WatchEvent { server, items }`.
 
 ## Home rows and "Remove"
 
@@ -1621,21 +1733,61 @@ still refuses. It sits beside the user's fields in the same map.
 
 ## Features
 
-Revision 1 has no regular features. Playlists, Liked and All, sharing
-by name, playlist covers, up next in a playlist, when an item was last
-viewed, play history, subtitle sync and search, downloads, music
-offline and looking an invite up were the `spoolframe:` features of
-revisions up to 15 (PX-16), which a client and a server each listed and
-used only when both did. They are base protocol now: a client names
-none, a server lists none, and every request, reply field and event
-below is there for every client. `Hello`, `ServerInfo`, `LoggedIn` and
-`WhoAmI` carry no `features`.
+Playlists, Liked and All, sharing by name, playlist covers, up next in
+a playlist, when an item was last viewed, play history, subtitle sync
+and search, downloads, music offline and looking an invite up were the
+`spoolframe:` features of revisions up to 15 (PX-16), which a client and
+a server each listed and used only when both did. They are base
+protocol 1.0 now: every request, reply field and event of theirs is
+there for every client, named or not.
 
-The only opt-ins are the experimental features (PX-49):
-`http-playback` and `federation`. A client names those it wants in
+What came after 0.16.3 is told by two things, and no other.
+
+The major revision, `PROTOCOL_VERSION`, is for a breaking change. A
+server refuses a `Hello` of any other.
+
+A regular feature is how a server knows a client handles something: a
+request, or what the server sends, such as a new event. An app built
+before it must not be sent what its code would misread, and a server
+older than it does not know its requests. Each is a `spoolframe:` name
+(`spoolframe_protocol::Feature`). The client names the features it
+handles in `Hello.features`; the server answers in
+`ServerInfo.features` with those of them it has. A feature is on for
+the connection only when both named it. The server sends a feature's
+events only to a connection it is on, and answers its requests only
+there: on another connection a feature's request is `unsupported`, as
+one the server does not know. A name either side does not know is
+ignored. Both fields are left out when empty, so an older peer sends
+and reads what it did before.
+
+The SDK names every feature it knows by default
+(`ClientOptions::features`), and `Session::has_feature(feature)` says
+whether one is on. A feature's calls are reached only through it being
+on: `Session::feature::<G>()` gives `On<G>`, and before a session
+`Client::invited::<G>(link)` gives `Invited<G>`, each `FeatureOff` when
+it is off, with nothing sent. A request of a feature that went off since
+(a reconnect to an older server) is stopped in the SDK the same way.
+
+| Feature | Brings |
+|---|---|
+| `spoolframe:profile-events` | `profile_removed` and `pin_changed` |
+| `spoolframe:invite-passkeys` | `begin_invite_passkey` and `redeem_invite_with_passkey` |
+| `spoolframe:watch-events` | `watch_changed` |
+| `spoolframe:next-episode` | `next_episode` and `show_next` |
+
+A new reply field needs neither. It is `serde(default)`, so a reply from
+an older server decodes. Where its absence means something other than
+its default, it is an `Option`, and `None` means "this server does not
+send it": a server that has the field always sends it. Nothing is
+decided from a version number: no server or SDK code reads the other
+side's version to choose what it sends.
+
+The third kind is experimental (PX-49): `http-playback` and
+`federation`. A client names those it wants in
 `Hello.experimental`; the server's answer, `ServerInfo.experimental`,
-names those it turned on, each by its setting. They are outside the
-protocol's stability.
+names those it turned on, each by its setting. Unlike a regular
+feature, which a server that has it always names, an operator turns an
+experimental one on. They are outside the protocol's stability.
 
 ## Playlists
 
@@ -1651,7 +1803,7 @@ in a playlist twice; edits name entries, never items.
 | `GetPlaylist { id, offset, limit }` | `Playlist(PlaylistPage)` | who sees it |
 | `CreatePlaylist { name, kinds, visibility }` | `PlaylistInfo` | anyone; `ServerWide` an admin |
 | `UpdatePlaylist { id, name?, kinds?, visibility? }` | `PlaylistInfo` | its manager |
-| `EditPlaylist { id, revision, edits }` | `PlaylistEdited { revision }` | its editors |
+| `EditPlaylist { id, revision, edits }` | `PlaylistEdited { revision, added }` | its editors |
 | `DeletePlaylist { id }` | `Done` | its manager |
 | `PinPlaylist { id, position }` | `Done` | who sees it |
 | `UnpinPlaylist { id }` | `Done` | anyone |
@@ -1709,7 +1861,10 @@ playable".
 ### Editing
 
 `EditPlaylist { id, revision, edits }` applies 1 to 100 edits, in order,
-all or none, and answers the new revision:
+all or none, and answers the new revision, and `added`: the entries its
+adds made, in the edits' order (a season's add makes one an episode;
+empty with no add). A server older than `added` leaves it out, which
+reads as `None`: read the playlist to find them.
 
 - `Add { id, before }` adds an item before entry `before`, or at the
   end. A movie, episode or track adds itself; a season its episodes; a
@@ -1870,6 +2025,41 @@ A request reads only `user_id` and `can_edit` of a share, and sends
 SDK: `Session::share_candidates(id, query, offset, limit)` returns the
 `ShareCandidatePage` (`PlaylistReadOnly` for a non-manager);
 `PlaylistShare::new(user_id, can_edit)` makes a share to send.
+
+## The next episode
+
+With feature `spoolframe:next-episode` on for the connection (both
+sides named it), a client asks the server what plays after an episode,
+and where a show's Continue goes, rather than walking the show itself.
+On a connection without it, both are `unsupported`. The names are
+fixed.
+
+```json
+{"type": "next_episode", "item": "plex:episode:212",
+ "mode": "in_order", "specials": false}
+{"type": "show_next", "show": "plex:show:100"}
+```
+
+Both are answered `{"type": "next_episode", "item": Item | null}`, the
+item filled with the user's watch state as `Item`'s children are.
+
+- `next_episode`: `mode` `in_order` is the episode right after `item`
+  in the show's order, across seasons; `first_unwatched` the first
+  after it the user has not watched. Specials (season 0) are in the
+  order only when `specials`, and then first, as a show lists its
+  seasons; without them a special has nothing after it. `null` at the
+  show's end. `item` must be an episode: anything else is
+  `invalid_input`.
+- `show_next`: the show's first episode in progress, else its first
+  the user has not watched, specials left out; `null` once every one
+  is watched. `show` must be a show.
+
+An episode the user may not see is `null`. Both are reads, retried on a
+new connection as any read is.
+
+SDK: `session.feature::<NextEpisodes>()` gives `On<NextEpisodes>`
+(`FeatureOff` without the feature), whose `next_episode(&item, mode,
+specials)` and `show_next(&show)` return `Option<Item>`.
 
 ## When an item was last viewed
 

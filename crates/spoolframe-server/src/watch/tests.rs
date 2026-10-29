@@ -161,13 +161,13 @@ impl Harness {
         std::fs::write(&self.media, b"stand-in").unwrap();
         write_episode(&self.media, id.key());
         self.watch
-            .progress(who, id, Duration::from_secs(secs))
+            .progress(who, id, Duration::from_secs(secs), None)
             .await
             .unwrap();
     }
 
     async fn mark(&self, who: Principal, id: &MediaId, watched: bool) {
-        self.watch.mark(who, id, watched).await.unwrap();
+        self.watch.mark(who, id, watched, None).await.unwrap();
     }
 
     /// `who`'s state on `id` as a client looking at it gets it: re-linked,
@@ -191,7 +191,7 @@ impl Harness {
     }
 
     async fn hide(&self, who: Principal, id: &MediaId) {
-        self.watch.hide(who, id).await.unwrap();
+        self.watch.hide(who, id, None).await.unwrap();
     }
 }
 
@@ -606,6 +606,7 @@ async fn a_paired_server_s_film_watched_offline_is_synced() {
                     device_now: now,
                 },
             )],
+            None,
         )
         .await
         .unwrap();
@@ -942,7 +943,7 @@ async fn unhide_restores_at_once() {
     let id = movie().id().clone();
     h.progress(h.alice, &id, 600).await;
     h.hide(h.alice, &id).await;
-    h.watch.unhide(h.alice, &id).await.unwrap();
+    h.watch.unhide(h.alice, &id, None).await.unwrap();
     assert_eq!(
         ids(&h.home(h.alice).await.continue_watching),
         [id.to_string()]

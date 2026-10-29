@@ -115,15 +115,10 @@ const MONTHS: [&str; 12] = [
 /// The day and month of `local` (Unix seconds moved by the browser's
 /// offset from UTC): "14 Oct".
 pub fn day_month(local: i64) -> String {
-    // Howard Hinnant's civil-from-days.
-    let z = local.div_euclid(86_400) + 719_468;
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{day} {}", MONTHS[(month - 1) as usize])
+    match spoolframe_types::CalendarDate::of_unix(local) {
+        Some(date) => format!("{} {}", date.day(), MONTHS[usize::from(date.month() - 1)]),
+        None => "?".to_owned(),
+    }
 }
 
 /// "14 Oct, 18:40", of `local` as for [`day_month`].

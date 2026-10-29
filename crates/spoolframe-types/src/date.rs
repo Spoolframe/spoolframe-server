@@ -40,6 +40,26 @@ impl CalendarDate {
     pub fn day(self) -> u8 {
         self.day
     }
+
+    /// The day `days` after 1970-01-01 (before it, negative), in UTC;
+    /// `None` outside years 1 to 9999. Howard Hinnant's civil-from-days.
+    pub fn from_unix_days(days: i64) -> Option<Self> {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        Self::new(u16::try_from(year).ok()?, month as u8, day as u8)
+    }
+
+    /// The UTC day of Unix seconds `secs`.
+    pub fn of_unix(secs: i64) -> Option<Self> {
+        Self::from_unix_days(secs.div_euclid(86_400))
+    }
 }
 
 fn days_in(year: u16, month: u8) -> u8 {
@@ -101,6 +121,14 @@ impl<'de> Deserialize<'de> for CalendarDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_days_are_the_utc_calendar_day() {
+        let days = [0, 19_782, -1, 11_016].map(CalendarDate::from_unix_days);
+        let expected = [(1970, 1, 1), (2024, 2, 29), (1969, 12, 31), (2000, 2, 29)]
+            .map(|(y, m, d)| CalendarDate::new(y, m, d));
+        assert_eq!(days, expected);
+    }
 
     #[test]
     fn a_date_is_a_yyyy_mm_dd_string_on_the_wire() {

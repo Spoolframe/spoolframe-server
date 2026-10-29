@@ -70,8 +70,15 @@ use crate::subtitles::{TextSource, TextState};
 use crate::tracks::{self, TrackOverride};
 use crate::watch::WatchError;
 use spoolframe_admin_api::PlexSyncRun;
-use spoolframe_protocol::ConvertedVideo;
+use spoolframe_protocol::{ConvertedVideo, Feature, Features};
 use spoolframe_types::Delivery;
+
+/// The regular features this server has: what it names, of those a
+/// client's `Hello` named. A feature not here is off for every
+/// connection, though this build knows its name.
+pub(crate) fn features() -> Features {
+    Feature::ProfileEvents | Feature::InvitePasskeys | Feature::NextEpisodes | Feature::WatchEvents
+}
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
 const SHUTDOWN_NOTICE: Duration = Duration::from_millis(500);
@@ -120,6 +127,9 @@ pub(crate) struct ClientProtocol {
     /// The connections that named the experimental `federation` feature
     /// (P8-02): told `LibrariesChanged`.
     federation_listeners: crate::events::FederationListeners,
+    /// The regular features each connection has on, agreed at its
+    /// `Hello`: what it is told (profile and watch events) and asks.
+    features: crate::events::ConnectionFeatures,
     /// Play history (PX-52): every playback's play, and those of a paired
     /// server's items reported by `UpdateWatchProgress` (P8-03).
     plays: Arc<crate::watch::Plays>,
@@ -570,6 +580,19 @@ impl ClientProtocol {
             services.auth.clone(),
             users.clone(),
         ));
+        let features = crate::events::ConnectionFeatures::default();
+        tokio::spawn(crate::events::tell_watch_news(
+            services.watch.changes(),
+            users.clone(),
+            features.clone(),
+            addresses.streams.clone(),
+        ));
+        services.auth.on_profile(crate::events::ProfileTeller {
+            users: users.clone(),
+            features: features.clone(),
+            connections: connections.clone(),
+            streams: addresses.streams.clone(),
+        });
         // P8-04: a paired server's user's playback that ends here other than
         // by its own stop is told to its connection, so a server playing it
         // on ends its own at once.
@@ -609,6 +632,7 @@ impl ClientProtocol {
             subtitle_listeners,
             download_listeners,
             federation_listeners,
+            features,
             plays,
             remote_plays,
         }
@@ -1127,10 +1151,14 @@ impl ClientProtocol {
             // A device signed in before platforms were kept gets
             // one now; a failure costs only the label.
             let endpoint = connection.remote_id().to_string();
+            let mut profile_events = false;
             if let Some(hello) = state.hello.get() {
                 self.services
                     .connected
                     .hello(connection.stable_id(), endpoint.clone(), hello);
+                let agreed = hello.features & features();
+                self.features.note(connection.stable_id(), agreed);
+                profile_events = agreed.contains(Feature::ProfileEvents);
                 // As for the events stream: closed meanwhile, the
                 // accept loop's closed() may have come first.
                 if connection.close_reason().is_some() {
@@ -1140,7 +1168,13 @@ impl ClientProtocol {
             if let Err(e) = self.store().note_device_platform(&endpoint, platform).await {
                 tracing::warn!(error = %e, %endpoint, "cannot keep the device's platform");
             }
-            self.open_events(connection).await;
+            // Only a connection that may be told it was signed out waits,
+            // at its sign-out, for its events to arrive (`Peer::sign_out`):
+            // any other is closed at once, as it always was, and a paired
+            // server's play connection is not held open to be asked on
+            // while it closes.
+            let peer = profile_events.then_some(&*state.peer);
+            self.open_events(connection, peer).await;
             // A device that kept a session is signed in already.
             self.addresses.tell(connection.stable_id());
         }
@@ -1152,9 +1186,15 @@ impl ClientProtocol {
                 &self.experimental_on(),
             )
         });
+        // And the regular ones it named that this server has.
+        let features = self
+            .features
+            .get(connection.stable_id())
+            .unwrap_or_default();
         Ok::<_, Error>(Reply::ServerInfo(ServerInfo {
             name: self.name.get(),
             experimental,
+            features,
             ..(*self.info).clone()
         }))
         .into()
@@ -1180,6 +1220,15 @@ impl ClientProtocol {
         let Some(hello) = state.hello.get() else {
             return Response::Err(Error::HandshakeRequired);
         };
+        // A feature's request is answered only where both named it; to
+        // any other connection it is one this server does not know.
+        if let Some(feature) = request.feature()
+            && !self.features.has(connection.stable_id(), feature)
+        {
+            return Response::Err(Error::Unsupported {
+                request: name.to_owned(),
+            });
+        }
         // The sign-ins a stranger makes, and what is guessed only at that
         // rate, draw on the strangers' sign-in budget first (PX-10).
         if crate::operations::on_strangers_budget(&request)
@@ -1292,6 +1341,7 @@ impl ClientProtocol {
                             username: p.username,
                             display_name: p.display_name,
                             pin_required: p.pin_required,
+                            pin_digits: p.pin_digits,
                             auto_login: p.auto_login,
                         })
                         .collect(),
@@ -1351,6 +1401,14 @@ impl ClientProtocol {
                 .map_err(relay_error),
             // P6-01: a sign-in a stranger makes, on the same budget.
             Request::RedeemInvite(redeem) => self.redeem_invite(connection, &redeem, hello).await,
+            // An account with a passkey, on the same budget.
+            Request::BeginInvitePasskey(begin) => {
+                self.begin_invite_passkey(connection, &begin).await
+            }
+            Request::RedeemInviteWithPasskey(redeem) => {
+                self.redeem_invite_with_passkey(connection, &redeem, hello)
+                    .await
+            }
             // A guess at a code, as a redemption is, on the same budget.
             Request::LookupInvite(lookup) => self.look_up_invite(connection, &lookup).await,
             // P8-04: a paired server's play token, on the same budget.
@@ -2507,7 +2565,7 @@ impl ClientProtocol {
             downloads_offered(hello)?;
         }
         if federation.is_some() {
-            self.federation_listeners.note(connection.stable_id());
+            self.federation_listeners.note(connection.stable_id(), ());
         }
         if federation.is_none()
             && matches!(
@@ -2800,17 +2858,31 @@ impl ClientProtocol {
                     }
                 }
                 let phc = auth::hash_pin(&pin).await.map_err(internal)?;
+                let told = self.services.auth.profile_ticket(user.user);
                 self.store()
                     .set_pin(user.user, &phc, digits)
                     .await
                     .map_err(internal)?;
+                told.tell(crate::events::ProfileNews::PinChanged {
+                    user: user.user,
+                    required: true,
+                    device: None,
+                    except: Some(connection.stable_id()),
+                });
                 tracing::info!(user = %user.username, "PIN set");
                 Ok(Reply::Done)
             }
             Request::ClearPin { proof } => {
                 let user = local(&who)?;
                 self.check_pin_proof(connection, user, proof).await?;
+                let told = self.services.auth.profile_ticket(user.user);
                 self.store().clear_pin(user.user).await.map_err(internal)?;
+                told.tell(crate::events::ProfileNews::PinChanged {
+                    user: user.user,
+                    required: false,
+                    device: None,
+                    except: Some(connection.stable_id()),
+                });
                 tracing::info!(user = %user.username, "PIN cleared");
                 Ok(Reply::Done)
             }
@@ -2966,6 +3038,7 @@ impl ClientProtocol {
                 let generation = state.locks.lock().generation;
                 let this = connection.remote_id().to_string();
                 let device = device.unwrap_or_else(|| this.clone());
+                let told = self.services.auth.profile_ticket(user.user);
                 self.store()
                     .set_pin_required(user.user, &device, required)
                     .await
@@ -2992,6 +3065,13 @@ impl ClientProtocol {
                         locks.unlock(&session);
                     }
                 }
+                // That device's connections, but this one: it knows.
+                told.tell(crate::events::ProfileNews::PinChanged {
+                    user: user.user,
+                    required,
+                    device: Some(device.clone()),
+                    except: Some(connection.stable_id()),
+                });
                 tracing::info!(user = %user.username, %device, required, "PIN requirement changed");
                 Ok(Reply::Done)
             }
@@ -3077,6 +3157,7 @@ impl ClientProtocol {
                 // It ends sessions elsewhere and takes away trust: a
                 // session left signed in does not (P4-03).
                 recently_signed_in(user, self.services.auth.store().now())?;
+                let told = self.services.auth.profile_ticket(user.user);
                 let deleted = self
                     .store()
                     .delete_device(user.user, &device)
@@ -3087,6 +3168,11 @@ impl ClientProtocol {
                         },
                         e @ (PinError::NoPin | PinError::Store(_)) => internal(e),
                     })?;
+                told.tell(crate::events::ProfileNews::Removed {
+                    user: user.user,
+                    device: Some(device.clone()),
+                    except: None,
+                });
                 tracing::info!(
                     user = %user.username,
                     %device,
@@ -3162,6 +3248,39 @@ impl ClientProtocol {
                     .await
                     .map_err(watch_error)?;
                 Ok(Reply::ItemFilterValues { values })
+            }
+            Request::NextEpisode {
+                item,
+                mode,
+                specials,
+            } => {
+                if item.kind() != MediaKind::Episode {
+                    return Err(Error::InvalidInput {
+                        message: format!("{item} is not an episode"),
+                    });
+                }
+                let unwatched = mode == spoolframe_protocol::NextMode::FirstUnwatched;
+                let next = self
+                    .services
+                    .watch
+                    .episode_after(principal, &item, unwatched, specials)
+                    .await
+                    .map_err(watch_error)?;
+                self.next_episode(principal, &actor, next).await
+            }
+            Request::ShowNext { show } => {
+                if show.kind() != MediaKind::Show {
+                    return Err(Error::InvalidInput {
+                        message: format!("{show} is not a show"),
+                    });
+                }
+                let next = self
+                    .services
+                    .watch
+                    .show_next(principal, &show)
+                    .await
+                    .map_err(watch_error)?;
+                self.next_episode(principal, &actor, next).await
             }
             Request::Item { id } => {
                 let mut found = catalog.item(&id).await.map_err(catalog_error)?;
@@ -3297,7 +3416,10 @@ impl ClientProtocol {
                 .playlists
                 .edit(&actor, &id, revision, edits)
                 .await
-                .map(|revision| Reply::PlaylistEdited { revision })
+                .map(|(revision, added)| Reply::PlaylistEdited {
+                    revision,
+                    added: Some(added),
+                })
                 .map_err(playlists_error),
             Request::RemovePlaylistArt { id } => self
                 .services
@@ -3578,7 +3700,7 @@ impl ClientProtocol {
                 if crate::watch::tracked(&item) && !matches!(who, Who::Remote(_)) {
                     self.services
                         .watch
-                        .progress(principal, &item, position)
+                        .progress(principal, &item, position, Some(connection.stable_id()))
                         .await
                         .map_err(watch_error)?;
                 }
@@ -3601,7 +3723,7 @@ impl ClientProtocol {
                 if crate::watch::tracked(&id) {
                     self.services
                         .watch
-                        .progress(principal, &id, position)
+                        .progress(principal, &id, position, Some(connection.stable_id()))
                         .await
                         .map_err(watch_error)?;
                 }
@@ -3628,7 +3750,7 @@ impl ClientProtocol {
             Request::MarkWatched { id } => {
                 self.services
                     .watch
-                    .mark(principal, &id, true)
+                    .mark(principal, &id, true, Some(connection.stable_id()))
                     .await
                     .map_err(watch_error)?;
                 Ok(Reply::Done)
@@ -3636,7 +3758,7 @@ impl ClientProtocol {
             Request::MarkUnwatched { id } => {
                 self.services
                     .watch
-                    .mark(principal, &id, false)
+                    .mark(principal, &id, false, Some(connection.stable_id()))
                     .await
                     .map_err(watch_error)?;
                 Ok(Reply::Done)
@@ -3661,7 +3783,7 @@ impl ClientProtocol {
             Request::HideFromContinueWatching { id } => {
                 self.services
                     .watch
-                    .hide(principal, &id)
+                    .hide(principal, &id, Some(connection.stable_id()))
                     .await
                     .map_err(watch_error)?;
                 Ok(Reply::Done)
@@ -3669,7 +3791,7 @@ impl ClientProtocol {
             Request::UnhideFromContinueWatching { id } => {
                 self.services
                     .watch
-                    .unhide(principal, &id)
+                    .unhide(principal, &id, Some(connection.stable_id()))
                     .await
                     .map_err(watch_error)?;
                 Ok(Reply::Done)
@@ -4329,10 +4451,21 @@ impl ClientProtocol {
             Request::StopPlayback { handle } => {
                 // Its session and endpoint were checked above, with its
                 // revision. Its own stop is not told back (P8-04).
+                let item = self
+                    .use_playback_with(connection, &handle, &session, Using::Plays, |p| {
+                        p.item.clone()
+                    })
+                    .await?;
                 self.remote_plays.lock().remove(&handle.0);
                 self.services
                     .playbacks
                     .end(&handle, crate::playback::EndReason::Finished);
+                // A paired server's user keeps their state at home (P8-03).
+                if !matches!(who, Who::Remote(_)) {
+                    self.services
+                        .watch
+                        .stopped(principal, &item, Some(connection.stable_id()));
+                }
                 Ok(Reply::Done)
             }
             // Converted playback only; served from P2-04 and P2-05.
@@ -4652,6 +4785,7 @@ impl ClientProtocol {
                 match &who {
                     Who::Local(user) => {
                         recently_signed_in(user, now)?;
+                        let told = self.services.auth.profile_ticket(user.user);
                         let ended =
                             self.store()
                                 .leave_local(user.user)
@@ -4663,6 +4797,11 @@ impl ClientProtocol {
                                     }
                                     e => internal(e),
                                 })?;
+                        told.tell(crate::events::ProfileNews::Removed {
+                            user: user.user,
+                            device: None,
+                            except: Some(connection.stable_id()),
+                        });
                         tracing::info!(
                             user = %user.username,
                             sessions_ended = ended,
@@ -4906,7 +5045,7 @@ impl ClientProtocol {
                         ),
                     });
                 }
-                let entries = entries
+                let entries: Vec<_> = entries
                     .into_iter()
                     .map(|entry| {
                         let offline = crate::watch::Offline {
@@ -4921,7 +5060,7 @@ impl ClientProtocol {
                 let synced = self
                     .services
                     .watch
-                    .offline(principal, entries)
+                    .offline(principal, entries, Some(connection.stable_id()))
                     .await
                     .map_err(watch_error)?;
                 Ok(Reply::OfflineWatchSynced {
@@ -5017,6 +5156,8 @@ impl ClientProtocol {
             | Request::TrustedProfiles
             | Request::ResumeProfile { .. }
             | Request::RedeemInvite(_)
+            | Request::BeginInvitePasskey(_)
+            | Request::RedeemInviteWithPasskey(_)
             | Request::LookupInvite(_)
             | Request::BeginPortableSignIn
             | Request::FinishPortableSignIn(_)
@@ -5117,6 +5258,97 @@ impl ClientProtocol {
             "an account was made with an invite"
         );
         Ok(self.logged_in(connection, token, false, false).await)
+    }
+
+    /// `NextEpisode`'s answer of `next`: filled as `Item`'s children are,
+    /// and none for an episode `actor` may not see.
+    async fn next_episode(
+        &self,
+        principal: Principal,
+        actor: &crate::principal::Actor,
+        next: Option<spoolframe_types::Item>,
+    ) -> Result<Reply, Error> {
+        let Some(mut item) = next.filter(|item| self.services.playlists.may_see(actor, item))
+        else {
+            return Ok(Reply::NextEpisode { item: None });
+        };
+        self.fill(principal, std::iter::once(&mut item)).await?;
+        Ok(Reply::NextEpisode { item: Some(item) })
+    }
+
+    /// Begin making an account with an invite and an app passkey
+    /// (feature `spoolframe:invite-passkeys`) on this connection's
+    /// endpoint: the code and username checked as a redemption checks
+    /// them, then the ceremony.
+    async fn begin_invite_passkey(
+        &self,
+        connection: &Connection,
+        begin: &spoolframe_protocol::BeginInvitePasskey,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let (hash, username) =
+            crate::invites::begin_with_passkey(&self.services.auth, &endpoint_id, begin)
+                .await
+                .map_err(redeem_error)?;
+        self.services
+            .app_passkeys
+            .begin_invite_registration(
+                self.id.as_bytes(),
+                &endpoint_id,
+                hash,
+                username,
+                begin.display_name.clone(),
+                &self.name.get(),
+            )
+            .map(Reply::PasskeyRegistrationBegun)
+            .map_err(sign_in_error)
+    }
+
+    /// Make the account this connection's endpoint began with an invite
+    /// and a passkey, and sign it in: a session bound to the endpoint, as
+    /// [`Self::redeem_invite`] opens. The invite is checked again first,
+    /// so one revoked, expired or used up meanwhile says so.
+    async fn redeem_invite_with_passkey(
+        &self,
+        connection: &Connection,
+        redeem: &spoolframe_protocol::RedeemInviteWithPasskey,
+        hello: &Hello,
+    ) -> Result<Reply, Error> {
+        let endpoint_id = connection.remote_id().to_string();
+        let auth = &self.services.auth;
+        let hash = crate::invites::usable_code(
+            auth,
+            &endpoint_id,
+            &redeem.code,
+            crate::store::invites::InviteKind::CreateUser,
+        )
+        .await
+        .map_err(redeem_error)?;
+        let made = self
+            .services
+            .app_passkeys
+            .finish_invite_registration(&endpoint_id, &hash, &redeem.finish)
+            .map_err(ceremony_error)?;
+        let (user, role) = crate::invites::redeem_with_passkey(auth.store(), &made)
+            .await
+            .map_err(redeem_error)?;
+        let binding = endpoint_binding(&endpoint_id, hello);
+        let token = auth
+            .open_session(user, &binding, Some(SignedInWith::Passkey))
+            .await
+            .map_err(internal)?;
+        let remembered = auth
+            .remembered(&token, &binding, user, redeem.remember)
+            .await
+            .map_err(internal)?;
+        tracing::info!(
+            endpoint = %endpoint_id,
+            %user,
+            %role,
+            remembered,
+            "an account was made with an invite and an app passkey"
+        );
+        Ok(self.logged_in(connection, token, remembered, false).await)
     }
 
     /// What invite code `lookup` is, from this connection's endpoint: the
@@ -6880,8 +7112,9 @@ impl ClientProtocol {
         }
     }
 
-    /// Open the server→client events stream for `connection`.
-    async fn open_events(&self, connection: &Connection) {
+    /// Open the server→client events stream for `connection`, and tell
+    /// `peer` of it, if given.
+    async fn open_events(&self, connection: &Connection, peer: Option<&Peer>) {
         let opened = async {
             let mut stream = connection.open_uni().await.map_err(std::io::Error::other)?;
             stream.write_u8(uni::EVENTS).await?;
@@ -6894,7 +7127,10 @@ impl ClientProtocol {
         match tokio::time::timeout(within, opened).await {
             Ok(Ok(stream)) => {
                 let id = connection.stable_id();
-                self.addresses.streams.insert(id, stream);
+                let stream = self.addresses.streams.insert(id, stream);
+                if let Some(peer) = peer {
+                    peer.events_opened(stream);
+                }
                 // Closed while the stream opened: the accept loop's
                 // remove() may have run before this insert.
                 if connection.close_reason().is_some() {
@@ -7069,6 +7305,7 @@ impl ProtocolHandler for ClientProtocol {
         self.subtitle_listeners.remove(id);
         self.download_listeners.remove(id);
         self.federation_listeners.remove(id);
+        self.features.remove(id);
         self.users.remove(id);
         self.connections.remove(id);
         self.services.connected.closed(id);
@@ -7502,13 +7739,16 @@ impl Asked {
             } => asked.credential = Some("wrong password"),
             Request::FinishPasskeySignIn { .. }
             | Request::FinishConfirmPasskey(_)
-            | Request::FinishPasskeyRegistration(_) => asked.credential = Some("passkey refused"),
+            | Request::FinishPasskeyRegistration(_)
+            | Request::RedeemInviteWithPasskey(_) => asked.credential = Some("passkey refused"),
             Request::TieFinish { .. } => asked.credential = Some("tie proof refused"),
             Request::FinishPortableSignIn(_) => {
                 asked.credential = Some("portable credential refused");
             }
             Request::ResumeProfile { .. } => asked.resume = true,
-            Request::RedeemInvite(_) | Request::RedeemPortableInvite(_) => asked.invite = true,
+            Request::RedeemInvite(_)
+            | Request::BeginInvitePasskey(_)
+            | Request::RedeemPortableInvite(_) => asked.invite = true,
             _ => {}
         }
         asked

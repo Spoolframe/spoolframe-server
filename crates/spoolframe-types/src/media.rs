@@ -9,12 +9,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::browse::{DynamicRange, Resolution};
 use crate::codec::{Container, HdrFormat, VideoCodec};
 use crate::duration_ms;
 
 /// The tracks of one media file. A track is identified by its position in
 /// its list, which is stable for as long as the file does not change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MediaTracks {
     #[serde(with = "duration_ms::option")]
     pub duration: Option<Duration>,
@@ -39,6 +41,7 @@ pub struct MediaTracks {
 /// A file's picture as it is stored, for "4K · HEVC · Dolby Vision ·
 /// 10-bit": what the file is, not how it will play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct VideoTrack {
     pub codec: VideoCodec,
     /// Pixels. A 2.40:1 4K film is 3840 by 1600: go by the width for
@@ -57,7 +60,29 @@ pub struct VideoTrack {
     pub bit_rate: Option<u64>,
 }
 
+impl VideoTrack {
+    /// Its picture size class, by height and width both, as the server
+    /// classes an item for a filter ([`Resolution::of`]): a 1920×800
+    /// scope film is 1080p. `None` for a track that gives no size.
+    pub fn resolution(&self) -> Option<Resolution> {
+        let size = |n: u32| (n > 0).then_some(n);
+        Resolution::of(size(self.width), size(self.height))
+    }
+
+    /// Its range in a filter's words: Dolby Vision, HDR for HDR10 and
+    /// HLG, else SDR.
+    pub fn dynamic_range(&self) -> DynamicRange {
+        match self.hdr {
+            None => DynamicRange::Sdr,
+            Some(HdrFormat::DolbyVision) => DynamicRange::DolbyVision,
+            Some(HdrFormat::Hdr10 | HdrFormat::Hlg) => DynamicRange::Hdr,
+            Some(HdrFormat::Unknown) => DynamicRange::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AudioTrack {
     /// An ISO 639-2 code such as `eng`, when the file says.
     pub language: Option<String>,
@@ -71,6 +96,7 @@ pub struct AudioTrack {
 
 /// What an audio track is for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum AudioRole {
     /// The programme's own sound.
@@ -87,6 +113,7 @@ pub enum AudioRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleTrack {
     /// An ISO 639-2 code such as `eng`, when the file says.
     pub language: Option<String>,
@@ -165,6 +192,7 @@ impl std::fmt::Display for SubtitleSource {
 /// A subtitle track downloaded from a subtitle site, for everyone
 /// on the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleDownload {
     /// The download's own id: what `RemoveSubtitleDownload` names.
     pub id: String,
@@ -188,6 +216,7 @@ pub struct SubtitleDownload {
 
 /// Who made a subtitle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SubtitleOrigin {
     /// Machine-translated from another language's subtitle.
@@ -203,6 +232,7 @@ pub enum SubtitleOrigin {
 
 /// One subtitle a search found, to download by its `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleResult {
     /// What `DownloadSubtitle` names: the site's id and its file's,
     /// `opensubtitles:5338574`, `subdl:3172974-3188291`. Opaque to a
@@ -245,6 +275,7 @@ pub struct SubtitleResult {
 /// AI-made after people's; rejected ones last. Every site the server
 /// searches is asked at once, and their results are one list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleSearch {
     /// The languages searched.
     pub languages: Vec<String>,
@@ -256,6 +287,7 @@ pub struct SubtitleSearch {
 
 /// How one site's part of a search went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleSourceStatus {
     /// `opensubtitles` or `subdl`, as [`SubtitleResult::source`].
     pub source: String,
@@ -266,6 +298,7 @@ pub struct SubtitleSourceStatus {
 
 /// Whether a site answered a search.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubtitleSourceState {
     /// It answered, with `found` of the results.
@@ -286,6 +319,7 @@ pub enum SubtitleSourceState {
 /// A subtitle downloaded: the item's new track, at once, and the
 /// downloads left today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleDownloaded {
     /// Its place in the item's `Tracks`' `subtitles`.
     pub track: u32,
@@ -300,6 +334,7 @@ pub struct SubtitleDownloaded {
 
 /// Whose downloads ran out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaOf {
     /// The server's account at the site: no one can download until it
@@ -316,6 +351,7 @@ pub enum QuotaOf {
 /// as it came, and moved by a manual offset on top. Set for everyone who
 /// plays the item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleTiming {
     pub sync: SubtitleSync,
     /// Added to every cue, ms, on top of the synced or original timing:
@@ -330,8 +366,25 @@ pub struct SubtitleTiming {
     pub offset_at: Option<i64>,
 }
 
+impl SubtitleTiming {
+    /// The most an offset moves a track, ms, either way: ten minutes.
+    pub const MAX_OFFSET_MS: i64 = 10 * 60 * 1000;
+    /// One press of a player's ± control, ms.
+    pub const OFFSET_STEP_MS: i64 = 100;
+
+    /// The offset `steps` presses of the ± control from this one
+    /// (negative: earlier), held within [`SubtitleTiming::MAX_OFFSET_MS`].
+    pub fn offset_stepped(&self, steps: i64) -> i64 {
+        steps
+            .saturating_mul(Self::OFFSET_STEP_MS)
+            .saturating_add(self.offset_ms)
+            .clamp(-Self::MAX_OFFSET_MS, Self::MAX_OFFSET_MS)
+    }
+}
+
 /// Where a subtitle's sync is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubtitleSync {
     /// Its own timing, as the file has it: never synced, or put back
@@ -364,6 +417,7 @@ pub enum SubtitleSync {
 
 /// What a subtitle track is for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SubtitleRole {
     /// For deaf and hard-of-hearing viewers: dialogue plus sounds and
@@ -382,6 +436,39 @@ pub enum SubtitleRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn video(width: u32, height: u32, hdr: Option<HdrFormat>) -> VideoTrack {
+        VideoTrack {
+            codec: VideoCodec::Hevc,
+            width,
+            height,
+            bit_depth: 10,
+            hdr,
+            bit_rate: None,
+        }
+    }
+
+    #[test]
+    fn a_scope_film_is_classed_by_its_width_too() {
+        assert_eq!(video(3840, 1600, None).resolution(), Some(Resolution::Uhd));
+        assert_eq!(
+            video(1920, 800, None).resolution(),
+            Some(Resolution::FullHd)
+        );
+        assert_eq!(video(720, 480, None).resolution(), Some(Resolution::Sd));
+        assert_eq!(video(0, 0, None).resolution(), None);
+    }
+
+    #[test]
+    fn hdr_formats_read_as_a_filters_ranges() {
+        let range = |hdr| video(3840, 2160, hdr).dynamic_range();
+        assert_eq!(range(None), DynamicRange::Sdr);
+        assert_eq!(range(Some(HdrFormat::Hlg)), DynamicRange::Hdr);
+        assert_eq!(
+            range(Some(HdrFormat::DolbyVision)),
+            DynamicRange::DolbyVision
+        );
+    }
 
     #[test]
     fn a_track_s_role_left_out_is_refused() {
@@ -548,6 +635,21 @@ mod tests {
             serde_json::from_value::<SubtitleTrack>(json).unwrap(),
             sidecar(Some(timing))
         );
+    }
+
+    #[test]
+    fn the_offset_moves_a_tenth_of_a_second_a_press_and_no_further_than_the_most() {
+        let timing = |offset_ms| SubtitleTiming {
+            sync: SubtitleSync::Original,
+            offset_ms,
+            offset_by: None,
+            offset_at: None,
+        };
+        assert_eq!(timing(1_500).offset_stepped(1), 1_600);
+        assert_eq!(timing(1_500).offset_stepped(-20), -500);
+        assert_eq!(timing(599_950).offset_stepped(1), 600_000);
+        assert_eq!(timing(-599_950).offset_stepped(-3), -600_000);
+        assert_eq!(timing(0).offset_stepped(i64::MAX), 600_000);
     }
 
     #[test]

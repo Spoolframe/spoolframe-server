@@ -8,6 +8,7 @@
 //! proprietary, can link it. It never depends on an AGPL server crate.
 
 pub mod browse;
+pub mod capabilities;
 pub mod codec;
 pub mod codec_string;
 pub mod date;
@@ -23,11 +24,17 @@ pub mod role;
 pub mod search;
 #[cfg(test)]
 mod test_support;
+#[cfg(feature = "uniffi")]
+mod uniffi_types;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 pub use browse::{
-    Counted, DynamicRange, FilterPart, ItemFilter, ItemFilterValues, ItemSort, Resolution, SortKey,
-    WatchedState,
+    Counted, DynamicRange, FilterPart, FilterValue, ItemFilter, ItemFilterValues, ItemQuery,
+    ItemSort, Resolution, SortKey, WatchedState,
 };
+pub use capabilities::{CodecProbe, Decoders, candidate_codec_strings};
 pub use codec::{
     AudioCodec, ClientCapabilities, Container, Delivery, DisplayCapabilities, HdrFormat,
     SubtitleFormat, VideoCodec, VideoLimits,
@@ -42,8 +49,9 @@ pub use media::{
     VideoTrack,
 };
 pub use model::{
-    Album, Artist, Artwork, ArtworkKind, CastMember, Episode, Item, Library, LibraryKind,
-    LibraryServer, Marker, MarkerKind, Movie, PlaybackState, Season, Show, Track,
+    Album, Artist, Artwork, ArtworkKind, Caption, CastMember, Episode, Item, Library, LibraryKind,
+    LibraryServer, Marker, MarkerKind, Movie, PlaybackState, Progress, Season, Show, Track,
+    YearsAired,
 };
 pub use platform::Platform;
 pub use preferences::{
@@ -54,6 +62,12 @@ pub use role::Role;
 pub use search::{Person, PersonRole, SearchKind, SearchScope};
 
 pub mod pin;
+
+/// Password syntax shared by clients and servers.
+pub mod password {
+    /// The fewest characters a new password may have.
+    pub const MIN_CHARS: usize = 8;
+}
 
 /// The domain every server's app passkeys are made under: a server's
 /// relying party is `<server id>.spoolframe.app`. Every client and the

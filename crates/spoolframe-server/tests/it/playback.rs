@@ -294,6 +294,38 @@ async fn progress_reports_while_paused_keep_a_playback_past_the_idle_limit() {
     server.stop().await;
 }
 
+/// A client playing from a full buffer reads nothing for minutes, and
+/// reports its position as it moves: each report keeps the playback
+/// alive past the idle limit as a paused one's does, with no read.
+#[tokio::test]
+async fn progress_reports_while_playing_from_a_full_buffer_keep_a_playback_alive() {
+    let (server, client, session) = ready("buffered-reports").await;
+    let file = server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    ok(client.read(&session, &handle, 0, 100).await.0);
+    let minutes = PLAYBACK_IDLE.as_secs() / 60 + 5;
+    for sequence in 1..=minutes {
+        server.clock.advance(Duration::from_secs(60));
+        let response = client
+            .call(
+                Some(&session),
+                Request::UpdatePlaybackProgress {
+                    handle: handle.clone(),
+                    sequence,
+                    position_ms: sequence * 60_000,
+                },
+            )
+            .await;
+        assert_eq!(response, Response::Ok(Reply::Done), "report {sequence}");
+        server.debug.playbacks.sweep();
+    }
+    let (response, bytes) = client.read(&session, &handle, 100, 100).await;
+    ok(response);
+    assert_eq!(bytes, file[100..200]);
+    client.close().await;
+    server.stop().await;
+}
+
 /// A playback the server ends, rather than its client, is logged once at
 /// INFO: how it ended, whose it was, and how long it had been idle. An
 /// Apple TV paused past the limit was told its playback had expired, and

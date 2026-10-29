@@ -304,6 +304,7 @@ async fn a_new_key_with_a_saved_server_id_is_an_identity_change() {
     let changed = SdkError::IdentityChanged {
         saved: old.clone(),
         now: new.clone(),
+        server_id: Some(server_id.as_str().to_owned()),
     };
     // Once it is heard, picking it says so, rather than connecting.
     until("the new key is an identity change", || async {

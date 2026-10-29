@@ -912,7 +912,7 @@ impl McpServer {
                 let library = self.library()?;
                 library
                     .watch
-                    .mark(caller.principal(), &media_id(&a.id)?, a.watched)
+                    .mark(caller.principal(), &media_id(&a.id)?, a.watched, None)
                     .await?;
                 Ok(json!({ "id": a.id, "watched": a.watched }))
             }
@@ -1418,7 +1418,10 @@ async fn edit_retrying(
             .await
         {
             Err(crate::playlists::PlaylistsError::Conflict { .. }) => continue,
-            done => return Ok((done.map_err(ToolError::from), server_wide)),
+            done => {
+                let revision = done.map(|(revision, _)| revision);
+                return Ok((revision.map_err(ToolError::from), server_wide));
+            }
         }
     }
     let kept_changing =

@@ -54,7 +54,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use password_hash::rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use spoolframe_protocol::{
@@ -62,7 +61,7 @@ use spoolframe_protocol::{
     PasskeySignInBegun, ServerId, app_passkey_challenge,
 };
 use webauthn_rs::prelude::{
-    DiscoverableAuthentication, PasskeyRegistration, PublicKeyCredential,
+    CredentialID, DiscoverableAuthentication, PasskeyRegistration, PublicKeyCredential,
     RegisterPublicKeyCredential, Uuid,
 };
 use webauthn_rs_proto::{AuthenticatorAssertionResponseRaw, AuthenticatorAttestationResponseRaw};
@@ -93,6 +92,10 @@ pub struct AppPasskeys {
     /// that began them, with its endpoint: one at a time each. Only a
     /// session begins one, so they are as many as the sessions at most.
     confirms: Mutex<HashMap<String, (Confirm, Instant)>>,
+    /// Accounts begun with an invite and a passkey (feature
+    /// `spoolframe:invite-passkeys`), by the endpoint that began them: one
+    /// at a time each, as sign-ins.
+    invites: Mutex<HashMap<String, (InviteRegistration, Instant)>>,
     /// What ceremonies expire by (PX-09).
     clock: crate::clock::Clock,
 }
@@ -105,6 +108,46 @@ struct Confirm {
 struct Registration {
     endpoint: String,
     state: PasskeyRegistration,
+}
+
+/// A registration [`AppPasskeys::start`] began.
+struct Started {
+    /// The user handle, as the options carry it.
+    user_id: Vec<u8>,
+    nonce: Vec<u8>,
+    state: PasskeyRegistration,
+}
+
+/// An account to make with an invite once its passkey is: who it is to
+/// be, and the invite's code (its hash), which the finish names again.
+struct InviteRegistration {
+    code_hash: String,
+    user: LocalUserId,
+    username: String,
+    display_name: Option<String>,
+    handle: String,
+    state: PasskeyRegistration,
+}
+
+/// An account to make with an invite and its passkey, made and verified
+/// ([`AppPasskeys::finish_invite_registration`]): what
+/// [`Store::redeem_invite_with_passkey`] keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitePasskey {
+    /// The invite's code's hash.
+    pub code_hash: String,
+    /// The id the account is made with: chosen at the beginning.
+    pub user: LocalUserId,
+    pub username: String,
+    pub display_name: Option<String>,
+    /// The WebAuthn user handle the passkey was made with.
+    pub handle: String,
+    pub credential_id: String,
+    /// The credential, as JSON.
+    pub credential: String,
+    /// As [`passkey_name`] gives it.
+    pub name: String,
+    pub rp_id: String,
 }
 
 struct SignIn {
@@ -143,6 +186,7 @@ impl AppPasskeys {
             registrations: Mutex::default(),
             sign_ins: Mutex::default(),
             confirms: Mutex::default(),
+            invites: Mutex::default(),
             clock: crate::clock::Clock::default(),
         }
     }
@@ -161,6 +205,50 @@ impl AppPasskeys {
     pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// A registration of a passkey with user handle `handle`, named
+    /// `user_name` and shown as `display_name`, for this server's endpoint
+    /// id `server`; `exclude`, the passkeys the user has here already.
+    fn start(
+        &self,
+        server: &[u8; 32],
+        handle: Uuid,
+        user_name: &str,
+        display_name: &str,
+        exclude: Option<Vec<CredentialID>>,
+    ) -> Result<Started, String> {
+        let (options, state) = self
+            .party
+            .webauthn
+            .start_passkey_registration(handle, user_name, display_name, exclude)
+            .map_err(|e| e.to_string())?;
+        let nonce = nonce();
+        let state = with_challenge(state, "rs", &app_passkey_challenge(server, &nonce))?;
+        Ok(Started {
+            user_id: options.public_key.user.id.to_vec(),
+            nonce,
+            state,
+        })
+    }
+
+    /// Room in `ceremonies` for one `endpoint` begins at `now`, the
+    /// expired ones dropped. Anyone can make an endpoint, so they are
+    /// counted, as the web's are: one more, when they are all taken, is
+    /// refused.
+    fn room_for<T>(
+        &self,
+        ceremonies: &mut HashMap<String, (T, Instant)>,
+        endpoint: &str,
+        now: Instant,
+    ) -> Result<(), SignInError> {
+        ceremonies.retain(|_, (_, expires_at)| *expires_at > now);
+        if !ceremonies.contains_key(endpoint) && ceremonies.len() >= MAX_SIGN_INS {
+            return Err(SignInError::RateLimited {
+                retry_after: self.lifetime,
+            });
+        }
+        Ok(())
     }
 
     /// Begin making an app passkey for `user` on `endpoint`, in the session
@@ -195,13 +283,12 @@ impl AppPasskeys {
         // is. The display name is the user's own.
         let display_name = user.display_name.as_deref().unwrap_or(&user.username);
         let user_name = format!("{} @ {server_name}", user.username);
-        let (options, state) = self
-            .party
-            .webauthn
-            .start_passkey_registration(handle, &user_name, display_name, Some(existing))
-            .map_err(|e| CeremonyError::Internal(e.to_string()))?;
-        let nonce = nonce();
-        let state = with_challenge(state, "rs", &app_passkey_challenge(server, &nonce))
+        let Started {
+            user_id,
+            nonce,
+            state,
+        } = self
+            .start(server, handle, &user_name, display_name, Some(existing))
             .map_err(CeremonyError::Internal)?;
         let mut registrations = self.registrations.lock();
         let now = self.clock.now();
@@ -213,7 +300,7 @@ impl AppPasskeys {
         registrations.insert(session.to_owned(), (registration, now + self.lifetime));
         Ok(PasskeyRegistrationBegun {
             nonce,
-            user_id: options.public_key.user.id.to_vec(),
+            user_id,
             user_name,
             display_name: display_name.to_owned(),
             exclude_credential_ids,
@@ -247,6 +334,87 @@ impl AppPasskeys {
         Ok(record)
     }
 
+    /// Begin making account `username` (normalized), shown as
+    /// `display_name`, on `endpoint` with this server's endpoint id
+    /// `server`, called `server_name`, with the invite whose code hashes to
+    /// `code_hash` and an app passkey (feature
+    /// `spoolframe:invite-passkeys`). The account's id and user handle are
+    /// chosen now; nothing is kept but the ceremony. The
+    /// invite and the username are the caller's to check. A registration
+    /// the endpoint began before is dropped.
+    pub fn begin_invite_registration(
+        &self,
+        server: &[u8; 32],
+        endpoint: &str,
+        code_hash: String,
+        username: String,
+        display_name: Option<String>,
+        server_name: &str,
+    ) -> Result<PasskeyRegistrationBegun, SignInError> {
+        let handle = Uuid::new_v4();
+        let shown = display_name.as_deref().unwrap_or(&username).to_owned();
+        let user_name = format!("{username} @ {server_name}");
+        let Started {
+            user_id,
+            nonce,
+            state,
+        } = self
+            .start(server, handle, &user_name, &shown, None)
+            .map_err(SignInError::Internal)?;
+        let mut invites = self.invites.lock();
+        let now = self.clock.now();
+        self.room_for(&mut invites, endpoint, now)?;
+        let registration = InviteRegistration {
+            code_hash,
+            user: LocalUserId::generate(),
+            username,
+            display_name,
+            handle: handle.to_string(),
+            state,
+        };
+        invites.insert(endpoint.to_owned(), (registration, now + self.lifetime));
+        Ok(PasskeyRegistrationBegun {
+            nonce,
+            user_id,
+            user_name,
+            display_name: shown,
+            exclude_credential_ids: Vec::new(),
+        })
+    }
+
+    /// Finish the account `endpoint` began with the invite whose code
+    /// hashes to `code_hash`, with what the app's platform made: what to
+    /// make it with. Once: the registration is taken whether or not the
+    /// passkey verifies.
+    pub fn finish_invite_registration(
+        &self,
+        endpoint: &str,
+        code_hash: &str,
+        made: &FinishPasskeyRegistration,
+    ) -> Result<InvitePasskey, CeremonyError> {
+        // Before the registration is taken: a name can be sent again.
+        let name = passkey_name(&made.name)?.to_owned();
+        let begun = self
+            .invites
+            .lock()
+            .remove(endpoint)
+            .filter(|(r, expires_at)| *expires_at > self.clock.now() && r.code_hash == code_hash)
+            .map(|(r, _)| r)
+            .ok_or(CeremonyError::NoCeremony)?;
+        let (credential_id, credential) = self.party.made(&registered(made), &begun.state)?;
+        Ok(InvitePasskey {
+            code_hash: begun.code_hash,
+            user: begun.user,
+            username: begun.username,
+            display_name: begun.display_name,
+            handle: begun.handle,
+            credential_id,
+            credential,
+            name,
+            rp_id: self.party.rp_id.clone(),
+        })
+    }
+
     /// Begin a sign-in on `endpoint`, with this server's endpoint id
     /// `server`: only `username`'s app passkeys finish it, or, without
     /// one, any. It lists none, whoever `username` is: anyone can ask. A
@@ -273,13 +441,7 @@ impl AppPasskeys {
             .map_err(SignInError::Internal)?;
         let mut sign_ins = self.sign_ins.lock();
         let now = self.clock.now();
-        sign_ins.retain(|_, (_, expires_at)| *expires_at > now);
-        // Anyone can make an endpoint: they are counted, as the web's are.
-        if !sign_ins.contains_key(endpoint) && sign_ins.len() >= MAX_SIGN_INS {
-            return Err(SignInError::RateLimited {
-                retry_after: self.lifetime,
-            });
-        }
+        self.room_for(&mut sign_ins, endpoint, now)?;
         sign_ins.insert(
             endpoint.to_owned(),
             (SignIn { state, allowed }, now + self.lifetime),
@@ -400,7 +562,7 @@ impl AppPasskeys {
 /// A fresh nonce for a ceremony.
 fn nonce() -> Vec<u8> {
     let mut nonce = vec![0; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    getrandom::fill(&mut nonce).expect("the OS gives random bytes");
     nonce
 }
 

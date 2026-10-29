@@ -142,6 +142,7 @@ impl PasskeySignInBegun {
 /// is required. Not on the wire: the client makes it from a
 /// [`PasskeyRegistrationBegun`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PasskeyCreation {
     /// The relying party to make it for: the server's,
     /// `<server id>.spoolframe.app`. Never `spoolframe.app` itself.
@@ -170,6 +171,7 @@ pub struct PasskeyCreation {
 /// A passkey made for a [`PasskeyCreation`], to keep
 /// (`FinishPasskeyRegistration`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FinishPasskeyRegistration {
     #[serde(with = "serde_bytes")]
     pub credential_id: Vec<u8>,
@@ -184,9 +186,22 @@ pub struct FinishPasskeyRegistration {
     pub name: String,
 }
 
+/// The most characters a name a user types for a device may have: a
+/// passkey's, an identity's, a pairing's label.
+pub const MAX_NAME_CHARS: usize = 64;
+
+/// `name` as a server takes it: trimmed and cut to [`MAX_NAME_CHARS`]
+/// characters, as the apps cut what is typed; `None` when nothing is left.
+pub fn fit_name(name: &str) -> Option<String> {
+    let name: String = name.trim().chars().take(MAX_NAME_CHARS).collect();
+    let name = name.trim_end();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// What signing in with a passkey needs: the platform's options. Not on
 /// the wire: the client makes it from a [`PasskeySignInBegun`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PasskeyRequest {
     /// The relying party to sign for, as [`PasskeyCreation::rp_id`].
     pub rp_id: String,
@@ -203,6 +218,7 @@ pub struct PasskeyRequest {
 
 /// A passkey's answer to a [`PasskeyRequest`] (`FinishPasskeySignIn`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FinishPasskeySignIn {
     #[serde(with = "serde_bytes")]
     pub credential_id: Vec<u8>,
@@ -226,6 +242,7 @@ pub struct FinishPasskeySignIn {
 /// well as the apps': the user sees every way they sign in, and the web
 /// UI's `me.passkeys` lists the same ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PasskeyInfo {
     /// Its credential id, base64url with no padding, as the web UI names
     /// it: what `RenamePasskey` and `RemovePasskey` take. For an app
@@ -352,6 +369,19 @@ mod optional_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_trimmed_and_cut_to_64_characters() {
+        assert_eq!(
+            fit_name("  Living room TV \n").as_deref(),
+            Some("Living room TV")
+        );
+        assert_eq!(fit_name(" \t"), None);
+        let long = "é".repeat(70);
+        assert_eq!(fit_name(&long).unwrap().chars().count(), 64);
+        let spaced = format!("{} b", "a".repeat(63));
+        assert_eq!(fit_name(&spaced), Some("a".repeat(63)));
+    }
 
     const NONCE: [u8; NONCE_LEN] = [7; NONCE_LEN];
 

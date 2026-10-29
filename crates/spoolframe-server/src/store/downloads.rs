@@ -4,8 +4,6 @@
 //! business (the user's decision, 2026-10-20). Writing, serving and
 //! removing the files is [`crate::downloads`]'s.
 
-use password_hash::rand_core::{OsRng, RngCore};
-
 use super::{Store, StoreError};
 
 /// Where a download's file is, as the database keeps it.
@@ -202,7 +200,7 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> Result<DownloadRow, sqlx::Error> {
 /// A new download id: 128 random bits.
 fn new_id() -> String {
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS gives random bytes");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -506,6 +504,21 @@ impl Store {
 
 /// The least string past every one `prefix` begins: its last character
 /// one more. `prefix` is a principal's start, in ASCII.
+/// Delete `principal`'s downloads, for a user deleted: the rows that were.
+pub(super) async fn delete_downloads_of(
+    tx: &mut sqlx::SqliteConnection,
+    principal: &str,
+) -> Result<Vec<DownloadRow>, sqlx::Error> {
+    let rows = sqlx::query(concat!(
+        "DELETE FROM downloads WHERE principal = ?1 RETURNING ",
+        columns!()
+    ))
+    .bind(principal)
+    .fetch_all(tx)
+    .await?;
+    rows.iter().map(row).collect()
+}
+
 fn past(prefix: &str) -> String {
     let mut past: Vec<char> = prefix.chars().collect();
     if let Some(last) = past.last_mut() {

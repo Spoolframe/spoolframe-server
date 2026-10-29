@@ -279,3 +279,52 @@ async fn a_browser_sign_in_says_a_new_password_is_required() {
     assert!(!signed_in("root", "root password".into()).await);
     server.stop().await;
 }
+
+/// A call in a one-time password's session is refused until the password
+/// is changed, and the SDK says so on `profile_events` too.
+#[tokio::test]
+async fn the_sdk_tells_a_password_to_change_as_a_profile_event() {
+    use spoolframe_client_sdk::{MemoryStorage, ProfileChange, SdkError};
+    let (server, _web, root) = server("one-time-profile-event").await;
+    let once = reset(&root, "alice").await;
+    let client = crate::support::sdk_client(
+        std::sync::Arc::new(MemoryStorage::default()),
+        spoolframe_client_sdk::Device {
+            name: "phone".into(),
+            client_name: "sdk-test".into(),
+            client_version: "0".into(),
+            platform: Platform::Ios,
+            capabilities: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let id = server.server.id().to_string();
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    client.add_address(&id, addrs).unwrap();
+    client.connect(&id).await.unwrap();
+    client.pin(&id, true).await.unwrap();
+    let session = client
+        .sign_in(&id, "alice", &once.password, false)
+        .await
+        .unwrap();
+    let mut events = client.profile_events();
+
+    assert_eq!(
+        session.libraries().await.unwrap_err(),
+        SdkError::PasswordChangeRequired
+    );
+    let told = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("no profile event within 5 s")
+        .unwrap();
+    assert_eq!(told.server, id);
+    assert_eq!(
+        told.change,
+        ProfileChange::PasswordChangeRequired {
+            user: session.user().user_id.clone()
+        }
+    );
+    client.close().await;
+    server.stop().await;
+}

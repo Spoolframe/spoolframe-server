@@ -485,7 +485,8 @@ async fn a_track_added_to_or_removed_from_a_followed_playlist_shows_up() {
     let revision = playlists
         .edit(&actor, &made.id, made.revision, vec![add("32")])
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let (laptop, session) = device(&server, Platform::Linux, "alice").await;
     let ask = |since| {
         changes(
@@ -501,7 +502,8 @@ async fn a_track_added_to_or_removed_from_a_followed_playlist_shows_up() {
     let revision = playlists
         .edit(&actor, &made.id, revision, vec![add("35")])
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let (added, cursor) = ask(Some(cursor)).await;
     let entry = server.store.playlist_entries(&made.id).await.unwrap()[0].entry_id;
     playlists

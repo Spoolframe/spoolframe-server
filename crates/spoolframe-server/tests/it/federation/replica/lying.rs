@@ -186,6 +186,7 @@ impl Lying {
                 auth_methods: Vec::new(),
                 web_url: None,
                 experimental: vec![FEDERATION.into()],
+                features: spoolframe_protocol::Features::empty(),
                 invite_only: true,
             }),
             Request::RedeemPlayToken(_) => Reply::PlayTokenRedeemed(PlayTokenRedeemed {

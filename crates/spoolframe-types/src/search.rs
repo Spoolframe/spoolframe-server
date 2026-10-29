@@ -8,6 +8,7 @@ use crate::id::PersonId;
 /// What a search covers: everything, or one kind of thing. Music is one
 /// scope, with artists, albums and tracks as groups inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SearchScope {
     All,
@@ -37,6 +38,7 @@ impl SearchScope {
 ///
 /// Ordered as the groups are shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SearchKind {
     Shows,
@@ -50,6 +52,7 @@ pub enum SearchKind {
 
 /// What a person did in the items they are found for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum PersonRole {
     Actor,
@@ -58,6 +61,7 @@ pub enum PersonRole {
 
 /// An actor or director a search found. Their items are listed by `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Person {
     pub id: PersonId,
     pub name: String,

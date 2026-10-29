@@ -15,6 +15,7 @@ use spoolframe_types::{
     MediaTracks, PersonId, Platform, Role, SubtitleFormat, TrackPreferences,
 };
 
+use crate::features::{Feature, Features};
 use crate::invite_admin::{CreateInvite, InviteCreated, InviteSummary};
 use crate::media::PlaybackHandle;
 use crate::pairing::{PairingAnswer, PairingOffer, RelayCode};
@@ -147,6 +148,25 @@ pub enum Request {
     /// is not signed in draws on the sign-in budget all such devices share,
     /// as `LoginPassword` does.
     RedeemInvite(RedeemInvite),
+    /// Begin making an account with an invite's code and an app passkey,
+    /// no password (feature `spoolframe:invite-passkeys`): `PasskeyRegistrationBegun`, a nonce, as
+    /// for `BeginPasskeyRegistration`, for the account `username` is to
+    /// be. The code and username are checked as `RedeemInvite` checks
+    /// them, with its errors; nothing is made or used up yet. The
+    /// registration is this device's, for 5 minutes, and beginning again
+    /// replaces it. On the strangers' budget, as redeeming is.
+    BeginInvitePasskey(BeginInvitePasskey),
+    /// Finish it with the passkey the platform made (feature
+    /// `spoolframe:invite-passkeys`): the
+    /// account is made with the invite's role, its one way to sign in the
+    /// passkey, one use of the invite taken, and the device signed in:
+    /// `LoggedIn`, trusted when `remember`. Only the device that began it,
+    /// with the same code, finishes it, once; otherwise
+    /// `InvalidCredentials`, as a passkey that does not verify is. The
+    /// invite is checked again, as `RedeemInvite` checks it, and a
+    /// username taken meanwhile is `UsernameTaken`; neither uses the
+    /// invite up.
+    RedeemInviteWithPasskey(RedeemInviteWithPasskey),
     /// What an invite's code is, before joining with it: `InviteLookup`,
     /// for the "Got an invite?" screen. Nothing is used up. The code is
     /// taken as `RedeemInvite` takes it, and counted as it counts one: a
@@ -262,6 +282,26 @@ pub enum Request {
     },
     Item {
         id: MediaId,
+    },
+    /// The episode to play after episode `item` (feature
+    /// `spoolframe:next-episode`): `NextEpisode`, filled as `Item`'s
+    /// children are, and `None` at the show's end. `in_order` is the
+    /// one right after it; `first_unwatched` the first after it the user
+    /// has not watched. Specials (season 0) are in the order only when
+    /// `specials`, first, as a show lists its seasons; without them, a
+    /// special has no episode after it. An episode the user may not see
+    /// is `None`. An item that is not an episode is `InvalidInput`.
+    NextEpisode {
+        item: MediaId,
+        mode: NextMode,
+        specials: bool,
+    },
+    /// What a show's Continue goes to (feature
+    /// `spoolframe:next-episode`): `NextEpisode`, the first episode in
+    /// progress, else the first the user has not watched, specials left
+    /// out, else `None`. An item that is not a show is `InvalidInput`.
+    ShowNext {
+        show: MediaId,
     },
     /// Scoped, grouped search. `Search`; for a client that names
     /// the experimental `federation` feature, `SearchHits`: this
@@ -1218,6 +1258,17 @@ pub enum Request {
     Unknown,
 }
 
+/// Which episode `NextEpisode` finds after the one given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(rename_all = "snake_case")]
+pub enum NextMode {
+    /// The one right after it.
+    InOrder,
+    /// The first after it the user has not watched.
+    FirstUnwatched,
+}
+
 impl Request {
     /// Served without a session.
     pub fn is_pre_auth(&self) -> bool {
@@ -1234,6 +1285,8 @@ impl Request {
                 | Request::TrustedProfiles
                 | Request::ResumeProfile { .. }
                 | Request::RedeemInvite(_)
+                | Request::BeginInvitePasskey(_)
+                | Request::RedeemInviteWithPasskey(_)
                 | Request::LookupInvite(_)
                 | Request::BeginPortableSignIn
                 | Request::FinishPortableSignIn(_)
@@ -1246,6 +1299,141 @@ impl Request {
                 | Request::CollectPairing { .. }
                 | Request::RedeemPlayToken(_)
         )
+    }
+
+    /// The feature it belongs to, if any: the server answers it only on a
+    /// connection where that feature is on, and is `Unsupported`
+    /// otherwise. Every request is named here, so a new one is given its
+    /// feature, or none, on purpose.
+    pub fn feature(&self) -> Option<Feature> {
+        match self {
+            Request::BeginInvitePasskey(_) => Some(Feature::InvitePasskeys),
+            Request::RedeemInviteWithPasskey(_) => Some(Feature::InvitePasskeys),
+            Request::NextEpisode { .. } | Request::ShowNext { .. } => Some(Feature::NextEpisodes),
+            Request::Hello { .. }
+            | Request::AuthMethods
+            | Request::LoginPassword { .. }
+            | Request::Ping
+            | Request::ActivateProfile
+            | Request::PlaybackProgressSequence { .. }
+            | Request::BeginDeviceSignIn { .. }
+            | Request::AwaitDeviceSignIn { .. }
+            | Request::BeginPasskeySignIn { .. }
+            | Request::FinishPasskeySignIn { .. }
+            | Request::TrustedProfiles
+            | Request::ResumeProfile { .. }
+            | Request::RedeemInvite { .. }
+            | Request::LookupInvite { .. }
+            | Request::BeginPortableSignIn
+            | Request::FinishPortableSignIn { .. }
+            | Request::RedeemPortableInvite { .. }
+            | Request::IdentityRecord { .. }
+            | Request::IdentityRecordByHandle { .. }
+            | Request::OfferPairing { .. }
+            | Request::FetchPairing { .. }
+            | Request::AnswerPairing { .. }
+            | Request::CollectPairing { .. }
+            | Request::Libraries
+            | Request::Items { .. }
+            | Request::ItemFilterValues { .. }
+            | Request::Item { .. }
+            | Request::Search { .. }
+            | Request::PersonItems { .. }
+            | Request::Tracks { .. }
+            | Request::WhoAmI
+            | Request::Logout
+            | Request::ListSessions
+            | Request::PlaybackPlan { .. }
+            | Request::StartPlayback { .. }
+            | Request::StopPlayback { .. }
+            | Request::PlaybackRevision { .. }
+            | Request::SeekPlayback { .. }
+            | Request::SetPin { .. }
+            | Request::ClearPin { .. }
+            | Request::UnlockProfile { .. }
+            | Request::ListDevices
+            | Request::BeginPasskeyRegistration
+            | Request::FinishPasskeyRegistration { .. }
+            | Request::ListPasskeys
+            | Request::RenamePasskey { .. }
+            | Request::RemovePasskey { .. }
+            | Request::ConfirmPassword { .. }
+            | Request::ChangePassword { .. }
+            | Request::BeginConfirmPasskey
+            | Request::FinishConfirmPasskey { .. }
+            | Request::GetPlexLink
+            | Request::SetPinRequired { .. }
+            | Request::LookupDeviceSignIn { .. }
+            | Request::ApproveDeviceSignIn { .. }
+            | Request::SetDeviceTrust { .. }
+            | Request::ForgetDevice { .. }
+            | Request::DenyDeviceSignIn { .. }
+            | Request::ChangeSubtitle { .. }
+            | Request::ChangeQuality { .. }
+            | Request::GetManifest { .. }
+            | Request::ReadSubtitle { .. }
+            | Request::ReadSubtitleSegment { .. }
+            | Request::GetPreviews { .. }
+            | Request::UpdatePlaybackProgress { .. }
+            | Request::UpdateWatchProgress { .. }
+            | Request::MarkWatched { .. }
+            | Request::MarkUnwatched { .. }
+            | Request::HideFromContinueWatching { .. }
+            | Request::UnhideFromContinueWatching { .. }
+            | Request::Home
+            | Request::GetTrackPreferences
+            | Request::SetTrackPreferences { .. }
+            | Request::SetTrackOverride { .. }
+            | Request::ClearTrackOverride { .. }
+            | Request::TieBegin
+            | Request::TieFinish { .. }
+            | Request::Untie { .. }
+            | Request::CreateInvite { .. }
+            | Request::ListInvites
+            | Request::RevokeInvite { .. }
+            | Request::HttpPlaybackUrl { .. }
+            | Request::PairServer { .. }
+            | Request::ShareLibraries { .. }
+            | Request::SetServerRow { .. }
+            | Request::RedeemPlayToken { .. }
+            | Request::RemoteHints { .. }
+            | Request::RemoteGrant { .. }
+            | Request::SetPlayFrom { .. }
+            | Request::LeaveServer
+            | Request::ListPlaylists
+            | Request::GetPlaylist { .. }
+            | Request::CreatePlaylist { .. }
+            | Request::UpdatePlaylist { .. }
+            | Request::EditPlaylist { .. }
+            | Request::DeletePlaylist { .. }
+            | Request::PinPlaylist { .. }
+            | Request::UnpinPlaylist { .. }
+            | Request::PlayPlaylist { .. }
+            | Request::NextInPlaylist { .. }
+            | Request::UpcomingInPlaylist { .. }
+            | Request::SetPlaylistSettings { .. }
+            | Request::ImportPlexPlaylists { .. }
+            | Request::DismissPinNotes
+            | Request::Like { .. }
+            | Request::Unlike { .. }
+            | Request::ListShareCandidates { .. }
+            | Request::RecentlyPlayed { .. }
+            | Request::RemovePlaylistArt { .. }
+            | Request::SyncSubtitle { .. }
+            | Request::UseOriginalSubtitleTiming { .. }
+            | Request::SetSubtitleOffset { .. }
+            | Request::SearchSubtitles { .. }
+            | Request::DownloadSubtitle { .. }
+            | Request::RemoveSubtitleDownload { .. }
+            | Request::DownloadOptions { .. }
+            | Request::PrepareDownload { .. }
+            | Request::DownloadStatus { .. }
+            | Request::CancelDownload { .. }
+            | Request::SyncOfflineWatch { .. }
+            | Request::MusicDownloadChanges { .. }
+            | Request::SyncOfflinePlays { .. }
+            | Request::Unknown => None,
+        }
     }
 }
 
@@ -1280,6 +1468,15 @@ pub struct Hello {
     /// what an older one did; an older server ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental: Vec<String>,
+    /// The regular features this client handles ([`crate::features`]);
+    /// the server's answer names those of them it has. Left out when
+    /// empty, as an older client does; an older server ignores it.
+    #[serde(
+        default,
+        with = "crate::features::names",
+        skip_serializing_if = "Features::is_empty"
+    )]
+    pub features: Features,
 }
 
 /// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
@@ -1347,6 +1544,47 @@ impl fmt::Debug for RedeemInvite {
             .field("username", &self.username)
             .field("display_name", &self.display_name)
             .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// An invite's code and the account to make with it and a passkey
+/// (`BeginInvitePasskey`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeginInvitePasskey {
+    pub code: String,
+    pub username: String,
+    /// What to show for them; the username when `None`.
+    #[serde(deserialize_with = "spoolframe_types::required::option")]
+    pub display_name: Option<String>,
+}
+
+impl fmt::Debug for BeginInvitePasskey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeginInvitePasskey")
+            .field("code", &"<redacted>")
+            .field("username", &self.username)
+            .field("display_name", &self.display_name)
+            .finish()
+    }
+}
+
+/// The invite's code again, and the passkey made for the account
+/// (`RedeemInviteWithPasskey`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedeemInviteWithPasskey {
+    pub code: String,
+    pub finish: FinishPasskeyRegistration,
+    /// Trust this device for the new user, as `LoginPassword`'s.
+    pub remember: bool,
+}
+
+impl fmt::Debug for RedeemInviteWithPasskey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedeemInviteWithPasskey")
+            .field("code", &"<redacted>")
+            .field("finish", &self.finish)
+            .field("remember", &self.remember)
             .finish()
     }
 }
@@ -1507,6 +1745,7 @@ impl fmt::Debug for PinProof {
 /// The session user's track preferences (`GetTrackPreferences`), and
 /// whether this server reads picture subtitles as text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TrackPreferencesInfo {
     pub preferences: TrackPreferences,
     /// The server reads picture subtitles as text: `subtitles.ocr` is on
@@ -1656,6 +1895,12 @@ pub enum Reply {
     /// what is shown.
     SearchHits(SearchResults<crate::search::SearchHit>),
     Tracks(MediaTracks),
+    /// What `NextEpisode` and `ShowNext` found: `None` when there is
+    /// nothing to play.
+    NextEpisode {
+        #[serde(deserialize_with = "spoolframe_types::required::option")]
+        item: Option<Item>,
+    },
     WhoAmI(WhoAmIReply),
     LoggedOut,
     Sessions {
@@ -1831,9 +2076,14 @@ pub enum Reply {
     SubtitleResults(spoolframe_types::SubtitleSearch),
     /// The track `DownloadSubtitle` added.
     SubtitleDownloaded(spoolframe_types::SubtitleDownloaded),
-    /// The playlist's revision after `EditPlaylist`.
+    /// The playlist's revision after `EditPlaylist`, and the entries its
+    /// adds made, in the edits' order (a show's add makes one an
+    /// episode). `None` only from a server older than the field, which
+    /// leaves it out.
     PlaylistEdited {
         revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        added: Option<Vec<crate::playlists::EntryId>>,
     },
     /// The entry to play now (`PlayPlaylist`, `NextInPlaylist`).
     PlaylistItem(crate::playlists::PlaylistNext),
@@ -1881,6 +2131,7 @@ pub enum Reply {
 
 /// Which HLS playlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestKind {
     /// The top playlist, naming the variant.
@@ -1896,6 +2147,7 @@ pub enum ManifestKind {
 
 /// Rows for a home screen. Every item carries the user's playback state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct HomeScreen {
     /// Started and not finished, most recent first.
     pub continue_watching: Vec<Item>,
@@ -1919,6 +2171,7 @@ pub struct HomeScreen {
 
 /// A paired server's row on Home.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ServerRow {
     pub server: spoolframe_types::LibraryServer,
     /// Whether the user shows it (`SetServerRow`); a row not shown has no
@@ -1953,6 +2206,20 @@ pub struct UserSummary {
     pub portable: Vec<PortableTie>,
 }
 
+impl UserSummary {
+    /// The portable identity a guest's session is (`portable:<hex>`);
+    /// `None` for an account of this server's own.
+    pub fn portable_id(&self) -> Option<crate::portable::PortableUserId> {
+        self.user_id.strip_prefix("portable:")?.parse().ok()
+    }
+
+    /// The session is a portable identity's, a guest's, rather than an
+    /// account of this server's own.
+    pub fn is_guest(&self) -> bool {
+        self.portable_id().is_some()
+    }
+}
+
 /// One of an account's ties to a portable identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableTie {
@@ -1983,6 +2250,7 @@ pub struct WhoAmIReply {
 
 /// A user's PIN as clients may know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PinState {
     /// How many digits it has (4 to 8); `None` for a PIN set before the
     /// server kept its length, until it is set again.
@@ -1991,6 +2259,7 @@ pub struct PinState {
 
 /// A user a device is trusted for, as that device sees them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TrustedProfile {
     /// What `ResumeProfile` takes: `UserSummary::user_id`.
     pub user_id: String,
@@ -2001,6 +2270,12 @@ pub struct TrustedProfile {
     /// The user's PIN is asked for on this device: a resumed session
     /// starts locked.
     pub pin_required: bool,
+    /// How many digits that PIN has (4 to 8), for the boxes a PIN pad
+    /// shows. `None` when it is not asked for here, for a PIN set before
+    /// the server kept its length (until it is set again), and from a
+    /// server older than the field.
+    #[serde(default)]
+    pub pin_digits: Option<u8>,
     /// Open this profile at start, past "Who's watching". At most one per
     /// device.
     pub auto_login: bool,
@@ -2008,6 +2283,7 @@ pub struct TrustedProfile {
 
 /// One of a user's devices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DeviceInfo {
     /// Hex `EndpointId`: what `SetPinRequired { device }` takes.
     pub endpoint_id: String,
@@ -2031,6 +2307,7 @@ pub struct DeviceInfo {
 
 /// A device waiting to be signed in, as the approver sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DeviceSignInRequest {
     /// What the device calls itself (from its `Hello`).
     #[serde(deserialize_with = "spoolframe_types::required::option")]
@@ -2058,6 +2335,7 @@ pub struct DeviceSignInRequest {
 
 /// An address a device reached the server from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DeviceAddress {
     /// Its IP address as text: `192.168.86.20`, `fd7a:115c:a1e0::1`. An
     /// IPv4 address is never in its IPv6-mapped form.
@@ -2069,6 +2347,7 @@ pub struct DeviceAddress {
 /// What kind of network an address is on, as the server's web approval
 /// page judges it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum AddressNetwork {
     /// The server's own machine: `127.0.0.0/8`, `::1`.
@@ -2127,6 +2406,15 @@ pub struct ServerInfo {
     /// out when none, as an older server does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental: Vec<String>,
+    /// The regular features on for this connection
+    /// ([`crate::features`]): those its `Hello` named that this server
+    /// has. Left out when none, as an older server does.
+    #[serde(
+        default,
+        with = "crate::features::names",
+        skip_serializing_if = "Features::is_empty"
+    )]
+    pub features: Features,
     /// An account is made only from an invite (`RedeemInvite`); there is
     /// no open sign-up. For a "servers on my network" list, before
     /// signing in.
@@ -2476,6 +2764,31 @@ pub enum Event {
         handle: PlaybackHandle,
         error: Error,
     },
+    /// The profile of local user `user` (a user id, as `WhoAmI` names
+    /// it) is gone from this device: the user was disabled or deleted, or
+    /// an admin forgot this device for them. Their sessions here end with
+    /// it; the next request in one is `Unauthenticated`. Leave the profile,
+    /// and offer to sign in again only if the user is not deleted. Only to
+    /// that user's connections, and sent only to a connection where the
+    /// `spoolframe:profile-events` feature is on (both sides named it).
+    ProfileRemoved { user: String },
+    /// Local user `user`'s PIN changed: set, changed or removed, by them on
+    /// another device or by an admin. `required` is whether they have a PIN
+    /// now. A device that has their profile unlocked locks it again where
+    /// the PIN is asked for; one that kept the old PIN to check offline
+    /// forgets it. Only to that user's connections, not the one that made
+    /// the change, and sent only to a connection where the
+    /// `spoolframe:profile-events` feature is on (both sides named it).
+    PinChanged { user: String, required: bool },
+    /// The user's watch state of `items` changed on another connection:
+    /// marked watched or unwatched (a season's or a show's id marks its
+    /// episodes), hidden from or put back in Continue watching, synced
+    /// from offline, or played into progress, to watched, or stopped (not
+    /// each progress report). Read again what shows them (Home, an item's page). Only
+    /// to that user's other connections, and sent only to a connection
+    /// where the `spoolframe:watch-events` feature is on (both sides
+    /// named it).
+    WatchChanged { items: Vec<MediaId> },
     /// An event type this build does not know; ignore it.
     #[serde(other)]
     Unknown,

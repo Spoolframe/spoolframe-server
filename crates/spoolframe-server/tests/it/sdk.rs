@@ -32,7 +32,7 @@ fn device(capabilities: ClientCapabilities) -> Device {
 }
 
 /// A client on `storage` that knows where `server` is.
-async fn client_on(server: &TestServer, storage: &Arc<MemoryStorage>) -> Client {
+pub(crate) async fn client_on(server: &TestServer, storage: &Arc<MemoryStorage>) -> Client {
     client_with(server, storage, mkv_capabilities()).await
 }
 
@@ -2419,7 +2419,8 @@ async fn two_devices_see_each_other_s_playlist_changes() {
             }],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .revision;
     // The laptop shows its playlists, and so is told of changes.
     assert_eq!(on_laptop.playlists().await.unwrap().playlists.len(), 1);
     let mut laptop_events = laptop.playlist_events();
@@ -2758,4 +2759,19 @@ impl spoolframe_hls_bridge::Segment for NoSegment {
     async fn reopen(&self, _: u64) -> Result<Self, spoolframe_hls_bridge::Error> {
         Err(not_read())
     }
+}
+
+/// "Confirm it's you" for a user with no app passkey is their password,
+/// and the password confirms them.
+#[tokio::test]
+async fn a_user_with_no_passkey_confirms_with_their_password() {
+    let (server, client, _) = ready("sdk-reauth").await;
+    let alice = alice(&server, &client).await;
+    assert_eq!(
+        alice.reauth_options().await.unwrap(),
+        spoolframe_client_sdk::Reauth::Password
+    );
+    alice.confirm_password("correct horse").await.unwrap();
+    client.close().await;
+    server.stop().await;
 }

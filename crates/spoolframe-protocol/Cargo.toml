@@ -12,6 +12,9 @@ publish = ["crates-io"]
 # A software security key that writes real CTAP2 assertions: for
 # tests, and for a device that has no key at hand to test with.
 soft-key = []
+# UniFFI's traits on the public types an app sees, for
+# spoolframe-client-ffi. Off by default: the server never builds UniFFI.
+uniffi = ["dep:uniffi", "spoolframe-types/uniffi"]
 
 [dependencies]
 # The invite holder's token for the server's relay.
@@ -21,6 +24,7 @@ ciborium = { workspace = true }
 ciborium-ll = { workspace = true }
 # Checks what a portable user's root signed; never signs.
 ed25519-dalek = { workspace = true }
+enumset = { workspace = true }
 # Checks what a security key root signed; never signs.
 p256 = { workspace = true }
 serde = { workspace = true }
@@ -29,6 +33,7 @@ sha2 = { workspace = true }
 spoolframe-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+uniffi = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

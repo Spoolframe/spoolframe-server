@@ -66,6 +66,7 @@ pub(crate) fn admin(auth: Auth, setup_code: Option<SetupCode>) -> Admin {
         library: None,
         optimized: None,
         federation: None,
+        downloads: None,
     }
 }
 
