@@ -1,15 +1,19 @@
-//! What this server speaks of the client protocol: its version and the
-//! experimental features on, as the Server page (`ServerStatus`),
-//! `spoolframe-server --version` and MCP's server info show them. Every
-//! other capability is the version's own: the regular features were
-//! folded into revision 1.
+//! What this server speaks of the client protocol: its version, the
+//! regular features it has and the experimental features on, as the
+//! Server page (`ServerStatus`), `spoolframe-server --version` and MCP's
+//! server info show them.
 
 use spoolframe_protocol::{PROTOCOL_VERSION, experimental};
 
-/// The protocol's version, and the experimental features on.
+/// The protocol's version, the regular features, and the experimental
+/// features on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolInfo {
     pub version: u32,
+    /// The regular features this server has (`client::features`), by
+    /// their `spoolframe:` names: each is on for a connection whose
+    /// `Hello` names it too.
+    pub features: Vec<&'static str>,
     /// The experimental features turned on here, each by its setting.
     pub experimental: Vec<&'static str>,
 }
@@ -19,16 +23,19 @@ impl ProtocolInfo {
     pub fn new(experimental: Vec<&'static str>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
+            features: crate::client::features().iter().map(|f| f.name()).collect(),
             experimental,
         }
     }
 
-    /// One line each, for `--version` and MCP: "client protocol: 1", then
-    /// the experimental features under the heading `experimental`, "none"
-    /// for an empty list, which is shown, not left out.
+    /// One line each, for `--version` and MCP: "client protocol: 1", the
+    /// regular features, then the experimental features under the heading
+    /// `experimental`, "none" for an empty list, which is shown, not left
+    /// out.
     pub fn lines(&self, experimental: &str) -> Vec<String> {
         vec![
             format!("client protocol: {}", self.version),
+            format!("features: {}", listed(&self.features)),
             format!("{experimental}: {}", listed(&self.experimental)),
         ]
     }
@@ -86,7 +93,12 @@ mod tests {
         let lines = info.lines("experimental features on");
         assert_eq!(
             lines,
-            ["client protocol: 1", "experimental features on: none"]
+            [
+                "client protocol: 1",
+                "features: spoolframe:profile-events, spoolframe:watch-events, \
+                 spoolframe:next-episode, spoolframe:invite-passkeys",
+                "experimental features on: none",
+            ]
         );
     }
 
@@ -111,6 +123,13 @@ mod tests {
         assert_eq!(
             lines.next(),
             Some(format!("client protocol: {PROTOCOL_VERSION}").as_str())
+        );
+        assert_eq!(
+            lines.next(),
+            Some(
+                "features: spoolframe:profile-events, spoolframe:watch-events, \
+                 spoolframe:next-episode, spoolframe:invite-passkeys"
+            )
         );
         assert_eq!(
             lines.next(),

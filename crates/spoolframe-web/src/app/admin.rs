@@ -1764,10 +1764,15 @@ fn ThisServer() -> Element {
                     Pair { label: "Name", b { "{s.name}" } }
                     Pair { label: "Version", span { class: "mono-value", {server_version(&s.version, s.revision.as_deref())} } }
                     // What it speaks to the apps: the protocol's
-                    // version, and the experimental features on, an
-                    // empty list shown as "none". Not on a phone, as
-                    // WebAdminPhone 3 keeps to the three above.
+                    // version, the regular features it has, and the
+                    // experimental features on, an empty list shown as
+                    // "none". Not on a phone, as WebAdminPhone 3 keeps
+                    // to the three above.
                     Pair { label: "Client protocol", class: "max-md:hidden", span { class: "mono-value", "{s.protocol_version}" } }
+                    Pair { label: "Features", class: "pair-stack max-md:hidden",
+                        span { class: "mono-value", {crate::logic::feature_list(&s.features)} }
+                        div { class: "mt-1 text-xs text-ctp-subtext0", "This server has them; each is on for an app that asks for it." }
+                    }
                     Pair { label: "Experimental", class: "pair-stack max-md:hidden",
                         span { class: "mono-value", {crate::logic::feature_list(&s.experimental_features)} }
                         div { class: "mt-1 text-xs text-ctp-subtext0", "On here, each by its setting; apps use one only when they ask for it." }

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The admin Server page, `spoolframe-server --version` and MCP's server
+  info list the regular protocol features the server has
+  (`spoolframe:profile-events`, `spoolframe:watch-events`,
+  `spoolframe:next-episode`, `spoolframe:invite-passkeys`), beside the
+  experimental ones. Admin API: `ServerStatus.features`.
+
 ## 0.16.4-beta.1 (2026-10-29)
 
 A beta, for internal testing before external testers: `0.16` and

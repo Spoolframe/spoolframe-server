@@ -459,6 +459,7 @@ impl StatusSource {
             web_urls: self.web_urls.get().cloned().unwrap_or_default(),
             preview_workers_default: preview_workers_default(),
             protocol_version: protocol.version,
+            features: names(&protocol.features),
             experimental_features: names(&protocol.experimental),
         }
     }

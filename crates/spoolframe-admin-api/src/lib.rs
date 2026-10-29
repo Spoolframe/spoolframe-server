@@ -981,6 +981,10 @@ pub struct ServerStatus {
     /// The client protocol's version (`spoolframe_protocol::
     /// PROTOCOL_VERSION`): an app speaks this one or is refused.
     pub protocol_version: u32,
+    /// The regular features this server has, by their `spoolframe:`
+    /// names (`spoolframe:watch-events`): each is on for an app that
+    /// names it too.
+    pub features: Vec<String>,
     /// The experimental features turned on here, each by its setting
     /// (`http-playback` by `http_playback.listen`).
     pub experimental_features: Vec<String>,
@@ -5136,6 +5140,7 @@ mod required_field_tests {
                     counted: CoreCount::LogicalCpus,
                 },
                 protocol_version: 1,
+                features: Vec::new(),
                 experimental_features: Vec::new(),
             },
             &[
@@ -5144,6 +5149,7 @@ mod required_field_tests {
                 "mdns",
                 "addresses",
                 "protocolVersion",
+                "features",
                 "experimentalFeatures",
             ],
         );
