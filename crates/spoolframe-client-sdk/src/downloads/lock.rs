@@ -15,8 +15,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use argon2::Argon2;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,17 @@ pub(crate) struct Locks {
     storage: OnceLock<Arc<dyn Storage>>,
     /// Held across each save: the last one writes what is newest.
     saving: tokio::sync::Mutex<()>,
+    /// The PIN that unlocked the active profile offline, kept in memory
+    /// only, until that profile is opened online: it unlocks it there too,
+    /// not asked for again ([`crate::Session::unlock_as_offline`]).
+    held_pin: Mutex<Option<HeldPin>>,
+}
+
+/// [`Locks::held_pin`].
+struct HeldPin {
+    server: String,
+    user_id: String,
+    pin: String,
 }
 
 fn key(server: &str, user_id: &str) -> String {
@@ -120,10 +131,30 @@ impl Locks {
             user_id: user_id.to_owned(),
             unlocked: false,
         });
+        // Another profile now: the PIN held was that one's.
+        *self.held_pin.lock() = None;
+    }
+
+    /// The PIN that unlocked `server`'s `user_id` offline is held.
+    pub fn holds_pin(&self, server: &str, user_id: &str) -> bool {
+        self.held_pin
+            .lock()
+            .as_ref()
+            .is_some_and(|h| h.server == server && h.user_id == user_id)
+    }
+
+    /// The PIN that unlocked `server`'s `user_id` offline, once.
+    pub fn take_pin(&self, server: &str, user_id: &str) -> Option<String> {
+        let mut held = self.held_pin.lock();
+        match held.as_ref() {
+            Some(h) if h.server == server && h.user_id == user_id => held.take().map(|h| h.pin),
+            _ => None,
+        }
     }
 
     pub fn clear_active(&self) {
         *self.active.lock() = None;
+        *self.held_pin.lock() = None;
     }
 
     /// The active profile, as `(server, user_id)`.
@@ -176,6 +207,11 @@ impl Locks {
             if let Some(lock) = self.profiles.lock().get_mut(&k) {
                 lock.wrong = 0;
             }
+            *self.held_pin.lock() = Some(HeldPin {
+                server: server.clone(),
+                user_id: user_id.clone(),
+                pin: pin.to_owned(),
+            });
             self.save().await;
             return self.open(&server, &user_id);
         }
@@ -286,6 +322,31 @@ impl Locks {
         self.save().await;
     }
 
+    /// `server`'s `user_id`'s PIN changed elsewhere; `required`, whether
+    /// they have one now. Without one, as [`Locks::pin_cleared`]. With a
+    /// new one, the PIN kept to check offline is the old one: it goes, and
+    /// the profile, if active, locks again where its PIN is asked for.
+    pub async fn pin_changed(&self, server: &str, user_id: &str, required: bool) {
+        if !required {
+            return self.pin_cleared(server, user_id).await;
+        }
+        {
+            let mut profiles = self.profiles.lock();
+            let Some(lock) = profiles.get_mut(&key(server, user_id)) else {
+                return;
+            };
+            lock.pin_check = None;
+            lock.wrong = 0;
+        }
+        if let Some(active) = self.active.lock().as_mut()
+            && active.server == server
+            && active.user_id == user_id
+        {
+            active.unlocked = false;
+        }
+        self.save().await;
+    }
+
     /// `server`'s `user_id` has no PIN now: nothing is asked for here.
     pub async fn pin_cleared(&self, server: &str, user_id: &str) {
         let removed = self.profiles.lock().remove(&key(server, user_id)).is_some();
@@ -307,10 +368,9 @@ fn wait_after(wrong: u32) -> Duration {
 async fn hash(pin: &str) -> Option<String> {
     let pin = zeroize::Zeroizing::new(pin.to_owned());
     let made = tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
-            .hash_password(pin.as_bytes(), &salt)
-            .map(|h| h.to_string())
+            .hash_password(pin.as_bytes())
+            .map(|h: PasswordHash| h.to_string())
             .map_err(|e| e.to_string())
     })
     .await

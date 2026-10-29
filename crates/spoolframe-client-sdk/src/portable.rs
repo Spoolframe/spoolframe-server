@@ -44,8 +44,10 @@ use crate::storage::{Storage, StorageError, keys};
 
 mod heads;
 mod key_roots;
+mod overview;
 mod sync;
 
+pub use overview::{Guest, IdentityAbilities, IdentityDevice, IdentityOverview};
 pub use sync::{RootLocation, RootSyncRefused};
 
 pub use heads::MAX_HEADS;

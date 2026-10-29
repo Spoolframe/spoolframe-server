@@ -15,8 +15,8 @@ use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
 use spoolframe_protocol::codec::{decode, read_frame_bytes, request_type, write_frame};
 use spoolframe_protocol::streams::{bi, uni};
 use spoolframe_protocol::{
-    AuthMethod, CLIENT_ALPN, DeviceSignInRequest, Error, Event, PROTOCOL_VERSION, Reply, Request,
-    Response, ServerInfo, SessionId, UserSummary,
+    AuthMethod, CLIENT_ALPN, DeviceSignInRequest, Error, Event, Features, PROTOCOL_VERSION, Reply,
+    Request, Response, ServerInfo, SessionId, UserSummary,
 };
 use spoolframe_types::Role;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,6 +63,9 @@ struct State {
     /// `ServerInfo` says accounts are made without an invite, as no
     /// server does yet.
     open_sign_up: AtomicBool,
+    /// The regular features it has, of which `ServerInfo` names those a
+    /// `Hello` named.
+    features: Mutex<Features>,
 }
 
 pub struct Stub {
@@ -147,6 +150,11 @@ impl Stub {
         self.state.refuse_hellos.store(true, Ordering::SeqCst);
     }
 
+    /// Have the regular features `features` from the next `Hello` on.
+    pub fn have_features(&self, features: Features) {
+        *self.state.features.lock() = features;
+    }
+
     /// Answer `Hello` with protocol revision `revision` from now on.
     pub fn speak_protocol(&self, revision: u32) {
         *self.state.protocol.lock() = Some(revision);
@@ -223,6 +231,17 @@ impl Stub {
             handle: spoolframe_protocol::PlaybackHandle(handle.to_owned()),
             max_bitrate,
         };
+        for events in streams {
+            let _ = write_frame(&mut *events.lock().await, &event).await;
+        }
+    }
+
+    /// Push a `WatchChanged` event for `items` to every connection that
+    /// said Hello, as the server does when another device of the user
+    /// changes their watch state.
+    pub async fn push_watch_changed(&self, items: Vec<spoolframe_types::MediaId>) {
+        let streams: Vec<_> = self.state.events.lock().values().cloned().collect();
+        let event = Event::WatchChanged { items };
         for events in streams {
             let _ = write_frame(&mut *events.lock().await, &event).await;
         }
@@ -507,7 +526,7 @@ fn answer(
                     .into(),
             });
         }
-        Request::Hello(_) => Reply::ServerInfo(ServerInfo {
+        Request::Hello(hello) => Reply::ServerInfo(ServerInfo {
             name: "Stub".into(),
             endpoint_id: id.to_string(),
             server_id,
@@ -516,6 +535,7 @@ fn answer(
             auth_methods: vec![AuthMethod::Password],
             web_url,
             experimental: Vec::new(),
+            features: hello.features & *state.features.lock(),
             invite_only: !state.open_sign_up.load(Ordering::SeqCst),
         }),
         Request::BeginDeviceSignIn { .. } => Reply::DeviceSignInStarted {
@@ -565,6 +585,8 @@ fn answer(
             requested_from: None,
         }),
         Request::ApproveDeviceSignIn { .. } => Reply::Done,
+        Request::Search(_) => Reply::Search(spoolframe_protocol::SearchResults::default()),
+        Request::Home => Reply::Home(spoolframe_protocol::HomeScreen::default()),
         _ => {
             return Response::Err(Error::Unsupported {
                 request: "not in the stub".into(),

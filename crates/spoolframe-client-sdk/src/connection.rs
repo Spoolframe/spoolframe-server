@@ -24,8 +24,9 @@ use serde::de::DeserializeOwned;
 use spoolframe_protocol::codec::{CodecError, read_frame, write_frame};
 use spoolframe_protocol::streams::bi;
 use spoolframe_protocol::{
-    ArtworkRequest, ArtworkResponse, CLIENT_ALPN, Hello, MAX_READ, MediaRead, MediaReadResponse,
-    PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo, SessionId, close,
+    ArtworkRequest, ArtworkResponse, CLIENT_ALPN, Features, Hello, MAX_READ, MediaRead,
+    MediaReadResponse, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, Response, ServerInfo,
+    SessionId, close,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
@@ -106,6 +107,7 @@ impl ServerConnection {
         addr: EndpointAddr,
         device: &Device,
         experimental: crate::Experimental,
+        features: Features,
         timeouts: &Timeouts,
     ) -> Result<Self, DialFailed> {
         let expected: EndpointId = addr.id;
@@ -126,7 +128,7 @@ impl ServerConnection {
                 }
                 Ok(Ok(conn)) => conn,
             };
-        Self::greet(conn, expected, device, experimental, timeouts)
+        Self::greet(conn, expected, device, experimental, features, timeouts)
             .await
             .map_err(|(error, stage)| DialFailed { error, stage })
     }
@@ -137,6 +139,7 @@ impl ServerConnection {
         expected: EndpointId,
         device: &Device,
         experimental: crate::Experimental,
+        features: Features,
         timeouts: &Timeouts,
     ) -> Result<Self, (SdkError, DialStage)> {
         let unreachable = |e: String| SdkError::Unreachable(format!("{expected}: {e}"));
@@ -166,6 +169,8 @@ impl ServerConnection {
             // What the app asked for; the answer names what the
             // server turned on.
             experimental: experimental.names(),
+            // The answer names those of them the server has.
+            features,
         });
         // A server that takes the connection and then says nothing is as
         // unreachable as one that never answered the dial.

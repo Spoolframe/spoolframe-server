@@ -416,6 +416,7 @@ pub(crate) fn time(secs: Option<u64>) -> Option<SystemTime> {
 
 /// A server this device knows: saved, heard on the LAN, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ServerEntry {
     /// The server's identity, hex.
     pub endpoint_id: String,
@@ -472,6 +473,37 @@ pub struct ServerEntry {
     pub use_relays: Option<bool>,
 }
 
+impl ServerEntry {
+    /// The address to show for it ([`display_host`]).
+    pub fn display_host(&self) -> Option<String> {
+        display_host(&self.addrs)
+    }
+}
+
+/// The address to show of `addrs`: a home-network IPv4 if there is one
+/// (192.168/16, then 10/8), never a container bridge's (172.16/12) while
+/// another is listed; the host without its port.
+pub fn display_host(addrs: &[SocketAddr]) -> Option<String> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4: Vec<Ipv4Addr> = addrs
+        .iter()
+        .filter_map(|a| match a.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    let bridge = |ip: &&Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        a == 172 && (16..=31).contains(&b)
+    };
+    v4.iter()
+        .find(|ip| ip.octets()[..2] == [192, 168])
+        .or_else(|| v4.iter().find(|ip| ip.octets()[0] == 10))
+        .or_else(|| v4.iter().find(|ip| !bridge(ip)))
+        .map(ToString::to_string)
+        .or_else(|| addrs.first().map(|a| a.ip().to_string()))
+}
+
 pub(crate) async fn load(storage: &dyn Storage) -> Result<Vec<SavedServer>, StorageError> {
     match storage.data(keys::SERVERS).await? {
         None => Ok(Vec::new()),
@@ -498,6 +530,30 @@ pub(crate) async fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_shown_is_the_home_networks_never_a_bridge() {
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|a| a.parse().unwrap()).collect()
+        };
+        assert_eq!(
+            display_host(&addrs(&[
+                "172.17.0.1:7430",
+                "10.0.0.5:7430",
+                "192.168.1.2:7430"
+            ])),
+            Some("192.168.1.2".into())
+        );
+        assert_eq!(
+            display_host(&addrs(&["172.17.0.1:7430", "203.0.113.9:7430"])),
+            Some("203.0.113.9".into())
+        );
+        assert_eq!(
+            display_host(&addrs(&["[2001:db8::1]:7430"])),
+            Some("2001:db8::1".into())
+        );
+        assert_eq!(display_host(&[]), None);
+    }
     use crate::storage::MemoryStorage;
 
     const ID: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";

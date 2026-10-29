@@ -23,7 +23,7 @@
 //! is not listed; neither is one of a newer version or a kind this build
 //! does not know, which is left as it is.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -351,16 +351,46 @@ pub(crate) struct Store {
     /// disk at first use, then kept by each write and removal here, so
     /// the manager need not read every manifest to find the next.
     active: Arc<Mutex<Option<Active>>>,
+    /// Where each item's downloads are, by the item's id and, for an
+    /// episode, its show's: read from the disk at first use, then kept
+    /// by each write and removal here, so finding one item's downloads
+    /// reads only theirs. Read again when another process adds or removes
+    /// a download (its [`Index::stamp`] moved).
+    items: Arc<Mutex<Option<Index>>>,
 }
+
+/// [`Items`], with what tells that the disk moved under it.
+#[derive(Debug)]
+struct Index {
+    items: Items,
+    /// The listing directories' modification times when it was read:
+    /// the root, each server's files directory and each kind's under it.
+    /// Adding or removing a download (here or in another process: an iOS
+    /// background session, a share extension, Android's WorkManager)
+    /// moves its kind directory's, so one that differs is read again.
+    stamp: Stamp,
+    /// Download directories that had no manifest to read then: one being
+    /// made, whose manifest comes after its directory. One that has it
+    /// now is read again.
+    unread: Vec<PathBuf>,
+}
+
+/// Each listing directory and its modification time, in path order.
+type Stamp = Vec<(PathBuf, Option<std::time::SystemTime>)>;
 
 /// Downloads by `(created_at, place, key)`: oldest first.
 type Active = BTreeSet<(i64, u32, String)>;
+
+/// The directories of the downloads of each item, and of each show's
+/// episodes. Tracks are not listed.
+type Items = HashMap<MediaId, BTreeSet<PathBuf>>;
 
 impl Store {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
             active: Arc::default(),
+            items: Arc::default(),
         }
     }
 
@@ -375,6 +405,7 @@ impl Store {
     /// the directory; one that cannot be moved is left where it was, and
     /// logged.
     pub fn migrate(&self) {
+        self.rescan();
         for server in read_dir(&self.root) {
             for user in user_dirs(&server) {
                 for kind in read_dir(&user) {
@@ -393,7 +424,53 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Forget what was read of the directory: the next read reads it
+    /// again, whole. For a download another process wrote, which the
+    /// index finds by itself too ([`Index::stamp`]), and the downloads
+    /// under way, which it does not.
+    pub fn rescan(&self) {
+        *self.items.lock() = None;
         *self.active.lock() = None;
+    }
+
+    /// The listing directories as they are now ([`Index::stamp`]).
+    fn stamp(&self) -> Stamp {
+        let mut dirs = vec![self.root.clone()];
+        for server in read_dir(&self.root) {
+            let files = server.join(FILES);
+            dirs.extend(read_dir(&files));
+            dirs.push(files);
+        }
+        dirs.sort();
+        dirs.into_iter()
+            .map(|dir| {
+                let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+                (dir, modified)
+            })
+            .collect()
+    }
+
+    /// Every download's directory, with its manifest when it can be read.
+    fn downloads(&self) -> Vec<(PathBuf, Option<Manifest>)> {
+        let mut found = Vec::new();
+        for server in read_dir(&self.root) {
+            for kind in read_dir(&server.join(FILES)) {
+                for key in read_dir(&kind) {
+                    let path = key.join(MANIFEST);
+                    let m = match read_manifest(&path) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "a download's manifest cannot be read; left out");
+                            None
+                        }
+                    };
+                    found.push((key, m));
+                }
+            }
+        }
+        found
     }
 
     /// Move one file of the older per-user layout from `old`.
@@ -474,6 +551,7 @@ impl Store {
     pub fn write(&self, m: &Manifest) -> std::io::Result<()> {
         write_json(&self.dir(m).join(MANIFEST), m)?;
         self.note(m, m.phase.is_active());
+        self.list(m, true);
         Ok(())
     }
 
@@ -503,6 +581,74 @@ impl Store {
             && !self.find(key).is_some_and(|m| m.phase.is_active())
         {
             active.retain(|(_, _, k)| k != key);
+        }
+    }
+
+    /// The ids `m` is listed under in [`Items`].
+    fn listed_as(m: &Manifest) -> Vec<MediaId> {
+        if m.kind == EntryKind::Track {
+            return Vec::new();
+        }
+        let mut ids = vec![m.item.id().clone()];
+        if let Item::Episode(e) = &m.item {
+            ids.push(e.show_id.clone());
+        }
+        ids
+    }
+
+    /// The downloads of item `id` and, for a show, of its episodes;
+    /// tracks are not among them.
+    pub fn of_item(&self, id: &MediaId) -> Vec<Manifest> {
+        let dirs: Vec<PathBuf> = {
+            let mut index = self.items.lock();
+            // Taken before the read: a change during it moves the stamp
+            // after this, and the next call reads again.
+            let stamp = self.stamp();
+            let current = index.as_ref().is_some_and(|i| {
+                i.stamp == stamp && !i.unread.iter().any(|d| d.join(MANIFEST).exists())
+            });
+            if !current {
+                let mut items = Items::new();
+                let mut unread = Vec::new();
+                for (dir, m) in self.downloads() {
+                    match m {
+                        Some(m) => {
+                            for id in Self::listed_as(&m) {
+                                items.entry(id).or_default().insert(dir.clone());
+                            }
+                        }
+                        // Not one being made: a newer build's, or one
+                        // that can't be read, which reading again won't
+                        // change.
+                        None if dir.join(MANIFEST).exists() => {}
+                        None => unread.push(dir),
+                    }
+                }
+                *index = Some(Index {
+                    items,
+                    stamp,
+                    unread,
+                });
+            }
+            let items = &index.as_ref().expect("read above").items;
+            items.get(id).into_iter().flatten().cloned().collect()
+        };
+        dirs.iter()
+            .filter_map(|dir| read_manifest(&dir.join(MANIFEST)).ok().flatten())
+            .collect()
+    }
+
+    /// `m` is on the disk, or no longer: [`Items`] kept in step.
+    fn list(&self, m: &Manifest, there: bool) {
+        if let Some(index) = self.items.lock().as_mut() {
+            for id in Self::listed_as(m) {
+                let dirs = index.items.entry(id).or_default();
+                if there {
+                    dirs.insert(self.dir(m));
+                } else {
+                    dirs.remove(&self.dir(m));
+                }
+            }
         }
     }
 
@@ -572,21 +718,11 @@ impl Store {
     /// Every download, oldest first. One whose manifest cannot be read is
     /// left out, and said so in the log.
     pub fn scan(&self) -> Vec<Manifest> {
-        let mut found = Vec::new();
-        for server in read_dir(&self.root) {
-            for kind in read_dir(&server.join(FILES)) {
-                for key in read_dir(&kind) {
-                    let path = key.join(MANIFEST);
-                    match read_manifest(&path) {
-                        Ok(Some(m)) => found.push(m),
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "a download's manifest cannot be read; left out")
-                        }
-                    }
-                }
-            }
-        }
+        let mut found: Vec<Manifest> = self
+            .downloads()
+            .into_iter()
+            .filter_map(|(_, m)| m)
+            .collect();
         found.sort_by(|a, b| (a.created_at, a.place, &a.key).cmp(&(b.created_at, b.place, &b.key)));
         found
     }
@@ -667,6 +803,7 @@ impl Store {
             _ => {}
         }
         self.note(m, false);
+        self.list(m, false);
         Ok(())
     }
 
@@ -984,6 +1121,69 @@ mod tests {
 
     fn id() -> MediaId {
         MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap()
+    }
+
+    /// An item's downloads, from the index: one written after it was
+    /// read is found, and one removed is not.
+    #[test]
+    fn an_item_s_downloads_are_found_as_they_are_written_and_removed() {
+        let store = store("of-item");
+        let first = manifest("aa", 1);
+        store.write(&first).unwrap();
+        assert_eq!(keys(store.of_item(&id())), ["aa"]);
+        store.write(&manifest("bb", 2)).unwrap();
+        store.remove(&first).unwrap();
+        let other = MediaId::new(Namespace::Plex, MediaKind::Movie, "2").unwrap();
+        assert_eq!(
+            (keys(store.of_item(&id())), keys(store.of_item(&other))),
+            (vec!["bb".to_owned()], Vec::new())
+        );
+    }
+
+    /// Another process writes into the same directory (an iOS background
+    /// session, a share extension, Android's WorkManager): its download
+    /// of an item this one has read is found, with no rescan.
+    #[test]
+    fn another_process_s_download_of_an_item_is_found() {
+        let here = store("other-process");
+        here.write(&manifest("aa", 1)).unwrap();
+        assert_eq!(keys(here.of_item(&id())), ["aa"]);
+        let there = Store::new(here.root().to_owned());
+        there.write(&manifest("bb", 2)).unwrap();
+        let mut found = keys(here.of_item(&id()));
+        found.sort();
+        assert_eq!(found, ["aa", "bb"]);
+    }
+
+    /// A download read while its directory was there but its manifest not
+    /// yet is found once the manifest is, though the listing didn't move.
+    #[test]
+    fn a_download_whose_manifest_came_after_its_directory_is_found() {
+        let here = store("manifest-after");
+        here.write(&manifest("aa", 1)).unwrap();
+        let late = manifest("bb", 2);
+        std::fs::create_dir_all(here.dir(&late)).unwrap();
+        assert_eq!(keys(here.of_item(&id())), ["aa"]);
+        let there = Store::new(here.root().to_owned());
+        there.write(&late).unwrap();
+        let mut found = keys(here.of_item(&id()));
+        found.sort();
+        assert_eq!(found, ["aa", "bb"]);
+    }
+
+    /// A rescan finds a download under way that another process started.
+    #[test]
+    fn a_rescan_finds_another_process_s_download_under_way() {
+        let here = store("rescan");
+        assert!(here.active().is_empty());
+        let there = Store::new(here.root().to_owned());
+        there.write(&manifest("aa", 1)).unwrap();
+        here.rescan();
+        assert_eq!(here.active(), ["aa"]);
+    }
+
+    fn keys(found: Vec<Manifest>) -> Vec<String> {
+        found.into_iter().map(|m| m.key).collect()
     }
 
     #[test]

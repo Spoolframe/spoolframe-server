@@ -11,12 +11,16 @@ publish = ["crates-io"]
 [features]
 default = []
 media-readers = []
+# UniFFI's traits on the public types an app sees, for
+# spoolframe-client-ffi. Off by default: the server never builds UniFFI.
+uniffi = ["dep:uniffi", "spoolframe-protocol/uniffi", "spoolframe-types/uniffi"]
 
 [dependencies]
 # The PIN checked offline, hashed as the server hashes it.
 argon2 = { workspace = true }
-password-hash = { workspace = true }
 async-trait = { workspace = true }
+# WebAuthn's JSON forms: base64url byte strings.
+base64 = { workspace = true }
 # The portable identity's root and its recovery phrase.
 bip39 = { workspace = true }
 blake3 = { workspace = true }
@@ -39,6 +43,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uniffi = { workspace = true, optional = true }
 # The pkarr relays servers are looked up at.
 url = { workspace = true }
 uuid = { workspace = true }

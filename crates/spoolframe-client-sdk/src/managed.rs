@@ -42,6 +42,21 @@ use std::time::Duration;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::time::Instant;
 
+mod cadence;
+mod choice;
+mod events;
+mod next;
+mod player_session;
+mod revival;
+mod routed;
+mod stall;
+mod subtitle_file;
+pub use cadence::PlayerState;
+pub use events::PlaybackEvent;
+pub use player_session::PlayerSession;
+pub use revival::{PlaybackStopped, RestartCause};
+pub use subtitle_file::SubtitleFile;
+
 /// Small transport port for media adapters and deterministic client tests.
 #[async_trait]
 pub trait PlaybackBackend: Send + Sync + 'static {
@@ -181,6 +196,40 @@ pub trait PlaybackBackend: Send + Sync + 'static {
     fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
         None
     }
+    /// Keep `selection` for the item's series or movie
+    /// ([`Session::set_track_override`]). A backend with no server keeps
+    /// the default, which refuses.
+    async fn set_track_override(
+        &self,
+        item: &MediaId,
+        selection: Selection,
+    ) -> Result<(), SdkError> {
+        let _ = (item, selection);
+        Err(SdkError::InvalidInput(
+            "this playback backend cannot keep a track choice".into(),
+        ))
+    }
+    /// The playback's subtitle file, whole ([`Session::read_subtitle`]).
+    /// A backend with no files keeps the default, which refuses.
+    async fn read_subtitle(&self, handle: &PlaybackHandle) -> Result<Subtitle, SdkError> {
+        let _ = handle;
+        Err(SdkError::InvalidInput(
+            "this playback backend has no subtitle files".into(),
+        ))
+    }
+    /// The server's subtitle timing changes, and the server's key they
+    /// name: a managed playback follows its own track's. A backend with
+    /// no server keeps the default.
+    fn subtitle_timings(
+        &self,
+    ) -> Option<(String, broadcast::Receiver<crate::SubtitleTimingEvent>)> {
+        None
+    }
+    /// How a paired server's item plays now
+    /// ([`ManagedPlayback::route`]); `None` for any other backend.
+    fn route(&self) -> Option<crate::RemoteMode> {
+        None
+    }
     /// HLS subtitle segment `n` ([`Session::read_subtitle_segment`]).
     async fn subtitle_segment(
         &self,
@@ -279,6 +328,12 @@ impl PlaybackBackend for Session {
     async fn subtitle_segment(&self, h: &PlaybackHandle, n: u32) -> Result<Subtitle, SdkError> {
         self.read_subtitle_segment(h, n).await
     }
+    async fn read_subtitle(&self, h: &PlaybackHandle) -> Result<Subtitle, SdkError> {
+        Session::read_subtitle(self, h).await
+    }
+    async fn set_track_override(&self, item: &MediaId, s: Selection) -> Result<(), SdkError> {
+        Session::set_track_override(self, item, s).await
+    }
     async fn open_segment(
         &self,
         h: &PlaybackHandle,
@@ -304,6 +359,14 @@ impl PlaybackBackend for Session {
     }
     fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
         Some(self.client.inner.shares.subscribe())
+    }
+    fn subtitle_timings(
+        &self,
+    ) -> Option<(String, broadcast::Receiver<crate::SubtitleTimingEvent>)> {
+        Some((
+            self.server.to_string(),
+            self.client.subtitle_timing_events(),
+        ))
     }
 }
 
@@ -350,6 +413,23 @@ struct State {
     limit_asked: Option<std::time::Instant>,
     /// The share of the server's uplink it was last told.
     share: Option<PlaybackShare>,
+    /// What the app's player last said it does ([`ManagedPlayback::set_state`]);
+    /// `None` until it says.
+    player: Option<PlayerState>,
+    /// When the server last heard from this playback: a read or a report.
+    contact: Instant,
+    /// When bytes were last read of it.
+    read_at: Instant,
+    /// Since when it has played without a pause or a restart: the
+    /// restart budget is whole again after [`ManagedPlayback::REFILL_AFTER`].
+    playing_since: Option<Instant>,
+    /// Whether an idle playback must be used to stay alive. A server that
+    /// keeps paused playbacks needs no keep-alive.
+    keepalive_needed: bool,
+    /// A stall the app reported made this ask to be planned for the link.
+    stall_limited: bool,
+    /// Each subtitle track's timing, as the server last said.
+    timings: HashMap<u32, spoolframe_types::SubtitleTiming>,
 }
 
 /// What a segment read was opened under: the handle it went to and the
@@ -383,6 +463,7 @@ struct Inner {
     control: tokio::sync::Mutex<()>,
     changed: watch::Sender<Playback>,
     errors: broadcast::Sender<SdkError>,
+    events: broadcast::Sender<PlaybackEvent>,
     notify: Arc<Notify>,
     runtime: tokio::runtime::Handle,
     /// Never sent: dropped with the playback, which ends the task that
@@ -393,6 +474,9 @@ struct Inner {
     keeper: std::sync::OnceLock<Arc<crate::downloads::Keeper>>,
     /// The read ahead of a kept track's file was started.
     reading_ahead: std::sync::atomic::AtomicBool,
+    /// True once its player read a byte, or it ended or was closed: what
+    /// opening the next one waits for ([`ManagedPlayback::open_after`]).
+    settled: watch::Sender<bool>,
 }
 
 /// A live playback with shared recovery, bounded progress reporting and cleanup.
@@ -459,6 +543,17 @@ enum Restart {
     /// there, as asked. Its plan may differ; the app builds a new reader
     /// from the result either way.
     Control { at: Duration },
+    /// The viewer picked other tracks, which the server serves only with
+    /// a new playback: start one with them at `at`, and stop the old one,
+    /// which is still live. A choice, not a revival: it spends no budget,
+    /// and a refusal leaves the old playback playing.
+    Reselect { at: Duration, selection: Selection },
+}
+
+/// Whether a restart brings back a playback that died, as against one
+/// the viewer asked for.
+fn revival(restart: Restart) -> bool {
+    !matches!(restart, Restart::Reselect { .. })
 }
 
 /// A playback's share of its server's uplink changed (the server's
@@ -533,9 +628,12 @@ fn segment_starts(playlist: &str) -> Vec<Duration> {
 }
 
 impl ManagedPlayback {
-    /// The most resumes in [`Self::RESUME_WINDOW`]. A playback the server
+    /// The most restarts in [`Self::RESUME_WINDOW`]: resumes behind the
+    /// app's back and [`Self::restart`]s alike. A playback the server
     /// keeps ending is not started again and again: past this the
-    /// operation fails with [`SdkError::PlaybackExpired`].
+    /// operation fails with [`SdkError::PlaybackExpired`]. The budget is
+    /// whole again once it has played [`Self::REFILL_AFTER`] on end
+    /// ([`Self::set_state`]). An app keeps no budget of its own.
     pub const MAX_RESUMES: usize = 3;
     pub const RESUME_WINDOW: Duration = Duration::from_secs(5 * 60);
 
@@ -596,15 +694,24 @@ impl ManagedPlayback {
                 recent_segments: VecDeque::new(),
                 limit_asked: None,
                 share: None,
+                player: None,
+                contact: Instant::now(),
+                read_at: Instant::now(),
+                playing_since: None,
+                keepalive_needed: true,
+                stall_limited: false,
+                timings: HashMap::new(),
             }),
             control: tokio::sync::Mutex::new(()),
             changed,
             errors,
+            events: broadcast::Sender::new(16),
             notify: notify.clone(),
             runtime: tokio::runtime::Handle::current(),
             gone: watch::Sender::new(()),
             keeper: std::sync::OnceLock::new(),
             reading_ahead: std::sync::atomic::AtomicBool::new(false),
+            settled: watch::Sender::new(false),
         });
         // A share of the server's uplink that moved: a playback in
         // Auto plans itself again where the viewer is, as the viewer's own
@@ -653,10 +760,29 @@ impl ManagedPlayback {
                 }
             }
         });
+        cadence::follow(&inner);
+        events::follow(&inner);
         Self(inner)
     }
     pub fn snapshot(&self) -> Playback {
         self.0.state.lock().playback.clone()
+    }
+    /// Whether it is planned as `plan` now: a replan's test, with no
+    /// copy of the playback.
+    pub fn is_planned(&self, plan: &PlaybackPlan) -> bool {
+        self.0.state.lock().playback.plan == *plan
+    }
+    /// Whether the server converts it now.
+    pub fn is_converted(&self) -> bool {
+        matches!(
+            self.0.state.lock().playback.plan,
+            PlaybackPlan::Converted { .. }
+        )
+    }
+    /// Whether `handle` is the one it reads now: a share or event for an
+    /// earlier start of it is not its own.
+    pub fn is_handle(&self, handle: &PlaybackHandle) -> bool {
+        self.0.state.lock().playback.handle == *handle
     }
     /// The link meter of the server this plays from, if it has one.
     #[cfg(feature = "media-readers")]
@@ -731,15 +857,18 @@ impl ManagedPlayback {
                 .take()
                 .map(|p| (state.playback.handle.clone(), p))
         };
-        if let Some((handle, position)) = report
-            && let Err(error) = self.0.backend.progress(&handle, position).await
-        {
+        let Some((handle, position)) = report else {
+            return Ok(());
+        };
+        if let Err(error) = self.0.backend.progress(&handle, position).await {
             let mut state = self.0.state.lock();
             if !state.closed && state.pending.is_none() {
                 state.pending = Some(position);
             }
             return Err(error);
         }
+        let mut state = self.0.state.lock();
+        state.contact = Instant::now();
         Ok(())
     }
     fn live(&self) -> Result<Playback, SdkError> {
@@ -782,7 +911,7 @@ impl ManagedPlayback {
         let (playback, opened) = self.live_opened()?;
         match op(playback.clone()).await {
             Err(SdkError::PlaybackExpired) => {
-                self.restart(&playback.handle, Restart::Resume { at })
+                self.replace(&playback.handle, Restart::Resume { at })
                     .await?;
                 let (playback, opened) = self.live_opened()?;
                 op(playback).await.map(|answer| (answer, opened))
@@ -813,10 +942,34 @@ impl ManagedPlayback {
 
     async fn read_remote(&self, offset: u64, length: u64) -> Result<Vec<u8>, SdkError> {
         let backend = &self.0.backend;
-        self.resuming(None, move |p| async move {
-            backend.read(&p.handle, offset, length).await
-        })
-        .await
+        let bytes = self
+            .resuming(None, move |p| async move {
+                backend.read(&p.handle, offset, length).await
+            })
+            .await?;
+        self.read_now();
+        Ok(bytes)
+    }
+
+    /// Bytes were read: the server heard from the playback.
+    fn read_now(&self) {
+        let mut state = self.0.state.lock();
+        let now = Instant::now();
+        state.read_at = now;
+        state.contact = now;
+        drop(state);
+        self.0.settled.send_replace(true);
+    }
+
+    /// Where the viewer last was: reported, sought to, or set.
+    pub(crate) fn last_position(&self) -> Option<Duration> {
+        self.0.state.lock().position
+    }
+
+    /// Wait `time` on the playback's runtime, from any thread or
+    /// executor: the timer is the runtime's.
+    pub(crate) async fn delay(&self, time: Duration) {
+        let _ = self.0.runtime.spawn(tokio::time::sleep(time)).await;
     }
 
     /// Fetch what the keeper is missing of the file, a piece at a time,
@@ -878,11 +1031,12 @@ impl ManagedPlayback {
             .await
         {
             Err(SdkError::PlaybackExpired) => {
-                self.restart(&p.handle, Restart::Resume { at: None })
+                self.replace(&p.handle, Restart::Resume { at: None })
                     .await?;
                 Err(self.moved_on(source))
             }
             Ok(chunk) => {
+                self.read_now();
                 if let Some(keeper) = self.0.keeper.get() {
                     keeper.chunk(source, offset, &chunk).await;
                 }
@@ -957,6 +1111,7 @@ impl ManagedPlayback {
                 })
                 .await?;
             self.opened_segment(variant, n, &opened);
+            self.read_now();
             self.segment_read(n, 0, chunk.bytes.len() as u64, chunk.size, chunk.complete);
             return Ok(chunk);
         }
@@ -966,10 +1121,11 @@ impl ManagedPlayback {
             .await
         {
             Err(SdkError::PlaybackExpired) => {
-                self.restart(&p.handle, Restart::Resume { at }).await?;
+                self.replace(&p.handle, Restart::Resume { at }).await?;
                 Err(self.resumed_error(at))
             }
             Ok(chunk) => {
+                self.read_now();
                 let read = chunk.bytes.len() as u64;
                 self.segment_read(n, offset, read, chunk.size, chunk.complete);
                 Ok(chunk)
@@ -1016,6 +1172,7 @@ impl ManagedPlayback {
             let body = self.open_rest(&p, variant, n, offset, length, at).await?;
             (body, opened)
         };
+        self.read_now();
         Ok(SegmentStream {
             playback: self.clone(),
             body,
@@ -1106,7 +1263,7 @@ impl ManagedPlayback {
             .await
         {
             Err(SdkError::PlaybackExpired) => {
-                self.restart(&p.handle, Restart::Resume { at }).await?;
+                self.replace(&p.handle, Restart::Resume { at }).await?;
                 Err(self.resumed_error(at))
             }
             answer => answer,
@@ -1131,11 +1288,16 @@ impl ManagedPlayback {
             .await
         {
             Err(SdkError::PlaybackExpired) => {
-                self.restart(&p.handle, Restart::Resume { at: None })
+                self.replace(&p.handle, Restart::Resume { at: None })
                     .await?;
                 Err(self.moved_on(source))
             }
-            answer => answer,
+            answer => {
+                if answer.is_ok() {
+                    self.read_now();
+                }
+                answer
+            }
         }
     }
 
@@ -1213,7 +1375,7 @@ impl ManagedPlayback {
         let at = at.or(self.0.state.lock().resumed_at).unwrap_or_default();
         SdkError::PlaybackResumed { at }
     }
-    async fn restart(&self, old: &PlaybackHandle, restart: Restart) -> Result<(), SdkError> {
+    async fn replace(&self, old: &PlaybackHandle, restart: Restart) -> Result<(), SdkError> {
         let _control = self.0.control.lock().await;
         self.restart_locked(old, restart).await
     }
@@ -1234,14 +1396,16 @@ impl ManagedPlayback {
                 return Ok(());
             }
             let now = Instant::now();
-            while state
-                .resumes
-                .front()
-                .is_some_and(|t| now.duration_since(*t) >= Self::RESUME_WINDOW)
+            let counted = revival(restart);
+            while counted
+                && state
+                    .resumes
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) >= Self::RESUME_WINDOW)
             {
                 state.resumes.pop_front();
             }
-            if state.resumes.len() >= Self::MAX_RESUMES {
+            if counted && state.resumes.len() >= Self::MAX_RESUMES {
                 tracing::warn!(
                     handle = %old.0,
                     "the playback expired again; not resuming it more than {} times in {} s",
@@ -1250,17 +1414,23 @@ impl ManagedPlayback {
                 );
                 return Err(SdkError::PlaybackExpired);
             }
-            state.resumes.push_back(now);
+            if counted {
+                state.resumes.push_back(now);
+            }
             let start = match restart {
                 Restart::Resume { at } => at.or(state.position),
-                Restart::Control { at } => Some(at),
+                Restart::Control { at } | Restart::Reselect { at, .. } => Some(at),
             }
             .or(state.options.start);
             let options = PlaybackOptions {
                 start,
                 ..state.options.clone()
             };
-            (state.playback.clone(), state.selection, options)
+            let selection = match restart {
+                Restart::Reselect { selection, .. } => Some(selection),
+                _ => state.selection,
+            };
+            (state.playback.clone(), selection, options)
         };
         let admission = admitted(
             self.0.runtime.clone(),
@@ -1273,9 +1443,10 @@ impl ManagedPlayback {
         let mut admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
-                if ends_for_good(&error) {
+                if revival(restart) && ends_for_good(&error) {
                     tracing::info!(handle = %old.0, %error, "the playback cannot be resumed");
                     self.0.state.lock().ended = Some(error.clone());
+                    self.0.settled.send_replace(true);
                 }
                 return Err(error);
             }
@@ -1285,6 +1456,7 @@ impl ManagedPlayback {
             // Dropping the admission stops the new playback.
             tracing::info!(handle = %old.0, "the resumed playback plays differently; not swapped in");
             self.0.state.lock().ended = Some(SdkError::PlaybackChanged);
+            self.0.settled.send_replace(true);
             return Err(SdkError::PlaybackChanged);
         }
         let next = admission.playback.take().expect("admitted playback");
@@ -1292,9 +1464,16 @@ impl ManagedPlayback {
             let mut state = self.0.state.lock();
             state.playback = next.clone();
             state.generation += 1;
+            if let Restart::Reselect { selection, .. } = restart {
+                state.selection = Some(selection);
+            }
+            // The budget refills after a stretch of play since this.
+            if state.playing_since.is_some() {
+                state.playing_since = Some(Instant::now());
+            }
             state.resumed_at = match restart {
                 Restart::Resume { .. } => Some(options.start.unwrap_or_default()),
-                Restart::Control { .. } => None,
+                Restart::Control { .. } | Restart::Reselect { .. } => None,
             };
             // The new playback learns where the viewer is (Continue
             // watching) before the player reports again.
@@ -1309,6 +1488,15 @@ impl ManagedPlayback {
             start_ms = options.start.map(|s| s.as_millis() as u64),
             "the server had ended the playback; started it again"
         );
+        if !revival(restart) {
+            let (backend, old) = (self.0.backend.clone(), old.clone());
+            self.0.runtime.spawn(async move {
+                let _ = backend.stop(&old).await;
+            });
+        }
+        let _ = self.0.events.send(PlaybackEvent::HandleChanged {
+            handle: next.handle.clone(),
+        });
         self.0.changed.send_replace(next);
         Ok(())
     }
@@ -1622,6 +1810,8 @@ impl ManagedPlayback {
             let mut state = self.0.state.lock();
             state.closed = true;
             state.pending = None;
+            drop(state);
+            self.0.settled.send_replace(true);
         }
         progress.and(stop)
     }
@@ -1789,6 +1979,23 @@ mod tests {
         release: Notify,
         /// The server's share events, once a test sends some (PX-46).
         shares: Mutex<Option<broadcast::Sender<PlaybackShare>>>,
+        /// Start a progressive conversion, not a direct play.
+        converted: std::sync::atomic::AtomicBool,
+        /// Chunks read.
+        chunks: std::sync::atomic::AtomicUsize,
+        /// The subtitle file's answers, in turn; the plan's subtitle is
+        /// read as text while any are left.
+        subtitles: Mutex<VecDeque<Result<Subtitle, SdkError>>>,
+        /// Plays as a paired server's item, from that server.
+        routed: std::sync::atomic::AtomicBool,
+        /// Direct reads made.
+        reads: std::sync::atomic::AtomicUsize,
+        /// Starts refused as Busy before one is let through.
+        busy: std::sync::atomic::AtomicUsize,
+        /// The converted subtitle is copied into the output.
+        copy_subtitle: std::sync::atomic::AtomicBool,
+        /// The server's subtitle timing changes, once a test sends some.
+        timings: Mutex<Option<broadcast::Sender<crate::SubtitleTimingEvent>>>,
     }
     use std::sync::atomic::Ordering::SeqCst;
     fn item() -> MediaId {
@@ -1818,14 +2025,54 @@ mod tests {
             _: Option<Selection>,
             _: PlaybackOptions,
         ) -> Result<Playback, SdkError> {
+            if self
+                .busy
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                self.events.lock().push("busy".into());
+                return Err(SdkError::Busy);
+            }
             let n = self.starts.fetch_add(1, SeqCst) + 1;
             if self.hold_start.load(SeqCst) {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
-            Ok(playback(n))
+            let mut p = playback(n);
+            if self.converted.load(SeqCst) {
+                p.size = 0;
+                p.plan = PlaybackPlan::Converted {
+                    delivery: spoolframe_types::Delivery::Progressive,
+                    container: Container::Matroska,
+                    video: None,
+                    audio: None,
+                    subtitle: if self.copy_subtitle.load(SeqCst) {
+                        Some(spoolframe_protocol::ConvertedSubtitle {
+                            index: 0,
+                            action: spoolframe_protocol::SubtitleAction::Copy {
+                                format: spoolframe_types::SubtitleFormat::Srt,
+                            },
+                        })
+                    } else {
+                        (!self.subtitles.lock().is_empty()).then_some(
+                            spoolframe_protocol::ConvertedSubtitle {
+                                index: 0,
+                                action: spoolframe_protocol::SubtitleAction::Ocr {
+                                    from: spoolframe_types::SubtitleFormat::Pgs,
+                                    to: spoolframe_types::SubtitleFormat::Srt,
+                                },
+                            },
+                        )
+                    },
+                    ladder: Vec::new(),
+                    reasons: vec![],
+                    source_codec: None,
+                };
+            }
+            Ok(p)
         }
         async fn read(&self, h: &PlaybackHandle, _: u64, _: u64) -> Result<Vec<u8>, SdkError> {
+            self.reads.fetch_add(1, SeqCst);
             if self.stopped.load(SeqCst) {
                 Err(SdkError::PlaybackStopped)
             } else if h.0 == "1" && self.expired.load(SeqCst) {
@@ -1841,6 +2088,7 @@ mod tests {
             _: u64,
             _: u64,
         ) -> Result<Chunk, SdkError> {
+            self.chunks.fetch_add(1, SeqCst);
             Ok(Chunk {
                 bytes: vec![42],
                 size: 1,
@@ -1858,10 +2106,13 @@ mod tests {
         async fn subtitle(
             &self,
             _: &PlaybackHandle,
-            _: Option<u32>,
+            selected: Option<u32>,
             _: BitmapSubtitles,
-            _: Duration,
+            at: Duration,
         ) -> Result<PlaybackChange, SdkError> {
+            self.events
+                .lock()
+                .push(format!("subtitle-change:{selected:?}:{}", at.as_secs()));
             Err(SdkError::Busy)
         }
         async fn progress(&self, h: &PlaybackHandle, p: Duration) -> Result<(), SdkError> {
@@ -1900,6 +2151,21 @@ mod tests {
                 epoch: 0,
             })
         }
+        fn route(&self) -> Option<crate::RemoteMode> {
+            self.routed
+                .load(SeqCst)
+                .then_some(crate::RemoteMode::Direct)
+        }
+        fn subtitle_timings(
+            &self,
+        ) -> Option<(String, broadcast::Receiver<crate::SubtitleTimingEvent>)> {
+            let timings = self.timings.lock();
+            Some(("srv".into(), timings.as_ref()?.subscribe()))
+        }
+        async fn read_subtitle(&self, _: &PlaybackHandle) -> Result<Subtitle, SdkError> {
+            self.events.lock().push("subtitle".into());
+            self.subtitles.lock().pop_front().expect("an answer")
+        }
         fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
             self.shares
                 .lock()
@@ -1926,6 +2192,25 @@ mod tests {
             handle: PlaybackHandle(handle.into()),
             max_bitrate,
         }
+    }
+
+    /// The tests a caller makes of it read it as it is now, with no copy.
+    #[tokio::test]
+    async fn a_playback_is_read_as_it_is_now() {
+        let b = Arc::new(Backend::default());
+        b.converted.store(true, SeqCst);
+        let p = open(b).await;
+        let now = p.snapshot();
+        assert_eq!(
+            (
+                p.is_planned(&now.plan),
+                p.is_planned(&playback(1).plan),
+                p.is_converted(),
+                p.is_handle(&PlaybackHandle("1".into())),
+                p.is_handle(&PlaybackHandle("2".into())),
+            ),
+            (true, false, true, true, false)
+        );
     }
 
     /// PX-46: the server tells this playback its share moved; in Auto it
@@ -2207,6 +2492,422 @@ mod tests {
         p.close().await.unwrap();
     }
 
+    fn progress(b: &Backend) -> Vec<String> {
+        b.events
+            .lock()
+            .iter()
+            .filter(|e| e.starts_with("progress:"))
+            .cloned()
+            .collect()
+    }
+
+    fn playing(secs: u64) -> PlayerState {
+        PlayerState::Playing {
+            pos: Duration::from_secs(secs),
+        }
+    }
+
+    fn paused(secs: u64) -> PlayerState {
+        PlayerState::Paused {
+            pos: Duration::from_secs(secs),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_playing_playback_reports_every_ten_seconds() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.set_state(playing(3)).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(progress(&b).is_empty(), "{:?}", progress(&b));
+        p.set_state(playing(8)).unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(progress(&b), ["progress:1:8"]);
+        p.set_state(playing(18)).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(progress(&b), ["progress:1:8", "progress:1:18"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_move_backwards_is_reported_at_once() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.set_state(playing(300)).unwrap();
+        p.set_state(playing(300) /* jitter */).unwrap();
+        p.set_state(PlayerState::Playing {
+            pos: Duration::from_millis(299_500),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(progress(&b).is_empty());
+        p.set_state(playing(40)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(progress(&b), ["progress:1:40"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_is_reported_at_once_and_kept_alive_every_minute() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.set_state(playing(30)).unwrap();
+        p.set_state(paused(31)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(progress(&b), ["progress:1:31"]);
+        // Paused again: nothing new to say.
+        p.set_state(paused(31)).unwrap();
+        tokio::time::sleep(Duration::from_secs(55)).await;
+        assert_eq!(progress(&b).len(), 1);
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        assert_eq!(progress(&b), ["progress:1:31", "progress:1:31"]);
+    }
+
+    /// A paired server's item reports home: the server that plays it is
+    /// kept by a read, and home still hears where it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_paired_servers_item_is_kept_alive_by_a_read() {
+        let b = Arc::new(Backend::default());
+        b.routed.store(true, SeqCst);
+        let p = open(b.clone()).await;
+        p.set_state(paused(31)).unwrap();
+        tokio::time::sleep(Duration::from_secs(55)).await;
+        assert_eq!(b.reads.load(SeqCst), 0);
+        // The tick at 70 s, a minute after the pause's report.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(b.reads.load(SeqCst), 1);
+        assert_eq!(progress(&b), ["progress:1:31", "progress:1:31"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_keeps_paused_playbacks_gets_no_keep_alive() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.set_keepalive_needed(false);
+        p.set_state(paused(31)).unwrap();
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(progress(&b), ["progress:1:31"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_conversion_that_reads_nothing_reads_a_byte_every_minute() {
+        let b = Arc::new(Backend::default());
+        b.converted.store(true, SeqCst);
+        let p = open(b.clone()).await;
+        p.set_state(playing(0)).unwrap();
+        tokio::time::sleep(Duration::from_secs(55)).await;
+        assert_eq!(b.chunks.load(SeqCst), 0);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(b.chunks.load(SeqCst), 1);
+        // Reads of its own count as use.
+        p.read_chunk(&p.snapshot(), 0, 1).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(55)).await;
+        assert_eq!(b.chunks.load(SeqCst), 2);
+        p.set_keepalive_needed(false);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(b.chunks.load(SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_and_close_reports_the_last_position_then_stops() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.set_state(playing(70)).unwrap();
+        p.flush_and_close().await.unwrap();
+        assert_eq!(*b.events.lock(), ["progress:1:70", "stop:1"]);
+        assert_eq!(p.set_state(playing(71)), Err(SdkError::PlaybackClosed));
+        assert_eq!(p.stopped(), Some(PlaybackStopped::Closed));
+    }
+
+    #[tokio::test]
+    async fn a_lost_transport_starts_a_new_playback_where_the_viewer_was() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.set_state(playing(42)).unwrap();
+        let next = p.restart(RestartCause::TransportLost).await.unwrap();
+        assert_eq!(next.handle.0, "2");
+        until(|| b.events.lock().contains(&"stop:1".into())).await;
+        assert!(b.events.lock().contains(&"progress:2:42".into()));
+    }
+
+    fn srt(text: &str) -> Result<Subtitle, SdkError> {
+        Ok(Subtitle {
+            format: spoolframe_types::SubtitleFormat::Srt,
+            bytes: text.into(),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subtitle_still_being_read_is_asked_for_every_five_seconds() {
+        let b = Arc::new(Backend::default());
+        b.converted.store(true, SeqCst);
+        *b.subtitles.lock() = VecDeque::from([
+            Err(SdkError::SubtitleNotReady { done_percent: 10 }),
+            Err(SdkError::SubtitleNotReady { done_percent: 60 }),
+            srt("1\n00:00:01,000 --> 00:00:02,000\nHi\n"),
+        ]);
+        let p = open(b.clone()).await;
+        let asked = Instant::now();
+        let file = p.subtitle_file().await.unwrap();
+        assert_eq!(asked.elapsed(), 2 * ManagedPlayback::SUBTITLE_RETRY);
+        assert_eq!(file.format, spoolframe_types::SubtitleFormat::Srt);
+        assert_eq!(
+            b.events.lock().iter().filter(|e| *e == "subtitle").count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_subtitle_file_is_refused() {
+        let b = Arc::new(Backend::default());
+        b.converted.store(true, SeqCst);
+        *b.subtitles.lock() = VecDeque::from([srt("  \n")]);
+        let p = open(b.clone()).await;
+        assert!(matches!(
+            p.subtitle_file().await,
+            Err(SdkError::Protocol(why)) if why.contains("empty")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_plan_with_no_subtitle_file_has_none_to_fetch() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        assert!(matches!(
+            p.subtitle_file().await,
+            Err(SdkError::InvalidInput(_))
+        ));
+        assert!(b.events.lock().is_empty());
+    }
+
+    fn timing(offset_ms: i64, sync: spoolframe_types::SubtitleSync) -> crate::SubtitleTimingEvent {
+        crate::SubtitleTimingEvent {
+            server: "srv".into(),
+            id: item(),
+            track: 0,
+            timing: spoolframe_types::SubtitleTiming {
+                sync,
+                offset_ms,
+                offset_by: None,
+                offset_at: None,
+            },
+        }
+    }
+
+    /// A playback showing subtitle 0, whose server sends timing changes.
+    async fn showing_subtitle(
+        b: &Arc<Backend>,
+    ) -> (
+        ManagedPlayback,
+        broadcast::Sender<crate::SubtitleTimingEvent>,
+    ) {
+        let (timings, _) = broadcast::channel(4);
+        *b.timings.lock() = Some(timings.clone());
+        let selection = Selection {
+            audio: None,
+            subtitle: Some(0),
+        };
+        let p = ManagedPlayback::open(
+            b.clone(),
+            item(),
+            Some(selection),
+            PlaybackOptions::default(),
+        )
+        .await
+        .unwrap();
+        p.report_position(Duration::from_secs(42)).unwrap();
+        (p, timings)
+    }
+
+    /// A subtitle in a converted output carries its timing in the
+    /// encode: a change on another device plans the playback again.
+    #[tokio::test]
+    async fn a_retimed_subtitle_in_the_output_plans_the_playback_again() {
+        let b = Arc::new(Backend::default());
+        b.converted.store(true, SeqCst);
+        b.copy_subtitle.store(true, SeqCst);
+        let (_p, timings) = showing_subtitle(&b).await;
+        timings
+            .send(timing(500, spoolframe_types::SubtitleSync::Original))
+            .unwrap();
+        until(|| {
+            b.events
+                .lock()
+                .contains(&"subtitle-change:Some(0):42".into())
+        })
+        .await;
+    }
+
+    /// One read as text comes as a file: the app is told to read it
+    /// again. A sync that has only begun, or another server's track,
+    /// changes nothing.
+    #[tokio::test]
+    async fn a_retimed_subtitle_file_is_read_again() {
+        let b = Arc::new(Backend::default());
+        b.converted.store(true, SeqCst);
+        *b.subtitles.lock() = VecDeque::from([srt("1")]);
+        let (p, timings) = showing_subtitle(&b).await;
+        let mut events = p.events();
+        let mut elsewhere = timing(100, spoolframe_types::SubtitleSync::Original);
+        elsewhere.server = "other".into();
+        timings.send(elsewhere).unwrap();
+        timings
+            .send(timing(0, spoolframe_types::SubtitleSync::Original))
+            .unwrap();
+        assert_eq!(
+            events.recv().await,
+            Ok(PlaybackEvent::SubtitleRetimed { track: 0 })
+        );
+        timings
+            .send(timing(0, spoolframe_types::SubtitleSync::Syncing))
+            .unwrap();
+        timings
+            .send(timing(300, spoolframe_types::SubtitleSync::Syncing))
+            .unwrap();
+        assert_eq!(
+            events.recv().await,
+            Ok(PlaybackEvent::SubtitleRetimed { track: 0 })
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(events.try_recv().is_err());
+        assert!(
+            !b.events
+                .lock()
+                .iter()
+                .any(|e| e.starts_with("subtitle-change"))
+        );
+    }
+
+    /// An AirPlay or Chromecast receiver holds a URL bound to the
+    /// handle: a new handle is an event.
+    #[tokio::test]
+    async fn a_new_handle_is_an_event() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        let mut events = p.events();
+        b.expired.store(true, SeqCst);
+        p.read(0, 1).await.unwrap();
+        assert_eq!(
+            events.recv().await,
+            Ok(PlaybackEvent::HandleChanged {
+                handle: PlaybackHandle("2".into())
+            })
+        );
+        // A seek keeps the handle.
+        p.seek(Duration::from_secs(5)).await.unwrap();
+        assert!(events.try_recv().is_err());
+    }
+
+    async fn next_after(
+        b: &Arc<Backend>,
+        after: &ManagedPlayback,
+    ) -> Result<ManagedPlayback, SdkError> {
+        ManagedPlayback::open_after(b.clone(), item(), after, None, PlaybackOptions::default())
+            .await
+    }
+
+    /// Opened at once, the next could end the one playing before its
+    /// player read a byte: it waits for that read, 10 s at most.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_item_waits_for_the_one_playing_to_be_read() {
+        let b = Arc::new(Backend::default());
+        let playing = open(b.clone()).await;
+        let asked = Instant::now();
+        next_after(&b, &playing).await.unwrap();
+        assert_eq!(asked.elapsed(), Duration::from_secs(10));
+        playing.read(0, 1).await.unwrap();
+        let asked = Instant::now();
+        next_after(&b, &playing).await.unwrap();
+        assert_eq!(asked.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_next_item_is_tried_again_four_times_in_all() {
+        let b = Arc::new(Backend::default());
+        let playing = open(b.clone()).await;
+        playing.read(0, 1).await.unwrap();
+        b.busy.store(3, SeqCst);
+        let asked = Instant::now();
+        assert!(next_after(&b, &playing).await.is_ok());
+        // 500 ms, then 1 s, then 1.5 s.
+        assert_eq!(asked.elapsed(), Duration::from_millis(3_000));
+        b.busy.store(4, SeqCst);
+        assert_eq!(next_after(&b, &playing).await.err(), Some(SdkError::Busy));
+        assert_eq!(b.busy.load(SeqCst), 0);
+    }
+
+    /// The viewer picked one item, then another while the first was
+    /// still being started: the first's late answer is ended, not played.
+    #[tokio::test]
+    async fn a_start_overtaken_by_another_is_ended_as_it_answers() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        b.hold_start.store(true, SeqCst);
+        let first = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .start(item(), None, PlaybackOptions::default())
+                    .await
+            })
+        };
+        b.entered.notified().await;
+        b.hold_start.store(false, SeqCst);
+        let second = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .start(item(), None, PlaybackOptions::default())
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        b.release.notify_one();
+        assert_eq!(first.await.unwrap().err(), Some(SdkError::PlaybackClosed));
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(second.snapshot().handle.0, "2");
+        assert_eq!(
+            session.current().map(|p| p.snapshot().handle.0),
+            Some("2".into())
+        );
+        assert!(b.events.lock().contains(&"stop:1".into()));
+    }
+
+    /// A new start stops what played, after its last report, before it
+    /// is asked; an end stops it too.
+    #[tokio::test]
+    async fn a_start_ends_what_played_first_and_an_end_ends_it() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        let one = session
+            .start(item(), None, PlaybackOptions::default())
+            .await
+            .unwrap();
+        one.report_position(Duration::from_secs(30)).unwrap();
+        session
+            .start(item(), None, PlaybackOptions::default())
+            .await
+            .unwrap();
+        session.end().await;
+        assert_eq!(*b.events.lock(), ["progress:1:30", "stop:1", "stop:2"]);
+        assert!(session.current().is_none());
+        assert_eq!(
+            session.restart(RestartCause::Expired).await.err(),
+            Some(SdkError::PlaybackClosed)
+        );
+    }
+
+    #[test]
+    fn an_error_says_whether_the_playback_is_over_for_good() {
+        assert_eq!(
+            PlaybackStopped::of(&SdkError::PlaybackStopped),
+            Some(PlaybackStopped::ByAdmin)
+        );
+        assert_eq!(
+            PlaybackStopped::of(&SdkError::PlaybackExpired),
+            Some(PlaybackStopped::TooManyRestarts)
+        );
+        assert_eq!(PlaybackStopped::of(&SdkError::Busy), None);
+    }
+
     /// A server that ends every live playback on `expire`, as idling out,
     /// a restart or a device gone do; it records each start.
     mod resume {
@@ -2240,6 +2941,8 @@ mod tests {
             replan_epoch: Mutex<Option<u32>>,
             /// The plan of the last start.
             plan: Mutex<Option<PlaybackPlan>>,
+            /// Each track choice kept.
+            overrides: Mutex<Vec<Selection>>,
         }
         impl Server {
             fn expire(&self) {
@@ -2343,6 +3046,14 @@ mod tests {
             }
             fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
                 self.meter.lock().clone()
+            }
+            async fn set_track_override(
+                &self,
+                _: &MediaId,
+                selection: Selection,
+            ) -> Result<(), SdkError> {
+                self.overrides.lock().push(selection);
+                Ok(())
             }
             async fn limit(
                 &self,
@@ -2511,6 +3222,40 @@ mod tests {
             assert_eq!(s.started(), 1 + ManagedPlayback::MAX_RESUMES);
             tokio::time::advance(ManagedPlayback::RESUME_WINDOW).await;
             assert_eq!(p.read(0, 1).await, Ok(vec![42]));
+        }
+
+        /// One budget: the app's restarts and the SDK's resumes count
+        /// together, and two minutes of play make it whole again.
+        #[tokio::test(start_paused = true)]
+        async fn the_restart_budget_is_shared_and_refilled_by_play() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            p.restart(RestartCause::TransportLost).await.unwrap();
+            for _ in 1..ManagedPlayback::MAX_RESUMES {
+                s.expire();
+                assert_eq!(p.read(0, 1).await, Ok(vec![42]));
+            }
+            assert_eq!(
+                p.restart(RestartCause::Expired).await,
+                Err(SdkError::PlaybackExpired)
+            );
+            p.set_state(PlayerState::Playing {
+                pos: Duration::from_secs(10),
+            })
+            .unwrap();
+            tokio::time::sleep(ManagedPlayback::REFILL_AFTER + Duration::from_secs(10)).await;
+            assert!(p.restart(RestartCause::Expired).await.is_ok());
+        }
+
+        /// The item's library was taken away under a restart: the playback
+        /// says why it is over.
+        #[tokio::test]
+        async fn a_restart_refused_for_good_says_why() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            *s.refuse.lock() = Some(SdkError::NotFound("item".into()));
+            assert!(p.restart(RestartCause::Expired).await.is_err());
+            assert_eq!(p.stopped(), Some(PlaybackStopped::Gone));
         }
 
         /// The progressive output of a new encode begins where it was
@@ -2732,6 +3477,77 @@ mod tests {
             assert_eq!(piece.len() as u64, two.size());
             drop(two);
             until(|| !s.limits.lock().is_empty()).await;
+        }
+
+        /// A link measured at 1000 bytes/s cannot carry 100 bytes in
+        /// 10 ms: a stall over 3 s asks once to be planned for it.
+        #[tokio::test]
+        async fn a_long_stall_on_a_slow_link_plans_once_for_the_link() {
+            let s = Arc::new(Server::default());
+            *s.meter.lock() = Some(slow_link());
+            *s.replan_epoch.lock() = Some(1);
+            let p = opened(&s).await;
+            let length = Duration::from_millis(10);
+            assert_eq!(p.stalled(Duration::from_secs(2), length).await, Ok(None));
+            assert!(s.limits.lock().is_empty());
+            p.stalled(Duration::from_secs(4), length).await.unwrap();
+            p.stalled(Duration::from_secs(9), length).await.unwrap();
+            assert_eq!(*s.limits.lock(), [8_000]);
+        }
+
+        /// A link that carries the file leaves a stall to the player.
+        #[tokio::test]
+        async fn a_stall_on_a_link_fast_enough_changes_nothing() {
+            let s = Arc::new(Server::default());
+            *s.meter.lock() = Some(slow_link());
+            let p = opened(&s).await;
+            let stalled = p
+                .stalled(Duration::from_secs(4), Duration::from_secs(60))
+                .await;
+            assert_eq!(stalled, Ok(None));
+            assert!(s.limits.lock().is_empty());
+        }
+
+        /// Other audio comes only with a new playback: started where the
+        /// viewer is with the new tracks, the old one stopped, and no
+        /// restart budget spent.
+        #[tokio::test]
+        async fn other_audio_starts_a_new_playback_with_it() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            p.report_position(Duration::from_secs(300)).unwrap();
+            let picked = Selection {
+                audio: Some(0),
+                subtitle: None,
+            };
+            // Back and forth, past the restart budget.
+            for n in 0..=ManagedPlayback::MAX_RESUMES {
+                let audio = Some(n as u32 % 2);
+                let pick = Selection { audio, ..picked };
+                let next = p.change_tracks(pick, true).await.unwrap();
+                assert_eq!(next.handle, PlaybackHandle(s.started().to_string()));
+            }
+            let (selection, options) = s.starts.lock()[1].clone();
+            assert_eq!(selection, Some(picked));
+            assert_eq!(options.start, Some(Duration::from_secs(300)));
+            until(|| !s.live.lock().contains("1")).await;
+            assert_eq!(s.overrides.lock().len(), 1 + ManagedPlayback::MAX_RESUMES);
+        }
+
+        /// The same audio with another subtitle is a change on the
+        /// playback, not a new one.
+        #[tokio::test]
+        async fn a_new_subtitle_with_the_same_audio_changes_the_playback() {
+            let s = Arc::new(Server::default());
+            let p = opened(&s).await;
+            let picked = Selection {
+                audio: Some(1),
+                subtitle: Some(0),
+            };
+            // The test server refuses subtitle changes as busy.
+            assert_eq!(p.change_tracks(picked, false).await, Err(SdkError::Busy));
+            assert_eq!(s.started(), 1);
+            assert!(s.overrides.lock().is_empty());
         }
 
         /// A different plan on the new start is not swapped in.

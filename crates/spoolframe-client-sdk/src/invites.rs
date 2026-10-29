@@ -41,23 +41,36 @@ use iroh::{EndpointId, RelayConfig, RelayUrl};
 use spoolframe_protocol::invite::{Invite, InviteLinkKind, MAX_HINTS, normalize_code, parse_link};
 use spoolframe_protocol::relay_access::invite_token;
 use spoolframe_protocol::{
-    InviteLookupOutcome, LookupInvite, RedeemInvite, RedeemPortableInvite, Reply, Request,
-    Response, fingerprint,
+    BeginInvitePasskey, FinishPasskeyRegistration, InviteLookupOutcome, LookupInvite,
+    PasskeyCreation, RedeemInvite, RedeemInviteWithPasskey, RedeemPortableInvite, Reply, Request,
+    Response, ServerId, fingerprint,
 };
 use spoolframe_types::Role;
 
 use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
+use crate::gate::{Gate, InvitePasskeys, Invited};
 use crate::invite_admin::{InviteKind, time};
 use crate::portable::PortableUserId;
 use crate::servers::{self, SavedServer};
 use crate::session::{Session, SignInMethod};
 use crate::{SdkError, ServerEntry};
 
+/// The code of account invite `invite`; one without only finds the
+/// server.
+fn code_of(invite: &Invite) -> Result<String, SdkError> {
+    invite.code.clone().ok_or_else(|| {
+        SdkError::InvalidInput(
+            "this invite has no code: it only finds the server; sign in instead".into(),
+        )
+    })
+}
+
 /// What an invite link says, read without a word to the server: for the
 /// "Add a server" summary and the join form ("Joins as a consumer ·
 /// expires Oct 14").
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InviteInfo {
     /// The server's key, hex: what the link pins.
     pub endpoint_id: String,
@@ -94,6 +107,7 @@ pub struct InviteInfo {
 /// What an invite's code is, as its server tells it before joining
 /// ([`Client::look_up_invite`]). Looking never uses it up.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum InviteOutcome {
     /// It can be redeemed now: with [`Client::redeem_invite`] for
     /// [`InviteKind::CreateUser`], [`Client::redeem_invite_portable`] for
@@ -123,12 +137,19 @@ pub enum InviteOutcome {
 
 /// An invite looked up: who answered, and what its code is.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InviteLookup {
     /// The server that answered, as [`Client::connect_invite`] says it:
     /// its name, fingerprint and server id, for "Is this the server you
     /// were invited to?". Not saved by the lookup.
     pub server: ServerEntry,
     pub outcome: InviteOutcome,
+    /// The invite as a link, which joining takes
+    /// ([`Client::redeem_invite`]): the link looked up, or for a code
+    /// typed in, one made of the server that answered (its addresses,
+    /// relays and lookup, so a server reached only through them is
+    /// joined through them too), what it said of the code, and the code.
+    pub link: String,
 }
 
 /// `typed` as an invite's code, normalized (`QW7K2MFPXR4T`), whatever
@@ -158,6 +179,142 @@ fn outcome_of(outcome: InviteLookupOutcome) -> InviteOutcome {
         InviteLookupOutcome::Revoked => InviteOutcome::Revoked,
         InviteLookupOutcome::NoMatch => InviteOutcome::NoMatch,
         InviteLookupOutcome::Unknown => InviteOutcome::Unknown,
+    }
+}
+
+/// Code `code`, typed for `server`, as an invite link: the server's
+/// name, `addrs` and relays (at most [`MAX_HINTS`] of each, as a link is
+/// read), its pkarr `lookup`, and what the server said of the code.
+fn code_link(
+    server: &ServerEntry,
+    addrs: Vec<SocketAddr>,
+    lookup: Option<String>,
+    code: String,
+    outcome: &InviteOutcome,
+) -> String {
+    let mut invite = Invite {
+        server: server.endpoint_id.clone(),
+        name: Some(server.name.clone()),
+        addrs: addrs.into_iter().take(MAX_HINTS).collect(),
+        relays: server.relays.iter().take(MAX_HINTS).cloned().collect(),
+        lookup,
+        code: Some(code),
+        ..Invite::default()
+    };
+    if let InviteOutcome::Valid {
+        kind,
+        role,
+        expires_at,
+        ..
+    } = outcome
+    {
+        invite.role = Some(*role);
+        invite.expires_at = expires_at
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        invite.kind = match kind {
+            InviteKind::PortableAccount => InviteLinkKind::PortableAccount,
+            InviteKind::Federation => InviteLinkKind::Federation,
+            InviteKind::CreateUser | InviteKind::Unknown => InviteLinkKind::CreateUser,
+        };
+    }
+    invite.link()
+}
+
+/// Why an invite's code will not work, as an app words it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum InviteRefusal {
+    /// No invite has the code, or it was revoked.
+    Invalid,
+    Expired,
+    /// Every use it had is used.
+    Used,
+    Revoked,
+    /// It is for the other kind of join: an account, or a portable
+    /// identity.
+    WrongKind,
+}
+
+impl InviteRefusal {
+    /// What a lookup said, as a refusal; `None` for a code that works, or
+    /// an outcome this build does not know (joining finds out).
+    pub fn of_outcome(outcome: &InviteOutcome) -> Option<Self> {
+        match outcome {
+            InviteOutcome::Expired { .. } => Some(Self::Expired),
+            InviteOutcome::Used => Some(Self::Used),
+            InviteOutcome::Revoked => Some(Self::Revoked),
+            InviteOutcome::NoMatch => Some(Self::Invalid),
+            InviteOutcome::Valid { .. } | InviteOutcome::Unknown => None,
+        }
+    }
+
+    /// What a redemption's `error` says of the code; `None` for one that
+    /// is not about it.
+    pub fn of_error(error: &SdkError) -> Option<Self> {
+        match error {
+            SdkError::InviteInvalid => Some(Self::Invalid),
+            SdkError::InviteExpired => Some(Self::Expired),
+            SdkError::InviteExhausted => Some(Self::Used),
+            SdkError::WrongInviteKind => Some(Self::WrongKind),
+            _ => None,
+        }
+    }
+
+    /// The error redeeming such a code is.
+    fn error(self) -> SdkError {
+        match self {
+            Self::Invalid | Self::Revoked => SdkError::InviteInvalid,
+            Self::Expired => SdkError::InviteExpired,
+            Self::Used => SdkError::InviteExhausted,
+            Self::WrongKind => SdkError::WrongInviteKind,
+        }
+    }
+}
+
+/// What an invite's check leads to once its server is reached
+/// ([`invite_next`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum InviteNext {
+    /// The account form: username, display name, password
+    /// ([`Client::redeem_invite`]).
+    MakeAccount,
+    /// Join as one of this device's identities
+    /// ([`Client::redeem_invite_portable`]).
+    JoinAsIdentity,
+    /// A guest invite, with no identity here to join as: make one first,
+    /// or open it on the phone that holds one.
+    NeedsIdentity,
+    /// A link that only finds the server: save it
+    /// ([`Client::save_invite_server`]), then sign in.
+    SaveServer,
+    /// A server invite: an admin pairs the open server with it
+    /// ([`crate::Session::pair_server`]), never a join.
+    PairServer,
+    /// The code will not work: say why, and offer "Save server only".
+    Refused { why: InviteRefusal },
+}
+
+/// What invite `info` leads to: by what the server said of its code in
+/// `lookup` first, else by what the link says. `identities_here`: this
+/// device holds a portable identity that can join (one whose root is
+/// here). The Apple and Linux apps each decided this alone.
+pub fn invite_next(
+    info: &InviteInfo,
+    lookup: Option<&InviteLookup>,
+    identities_here: bool,
+) -> InviteNext {
+    if let Some(why) = lookup.and_then(|l| InviteRefusal::of_outcome(&l.outcome)) {
+        return InviteNext::Refused { why };
+    }
+    match info.kind {
+        InviteLinkKind::Federation => InviteNext::PairServer,
+        InviteLinkKind::PortableAccount if identities_here => InviteNext::JoinAsIdentity,
+        InviteLinkKind::PortableAccount => InviteNext::NeedsIdentity,
+        InviteLinkKind::CreateUser if info.has_code => InviteNext::MakeAccount,
+        InviteLinkKind::CreateUser => InviteNext::SaveServer,
     }
 }
 
@@ -209,12 +366,8 @@ impl Client {
         invite: &Invite,
         id: EndpointId,
     ) -> Result<(ServerEntry, Arc<ServerConnection>), SdkError> {
-        let conn = self.reach(invite, id).await?;
-        let saved = servers::load(self.inner.storage.as_ref()).await?;
+        let (conn, saved) = self.reach_checked(invite, id).await?;
         let pinned = saved.iter().find(|s| s.endpoint_id == invite.server);
-        if pinned.is_none() {
-            refuse_another_key(&saved, id, &conn)?;
-        }
         Ok((self.entry(id, &conn, pinned), conn))
     }
 
@@ -235,7 +388,11 @@ impl Client {
         };
         let (server, _) = self.connect_invited(&invite, id).await?;
         let outcome = self.look_up(id, code).await?;
-        Ok(InviteLookup { server, outcome })
+        Ok(InviteLookup {
+            server,
+            outcome,
+            link: invite.link(),
+        })
     }
 
     /// "Got an invite?" with a code typed in, for server `endpoint_id`: a
@@ -257,8 +414,55 @@ impl Client {
         let id = parse_id(endpoint_id)?;
         self.hint_addrs(id, &addrs);
         let server = self.connect(&id.to_string()).await?;
-        let outcome = self.look_up(id, code).await?;
-        Ok(InviteLookup { server, outcome })
+        let outcome = self.look_up(id, code.clone()).await?;
+        let lookup = servers::load(self.inner.storage.as_ref())
+            .await?
+            .into_iter()
+            .find(|s| s.endpoint_id == server.endpoint_id)
+            .and_then(|s| s.lookup);
+        let addrs = if addrs.is_empty() {
+            server.addrs.clone()
+        } else {
+            addrs
+        };
+        let link = code_link(&server, addrs, lookup, code, &outcome);
+        Ok(InviteLookup {
+            server,
+            outcome,
+            link,
+        })
+    }
+
+    /// Join with a code typed in, for server `endpoint_id` (as for
+    /// [`Client::look_up_invite_code`]): the code is looked up, then
+    /// redeemed as [`Client::redeem_invite`] redeems a link, with nothing
+    /// else to type. A code the lookup says will not work is refused as
+    /// redeeming it would be ([`SdkError::InviteInvalid`],
+    /// [`SdkError::InviteExpired`], [`SdkError::InviteExhausted`]); one for
+    /// a portable identity is [`SdkError::WrongInviteKind`].
+    pub async fn redeem_invite_code(
+        &self,
+        endpoint_id: &str,
+        addrs: Vec<SocketAddr>,
+        typed: &str,
+        username: &str,
+        display_name: Option<&str>,
+        password: &str,
+    ) -> Result<Session, SdkError> {
+        let lookup = self.look_up_invite_code(endpoint_id, addrs, typed).await?;
+        match InviteRefusal::of_outcome(&lookup.outcome) {
+            Some(refusal) => Err(refusal.error()),
+            None => match lookup.outcome {
+                InviteOutcome::Valid {
+                    kind: InviteKind::PortableAccount | InviteKind::Federation,
+                    ..
+                } => Err(SdkError::WrongInviteKind),
+                _ => {
+                    self.redeem_invite(&lookup.link, username, display_name, password)
+                        .await
+                }
+            },
+        }
     }
 
     /// Ask server `id` what invite `code` is.
@@ -355,18 +559,10 @@ impl Client {
         password: &str,
     ) -> Result<Session, SdkError> {
         let (invite, id) = parsed(link)?;
-        let Some(code) = invite.code.clone() else {
-            return Err(SdkError::InvalidInput(
-                "this invite has no code: it only finds the server; sign in instead".into(),
-            ));
-        };
-        let conn = self.reach(&invite, id).await?;
+        let code = code_of(&invite)?;
         // Before an account is made: a key claiming a saved server's id
         // is refused now, not after.
-        let saved = servers::load(self.inner.storage.as_ref()).await?;
-        if !saved.iter().any(|s| s.endpoint_id == invite.server) {
-            refuse_another_key(&saved, id, &conn)?;
-        }
+        self.reach_checked(&invite, id).await?;
         let request = Request::RedeemInvite(RedeemInvite {
             code,
             username: username.to_owned(),
@@ -389,6 +585,22 @@ impl Client {
         self.save_invite_server(link).await?;
         self.keep_session(id, token, Some(SignInMethod::Password), remembered)
             .await
+    }
+
+    /// Feature `G`'s calls for invite `link`'s server, before an account:
+    /// the server is reached, and they are [`SdkError::FeatureOff`] if it
+    /// did not name `G`. Nothing else is sent. For an account with no
+    /// password, [`Invited<InvitePasskeys>`]; off, offer a password
+    /// ([`Client::redeem_invite`]).
+    pub async fn invited<G: Gate>(&self, link: &str) -> Result<Invited<G>, SdkError> {
+        let (invite, id) = parsed(link)?;
+        let conn = self.reach(&invite, id).await?;
+        if !conn.info.features.contains(G::FEATURE) {
+            return Err(SdkError::FeatureOff {
+                feature: G::FEATURE,
+            });
+        }
+        Ok(Invited::new(self.clone(), link.to_owned(), invite, id))
     }
 
     /// Join the server guest invite `link` names as portable identity
@@ -437,11 +649,7 @@ impl Client {
             Ok(_) | Err(SdkError::UnknownIdentity(_) | SdkError::Credential(_)) => {}
             Err(e) => return Err(e),
         }
-        let conn = self.reach(&invite, id).await?;
-        let saved = servers::load(self.inner.storage.as_ref()).await?;
-        if !saved.iter().any(|s| s.endpoint_id == invite.server) {
-            refuse_another_key(&saved, id, &conn)?;
-        }
+        self.reach_checked(&invite, id).await?;
         let sign_in = self.portable_sign_in(id, identity, display_name).await?;
         let request = Request::RedeemPortableInvite(RedeemPortableInvite { code, sign_in });
         let token = crate::portable_sign_in::logged_in(self.call(id, None, request).await?)?;
@@ -541,6 +749,24 @@ impl Client {
     }
 }
 
+impl Client {
+    /// `invite`'s server reached at key `id`, and the saved servers: a key
+    /// not saved that answers with a saved server's server id is
+    /// [`SdkError::IdentityChanged`], before anything is sent to it.
+    async fn reach_checked(
+        &self,
+        invite: &Invite,
+        id: EndpointId,
+    ) -> Result<(Arc<ServerConnection>, Vec<SavedServer>), SdkError> {
+        let conn = self.reach(invite, id).await?;
+        let saved = servers::load(self.inner.storage.as_ref()).await?;
+        if !saved.iter().any(|s| s.endpoint_id == invite.server) {
+            refuse_another_key(&saved, id, &conn)?;
+        }
+        Ok((conn, saved))
+    }
+}
+
 /// [`SdkError::IdentityChanged`] if `conn`, to unsaved key `id`, answered
 /// with the server id of a server saved under another key.
 fn refuse_another_key(
@@ -552,6 +778,7 @@ fn refuse_another_key(
         Some(old) => Err(SdkError::IdentityChanged {
             saved: old.endpoint_id.clone(),
             now: id.to_string(),
+            server_id: old.server_id.clone(),
         }),
         None => Ok(()),
     }
@@ -576,6 +803,105 @@ fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
         if !server.relays.contains(relay) {
             server.relays.push(relay.clone());
         }
+    }
+}
+
+impl Invited<InvitePasskeys> {
+    /// Begin making an account with the invite's code and an app passkey,
+    /// with no password: what the platform's passkey API makes the passkey
+    /// with, for `username`, shown as `display_name` or the username.
+    /// Nothing is made or saved yet; finish with
+    /// [`Invited::redeem_invite_passkey`] within 5 minutes, from this
+    /// device.
+    ///
+    /// Refusals as for [`Client::redeem_invite`]: a username someone has is
+    /// [`SdkError::UsernameTaken`] now, though one may still take it before
+    /// the finish.
+    pub async fn begin_invite_passkey(
+        &self,
+        username: &str,
+        display_name: Option<&str>,
+    ) -> Result<PasskeyCreation, SdkError> {
+        let client = &self.client;
+        let (invite, id) = (&self.invite, self.id);
+        let code = code_of(invite)?;
+        // A key claiming a saved server's id is refused before a passkey is
+        // made for it.
+        let (conn, _) = client.reach_checked(invite, id).await?;
+        let server_id: ServerId = conn.info.server_id.parse().map_err(|_| {
+            SdkError::Protocol(format!("{:?} is not a server id", conn.info.server_id))
+        })?;
+        let request = Request::BeginInvitePasskey(BeginInvitePasskey {
+            code,
+            username: username.to_owned(),
+            display_name: display_name.map(str::to_owned),
+        });
+        match client.call(id, None, request).await? {
+            Response::Ok(Reply::PasskeyRegistrationBegun(begun)) => {
+                Ok(begun.for_server(id.as_bytes(), &server_id))
+            }
+            Response::Ok(other) => Err(SdkError::Protocol(format!(
+                "BeginInvitePasskey answered {other:?}"
+            ))),
+            Response::Err(e) => Err(SdkError::from_server(e)),
+        }
+    }
+
+    /// Finish it with the passkey the platform made (`made.name` names
+    /// this device, as for [`Session::finish_passkey_registration`]): the
+    /// account is made, and its session kept, as [`Client::redeem_invite`]
+    /// keeps one; `remember` trusts this device for them, as for
+    /// [`Client::sign_in`]. The server is saved once the account is made;
+    /// a refused redemption saves nothing.
+    ///
+    /// A passkey that does not verify, a registration over or begun on
+    /// another device, or another invite's link is
+    /// [`SdkError::InvalidCredentials`]: begin again. The invite's
+    /// refusals are [`Client::redeem_invite`]'s, and a username taken since
+    /// the beginning is [`SdkError::UsernameTaken`]; neither uses the
+    /// invite up.
+    pub async fn redeem_invite_passkey(
+        &self,
+        made: FinishPasskeyRegistration,
+        remember: bool,
+    ) -> Result<Session, SdkError> {
+        let (invite, _) = parsed(&self.link)?;
+        let redeemed = self.redeem_passkey(made, remember).await;
+        self.client.drop_token(&invite).await;
+        redeemed
+    }
+
+    async fn redeem_passkey(
+        &self,
+        made: FinishPasskeyRegistration,
+        remember: bool,
+    ) -> Result<Session, SdkError> {
+        let client = &self.client;
+        let (invite, id) = (&self.invite, self.id);
+        let code = code_of(invite)?;
+        client.reach_checked(invite, id).await?;
+        let request = Request::RedeemInviteWithPasskey(RedeemInviteWithPasskey {
+            code,
+            finish: made,
+            remember,
+        });
+        let (token, remembered) = match client.call(id, None, request).await? {
+            Response::Ok(Reply::LoggedIn {
+                session,
+                remembered,
+                ..
+            }) => (session, remembered),
+            Response::Ok(other) => {
+                return Err(SdkError::Protocol(format!(
+                    "RedeemInviteWithPasskey answered {other:?}"
+                )));
+            }
+            Response::Err(e) => return Err(SdkError::from_server(e)),
+        };
+        client.save_invite_server(&self.link).await?;
+        client
+            .keep_session(id, token, Some(SignInMethod::Passkey), remembered)
+            .await
     }
 }
 
@@ -640,5 +966,103 @@ mod tests {
         ] {
             assert_eq!(outcome_of(wire), read);
         }
+    }
+
+    fn info(kind: InviteLinkKind, has_code: bool) -> InviteInfo {
+        InviteInfo {
+            endpoint_id: "ab".into(),
+            fingerprint: String::new(),
+            name: None,
+            addrs: Vec::new(),
+            relays: Vec::new(),
+            has_code,
+            expires_at: None,
+            role: None,
+            kind,
+            saved: false,
+        }
+    }
+
+    #[test]
+    fn an_invite_leads_by_what_its_link_says() {
+        use InviteLinkKind::*;
+        let next =
+            |kind, has_code, identities| invite_next(&info(kind, has_code), None, identities);
+        assert_eq!(
+            [
+                next(CreateUser, true, false),
+                next(CreateUser, false, false),
+                next(PortableAccount, true, true),
+                next(PortableAccount, true, false),
+                next(Federation, true, false),
+            ],
+            [
+                InviteNext::MakeAccount,
+                InviteNext::SaveServer,
+                InviteNext::JoinAsIdentity,
+                InviteNext::NeedsIdentity,
+                InviteNext::PairServer,
+            ]
+        );
+    }
+
+    #[test]
+    fn what_the_server_said_of_the_code_comes_first() {
+        let server = ServerEntry {
+            endpoint_id: "ab".into(),
+            name: "Home Media".into(),
+            addrs: Vec::new(),
+            advertised_addrs: Vec::new(),
+            relays: Vec::new(),
+            relays_edited: false,
+            advertised_at: None,
+            fingerprint: String::new(),
+            server_id: None,
+            pinned: false,
+            verified: false,
+            on_network: false,
+            pinned_at: None,
+            verified_at: None,
+            last_connected_at: None,
+            use_relays: None,
+        };
+        let lookup = InviteLookup {
+            server,
+            outcome: InviteOutcome::NoMatch,
+            link: String::new(),
+        };
+        assert_eq!(
+            invite_next(
+                &info(InviteLinkKind::CreateUser, true),
+                Some(&lookup),
+                false
+            ),
+            InviteNext::Refused {
+                why: InviteRefusal::Invalid
+            }
+        );
+    }
+
+    #[test]
+    fn a_redemptions_refusal_is_read_as_the_lookups() {
+        assert_eq!(
+            [
+                SdkError::InviteInvalid,
+                SdkError::InviteExpired,
+                SdkError::InviteExhausted,
+                SdkError::WrongInviteKind,
+                SdkError::UsernameTaken,
+            ]
+            .iter()
+            .map(InviteRefusal::of_error)
+            .collect::<Vec<_>>(),
+            [
+                Some(InviteRefusal::Invalid),
+                Some(InviteRefusal::Expired),
+                Some(InviteRefusal::Used),
+                Some(InviteRefusal::WrongKind),
+                None,
+            ]
+        );
     }
 }

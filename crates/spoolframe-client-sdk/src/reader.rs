@@ -715,6 +715,19 @@ mod tests {
     use spoolframe_types::{MediaKind, Namespace};
 
     use super::*;
+
+    impl MediaReader {
+        /// Wait, up to 10 s, until `done` holds: woken by each fetch
+        /// that lands, as a read is.
+        fn wait_until(&self, done: impl Fn(&State) -> bool) {
+            let mut state = self.shared.lock();
+            let _ = self.shared.changed.wait_while_for(
+                &mut state,
+                |state| !done(state),
+                Duration::from_secs(10),
+            );
+        }
+    }
     use crate::Playback as PlaybackStart;
     use crate::reader_tests::{FakeClient, TestBackend as Session, direct_plan};
     use spoolframe_protocol::{PlaybackHandle, Selection};
@@ -1205,12 +1218,11 @@ mod tests {
         reader.expect(4 * BLOCK);
         reader.read(0, 100).unwrap();
         // Let the fetches for block 4 land.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !reader.shared.lock().blocks.contains_key(&4) && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        reader.wait_until(|state| state.blocks.contains_key(&4));
         reader.read(BLOCK, 100).unwrap();
+        // The read-ahead that read started (blocks 2 and 3) lands first:
+        // counted after, a late one looked like block 4 fetched again.
+        reader.wait_until(|state| state.pending.is_empty());
         let before = *fetches.lock();
         let at = 4 * BLOCK + 10;
         assert_eq!(

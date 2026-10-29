@@ -13,6 +13,7 @@ use spoolframe_protocol::experimental::{FEDERATION, HTTP_PLAYBACK};
 /// The experimental features an app asks for, or a server turned on. None
 /// by default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Experimental {
     /// A playback's HLS, or its file, over plain HTTP from the server's
     /// own port, for a player with no Iroh: an AirPlay receiver
@@ -55,6 +56,7 @@ impl Experimental {
 /// Where a player with no Iroh fetches a playback, or why the server gives
 /// no such place ([`crate::Session::http_playback_url`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum HttpPlayback {
     /// `http://<address>:<port>/<token>/master.m3u8` for HLS, `.../file`
     /// for direct play (with byte ranges). It works until the playback

@@ -52,6 +52,9 @@ pub mod keys {
     /// principal, such as a portable identity paired by QR.
     pub const ALLOW_GUESTS: &str = "allow-guests";
 
+    /// Data: the profile browsed last, JSON: its server and username.
+    pub const LAST_PROFILE: &str = "last-profile";
+
     /// Secret: each profile's lock offline, JSON: whether its PIN
     /// is asked for on this device, and a hash of the PIN to check.
     pub const OFFLINE_LOCKS: &str = "offline-locks";

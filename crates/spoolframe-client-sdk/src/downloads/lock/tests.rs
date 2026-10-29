@@ -158,3 +158,14 @@ async fn a_pin_set_here_is_the_one_checked() {
     ));
     locks.unlock_offline("987654").await.unwrap();
 }
+
+/// A PIN kept before argon2 0.6 (by 0.5.3) still checks offline.
+#[tokio::test]
+async fn a_pin_kept_by_argon2_0_5_still_checks() {
+    const MADE_BY_0_5: &str = "$argon2id$v=19$m=19456,t=2,p=1$OUvtUnxqHJOhhNri7jMXXg$\
+                               rsEGau+8AwlcZf7MqbxbuoF/5tZ6dvMeByUyEM3IX8s";
+    assert!(verify("4321", MADE_BY_0_5.into()).await.unwrap());
+    assert!(!verify("1234", MADE_BY_0_5.into()).await.unwrap());
+    let made_now = hash("4321").await.unwrap();
+    assert!(verify("4321", made_now).await.unwrap());
+}

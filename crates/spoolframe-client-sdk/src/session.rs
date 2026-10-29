@@ -10,7 +10,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{
     ArtworkRequest, ArtworkResponse, ArtworkSize, BitmapSubtitles, ChangePassword, ChosenTracks,
-    ConfirmPassword, DeviceInfo, DeviceSignInRequest, FinishPasskeyRegistration,
+    ConfirmPassword, DeviceInfo, DeviceSignInRequest, Feature, FinishPasskeyRegistration,
     FinishPasskeySignIn, HomeScreen, ManifestKind, MediaRead, MediaReadResponse, PasskeyCreation,
     PasskeyInfo, PasskeyRequest, PinProof, PlaybackHandle, PlaybackPlan, PlexLink, PortableTie,
     Previews, Quality, Reply, Request, Response, SearchRequest, SearchResults, Selection,
@@ -65,8 +65,22 @@ pub struct SavedProfile {
     pub portable: Option<PortableUserId>,
 }
 
+/// How "Confirm it's you" confirms a user ([`Session::reauth_options`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reauth {
+    /// With an app passkey: sign `request`, then
+    /// [`Session::finish_confirm_passkey`]. A user who cancels the
+    /// passkey's sheet may use their password instead.
+    Passkey { request: PasskeyRequest },
+    /// They have no app passkey: their password
+    /// ([`Session::confirm_password`]). One with no password either gets
+    /// [`SdkError::NoPassword`] there: confirm on the server's web page.
+    Password,
+}
+
 /// How a profile signed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum SignInMethod {
     /// [`crate::Client::sign_in`], with a password.
@@ -138,6 +152,7 @@ pub(crate) async fn save(
 
 /// A page of a library.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ItemsPage {
     pub items: Vec<Item>,
     /// How many items the library has in all.
@@ -151,6 +166,7 @@ pub struct ItemsPage {
 
 /// An item and what is under it: a show's seasons, a season's episodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ItemDetail {
     pub item: Item,
     pub children: Vec<Item>,
@@ -174,6 +190,7 @@ pub struct ItemDetail {
 
 /// How the server would play an item.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Plan {
     pub plan: PlaybackPlan,
     /// The tracks the server chose, when none were asked for.
@@ -229,6 +246,7 @@ pub struct PlaybackOptions {
 /// The quality a viewer chooses for a playback. The app's own
 /// limit (`ClientCapabilities::max_bitrate`) stays a ceiling over each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PlaybackQuality {
     /// For the link, as the SDK measures it ([`Session::link_rate`]): a
     /// slow link starts as a conversion sized to it, and a direct play
@@ -570,6 +588,17 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// Whether regular feature `feature` is on for the connection this
+    /// session is on: this device named it
+    /// ([`crate::ClientOptions::features`]) and the server has it. False
+    /// before a connection. Read it when it matters: a reconnect may change
+    /// it.
+    pub fn has_feature(&self, feature: Feature) -> bool {
+        self.client
+            .server_info(self.server)
+            .is_some_and(|info| info.features.contains(feature))
+    }
+
     /// Experimental (`http-playback`): where a player with no Iroh
     /// (an AirPlay receiver) fetches playback `handle` over plain HTTP from
     /// the server's own port, or why not. Without the feature turned on
@@ -633,17 +662,40 @@ impl Session {
     /// One request in this session. A session the server no longer knows
     /// is forgotten here, and the caller gets [`SdkError::SignInRequired`].
     pub(crate) async fn call(&self, request: Request) -> Result<Reply, SdkError> {
+        // A change clears what it touches before it is sent (a read
+        // meanwhile asks the server) and after, whatever the answer: one
+        // that timed out may still have been made.
+        let clear = self.catalog().and(crate::catalog_cache::clears(&request));
+        if let Some(clear) = &clear {
+            self.clear_catalog(clear);
+        }
+        let answer = self.call_uncached(request).await;
+        if let Some(clear) = &clear {
+            self.clear_catalog(clear);
+        }
+        answer
+    }
+
+    async fn call_uncached(&self, request: Request) -> Result<Reply, SdkError> {
         if matches!(
             request,
             Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. }
         ) {
             return self.subtitle_resource(request).await;
         }
-        match self
+        let answer = self
             .client
             .call(self.server, Some(&self.token), request)
-            .await?
-        {
+            .await
+            .inspect_err(|e| {
+                if *e == SdkError::SignInRequired {
+                    self.tell_profile(crate::ProfileChange::SessionEnded {
+                        user: self.user.user_id.clone(),
+                        reason: crate::SessionEndReason::SignedOut,
+                    });
+                }
+            })?;
+        match answer {
             Response::Ok(reply) => Ok(reply),
             Response::Err(e) => Err(self.failed(e).await),
         }
@@ -727,12 +779,32 @@ impl Session {
 
     pub(crate) async fn failed(&self, error: spoolframe_protocol::Error) -> SdkError {
         let error = SdkError::from_server(error);
-        if error == SdkError::SignInRequired
-            && let Err(e) = self.client.end_session(self.server, &self.token).await
-        {
-            return e;
+        let user = self.user.user_id.clone();
+        match error {
+            SdkError::SignInRequired => {
+                if let Err(e) = self.client.end_session(self.server, &self.token).await {
+                    return e;
+                }
+                self.tell_profile(crate::ProfileChange::SessionEnded {
+                    user,
+                    reason: crate::SessionEndReason::Ended,
+                });
+            }
+            SdkError::PasswordChangeRequired => {
+                self.tell_profile(crate::ProfileChange::PasswordChangeRequired { user });
+            }
+            _ => {}
         }
         error
+    }
+
+    /// Pass a change to this session's profile on; nobody listening is
+    /// fine.
+    fn tell_profile(&self, change: crate::ProfileChange) {
+        let _ = self.client.inner.profile_events.send(crate::ProfileEvent {
+            server: self.server.to_string(),
+            change,
+        });
     }
 
     /// Ask the server who this session is.
@@ -762,7 +834,79 @@ impl Session {
         }
     }
 
+    /// The catalog cache, when the client keeps one.
+    fn catalog(&self) -> Option<Arc<crate::catalog_cache::CatalogCache>> {
+        self.client.inner.catalog.clone()
+    }
+
+    fn catalog_scope(&self) -> crate::catalog_cache::Scope {
+        crate::catalog_cache::Scope {
+            server: self.server.to_string(),
+            user: self.user.user_id.clone(),
+        }
+    }
+
+    fn clear_catalog(&self, clear: &crate::catalog_cache::Clear) {
+        if let Some(catalog) = self.catalog() {
+            catalog.clear(&self.catalog_scope(), clear);
+        }
+    }
+
+    /// Forget this session's kept catalog reads
+    /// ([`crate::ClientOptions::catalog_cache`]): the next reads ask the
+    /// server. For a pull to refresh.
+    pub fn forget_catalog(&self) {
+        self.clear_catalog(&crate::catalog_cache::Clear::Everything);
+    }
+
+    /// This session's kept catalog reads whose re-read came back
+    /// different ([`crate::ClientOptions::catalog_cache`]): the screen
+    /// showing one reads it again. Nothing comes with the cache off.
+    pub fn catalog_changes(&self) -> crate::CatalogChanges {
+        crate::CatalogChanges::of(self.catalog_scope(), self.catalog().as_deref())
+    }
+
+    /// `read` from the catalog cache, else `fetch`ed; with no cache,
+    /// always `fetch`ed.
+    pub(crate) async fn cached<T: 'static, F, Fut>(
+        &self,
+        read: crate::CatalogKey,
+        fetch: F,
+        wrap: fn(T) -> crate::catalog_cache::Value,
+        unwrap: fn(crate::catalog_cache::Value) -> Option<T>,
+    ) -> Result<T, SdkError>
+    where
+        F: FnOnce(Session) -> Fut,
+        Fut: std::future::Future<Output = Result<T, SdkError>> + Send + 'static,
+    {
+        let Some(catalog) = self.catalog() else {
+            return fetch(self.clone()).await;
+        };
+        let session = self.clone();
+        let value = catalog
+            .read(&self.catalog_scope(), read, move || {
+                let fetching = fetch(session);
+                async move { fetching.await.map(wrap) }
+            })
+            .await?;
+        unwrap(value).ok_or_else(|| SdkError::Protocol("the catalog kept another kind".into()))
+    }
+
     pub async fn home(&self) -> Result<HomeScreen, SdkError> {
+        use crate::catalog_cache::Value;
+        self.cached(
+            crate::CatalogKey::Home,
+            |s| async move { s.home_fresh().await },
+            |home| Value::Home(Box::new(home)),
+            |value| match value {
+                Value::Home(home) => Some(*home),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn home_fresh(&self) -> Result<HomeScreen, SdkError> {
         match self.call(Request::Home).await? {
             Reply::Home(home) => Ok(home),
             other => Err(unexpected(other)),
@@ -770,6 +914,20 @@ impl Session {
     }
 
     pub async fn libraries(&self) -> Result<Vec<Library>, SdkError> {
+        use crate::catalog_cache::Value;
+        self.cached(
+            crate::CatalogKey::Libraries,
+            |s| async move { s.libraries_fresh().await },
+            Value::Libraries,
+            |value| match value {
+                Value::Libraries(libraries) => Some(libraries),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn libraries_fresh(&self) -> Result<Vec<Library>, SdkError> {
         match self.call(Request::Libraries).await? {
             Reply::Libraries { libraries } => Ok(libraries),
             other => Err(unexpected(other)),
@@ -799,13 +957,46 @@ impl Session {
         sort: Option<ItemSort>,
         filter: Option<ItemFilter>,
     ) -> Result<ItemsPage, SdkError> {
+        use crate::catalog_cache::Value;
+        // An empty filter keeps everything: the plain listing.
+        let filter = filter.filter(|f| !f.is_empty());
+        let order = match (&sort, &filter) {
+            (None, None) => String::new(),
+            order => serde_json::to_string(&order).unwrap_or_default(),
+        };
+        let read = crate::CatalogKey::Items {
+            library: library.clone(),
+            offset,
+            limit,
+            order,
+        };
+        let library = library.clone();
+        self.cached(
+            read,
+            move |s| async move { s.items_fresh(&library, offset, limit, sort, filter).await },
+            Value::Items,
+            |value| match value {
+                Value::Items(page) => Some(page),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn items_fresh(
+        &self,
+        library: &LibraryId,
+        offset: u32,
+        limit: u32,
+        sort: Option<ItemSort>,
+        filter: Option<ItemFilter>,
+    ) -> Result<ItemsPage, SdkError> {
         let request = Request::Items {
             library: library.clone(),
             offset,
             limit,
             sort,
-            // An empty filter keeps everything: left out.
-            filter: filter.filter(|f| !f.is_empty()),
+            filter,
         };
         match self.call(request).await? {
             Reply::Items { items, total, .. } => Ok(ItemsPage {
@@ -833,6 +1024,21 @@ impl Session {
     }
 
     pub async fn item(&self, id: &MediaId) -> Result<ItemDetail, SdkError> {
+        use crate::catalog_cache::Value;
+        let asked = id.clone();
+        self.cached(
+            crate::CatalogKey::Item(id.clone()),
+            move |s| async move { s.item_fresh(&asked).await },
+            |detail| Value::Item(Box::new(detail)),
+            |value| match value {
+                Value::Item(detail) => Some(*detail),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn item_fresh(&self, id: &MediaId) -> Result<ItemDetail, SdkError> {
         match self.call(Request::Item { id: id.clone() }).await? {
             Reply::Item {
                 item,
@@ -1013,7 +1219,9 @@ impl Session {
         }
     }
 
-    /// Unlock this profile on this device with its PIN. A wrong
+    /// Unlock this profile on this device with its PIN. Text that is no
+    /// PIN ([`crate::Pin::new`]) is [`SdkError::InvalidInput`], sent to no
+    /// one and counted as no guess. A wrong
     /// PIN is [`SdkError::InvalidCredentials`], too many in a while
     /// [`SdkError::RateLimited`]; after 10 wrong in a row the session here
     /// is ended ([`SdkError::SignInRequired`]) and the user signs in with
@@ -1025,6 +1233,8 @@ impl Session {
     /// and the profile is unlocked for them too if it is
     /// [`crate::Downloads::set_profile`]'s.
     pub async fn unlock(&self, pin: &str) -> Result<(), SdkError> {
+        // Not a PIN cannot be theirs: no guess is spent on it.
+        crate::Pin::new(pin).map_err(|e| SdkError::InvalidInput(e.to_string()))?;
         self.done(Request::UnlockProfile {
             pin: pin.to_owned(),
         })
@@ -1314,16 +1524,48 @@ impl Session {
     /// server's owner can restore it.
     ///
     /// Only soon after signing in ([`SdkError::RecentSignInRequired`]): a
-    /// local user confirms ([`Session::confirm_password`] or
-    /// [`Session::begin_confirm_passkey`]); a portable user signs in again
-    /// with its credential ([`crate::Client::sign_in_portable`]), and leaves
-    /// from the new session. The last admin gets [`SdkError::LastAdmin`]. A
+    /// local user confirms ([`Session::reauth_options`]), then asks again;
+    /// a portable user is signed in again here with its credential
+    /// ([`crate::Client::sign_in_portable`]), asking nothing, and leaves
+    /// from that session. The last admin gets [`SdkError::LastAdmin`]. A
     /// refused leave changes nothing, here or on the server.
     pub async fn leave_server(&self) -> Result<(), SdkError> {
-        self.done(Request::LeaveServer).await?;
+        match self.done(Request::LeaveServer).await {
+            Ok(()) => {}
+            Err(SdkError::RecentSignInRequired) => {
+                let Some(identity) = self.user.portable_id() else {
+                    return Err(SdkError::RecentSignInRequired);
+                };
+                let fresh = self
+                    .client
+                    .sign_in_portable(&self.server(), identity)
+                    .await?;
+                fresh.done(Request::LeaveServer).await?;
+                self.client
+                    .left(self.server, &fresh.token, &self.user.username)
+                    .await?;
+            }
+            Err(e) => return Err(e),
+        }
         self.client
             .left(self.server, &self.token, &self.user.username)
             .await
+    }
+
+    /// How "Confirm it's you" confirms this user, after a change answered
+    /// [`SdkError::RecentSignInRequired`]: with one of their app passkeys
+    /// (the request to sign, for [`Session::finish_confirm_passkey`]), or,
+    /// with none, their password ([`Session::confirm_password`]). Asking
+    /// begins the passkey's challenge, as
+    /// [`Session::begin_confirm_passkey`] does. A portable user needs
+    /// neither: their credential signs in again
+    /// ([`crate::Client::sign_in_portable`]).
+    pub async fn reauth_options(&self) -> Result<Reauth, SdkError> {
+        match self.begin_confirm_passkey().await {
+            Ok(request) => Ok(Reauth::Passkey { request }),
+            Err(SdkError::NotFound(_)) => Ok(Reauth::Password),
+            Err(e) => Err(e),
+        }
     }
 
     /// Whether the user may leave this server ([`Session::leave_server`]),

@@ -63,6 +63,7 @@ pub const DIRECT_DIAL: Duration = Duration::from_secs(5);
 
 /// How a paired server's item plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RemoteMode {
     /// From the paired server to this device.
     Direct,
@@ -100,6 +101,16 @@ pub struct RemoteDownload {
     _relays: Option<std::sync::Arc<crate::client::PlayRelays>>,
 }
 
+/// This server's own item as a hit: its own copy, from nowhere else.
+fn own_hit(item: spoolframe_types::Item) -> SearchHit {
+    SearchHit {
+        play_from: item.id().clone(),
+        origin: None,
+        also_on: Vec::new(),
+        item,
+    }
+}
+
 /// Whether [`Session::open_origin`] reached the paired server.
 enum Opening {
     Reached(Box<Opened>),
@@ -119,6 +130,7 @@ struct Opened {
 /// online or went offline, or shared or stopped sharing a library. List
 /// them again ([`Session::libraries`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LibrariesChanged {
     /// The server's key: the one whose libraries changed.
     pub server: String,
@@ -192,23 +204,21 @@ impl Session {
     /// A search over this session's server and what its paired servers
     /// share, each item a [`SearchHit`]: a title on several servers
     /// once, with where it is from, its other copies and the copy that
-    /// plays. Counts are approximate. A server that answers with plain
-    /// results (one too old for hits) gives hits of its own items.
-    /// [`SdkError::Unsupported`] without
-    /// [`crate::Experimental::federation`], and nothing is sent.
+    /// plays. Counts are approximate. One search screen serves every
+    /// server: without [`crate::Experimental::federation`], or from a
+    /// server that answers with plain results (one too old for hits),
+    /// the hits are this server's own items, each its own copy. Any
+    /// other error is the search's, never hidden by a second search.
     pub async fn search_hits(
         &self,
         request: SearchRequest,
     ) -> Result<SearchResults<SearchHit>, SdkError> {
-        self.federated()?;
+        if self.federated().is_err() {
+            return self.search(request).await.map(|r| r.map(own_hit));
+        }
         match self.call(Request::Search(request)).await? {
             Reply::SearchHits(hits) => Ok(hits),
-            Reply::Search(results) => Ok(results.map(|item| SearchHit {
-                play_from: item.id().clone(),
-                origin: None,
-                also_on: Vec::new(),
-                item,
-            })),
+            Reply::Search(results) => Ok(results.map(own_hit)),
             other => Err(unexpected(other)),
         }
     }

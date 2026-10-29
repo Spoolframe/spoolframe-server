@@ -54,7 +54,10 @@ use spoolframe_types::{Item, MediaId, MediaKind, MediaTracks};
 use super::store::{
     self, EntryKind, Hold, Manifest, Store, kept_key, key_of, read_json, write_json,
 };
-use super::{Downloads, LocalArtwork, LocalDownload, LocalWatch, Shared, disk, manager, now};
+use super::{
+    DownloadEvent, DownloadPhase, Downloads, LocalArtwork, LocalDownload, LocalWatch, Shared, disk,
+    manager, now,
+};
 use crate::client::{Client, Inner};
 use crate::{SdkError, Session};
 
@@ -68,6 +71,7 @@ const FOLLOW_EVERY: Duration = Duration::from_secs(15 * 60);
 
 /// The quality music is downloaded in: a setting of this device.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "snake_case")]
 pub enum MusicQuality {
     /// The source file when this device plays it as it is; else the
@@ -94,6 +98,7 @@ impl MusicQuality {
 /// How this device reaches the network now, as the app tells it
 /// ([`Downloads::set_network`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum NetworkKind {
     /// Wi-Fi or wired: downloads move.
     #[default]
@@ -106,6 +111,7 @@ pub enum NetworkKind {
 /// This device's download settings, kept in the downloads directory
 /// ([`Downloads::settings`], [`Downloads::set_settings`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(default)]
 pub struct DownloadSettings {
     /// The quality music downloads are made in. A change applies to
@@ -134,6 +140,7 @@ impl Default for DownloadSettings {
 
 /// What a music download is of.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MusicTarget {
     Track {
@@ -219,7 +226,8 @@ fn expect_kind(id: &MediaId, kind: MediaKind) -> Result<(), SdkError> {
 
 /// A music download, as the Downloads page shows it
 /// ([`Downloads::music_downloads`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MusicDownload {
     /// Its key here: what [`Downloads::remove_music`] takes.
     pub key: String,
@@ -239,10 +247,49 @@ pub struct MusicDownload {
     pub size: u64,
     /// Unix seconds, by this device's clock.
     pub created_at: i64,
+    /// Where it is, over its tracks.
+    pub phase: MusicPhase,
+    /// How many of its tracks failed ([`Downloads::retry_music`]).
+    pub failed: u32,
+}
+
+/// Where a music download is, over its tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MusicPhase {
+    /// Nothing is moving yet: the tracks wait for their turn, or for
+    /// Wi-Fi.
+    Waiting,
+    /// A track is being prepared or coming to this device.
+    Moving,
+    /// Each not here is paused ([`Downloads::pause_music`]).
+    Paused,
+    /// Every track is here.
+    Done,
+    /// Nothing more moves and `failed` tracks failed: the rest are here.
+    Partial { failed: u32 },
+}
+
+impl MusicPhase {
+    /// The phase of a download whose tracks are these, with `total` in
+    /// all: a track not on the device yet waits.
+    fn of(total: u32, done: u32, moving: u32, paused: u32, failed: u32) -> Self {
+        let waiting = total.saturating_sub(done + moving + paused + failed);
+        match () {
+            _ if done == total => Self::Done,
+            _ if moving > 0 => Self::Moving,
+            _ if waiting > 0 => Self::Waiting,
+            _ if paused > 0 => Self::Paused,
+            _ => Self::Partial { failed },
+        }
+    }
 }
 
 /// How a track came to be on this device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(rename_all = "snake_case")]
 pub enum OfflineMark {
     /// Downloaded: it stays until the user removes it.
     Download,
@@ -251,7 +298,8 @@ pub enum OfflineMark {
 }
 
 /// A track to play with no server ([`Downloads::offline_music`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OfflineTrack {
     /// Its entry's key: what [`Downloads::record_play`] and
     /// [`Downloads::record_like`] take.
@@ -271,10 +319,16 @@ pub struct OfflineTrack {
     /// track downloaded itself, else its album, an artist, a playlist or
     /// Liked. Empty for one only kept from listening.
     pub held_by: Vec<MusicTarget>,
+    /// Its heart: a like or unlike made here and not sent yet
+    /// ([`Downloads::record_like`]) wins, so the heart is right after a
+    /// relaunch; else liked when Liked downloaded holds it; else not
+    /// known here.
+    pub liked: Option<bool>,
 }
 
 /// An album with the tracks of it on this device.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OfflineAlbum {
     pub id: MediaId,
     /// As the server had it, when it was asked; else only `title`.
@@ -334,6 +388,7 @@ impl OfflineAlbum {
 
 /// One track of an album's tracklist ([`OfflineAlbum::tracklist`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AlbumTrack {
     /// The track, as the server had it.
     pub item: Item,
@@ -343,6 +398,7 @@ pub struct AlbumTrack {
 
 /// An artist with the albums of theirs on this device.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OfflineArtist {
     pub id: MediaId,
     pub artist: Option<Item>,
@@ -354,6 +410,7 @@ pub struct OfflineArtist {
 /// A playlist or Liked downloaded, with its tracks on this device, in
 /// its order.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OfflinePlaylist {
     /// [`MusicTarget::Playlist`] or [`MusicTarget::Liked`].
     pub target: MusicTarget,
@@ -364,6 +421,7 @@ pub struct OfflinePlaylist {
 /// A user's music on this device, made up from what is here, with no
 /// server ([`Downloads::offline_music`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OfflineMusic {
     /// By name.
     pub artists: Vec<OfflineArtist>,
@@ -373,6 +431,7 @@ pub struct OfflineMusic {
 
 /// What became of one play or like sent ([`Downloads::sync_music`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SyncedPlay {
     pub track: MediaId,
     /// `Unknown`: kept, and sent again next time.
@@ -381,6 +440,7 @@ pub struct SyncedPlay {
 
 /// What [`Downloads::sync_music`] sent and found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MusicSynced {
     pub plays: Vec<SyncedPlay>,
     pub liked: Vec<SyncedPlay>,
@@ -388,6 +448,7 @@ pub struct MusicSynced {
 
 /// How full the cache of tracks kept from listening is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct CacheSpace {
     pub used: u64,
     /// [`DownloadSettings::cache_max_bytes`].
@@ -546,6 +607,72 @@ impl Downloads {
             &stored.target.hold(&user_id),
         )
         .await
+    }
+
+    /// Try music download `key`'s failed tracks again.
+    pub async fn retry_music(&self, key: &str) -> Result<MusicDownload, SdkError> {
+        let (tracks, view) =
+            self.music_tracks_where(key, |phase| matches!(phase, DownloadPhase::Failed { .. }))?;
+        for track in tracks {
+            self.retry(&track).await?;
+        }
+        Ok(view())
+    }
+
+    /// Stop moving music download `key`'s tracks until
+    /// [`Downloads::resume_music`]. The tracks here stay.
+    pub async fn pause_music(&self, key: &str) -> Result<MusicDownload, SdkError> {
+        let (tracks, view) = self.music_tracks_where(key, DownloadPhase::is_active)?;
+        for track in tracks {
+            self.pause(&track).await?;
+        }
+        Ok(view())
+    }
+
+    /// Go on with music download `key`'s paused tracks.
+    pub async fn resume_music(&self, key: &str) -> Result<MusicDownload, SdkError> {
+        let (tracks, view) =
+            self.music_tracks_where(key, |phase| *phase == DownloadPhase::Paused)?;
+        for track in tracks {
+            self.resume(&track).await?;
+        }
+        Ok(view())
+    }
+
+    /// The keys of music download `key`'s tracks in a phase `which`
+    /// takes, the active profile's own, and the download as it is when
+    /// asked.
+    fn music_tracks_where(
+        &self,
+        key: &str,
+        which: impl Fn(&DownloadPhase) -> bool,
+    ) -> Result<(Vec<String>, impl FnOnce() -> MusicDownload + '_), SdkError> {
+        let shared = self.shared();
+        let store = shared.store()?;
+        let Some((server, user_id, stored)) = shared.find_music(store, key) else {
+            return Err(SdkError::NotFound(format!("music download {key}")));
+        };
+        if shared
+            .locks
+            .active()
+            .is_some_and(|active| active != (server.clone(), user_id.clone()))
+        {
+            return Err(SdkError::NotFound(format!("music download {key}")));
+        }
+        let source = stored.quality.source();
+        let tracks = stored
+            .tracks
+            .iter()
+            .map(|id| track_key(&server, id, &source))
+            .filter(|track| {
+                store
+                    .find_track(&server, track)
+                    .is_some_and(|m| which(&m.phase))
+            })
+            .collect();
+        Ok((tracks, move || {
+            shared.music_view(store, &server, &user_id, &stored)
+        }))
     }
 
     /// Let go of `hold` on the tracks of `ids` here in `source`.
@@ -1031,6 +1158,36 @@ impl Shared {
         None
     }
 
+    /// Tell each music download that holds track `m`, as the active
+    /// profile may see it, that it moved on.
+    pub(super) fn emit_music(&self, m: &Manifest) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let active = self.locks.active();
+        for hold in &m.holds {
+            let Some(user_id) = hold.user.as_deref() else {
+                continue;
+            };
+            if active
+                .as_ref()
+                .is_some_and(|a| *a != (m.server.clone(), user_id.to_owned()))
+                || self.locks.is_locked(&m.server, user_id)
+            {
+                continue;
+            }
+            let Some(target) = MusicTarget::of_hold(hold, m.item.id()) else {
+                continue;
+            };
+            let key = music_key(&m.server, user_id, &target);
+            let state: MusicState = read_json(&store.music_path(&m.server, user_id));
+            if let Some(stored) = state.downloads.iter().find(|d| d.key == key) {
+                let view = self.music_view(store, &m.server, user_id, stored);
+                let _ = self.events.send(DownloadEvent::MusicChanged(view));
+            }
+        }
+    }
+
     fn music_view(
         &self,
         store: &Store,
@@ -1040,16 +1197,25 @@ impl Shared {
     ) -> MusicDownload {
         let source = stored.quality.source();
         let (mut done, mut received, mut size) = (0, 0, 0);
+        let (mut moving, mut paused, mut failed) = (0, 0, 0);
         for id in &stored.tracks {
             let key = track_key(server, id, &source);
             if let Some(m) = store.find_track(server, &key) {
-                if m.phase == super::DownloadPhase::Done {
-                    done += 1;
+                match m.phase {
+                    super::DownloadPhase::Done => done += 1,
+                    super::DownloadPhase::Paused => paused += 1,
+                    super::DownloadPhase::Failed { .. } => failed += 1,
+                    // Held for Wi-Fi, it waits.
+                    _ if self.network_held() => {}
+                    super::DownloadPhase::Preparing { .. } | super::DownloadPhase::Transferring => {
+                        moving += 1
+                    }
                 }
                 received += self.received_of(&m);
                 size += m.size.unwrap_or(0);
             }
         }
+        let total = stored.tracks.len() as u32;
         MusicDownload {
             key: stored.key.clone(),
             server: server.to_owned(),
@@ -1057,11 +1223,13 @@ impl Shared {
             target: stored.target.clone(),
             name: stored.name.clone(),
             quality: stored.quality,
-            tracks: stored.tracks.len() as u32,
+            tracks: total,
             done,
             received,
             size,
             created_at: stored.created_at,
+            phase: MusicPhase::of(total, done, moving, paused, failed),
+            failed,
         }
     }
 
@@ -1104,8 +1272,15 @@ impl Shared {
                 by_track.insert(id, (m, track));
             }
         }
+        let pending: PendingPlays = read_json(&store.offline_plays_path(server, user_id));
         for (id, (_, track)) in &mut by_track {
             track.held_by = held_by.remove(id).unwrap_or_default();
+            track.liked = pending
+                .liked
+                .iter()
+                .find(|l| l.track == *id)
+                .map(|l| l.liked)
+                .or_else(|| track.held_by.contains(&MusicTarget::Liked).then_some(true));
         }
         let state: MusicState = read_json(&store.music_path(server, user_id));
         let mut artists: HashMap<MediaId, OfflineArtist> = HashMap::new();
@@ -1203,6 +1378,7 @@ impl Shared {
             size: m.size.unwrap_or(0),
             last_played_at: m.last_played_at,
             held_by: Vec::new(),
+            liked: None,
         })
     }
 
@@ -1218,7 +1394,9 @@ impl Shared {
         let path = store.offline_plays_path(server, user_id);
         let mut pending: PendingPlays = read_json(&path);
         change(&mut pending);
-        write_json(&path, &pending).map_err(disk)
+        write_json(&path, &pending).map_err(disk)?;
+        self.want_sync(server, user_id);
+        Ok(())
     }
 
     /// Track `id` of `server` was just played, streamed: its
@@ -1258,10 +1436,45 @@ pub(super) fn users_to_sync(store: &Store) -> Vec<(String, String)> {
     users
 }
 
+/// The servers and users with plays or likes here not sent yet.
+pub(super) fn plays_to_send(store: &Store) -> Vec<(String, String)> {
+    store
+        .users_with(store::OFFLINE_PLAYS_FILE)
+        .into_iter()
+        .filter(|(server, user_id)| {
+            let pending: PendingPlays = read_json(&store.offline_plays_path(server, user_id));
+            !pending.plays.is_empty() || !pending.liked.is_empty()
+        })
+        .collect()
+}
+
+/// The servers and users with an artist, a playlist or Liked downloaded:
+/// followed, so brought up to date now and then.
+pub(super) fn following(store: &Store) -> Vec<(String, String)> {
+    store
+        .users_with(store::MUSIC_FILE)
+        .into_iter()
+        .filter(|(server, user_id)| {
+            let state: MusicState = read_json(&store.music_path(server, user_id));
+            state
+                .downloads
+                .iter()
+                .any(|d| d.target.followed().is_some())
+        })
+        .collect()
+}
+
 /// Send `session`'s user's plays and likes, then bring their followed
 /// downloads up to date.
 pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<MusicSynced, SdkError> {
     let synced = send_plays(shared, session).await?;
+    let items = synced
+        .plays
+        .iter()
+        .chain(&synced.liked)
+        .map(|p| p.track.clone())
+        .collect();
+    shared.watch_synced(session, items);
     refresh(shared, session, None).await?;
     Ok(synced)
 }
@@ -1469,7 +1682,7 @@ impl FollowDue {
         }
     }
 
-    fn soonest(&self) -> Option<Instant> {
+    pub(super) fn soonest(&self) -> Option<Instant> {
         self.0.values().map(|(at, _)| *at).min()
     }
 
@@ -1700,6 +1913,21 @@ mod tests {
         store.scan().into_iter().map(|m| m.key).collect()
     }
 
+    /// A music download's phase over its tracks: one moving is Moving,
+    /// one not started waits, and failures show once nothing else is
+    /// left to move.
+    #[test]
+    fn a_music_download_is_where_its_tracks_are() {
+        assert_eq!(MusicPhase::of(3, 3, 0, 0, 0), MusicPhase::Done);
+        assert_eq!(MusicPhase::of(3, 1, 1, 0, 1), MusicPhase::Moving);
+        assert_eq!(MusicPhase::of(3, 1, 0, 0, 1), MusicPhase::Waiting);
+        assert_eq!(MusicPhase::of(3, 1, 0, 2, 0), MusicPhase::Paused);
+        assert_eq!(
+            MusicPhase::of(3, 2, 0, 0, 1),
+            MusicPhase::Partial { failed: 1 }
+        );
+    }
+
     /// Over the cap, the least recently played kept track goes first; a
     /// download, however big, neither counts nor goes.
     #[tokio::test]
@@ -1924,6 +2152,32 @@ mod tests {
                 ],
             )
         );
+    }
+
+    /// A heart changed here with no server shows on the track until it
+    /// is sent, over what Liked downloaded says.
+    #[test]
+    fn offline_a_tracks_heart_is_the_like_made_here_first() {
+        let (shared, store) = shared("offline-hearts", 1 << 30);
+        playable(&store, "1", vec![MusicTarget::Liked.hold("user")]);
+        playable(&store, "3", vec![Hold::download("user")]);
+        let hearts = |shared: &Shared| -> Vec<Option<bool>> {
+            let music = shared.offline_music("server", "user");
+            let mut tracks: Vec<_> = music.artists[0].albums[0].tracks.clone();
+            tracks.sort_by_key(|t| t.key.clone());
+            tracks.iter().map(|t| t.liked).collect()
+        };
+        assert_eq!(hearts(&shared), [Some(true), None]);
+        let pending = PendingPlays {
+            liked: vec![OfflineLike {
+                track: track("1").id().clone(),
+                liked: false,
+                at: 1,
+            }],
+            ..PendingPlays::default()
+        };
+        write_json(&store.offline_plays_path("server", "user"), &pending).unwrap();
+        assert_eq!(hearts(&shared), [Some(false), None]);
     }
 
     /// With no tracklist kept (a track kept from listening), an album

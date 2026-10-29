@@ -63,6 +63,7 @@ pub struct KeyAssertion {
 /// client's libfido2 transport (`spoolframe_linux_core::fido2`) and the
 /// iPhone's Core NFC tell them apart, so the app says the right thing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SecurityKeyError {
     #[error("the PIN is wrong")]
     WrongPin,

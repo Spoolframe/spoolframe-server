@@ -5,6 +5,7 @@
 
 mod addresses;
 mod closing;
+mod features;
 mod invite_lookup;
 mod lan_info;
 mod leave;
@@ -12,6 +13,7 @@ mod one_time_password;
 mod playlists;
 mod reachability;
 mod reconnect;
+mod search;
 mod stalls;
 mod stream_window;
 mod stub;

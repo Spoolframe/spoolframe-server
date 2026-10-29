@@ -201,7 +201,7 @@ async fn drive(client: &Client, shared: &Arc<Shared>, key: &str) {
 
 /// The session of `user_id` on `server` that has downloads: the one last
 /// made or found, else one of the server's profiles here.
-async fn session_for(
+pub(super) async fn session_for(
     client: &Client,
     shared: &Shared,
     server: &str,
@@ -918,6 +918,7 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
             }
         }
     }
+    shared.watch_synced(session, synced.iter().map(|s| s.item.clone()).collect());
     Ok(synced)
 }
 

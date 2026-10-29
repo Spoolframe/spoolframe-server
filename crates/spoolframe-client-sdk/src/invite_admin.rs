@@ -20,6 +20,7 @@ use crate::{SdkError, Session};
 
 /// What redeeming an invite does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum InviteKind {
     /// Makes an account on the server.
     CreateUser,
@@ -38,6 +39,7 @@ pub enum InviteKind {
 /// An invite to make. Each `None` leaves it to the server, as the web UI
 /// does: one use, 7 days, the consumer role.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InviteSpec {
     pub kind: InviteKind,
     /// Who it is for, for the admins' list: at most 64 characters, one
@@ -56,6 +58,7 @@ pub struct InviteSpec {
 /// An invite just made: its code shows only now, as the server keeps only
 /// its hash.
 #[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MintedInvite {
     pub id: String,
     pub kind: InviteKind,
@@ -90,6 +93,7 @@ impl std::fmt::Debug for MintedInvite {
 
 /// Who made an invite.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InviteCreator {
     /// What to show: the admin's display name, or "server CLI".
     pub display_name: String,
@@ -100,6 +104,7 @@ pub struct InviteCreator {
 
 /// Where an invite was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum InviteOrigin {
     /// The web UI's admin pages. Also an invite the server has no app
     /// origin recorded for, unless the CLI made it.
@@ -121,6 +126,7 @@ pub enum InviteOrigin {
 /// still be redeemed are listed: a revoked, expired or used-up one is
 /// gone from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct InviteSummary {
     /// What [`Session::revoke_invite`] takes.
     pub id: String,

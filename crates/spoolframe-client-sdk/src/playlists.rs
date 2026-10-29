@@ -19,6 +19,8 @@
 //! fixed tiles), and `custom_art`; [`Session::set_playlist_art`] uploads
 //! a cover, and [`Session::remove_playlist_art`] takes it away.
 
+pub mod view;
+
 use spoolframe_protocol::playlists::{
     EntryId, Kinds, PinNote, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
     PlaylistSummary, ShareCandidatePage, Visibility,
@@ -35,13 +37,27 @@ use crate::{SdkError, Session};
 /// pinned ones that left their Pinned: show each once, then
 /// [`Session::dismiss_pin_notes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistList {
     pub playlists: Vec<PlaylistSummary>,
     pub pin_notes: Vec<PinNote>,
 }
 
+/// What [`Session::edit_playlist`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PlaylistEdited {
+    /// The playlist's revision now.
+    pub revision: u64,
+    /// The entries the edit's adds made, in its order: one an episode for
+    /// a show added. `None` from a server older than the field: read the
+    /// playlist again to find them.
+    pub added: Option<Vec<EntryId>>,
+}
+
 /// What [`Session::update_playlist`] changes; `None` leaves it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistUpdate {
     pub name: Option<String>,
     /// Only ever wider than now.
@@ -52,6 +68,7 @@ pub struct PlaylistUpdate {
 /// A playlist change a server told this device of. Read again what is
 /// shown, for any user signed in on that server.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaylistEvent {
     /// The server's key.
     pub server: String,
@@ -59,6 +76,7 @@ pub struct PlaylistEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PlaylistChange {
     /// A playlist the user sees was made or changed.
     Changed { id: String, revision: u64 },
@@ -72,6 +90,20 @@ impl Session {
     /// Every playlist the user sees: theirs, shared with them, and
     /// server-wide, with whether and where each is pinned.
     pub async fn playlists(&self) -> Result<PlaylistList, SdkError> {
+        use crate::catalog_cache::Value;
+        self.cached(
+            crate::CatalogKey::Playlists,
+            |s| async move { s.playlists_fresh().await },
+            |list| Value::Playlists(Box::new(list)),
+            |value| match value {
+                Value::Playlists(list) => Some(*list),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn playlists_fresh(&self) -> Result<PlaylistList, SdkError> {
         match self.call(Request::ListPlaylists).await? {
             Reply::Playlists {
                 playlists,
@@ -87,6 +119,30 @@ impl Session {
     /// Playlist `id` and a page of its entries, from `offset`, at most
     /// `limit` (200), with the user's place and settings.
     pub async fn playlist(
+        &self,
+        id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<PlaylistPage, SdkError> {
+        use crate::catalog_cache::Value;
+        let asked = id.to_owned();
+        self.cached(
+            crate::CatalogKey::Playlist {
+                id: id.into(),
+                offset,
+                limit,
+            },
+            move |s| async move { s.playlist_fresh(&asked, offset, limit).await },
+            |page| Value::Playlist(Box::new(page)),
+            |value| match value {
+                Value::Playlist(page) => Some(*page),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    async fn playlist_fresh(
         &self,
         id: &str,
         offset: u32,
@@ -143,21 +199,22 @@ impl Session {
     }
 
     /// Change a playlist's entries, as seen at `revision`: its new
-    /// revision. [`SdkError::PlaylistConflict`] when someone changed the
-    /// same entries since: "Someone changed this playlist; reload".
+    /// revision, and the entries added. [`SdkError::PlaylistConflict`] when
+    /// someone changed the same entries since: "Someone changed this
+    /// playlist; reload".
     pub async fn edit_playlist(
         &self,
         id: &str,
         revision: u64,
         edits: Vec<PlaylistEdit>,
-    ) -> Result<u64, SdkError> {
+    ) -> Result<PlaylistEdited, SdkError> {
         let request = Request::EditPlaylist {
             id: id.into(),
             revision,
             edits,
         };
         match self.call(request).await? {
-            Reply::PlaylistEdited { revision } => Ok(revision),
+            Reply::PlaylistEdited { revision, added } => Ok(PlaylistEdited { revision, added }),
             other => Err(unexpected(other)),
         }
     }

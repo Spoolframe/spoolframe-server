@@ -14,8 +14,8 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use std::time::Duration;
 
 use spoolframe_protocol::{
-    FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response, ServerId,
-    SessionId, TrustedProfile, device_sign_in, fingerprint, lan,
+    Features, FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response,
+    ServerId, SessionId, TrustedProfile, device_sign_in, fingerprint, lan,
 };
 use spoolframe_types::{ClientCapabilities, Platform};
 
@@ -141,12 +141,23 @@ pub struct ClientOptions {
     /// connection's `Hello`; none by default. Whether a server
     /// turned one on is [`crate::Session::experimental`].
     pub experimental: crate::Experimental,
+    /// The regular features to name in each connection's `Hello`
+    /// ([`spoolframe_protocol::features`]): every one this SDK knows, by
+    /// default. A server answers a feature's requests and sends its events
+    /// only to a connection that named it; whether it is on is
+    /// [`crate::Session::has_feature`].
+    pub features: Features,
     /// Where downloads are kept ([`Client::downloads`]); none by
     /// default, and then nothing is downloaded. The client's download
     /// manager runs with one. iOS: a directory in Application Support,
     /// excluded from backup by the app; Linux:
     /// `$XDG_DATA_HOME/spoolframe/downloads`.
     pub downloads_dir: Option<std::path::PathBuf>,
+    /// Keep catalog reads in memory and answer them at once, read again
+    /// behind them once old (see [`crate::Session::catalog_changes`]).
+    /// Off (`None`) by default: an app with a cache of its own would read
+    /// twice.
+    pub catalog_cache: Option<crate::CacheConfig>,
 }
 
 impl Default for ClientOptions {
@@ -156,8 +167,18 @@ impl Default for ClientOptions {
             lan_discovery: true,
             relays: true,
             experimental: crate::Experimental::default(),
+            features: Features::all(),
             downloads_dir: None,
+            catalog_cache: None,
         }
+    }
+}
+
+impl ClientOptions {
+    /// These options with the catalog cache on, as `config` sets it.
+    pub fn catalog_cache(mut self, config: crate::CacheConfig) -> Self {
+        self.catalog_cache = Some(config);
+        self
     }
 }
 
@@ -174,6 +195,8 @@ pub(crate) struct Inner {
     pub(crate) timeouts: Timeouts,
     /// What every Hello asks for.
     pub(crate) experimental: crate::Experimental,
+    /// The regular features named in each `Hello`.
+    pub(crate) features: Features,
     pub(crate) discovery: Discovery,
     /// Addresses the app gave for servers, and invites' hints.
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
@@ -220,8 +243,14 @@ pub(crate) struct Inner {
     pub(crate) subtitle_events: tokio::sync::broadcast::Sender<crate::SubtitleTimingEvent>,
     /// Library changes the servers told.
     pub(crate) library_events: tokio::sync::broadcast::Sender<crate::LibrariesChanged>,
+    /// Profile changes the servers told, or calls' answers said.
+    pub(crate) profile_events: tokio::sync::broadcast::Sender<crate::ProfileEvent>,
+    /// Watch state changes the servers told.
+    pub(crate) watch_events: tokio::sync::broadcast::Sender<crate::WatchEvent>,
     /// This device's downloads and their manager.
     pub(crate) downloads: Arc<crate::downloads::Shared>,
+    /// Catalog reads kept, with [`ClientOptions::catalog_cache`].
+    pub(crate) catalog: Option<Arc<crate::catalog_cache::CatalogCache>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -306,7 +335,9 @@ impl Client {
             lan_discovery,
             relays,
             experimental,
+            features,
             downloads_dir,
+            catalog_cache,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
         let reach = Arc::new(ReachLog::default());
@@ -380,6 +411,7 @@ impl Client {
                 device,
                 timeouts,
                 experimental,
+                features,
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
@@ -402,7 +434,15 @@ impl Client {
                 playlist_events: tokio::sync::broadcast::channel(64).0,
                 subtitle_events: tokio::sync::broadcast::channel(64).0,
                 library_events: tokio::sync::broadcast::channel(16).0,
+                profile_events: tokio::sync::broadcast::channel(16).0,
+                watch_events: tokio::sync::broadcast::channel(64).0,
                 downloads: crate::downloads::Shared::new(downloads_dir),
+                catalog: catalog_cache.map(|config| {
+                    crate::catalog_cache::CatalogCache::new(
+                        tokio::runtime::Handle::current(),
+                        config,
+                    )
+                }),
             }),
         };
         // Where saved servers publish: looked up there from the
@@ -538,12 +578,52 @@ impl Client {
         self.inner.subtitle_events.subscribe()
     }
 
+    /// The watch state of `items` changed on server `server` (its key)
+    /// other than through this client: another device marked them, or a
+    /// server event said so. Kept reads of them, of the shows and seasons
+    /// of those kept, and Home are forgotten, for every user of that
+    /// server. Nothing with the cache off.
+    pub fn watch_changed(&self, server: &str, items: &[spoolframe_types::MediaId]) {
+        if let Some(catalog) = &self.inner.catalog {
+            catalog.watch_changed(server, items);
+        }
+    }
+
+    /// Forget every kept catalog read, of every server: the next reads
+    /// ask the servers.
+    pub fn forget_catalog(&self) {
+        if let Some(catalog) = &self.inner.catalog {
+            catalog.clear_all();
+        }
+    }
+
     /// Every time a server this device is connected to says its libraries
     /// changed (experimental `federation`): a paired server came
     /// online or went offline, or shared or stopped sharing a library. A
     /// screen listing that server's libraries lists them again.
     pub fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<crate::LibrariesChanged> {
         self.inner.library_events.subscribe()
+    }
+
+    /// Every change to a profile signed in on this device, on any
+    /// server: the user removed from this device or their PIN changed, as
+    /// a server tells it with `spoolframe:profile-events` on
+    /// ([`crate::ClientOptions::features`] names it by default), and a
+    /// session ended or a password to change, as a call's answer
+    /// says. A "Who's watching" screen, and the profile shown, follow them.
+    /// Changes before the call, or while not connected, are not seen.
+    pub fn profile_events(&self) -> tokio::sync::broadcast::Receiver<crate::ProfileEvent> {
+        self.inner.profile_events.subscribe()
+    }
+
+    /// Every change to a signed-in user's watch state made on another
+    /// device, on any server, as a server tells it with
+    /// `spoolframe:watch-events` on ([`crate::ClientOptions::features`]
+    /// names it by default). This device's own changes are not told.
+    /// Changes while not connected are not seen: read again on
+    /// connecting.
+    pub fn watch_events(&self) -> tokio::sync::broadcast::Receiver<crate::WatchEvent> {
+        self.inner.watch_events.subscribe()
     }
 
     /// Where a paired server of server `home`'s may be dialled: its
@@ -644,6 +724,7 @@ impl Client {
             return Err(SdkError::IdentityChanged {
                 saved: old.endpoint_id.clone(),
                 now: endpoint_id.to_owned(),
+                server_id: old.server_id.clone(),
             });
         }
         let conn = match self.link(id).connection(self).await {
@@ -655,6 +736,7 @@ impl Client {
                     return Err(SdkError::IdentityChanged {
                         saved: old.endpoint_id.clone(),
                         now: now.to_string(),
+                        server_id: old.server_id.clone(),
                     });
                 }
                 return Err(e);
@@ -666,6 +748,7 @@ impl Client {
             return Err(SdkError::IdentityChanged {
                 saved: old.endpoint_id.clone(),
                 now: endpoint_id.to_owned(),
+                server_id: old.server_id.clone(),
             });
         }
         // Read again: dialling it has just dated the connect.
@@ -716,6 +799,7 @@ impl Client {
                 return Err(SdkError::IdentityChanged {
                     saved: old.endpoint_id.clone(),
                     now: endpoint_id.to_owned(),
+                    server_id: old.server_id.clone(),
                 });
             }
         }
@@ -738,6 +822,7 @@ impl Client {
             return Err(SdkError::IdentityChanged {
                 saved: old.endpoint_id.clone(),
                 now: endpoint_id.to_owned(),
+                server_id: old.server_id.clone(),
             });
         }
         saved.retain(|s| s.endpoint_id != endpoint_id);
@@ -1449,10 +1534,21 @@ impl Client {
     pub async fn profiles(&self, endpoint_id: &str) -> Result<Vec<Session>, SdkError> {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
-        let stored = session::load(self.inner.storage.as_ref(), &server).await?;
+        let mut stored = session::load(self.inner.storage.as_ref(), &server).await?;
+        self.sessions_of(server, &mut stored).await
+    }
+
+    /// [`Client::profiles`] of the sessions `stored` for `server`, as
+    /// loaded: one that ended is ended here and left without its token in
+    /// `stored` too, as it is now kept.
+    pub(crate) async fn sessions_of(
+        &self,
+        server: EndpointId,
+        stored: &mut [session::StoredSession],
+    ) -> Result<Vec<Session>, SdkError> {
         let mut profiles = Vec::new();
-        for s in stored {
-            let Some(token) = s.token else {
+        for s in stored.iter_mut() {
+            let Some(token) = s.token.clone() else {
                 continue;
             };
             let token = SessionId(token);
@@ -1489,6 +1585,7 @@ impl Client {
                         "a session has ended; keeping the profile"
                     );
                     self.end_session(server, &token).await?;
+                    s.token = None;
                 }
                 Response::Ok(other) => {
                     return Err(SdkError::Protocol(format!("WhoAmI answered {other:?}")));
@@ -1682,6 +1779,7 @@ impl Client {
         let link = self.link(server);
         self.not_signed_out(&link, session)?;
         let conn = link.connection(self).await?;
+        let feature = request.feature();
         let operation = (!retry_safe(&request)).then(|| Operation {
             id: uuid::Uuid::now_v7().to_string(),
             instance: conn.instance.id.clone(),
@@ -1704,7 +1802,18 @@ impl Client {
         let reply = self
             .on_connection(server, session, true, |conn| {
                 let wire = &wire;
-                async move { conn.call(wire, limit).await }
+                async move {
+                    // A feature's calls are reached only through `On` or
+                    // `Invited`; this stops one on a connection where it
+                    // went off since, a reconnect's included, or by a
+                    // path that skipped them.
+                    if let Some(feature) = feature
+                        && !conn.info.features.contains(feature)
+                    {
+                        return Err(SdkError::FeatureOff { feature });
+                    }
+                    conn.call(wire, limit).await
+                }
             })
             .await?;
         if let (Some(revision), Some(session)) = (&reply.playback, session) {
@@ -2024,6 +2133,7 @@ impl Client {
             endpoint_addr(id, &addrs, &relays),
             &self.inner.device,
             self.inner.experimental,
+            self.inner.features,
             &self.inner.timeouts,
         )
         .await;

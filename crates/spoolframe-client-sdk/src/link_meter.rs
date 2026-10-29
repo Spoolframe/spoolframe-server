@@ -7,9 +7,10 @@
 //! link's busy time, as they arrive: on a slow link an 8 MiB block takes
 //! long enough that waiting for it to finish would tell too late. Idle
 //! time, while the read-ahead is full, is not counted: the link was not
-//! asked to carry anything then. Converted reads are not counted: the
-//! server holds them while the encode catches up, which says nothing
-//! about the link.
+//! asked to carry anything then. A converted read (an HLS segment, a
+//! chunk) is counted from its first byte: the server holds it while the
+//! encode catches up, which says nothing about the link, and the bytes
+//! once they flow do.
 //!
 //! One meter per server, shared by every playback on it, so a later
 //! playback starts from what an earlier one measured.

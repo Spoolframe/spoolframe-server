@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use spoolframe_protocol::Error as ServerError;
+use spoolframe_protocol::{Error as ServerError, Feature};
 
 use crate::pairing::PairingError;
 use crate::portable::{CredentialError, PhraseError, StateError};
@@ -52,9 +52,14 @@ pub enum SdkError {
     /// when `now` answers with `saved`'s pinned server id; for a saved
     /// server with no server id pinned yet, when `now` is heard under its
     /// name. Show both fingerprints; [`crate::Client::trust_new_identity`]
-    /// if the user says so, which keeps the server id.
+    /// if the user says so, which keeps the server id. `server_id` is the
+    /// saved server's pinned server id, `None` while none is pinned yet.
     #[error("server {saved} answered with another key, {now}")]
-    IdentityChanged { saved: String, now: String },
+    IdentityChanged {
+        saved: String,
+        now: String,
+        server_id: Option<String>,
+    },
     /// Saved server `endpoint_id` answered under its pinned key with
     /// another server id, `now`, than the one pinned, `saved`. A
     /// server never changes its id, and its app passkeys are bound to it,
@@ -327,6 +332,16 @@ pub enum SdkError {
     /// Hide what needs it.
     #[error("{feature} is not on for this session")]
     Unsupported { feature: String },
+    /// A regular feature this call needs is not on for the connection: the
+    /// app did not name it ([`crate::ClientOptions::features`]), or the
+    /// server does not have it ([`crate::Session::has_feature`]). Nothing
+    /// was sent. Hide what needs it.
+    #[error("{feature} is not on for this connection")]
+    FeatureOff { feature: Feature },
+    /// The server does not know this request: it is older than this SDK.
+    /// Hide what needs it.
+    #[error("this server does not know the request {request:?}")]
+    NotOnServer { request: String },
     /// The user sees the playlist and may not make this change:
     /// an edit on a read-only share, or a rename, sharing change or
     /// delete by anyone but its owner (or an admin, for a server-wide
@@ -403,11 +418,73 @@ pub enum SdkError {
     Protocol(String),
 }
 
+/// What an app does about an [`SdkError`], whichever one it is
+/// ([`SdkError::kind`]). An app that only needs to know whether to try
+/// again, ask for something or say no matches on this; one that says more
+/// matches on the error itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ErrorKind {
+    /// The connection failed under the request ([`SdkError::is_transport`]):
+    /// show the state again; the next call dials.
+    Transport,
+    /// The session is gone and forgotten ([`SdkError::SignInRequired`]):
+    /// show "Who's watching" or the sign-in.
+    SessionEnded,
+    /// The profile is locked here ([`SdkError::ProfileLocked`]): ask for
+    /// its PIN and [`crate::Session::unlock`].
+    NeedsPin,
+    /// A one-time password signed this session in
+    /// ([`SdkError::PasswordChangeRequired`]): show "Choose a new password".
+    NeedsNewPassword,
+    /// The sign-in is too old for this ([`SdkError::RecentSignInRequired`]):
+    /// confirm it is the user, then ask again.
+    NeedsRecentSignIn,
+    /// Too many tries ([`SdkError::RateLimited`]): try again after
+    /// `retry_after`.
+    RateLimited { retry_after: Duration },
+    /// The server is older than this SDK: it does not know the request
+    /// ([`SdkError::NotOnServer`]), does not have the feature it is behind
+    /// ([`SdkError::FeatureOff`]), or speaks an older protocol revision
+    /// ([`SdkError::UpdateRequired`] with a lower `server_protocol`). Hide
+    /// what needs it.
+    ServerTooOld,
+    /// Anything else: the request was refused, or failed, for the reason
+    /// the error says. Trying again as it is does not help.
+    Refused,
+}
+
 impl SdkError {
     /// The connection failed under a request: it was not answered in
     /// time, or its stream broke. The connection may be dead.
-    pub(crate) fn is_transport(&self) -> bool {
+    pub fn is_transport(&self) -> bool {
         matches!(self, SdkError::TimedOut(_) | SdkError::Unreachable(_))
+    }
+
+    /// What an app does about this error ([`ErrorKind`]).
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            e if e.is_transport() => ErrorKind::Transport,
+            SdkError::SignInRequired => ErrorKind::SessionEnded,
+            SdkError::ProfileLocked => ErrorKind::NeedsPin,
+            SdkError::PasswordChangeRequired => ErrorKind::NeedsNewPassword,
+            SdkError::RecentSignInRequired => ErrorKind::NeedsRecentSignIn,
+            SdkError::RateLimited { retry_after } => ErrorKind::RateLimited {
+                retry_after: *retry_after,
+            },
+            SdkError::NotOnServer { .. } | SdkError::FeatureOff { .. } => ErrorKind::ServerTooOld,
+            // One rule with `who_updates`: the server is the side to update.
+            // At equal revisions it says the server too, there being
+            // nothing newer here to blame, but the server is not older,
+            // so that stays `Refused`.
+            SdkError::UpdateRequired { server_protocol }
+                if self.who_updates() == Some(crate::describe::UpdateNeeded::Server)
+                    && *server_protocol != Some(spoolframe_protocol::PROTOCOL_VERSION) =>
+            {
+                ErrorKind::ServerTooOld
+            }
+            _ => ErrorKind::Refused,
+        }
     }
 
     /// The error for a server's answer. `Unauthenticated` is
@@ -485,6 +562,7 @@ impl SdkError {
             ServerError::DownloadNotReady => SdkError::DownloadNotReady,
             ServerError::PairingRefused { reason } => SdkError::PairingRefused { reason },
             ServerError::OriginOffline => SdkError::OriginOffline,
+            ServerError::Unsupported { request } => SdkError::NotOnServer { request },
             other => SdkError::Server(other.to_string()),
         }
     }
@@ -493,6 +571,93 @@ impl SdkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_connection_is_transport() {
+        assert_eq!(
+            SdkError::TimedOut("hello".into()).kind(),
+            ErrorKind::Transport
+        );
+        assert_eq!(
+            SdkError::Unreachable("s".into()).kind(),
+            ErrorKind::Transport
+        );
+    }
+
+    #[test]
+    fn what_the_app_asks_for_is_its_own_kind() {
+        assert_eq!(SdkError::SignInRequired.kind(), ErrorKind::SessionEnded);
+        assert_eq!(SdkError::ProfileLocked.kind(), ErrorKind::NeedsPin);
+        assert_eq!(
+            SdkError::PasswordChangeRequired.kind(),
+            ErrorKind::NeedsNewPassword
+        );
+        assert_eq!(
+            SdkError::RecentSignInRequired.kind(),
+            ErrorKind::NeedsRecentSignIn
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_keeps_when_to_try_again() {
+        let error = SdkError::RateLimited {
+            retry_after: Duration::from_secs(30),
+        };
+        assert_eq!(
+            error.kind(),
+            ErrorKind::RateLimited {
+                retry_after: Duration::from_secs(30)
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_server_is_too_old_and_a_newer_one_is_refused() {
+        let missing = SdkError::NotOnServer {
+            request: "DeleteUser".into(),
+        };
+        assert_eq!(missing.kind(), ErrorKind::ServerTooOld);
+        let off = SdkError::FeatureOff {
+            feature: spoolframe_protocol::Feature::NextEpisodes,
+        };
+        assert_eq!(off.kind(), ErrorKind::ServerTooOld);
+        let older = SdkError::UpdateRequired {
+            server_protocol: Some(spoolframe_protocol::PROTOCOL_VERSION - 1),
+        };
+        assert_eq!(older.kind(), ErrorKind::ServerTooOld);
+        let newer = SdkError::UpdateRequired {
+            server_protocol: Some(spoolframe_protocol::PROTOCOL_VERSION + 1),
+        };
+        assert_eq!(newer.kind(), ErrorKind::Refused);
+        let unsaid = SdkError::UpdateRequired {
+            server_protocol: None,
+        };
+        assert_eq!(unsaid.kind(), ErrorKind::Refused);
+        let same = SdkError::UpdateRequired {
+            server_protocol: Some(spoolframe_protocol::PROTOCOL_VERSION),
+        };
+        assert_eq!(same.kind(), ErrorKind::Refused);
+    }
+
+    #[test]
+    fn a_refusal_with_a_reason_is_refused() {
+        assert_eq!(SdkError::Busy.kind(), ErrorKind::Refused);
+        assert_eq!(SdkError::NotFound("item".into()).kind(), ErrorKind::Refused);
+    }
+
+    /// A server older than the SDK answers a request it lacks with
+    /// `Unsupported`; an app gets a typed error to hide the feature by.
+    #[test]
+    fn a_request_the_server_does_not_know_is_not_on_server() {
+        assert_eq!(
+            SdkError::from_server(ServerError::Unsupported {
+                request: "DeleteUser".into(),
+            }),
+            SdkError::NotOnServer {
+                request: "DeleteUser".into(),
+            }
+        );
+    }
 
     /// PX-02's refusals reach an app with their fields, not as a
     /// server message to match on.

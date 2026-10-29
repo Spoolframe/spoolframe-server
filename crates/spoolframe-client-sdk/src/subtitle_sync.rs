@@ -20,6 +20,7 @@ use crate::{SdkError, Session};
 
 /// A subtitle track's timing changed, as a server told.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitleTimingEvent {
     /// The server's key.
     pub server: String,

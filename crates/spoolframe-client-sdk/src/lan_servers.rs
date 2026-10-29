@@ -12,6 +12,7 @@ use crate::{SdkError, ServerEntry};
 /// A server as a "servers on my network" row shows it, from its `Hello`
 /// answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LanServerInfo {
     /// The server's key, hex: what [`Client::connect`] and
     /// [`Client::pin`] take.

@@ -61,6 +61,7 @@ const CHECK_MARGIN: Duration = Duration::from_millis(500);
 
 /// Where a server's connection stands, for the app to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ConnectionState {
     /// Not connected, and not trying to be.
     Disconnected,
@@ -80,6 +81,7 @@ pub enum ConnectionState {
 /// port look the same. What the address is does tell the local network
 /// apart: `Lan` is a private, link-local or loopback address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ConnectionPath {
     /// Straight to the server on the local network.
     Lan { addr: SocketAddr },
@@ -670,12 +672,38 @@ async fn events(conn: &Connection) -> Option<RecvStream> {
 }
 
 /// Pass a playlist change from server `id` on; nobody listening is fine.
+/// Kept Home and items name the playlists, so they go.
 fn tell_playlists(client: &Weak<Inner>, id: EndpointId, change: crate::PlaylistChange) {
+    use crate::catalog_cache::Clear;
+    let clear = match &change {
+        crate::PlaylistChange::Changed { id, .. } | crate::PlaylistChange::Gone { id } => {
+            Clear::Playlist(id.clone())
+        }
+        crate::PlaylistChange::PinsChanged => Clear::Pins,
+    };
+    clear_catalog(client, id, clear);
     if let Some(inner) = client.upgrade() {
         let _ = inner.playlist_events.send(crate::PlaylistEvent {
             server: id.to_string(),
             change,
         });
+    }
+}
+
+/// Pass a profile change from server `id` on; nobody listening is fine.
+fn tell_profiles(client: &Weak<Inner>, id: EndpointId, change: crate::ProfileChange) {
+    if let Some(inner) = client.upgrade() {
+        let _ = inner.profile_events.send(crate::ProfileEvent {
+            server: id.to_string(),
+            change,
+        });
+    }
+}
+
+/// Forget what `clear` covers of server `id`'s kept catalog reads.
+fn clear_catalog(client: &Weak<Inner>, id: EndpointId, clear: crate::catalog_cache::Clear) {
+    if let Some(catalog) = client.upgrade().and_then(|inner| inner.catalog.clone()) {
+        catalog.clear_server(&id.to_string(), &clear);
     }
 }
 
@@ -723,8 +751,11 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
             tell_playlists(client, id, crate::PlaylistChange::Gone { id: playlist });
         }
         Event::PinsChanged => tell_playlists(client, id, crate::PlaylistChange::PinsChanged),
-        // Liked downloaded is asked about again.
-        Event::LikedChanged => tell_music(client, id, Followed::Liked),
+        // Liked downloaded is asked about again; kept hearts go.
+        Event::LikedChanged => {
+            clear_catalog(client, id, crate::catalog_cache::Clear::Items);
+            tell_music(client, id, Followed::Liked);
+        }
         Event::ServerAddresses {
             addrs,
             relays,
@@ -777,11 +808,45 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
         }
         // Experimental: for whoever lists the libraries.
         Event::LibrariesChanged => {
+            clear_catalog(client, id, crate::catalog_cache::Clear::Everything);
             if let Some(inner) = client.upgrade() {
                 let _ = inner.library_events.send(crate::LibrariesChanged {
                     server: id.to_string(),
                 });
             }
+        }
+        // For whoever shows the items: kept reads of them are forgotten
+        // first, so a screen that reads them again on the event is told
+        // the new state.
+        Event::WatchChanged { items } => {
+            if let Some(inner) = client.upgrade() {
+                if let Some(catalog) = &inner.catalog {
+                    catalog.watch_changed(&id.to_string(), &items);
+                }
+                let _ = inner.watch_events.send(crate::WatchEvent {
+                    server: id.to_string(),
+                    items,
+                });
+            }
+        }
+        // For whoever shows the profile.
+        Event::ProfileRemoved { user } => {
+            tell_profiles(client, id, crate::ProfileChange::Removed { user });
+        }
+        // The profile locks again here, before whoever shows it is told.
+        Event::PinChanged { user, required } => {
+            if let Some(inner) = client.upgrade() {
+                inner
+                    .downloads
+                    .locks
+                    .pin_changed(&id.to_string(), &user, required)
+                    .await;
+            }
+            tell_profiles(
+                client,
+                id,
+                crate::ProfileChange::PinChanged { user, required },
+            );
         }
         Event::Unknown => {}
     }
@@ -917,6 +982,7 @@ mod tests {
             SdkError::IdentityChanged {
                 saved: "a".into(),
                 now: "b".into(),
+                server_id: None,
             },
             SdkError::ServerIdChanged {
                 endpoint_id: "a".into(),

@@ -45,6 +45,7 @@ pub fn direct_plan() -> PlaybackPlan {
         video: None,
         audio: None,
         subtitle: None,
+        source_codec: None,
     }
 }
 pub struct TestProfile;
@@ -129,6 +130,7 @@ impl TestBackend {
                     subtitle: None,
                     ladder: Vec::new(),
                     reasons: vec![],
+                    source_codec: None,
                 }
             } else {
                 direct_plan()
@@ -269,6 +271,7 @@ impl PlaybackBackend for TestBackend {
                 subtitle: None,
                 ladder: Vec::new(),
                 reasons: vec![],
+                source_codec: None,
             },
             size: 0,
             epoch: 1,

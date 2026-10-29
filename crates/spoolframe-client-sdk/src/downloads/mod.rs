@@ -40,21 +40,31 @@
 //! the views show, and locks a profile whose PIN is asked for here until
 //! [`Downloads::unlock_offline`].
 
+mod background;
+mod batch;
+mod library;
 mod listening;
 mod lock;
 mod manager;
 mod music;
 mod space;
 mod store;
+mod view;
 mod writer;
 
+pub use background::{
+    REFRESH_EVERY, RefreshMissed, RefreshReport, RunProgress, RunTally, UNITS_PER_DOWNLOAD,
+};
+pub use batch::{BatchStart, ChildPlan, FailedChild, SkipReason, SkippedChild};
+pub use library::{DownloadLibrary, DownloadedShow, DownloadsHere, ProfileHere};
 pub(crate) use listening::Keeper;
 pub(crate) use lock::Locks;
 pub use music::{
-    AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicQuality,
-    MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark, OfflineMusic,
-    OfflinePlaylist, OfflineTrack, SyncedPlay,
+    AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicPhase,
+    MusicQuality, MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark,
+    OfflineMusic, OfflinePlaylist, OfflineTrack, SyncedPlay,
 };
+pub use view::{Applied, DownloadAction, DownloadList};
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -80,6 +90,7 @@ use store::{EntryKind, Hold, Manifest, Store};
 
 /// Where a download is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownloadPhase {
     /// The server is making the file: `server` is where it says it is
@@ -108,7 +119,7 @@ pub enum DownloadPhase {
 
 impl DownloadPhase {
     /// The manager moves it on.
-    fn is_active(&self) -> bool {
+    pub(super) fn is_active(&self) -> bool {
         matches!(self, Self::Preparing { .. } | Self::Transferring)
     }
 }
@@ -116,15 +127,15 @@ impl DownloadPhase {
 /// Where the user got to in a download while watching it here. Sent to
 /// the server by [`Downloads::sync_watch`] while `pending`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LocalWatch {
     /// Where it stopped, in milliseconds; `None` when only `watched` was
     /// set, which starts it over.
     pub position_ms: Option<u64>,
-    /// What the user marked it on this device, or the server's watched
-    /// as of the download or the last sync; `None` once a position is
-    /// recorded after it. For showing only: with a position the server
-    /// judges watched by its own rules (the credits), which this SDK does
-    /// not know.
+    /// What the user marked it on this device, or the server's watched as
+    /// of the download or the last sync. A position recorded later keeps
+    /// it, and one inside the credits or the last 30 s marks it watched
+    /// ([`Downloads::record_position`]).
     pub watched: Option<bool>,
     /// When, Unix seconds by this device's clock.
     pub at: i64,
@@ -150,6 +161,27 @@ impl LocalWatch {
         }
     }
 
+    /// `change` made here now, merged with what was there: a position
+    /// keeps what was marked (and marks it watched at `item`'s end), and
+    /// unwatched starts it over. Pending until the server hears it.
+    fn record(&mut self, change: WatchChange, item: &Item, markers: &[Marker]) {
+        match change {
+            WatchChange::Position(ms) => {
+                self.position_ms = Some(ms);
+                if at_end(item, markers, ms) {
+                    self.watched = Some(true);
+                }
+            }
+            WatchChange::Watched(true) => self.watched = Some(true),
+            WatchChange::Watched(false) => {
+                self.watched = Some(false);
+                self.position_ms = None;
+            }
+        }
+        self.at = now();
+        self.pending = true;
+    }
+
     /// The entry `SyncOfflineWatch` sends for `item`; `None` with nothing
     /// to send.
     pub(crate) fn entry(&self, item: &Item) -> Option<OfflineWatch> {
@@ -162,8 +194,38 @@ impl LocalWatch {
     }
 }
 
+/// What the user did to a download's watch here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchChange {
+    /// Got to this many milliseconds.
+    Position(u64),
+    /// Marked it watched, or not.
+    Watched(bool),
+}
+
+/// How near its end a position counts as watched when the item has no
+/// credits marker; with one, anywhere in the credits does.
+pub const WATCHED_NEAR_END: Duration = Duration::from_secs(30);
+
+/// Whether `position_ms` is at `item`'s end: inside its credits, or in
+/// its last [`WATCHED_NEAR_END`].
+fn at_end(item: &Item, markers: &[Marker], position_ms: u64) -> bool {
+    let in_credits = markers.iter().any(|marker| {
+        marker.kind == spoolframe_types::MarkerKind::Credits && position_ms >= marker.start_ms
+    });
+    let duration = match item {
+        Item::Movie(m) => m.duration,
+        Item::Episode(e) => e.duration,
+        _ => None,
+    };
+    let near_end = duration
+        .is_some_and(|length| Duration::from_millis(position_ms) + WATCHED_NEAR_END >= length);
+    in_credits || near_end
+}
+
 /// A picture kept with a download.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LocalArtwork {
     /// What it is of: the download's item, or an episode's show or
     /// season.
@@ -173,8 +235,10 @@ pub struct LocalArtwork {
 }
 
 /// A download on this device, as [`Downloads::list`] gives it: all an app
-/// needs to show and play it with no server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// needs to show and play it with no server. Serde, so an app can keep
+/// or pass it on as it is (snake_case fields, paths as strings).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LocalDownload {
     /// Its key here: what the other calls take.
     pub key: String,
@@ -228,15 +292,27 @@ pub struct LocalDownload {
 // event is sent at most once per piece read.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DownloadEvent {
     /// Its phase, progress, watch or note: show it again.
     Changed(LocalDownload),
     /// It was cancelled or deleted.
     Removed { key: String },
+    /// A music download's tracks moved on: show it again. Sent with each
+    /// change of a track it holds.
+    MusicChanged(MusicDownload),
+    /// What `user` watched, played or liked here with no server reached
+    /// `server`: these items. Show their state from the server again.
+    WatchSynced {
+        server: String,
+        user: String,
+        items: Vec<MediaId>,
+    },
 }
 
 /// The room downloads have ([`Downloads::space`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DownloadSpace {
     /// Free bytes where the downloads are: the app's own figure
     /// ([`Downloads::set_free_space`]) if it gave one, else the file
@@ -246,8 +322,50 @@ pub struct DownloadSpace {
     pub used: u64,
 }
 
+/// Stops a [`Downloads::run_until_cancelled`]. Cheap to clone; once
+/// cancelled, cancelled for good: a new run takes a new one.
+#[derive(Debug, Clone)]
+pub struct RunCancel(Arc<watch::Sender<bool>>);
+
+impl RunCancel {
+    pub fn new() -> Self {
+        Self(Arc::new(watch::Sender::new(false)))
+    }
+
+    /// Stop the run: it returns [`RunEnd::Cancelled`] at once, or as soon
+    /// as it starts.
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+}
+
+impl Default for RunCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How a [`Downloads::run_until_cancelled`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum RunEnd {
+    /// Nothing is preparing or transferring.
+    Done,
+    /// Its [`RunCancel`] stopped it.
+    Cancelled,
+    /// Downloads are under way, and every one waits for a network
+    /// downloads may use ([`Downloads::set_network`]): a run would wait
+    /// for nothing until the network changes.
+    Held,
+}
+
 /// What became of one item's offline watch ([`Downloads::sync_watch`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SyncedWatch {
     pub item: MediaId,
     /// `Older`: the server has something newer, which is now the
@@ -555,30 +673,64 @@ impl Downloads {
         }
     }
 
+    /// [`Downloads::list`] of item `id` alone (or show `id`'s episodes):
+    /// only their manifests are read.
+    pub(crate) fn list_of(&self, id: &MediaId) -> Vec<LocalDownload> {
+        let shared = self.shared();
+        match &shared.store {
+            Some(store) => store
+                .of_item(id)
+                .iter()
+                .filter(|m| shared.shown(m).is_ok())
+                .map(|m| shared.view(m))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Download `key`, from disk.
     pub fn get(&self, key: &str) -> Result<LocalDownload, SdkError> {
         Ok(self.shared().view(&self.find(key)?))
     }
 
     /// Move every download on until none is preparing or transferring
-    /// (each is done, failed or paused): for a background task's time.
+    /// (each is done, failed or paused), or every one waits for a network
+    /// downloads may use: for a background task's time.
     /// Ones waiting to try again try now. Cancel it (drop the future)
     /// when the time is up; nothing is lost.
     pub async fn run_until_done(&self) -> Result<(), SdkError> {
+        self.run_until_cancelled(&RunCancel::new())
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Downloads::run_until_done`], stopped early by `cancel` from any
+    /// task or thread: for an app whose own cancellation never reaches
+    /// this future (a UniFFI binding, whose Swift task cancellation does
+    /// not drop it). Nothing is lost either way.
+    pub async fn run_until_cancelled(&self, cancel: &RunCancel) -> Result<RunEnd, SdkError> {
         let shared = self.shared();
         let store = shared.store()?;
         shared.retry_at.lock().clear();
         shared.check_at.lock().clear();
         shared.wake.notify_one();
         let mut closed = shared.closed.subscribe();
+        let mut cancelled = cancel.0.subscribe();
         loop {
             let mut events = shared.events.subscribe();
+            if *cancelled.borrow_and_update() {
+                return Ok(RunEnd::Cancelled);
+            }
             if store.active().is_empty() {
-                return Ok(());
+                return Ok(RunEnd::Done);
+            }
+            if shared.network_held() {
+                return Ok(RunEnd::Held);
             }
             tokio::select! {
                 _ = events.recv() => {}
                 () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = cancelled.changed() => {}
                 _ = closed.wait_for(|closed| *closed) => {
                     return Err(SdkError::Downloads("the client was closed".into()));
                 }
@@ -596,6 +748,19 @@ impl Downloads {
         })
     }
 
+    /// Read the downloads directory again, whole, on the next read: for
+    /// downloads another process wrote into it (an iOS background
+    /// `URLSession` or a share extension, Android's `WorkManager`). Call
+    /// it when the app returns to the foreground and when such background
+    /// work completes. An item's downloads are found without it (the
+    /// index reads the directory again when a download was added or
+    /// removed there); the downloads under way are not.
+    pub fn rescan(&self) {
+        if let Some(store) = &self.shared().store {
+            store.rescan();
+        }
+    }
+
     /// The free bytes to go by instead of the file system's, or `None` to
     /// go by it again: on iOS, `volumeAvailableCapacityForImportantUsage`,
     /// which counts what the system would purge. A download needs its
@@ -605,40 +770,30 @@ impl Downloads {
     }
 
     /// The user got to `position` in download `key`, playing it here.
+    /// What they marked stays; inside the credits (by its markers) or in
+    /// the last [`WATCHED_NEAR_END`] it is marked watched. Sent to the
+    /// server as soon as a session of theirs is here.
     pub async fn record_position(
         &self,
         key: &str,
         position: Duration,
     ) -> Result<LocalDownload, SdkError> {
-        self.watched(key, Some(position.as_millis() as u64), None)
+        self.watched(key, WatchChange::Position(position.as_millis() as u64))
             .await
     }
 
-    /// The user marked download `key` watched or not, here. Unwatched
-    /// starts it over.
+    /// The user marked download `key` watched or not, here: where they got
+    /// to is kept, but unwatched starts it over. Sent to the server as
+    /// soon as a session of theirs is here.
     pub async fn set_watched(&self, key: &str, watched: bool) -> Result<LocalDownload, SdkError> {
-        self.watched(key, None, Some(watched)).await
+        self.watched(key, WatchChange::Watched(watched)).await
     }
 
-    async fn watched(
-        &self,
-        key: &str,
-        position_ms: Option<u64>,
-        watched: Option<bool>,
-    ) -> Result<LocalDownload, SdkError> {
+    async fn watched(&self, key: &str, change: WatchChange) -> Result<LocalDownload, SdkError> {
         let shared = self.shared();
         let user_id = shared.acting(&self.find(key)?);
-        let m = shared
-            .update(key, |m| {
-                *m.watch_mut(&user_id) = LocalWatch {
-                    position_ms,
-                    watched,
-                    at: now(),
-                    pending: true,
-                };
-                Ok(())
-            })
-            .await?;
+        let m = shared.record_watch(key, &user_id, change).await?;
+        shared.want_sync(&m.server, &user_id);
         Ok(shared.view(&m))
     }
 
@@ -858,6 +1013,47 @@ impl Shared {
         self.wake.notify_one();
     }
 
+    /// Record `change` to `user_id`'s watch of download `key`, merged with
+    /// what is there.
+    async fn record_watch(
+        &self,
+        key: &str,
+        user_id: &str,
+        change: WatchChange,
+    ) -> Result<Manifest, SdkError> {
+        self.update(key, |m| {
+            let (item, markers) = (m.item.clone(), m.markers.clone());
+            m.watch_mut(user_id).record(change, &item, &markers);
+            Ok(())
+        })
+        .await
+    }
+
+    /// `user_id` on `server` has something to send: with a session of
+    /// theirs here the manager sends it now, else when one is made.
+    pub(super) fn want_sync(&self, server: &str, user_id: &str) {
+        let Ok(server) = crate::client::parse_id(server) else {
+            return;
+        };
+        let key = (server, user_id.to_owned());
+        if self.sessions.lock().contains_key(&key) {
+            self.sync_wanted.lock().insert(key);
+            self.wake.notify_one();
+        }
+    }
+
+    /// `session`'s server heard what its user did here to `items`: tell
+    /// the app, so it shows them from the server again. Nothing for none.
+    fn watch_synced(&self, session: &Session, items: Vec<MediaId>) {
+        if !items.is_empty() {
+            let _ = self.events.send(DownloadEvent::WatchSynced {
+                server: session.server(),
+                user: session.user().user_id.clone(),
+                items,
+            });
+        }
+    }
+
     /// Server `server` told that its download `id` moved.
     pub(crate) fn server_event(&self, server: EndpointId, id: String) {
         let _ = self.server_events.send(ServerChange { server, id });
@@ -906,6 +1102,9 @@ impl Shared {
     fn emit(&self, m: &Manifest) {
         if self.shown(m).is_ok() {
             let _ = self.events.send(DownloadEvent::Changed(self.view(m)));
+        }
+        if m.kind == EntryKind::Track {
+            self.emit_music(m);
         }
     }
 
@@ -1012,3 +1211,7 @@ const WAITING_FOR_NETWORK: &str = "Waiting for Wi-Fi or a wired network";
 fn disk(e: std::io::Error) -> SdkError {
     SdkError::Downloads(e.to_string())
 }
+
+#[cfg(test)]
+#[path = "watch_tests.rs"]
+mod watch_tests;

@@ -65,6 +65,7 @@ use crate::storage::{Storage, StorageError, keys};
 
 /// Where identity `id`'s root is on this device ([`Portable::root_location`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RootLocation {
     /// Not here: a guest, a security key identity, or one forgotten.
     None,
@@ -79,6 +80,7 @@ pub enum RootLocation {
 
 /// Why turning on a root's sync was refused ([`Portable::enable_root_sync`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RootSyncRefused {
     /// The identity is rooted in security keys: it has no secret to sync,
     /// and a key acts for it on any device as it is.
