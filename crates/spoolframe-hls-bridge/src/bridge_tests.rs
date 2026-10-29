@@ -1,7 +1,7 @@
 //! A controllable backend exercises HTTP readers without a server or sleeps.
 use super::*;
 use spoolframe_client_sdk::{self as sdk, SdkError};
-use crate::SdkSource;
+use crate::{MenuEntry, SdkSource};
 use sdk::{PlaybackBackend, PlaybackHandle, PlaybackOptions, Playback, Selection, BitmapSubtitles, PlaybackChange, Chunk, types};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,7 +35,7 @@ impl PlaybackBackend for Backend {
 fn snapshot() -> Playback {
     Playback {
         handle: PlaybackHandle("test-playback".into()),
-        plan: sdk::PlaybackPlan::Direct { container: types::Container::Mp4, video: None, audio: None, subtitle: None },
+        plan: sdk::PlaybackPlan::Direct { container: types::Container::Mp4, video: None, audio: None, subtitle: None, source_codec: None },
         size: 2, chosen: None, epoch: 0, markers: vec![],
     }
 }
@@ -89,4 +89,14 @@ async fn retiring_url_cancels_a_delayed_reopen() {
     backend.entered.notified().await;
     stream.retired.send_replace(true);
     assert!(tokio::time::timeout(Duration::from_secs(2), reading).await.unwrap().unwrap().is_err());
+}
+
+#[tokio::test]
+async fn a_stream_its_caller_keeps_is_the_one_served() {
+    let bridge = Bridge::new();
+    let kept = stream(Arc::new(Backend::default()));
+    let token = bridge.register_shared(kept.clone());
+    let entry = MenuEntry { index: 1, name: "English".into(), language: Some("en".into()), forced: false };
+    bridge.set_menu(&token, vec![entry.clone()]);
+    assert_eq!((kept.menu(), bridge.stream(&token).is_some_and(|s| Arc::ptr_eq(&s, &kept))), (Some(vec![entry]), true));
 }

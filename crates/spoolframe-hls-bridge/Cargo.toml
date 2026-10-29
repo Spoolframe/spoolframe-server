@@ -9,22 +9,33 @@ license = "MIT OR Apache-2.0"
 publish = ["crates-io"]
 
 [features]
-default = []
+# The HTTP server a player that only takes a URL reads from. Off, a
+# caller reads each resource by name ([`Bridge::resource`]): no hyper and
+# no socket (Android's Media3).
+default = ["http"]
+http = [
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "tokio/net",
+]
 # The source over the client SDK's `ManagedPlayback`, for the apps. Off by
 # default, so the server serves its own source without building the SDK.
 sdk = ["dep:spoolframe-client-sdk"]
 
 [dependencies]
-bytes = { workspace = true }
-futures-util = { workspace = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 # The playback tokens in the path.
 getrandom = { workspace = true }
-http-body-util = { workspace = true }
-hyper = { workspace = true, features = ["http1", "server"] }
-hyper-util = { workspace = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, features = ["http1", "server"], optional = true }
+hyper-util = { workspace = true, optional = true }
 spoolframe-client-sdk = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -35,3 +46,12 @@ hyper = { workspace = true, features = ["http1", "client"] }
 tokio = { workspace = true }
 # The in-memory source in tests/http.rs.
 parking_lot = { workspace = true }
+
+# They fetch from the bridge over HTTP.
+[[test]]
+name = "http"
+required-features = ["http"]
+
+[[test]]
+name = "options"
+required-features = ["http"]

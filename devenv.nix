@@ -64,6 +64,12 @@ in {
 
     [profile.default]
     test-threads = "num-cpus"
+    # spoolframe-client-ffi's bindings test reads the crate's own cdylib
+    # (its UniFFI metadata), which no test binary links: the archive
+    # carries it to the shards.
+    archive.include = [
+      { path = "debug/deps/libspoolframe_client_ffi.so", relative-to = "target", depth = 0, on-missing = "error" },
+    ]
 
     [profile.ci]
     test-threads = "num-cpus"

@@ -28,6 +28,11 @@ pub enum Error {
     /// says so.
     #[error("the playback has expired")]
     Expired,
+    /// Planned again since it was served (a quality change, an Auto
+    /// re-plan): none of the new plan's resources go to a player on the
+    /// old one's, `410`. The app serves the new plan under a new token.
+    #[error("the playback was planned again: follow the new plan")]
+    Replanned,
     /// The playback has no such resource: `404`.
     #[error("not found")]
     NotFound,

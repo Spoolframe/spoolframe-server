@@ -3,8 +3,44 @@
 use spoolframe_client_sdk::{self as sdk, SdkError};
 use tokio::sync::watch;
 
-use crate::Error;
 use crate::source::{Chunk, ManifestKind, Segment, Source, Subtitle};
+use crate::{Error, Kind};
+
+impl Kind {
+    /// How a bridge serves `playback`, as its plan says: the file as it
+    /// is, as the MIME type its container plays as ([`mime`]), or the
+    /// server's HLS from the playback's epoch. `None` for a plan a bridge
+    /// cannot serve: one the device cannot play, or a progressive
+    /// conversion.
+    pub fn of(playback: &sdk::Playback) -> Option<Self> {
+        match &playback.plan {
+            sdk::PlaybackPlan::Direct { container, .. } => {
+                Some(Self::direct(playback.size, mime(*container)))
+            }
+            sdk::PlaybackPlan::Converted {
+                delivery: sdk::types::Delivery::Hls,
+                ..
+            } => Some(Self::Hls {
+                epoch: std::sync::Mutex::new(playback.epoch),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The MIME type a file in `container` is served as
+/// ([`Container::mime`](sdk::types::Container::mime)).
+pub fn mime(container: sdk::types::Container) -> &'static str {
+    container.mime()
+}
+
+/// Whether `after` is another playback for the player than `before`:
+/// another plan, or another encode of it. One that is must be served
+/// under a new path for the player to switch to; one that is not plays on
+/// where it is.
+pub fn changed(before: &sdk::Playback, after: &sdk::Playback) -> bool {
+    after.plan != before.plan || after.epoch != before.epoch
+}
 
 /// A playback read over the SDK. A playback the server ends (idle, a
 /// restart) is started again behind it by the SDK, and the read goes on.
@@ -69,7 +105,7 @@ impl Source for SdkSource {
     }
 
     fn replanned(&self) -> bool {
-        self.playback.snapshot().plan != self.plan
+        !self.playback.is_planned(&self.plan)
     }
 
     async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
@@ -148,5 +184,96 @@ impl Segment for SdkSegment {
 
     async fn reopen(&self, length: u64) -> Result<Self, Error> {
         Ok(Self(self.0.reopen(length).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdk::types::{Container, Delivery};
+
+    fn playback(plan: sdk::PlaybackPlan, epoch: u32) -> sdk::Playback {
+        sdk::Playback {
+            handle: sdk::PlaybackHandle("p".into()),
+            plan,
+            size: 2048,
+            chosen: None,
+            epoch,
+            markers: Vec::new(),
+        }
+    }
+
+    fn direct(container: Container) -> sdk::PlaybackPlan {
+        sdk::PlaybackPlan::Direct {
+            container,
+            video: None,
+            audio: None,
+            subtitle: None,
+            source_codec: None,
+        }
+    }
+
+    fn converted(delivery: Delivery) -> sdk::PlaybackPlan {
+        sdk::PlaybackPlan::Converted {
+            delivery,
+            container: Container::Mp4,
+            video: None,
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+            source_codec: None,
+        }
+    }
+
+    #[test]
+    fn a_direct_plan_is_its_file_as_its_container_plays() {
+        let kind = Kind::of(&playback(direct(Container::Mp4), 0)).unwrap();
+        assert!(matches!(&kind, Kind::Direct { size: 2048, mime } if mime == "video/mp4"));
+        assert_eq!(kind.entry(), "file");
+    }
+
+    #[test]
+    fn a_file_is_typed_as_the_server_types_it_and_an_unknown_one_sniffed() {
+        let types = [
+            Container::Matroska,
+            Container::MpegTs,
+            Container::Flac,
+            Container::Unknown,
+        ]
+        .map(mime);
+        assert_eq!(
+            types,
+            [
+                "video/x-matroska",
+                "video/mp2t",
+                "audio/flac",
+                "application/octet-stream"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_hls_plan_is_its_master_playlist_from_its_epoch() {
+        let kind = Kind::of(&playback(converted(Delivery::Hls), 3)).unwrap();
+        assert!(matches!(&kind, Kind::Hls { epoch } if *epoch.lock().unwrap() == 3));
+        assert_eq!(kind.entry(), "master.m3u8");
+    }
+
+    #[test]
+    fn a_plan_a_bridge_cannot_serve_is_none() {
+        assert!(Kind::of(&playback(converted(Delivery::Progressive), 0)).is_none());
+        let unsupported = sdk::PlaybackPlan::Unsupported {
+            reasons: vec!["audio 0".into()],
+        };
+        assert!(Kind::of(&playback(unsupported, 0)).is_none());
+    }
+
+    #[test]
+    fn another_plan_or_encode_is_a_change_and_the_same_is_not() {
+        let before = playback(direct(Container::Mp4), 0);
+        assert!(!changed(&before, &before.clone()));
+        assert!(changed(&before, &playback(converted(Delivery::Hls), 0)));
+        assert!(changed(&before, &playback(direct(Container::Mp4), 1)));
     }
 }

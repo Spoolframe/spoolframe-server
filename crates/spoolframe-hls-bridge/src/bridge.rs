@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[cfg(feature = "http")]
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
 
 use crate::source::Source;
+use crate::Error;
 
 /// A subtitle track as the system player's menu names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,16 @@ impl Kind {
     /// HLS, from the first encode.
     pub fn hls() -> Self {
         Self::Hls { epoch: Mutex::new(0) }
+    }
+
+    /// The path a player opens under the playback's token: `file`, or the
+    /// multivariant playlist, `master.m3u8`. AVPlayer, AirPlay and the
+    /// system subtitle menu depend on these names.
+    pub fn entry(&self) -> &'static str {
+        match self {
+            Self::Direct { .. } => "file",
+            Self::Hls { .. } => "master.m3u8",
+        }
     }
 }
 
@@ -122,6 +134,16 @@ impl<S> Stream<S> {
         &self.notes
     }
 
+    /// The subtitle tracks its master playlist names, once set.
+    pub fn menu(&self) -> Option<Vec<MenuEntry>> {
+        self.menu.lock().expect("never poisoned").clone()
+    }
+
+    /// Name `entries` in its master playlist.
+    pub fn set_menu(&self, entries: Vec<MenuEntry>) {
+        *self.menu.lock().expect("never poisoned") = Some(entries);
+    }
+
     /// A read found the server's admin had stopped the playback.
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
@@ -151,6 +173,15 @@ impl<S> Stream<S> {
     pub(crate) fn asked(&self) {
         *self.last_request.lock().expect("never poisoned") = Instant::now();
     }
+}
+
+/// A new token, unguessable and one URL path segment: what
+/// [`Bridge::register`] serves a stream under, for a caller that keys
+/// a playback the bridge does not serve the same way.
+pub fn token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS has randomness");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// What [`Bridge::on_request`] calls, with the token of each request for
@@ -204,14 +235,56 @@ impl<S: Source> Bridge<S> {
         stream.map(|s| *s.last_request.lock().expect("never poisoned"))
     }
 
+    /// What `name` of `token`'s HLS playback reads, whole, with its MIME
+    /// type: what the bridge answers `/<token>/<name>` with, for a caller
+    /// that reads by name itself (Media3's `DataSource`), with no HTTP.
+    /// `None` for no such playback, or no such name; a direct playback's
+    /// `file` is read by range through its source. A read that finds the
+    /// playback stopped or ended says so to [`Bridge::stopped`] and
+    /// [`Bridge::expired`], as one over HTTP does.
+    pub async fn resource(&self, token: &str, name: &str) -> Result<Option<(&'static str, Vec<u8>)>, Error> {
+        let stream = self.streams.lock().expect("never poisoned").get(token).cloned();
+        let Some(stream) = stream else { return Ok(None) };
+        stream.asked();
+        if let Some(hook) = &self.on_request { hook(token); }
+        if !matches!(stream.kind, Kind::Hls { .. }) { return Ok(None); }
+        Self::read_resource(&stream, name, &self.options).await
+    }
+
+    /// `name` of `stream`, an HLS playback's, whole: the rules for every
+    /// reader of it, by name or over HTTP. None of a new plan's playlists
+    /// or segments go to a player on the old plan's; a read under way ends
+    /// when its token is retired (the playback ended, or was followed to
+    /// a new plan) rather than wait on the server for up to a segment's
+    /// deadline; and a read that finds the playback stopped or ended
+    /// flags it.
+    pub(crate) async fn read_resource(stream: &Stream<S>, name: &str, options: &BridgeOptions) -> Result<Option<(&'static str, Vec<u8>)>, Error> {
+        if stream.playback.replanned() {
+            crate::resource::note(stream, format!("bridge: {name} asked after a re-plan"));
+            return Err(Error::Replanned);
+        }
+        let read = tokio::select! {
+            read = crate::resource::hls(stream, name, options) => read,
+            _ = stream.cancelled() => return Err(Error::Expired),
+        };
+        match &read {
+            Err(Error::Stopped) => stream.stopped.store(true, Ordering::Relaxed),
+            Err(Error::Expired) => stream.expired.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+        read
+    }
+
     /// Answer every connection `listener` takes. Ends when accepting fails
     /// again and again (the socket is gone, taken back while the app was
     /// suspended): serve the bridge again on a new listener then.
+    #[cfg(feature = "http")]
     pub async fn serve(&self, listener: TcpListener) {
         crate::http::accept(self.clone(), listener).await
     }
 
     /// Answer one connection's requests, HTTP/1.1 kept alive.
+    #[cfg(feature = "http")]
     pub async fn serve_connection<I>(&self, io: I) -> Result<(), hyper::Error>
     where
         I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -227,6 +300,7 @@ impl<S: Source> Bridge<S> {
 
     /// The answer to one request, `/<token>/<name>`, for a caller that runs
     /// its own HTTP server. The request's body is never read.
+    #[cfg(feature = "http")]
     pub async fn answer<B>(&self, request: hyper::Request<B>) -> hyper::Response<crate::Body> {
         match crate::http::answer(self.clone(), request).await {
             Ok(response) => response,
@@ -273,18 +347,27 @@ impl<S: Source> Bridge<S> {
     /// Name `entries` in `token`'s master playlist; false if there's no such
     /// playback.
     pub fn set_menu(&self, token: &str, entries: Vec<MenuEntry>) -> bool {
-        let Some(stream) = self.streams.lock().expect("never poisoned").get(token).cloned() else { return false };
-        *stream.menu.lock().expect("never poisoned") = Some(entries);
+        let Some(stream) = self.stream(token) else { return false };
+        stream.set_menu(entries);
         true
     }
 
     /// Serve `stream` under a new token; the token, for its URL.
     pub fn register(&self, stream: Stream<S>) -> String {
-        let mut bytes = [0u8; 16];
-        getrandom::fill(&mut bytes).expect("the OS has randomness");
-        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        self.streams.lock().expect("never poisoned").insert(token.clone(), Arc::new(stream));
+        self.register_shared(Arc::new(stream))
+    }
+
+    /// Serve `stream`, which the caller keeps too, under a new token; the
+    /// token, for its URL.
+    pub fn register_shared(&self, stream: Arc<Stream<S>>) -> String {
+        let token = token();
+        self.streams.lock().expect("never poisoned").insert(token.clone(), stream);
         token
+    }
+
+    /// `token`'s stream, while it's served.
+    pub fn stream(&self, token: &str) -> Option<Arc<Stream<S>>> {
+        self.streams.lock().expect("never poisoned").get(token).cloned()
     }
 
     /// Serve `stream` under `token`, one the caller made. It must be

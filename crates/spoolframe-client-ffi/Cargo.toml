@@ -1,0 +1,57 @@
+[package]
+name = "spoolframe-client-ffi"
+description = "Spoolframe's client SDK and HLS bridge for Swift and Kotlin, through UniFFI."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+# As the client SDK and the HLS bridge: the apps, proprietary ones too,
+# link it into theirs (ARCHITECTURE §56).
+license = "MIT OR Apache-2.0"
+# On crates.io with the other client crates: Android takes it from
+# there; the Apple apps build it into an XCFramework from this source.
+publish = ["crates-io"]
+
+[lib]
+# staticlib for the XCFramework, cdylib for Android's .so, lib for the
+# bindings generator and the tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+# The generator at the same UniFFI version as the library, so the
+# bindings always match the scaffolding:
+# `cargo run -p spoolframe-client-ffi --features bindgen --bin uniffi-bindgen -- generate …`.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# The loopback HLS bridge the platform player reads a playback from,
+# and every call that plays through it. Android leaves it out.
+default = ["hls-bridge"]
+hls-bridge = ["spoolframe-hls-bridge/http"]
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[dependencies]
+async-trait = { workspace = true }
+# Playback tokens: the bridge's URL paths, so unguessable.
+serde_json = { workspace = true }
+# media-readers: the reads a player that reads bytes itself takes
+# (Media3's DataSource), with or without the bridge.
+spoolframe-client-sdk = { workspace = true, features = ["uniffi", "media-readers"] }
+# Always: its HLS reads by name, for Media3 with no bridge. Its HTTP server
+# only with `hls-bridge`.
+spoolframe-hls-bridge = { workspace = true, features = ["sdk"] }
+spoolframe-protocol = { workspace = true, features = ["uniffi"] }
+spoolframe-types = { workspace = true, features = ["uniffi"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
+tracing = { workspace = true }
+# The core's log on stderr, only with SPOOLFRAME_RUST_LOG set (client.rs).
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+uniffi = { workspace = true }
+
+[dev-dependencies]
+camino = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+uniffi_bindgen = { workspace = true }

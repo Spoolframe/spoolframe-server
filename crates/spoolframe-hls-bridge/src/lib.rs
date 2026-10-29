@@ -23,8 +23,11 @@
 //! [`BridgeOptions`]. It logs through `tracing`.
 //!
 //! Listening is the caller's choice: the app binds 127.0.0.1, the server
-//! its configured address. [`Bridge::serve`] takes a bound listener; the
+//! its configured address. `Bridge::serve` takes a bound listener; the
 //! same bridge may be served again on a new one after the first stops.
+//! The HTTP side is the `http` feature, on by default; without it a
+//! caller reads each resource by name ([`Bridge::resource`]), with no
+//! hyper and no socket.
 //!
 //! Permissively licensed (MIT OR Apache-2.0) so proprietary clients can
 //! link it; it never depends on an AGPL crate. The source over the client
@@ -35,15 +38,20 @@
 #[rustfmt::skip]
 mod bridge;
 mod error;
+#[cfg(feature = "http")]
 #[rustfmt::skip]
 mod http;
+#[rustfmt::skip]
+mod resource;
 #[cfg(feature = "sdk")]
 mod sdk;
 mod source;
 
-pub use bridge::{Bridge, BridgeOptions, Kind, MenuEntry, RequestHook, Stream};
+pub use bridge::{Bridge, BridgeOptions, Kind, MenuEntry, RequestHook, Stream, token};
 pub use error::Error;
-pub use http::{Body, SEGMENT_MAX};
+#[cfg(feature = "http")]
+pub use http::Body;
+pub use resource::SEGMENT_MAX;
 #[cfg(feature = "sdk")]
-pub use sdk::{SdkSegment, SdkSource};
+pub use sdk::{SdkSegment, SdkSource, changed, mime};
 pub use source::{Chunk, ManifestKind, Segment, Source, Subtitle};
