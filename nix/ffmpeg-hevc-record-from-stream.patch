@@ -1,0 +1,119 @@
+--- a/libavformat/hevc.c	2026-10-30 14:34:57.430867606 -0700
++++ b/libavformat/hevc.c	2026-10-30 14:34:57.432867637 -0700
+@@ -1398,6 +1398,27 @@
+     return ret;
+ }
+ 
++int ff_hevc_annexb_has_parameter_sets(const uint8_t *buf, int size)
++{
++    const uint8_t *end = buf + size;
++    const uint8_t *nal = ff_nal_find_startcode(buf, end);
++    int found = 0;
++
++    while (nal < end) {
++        int type;
++        while (nal < end && !*(nal++));
++        if (nal >= end)
++            break;
++        type = (*nal >> 1) & 0x3f;
++        if (type < 32)
++            break;
++        if (type <= 34)
++            found |= 1 << (type - 32);
++        nal = ff_nal_find_startcode(nal, end);
++    }
++    return found == 7;
++}
++
+ int ff_isom_write_hvcc(AVIOContext *pb, const uint8_t *data,
+                        int size, int ps_array_completeness, void *logctx)
+ {
+--- a/libavformat/hevc.h	2026-10-30 14:34:57.430867606 -0700
++++ b/libavformat/hevc.h	2026-10-30 14:34:57.432867637 -0700
+@@ -99,6 +99,12 @@
+                        int size, int ps_array_completeness, void *logctx);
+ 
+ /**
++ * Tell whether an Annex B packet holds a VPS, an SPS and a PPS before its
++ * first slice.
++ */
++int ff_hevc_annexb_has_parameter_sets(const uint8_t *buf, int size);
++
++/**
+  * Writes L-HEVC extradata (parameter sets with nuh_layer_id > 0, as a
+  * LHEVCDecoderConfigurationRecord) to the provided AVIOContext.
+  *
+--- a/libavformat/matroskaenc.c	2026-10-30 14:34:57.429867590 -0700
++++ b/libavformat/matroskaenc.c	2026-10-30 14:34:57.432867637 -0700
+@@ -199,6 +199,7 @@
+     int64_t         duration_offset;
+     uint64_t        max_blockaddid;
+     int64_t         blockadditionmapping_offset;
++    int             hevc_record_checked;
+     int             codecpriv_offset;
+     unsigned        codecpriv_size;     ///< size reserved for CodecPrivate excluding header+length field
+     int64_t         ts_offset;
+@@ -3097,6 +3098,25 @@
+                 return ret;
+         }
+         break;
++    case AV_CODEC_ID_HEVC:
++        /* As in the MP4 muxer: the sets before the first slice are the ones
++         * the stream was coded to, and extradata need not be. CodecPrivate
++         * can only be rewritten in a seekable file, and only in the space it
++         * has; a larger record leaves the sets in the stream to say it. */
++        if (mkv->track.bc && !track->hevc_record_checked) {
++            track->hevc_record_checked = 1;
++            if (par->extradata_size > 6 &&
++                (AV_RB24(par->extradata) == 1 || AV_RB32(par->extradata) == 1) &&
++                ff_hevc_annexb_has_parameter_sets(pkt->data, pkt->size)) {
++                ret = mkv_update_codecprivate(s, mkv, pkt->data, pkt->size,
++                                              par, mkv->track.bc, track, 0);
++                if (ret == AVERROR(ENOSPC))
++                    av_log(s, AV_LOG_WARNING, "CodecPrivate has no room for the stream's record\n");
++                else if (ret < 0)
++                    return ret;
++            }
++        }
++        break;
+ #endif
+     // FIXME: Remove the following once libaom starts propagating proper extradata during init()
+     //        See https://bugs.chromium.org/p/aomedia/issues/detail?id=2208
+--- a/libavformat/movenc.c	2026-10-30 14:34:57.429867590 -0700
++++ b/libavformat/movenc.c	2026-10-30 14:34:57.431867621 -0700
+@@ -7023,6 +7023,25 @@
+         trk->extradata_size[0] = par->extradata_size;
+     }
+ 
++    /* The parameter sets before a stream's first slice are the ones it was
++     * coded to; an encoder's extradata need not be. hevc_vaapi's is not over
++     * Mesa, which writes its own sets, and in an hvc1 track, whose samples
++     * lose their sets, a decoder has only the record. Build the record from
++     * the stream, as for a stream with no extradata. Not from a packet that
++     * starts with the extradata, as hevc_mp4toannexb's do: that is the same
++     * record, and would be written twice over. */
++    if (par->codec_id == AV_CODEC_ID_HEVC && !trk->hevc_record_checked) {
++        trk->hevc_record_checked = 1;
++        if (trk->extradata_size[0] > 6 &&
++            (AV_RB24(trk->extradata[0]) == 1 || AV_RB32(trk->extradata[0]) == 1) &&
++            (size < trk->extradata_size[0] ||
++             memcmp(pkt->data, trk->extradata[0], trk->extradata_size[0])) &&
++            ff_hevc_annexb_has_parameter_sets(pkt->data, size)) {
++            av_freep(&trk->extradata[0]);
++            trk->extradata_size[0] = 0;
++        }
++    }
++
+     if ((par->codec_id == AV_CODEC_ID_DNXHD ||
+          par->codec_id == AV_CODEC_ID_H264 ||
+          par->codec_id == AV_CODEC_ID_HEVC ||
+--- a/libavformat/movenc.h	2026-10-30 14:34:57.429867590 -0700
++++ b/libavformat/movenc.h	2026-10-30 14:34:57.430867606 -0700
+@@ -110,6 +110,7 @@
+     long        sample_size;
+     long        chunkCount;
+     int         has_keyframes;
++    int         hevc_record_checked;
+     int         has_disposable;
+ #define MOV_TRACK_CTTS         0x0001
+ #define MOV_TRACK_STPS         0x0002
