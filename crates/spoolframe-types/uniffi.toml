@@ -1,0 +1,7 @@
+# The Kotlin bindings' names where UniFFI's clash with Kotlin's or JNA's
+# (spoolframe-client-ffi's tests/bindings.rs compiles them). Swift keeps
+# the Rust names. UniFFI reads each crate's own table for its items, and
+# applies it in every crate that uses them.
+[bindings.kotlin.rename]
+# JNA's com.sun.jna.Library, which every generated file imports.
+Library = "MediaLibrary"

@@ -18,6 +18,27 @@
   `spoolframe:next-episode`, `spoolframe:invite-passkeys`), beside the
   experimental ones. Admin API: `ServerStatus.features`.
 
+- FFI: the generated Kotlin compiles, with no bindgen config of the
+  app's. 0.16.4-beta.1's did not (95 errors): its names clashed with
+  JNA's and Kotlin's. Kotlin alone gets new names, from each crate's
+  `uniffi.toml`; Swift and the Rust API keep theirs:
+  - `spoolframe_types::Library` is `MediaLibrary` (JNA's
+    `com.sun.jna.Library`), `List<MediaLibrary>` too.
+  - `spoolframe_protocol::PairingRefused` is `PairingRefusal`
+    (`SpoolException.PairingRefused`, the case carrying it, hid it).
+  - `SpoolClient.close()` is `shutDown()` (`AutoCloseable.close()`).
+  - The `message` field is `reason` (`Throwable.message`) in
+    `SpoolException`'s `Unavailable`, `Storage`, `TimedOut`,
+    `InvalidInput`, `Downloads`, `Server`, `Protocol` and `Bridge`, and
+    in `StorageFailure.Failed` and `KeyFailure.Failed`.
+
+  An exception's `message` is UniFFI's `field=value` text, which UniFFI
+  does not let a type with fields change; the readable text is
+  `toString()` (the Rust `Display`) and `message()`.
+  `tests/bindings.rs` compiles the Kotlin with kotlinc against JNA and
+  kotlinx-coroutines, and typechecks the Swift with swiftc on Linux;
+  devenv's ci profile carries both, and the jars through Nix.
+
 ## 0.16.4-beta.1 (2026-10-29)
 
 A beta, for internal testing before external testers: `0.16` and

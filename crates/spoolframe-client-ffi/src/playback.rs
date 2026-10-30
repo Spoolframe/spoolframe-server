@@ -211,7 +211,7 @@ impl SpoolSession {
 
     /// Open `id` from `start` (or the start), with `tracks` or, for
     /// `None`, the tracks the server picks from the user's preferences,
-    /// for a player that reads it itself (`read_playback`): no URL.
+    /// for a player that reads it itself (`playback_reader`): no URL.
     /// `end_playback` with its token when done. `display`: the screen's
     /// HDR and bit depth as it is now, kept for this playback's re-plans.
     pub async fn open_playback(

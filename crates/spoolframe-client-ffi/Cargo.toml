@@ -55,4 +55,6 @@ uniffi = { workspace = true }
 [dev-dependencies]
 camino = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
-uniffi_bindgen = { workspace = true }
+# cargo-metadata: each crate's uniffi.toml, found as an app's bindgen
+# finds it (tests/bindings.rs).
+uniffi_bindgen = { workspace = true, features = ["cargo-metadata"] }

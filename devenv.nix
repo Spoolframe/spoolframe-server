@@ -401,16 +401,54 @@ in {
             LLVM_PROFDATA = "${llvmBin}/llvm-profdata";
           };
       });
+    # What the FFI's generated Kotlin compiles against
+    # (crates/spoolframe-client-ffi/tests/bindings.rs): the JNA and
+    # coroutines an app's build gives it, from Maven Central through the
+    # store, not fetched by the test.
+    kotlinJars = [
+      (pkgs.fetchurl {
+        url = "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.19.1/jna-5.19.1.jar";
+        hash = "sha256-T7FB3Y72sFhf/O6kvElgL7xjEvqXfixIh5TqPmqv7K4=";
+      })
+      (pkgs.fetchurl {
+        url = "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.11.0/kotlinx-coroutines-core-jvm-1.11.0.jar";
+        hash = "sha256-0ddaoB3/u00cUg5n5MTn9fYXRxjny0YyQSUD8vDmBPo=";
+      })
+    ];
+    # The generated Swift's Foundation and Dispatch on Linux, which swiftc
+    # finds only through a build's setup hooks; the test passes them.
+    swift = pkgs.swiftPackages;
+    swiftIncludes = [
+      "${swift.Foundation}/lib/swift/linux/${pkgs.stdenv.hostPlatform.parsed.cpu.name}"
+      "${lib.getDev swift.Foundation}/include"
+      "${swift.Dispatch}/lib/swift"
+      "${lib.getDev swift.Dispatch}/include"
+    ];
   in {
     # devenv's automatic cachix setup fails under a pure flake eval and an
     # untrusted runner user; substituters are configured on the runner host.
     cachix.enable = lib.mkForce false;
 
-    packages = with pkgs; [
-      cargo-nextest
-      cargoLlvmCov
-      cargo-audit
-    ];
+    packages = with pkgs;
+      [
+        cargo-nextest
+        cargoLlvmCov
+        cargo-audit
+        # kotlinc and its JDK, for the FFI's bindings test.
+        kotlin
+        jdk
+      ]
+      ++ lib.optionals stdenv.hostPlatform.isLinux [swift.swift];
+
+    # The FFI's bindings test compiles the generated Kotlin (and, on
+    # Linux, typechecks the Swift) with these; CI fails it without them.
+    env =
+      {
+        SPOOLFRAME_KOTLIN_CLASSPATH = lib.concatStringsSep ":" kotlinJars;
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        SPOOLFRAME_SWIFT_INCLUDE = lib.concatStringsSep ":" swiftIncludes;
+      };
 
     tasks = {
       "ci:style" = {

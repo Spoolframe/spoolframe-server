@@ -1,0 +1,21 @@
+# The Kotlin bindings' names where UniFFI's clash with Kotlin's
+# (tests/bindings.rs compiles them). Swift keeps the Rust names.
+[bindings.kotlin.rename]
+# spoolframe_types::Library (renamed in that crate's uniffi.toml, for JNA's
+# com.sun.jna.Library). UniFFI names a List<Library> here by this crate's
+# table, not the types crate's, so the rename is given again.
+Library = "MediaLibrary"
+# AutoCloseable.close(), which every object implements, not suspending.
+"SpoolClient.close" = "shutDown"
+# Throwable.message, which an exception's field may not hide. The readable
+# text is toString() (the Rust Display) and message().
+"SpoolError.Unavailable.message" = "reason"
+"SpoolError.Storage.message" = "reason"
+"SpoolError.TimedOut.message" = "reason"
+"SpoolError.InvalidInput.message" = "reason"
+"SpoolError.Downloads.message" = "reason"
+"SpoolError.Server.message" = "reason"
+"SpoolError.Protocol.message" = "reason"
+"SpoolError.Bridge.message" = "reason"
+"StorageFailure.Failed.message" = "reason"
+"KeyFailure.Failed.message" = "reason"
