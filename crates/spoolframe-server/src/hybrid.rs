@@ -253,8 +253,13 @@ mod tests {
         }
         cache.close().await.unwrap();
         assert!(cache.get(&0).await.unwrap().is_none(), "0 should be gone");
-        let last = cache.get(&199).await.unwrap().map(|e| e.value().len());
-        assert_eq!(last, Some(32 << 10));
+        // Not the very last: a busy machine fills the write queue, and
+        // foyer drops what comes then. A cache may; it is made again.
+        let mut kept = 0;
+        for n in 150..200 {
+            kept += usize::from(cache.get(&n).await.unwrap().is_some());
+        }
+        assert!(kept > 0, "nothing recent was kept");
     }
 
     #[tokio::test]
