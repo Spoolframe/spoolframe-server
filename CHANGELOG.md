@@ -120,22 +120,6 @@ with a 0.16 server.
   does not know, as it is read or built (`MarkerKind::Unknown` stays,
   for a marker read on its own). `SortKey::ALL` is a slice.
 
-- A paired server's new name reaches the servers it is paired with.
-  Before, each kept the name it had at pairing. Its name is taken
-  whenever the two connect, and a rename while connected is passed on
-  with the next sync (a `Libraries` reply now carries the sender's name;
-  an older peer ignores it and sends none). An alias set here still
-  wins.
-- A card whose encoder crashes (ffmpeg aborted or faulted) is
-  quarantined for 5 minutes once another encoder then encodes the same
-  playback, which shows the file was not to blame; at once when its
-  codec has no other encoder. Meanwhile no playback is planned with or
-  sent to it, a failed encode does not move onto it, and a playback
-  already converting on it moves its next run (a seek) elsewhere.
-  Encodes running on it go on. The Server page's GPUs card shows a
-  quarantined card and how long it has left. A plain error exit or a stall does not
-  quarantine. With one GPU, playbacks go to software H.264 meanwhile,
-  and HDR that needs that card's 10-bit encoder is refused.
 - New: an admin can delete a user (`admin.userDelete`, Delete on the
   user's page): their sessions, ways to sign in, devices' trust and
   PIN, watch state, plays, likes, downloads, playlists and Plex link go,
@@ -864,12 +848,28 @@ with a 0.16 server.
 
 ## 0.16.3 (2026-10-28)
 
+- A paired server's new name reaches the servers it is paired with.
+  Before, each kept the name it had at pairing. Its name is taken
+  whenever the two connect, and a rename while connected is passed on
+  with the next sync (a `Libraries` reply now carries the sender's name;
+  a 0.16.2 peer ignores it and sends none). An alias set here still
+  wins.
 - A GPU encode that fails before its first segment (ffmpeg exits
   non-zero, stalls, or is aborted by its driver, as amdgpu does when the
   video engine hangs) runs again on the next encoder of its codec:
   another card's, then software's where software encodes the codec. Each
   is tried once; the playback stays on the encoder it moved to, seeks
   too. Before, an abort failed the playback outright.
+- A card whose encoder crashes (ffmpeg aborted or faulted) is
+  quarantined for 5 minutes once another encoder then encodes the same
+  playback, which shows the file was not to blame; at once when its
+  codec has no other encoder. Meanwhile no playback is planned with or
+  sent to it, a failed encode does not move onto it, and a playback
+  already converting on it moves its next run (a seek) elsewhere.
+  Encodes running on it go on. Settings › GPUs shows a quarantined
+  card and how long it has left. A plain error exit or a stall does not
+  quarantine. With one GPU, playbacks go to software H.264 meanwhile,
+  and HDR that needs that card's 10-bit encoder is refused.
 - `transcode.video_codecs` defaults to `["hevc", "h264"]`: AV1 is off
   unless listed. Settings › Playback still shows it first, unticked; GPUs'
   support for it is spotty (a Radeon 890M's video engine hung converting
