@@ -1,10 +1,6 @@
 # Changelog
 
-## 0.17.0-beta.2 (2026-10-30)
-
-A beta. Its images are under its own tags alone (`0.17.0-beta.2`,
-`-slim`, `-nvidia`/`-cpu`, each with its build's commit too): `latest`
-and `0.16` stay on 0.16.3, and no `0.17` tag is made until 0.17.0.
+## 0.17.0 (2026-10-30)
 
 The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates

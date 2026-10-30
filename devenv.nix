@@ -309,6 +309,11 @@ in {
         listen = "[::]:7422";
       }
 
+      # For the apps to test (PX-64).
+      experimental {
+        smart_crop = true;
+      }
+
       # Traces to nimble's Alloy (yard), which sends them on to Tempo.
       telemetry {
         otlp {
