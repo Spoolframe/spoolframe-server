@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.16.4-beta.2 (2026-10-29)
+
+A second internal beta: `0.16` and `latest` stay on 0.16.3.
 
 - The public crates publish to the Coldsteel registry
   (`https://cargo.coldsteel.casa`) again, besides crates.io: `publish =
