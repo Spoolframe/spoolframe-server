@@ -34,14 +34,6 @@ pub fn mime(container: sdk::types::Container) -> &'static str {
     container.mime()
 }
 
-/// Whether `after` is another playback for the player than `before`:
-/// another plan, or another encode of it. One that is must be served
-/// under a new path for the player to switch to; one that is not plays on
-/// where it is.
-pub fn changed(before: &sdk::Playback, after: &sdk::Playback) -> bool {
-    after.plan != before.plan || after.epoch != before.epoch
-}
-
 /// A playback read over the SDK. A playback the server ends (idle, a
 /// restart) is started again behind it by the SDK, and the read goes on.
 #[derive(Clone, Debug)]
@@ -54,19 +46,14 @@ pub struct SdkSource {
 }
 
 impl SdkSource {
-    /// Serve `playback` as it is planned now.
-    pub fn new(playback: sdk::ManagedPlayback) -> Self {
-        let plan = playback.snapshot().plan;
+    /// Serve `playback` planned as `plan`: the plan of the snapshot its
+    /// player was given ([`sdk::ManagedPlayback::snapshot_with_generation`]).
+    pub fn new(playback: sdk::ManagedPlayback, plan: sdk::PlaybackPlan) -> Self {
         Self { playback, plan }
     }
 
     pub fn playback(&self) -> &sdk::ManagedPlayback {
         &self.playback
-    }
-
-    /// The plan it was served with.
-    pub fn plan(&self) -> &sdk::PlaybackPlan {
-        &self.plan
     }
 }
 
@@ -77,6 +64,7 @@ impl From<SdkError> for Error {
             SdkError::PlaybackStopped => Error::Stopped,
             SdkError::PlaybackRestarted { epoch } => Error::Restarted { epoch },
             SdkError::PlaybackResumed { at } => Error::Resumed { at },
+            SdkError::Replanned => Error::Replanned,
             SdkError::SubtitleNotReady { done_percent } => Error::NotReady { done_percent },
             // Rewritten while read: asked for again, as one not ready is.
             SdkError::SubtitleChanged => Error::NotReady { done_percent: 0 },
@@ -200,6 +188,7 @@ mod tests {
             chosen: None,
             epoch,
             markers: Vec::new(),
+            duration: None,
         }
     }
 
@@ -267,13 +256,5 @@ mod tests {
             reasons: vec!["audio 0".into()],
         };
         assert!(Kind::of(&playback(unsupported, 0)).is_none());
-    }
-
-    #[test]
-    fn another_plan_or_encode_is_a_change_and_the_same_is_not() {
-        let before = playback(direct(Container::Mp4), 0);
-        assert!(!changed(&before, &before.clone()));
-        assert!(changed(&before, &playback(converted(Delivery::Hls), 0)));
-        assert!(changed(&before, &playback(direct(Container::Mp4), 1)));
     }
 }

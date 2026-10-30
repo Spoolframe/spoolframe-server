@@ -77,13 +77,20 @@ impl CodecPlayer for PlaysAvc {
     }
 }
 
+/// A player that names HEVC as decoded in hardware.
+fn hevc_in_hardware() -> PlayerDecoders {
+    PlayerDecoders {
+        hardware_video: Some(vec![VideoCodec::Hevc]),
+        ..PlayerDecoders::default()
+    }
+}
+
 #[test]
 fn the_probe_keeps_the_codec_strings_the_player_plays() {
     let probed = probe_capabilities(
         Arc::new(PlaysAvc),
-        vec![VideoCodec::Hevc],
         ScreenCapabilities::default(),
-        PlayerDecoders::default(),
+        hevc_in_hardware(),
     );
     let codecs = probed.video_codecs.unwrap();
     assert!(
@@ -96,11 +103,53 @@ fn the_probe_keeps_the_codec_strings_the_player_plays() {
 fn hevc_in_hardware_probes_as_ten_bit() {
     let probed = probe_capabilities(
         Arc::new(PlaysAvc),
-        vec![VideoCodec::Hevc],
         ScreenCapabilities::default(),
+        hevc_in_hardware(),
+    );
+    assert_eq!(
+        (
+            probed.max_video.and_then(|v| v.bit_depth),
+            probed.video.contains(&VideoCodec::Hevc)
+        ),
+        (Some(10), true)
+    );
+}
+
+/// The probe is the decoders' limits: the screen's mode goes with each
+/// plan (`SpoolClient.set_display`), not with the sign-in.
+#[test]
+fn the_screen_s_mode_is_not_the_probe_s_limit() {
+    let probed = probe_capabilities(
+        Arc::new(PlaysAvc),
+        ScreenCapabilities {
+            max_height: Some(1080),
+            max_frame_rate: Some(60),
+            ..ScreenCapabilities::default()
+        },
         PlayerDecoders::default(),
     );
-    assert_eq!(probed.max_video.and_then(|v| v.bit_depth), Some(10));
+    let limits = probed.max_video.unwrap();
+    assert_eq!((limits.height, limits.frame_rate), (None, None));
+}
+
+/// `None` is every HDR format and an empty list is none: a screen
+/// without HDR must say the empty list, or the server sends it HDR.
+#[test]
+fn a_screen_without_hdr_says_none_rather_than_all() {
+    let hdr = screen_for_hdr(false, false).hdr;
+    assert_eq!(hdr, Some(vec![]));
+}
+
+#[test]
+fn android_s_decoder_types_name_their_codecs() {
+    assert_eq!(
+        (
+            video_codec_for_mime("video/av01".into()),
+            audio_codec_for_mime("audio/true-hd".into()),
+            audio_codec_for_mime("audio/x-unknown".into()),
+        ),
+        (Some(VideoCodec::Av1), Some(AudioCodec::TrueHd), None)
+    );
 }
 
 #[test]

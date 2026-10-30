@@ -41,6 +41,39 @@ where
     }
 }
 
+/// Run `work` on the SDK's runtime and wait for it on this thread: for
+/// the reads a player makes on its own blocking loader threads. Never on
+/// the runtime's own threads. A panic in `work` goes on here, with its
+/// message. (Not `RUNTIME.block_on`: that panics on a thread inside any
+/// tokio runtime, as a test's is.)
+pub(crate) fn block<T, F>(work: F) -> T
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (done, answer) = std::sync::mpsc::sync_channel(1);
+    let task = RUNTIME.spawn(work);
+    RUNTIME.spawn(async move {
+        let _ = done.send(task.await);
+    });
+    match answer
+        .recv()
+        .expect("the runtime ends only with the process")
+    {
+        Ok(value) => value,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => panic!("the runtime dropped a call: {e}"),
+    }
+}
+
+/// Run `work` on the SDK's runtime, with no one waiting for it.
+pub(crate) fn spawn<F>(work: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    RUNTIME.spawn(work);
+}
+
 /// Spawn on the SDK's runtime, as the SDK's readers take it: their
 /// fetches run there while a foreign thread waits on a read.
 pub(crate) fn spawner() -> spoolframe_client_sdk::reader::Spawn {
@@ -52,6 +85,13 @@ pub(crate) fn spawner() -> spoolframe_client_sdk::reader::Spawn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_in_blocked_work_keeps_its_message() {
+        let caught = std::panic::catch_unwind(|| block(async { panic!("the work's own words") }));
+        let message = caught.unwrap_err().downcast::<&str>().map(|m| *m);
+        assert_eq!(message.ok(), Some("the work's own words"));
+    }
 
     #[tokio::test]
     async fn cancelling_foreign_waiter_drops_delayed_runtime_work() {

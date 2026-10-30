@@ -32,6 +32,10 @@ required-features = ["bindgen"]
 default = ["hls-bridge"]
 hls-bridge = ["spoolframe-hls-bridge/http"]
 bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+# The JNI call that hands the app's Context to ndk-context (android.rs),
+# in this crate's own .so, so an Android app ships it with no Rust of its
+# own. Only on Android; elsewhere it adds nothing.
+android = ["dep:jni", "dep:ndk-context"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -51,6 +55,11 @@ tracing = { workspace = true }
 # The core's log on stderr, only with SPOOLFRAME_RUST_LOG set (client.rs).
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 uniffi = { workspace = true }
+
+# The `android` feature (android.rs).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true, optional = true }
+ndk-context = { workspace = true, optional = true }
 
 [dev-dependencies]
 camino = { workspace = true }

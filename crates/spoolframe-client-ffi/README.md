@@ -28,12 +28,18 @@ Everything is typed. Nothing is passed as JSON.
   `java.time.Duration`); times as timestamps (`Date`, `Instant`).
 - A few records of this crate's own, where UniFFI can't take the SDK's
   type as it is (`values.rs`): `DeviceCapabilities` (sets as lists),
-  `FilterValues` (a counted value per type), and `ItemSearchResults` and
-  `HitSearchResults` (the generic `SearchResults`, once per item type).
+  `FilterValues` (a counted value per type), and `SearchResults`. A plain
+  search and a federated one both give `SearchResults` of
+  `SearchResult`s, each an item with its `copies` (`None` for a plain
+  search's); `only_from(origin)` narrows it to one server for a chip,
+  counted again, and `see_all_count(kind)` is the number "See all" names.
 - `SpoolClient` (the device), `SpoolSession` (a user on a server),
-  `SpoolPortable` (portable identities), `SpoolPairing` and
-  `SpoolPairingOffer` are objects; `CoreStorage` and `AppSecurityKey` are
-  traits the app implements.
+  `SpoolPlayback` (one item playing), `SpoolPortable` (portable
+  identities), `SpoolPairing` and `SpoolPairingOffer` are objects;
+  `CoreStorage` and `AppSecurityKey` are traits the app implements. Or, for `CoreStorage`, `FileStorage(root,
+  cipher)`: a file per key under `root`, each written whole and renamed
+  into place, the secrets sealed by the app's `SecretCipher` (`seal`,
+  `unseal`; on Android a Keystore key).
 
 The bindings are one file per crate: `spoolframe_client_ffi`,
 `spoolframe_client_sdk`, `spoolframe_protocol` and `spoolframe_types`.
@@ -89,17 +95,28 @@ Task {
 | Stream | From | Gives |
 | --- | --- | --- |
 | `watch_profiles` | `SpoolClient` | `ProfileNotice` (`ProfileEvent`, or `Lagged`) |
+| `watch_own_profile` | `SpoolSession` | `OwnProfileNotice` (`Change`, `Lagged`): this user's profile only |
 | `watch_playlists` | `SpoolClient` | `PlaylistNotice` |
 | `watch_libraries` | `SpoolClient` | `LibrariesNotice` |
 | `watch_subtitle_timing` | `SpoolClient` | `SubtitleTimingNotice` |
 | `watch_downloads` | `SpoolClient` | `DownloadNotice` (`Changed`, `Removed`, `Lagged`) |
-| `watch_servers` | `SpoolClient` | `changed()`: the list changed |
-| `state(endpoint_id)` | `SpoolClient` | `changed()`: a `ConnectionState` |
-| `signed_out(endpoint_id)` | `SpoolClient` | `next()`: the server signed this device out |
-| `watch_playback_share(token)` | `SpoolSession` | `UplinkShare`: the playback's share of the server's uplink |
+| `watch_running_downloads` | `SpoolClient` | the count of downloads under way, every profile's (`running_downloads()`), after each change; `current()` is it now |
+| `watch_servers` | `SpoolClient` | the server list (`servers()`), after each change to it |
+| `watch_server(endpoint_id)` | `SpoolClient` | `ServerEvent`: what a connection banner shows |
+| `watch_catalog` | `SpoolSession` | `CatalogKey`: a kept catalog read came back different |
+| `watch_share()` | `SpoolPlayback` | `UplinkShare`: the playback's share of the server's uplink |
 
 `Lagged { missed }` means the app fell behind and events were dropped:
 read the state again.
+
+`watch_server` is one server's connection state, sign-outs and a needed
+update as one stream, for a banner: `Connection { state }` (a
+`ConnectionState`), `SignedOut` (the server signed this device out: its
+sessions there are ended), or `UpdateRequired { who }` (the app and the
+server speak different protocol revisions; the link stopped dialling).
+A sign-out comes before the state it left. `current()` is the state when
+the watch began. `state(endpoint_id)` and `signed_out(endpoint_id)` are
+the two halves alone.
 
 A foreign task's cancellation does not reach the Rust future. Calls that
 must stop early have their own `cancel()`: `PendingSignIn`,
@@ -110,28 +127,57 @@ must stop early have their own `cancel()`: `PendingSignIn`,
 `SpoolSession::play` plans the item, opens it with the SDK's
 `ManagedPlayback` and serves it on the loopback bridge (127.0.0.1, one
 port for the app, a new one if the system takes a suspended app's socket
-back). The URL is `http://127.0.0.1:<port>/<token>/master.m3u8` for HLS
-or `/<token>/file` for direct play: AVPlayer, AirPlay and the system
-subtitle menu depend on that shape. The token is what the other playback
-calls take (`update_progress`, `change_quality`, `follow_replan`,
-`subtitle_menu`, `end_playback`).
+back), as a `SpoolPlayback`. Its `info().url` is
+`http://127.0.0.1:<port>/<token>/master.m3u8` for HLS or
+`/<token>/file` for direct play: AVPlayer, AirPlay and the system
+subtitle menu depend on that shape.
+
+A `SpoolPlayback` is one item playing, and its controls:
+`report_position` on every player tick (sent in the background, a few
+at a time) and `flush` on pause; `change_quality`, `change_subtitle`
+and `limit`, each the new plan to switch to or `None`; `read_subtitle`
+for a subtitle that comes as a file (waited for up to 30 s while the
+server reads it as text); `finish(position)` or `stop` at the end, and
+dropping it closes it. `info()` is how it plays now: its plan, the
+tracks the server chose, its markers and its running time.
+
+A seek is told around the player's own: `seek_started(target)` as it
+begins (the app's scrubber or a seek it asked of the player), and
+`seek_done()` from the player's seek-complete signal (Media3's position
+discontinuity, AVPlayer's seek completion handler). Until then the
+player's positions are still the old place's, so `report_position` saves
+`target` instead. Without `seek_done` the seek is over once a position
+lands within 2 s of the target, or after 5 s.
+
+The screen's mode is a planning input, not a sign-in one: a TV switches
+between a 1080p UI mode and a 4K mode for the film, and the sign-in is
+sent once. `DeviceSpec.capabilities` is the decoders' limits only. Say
+the screen as it is now with `SpoolClient.set_display(ScreenCapabilities)`
+(Swift and Kotlin `setDisplay`) once after `open` and again on each
+change; every plan, open and re-plan that names no display of its own
+sends it, so a mode switch counts from the next plan. `None` forgets it.
+
+The SDK may plan a playback again behind the player (an Auto playback
+on a slow link, or its share of the uplink moved). The object follows
+it: a read of the old plan's bytes answers `Replanned` once, the object
+already on the new plan, and the player builds its media again from
+`info()`. A URL player, whose reads the bridge answers, asks with
+`follow_replan()` when it stalls.
 
 The bridge is the `hls-bridge` feature, on by default. A player that
 reads the bytes itself (Android's Media3, through a `DataSource`) needs
 no bridge: it builds with `--no-default-features`, opens with
-`open_playback` (a token, no URL) and reads through
-`playback_reader(token, length)`, the SDK's media readers: `read`
-blocks its thread until the bytes are here, `size`, `content_type`,
-and `set_flushing` to let a waiting read go. A conversion's HLS is read
-by name instead: `open_playback_resource(token, path)` reads
-`master.m3u8`, or a name a playlist gives, whole (its type and length),
-and `read_playback_resource(token, path, offset, length)` reads ranges
-of the one opened last, so Media3's ranges in one segment are one fetch.
-The server's playlists name their resources relatively, so
-`HlsMediaSource` resolves them under the app's own scheme and token.
-Every other playback call takes the token either way; only `play`,
-`playback_url` (serve an opened playback) and `SpoolError.Bridge` need
-the feature.
+`open_playback` (no URL) and reads from the object, on its loader
+threads: every read blocks until the bytes are here. A direct play's
+file or a progressive conversion's output is `read(offset, length)`,
+with `size`, `content_type`, and `set_flushing` to let a waiting read
+go. A conversion's HLS is read by name instead: `open_resource(path)`
+reads `master.m3u8`, or a name a playlist gives, whole (its type and
+length), and `read_resource(path, offset, length)` reads ranges of the
+one opened last, so Media3's ranges in one segment are one fetch. The
+server's playlists name their resources relatively, so `HlsMediaSource`
+resolves them under the app's own scheme. Only `play`, `url()` (serve
+an opened playback) and `SpoolError.Bridge` need the feature.
 
 A paired server's `fed:` item plays from that server when this device
 reaches it, else through the user's own (`PlaybackStart.proxied`). That
@@ -147,7 +193,7 @@ Coldsteel copy:
 
 ```toml
 [patch.crates-io]
-spoolframe-client-ffi = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+spoolframe-client-ffi = { version = "=0.17.0-beta.1", registry = "coldsteel" }
 # and spoolframe-types, -protocol, -policy, -client-sdk, -hls-bridge
 ```
 
@@ -205,7 +251,8 @@ With [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and the NDK:
 
 ```sh
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o android/src/main/jniLibs \
-  build --locked --release -p spoolframe-client-ffi --lib
+  build --locked --release -p spoolframe-client-ffi --lib \
+  --no-default-features --features android
 cargo run -p spoolframe-client-ffi --features bindgen --bin uniffi-bindgen -- \
   generate --library target/aarch64-linux-android/release/libspoolframe_client_ffi.so \
   --language kotlin --out-dir android/src/main/kotlin
@@ -215,10 +262,32 @@ The Kotlin bindings load `libspoolframe_client_ffi.so` through JNA
 (`net.java.dev.jna:jna`, the `@aar` artifact); the Gradle library module
 with `jniLibs` and the generated sources builds the AAR.
 
+The SDK's network crates call Android's Java APIs through ndk-context,
+which needs the app's Context, and abort without it. The `android`
+feature puts the one JNI call that hands it over in this crate's own
+`.so`, so the app needs no Rust of its own, only this class beside the
+generated bindings:
+
+```kotlin
+package uniffi.spoolframe_client_ffi
+
+object AndroidContext {
+    init { System.loadLibrary("spoolframe_client_ffi") }
+
+    @JvmStatic external fun init(context: android.content.Context)
+}
+```
+
+Call `AndroidContext.init(context.applicationContext)` before
+`SpoolClient.open`; a later call does nothing.
+
 ## Tests
 
 `cargo nextest run -p spoolframe-client-ffi`: every `SdkError` variant
 crosses as the case of its name with its text and kind, the conversions,
 the bridge's URLs, and `tests/bindings.rs`, which generates the Swift and
 Kotlin bindings from the crate's cdylib and checks every crate's files
-are there. Nothing is compiled in Swift or Kotlin here.
+are there. In devenv's `ci-test` profile, which brings `kotlinc`, a JDK
+and Swift, it also compiles every crate's Kotlin together and typechecks
+the Swift as one module (on Linux); elsewhere those two tests say so and
+pass.

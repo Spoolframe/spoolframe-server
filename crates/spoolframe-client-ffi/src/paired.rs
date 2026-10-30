@@ -9,7 +9,7 @@ use spoolframe_client_sdk::{self as sdk, PeerServer};
 
 use crate::error::SpoolError;
 use crate::session::SpoolSession;
-use crate::values::HitSearchResults;
+use crate::values::SearchResults;
 
 #[uniffi::export]
 impl SpoolSession {
@@ -49,7 +49,7 @@ impl SpoolSession {
         scope: SearchScope,
         kind: Option<SearchKind>,
         library: Option<LibraryId>,
-    ) -> Result<HitSearchResults, SpoolError> {
+    ) -> Result<SearchResults, SpoolError> {
         let request = sdk::SearchRequest {
             query,
             limit,
@@ -60,7 +60,7 @@ impl SpoolSession {
         let results = self
             .call(|s| async move { s.search_hits(request).await })
             .await?;
-        Ok(results.into())
+        Ok(sdk::search_results(results).into())
     }
 
     /// Play the title `title` (any copy's id) from the paired server

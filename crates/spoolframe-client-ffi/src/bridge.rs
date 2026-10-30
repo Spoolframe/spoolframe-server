@@ -12,6 +12,7 @@
 //! server's HLS names (`master.m3u8`, `media.m3u8`, segments, subtitles).
 //! Only this machine can connect, and only with a playback's token.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -20,20 +21,20 @@ use spoolframe_client_sdk::{PlaybackQuality, Selection};
 use tokio::net::TcpListener;
 
 use crate::error::SpoolError;
-use crate::playback::{PlaybackStart, RegisteredPlayback, open, registered};
+use crate::playback::{RegisteredPlayback, SpoolPlayback, open, registered};
 use crate::resources::bridge;
 use crate::runtime::run;
 use crate::session::SpoolSession;
 use crate::values::ScreenCapabilities;
 
 /// The listening socket's port, and its accept loop.
-static LISTENER: tokio::sync::Mutex<Option<(u16, tokio::task::AbortHandle)>> =
+pub(crate) static LISTENER: tokio::sync::Mutex<Option<(u16, tokio::task::AbortHandle)>> =
     tokio::sync::Mutex::const_new(None);
 
 #[uniffi::export]
 impl SpoolSession {
     /// Start playing `id` for a URL player: `open_playback`, served on
-    /// the loopback bridge. `end_playback` with its token when done.
+    /// the loopback bridge, at `info().url`.
     pub async fn play(
         &self,
         id: MediaId,
@@ -41,41 +42,69 @@ impl SpoolSession {
         tracks: Option<Selection>,
         quality: PlaybackQuality,
         display: Option<ScreenCapabilities>,
-    ) -> Result<PlaybackStart, SpoolError> {
+    ) -> Result<Arc<SpoolPlayback>, SpoolError> {
         let session = self.session.clone();
-        run(async move {
+        let opened = run(async move {
             let opened = open(session, id, start, tracks, quality, display).await?;
             serve_opened(opened).await
         })
-        .await
-        .map(RegisteredPlayback::take)
-    }
-
-    /// The URL the open playback `token` plays at on the loopback bridge,
-    /// serving it there first if it isn't yet.
-    pub async fn playback_url(&self, token: String) -> Result<String, SpoolError> {
-        run(async move { serve(&token).await }).await
+        .await?;
+        Ok(SpoolPlayback::new(opened))
     }
 }
 
-/// `opened` served on the bridge, its URL set; on failure its playback
-/// is closed, and dropping it closes the token.
+#[uniffi::export]
+impl SpoolPlayback {
+    /// The URL it plays at on the loopback bridge, serving it there first
+    /// if it isn't yet: from then on, its new plans are served too.
+    pub async fn url(&self) -> Result<String, SpoolError> {
+        // Before serving: a move from here on serves its new plan.
+        self.served.store(true, Ordering::Relaxed);
+        let token = self.token();
+        let url = run({
+            let token = token.clone();
+            async move { serve(&token).await }
+        })
+        .await;
+        // Moved on while this served the old plan: the move served the
+        // new one, its URL in `info()`.
+        if self.token() != token
+            && let Some(url) = self.info().url
+        {
+            return Ok(url);
+        }
+        let url = url?;
+        // Ignored should the player have moved on meanwhile.
+        self.set_url(&token, url.clone());
+        Ok(url)
+    }
+}
+
+/// `opened`, a playback just started, served on the bridge, its URL
+/// set; on failure its playback is closed, and dropping it closes the
+/// token.
 pub(crate) async fn serve_opened(
+    opened: RegisteredPlayback,
+) -> Result<RegisteredPlayback, SpoolError> {
+    let managed = opened.0.as_ref().map(|o| o.playback.managed.clone());
+    let served = serve_token(opened).await;
+    if served.is_err()
+        && let Some(managed) = managed
+    {
+        let _ = managed.close().await;
+    }
+    served
+}
+
+/// `opened`'s token served on the bridge, its URL set; on failure
+/// dropping it closes the token, and its playback is left open.
+pub(crate) async fn serve_token(
     mut opened: RegisteredPlayback,
 ) -> Result<RegisteredPlayback, SpoolError> {
-    let start = opened.0.as_mut().expect("owned result");
-    match serve(&start.token).await {
-        Ok(url) => {
-            start.url = Some(url);
-            Ok(opened)
-        }
-        Err(e) => {
-            if let Some(playback) = registered(&start.token) {
-                let _ = playback.managed.close().await;
-            }
-            Err(e)
-        }
-    }
+    let current = opened.0.as_mut().expect("owned result");
+    let url = serve(&current.playback.token).await?;
+    current.start.url = Some(url);
+    Ok(opened)
 }
 
 /// Serve the open playback `token` on the bridge, as its plan says (the
@@ -88,7 +117,7 @@ async fn serve(token: &str) -> Result<String, SpoolError> {
         return Err(SpoolError::CannotPlay {
             reasons: vec![format!(
                 "this device can't take the server's plan: {:?}",
-                playback.plan
+                playback.managed.snapshot().plan
             )],
         });
     };
@@ -96,7 +125,6 @@ async fn serve(token: &str) -> Result<String, SpoolError> {
         message: e.to_string(),
     })?;
     // Registered with the bridge when it was opened: served now.
-    playback.served.store(true, Ordering::Relaxed);
     let entry = stream.kind().entry();
     Ok(format!("{base}/{token}/{entry}"))
 }

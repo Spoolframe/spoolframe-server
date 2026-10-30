@@ -19,6 +19,8 @@
 
 uniffi::setup_scaffolding!();
 
+#[cfg(all(feature = "android", target_os = "android"))]
+mod android;
 #[cfg(feature = "hls-bridge")]
 mod bridge;
 mod client;
@@ -43,6 +45,8 @@ mod session;
 mod settings;
 mod sign_in;
 mod storage;
+#[cfg(test)]
+mod test_fixtures;
 pub mod values;
 
 pub use client::{
@@ -57,17 +61,16 @@ pub use events::{
 };
 pub use features::{InvitePasskeysApi, NextEpisodesApi};
 pub use pairing::{Connected, Paired, PairedServer, SpoolPairing, SpoolPairingOffer};
-pub use playback::{PlaybackStart, SubtitleEntry};
+pub use playback::{PlaybackStart, PlaybackSubtitle, SpoolPlayback, SubtitleEntry};
 pub use portable::{
     Guest, IdentityState, IssuedDevice, NewIdentity, PortableIdentity, RecoveryPhrase,
     RevokedDevice, SpoolPortable,
 };
-pub use reader::PlaybackReader;
 pub use resources::PlaybackResource;
 pub use security_key::{AppSecurityKey, IdentityRoot, KeyAnswer, KeyFailure, KeyRegistration};
 pub use session::{AccountTie, ApprovalLink, PictureSubtitles, SpoolSession, User};
 pub use settings::{CodecPlayer, PlayerDecoders};
-pub use storage::{CoreStorage, StorageFailure};
+pub use storage::{CoreStorage, FileStorage, SecretCipher, StorageFailure};
 
 use spoolframe_client_sdk as sdk;
 

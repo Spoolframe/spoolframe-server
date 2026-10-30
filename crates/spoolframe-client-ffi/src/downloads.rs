@@ -18,6 +18,7 @@ use crate::client::SpoolClient;
 use crate::error::SpoolError;
 use crate::runtime::run;
 use crate::session::SpoolSession;
+use crate::values::count;
 
 /// A download changed.
 // No box: UniFFI passes enum fields by value, and a notice is sent at most
@@ -279,6 +280,26 @@ impl SpoolClient {
         ))))
     }
 
+    /// How many transfers are under way (preparing or transferring),
+    /// every profile's and music's, not only the shown profile's
+    /// (`downloads()` is): what `close` would stop. Each music track is
+    /// one, so an album counts as its tracks; any count above 0 is reason
+    /// to keep running. Ask it before quitting, and to keep a
+    /// background task or foreground service going.
+    pub fn running_downloads(&self) -> u32 {
+        count(self.client.downloads().running())
+    }
+
+    /// `running_downloads()` now and on each change, for any profile.
+    /// It does not keep the client: `next` ends once the client is gone.
+    pub fn watch_running_downloads(&self) -> Arc<RunningDownloadsWatch> {
+        let current = self.client.downloads().watch_running();
+        Arc::new(RunningDownloadsWatch {
+            changes: Arc::new(Mutex::new(current.clone())),
+            current,
+        })
+    }
+
     /// Move every download on until none is under way: for a background
     /// task's time.
     pub fn run_downloads(&self) -> Arc<DownloadRun> {
@@ -499,6 +520,34 @@ impl DownloadWatch {
                 Err(RecvError::Lagged(missed)) => DownloadNotice::Lagged { missed },
                 Err(RecvError::Closed) => return None,
             })
+        })
+        .await
+    }
+}
+
+/// `running_downloads()` as it changes.
+#[derive(uniffi::Object)]
+pub struct RunningDownloadsWatch {
+    /// Read by `current`, never waited on: a `next` waiting doesn't hold
+    /// it up.
+    current: tokio::sync::watch::Receiver<usize>,
+    changes: Arc<Mutex<tokio::sync::watch::Receiver<usize>>>,
+}
+
+#[uniffi::export]
+impl RunningDownloadsWatch {
+    /// The count now.
+    pub fn current(&self) -> u32 {
+        count(*self.current.borrow())
+    }
+
+    /// The count after its next change; `None` once the client is gone.
+    pub async fn next(&self) -> Option<u32> {
+        let watch = self.changes.clone();
+        run(async move {
+            let mut watch = watch.lock().await;
+            watch.changed().await.ok()?;
+            Some(count(*watch.borrow_and_update()))
         })
         .await
     }

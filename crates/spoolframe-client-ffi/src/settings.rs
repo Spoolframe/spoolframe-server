@@ -84,6 +84,25 @@ impl SpoolSession {
     }
 }
 
+/// `at_home` and `default_quality` with this device's addresses read
+/// here, on Apple and Linux; Android passes its own.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[uniffi::export]
+impl SpoolSession {
+    /// Whether this device is on the server's home network now, by the
+    /// addresses its interfaces have now.
+    pub fn at_home_here(&self) -> bool {
+        self.session.at_home_here()
+    }
+
+    /// The quality a playback starts with when the viewer picked none,
+    /// for this session's server, on the network this device is on now:
+    /// `limit` is the device's own for it.
+    pub fn default_quality_here(&self, limit: Option<u64>) -> PlaybackQuality {
+        self.session.default_quality_here(limit)
+    }
+}
+
 /// The screen as it is now: with `show` (the device shows HDR and "Show
 /// HDR" is on) HDR10 and HLG, and Dolby Vision only with `dolby_vision`;
 /// off, none.
@@ -130,18 +149,34 @@ impl From<PlayerDecoders> for types::Decoders {
 }
 
 /// What this device plays, probed as the iOS app does on every platform:
-/// each candidate codec string asked of `player`, the `hardware` decoders
-/// the platform names, 10-bit where HEVC decodes in hardware, on
-/// `display`, over `decoders`' fixed lists.
+/// each candidate codec string asked of `player`, the decoders the
+/// platform names as hardware (`decoders.hardware_video`), 10-bit where
+/// HEVC decodes in hardware, on `display` (its HDR and bit depth), over
+/// `decoders`' fixed lists. The display's mode is not a limit here: the
+/// decoders' are, and `SpoolClient.set_display` sends the mode with each
+/// plan.
 #[uniffi::export]
 pub fn probe_capabilities(
     player: Arc<dyn CodecPlayer>,
-    hardware: Vec<VideoCodec>,
     display: ScreenCapabilities,
     decoders: PlayerDecoders,
 ) -> DeviceCapabilities {
     let plays = |codec: &str| player.plays(codec.to_owned());
-    types::ClientCapabilities::probe(&plays, &hardware, &display.into(), decoders.into()).into()
+    types::ClientCapabilities::probe(&plays, &display.into(), decoders.into()).into()
+}
+
+/// The video codec of an Android `MediaCodec` MIME type (`video/hevc`),
+/// as `MediaCodecList` names its decoders; `None` for another.
+#[uniffi::export]
+pub fn video_codec_for_mime(mime: String) -> Option<VideoCodec> {
+    VideoCodec::for_mime(&mime)
+}
+
+/// The audio codec of an Android `MediaCodec` MIME type (`audio/eac3`);
+/// E-AC-3 with Atmos is E-AC-3, DTS-HD is DTS. `None` for another.
+#[uniffi::export]
+pub fn audio_codec_for_mime(mime: String) -> Option<AudioCodec> {
+    AudioCodec::for_mime(&mime)
 }
 
 /// The offset `timing` moves to after `steps` presses of the ± control

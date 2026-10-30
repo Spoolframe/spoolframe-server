@@ -78,3 +78,35 @@ fn a_librarys_filter_values_carry_its_decades_newest_first() {
     };
     assert_eq!(FilterValues::from(values).decades, [2020, 2000, 1990]);
 }
+
+/// An item read through Swift's and Kotlin's accessors, whatever kind it
+/// is: what a list keys its rows by and shows.
+#[test]
+fn an_item_s_accessors_read_it_whatever_its_kind() {
+    let film = crate::test_fixtures::arrival();
+    assert_eq!(
+        (
+            film.id_owned().to_string(),
+            film.title_owned(),
+            film.artwork_owned().len(),
+            film.duration(),
+            film.playback_owned().and_then(|p| p.position),
+        ),
+        (
+            "plex:movie:1".to_owned(),
+            "Arrival".to_owned(),
+            1,
+            Some(std::time::Duration::from_secs(6_000)),
+            Some(std::time::Duration::from_secs(60)),
+        )
+    );
+}
+
+#[test]
+fn a_quota_says_whether_it_is_the_user_s_own() {
+    use spoolframe_client_sdk::types::QuotaOf;
+    assert_eq!(
+        [QuotaOf::User, QuotaOf::Account, QuotaOf::Unknown].map(|q| q.is_user()),
+        [true, false, false]
+    );
+}

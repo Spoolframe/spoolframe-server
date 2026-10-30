@@ -3,8 +3,10 @@
 //! ids, fingerprints, names and, once, a new identity's phrase.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use spoolframe_client_sdk as sdk;
+use spoolframe_client_sdk::types::serde_time::unix_seconds;
 
 use crate::error::{SpoolError, invalid};
 use crate::runtime::run;
@@ -18,8 +20,8 @@ pub struct PortableIdentity {
     pub fingerprint: String,
     /// What the user called it here: its name as a guest on a server it joins.
     pub name: String,
-    /// Unix seconds: made, or first recovered, here.
-    pub created_at: u64,
+    /// Made, or first recovered, here.
+    pub created_at: SystemTime,
     /// Its root key is in this device's keychain. False for one a restored
     /// backup listed without its root: recover it from its phrase before
     /// it can authorize, revoke or tie.
@@ -49,14 +51,12 @@ pub struct IssuedDevice {
     pub device_key: String,
     pub fingerprint: String,
     pub serial: u64,
-    /// Unix seconds.
-    pub issued_at: i64,
-    /// Unix seconds.
-    pub expires_at: i64,
+    pub issued_at: SystemTime,
+    pub expires_at: SystemTime,
     /// What the user called the device when authorizing it.
     pub label: Option<String>,
-    /// Unix seconds; none while it isn't revoked.
-    pub revoked_at: Option<i64>,
+    /// None while it isn't revoked.
+    pub revoked_at: Option<SystemTime>,
 }
 
 impl From<sdk::portable::IssuedCredential> for IssuedDevice {
@@ -82,8 +82,8 @@ pub struct Guest {
     /// `None`).
     pub server_name: Option<String>,
     pub server_endpoint_id: Option<String>,
-    /// When, Unix seconds.
-    pub paired_at: Option<u64>,
+    /// When.
+    pub paired_at: Option<SystemTime>,
 }
 
 /// A new identity, with the phrase to show once.
@@ -118,8 +118,7 @@ pub struct RevokedDevice {
     /// The key, 64 hex digits.
     pub key: String,
     pub fingerprint: String,
-    /// Unix seconds.
-    pub revoked_at: i64,
+    pub revoked_at: SystemTime,
 }
 
 /// An identity's newest signed state on this device: what it revokes.
@@ -127,8 +126,7 @@ pub struct RevokedDevice {
 pub struct IdentityState {
     pub revision: u64,
     pub revoked: Vec<RevokedDevice>,
-    /// Unix seconds.
-    pub issued_at: i64,
+    pub issued_at: SystemTime,
 }
 
 impl From<sdk::PortableIdentityState> for IdentityState {
@@ -141,10 +139,10 @@ impl From<sdk::PortableIdentityState> for IdentityState {
                 .map(|r| RevokedDevice {
                     key: r.key.to_string(),
                     fingerprint: key_fingerprint(&r.key),
-                    revoked_at: r.revoked_at,
+                    revoked_at: unix_seconds::from_wire(r.revoked_at),
                 })
                 .collect(),
-            issued_at: state.issued_at,
+            issued_at: unix_seconds::from_wire(state.issued_at),
         }
     }
 }

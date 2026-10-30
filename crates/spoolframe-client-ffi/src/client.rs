@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use spoolframe_client_sdk::{
     self as sdk, ConnectionState, Experimental, FinishPasskeySignIn, InviteInfo, InviteLookup,
-    LanServerInfo, PasskeyRequest, Reachability, ServerEntry, TrustedProfile, types::Platform,
+    LanServerInfo, PasskeyRequest, Reachability, ServerEntry, ServerEvent, TrustedProfile,
+    types::Platform,
 };
 use tokio::sync::Mutex;
 
@@ -16,7 +17,7 @@ use crate::portable::SpoolPortable;
 use crate::runtime::run;
 use crate::session::SpoolSession;
 use crate::storage::{Bridge, CoreStorage};
-use crate::values::DeviceCapabilities;
+use crate::values::{DeviceCapabilities, ScreenCapabilities};
 
 /// What the app says about this device.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -39,7 +40,43 @@ pub struct DeviceSpec {
     pub experimental: Experimental,
     /// Where downloads are kept: a directory excluded from backup. `None`
     /// downloads nothing (tvOS).
+    #[uniffi(default = None)]
     pub downloads_dir: Option<String>,
+    /// Keep up to this many catalog reads (Home, the libraries, their
+    /// pages, items' details, the playlists) in memory, answered at once
+    /// and read again behind the screen once old; `SpoolSession`'s
+    /// `watch_catalog` says which came back different. `None`: off, every
+    /// read asks the server. `catalog_cache_capacity()` is the SDK's
+    /// suggestion.
+    #[uniffi(default = None)]
+    pub catalog_cache: Option<u32>,
+}
+
+/// The protocol version this core speaks, for Settings › About beside
+/// the server's.
+#[uniffi::export]
+pub fn protocol_version() -> u32 {
+    spoolframe_protocol::PROTOCOL_VERSION
+}
+
+/// How many catalog reads the SDK suggests keeping
+/// (`DeviceSpec.catalog_cache`).
+#[uniffi::export]
+pub fn catalog_cache_capacity() -> u32 {
+    crate::values::count(sdk::CacheConfig::default().capacity)
+}
+
+/// The SDK's options for `device`.
+fn options_of(device: &DeviceSpec) -> sdk::ClientOptions {
+    sdk::ClientOptions {
+        relays: device.relays,
+        experimental: device.experimental,
+        downloads_dir: device.downloads_dir.as_ref().map(std::path::PathBuf::from),
+        catalog_cache: device.catalog_cache.map(|capacity| sdk::CacheConfig {
+            capacity: capacity as usize,
+        }),
+        ..sdk::ClientOptions::default()
+    }
 }
 
 /// A profile that signs in as a portable identity.
@@ -102,12 +139,7 @@ impl SpoolClient {
                 .with_writer(std::io::stderr)
                 .try_init();
         }
-        let options = sdk::ClientOptions {
-            relays: device.relays,
-            experimental: device.experimental,
-            downloads_dir: device.downloads_dir.map(std::path::PathBuf::from),
-            ..sdk::ClientOptions::default()
-        };
+        let options = options_of(&device);
         let device = sdk::Device {
             name: device.name,
             client_name: device.client_name,
@@ -146,6 +178,15 @@ impl SpoolClient {
         Arc::new(SpoolPortable(self.client.portable()))
     }
 
+    /// The screen as it is now: its mode (height, frame rate), HDR and bit
+    /// depth. Say it once after `open` and again whenever it changes; every
+    /// plan, open and re-plan that names no `display` of its own sends it,
+    /// so a mode switch counts from the next plan. `None` forgets it.
+    /// `DeviceSpec.capabilities` stays the decoders' limits.
+    pub fn set_display(&self, display: Option<ScreenCapabilities>) {
+        self.client.set_display(display.map(Into::into));
+    }
+
     /// This device's key, hex.
     pub fn id(&self) -> String {
         self.client.id()
@@ -157,11 +198,35 @@ impl SpoolClient {
         Ok(run(async move { client.servers().await }).await?)
     }
 
-    /// Wakes on each change to `servers()`.
+    /// Server `endpoint_id` as `servers()` lists it; `None` for one
+    /// neither saved nor heard on the LAN.
+    pub async fn server(&self, endpoint_id: String) -> Result<Option<ServerEntry>, SpoolError> {
+        let client = self.client.clone();
+        Ok(run(async move { client.server(&endpoint_id).await }).await?)
+    }
+
+    /// The servers heard on the LAN now, saved or not, by name.
+    pub async fn servers_on_network(&self) -> Result<Vec<ServerEntry>, SpoolError> {
+        let client = self.client.clone();
+        Ok(run(async move { client.servers_on_network().await }).await?)
+    }
+
+    /// `servers()` again on each change to it.
     pub fn watch_servers(&self) -> Arc<ServerWatch> {
-        Arc::new(ServerWatch(Arc::new(Mutex::new(
-            self.client.watch_servers(),
-        ))))
+        Arc::new(ServerWatch {
+            client: self.client.downgrade(),
+            changes: Arc::new(Mutex::new(self.client.watch_servers())),
+        })
+    }
+
+    /// Server `endpoint_id`'s connection state, sign-outs and a needed
+    /// update, as one stream: what a connection banner shows.
+    pub fn watch_server(&self, endpoint_id: String) -> Result<Arc<ServerEventWatch>, SpoolError> {
+        let events = self.client.server_events(&endpoint_id)?;
+        Ok(Arc::new(ServerEventWatch {
+            current: events.current(),
+            events: Arc::new(Mutex::new(events)),
+        }))
     }
 
     /// Addresses to dial a server at, beside what the LAN says
@@ -551,16 +616,55 @@ impl SpoolClient {
     }
 }
 
-/// Changes of the server list.
+/// The server list, as it changes.
 #[derive(uniffi::Object)]
-pub struct ServerWatch(Arc<Mutex<sdk::ServersWatch>>);
+pub struct ServerWatch {
+    /// Weak: the watch must not keep the client, and so its list's
+    /// sender, alive, or `next` never ends.
+    client: sdk::WeakClient,
+    changes: Arc<Mutex<sdk::ServersWatch>>,
+}
 
 #[uniffi::export]
 impl ServerWatch {
-    /// Waits for the next change; `false` once the client is gone.
-    pub async fn changed(&self) -> bool {
-        let watch = self.0.clone();
-        run(async move { watch.lock().await.changed().await }).await
+    /// `servers()` after the next change; `None` once the client is
+    /// gone.
+    pub async fn next(&self) -> Result<Option<Vec<ServerEntry>>, SpoolError> {
+        let client = self.client.clone();
+        let changes = self.changes.clone();
+        run(async move {
+            if !changes.lock().await.changed().await {
+                return Ok(None);
+            }
+            match client.upgrade() {
+                Some(client) => client.servers().await.map(Some),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// One server's connection banner: its state, sign-outs and a needed
+/// update.
+#[derive(uniffi::Object)]
+pub struct ServerEventWatch {
+    current: ConnectionState,
+    events: Arc<Mutex<sdk::ServerEvents>>,
+}
+
+#[uniffi::export]
+impl ServerEventWatch {
+    /// The connection state when the watch began.
+    pub fn current(&self) -> ConnectionState {
+        self.current
+    }
+
+    /// The next event; `None` once the client is gone.
+    pub async fn next(&self) -> Option<ServerEvent> {
+        let events = self.events.clone();
+        run(async move { events.lock().await.next().await }).await
     }
 }
 
@@ -608,6 +712,20 @@ impl SignOutWatch {
     }
 }
 
+/// What a waiting sign-in shows ([`PendingSignIn::details`]).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SignInCode {
+    /// As shown, large: `BCDF-GHJK`.
+    pub code: String,
+    /// What the QR code carries.
+    pub link: String,
+    /// The server's web page that approves it; `None` without a public
+    /// web UI.
+    pub web_url: Option<String>,
+    /// How long it can be approved from when it began.
+    pub expires_in: std::time::Duration,
+}
+
 /// This device's sign-in, waiting for another device to approve it.
 #[derive(uniffi::Object)]
 pub struct PendingSignIn {
@@ -641,6 +759,17 @@ impl PendingSignIn {
         self.sign_in.expires_in
     }
 
+    /// The code, link, web page and expiry in one record, as the screen
+    /// shows them.
+    pub fn details(&self) -> SignInCode {
+        SignInCode {
+            code: self.code(),
+            link: self.link(),
+            web_url: self.web_url(),
+            expires_in: self.expires_in(),
+        }
+    }
+
     /// Wait for the outcome: the session once approved, `SignInDenied`, or
     /// `SignInExpired` (start again). `Cancelled` once `cancel` stops it.
     pub async fn wait(&self) -> Result<Arc<SpoolSession>, SpoolError> {
@@ -665,5 +794,37 @@ impl PendingSignIn {
         if let Some(task) = self.waiting.lock().expect("never poisoned").take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::values::DeviceCapabilities;
+
+    fn device(catalog_cache: Option<u32>) -> DeviceSpec {
+        DeviceSpec {
+            name: "iPhone".into(),
+            client_name: "spoolframe-ios".into(),
+            client_version: "1".into(),
+            platform: Platform::Ios,
+            capabilities: DeviceCapabilities::default(),
+            relays: true,
+            experimental: Experimental::default(),
+            downloads_dir: None,
+            catalog_cache,
+        }
+    }
+
+    /// The app turns the catalog cache on with a capacity; off by default.
+    #[test]
+    fn a_device_asks_for_the_catalog_cache_by_its_capacity() {
+        assert_eq!(
+            [
+                options_of(&device(Some(500))).catalog_cache,
+                options_of(&device(None)).catalog_cache,
+            ],
+            [Some(sdk::CacheConfig { capacity: 500 }), None]
+        );
     }
 }

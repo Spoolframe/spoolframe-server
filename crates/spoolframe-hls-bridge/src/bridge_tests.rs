@@ -2,7 +2,7 @@
 use super::*;
 use spoolframe_client_sdk::{self as sdk, SdkError};
 use crate::{MenuEntry, SdkSource};
-use sdk::{PlaybackBackend, PlaybackHandle, PlaybackOptions, Playback, Selection, BitmapSubtitles, PlaybackChange, Chunk, types};
+use sdk::{PlaybackBackend, PlaybackHandle, PlaybackOptions, Playback, Selection, PlaybackChange, Chunk, types};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Default)]
@@ -27,22 +27,49 @@ impl PlaybackBackend for Backend {
         Ok(Chunk { bytes: if offset < 2 { vec![epoch as u8] } else { vec![] }, size: 2, complete: true, epoch })
     }
     async fn seek(&self, _: &PlaybackHandle, _: Duration) -> Result<u32, SdkError> { Ok(1) }
-    async fn subtitle(&self, _: &PlaybackHandle, _: Option<u32>, _: BitmapSubtitles, _: Duration) -> Result<PlaybackChange, SdkError> { Err(SdkError::Busy) }
+    async fn subtitle(&self, _: &PlaybackHandle, _: Option<u32>, _: &spoolframe_client_sdk::Replan) -> Result<PlaybackChange, SdkError> { Err(SdkError::Busy) }
     async fn progress(&self, _: &PlaybackHandle, _: Duration) -> Result<(), SdkError> { Ok(()) }
     async fn stop(&self, _: &PlaybackHandle) -> Result<(), SdkError> { Ok(()) }
+    fn link_meter(&self) -> Option<std::sync::Arc<spoolframe_client_sdk::LinkMeter>> {
+        None
+    }
+    fn shares(&self) -> Option<tokio::sync::broadcast::Receiver<spoolframe_client_sdk::PlaybackShare>> {
+        None
+    }
+    async fn set_track_override(
+        &self,
+        _: &spoolframe_client_sdk::types::MediaId,
+        _: spoolframe_client_sdk::Selection,
+    ) -> Result<(), spoolframe_client_sdk::SdkError> {
+        Err(spoolframe_client_sdk::SdkError::InvalidInput("no track choices here".into()))
+    }
+    async fn read_subtitle(
+        &self,
+        _: &spoolframe_client_sdk::PlaybackHandle,
+    ) -> Result<spoolframe_client_sdk::Subtitle, spoolframe_client_sdk::SdkError> {
+        Err(spoolframe_client_sdk::SdkError::InvalidInput("no subtitle files here".into()))
+    }
+    fn subtitle_timings(
+        &self,
+    ) -> Option<(String, tokio::sync::broadcast::Receiver<spoolframe_client_sdk::SubtitleTimingEvent>)> {
+        None
+    }
+    fn route(&self) -> Option<spoolframe_client_sdk::RemoteMode> {
+        None
+    }
 }
 
 fn snapshot() -> Playback {
     Playback {
         handle: PlaybackHandle("test-playback".into()),
         plan: sdk::PlaybackPlan::Direct { container: types::Container::Mp4, video: None, audio: None, subtitle: None, source_codec: None },
-        size: 2, chosen: None, epoch: 0, markers: vec![],
+        size: 2, chosen: None, epoch: 0, markers: vec![], duration: None,
     }
 }
 
 fn stream(backend: Arc<Backend>) -> Arc<Stream<SdkSource>> {
     let playback = sdk::ManagedPlayback::adopt(backend, "plex:movie:1".parse().unwrap(), None, PlaybackOptions::default(), snapshot());
-    Arc::new(Stream::new(SdkSource::new(playback), Kind::hls(), None, Default::default()))
+    Arc::new(Stream::new(SdkSource::new(playback, snapshot().plan), Kind::hls(), None, Default::default()))
 }
 
 async fn body(stream: Arc<Stream<SdkSource>>) -> Body {

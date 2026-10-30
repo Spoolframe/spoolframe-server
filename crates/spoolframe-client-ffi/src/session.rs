@@ -3,9 +3,10 @@
 
 use std::future::Future;
 
+use spoolframe_client_sdk::types::serde_time::unix_seconds;
 use spoolframe_client_sdk::types::{
-    ArtworkId, BitmapPreference, Item, ItemFilter, ItemSort, Library, LibraryId, MediaId,
-    MediaTracks, PersonId, Role, SearchKind, SearchScope, TrackPreferences,
+    ArtworkId, BitmapPreference, ForcedPreference, Item, ItemFilter, ItemSort, Library, LibraryId,
+    MediaId, MediaTracks, PersonId, Role, SdhPreference, SearchKind, SearchScope, TrackPreferences,
 };
 use spoolframe_client_sdk::{
     self as sdk, ArtworkSize, ConnectionPath, DeviceInfo, DeviceSignInRequest, Experimental,
@@ -16,7 +17,7 @@ use spoolframe_client_sdk::{
 
 use crate::error::SpoolError;
 use crate::runtime::run;
-use crate::values::{FilterValues, ItemSearchResults};
+use crate::values::{FilterValues, SearchResults};
 
 /// Who a session is.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -34,6 +35,25 @@ pub struct User {
     pub guest: bool,
     /// The user has a PIN, and its digits when the server kept them.
     pub pin: Option<PinState>,
+}
+
+#[uniffi::export]
+impl User {
+    /// Manages other users and the server.
+    pub fn is_admin(&self) -> bool {
+        self.role == Role::Admin
+    }
+
+    /// The user has a PIN.
+    pub fn has_pin(&self) -> bool {
+        self.pin.is_some()
+    }
+
+    /// How many boxes the PIN pad shows; `None` with no PIN, or one
+    /// whose length the server didn't keep: a free-length pad then.
+    pub fn pin_digits(&self) -> Option<u8> {
+        self.pin.as_ref().and_then(|p| p.digits)
+    }
 }
 
 impl From<&sdk::UserSummary> for User {
@@ -56,10 +76,9 @@ pub struct AccountTie {
     /// Hex.
     pub id: String,
     pub fingerprint: String,
-    /// Unix seconds.
-    pub tied_at: i64,
+    pub tied_at: std::time::SystemTime,
     /// When it last signed in; `None` until it has.
-    pub last_used_at: Option<i64>,
+    pub last_used_at: Option<std::time::SystemTime>,
 }
 
 /// The user's picture subtitle choice.
@@ -81,9 +100,28 @@ pub struct ApprovalLink {
     pub code: String,
 }
 
+/// Equal and hashed as the same user on the same server, whichever
+/// session object holds them: a profile opened again is the same one.
 #[derive(uniffi::Object)]
+#[uniffi::export(Eq, Hash)]
 pub struct SpoolSession {
     pub(crate) session: sdk::Session,
+}
+
+impl PartialEq for SpoolSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.session.server_id() == other.session.server_id()
+            && self.session.user().user_id == other.session.user().user_id
+    }
+}
+
+impl Eq for SpoolSession {}
+
+impl std::hash::Hash for SpoolSession {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.session.server_id().hash(state);
+        self.session.user().user_id.hash(state);
+    }
 }
 
 /// A session the SDK opened, as the apps hold it: for Rust that drives
@@ -115,6 +153,12 @@ impl SpoolSession {
     /// The server's key.
     pub fn server(&self) -> String {
         self.session.server()
+    }
+
+    /// This session's server as `SpoolClient.servers()` lists it; `None`
+    /// once forgotten and out of earshot.
+    pub async fn server_entry(&self) -> Result<Option<sdk::ServerEntry>, SpoolError> {
+        self.call(|s| async move { s.server_entry().await }).await
     }
 
     /// Where a browser reaches the server's web UI, when it has a public
@@ -246,7 +290,7 @@ impl SpoolSession {
         scope: SearchScope,
         kind: Option<SearchKind>,
         library: Option<LibraryId>,
-    ) -> Result<ItemSearchResults, SpoolError> {
+    ) -> Result<SearchResults, SpoolError> {
         let request = sdk::SearchRequest {
             query,
             limit,
@@ -257,7 +301,7 @@ impl SpoolSession {
         let results = self
             .call(|s| async move { s.search(request).await })
             .await?;
-        Ok(results.into())
+        Ok(sdk::search_results(results).into())
     }
 
     /// What a person a search found is in.
@@ -317,19 +361,17 @@ impl SpoolSession {
         })
     }
 
-    /// Read them as text (`as_text`) or show them as pictures. The user's
-    /// other track preferences are kept as the server has them.
+    /// Read them as text (`as_text`) or show them as pictures, the
+    /// other track preferences as they are. A read and a whole write, as
+    /// `set_subtitle_search`: a change made elsewhere in between is lost.
     pub async fn set_picture_subtitles(&self, as_text: bool) -> Result<(), SpoolError> {
-        self.call(|s| async move {
-            let mut preferences = s.track_preferences().await?.preferences;
-            preferences.subtitles.bitmap = if as_text {
-                BitmapPreference::Text
-            } else {
-                BitmapPreference::Pictures
-            };
-            s.set_track_preferences(&preferences).await
-        })
-        .await
+        let bitmap = if as_text {
+            BitmapPreference::Text
+        } else {
+            BitmapPreference::Pictures
+        };
+        self.call(move |s| async move { s.set_picture_subtitles(bitmap).await })
+            .await
     }
 
     /// How this user wants tracks chosen, on every device.
@@ -344,6 +386,21 @@ impl SpoolSession {
         preferences: TrackPreferences,
     ) -> Result<(), SpoolError> {
         self.call(move |s| async move { s.set_track_preferences(&preferences).await })
+            .await
+    }
+
+    /// Keep `sdh` and `forced` as the subtitle search's preferences,
+    /// every other track preference as it is. It reads them all and
+    /// writes them back, as `set_track_preferences` does: a change
+    /// another device makes to another preference in between is lost,
+    /// and a value this build does not know is written back as its
+    /// fallback (an unknown subtitle mode as forced only).
+    pub async fn set_subtitle_search(
+        &self,
+        sdh: SdhPreference,
+        forced: ForcedPreference,
+    ) -> Result<(), SpoolError> {
+        self.call(move |s| async move { s.set_subtitle_search(sdh, forced).await })
             .await
     }
 
@@ -517,8 +574,8 @@ impl SpoolSession {
             .map(|t| AccountTie {
                 fingerprint: t.id.fingerprint(),
                 id: t.id.to_string(),
-                tied_at: t.tied_at,
-                last_used_at: t.last_used_at,
+                tied_at: unix_seconds::from_wire(t.tied_at),
+                last_used_at: t.last_used_at.map(unix_seconds::from_wire),
             })
             .collect())
     }
@@ -602,5 +659,40 @@ fn pin_proof(pin: Option<String>, password: Option<String>) -> Option<sdk::PinPr
         (Some(pin), _) => Some(sdk::PinProof::Pin { pin }),
         (None, Some(password)) => Some(sdk::PinProof::Password { password }),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spoolframe_client_sdk::PinState;
+
+    fn user(role: Role, pin: Option<PinState>) -> User {
+        User {
+            user_id: "u1".into(),
+            username: "ana".into(),
+            display_name: "Ana".into(),
+            role,
+            locked: false,
+            guest: false,
+            pin,
+        }
+    }
+
+    #[test]
+    fn a_user_says_their_role_and_pin() {
+        let read = |u: User| (u.is_admin(), u.has_pin(), u.pin_digits());
+        assert_eq!(
+            [
+                read(user(Role::Admin, Some(PinState { digits: Some(6) }))),
+                read(user(Role::Consumer, Some(PinState { digits: None }))),
+                read(user(Role::Unknown, None)),
+            ],
+            [
+                (true, true, Some(6)),
+                (false, true, None),
+                (false, false, None)
+            ]
+        );
     }
 }

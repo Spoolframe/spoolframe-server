@@ -39,6 +39,9 @@ pub struct WatchingProfile {
     pub display_name: String,
     pub opens: ProfileOpens,
     pub locked: bool,
+    /// It has a PIN, locked now or not: a lock on its card. False for a
+    /// saved sign-in with no session, where nothing here says.
+    pub pin_required: bool,
     /// How many digits its PIN has, when the server says.
     pub pin_digits: Option<u8>,
     pub auto_login: bool,
@@ -51,6 +54,9 @@ pub struct WhosWatching {
     pub profiles: Vec<WatchingProfile>,
     /// For `open_last` as asked.
     pub launch: LaunchTarget,
+    /// The server wasn't reached: these are the sign-ins saved here, none
+    /// opens until it's back; offline mode shows their downloads.
+    pub offline: bool,
 }
 
 /// A server a paired guest could not be signed in to.
@@ -91,6 +97,7 @@ impl SpoolClient {
         let launch = watching.launch_target(open_last);
         Ok(WhosWatching {
             launch,
+            offline: watching.offline,
             profiles: watching
                 .profiles
                 .into_iter()
@@ -108,12 +115,42 @@ impl SpoolClient {
                         sdk::ProfileOpens::SignIn { method } => ProfileOpens::SignIn { method },
                     },
                     locked: p.locked,
+                    pin_required: p.pin_required,
                     pin_digits: p.pin_digits,
                     auto_login: p.auto_login,
                     last: p.last,
                 })
                 .collect(),
         })
+    }
+
+    /// Open `username`'s profile on `endpoint_id`, as "Who's watching"
+    /// lists it, as the foreground profile: no walk over `profiles`,
+    /// `trusted_profiles` and `resume_profile`. A locked one opens too;
+    /// `unlock` it with its PIN before anything else. `NotFound` for no
+    /// such profile, `SignInRequired` for one that signs in again,
+    /// `Unreachable` with the server not reached.
+    pub async fn open_profile(
+        &self,
+        endpoint_id: String,
+        username: String,
+    ) -> Result<Arc<SpoolSession>, SpoolError> {
+        let client = self.client.clone();
+        let session =
+            run(async move { client.open_profile(&endpoint_id, &username).await }).await?;
+        Ok(Arc::new(SpoolSession::new(session)))
+    }
+
+    /// Take `username` off "Who's watching" for `endpoint_id` on this
+    /// device. A session kept for them is only forgotten here, not ended
+    /// on the server: `sign_out` does both.
+    pub async fn forget_profile(
+        &self,
+        endpoint_id: String,
+        username: String,
+    ) -> Result<(), SpoolError> {
+        let client = self.client.clone();
+        Ok(run(async move { client.forget_profile(&endpoint_id, &username).await }).await?)
     }
 
     /// Keep `username` on `endpoint_id` as the profile browsed last.

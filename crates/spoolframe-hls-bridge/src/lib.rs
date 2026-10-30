@@ -53,5 +53,5 @@ pub use error::Error;
 pub use http::Body;
 pub use resource::SEGMENT_MAX;
 #[cfg(feature = "sdk")]
-pub use sdk::{SdkSegment, SdkSource, changed, mime};
+pub use sdk::{SdkSegment, SdkSource, mime};
 pub use source::{Chunk, ManifestKind, Segment, Source, Subtitle};

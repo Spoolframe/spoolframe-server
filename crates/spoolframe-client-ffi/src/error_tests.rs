@@ -70,6 +70,7 @@ fn every_variant() -> Vec<SdkError> {
         SdkError::PlaybackResumed {
             at: Duration::from_secs(90),
         },
+        SdkError::Replanned,
         SdkError::ProfileLocked,
         SdkError::NoOfflinePin,
         SdkError::InvalidInput("a PIN is 4 to 8 digits".into()),
@@ -243,10 +244,7 @@ fn a_security_key_cancel_is_its_own_case() {
 
 #[test]
 fn the_layer_s_own_cases_are_refused() {
-    assert_eq!(
-        [SpoolError::Cancelled, SpoolError::Replanned].map(|e| e.kind()),
-        [ErrorKind::Refused, ErrorKind::Refused]
-    );
+    assert_eq!(SpoolError::Cancelled.kind(), ErrorKind::Refused);
 }
 
 #[cfg(feature = "hls-bridge")]
@@ -268,5 +266,30 @@ fn a_rate_limit_says_when_to_try_again() {
         ErrorKind::RateLimited {
             retry_after: Duration::from_secs(30)
         }
+    );
+}
+
+/// The errors nested in a `SpoolError` say what to show, as it does.
+#[test]
+fn a_nested_error_s_message_is_its_text() {
+    let phrase = PhraseFailure::WordCount { found: 12 };
+    let pairing = PairingFailure::Aborted {
+        message: "cut off".into(),
+    };
+    let key = SecurityKeyError::Locked;
+    let refused = PairingRefused::InviteExpired;
+    assert_eq!(
+        [
+            phrase.message(),
+            pairing.message(),
+            key.message(),
+            refused.message()
+        ],
+        [
+            phrase.to_string(),
+            pairing.to_string(),
+            key.to_string(),
+            refused.to_string()
+        ]
     );
 }

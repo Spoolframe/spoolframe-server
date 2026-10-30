@@ -13,9 +13,11 @@ use spoolframe_client_sdk::{
     SecurityKeyError, StateError,
 };
 
+use crate::values::count;
+
 /// Why a call failed. The cases are [`SdkError`]'s, with the same names,
-/// and this layer's own: [`SpoolError::Cancelled`],
-/// [`SpoolError::Replanned`], and `Bridge` with the `hls-bridge` feature.
+/// and this layer's own: [`SpoolError::Cancelled`], and `Bridge` with the
+/// `hls-bridge` feature.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 #[uniffi::export(Display)]
 pub enum SpoolError {
@@ -25,7 +27,7 @@ pub enum SpoolError {
     OperationExpired,
     #[error("the operation ID was already used with different arguments")]
     OperationConflict,
-    /// The playback was ended here already (after `end_playback`).
+    /// The playback was ended here already (after `SpoolPlayback::stop`).
     #[error("the playback is closed")]
     PlaybackClosed,
     #[error("the media changed while recovering playback")]
@@ -276,8 +278,10 @@ pub enum SpoolError {
     /// `DownloadRun::cancel`).
     #[error("cancelled")]
     Cancelled,
-    /// A playback's resource asked after it was planned again: follow
-    /// the new plan (`follow_replan`) rather than read the old one's.
+    /// A playback's bytes asked after it moved on (planned again, another
+    /// encode, started again): the `SpoolPlayback` is on the new plan
+    /// now, so build the player's media again from its `info()` rather
+    /// than read the old one's.
     #[error("the playback was planned again: follow the new plan")]
     Replanned,
     /// The loopback bridge the player reads from couldn't start.
@@ -329,8 +333,20 @@ pub enum PairingFailure {
     Aborted { message: String },
 }
 
-fn count(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
+#[uniffi::export]
+impl PhraseFailure {
+    /// What to show: the same text as its `Display`.
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
+#[uniffi::export]
+impl PairingFailure {
+    /// What to show: the same text as its `Display`.
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl From<sdk::PhraseError> for PhraseFailure {
@@ -423,6 +439,7 @@ impl From<SdkError> for SpoolError {
             SdkError::PlaybackFailed(reason) => Self::PlaybackFailed { reason },
             SdkError::PlaybackRestarted { epoch } => Self::PlaybackRestarted { epoch },
             SdkError::PlaybackResumed { at } => Self::PlaybackResumed { at },
+            SdkError::Replanned => Self::Replanned,
             SdkError::ProfileLocked => Self::ProfileLocked,
             SdkError::NoOfflinePin => Self::NoOfflinePin,
             SdkError::InvalidInput(message) => Self::InvalidInput { message },

@@ -199,3 +199,233 @@ fn swift_bindings_typecheck() {
     swiftc.args(sources(&dir, "swift"));
     succeeds(swiftc);
 }
+
+/// The calls the apps asked for, by their Swift and Kotlin names: the
+/// enums' wire names and lists, a sort's and filter's settings string,
+/// an item's and a plan's accessors, the derived flags and the nested
+/// errors' text. Names only; the Rust tests check what they answer.
+const APP_CALLS: &[&str] = &[
+    // Wire names.
+    "wireName",
+    "sortKeyFromWireName",
+    "allSortKeys",
+    "allAudioCodecs",
+    "subtitleModeFromWireName",
+    "allBitmapPreferences",
+    "settingsString",
+    "itemSortFromSettings",
+    "itemFilterFromSettings",
+    // Item and plan accessors.
+    "id",
+    "title",
+    "artwork",
+    "duration",
+    "playback",
+    "kind",
+    "ladder",
+    "sourceCodec",
+    "convertedVideo",
+    "audioAction",
+    "subtitleAction",
+    "burnsInSubtitle",
+    "encodedHeight",
+    // Derived flags.
+    "isAdmin",
+    "hasPin",
+    "pinDigits",
+    "isPortable",
+    "isFederation",
+    "isLocal",
+    "isUser",
+    // This device's own addresses, read here (Apple and Linux).
+    "atHomeHere",
+    "defaultQualityHere",
+    // The catalog cache.
+    "catalogCacheCapacity",
+    "watchCatalog",
+    "forgetCatalog",
+    // One kind of search results, narrowed to a server.
+    "onlyFrom",
+    "seeAllCount",
+    // Nested errors.
+    "message",
+    "pairingRefusedMessage",
+    // Profiles, servers and the connection banner (Android).
+    "openProfile",
+    "forgetProfile",
+    "protocolVersion",
+    "watchServer",
+    "server",
+    "serversOnNetwork",
+    "serverEntry",
+    "details",
+    "watchOwnProfile",
+    "poster",
+    "background",
+    "thumb",
+    "isForced",
+    "mediaOrigin",
+    "setSubtitleSearch",
+];
+
+#[test]
+fn the_apps_calls_are_in_both_languages() {
+    let read = |name: &str, language: TargetLanguage| {
+        let dir = out_dir(name);
+        generate_in(&dir, language);
+        let ext = if name.starts_with("kotlin") {
+            "kt"
+        } else {
+            "swift"
+        };
+        sources(&dir, ext)
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<String>()
+    };
+    let kotlin = read("kotlin-calls", TargetLanguage::Kotlin);
+    let swift = read("swift-calls", TargetLanguage::Swift);
+    let missing: Vec<String> = APP_CALLS
+        .iter()
+        .flat_map(|call| {
+            [
+                (!kotlin.contains(&format!("fun `{call}`("))).then(|| format!("Kotlin {call}")),
+                (!swift.contains(&format!("func {call}("))).then(|| format!("Swift {call}")),
+            ]
+        })
+        .flatten()
+        .collect();
+    assert!(missing.is_empty(), "missing: {missing:?}");
+}
+
+/// A session compares and hashes as its server and user in both
+/// languages: a profile opened again equals the one held.
+#[test]
+fn a_session_is_equatable_and_hashable() {
+    let read = |name: &str, language: TargetLanguage, ext: &str| {
+        let dir = out_dir(name);
+        generate_in(&dir, language);
+        sources(&dir, ext)
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<String>()
+    };
+    let kotlin = read("kotlin-session-eq", TargetLanguage::Kotlin, "kt");
+    let swift = read("swift-session-eq", TargetLanguage::Swift, "swift");
+    let session = kotlin
+        .split("open class SpoolSession:")
+        .nth(1)
+        .and_then(|rest| rest.split("\nopen class ").next())
+        .unwrap_or_default();
+    assert!(
+        session.contains("override fun equals(") && session.contains("override fun hashCode("),
+        "Kotlin SpoolSession lacks equals and hashCode"
+    );
+    assert!(
+        swift.contains(
+            "class SpoolSession: SpoolSessionProtocol, @unchecked Sendable, Equatable, Hashable"
+        ),
+        "Swift SpoolSession is not Equatable and Hashable"
+    );
+}
+
+/// Spans and times reach both languages as their own types, not as
+/// integers in some unit: a marker's start is a `Duration`
+/// (`TimeInterval`), when an item was viewed an `Instant` (`Date`).
+#[test]
+fn times_are_instants_and_spans_durations() {
+    let read = |name: &str, language: TargetLanguage, ext: &str| {
+        let dir = out_dir(name);
+        generate_in(&dir, language);
+        sources(&dir, ext)
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<String>()
+    };
+    let kotlin = read("kotlin-times", TargetLanguage::Kotlin, "kt");
+    let swift = read("swift-times", TargetLanguage::Swift, "swift");
+    let expected = [
+        (&kotlin, "var `start`: java.time.Duration"),
+        (&kotlin, "var `lastViewedAt`: java.time.Instant?"),
+        (
+            &kotlin,
+            "fun `ago`(`at`: java.time.Instant, `now`: java.time.Instant)",
+        ),
+        (&swift, "public var start: TimeInterval"),
+        (&swift, "public var lastViewedAt: Date?"),
+        (&swift, "public func ago(at: Date, now: Date)"),
+    ];
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|(source, line)| !source.contains(line))
+        .map(|(_, line)| *line)
+        .collect();
+    assert!(missing.is_empty(), "missing: {missing:?}");
+}
+
+/// The records an app builds take their defaults in both languages:
+/// false for a playlist's kinds and play settings, nil and empty for the
+/// optional parts of a selection, filter, invite and device.
+#[test]
+fn the_records_apps_build_have_defaults() {
+    let read = |name: &str, language: TargetLanguage, ext: &str| {
+        let dir = out_dir(name);
+        generate_in(&dir, language);
+        sources(&dir, ext)
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let kotlin = read("kotlin-defaults", TargetLanguage::Kotlin, "kt");
+    let swift = read("swift-defaults", TargetLanguage::Swift, "swift");
+    let expected = [
+        (&kotlin, "var `movies`: kotlin.Boolean = false"),
+        (&kotlin, "var `skipWatched`: kotlin.Boolean = false"),
+        (&kotlin, "var `subtitle`: kotlin.UInt? = null"),
+        (&kotlin, "var `yearFrom`: kotlin.UShort? = null"),
+        (&kotlin, "var `genres`: List<kotlin.String> = listOf()"),
+        (&kotlin, "var `expiresIn`: java.time.Duration? = null"),
+        (&kotlin, "var `downloadsDir`: kotlin.String? = null"),
+        (&swift, "movies: Bool = false"),
+        (&swift, "skipWatched: Bool = false"),
+        (&swift, "subtitle: UInt32? = nil"),
+        (&swift, "yearFrom: UInt16? = nil"),
+        (&swift, "genres: [String] = []"),
+        (&swift, "expiresIn: TimeInterval? = nil"),
+        (&swift, "downloadsDir: String? = nil"),
+    ];
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|(source, line)| !source.contains(line))
+        .map(|(_, line)| *line)
+        .collect();
+    assert!(missing.is_empty(), "missing: {missing:?}");
+}
+
+/// Swift alone takes the names the Apple app asked for; Kotlin keeps the
+/// Rust ones.
+#[test]
+fn swift_alone_renames_quality_and_plan() {
+    let read = |name: &str, language: TargetLanguage, ext: &str| {
+        let dir = out_dir(name);
+        generate_in(&dir, language);
+        sources(&dir, ext)
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<String>()
+    };
+    let swift = read("swift-renames", TargetLanguage::Swift, "swift");
+    let kotlin = read("kotlin-renames", TargetLanguage::Kotlin, "kt");
+    assert_eq!(
+        [
+            swift.contains("public enum PlanQuality"),
+            swift.contains("public struct PlaybackPlanKind"),
+            kotlin.contains("sealed class Quality"),
+            kotlin.contains("data class Plan ("),
+        ],
+        [true; 4]
+    );
+}

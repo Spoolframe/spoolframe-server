@@ -2,7 +2,7 @@
 //! `describe` module and the types' caption parts give it: parts each
 //! platform words and localises itself, as the SDK's own types.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use spoolframe_client_sdk::describe::{
     self, Ago, AudioFormat, HoursMinutes, Language, PathChip, PictureClass, Played, TrackLabel,
@@ -64,15 +64,15 @@ pub fn remaining(length: Duration, position: Duration) -> HoursMinutes {
     describe::remaining(length, position)
 }
 
-/// How long before `now` `at` was; both Unix seconds.
+/// How long before `now` `at` was.
 #[uniffi::export]
-pub fn ago(at: u64, now: u64) -> Ago {
+pub fn ago(at: SystemTime, now: SystemTime) -> Ago {
     describe::ago(at, now)
 }
 
 /// "Played 3 times · 2 days ago"; `None` for never played.
 #[uniffi::export]
-pub fn played(state: PlaybackState, now: u64) -> Option<Played> {
+pub fn played(state: PlaybackState, now: SystemTime) -> Option<Played> {
     describe::played(&state, now)
 }
 
@@ -115,7 +115,12 @@ pub fn reach_facts(reachability: Reachability) -> String {
 /// The whole report for Copy report: a header with when it failed (`now`
 /// when it has not), `build` and `device`, then the facts.
 #[uniffi::export]
-pub fn reach_report(reachability: Reachability, now: u64, build: String, device: String) -> String {
+pub fn reach_report(
+    reachability: Reachability,
+    now: SystemTime,
+    build: String,
+    device: String,
+) -> String {
     reachability.report(now, &build, &device)
 }
 

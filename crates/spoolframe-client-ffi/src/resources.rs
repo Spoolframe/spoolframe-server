@@ -14,9 +14,8 @@ use std::sync::{Arc, LazyLock};
 use spoolframe_hls_bridge::{Bridge, BridgeOptions, SdkSource};
 
 use crate::error::SpoolError;
-use crate::playback::registered;
-use crate::runtime::run;
-use crate::session::SpoolSession;
+use crate::playback::{Registered, registered};
+use crate::runtime::block;
 
 /// The app's one bridge: the playbacks it reads, by token.
 /// Debugging switches from the environment: `SPOOLFRAME_BRIDGE_LOG=1`
@@ -46,6 +45,16 @@ pub(crate) struct Fetched {
     bytes: Vec<u8>,
 }
 
+impl Fetched {
+    /// It as a `DataSource` opens it.
+    pub(crate) fn resource(&self) -> PlaybackResource {
+        PlaybackResource {
+            content_type: self.content_type.to_owned(),
+            length: self.bytes.len() as u64,
+        }
+    }
+}
+
 /// A resource as a `DataSource` opens it.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PlaybackResource {
@@ -71,20 +80,27 @@ fn failed(path: &str, error: spoolframe_hls_bridge::Error) -> SpoolError {
     }
 }
 
-/// `path` of `token`'s playback, read whole now and kept for its ranges,
-/// in place of the one kept for `path` before (a playlist that grew);
-/// the least recently used goes past [`KEPT`].
-pub(crate) async fn fetch(token: String, path: String) -> Result<Arc<Fetched>, SpoolError> {
-    let Some(playback) = registered(&token) else {
+/// `path` of `playback`, read whole now and kept for its ranges, in place
+/// of the one kept for `path` before (a playlist that grew); the least
+/// recently used goes past [`KEPT`]. Runs on the SDK's runtime
+/// ([`block`]).
+pub(crate) async fn fetch(
+    playback: Arc<Registered>,
+    path: String,
+) -> Result<Arc<Fetched>, SpoolError> {
+    // Closed (ended, or the player moved on): the bridge has no stream
+    // under its token to read.
+    if registered(&playback.token).is_none() {
         return Err(SpoolError::PlaybackExpired);
-    };
-    let read = run({
-        let (token, path) = (token.clone(), path.clone());
-        async move { BRIDGE.resource(&token, &path).await }
-    })
-    .await;
-    let (content_type, bytes) = match read {
+    }
+    let (content_type, bytes) = match BRIDGE.resource(&playback.token, &path).await {
         Ok(Some(found)) => found,
+        // Unregistered since the check above (ended, or the player
+        // moved on): expired, which the player follows, not a resource
+        // missing from a plan still on.
+        Ok(None) if registered(&playback.token).is_none() => {
+            return Err(SpoolError::PlaybackExpired);
+        }
         Ok(None) => return Err(SpoolError::NotFound { what: path }),
         Err(error) => return Err(failed(&path, error)),
     };
@@ -102,79 +118,48 @@ pub(crate) async fn fetch(token: String, path: String) -> Result<Arc<Fetched>, S
     Ok(fetched)
 }
 
-/// The kept `path` of `token`'s playback, else read now.
-pub(crate) async fn kept(token: String, path: String) -> Result<Arc<Fetched>, SpoolError> {
-    let kept = registered(&token).and_then(|p| {
-        let mut kept = p.resources.lock().expect("never poisoned");
-        let at = kept.iter().position(|f| f.path == path)?;
-        let fetched = kept.remove(at);
-        kept.push(fetched.clone());
-        Some(fetched)
-    });
-    match kept {
+/// The kept `path` of `playback`, now the most recently used.
+fn kept(playback: &Registered, path: &str) -> Option<Arc<Fetched>> {
+    let mut kept = playback.resources.lock().expect("never poisoned");
+    let at = kept.iter().position(|f| f.path == path)?;
+    let fetched = kept.remove(at);
+    kept.push(fetched.clone());
+    Some(fetched)
+}
+
+/// The kept `path` of `playback` on this thread, else read now, waiting
+/// for it.
+fn kept_or_fetched(playback: &Arc<Registered>, path: String) -> Result<Arc<Fetched>, SpoolError> {
+    match kept(playback, &path) {
         Some(fetched) => Ok(fetched),
-        None => fetch(token, path).await,
+        None => block(fetch(playback.clone(), path)),
     }
 }
 
-/// [`SpoolSession::open_playback_resource`]: a playlist read again, for
-/// one that grew, and a subtitle, which a timing change rewrites under
-/// the same name (and is small); a media segment or the init, which never
-/// change under their names, from the one kept if it is.
-pub(crate) async fn open(token: String, path: String) -> Result<Arc<Fetched>, SpoolError> {
+/// `SpoolPlayback::open_resource`: a playlist read again, for one that
+/// grew, and a subtitle, which a timing change rewrites under the same
+/// name (and is small); a media segment or the init, which never change
+/// under their names, from the one kept if it is. Blocks on a read.
+pub(crate) fn open(playback: &Arc<Registered>, path: String) -> Result<Arc<Fetched>, SpoolError> {
     if path.ends_with(".m3u8") || path.ends_with(".vtt") {
-        fetch(token, path).await
+        block(fetch(playback.clone(), path))
     } else {
-        kept(token, path).await
+        kept_or_fetched(playback, path)
     }
 }
 
-/// [`SpoolSession::read_playback_resource`].
-pub(crate) async fn read_range(
-    token: String,
+/// `SpoolPlayback::read_resource`: from the kept body, else read now.
+pub(crate) fn read_range(
+    playback: &Arc<Registered>,
     path: String,
     offset: u64,
     length: u64,
 ) -> Result<Vec<u8>, SpoolError> {
-    let fetched = kept(token, path).await?;
+    let fetched = kept_or_fetched(playback, path)?;
     let size = fetched.bytes.len() as u64;
     let start = offset.min(size) as usize;
     let end = offset.saturating_add(length).min(size) as usize;
     Ok(fetched.bytes[start..end].to_vec())
-}
-
-#[uniffi::export]
-impl SpoolSession {
-    /// Open `path` of the open playback `token` (`master.m3u8`, or a name
-    /// a playlist gives): it is read whole now, as a `DataSource`'s open
-    /// does, and kept for `read_playback_resource`'s ranges: the last few
-    /// opened, each by its path. A playlist or subtitle opened again is
-    /// read again; a media segment kept is not.
-    pub async fn open_playback_resource(
-        &self,
-        token: String,
-        path: String,
-    ) -> Result<PlaybackResource, SpoolError> {
-        let fetched = open(token, path).await?;
-        Ok(PlaybackResource {
-            content_type: fetched.content_type.to_owned(),
-            length: fetched.bytes.len() as u64,
-        })
-    }
-
-    /// Up to `length` bytes of `path` of the playback `token` from
-    /// `offset`, none past its end: from the body `open_playback_resource`
-    /// kept for `path` (the one its length was), so a run of ranges reads
-    /// it once.
-    pub async fn read_playback_resource(
-        &self,
-        token: String,
-        path: String,
-        offset: u64,
-        length: u64,
-    ) -> Result<Vec<u8>, SpoolError> {
-        read_range(token, path, offset, length).await
-    }
 }
 
 #[cfg(test)]
