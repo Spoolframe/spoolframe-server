@@ -212,6 +212,7 @@ mod tests {
             "experimental.libplacebo_shared_on_amd",
             "experimental.index_ahead",
             "experimental.federation",
+            "experimental.smart_crop",
         ] {
             assert!(!is_advanced(key), "{key}");
         }

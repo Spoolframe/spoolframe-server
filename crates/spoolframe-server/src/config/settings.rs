@@ -172,6 +172,8 @@ pub const SETTINGS: &[Setting] = &[
     live("experimental.index_ahead"),
     // The endpoint's ALPNs are fixed when it binds (P8-01).
     restart("experimental.federation"),
+    // The cache is built with the scanner, at start.
+    restart("experimental.smart_crop"),
     live("federation.sync_interval_secs"),
     live("federation.cache_max_mb"),
     live("federation.cache_total_mb"),

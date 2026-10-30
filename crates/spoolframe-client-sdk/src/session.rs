@@ -2226,6 +2226,19 @@ impl Session {
     /// An image, at `size`.
     /// Images larger than 64 MiB are refused before allocating their body.
     pub async fn artwork(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Vec<u8>, SdkError> {
+        Ok(self.backdrop(id, size).await?.bytes)
+    }
+
+    /// An image, at `size`, and the faces in it if it is a backdrop whose
+    /// faces are known ([`crate::Backdrop::faces`]), for
+    /// [`crate::backdrop_crop`]: the same fractions at every size. As
+    /// [`Self::artwork`] with no faces on a server without
+    /// [`crate::Experimental::smart_crop`].
+    pub async fn backdrop(
+        &self,
+        id: &ArtworkId,
+        size: ArtworkSize,
+    ) -> Result<crate::Backdrop, SdkError> {
         let request = ArtworkRequest {
             session: self.token.clone(),
             id: id.clone(),
@@ -2240,7 +2253,10 @@ impl Session {
                         .await
                 });
         match artwork.await? {
-            (ArtworkResponse::Ok(_), bytes) => Ok(bytes),
+            (ArtworkResponse::Ok(reply), bytes) => Ok(crate::Backdrop {
+                bytes,
+                faces: reply.faces,
+            }),
             (ArtworkResponse::Err(e), _) => Err(self.failed(e).await),
         }
     }

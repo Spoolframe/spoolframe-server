@@ -511,6 +511,7 @@ mod sdk {
     const ASKING: Experimental = Experimental {
         http_playback: true,
         federation: false,
+        smart_crop: false,
     };
 
     #[tokio::test]

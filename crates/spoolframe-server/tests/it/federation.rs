@@ -1989,7 +1989,7 @@ mod admin {
 // invite, as the QR flow does, through the SDK; only an app that names
 // the experimental `federation` feature may.
 
-mod app {
+pub(crate) mod app {
     use spoolframe_client_sdk::{
         Client, ClientOptions, Device, Experimental, InviteKind as SdkKind, InviteOutcome,
         InviteSpec, MemoryStorage, SdkError, Session,
@@ -1999,11 +1999,11 @@ mod app {
     use super::*;
     use crate::support::mkv_capabilities;
 
-    pub(super) const PASSWORD: &str = "correct horse";
+    pub(crate) const PASSWORD: &str = "correct horse";
 
     /// An app on loopback that asks for `experimental`, signed in to
     /// `server` as `username`.
-    pub(super) async fn signed_in(
+    pub(crate) async fn signed_in(
         server: &TestServer,
         username: &str,
         experimental: Experimental,
@@ -2050,6 +2050,7 @@ mod app {
     pub(super) const FEDERATION: Experimental = Experimental {
         http_playback: false,
         federation: true,
+        smart_crop: false,
     };
 
     async fn with_admin(test: &str, name: &str, admin: &str) -> TestServer {

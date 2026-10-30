@@ -904,8 +904,77 @@ fn artwork_messages_round_trip() {
         content_type: "image/jpeg".into(),
         length: 1234,
         etag: "abc".into(),
+        faces: None,
     }));
     round_trip(crate::ArtworkResponse::Err(Error::Unauthenticated));
+}
+
+mod smart_crop {
+    use crate::ArtworkFace;
+    use crate::resource::{ResourceMetadata, ResourceResponse};
+
+    use super::*;
+
+    fn ready(faces: Option<Vec<ArtworkFace>>) -> ResourceResponse {
+        ResourceResponse::Ready {
+            length: 9,
+            metadata: ResourceMetadata::Artwork {
+                content_type: "image/jpeg".into(),
+                etag: "e".into(),
+                faces,
+            },
+        }
+    }
+
+    #[test]
+    fn faces_cross_the_wire_and_none_found_is_not_not_scanned() {
+        let face = ArtworkFace {
+            left: 0.1,
+            right: 0.2,
+            top: 0.3,
+            bottom: 0.4,
+            eyes: 0.35,
+        };
+        round_trip(ready(Some(vec![face])));
+        round_trip(ready(Some(Vec::new())));
+        round_trip(ready(None));
+    }
+
+    /// A peer without the feature sees what it saw before there was one.
+    #[test]
+    fn without_faces_the_reply_is_as_it_was() {
+        assert_eq!(
+            serde_json::to_value(ready(None)).unwrap(),
+            serde_json::json!({
+                "type": "ready",
+                "length": 9,
+                "metadata": {"type": "artwork", "content_type": "image/jpeg", "etag": "e"},
+            })
+        );
+    }
+
+    /// An SDK with the field reads a server without it.
+    #[test]
+    fn a_reply_of_an_older_server_has_no_faces() {
+        #[derive(serde::Serialize)]
+        struct Older<'a> {
+            r#type: &'a str,
+            content_type: &'a str,
+            etag: &'a str,
+        }
+        let mut bytes = Vec::new();
+        let older = Older {
+            r#type: "artwork",
+            content_type: "image/jpeg",
+            etag: "e",
+        };
+        ciborium::into_writer(&older, &mut bytes).unwrap();
+        let read: ResourceMetadata = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let ResourceMetadata::Artwork { faces, .. } = read else {
+            panic!("{read:?}");
+        };
+        assert_eq!(faces, None);
+    }
 }
 
 #[test]

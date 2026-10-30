@@ -43,9 +43,14 @@ impl ProtocolInfo {
 
 /// The experimental features on: `http-playback` while its port is
 /// configured (`http_playback.listen`), `federation` while
-/// `experimental.federation` is on (P8-01); the same answer the client
+/// `experimental.federation` is on (P8-01), `smart-crop` while
+/// `experimental.smart_crop` is (PX-64); the same answer the client
 /// protocol's `Hello` gets.
-pub fn experimental_on(http_playback: bool, federation: bool) -> Vec<&'static str> {
+pub fn experimental_on(
+    http_playback: bool,
+    federation: bool,
+    smart_crop: bool,
+) -> Vec<&'static str> {
     let mut on = Vec::new();
     if http_playback {
         on.push(experimental::HTTP_PLAYBACK);
@@ -53,13 +58,16 @@ pub fn experimental_on(http_playback: bool, federation: bool) -> Vec<&'static st
     if federation {
         on.push(experimental::FEDERATION);
     }
+    if smart_crop {
+        on.push(experimental::SMART_CROP);
+    }
     on
 }
 
 /// Every experimental feature this build knows, each on by its setting:
 /// what `--version` names, as it reads no config.
 pub fn experimental_known() -> Vec<&'static str> {
-    experimental_on(true, true)
+    experimental_on(true, true, true)
 }
 
 /// `names` joined, or "none".
@@ -104,14 +112,25 @@ mod tests {
 
     #[test]
     fn the_experimental_features_are_those_on() {
-        let info = ProtocolInfo::new(experimental_on(true, false));
+        let info = ProtocolInfo::new(experimental_on(true, false, false));
         assert_eq!(info.version, PROTOCOL_VERSION);
         assert_eq!(info.experimental, [experimental::HTTP_PLAYBACK]);
-        assert!(experimental_on(false, false).is_empty());
-        assert_eq!(experimental_on(false, true), [experimental::FEDERATION]);
+        assert!(experimental_on(false, false, false).is_empty());
+        assert_eq!(
+            experimental_on(false, true, false),
+            [experimental::FEDERATION]
+        );
+        assert_eq!(
+            experimental_on(false, false, true),
+            [experimental::SMART_CROP]
+        );
         assert_eq!(
             experimental_known(),
-            [experimental::HTTP_PLAYBACK, experimental::FEDERATION]
+            [
+                experimental::HTTP_PLAYBACK,
+                experimental::FEDERATION,
+                experimental::SMART_CROP
+            ]
         );
     }
 
@@ -133,7 +152,9 @@ mod tests {
         );
         assert_eq!(
             lines.next(),
-            Some("experimental features (each on by its setting): http-playback, federation")
+            Some(
+                "experimental features (each on by its setting): http-playback, federation, smart-crop"
+            )
         );
         assert_eq!(lines.next(), None);
     }

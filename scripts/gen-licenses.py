@@ -27,6 +27,9 @@ What is listed is what the server ships:
   build copies in from nixpkgs (their name tables, SPOOLFRAME_WEB_FONTS)
   and Tailwind, whose output is the stylesheet.
 
+- The model the server carries (model): YuNet, the face detector PX-64
+  embeds, from scripts/licenses/yunet.LICENSE.
+
 - The programs the server runs (programs): FFmpeg, built with libplacebo
   (nix/ffmpeg.nix), and Tesseract (nix/package.nix), as nixpkgs builds
   them at the revision flake.lock pins. They run as separate programs,
@@ -37,8 +40,8 @@ The C libraries the server links from the host (OpenSSL, libucl) are not
 listed: Nix and the distributions that ship them carry their notices.
 
 Groups: this workspace's crates are "spoolframe", every other crate is
-"crates", the programs "programs", and the web app's fixed entries
-"browser". A crate's `ships` names where it is: "server", "web" or both.
+"crates", the model "models", the programs "programs", and the web app's
+fixed entries "browser". A crate's `ships` names where it is: "server", "web" or both.
 
 Texts: each crate's own license files, matched to the SPDX ids of its
 license expression by their wording. An id with no file of its own gets
@@ -106,6 +109,9 @@ PROGRAMS = [
     ("libplacebo", "7.360.1", "LGPL-2.1-or-later", []),
     ("Tesseract", "5.5.3", "Apache-2.0", []),
 ]
+
+# The face detector's model, in crates/spoolframe-server/assets.
+YUNET = "yunet-2023mar.nnef.tar"
 
 # A license file's id, by its wording. The first that matches wins, so the
 # more specific come first.
@@ -402,6 +408,18 @@ def fixed_components(text_id):
     return out
 
 
+def model(text_id):
+    """YuNet, in the server binary as NNEF: no crate carries its notice."""
+    text = read(os.path.join(LICENSES_DIR, "yunet.LICENSE"))
+    if classify(text) != ["MIT"] or "Shiqi Yu" not in text:
+        sys.exit("gen-licenses: scripts/licenses/yunet.LICENSE is no longer MIT, Shiqi Yu: "
+                 "update the entry in model")
+    if not os.path.exists(os.path.join(ROOT, "crates", "spoolframe-server", "assets", YUNET)):
+        sys.exit(f"gen-licenses: the server no longer carries {YUNET}: update the entry in model")
+    return [{"name": "YuNet", "version": "2023mar", "group": "models", "ships": ["server"],
+             "license": "MIT", "copyright": holders([text]), "texts": {"MIT": text_id(text)}}]
+
+
 def programs(text_id):
     """FFmpeg, libplacebo and Tesseract: what the server runs, as nixpkgs
     builds them. --check fails when the nixpkgs flake.lock pins, or the
@@ -464,6 +482,7 @@ def generate():
         })
 
     components.extend(fixed_components(text_id))
+    components.extend(model(text_id))
     components.extend(programs(text_id))
 
     data = {"components": components, "texts": texts}

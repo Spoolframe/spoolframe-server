@@ -657,6 +657,12 @@ experimental {
   # ALPN) may still change in ways that break pairings. Pair only with
   # servers you trust. Applies after a restart.
   federation = false;
+  # Find the faces in each backdrop, once per image, and tell apps where
+  # they are, so a wide hero can keep the heads in its crop. New images
+  # are scanned as they are first shown, the rest a few a second at a low
+  # priority. Off, nothing is scanned, and apps crop as they always did.
+  # Applies after a restart.
+  smart_crop = false;
 }
 
 # HTTP playback (PX-49): a playback's HLS, or its file, over plain HTTP on

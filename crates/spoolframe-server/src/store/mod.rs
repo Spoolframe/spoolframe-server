@@ -18,6 +18,7 @@ macro_rules! own_item {
     };
 }
 
+pub mod artwork_faces;
 pub mod audit;
 pub mod downloads;
 pub mod federation;

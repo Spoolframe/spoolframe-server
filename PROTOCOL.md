@@ -51,6 +51,7 @@ be updated together. The changes per revision are in
 - [Sorting and filtering a library](#sorting-and-filtering-a-library)
 - [Downloads](#downloads)
 - [Portable identities](#portable-identities)
+- [Faces in backdrops](#faces-in-backdrops) (experimental)
 - [Federation](#federation) (experimental):
   [sharing libraries](#sharing-libraries),
   [paired servers in an app](#paired-servers-in-an-app),
@@ -110,7 +111,7 @@ them. A few fields may still be left out, each for a reason of its own:
 | `last_viewed_at`, `play_count`, `last_played_at` on a playback state; `timing`, `download` on a subtitle track | `null`, 0 | as `year`; a server sends them always |
 | `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent | stored as JSON by servers and devices; left out when empty |
 | `expected_size` on a download, `cause` on a failed one | `null`, `other` | the SDK keeps them with a download |
-| the experimental features' fields (`federation`'s `unavailable`, `servers`, a library's `server`, `copies`) | none | left out for a client without the feature |
+| the experimental features' fields (`federation`'s `unavailable`, `servers`, a library's `server`, `copies`; `smart-crop`'s `faces` on an artwork reply) | none | left out for a client without the feature |
 
 ## Connections and streams
 
@@ -1326,7 +1327,7 @@ stream.
 
 | Request | Carries | Header (`ResourceMetadata`) |
 |---|---|---|
-| `artwork { request, max_bytes }` | an `ArtworkRequest` | `artwork { content_type, etag }` |
+| `artwork { request, max_bytes }` | an `ArtworkRequest` | `artwork { content_type, etag, faces? }` |
 | `media { request, revision }` | a `MediaRead { session, handle, offset, length, epoch, segment, variant }` | `media { size, complete, epoch, revision }` |
 | `subtitle { session, handle, revision, offset, version }` | a chunk of a whole-file subtitle | `subtitle { format, total, version, revision }` |
 | `subtitle_segment { session, handle, revision, segment }` | an HLS subtitle segment | `subtitle { … }` |
@@ -1787,12 +1788,29 @@ send it": a server that has the field always sends it. Nothing is
 decided from a version number: no server or SDK code reads the other
 side's version to choose what it sends.
 
-The third kind is experimental (PX-49): `http-playback` and
-`federation`. A client names those it wants in
+The third kind is experimental (PX-49): `http-playback`, `federation`
+and `smart-crop`. A client names those it wants in
 `Hello.experimental`; the server's answer, `ServerInfo.experimental`,
 names those it turned on, each by its setting. Unlike a regular
 feature, which a server that has it always names, an operator turns an
 experimental one on. They are outside the protocol's stability.
+
+## Faces in backdrops
+
+Experimental (PX-64), for a client that names `smart-crop` on a server
+with `experimental.smart_crop` on. An artwork reply for a backdrop adds
+`faces`, a list of `{left, right, top, bottom, eyes}`, each a fraction
+of the image's width or height, at any `ArtworkSize`; `eyes` is the
+mean height of the two eyes, and a box runs from about the brow to the
+chin. An empty list means the server scanned the image and found none.
+`faces` is left out for a backdrop not scanned yet, for every other
+image, and for a client that did not name the feature, whose reply is
+as it always was.
+
+The server scans a backdrop once, off the request path, after first
+fetching its original or in a low-priority sweep, so the first reply
+for an image usually has no `faces`. The client's SDK turns `faces` and
+a hero's shape into the crop (`backdrop_crop`), so that apps agree.
 
 ## Playlists
 

@@ -2,9 +2,10 @@
 //! away in one place. HTTP playback for AirPlay (PX-49), which was the
 //! config file's and the CLI's only, libplacebo's shared Vulkan device on
 //! AMD (PGPU-04), which was at the foot of Playback, keyframes read
-//! ahead of any play (`experimental.index_ahead`), and pairing with other
-//! servers (`experimental.federation`, P8-01), with its cache and limits
-//! under "Show advanced settings" (P8-04).
+//! ahead of any play (`experimental.index_ahead`), faces in backdrops
+//! (`experimental.smart_crop`, PX-64), and pairing with other servers
+//! (`experimental.federation`, P8-01), with its cache and limits under
+//! "Show advanced settings" (P8-04).
 
 use dioxus::prelude::*;
 use serde_json::json;
@@ -56,6 +57,7 @@ fn ExperimentalFields(
     let address = use_signal(|| text(&settings, "http_playback.address"));
     let mut shared_on_amd = use_signal(|| flag(&settings, "experimental.libplacebo_shared_on_amd"));
     let mut index_ahead = use_signal(|| flag(&settings, "experimental.index_ahead"));
+    let mut smart_crop = use_signal(|| flag(&settings, "experimental.smart_crop"));
     let mut federation = use_signal(|| flag(&settings, crate::federation::SETTING));
     // One field per federation setting, always as many, in one order.
     let limits: Vec<Signal<String>> = crate::federation::LIMITS
@@ -88,6 +90,7 @@ fn ExperimentalFields(
                 Some(json!(shared_on_amd())),
             ),
             ("experimental.index_ahead", Some(json!(index_ahead()))),
+            ("experimental.smart_crop", Some(json!(smart_crop()))),
             (crate::federation::SETTING, Some(json!(federation()))),
         ];
         for (field, value) in crate::federation::LIMITS.iter().zip(&typed_limits) {
@@ -188,6 +191,24 @@ fn ExperimentalFields(
                 }
             }
             Note { settings: settings.clone(), setting: "experimental.index_ahead", on_changed: move |_| on_reload.call(()) }
+        }
+        div { class: "flex flex-col gap-2",
+            h2 { "Smart crop" }
+            div { class: "flex items-start gap-3",
+                button {
+                    class: "switch mt-0.5",
+                    role: "switch",
+                    aria_checked: "{smart_crop()}",
+                    aria_label: "Find faces in backdrops",
+                    disabled: locked(&settings, "experimental.smart_crop"),
+                    onclick: move |_| smart_crop.toggle(),
+                }
+                span { class: "choice-what",
+                    b { "Find faces in backdrops" }
+                    "A wide hero keeps only part of a backdrop's height, and a crop through the middle can cut heads off. With this on, the server finds the faces in each backdrop, once per image, and apps that can use them place the crop around them. New images are scanned as they are first shown, the rest a few a second. Applies after a restart."
+                }
+            }
+            Note { settings: settings.clone(), setting: "experimental.smart_crop", on_changed: move |_| on_reload.call(()) }
         }
         div { class: "flex flex-col gap-2",
             h2 { "Federation" }

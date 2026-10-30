@@ -114,11 +114,13 @@ pub struct ArtworkCache {
     /// The catalog's changes ([`crate::catalog::LiveCatalog::changes`]):
     /// a library added, removed or changed forgets every answer.
     changes: Option<tokio::sync::watch::Receiver<u64>>,
-    /// Resizes running at once, one per core.
-    resizes: tokio::sync::Semaphore,
+    /// Resizes running at once, one per core; face scans take a turn too.
+    resizes: Arc<tokio::sync::Semaphore>,
     /// Playlists' uploaded covers (PX-53), for `image:playlist/…` ids.
     /// Mosaics and tiles need none.
     covers: Option<Arc<crate::covers::Covers>>,
+    /// Backdrops' faces (PX-64), while `experimental.smart_crop` is on.
+    faces: Option<Arc<crate::faces::Faces>>,
 }
 
 /// How long the catalog's word that an artwork is served is taken: a
@@ -197,10 +199,11 @@ impl ArtworkCache {
             evictions,
             authorized: Mutex::default(),
             changes: None,
-            resizes: tokio::sync::Semaphore::new(
+            resizes: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(2, |n| n.get()),
-            ),
+            )),
             covers: None,
+            faces: None,
         })
     }
 
@@ -208,6 +211,28 @@ impl ArtworkCache {
     pub fn with_covers(mut self, covers: Arc<crate::covers::Covers>) -> Self {
         self.covers = Some(covers);
         self
+    }
+
+    /// Scan each backdrop for faces, once, keeping them in `store` (PX-64).
+    pub fn with_faces(
+        mut self,
+        store: crate::store::Store,
+    ) -> Result<Self, crate::faces::FaceError> {
+        self.faces = Some(Arc::new(crate::faces::Faces::new(
+            store,
+            self.resizes.clone(),
+        )?));
+        Ok(self)
+    }
+
+    /// Backdrops' faces, while they are looked for.
+    pub fn faces(&self) -> Option<&Arc<crate::faces::Faces>> {
+        self.faces.as_ref()
+    }
+
+    /// The catalog it fills from.
+    pub fn catalog(&self) -> Arc<dyn Catalog> {
+        self.catalog.clone()
     }
 
     /// Forget what the catalog said each time it changes (`changes`, the
@@ -407,6 +432,7 @@ impl ArtworkCache {
         // with the pair (P8-02): not in this cache too. Its sizes are.
         if size.width().is_none() && id.namespace() == Namespace::Federated {
             let image = self.make(id, size).await?;
+            self.scan_for_faces(id, &image);
             return Ok((
                 Artwork {
                     bytes: image.bytes,
@@ -425,7 +451,48 @@ impl ArtworkCache {
             return Ok((hit, true));
         }
         let image = self.make(id, size).await?;
+        if size.width().is_none() {
+            self.scan_for_faces(id, &image);
+        }
         Ok((self.store(&key, image), false))
+    }
+
+    /// With original `image` just fetched: start a scan if it is a
+    /// backdrop, in a task of its own, for no request to wait on.
+    fn scan_for_faces(&self, id: &ArtworkId, image: &Image) {
+        let Some(faces) = self.faces.clone() else {
+            return;
+        };
+        if crate::faces::is_backdrop(id) {
+            let (id, bytes) = (id.clone(), image.bytes.clone());
+            tokio::spawn(async move { faces.scan(&id, bytes).await });
+        }
+    }
+
+    /// Scan backdrop `id` if that was not done, from the original here if
+    /// there is one, else from the catalog, not kept: a sweep of a whole
+    /// library must not push out what people are looking at. Whether it
+    /// looked at the image. One the catalog does not give is left for the
+    /// next sweep.
+    pub(crate) async fn scan_backlog(&self, id: &ArtworkId) -> bool {
+        let Some(faces) = &self.faces else {
+            return false;
+        };
+        if faces.known(id).await.is_some() {
+            return false;
+        }
+        let bytes = match self.read(&cache_key(id, ArtworkSize::Original)).await {
+            Ok(Some(kept)) => kept.bytes,
+            _ => match self.catalog.artwork(id).await {
+                Ok(image) => image.bytes,
+                Err(e) => {
+                    tracing::debug!(%id, error = %e, "no backdrop to scan for faces");
+                    return false;
+                }
+            },
+        };
+        faces.scan(id, bytes).await;
+        true
     }
 
     async fn make(&self, id: &ArtworkId, size: ArtworkSize) -> Result<Image, ArtworkError> {
@@ -694,6 +761,94 @@ mod tests {
 
     fn fetches(c: &Counting) -> usize {
         c.fetches.load(Ordering::SeqCst)
+    }
+
+    /// `id(n)`, as a backdrop's path.
+    fn backdrop(n: u32) -> ArtworkId {
+        ArtworkId::new(Namespace::Plex, format!("/library/metadata/{n}/art/1")).unwrap()
+    }
+
+    /// The cache with faces looked for, and `store` for them.
+    async fn scanning(
+        test: &str,
+    ) -> (
+        ArtworkCache,
+        Arc<Counting>,
+        (spoolframe_test_dir::TestDir, crate::store::tests::TestStore),
+    ) {
+        let (cache, catalog, tmp) = cache(test, ROOMY).await;
+        let store = crate::store::tests::test_store(&format!("{test}-store")).await;
+        let cache = cache.with_faces((*store).clone()).unwrap();
+        (cache, catalog, (tmp, store))
+    }
+
+    /// How many faces a scan of `id` found, after a while for it to
+    /// finish: a request does not wait for it.
+    async fn scans(cache: &ArtworkCache, id: &ArtworkId) -> Option<usize> {
+        let faces = cache.faces().unwrap();
+        for _ in 0..200 {
+            if let Some(found) = faces.known(id).await {
+                return Some(found.len());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn a_backdrop_is_scanned_after_its_original_is_fetched() {
+        let (cache, _, _kept) = scanning("faces-backdrop").await;
+        cache.get(&backdrop(1), ArtworkSize::Medium).await.unwrap();
+        assert_eq!(scans(&cache, &backdrop(1)).await, Some(0));
+    }
+
+    /// Its original is not kept here, but it is scanned here all the same.
+    #[tokio::test]
+    async fn a_paired_server_s_backdrop_is_scanned_when_it_is_fetched() {
+        let (cache, _, _kept) = scanning("faces-federated").await;
+        let id = ArtworkId::federated("mzxw6ytbojtg633c", &backdrop(1)).unwrap();
+        cache.get(&id, ArtworkSize::Original).await.unwrap();
+        assert_eq!(scans(&cache, &id).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_poster_is_not_scanned() {
+        let (cache, _, _kept) = scanning("faces-poster").await;
+        cache.get(&id(1), ArtworkSize::Original).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.faces().unwrap().scanned(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_backlog_scans_once_and_leaves_the_cache_as_it_was() {
+        let (cache, catalog, _kept) = scanning("faces-backlog").await;
+        assert!(cache.scan_backlog(&backdrop(1)).await);
+        assert_eq!(fetches(&catalog), 1);
+        assert_eq!(cache.memory_bytes(), 0);
+        assert!(!cache.scan_backlog(&backdrop(1)).await);
+        assert_eq!(fetches(&catalog), 1);
+        assert_eq!(cache.faces().unwrap().scanned(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_backlog_does_not_fetch_an_original_it_has() {
+        let (off, catalog, _tmp) = cache("faces-kept", ROOMY).await;
+        off.get(&backdrop(1), ArtworkSize::Original).await.unwrap();
+        let store = crate::store::tests::test_store("faces-kept-store").await;
+        let on = off.with_faces((*store).clone()).unwrap();
+        assert!(on.scan_backlog(&backdrop(1)).await);
+        assert_eq!(fetches(&catalog), 1);
+    }
+
+    #[tokio::test]
+    async fn without_the_feature_nothing_is_scanned() {
+        let (cache, _, _tmp) = cache("faces-off", ROOMY).await;
+        cache
+            .get(&backdrop(1), ArtworkSize::Original)
+            .await
+            .unwrap();
+        assert!(cache.faces().is_none());
+        assert!(!cache.scan_backlog(&backdrop(1)).await);
     }
 
     #[tokio::test]

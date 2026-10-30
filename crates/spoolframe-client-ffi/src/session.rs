@@ -349,6 +349,17 @@ impl SpoolSession {
             .await
     }
 
+    /// An image and, with the experimental `smart_crop`, the faces in it,
+    /// for `backdrop_crop`.
+    pub async fn backdrop(
+        &self,
+        id: ArtworkId,
+        size: ArtworkSize,
+    ) -> Result<sdk::Backdrop, SpoolError> {
+        self.call(|s| async move { s.backdrop(&id, size).await })
+            .await
+    }
+
     /// How this user wants picture subtitles (PGS, VobSub, DVB) shown, on
     /// every device, and whether the server reads them as text at all.
     pub async fn picture_subtitles(&self) -> Result<PictureSubtitles, SpoolError> {

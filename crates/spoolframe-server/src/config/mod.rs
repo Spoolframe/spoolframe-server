@@ -611,6 +611,11 @@ pub struct ExperimentalConfig {
     /// start: the endpoint's ALPNs are fixed when it binds.
     #[ucl(default)]
     pub federation: Option<bool>,
+    /// Backdrops are scanned for faces ([`crate::faces`]), and an app that
+    /// names `smart-crop` is told where they are. Off if left out: no scan
+    /// and no sweep, and nothing changes on the wire. Read at start.
+    #[ucl(default)]
+    pub smart_crop: Option<bool>,
 }
 
 impl ExperimentalConfig {
@@ -629,6 +634,11 @@ impl ExperimentalConfig {
         self.federation.unwrap_or(false)
     }
 
+    /// `smart_crop`.
+    pub fn smart_crop(&self) -> bool {
+        self.smart_crop.unwrap_or(false)
+    }
+
     /// The switches turned on, by key, as the start's log names them.
     pub fn on(&self) -> Vec<&'static str> {
         [
@@ -638,6 +648,7 @@ impl ExperimentalConfig {
             ),
             ("experimental.index_ahead", self.index_ahead()),
             ("experimental.federation", self.federation()),
+            ("experimental.smart_crop", self.smart_crop()),
         ]
         .into_iter()
         .filter_map(|(key, on)| on.then_some(key))
@@ -3977,9 +3988,10 @@ mod tests {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
         assert!(config.experimental.on().is_empty());
         type Switch = fn(&ExperimentalConfig) -> bool;
-        let switches: [(&str, Switch); 2] = [
+        let switches: [(&str, Switch); 3] = [
             ("libplacebo_shared_on_amd", |e| e.libplacebo_shared_on_amd()),
             ("index_ahead", |e| e.index_ahead()),
+            ("smart_crop", |e| e.smart_crop()),
         ];
         for (key, switch) in switches {
             assert!(!switch(&config.experimental), "{key}");

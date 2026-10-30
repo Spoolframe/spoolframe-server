@@ -16,6 +16,9 @@ pub enum Group {
     Spoolframe,
     /// Every other crate the server or the web app is built from.
     Crates,
+    /// What the server carries and runs that is no crate's: a detector's
+    /// weights.
+    Models,
     /// The programs the server runs, as its image ships them.
     Programs,
     /// What the web app carries into the browser besides crates.
@@ -23,9 +26,10 @@ pub enum Group {
 }
 
 impl Group {
-    pub const ALL: [Group; 4] = [
+    pub const ALL: [Group; 5] = [
         Group::Spoolframe,
         Group::Crates,
+        Group::Models,
         Group::Programs,
         Group::Browser,
     ];
@@ -34,6 +38,7 @@ impl Group {
         match self {
             Group::Spoolframe => "Spoolframe",
             Group::Crates => "Crates",
+            Group::Models => "Models",
             Group::Programs => "Run by the server",
             Group::Browser => "In your browser",
         }
@@ -43,6 +48,7 @@ impl Group {
         match self {
             Group::Spoolframe => "The server's and the web app's own crates.",
             Group::Crates => "The Rust crates the server and the web app are built from.",
+            Group::Models => "The face detector the server carries in its binary.",
             Group::Programs => {
                 "The server runs FFmpeg (with libplacebo built in) and Tesseract as separate \
                  programs; none of them is linked into the server."

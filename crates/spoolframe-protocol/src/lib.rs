@@ -42,7 +42,7 @@ pub mod streams;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use artwork::{ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
+pub use artwork::{ArtworkFace, ArtworkReply, ArtworkRequest, ArtworkResponse, ArtworkSize};
 pub use features::{Feature, Features};
 pub use home_view::{Featured, FeaturedLimits, FeaturedRow};
 pub use media::{MAX_READ, MediaRead, MediaReadReply, MediaReadResponse, PlaybackHandle};

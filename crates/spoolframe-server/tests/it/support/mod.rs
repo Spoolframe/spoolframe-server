@@ -498,6 +498,8 @@ pub struct ServerOptions {
     /// has, as a server detects them (E-AC-3 among them), not the
     /// baseline's AAC alone.
     pub detect_encoders: bool,
+    /// `experimental.smart_crop` (PX-64): off unless a test is about it.
+    pub smart_crop: bool,
     /// `experimental.federation` (P8-01).
     pub federation: bool,
     /// The pairs' relays on any host are kept and dialled, for a test
@@ -568,6 +570,7 @@ impl Default for ServerOptions {
             finders: offline_finders(),
             uplink: Default::default(),
             http_playback: Default::default(),
+            smart_crop: false,
             index_ahead: false,
             speech: None,
             subtitle_sites: Default::default(),
@@ -941,6 +944,9 @@ impl TestServer {
             .with_covers(covers.clone());
         if let Some(live) = &options.catalog {
             artwork = artwork.with_changes(live.changes());
+        }
+        if options.smart_crop {
+            artwork = artwork.with_faces(store.clone()).unwrap();
         }
         let artwork = Arc::new(artwork);
         let ffprobe = if let Some(ffprobe) = &options.real_ffprobe {
@@ -2070,11 +2076,17 @@ impl TestClient {
         let response = match response {
             ResourceResponse::Ready {
                 length,
-                metadata: ResourceMetadata::Artwork { content_type, etag },
+                metadata:
+                    ResourceMetadata::Artwork {
+                        content_type,
+                        etag,
+                        faces,
+                    },
             } => ArtworkResponse::Ok(spoolframe_protocol::ArtworkReply {
                 length,
                 content_type,
                 etag,
+                faces,
             }),
             ResourceResponse::Error { error } => ArtworkResponse::Err(error),
             other => panic!("unexpected artwork: {other:?}"),

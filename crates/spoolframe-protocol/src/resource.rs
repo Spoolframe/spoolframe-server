@@ -1,6 +1,6 @@
 //! One metadata frame followed by exactly `length` raw bytes for every
 //! binary resource. Playback revisions are independent of encoder epochs.
-use crate::{ArtworkRequest, Error, MediaRead, PlaybackHandle, SessionId};
+use crate::{ArtworkFace, ArtworkRequest, Error, MediaRead, PlaybackHandle, SessionId};
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{ArtworkId, SubtitleFormat};
 
@@ -55,12 +55,17 @@ pub enum ResourceRequest {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResourceMetadata {
     Artwork {
         content_type: String,
         etag: String,
+        /// Experimental (`smart-crop`), for a connection that named it:
+        /// the faces in this backdrop, empty if it has none. Left out for
+        /// a backdrop not scanned yet, and for any other image.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        faces: Option<Vec<ArtworkFace>>,
     },
     Media {
         size: u64,
@@ -75,16 +80,12 @@ pub enum ResourceMetadata {
         revision: u64,
     },
     /// The cover `SetPlaylistArt` stored: the playlist's `artwork` now.
-    PlaylistArt {
-        artwork: ArtworkId,
-    },
+    PlaylistArt { artwork: ArtworkId },
     /// A download's file (`Download`): its whole length.
-    Download {
-        size: u64,
-    },
+    Download { size: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResourceResponse {
     Ready {

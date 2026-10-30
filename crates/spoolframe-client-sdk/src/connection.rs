@@ -482,11 +482,17 @@ impl ServerConnection {
         let response = match response {
             ResourceResponse::Ready {
                 length,
-                metadata: ResourceMetadata::Artwork { content_type, etag },
+                metadata:
+                    ResourceMetadata::Artwork {
+                        content_type,
+                        etag,
+                        faces,
+                    },
             } => ArtworkResponse::Ok(spoolframe_protocol::ArtworkReply {
                 length,
                 content_type,
                 etag,
+                faces,
             }),
             ResourceResponse::Error { error } => ArtworkResponse::Err(error),
             _ => {

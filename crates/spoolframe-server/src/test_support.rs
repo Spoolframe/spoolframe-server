@@ -28,6 +28,10 @@ pub static RPC_REQUEST_DECODES: std::sync::atomic::AtomicUsize =
 /// The fake catalog's one image.
 pub const POSTER: &str = "/library/metadata/1/thumb/1";
 
+/// The fake catalog's one backdrop, with one face in it. Served, but on
+/// no item: nothing but a test asks for it.
+pub const BACKDROP: &str = "/library/metadata/1/art/1";
+
 pub fn poster() -> ArtworkId {
     ArtworkId::new(Namespace::Plex, POSTER).unwrap()
 }
@@ -833,6 +837,12 @@ impl Catalog for FakeCatalog {
             return Ok(Image {
                 bytes: b"<!doctype html><script>alert(1)</script>".to_vec(),
                 content_type,
+            });
+        }
+        if id.key() == BACKDROP {
+            return Ok(Image {
+                bytes: include_bytes!("../tests/fixtures/astronaut-16x9.jpg").to_vec(),
+                content_type: "image/jpeg".into(),
             });
         }
         let color = match (*self.posters.lock(), poster_color(id)) {

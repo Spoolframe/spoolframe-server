@@ -23,6 +23,8 @@ mod catalog_cache;
 mod catalog_view;
 mod client;
 mod connection;
+mod crop;
+pub use crop::{Backdrop, BackdropCrop, backdrop_crop};
 pub mod describe;
 mod discovery;
 mod downloads;
@@ -164,13 +166,13 @@ pub use spoolframe_protocol::playlists::{
 };
 // The wire types the calls take and return, so an app needs only the SDK.
 pub use spoolframe_protocol::{
-    AddressNetwork, ArtworkSize, AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio,
-    ConvertedSubtitle, ConvertedVideo, DeviceAddress, DeviceInfo, DeviceSignInRequest, HomeScreen,
-    MAX_READ, ManifestKind, PinProof, PinState, PlannedAudio, PlannedSubtitle, PlaybackHandle,
-    PlaybackPlan, PlexLink, PlexSyncSummary, PortableTie, PreviewTile, Previews, Quality, Rung,
-    SearchCounts, SearchGroup, SearchRequest, SearchResults, Selection, SessionInfo,
-    SubtitleAction, SubtitleDelivery, TopResult, TrackPreferencesInfo, TrackReason, TrustedProfile,
-    UserSummary,
+    AddressNetwork, ArtworkFace, ArtworkSize, AudioAction, BitmapSubtitles, ChosenTracks,
+    ConvertedAudio, ConvertedSubtitle, ConvertedVideo, DeviceAddress, DeviceInfo,
+    DeviceSignInRequest, HomeScreen, MAX_READ, ManifestKind, PinProof, PinState, PlannedAudio,
+    PlannedSubtitle, PlaybackHandle, PlaybackPlan, PlexLink, PlexSyncSummary, PortableTie,
+    PreviewTile, Previews, Quality, Rung, SearchCounts, SearchGroup, SearchRequest, SearchResults,
+    Selection, SessionInfo, SubtitleAction, SubtitleDelivery, TopResult, TrackPreferencesInfo,
+    TrackReason, TrustedProfile, UserSummary,
 };
 // A plan as an info panel shows it ([`PlaybackPlan::summary`]).
 pub use spoolframe_protocol::{

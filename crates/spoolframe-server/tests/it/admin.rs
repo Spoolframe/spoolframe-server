@@ -27,7 +27,7 @@ fn status() -> std::sync::Arc<admin::StatusSource> {
         crate::support::transcoding(),
     )
     .with_experimental(spoolframe_server::protocol_info::experimental_on(
-        true, false,
+        true, false, false,
     ));
     status.set_endpoint_id(VECTOR.0.to_owned());
     std::sync::Arc::new(status)

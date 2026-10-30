@@ -29,6 +29,11 @@ pub const HTTP_PLAYBACK: &str = "http-playback";
 /// while its `experimental.federation` is on.
 pub const FEDERATION: &str = "federation";
 
+/// Faces in backdrops, so that a wide hero's crop keeps the heads: an
+/// artwork reply's `faces`, left out for a connection without the feature.
+/// On while the server's `experimental.smart_crop` is.
+pub const SMART_CROP: &str = "smart-crop";
+
 /// The most feature names a server keeps of a `Hello`; the rest are
 /// dropped, as each name is cut to `MAX_HELLO_TEXT` characters.
 pub const MAX_ASKED: usize = 16;

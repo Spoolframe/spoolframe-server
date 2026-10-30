@@ -966,6 +966,7 @@ async fn run(
             .with_experimental(spoolframe_server::protocol_info::experimental_on(
                 http_playback.listen.is_some(),
                 config.experimental.federation(),
+                config.experimental.smart_crop(),
             ))
             .with_ocr_languages(subtitles.ocr().languages().iter().cloned().collect()),
     );
@@ -977,20 +978,33 @@ async fn run(
         state_dir,
         ffmpeg.clone(),
     ));
-    let artwork_dir = state_dir.join("cache").join("artwork");
-    let artwork = Arc::new(
-        ArtworkCache::open(&artwork_dir, config.artwork.tiers(), catalog.clone())
-            .await
-            .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?
-            .with_changes(live.changes())
-            .with_covers(covers.clone()),
-    );
-    // Closed as the server stops, its last writes on disk.
-    let artwork_cache = artwork.clone();
-
     let store = Store::open(state_dir).await?;
     // Closed last, as the server stops.
     let database = store.clone();
+    let artwork_dir = state_dir.join("cache").join("artwork");
+    let mut artwork = ArtworkCache::open(&artwork_dir, config.artwork.tiers(), catalog.clone())
+        .await
+        .with_context(|| format!("cannot open the artwork cache {}", artwork_dir.display()))?
+        .with_changes(live.changes())
+        .with_covers(covers.clone());
+    // Backdrops' faces (PX-64): experimental, off unless the setting turns
+    // them on.
+    if config.experimental.smart_crop() {
+        artwork = artwork
+            .with_faces(store.clone())
+            .context("cannot load the face model")?;
+    }
+    let artwork = Arc::new(artwork);
+    if artwork.faces().is_some() {
+        tokio::spawn(spoolframe_server::faces::sweep(
+            Arc::downgrade(&artwork),
+            spoolframe_server::faces::Pace::default(),
+            Some(live.changes()),
+        ));
+    }
+    // Closed as the server stops, its last writes on disk.
+    let artwork_cache = artwork.clone();
+
     // Subtitle sync and offset (PX-03). A sync a stopped server left
     // running is failed; it is served as it was.
     match store.end_interrupted_subtitle_syncs().await {

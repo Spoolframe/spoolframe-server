@@ -57,6 +57,21 @@ impl ArtworkSize {
     }
 }
 
+/// A face found in a backdrop (experimental `smart-crop`). Each edge is a
+/// fraction of the image's width or height, from its left or top, so it
+/// holds at every [`ArtworkSize`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ArtworkFace {
+    pub left: f32,
+    pub right: f32,
+    /// A box runs from about the brow to the chin: hair is above it.
+    pub top: f32,
+    pub bottom: f32,
+    /// The eyes' height: the mean of the two.
+    pub eyes: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtworkRequest {
     pub session: SessionId,
@@ -65,7 +80,7 @@ pub struct ArtworkRequest {
 }
 
 /// What follows on the stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtworkReply {
     /// e.g. `image/jpeg`.
     pub content_type: String,
@@ -74,9 +89,12 @@ pub struct ArtworkReply {
     /// Stable for this `(id, size)`: artwork ids change when the image
     /// does, so a client may keep its own copy under this key.
     pub etag: String,
+    /// Experimental (`smart-crop`): the faces in a backdrop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faces: Option<Vec<ArtworkFace>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtworkResponse {
     Ok(ArtworkReply),

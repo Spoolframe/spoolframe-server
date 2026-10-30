@@ -701,6 +701,7 @@ impl ClientProtocol {
         crate::protocol_info::experimental_on(
             self.http_playback.is_some(),
             self.services.federation.is_some(),
+            self.services.artwork.faces().is_some(),
         )
     }
 
@@ -1734,6 +1735,7 @@ impl ClientProtocol {
                 ))
             }
             ResourceRequest::Artwork { request, max_bytes } => {
+                let id = request.id.clone();
                 let image = self.find_artwork(connection, state, hello, request).await?;
                 let length = image.bytes.len() as u64;
                 if length > max_bytes {
@@ -1743,6 +1745,7 @@ impl ClientProtocol {
                     ResourceMetadata::Artwork {
                         content_type: image.content_type,
                         etag: image.etag,
+                        faces: self.faces_for(hello, &id).await,
                     },
                     length,
                     ResourceBody::Bytes(image.bytes),
@@ -2124,6 +2127,26 @@ impl ClientProtocol {
                 },
                 other => internal(other),
             })
+    }
+
+    /// What is known of the faces in backdrop `id`, for a connection that
+    /// named `smart-crop` (PX-64). Asks the database, so only for a
+    /// backdrop: a grid of posters costs no reads.
+    async fn faces_for(
+        &self,
+        hello: &Hello,
+        id: &ArtworkId,
+    ) -> Option<Vec<spoolframe_protocol::ArtworkFace>> {
+        let named = hello
+            .experimental
+            .iter()
+            .any(|n| n == spoolframe_protocol::experimental::SMART_CROP);
+        let faces = self
+            .services
+            .artwork
+            .faces()
+            .filter(|_| named && crate::faces::is_backdrop(id))?;
+        faces.known(id).await
     }
 
     /// A sheet of frame previews (P3-13), from the previews cache rather

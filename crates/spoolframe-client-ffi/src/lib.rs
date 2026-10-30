@@ -104,6 +104,14 @@ pub fn passkey_domain(server_id: String) -> Option<String> {
     server_id.parse::<sdk::ServerId>().ok().map(|id| id.rp_id())
 }
 
+/// The crop of a backdrop for a hero `hero_ratio` wide to its 1 high:
+/// `spoolframe_client_sdk::backdrop_crop`, the same in every app. Faces
+/// from `SpoolSession.backdrop`, or none for the middle.
+#[uniffi::export]
+pub fn backdrop_crop(faces: Vec<sdk::ArtworkFace>, hero_ratio: f64) -> sdk::BackdropCrop {
+    sdk::backdrop_crop(&faces, hero_ratio)
+}
+
 /// What kind of client a platform is, as device and session lists show
 /// it ("Apple TV app").
 #[uniffi::export]

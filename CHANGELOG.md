@@ -10,6 +10,16 @@ The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates
 with a 0.16 server.
 
+- Experimental `smart-crop` (`experimental.smart_crop`, off by default,
+  applies after a restart): the server finds the faces in each backdrop
+  with YuNet, on the CPU, once per image, and an app that names the
+  feature is told where they are in the artwork reply. New images are
+  scanned as they are first shown and the rest two a second, never in a
+  request, and a paired server's when first shown here. The SDK's
+  `backdrop_crop` places a wide hero's crop from them, the same in every
+  app, and `Session::backdrop` fetches an image with its faces. Apps
+  come later. The server's binary grows by about 17 MB, on or off: the
+  model and tract, and the licences page gains a Models group.
 - Server: a copied video resumed or sought onto a very short segment with
   its audio encoded as E-AC-3 played nothing: `init.mp4` was cut before the
   audio's first packet. A run now starts on a segment of at least 500 ms,

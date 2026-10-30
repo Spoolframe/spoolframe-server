@@ -8,7 +8,7 @@
 //! calls answer as off without asking it.
 
 pub use spoolframe_protocol::experimental::HttpPlaybackRefusal;
-use spoolframe_protocol::experimental::{FEDERATION, HTTP_PLAYBACK};
+use spoolframe_protocol::experimental::{FEDERATION, HTTP_PLAYBACK, SMART_CROP};
 
 /// The experimental features an app asks for, or a server turned on. None
 /// by default.
@@ -28,6 +28,10 @@ pub struct Experimental {
     /// ([`crate::Session::update_watch_progress`]) and its Home row. On a
     /// server with `experimental.federation` on.
     pub federation: bool,
+    /// Where the faces in a backdrop are ([`crate::Session::backdrop`]),
+    /// for [`crate::backdrop_crop`]. On a server with
+    /// `experimental.smart_crop` on.
+    pub smart_crop: bool,
 }
 
 impl Experimental {
@@ -40,6 +44,9 @@ impl Experimental {
         if self.federation {
             names.push(FEDERATION.to_owned());
         }
+        if self.smart_crop {
+            names.push(SMART_CROP.to_owned());
+        }
         names
     }
 
@@ -49,6 +56,7 @@ impl Experimental {
         Self {
             http_playback: names.iter().any(|n| n == HTTP_PLAYBACK),
             federation: names.iter().any(|n| n == FEDERATION),
+            smart_crop: names.iter().any(|n| n == SMART_CROP),
         }
     }
 }
@@ -78,10 +86,15 @@ mod tests {
         let asked = Experimental {
             http_playback: true,
             federation: true,
+            smart_crop: true,
         };
         assert_eq!(
             asked.names(),
-            vec![HTTP_PLAYBACK.to_owned(), FEDERATION.to_owned()]
+            vec![
+                HTTP_PLAYBACK.to_owned(),
+                FEDERATION.to_owned(),
+                SMART_CROP.to_owned()
+            ]
         );
         assert_eq!(Experimental::of(&asked.names()), asked);
         assert_eq!(

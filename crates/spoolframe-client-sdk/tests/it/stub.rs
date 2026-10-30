@@ -403,6 +403,7 @@ async fn stream(
             ResourceRequest::Artwork { .. } => ResourceMetadata::Artwork {
                 content_type: "image/png".into(),
                 etag: "stub".into(),
+                faces: None,
             },
             _ => panic!("unexpected resource"),
         };
