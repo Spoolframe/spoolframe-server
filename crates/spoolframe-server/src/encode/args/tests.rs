@@ -3261,3 +3261,81 @@ fn a_stored_video_is_never_encoded() {
     spec.inputs.video = Some(Path::new("/job/video"));
     assert!(ffmpeg_args(&spec).is_err());
 }
+
+fn probed(video: ConvertedVideo, encoders: &Encoders, source_depth: u32) -> Vec<String> {
+    let mut film = wide_film();
+    film.video.as_mut().unwrap().bit_depth = source_depth;
+    let spec = EncodeSpec {
+        vaapi_device: Path::new("/dev/dri/renderD129"),
+        encoders,
+        descriptor: &film,
+        video: Some(video),
+        ..planning_spec(encoders, &film, video, None, false)
+    };
+    probe_args(&spec, Path::new("/scratch/probe.mp4")).unwrap()
+}
+
+fn wide_film() -> MediaDescriptor {
+    let mut film = film();
+    let video = film.video.as_mut().unwrap();
+    (video.width, video.height) = (3840, 1600);
+    video.frame_rate_millis = Some(23_976);
+    film
+}
+
+fn hevc_on_vaapi() -> Encoders {
+    let encoder = VideoEncoder {
+        codec: VideoCodec::Hevc,
+        name: "hevc_vaapi".into(),
+        hardware: Some(Hardware::Vaapi),
+    };
+    Encoders {
+        video: vec![encoder.clone()],
+        ten_bit: vec![encoder],
+        ..Encoders::software_baseline()
+    }
+}
+
+const PROBED: ConvertedVideo = ConvertedVideo::Encode {
+    codec: VideoCodec::Hevc,
+    height: 1080,
+    max_bitrate: Some(8_000_000),
+    tone_map: false,
+};
+
+#[test]
+fn a_probe_is_one_frame_at_the_size_and_rate_written() {
+    let args = probed(PROBED, &hevc_on_vaapi(), 8);
+    assert!(has(&args, &["-frames:v", "1"]), "{args:?}");
+    assert!(
+        has(&args, &["-i", "testsrc2=size=2592x1080:rate=23976/1000"]),
+        "{args:?}"
+    );
+    assert!(
+        has(&args, &["-vaapi_device", "/dev/dri/renderD129"]),
+        "{args:?}"
+    );
+    assert!(has(&args, &["-b:v", "8000000"]), "{args:?}");
+    assert!(has(&args, &["-tag:v", "hvc1"]), "{args:?}");
+    assert!(has(&args, &["-f", "mp4", "/scratch/probe.mp4"]), "{args:?}");
+}
+
+#[test]
+fn a_probe_of_a_film_kept_in_ten_bits_writes_main_10() {
+    let args = probed(PROBED, &hevc_on_vaapi(), 10);
+    assert!(has(&args, &["-vf", "format=p010,hwupload"]), "{args:?}");
+    assert!(has(&args, &["-profile:v", "main10"]), "{args:?}");
+}
+
+#[test]
+fn a_probe_of_a_tone_mapped_film_is_eight_bits() {
+    let mapped = ConvertedVideo::Encode {
+        codec: VideoCodec::Hevc,
+        height: 1080,
+        max_bitrate: Some(8_000_000),
+        tone_map: true,
+    };
+    let args = probed(mapped, &hevc_on_vaapi(), 10);
+    assert!(has(&args, &["-vf", "format=nv12,hwupload"]), "{args:?}");
+    assert!(!args.contains(&"main10".to_owned()), "{args:?}");
+}

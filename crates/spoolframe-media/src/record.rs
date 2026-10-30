@@ -10,6 +10,8 @@
 //! as before, by the HLS muxer, which writes its header after the first
 //! packets.
 
+use spoolframe_types::CodecString;
+
 /// Whether `codec`'s record `extradata` (as ffprobe gives it, the MP4 or
 /// Matroska record or Annex B) holds every parameter set a decoder starts
 /// with: H.264's SPS and PPS, HEVC's VPS, SPS and PPS. `tag` is the
@@ -165,17 +167,55 @@ fn find_box<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
     None
 }
 
-/// The `hvcC` of the first sample entry in `init`.
+/// The top-level boxes of `data`, as (type, payload).
+fn each_box(data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let head = data.get(at..at + 8)?;
+        let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if size < 8 {
+            return None;
+        }
+        let payload = data.get(at + 8..at + size)?;
+        at += size;
+        Some((&head[4..8], payload))
+    })
+}
+
+/// The boxes of each track's first sample entry.
+fn sample_entries(init: &[u8]) -> impl Iterator<Item = &[u8]> {
+    find_box(init, b"moov")
+        .into_iter()
+        .flat_map(each_box)
+        .filter(|(kind, _)| *kind == b"trak")
+        .filter_map(|(_, trak)| {
+            let mut boxes = trak;
+            for kind in [b"mdia", b"minf", b"stbl", b"stsd"] {
+                boxes = find_box(boxes, kind)?;
+            }
+            // `stsd`: its version, flags and entry count, then the entries;
+            // an entry's size and type, a visual entry's 78 bytes, then its
+            // boxes.
+            let entry = boxes.get(8..)?;
+            let size = u32::from_be_bytes(entry.get(..4)?.try_into().ok()?) as usize;
+            entry.get(86..size)
+        })
+}
+
+/// The `hvcC` of the first sample entry in `init` that has one.
 fn hvcc_of(init: &[u8]) -> Option<&[u8]> {
-    let mut boxes = init;
-    for kind in [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"] {
-        boxes = find_box(boxes, kind)?;
-    }
-    // `stsd`: its version, flags and entry count, then the entries; an
-    // entry's size and type, a visual entry's 78 bytes, then its boxes.
-    let entry = boxes.get(8..)?;
-    let size = u32::from_be_bytes(entry.get(..4)?.try_into().ok()?) as usize;
-    find_box(entry.get(86..size)?, b"hvcC")
+    sample_entries(init).find_map(|boxes| find_box(boxes, b"hvcC"))
+}
+
+/// The codec string of the video in an MP4 or an `init.mp4`, read from its
+/// sample entry's record: what the encode really wrote, profile, tier,
+/// flags and level. `None` for a file with no record that can be read.
+pub fn codec_string_of_mp4(init: &[u8]) -> Option<CodecString> {
+    sample_entries(init).find_map(|boxes| {
+        [(b"hvcC", "hevc"), (b"avcC", "h264"), (b"av1C", "av1")]
+            .into_iter()
+            .find_map(|(kind, codec)| crate::codec_string::of_record(codec, find_box(boxes, kind)?))
+    })
 }
 
 /// Every VPS, SPS and PPS in an `hvcC`, as (type, bytes).
@@ -264,6 +304,54 @@ mod tests {
         include_bytes!("../tests/fixtures/hvcc/fixed-init.mp4"),
         include_bytes!("../tests/fixtures/hvcc/fixed-seg0.m4s"),
     );
+
+    /// An MP4's `moov` with one track whose sample entry holds `record`
+    /// as a box of `kind`.
+    fn mp4_with(kind: &[u8; 4], record: &[u8]) -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend(kind);
+            out.extend(payload);
+            out
+        }
+        let mut entry = vec![0; 78];
+        entry.extend(boxed(kind, record));
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd.extend(boxed(b"encv", &entry));
+        let mut moov = boxed(b"stsd", &stsd);
+        for kind in [b"stbl", b"minf", b"mdia", b"trak", b"moov"] {
+            moov = boxed(kind, &moov);
+        }
+        moov
+    }
+
+    #[test]
+    fn an_init_says_its_encode_s_whole_hevc_string() {
+        // `hevc_vaapi` at 320x180: Main, compatible with Main and Main 10,
+        // main tier, level 2.0, as its `hvcC` says.
+        let string = codec_string_of_mp4(MATCHED.0).unwrap();
+        assert_eq!(string.to_string(), "hvc1.1.6.L60.B0");
+    }
+
+    #[test]
+    fn an_init_says_its_encode_s_avc_string() {
+        let string = codec_string_of_mp4(&mp4_with(b"avcC", &AVCC)).unwrap();
+        assert_eq!(string.to_string(), "avc1.42C00C");
+    }
+
+    #[test]
+    fn an_init_says_its_encode_s_av1_string() {
+        // What `av1_vaapi` wrote at 2592x1080: Main, level 5.0, 8 bits.
+        let record = [0x81, 0x0c, 0x0c, 0x00];
+        let string = codec_string_of_mp4(&mp4_with(b"av1C", &record)).unwrap();
+        assert_eq!(string.to_string(), "av01.0.12M.08");
+    }
+
+    #[test]
+    fn a_file_with_no_record_has_no_string() {
+        assert_eq!(codec_string_of_mp4(b"not an mp4"), None);
+        assert_eq!(codec_string_of_mp4(&mp4_with(b"esds", &[1, 2, 3])), None);
+    }
 
     #[test]
     fn an_hvcc_unlike_the_stream_it_describes_disagrees() {

@@ -865,6 +865,13 @@ with a 0.16 server.
   at start, with a warning, and falls back. Tracks stored before this
   (optimized versions, binge-ahead) keep the false record and must be
   remade.
+- Fixed: an encoded video's `CODECS` in an HLS playlist is what the
+  encoder writes, profile, tier, flags and level, not a guess from its
+  height: Verity at 2592x1080 said `hvc1.1.6.L120.B0` over an `hvcC` of
+  level 5. A client that refuses a level it cannot decode now sees the
+  true one. One frame through the encoder reads it, the first time a
+  size, rate and depth is asked for; a card at its limit, or a probe that
+  fails, leaves the guess for that playlist.
 
 ## 0.16.3 (2026-10-28)
 

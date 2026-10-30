@@ -20,6 +20,7 @@ use spoolframe_media::sandbox::{GpuUse, Tool, Vulkan};
 
 use super::JobLimits;
 use super::args::{Made, PLAYLIST};
+use super::codec_strings::CodecStrings;
 use crate::metrics::{Counter, Histograms};
 
 pub(crate) use self::budget::Yielding;
@@ -202,6 +203,8 @@ pub struct Jobs {
     /// files, PX-02's downloads), in the hidden state directory: a job
     /// takes a copy of one, as no run may open it as an input.
     own_subtitles: Option<PathBuf>,
+    /// What each encode's record says it is, for playlists.
+    codec_strings: CodecStrings,
 }
 
 /// What the jobs did since the server started (P3-14).
@@ -330,6 +333,7 @@ impl Jobs {
             dir,
             ffmpeg,
             own_subtitles: None,
+            codec_strings: CodecStrings::default(),
         })
     }
 
@@ -490,6 +494,10 @@ impl Jobs {
 
     /// The ffmpeg jobs run with, unless a run brings its own (a GPU
     /// card's, confined to its nodes).
+    pub(crate) fn codec_strings(&self) -> &CodecStrings {
+        &self.codec_strings
+    }
+
     pub(crate) fn ffmpeg(&self) -> &Tool {
         &self.ffmpeg
     }

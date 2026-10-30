@@ -2,6 +2,7 @@
 //! handles, and how their output is read.
 
 pub mod args;
+mod codec_strings;
 pub mod hls;
 pub mod job;
 pub mod pick;
@@ -15,17 +16,20 @@ pub(crate) mod track_run;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use spoolframe_media::encoders::{Ffmpeg as _, FfmpegCommand};
+use spoolframe_media::sandbox::{GpuUse, Tool};
 use spoolframe_media::{MediaDescriptor, codecs};
 use spoolframe_protocol::{
     ConvertedAudio, ConvertedSubtitle, ConvertedVideo, ManifestKind, PlaybackPlan, Rung,
     SubtitleAction,
 };
-use spoolframe_types::{Delivery, SubtitleFormat};
+use spoolframe_types::{CodecString, Delivery, SubtitleFormat};
 
 use self::args::{Cuts, EncodeSpec, Inputs, Output};
 pub use self::args::{Decoder, FilterOn, Made};
+use self::codec_strings::Key;
 use self::hls::Segments;
 pub use self::job::{BudgetUse, CaughtUp, Encoding, EncodingGuard, Load, Measured, Units};
 use self::job::{EncodeJob, JobError, Jobs, Slot};
@@ -74,6 +78,58 @@ pub struct JobLimits {
     /// The codecs a GPU encodes to, the first preferred
     /// (`transcode.video_codecs`, PGPU-06).
     pub video_codecs: Vec<spoolframe_types::VideoCodec>,
+}
+
+/// What a probe writes, in its own directory.
+const PROBE_FILE: &str = "probe.mp4";
+
+/// The most a probe takes before its playlist goes on without it. A wedged
+/// driver must not hold up a playback's start for long.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One frame through an encode's encoder ([`args::probe_args`]), to read
+/// its record ([`codec_strings`]).
+struct Probe {
+    key: Key,
+    /// Writing [`PROBE_FILE`], to be put in the probe's directory.
+    args: Vec<String>,
+    gpu: GpuUse,
+    card: Option<job::CardLimit>,
+    ffmpeg: Tool,
+}
+
+impl Probe {
+    /// Run in `dir`, and say what was read in `jobs`' strings.
+    async fn run(self, jobs: &Jobs, dir: &Path) {
+        let began = Instant::now();
+        let file = dir.join(PROBE_FILE);
+        let read = self.read(dir, &file).await;
+        let _ = std::fs::remove_dir_all(dir);
+        let took_ms = began.elapsed().as_millis() as u64;
+        match read {
+            Ok(string) => {
+                tracing::info!(key = ?self.key, %string, took_ms, "an encode's codec string, probed");
+                jobs.codec_strings().found(self.key, string);
+            }
+            Err(why) => {
+                tracing::warn!(key = ?self.key, why, took_ms, "no codec string from a probe: the playlist guesses");
+                jobs.codec_strings().failed(self.key, Instant::now());
+            }
+        }
+    }
+
+    async fn read(&self, dir: &Path, file: &Path) -> Result<CodecString, String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut args = self.args.clone();
+        *args.last_mut().ok_or("no arguments")? = file.display().to_string();
+        let ffmpeg = FfmpegCommand {
+            tool: self.ffmpeg.clone(),
+            timeout: PROBE_TIMEOUT,
+        };
+        ffmpeg.succeeds(&args, dir, self.gpu.into()).await?;
+        let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+        spoolframe_media::codec_string_of_mp4(&bytes).ok_or_else(|| "no record in it".to_owned())
+    }
 }
 
 /// A playback's conversion: what to encode, and the encode running now.
@@ -573,7 +629,7 @@ impl Conversion {
             _ if self.ladder.is_empty() => hls::multivariant_playlist(
                 &self.descriptor,
                 self.video,
-                self.video.and_then(|v| self.written_size(v)),
+                self.video.map_or((None, None), |v| self.written(v)),
                 self.audio,
                 rendition,
             ),
@@ -585,11 +641,123 @@ impl Conversion {
                     .chain((0..self.rungs()).filter(|&n| n != first))
                     .filter_map(|n| {
                         let video = rung_video(self.video, &self.ladder, n)?;
-                        Some((n, video, self.written_size(video)))
+                        Some((n, video, self.written(video)))
                     })
                     .collect();
                 hls::ladder_playlist(&self.descriptor, &rungs, self.audio, rendition)
             }
+        })
+    }
+
+    /// What the playlist states of `video`: the picture it writes, and
+    /// the string its record gave, where one was read.
+    fn written(&self, video: ConvertedVideo) -> (Option<(u32, u32)>, Option<CodecString>) {
+        let encoded = self
+            .probe_for(video)
+            .and_then(|probe| self.jobs.codec_strings().known(&probe.key));
+        (self.written_size(video), encoded)
+    }
+
+    /// Read what each encode of this conversion is, before the
+    /// multivariant playlist is answered: those not known, on a card with
+    /// room. Not one takes a place in the budget or waits for one; those
+    /// left out are named by the bucket this time.
+    pub async fn read_codec_strings(&self) {
+        let videos = (0..self.rungs()).filter_map(|n| rung_video(self.video, &self.ladder, n));
+        let mut probes = Vec::new();
+        for video in videos {
+            let Some(probe) = self.probe_for(video) else {
+                continue;
+            };
+            if !probe
+                .card
+                .as_ref()
+                .is_none_or(|c| self.jobs.card_has_room(c))
+            {
+                tracing::debug!(key = ?probe.key, "no probe of an encode on a full card");
+                continue;
+            }
+            if self.jobs.codec_strings().claim(&probe.key, Instant::now()) {
+                // Its own task: a reader gone leaves no key claimed for ever.
+                let jobs = self.jobs.clone();
+                let dir = self.dir.join(format!("probe-{}", probes.len()));
+                probes.push(tokio::spawn(async move { probe.run(&jobs, &dir).await }));
+            }
+        }
+        for probe in probes {
+            let _ = probe.await;
+        }
+    }
+
+    /// `rung`'s run wrote `init`, whole: what it says replaces the probe's
+    /// string, for the next playlist of any conversion.
+    pub async fn init_written(&self, rung: u32, init: &Path) {
+        let Some(probe) =
+            rung_video(self.video, &self.ladder, rung).and_then(|v| self.probe_for(v))
+        else {
+            return;
+        };
+        let string = tokio::fs::read(init)
+            .await
+            .ok()
+            .and_then(|bytes| spoolframe_media::codec_string_of_mp4(&bytes));
+        let Some(string) = string else {
+            tracing::warn!(rung, init = %init.display(), "a run's init has no record to read");
+            return;
+        };
+        if let Some(probed) = self.jobs.codec_strings().found(probe.key, string) {
+            tracing::info!(%probed, written = %string, "an encode's record is not its probe's");
+        }
+    }
+
+    /// `video`'s probe where its runs go, if it is an encode.
+    fn probe_for(&self, video: ConvertedVideo) -> Option<Probe> {
+        let ConvertedVideo::Encode {
+            codec,
+            max_bitrate,
+            tone_map,
+            ..
+        } = video
+        else {
+            return None;
+        };
+        let jobs = &self.jobs;
+        let (gpu_filters, tone_map_setting) = jobs.filters();
+        let run_on = self.run_on.lock().alone();
+        let spec = EncodeSpec {
+            inputs: self.inputs(),
+            descriptor: &self.descriptor,
+            video: Some(video),
+            audio: self.audio,
+            subtitle: self.subtitle,
+            encoders: run_on.encoders(),
+            vaapi_device: run_on.vaapi_device(),
+            hardware_decode: !jobs.hardware_decode_failed(&self.file),
+            gpu_filters,
+            tone_map: tone_map_setting,
+            start: None,
+            output: Output::Progressive {
+                file: PathBuf::new(),
+            },
+        };
+        let place = args::placement(&spec)?;
+        let frame_rate = self.descriptor.video.as_ref()?.frame_rate_millis;
+        let key = Key {
+            card: run_on.key(),
+            encoder: place.encoder.name.clone(),
+            size: args::written_size(&spec)?,
+            frame_rate: frame_rate.unwrap_or(24_000).div_ceil(1000),
+            ten_bits: args::ten_bits_out(&spec, codec, tone_map, place.encoder.hardware),
+            max_bitrate,
+        };
+        Some(Probe {
+            key,
+            args: args::probe_args(&spec, Path::new(PROBE_FILE))?,
+            gpu: place.gpu(),
+            card: run_on.encode_card(),
+            ffmpeg: run_on
+                .gpu()
+                .map_or_else(|| jobs.ffmpeg().clone(), |gpu| gpu.ffmpeg.clone()),
         })
     }
 
@@ -1358,6 +1526,194 @@ pub(crate) mod tests {
         )
         .unwrap();
         (conversion, tmp)
+    }
+
+    /// One frame of `hevc_vaapi`'s through the HLS muxer: its record says
+    /// `hvc1.1.6.L60.B0`.
+    const RECORD: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../spoolframe-media/tests/fixtures/hvcc/fixed-init.mp4"
+    );
+
+    /// [`LADDER_FFMPEG`], counting its probes in `probes` beside it, each
+    /// doing `then`.
+    fn probed_by(then: &str) -> String {
+        format!(
+            "case \"$*\" in *{PROBE_FILE}) for a; do out=$a; done\n\
+             echo probe >> \"$(dirname \"$0\")/probes\"\n{then}\nesac\n{LADDER_FFMPEG}"
+        )
+    }
+
+    async fn ladder_probed_by(
+        test: &str,
+        then: &str,
+    ) -> (Arc<Conversion>, spoolframe_test_dir::TestDir) {
+        let script = probed_by(then);
+        resumed_ladder_run_by(
+            test,
+            spoolframe_types::VideoCodec::Hevc,
+            "hevc_vaapi",
+            &script,
+        )
+        .await
+    }
+
+    fn probes(tmp: &spoolframe_test_dir::TestDir) -> usize {
+        std::fs::read_to_string(tmp.as_ref().join("bin/probes"))
+            .map_or(0, |text| text.lines().count())
+    }
+
+    fn master(conversion: &Conversion) -> String {
+        conversion.manifest(ManifestKind::Multivariant, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_master_names_every_rung_by_what_its_probe_read() {
+        let copied = format!("cp {RECORD} \"$out\"; exit 0;;");
+        let (conversion, tmp) = ladder_probed_by("spoolframe-probe-read", &copied).await;
+        assert!(!master(&conversion).contains("L60"), "nothing read yet");
+        conversion.read_codec_strings().await;
+        let text = master(&conversion);
+        let named = text.matches("CODECS=\"hvc1.1.6.L60.B0\"").count();
+        assert_eq!(named, conversion.rungs() as usize, "{text}");
+        assert_eq!(probes(&tmp), conversion.rungs() as usize);
+    }
+
+    #[tokio::test]
+    async fn a_string_read_is_not_probed_again() {
+        let copied = format!("cp {RECORD} \"$out\"; exit 0;;");
+        let (conversion, tmp) = ladder_probed_by("spoolframe-probe-once", &copied).await;
+        conversion.read_codec_strings().await;
+        let once = probes(&tmp);
+        conversion.read_codec_strings().await;
+        assert_eq!(probes(&tmp), once);
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_keeps_the_bucket_and_waits() {
+        let (conversion, tmp) = ladder_probed_by("spoolframe-probe-failed", "exit 1;;").await;
+        conversion.read_codec_strings().await;
+        let once = probes(&tmp);
+        assert!(once > 0);
+        let text = master(&conversion);
+        assert!(text.contains("CODECS=\"hvc1.1.6.L120.B0\""), "{text}");
+        conversion.read_codec_strings().await;
+        assert_eq!(probes(&tmp), once, "not tried again for a minute");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_keeps_the_bucket() {
+        let junk = "printf junk > \"$out\"; exit 0;;";
+        let (conversion, _tmp) = ladder_probed_by("spoolframe-probe-junk", junk).await;
+        conversion.read_codec_strings().await;
+        let text = master(&conversion);
+        assert!(text.contains("CODECS=\"hvc1.1.6.L120.B0\""), "{text}");
+    }
+
+    /// A probe takes no place, and a card with none left is not probed: a
+    /// real encode must not wait on one, or find it in its way.
+    #[tokio::test]
+    async fn a_full_card_is_not_probed_and_keeps_the_bucket() {
+        let copied = format!("cp {RECORD} \"$out\"; exit 0;;");
+        let (conversion, tmp) = ladder_probed_by("spoolframe-probe-full", &copied).await;
+        let card = conversion.run_on.lock().encode_card();
+        assert!(card.is_some(), "the ladder runs on a GPU");
+        let _full: Vec<_> =
+            std::iter::from_fn(|| conversion.jobs.hold(Load::GpuOnly, card.clone()).ok()).collect();
+        conversion.read_codec_strings().await;
+        assert_eq!(probes(&tmp), 0);
+        assert!(!master(&conversion).contains("L60"));
+    }
+
+    #[tokio::test]
+    async fn a_run_s_init_replaces_what_its_probe_read() {
+        let (conversion, tmp) = ladder_probed_by("spoolframe-probe-junk-then", "exit 1;;").await;
+        conversion.read_codec_strings().await;
+        conversion.init_written(1, Path::new(RECORD)).await;
+        let text = master(&conversion);
+        assert_eq!(text.matches("hvc1.1.6.L60.B0").count(), 1, "{text}");
+        drop(tmp);
+    }
+
+    /// Real probes on a real GPU, each with its string and how long it
+    /// took, for the eye: ignored, as CI has no GPU.
+    ///
+    /// ```text
+    /// SPOOLFRAME_PROBE_VAAPI=/dev/dri/renderD129 devenv shell -- cargo test \\
+    ///     -p spoolframe-server --lib real_probes -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a GPU: SPOOLFRAME_PROBE_VAAPI"]
+    async fn real_probes_read_real_records() {
+        use spoolframe_media::VideoStream;
+        use spoolframe_media::encoders::{Hardware, VideoEncoder};
+        use spoolframe_types::VideoCodec::{Av1, H264, Hevc};
+
+        let device = PathBuf::from(std::env::var("SPOOLFRAME_PROBE_VAAPI").unwrap());
+        let tmp = spoolframe_test_dir::TestDir::new("spoolframe-real-probes").await;
+        for (name, codec, bit_depth) in [
+            ("hevc_vaapi", Hevc, 8),
+            ("hevc_vaapi", Hevc, 10),
+            ("h264_vaapi", H264, 8),
+            ("av1_vaapi", Av1, 8),
+            ("av1_vaapi", Av1, 10),
+        ] {
+            let encoder = VideoEncoder {
+                codec,
+                name: name.into(),
+                hardware: Some(Hardware::Vaapi),
+            };
+            let encoders = Encoders {
+                video: vec![encoder.clone()],
+                ten_bit: vec![encoder],
+                ..Encoders::software_baseline()
+            };
+            let film = MediaDescriptor {
+                container: "matroska,webm".into(),
+                duration: None,
+                bit_rate: None,
+                video: Some(VideoStream {
+                    index: 0,
+                    codec: "hevc".into(),
+                    profile: None,
+                    level: None,
+                    width: 2592,
+                    height: 1080,
+                    pixel_format: None,
+                    color_transfer: None,
+                    frame_rate_millis: Some(24_000),
+                    bit_depth,
+                    hdr: None,
+                    dolby_vision: None,
+                    bit_rate: None,
+                    parameter_sets_in_record: false,
+                    codec_string: None,
+                }),
+                audio: Vec::new(),
+                subtitles: Vec::new(),
+            };
+            let video = ConvertedVideo::Encode {
+                codec,
+                height: 1080,
+                max_bitrate: Some(8_000_000),
+                tone_map: false,
+            };
+            let spec = EncodeSpec {
+                vaapi_device: &device,
+                ..args::planning_spec(&encoders, &film, video, None, false)
+            };
+            let dir = tmp.as_ref().join(format!("{name}-{bit_depth}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(PROBE_FILE);
+            let args = args::probe_args(&spec, &file).unwrap();
+            let ffmpeg = FfmpegCommand::new(Tool::unconfined("ffmpeg"));
+            let began = Instant::now();
+            let run = ffmpeg.succeeds(&args, &dir, GpuUse::None.into()).await;
+            let took = began.elapsed();
+            let string =
+                run.map(|()| spoolframe_media::codec_string_of_mp4(&std::fs::read(&file).unwrap()));
+            println!("{name} {bit_depth}-bit: {string:?} in {took:?}");
+        }
     }
 
     /// Two reads that each need a new run at one far segment, at once:

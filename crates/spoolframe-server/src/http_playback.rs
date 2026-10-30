@@ -630,8 +630,11 @@ impl Source for ServerSource {
         if let Some(remote) = self.remote().await? {
             return remote.manifest(kind, variant).await.map_err(bridge_error);
         }
-        self.conversion()
-            .await?
+        let conversion = self.conversion().await?;
+        if kind == spoolframe_protocol::ManifestKind::Multivariant {
+            conversion.read_codec_strings().await;
+        }
+        conversion
             .manifest(kind, variant)
             .ok_or(BridgeError::NotFound)
     }

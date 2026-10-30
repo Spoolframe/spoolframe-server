@@ -4498,6 +4498,11 @@ impl ClientProtocol {
                 variant,
             } => {
                 let playback = self.use_playback(connection, &handle, &session).await?;
+                if let (spoolframe_protocol::ManifestKind::Multivariant, Some(conversion)) =
+                    (kind, &playback.conversion)
+                {
+                    conversion.read_codec_strings().await;
+                }
                 playback
                     .conversion
                     .and_then(|c| c.manifest(kind, variant))
@@ -8652,6 +8657,9 @@ async fn segment_range(
     } else {
         None
     };
+    if n == 0 && read.offset == 0 && opened.is_some() {
+        conversion.init_written(read.variant, &file).await;
+    }
     let complete = opened.is_some();
     let size = opened.as_ref().map_or(0, |(_, size)| *size);
     let sent = read

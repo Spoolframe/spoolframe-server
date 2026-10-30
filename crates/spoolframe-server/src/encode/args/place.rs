@@ -704,6 +704,69 @@ pub fn written_size(spec: &EncodeSpec<'_>) -> Option<(u32, u32)> {
     }
 }
 
+/// ffmpeg's arguments for one frame of a test pattern through `spec`'s
+/// encoder, as a run writes it: its size, frame rate, depth, rate and
+/// keyframe options, into the MP4 `file`, whose record
+/// [`spoolframe_media::codec_string_of_mp4`] reads. `None` for anything
+/// but an encode this machine can run.
+pub(crate) fn probe_args(spec: &EncodeSpec<'_>, file: &Path) -> Option<Vec<String>> {
+    let ConvertedVideo::Encode {
+        codec,
+        max_bitrate,
+        tone_map,
+        ..
+    } = spec.video?
+    else {
+        return None;
+    };
+    let encoder = placement(spec)?.encoder;
+    let (width, height) = written_size(spec)?;
+    let stream = spec.descriptor.video.as_ref()?;
+    let ten_bits = ten_bits_out(spec, codec, tone_map, encoder.hardware);
+    let vaapi = encoder.hardware == Some(Hardware::Vaapi);
+    let rate = stream.frame_rate_millis.unwrap_or(24_000);
+    let mut args: Vec<String> = QUIET_ARGS.map(s).to_vec();
+    if vaapi {
+        args.extend([s("-vaapi_device"), s(spec.vaapi_device.display())]);
+    }
+    args.extend([
+        s("-f"),
+        s("lavfi"),
+        s("-i"),
+        format!("testsrc2=size={width}x{height}:rate={rate}/1000"),
+        s("-frames:v"),
+        s(1),
+    ]);
+    let format = if ten_bits { "p010" } else { "nv12" };
+    if vaapi {
+        args.extend([s("-vf"), format!("format={format},hwupload")]);
+    } else if ten_bits {
+        args.extend([s("-pix_fmt"), s("p010le")]);
+    } else {
+        args.extend([s("-pix_fmt"), s("yuv420p")]);
+    }
+    args.extend([s("-c:v"), encoder.name.clone()]);
+    if ten_bits && codec == VideoCodec::Hevc {
+        args.extend([s("-profile:v"), s("main10")]);
+    }
+    if let Some(rate) = max_bitrate {
+        args.extend([
+            s("-b:v"),
+            s(rate),
+            s("-maxrate"),
+            s(rate),
+            s("-bufsize"),
+            s(rate.saturating_mul(2)),
+        ]);
+    }
+    args.extend(only_forced_keyframes(&encoder.name));
+    if codec == VideoCodec::Hevc {
+        args.extend([s("-tag:v"), s("hvc1")]);
+    }
+    args.extend([s("-f"), s("mp4"), s(file.display())]);
+    Some(args)
+}
+
 /// `width` × `height` scaled to `to` high as `scale=-2:to` does: the
 /// width kept in proportion, rounded to the nearest even number. A video
 /// no taller than `to` is not scaled.

@@ -31,6 +31,7 @@ pub mod vobsub;
 
 pub use keyframe_store::KeyframeStore;
 pub use probe::{Ahead, KeyframeTimes, KeyframesFrom, ProbeError, Prober};
+pub use record::codec_string_of_mp4;
 
 pub use descriptor::{
     AudioStream, DolbyVision, DvBase, MAX_DURATION, MediaDescriptor, SubtitleKind, SubtitleSource,
