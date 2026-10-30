@@ -27,7 +27,8 @@
 # here, not a skip.
 #
 # crates.io is slower to take a crate than the Coldsteel registry, in
-# three ways this script waits out for it alone, each bounded and logged:
+# three ways this script waits out, each bounded and logged (the last for
+# every registry, the first two for crates.io):
 #   - it rate-limits NEW crates (a small burst, then about one every 10
 #     minutes): a publish refused with HTTP 429 or "rate limit" waits the
 #     time crates.io names (or 10 minutes) and tries again;
@@ -46,18 +47,15 @@
 # that workspace's devenv shell so `cargo publish`'s verify build has the
 # right native deps), curl, jq, date (GNU, to read crates.io's retry time).
 #
-# The crates depend on each other as crates.io crates (the apps patch
-# them to the Coldsteel copies). To another registry than crates.io, a
-# version runs first, when crates.io does not have it yet, so `cargo
-# publish` there resolves the siblings from that registry itself: each
-# sibling already on it at its version is patched to it (`--config
-# patch.crates-io.<crate>`), for the packaged Cargo.lock and the verify
-# build. In dependency order, a crate's siblings are published before it.
-# Only those already on it are patched: cargo refuses a patch whose
-# version the registry lacks. cargo records the patches the workspace
-# itself does not use in Cargo.lock (`[[patch.unused]]`), so that publish
-# cannot be `--locked`: the lock is checked without them first, and put
-# back after.
+# crates.io goes first (.forgejo/workflows/publish.yaml), another
+# registry after it. The crates depend on each other as crates.io crates
+# (the apps patch them to the Coldsteel copies), and `cargo publish`
+# resolves them for the packaged Cargo.lock even with `--no-verify`: to
+# another registry, a new version's siblings must be on crates.io
+# already. That publish is `--no-verify`, because the crates.io run has
+# just verify-built the same sources; and it resolves crates.io through
+# whatever replaces it in cargo's config (the kellnr proxy), which may
+# lag crates.io, so a sibling not found yet is waited for as below.
 #
 # Usage:
 #   publish-changed.sh [--publish] [--registry NAME] [--]
@@ -97,8 +95,8 @@ PUBLISH_TO='["coldsteel","crates-io"]'
 # A refused publish is tried this many times in all: to crates.io, and to
 # another registry.
 PUBLISH_ATTEMPTS=8
-OTHER_ATTEMPTS=3
-# Between tries to another registry.
+OTHER_ATTEMPTS=8
+# Between tries to another registry, but for a dependency not found yet.
 OTHER_WAIT=10
 # Without a time in crates.io's answer: its rate for new crates.
 RATE_LIMIT_WAIT=600
@@ -108,7 +106,7 @@ RATE_LIMIT_WAIT_MAX=1800
 DEP_WAIT=30
 
 usage() {
-    sed -n '2,89p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 publish=0
@@ -288,49 +286,47 @@ rate_limit_wait() {
     fi
 }
 
-# publish_other ROOT NAME VERSION SIBLING...
-# `cargo publish` to a registry other than crates.io, its SIBLINGS on it
-# patched to it, verify-built. Tried again, up to OTHER_ATTEMPTS in all,
+# dependency_not_found LOG
+# Whether a refused `cargo publish` in LOG could not find a spoolframe
+# dependency: one published moments ago, not seen yet where cargo looks.
+dependency_not_found() {
+    # The backticks are cargo's, matched as they are.
+    # shellcheck disable=SC2016
+    grep -q -E 'no matching package named `spoolframe-|failed to select a version for the requirement `spoolframe-' "$1"
+}
+
+# publish_other ROOT NAME VERSION
+# `cargo publish --no-verify` to a registry other than crates.io (see the
+# header). Tried again, up to OTHER_ATTEMPTS in all, when a sibling it
+# depends on is not found yet through the source cargo resolves crates.io
+# with (waiting DEP_WAIT), or for any other refusal (waiting OTHER_WAIT),
 # unless the version is on the index after all (an upload whose answer was
-# lost); hard-exits past the last.
+# lost). Hard-exits past the last.
 publish_other() {
-    local root="$1" name="$2" vers="$3" attempt sibling
-    shift 3
-    # `version` is process_workspace's, each sibling's workspace version:
-    # not a name to take for a local here.
-    local -a patches=()
-    for sibling in "$@"; do
-        if version_published "$sibling" "${version[$sibling]}"; then
-            patches+=(--config "patch.crates-io.$sibling.registry=\"$REGISTRY_NAME\""
-                      --config "patch.crates-io.$sibling.version=\"=${version[$sibling]}\"")
-        fi
-    done
-    if ! (cd "$root" && cargo metadata --locked --format-version 1 >/dev/null); then
-        echo "Error: Cargo.lock in $root is not up to date" >&2
-        exit 1
-    fi
-    local lock kept
-    lock="$root/Cargo.lock"
-    kept=$(mktemp)
-    cp "$lock" "$kept"
+    local root="$1" name="$2" version="$3" attempt log
+    log=$(mktemp)
     for ((attempt = 1; attempt <= OTHER_ATTEMPTS; attempt++)); do
-        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" "${patches[@]}"); then
-            cp "$kept" "$lock"
-            rm -f "$kept"
+        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify) 2>&1 | tee "$log"; then
+            rm -f "$log"
             return 0
         fi
-        cp "$kept" "$lock"
-        if version_published "$name" "$vers"; then
-            rm -f "$kept"
+        if version_published "$name" "$version"; then
+            rm -f "$log"
             return 0
         fi
-        if ((attempt < OTHER_ATTEMPTS)); then
-            echo "  [retry]   $name $vers: $REGISTRY_NAME refused it (attempt $attempt of $OTHER_ATTEMPTS); waiting ${OTHER_WAIT}s"
+        if ((attempt == OTHER_ATTEMPTS)); then
+            break
+        fi
+        if dependency_not_found "$log"; then
+            echo "  [wait]    $name $version: cargo does not see a dependency on crates.io yet (attempt $attempt of $OTHER_ATTEMPTS); waiting ${DEP_WAIT}s"
+            sleep "$DEP_WAIT"
+        else
+            echo "  [retry]   $name $version: $REGISTRY_NAME refused it (attempt $attempt of $OTHER_ATTEMPTS); waiting ${OTHER_WAIT}s"
             sleep "$OTHER_WAIT"
         fi
     done
-    rm -f "$kept"
-    echo "Error: cargo publish to $REGISTRY_NAME failed for $name $vers in $root" >&2
+    rm -f "$log"
+    echo "Error: cargo publish to $REGISTRY_NAME failed for $name $version in $root" >&2
     exit 1
 }
 
@@ -360,13 +356,11 @@ publish_crate() {
         if ((attempt == PUBLISH_ATTEMPTS)); then
             break
         fi
-        # The backticks below are cargo's, matched as they are.
-        # shellcheck disable=SC2016
         if grep -q -i -E '429|too many requests|rate limit|too many new crates|try again after' "$log"; then
             wait=$(rate_limit_wait "$log")
             echo "  [rate-limited] $name $version: crates.io refused it (attempt $attempt of $PUBLISH_ATTEMPTS); waiting ${wait}s"
             sleep "$wait"
-        elif grep -q -E 'no matching package named `spoolframe-|failed to select a version for the requirement `spoolframe-' "$log"; then
+        elif dependency_not_found "$log"; then
             echo "  [wait]    $name $version: cargo does not see a dependency it was published after yet (attempt $attempt of $PUBLISH_ATTEMPTS); waiting ${DEP_WAIT}s"
             sleep "$DEP_WAIT"
         else
@@ -534,7 +528,7 @@ process_workspace() {
         if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
             publish_crate "$root" "$n" "$v"
         else
-            publish_other "$root" "$n" "$v" "${order[@]}"
+            publish_other "$root" "$n" "$v"
         fi
         wait_for_index "$n" "$v"
     done

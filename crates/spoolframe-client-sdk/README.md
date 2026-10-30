@@ -22,9 +22,9 @@ workspace.
 ## Taking the crates from the Coldsteel registry
 
 Each version also goes to the Coldsteel registry (kellnr,
-`https://cargo.coldsteel.casa`), usually a minute after the merge, before
-crates.io has it and before the kellnr crates.io proxy's cache does. During
-development an app can take every spoolframe crate from there. Name the
+`https://cargo.coldsteel.casa`), right after crates.io, so an app need not
+wait for the kellnr crates.io proxy's cache to see it. During development
+an app can take every spoolframe crate from there. Name the
 registry in the app's `.cargo/config.toml`:
 
 ```toml

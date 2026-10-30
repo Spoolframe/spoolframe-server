@@ -4,14 +4,13 @@
 
 - The public crates publish to the Coldsteel registry
   (`https://cargo.coldsteel.casa`) again, besides crates.io: `publish =
-  ["crates-io", "coldsteel"]`, Coldsteel first on each master push and
-  crates.io after it, whether or not Coldsteel took them. An app in
-  development patches each spoolframe crate to its Coldsteel copy (the
-  SDK's README says how) and has a version before crates.io's index and
-  the kellnr proxy's cache do. The dependencies stay crates.io ones, so
-  the crates.io packages are unchanged. `scripts/publish-changed.sh` takes
-  `--registry` (the index from cargo's config), and publishes to Coldsteel
-  with the siblings resolved from Coldsteel itself, verify-built.
+  ["crates-io", "coldsteel"]`, crates.io first on each master push and
+  Coldsteel right after it. An app in development patches each spoolframe
+  crate to its Coldsteel copy (the SDK's README says how) and has a
+  version without waiting for the kellnr crates.io proxy's cache. The
+  dependencies stay crates.io ones, so the crates.io packages are
+  unchanged. `scripts/publish-changed.sh` takes `--registry` (the index
+  from cargo's config).
 
 - The admin Server page, `spoolframe-server --version` and MCP's server
   info list the regular protocol features the server has

@@ -59,8 +59,8 @@ but committed, and `ci:style` fails when it is stale.
 ## Publishing the crates
 
 `.forgejo/workflows/publish.yaml` runs `scripts/publish-changed.sh` on every
-push to `master`, once for each registry: the Coldsteel registry (kellnr,
-`https://cargo.coldsteel.casa`) first, then crates.io. Each run publishes,
+push to `master`, once for each registry: crates.io first, then the
+Coldsteel registry (kellnr, `https://cargo.coldsteel.casa`). Each run publishes,
 in dependency order, each crate with `publish = ["crates-io", "coldsteel"]`
 whose version is not on that registry yet: spoolframe-types, -protocol,
 -policy, -client-sdk, -client-ffi, -test-dir and -hls-bridge. test-dir is
@@ -69,10 +69,13 @@ publish the SDK. A crate without exactly that `publish` pair (or `publish =
 false`) stops the script.
 
 The apps take the crates from Coldsteel during development, by patching each
-spoolframe crate to it (the SDK's README). The crates depend on each other
-as crates.io crates, so the Coldsteel run patches the siblings already on
-Coldsteel to it for the publish: a new version is not on crates.io yet when
-it runs.
+spoolframe crate to it (the SDK's README), so they need not wait for the
+kellnr crates.io proxy's cache. crates.io goes first because the crates
+depend on each other as crates.io crates: packaging one for Coldsteel
+resolves its siblings from crates.io, through the kellnr proxy, so a new
+version must be on crates.io already. If the proxy has not seen it yet,
+the script waits 30 s and tries again. Coldsteel's publish is
+`--no-verify`: crates.io's run has just verify-built the same sources.
 
 To see what each would publish:
 
@@ -84,8 +87,8 @@ devenv shell -- scripts/publish-changed.sh --registry crates-io .
 - The Coldsteel run reads the index from `.cargo/config.toml`
   (`[registries.coldsteel]`) and the token from the
   `CARGO_REGISTRIES_COLDSTEEL_TOKEN` secret: an API token from the kellnr
-  web UI. A failed Coldsteel publish does not stop crates.io's; the job
-  goes red after it.
+  web UI. Either publish failing does not stop the other; the job goes
+  red after both, saying which failed.
 - The crates.io token is the `CARGO_REGISTRY_TOKEN` secret: a crates.io API
   token with the publish-new and publish-update scopes, for `spoolframe-*`.
 - crates.io rate-limits new crates (a few, then about one every 10
