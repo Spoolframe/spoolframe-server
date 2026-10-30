@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.17.0-beta.1 (2026-10-30)
+## 0.17.0-beta.2 (2026-10-30)
 
-A beta. Its images are under its own tags alone (`0.17.0-beta.1`,
+A beta. Its images are under its own tags alone (`0.17.0-beta.2`,
 `-slim`, `-nvidia`/`-cpu`, each with its build's commit too): `latest`
 and `0.16` stay on 0.16.3, and no `0.17` tag is made until 0.17.0.
 
@@ -212,7 +212,9 @@ with a 0.16 server.
     Android app ships it with no Rust crate of its own. The app declares
     the Kotlin `object AndroidContext` (README, AAR). It takes once per
     process; a failure is logged, never unwound into the JVM.
-  - `FileStorage(root, cipher)`, a `CoreStorage` of files: one per key
+  - `FileStorage(root, cipher)`, opened with `SpoolClient.openFiles`
+    (on Android `open` aborts: two callbacks would nest), a
+    `CoreStorage` of files: one per key
     under `root/data` and `root/secrets`, its name the key with every
     byte but letters, digits, `-` and `_` as `%XX`, written whole,
     synced and renamed into place, a crash's leftovers cleared. Secrets
@@ -284,8 +286,9 @@ with a 0.16 server.
     and `reach_report(reachability, now, build, device)`;
     `server_display_host(entry)`; `plan_encoded_height(plan)`;
     `media_origin(id)`, a federated item's server.
-  - Accessors: `Item`'s `id()`, `title()`, `artwork()`, `poster()`,
-    `background()`, `thumb()`, `duration()` and `playback()`;
+  - Accessors: `Item`'s `itemId()`, `itemTitle()`, `itemArtwork()`, `poster()`,
+    `background()`, `thumb()`, `itemDuration()` and `itemPlayback()`
+    (`item` in the name so an app's Swift can add `var id`);
     `PlaybackPlan`'s `kind()` (`PlanKind`), `ladder()`,
     `source_codec()`, `converted_video()`, `audio_action()`,
     `subtitle_action()`, `burns_in_subtitle()` and `encoded_height()`;
