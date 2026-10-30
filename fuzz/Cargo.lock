@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-admin-api"
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 dependencies = [
  "jsonrpsee",
  "serde",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-catalog"
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 dependencies = [
  "async-trait",
  "spoolframe-types",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-media"
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 dependencies = [
  "alass-core",
  "async-trait",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-plex"
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1973,9 +1973,10 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

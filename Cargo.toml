@@ -10,7 +10,7 @@ exclude = ["vendor"]
 # (ARCHITECTURE §56). Each crate states its own, and
 # `spoolframe-server/tests/it/license_boundary.rs` keeps the two sides apart.
 [workspace.package]
-version = "0.16.4-beta.2"
+version = "0.17.0-beta.1"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 repository = "https://github.com/Spoolframe/spoolframe-server"
@@ -41,20 +41,20 @@ foyer = "0.22.5"
 # into a crates.io dependency; bump it with `workspace.package.version`.
 # No `registry`: crates.io is the default, and a published crate's
 # dependencies must come from crates.io too.
-spoolframe-types = { path = "crates/spoolframe-types", version = "0.16.4-beta.2" }
-spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.16.4-beta.2" }
+spoolframe-types = { path = "crates/spoolframe-types", version = "0.17.0-beta.1" }
+spoolframe-policy = { path = "crates/spoolframe-policy", version = "0.17.0-beta.1" }
 spoolframe-catalog = { path = "crates/spoolframe-catalog" }
 spoolframe-federation = { path = "crates/spoolframe-federation" }
 spoolframe-plex = { path = "crates/spoolframe-plex" }
 spoolframe-media = { path = "crates/spoolframe-media" }
-spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.16.4-beta.2" }
+spoolframe-protocol = { path = "crates/spoolframe-protocol", version = "0.17.0-beta.1" }
 spoolframe-admin-api = { path = "crates/spoolframe-admin-api" }
-spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.16.4-beta.2" }
+spoolframe-client-sdk = { path = "crates/spoolframe-client-sdk", version = "0.17.0-beta.1" }
 spoolframe-probe = { path = "crates/spoolframe-probe" }
-spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.16.4-beta.2" }
+spoolframe-test-dir = { path = "crates/spoolframe-test-dir", version = "0.17.0-beta.1" }
 # Without its HTTP server by default: each dependent names `http` when it
 # serves over HTTP (the server, the FFI's `hls-bridge` feature).
-spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.16.4-beta.2", default-features = false }
+spoolframe-hls-bridge = { path = "crates/spoolframe-hls-bridge", version = "0.17.0-beta.1", default-features = false }
 
 # Vendored (vendor/easy-ffprobe/VENDORED.md). Only the typed model of
 # ffprobe's JSON is used.
@@ -275,6 +275,15 @@ uniffi = { version = "0.32.2", default-features = false }
 # The bindings generator, as a library: spoolframe-client-ffi's
 # uniffi-bindgen bin (feature `bindgen`) and its bindings smoke test.
 uniffi_bindgen = { version = "0.32.2", default-features = false }
+# This device's addresses, for the FFI's at_home_here and
+# default_quality_here on Apple and Linux (getifaddrs): the version iroh's
+# netwatch already builds, so no second copy (0.47 is out).
+netdev = "0.46"
+# The FFI's `android` feature: the app's Context, through JNI, for
+# ndk-context. The versions netdev already builds (jni 0.22 is out, and
+# the DNS resolver's; netdev's 0.21 is the one whose Context this sets).
+jni = "0.21.1"
+ndk-context = "0.1.1"
 camino = "1"
 anyhow = "1"
 
