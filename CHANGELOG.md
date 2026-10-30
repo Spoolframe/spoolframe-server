@@ -856,6 +856,15 @@ with a 0.16 server.
   its running time, where the paired server knows its file's; it now
   takes that server's, falling back to the listing only when it gives
   none.
+- Fixed: HEVC encoded on an AMD GPU played green, with stray blocks and
+  the clock running, on any client that plays it as HLS. ffmpeg's
+  `hevc_vaapi` named parameter sets in its codec record that were not
+  the ones Mesa's encoder coded to, and an `hvc1` track keeps only the
+  record. The packaged ffmpeg now builds the record from the stream, and
+  a server whose ffmpeg writes a false one refuses that encoder for HEVC
+  at start, with a warning, and falls back. Tracks stored before this
+  (optimized versions, binge-ahead) keep the false record and must be
+  remade.
 
 ## 0.16.3 (2026-10-28)
 

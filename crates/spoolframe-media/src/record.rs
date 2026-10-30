@@ -129,6 +129,104 @@ fn hvcc_types(record: &[u8]) -> Option<Vec<u8>> {
     Some(types)
 }
 
+/// Whether a fragmented MP4's `hvcC` holds the parameter sets its first
+/// sample carries, `init` and `segment` being the files the HLS muxer
+/// wrote as `hev1` (`hvc1` takes the sets out of the samples). `None` for
+/// files that cannot say: not MP4, no `hvcC`, or no sets in the sample.
+///
+/// A decoder of `hvc1` has the record alone. A record that differs from
+/// what the slices were coded to reads them wrongly: green, with stray
+/// blocks.
+pub(crate) fn hvcc_agrees(init: &[u8], segment: &[u8]) -> Option<bool> {
+    let record = hvcc_of(init)?;
+    let mut stated = hvcc_sets(record)?;
+    let mut carried = first_sample_sets(find_box(segment, b"mdat")?, record)?;
+    if carried.is_empty() {
+        return None;
+    }
+    stated.sort();
+    carried.sort();
+    Some(stated == carried)
+}
+
+/// The payload of the first top-level box of `kind` in `data`.
+fn find_box<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+    let mut at = 0;
+    while let Some(head) = data.get(at..at + 8) {
+        let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if size < 8 {
+            return None;
+        }
+        if head[4..8] == *kind {
+            return data.get(at + 8..at + size);
+        }
+        at += size;
+    }
+    None
+}
+
+/// The `hvcC` of the first sample entry in `init`.
+fn hvcc_of(init: &[u8]) -> Option<&[u8]> {
+    let mut boxes = init;
+    for kind in [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"] {
+        boxes = find_box(boxes, kind)?;
+    }
+    // `stsd`: its version, flags and entry count, then the entries; an
+    // entry's size and type, a visual entry's 78 bytes, then its boxes.
+    let entry = boxes.get(8..)?;
+    let size = u32::from_be_bytes(entry.get(..4)?.try_into().ok()?) as usize;
+    find_box(entry.get(86..size)?, b"hvcC")
+}
+
+/// Every VPS, SPS and PPS in an `hvcC`, as (type, bytes).
+fn hvcc_sets(record: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    let mut sets = Vec::new();
+    let arrays = *record.get(22)?;
+    let mut at = 23;
+    for _ in 0..arrays {
+        let kind = *record.get(at)? & 0x3f;
+        let count = u16_at(record, at + 1)?;
+        at += 3;
+        for _ in 0..count {
+            let len = u16_at(record, at)?;
+            let unit = record.get(at + 2..at + 2 + len)?;
+            if (32..=34).contains(&kind) {
+                sets.push((kind, trimmed(unit).to_vec()));
+            }
+            at += 2 + len;
+        }
+    }
+    Some(sets)
+}
+
+/// The VPSs, SPSs and PPSs before the first slice in `mdat`, as (type,
+/// bytes); `record` says how long a unit's length is.
+fn first_sample_sets(mdat: &[u8], record: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    let length = usize::from(*record.get(21)? & 3) + 1;
+    let mut sets = Vec::new();
+    let mut at = 0;
+    loop {
+        let bytes = mdat.get(at..at + length)?;
+        let len = bytes.iter().fold(0, |n, b| n << 8 | usize::from(*b));
+        let unit = mdat.get(at + length..at + length + len)?;
+        let kind = nal_type(*unit.first()?, Codec::Hevc);
+        if kind < 32 {
+            return Some(sets);
+        }
+        if kind <= 34 {
+            sets.push((kind, trimmed(unit).to_vec()));
+        }
+        at += length + len;
+    }
+}
+
+/// `unit` without trailing zero bytes, which a record or a stream may or
+/// may not keep.
+fn trimmed(unit: &[u8]) -> &[u8] {
+    let end = unit.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    &unit[..end]
+}
+
 /// The bytes of ffprobe's `-show_data` hex dump: lines of an offset, up to
 /// eight groups of four hex digits, and the bytes as text after two
 /// spaces. `None` for anything else.
@@ -153,6 +251,45 @@ pub(crate) fn hex_dump_bytes(dump: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One frame of `testsrc2` through `hevc_vaapi` on Mesa and the HLS
+    /// muxer as `hev1`, so the sample keeps its parameter sets: from stock
+    /// ffmpeg, whose `hvcC` is its own sets and not the stream's, then
+    /// from the package's, whose `hvcC` is built from the stream.
+    const MISMATCHED: (&[u8], &[u8]) = (
+        include_bytes!("../tests/fixtures/hvcc/mesa-init.mp4"),
+        include_bytes!("../tests/fixtures/hvcc/mesa-seg0.m4s"),
+    );
+    const MATCHED: (&[u8], &[u8]) = (
+        include_bytes!("../tests/fixtures/hvcc/fixed-init.mp4"),
+        include_bytes!("../tests/fixtures/hvcc/fixed-seg0.m4s"),
+    );
+
+    #[test]
+    fn an_hvcc_unlike_the_stream_it_describes_disagrees() {
+        assert_eq!(hvcc_agrees(MISMATCHED.0, MISMATCHED.1), Some(false));
+    }
+
+    #[test]
+    fn an_hvcc_built_from_the_stream_agrees() {
+        assert_eq!(hvcc_agrees(MATCHED.0, MATCHED.1), Some(true));
+    }
+
+    #[test]
+    fn a_sample_with_no_sets_in_it_says_nothing() {
+        // An `mdat` whose first unit is an IDR slice, as `hvc1` writes it.
+        let mut segment = 14u32.to_be_bytes().to_vec();
+        segment.extend(b"mdat");
+        segment.extend(2u32.to_be_bytes());
+        segment.extend([19 << 1, 1]);
+        assert_eq!(hvcc_agrees(MATCHED.0, &segment), None);
+    }
+
+    #[test]
+    fn a_file_that_is_not_mp4_says_nothing() {
+        assert_eq!(hvcc_agrees(b"not an mp4", MATCHED.1), None);
+        assert_eq!(hvcc_agrees(MATCHED.0, b"not an mp4"), None);
+    }
 
     const ZEROS: &[u8; 4] = &[0; 4];
 

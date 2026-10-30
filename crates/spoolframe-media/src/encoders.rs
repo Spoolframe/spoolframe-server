@@ -540,11 +540,115 @@ fn encode_args(
     depth_encode_args(encoder, hardware, settings, false)
 }
 
+/// One frame from `encoder` through the HLS muxer into `dir`, as a live
+/// encode's goes, with its rate. `hev1`, not the `hvc1` a live encode
+/// writes: the muxer takes the parameter sets out of an `hvc1` sample, and
+/// [`hvcc_refusal`] compares them with the record.
+fn hvcc_args(
+    encoder: &str,
+    hardware: Option<Hardware>,
+    settings: &TranscodeSettings,
+    dir: &Path,
+) -> Vec<String> {
+    let mut args = pattern_args(encoder, hardware, settings, false);
+    args.extend(
+        [
+            "-frames:v",
+            "1",
+            "-b:v",
+            "1000000",
+            "-tag:v",
+            "hev1",
+            "-f",
+            "hls",
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+            "-hls_list_size",
+            "0",
+            "-hls_segment_filename",
+        ]
+        .map(String::from),
+    );
+    args.push(dir.join("seg%d.m4s").display().to_string());
+    args.push(dir.join("out.m3u8").display().to_string());
+    args
+}
+
+/// Why `encoder` is refused for HEVC: its `hvcC` is not what its stream
+/// was coded to, which is how stock ffmpeg's `hevc_vaapi` writes it over
+/// Mesa's encoder (`nix/ffmpeg.nix`). A player of `hvc1` has that record
+/// alone and shows green with stray blocks, and nothing in ffmpeg's exit
+/// says so. `None` for one that agrees, and for a test that cannot say:
+/// an encoder is left out on what this saw, not on what it could not see.
+async fn hvcc_refusal(
+    ffmpeg: &dyn Ffmpeg,
+    encoder: &str,
+    hardware: Option<Hardware>,
+    settings: &TranscodeSettings,
+    scratch: &Path,
+) -> Option<String> {
+    let dir = scratch.join(format!("hvcc-{encoder}"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(encoder, error = %e, "cannot make the hvcC test's directory; not tested");
+        return None;
+    }
+    let gpu = hardware.map_or(GpuUse::None, Hardware::gpu);
+    let run = ffmpeg
+        .succeeds(
+            &hvcc_args(encoder, hardware, settings, &dir),
+            scratch,
+            gpu.into(),
+        )
+        .await;
+    let agrees = match (
+        std::fs::read(dir.join("init.mp4")),
+        std::fs::read(dir.join("seg0.m4s")),
+    ) {
+        (Ok(init), Ok(segment)) => crate::record::hvcc_agrees(&init, &segment),
+        _ => None,
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    match agrees {
+        Some(true) => None,
+        Some(false) => {
+            tracing::warn!(
+                encoder,
+                "this encoder's hvcC is not what its stream is coded to, and players would \
+                 show green: refused for HEVC. The ffmpeg packaged with this server has the fix"
+            );
+            Some(format!("{encoder}'s hvcC disagrees with its stream"))
+        }
+        None => {
+            tracing::warn!(
+                encoder,
+                error = run.err(),
+                "the hvcC test could not say whether this encoder's record is true; kept"
+            );
+            None
+        }
+    }
+}
+
 /// A one-second encode of a test pattern with `encoder`, 10-bit
 /// (`p010`) with `ten_bit`: what an encode that keeps HDR gives it
 /// (PGPU-06). A GPU that encodes 8-bit HEVC does not always encode
 /// Main 10.
 fn depth_encode_args(
+    encoder: &str,
+    hardware: Option<Hardware>,
+    settings: &TranscodeSettings,
+    ten_bit: bool,
+) -> Vec<String> {
+    let mut args = pattern_args(encoder, hardware, settings, ten_bit);
+    args.extend(["-f", "null", "-"].map(String::from));
+    args
+}
+
+/// A second of a test pattern into `encoder`, everything before the
+/// output.
+fn pattern_args(
     encoder: &str,
     hardware: Option<Hardware>,
     settings: &TranscodeSettings,
@@ -574,13 +678,7 @@ fn depth_encode_args(
     } else if ten_bit {
         args.extend(["-pix_fmt".into(), "p010le".into()]);
     }
-    args.extend([
-        "-c:v".into(),
-        encoder.into(),
-        "-f".into(),
-        "null".into(),
-        "-".into(),
-    ]);
+    args.extend(["-c:v".into(), encoder.into()]);
     args
 }
 
@@ -676,11 +774,28 @@ pub async fn detect(ffmpeg: &dyn Ffmpeg, settings: &TranscodeSettings, scratch: 
                 .succeeds(&encode_args(&name, hardware, settings), scratch, gpu.into())
                 .await
             {
-                Ok(()) => video.push(VideoEncoder {
-                    codec,
-                    name,
-                    hardware,
-                }),
+                Ok(()) => {
+                    let refused = if codec == VideoCodec::Hevc && hardware.is_some() && scratch_made
+                    {
+                        hvcc_refusal(ffmpeg, &name, hardware, settings, scratch).await
+                    } else {
+                        None
+                    };
+                    match refused {
+                        Some(why) => failed(
+                            &mut failures,
+                            hardware,
+                            &name,
+                            &format!("{} encode", codec.as_str()),
+                            why,
+                        ),
+                        None => video.push(VideoEncoder {
+                            codec,
+                            name,
+                            hardware,
+                        }),
+                    }
+                }
                 Err(why) => failed(
                     &mut failures,
                     hardware,
@@ -1477,6 +1592,94 @@ mod tests {
                 runs: Mutex::default(),
             }
         }
+    }
+
+    /// [`Recorded`], whose HLS runs write `files` (`init.mp4`, a segment),
+    /// as the real muxer would.
+    struct WritesHls {
+        ffmpeg: Recorded,
+        files: (&'static [u8], &'static [u8]),
+    }
+
+    #[async_trait]
+    impl Ffmpeg for WritesHls {
+        async fn encoders(&self) -> Result<String, String> {
+            self.ffmpeg.encoders().await
+        }
+
+        async fn succeeds(
+            &self,
+            args: &[String],
+            scratch: &Path,
+            gpu: TestGpu,
+        ) -> Result<(), String> {
+            self.ffmpeg.succeeds(args, scratch, gpu).await?;
+            if args.iter().any(|a| a == "hls") {
+                let dir = Path::new(args.last().unwrap()).parent().unwrap();
+                std::fs::write(dir.join("init.mp4"), self.files.0).unwrap();
+                std::fs::write(dir.join("seg0.m4s"), self.files.1).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    const HVCC_FALSE: (&[u8], &[u8]) = (
+        include_bytes!("../tests/fixtures/hvcc/mesa-init.mp4"),
+        include_bytes!("../tests/fixtures/hvcc/mesa-seg0.m4s"),
+    );
+    const HVCC_TRUE: (&[u8], &[u8]) = (
+        include_bytes!("../tests/fixtures/hvcc/fixed-init.mp4"),
+        include_bytes!("../tests/fixtures/hvcc/fixed-seg0.m4s"),
+    );
+
+    async fn detected_with_hvcc(files: (&'static [u8], &'static [u8]), name: &str) -> Encoders {
+        let ffmpeg = WritesHls {
+            ffmpeg: Recorded::new(&["libx264", "h264_vaapi", "hevc_vaapi", "hevc_vaapi@10"]),
+            files,
+        };
+        let settings = TranscodeSettings {
+            hardware: HardwarePolicy::Auto,
+            ..TranscodeSettings::default()
+        };
+        detect(&ffmpeg, &settings, scratch(name).await.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn an_hevc_encoder_whose_hvcc_disagrees_is_refused() {
+        let e = detected_with_hvcc(HVCC_FALSE, "hvcc-false").await;
+        assert!(!e.video.iter().any(|v| v.name == "hevc_vaapi"), "{e:?}");
+        assert!(!e.ten_bit.iter().any(|v| v.name == "hevc_vaapi"), "{e:?}");
+        assert!(
+            e.failed
+                .iter()
+                .any(|f| f.test == "hevc_vaapi" && f.stderr.contains("hvcC")),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_planner_falls_back_when_hevc_is_refused() {
+        let e = detected_with_hvcc(HVCC_FALSE, "hvcc-fallback").await;
+        assert!(e.video.iter().any(|v| v.name == "h264_vaapi"), "{e:?}");
+        assert!(e.video.iter().any(|v| v.name == "libx264"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn an_hevc_encoder_whose_hvcc_agrees_is_kept() {
+        let e = detected_with_hvcc(HVCC_TRUE, "hvcc-true").await;
+        assert!(e.video.iter().any(|v| v.name == "hevc_vaapi"), "{e:?}");
+        assert!(!e.failed.iter().any(|f| f.test == "hevc_vaapi"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_software_encoder_is_not_put_through_the_hvcc_test() {
+        let ffmpeg = Recorded::new(&["libx264"]);
+        let settings = TranscodeSettings {
+            hardware: HardwarePolicy::None,
+            ..TranscodeSettings::default()
+        };
+        detect(&ffmpeg, &settings, scratch("hvcc-soft").await.as_ref()).await;
+        assert!(!ffmpeg.runs.lock().iter().any(|r| r.contains(&"hls".into())));
     }
 
     #[async_trait]
