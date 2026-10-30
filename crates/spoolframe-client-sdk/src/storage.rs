@@ -3,6 +3,8 @@
 //! Secret Service and data under the XDG data directory on Linux, and both
 //! in the Keychain on Apple platforms.
 
+pub mod files;
+
 use parking_lot::Mutex;
 use std::collections::HashMap;
 

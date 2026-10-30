@@ -190,6 +190,9 @@ pub struct MediaReader {
 
 struct Shared {
     playback: ManagedPlayback,
+    /// The playback's generation it reads: bytes read once it moved on are
+    /// another plan's, and are refused ([`crate::SdkError::Replanned`]).
+    generation: u64,
     /// The server's link meter: how fast direct reads arrive.
     meter: Option<Arc<crate::LinkMeter>>,
     size: u64,
@@ -220,8 +223,6 @@ struct State {
     stopped: bool,
     /// A stall made the reader ask for a plan the link can carry.
     limit_asked: bool,
-    /// The playback was planned again: reads are over, with this epoch.
-    replanned: Option<u32>,
 }
 
 impl Drop for MediaReader {
@@ -239,9 +240,43 @@ impl MediaReader {
         Self::with_tuning(playback, spawn, length, Tuning::default())
     }
 
+    /// [`MediaReader::new`] for the playback as it was in `generation`
+    /// ([`ManagedPlayback::generation`]), as its player was given it:
+    /// [`crate::SdkError::Replanned`] if it has moved on since, rather
+    /// than a reader of the new plan's bytes for a player of the old.
+    pub fn for_generation(
+        playback: ManagedPlayback,
+        spawn: Spawn,
+        length: Option<Duration>,
+        generation: u64,
+    ) -> Result<Self, BackendError> {
+        let size = playback.snapshot_at(generation)?.size;
+        Ok(Self::of(
+            playback,
+            size,
+            generation,
+            spawn,
+            length,
+            Tuning::default(),
+        ))
+    }
+
     /// [`MediaReader::new`], working the link as `tuning` says.
     pub fn with_tuning(
         playback: ManagedPlayback,
+        spawn: Spawn,
+        length: Option<Duration>,
+        tuning: Tuning,
+    ) -> Self {
+        let (now, generation) = playback.snapshot_with_generation();
+        Self::of(playback, now.size, generation, spawn, length, tuning)
+    }
+
+    /// A reader of a file of `size` bytes, the playback's in `generation`.
+    fn of(
+        playback: ManagedPlayback,
+        size: u64,
+        generation: u64,
         spawn: Spawn,
         length: Option<Duration>,
         tuning: Tuning,
@@ -250,11 +285,11 @@ impl MediaReader {
             in_flight: tuning.in_flight.max(1),
             ..tuning
         };
-        let size = playback.snapshot().size;
         let length = length.filter(|l| !l.is_zero());
         MediaReader {
             shared: Arc::new(Shared {
                 meter: playback.link_meter(),
+                generation,
                 playback,
                 size,
                 // None for a size of 0 too: a rate of 0 made status()'s
@@ -276,7 +311,6 @@ impl MediaReader {
                     throughput: None,
                     stopped: false,
                     limit_asked: false,
-                    replanned: None,
                 }),
                 changed: Condvar::new(),
             }),
@@ -302,6 +336,9 @@ impl MediaReader {
         length: u64,
         buffering: &mut dyn FnMut(u8),
     ) -> Result<Vec<u8>, ReadError> {
+        if self.shared.stale() {
+            return Err(BackendError::Replanned.into());
+        }
         let end = offset.saturating_add(length).min(self.shared.size);
         let mut bytes = Vec::with_capacity(end.saturating_sub(offset) as usize);
         let mut at = offset;
@@ -330,6 +367,11 @@ impl MediaReader {
             }
             bytes.extend_from_slice(&block[start..stop]);
             at = index * BLOCK + stop as u64;
+        }
+        // Planned again while the bytes were on the link: they may be the
+        // new plan's, at this one's offsets.
+        if self.shared.stale() {
+            return Err(BackendError::Replanned.into());
         }
         let mut state = self.shared.lock();
         state.playhead = at;
@@ -395,8 +437,8 @@ impl MediaReader {
             // GstPlay pauses under 100 and plays again only at 100.
             let early = if state.flushing {
                 Some(ReadError::Flushing)
-            } else if let Some(epoch) = state.replanned {
-                Some(BackendError::PlaybackRestarted { epoch }.into())
+            } else if shared.stale() {
+                Some(BackendError::Replanned.into())
             } else {
                 state.failed.remove(&index).map(ReadError::from)
             };
@@ -470,6 +512,11 @@ impl MediaReader {
 }
 
 impl Shared {
+    /// The playback moved on from the generation this reads.
+    fn stale(&self) -> bool {
+        self.playback.generation() != self.generation
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock()
     }
@@ -604,7 +651,7 @@ impl Shared {
     /// the file's bitrate), ask once for the playback to be planned for
     /// the link; an ask that failed is made again at the stall's next
     /// check, while it lasts. A new plan ends this reader: its reads are then
-    /// [`BackendError::PlaybackRestarted`], and the player makes a new
+    /// [`crate::SdkError::Replanned`], and the player makes a new
     /// one from the playback's snapshot, as after a subtitle change.
     fn limit_if_too_slow(&self, this: &Arc<Self>, state: &mut State) {
         if state.limit_asked || state.stopped || self.playback.quality() != PlaybackQuality::Auto {
@@ -629,8 +676,9 @@ impl Shared {
         let shared = this.clone();
         (self.spawn)(Box::pin(async move {
             match shared.playback.limit(link_bitrate).await {
+                // The playback's generation moved: a read waiting through
+                // the stall is woken to say so.
                 Ok(next) if !matches!(next.plan, PlaybackPlan::Direct { .. }) => {
-                    shared.lock().replanned = Some(next.epoch);
                     shared.changed.notify_all();
                 }
                 Ok(_) => {}
@@ -785,8 +833,10 @@ mod tests {
         assert_eq!(reader.read(6_000, 100).unwrap(), Vec::<u8>::new());
     }
 
+    /// The playback is started again under a new handle, which moves the
+    /// player: this reader says so, and one made now reads on.
     #[test]
-    fn an_expired_handle_is_started_again_and_the_read_succeeds() {
+    fn an_expired_handle_is_started_again_and_a_new_reader_reads() {
         let (_dir, path, bytes) = media_file("reader-expired", 3_000);
         let client = FakeClient::new(Some(path));
         let profile = FakeClient::profile("andrey");
@@ -800,6 +850,7 @@ mod tests {
             chosen: None,
             epoch: 0,
             markers: Vec::new(),
+            duration: None,
         };
         let reader = MediaReader::for_test(
             session,
@@ -809,7 +860,15 @@ mod tests {
             thread_spawn(),
             None,
         );
-        assert_eq!(reader.read(0, 10).unwrap(), bytes[..10]);
+        let refused = reader.read(0, 10);
+        let again = MediaReader::new(reader.shared.playback.clone(), thread_spawn(), None);
+        assert_eq!(
+            (refused, again.read(0, 10).unwrap()),
+            (
+                Err(ReadError::Backend(BackendError::Replanned)),
+                bytes[..10].to_vec()
+            )
+        );
     }
 
     #[test]
@@ -1081,6 +1140,41 @@ mod tests {
         (reader, session)
     }
 
+    /// A plan made behind the reader (a quality the viewer picked, an
+    /// Auto re-plan) ends it too: a read after it is refused, not handed
+    /// the new plan's bytes at this one's offsets.
+    #[test]
+    fn a_read_after_a_plan_made_behind_the_reader_is_refused() {
+        let (_dir, path, bytes) = media_file("reader-behind", 3 * BLOCK as usize);
+        let (reader, _session) = reader_for(path);
+        assert_eq!(reader.read(0, 10).unwrap(), bytes[..10]);
+        ready(reader.shared.playback.limit(1 << 20)).unwrap();
+        assert_eq!(
+            reader.read(10, 10),
+            Err(ReadError::Backend(BackendError::Replanned))
+        );
+    }
+
+    /// A reader asked for a generation the playback has moved on from is
+    /// refused at once; one for the generation now reads.
+    #[test]
+    fn a_reader_for_a_generation_moved_on_from_is_refused() {
+        let (_dir, path, _) = media_file("reader-stale", 3 * BLOCK as usize);
+        let (reader, _session) = reader_for(path);
+        let playback = reader.shared.playback.clone();
+        let spawn = reader.shared.spawn.clone();
+        let before = playback.generation();
+        ready(playback.limit(1 << 20)).unwrap();
+        let reader = |generation| {
+            MediaReader::for_generation(playback.clone(), spawn.clone(), None, generation)
+                .map(|r| r.read(0, 10).is_ok())
+        };
+        assert_eq!(
+            (reader(before), reader(playback.generation())),
+            (Err(BackendError::Replanned), Ok(true))
+        );
+    }
+
     /// A stall on a link too slow for the file asks for a plan it can
     /// carry, and the new plan ends the reader (P6-06).
     #[test]
@@ -1089,12 +1183,7 @@ mod tests {
         let (reader, session) = stalling_reader("reader-limit", 1 << 20, Duration::from_secs(2));
         reader.read(BLOCK - 100, 100).unwrap();
         let read = reader.read(BLOCK, 100);
-        assert_eq!(
-            read,
-            Err(ReadError::Backend(BackendError::PlaybackRestarted {
-                epoch: 1
-            }))
-        );
+        assert_eq!(read, Err(ReadError::Backend(BackendError::Replanned)));
         assert_eq!(*session.limits.lock(), [8 << 20]);
     }
 
@@ -1117,9 +1206,7 @@ mod tests {
         });
         assert_eq!(
             reader.read(BLOCK, 100),
-            Err(ReadError::Backend(BackendError::PlaybackRestarted {
-                epoch: 1
-            }))
+            Err(ReadError::Backend(BackendError::Replanned))
         );
         assert_eq!(session.limits.lock().len(), 2);
     }

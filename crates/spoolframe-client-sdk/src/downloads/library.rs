@@ -84,7 +84,7 @@ fn finished(d: &LocalDownload) -> bool {
 
 /// Begun and not watched: where to go on from.
 fn in_the_middle(d: &LocalDownload) -> bool {
-    finished(d) && !d.watched_here() && d.watch.position_ms.is_some_and(|p| p > 0)
+    finished(d) && !d.watched_here() && d.watch.position.is_some_and(|p| !p.is_zero())
 }
 
 /// `downloads` grouped as [`Downloads::library`] has them.

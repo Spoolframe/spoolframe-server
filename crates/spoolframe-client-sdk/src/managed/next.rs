@@ -41,6 +41,18 @@ impl ManagedPlayback {
         })
         .await
     }
+
+    /// [`Self::open_after`] this playback, through its own backend: the
+    /// next item for an app that holds the playback but not the session
+    /// ([`Session::open_playback_next`] for one that does).
+    pub async fn open_next(
+        &self,
+        item: MediaId,
+        selection: Option<Selection>,
+        options: PlaybackOptions,
+    ) -> Result<Self, SdkError> {
+        Self::open_after(self.0.backend.clone(), item, self, selection, options).await
+    }
 }
 
 impl Session {

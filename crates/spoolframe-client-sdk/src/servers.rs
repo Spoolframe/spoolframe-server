@@ -43,7 +43,9 @@
 //! still has.
 
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use spoolframe_types::serde_time::unix_seconds;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::invite::{MAX_HINTS, is_relay_url};
@@ -410,8 +412,8 @@ fn relay_list(relays: Vec<String>) -> Vec<String> {
 }
 
 /// Unix seconds as a time.
-pub(crate) fn time(secs: Option<u64>) -> Option<SystemTime> {
-    secs.map(|s| UNIX_EPOCH + Duration::from_secs(s))
+pub(crate) fn time(secs: u64) -> SystemTime {
+    unix_seconds::from_wire(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 /// A server this device knows: saved, heard on the LAN, or both.

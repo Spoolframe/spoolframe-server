@@ -50,6 +50,7 @@ impl Default for CacheConfig {
 
 /// One read the cache keeps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CatalogKey {
     Home,
     Libraries,

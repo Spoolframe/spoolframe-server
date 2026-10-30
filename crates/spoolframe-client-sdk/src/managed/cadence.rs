@@ -52,9 +52,16 @@ impl ManagedPlayback {
     const BACKWARDS: Duration = Duration::from_secs(1);
 
     /// What the player does now: call it from the player's own ticks,
-    /// and on every play, pause and seek. The SDK reports from it.
+    /// and on every play, pause and seek. The SDK reports from it, at a
+    /// seek's target while the seek is in flight
+    /// ([`Self::seek_started`]).
     pub fn set_state(&self, player: PlayerState) -> Result<(), SdkError> {
         let mut state = self.0.state.lock();
+        let (at, _) = state.gate.position(player.position());
+        let player = match player {
+            PlayerState::Playing { .. } => PlayerState::Playing { pos: at },
+            PlayerState::Paused { .. } => PlayerState::Paused { pos: at },
+        };
         if state.finishing || state.closed {
             return Err(SdkError::PlaybackClosed);
         }

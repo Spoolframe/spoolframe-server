@@ -141,8 +141,8 @@ mod tests {
         PortableIdentity {
             id: "ab".repeat(32).parse().unwrap(),
             name: "Sam".into(),
-            name_set_at: 0,
-            created_at: 0,
+            name_set_at: spoolframe_types::serde_time::unix_seconds::from_wire(0),
+            created_at: spoolframe_types::serde_time::unix_seconds::from_wire(0),
             has_root,
             key_rooted,
         }

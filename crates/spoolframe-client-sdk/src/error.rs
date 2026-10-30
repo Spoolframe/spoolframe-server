@@ -174,10 +174,18 @@ pub enum SdkError {
     /// whose new encode begins at `at`, and an HLS segment read part-way
     /// ([`crate::ManagedPlayback::read_segment`] at an offset past 0).
     /// Build a new reader from the snapshot, from offset 0, and show the
-    /// player at `at`; read the segment again from offset 0. Direct play,
-    /// playlists, whole segments and controls go on with no error.
+    /// player at `at`; read the segment again from offset 0. Direct reads
+    /// ([`crate::ManagedPlayback::read`]), playlists, whole segments and
+    /// controls go on with no error; a reader made before the restart
+    /// ([`crate::reader::MediaReader`]) says [`SdkError::Replanned`].
     #[error("the playback was started again at {} s", at.as_secs())]
     PlaybackResumed { at: Duration },
+    /// The playback moved on since the reader was made (another plan,
+    /// another encode, started again: [`crate::managed::moves_player`]):
+    /// what it read now is not the player's. The player moves to the playback as it is
+    /// ([`crate::ManagedPlayback::snapshot`]) with a new reader.
+    #[error("the playback was planned again: follow the new plan")]
+    Replanned,
     /// This profile is locked on this device: ask for its PIN and
     /// [`crate::Session::unlock`]. The profile's [`crate::Session::user`]
     /// from [`crate::Client::profiles`] says `locked` before anything is

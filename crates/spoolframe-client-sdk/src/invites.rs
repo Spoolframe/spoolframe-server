@@ -50,11 +50,12 @@ use spoolframe_types::Role;
 use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
 use crate::gate::{Gate, InvitePasskeys, Invited};
-use crate::invite_admin::{InviteKind, time};
+use crate::invite_admin::InviteKind;
 use crate::portable::PortableUserId;
 use crate::servers::{self, SavedServer};
 use crate::session::{Session, SignInMethod};
 use crate::{SdkError, ServerEntry};
+use spoolframe_types::serde_time::unix_seconds;
 
 /// The code of account invite `invite`; one without only finds the
 /// server.
@@ -102,6 +103,21 @@ pub struct InviteInfo {
     pub kind: InviteLinkKind,
     /// This key is a saved server already: the link only adds its hints.
     pub saved: bool,
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl InviteInfo {
+    /// Its code grants a portable identity access: join with
+    /// [`Client::redeem_invite_portable`].
+    pub fn is_portable(&self) -> bool {
+        self.kind == InviteLinkKind::PortableAccount
+    }
+
+    /// It pairs another server (experimental): an admin of that server
+    /// redeems it, not a device.
+    pub fn is_federation(&self) -> bool {
+        self.kind == InviteLinkKind::Federation
+    }
 }
 
 /// What an invite's code is, as its server tells it before joining
@@ -171,10 +187,12 @@ fn outcome_of(outcome: InviteLookupOutcome) -> InviteOutcome {
         } => InviteOutcome::Valid {
             kind: kind.into(),
             role,
-            expires_at: time(expires_at),
+            expires_at: unix_seconds::from_wire(expires_at),
             inviter,
         },
-        InviteLookupOutcome::Expired { at } => InviteOutcome::Expired { at: time(at) },
+        InviteLookupOutcome::Expired { at } => InviteOutcome::Expired {
+            at: unix_seconds::from_wire(at),
+        },
         InviteLookupOutcome::Used => InviteOutcome::Used,
         InviteLookupOutcome::Revoked => InviteOutcome::Revoked,
         InviteLookupOutcome::NoMatch => InviteOutcome::NoMatch,
@@ -981,6 +999,19 @@ mod tests {
             kind,
             saved: false,
         }
+    }
+
+    #[test]
+    fn an_invite_says_whether_it_is_portable_or_a_server_s() {
+        use InviteLinkKind::*;
+        let says = |kind| {
+            let info = info(kind, true);
+            (info.is_portable(), info.is_federation())
+        };
+        assert_eq!(
+            [says(CreateUser), says(PortableAccount), says(Federation)],
+            [(false, false), (true, false), (false, true)]
+        );
     }
 
     #[test]

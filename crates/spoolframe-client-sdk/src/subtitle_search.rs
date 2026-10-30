@@ -22,11 +22,60 @@
 //! `QuotaExhausted` with whose it is and, for an account, its `site`.
 
 use spoolframe_protocol::{Reply, Request};
-use spoolframe_types::{MediaId, SubtitleDownloaded, SubtitleSearch};
+use spoolframe_types::{
+    BitmapPreference, ForcedPreference, MediaId, SdhPreference, SubtitleDownloaded, SubtitleSearch,
+    TrackPreferences,
+};
 
 use crate::{SdkError, Session};
 
 impl Session {
+    /// Change some of this user's track preferences with `change`, the
+    /// others as read: [`Session::set_subtitle_search`] says what that
+    /// loses.
+    async fn change_track_preferences(
+        &self,
+        change: impl FnOnce(&mut TrackPreferences),
+    ) -> Result<(), SdkError> {
+        let mut preferences = self.track_preferences().await?.preferences;
+        change(&mut preferences);
+        self.set_track_preferences(&preferences).await
+    }
+
+    /// Keep `sdh` and `forced` as this user's subtitle search
+    /// preferences, every other track preference as it is.
+    ///
+    /// The wire has only a whole write, so this and
+    /// [`Session::set_picture_subtitles`] read the preferences and write
+    /// them all back, as [`Session::set_track_preferences`] does; neither
+    /// is a change of its fields alone:
+    ///
+    /// - a change another device makes to another preference in between
+    ///   is lost;
+    /// - a value this build does not know, from a newer server or app,
+    ///   is read as its fallback (an unknown `SubtitleMode` as
+    ///   `ForcedOnly`, an unknown `BitmapPreference` as `Text`) and
+    ///   written back as that, replacing the newer value.
+    pub async fn set_subtitle_search(
+        &self,
+        sdh: SdhPreference,
+        forced: ForcedPreference,
+    ) -> Result<(), SdkError> {
+        self.change_track_preferences(|p| {
+            p.subtitles.sdh = sdh;
+            p.subtitles.forced = forced;
+        })
+        .await
+    }
+
+    /// Read picture subtitles (PGS, VobSub, DVB) as text, or show them as
+    /// pictures, by `bitmap`, the others as they are: a read and a whole
+    /// write, with what that loses ([`Session::set_subtitle_search`]).
+    pub async fn set_picture_subtitles(&self, bitmap: BitmapPreference) -> Result<(), SdkError> {
+        self.change_track_preferences(|p| p.subtitles.bitmap = bitmap)
+            .await
+    }
+
     /// Search for item `id`'s subtitles in `language` (`en`, `pt-BR`), or
     /// with `None` in the languages the server offers first. Kept a day
     /// on the server: asking again costs nothing.

@@ -213,6 +213,8 @@ pub struct Playback {
     /// The item's intro and credits, as in [`ItemDetail::markers`]. Their
     /// times are the item's own, wherever the playback started.
     pub markers: Vec<Marker>,
+    /// The item's running time, when the server knows it.
+    pub duration: Option<Duration>,
 }
 
 /// A playback after [`Session::change_subtitle`].
@@ -235,11 +237,11 @@ pub struct PlaybackOptions {
     pub bitmap: BitmapSubtitles,
     /// The quality the viewer chose for it.
     pub quality: PlaybackQuality,
-    /// What the screen shows as it starts (PGPU-06): its HDR formats and
-    /// bit depth, over the device's capabilities, for this playback and
-    /// its re-plans. An app whose display mode changes while it runs (a
-    /// TV's Match Dynamic Range) works it out at each start. `None`: the
-    /// device's capabilities as they are.
+    /// The screen this playback is for (PGPU-06): its mode, HDR formats
+    /// and bit depth, within the device's capabilities. Given, it holds
+    /// for the life of the playback, its re-plans and restarts too.
+    /// `None`: the screen as the app says it ([`crate::Client::set_display`]),
+    /// read again at each re-plan, so a mode switched since counts.
     pub display: Option<DisplayCapabilities>,
 }
 
@@ -565,6 +567,12 @@ impl Session {
     /// The server's key.
     pub fn server(&self) -> String {
         self.server.to_string()
+    }
+
+    /// The server's key, as the endpoint id it is: [`Session::server`]
+    /// without the hex string.
+    pub fn server_id(&self) -> EndpointId {
+        self.server
     }
 
     /// Where a browser reaches the server's web UI (its `admin.public_url`),
@@ -1009,7 +1017,9 @@ impl Session {
     }
 
     /// What `library` can be sorted and filtered by, and the values its
-    /// items have: what an app builds its controls from.
+    /// items have: what an app builds its controls from. Only what this
+    /// build can name ([`ItemFilterValues::known`]): a newer server's
+    /// sort key, filter part, resolution or range is left out.
     pub async fn item_filter_values(
         &self,
         library: &LibraryId,
@@ -1018,7 +1028,7 @@ impl Session {
             library: library.clone(),
         };
         match self.call(request).await? {
-            Reply::ItemFilterValues { values } => Ok(values),
+            Reply::ItemFilterValues { values } => Ok(values.known()),
             other => Err(unexpected(other)),
         }
     }
@@ -1051,7 +1061,7 @@ impl Session {
             } => Ok(ItemDetail {
                 item,
                 children,
-                markers,
+                markers: markers.into_vec(),
                 playlists,
                 liked,
                 liked_children,
@@ -1139,7 +1149,7 @@ impl Session {
             id: id.clone(),
             selection,
             bitmap,
-            display,
+            display: display.or_else(|| self.client.display()),
         };
         match self.call(request).await? {
             Reply::PlaybackPlan { plan, chosen } => Ok(Plan { plan, chosen }),
@@ -1177,7 +1187,7 @@ impl Session {
             start_ms: options.start.map(millis),
             bitmap: options.bitmap,
             quality: self.wire_quality(options.quality),
-            display: options.display,
+            display: options.display.or_else(|| self.client.display()),
             capabilities: None,
             onward_share: None,
         };
@@ -1189,13 +1199,15 @@ impl Session {
                 chosen,
                 epoch,
                 markers,
+                duration,
             } => Ok(Playback {
                 handle,
                 plan,
                 size,
                 chosen,
                 epoch,
-                markers,
+                markers: markers.into_vec(),
+                duration,
             }),
             other => Err(unexpected(other)),
         }
@@ -1741,13 +1753,30 @@ impl Session {
         bitmap: BitmapSubtitles,
         position: Duration,
     ) -> Result<PlaybackChange, SdkError> {
+        let replan = crate::Replan {
+            bitmap,
+            position,
+            display: None,
+        };
+        self.change_subtitle_on(handle, subtitle, &replan).await
+    }
+
+    /// [`Session::change_subtitle`] as `replan` says, for the display a
+    /// playback was opened for ([`crate::Replan::display`]).
+    pub(crate) async fn change_subtitle_on(
+        &self,
+        handle: &PlaybackHandle,
+        subtitle: Option<u32>,
+        replan: &crate::Replan,
+    ) -> Result<PlaybackChange, SdkError> {
         let request = Request::ChangeSubtitle {
             handle: handle.clone(),
             subtitle,
-            bitmap,
-            position_ms: millis(position),
-            // The playback's own, as it started.
-            display: None,
+            bitmap: replan.bitmap,
+            position_ms: millis(replan.position),
+            // A mode switched since the start counts here, unless the
+            // playback was opened for a display of its own.
+            display: replan.display.clone().or_else(|| self.client.display()),
             onward_share: None,
         };
         match self.call(request).await? {
@@ -1780,8 +1809,23 @@ impl Session {
         bitmap: BitmapSubtitles,
         position: Duration,
     ) -> Result<PlaybackChange, SdkError> {
-        self.quality_request(handle, self.wire_quality(quality), bitmap, position)
-            .await
+        let replan = crate::Replan {
+            bitmap,
+            position,
+            display: None,
+        };
+        self.change_quality_on(handle, quality, &replan).await
+    }
+
+    /// [`Session::change_quality`] as `replan` says.
+    pub(crate) async fn change_quality_on(
+        &self,
+        handle: &PlaybackHandle,
+        quality: PlaybackQuality,
+        replan: &crate::Replan,
+    ) -> Result<PlaybackChange, SdkError> {
+        let quality = self.wire_quality(quality);
+        self.quality_request(handle, quality, replan).await
     }
 
     /// Tell the server the link carries only `link_bitrate` bits per
@@ -1794,27 +1838,40 @@ impl Session {
         bitmap: BitmapSubtitles,
         position: Duration,
     ) -> Result<PlaybackChange, SdkError> {
+        let replan = crate::Replan {
+            bitmap,
+            position,
+            display: None,
+        };
+        self.limit_playback_on(handle, link_bitrate, &replan).await
+    }
+
+    /// [`Session::limit_playback`] as `replan` says.
+    pub(crate) async fn limit_playback_on(
+        &self,
+        handle: &PlaybackHandle,
+        link_bitrate: u64,
+        replan: &crate::Replan,
+    ) -> Result<PlaybackChange, SdkError> {
         let quality = Quality::Auto {
             link_bitrate: Some(link_bitrate),
         };
-        self.quality_request(handle, quality, bitmap, position)
-            .await
+        self.quality_request(handle, quality, replan).await
     }
 
     async fn quality_request(
         &self,
         handle: &PlaybackHandle,
         quality: Quality,
-        bitmap: BitmapSubtitles,
-        position: Duration,
+        replan: &crate::Replan,
     ) -> Result<PlaybackChange, SdkError> {
         let request = Request::ChangeQuality {
             handle: handle.clone(),
             quality,
-            bitmap,
-            position_ms: millis(position),
-            // The playback's own, as it started.
-            display: None,
+            bitmap: replan.bitmap,
+            position_ms: millis(replan.position),
+            // As in `change_subtitle_on`.
+            display: replan.display.clone().or_else(|| self.client.display()),
             onward_share: None,
         };
         match self.call(request).await? {

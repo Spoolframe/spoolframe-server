@@ -69,7 +69,7 @@ impl Markers {
         up_next_shown: bool,
     ) -> Option<MarkerOffer> {
         let (_, marker) = self.marker_at(time)?;
-        let end = Duration::from_millis(marker.end_ms);
+        let end = marker.end;
         let to = duration.map_or(end, |d| end.min(d));
         match marker.kind {
             MarkerKind::Intro => Some(MarkerOffer::SkipIntro { to }),
@@ -84,8 +84,8 @@ impl Markers {
     /// The marker whose button shows at `time`, with its place.
     fn marker_at(&self, time: Duration) -> Option<(usize, &Marker)> {
         self.markers.iter().enumerate().find(|(_, m)| {
-            let start = Duration::from_millis(m.start_ms);
-            let end = Duration::from_millis(m.end_ms).saturating_sub(SKIP_END_MARGIN);
+            let start = m.start;
+            let end = m.end.saturating_sub(SKIP_END_MARGIN);
             m.kind != MarkerKind::Unknown && start <= time && (time < end || m.to_end)
         })
     }
@@ -111,7 +111,7 @@ pub fn credits_start(markers: &[Marker]) -> Option<Duration> {
         .clone()
         .find(|m| m.to_end)
         .or_else(|| credits.next_back())?;
-    Some(Duration::from_millis(marker.start_ms))
+    Some(marker.start)
 }
 
 /// What the player does at a position ([`MarkerTracker::on_position`]).
@@ -132,6 +132,21 @@ struct Skip {
     at: Instant,
 }
 
+/// How an app shows the end of an item ([`MarkerTracker::with_options`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerOptions {
+    /// It has an Up next card, which takes Next's place once due. Without
+    /// one, Next is offered through credits that run to the end, and no
+    /// [`MarkerAction::UpNext`] comes. On by default.
+    pub up_next_card: bool,
+}
+
+impl Default for MarkerOptions {
+    fn default() -> Self {
+        Self { up_next_card: true }
+    }
+}
+
 /// Follows the position through an item's markers: what to show, and
 /// when to skip an intro by itself. One per item played.
 #[derive(Debug)]
@@ -139,6 +154,7 @@ pub struct MarkerTracker {
     markers: Markers,
     /// Skip intros without asking (a preference).
     auto_skip: bool,
+    options: MarkerOptions,
     offered: Option<MarkerOffer>,
     up_next: bool,
     /// The markers already skipped by themselves: each once.
@@ -148,9 +164,14 @@ pub struct MarkerTracker {
 
 impl MarkerTracker {
     pub fn new(markers: Markers, auto_skip: bool) -> Self {
+        Self::with_options(markers, auto_skip, MarkerOptions::default())
+    }
+
+    pub fn with_options(markers: Markers, auto_skip: bool, options: MarkerOptions) -> Self {
         Self {
             markers,
             auto_skip,
+            options,
             offered: None,
             up_next: false,
             skipped: Vec::new(),
@@ -177,7 +198,7 @@ impl MarkerTracker {
         settled: bool,
     ) -> Vec<MarkerAction> {
         let mut actions = Vec::new();
-        let up_next = self.markers.up_next_due(at, length);
+        let up_next = self.options.up_next_card && self.markers.up_next_due(at, length);
         if up_next != self.up_next {
             self.up_next = up_next;
             actions.push(MarkerAction::UpNext(up_next));
@@ -226,8 +247,8 @@ mod tests {
     fn marker(kind: MarkerKind, start_ms: u64, end_ms: u64, to_end: bool) -> Marker {
         Marker {
             kind,
-            start_ms,
-            end_ms,
+            start: Duration::from_millis(start_ms),
+            end: Duration::from_millis(end_ms),
             to_end,
         }
     }
@@ -402,6 +423,22 @@ mod tests {
             t.on_position(secs(2_650), LENGTH, true),
             [MarkerAction::UpNext(true)]
         );
+    }
+
+    #[test]
+    fn with_no_up_next_card_next_stays_through_the_credits() {
+        let mut t = MarkerTracker::with_options(
+            Markers::new(episode(), true),
+            false,
+            MarkerOptions {
+                up_next_card: false,
+            },
+        );
+        assert_eq!(
+            t.on_position(secs(2_650), LENGTH, true),
+            [MarkerAction::Offer(Some(MarkerOffer::Next))]
+        );
+        assert_eq!(t.on_position(secs(2_690), LENGTH, true), []);
     }
 
     #[tokio::test(start_paused = true)]

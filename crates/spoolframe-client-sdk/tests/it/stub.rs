@@ -580,7 +580,7 @@ fn answer(
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
-            requested_at: 0,
+            requested_at: spoolframe_types::serde_time::unix_seconds::from_wire(0),
             remember: false,
             requested_from: None,
         }),

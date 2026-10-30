@@ -15,7 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use spoolframe_protocol::{BitmapSubtitles, ManifestKind, PlaybackHandle, Selection};
+use spoolframe_protocol::{ManifestKind, PlaybackHandle, Selection};
 use spoolframe_types::{MediaId, Namespace};
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,10 +76,9 @@ impl PlaybackBackend for Routed {
         &self,
         h: &PlaybackHandle,
         s: Option<u32>,
-        b: BitmapSubtitles,
-        p: Duration,
+        replan: &super::Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        PlaybackBackend::subtitle(&self.on(), h, s, b, p).await
+        PlaybackBackend::subtitle(&self.on(), h, s, replan).await
     }
     /// Home, by the `fed:` id: the paired server keeps nothing of it.
     async fn progress(&self, _: &PlaybackHandle, position: Duration) -> Result<(), SdkError> {
@@ -92,19 +91,17 @@ impl PlaybackBackend for Routed {
         &self,
         h: &PlaybackHandle,
         q: PlaybackQuality,
-        b: BitmapSubtitles,
-        p: Duration,
+        replan: &super::Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        PlaybackBackend::change_quality(&self.on(), h, q, b, p).await
+        PlaybackBackend::change_quality(&self.on(), h, q, replan).await
     }
     async fn limit(
         &self,
         h: &PlaybackHandle,
         l: u64,
-        b: BitmapSubtitles,
-        p: Duration,
+        replan: &super::Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        PlaybackBackend::limit(&self.on(), h, l, b, p).await
+        PlaybackBackend::limit(&self.on(), h, l, replan).await
     }
     async fn http_playback_url(&self, h: &PlaybackHandle) -> Result<crate::HttpPlayback, SdkError> {
         PlaybackBackend::http_playback_url(&self.on(), h).await
@@ -166,6 +163,13 @@ impl PlaybackBackend for Routed {
     }
     fn route(&self) -> Option<RemoteMode> {
         self.route.lock().as_ref().map(|r| r.mode)
+    }
+    /// None followed: the playback picks its server once, at start, and a
+    /// paired server's events name its own item, not the `fed:` id.
+    fn subtitle_timings(
+        &self,
+    ) -> Option<(String, broadcast::Receiver<crate::SubtitleTimingEvent>)> {
+        None
     }
 }
 

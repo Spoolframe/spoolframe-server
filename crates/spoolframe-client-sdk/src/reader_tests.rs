@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, PlaybackPlan, Selection};
+use spoolframe_protocol::{PlaybackHandle, PlaybackPlan, Selection};
 use spoolframe_types::{Container, Delivery, MediaId, MediaKind, Namespace};
 use std::{
     collections::HashMap,
@@ -121,6 +121,7 @@ impl TestBackend {
             },
             chosen: None,
             markers: vec![],
+            duration: None,
             plan: if self.grow.is_some() {
                 PlaybackPlan::Converted {
                     delivery: Delivery::Progressive,
@@ -231,8 +232,7 @@ impl PlaybackBackend for TestBackend {
         &self,
         _: &PlaybackHandle,
         _: Option<u32>,
-        _: BitmapSubtitles,
-        _: Duration,
+        _: &crate::Replan,
     ) -> Result<PlaybackChange, SdkError> {
         Err(SdkError::InvalidInput(
             "test transport has no subtitles".into(),
@@ -252,8 +252,7 @@ impl PlaybackBackend for TestBackend {
         &self,
         _: &PlaybackHandle,
         link_bitrate: u64,
-        _: BitmapSubtitles,
-        _: Duration,
+        _: &crate::Replan,
     ) -> Result<PlaybackChange, SdkError> {
         self.limits.lock().push(link_bitrate);
         if self
@@ -276,5 +275,36 @@ impl PlaybackBackend for TestBackend {
             size: 0,
             epoch: 1,
         })
+    }
+    fn shares(&self) -> Option<tokio::sync::broadcast::Receiver<crate::managed::PlaybackShare>> {
+        None
+    }
+    async fn set_track_override(
+        &self,
+        _: &spoolframe_types::MediaId,
+        _: spoolframe_protocol::Selection,
+    ) -> Result<(), crate::SdkError> {
+        Err(crate::SdkError::InvalidInput(
+            "no track choices here".into(),
+        ))
+    }
+    async fn read_subtitle(
+        &self,
+        _: &spoolframe_protocol::PlaybackHandle,
+    ) -> Result<crate::Subtitle, crate::SdkError> {
+        Err(crate::SdkError::InvalidInput(
+            "no subtitle files here".into(),
+        ))
+    }
+    fn subtitle_timings(
+        &self,
+    ) -> Option<(
+        String,
+        tokio::sync::broadcast::Receiver<crate::SubtitleTimingEvent>,
+    )> {
+        None
+    }
+    fn route(&self) -> Option<crate::RemoteMode> {
+        None
     }
 }

@@ -28,6 +28,9 @@ impl ManagedPlayback {
     /// How long to wait before asking again for a subtitle the server is
     /// still reading as text.
     pub const SUBTITLE_RETRY: Duration = Duration::from_secs(5);
+    /// How long a player waits for a subtitle the server is still reading
+    /// as text before it plays on without ([`Self::subtitle_file_within`]).
+    pub const SUBTITLE_WAIT: Duration = Duration::from_secs(30);
 
     /// The playback's subtitle file, once the server has it. One still
     /// being read as text is asked for again every
@@ -37,18 +40,37 @@ impl ManagedPlayback {
     /// UTF-8 text, is [`SdkError::Protocol`], as every subtitle file the
     /// server sends is text.
     pub async fn subtitle_file(&self) -> Result<SubtitleFile, SdkError> {
+        self.subtitle_file_until(None).await
+    }
+
+    /// [`Self::subtitle_file`], waiting up to `wait` for one still being
+    /// read as text ([`Self::SUBTITLE_WAIT`] is a player's): then, once
+    /// the next ask would come past it, [`SdkError::SubtitleNotReady`]
+    /// with how far the server got.
+    pub async fn subtitle_file_within(&self, wait: Duration) -> Result<SubtitleFile, SdkError> {
+        self.subtitle_file_until(Some(tokio::time::Instant::now() + wait))
+            .await
+    }
+
+    async fn subtitle_file_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<SubtitleFile, SdkError> {
         let this = self.clone();
         let mut asking = Asking(
             self.0
                 .runtime
-                .spawn(async move { this.ask_subtitle().await }),
+                .spawn(async move { this.ask_subtitle(deadline).await }),
         );
         (&mut asking.0)
             .await
             .map_err(|e| SdkError::Protocol(format!("subtitle task ended: {e}")))?
     }
 
-    async fn ask_subtitle(&self) -> Result<SubtitleFile, SdkError> {
+    async fn ask_subtitle(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<SubtitleFile, SdkError> {
         if !subtitle_comes_as_file(&self.live()?.plan) {
             return Err(SdkError::InvalidInput(
                 "this playback's subtitle is not a file".into(),
@@ -64,7 +86,12 @@ impl ManagedPlayback {
             match answer {
                 Err(SdkError::SubtitleNotReady { done_percent }) => {
                     tracing::debug!(done_percent, "the subtitle is still being read");
-                    tokio::time::sleep(Self::SUBTITLE_RETRY).await;
+                    // The next ask would come past the wait: given up now.
+                    let next = tokio::time::Instant::now() + Self::SUBTITLE_RETRY;
+                    if deadline.is_some_and(|deadline| next > deadline) {
+                        return Err(SdkError::SubtitleNotReady { done_percent });
+                    }
+                    tokio::time::sleep_until(next).await;
                 }
                 answer => break answer?,
             }

@@ -24,7 +24,6 @@
 //! does not know, which is left as it is.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,9 +31,10 @@ use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::downloads::{DownloadFile, DownloadSource, DownloadTracks, OfflineWatch};
-use spoolframe_types::{ArtworkKind, Container, Item, Marker, MediaId, MediaTracks};
+use spoolframe_types::{ArtworkKind, Container, Item, Markers, MediaId, MediaTracks};
 
 use super::{DownloadPhase, LocalWatch};
+use crate::storage::files;
 
 /// This layout's version, in each manifest: 2 since files are shared by
 /// the device's users.
@@ -165,7 +165,9 @@ pub(crate) struct Manifest {
     /// An episode's show and season, as the server had them.
     pub show: Option<Item>,
     pub season: Option<Item>,
-    pub markers: Vec<Marker>,
+    /// One kept by an older SDK may hold a kind this build does not
+    /// know: [`Markers`] leaves it out.
+    pub markers: Markers,
     pub artwork: Vec<StoredArtwork>,
     /// The item's tracks, as `Tracks` gave them: what the file's tracks
     /// are labelled with offline.
@@ -351,6 +353,9 @@ pub(crate) struct Store {
     /// disk at first use, then kept by each write and removal here, so
     /// the manager need not read every manifest to find the next.
     active: Arc<Mutex<Option<Active>>>,
+    /// How many of every profile's downloads are under way, as `active`
+    /// last held: sent on each change of it.
+    running: Arc<tokio::sync::watch::Sender<usize>>,
     /// Where each item's downloads are, by the item's id and, for an
     /// episode, its show's: read from the disk at first use, then kept
     /// by each write and removal here, so finding one item's downloads
@@ -390,6 +395,7 @@ impl Store {
         Self {
             root,
             active: Arc::default(),
+            running: Arc::new(tokio::sync::watch::Sender::new(0)),
             items: Arc::default(),
         }
     }
@@ -433,6 +439,10 @@ impl Store {
     pub fn rescan(&self) {
         *self.items.lock() = None;
         *self.active.lock() = None;
+        // Read again now, as the store opens (`migrate` rescans first):
+        // the running count ([`Store::running`]) is never read from the
+        // disk by its caller, an app's UI thread among them.
+        self.change_active(|_| ());
     }
 
     /// The listing directories as they are now ([`Index::stamp`]).
@@ -557,9 +567,21 @@ impl Store {
 
     /// The keys of the downloads under way, oldest first.
     pub fn active(&self) -> Vec<String> {
+        self.change_active(|active| active.iter().map(|(_, _, key)| key.clone()).collect())
+    }
+
+    /// How many downloads are under way, every profile's, and each
+    /// change of that from now.
+    pub fn running(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.running.subscribe()
+    }
+
+    /// Look at or change the downloads under way, then send their count
+    /// ([`Store::running`]) if it moved. They are read from the disk if
+    /// not held, while the lock is held: a write meanwhile notes itself
+    /// after this, not before.
+    fn change_active<T>(&self, change: impl FnOnce(&mut Active) -> T) -> T {
         let mut active = self.active.lock();
-        // Read while the lock is held: a write meanwhile notes itself
-        // after this, not before.
         let active = active.get_or_insert_with(|| {
             self.scan()
                 .into_iter()
@@ -567,21 +589,27 @@ impl Store {
                 .map(|m| (m.created_at, m.place, m.key))
                 .collect()
         });
-        active.iter().map(|(_, _, key)| key.clone()).collect()
+        let answer = change(active);
+        let count = active.len();
+        self.running.send_if_modified(|sent| {
+            let moved = *sent != count;
+            *sent = count;
+            moved
+        });
+        answer
     }
 
     /// Download `key` was found not under way: changed or removed by
     /// another process using this directory, it is let go of unless the
     /// disk says it is under way.
     pub fn recheck(&self, key: &str) {
-        let mut active = self.active.lock();
         // Read while the lock is held: a write meanwhile notes itself
         // after this.
-        if let Some(active) = active.as_mut()
-            && !self.find(key).is_some_and(|m| m.phase.is_active())
-        {
-            active.retain(|(_, _, k)| k != key);
-        }
+        self.change_active(|active| {
+            if !self.find(key).is_some_and(|m| m.phase.is_active()) {
+                active.retain(|(_, _, k)| k != key);
+            }
+        });
     }
 
     /// The ids `m` is listed under in [`Items`].
@@ -652,16 +680,17 @@ impl Store {
         }
     }
 
-    /// `m` is under way, or no longer.
+    /// `m` is under way, or no longer. Read from the disk first if not
+    /// held, so the count sent ([`Store::running`]) is every change.
     fn note(&self, m: &Manifest, under_way: bool) {
-        if let Some(active) = self.active.lock().as_mut() {
-            let entry = (m.created_at, m.place, m.key.clone());
+        let entry = (m.created_at, m.place, m.key.clone());
+        self.change_active(|active| {
             if under_way {
                 active.insert(entry);
             } else {
                 active.remove(&entry);
             }
-        }
+        });
     }
 
     /// A new manifest for these.
@@ -692,7 +721,7 @@ impl Store {
             item,
             show: None,
             season: None,
-            markers: Vec::new(),
+            markers: Markers::default(),
             artwork: Vec::new(),
             tracks,
             source,
@@ -944,9 +973,10 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -
     }
 }
 
-/// Write `value` to `path` as JSON, whole or not at all.
+/// Write `value` to `path` as JSON, whole or not at all, and kept
+/// ([`files::write`]).
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    write_whole(
+    files::write(
         path,
         &serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?,
     )
@@ -954,24 +984,10 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Resul
 
 /// [`write_json`] on one line, with no spaces.
 fn write_json_compact<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    write_whole(
+    files::write(
         path,
         &serde_json::to_vec(value).map_err(std::io::Error::other)?,
     )
-}
-
-/// Write `bytes` to `path` whole or not at all: to a file beside it,
-/// renamed over it.
-fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().expect("a file in a directory");
-    std::fs::create_dir_all(dir)?;
-    let mut new = path.as_os_str().to_owned();
-    new.push(".new");
-    let new = PathBuf::from(new);
-    let mut file = std::fs::File::create(&new)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&new, path)
 }
 
 /// [`dir_name`] undone; `None` for a name it would not make.
@@ -1500,9 +1516,9 @@ mod tests {
             m["holds"] = serde_json::json!([{"by": "download", "id": null}]);
             m.as_object_mut().unwrap().remove("watches");
             m["watch"] = serde_json::to_value(LocalWatch {
-                position_ms: Some(position),
+                position: Some(std::time::Duration::from_millis(position)),
                 watched: None,
-                at: 5,
+                at: spoolframe_types::serde_time::unix_seconds::from_wire(5),
                 pending: true,
             })
             .unwrap();
@@ -1546,8 +1562,14 @@ mod tests {
             film.holds,
             [Hold::download("local:0f3a"), Hold::download("local:bob")]
         );
-        assert_eq!(film.watch_of("local:0f3a").position_ms, Some(10));
-        assert_eq!(film.watch_of("local:bob").position_ms, Some(20));
+        assert_eq!(
+            film.watch_of("local:0f3a").position,
+            Some(std::time::Duration::from_millis(10))
+        );
+        assert_eq!(
+            film.watch_of("local:bob").position,
+            Some(std::time::Duration::from_millis(20))
+        );
         // The finished one stayed, with its file.
         assert_eq!(film.phase, DownloadPhase::Done);
         assert_eq!(
@@ -1656,9 +1678,9 @@ mod tests {
         let store = store("carried");
         let mut m = manifest("ab12", 1);
         *m.watch_mut("local:0f3a") = LocalWatch {
-            position_ms: Some(90_000),
+            position: Some(std::time::Duration::from_millis(90_000)),
             watched: None,
-            at: 1_700_000_000,
+            at: spoolframe_types::serde_time::unix_seconds::from_wire(1_700_000_000),
             pending: true,
         };
         store.write(&m).unwrap();
@@ -1687,7 +1709,7 @@ mod tests {
         // A sent one is not kept.
         let mut sent = manifest("cd34", 2);
         sent.watch_mut("local:0f3a").pending = false;
-        sent.watch_mut("local:0f3a").position_ms = Some(5);
+        sent.watch_mut("local:0f3a").position = Some(std::time::Duration::from_millis(5));
         store.write(&sent).unwrap();
         store.remove(&sent).unwrap();
         assert_eq!(store.carried("server-key", "local:0f3a").len(), 1);

@@ -4,18 +4,9 @@
 use super::*;
 use crate::LocalWatch;
 use crate::downloads::store::{Hold, Store};
+use crate::test_fixtures::movie;
 use spoolframe_protocol::downloads::{DownloadFailure, DownloadSource, DownloadTracks};
 use spoolframe_types::MediaTracks;
-
-fn movie(id: &str, title: &str) -> Item {
-    serde_json::from_value(serde_json::json!({
-        "kind": "movie", "id": id, "title": title, "year": 2016,
-        "release_date": null, "summary": null, "content_rating": null,
-        "duration": 6_000_000, "artwork": [],
-        "playback": { "position": null, "watched": false },
-    }))
-    .expect("a movie")
-}
 
 fn show(id: &str, title: &str) -> Item {
     serde_json::from_value(serde_json::json!({
@@ -63,7 +54,7 @@ fn download(key: &str, item: Item, phase: DownloadPhase, created_at: i64) -> Loc
         file_url: None,
         watch: LocalWatch::default(),
         note: None,
-        created_at,
+        created_at: spoolframe_types::serde_time::unix_seconds::from_wire(created_at),
     }
 }
 
@@ -74,9 +65,9 @@ fn done(key: &str, item: Item) -> LocalDownload {
 /// Stopped at a minute in, at `at`.
 fn begun(mut d: LocalDownload, at: i64) -> LocalDownload {
     d.watch = LocalWatch {
-        position_ms: Some(60_000),
+        position: Some(std::time::Duration::from_millis(60_000)),
         watched: None,
-        at,
+        at: spoolframe_types::serde_time::unix_seconds::from_wire(at),
         pending: true,
     };
     d

@@ -49,6 +49,8 @@ pub struct ProgressiveReader {
 
 struct Shared {
     playback: ManagedPlayback,
+    /// The playback's generation it reads (`ManagedPlayback::generation`).
+    generation: u64,
     source: crate::Playback,
     /// The most fetched ahead of the last read.
     cap: u64,
@@ -89,9 +91,45 @@ impl ProgressiveReader {
         Self::with_cap(playback, spawn, MAX_BUFFERED, resume)
     }
 
+    /// [`ProgressiveReader::new`] for the playback as it was in
+    /// `generation`, as its player was given it:
+    /// [`crate::SdkError::Replanned`] if it has moved on since, rather
+    /// than a reader of the new encode for a player of the old.
+    pub fn for_generation(
+        playback: ManagedPlayback,
+        spawn: Spawn,
+        bitrate: Option<u64>,
+        generation: u64,
+    ) -> Result<Self, BackendError> {
+        let source = playback.snapshot_at(generation)?;
+        let resume = resume_bytes(bitrate);
+        Ok(Self::of(
+            playback,
+            source,
+            generation,
+            spawn,
+            MAX_BUFFERED,
+            resume,
+        ))
+    }
+
     fn with_cap(playback: ManagedPlayback, spawn: Spawn, cap: u64, resume: u64) -> Self {
+        let (source, generation) = playback.snapshot_with_generation();
+        Self::of(playback, source, generation, spawn, cap, resume)
+    }
+
+    /// A reader of `source`, the playback in `generation`.
+    fn of(
+        playback: ManagedPlayback,
+        source: crate::Playback,
+        generation: u64,
+        spawn: Spawn,
+        cap: u64,
+        resume: u64,
+    ) -> Self {
         let shared = Arc::new(Shared {
-            source: playback.snapshot(),
+            generation,
+            source,
             playback,
             cap,
             resume,
@@ -142,6 +180,13 @@ impl ByteSource for ProgressiveReader {
                 drop(state);
                 finish(reported, buffering);
                 return Err(ReadError::Flushing);
+            }
+            // Planned again, or started again: what is kept, and what
+            // comes, is another encode's.
+            if shared.playback.generation() != shared.generation {
+                drop(state);
+                finish(reported, buffering);
+                return Err(BackendError::Replanned.into());
             }
             let ready = state.end.saturating_sub(offset);
             let enough = !reported || ready >= shared.resume || state.complete;

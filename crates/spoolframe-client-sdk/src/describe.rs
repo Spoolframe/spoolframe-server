@@ -6,7 +6,7 @@
 //! A card's caption is [`spoolframe_types::Item::caption_parts`].
 //! Nothing here is English but [`Language::english`], a fallback.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use spoolframe_protocol::Selection;
 use spoolframe_types::{
@@ -388,9 +388,10 @@ pub enum Ago {
     Days(u64),
 }
 
-/// How long before `now` `at` was, both Unix seconds.
-pub fn ago(at: u64, now: u64) -> Ago {
-    let secs = now.saturating_sub(at);
+/// How long before `now` `at` was; just now for a time after `now`
+/// (another device's clock).
+pub fn ago(at: SystemTime, now: SystemTime) -> Ago {
+    let secs = now.duration_since(at).map_or(0, |d| d.as_secs());
     match secs {
         0..60 => Ago::JustNow,
         60..3600 => Ago::Minutes(secs / 60),
@@ -404,18 +405,18 @@ pub fn ago(at: u64, now: u64) -> Ago {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Played {
     pub count: u32,
-    /// When it was last played, Unix seconds, for a date of the
-    /// platform's own; and how long before now that was.
-    pub last_at: Option<i64>,
+    /// When it was last played, for a date of the platform's own; and
+    /// how long before now that was.
+    pub last_at: Option<SystemTime>,
     pub last: Option<Ago>,
 }
 
 /// What `state` says of plays at `now`; `None` for never played.
-pub fn played(state: &PlaybackState, now: u64) -> Option<Played> {
+pub fn played(state: &PlaybackState, now: SystemTime) -> Option<Played> {
     (state.play_count > 0).then(|| Played {
         count: state.play_count,
         last_at: state.last_played_at,
-        last: state.last_played_at.map(|at| ago(at.max(0) as u64, now)),
+        last: state.last_played_at.map(|at| ago(at, now)),
     })
 }
 
@@ -496,6 +497,7 @@ pub fn year_range(filter: &ItemFilter) -> YearRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn languages_are_known_by_either_code_and_keep_their_region() {
@@ -666,27 +668,29 @@ mod tests {
             remaining(Duration::from_secs(60), Duration::from_secs(59)).minutes,
             1
         );
-        assert_eq!(ago(100, 130), Ago::JustNow);
-        assert_eq!(ago(0, 7200), Ago::Hours(2));
-        assert_eq!(ago(0, 3 * 86_400), Ago::Days(3));
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        assert_eq!(ago(at(100), at(130)), Ago::JustNow);
+        assert_eq!(ago(at(0), at(7200)), Ago::Hours(2));
+        assert_eq!(ago(at(0), at(3 * 86_400)), Ago::Days(3));
+        assert_eq!(ago(at(130), at(100)), Ago::JustNow);
     }
 
     #[test]
     fn played_says_how_often_and_when() {
         let state = PlaybackState {
             play_count: 3,
-            last_played_at: Some(1000),
+            last_played_at: Some(UNIX_EPOCH + Duration::from_secs(1000)),
             ..PlaybackState::default()
         };
         assert_eq!(
-            played(&state, 1000 + 120),
+            played(&state, UNIX_EPOCH + Duration::from_secs(1000 + 120)),
             Some(Played {
                 count: 3,
-                last_at: Some(1000),
+                last_at: state.last_played_at,
                 last: Some(Ago::Minutes(2))
             })
         );
-        assert_eq!(played(&PlaybackState::default(), 0), None);
+        assert_eq!(played(&PlaybackState::default(), UNIX_EPOCH), None);
     }
 
     #[test]

@@ -48,6 +48,12 @@ uniffi = { workspace = true, optional = true }
 url = { workspace = true }
 uuid = { workspace = true }
 
+# This device's addresses (getifaddrs) for Session::at_home_here and
+# default_quality_here. Android passes its own: ConnectivityManager knows
+# its networks, and getifaddrs needs no permission it lacks there.
+[target.'cfg(any(target_vendor = "apple", target_os = "linux"))'.dependencies]
+netdev = { workspace = true }
+
 [dev-dependencies]
 socket2 = { workspace = true }
 spoolframe-test-dir = { workspace = true }

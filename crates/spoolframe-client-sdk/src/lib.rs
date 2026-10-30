@@ -31,6 +31,7 @@ mod experimental;
 mod federation;
 pub mod gate;
 mod home_network;
+pub use home_network::at_home;
 mod invite_admin;
 mod invites;
 mod lan_servers;
@@ -53,12 +54,16 @@ pub mod queue;
 mod reachability;
 mod refusals;
 mod relay_policy;
+mod search_result;
+mod server_events;
 mod servers;
 mod session;
 mod sign_in_rules;
 pub mod storage;
 mod subtitle_search;
 mod subtitle_sync;
+#[cfg(test)]
+mod test_fixtures;
 mod watch_events;
 pub mod webauthn;
 mod whos_watching;
@@ -68,7 +73,9 @@ pub use catalog_cache::{CacheConfig, CatalogChanged, CatalogChanges, CatalogKey}
 pub use catalog_view::{
     AlbumTracks, ItemsSource, LibraryPager, SeasonEpisodes, ShowDetail, ShowTree, WatchScope,
 };
-pub use client::{Client, ClientOptions, Device, DeviceSignIn, STREAM_WINDOW, ServersWatch};
+pub use client::{
+    Client, ClientOptions, Device, DeviceSignIn, STREAM_WINDOW, ServersWatch, WeakClient,
+};
 pub use connection::Timeouts;
 pub use profile_store::{ProfileStore, profile_hash};
 pub use sign_in_rules::{
@@ -133,7 +140,7 @@ pub use portable::{
     RootSyncRefused, SecurityKey, SecurityKeyError, SoftSecurityKey, StateError, TieProof,
     UserDeviceCredential, WebAuthnError,
 };
-pub use profile_events::{ProfileChange, ProfileEvent, SessionEndReason};
+pub use profile_events::{OwnProfileEvents, ProfileChange, ProfileEvent, SessionEndReason};
 pub use quality::NotAQuality;
 pub use reachability::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
@@ -170,7 +177,13 @@ pub use spoolframe_protocol::{
     AudioSummary, PlanKind, PlanSummary, SubtitleHow, SubtitleSummary, VideoSummary,
 };
 // Experimental federation: a search's hits and a title's copies.
-pub use spoolframe_protocol::{Copies, HiddenUnder, PlayFromChoice, SearchHit, TitleCopy};
+pub use spoolframe_protocol::{
+    Copies, HiddenUnder, PlayFromChoice, SearchHit, SearchResult, TitleCopy,
+};
+// One server's events for a connection banner.
+pub use server_events::{ServerEvent, ServerEvents};
+// One kind of result for both searches.
+pub use search_result::search_results;
 // What a TV features from Home ([`HomeScreen::featured`]).
 pub use spoolframe_protocol::{Featured, FeaturedLimits, FeaturedRow};
 // Passkeys in the app: the raw WebAuthn bytes the platform's
@@ -198,16 +211,17 @@ uniffi::setup_scaffolding!();
 mod managed;
 mod markers;
 pub use markers::{
-    MarkerAction, MarkerOffer, MarkerTracker, Markers, SKIP_END_MARGIN, UNDO_WINDOW, UP_NEXT_LEAD,
-    UP_NEXT_MIN_LENGTH, credits_start,
+    MarkerAction, MarkerOffer, MarkerOptions, MarkerTracker, Markers, SKIP_END_MARGIN, UNDO_WINDOW,
+    UP_NEXT_LEAD, UP_NEXT_MIN_LENGTH, credits_start,
 };
 pub mod tracks;
 pub use managed::{
     ManagedPlayback, PlaybackBackend, PlaybackEvent, PlaybackShare, PlaybackStopped, PlayerSession,
-    PlayerState, RestartCause, SegmentStream, SubtitleFile,
+    PlayerState, Replan, RestartCause, SegmentStream, ShareWatch, SubtitleFile, WeakPlayback,
+    moves_player,
 };
 pub mod driver;
-pub use driver::{LocalSpawn, PlaybackController, PlaybackDriver};
+pub use driver::{LocalController, LocalSpawn, PlaybackController, PlaybackDriver};
 mod profile_scope;
 pub use profile_scope::{ProfileScope, ProfileToken};
 

@@ -117,22 +117,16 @@ fn is_local(ip: IpAddr) -> bool {
     }
 }
 
-/// A link's state, and why the SDK stopped dialling, sent together so a
-/// watcher never sees one without the other.
+/// A link's state, why the SDK stopped dialling, and how many times the
+/// server signed this device out, sent together so a watcher never sees
+/// one without the others: a sign-out and the stop it causes are one
+/// change.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Status {
-    state: ConnectionState,
+pub(crate) struct Status {
+    pub(crate) state: ConnectionState,
     /// Set only with [`ConnectionState::Disconnected`].
-    stopped: Option<SdkError>,
-}
-
-impl Status {
-    fn new(state: ConnectionState) -> Self {
-        Self {
-            state,
-            stopped: None,
-        }
-    }
+    pub(crate) stopped: Option<SdkError>,
+    pub(crate) sign_outs: u64,
 }
 
 /// Changes of one server's [`ConnectionState`].
@@ -174,29 +168,42 @@ impl StateWatch {
     pub fn stopped(&self) -> Option<SdkError> {
         self.0.borrow().stopped.clone()
     }
+
+    /// The whole status this watches, sign-outs too.
+    pub(crate) fn into_status(self) -> watch::Receiver<Status> {
+        self.0
+    }
 }
 
 /// Each time a server signs this device out: it closed the connection
 /// because the device's last session there ended ([`crate::Client::signed_out`]).
 #[derive(Debug, Clone)]
-pub struct SignOutWatch(watch::Receiver<u64>);
+pub struct SignOutWatch {
+    status: watch::Receiver<Status>,
+    /// The sign-outs counted when last told.
+    told: u64,
+}
 
 impl SignOutWatch {
     /// Returns at the next sign-out; `None` once the client is gone. A
     /// sign-out since the last call returns at once, so none goes unseen
-    /// between two calls; several are told as one.
+    /// between two calls, or before the client went; several are told as
+    /// one.
     pub async fn next(&mut self) -> Option<()> {
-        self.0.changed().await.ok()?;
-        self.0.borrow_and_update();
-        Some(())
+        loop {
+            let sign_outs = self.status.borrow_and_update().sign_outs;
+            if sign_outs != self.told {
+                self.told = sign_outs;
+                return Some(());
+            }
+            self.status.changed().await.ok()?;
+        }
     }
 }
 
 pub(crate) struct Link {
     id: EndpointId,
     state: watch::Sender<Status>,
-    /// How many times the server has signed this device out.
-    sign_outs: watch::Sender<u64>,
     /// The sessions a sign-out ended: a call in one is
     /// [`SdkError::SignInRequired`] without a dial.
     ended: Mutex<HashSet<String>>,
@@ -236,8 +243,11 @@ impl Link {
     pub fn new(id: EndpointId) -> Arc<Self> {
         Arc::new(Self {
             id,
-            state: watch::Sender::new(Status::new(ConnectionState::Disconnected)),
-            sign_outs: watch::Sender::new(0),
+            state: watch::Sender::new(Status {
+                state: ConnectionState::Disconnected,
+                stopped: None,
+                sign_outs: 0,
+            }),
             ended: Mutex::default(),
             current: Mutex::default(),
             info: Mutex::default(),
@@ -264,7 +274,9 @@ impl Link {
     }
 
     pub fn sign_outs(&self) -> SignOutWatch {
-        SignOutWatch(self.sign_outs.subscribe())
+        let status = self.state.subscribe();
+        let told = status.borrow().sign_outs;
+        SignOutWatch { status, told }
     }
 
     /// Whether the server signed this device out of `session`.
@@ -306,16 +318,30 @@ impl Link {
     }
 
     /// Say `state`, with no reason to have stopped.
-    fn show(&self, state: ConnectionState) {
-        self.state.send_replace(Status::new(state));
+    pub(crate) fn show(&self, state: ConnectionState) {
+        self.state.send_modify(|s| {
+            s.state = state;
+            s.stopped = None;
+        });
     }
 
     /// Stop with no connection: `Disconnected`, because of `reason`.
-    fn stop(&self, reason: SdkError) {
+    pub(crate) fn stop(&self, reason: SdkError) {
         *self.current.lock() = None;
-        self.state.send_replace(Status {
-            state: ConnectionState::Disconnected,
-            stopped: Some(reason),
+        self.state.send_modify(|s| {
+            s.state = ConnectionState::Disconnected;
+            s.stopped = Some(reason);
+        });
+    }
+
+    /// The server signed this device out: [`Link::stop`] for
+    /// [`SdkError::SignInRequired`] and a sign-out counted, in one change.
+    pub(crate) fn sign_out(&self) {
+        *self.current.lock() = None;
+        self.state.send_modify(|s| {
+            s.state = ConnectionState::Disconnected;
+            s.stopped = Some(SdkError::SignInRequired);
+            s.sign_outs += 1;
         });
     }
 
@@ -622,8 +648,7 @@ async fn signed_out(link: &Link, client: &Weak<Inner>) {
             Err(e) => tracing::warn!(server = %link.id, error = %e, "cannot end the sessions kept"),
         }
     }
-    link.stop(SdkError::SignInRequired);
-    link.sign_outs.send_modify(|n| *n += 1);
+    link.sign_out();
 }
 
 /// Returns when `conn` closes, the server says it is shutting down (then
@@ -859,6 +884,22 @@ mod tests {
 
     fn link() -> Arc<Link> {
         Link::new(iroh::SecretKey::from_bytes(&[7; 32]).public())
+    }
+
+    /// A sign-out the link sent just before it went is told before the
+    /// end; one from before the watch began is not.
+    #[tokio::test]
+    async fn a_sign_out_before_the_link_went_is_told() {
+        let link = link();
+        link.sign_out();
+        let mut sign_outs = link.sign_outs();
+        link.sign_out();
+        link.show(ConnectionState::Connecting);
+        drop(link);
+        assert_eq!(
+            [sign_outs.next().await, sign_outs.next().await],
+            [Some(()), None]
+        );
     }
 
     /// When each dial was made, `dial` failing with `error` until the

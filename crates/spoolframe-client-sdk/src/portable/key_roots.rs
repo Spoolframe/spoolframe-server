@@ -40,7 +40,6 @@ use super::{
     public_key, save, save_heads, save_issued, save_revoked, take_in, unix_now,
 };
 use crate::error::SdkError;
-use crate::servers::now;
 use crate::storage::{Storage, StorageError, keys};
 
 /// How long before a credential expires it is due for renewal: its last
@@ -104,6 +103,14 @@ pub enum SecurityKeyError {
     /// The person cancelled: the app says nothing.
     #[error("the security key action was cancelled")]
     Cancelled,
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl SecurityKeyError {
+    /// What to show: the same text as its `Display`.
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
 }
 
 /// A FIDO2 security key, as a device reaches it: raw CTAP2, as
@@ -600,8 +607,8 @@ impl super::Portable {
         let record = super::IssuedCredential {
             device_key,
             serial,
-            issued_at: now,
-            expires_at,
+            issued_at: spoolframe_types::serde_time::unix_seconds::from_wire(now),
+            expires_at: spoolframe_types::serde_time::unix_seconds::from_wire(expires_at),
             label: None,
             revoked_at: None,
         };
@@ -1058,8 +1065,8 @@ impl super::Portable {
             saved.push(PortableIdentity {
                 id,
                 name: name.to_owned(),
-                name_set_at: 0,
-                created_at: now(),
+                name_set_at: std::time::UNIX_EPOCH,
+                created_at: spoolframe_types::serde_time::unix_seconds::now(),
                 has_root: false,
                 key_rooted,
             });

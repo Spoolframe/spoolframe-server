@@ -25,6 +25,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use spoolframe_types::serde_time::unix_seconds;
 
 use bip39::{Language, Mnemonic};
 use ed25519_dalek::{Signer, SigningKey};
@@ -228,9 +231,9 @@ pub struct GuestPairing {
     /// ([`crate::Paired::servers`]). `None` when there was none, or none
     /// is recorded.
     pub server: Option<GuestServer>,
-    /// When it was last paired onto this device, Unix seconds. `None` when
-    /// none is recorded.
-    pub paired_at: Option<u64>,
+    /// When it was last paired onto this device (kept as Unix seconds).
+    /// `None` when none is recorded.
+    pub paired_at: Option<SystemTime>,
 }
 
 /// The server a guest was paired for ([`GuestPairing::server`]), as this
@@ -276,15 +279,19 @@ pub struct PortableIdentity {
     /// record, to the user's own devices only, and the newest name
     /// ([`Self::name_set_at`]) is the one every device lists.
     pub name: String,
-    /// Unix seconds: when [`Self::name`] was last set by a rename, here or
-    /// on another synced device. 0 for the name it was made, recovered or
-    /// adopted with, so any rename beats that one.
-    // Read as the default when left out: a stored record, not a message of
+    /// When [`Self::name`] was last set by a rename, here or on another
+    /// synced device (kept as Unix seconds). The epoch for the name it was
+    /// made, recovered or adopted with, so any rename beats that one.
+    // Read as the epoch when left out: a stored record, not a message of
     // the client protocol, and one written by an SDK before it lacks the key.
-    #[serde(default)]
-    pub name_set_at: u64,
-    /// Unix seconds: made, or first recovered, here.
-    pub created_at: u64,
+    #[serde(
+        default = "spoolframe_types::serde_time::epoch",
+        with = "spoolframe_types::serde_time::unix_seconds"
+    )]
+    pub name_set_at: SystemTime,
+    /// Made, or first recovered, here (kept as Unix seconds).
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub created_at: SystemTime,
     /// Whether its root is here now, as [`Portable::list`] found it: this
     /// device's own copy, or the synced one ([`Portable::root_location`]).
     /// Not stored: an app's storage restored from a backup that leaves
@@ -309,18 +316,20 @@ pub struct PortableIdentity {
 pub struct IssuedCredential {
     pub device_key: DevicePublicKey,
     pub serial: u64,
-    /// Unix seconds.
-    pub issued_at: i64,
-    /// Unix seconds.
-    pub expires_at: i64,
+    /// Kept as Unix seconds.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub issued_at: SystemTime,
+    /// Kept as Unix seconds.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub expires_at: SystemTime,
     /// What the user called the device when issuing ("Living room TV");
     /// theirs alone. A renewal without one keeps the one before.
     pub label: Option<String>,
-    /// Unix seconds: revoked here (by this root, or in a state accepted
+    /// When it was revoked here (by this root, or in a state accepted
     /// from elsewhere), however long ago. Not stored: read from the
     /// revoked keys when listed.
     #[serde(skip)]
-    pub revoked_at: Option<i64>,
+    pub revoked_at: Option<SystemTime>,
 }
 
 /// The portable identities on this device, kept in the app's [`Storage`]:
@@ -389,13 +398,17 @@ impl Portable {
         let revoked = load_revoked(storage, id).await?;
         let heads = load_heads(storage, id).await?;
         for entry in &mut issued {
-            entry.revoked_at = revoked.get(&entry.device_key).copied().or_else(|| {
-                heads
-                    .iter()
-                    .flat_map(|s| &s.revoked)
-                    .find(|r| r.key == entry.device_key)
-                    .map(|r| r.revoked_at)
-            });
+            entry.revoked_at = revoked
+                .get(&entry.device_key)
+                .copied()
+                .or_else(|| {
+                    heads
+                        .iter()
+                        .flat_map(|s| &s.revoked)
+                        .find(|r| r.key == entry.device_key)
+                        .map(|r| r.revoked_at)
+                })
+                .map(unix_seconds::from_wire);
         }
         Ok(issued)
     }
@@ -452,10 +465,15 @@ impl Portable {
     /// [`SdkError::UnknownIdentity`]. The name it has already changes
     /// nothing.
     pub async fn rename(&self, id: PortableUserId, name: &str) -> Result<(), SdkError> {
-        self.rename_at(id, name, now()).await
+        self.rename_at(id, name, unix_seconds::now()).await
     }
 
-    async fn rename_at(&self, id: PortableUserId, name: &str, now: u64) -> Result<(), SdkError> {
+    async fn rename_at(
+        &self,
+        id: PortableUserId,
+        name: &str,
+        now: SystemTime,
+    ) -> Result<(), SdkError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(SdkError::InvalidInput("the name is empty".into()));
@@ -480,7 +498,7 @@ impl Portable {
         }
         entry.name = name.to_owned();
         // Newer than the last, even with the clock behind it.
-        entry.name_set_at = (entry.name_set_at + 1).max(now);
+        entry.name_set_at = (entry.name_set_at + Duration::from_secs(1)).max(now);
         save(storage, &saved).await?;
         // sync_data takes the lock itself.
         drop(saving);
@@ -568,8 +586,8 @@ impl Portable {
         let record = IssuedCredential {
             device_key,
             serial,
-            issued_at: credential.issued_at,
-            expires_at: credential.expires_at,
+            issued_at: unix_seconds::from_wire(credential.issued_at),
+            expires_at: unix_seconds::from_wire(credential.expires_at),
             label: None,
             revoked_at: None,
         };
@@ -1060,7 +1078,7 @@ impl Portable {
             listed.push(GuestPairing {
                 id,
                 server: record.as_ref().and_then(|r| r.server.clone()),
-                paired_at: record.map(|r| r.paired_at),
+                paired_at: record.map(|r| crate::servers::time(r.paired_at)),
             });
         }
         Ok(listed)
@@ -1167,8 +1185,8 @@ impl Portable {
             saved.push(PortableIdentity {
                 id,
                 name: name.to_owned(),
-                name_set_at: 0,
-                created_at: now(),
+                name_set_at: UNIX_EPOCH,
+                created_at: unix_seconds::now(),
                 has_root: true,
                 key_rooted: false,
             });
@@ -2216,7 +2234,10 @@ mod tests {
         let issued = Portable::new(storage).issued(id).await.unwrap();
         let seen: Vec<_> = issued
             .iter()
-            .map(|e| (e.device_key, e.serial, e.issued_at, e.label.as_deref()))
+            .map(|e| {
+                let issued_at = unix_seconds::to_wire(e.issued_at);
+                (e.device_key, e.serial, issued_at, e.label.as_deref())
+            })
             .collect();
         assert_eq!(
             seen,
@@ -2225,7 +2246,10 @@ mod tests {
                 (laptop, T as u64 * 1000 + 1, T, Some("Laptop"))
             ]
         );
-        assert_eq!(issued[0].expires_at, renewed.expires_at);
+        assert_eq!(
+            unix_seconds::to_wire(issued[0].expires_at),
+            renewed.expires_at
+        );
         // A renewal with a label takes it.
         phone
             .issue_credential_at(id, laptop, Some("Old laptop"), T + 6)
@@ -2254,7 +2278,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .map(|e| e.revoked_at)
+            .map(|e| e.revoked_at.map(unix_seconds::to_wire))
             .collect();
         assert_eq!(revoked, [Some(T + 7), None]);
     }
@@ -2460,7 +2484,7 @@ mod tests {
     async fn each_rename_here_is_newer_than_the_one_before() {
         let (_, portable) = portable();
         let (id, _) = portable.create("Steve").await.unwrap();
-        assert_eq!(portable.list().await.unwrap()[0].name_set_at, 0);
+        assert_eq!(portable.list().await.unwrap()[0].name_set_at, UNIX_EPOCH);
         portable.rename(id, "A").await.unwrap();
         let first = portable.list().await.unwrap()[0].name_set_at;
         portable.rename(id, "B").await.unwrap();
@@ -2478,6 +2502,9 @@ mod tests {
             .await
             .unwrap();
         let listed = portable.list().await.unwrap();
-        assert_eq!((listed[0].name.as_str(), listed[0].name_set_at), ("Ann", 0));
+        assert_eq!(
+            (listed[0].name.as_str(), listed[0].name_set_at),
+            ("Ann", UNIX_EPOCH)
+        );
     }
 }

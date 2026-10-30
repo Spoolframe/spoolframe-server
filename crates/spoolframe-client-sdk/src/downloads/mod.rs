@@ -70,7 +70,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,7 @@ use spoolframe_protocol::downloads::{
     DownloadTracks, OfflineWatch, OfflineWatchOutcome,
 };
 use spoolframe_protocol::{Reply, Request};
-use spoolframe_types::{ArtworkKind, Item, Marker, MediaId, MediaTracks};
+use spoolframe_types::{ArtworkKind, Item, Marker, MediaId, MediaTracks, serde_time};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::client::{Client, Inner};
@@ -126,21 +126,39 @@ impl DownloadPhase {
 
 /// Where the user got to in a download while watching it here. Sent to
 /// the server by [`Downloads::sync_watch`] while `pending`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LocalWatch {
-    /// Where it stopped, in milliseconds; `None` when only `watched` was
-    /// set, which starts it over.
-    pub position_ms: Option<u64>,
+    /// Where it stopped; `None` when only `watched` was set, which
+    /// starts it over. Kept as `position_ms`.
+    #[serde(
+        default,
+        rename = "position_ms",
+        with = "spoolframe_types::serde_time::millis::option"
+    )]
+    pub position: Option<Duration>,
     /// What the user marked it on this device, or the server's watched as
     /// of the download or the last sync. A position recorded later keeps
     /// it, and one inside the credits or the last 30 s marks it watched
     /// ([`Downloads::record_position`]).
     pub watched: Option<bool>,
-    /// When, Unix seconds by this device's clock.
-    pub at: i64,
+    /// When, by this device's clock (kept as Unix seconds).
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub at: SystemTime,
     /// Not sent to the server yet.
     pub pending: bool,
+}
+
+/// Nothing done here, at the epoch: older than any change.
+impl Default for LocalWatch {
+    fn default() -> Self {
+        Self {
+            position: None,
+            watched: None,
+            at: std::time::UNIX_EPOCH,
+            pending: false,
+        }
+    }
 }
 
 impl LocalWatch {
@@ -152,11 +170,11 @@ impl LocalWatch {
             _ => None,
         };
         Self {
-            position_ms: playback
+            position: playback
                 .and_then(|p| p.position)
-                .map(|p| p.as_millis() as u64),
+                .map(serde_time::millis::whole),
             watched: playback.map(|p| p.watched),
-            at: now(),
+            at: serde_time::unix_seconds::now(),
             pending: false,
         }
     }
@@ -166,30 +184,31 @@ impl LocalWatch {
     /// unwatched starts it over. Pending until the server hears it.
     fn record(&mut self, change: WatchChange, item: &Item, markers: &[Marker]) {
         match change {
-            WatchChange::Position(ms) => {
-                self.position_ms = Some(ms);
-                if at_end(item, markers, ms) {
+            WatchChange::Position(position) => {
+                let position = serde_time::millis::whole(position);
+                self.position = Some(position);
+                if at_end(item, markers, position) {
                     self.watched = Some(true);
                 }
             }
             WatchChange::Watched(true) => self.watched = Some(true),
             WatchChange::Watched(false) => {
                 self.watched = Some(false);
-                self.position_ms = None;
+                self.position = None;
             }
         }
-        self.at = now();
+        self.at = serde_time::unix_seconds::now();
         self.pending = true;
     }
 
     /// The entry `SyncOfflineWatch` sends for `item`; `None` with nothing
     /// to send.
     pub(crate) fn entry(&self, item: &Item) -> Option<OfflineWatch> {
-        (self.position_ms.is_some() || self.watched.is_some()).then(|| OfflineWatch {
+        (self.position.is_some() || self.watched.is_some()).then(|| OfflineWatch {
             id: item.id().clone(),
-            position_ms: self.position_ms,
+            position_ms: self.position.map(serde_time::millis::to_wire),
             watched: self.watched,
-            at: self.at,
+            at: serde_time::unix_seconds::to_wire(self.at),
         })
     }
 }
@@ -197,8 +216,8 @@ impl LocalWatch {
 /// What the user did to a download's watch here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchChange {
-    /// Got to this many milliseconds.
-    Position(u64),
+    /// Got this far.
+    Position(Duration),
     /// Marked it watched, or not.
     Watched(bool),
 }
@@ -207,19 +226,18 @@ enum WatchChange {
 /// credits marker; with one, anywhere in the credits does.
 pub const WATCHED_NEAR_END: Duration = Duration::from_secs(30);
 
-/// Whether `position_ms` is at `item`'s end: inside its credits, or in
+/// Whether `position` is at `item`'s end: inside its credits, or in
 /// its last [`WATCHED_NEAR_END`].
-fn at_end(item: &Item, markers: &[Marker], position_ms: u64) -> bool {
+fn at_end(item: &Item, markers: &[Marker], position: Duration) -> bool {
     let in_credits = markers.iter().any(|marker| {
-        marker.kind == spoolframe_types::MarkerKind::Credits && position_ms >= marker.start_ms
+        marker.kind == spoolframe_types::MarkerKind::Credits && position >= marker.start
     });
     let duration = match item {
         Item::Movie(m) => m.duration,
         Item::Episode(e) => e.duration,
         _ => None,
     };
-    let near_end = duration
-        .is_some_and(|length| Duration::from_millis(position_ms) + WATCHED_NEAR_END >= length);
+    let near_end = duration.is_some_and(|length| position + WATCHED_NEAR_END >= length);
     in_credits || near_end
 }
 
@@ -283,8 +301,9 @@ pub struct LocalDownload {
     /// Why it is not moving, while the manager waits to try again (the
     /// server cannot be reached, the user must sign in again).
     pub note: Option<String>,
-    /// When it was started, Unix seconds by this device's clock.
-    pub created_at: i64,
+    /// When it was started, by this device's clock.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub created_at: SystemTime,
 }
 
 /// A download changed: what [`Client::download_events`] gives.
@@ -488,7 +507,7 @@ impl Downloads {
             LocalWatch::of(&detail.item),
             now(),
         );
-        m.markers = detail.markers;
+        m.markers = detail.markers.into();
         (m.show, m.season) = manager::parents(session, &detail.item).await;
         manager::take(&mut m, info);
         m.artwork = manager::fetch_artwork(session, store, &m, &mut HashMap::new()).await;
@@ -673,6 +692,27 @@ impl Downloads {
         }
     }
 
+    /// How many transfers are under way (preparing or transferring),
+    /// every profile's and music's too, not only the shown profile's:
+    /// what closing the client would stop. Each music track is one, so
+    /// an album counts as its tracks; any count above 0 is reason to
+    /// keep running. Ask before quitting, or to keep a background
+    /// task or foreground service going. 0 without a downloads directory.
+    pub fn running(&self) -> usize {
+        *self.watch_running().borrow()
+    }
+
+    /// [`Downloads::running`] now and on each change: a download started,
+    /// done, failed, paused, cancelled or deleted, for any profile. It
+    /// ends (`changed` is an error) when the client is dropped, and at
+    /// once without a downloads directory.
+    pub fn watch_running(&self) -> watch::Receiver<usize> {
+        match &self.shared().store {
+            Some(store) => store.running(),
+            None => watch::channel(0).1,
+        }
+    }
+
     /// [`Downloads::list`] of item `id` alone (or show `id`'s episodes):
     /// only their manifests are read.
     pub(crate) fn list_of(&self, id: &MediaId) -> Vec<LocalDownload> {
@@ -778,8 +818,7 @@ impl Downloads {
         key: &str,
         position: Duration,
     ) -> Result<LocalDownload, SdkError> {
-        self.watched(key, WatchChange::Position(position.as_millis() as u64))
-            .await
+        self.watched(key, WatchChange::Position(position)).await
     }
 
     /// The user marked download `key` watched or not, here: where they got
@@ -1152,7 +1191,7 @@ impl Shared {
             item: m.item.clone(),
             show: m.show.clone(),
             season: m.season.clone(),
-            markers: m.markers.clone(),
+            markers: m.markers.clone().into_vec(),
             artwork: m
                 .artwork
                 .iter()
@@ -1178,7 +1217,7 @@ impl Shared {
             } else {
                 m.note.clone()
             },
-            created_at: m.created_at,
+            created_at: serde_time::unix_seconds::from_wire(m.created_at),
         }
     }
 

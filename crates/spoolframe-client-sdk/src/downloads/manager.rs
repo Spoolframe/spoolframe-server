@@ -13,7 +13,7 @@ use spoolframe_protocol::downloads::{
 };
 use spoolframe_protocol::resource::{ResourceMetadata, ResourceRequest, ResourceResponse};
 use spoolframe_protocol::{ArtworkSize, Reply, Request};
-use spoolframe_types::{ArtworkId, Item, MediaId};
+use spoolframe_types::{ArtworkId, Item, MediaId, serde_time};
 
 use super::store::{EntryKind, Hold, Manifest, Store, StoredArtwork, sha256_file};
 use super::writer::{BlockWriter, Unfinished};
@@ -897,7 +897,8 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
                             // Watched again while this was on the way: that
                             // is sent next time.
                             let watch = m.watch_mut(&user_id);
-                            if watch.at == at {
+                            // Kept and sent as whole seconds.
+                            if serde_time::unix_seconds::to_wire(watch.at) == at {
                                 watch.pending = false;
                                 if let Some(item) = &server_state {
                                     *watch = LocalWatch::of(item);

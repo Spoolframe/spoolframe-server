@@ -245,8 +245,9 @@ pub struct MusicDownload {
     /// (the tracks not prepared yet are not counted).
     pub received: u64,
     pub size: u64,
-    /// Unix seconds, by this device's clock.
-    pub created_at: i64,
+    /// When it was started, by this device's clock.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub created_at: std::time::SystemTime,
     /// Where it is, over its tracks.
     pub phase: MusicPhase,
     /// How many of its tracks failed ([`Downloads::retry_music`]).
@@ -313,8 +314,9 @@ pub struct OfflineTrack {
     /// Its cover (the album's) and its artist's picture, kept beside it.
     pub artwork: Vec<LocalArtwork>,
     pub size: u64,
-    /// When it was last played here, Unix seconds by this device's clock.
-    pub last_played_at: Option<i64>,
+    /// When it was last played here, by this device's clock.
+    #[serde(default, with = "spoolframe_types::serde_time::unix_seconds::option")]
+    pub last_played_at: Option<std::time::SystemTime>,
     /// The user's downloads that hold it: [`MusicTarget::Track`] for the
     /// track downloaded itself, else its album, an artist, a playlist or
     /// Liked. Empty for one only kept from listening.
@@ -1227,7 +1229,7 @@ impl Shared {
             done,
             received,
             size,
-            created_at: stored.created_at,
+            created_at: spoolframe_types::serde_time::unix_seconds::from_wire(stored.created_at),
             phase: MusicPhase::of(total, done, moving, paused, failed),
             failed,
         }
@@ -1376,7 +1378,9 @@ impl Shared {
             file_url: view.file_url,
             artwork: view.artwork,
             size: m.size.unwrap_or(0),
-            last_played_at: m.last_played_at,
+            last_played_at: m
+                .last_played_at
+                .map(spoolframe_types::serde_time::unix_seconds::from_wire),
             held_by: Vec::new(),
             liked: None,
         })

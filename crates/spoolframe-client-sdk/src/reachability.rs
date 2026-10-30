@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::address_lookup::Item;
 use iroh::{EndpointId, TransportAddr};
@@ -41,7 +42,8 @@ pub struct Reachability {
     pub addrs: Vec<SavedAddr>,
     /// What its last `ServerAddresses` event listed, and when it came.
     pub advertised_addrs: Vec<String>,
-    pub advertised_at: Option<u64>,
+    #[serde(default, with = "spoolframe_types::serde_time::unix_seconds::option")]
+    pub advertised_at: Option<SystemTime>,
     /// The relays kept for it, and whether they are the user's list.
     pub relays: Vec<String>,
     pub relays_edited: bool,
@@ -67,7 +69,8 @@ pub struct Reachability {
     /// The last dial in this run, if any.
     pub last_dial: Option<DialReport>,
     /// When it last answered a dial as itself, in any run.
-    pub last_connected_at: Option<u64>,
+    #[serde(default, with = "spoolframe_types::serde_time::unix_seconds::option")]
+    pub last_connected_at: Option<SystemTime>,
     /// The paths of the connection open now; empty without one.
     pub live: Vec<LivePath>,
 }
@@ -80,7 +83,8 @@ pub struct SavedAddr {
     /// `true`: a connection reached it there; `false`: only the server
     /// said so.
     pub reached: bool,
-    pub last_seen: u64,
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub last_seen: SystemTime,
 }
 
 /// What one lookup answered about one server.
@@ -89,7 +93,8 @@ pub struct SavedAddr {
 pub struct LookupResult {
     /// `mdns`, or the pkarr relay's URL.
     pub lookup: String,
-    pub at: u64,
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub at: SystemTime,
     pub outcome: LookupOutcome,
 }
 
@@ -113,9 +118,11 @@ pub enum LookupOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DialReport {
-    pub at: u64,
-    /// How long it took, in milliseconds.
-    pub took_ms: u64,
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub at: SystemTime,
+    /// How long it took.
+    #[serde(rename = "took_ms", with = "spoolframe_types::serde_time::millis")]
+    pub took: Duration,
     pub connected: bool,
     /// Where it stopped; `None` when it connected.
     pub stage: Option<DialStage>,
@@ -196,7 +203,8 @@ fn ip_kind(addr: SocketAddr) -> PathKind {
 pub struct LivePath {
     pub kind: PathKind,
     pub addr: String,
-    pub rtt_ms: u64,
+    #[serde(rename = "rtt_ms", with = "spoolframe_types::serde_time::millis")]
+    pub rtt: Duration,
     /// The one packets go by.
     pub selected: bool,
 }
@@ -218,7 +226,7 @@ impl ReachLog {
             id,
             LookupResult {
                 lookup: lookup.to_owned(),
-                at: servers::now(),
+                at: SystemTime::now(),
                 outcome,
             },
         ));
@@ -277,13 +285,14 @@ pub(crate) fn saved_addrs(server: &servers::SavedServer) -> Vec<SavedAddr> {
         .map(|k| SavedAddr {
             addr: k.addr.to_string(),
             reached: k.source == AddrSource::Reached,
-            last_seen: k.last_seen,
+            last_seen: servers::time(k.last_seen),
         })
         .collect()
 }
 
-/// `at` (Unix seconds) as ISO 8601 in UTC: `2026-10-11T21:40:02Z`.
-pub fn iso_utc(at: u64) -> String {
+/// `at` as ISO 8601 in UTC, to the second: `2026-10-11T21:40:02Z`.
+pub fn iso_utc(at: SystemTime) -> String {
+    let at = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, secs) = (at / 86_400, at % 86_400);
     let date = spoolframe_types::CalendarDate::from_unix_days(days as i64)
         .map_or_else(|| "????-??-??".to_owned(), |d| d.to_string());
@@ -333,7 +342,7 @@ impl Reachability {
     /// the Apple and Linux apps write it: a header naming when it failed
     /// (`now` when it has not), the `build` and the `device`, then the
     /// facts ([`Self`]'s `Display`). Nothing about the account.
-    pub fn report(&self, now: u64, build: &str, device: &str) -> String {
+    pub fn report(&self, now: SystemTime, build: &str, device: &str) -> String {
         let failed_at = self
             .last_dial
             .as_ref()
@@ -439,7 +448,11 @@ impl std::fmt::Display for Reachability {
         }
         match &self.last_dial {
             Some(dial) => {
-                let mut line = format!("last dial: {} · {} ms · ", iso_utc(dial.at), dial.took_ms);
+                let mut line = format!(
+                    "last dial: {} · {} ms · ",
+                    iso_utc(dial.at),
+                    dial.took.as_millis()
+                );
                 if dial.connected {
                     line.push_str("connected");
                 } else {
@@ -469,7 +482,7 @@ impl std::fmt::Display for Reachability {
                 "live {} {} · {} ms{}",
                 path.kind.as_str(),
                 path.addr,
-                path.rtt_ms,
+                path.rtt.as_millis(),
                 if path.selected { " · selected" } else { "" }
             ));
         }
@@ -485,6 +498,11 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    /// `secs` after the epoch.
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
     /// Cabin, last dialled 30 s ago and not reached (the Linux app's).
     fn cabin() -> Reachability {
         Reachability {
@@ -495,12 +513,12 @@ mod tests {
                 SavedAddr {
                     addr: "203.0.113.24:41641".into(),
                     reached: true,
-                    last_seen: NOW - 3 * 86400,
+                    last_seen: at(NOW - 3 * 86400),
                 },
                 SavedAddr {
                     addr: "192.168.7.2:7430".into(),
                     reached: false,
-                    last_seen: NOW - 86400,
+                    last_seen: at(NOW - 86400),
                 },
             ],
             advertised_addrs: vec!["203.0.113.24:41641".into()],
@@ -516,26 +534,26 @@ mod tests {
             lookups: vec!["mdns".into()],
             lookup_results: vec![LookupResult {
                 lookup: "https://dns.iroh.link/pkarr".into(),
-                at: NOW - 60,
+                at: at(NOW - 60),
                 outcome: LookupOutcome::NoRecord,
             }],
             last_dial: Some(DialReport {
-                at: NOW - 30,
-                took_ms: 10_000,
+                at: at(NOW - 30),
+                took: std::time::Duration::from_millis(10_000),
                 connected: false,
                 stage: Some(DialStage::Timeout),
                 error: Some("timed out".into()),
                 dialled: vec!["203.0.113.24:41641".into(), "192.168.7.2:7430".into()],
                 known: Vec::new(),
             }),
-            last_connected_at: Some(NOW - 3 * 86400),
+            last_connected_at: Some(at(NOW - 3 * 86400)),
             live: Vec::new(),
         }
     }
 
     #[test]
     fn the_report_reads_as_the_apps_write_it() {
-        let report = cabin().report(NOW, "0.16.4", "nimble");
+        let report = cabin().report(at(NOW), "0.16.4", "nimble");
         let lines: Vec<&str> = report.lines().collect();
         assert_eq!(
             lines,
@@ -563,8 +581,16 @@ mod tests {
 
     #[test]
     fn utc_times_read_as_iso_8601() {
-        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(
+            iso_utc(spoolframe_types::serde_time::unix_seconds::from_wire(0)),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            iso_utc(spoolframe_types::serde_time::unix_seconds::from_wire(
+                951_782_400
+            )),
+            "2000-02-29T00:00:00Z"
+        );
     }
 
     fn id(seed: u8) -> EndpointId {
@@ -609,12 +635,25 @@ mod tests {
         assert_eq!(log.lookups_of(&id(2)).len(), MAX_LOOKUP_RESULTS);
     }
 
+    /// A snapshot written without `advertised_at` or
+    /// `last_connected_at` reads them as none, as when they were plain
+    /// `Option`s.
+    #[test]
+    fn a_snapshot_without_its_optional_times_reads_them_as_none() {
+        let mut json = serde_json::to_value(cabin()).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("advertised_at");
+        fields.remove("last_connected_at");
+        let read: Reachability = serde_json::from_value(json).unwrap();
+        assert_eq!((read.advertised_at, read.last_connected_at), (None, None));
+    }
+
     #[test]
     fn the_last_dial_of_at_most_so_many_servers_is_kept() {
         let log = ReachLog::default();
-        let report = |at: u64| DialReport {
-            at,
-            took_ms: 1,
+        let report = |secs: u64| DialReport {
+            at: at(secs),
+            took: std::time::Duration::from_millis(1),
             connected: false,
             stage: Some(DialStage::Timeout),
             error: Some("no answer".into()),
@@ -626,9 +665,9 @@ mod tests {
         }
         // The oldest, server 0's, made room.
         assert_eq!(log.last_dial(&id(0)), None);
-        assert_eq!(log.last_dial(&id(MAX_DIALS as u8)).unwrap().at, 132);
+        assert_eq!(log.last_dial(&id(MAX_DIALS as u8)).unwrap().at, at(132));
         log.dialled(id(5), report(500));
-        assert_eq!(log.last_dial(&id(5)).unwrap().at, 500);
+        assert_eq!(log.last_dial(&id(5)).unwrap().at, at(500));
     }
 
     #[test]

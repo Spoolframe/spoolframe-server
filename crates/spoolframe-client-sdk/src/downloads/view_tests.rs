@@ -63,7 +63,7 @@ fn download(phase: DownloadPhase) -> LocalDownload {
         file_url: None,
         watch: LocalWatch::default(),
         note: None,
-        created_at: 1,
+        created_at: spoolframe_types::serde_time::unix_seconds::from_wire(1),
     }
 }
 
@@ -99,9 +99,9 @@ fn with_file(mut d: LocalDownload) -> LocalDownload {
 fn a_watched_download_plays_from_the_start() {
     let mut d = download(DownloadPhase::Done);
     d.watch = LocalWatch {
-        position_ms: Some(60_000),
+        position: Some(std::time::Duration::from_millis(60_000)),
         watched: Some(true),
-        at: 5,
+        at: spoolframe_types::serde_time::unix_seconds::from_wire(5),
         pending: true,
     };
     assert_eq!((d.watched_here(), d.resume_point()), (true, None));
@@ -112,9 +112,9 @@ fn a_watched_download_plays_from_the_start() {
 fn a_download_stopped_at_its_start_plays_from_the_start() {
     let mut d = download(DownloadPhase::Done);
     d.watch = LocalWatch {
-        position_ms: Some(0),
+        position: Some(std::time::Duration::from_millis(0)),
         watched: None,
-        at: 5,
+        at: spoolframe_types::serde_time::unix_seconds::from_wire(5),
         pending: true,
     };
     assert_eq!(d.resume_point(), None);
@@ -124,9 +124,9 @@ fn a_download_stopped_at_its_start_plays_from_the_start() {
 fn a_place_the_server_has_not_heard_wins_over_the_asked_one() {
     let mut d = download(DownloadPhase::Done);
     d.watch = LocalWatch {
-        position_ms: Some(60_000),
+        position: Some(std::time::Duration::from_millis(60_000)),
         watched: None,
-        at: 5,
+        at: spoolframe_types::serde_time::unix_seconds::from_wire(5),
         pending: true,
     };
     let asked = Some(Duration::from_secs(10));
@@ -253,6 +253,46 @@ fn with_nothing_asked_the_files_first_audio_plays_without_subtitles() {
         Selection {
             audio: Some(0),
             subtitle: None
+        }
+    );
+}
+
+/// The file carries a subtitle the server had beside the film: it is a
+/// stream of the file like the rest, at the file's place.
+#[test]
+fn a_downloads_subtitles_are_all_streams_of_its_file() {
+    use crate::tracks::{StreamPicks, SubtitleHandling};
+    let mut d = download(DownloadPhase::Done);
+    let mut beside = subtitle("fr");
+    beside.external = true;
+    d.tracks.subtitles = vec![subtitle("en"), beside, subtitle("de")];
+    d.file = Some(DownloadFile {
+        container: Container::Matroska,
+        tracks: FileTracks {
+            audio: vec![0],
+            subtitles: vec![1, 2],
+        },
+    });
+    let picks = |subtitle| {
+        d.stream_picks(Some(Selection {
+            audio: Some(0),
+            subtitle: Some(subtitle),
+        }))
+    };
+    assert_eq!(
+        picks(2),
+        StreamPicks {
+            audio_stream: Some(0),
+            subtitle: SubtitleHandling::Embedded(1),
+        }
+    );
+    assert_eq!(picks(1).subtitle, SubtitleHandling::Embedded(0));
+    assert_eq!(picks(0).subtitle, SubtitleHandling::None, "not in the file");
+    assert_eq!(
+        d.stream_picks(None),
+        StreamPicks {
+            audio_stream: Some(0),
+            subtitle: SubtitleHandling::None,
         }
     );
 }

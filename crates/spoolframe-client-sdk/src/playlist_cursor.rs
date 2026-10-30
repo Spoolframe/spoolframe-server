@@ -612,7 +612,7 @@ pub(crate) mod tests {
         PlaylistNext {
             entry: e.entry,
             item: e.item,
-            markers: Vec::new(),
+            markers: spoolframe_types::Markers::default(),
             liked: false,
         }
     }

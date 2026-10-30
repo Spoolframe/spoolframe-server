@@ -793,6 +793,7 @@ async fn a_guest_paired_by_qr_is_listed_with_its_server_and_when() {
             })
         );
         let at = listed[0].paired_at.expect("when it was paired");
+        let at = spoolframe_types::serde_time::unix_seconds::to_wire(at) as u64;
         assert!(at >= before && at <= crate::servers::now(), "{at}");
 
         tv.portable().forget_guest(id).await.unwrap();

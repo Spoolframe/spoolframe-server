@@ -37,14 +37,14 @@ Coldsteel copy, at the same exact version:
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = "=0.16.4-beta.1"
+spoolframe-client-sdk = "=0.17.0-beta.1"
 
 [patch.crates-io]
-spoolframe-types = { version = "=0.16.4-beta.1", registry = "coldsteel" }
-spoolframe-protocol = { version = "=0.16.4-beta.1", registry = "coldsteel" }
-spoolframe-policy = { version = "=0.16.4-beta.1", registry = "coldsteel" }
-spoolframe-client-sdk = { version = "=0.16.4-beta.1", registry = "coldsteel" }
-spoolframe-hls-bridge = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+spoolframe-types = { version = "=0.17.0-beta.1", registry = "coldsteel" }
+spoolframe-protocol = { version = "=0.17.0-beta.1", registry = "coldsteel" }
+spoolframe-policy = { version = "=0.17.0-beta.1", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.17.0-beta.1", registry = "coldsteel" }
+spoolframe-hls-bridge = { version = "=0.17.0-beta.1", registry = "coldsteel" }
 ```
 
 The Coldsteel copies depend on each other as crates.io crates, and a

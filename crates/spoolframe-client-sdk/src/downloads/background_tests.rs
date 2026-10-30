@@ -36,7 +36,7 @@ fn download(key: &str, phase: DownloadPhase) -> LocalDownload {
         file_url: None,
         watch: LocalWatch::default(),
         note: None,
-        created_at: 1,
+        created_at: spoolframe_types::serde_time::unix_seconds::from_wire(1),
     }
 }
 

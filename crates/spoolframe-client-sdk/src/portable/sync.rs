@@ -51,6 +51,8 @@
 //! [`Portable`]: super::Portable
 //! [`Portable::forget`]: super::Portable::forget
 
+use std::time::SystemTime;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
@@ -94,15 +96,19 @@ pub enum RootSyncRefused {
 }
 
 /// What [`keys::portable_synced`] holds.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SyncRecord {
     name: String,
     /// When `name` was set by a rename ([`super::PortableIdentity::name_set_at`]).
     // Read as the default when left out: a stored record, not a message of
     // the client protocol, and one written by an SDK before it lacks the key.
-    #[serde(default)]
-    name_set_at: u64,
-    created_at: u64,
+    #[serde(
+        default = "spoolframe_types::serde_time::epoch",
+        with = "spoolframe_types::serde_time::unix_seconds"
+    )]
+    name_set_at: SystemTime,
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    created_at: SystemTime,
     #[serde(default)]
     revoked: Revoked,
     #[serde(default)]
@@ -819,8 +825,11 @@ mod tests {
     #[tokio::test]
     async fn the_newer_of_two_unheard_renames_wins_whoever_wrote_last() {
         let ((a_storage, phone), (b_storage, ipad), id) = two_synced_devices().await;
-        let now = crate::servers::now();
-        phone.rename_at(id, "Samantha", now - 10).await.unwrap();
+        let now = spoolframe_types::serde_time::unix_seconds::now();
+        phone
+            .rename_at(id, "Samantha", now - std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
         ipad.rename_at(id, "Sammy", now).await.unwrap();
         // The phone wrote last: its record replaces the iPad's.
         deliver(&a_storage, &b_storage, id).await;

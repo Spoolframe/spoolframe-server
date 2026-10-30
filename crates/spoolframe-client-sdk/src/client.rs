@@ -11,16 +11,16 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use spoolframe_protocol::{
     Features, FinishPasskeySignIn, LoginPassword, PasskeyRequest, Reply, Request, Response,
     ServerId, SessionId, TrustedProfile, device_sign_in, fingerprint, lan,
 };
-use spoolframe_types::{ClientCapabilities, Platform};
+use spoolframe_types::{ClientCapabilities, Platform, serde_time};
 
 use crate::connection::{ServerConnection, Timeouts};
-use crate::discovery::Discovery;
+use crate::discovery::{Discovery, Heard};
 use crate::error::SdkError;
 use crate::link::{ConnectionPath, Link, SignOutWatch, StateWatch};
 use crate::portable::{Portable, PortableUserId};
@@ -188,6 +188,37 @@ pub struct Client {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// The last clone is gone without [`Client::close`]: each link is closed
+/// all the same, so its supervisor ends and lets the link, its connection
+/// and the watches of its state go, rather than keep the server's
+/// connection up for no one.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for (_, link) in self.links.get_mut().drain() {
+            link.close();
+        }
+    }
+}
+
+/// A [`Client`] that does not keep it open: for a watch that ends once
+/// the app has dropped every clone ([`Client::downgrade`]).
+#[derive(Clone)]
+pub struct WeakClient(std::sync::Weak<Inner>);
+
+impl WeakClient {
+    /// The client, while any clone of it is held.
+    pub fn upgrade(&self) -> Option<Client> {
+        self.0.upgrade().map(|inner| Client { inner })
+    }
+}
+
+impl Client {
+    /// A handle to this client that does not keep it open.
+    pub fn downgrade(&self) -> WeakClient {
+        WeakClient(Arc::downgrade(&self.inner))
+    }
+}
+
 pub(crate) struct Inner {
     pub(crate) endpoint: Endpoint,
     pub(crate) storage: Arc<dyn Storage>,
@@ -251,6 +282,8 @@ pub(crate) struct Inner {
     pub(crate) downloads: Arc<crate::downloads::Shared>,
     /// Catalog reads kept, with [`ClientOptions::catalog_cache`].
     pub(crate) catalog: Option<Arc<crate::catalog_cache::CatalogCache>>,
+    /// The screen as the app said it is now ([`Client::set_display`]).
+    display: Mutex<Option<spoolframe_types::DisplayCapabilities>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -443,6 +476,7 @@ impl Client {
                         config,
                     )
                 }),
+                display: Mutex::default(),
             }),
         };
         // Where saved servers publish: looked up there from the
@@ -475,70 +509,80 @@ impl Client {
     pub async fn servers(&self) -> Result<Vec<ServerEntry>, SdkError> {
         let saved = servers::load(self.inner.storage.as_ref()).await?;
         let mut heard = self.inner.discovery.heard();
-        // Only a pin with no server id yet is matched by name: one with an
-        // id is matched by that, and a name may change freely.
-        let away: Vec<String> = saved
-            .iter()
-            .filter(|s| s.server_id.is_none())
-            .filter(|s| parse_id(&s.endpoint_id).map_or(true, |id| !heard.contains_key(&id)))
-            .map(|s| s.name.clone())
-            .collect();
+        let away = away(&saved, &heard);
         let mut entries: Vec<ServerEntry> = saved
             .into_iter()
             .map(|s| {
-                let id = EndpointId::from_str(&s.endpoint_id).ok();
-                let on_lan = id.and_then(|id| heard.remove(&id));
-                let addrs = listed([
-                    id.map(|id| self.in_use(id)).unwrap_or_default(),
-                    on_lan.as_ref().map(|h| h.addrs.clone()).unwrap_or_default(),
-                    s.addrs(),
-                ]);
-                ServerEntry {
-                    fingerprint: fingerprint::of_hex(&s.endpoint_id).unwrap_or_default(),
-                    pinned_at: servers::time(s.pinned_at),
-                    verified_at: servers::time(s.verified_at),
-                    last_connected_at: servers::time(s.last_connected_at),
-                    server_id: s.server_id,
-                    endpoint_id: s.endpoint_id,
-                    name: s.name,
-                    pinned: true,
-                    verified: s.verified,
-                    on_network: on_lan.is_some(),
-                    addrs,
-                    advertised_at: servers::time(s.advertised_at),
-                    advertised_addrs: s.advertised_addrs,
-                    relays: s.relays,
-                    relays_edited: s.relays_edited,
-                    use_relays: s.use_relays,
-                }
+                let on_lan = EndpointId::from_str(&s.endpoint_id)
+                    .ok()
+                    .and_then(|id| heard.remove(&id));
+                self.saved_entry(s, on_lan)
             })
             .collect();
         let mut unsaved: Vec<ServerEntry> = heard
             .into_iter()
             .filter(|(_, h)| !away.contains(&h.name))
-            .map(|(id, h)| ServerEntry {
-                endpoint_id: id.to_string(),
-                fingerprint: fingerprint::fingerprint(id.as_bytes()),
-                name: h.name,
-                addrs: h.addrs,
-                advertised_addrs: Vec::new(),
-                relays: Vec::new(),
-                advertised_at: None,
-                pinned: false,
-                verified: false,
-                on_network: true,
-                pinned_at: None,
-                verified_at: None,
-                last_connected_at: None,
-                server_id: None,
-                use_relays: None,
-                relays_edited: false,
-            })
+            .map(|(id, h)| heard_entry(id, h))
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         unsaved.sort_by(|a, b| a.name.cmp(&b.name));
         entries.extend(unsaved);
         Ok(entries)
+    }
+
+    /// Server `endpoint_id` as [`Client::servers`] lists it; `None` for
+    /// one neither saved nor heard on the LAN.
+    pub async fn server(&self, endpoint_id: &str) -> Result<Option<ServerEntry>, SdkError> {
+        let mut saved = servers::load(self.inner.storage.as_ref()).await?;
+        let mut heard = self.inner.discovery.heard();
+        let id = EndpointId::from_str(endpoint_id).ok();
+        let on_lan = id.and_then(|id| heard.remove(&id));
+        if let Some(at) = saved.iter().position(|s| s.endpoint_id == endpoint_id) {
+            return Ok(Some(self.saved_entry(saved.swap_remove(at), on_lan)));
+        }
+        heard.extend(id.zip(on_lan.clone()));
+        let away = away(&saved, &heard);
+        Ok(id
+            .zip(on_lan)
+            .filter(|(_, h)| !away.contains(&h.name))
+            .map(|(id, h)| heard_entry(id, h)))
+    }
+
+    /// The servers heard on the LAN now, saved or not, by name: as
+    /// [`Client::lan_servers`], which lists the saved ones first.
+    pub async fn servers_on_network(&self) -> Result<Vec<ServerEntry>, SdkError> {
+        let mut servers = self.lan_servers().await?;
+        servers.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(servers)
+    }
+
+    /// Saved server `s` as [`Client::servers`] lists it, heard on the LAN
+    /// as `on_lan` if it is.
+    fn saved_entry(&self, s: SavedServer, on_lan: Option<Heard>) -> ServerEntry {
+        let id = EndpointId::from_str(&s.endpoint_id).ok();
+        let addrs = listed([
+            id.map(|id| self.in_use(id)).unwrap_or_default(),
+            on_lan.as_ref().map(|h| h.addrs.clone()).unwrap_or_default(),
+            s.addrs(),
+        ]);
+        ServerEntry {
+            fingerprint: fingerprint::of_hex(&s.endpoint_id).unwrap_or_default(),
+            pinned_at: s.pinned_at.map(servers::time),
+            verified_at: s.verified_at.map(servers::time),
+            last_connected_at: s.last_connected_at.map(servers::time),
+            server_id: s.server_id,
+            endpoint_id: s.endpoint_id,
+            name: s.name,
+            pinned: true,
+            verified: s.verified,
+            on_network: on_lan.is_some(),
+            addrs,
+            advertised_at: s.advertised_at.map(servers::time),
+            advertised_addrs: s.advertised_addrs,
+            relays: s.relays,
+            relays_edited: s.relays_edited,
+            use_relays: s.use_relays,
+        }
     }
 
     /// Changes of [`Client::servers`]: a server heard or gone on the LAN, or
@@ -771,24 +815,7 @@ impl Client {
             let mut saved = servers::load(storage).await?;
             if let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) {
                 server.set_verified(verified);
-                let entry = ServerEntry {
-                    endpoint_id: server.endpoint_id.clone(),
-                    name: server.name.clone(),
-                    addrs: listed([self.in_use(id), server.addrs()]),
-                    fingerprint: fingerprint::fingerprint(id.as_bytes()),
-                    pinned: true,
-                    verified,
-                    on_network: self.inner.discovery.get(&id).is_some(),
-                    pinned_at: servers::time(server.pinned_at),
-                    verified_at: servers::time(server.verified_at),
-                    last_connected_at: servers::time(server.last_connected_at),
-                    server_id: server.server_id.clone(),
-                    advertised_addrs: server.advertised_addrs.clone(),
-                    relays: server.relays.clone(),
-                    advertised_at: servers::time(server.advertised_at),
-                    use_relays: server.use_relays,
-                    relays_edited: server.relays_edited,
-                };
+                let entry = self.saved_entry(server.clone(), self.inner.discovery.get(&id));
                 servers::save(storage, &saved).await?;
                 self.inner.discovery.changed();
                 return Ok(entry);
@@ -937,15 +964,15 @@ impl Client {
             pinned: saved.is_some(),
             verified: saved.is_some_and(|s| s.verified),
             on_network: self.inner.discovery.get(&id).is_some(),
-            pinned_at: saved.and_then(|s| servers::time(s.pinned_at)),
-            verified_at: saved.and_then(|s| servers::time(s.verified_at)),
-            last_connected_at: saved.and_then(|s| servers::time(s.last_connected_at)),
+            pinned_at: saved.and_then(|s| s.pinned_at.map(servers::time)),
+            verified_at: saved.and_then(|s| s.verified_at.map(servers::time)),
+            last_connected_at: saved.and_then(|s| s.last_connected_at.map(servers::time)),
             server_id: Some(conn.info.server_id.clone()),
             advertised_addrs: saved
                 .map(|s| s.advertised_addrs.clone())
                 .unwrap_or_default(),
             relays: saved.map(|s| s.relays.clone()).unwrap_or_default(),
-            advertised_at: saved.and_then(|s| servers::time(s.advertised_at)),
+            advertised_at: saved.and_then(|s| s.advertised_at.map(servers::time)),
             use_relays: saved.and_then(|s| s.use_relays),
             relays_edited: saved.is_some_and(|s| s.relays_edited),
         }
@@ -1535,32 +1562,45 @@ impl Client {
         let server = parse_id(endpoint_id)?;
         self.require_pinned(server).await?;
         let mut stored = session::load(self.inner.storage.as_ref(), &server).await?;
-        self.sessions_of(server, &mut stored).await
+        Ok(self
+            .sessions_of(server, &mut stored)
+            .await?
+            .unwrap_or_default())
     }
 
     /// [`Client::profiles`] of the sessions `stored` for `server`, as
     /// loaded: one that ended is ended here and left without its token in
-    /// `stored` too, as it is now kept.
+    /// `stored` too, as it is now kept. `None` when none was asked of the
+    /// server: no session was kept, or each kept one had already ended
+    /// here, so the answer says nothing of whether the server is reached.
     pub(crate) async fn sessions_of(
         &self,
         server: EndpointId,
         stored: &mut [session::StoredSession],
-    ) -> Result<Vec<Session>, SdkError> {
+    ) -> Result<Option<Vec<Session>>, SdkError> {
+        let link = self.link(server);
         let mut profiles = Vec::new();
+        let mut asked = false;
         for s in stored.iter_mut() {
             let Some(token) = s.token.clone() else {
                 continue;
             };
             let token = SessionId(token);
-            // The server may sign the device out (close::SIGNED_OUT) after
-            // the sessions were read: then the call is SignInRequired, with
-            // or without asking. That session ended as surely as one the
-            // server answers Unauthenticated for, and the list goes on.
-            let answer = match self.call(server, Some(&token), Request::WhoAmI).await {
-                Err(SdkError::SignInRequired) => {
-                    Response::Err(spoolframe_protocol::Error::Unauthenticated)
+            // A sign-out already ended it here: not asked. The server may
+            // also sign the device out (close::SIGNED_OUT) while it is
+            // asked: then the call is SignInRequired. Either ended as surely
+            // as one the server answers Unauthenticated for, and the list
+            // goes on.
+            let answer = if link.has_ended(&token) {
+                Response::Err(spoolframe_protocol::Error::Unauthenticated)
+            } else {
+                asked = true;
+                match self.call(server, Some(&token), Request::WhoAmI).await {
+                    Err(SdkError::SignInRequired) => {
+                        Response::Err(spoolframe_protocol::Error::Unauthenticated)
+                    }
+                    answer => answer?,
                 }
-                answer => answer?,
             };
             match answer {
                 Response::Ok(Reply::WhoAmI(spoolframe_protocol::WhoAmIReply {
@@ -1593,7 +1633,7 @@ impl Client {
                 Response::Err(e) => return Err(SdkError::from_server(e)),
             }
         }
-        Ok(profiles)
+        Ok(asked.then_some(profiles))
     }
 
     /// Select the foreground profile. Listing profiles or making background
@@ -2127,7 +2167,7 @@ impl Client {
         ]);
         let last_path = pinned.and_then(|s| s.last_path);
         let relays = self.relays_of(id, pinned);
-        let (at, started) = (servers::now(), std::time::Instant::now());
+        let (at, started) = (SystemTime::now(), std::time::Instant::now());
         let dial = ServerConnection::dial(
             &self.inner.endpoint,
             endpoint_addr(id, &addrs, &relays),
@@ -2147,7 +2187,7 @@ impl Client {
         let failed = dial.as_ref().err();
         let report = DialReport {
             at,
-            took_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            took: serde_time::millis::whole(started.elapsed()),
             connected: failed.is_none(),
             stage: failed.map(|f| f.stage),
             error: failed.map(|f| f.error.to_string()),
@@ -2414,7 +2454,7 @@ impl Client {
             advertised_addrs: pinned
                 .map(|s| s.advertised_addrs.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
-            advertised_at: pinned.and_then(|s| s.advertised_at),
+            advertised_at: pinned.and_then(|s| s.advertised_at.map(servers::time)),
             relays: pinned.map(|s| s.relays.clone()).unwrap_or_default(),
             relays_edited: pinned.is_some_and(|s| s.relays_edited),
             lookup: pinned.and_then(|s| s.lookup.clone()),
@@ -2428,7 +2468,7 @@ impl Client {
             lookups,
             lookup_results: self.inner.reach.lookups_of(&id),
             last_dial,
-            last_connected_at: pinned.and_then(|s| s.last_connected_at),
+            last_connected_at: pinned.and_then(|s| s.last_connected_at.map(servers::time)),
             live,
         })
     }
@@ -2470,6 +2510,23 @@ impl Client {
     /// making another [`Portable`] over the same storage.
     pub fn portable(&self) -> Portable {
         self.inner.portable.clone()
+    }
+
+    /// The screen as it is now: its mode (height, refresh rate), HDR and
+    /// bit depth. Say it once the app knows it, and again whenever it
+    /// changes (a TV switched to another mode, Match Dynamic Range): the
+    /// SDK sends it with every plan, start and re-plan that names no
+    /// display of its own ([`crate::PlaybackOptions::display`]), so a
+    /// change counts from the next one. The device's capabilities
+    /// (Hello's) stay its decoders' limits: the server plays within both.
+    /// `None`: the device's capabilities alone.
+    pub fn set_display(&self, display: Option<spoolframe_types::DisplayCapabilities>) {
+        *self.inner.display.lock() = display;
+    }
+
+    /// The screen as the app last said it ([`Client::set_display`]).
+    pub fn display(&self) -> Option<spoolframe_types::DisplayCapabilities> {
+        self.inner.display.lock().clone()
     }
 
     /// This device's identity, as servers see it.
@@ -2565,7 +2622,7 @@ fn live_paths(conn: &iroh::endpoint::Connection) -> Vec<LivePath> {
             Some(LivePath {
                 kind,
                 addr,
-                rtt_ms: p.rtt().as_millis().try_into().unwrap_or(u64::MAX),
+                rtt: serde_time::millis::whole(p.rtt()),
                 selected: p.is_selected(),
             })
         })
@@ -2715,6 +2772,42 @@ pub(crate) fn without_empty_user_handle(mut signed: FinishPasskeySignIn) -> Fini
         signed.user_handle = None;
     }
     signed
+}
+
+/// The names of saved servers not heard on the LAN that a server heard
+/// there with the same name stands for: only a pin with no server id yet
+/// is matched by name; one with an id is matched by that, and a name may
+/// change freely.
+fn away(saved: &[SavedServer], heard: &HashMap<EndpointId, Heard>) -> Vec<String> {
+    saved
+        .iter()
+        .filter(|s| s.server_id.is_none())
+        .filter(|s| parse_id(&s.endpoint_id).map_or(true, |id| !heard.contains_key(&id)))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// A server heard on the LAN and not saved, as [`Client::servers`] lists
+/// it.
+fn heard_entry(id: EndpointId, h: Heard) -> ServerEntry {
+    ServerEntry {
+        endpoint_id: id.to_string(),
+        fingerprint: fingerprint::fingerprint(id.as_bytes()),
+        name: h.name,
+        addrs: h.addrs,
+        advertised_addrs: Vec::new(),
+        relays: Vec::new(),
+        advertised_at: None,
+        pinned: false,
+        verified: false,
+        on_network: true,
+        pinned_at: None,
+        verified_at: None,
+        last_connected_at: None,
+        server_id: None,
+        use_relays: None,
+        relays_edited: false,
+    }
 }
 
 #[cfg(test)]

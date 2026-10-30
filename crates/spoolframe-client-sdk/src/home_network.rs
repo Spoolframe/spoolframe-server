@@ -36,20 +36,28 @@ fn in_local_64(ip: Ipv6Addr, local_addrs: &[IpAddr]) -> bool {
     })
 }
 
+/// Whether `path` is inside the home network: the LAN, or a direct IPv6
+/// path into the /64 of one of `local_addrs` (this device's own addresses;
+/// only global IPv6 ones count). No path yet is not home: see
+/// [`ConnectionPath::at_home`] for a server heard on this network.
+pub fn at_home(path: &ConnectionPath, local_addrs: &[IpAddr]) -> bool {
+    match path {
+        ConnectionPath::Lan { .. } => true,
+        ConnectionPath::Direct { addr } => match addr.ip() {
+            IpAddr::V6(v6) => in_local_64(v6, local_addrs),
+            IpAddr::V4(_) => false,
+        },
+        ConnectionPath::Relay | ConnectionPath::Unknown => false,
+    }
+}
+
 impl ConnectionPath {
-    /// Whether this path is inside the home network: the LAN, or a direct
-    /// IPv6 path into the /64 of one of `local_addrs` (this device's own
-    /// addresses; only global IPv6 ones count). With no path yet,
-    /// `heard`: the server was heard on this network.
+    /// [`at_home`], and with no path yet, `heard`: the server was heard
+    /// on this network.
     pub fn at_home(&self, local_addrs: &[IpAddr], heard: bool) -> bool {
         match self {
-            ConnectionPath::Lan { .. } => true,
-            ConnectionPath::Direct { addr } => match addr.ip() {
-                IpAddr::V6(v6) => in_local_64(v6, local_addrs),
-                IpAddr::V4(_) => false,
-            },
-            ConnectionPath::Relay => false,
             ConnectionPath::Unknown => heard,
+            path => at_home(path, local_addrs),
         }
     }
 }
@@ -90,6 +98,47 @@ impl Session {
     }
 }
 
+/// `at_home` and `default_quality` with this device's addresses read
+/// here, on Apple and Linux; Android passes its own.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+impl Session {
+    /// [`Session::at_home`] by the addresses this device's interfaces
+    /// have now. They are read only for a direct IPv6 path, the one that
+    /// needs them.
+    pub fn at_home_here(&self) -> bool {
+        let path = self.connection_path();
+        let addrs = match &path {
+            ConnectionPath::Direct { addr } if addr.is_ipv6() => global_v6_here(),
+            _ => Vec::new(),
+        };
+        let heard = self.client.inner.discovery.get(&self.server).is_some();
+        path.at_home(&addrs, heard)
+    }
+
+    /// [`Session::default_quality`] by this device's addresses now: read
+    /// only when the answer turns on them, with no `limit` and not on a
+    /// TV box.
+    pub fn default_quality_here(&self, limit: Option<u64>) -> PlaybackQuality {
+        let platform = self.client.inner.device.platform;
+        let decided = limit.is_some_and(|l| l > 0) || platform == Platform::Tvos;
+        let at_home = !decided && self.at_home_here();
+        PlaybackQuality::default_for(limit, platform, at_home)
+    }
+}
+
+/// This device's global IPv6 addresses, as its interfaces have them now
+/// (getifaddrs): the only ones [`at_home`] reads.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn global_v6_here() -> Vec<IpAddr> {
+    netdev::get_interfaces()
+        .into_iter()
+        .flat_map(|i| i.ipv6)
+        .map(|n| n.addr())
+        .filter(|ip| global(*ip))
+        .map(IpAddr::V6)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +158,18 @@ mod tests {
         }
     }
 
+    /// Only this device's global IPv6 addresses are read: no IPv4, no
+    /// link-local or loopback one, though every machine has some.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn only_global_ipv6_addresses_are_read_here() {
+        assert!(
+            global_v6_here()
+                .iter()
+                .all(|ip| matches!(ip, IpAddr::V6(v6) if global(*v6)))
+        );
+    }
+
     #[test]
     fn a_direct_path_into_this_devices_own_64_is_at_home() {
         assert!(direct("[2001:db8:1:2::99]:7430").at_home(&home(), false));
@@ -121,6 +182,14 @@ mod tests {
         let local: Vec<IpAddr> = vec!["fe80::1".parse().unwrap(), "fd00::1".parse().unwrap()];
         assert!(!direct("[fe80::99]:7430").at_home(&local, false));
         assert!(!direct("[fd00::99]:7430").at_home(&local, false));
+    }
+
+    #[test]
+    fn the_pure_check_needs_a_path() {
+        assert!(at_home(&direct("[2001:db8:1:2::99]:7430"), &home()));
+        assert!(!at_home(&direct("[2001:db8:1:3::99]:7430"), &home()));
+        assert!(!at_home(&ConnectionPath::Unknown, &home()));
+        assert!(!at_home(&ConnectionPath::Relay, &home()));
     }
 
     #[test]

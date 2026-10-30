@@ -20,6 +20,10 @@ pub struct WatchingProfile {
     pub opens: ProfileOpens,
     /// Its PIN is asked for before it opens.
     pub locked: bool,
+    /// It has a PIN, asked for when it opens on a device that asks (a
+    /// lock on its card), whether or not it is locked now. False where
+    /// nothing here says: a saved sign-in with no session.
+    pub pin_required: bool,
     /// How many digits its PIN has, for a PIN pad of that length: as the
     /// server says for a trusted profile, or a session's user; `None`
     /// when it does not say.
@@ -54,6 +58,10 @@ pub enum ProfileOpens {
 #[derive(Debug, Clone, Default)]
 pub struct WhosWatching {
     pub profiles: Vec<WatchingProfile>,
+    /// The server could not be reached: the profiles are only the
+    /// sign-ins saved here, none signed in, and none opens until it is
+    /// back. Offline mode shows their downloads.
+    pub offline: bool,
 }
 
 /// What an app does at start, or when a server is chosen
@@ -130,26 +138,72 @@ impl Client {
         // One load: the sessions asked of the server and the saved
         // sign-ins are both of it, with any that ended left unsigned.
         let mut stored = crate::session::load(self.inner.storage.as_ref(), &server).await?;
-        let (sessions, trusted) = tokio::join!(
+        let (sessions, trusted, last) = tokio::join!(
             self.sessions_of(server, &mut stored),
-            self.trusted_profiles(endpoint_id)
+            self.trusted_profiles(endpoint_id),
+            self.last_profile()
         );
-        let sessions = sessions?;
-        let trusted = match trusted {
-            Ok(trusted) => trusted,
-            Err(e) if e.is_transport() => return Err(e),
-            Err(e) => {
-                tracing::debug!(error = %e, "no trusted profiles; listed without them");
-                Vec::new()
-            }
-        };
         let saved = stored.iter().map(crate::SavedProfile::from).collect();
-        let last = self
-            .last_profile()
-            .await?
+        let last = last?
             .filter(|l| l.server == endpoint_id)
             .map(|l| l.username);
-        Ok(merge(sessions, trusted, saved, last.as_deref()))
+        // With no session asked of the server, the trusted profiles are
+        // all that says whether it is reached.
+        watching(sessions.transpose(), trusted, saved, last.as_deref())
+    }
+
+    /// Open `username`'s profile on server `endpoint_id` as "Who's
+    /// watching" lists it, made the foreground profile: its session, or
+    /// one resumed on a trusted device, or a portable identity's signed
+    /// in. A locked profile opens too, and asks for its PIN
+    /// ([`Session::unlock`]) before anything else. [`SdkError::NotFound`]
+    /// for no such profile; [`SdkError::SignInRequired`] for one that
+    /// signs in again with a password or passkey; transport errors while
+    /// the server is not reached.
+    pub async fn open_profile(
+        &self,
+        endpoint_id: &str,
+        username: &str,
+    ) -> Result<Session, SdkError> {
+        let server = crate::client::parse_id(endpoint_id)?;
+        self.require_pinned(server).await?;
+        // Only `username`'s own: its kept session, asked of the server
+        // alone, then what "Who's watching" would fall back to, in the
+        // same order.
+        let mut stored = crate::session::load(self.inner.storage.as_ref(), &server).await?;
+        let mine = stored.iter().position(|s| s.username == username);
+        if let Some(at) = mine.filter(|&at| stored[at].token.is_some())
+            && let Some(session) = self
+                .sessions_of(server, &mut stored[at..=at])
+                .await?
+                .unwrap_or_default()
+                .pop()
+        {
+            self.activate_profile(&session).await?;
+            return Ok(session);
+        }
+        let saved = mine.map(|at| crate::SavedProfile::from(&stored[at]));
+        let trusted = match self.trusted_profiles(endpoint_id).await {
+            Ok(trusted) => trusted.into_iter().find(|t| t.username == username),
+            // A saved sign-in still opens without the trusted profiles.
+            Err(e) if saved.is_none() => return Err(e),
+            Err(_) => None,
+        };
+        let session = match (trusted, saved) {
+            (Some(trusted), _) => self.resume_profile(endpoint_id, &trusted.user_id).await?,
+            (
+                None,
+                Some(crate::SavedProfile {
+                    portable: Some(identity),
+                    method: Some(SignInMethod::Portable),
+                    ..
+                }),
+            ) => self.sign_in_portable(endpoint_id, identity).await?,
+            (None, Some(_)) => return Err(SdkError::SignInRequired),
+            (None, None) => return Err(SdkError::NotFound(format!("profile {username}"))),
+        };
+        self.activate_profile(&session).await?;
+        Ok(session)
     }
 
     /// Keep `username` on server `endpoint_id` as the profile browsed
@@ -252,6 +306,42 @@ impl Session {
     }
 }
 
+/// [`Client::whos_watching`] from what the server answered: merged, or,
+/// with the server not reached, the saved sign-ins alone, marked
+/// offline. `sessions` is `None` when no session was asked of it; then
+/// the trusted profiles are the only call, and their transport error is
+/// the server not reached. Any other failure of the sessions is the
+/// error. A failure of the trusted profiles alone, a timeout too, leaves
+/// them out when the sessions answered: the server is reached and they
+/// still open.
+fn watching(
+    sessions: Option<Result<Vec<Session>, SdkError>>,
+    trusted: Result<Vec<spoolframe_protocol::TrustedProfile>, SdkError>,
+    saved: Vec<crate::SavedProfile>,
+    last: Option<&str>,
+) -> Result<WhosWatching, SdkError> {
+    let unreached = match &sessions {
+        Some(sessions) => sessions.as_ref().is_err_and(SdkError::is_transport),
+        None => trusted.as_ref().is_err_and(SdkError::is_transport),
+    };
+    if unreached {
+        return Ok(WhosWatching {
+            offline: true,
+            ..merge(Vec::new(), Vec::new(), saved, last)
+        });
+    }
+    let trusted = trusted.unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "no trusted profiles; listed without them");
+        Vec::new()
+    });
+    Ok(merge(
+        sessions.transpose()?.unwrap_or_default(),
+        trusted,
+        saved,
+        last,
+    ))
+}
+
 /// [`Client::whos_watching`]'s merge, by username: each session; each
 /// trusted profile with none; each saved sign-in with neither, portable
 /// ones before those to sign in again.
@@ -278,6 +368,7 @@ fn merge(
             username: s.user().username.clone(),
             display_name: s.user().display_name.clone(),
             locked: s.user().locked,
+            pin_required: s.user().locked || s.user().pin.is_some(),
             // The user's own, else as the trusted row says.
             pin_digits: s
                 .user()
@@ -301,6 +392,7 @@ fn merge(
                     user_id: t.user_id.clone(),
                 },
                 locked: t.pin_required,
+                pin_required: t.pin_required,
                 pin_digits: t.pin_digits,
                 auto_login: t.auto_login,
                 last: false,
@@ -329,6 +421,7 @@ fn merge(
             display_name: s.display_name,
             opens,
             locked: false,
+            pin_required: false,
             pin_digits: None,
             auto_login: false,
             last: false,
@@ -337,7 +430,10 @@ fn merge(
     for p in &mut profiles {
         p.last = last == Some(p.username.as_str());
     }
-    WhosWatching { profiles }
+    WhosWatching {
+        profiles,
+        offline: false,
+    }
 }
 
 #[cfg(test)]

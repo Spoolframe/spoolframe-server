@@ -45,11 +45,7 @@ impl LocalDownload {
     pub fn resume_point(&self) -> Option<Duration> {
         match self.watched_here() {
             true => None,
-            false => self
-                .watch
-                .position_ms
-                .map(Duration::from_millis)
-                .filter(|p| !p.is_zero()),
+            false => self.watch.position.filter(|p| !p.is_zero()),
         }
     }
 
@@ -165,6 +161,23 @@ impl LocalDownload {
                 audio: (!self.file_tracks().audio.is_empty()).then_some(0),
                 subtitle: None,
             },
+        }
+    }
+
+    /// The streams of its file to play for `asked`, as
+    /// [`LocalDownload::pick_tracks`] picks them. Every subtitle in a
+    /// download is a stream of the file, one the server had beside the
+    /// film too: the file's place is the stream's, never counted past
+    /// the item's external ones as [`crate::tracks::map_selection`] counts
+    /// a direct play's.
+    pub fn stream_picks(&self, asked: Option<Selection>) -> crate::tracks::StreamPicks {
+        use crate::tracks::{StreamPicks, SubtitleHandling};
+        let picked = self.pick_tracks(asked);
+        StreamPicks {
+            audio_stream: picked.audio.map(|a| a as usize),
+            subtitle: picked.subtitle.map_or(SubtitleHandling::None, |s| {
+                SubtitleHandling::Embedded(s as usize)
+            }),
         }
     }
 

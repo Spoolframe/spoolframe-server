@@ -38,6 +38,7 @@ use spoolframe_types::MediaId;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::time::Instant;
@@ -49,6 +50,7 @@ mod next;
 mod player_session;
 mod revival;
 mod routed;
+pub(crate) mod seek_gate;
 mod stall;
 mod subtitle_file;
 pub use cadence::PlayerState;
@@ -57,7 +59,27 @@ pub use player_session::PlayerSession;
 pub use revival::{PlaybackStopped, RestartCause};
 pub use subtitle_file::SubtitleFile;
 
+/// What a re-plan of a playing playback goes with
+/// ([`PlaybackBackend::subtitle`], [`PlaybackBackend::change_quality`],
+/// [`PlaybackBackend::limit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replan {
+    /// How a picked bitmap subtitle is shown.
+    pub bitmap: BitmapSubtitles,
+    /// Where the viewer is: a converted playback's encode starts again
+    /// here.
+    pub position: Duration,
+    /// The display the playback was opened for
+    /// ([`PlaybackOptions::display`]); `None` is the screen the app said
+    /// last ([`crate::Client::set_display`]).
+    pub display: Option<spoolframe_types::DisplayCapabilities>,
+}
+
 /// Small transport port for media adapters and deterministic client tests.
+///
+/// Every method playback reaches has no default (the subtitle file, a
+/// stall, a track change, a re-plan, the route), so a backend that misses
+/// one fails to compile rather than mid-playback.
 #[async_trait]
 pub trait PlaybackBackend: Send + Sync + 'static {
     async fn start(
@@ -84,8 +106,7 @@ pub trait PlaybackBackend: Send + Sync + 'static {
         &self,
         handle: &PlaybackHandle,
         selected: Option<u32>,
-        bitmap: BitmapSubtitles,
-        position: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError>;
     async fn progress(&self, handle: &PlaybackHandle, position: Duration) -> Result<(), SdkError>;
     async fn stop(&self, handle: &PlaybackHandle) -> Result<(), SdkError>;
@@ -96,10 +117,9 @@ pub trait PlaybackBackend: Send + Sync + 'static {
         &self,
         handle: &PlaybackHandle,
         quality: PlaybackQuality,
-        bitmap: BitmapSubtitles,
-        position: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        let _ = (handle, quality, bitmap, position);
+        let _ = (handle, quality, replan);
         Err(SdkError::InvalidInput(
             "this playback backend cannot change a playback's quality".into(),
         ))
@@ -111,10 +131,9 @@ pub trait PlaybackBackend: Send + Sync + 'static {
         &self,
         handle: &PlaybackHandle,
         link_bitrate: u64,
-        bitmap: BitmapSubtitles,
-        position: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        let _ = (handle, link_bitrate, bitmap, position);
+        let _ = (handle, link_bitrate, replan);
         Err(SdkError::InvalidInput(
             "this playback backend cannot plan for its link".into(),
         ))
@@ -185,51 +204,35 @@ pub trait PlaybackBackend: Send + Sync + 'static {
             .await
             .map(ChunkStream::from)
     }
+    // The six below have no default: playback reaches each of them
+    // (the subtitle file, a stall, a track change, a re-plan), and a
+    // default that refused would compile and only fail mid-playback. A
+    // backend with nothing to give says so itself: `None`, or an error.
+
     /// How fast the link to the server carries media, for the
-    /// direct reader to feed. A backend with no link keeps the default.
-    fn link_meter(&self) -> Option<Arc<crate::LinkMeter>> {
-        None
-    }
+    /// direct reader to feed; `None` with no link.
+    fn link_meter(&self) -> Option<Arc<crate::LinkMeter>>;
     /// Playbacks whose share of the server's uplink changed: a
-    /// managed playback in Auto plans itself again on its own. A backend
-    /// with no server keeps the default.
-    fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
-        None
-    }
+    /// managed playback in Auto plans itself again on its own; `None`
+    /// with no server.
+    fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>>;
     /// Keep `selection` for the item's series or movie
-    /// ([`Session::set_track_override`]). A backend with no server keeps
-    /// the default, which refuses.
+    /// ([`Session::set_track_override`]).
     async fn set_track_override(
         &self,
         item: &MediaId,
         selection: Selection,
-    ) -> Result<(), SdkError> {
-        let _ = (item, selection);
-        Err(SdkError::InvalidInput(
-            "this playback backend cannot keep a track choice".into(),
-        ))
-    }
+    ) -> Result<(), SdkError>;
     /// The playback's subtitle file, whole ([`Session::read_subtitle`]).
-    /// A backend with no files keeps the default, which refuses.
-    async fn read_subtitle(&self, handle: &PlaybackHandle) -> Result<Subtitle, SdkError> {
-        let _ = handle;
-        Err(SdkError::InvalidInput(
-            "this playback backend has no subtitle files".into(),
-        ))
-    }
+    async fn read_subtitle(&self, handle: &PlaybackHandle) -> Result<Subtitle, SdkError>;
     /// The server's subtitle timing changes, and the server's key they
-    /// name: a managed playback follows its own track's. A backend with
-    /// no server keeps the default.
-    fn subtitle_timings(
-        &self,
-    ) -> Option<(String, broadcast::Receiver<crate::SubtitleTimingEvent>)> {
-        None
-    }
+    /// name: a managed playback follows its own track's; `None` with no
+    /// server.
+    fn subtitle_timings(&self)
+    -> Option<(String, broadcast::Receiver<crate::SubtitleTimingEvent>)>;
     /// How a paired server's item plays now
     /// ([`ManagedPlayback::route`]); `None` for any other backend.
-    fn route(&self) -> Option<crate::RemoteMode> {
-        None
-    }
+    fn route(&self) -> Option<crate::RemoteMode>;
     /// HLS subtitle segment `n` ([`Session::read_subtitle_segment`]).
     async fn subtitle_segment(
         &self,
@@ -274,10 +277,9 @@ impl PlaybackBackend for Session {
         &self,
         h: &PlaybackHandle,
         s: Option<u32>,
-        b: BitmapSubtitles,
-        p: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        self.change_subtitle(h, s, b, p).await
+        self.change_subtitle_on(h, s, replan).await
     }
     async fn progress(&self, h: &PlaybackHandle, p: Duration) -> Result<(), SdkError> {
         self.update_progress(h, p).await
@@ -289,19 +291,17 @@ impl PlaybackBackend for Session {
         &self,
         h: &PlaybackHandle,
         l: u64,
-        b: BitmapSubtitles,
-        p: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        self.limit_playback(h, l, b, p).await
+        self.limit_playback_on(h, l, replan).await
     }
     async fn change_quality(
         &self,
         h: &PlaybackHandle,
         q: PlaybackQuality,
-        b: BitmapSubtitles,
-        p: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        Session::change_quality(self, h, q, b, p).await
+        self.change_quality_on(h, q, replan).await
     }
     async fn manifest(
         &self,
@@ -368,6 +368,10 @@ impl PlaybackBackend for Session {
             self.client.subtitle_timing_events(),
         ))
     }
+    /// The user's own server's item: no route.
+    fn route(&self) -> Option<crate::RemoteMode> {
+        None
+    }
 }
 
 struct State {
@@ -381,10 +385,11 @@ struct State {
     /// Where each HLS segment starts (segment `n` at `[n - 1]`), from the
     /// media playlist last read: a segment read says where the player is.
     segments: Vec<Duration>,
-    /// One more each time the encode is replaced: with the handle (a
-    /// resume), or under it (a seek, a subtitle or quality change, a
-    /// re-plan for the link), as the server serves segments by number
-    /// from its encode now.
+    /// One more each time the player must move ([`moves_player`]): the
+    /// encode replaced with the handle (a resume), or under it (a seek, a subtitle or quality
+    /// change, a re-plan for the link), as the server serves segments by
+    /// number from its encode now. Only [`State::set_playback`] moves it,
+    /// and [`Inner::generation`] with it.
     generation: u64,
     /// What each HLS segment (by rung and number) was last opened from
     /// offset 0 under, for a read of its rest that names no
@@ -430,6 +435,29 @@ struct State {
     stall_limited: bool,
     /// Each subtitle track's timing, as the server last said.
     timings: HashMap<u32, spoolframe_types::SubtitleTiming>,
+    /// A seek the player has not landed yet: positions until it does are
+    /// reported as its target ([`ManagedPlayback::seek_started`]).
+    gate: seek_gate::SeekGate,
+}
+
+/// Whether a player reading `before` must move to `after`, made of it
+/// since: another plan, another encode of it, or the playback started
+/// again under a new handle. The player gets a new reader of `after`
+/// where the viewer was. [`ManagedPlayback::generation`] goes up on each.
+pub fn moves_player(before: &Playback, after: &Playback) -> bool {
+    before.plan != after.plan || before.epoch != after.epoch || before.handle != after.handle
+}
+
+impl State {
+    /// The playback as it is now: the generation goes up where it moves
+    /// the player ([`moves_player`]), in `generation` too.
+    fn set_playback(&mut self, next: Playback, generation: &AtomicU64) {
+        if moves_player(&self.playback, &next) {
+            self.generation += 1;
+            generation.store(self.generation, std::sync::atomic::Ordering::Release);
+        }
+        self.playback = next;
+    }
 }
 
 /// What a segment read was opened under: the handle it went to and the
@@ -457,6 +485,9 @@ impl Opened {
 }
 
 struct Inner {
+    /// [`State::generation`], to read without the lock
+    /// ([`ManagedPlayback::generation`]).
+    generation: AtomicU64,
     backend: Arc<dyn PlaybackBackend>,
     item: MediaId,
     state: Mutex<State>,
@@ -482,6 +513,89 @@ struct Inner {
 /// A live playback with shared recovery, bounded progress reporting and cleanup.
 #[derive(Clone)]
 pub struct ManagedPlayback(Arc<Inner>);
+
+/// One playback's share of the server's uplink, as the server moves it
+/// ([`ManagedPlayback::watch_share`]).
+pub struct ShareWatch {
+    shares: Shares,
+    playback: WeakPlayback,
+}
+
+/// The server's share events for a playback's session, until the
+/// playback is dropped.
+struct Shares {
+    shares: broadcast::Receiver<PlaybackShare>,
+    /// Ends as the playback is dropped.
+    gone: watch::Receiver<()>,
+}
+
+impl Shares {
+    /// The next share event, for any playback of the session; `None` once
+    /// the playback or the client is gone. Events missed while behind are
+    /// skipped.
+    async fn recv(&mut self) -> Option<PlaybackShare> {
+        loop {
+            let received = tokio::select! {
+                received = self.shares.recv() => received,
+                // Only ever an error: the playback was dropped.
+                _ = self.gone.changed() => return None,
+            };
+            match received {
+                Ok(share) => return Some(share),
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
+/// A [`ManagedPlayback`] held without keeping it
+/// ([`ManagedPlayback::downgrade`]).
+#[derive(Clone)]
+pub struct WeakPlayback(std::sync::Weak<Inner>);
+
+impl std::fmt::Debug for WeakPlayback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakPlayback").finish_non_exhaustive()
+    }
+}
+
+impl WeakPlayback {
+    /// The playback, while any clone of it is held.
+    pub fn upgrade(&self) -> Option<ManagedPlayback> {
+        self.0.upgrade().map(ManagedPlayback)
+    }
+
+    /// [`ManagedPlayback::share`]; `None` once the playback is gone too.
+    pub fn share(&self) -> Option<PlaybackShare> {
+        self.upgrade()?.share()
+    }
+}
+
+impl std::fmt::Debug for ShareWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareWatch").finish_non_exhaustive()
+    }
+}
+
+impl ShareWatch {
+    /// [`ManagedPlayback::share`]; `None` once the playback is gone too.
+    pub fn current(&self) -> Option<PlaybackShare> {
+        self.playback.share()
+    }
+
+    /// The next move of the playback's share; `None` once the playback
+    /// or the client is gone. Moves missed while behind are skipped: the
+    /// next one is the share now.
+    pub async fn next(&mut self) -> Option<PlaybackShare> {
+        loop {
+            let share = self.shares.recv().await?;
+            if self.playback.upgrade()?.is_handle(&share.handle) {
+                return Some(share);
+            }
+        }
+    }
+}
 impl std::fmt::Debug for ManagedPlayback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ManagedPlayback")
@@ -675,6 +789,7 @@ impl ManagedPlayback {
         let (errors, _) = broadcast::channel(16);
         let notify = Arc::new(Notify::new());
         let inner = Arc::new(Inner {
+            generation: AtomicU64::new(0),
             backend,
             item,
             state: Mutex::new(State {
@@ -701,6 +816,7 @@ impl ManagedPlayback {
                 keepalive_needed: true,
                 stall_limited: false,
                 timings: HashMap::new(),
+                gate: seek_gate::SeekGate::default(),
             }),
             control: tokio::sync::Mutex::new(()),
             changed,
@@ -716,23 +832,15 @@ impl ManagedPlayback {
         // A share of the server's uplink that moved: a playback in
         // Auto plans itself again where the viewer is, as the viewer's own
         // quality change would.
-        if let Some(mut shares) = inner.backend.shares() {
-            let weak = Arc::downgrade(&inner);
-            let mut gone = inner.gone.subscribe();
+        if let Some(shares) = inner.backend.shares() {
+            let weak = WeakPlayback(Arc::downgrade(&inner));
+            let mut shares = Shares {
+                shares,
+                gone: inner.gone.subscribe(),
+            };
             inner.runtime.spawn(async move {
-                loop {
-                    let received = tokio::select! {
-                        received = shares.recv() => received,
-                        // Only ever an error: the playback was dropped.
-                        _ = gone.changed() => return,
-                    };
-                    let share = match received {
-                        Ok(share) => share,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    };
-                    let Some(inner) = weak.upgrade() else { return };
-                    let this = ManagedPlayback(inner);
+                while let Some(share) = shares.recv().await {
+                    let Some(this) = weak.upgrade() else { return };
                     let mine = {
                         let mut state = this.0.state.lock();
                         let ours = state.playback.handle == share.handle && !state.closed;
@@ -769,6 +877,29 @@ impl ManagedPlayback {
     }
     /// Whether it is planned as `plan` now: a replan's test, with no
     /// copy of the playback.
+    /// One more each time the player must move ([`moves_player`]): a
+    /// reader made under another must not hand out what it reads now
+    /// ([`SdkError::Replanned`]), and its player moves to the playback as
+    /// it is.
+    pub fn generation(&self) -> u64 {
+        self.0.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// [`ManagedPlayback::snapshot`] and the generation it is of, read
+    /// together: a re-plan between two reads would pair a playback with
+    /// a newer generation.
+    pub fn snapshot_with_generation(&self) -> (Playback, u64) {
+        let state = self.0.state.lock();
+        (state.playback.clone(), state.generation)
+    }
+    /// The playback as it is in `generation`, as its player was given it;
+    /// [`SdkError::Replanned`] if it has moved on since.
+    pub fn snapshot_at(&self, generation: u64) -> Result<Playback, SdkError> {
+        let (playback, now) = self.snapshot_with_generation();
+        if now != generation {
+            return Err(SdkError::Replanned);
+        }
+        Ok(playback)
+    }
     pub fn is_planned(&self, plan: &PlaybackPlan) -> bool {
         self.0.state.lock().playback.plan == *plan
     }
@@ -778,6 +909,15 @@ impl ManagedPlayback {
             self.0.state.lock().playback.plan,
             PlaybackPlan::Converted { .. }
         )
+    }
+    /// A re-plan of this playback, shown as `bitmap`, from `position`,
+    /// for the display it was opened for ([`PlaybackOptions::display`]).
+    fn replan(&self, bitmap: BitmapSubtitles, position: Duration) -> Replan {
+        Replan {
+            bitmap,
+            position,
+            display: self.0.state.lock().options.display.clone(),
+        }
     }
     /// Whether `handle` is the one it reads now: a share or event for an
     /// earlier start of it is not its own.
@@ -793,6 +933,29 @@ impl ManagedPlayback {
     /// resume behind the app's back.
     pub fn changes(&self) -> watch::Receiver<Playback> {
         self.0.changed.subscribe()
+    }
+    /// The server's share events as it sends them, for every playback of
+    /// the session (each names its handle); `None` with no server to
+    /// say. [`ManagedPlayback::share`] is this playback's last.
+    pub fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
+        self.0.backend.shares()
+    }
+    /// This playback's share as the server moves it; `None` with no
+    /// server to say. It holds the playback weakly: kept after the app
+    /// drops the playback, it ends instead of keeping it, its session and
+    /// the client.
+    pub fn watch_share(&self) -> Option<ShareWatch> {
+        Some(ShareWatch {
+            shares: Shares {
+                shares: self.shares()?,
+                gone: self.0.gone.subscribe(),
+            },
+            playback: self.downgrade(),
+        })
+    }
+    /// This playback, held without keeping it.
+    pub fn downgrade(&self) -> WeakPlayback {
+        WeakPlayback(Arc::downgrade(&self.0))
     }
     /// The share of the server's uplink this playback was last told:
     /// `max_bitrate` is what it may take, bits/s, `None` for no
@@ -810,9 +973,11 @@ impl ManagedPlayback {
         self.0.errors.subscribe()
     }
     /// Where the player is. Reports are coalesced and sent in the
-    /// background; a resume starts the new playback here.
+    /// background; a resume starts the new playback here. While a seek is
+    /// in flight ([`Self::seek_started`]) it is the seek's target.
     pub fn report_position(&self, position: Duration) -> Result<(), SdkError> {
         let mut state = self.0.state.lock();
+        let (position, _) = state.gate.position(position);
         if state.finishing || state.closed {
             return Err(SdkError::PlaybackClosed);
         }
@@ -959,6 +1124,29 @@ impl ManagedPlayback {
         state.contact = now;
         drop(state);
         self.0.settled.send_replace(true);
+    }
+
+    /// The player seeks to `target`, by itself (its own scrubber) or as
+    /// asked: its positions are the old place's until it lands, so
+    /// [`Self::report_position`] and [`Self::set_state`] save the target
+    /// meanwhile, never the place it left. Call it as the player's seek
+    /// begins; [`Self::seek_done`] from its own seek-complete signal.
+    /// Without that, the seek is over once a position lands within
+    /// [`seek_gate::SEEK_LANDED`] of the target, or after
+    /// [`seek_gate::SEEK_GIVE_UP`].
+    pub fn seek_started(&self, target: Duration) {
+        self.0.state.lock().gate.started(target);
+    }
+
+    /// The player's seek is done: its positions count again.
+    pub fn seek_done(&self) {
+        self.0.state.lock().gate.done();
+    }
+
+    /// The player at `at` through the seek gate: where it is for the
+    /// progress and the markers, and whether that is settled.
+    pub(crate) fn gated(&self, at: Duration) -> (Duration, bool) {
+        self.0.state.lock().gate.position(at)
     }
 
     /// Where the viewer last was: reported, sought to, or set.
@@ -1462,8 +1650,7 @@ impl ManagedPlayback {
         let next = admission.playback.take().expect("admitted playback");
         {
             let mut state = self.0.state.lock();
-            state.playback = next.clone();
-            state.generation += 1;
+            state.set_playback(next.clone(), &self.0.generation);
             if let Restart::Reselect { selection, .. } = restart {
                 state.selection = Some(selection);
             }
@@ -1526,10 +1713,12 @@ impl ManagedPlayback {
         match self.0.backend.seek(&before.handle, position).await {
             Ok(epoch) => {
                 let mut state = self.0.state.lock();
-                state.playback.epoch = epoch;
                 // A new encode under the same handle.
-                state.generation += 1;
-                let next = state.playback.clone();
+                let next = Playback {
+                    epoch,
+                    ..state.playback.clone()
+                };
+                state.set_playback(next.clone(), &self.0.generation);
                 drop(state);
                 self.0.changed.send_replace(next);
             }
@@ -1565,7 +1754,7 @@ impl ManagedPlayback {
             Ok(()) => {
                 self.0
                     .backend
-                    .subtitle(&p.handle, selected, bitmap, position)
+                    .subtitle(&p.handle, selected, &self.replan(bitmap, position))
                     .await
             }
             Err(error) => Err(error),
@@ -1588,11 +1777,15 @@ impl ManagedPlayback {
             Err(error) => return Err(error),
         };
         let mut state = self.0.state.lock();
-        state.playback.plan = changed.plan;
-        state.playback.size = changed.size;
-        state.playback.epoch = changed.epoch;
-        // A new encode under the same handle.
-        state.generation += 1;
+        // A new encode under the same handle, or (a direct play's) the
+        // same bytes.
+        let next = Playback {
+            plan: changed.plan,
+            size: changed.size,
+            epoch: changed.epoch,
+            ..state.playback.clone()
+        };
+        state.set_playback(next, &self.0.generation);
         state.selection.get_or_insert(Selection::default()).subtitle = selected;
         state.options.bitmap = bitmap;
         state.position = Some(position);
@@ -1638,7 +1831,7 @@ impl ManagedPlayback {
             Ok(()) => {
                 self.0
                     .backend
-                    .limit(&p.handle, link_bitrate, bitmap, position)
+                    .limit(&p.handle, link_bitrate, &self.replan(bitmap, position))
                     .await
             }
             Err(error) => Err(error),
@@ -1660,11 +1853,14 @@ impl ManagedPlayback {
             return Ok(p);
         }
         let mut state = self.0.state.lock();
-        state.playback.plan = changed.plan;
-        state.playback.size = changed.size;
-        state.playback.epoch = changed.epoch;
         // A new encode under the same handle.
-        state.generation += 1;
+        let next = Playback {
+            plan: changed.plan,
+            size: changed.size,
+            epoch: changed.epoch,
+            ..state.playback.clone()
+        };
+        state.set_playback(next, &self.0.generation);
         state.position = Some(position);
         let next = state.playback.clone();
         drop(state);
@@ -1737,7 +1933,7 @@ impl ManagedPlayback {
             Ok(()) => {
                 self.0
                     .backend
-                    .change_quality(&p.handle, quality, bitmap, position)
+                    .change_quality(&p.handle, quality, &self.replan(bitmap, position))
                     .await
             }
             Err(error) => Err(error),
@@ -1761,11 +1957,14 @@ impl ManagedPlayback {
         if changed.plan == p.plan && changed.epoch == p.epoch {
             return Ok(state.playback.clone());
         }
-        state.playback.plan = changed.plan;
-        state.playback.size = changed.size;
-        state.playback.epoch = changed.epoch;
         // A new encode under the same handle.
-        state.generation += 1;
+        let next = Playback {
+            plan: changed.plan,
+            size: changed.size,
+            epoch: changed.epoch,
+            ..state.playback.clone()
+        };
+        state.set_playback(next, &self.0.generation);
         let next = state.playback.clone();
         drop(state);
         self.0.changed.send_replace(next.clone());
@@ -2015,8 +2214,25 @@ mod tests {
             chosen: None,
             epoch: 0,
             markers: vec![],
+            duration: None,
         }
     }
+    #[test]
+    fn another_plan_encode_or_handle_moves_the_player_and_the_same_does_not() {
+        let before = playback(1);
+        let encode = Playback {
+            epoch: 1,
+            ..playback(1)
+        };
+        let plan = Playback {
+            plan: PlaybackPlan::Unsupported { reasons: vec![] },
+            ..playback(1)
+        };
+        let moved =
+            [&before, &encode, &plan, &playback(2)].map(|after| moves_player(&before, after));
+        assert_eq!(moved, [false, true, true, true]);
+    }
+
     #[async_trait]
     impl PlaybackBackend for Backend {
         async fn start(
@@ -2107,12 +2323,12 @@ mod tests {
             &self,
             _: &PlaybackHandle,
             selected: Option<u32>,
-            _: BitmapSubtitles,
-            at: Duration,
+            replan: &Replan,
         ) -> Result<PlaybackChange, SdkError> {
-            self.events
-                .lock()
-                .push(format!("subtitle-change:{selected:?}:{}", at.as_secs()));
+            self.events.lock().push(format!(
+                "subtitle-change:{selected:?}:{}",
+                replan.position.as_secs()
+            ));
             Err(SdkError::Busy)
         }
         async fn progress(&self, h: &PlaybackHandle, p: Duration) -> Result<(), SdkError> {
@@ -2133,13 +2349,12 @@ mod tests {
             &self,
             h: &PlaybackHandle,
             quality: PlaybackQuality,
-            _: BitmapSubtitles,
-            position: Duration,
+            replan: &Replan,
         ) -> Result<PlaybackChange, SdkError> {
             self.events.lock().push(format!(
                 "quality:{}:{quality:?}:{}",
                 h.0,
-                position.as_secs()
+                replan.position.as_secs()
             ));
             if self.hold_quality.swap(false, SeqCst) {
                 self.entered.notify_one();
@@ -2171,6 +2386,18 @@ mod tests {
                 .lock()
                 .as_ref()
                 .map(broadcast::Sender::subscribe)
+        }
+        fn link_meter(&self) -> Option<std::sync::Arc<crate::LinkMeter>> {
+            None
+        }
+        async fn set_track_override(
+            &self,
+            _: &spoolframe_types::MediaId,
+            _: spoolframe_protocol::Selection,
+        ) -> Result<(), crate::SdkError> {
+            Err(crate::SdkError::InvalidInput(
+                "no track choices here".into(),
+            ))
         }
     }
     async fn open(b: Arc<Backend>) -> ManagedPlayback {
@@ -2804,6 +3031,21 @@ mod tests {
             .await
     }
 
+    /// The playback opens the next item through its own backend, waiting
+    /// as `open_after` does.
+    #[tokio::test(start_paused = true)]
+    async fn a_playback_opens_the_next_through_its_own_backend() {
+        let b = Arc::new(Backend::default());
+        let playing = open(b.clone()).await;
+        let asked = Instant::now();
+        let next = playing
+            .open_next(item(), None, PlaybackOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(asked.elapsed(), Duration::from_secs(10));
+        assert_ne!(next.snapshot().handle, playing.snapshot().handle);
+    }
+
     /// Opened at once, the next could end the one playing before its
     /// player read a byte: it waits for that read, 10 s at most.
     #[tokio::test(start_paused = true)]
@@ -3028,8 +3270,7 @@ mod tests {
                 &self,
                 h: &PlaybackHandle,
                 _: Option<u32>,
-                _: BitmapSubtitles,
-                _: Duration,
+                _: &Replan,
             ) -> Result<PlaybackChange, SdkError> {
                 self.alive(h)?;
                 Err(SdkError::Busy)
@@ -3059,8 +3300,7 @@ mod tests {
                 &self,
                 h: &PlaybackHandle,
                 link_bitrate: u64,
-                _: BitmapSubtitles,
-                _: Duration,
+                _: &Replan,
             ) -> Result<PlaybackChange, SdkError> {
                 self.alive(h)?;
                 self.limits.lock().push(link_bitrate);
@@ -3106,6 +3346,31 @@ mod tests {
                     epoch: e,
                 })
             }
+            fn shares(
+                &self,
+            ) -> Option<tokio::sync::broadcast::Receiver<crate::managed::PlaybackShare>>
+            {
+                None
+            }
+            async fn read_subtitle(
+                &self,
+                _: &spoolframe_protocol::PlaybackHandle,
+            ) -> Result<crate::Subtitle, crate::SdkError> {
+                Err(crate::SdkError::InvalidInput(
+                    "no subtitle files here".into(),
+                ))
+            }
+            fn subtitle_timings(
+                &self,
+            ) -> Option<(
+                String,
+                tokio::sync::broadcast::Receiver<crate::SubtitleTimingEvent>,
+            )> {
+                None
+            }
+            fn route(&self) -> Option<crate::RemoteMode> {
+                None
+            }
         }
         /// A screen in an SDR mode, 8 bits.
         fn sdr_display() -> spoolframe_types::DisplayCapabilities {
@@ -3113,6 +3378,8 @@ mod tests {
                 bit_depth: Some(8),
                 hdr: Some(std::collections::BTreeSet::new()),
                 video_codecs: None,
+                height: None,
+                frame_rate: None,
             }
         }
 

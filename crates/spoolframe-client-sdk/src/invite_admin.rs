@@ -9,10 +9,11 @@
 //! [`Session::confirm_password`] or a passkey
 //! ([`Session::begin_confirm_passkey`]), then ask again. Listing does not.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use spoolframe_protocol::invite_admin::{self as wire, CreateInvite};
 use spoolframe_protocol::{Reply, Request};
+use spoolframe_types::serde_time::unix_seconds;
 use spoolframe_types::{Platform, Role};
 
 use crate::session::unexpected;
@@ -44,14 +45,18 @@ pub struct InviteSpec {
     pub kind: InviteKind,
     /// Who it is for, for the admins' list: at most 64 characters, one
     /// line.
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub note: Option<String>,
     /// How many times it may be redeemed: 1 to 100.
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub uses: Option<u32>,
     /// How long it lasts: an hour to 30 days, to the second.
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub expires_in: Option<Duration>,
     /// The role the accounts it makes get: only for
     /// [`InviteKind::CreateUser`]. Any other kind with a role but the
     /// consumer's is [`SdkError::InvalidInput`].
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub role: Option<Role>,
 }
 
@@ -169,7 +174,7 @@ impl Session {
                 kind: created.invite.kind.into(),
                 code: created.code,
                 link: created.link,
-                expires_at: time(created.invite.expires_at),
+                expires_at: unix_seconds::from_wire(created.invite.expires_at),
                 uses: created.invite.uses,
             }),
             other => Err(unexpected(other)),
@@ -225,11 +230,6 @@ impl TryFrom<InviteKind> for wire::InviteKind {
     }
 }
 
-/// Unix seconds as a time; one before 1970 (none is) as 1970.
-pub(crate) fn time(secs: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0))
-}
-
 fn summary(invite: wire::InviteSummary, this_device: &str) -> InviteSummary {
     let created_from = match invite.created_from {
         wire::InviteOrigin::WebAdmin => InviteOrigin::WebAdmin,
@@ -252,8 +252,8 @@ fn summary(invite: wire::InviteSummary, this_device: &str) -> InviteSummary {
         role: invite.role,
         uses: invite.uses,
         used: invite.uses.saturating_sub(invite.uses_left),
-        expires_at: time(invite.expires_at),
-        created_at: time(invite.created_at),
+        expires_at: unix_seconds::from_wire(invite.expires_at),
+        created_at: unix_seconds::from_wire(invite.created_at),
         created_by: InviteCreator {
             display_name: invite.created_by.display_name,
             username: invite.created_by.username,
@@ -344,9 +344,6 @@ mod tests {
         let invite = summary(listed(wire::InviteOrigin::WebAdmin), "");
         assert_eq!((invite.uses, invite.used), (4, 1));
         assert_eq!(invite.created_by.display_name, "Andrey");
-        assert_eq!(
-            invite.expires_at,
-            UNIX_EPOCH + Duration::from_secs(1_800_000_000)
-        );
+        assert_eq!(invite.expires_at, unix_seconds::from_wire(1_800_000_000));
     }
 }
