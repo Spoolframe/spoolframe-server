@@ -72,8 +72,8 @@ fn credits_that_run_to_the_end_need_no_duration() {
 fn marker(kind: MarkerKind, start_ms: u64, to_end: bool) -> Marker {
     Marker {
         kind,
-        start_ms,
-        end_ms: start_ms + 60_000,
+        start: Duration::from_millis(start_ms),
+        end: Duration::from_millis(start_ms + 60_000),
         to_end,
     }
 }

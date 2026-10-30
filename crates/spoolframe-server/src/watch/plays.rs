@@ -472,7 +472,7 @@ impl Watch {
                 continue;
             };
             state.play_count = count;
-            state.last_played_at = last;
+            state.last_played_at = last.map(spoolframe_types::serde_time::unix_seconds::from_wire);
         }
         Ok(())
     }

@@ -115,7 +115,7 @@ async fn a_player_gets_previews_and_finds_the_frame_for_a_time_on_its_sheet() {
     assert_eq!((previews.tile_width, previews.tile_height), (320, 180));
 
     // 2:40 is tile 16, read off the sheet as a player would.
-    let tile = previews.tile(160_000).unwrap();
+    let tile = previews.tile(Duration::from_secs(160)).unwrap();
     let (response, bytes) = client
         .artwork(
             &session,

@@ -3005,7 +3005,9 @@ impl ClientProtocol {
                         platform: d.platform(),
                         endpoint_id: d.endpoint_id,
                         name: d.name,
-                        last_seen_at: d.last_seen_at,
+                        last_seen_at: spoolframe_types::serde_time::unix_seconds::from_wire(
+                            d.last_seen_at,
+                        ),
                         pin_required: d.pin_required,
                         trusted: d.trusted,
                         auto_login: d.auto_login,
@@ -3350,7 +3352,7 @@ impl ClientProtocol {
                 Ok(Reply::Item {
                     item: found.item,
                     children: found.children,
-                    markers: found.markers,
+                    markers: found.markers.into(),
                     playlists,
                     liked,
                     liked_children: liked_children.unwrap_or_default(),
@@ -4282,7 +4284,8 @@ impl ClientProtocol {
                         size,
                         chosen,
                         epoch: 0,
-                        markers,
+                        markers: markers.into(),
+                        duration,
                     })
                 }
                 .await;
@@ -4669,7 +4672,9 @@ impl ClientProtocol {
                         device_name: waiting.device_name,
                         client_name: waiting.client_name,
                         platform: waiting.platform,
-                        requested_at: waiting.requested_at,
+                        requested_at: spoolframe_types::serde_time::unix_seconds::from_wire(
+                            waiting.requested_at,
+                        ),
                         remember: waiting.remember,
                         requested_from: waiting.address.map(crate::device_sign_in::device_address),
                     })),
@@ -6837,6 +6842,7 @@ impl ClientProtocol {
             chosen,
             epoch,
             markers,
+            duration,
         } = federation
             .start_proxy(who, start)
             .await
@@ -6844,7 +6850,8 @@ impl ClientProtocol {
         let (trace, _span) = crate::playback::PlaybackTrace::begin();
         let principal = who.principal();
         let title_key = self.services.watch.title_key(&found).await;
-        let duration = crate::watch::length(None, &found.item);
+        // SA probed the file; this server's catalog has only its listing.
+        let duration = duration.or_else(|| crate::watch::length(None, &found.item));
         let hello = state.hello.get();
         let handle = self.services.playbacks.start(
             Playbacks::new_handle(),
@@ -6909,7 +6916,8 @@ impl ClientProtocol {
             size,
             chosen,
             epoch,
-            markers,
+            markers: markers.into(),
+            duration,
         })
     }
 
@@ -7588,7 +7596,9 @@ fn plex_link(
         username: shown.username,
         email: shown.email,
         by_config: shown.by_config,
-        linked_at: shown.linked_at,
+        linked_at: shown
+            .linked_at
+            .map(spoolframe_types::serde_time::unix_seconds::from_wire),
         last_sync: last_run.map(|run| PlexSyncSummary {
             at: run.at,
             libraries: run.libraries,
@@ -8175,8 +8185,10 @@ fn passkey_info(p: PasskeyRecord, app_rp_id: &str) -> PasskeyInfo {
         usable_here: p.rp_id == app_rp_id,
         id: p.credential_id,
         name: p.name,
-        created_at: p.created_at,
-        last_used_at: p.last_used_at,
+        created_at: spoolframe_types::serde_time::unix_seconds::from_wire(p.created_at),
+        last_used_at: p
+            .last_used_at
+            .map(spoolframe_types::serde_time::unix_seconds::from_wire),
         rp_id: p.rp_id,
     }
 }
@@ -9171,6 +9183,10 @@ impl PlayCaps {
 
 /// What a playback plans for (P8-04): `over`, the device's own when a
 /// paired server plays on to it, else Hello's; the screen's over them.
+/// Every plan's capabilities are formed here, through
+/// [`ClientCapabilities::with_display`](spoolframe_types::ClientCapabilities::with_display)
+/// even with no display, so the planner never reads a 0 height or frame
+/// rate.
 fn capabilities_over(
     state: &ConnectionState,
     over: Option<&spoolframe_types::ClientCapabilities>,
@@ -9286,7 +9302,9 @@ mod tests {
                 username: Some("alice_plex".into()),
                 email: Some("alice@example.com".into()),
                 by_config: false,
-                linked_at: Some(1_790_000_000),
+                linked_at: Some(spoolframe_types::serde_time::unix_seconds::from_wire(
+                    1_790_000_000
+                )),
                 last_sync: Some(PlexSyncSummary {
                     at: 1_790_000_100,
                     libraries: 2,

@@ -1621,7 +1621,7 @@ impl Playlists {
         Ok(Some(PlaylistNext {
             entry: entry_id,
             item,
-            markers,
+            markers: markers.into(),
             liked,
         }))
     }

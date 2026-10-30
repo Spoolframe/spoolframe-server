@@ -474,14 +474,14 @@ pub fn markers() -> Vec<Marker> {
     vec![
         Marker {
             kind: MarkerKind::Intro,
-            start_ms: 30_000,
-            end_ms: 90_000,
+            start: std::time::Duration::from_millis(30_000),
+            end: std::time::Duration::from_millis(90_000),
             to_end: false,
         },
         Marker {
             kind: MarkerKind::Credits,
-            start_ms: 2_400_000,
-            end_ms: 2_640_001,
+            start: std::time::Duration::from_millis(2_400_000),
+            end: std::time::Duration::from_millis(2_640_001),
             to_end: true,
         },
     ]

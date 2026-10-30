@@ -543,7 +543,7 @@ async fn an_item_page_shows_what_a_client_would_get() {
     let client = spoolframe_protocol::Reply::Item {
         item: found.item,
         children: found.children,
-        markers: found.markers,
+        markers: found.markers.into(),
         playlists: Vec::new(),
         liked: None,
         liked_children: Vec::new(),

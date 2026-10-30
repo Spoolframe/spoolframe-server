@@ -37,7 +37,7 @@ async fn device(server: &TestServer) -> TestClient {
 }
 
 /// The first Continue watching item's `last_viewed_at`.
-async fn on_home(tv: &TestClient, who: &SessionId) -> Option<i64> {
+async fn on_home(tv: &TestClient, who: &SessionId) -> Option<std::time::SystemTime> {
     match home(tv, who).await.continue_watching.first() {
         Some(Item::Movie(m)) => m.playback.last_viewed_at,
         Some(Item::Episode(e)) => e.playback.last_viewed_at,
@@ -70,7 +70,10 @@ async fn the_last_view_is_any_device_s_and_the_user_s_own() {
     server.clock.advance(Duration::from_secs(3600));
     progress(&server, &phone, &on_phone, &film, 900).await;
     let later = on_home(&tv, &on_tv).await.expect("a time on Home");
-    assert!(later >= first + 3600, "{first} then {later}");
+    assert!(
+        later >= first + Duration::from_secs(3600),
+        "{first:?} then {later:?}"
+    );
 
     server.clock.advance(Duration::from_secs(3600));
     progress(&server, &phone, &bob, &film, 300).await;

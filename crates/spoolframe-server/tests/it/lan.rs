@@ -202,6 +202,11 @@ async fn a_server_is_saved_only_when_pinned_and_stays_pinned() {
     assert!(pinned.pinned && !pinned.verified, "{pinned:?}");
     let verified = client.pin(&heard.endpoint_id, true).await.unwrap();
     assert!(verified.pinned && verified.verified, "{verified:?}");
+    // It answers the server as the list then has it.
+    assert_eq!(
+        Some(verified),
+        client.server(&heard.endpoint_id).await.unwrap()
+    );
     client.close().await;
 
     // The app restarts: the same device, and the same pin, still verified.

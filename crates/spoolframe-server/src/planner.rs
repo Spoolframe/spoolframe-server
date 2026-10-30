@@ -2705,6 +2705,8 @@ mod tests {
             bit_depth: None,
             hdr: Some(BTreeSet::new()),
             video_codecs: None,
+            height: None,
+            frame_rate: None,
         };
         assert_eq!(
             encoded(
@@ -2726,6 +2728,8 @@ mod tests {
             bit_depth: Some(10),
             hdr: Some([HdrFormat::Hdr10].into()),
             video_codecs: None,
+            height: None,
+            frame_rate: None,
         };
         assert_eq!(
             encoded(&sdr_at_hello, &hevc_dts(), &encoders),

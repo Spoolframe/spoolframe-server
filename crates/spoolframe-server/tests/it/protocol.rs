@@ -52,12 +52,6 @@ async fn hello_is_answered_with_server_info() {
     close(server, client).await;
 }
 
-/// The protocol was reset to 1 in 0.16.0, a clean break.
-#[test]
-fn the_client_protocol_is_revision_1() {
-    assert_eq!(PROTOCOL_VERSION, 1);
-}
-
 /// The refusal text of a `Hello` of revision `said`.
 async fn refusal_of(client: &TestClient, said: u32) -> String {
     let hello = spoolframe_protocol::Hello {

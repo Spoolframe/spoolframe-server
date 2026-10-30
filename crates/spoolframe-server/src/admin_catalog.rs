@@ -807,7 +807,7 @@ impl AdminApi {
         let reply = spoolframe_protocol::Reply::Item {
             item: found.item,
             children: found.children,
-            markers: found.markers,
+            markers: found.markers.into(),
             playlists,
             liked,
             liked_children,

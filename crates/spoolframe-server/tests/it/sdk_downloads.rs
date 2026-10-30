@@ -582,6 +582,51 @@ async fn two_profiles_share_one_file_and_each_sees_their_own() {
     server.stop().await;
 }
 
+/// Alice's download runs while bob is shown: his list is empty, but the
+/// running count is every profile's, so an app does not quit on it. The
+/// watch steps 0, 1, 0. Held on a mobile network, it stays under way
+/// until Wi-Fi.
+#[tokio::test]
+async fn a_download_runs_for_one_profile_while_another_is_shown() {
+    let server = server("sdk-downloads-running", ServerOptions::default()).await;
+    server.add_user("bob", PASSWORD, None).await;
+    let dir = TestDir::new("spoolframe-sdk-downloads-running").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let alice = alice(&server, &client).await;
+    let bob = client
+        .sign_in(&server.server.id().to_string(), "bob", PASSWORD, false)
+        .await
+        .unwrap();
+    let downloads = client.downloads();
+    let id = server.server.id().to_string();
+    let mut running = downloads.watch_running();
+    assert_eq!(*running.borrow_and_update(), 0);
+    downloads.set_network(NetworkKind::Cellular);
+    downloads.set_profile(&id, &alice.user().user_id);
+    let key = start(&client, &alice).await.key;
+    let steps = |want: usize| {
+        let mut running = running.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(120), running.wait_for(|n| *n == want))
+                .await
+                .unwrap_or_else(|_| panic!("the count never got to {want}"))
+                .map(|n| *n)
+                .unwrap()
+        }
+    };
+    assert_eq!(steps(1).await, 1);
+
+    downloads.set_profile(&id, &bob.user().user_id);
+    assert_eq!((downloads.list().len(), downloads.running()), (0, 1));
+    downloads.set_network(NetworkKind::Unmetered);
+    assert_eq!(steps(0).await, 0);
+    downloads.set_profile(&id, &alice.user().user_id);
+    assert_eq!(downloads.get(&key).unwrap().phase, DownloadPhase::Done);
+    client.close().await;
+    server.stop().await;
+}
+
 /// The PIN asked for on this device locks the profile's downloads with no
 /// server, as it locks the profile online, until its PIN is given (PX-60).
 #[tokio::test]

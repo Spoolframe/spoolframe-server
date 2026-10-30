@@ -84,6 +84,125 @@ async fn alice(server: &TestServer, client: &Client) -> Session {
         .unwrap()
 }
 
+/// The app's watches end once it drops the client and its sessions: none
+/// holds the client up, and its links close with it, so a loop over
+/// `next()` sees `None`.
+#[tokio::test]
+async fn the_watches_end_once_the_client_is_dropped() {
+    use spoolframe_client_ffi::{SpoolClient, SpoolSession};
+
+    let (server, client, _) = ready("watches-end").await;
+    let session = SpoolSession::from(alice(&server, &client).await);
+    let client = SpoolClient::from(client);
+    let servers = client.watch_servers();
+    let banner = client.watch_server(id(&server)).unwrap();
+    let own = session.watch_own_profile();
+    let catalog = session.watch_catalog();
+    drop((session, client));
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        (
+            servers.next().await.ok(),
+            // The banner may say Disconnected first.
+            loop {
+                if banner.next().await.is_none() {
+                    break None::<()>;
+                }
+            },
+            own.next().await.is_none(),
+            catalog.next().await,
+        )
+    })
+    .await;
+    assert_eq!(ended, Ok((Some(None), None, true, None)));
+    server.stop().await;
+}
+
+/// A playback's share watch ends once the app drops the playback and
+/// the client: it holds up neither, so a loop over `next()` sees `None`.
+#[tokio::test]
+async fn a_share_watch_ends_once_the_playback_and_client_are_dropped() {
+    use spoolframe_client_ffi::{SpoolClient, SpoolSession};
+
+    let (server, client, _) = ready("share-watch-ends").await;
+    server.write_media(1000);
+    let session = SpoolSession::from(alice(&server, &client).await);
+    let client = SpoolClient::from(client);
+    let playback = session
+        .open_playback(
+            movie().id().clone(),
+            None,
+            None,
+            spoolframe_client_sdk::PlaybackQuality::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let shares = playback.watch_share().unwrap();
+    drop((playback, session, client));
+    let ended = tokio::time::timeout(Duration::from_secs(10), shares.next()).await;
+    assert_eq!(ended, Ok(None));
+    server.stop().await;
+}
+
+/// "Who's watching" opens one profile by its username: a kept session
+/// is asked of the server alone and made the foreground profile; a
+/// username kept nowhere is not found.
+#[tokio::test]
+async fn a_profile_opens_by_its_username() {
+    let (server, client, _) = ready("open-profile").await;
+    alice(&server, &client).await;
+    let opened = client.open_profile(&id(&server), "alice").await.unwrap();
+    assert_eq!(opened.user().username, "alice");
+    assert!(matches!(
+        client.open_profile(&id(&server), "carol").await,
+        Err(SdkError::NotFound(_))
+    ));
+    client.close().await;
+    server.stop().await;
+}
+
+/// One server is looked up as `servers()` lists it, and its session's
+/// server is that one; a server neither saved nor heard is none.
+#[tokio::test]
+async fn a_server_is_looked_up_as_the_list_has_it() {
+    let (server, client, _) = ready("server-lookup").await;
+    let alice = alice(&server, &client).await;
+    let listed = client.servers().await.unwrap();
+    let one = client.server(&id(&server)).await.unwrap();
+    assert_eq!(
+        one.as_ref(),
+        listed.iter().find(|s| s.endpoint_id == id(&server))
+    );
+    assert_eq!(alice.server_entry().await.unwrap(), one);
+    let stranger = iroh::SecretKey::generate().public().to_string();
+    assert_eq!(client.server(&stranger).await.unwrap(), None);
+    client.close().await;
+    server.stop().await;
+}
+
+/// The FFI's session is equal, and hashes the same, as the same user on
+/// the same server, whichever session object holds them.
+#[tokio::test]
+async fn a_session_equals_another_of_the_same_user_and_server() {
+    use spoolframe_client_ffi::SpoolSession;
+    use std::hash::{BuildHasher, RandomState};
+
+    let (server, client, _) = ready("session-equality").await;
+    let first = SpoolSession::from(alice(&server, &client).await);
+    let again = SpoolSession::from(client.open_profile(&id(&server), "alice").await.unwrap());
+    let bob = SpoolSession::from(
+        client
+            .sign_in(&id(&server), "bob", "battery staple", false)
+            .await
+            .unwrap(),
+    );
+    let hash = RandomState::new();
+    assert_eq!((first == again, first == bob), (true, false));
+    assert_eq!(hash.hash_one(&first), hash.hash_one(&again));
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn sign_in_and_browse() {
     let (server, client, _) = ready("browse").await;
@@ -395,6 +514,30 @@ async fn profiles_read_across_a_sign_out_list_it_as_ended() {
     server.stop().await;
 }
 
+/// A session kept but already ended by a sign-out is not asked of the
+/// server: with the server then gone, the trusted profiles are the only
+/// call, and "Who's watching" is offline, not a list to sign in again.
+#[tokio::test]
+async fn a_session_ended_here_is_not_asked_so_an_unreached_server_is_offline() {
+    let (server, client, storage) = ready("ended-here-offline").await;
+    alice(&server, &client).await;
+    let key = format!("sessions/{}", id(&server));
+    let before = storage.secret(&key).await.unwrap();
+    let mut signed_out = client.signed_out(&id(&server)).unwrap();
+    server.store.disable_user("alice").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), signed_out.next())
+        .await
+        .expect("no sign-out within 5 s")
+        .expect("the client is open");
+    storage.set_secret(&key, before).await.unwrap();
+    let endpoint = id(&server);
+    server.stop().await;
+
+    let watching = client.whos_watching(&endpoint).await.unwrap();
+    assert!(watching.offline, "{watching:?}");
+    client.close().await;
+}
+
 #[tokio::test]
 async fn signing_in_again_makes_an_ended_profile_automatic() {
     let (server, client, _) = ready("ended-again").await;
@@ -517,6 +660,95 @@ async fn an_episode_s_markers_come_with_its_details_and_its_playback() {
     );
     let playback = alice.start_playback(with_markers.id(), None).await.unwrap();
     assert_eq!(playback.markers, markers());
+    client.close().await;
+    server.stop().await;
+}
+
+/// The screen the app said ([`Client::set_display`]) goes with a plan
+/// that names none: the episode's 1080p is over a 240p screen.
+#[tokio::test]
+async fn a_plan_goes_by_the_screen_the_app_said() {
+    let (server, first, _) = ready("display").await;
+    first.close().await;
+    server.write_episode("15");
+    let mut capabilities = mkv_capabilities();
+    capabilities.video.insert(VideoCodec::H264);
+    let client = client_with(&server, &Arc::default(), capabilities).await;
+    let alice = alice(&server, &client).await;
+    let id = episode("15", "14", 2, 1).id().clone();
+    // This server has no encoder, so a plan over the screen is
+    // Unsupported, not Converted: the reason is what shows the screen.
+    let over_the_screen = |plan: &PlaybackPlan| match plan {
+        PlaybackPlan::Converted { reasons, .. } | PlaybackPlan::Unsupported { reasons } => reasons
+            .iter()
+            .any(|r| r == "video: 1080p, the client shows 240p"),
+        _ => false,
+    };
+    let before = alice.playback_plan(&id, None).await.unwrap();
+    client.set_display(Some(spoolframe_types::DisplayCapabilities {
+        height: Some(240),
+        ..Default::default()
+    }));
+    let after = alice.playback_plan(&id, None).await.unwrap();
+    assert_eq!(
+        (over_the_screen(&before.plan), over_the_screen(&after.plan)),
+        (false, true)
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A display given at the start holds for the life of that playback:
+/// a 240p screen said since does not re-plan it down on a subtitle
+/// change.
+#[tokio::test]
+async fn a_playback_s_own_display_holds_over_the_screen_said_since() {
+    let (server, first, _) = ready("display-held").await;
+    first.close().await;
+    server.write_episode("15");
+    let mut capabilities = mkv_capabilities();
+    capabilities.video.insert(VideoCodec::H264);
+    let client = client_with(&server, &Arc::default(), capabilities).await;
+    let alice = alice(&server, &client).await;
+    let id = episode("15", "14", 2, 1).id().clone();
+    let playback = alice
+        .open_playback(
+            &id,
+            None,
+            PlaybackOptions {
+                display: Some(spoolframe_types::DisplayCapabilities::default()),
+                ..PlaybackOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    client.set_display(Some(spoolframe_types::DisplayCapabilities {
+        height: Some(240),
+        ..Default::default()
+    }));
+    let changed = playback
+        .change_subtitle(None, BitmapSubtitles::Auto, Duration::ZERO)
+        .await
+        .map(|p| matches!(p.plan, PlaybackPlan::Direct { .. }));
+    assert_eq!(changed.ok(), Some(true));
+    client.close().await;
+    server.stop().await;
+}
+
+/// The file's own length, as probed (the episode's file is 1309.472 s),
+/// over the catalog's (2640 s): what the player plays.
+#[tokio::test]
+async fn a_playback_says_its_file_s_running_time() {
+    let (server, first, _) = ready("duration").await;
+    first.close().await;
+    server.write_episode("15");
+    let mut capabilities = mkv_capabilities();
+    capabilities.video.insert(VideoCodec::H264);
+    let client = client_with(&server, &Arc::default(), capabilities).await;
+    let alice = alice(&server, &client).await;
+    let id = episode("15", "14", 2, 1).id().clone();
+    let playback = alice.start_playback(&id, None).await.unwrap();
+    assert_eq!(playback.duration, Some(Duration::from_millis(1_309_472)));
     client.close().await;
     server.stop().await;
 }
@@ -704,6 +936,65 @@ async fn track_preferences_round_trip_and_choose() {
     let chosen = plan.chosen.unwrap();
     assert_eq!(chosen.selection.audio, Some(2));
     assert_eq!(chosen.subtitle, TrackReason::NotWanted);
+    client.close().await;
+    server.stop().await;
+}
+
+/// The subtitle search's two preferences change alone: the others come
+/// back as they were.
+#[tokio::test]
+async fn the_subtitle_search_preferences_change_alone() {
+    use spoolframe_client_sdk::types::{
+        BitmapPreference, ForcedPreference, SdhPreference, SubtitleMode,
+    };
+
+    let (server, client, _) = ready("subtitle-search-preferences").await;
+    let alice = alice(&server, &client).await;
+    let mut preferences = alice.track_preferences().await.unwrap().preferences;
+    preferences.audio.languages = vec!["jpn".into()];
+    preferences.subtitles.mode = SubtitleMode::Always;
+    preferences.subtitles.languages = vec!["eng".into()];
+    preferences.subtitles.bitmap = BitmapPreference::Pictures;
+    alice.set_track_preferences(&preferences).await.unwrap();
+
+    alice
+        .set_subtitle_search(SdhPreference::Only, ForcedPreference::Avoid)
+        .await
+        .unwrap();
+    preferences.subtitles.sdh = SdhPreference::Only;
+    preferences.subtitles.forced = ForcedPreference::Avoid;
+    assert_eq!(
+        alice.track_preferences().await.unwrap().preferences,
+        preferences
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The picture-subtitle preference changes alone: the others come back as
+/// they were.
+#[tokio::test]
+async fn the_picture_subtitle_preference_changes_alone() {
+    use spoolframe_client_sdk::types::{BitmapPreference, SdhPreference, SubtitleMode};
+
+    let (server, client, _) = ready("picture-subtitle-preference").await;
+    let alice = alice(&server, &client).await;
+    let mut preferences = alice.track_preferences().await.unwrap().preferences;
+    preferences.audio.languages = vec!["jpn".into()];
+    preferences.subtitles.mode = SubtitleMode::Always;
+    preferences.subtitles.sdh = SdhPreference::Only;
+    preferences.subtitles.bitmap = BitmapPreference::Pictures;
+    alice.set_track_preferences(&preferences).await.unwrap();
+
+    alice
+        .set_picture_subtitles(BitmapPreference::Text)
+        .await
+        .unwrap();
+    preferences.subtitles.bitmap = BitmapPreference::Text;
+    assert_eq!(
+        alice.track_preferences().await.unwrap().preferences,
+        preferences
+    );
     client.close().await;
     server.stop().await;
 }
@@ -1092,7 +1383,7 @@ async fn a_player_finds_the_frame_for_a_time_in_an_item_s_previews() {
         }
     };
     assert_eq!(previews.count, 3);
-    let tile = previews.tile(25_000).unwrap();
+    let tile = previews.tile(Duration::from_secs(25)).unwrap();
     assert_eq!((tile.index, tile.sheet, tile.x, tile.y), (2, 0, 640, 0));
     let sheet = session
         .artwork(&previews.sheets[tile.sheet], ArtworkSize::Original)
@@ -1191,7 +1482,12 @@ async fn a_session_reads_its_user_s_plex_link() {
     let link = alice.plex_link().await.unwrap().expect("linked");
     assert_eq!(link.username.as_deref(), Some("alice_plex"));
     assert_eq!(link.email.as_deref(), Some("alice@example.com"));
-    assert_eq!(link.linked_at, Some(1_790_000_000));
+    assert_eq!(
+        link.linked_at,
+        Some(spoolframe_types::serde_time::unix_seconds::from_wire(
+            1_790_000_000
+        ))
+    );
     assert!(!link.by_config);
 
     // Only hers: bob's session says he is not linked.

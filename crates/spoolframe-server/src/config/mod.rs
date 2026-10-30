@@ -3970,49 +3970,41 @@ mod tests {
         );
     }
 
-    /// PGPU-04: the experimental block, off if left out; on, it reaches
-    /// detection and is named for the start's log.
+    /// PGPU-04: each experimental switch is off if left out, and named for
+    /// the start's log when on; libplacebo's reaches detection.
     #[test]
     fn experimental_switches_are_off_unless_set() {
         let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert!(!config.experimental.libplacebo_shared_on_amd());
         assert!(config.experimental.on().is_empty());
-        assert!(
-            !config
-                .transcode
-                .settings(&config.experimental)
+        type Switch = fn(&ExperimentalConfig) -> bool;
+        let switches: [(&str, Switch); 2] = [
+            ("libplacebo_shared_on_amd", |e| e.libplacebo_shared_on_amd()),
+            ("index_ahead", |e| e.index_ahead()),
+        ];
+        for (key, switch) in switches {
+            assert!(!switch(&config.experimental), "{key}");
+            let on = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} experimental {{ {key} = true; }}"#
+            ))
+            .unwrap();
+            assert!(switch(&on.experimental), "{key}");
+            assert_eq!(on.experimental.on(), [format!("experimental.{key}")]);
+        }
+        let settings = |c: &ServerConfig| {
+            c.transcode
+                .settings(&c.experimental)
                 .unwrap()
                 .libplacebo_shared_on_amd
-        );
+        };
+        assert!(!settings(&config));
         let on = plex(
             r#"plex { url = "http://nas:32400"; } experimental { libplacebo_shared_on_amd = true; }"#,
         )
         .unwrap();
-        assert!(
-            on.transcode
-                .settings(&on.experimental)
-                .unwrap()
-                .libplacebo_shared_on_amd
-        );
-        assert_eq!(
-            on.experimental.on(),
-            ["experimental.libplacebo_shared_on_amd"]
-        );
+        assert!(settings(&on));
         assert!(
             plex(r#"plex { url = "http://nas:32400"; } experimental { shared = true; }"#).is_err()
         );
-    }
-
-    /// Keyframes read ahead: off if left out, and named for the start's
-    /// log when on.
-    #[test]
-    fn index_ahead_is_off_unless_set() {
-        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert!(!config.experimental.index_ahead());
-        let on = plex(r#"plex { url = "http://nas:32400"; } experimental { index_ahead = true; }"#)
-            .unwrap();
-        assert!(on.experimental.index_ahead());
-        assert_eq!(on.experimental.on(), ["experimental.index_ahead"]);
     }
 
     /// P8-01: federation is off if left out, and named for the start's
@@ -4513,31 +4505,24 @@ mod tests {
         assert!(plex(r#"plex { url = "http://a:32400"; } libraries []"#).is_ok());
     }
 
+    /// mDNS and IPv6 are on and the port is picked unless set.
     #[test]
-    fn mdns_can_be_turned_off() {
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } network { mdns = false; }"#).unwrap();
-        assert!(!config.network.endpoint_options().unwrap().mdns);
-    }
-
-    #[test]
-    fn ipv6_is_on_unless_set() {
-        let config = plex(r#"plex { url = "http://nas:32400"; }"#).unwrap();
-        assert!(config.network.endpoint_options().unwrap().ipv6);
-    }
-
-    #[test]
-    fn ipv6_can_be_turned_off() {
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } network { ipv6 = false; }"#).unwrap();
-        assert!(!config.network.endpoint_options().unwrap().ipv6);
-    }
-
-    #[test]
-    fn a_fixed_port_is_read() {
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } network { port = 7420; }"#).unwrap();
-        assert_eq!(config.network.endpoint_options().unwrap().port, Some(7420));
+    fn the_network_s_switches_and_port_are_read() {
+        type Read = fn(&EndpointOptions) -> (bool, bool, Option<u16>);
+        let read: Read = |o| (o.mdns, o.ipv6, o.port);
+        for (network, expected) in [
+            ("", (true, true, None)),
+            ("mdns = false;", (false, true, None)),
+            ("ipv6 = false;", (true, false, None)),
+            ("port = 7420;", (true, true, Some(7420))),
+        ] {
+            let config = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} network {{ {network} }}"#
+            ))
+            .unwrap();
+            let options = config.network.endpoint_options().unwrap();
+            assert_eq!(read(&options), expected, "{network}");
+        }
     }
 
     #[test]
@@ -4880,19 +4865,6 @@ mod tests {
     }
 
     #[test]
-    fn relays_written_as_one_comma_separated_string_are_refused_naming_the_list() {
-        let err = relays(r#""https://relay.example.com, default""#).unwrap_err();
-        let ConfigError::Invalid {
-            key: "network.relays",
-            message,
-        } = err
-        else {
-            panic!("{err:?}");
-        };
-        assert!(message.contains("a list now"), "{message}");
-    }
-
-    #[test]
     fn a_relay_list_with_a_bad_or_repeated_entry_is_refused() {
         for list in [
             r#"["disabled"]"#,
@@ -5190,6 +5162,10 @@ mod tests {
             (
                 r#"admin { metrics_from = "127.0.0.0/8, ::1"; }"#,
                 "admin.metrics_from",
+            ),
+            (
+                r#"network { relays = "https://relay.example.com, default"; }"#,
+                "network.relays",
             ),
         ] {
             let err =

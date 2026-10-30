@@ -130,7 +130,9 @@ fn timing_info(
         sync,
         offset_ms: timing.offset_ms,
         offset_by: timing.offset_by,
-        offset_at: timing.offset_at,
+        offset_at: timing
+            .offset_at
+            .map(spoolframe_types::serde_time::unix_seconds::to_wire),
         download,
     }
 }

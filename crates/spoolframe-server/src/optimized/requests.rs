@@ -376,8 +376,8 @@ impl Pool {
     /// Look at every kept rule's scope now, as the asker does every
     /// [`FOLLOW`], and ask for what is not asked for yet: how many items
     /// the rules gained.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn follow_requests(&self) -> Result<u64, RequestError> {
+    #[cfg(test)]
+    pub(crate) async fn follow_requests(&self) -> Result<u64, RequestError> {
         let gained = self.inner.follow().await?;
         self.inner.ask.notify_one();
         Ok(gained)

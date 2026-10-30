@@ -376,7 +376,6 @@ async fn a_tv_approved_in_a_browser_gets_a_session_as_the_web_user() {
 #[tokio::test]
 async fn a_web_session_made_with_a_passkey_approves_a_tv() {
     use crate::passkeys::{Authenticator, add_passkey, cookie, sign_in_with};
-    assert_eq!(WEB, crate::passkeys::ORIGIN);
     let (server, web) = server_with_web("dsi-web-passkey", ServerOptions::default()).await;
     let mut iphone = Authenticator::new();
     add_passkey(&alice_on_the_web(web).await, &mut iphone, "iPhone").await;

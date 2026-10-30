@@ -460,20 +460,6 @@ fn a_qsv_encode_decodes_in_software() {
     assert!(!ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")));
 }
 
-/// A film whose NVDEC decode failed before decodes in software, still
-/// encoded on NVENC: the run the job falls back to.
-#[test]
-fn an_nvenc_encode_whose_gpu_decode_failed_decodes_in_software() {
-    let (film, enc) = (film(), nvidia());
-    let mut spec = spec_with(&film, &enc, TONE_MAPPED_H264, None);
-    spec.hardware_decode = false;
-    assert_eq!(decode(&spec), Decode::Software);
-    let args = ffmpeg_args(&spec).unwrap();
-    assert!(!args.contains(&s("-hwaccel")), "{args:?}");
-    assert!(has(&args, &["-c:v", "h264_nvenc"]));
-    assert_eq!(made(&spec).decoder, Decoder::Software);
-}
-
 // PGPU-06: an encode that keeps HDR writes 10 bits.
 
 /// VA-API's encoders, HEVC's having taken a 10-bit test frame, and
@@ -891,24 +877,32 @@ fn the_cuda_path_s_fallback_is_the_cpu_chain() {
     assert_eq!(made(&spec).burn_in, FilterOn::Cpu);
 }
 
+/// A film whose GPU decode failed before decodes in software, still
+/// encoded on the GPU (the run the job falls back to); a copied video is
+/// not decoded at all.
 #[test]
-fn a_file_whose_hardware_decode_failed_decodes_in_software() {
-    let (film, enc) = (film(), with_decoders(true));
-    let mut spec = spec(&film, &enc, TONE_MAPPED_H264, COPY_DTS, None, hls());
-    spec.hardware_decode = false;
-    assert_eq!(decode(&spec), Decode::Software);
-    let args = ffmpeg_args(&spec).unwrap();
-    assert!(!args.contains(&s("-hwaccel")), "{args:?}");
-    // Still encoded on the GPU.
-    assert!(has(&args, &["-c:v", "h264_vaapi"]));
-}
-
-#[test]
-fn a_copied_video_is_not_decoded() {
-    let (film, enc) = (film(), with_decoders(true));
-    let spec = spec(&film, &enc, COPY_HEVC, COPY_DTS, None, hls());
-    assert_eq!(decode(&spec), Decode::Software);
-    assert!(!ffmpeg_args(&spec).unwrap().contains(&s("-hwaccel")));
+fn a_failed_gpu_decode_or_a_copy_runs_no_hardware_decoder() {
+    let film = film();
+    for (enc, video, decode_failed, encoder) in [
+        (nvidia(), TONE_MAPPED_H264, true, Some("h264_nvenc")),
+        (
+            with_decoders(true),
+            TONE_MAPPED_H264,
+            true,
+            Some("h264_vaapi"),
+        ),
+        (with_decoders(true), COPY_HEVC, false, None),
+    ] {
+        let mut spec = spec_with(&film, &enc, video, None);
+        spec.hardware_decode = !decode_failed;
+        assert_eq!(decode(&spec), Decode::Software, "{encoder:?}");
+        let args = ffmpeg_args(&spec).unwrap();
+        assert!(!args.contains(&s("-hwaccel")), "{args:?}");
+        if let Some(encoder) = encoder {
+            assert!(has(&args, &["-c:v", encoder]), "{args:?}");
+            assert_eq!(made(&spec).decoder, Decoder::Software, "{encoder}");
+        }
+    }
 }
 
 /// No VA-API driver decodes 10-bit H.264 or 4:2:2: not tried.
@@ -2219,35 +2213,28 @@ fn a_keyframe_list_is_held_to_one_argument() {
     assert_eq!(forced_through(&cuts[..100], None), None);
 }
 
-/// NVIDIA's encoder is told the same in its own words.
+/// NVIDIA's encoder is told the same in its own words. libx265 takes
+/// neither `-sc_threshold` (ffmpeg reports it unused, and it cut at every
+/// scene change) nor a closed GOP from ffmpeg (its forced keyframes were
+/// CRA): both in its own parameters. libsvtav1 likewise; libx264 and
+/// VA-API take ffmpeg's own.
 #[test]
-fn nvenc_adds_no_keyframes_of_its_own() {
-    let args = only_forced_keyframes("hevc_nvenc");
-    assert_eq!(
-        args,
-        ["-g", "1000", "-no-scenecut", "1", "-forced-idr", "1"]
-    );
-    assert_eq!(only_forced_keyframes("av1_vaapi"), ["-g", "1000"]);
-}
-
-/// libx265 takes neither `-sc_threshold` (ffmpeg reports it unused,
-/// and it cut at every scene change) nor a closed GOP from ffmpeg (its
-/// forced keyframes were CRA): both in its own parameters. libsvtav1
-/// likewise; libx264 takes ffmpeg's own.
-#[test]
-fn software_encoders_add_no_keyframes_of_their_own() {
-    assert_eq!(
-        only_forced_keyframes("libx265"),
-        ["-g", "1000", "-x265-params", "scenecut=0:open-gop=0"]
-    );
-    assert_eq!(
-        only_forced_keyframes("libsvtav1"),
-        ["-g", "1000", "-svtav1-params", "scd=0"]
-    );
-    assert_eq!(
-        only_forced_keyframes("libx264"),
-        ["-g", "1000", "-sc_threshold", "0"]
-    );
+fn each_encoder_adds_no_keyframes_of_its_own() {
+    for (encoder, expected) in [
+        (
+            "hevc_nvenc",
+            &["-g", "1000", "-no-scenecut", "1", "-forced-idr", "1"][..],
+        ),
+        ("av1_vaapi", &["-g", "1000"]),
+        (
+            "libx265",
+            &["-g", "1000", "-x265-params", "scenecut=0:open-gop=0"],
+        ),
+        ("libsvtav1", &["-g", "1000", "-svtav1-params", "scd=0"]),
+        ("libx264", &["-g", "1000", "-sc_threshold", "0"]),
+    ] {
+        assert_eq!(only_forced_keyframes(encoder), expected, "{encoder}");
+    }
 }
 
 /// A copied video is cut at its own keyframes: no head of its own.

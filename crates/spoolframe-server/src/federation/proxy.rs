@@ -73,6 +73,8 @@ pub struct ProxyStarted {
     pub chosen: Option<ChosenTracks>,
     pub epoch: u32,
     pub markers: Vec<Marker>,
+    /// The film's running time as SA says it: its file's, probed there.
+    pub duration: Option<std::time::Duration>,
 }
 
 /// Why SB could not play a paired server's item from there.
@@ -620,6 +622,7 @@ impl Federation {
                     chosen,
                     epoch,
                     markers,
+                    duration,
                 }) => {
                     play.handle = handle;
                     play.revision = AtomicU64::new(revision);
@@ -630,7 +633,8 @@ impl Federation {
                         size,
                         chosen,
                         epoch,
-                        markers,
+                        markers: markers.into_vec(),
+                        duration,
                     })
                 }
                 Response::Ok(other) => Err(ProxyError::Origin(answered_with("a start", &other))),

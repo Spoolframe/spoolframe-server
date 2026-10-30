@@ -250,6 +250,9 @@ pub(crate) fn run_inputs(links: Inputs<'_>) -> Result<Vec<PathBuf>, JobError> {
     if let Some(sidecar) = links.sidecar {
         inputs.push(link_target(sidecar)?);
     }
+    if let Some(copy) = links.video {
+        inputs.push(link_target(copy)?);
+    }
     if let Some(copy) = links.audio {
         inputs.push(link_target(copy)?);
     }
@@ -461,6 +464,37 @@ mod tests {
             panic!("a missing link is a failure to prepare");
         };
         assert!(why.contains("missing"), "{why}");
+    }
+
+    /// A copy's stored video and audio are in the jail with the film:
+    /// left out, ffmpeg's open of the video was refused as "Permission
+    /// denied" and every encode of a copy with an encoded video failed.
+    #[tokio::test]
+    async fn a_copy_s_stored_tracks_are_inputs_of_the_run() {
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-encode-inputs").await;
+        let link = |name: &str, to: &str| {
+            let at = dir.as_ref().join(name);
+            std::os::unix::fs::symlink(to, &at).unwrap();
+            at
+        };
+        let film = link("input", "/media/film.mkv");
+        let video = link("video", "/copies/video.mp4");
+        let audio = link("audio", "/copies/audio.mp4");
+        let inputs = run_inputs(Inputs {
+            film: &film,
+            sidecar: None,
+            video: Some(&video),
+            audio: Some(&audio),
+        })
+        .unwrap();
+        assert_eq!(
+            inputs,
+            [
+                PathBuf::from("/media/film.mkv"),
+                PathBuf::from("/copies/video.mp4"),
+                PathBuf::from("/copies/audio.mp4"),
+            ]
+        );
     }
 
     #[test]

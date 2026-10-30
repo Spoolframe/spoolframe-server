@@ -935,7 +935,7 @@ pub fn sheet_of(id: &ArtworkId) -> Option<(&str, u32)> {
 /// The set under `key` as a client gets it.
 pub fn reply(key: &str, meta: &SetMeta) -> spoolframe_protocol::Previews {
     spoolframe_protocol::Previews {
-        interval_ms: meta.interval_ms,
+        interval: std::time::Duration::from_millis(meta.interval_ms),
         tile_width: meta.tile_width,
         tile_height: meta.tile_height,
         columns: meta.columns,

@@ -750,7 +750,7 @@ pub fn item_json(item: &Item) -> Value {
         });
         // Where a tool filled it: when it was last viewed, Unix seconds.
         if let Some(at) = p.last_viewed_at {
-            state["lastViewedAt"] = json!(at);
+            state["lastViewedAt"] = json!(spoolframe_types::serde_time::unix_seconds::to_wire(at));
         }
         state
     };

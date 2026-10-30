@@ -665,7 +665,9 @@ fn wire(row: Option<&TimingRow>) -> SubtitleTiming {
         sync,
         offset_ms: row.offset_ms,
         offset_by: row.offset_name.clone(),
-        offset_at: row.offset_at,
+        offset_at: row
+            .offset_at
+            .map(spoolframe_types::serde_time::unix_seconds::from_wire),
     }
 }
 

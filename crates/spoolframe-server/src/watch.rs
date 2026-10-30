@@ -973,7 +973,8 @@ impl Watch {
             }
             let at = states.get(&item.id().to_string()).map(|row| row.updated_at);
             if let Some(playback) = playback_mut(item) {
-                playback.last_viewed_at = at;
+                playback.last_viewed_at =
+                    at.map(spoolframe_types::serde_time::unix_seconds::from_wire);
             }
         }
         Ok(())

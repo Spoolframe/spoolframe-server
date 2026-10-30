@@ -6745,6 +6745,25 @@ mod replica {
             pair.stop().await;
         }
 
+        /// A start through SB says the film's running time as SA knows
+        /// it (its media's, 2644 s), not SB's listing's (the catalog's
+        /// 7020 s).
+        #[tokio::test]
+        async fn a_proxied_start_says_sa_s_running_time() {
+            let pair = Pair::start("fed-media-proxy-length").await;
+            shared(&pair).await;
+            let (device, bob) = on_sb(&pair, "bob").await;
+            let duration = match device
+                .call(Some(&bob), start(&pair.fed(movie().id())))
+                .await
+            {
+                Response::Ok(Reply::PlaybackStarted { duration, .. }) => duration,
+                other => panic!("did not start through SB: {other:?}"),
+            };
+            assert_eq!(duration.map(|d| d.as_secs()), Some(2644));
+            pair.stop().await;
+        }
+
         /// SB keeps its connection to SA only while a play needs it, and a
         /// while after: once its plays stop it is closed after the idle
         /// time. An unpairing closes it at once, and ends the plays on it.

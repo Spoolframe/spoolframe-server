@@ -1132,7 +1132,7 @@ async fn the_app_lists_its_user_s_passkeys_the_web_ui_s_too() {
     assert!(made.app);
     assert!(made.usable_here);
     assert_eq!(made.last_used_at, None);
-    assert!(made.created_at > 0);
+    assert!(made.created_at > std::time::UNIX_EPOCH);
     assert_eq!(web.id, "d2ViLTE");
     assert_eq!(web.name, "YubiKey");
     assert_eq!(web.rp_id, "localhost");
