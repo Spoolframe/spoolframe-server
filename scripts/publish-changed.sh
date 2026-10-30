@@ -34,11 +34,12 @@
 #     time crates.io names (or 10 minutes) and tries again;
 #   - its index lags a publish by seconds: the next crate in order waits
 #     until the version it depends on shows on the index;
-#   - `cargo publish` resolves a crate's dependencies through whatever
-#     replaces crates-io in cargo's config (the coldsteel devenv profile's
-#     kellnr proxy, devenv.nix), which may lag crates.io in turn: a publish
-#     refused because a just-published dependency is not found yet waits
-#     and tries again.
+#   - `cargo publish` resolves a crate's dependencies through crates.io's
+#     own index, which may lag a publish in turn: a publish refused
+#     because a just-published dependency is not found yet waits and
+#     tries again. Never through what replaces crates-io in the caller's
+#     cargo home (the devenv shell's kellnr proxy, devenv.nix): `cargo
+#     publish` runs with a home of its own (PUBLISH_HOME, below).
 #
 # Copied from foundry's scripts/publish-changed.sh when spoolframe left the
 # monorepo; .forgejo/workflows/publish.yaml runs it on every master push.
@@ -171,6 +172,19 @@ for bin in cargo curl jq date; do
         exit 1
     fi
 done
+
+# `cargo publish` runs with a cargo home of its own, made empty here and
+# removed on exit, so a crate's dependencies resolve through crates.io's
+# own index. The caller's home may replace crates-io (the devenv shell
+# writes coldsteel-mirror, kellnr's crates.io proxy, into it), and that
+# proxy's index entry for a crate can stay stale for good: 0.17.0-beta.1's
+# spoolframe-protocol found no spoolframe-types 0.17.0-beta.1 through it,
+# eight tries over, on both registries' runs. The home holds nothing a
+# publish needs: tokens come from the environment, and [registries.*]
+# from the workspace's .cargo/config.toml. cargo metadata and the index
+# reads (curl) use the caller's.
+PUBLISH_HOME=$(mktemp -d)
+trap 'rm -rf "$PUBLISH_HOME"' EXIT
 
 # config_index ROOT
 # `index` under [registries.<name>] in ROOT's .cargo/config.toml; empty
@@ -306,7 +320,7 @@ publish_other() {
     local root="$1" name="$2" version="$3" attempt log
     log=$(mktemp)
     for ((attempt = 1; attempt <= OTHER_ATTEMPTS; attempt++)); do
-        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify) 2>&1 | tee "$log"; then
+        if (cd "$root" && CARGO_HOME="$PUBLISH_HOME" cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify) 2>&1 | tee "$log"; then
             rm -f "$log"
             return 0
         fi
@@ -343,7 +357,7 @@ publish_crate() {
     local root="$1" name="$2" version="$3" attempt log wait
     log=$(mktemp)
     for ((attempt = 1; attempt <= PUBLISH_ATTEMPTS; attempt++)); do
-        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked) 2>&1 | tee "$log"; then
+        if (cd "$root" && CARGO_HOME="$PUBLISH_HOME" cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked) 2>&1 | tee "$log"; then
             rm -f "$log"
             return 0
         fi

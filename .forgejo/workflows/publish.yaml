@@ -54,8 +54,8 @@ jobs:
       #
       # crates.io first: the crates depend on each other as crates.io
       # crates, and packaging one for Coldsteel resolves its siblings from
-      # crates.io (through the kellnr proxy), so a new version must be there
-      # first. Its failure does not skip Coldsteel's step, which publishes
+      # crates.io's own index (the script gives `cargo publish` a cargo home
+      # with no kellnr proxy in it), so a new version must be there first. Its failure does not skip Coldsteel's step, which publishes
       # whatever crates.io took.
       #
       # CARGO_REGISTRY_TOKEN, a secret of this repository: a crates.io API

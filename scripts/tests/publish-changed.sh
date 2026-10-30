@@ -160,6 +160,41 @@ for case in 'publish = ["crates-io"]' ''; do
     fi
 done
 
+# Publishing runs with a cargo home of its own, with nothing replacing
+# crates-io: one that does (the devenv shell's kellnr proxy) resolves a
+# crate's dependencies through that proxy, whose index can lag crates.io
+# for good. A fake cargo on PATH records the home `cargo publish` gets and
+# puts the version on the index, as the registry would; the rest is cargo.
+real_cargo=$(command -v cargo)
+mkdir -p "$work/bin" "$work/home"
+cat >"$work/home/config.toml" <<'TOML'
+[source.crates-io]
+replace-with = "mirror"
+
+[source.mirror]
+registry = "sparse+http://127.0.0.1:1/"
+TOML
+cat >"$work/bin/cargo" <<SH
+#!/usr/bin/env bash
+if [[ "\$1" == publish ]]; then
+    { echo "home \$CARGO_HOME"; cat "\$CARGO_HOME/config.toml" 2>/dev/null; } >>"$work/published"
+    mkdir -p "$index/be/ta"
+    echo '{"name":"beta","vers":"1.0.0","deps":[],"cksum":"0","features":{},"yanked":false}' >"$index/be/ta/beta"
+    exit 0
+fi
+exec "$real_cargo" "\$@"
+SH
+chmod +x "$work/bin/cargo"
+run env PATH="$work/bin:$PATH" CARGO_HOME="$work/home" CARGO_REGISTRIES_COLDSTEEL_TOKEN=t \
+    "$script" --publish --registry coldsteel "$good"
+published=$(cat "$work/published" 2>/dev/null || true)
+if [[ $status -eq 0 && "$published" == "home "* && "$published" != "home $work/home"* \
+    && "$published" != *replace-with* ]]; then
+    pass "cargo publish runs with a home that replaces nothing"
+else
+    fail "cargo publish runs with a home that replaces nothing: $published $out"
+fi
+
 if [[ $failures -gt 0 ]]; then
     echo "$failures failed" >&2
     exit 1
