@@ -1,0 +1,77 @@
+name: Publish a PR build
+
+# Pre-releases of the crates from a PR's branch, to the Coldsteel registry
+# only, so an app can try a new SDK before the PR merges. Each commit gets
+# its own version, 0.17.0-beta.3.gab12d3b; the job's last line names it, and
+# crates/spoolframe-client-sdk/README.md says how an app takes it. crates.io
+# only ever gets what lands on master (publish.yaml): this workflow has no
+# token for it.
+#
+# On push, not pull_request: Forgejo withholds secrets from pull_request
+# runs, and only maintainers push to branches here. `paths` is what can
+# change a published crate, so a matching push costs kellnr 7 crates and any
+# other costs it nothing. These versions are never removed.
+on:
+  push:
+    branches-ignore:
+      - master
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/spoolframe-types/**
+      - crates/spoolframe-protocol/**
+      - crates/spoolframe-policy/**
+      - crates/spoolframe-client-sdk/**
+      - crates/spoolframe-client-ffi/**
+      - crates/spoolframe-test-dir/**
+      - crates/spoolframe-hls-bridge/**
+
+env:
+  CI: "true"
+  TERM: dumb
+  NO_COLOR: "1"
+
+jobs:
+  publish-pr:
+    name: "publish-pr"
+    # `branches-ignore` already says so. Master must never run this, and a
+    # filter in a trigger is one line from gone.
+    if: ${{ startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/master' }}
+    runs-on: beefy
+    steps:
+      - uses: actions/checkout@v4
+      # As in publish.yaml.
+      - name: GitHub token for Nix, when this run has one
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            echo "NIX_CONFIG=access-tokens = github.com=$GH_PAT" >> "$GITHUB_ENV"
+          fi
+
+      # A branch with no open PR has nothing for an app to try: the job
+      # stays green and publishes nothing. The list and a filter, not
+      # pulls/{base}/{head}: that route cannot take a branch with a slash.
+      # An API that refuses fails the job, so nothing is skipped in silence.
+      - name: is there an open PR
+        id: pr
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          pulls=$(curl -fsS -H "Authorization: token $FORGEJO_TOKEN" \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/pulls?state=open&limit=50")
+          open=$(jq --arg branch "$BRANCH" 'any(.[]; .head.ref == $branch)' <<<"$pulls")
+          echo "open=$open" >> "$GITHUB_OUTPUT"
+          echo "$BRANCH has an open PR: $open"
+
+      # CARGO_REGISTRIES_COLDSTEEL_TOKEN, as in publish.yaml. The rewrite
+      # stays in this job's checkout; nothing is pushed back. No kache
+      # flush: `--no-verify` compiles nothing.
+      - name: publish-pr
+        if: ${{ steps.pr.outputs.open == 'true' }}
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        env:
+          CARGO_REGISTRIES_COLDSTEEL_TOKEN: ${{ secrets.CARGO_REGISTRIES_COLDSTEEL_TOKEN }}
+        run: scripts/publish-pr.sh --publish .

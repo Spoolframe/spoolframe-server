@@ -94,7 +94,16 @@ devenv shell -- scripts/publish-changed.sh --registry crates-io .
 - crates.io rate-limits new crates (a few, then about one every 10
   minutes). The script waits and retries, and logs each wait.
 - A missed or failed publish heals on the next push to `master`.
-- `scripts/tests/publish-changed.sh` tests the script (CI's lint job).
+- `scripts/tests/publish-changed.sh` tests the scripts (CI's lint job).
+
+A branch with an open PR also publishes to Coldsteel, so an app can try a
+new SDK first: `.forgejo/workflows/publish-pr.yaml` runs
+`scripts/publish-pr.sh` on each push that changes a published crate. Each
+commit gets its own version (`0.17.0-beta.3.gab12d3b`) and its crates depend
+on each other in Coldsteel, through a rewrite of `Cargo.toml` in CI's tree
+that is never committed. crates.io gets none of it. A push made before the
+PR is opened publishes nothing. These versions stay on kellnr until someone
+removes them.
 
 ## Images
 

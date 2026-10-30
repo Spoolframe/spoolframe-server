@@ -59,6 +59,26 @@ crate patched none comes from crates.io. A patch the graph does not use
 is a warning only. Remove the section to go back to crates.io; cargo drops
 `[patch]` when the app publishes, as for noq-proto below.
 
+### Taking a PR build
+
+Each push to a branch with an open PR publishes the crates to Coldsteel, if
+the push changes one of them. To try a new SDK before the PR merges, use the
+version of the commit: the workspace version, `.g`, and the first 7
+characters of the commit hash. The end of the Forgejo job's log gives it.
+No `[patch]` is necessary, because these builds depend on each other in
+Coldsteel. Keep only the `[registries.coldsteel]` section above and name the
+registry on the dependency:
+
+```toml
+[dependencies]
+spoolframe-client-sdk = { version = "=0.17.0-beta.3.gab12d3b", registry = "coldsteel" }
+```
+
+Always use `=`. `"0.17"` does not match a PR build, but
+`"0.17.0-beta.1"` does: it matches every later pre-release of 0.17.0, so
+it can select a build from any PR. The noq-proto patch below still applies.
+These builds are for tests only: they are never on crates.io.
+
 ## Getting started
 
 The app gives the SDK a `Storage` (where to keep secrets and data) and a

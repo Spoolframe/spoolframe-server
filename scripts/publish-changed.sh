@@ -58,8 +58,12 @@
 # whatever replaces it in cargo's config (the kellnr proxy), which may
 # lag crates.io, so a sibling not found yet is waited for as below.
 #
+# scripts/publish-pr.sh runs this for a PR's builds, Coldsteel only, on a
+# tree it has rewritten so that the siblings resolve from Coldsteel: nothing
+# has to be on crates.io first, and --allow-dirty lets that tree through.
+#
 # Usage:
-#   publish-changed.sh [--publish] [--registry NAME] [--]
+#   publish-changed.sh [--publish] [--allow-dirty] [--registry NAME] [--]
 #                      <workspace-root> [<workspace-root> ...]
 #
 # Options:
@@ -75,6 +79,8 @@
 #                    (CARGO_REGISTRIES_COLDSTEEL_TOKEN). Without this flag
 #                    the script only reports what it would do (dry run) and
 #                    never touches the registry beyond reading its index.
+#   --allow-dirty    Pass --allow-dirty to `cargo publish`: the tree differs
+#                    from its commit on purpose. Refused for crates-io.
 #   -h, --help       Show this help.
 #
 # A publish failure aborts the script immediately (no silent skip) — the
@@ -107,16 +113,21 @@ RATE_LIMIT_WAIT_MAX=1800
 DEP_WAIT=30
 
 usage() {
-    sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,94p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 publish=0
+allow_dirty=()
 roots=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --publish)
             publish=1
+            shift
+            ;;
+        --allow-dirty)
+            allow_dirty=(--allow-dirty)
             shift
             ;;
         --registry)
@@ -150,6 +161,10 @@ if [[ ${#roots[@]} -eq 0 ]]; then
     exit 1
 fi
 
+if [[ ${#allow_dirty[@]} -gt 0 && "$REGISTRY_NAME" == "crates-io" ]]; then
+    echo "Error: --allow-dirty is not for crates-io: what goes there is a commit." >&2
+    exit 1
+fi
 
 # CARGO_REGISTRIES_<NAME>_..., as cargo spells a registry's variables.
 REGISTRY_VAR="CARGO_REGISTRIES_$(tr '[:lower:]-' '[:upper:]_' <<<"$REGISTRY_NAME")"
@@ -320,7 +335,7 @@ publish_other() {
     local root="$1" name="$2" version="$3" attempt log
     log=$(mktemp)
     for ((attempt = 1; attempt <= OTHER_ATTEMPTS; attempt++)); do
-        if (cd "$root" && CARGO_HOME="$PUBLISH_HOME" cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify) 2>&1 | tee "$log"; then
+        if (cd "$root" && CARGO_HOME="$PUBLISH_HOME" cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify "${allow_dirty[@]}") 2>&1 | tee "$log"; then
             rm -f "$log"
             return 0
         fi
@@ -332,7 +347,7 @@ publish_other() {
             break
         fi
         if dependency_not_found "$log"; then
-            echo "  [wait]    $name $version: cargo does not see a dependency on crates.io yet (attempt $attempt of $OTHER_ATTEMPTS); waiting ${DEP_WAIT}s"
+            echo "  [wait]    $name $version: cargo does not see a dependency yet (attempt $attempt of $OTHER_ATTEMPTS); waiting ${DEP_WAIT}s"
             sleep "$DEP_WAIT"
         else
             echo "  [retry]   $name $version: $REGISTRY_NAME refused it (attempt $attempt of $OTHER_ATTEMPTS); waiting ${OTHER_WAIT}s"

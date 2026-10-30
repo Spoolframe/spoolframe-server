@@ -9,8 +9,11 @@ name: Publish
 # (crates/spoolframe-client-sdk/README.md); everyone else from crates.io.
 # Adapted from foundry's publish.yaml.
 #
-# Publishing is a consequence of landing on master, never of proposing to
-# it: no pull_request trigger. It runs on every master push, not only on a
+# Publishing a version is a consequence of landing on master, never of
+# proposing to it: no pull_request trigger, and crates.io takes nothing
+# else. The one exception is Coldsteel's pre-releases from a PR's branch,
+# so an app can try a new SDK first: publish-pr.yaml, each commit under a
+# version of its own. This runs on every master push, not only on a
 # version bump: scripts/publish-changed.sh compares each crate's version
 # with a registry's index and publishes only what is missing, in
 # dependency order, so a missed publish (a failed run, a registry down)

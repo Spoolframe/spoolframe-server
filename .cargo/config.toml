@@ -3,6 +3,7 @@
 # take them from it during development, past crates.io's index lag and the
 # kellnr proxy's cache. A name only: the workspace dependencies are
 # crates.io ones, and building or testing never reads this index.
-# Publishing is .forgejo/workflows/publish.yaml.
+# Publishing is .forgejo/workflows/publish.yaml; a PR's pre-releases,
+# publish-pr.yaml, rewrite those dependencies to it in CI's tree only.
 [registries.coldsteel]
 index = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
