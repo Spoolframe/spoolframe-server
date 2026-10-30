@@ -8,9 +8,10 @@ repository.workspace = true
 # As the client SDK and the HLS bridge: the apps, proprietary ones too,
 # link it into theirs (ARCHITECTURE §56).
 license = "MIT OR Apache-2.0"
-# On crates.io with the other client crates: Android takes it from
-# there; the Apple apps build it into an XCFramework from this source.
-publish = ["crates-io"]
+# On crates.io and the Coldsteel registry with the other client crates:
+# Android takes it from there; the Apple apps build it into an XCFramework
+# from this source.
+publish = ["crates-io", "coldsteel"]
 
 [lib]
 # staticlib for the XCFramework, cdylib for Android's .so, lib for the

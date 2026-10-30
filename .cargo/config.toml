@@ -1,0 +1,8 @@
+# The Coldsteel cargo registry (kellnr), where the public crates publish
+# besides crates.io (`publish = ["crates-io", "coldsteel"]`) so the apps
+# take them from it during development, past crates.io's index lag and the
+# kellnr proxy's cache. A name only: the workspace dependencies are
+# crates.io ones, and building or testing never reads this index.
+# Publishing is .forgejo/workflows/publish.yaml.
+[registries.coldsteel]
+index = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"

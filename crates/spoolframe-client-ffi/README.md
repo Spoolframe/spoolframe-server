@@ -138,6 +138,19 @@ reaches it, else through the user's own (`PlaybackStart.proxied`). That
 routing (`federation.rs`) moves into the SDK as
 `Session::open_any_playback`.
 
+## From the Coldsteel registry
+
+During development, take this crate and the SDK crates under it from the
+Coldsteel registry, as the SDK's README says ("Taking the crates from the
+Coldsteel registry"): patch each spoolframe crate, this one too, to its
+Coldsteel copy:
+
+```toml
+[patch.crates-io]
+spoolframe-client-ffi = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+# and spoolframe-types, -protocol, -policy, -client-sdk, -hls-bridge
+```
+
 ## Building
 
 The bindings generator is this crate's `uniffi-bindgen` bin, at the

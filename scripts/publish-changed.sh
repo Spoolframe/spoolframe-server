@@ -6,9 +6,12 @@
 # hand-maintained list), compute their topological dependency order (deps
 # before dependents — crates.io rejects a crate whose in-workspace dep
 # versions aren't present yet), and for each crate compare its Cargo.toml
-# version against crates.io's sparse index (https://index.crates.io/). A
-# version already on the index is skipped; an absent version is reported
-# (dry run, the default) or published (--publish).
+# version against one registry's sparse index: crates.io's
+# (https://index.crates.io/) or the Coldsteel registry's (kellnr, where
+# the apps take the crates from during development). A version already on
+# the index is skipped; an absent version is reported (dry run, the
+# default) or published (--publish). One run is one registry:
+# .forgejo/workflows/publish.yaml runs it for each.
 #
 # This is the version-diff mechanism, not a path/tag trigger: it is safe to
 # run on every push to master, including pushes that touch nothing
@@ -16,14 +19,15 @@
 # instead of being lost.
 #
 # Publishing must be opted into explicitly: every crate whose manifest is
-# not `publish = false` must say `publish = ["crates-io"]` exactly. An
+# not `publish = false` must say `publish = ["crates-io", "coldsteel"]`
+# exactly (either order), the two registries every public crate goes to. An
 # absent `publish` field — and the equivalent `publish = true` — also
 # means crates.io to cargo, but a crate that never said so would go public
 # by default the moment it joined the workspace. That is a hard error
 # here, not a skip.
 #
-# crates.io is slower to take a crate than the private registry was, in
-# three ways this script waits out, each bounded and logged:
+# crates.io is slower to take a crate than the Coldsteel registry, in
+# three ways this script waits out for it alone, each bounded and logged:
 #   - it rate-limits NEW crates (a small burst, then about one every 10
 #     minutes): a publish refused with HTTP 429 or "rate limit" waits the
 #     time crates.io names (or 10 minutes) and tries again;
@@ -42,16 +46,30 @@
 # that workspace's devenv shell so `cargo publish`'s verify build has the
 # right native deps), curl, jq, date (GNU, to read crates.io's retry time).
 #
+# A crate goes to the Coldsteel registry with `--no-verify`: its
+# dependencies on its siblings are crates.io dependencies (the apps patch
+# them to the Coldsteel copies), and before the crates.io run that follows
+# a new version is not on crates.io yet for a verify build to find. The
+# crates.io run verify-builds the same sources.
+#
 # Usage:
-#   publish-changed.sh [--publish] [--] <workspace-root> [<workspace-root> ...]
+#   publish-changed.sh [--publish] [--registry NAME] [--index URL] [--]
+#                      <workspace-root> [<workspace-root> ...]
 #
 # Options:
-#   --publish   Actually run `cargo publish` for crates found absent from
-#               the index. Requires CARGO_REGISTRY_TOKEN (a crates.io API
-#               token). Without this flag the script only reports what it
-#               would do (dry run) and never touches crates.io beyond
-#               reading the sparse index.
-#   -h, --help  Show this help.
+#   --registry NAME  The registry to compare with and publish to: crates-io
+#                    (the default) or a registry .cargo/config.toml names
+#                    (coldsteel).
+#   --index URL      Its sparse index, without `sparse+`; for crates-io,
+#                    https://index.crates.io unless given.
+#   --publish        Actually run `cargo publish` for crates found absent
+#                    from the index. Requires the registry's token, as
+#                    cargo reads it: CARGO_REGISTRY_TOKEN for crates-io,
+#                    CARGO_REGISTRIES_<NAME>_TOKEN for another
+#                    (CARGO_REGISTRIES_COLDSTEEL_TOKEN). Without this flag
+#                    the script only reports what it would do (dry run) and
+#                    never touches the registry beyond reading its index.
+#   -h, --help       Show this help.
 #
 # A publish failure aborts the script immediately (no silent skip) — the
 # job that runs this must go red, because a red publish job means every
@@ -61,12 +79,14 @@
 # publish error; 1 on any hard failure (bad workspace, index unreachable,
 # publish failed or still rate-limited after its retries, dependency cycle
 # among publishable crates, a crate that is publishable without an
-# explicit `publish = ["crates-io"]`).
+# explicit `publish = ["crates-io", "coldsteel"]`).
 
 set -euo pipefail
 
 REGISTRY_NAME="crates-io"
-INDEX_BASE="https://index.crates.io"
+INDEX_BASE=""
+# What every publishable crate's `publish` must be, sorted.
+PUBLISH_TO='["coldsteel","crates-io"]'
 # A refused publish is tried this many times in all.
 PUBLISH_ATTEMPTS=8
 # Without a time in crates.io's answer: its rate for new crates.
@@ -77,7 +97,7 @@ RATE_LIMIT_WAIT_MAX=1800
 DEP_WAIT=30
 
 usage() {
-    sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 publish=0
@@ -88,6 +108,14 @@ while [[ $# -gt 0 ]]; do
         --publish)
             publish=1
             shift
+            ;;
+        --registry)
+            REGISTRY_NAME="${2:?--registry needs a name}"
+            shift 2
+            ;;
+        --index)
+            INDEX_BASE="${2:?--index needs a URL}"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -116,8 +144,25 @@ if [[ ${#roots[@]} -eq 0 ]]; then
     exit 1
 fi
 
-if [[ "$publish" -eq 1 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-    echo "Error: --publish requires CARGO_REGISTRY_TOKEN to be set." >&2
+if [[ -z "$INDEX_BASE" ]]; then
+    if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
+        INDEX_BASE="https://index.crates.io"
+    else
+        echo "Error: --registry $REGISTRY_NAME needs --index <its sparse index URL>." >&2
+        exit 1
+    fi
+fi
+INDEX_BASE="${INDEX_BASE%/}"
+
+# The variable cargo reads the registry's token from.
+if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
+    TOKEN_VAR="CARGO_REGISTRY_TOKEN"
+else
+    TOKEN_VAR="CARGO_REGISTRIES_$(tr '[:lower:]-' '[:upper:]_' <<<"$REGISTRY_NAME")_TOKEN"
+fi
+
+if [[ "$publish" -eq 1 && -z "${!TOKEN_VAR:-}" ]]; then
+    echo "Error: --publish to $REGISTRY_NAME requires $TOKEN_VAR to be set." >&2
     exit 1
 fi
 
@@ -191,7 +236,7 @@ wait_for_index() {
         [[ "$attempt" -eq 0 ]] && echo "  [wait]    $name $version: not on the index yet, polling every 5 s"
         sleep 5
     done
-    echo "Error: $name $version did not appear on crates.io's index after publishing (timed out after 5 minutes)." >&2
+    echo "Error: $name $version did not appear on $REGISTRY_NAME's index after publishing (timed out after 5 minutes)." >&2
     exit 1
 }
 
@@ -215,7 +260,8 @@ rate_limit_wait() {
 }
 
 # publish_crate ROOT NAME VERSION
-# `cargo publish` to crates.io, tried again — up to PUBLISH_ATTEMPTS in
+# `cargo publish` to the registry. To another than crates.io: once,
+# without a verify build (see the header). To crates.io: tried again — up to PUBLISH_ATTEMPTS in
 # all — when crates.io rate-limits it, or when the dependency it was just
 # preceded by is not found yet through the source cargo resolves with.
 # Any other failure, or one of those past the last attempt, hard-exits.
@@ -225,6 +271,13 @@ rate_limit_wait() {
 # the upload go to crates.io itself rather than to the replacement.
 publish_crate() {
     local root="$1" name="$2" version="$3" attempt log wait
+    if [[ "$REGISTRY_NAME" != "crates-io" ]]; then
+        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify); then
+            return 0
+        fi
+        echo "Error: cargo publish to $REGISTRY_NAME failed for $name $version in $root" >&2
+        exit 1
+    fi
     log=$(mktemp)
     for ((attempt = 1; attempt <= PUBLISH_ATTEMPTS; attempt++)); do
         if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked) 2>&1 | tee "$log"; then
@@ -240,6 +293,8 @@ publish_crate() {
         if ((attempt == PUBLISH_ATTEMPTS)); then
             break
         fi
+        # The backticks below are cargo's, matched as they are.
+        # shellcheck disable=SC2016
         if grep -q -i -E '429|too many requests|rate limit|too many new crates|try again after' "$log"; then
             wait=$(rate_limit_wait "$log")
             echo "  [rate-limited] $name $version: crates.io refused it (attempt $attempt of $PUBLISH_ATTEMPTS); waiting ${wait}s"
@@ -261,7 +316,7 @@ process_workspace() {
     local root="$1"
     local manifest="$root/Cargo.toml"
 
-    echo "=== workspace: $root ==="
+    echo "=== workspace: $root, registry: $REGISTRY_NAME ($INDEX_BASE) ==="
 
     if [[ ! -f "$manifest" ]]; then
         echo "Error: no Cargo.toml at $manifest" >&2
@@ -277,7 +332,8 @@ process_workspace() {
     # Opt-in gate. Publishing is a deliberate, per-crate decision, so the
     # only two manifest states this script accepts are `publish = false`
     # (an unpublishable crate — `[]` in cargo metadata) and
-    # `publish = ["crates-io"]` exactly. Everything else is a hard error:
+    # `publish = ["crates-io", "coldsteel"]` exactly. Everything else is a
+    # hard error:
     #
     #   - an absent `publish` field, and the identical-in-metadata
     #     `publish = true`, both mean "publishable to crates.io" too, but
@@ -285,25 +341,25 @@ process_workspace() {
     #     get by writing nothing — a new crate in a configured workspace
     #     would publish itself on the next master push, and nobody decided
     #     it should be public;
-    #   - an array naming any other registry, or crates-io among others,
-    #     is a crate whose blast radius is wider than this job.
+    #   - an array naming any other registry, or only one of the two, is a
+    #     crate whose blast radius differs from this job's.
     #
     # No skip, no "publish the crates.io ones and ignore the rest": a
     # manifest this script cannot vouch for stops the whole workspace rather
     # than falling back to a guess. The fix is always
     # one line in the named crate's Cargo.toml.
     local unvetted
-    unvetted=$(jq -r --arg reg "$REGISTRY_NAME" '
+    unvetted=$(jq -r --argjson to "$PUBLISH_TO" '
         .packages[]
-        | select(.publish != [] and .publish != [$reg])
+        | select(.publish != [] and ((.publish // []) | sort) != $to)
         | "  \(.name) \(.version): publish = " +
           (if .publish == null then "absent (or `true`)" else (.publish | tojson) end)
     ' <<<"$meta")
 
     if [[ -n "$unvetted" ]]; then
-        echo "Error: crate(s) in $root are publishable without an explicit \`publish = [\"$REGISTRY_NAME\"]\`:" >&2
+        echo "Error: crate(s) in $root are publishable without an explicit \`publish = [\"crates-io\", \"coldsteel\"]\`:" >&2
         echo "$unvetted" >&2
-        echo "Set \`publish = [\"$REGISTRY_NAME\"]\` to publish it to crates.io, or \`publish = false\` to keep it out of every registry." >&2
+        echo "Set \`publish = [\"crates-io\", \"coldsteel\"]\` to publish it to both, or \`publish = false\` to keep it out of every registry." >&2
         exit 1
     fi
 
@@ -398,12 +454,12 @@ process_workspace() {
     for n in "${order[@]}"; do
         v="${version[$n]}"
         if version_published "$n" "$v"; then
-            echo "  [skip]    $n $v (already on crates.io)"
+            echo "  [skip]    $n $v (already on $REGISTRY_NAME)"
             continue
         fi
 
         if [[ "$publish" -eq 0 ]]; then
-            echo "  [would publish] $n $v (not on crates.io)"
+            echo "  [would publish] $n $v (not on $REGISTRY_NAME)"
             continue
         fi
 

@@ -6,7 +6,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-publish = ["crates-io"]
+publish = ["crates-io", "coldsteel"]
 
 [dependencies]
 spoolframe-types = { workspace = true }

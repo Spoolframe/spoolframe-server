@@ -1,19 +1,24 @@
 name: Publish
 
 # The SDK and the crates it needs (spoolframe-types, -protocol, -policy,
-# -client-sdk, -test-dir, -hls-bridge: every crate with
-# `publish = ["crates-io"]`) go to crates.io, where the Linux and Apple
-# clients take them from; since 0.16.1, no longer to the Coldsteel
-# registry. Adapted from foundry's publish.yaml.
+# -client-sdk, -client-ffi, -test-dir, -hls-bridge: every crate with
+# `publish = ["crates-io", "coldsteel"]`) go to the Coldsteel registry
+# (kellnr, https://cargo.coldsteel.casa) and to crates.io. The apps take
+# them from Coldsteel during development, past crates.io's index lag and
+# the kellnr proxy's cache, by patching each spoolframe crate to it
+# (crates/spoolframe-client-sdk/README.md); everyone else from crates.io.
+# Adapted from foundry's publish.yaml.
 #
 # Publishing is a consequence of landing on master, never of proposing to
 # it: no pull_request trigger. It runs on every master push, not only on a
 # version bump: scripts/publish-changed.sh compares each crate's version
-# with crates.io's index and publishes only what is missing, in dependency
-# order, so a missed publish (a failed run, crates.io down) heals on the
-# next push. A run that publishes new crates waits out crates.io's rate
-# limit for them (about one every 10 minutes after a small burst), so the
-# first one, with all six new, takes some 10 to 20 minutes.
+# with a registry's index and publishes only what is missing, in
+# dependency order, so a missed publish (a failed run, a registry down)
+# heals on the next push. Coldsteel first: it has no rate limits, so the
+# apps have a version in a minute. Its failure does not stop crates.io's
+# publish; the job goes red after it. A run that publishes new crates to
+# crates.io waits out its rate limit for them (about one every 10 minutes
+# after a small burst).
 on:
   push:
     branches:
@@ -45,7 +50,22 @@ jobs:
           fi
 
       # Inside the ci profile's shell, as CI's tasks run: `cargo publish`
-      # verify-builds each crate and needs the pinned toolchain.
+      # needs the pinned toolchain.
+      #
+      # CARGO_REGISTRIES_COLDSTEEL_TOKEN: an API token from the kellnr web
+      # UI at https://cargo.coldsteel.casa, a secret of this repository or
+      # its org.
+      - name: publish-changed (coldsteel)
+        id: coldsteel
+        continue-on-error: true
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        env:
+          CARGO_REGISTRIES_COLDSTEEL_TOKEN: ${{ secrets.CARGO_REGISTRIES_COLDSTEEL_TOKEN }}
+        run: >-
+          scripts/publish-changed.sh --publish --registry coldsteel
+          --index https://cargo.coldsteel.casa/api/v1/crates .
+
+      # Verify-builds each crate.
       #
       # CARGO_REGISTRY_TOKEN, a secret of this repository: a crates.io API
       # token (crates.io › Account Settings › API Tokens › New Token) with
@@ -53,11 +73,20 @@ jobs:
       # pattern `spoolframe-*`, so it can publish nothing else. One with an
       # expiry date needs replacing when it runs out: publishing then fails
       # to authenticate.
-      - name: publish-changed
+      - name: publish-changed (crates-io)
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: scripts/publish-changed.sh --publish .
+        run: scripts/publish-changed.sh --publish --registry crates-io .
+
+      # The Coldsteel publish failed, but crates.io's ran: say so, and fail
+      # the job, so the next master push (which publishes what is missing)
+      # is not the only notice.
+      - name: report a failed Coldsteel publish
+        if: ${{ !cancelled() && steps.coldsteel.outcome == 'failure' }}
+        run: |
+          echo "::error::publishing to the Coldsteel registry failed; see the publish-changed (coldsteel) step. crates.io was published to regardless."
+          exit 1
 
       # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,
       # and the job's container may go before it drains them.

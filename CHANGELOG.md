@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The public crates publish to the Coldsteel registry
+  (`https://cargo.coldsteel.casa`) again, besides crates.io: `publish =
+  ["crates-io", "coldsteel"]`, Coldsteel first on each master push and
+  crates.io after it, whether or not Coldsteel took them. An app in
+  development patches each spoolframe crate to its Coldsteel copy (the
+  SDK's README says how) and has a version before crates.io's index and
+  the kellnr proxy's cache do. The dependencies stay crates.io ones, so
+  the crates.io packages are unchanged. `scripts/publish-changed.sh` takes
+  `--registry` and `--index`.
+
 - The admin Server page, `spoolframe-server --version` and MCP's server
   info list the regular protocol features the server has
   (`spoolframe:profile-events`, `spoolframe:watch-events`,

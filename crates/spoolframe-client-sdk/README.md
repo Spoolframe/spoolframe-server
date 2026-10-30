@@ -19,6 +19,40 @@ spoolframe-client-sdk = "0.16"
 The SDK runs on Tokio. Then add the noq-proto patch below to your
 workspace.
 
+## Taking the crates from the Coldsteel registry
+
+Each version also goes to the Coldsteel registry (kellnr,
+`https://cargo.coldsteel.casa`), usually a minute after the merge, before
+crates.io has it and before the kellnr crates.io proxy's cache does. During
+development an app can take every spoolframe crate from there. Name the
+registry in the app's `.cargo/config.toml`:
+
+```toml
+[registries.coldsteel]
+index = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
+```
+
+Keep the dependency a crates.io one, and patch each spoolframe crate to its
+Coldsteel copy, at the same exact version:
+
+```toml
+[dependencies]
+spoolframe-client-sdk = "=0.16.4-beta.1"
+
+[patch.crates-io]
+spoolframe-types = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+spoolframe-protocol = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+spoolframe-policy = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+spoolframe-hls-bridge = { version = "=0.16.4-beta.1", registry = "coldsteel" }
+```
+
+The Coldsteel copies depend on each other as crates.io crates, and a
+`[patch.crates-io]` applies to the whole graph, so with every spoolframe
+crate patched none comes from crates.io. A patch the graph does not use
+is a warning only. Remove the section to go back to crates.io; cargo drops
+`[patch]` when the app publishes, as for noq-proto below.
+
 ## Getting started
 
 The app gives the SDK a `Storage` (where to keep secrets and data) and a
