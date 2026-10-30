@@ -10,6 +10,10 @@ The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates
 with a 0.16 server.
 
+- Server: a copied video resumed or sought onto a very short segment with
+  its audio encoded as E-AC-3 played nothing: `init.mp4` was cut before the
+  audio's first packet. A run now starts on a segment of at least 500 ms,
+  up to 10 s back.
 - Server: a progress report's outcome (`UpdatePlaybackProgress`,
   `UpdateWatchProgress`) is kept 30 s, not its operation's 15 minutes, and
   a refused one not at all. Each held an operation against its user's

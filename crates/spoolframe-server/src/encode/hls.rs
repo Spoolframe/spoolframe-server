@@ -50,6 +50,16 @@ const TAIL_MS: u64 = 500;
 /// [`Segments::encoded`] says: 0–2 s, 2–4 s and 4–8 s.
 const ENCODED_HEAD: u32 = 3;
 
+/// The shortest first segment of a run cut at every keyframe. The HLS muxer
+/// writes `init.mp4` at the run's first cut, and a run seeks halfway through
+/// a segment, so a short one is cut before an E-AC-3 encode's first packet:
+/// `moov` says size 0 and nothing plays. 12 Monkeys S1E4 from DTS: every
+/// segment to 251 ms failed, every one from 291 ms played.
+const RUN_FIRST_SEGMENT_MS: u64 = 500;
+
+/// How far back a run looks for such a segment. An all-intra film has none.
+const RUN_BACK_MS: u64 = 10_000;
+
 /// The segments of a converted playback: segment `n` (from 1) starts at
 /// `starts_ms[n - 1]` and ends where the next starts, or at `total_ms`.
 ///
@@ -69,6 +79,9 @@ pub struct Segments {
     /// ([`Segments::copied`]): where a run from the start begins, its
     /// first keyframe's own time, ms. `None` for any other.
     copy_from_ms: Option<i64>,
+    /// Cut at every keyframe ([`Segments::at_keyframes`]): a run starts at
+    /// a segment long enough ([`RUN_FIRST_SEGMENT_MS`]).
+    at_keyframes: bool,
     media: OnceLock<String>,
     subtitles: OnceLock<String>,
 }
@@ -142,7 +155,10 @@ impl Segments {
         let mut starts_ms = vec![0];
         let later = keyframes.iter().skip(1).copied();
         starts_ms.extend(later.filter(|&t| t > 0 && t < total_ms));
-        Self::tidy(starts_ms, total_ms, 0)
+        Self {
+            at_keyframes: true,
+            ..Self::tidy(starts_ms, total_ms, 0)
+        }
     }
 
     /// A copied video cut by ffmpeg's segment muxer (review 2026-10-11 M2):
@@ -187,6 +203,7 @@ impl Segments {
             total_ms,
             head,
             copy_from_ms: None,
+            at_keyframes: false,
             media: OnceLock::new(),
             subtitles: OnceLock::new(),
         }
@@ -204,10 +221,25 @@ impl Segments {
     }
 
     /// The segment a run that is to write segment `n` starts at: `n`
-    /// itself, or 1 for a segment of the head, which a run started
-    /// anywhere else cuts elsewhere.
+    /// itself, 1 for a segment of the head, which a run started anywhere
+    /// else cuts elsewhere, or for a cut at every keyframe the nearest
+    /// long enough to start one.
     pub fn run_from(&self, n: u32) -> u32 {
-        if n <= self.head { 1 } else { n }
+        if n <= self.head {
+            return 1;
+        }
+        let Some(at) = self.start(n).filter(|_| self.at_keyframes) else {
+            return n;
+        };
+        (1..=n)
+            .rev()
+            .take_while(|&m| self.start(m).is_some_and(|s| at - s <= RUN_BACK_MS))
+            .find(|&m| m == 1 || self.length_ms(m) >= RUN_FIRST_SEGMENT_MS)
+            .unwrap_or(n)
+    }
+
+    fn length_ms(&self, n: u32) -> u64 {
+        self.duration_ms(n as usize - 1)
     }
 
     pub fn count(&self) -> u32 {
@@ -1147,6 +1179,29 @@ mod tests {
             variant(&text).contains("CODECS=\"hvc1.1.6.L120.B0\""),
             "{text}"
         );
+    }
+
+    /// 12 Monkeys S1E4's 11:59: a keyframe 83 ms after the last.
+    #[test]
+    fn a_run_cut_at_keyframes_does_not_start_on_a_short_segment() {
+        let s = Segments::at_keyframes(&[0, 2000, 3000, 3083, 3200, 5000], 8000);
+        assert_eq!(s.run_from(3), 2, "83 ms: back to the second before");
+        assert_eq!(s.run_from(4), 2, "117 ms, then 83: back past both");
+        assert_eq!(s.run_from(5), 5, "long enough itself");
+    }
+
+    #[test]
+    fn a_short_segment_at_the_start_runs_from_the_start() {
+        let s = Segments::at_keyframes(&[0, 100, 200, 3000], 6000);
+        assert_eq!(s.run_from(2), 1);
+    }
+
+    /// Nothing long enough near: a run cannot go back through a film.
+    #[test]
+    fn an_all_intra_film_starts_where_it_is_asked() {
+        let keyframes: Vec<u64> = (0..2000).map(|n| n * 42).collect();
+        let s = Segments::at_keyframes(&keyframes, 84_000);
+        assert_eq!(s.run_from(1500), 1500);
     }
 
     #[test]
