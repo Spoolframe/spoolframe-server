@@ -996,6 +996,38 @@ async fn two_controls_with_the_same_revision_cannot_both_apply() {
     server.stop().await;
 }
 
+/// A report sent again after a lost reply gets its `Done`: run again, it
+/// would be `StaleProgress`, its sequence used.
+#[tokio::test]
+async fn a_report_retried_after_a_lost_reply_gets_its_done() {
+    use spoolframe_protocol::RequestEnvelope;
+    use spoolframe_protocol::rpc::RpcRequest;
+
+    let (server, client, session) = ready("progress-retry").await;
+    server.write_media(1000);
+    let (handle, _) = started(&client, &session).await;
+    let report = RpcRequest {
+        envelope: RequestEnvelope {
+            session: Some(session.clone()),
+            request: Request::UpdatePlaybackProgress {
+                handle,
+                sequence: 1,
+                position_ms: 30_000,
+            },
+        },
+        operation: Some(client.operation()),
+        expected_revision: None,
+    };
+    let first = client.wire(&report).await.reply.response;
+    let again = client.wire(&report).await.reply.response;
+    assert_eq!(
+        (first, again),
+        (Response::Ok(Reply::Done), Response::Ok(Reply::Done))
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn progress_rejects_old_sequences_superseded_and_stopped_handles() {
     let (server, client, session) = ready("progress-order").await;

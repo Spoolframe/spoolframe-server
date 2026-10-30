@@ -125,7 +125,9 @@ the life of a `Client`; an app whose user changes it opens a new one.
 
 `Session::open_playback` returns a `ManagedPlayback`. Keep clones in the
 player and its readers so they share replacement handles. `report_position`
-coalesces updates; `flush` waits for pending progress; `finish(position)`
+takes every tick and sends the first at once, then the newest every
+`PROGRESS_EVERY` (a move back or a seek at once); `flush` waits for pending
+progress; `finish(position)`
 sends the final position before stopping. `close` stops without replacing
 the pending position. Subscribe to `errors()` to show background progress
 failures.

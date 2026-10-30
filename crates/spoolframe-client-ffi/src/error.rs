@@ -102,7 +102,7 @@ pub enum SpoolError {
     InviteExhausted,
     #[error("that username is taken")]
     UsernameTaken,
-    #[error("too many failed sign-ins; try again in {} s", retry_after.as_secs())]
+    #[error("too many requests; try again in {} s", retry_after.as_secs())]
     RateLimited { retry_after: Duration },
     #[error("cannot play: {}", reasons.join("; "))]
     CannotPlay { reasons: Vec<String> },

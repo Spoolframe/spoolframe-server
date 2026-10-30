@@ -2487,8 +2487,9 @@ pub enum Error {
     /// Wrong username or password; deliberately the same for both.
     #[error("invalid credentials")]
     InvalidCredentials,
-    /// Too many failed logins for this username or from this endpoint.
-    #[error("too many failed logins; retry in {retry_after_ms} ms")]
+    /// Too many requests: failed sign-ins for this username or from this
+    /// endpoint, or more operations than a pool has room for now.
+    #[error("too many requests; retry in {retry_after_ms} ms")]
     RateLimited { retry_after_ms: u64 },
     /// The client cannot play this selection; one reason per stream, as
     /// in [`PlaybackPlan::Unsupported`].

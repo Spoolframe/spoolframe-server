@@ -29,14 +29,28 @@ const CEREMONY_REPLY: usize = 64 << 10;
 /// bytes (1/8): it can fill the pool only with seven others.
 const OWNER_SHARE: usize = 8;
 
-/// How long an anonymous outcome is kept once it is known: long enough for
-/// a client's retry after a lost reply, short enough that sign-in attempts
-/// cannot hold the anonymous pool for an operation's whole 15 minutes.
-/// An outcome that changed nothing is not kept at all ([`changed_nothing`]).
-const ANONYMOUS_KEPT_MS: u64 = 30_000;
+/// How long an outcome kept briefly is kept once it is known: long enough
+/// for a client's retry after a lost reply, short enough that sign-in
+/// attempts cannot hold the anonymous pool, nor a player's reports a
+/// user's share, for an operation's whole 15 minutes. An outcome that
+/// changed nothing is not kept at all ([`changed_nothing`]).
+const KEPT_BRIEFLY_MS: u64 = 30_000;
 
-/// Whether an anonymous request's `reply` left nothing that a retry could
-/// not do again: a refusal or failure, or a device's wait still pending.
+/// How long `request`'s outcome is kept, if less than its pool's: a
+/// progress report's is kept briefly. A player sends them all the time,
+/// and a report held to its expiry counts against everything else its
+/// user does; the next one says the same and more, and its sequence keeps
+/// one from applying twice, so only a retry after a lost reply needs it.
+pub(crate) fn kept_ms(request: &Request) -> Option<u64> {
+    matches!(
+        request,
+        Request::UpdatePlaybackProgress { .. } | Request::UpdateWatchProgress { .. }
+    )
+    .then_some(KEPT_BRIEFLY_MS)
+}
+
+/// Whether the `reply` to a request kept briefly left nothing that a retry
+/// could not do again: a refusal or failure, or a device's wait still pending.
 /// A retry after a lost reply is then answered by running it again, which
 /// refuses, fails or waits again; a wrong password is counted again, which
 /// errs on the safe side. Kept, such outcomes let strangers hold the
@@ -200,7 +214,7 @@ impl Operations {
         Self {
             max_operations: 512,
             max_bytes: 8 << 20,
-            kept_ms: Some(ANONYMOUS_KEPT_MS),
+            kept_ms: Some(KEPT_BRIEFLY_MS),
             ..Self::default()
         }
     }
@@ -367,6 +381,7 @@ impl Operations {
         id: &str,
         send: watch::Sender<Option<RpcReply>>,
         mut reply: RpcReply,
+        kept_ms: Option<u64>,
         now: u64,
     ) {
         let size = spoolframe_protocol::codec::encode_limited(&reply, MAX_OUTCOME)
@@ -383,7 +398,7 @@ impl Operations {
         };
         let key = (endpoint.to_owned(), id.to_owned());
         let mut entries = self.entries.lock();
-        match self.kept_ms {
+        match kept_ms.or(self.kept_ms) {
             // Requests waiting on it hold its outcome already.
             Some(_) if changed_nothing(&reply) => {
                 entries.remove(&key);
@@ -561,7 +576,14 @@ mod tests {
             })
             .collect();
         for (user, id, invocation) in begun {
-            cache.finish(&user, &id, invocation.execute.unwrap(), reply.clone(), 1);
+            cache.finish(
+                &user,
+                &id,
+                invocation.execute.unwrap(),
+                reply.clone(),
+                None,
+                1,
+            );
         }
     }
 
@@ -659,6 +681,7 @@ mod tests {
                         retry_after_ms: 200,
                     })
                     .into(),
+                    None,
                     1,
                 );
             }
@@ -701,6 +724,7 @@ mod tests {
             &op.id,
             invocation.execute.unwrap(),
             Response::Ok(Reply::DeviceSignInPending).into(),
+            None,
             1,
         );
         assert!(
@@ -915,7 +939,14 @@ mod tests {
         let invocation = anonymous
             .begin(at("peer"), "process-1", &op, [1; 32], SMALL_REPLY, 1)
             .unwrap();
-        anonymous.finish("peer", &op.id, invocation.execute.unwrap(), logged_in(), 1);
+        anonymous.finish(
+            "peer",
+            &op.id,
+            invocation.execute.unwrap(),
+            logged_in(),
+            None,
+            1,
+        );
         let replayed = |now| {
             anonymous
                 .lookup("peer", "process-1", &op, [1; 32], now)
@@ -924,6 +955,146 @@ mod tests {
         };
         assert!(replayed(1 + 29_000), "not replayed within 30 s");
         assert!(!replayed(1 + 31_000), "still held after 30 s");
+    }
+
+    fn progress_reports() -> [Request; 2] {
+        [
+            Request::UpdatePlaybackProgress {
+                handle: spoolframe_protocol::PlaybackHandle("h".into()),
+                sequence: 1,
+                position_ms: 0,
+            },
+            Request::UpdateWatchProgress {
+                id: spoolframe_types::MediaId::new(
+                    spoolframe_types::Namespace::Plex,
+                    spoolframe_types::MediaKind::Movie,
+                    "1",
+                )
+                .unwrap(),
+                position_ms: 0,
+            },
+        ]
+    }
+
+    /// Reports twice a second go past a user's share of the operations
+    /// within minutes, and are all taken, and a start after them is too:
+    /// each one's sequence keeps it from applying twice, so it needs no
+    /// outcome for its operation's whole 15 minutes.
+    #[test]
+    fn reports_past_a_share_are_taken_and_a_start_still_is() {
+        for report in progress_reports() {
+            let cache = Operations::default();
+            let mut now = 1;
+            for n in 0..2 * MAX_OPERATIONS / OWNER_SHARE {
+                now = 1 + n as u64 * 500;
+                let op = Operation {
+                    id: format!("report-{n}"),
+                    instance: "process-1".into(),
+                    expires_at_ms: now + OPERATION_WINDOW_MS,
+                };
+                let invocation = cache
+                    .begin(
+                        of("peer", "a"),
+                        "process-1",
+                        &op,
+                        [1; 32],
+                        reservation(&report),
+                        now,
+                    )
+                    .unwrap_or_else(|error| panic!("report {n} refused: {error}"));
+                cache.finish(
+                    "peer",
+                    &op.id,
+                    invocation.execute.unwrap(),
+                    Response::Ok(Reply::Done).into(),
+                    kept_ms(&report),
+                    now,
+                );
+            }
+            let start = Operation {
+                id: "start".into(),
+                instance: "process-1".into(),
+                expires_at_ms: now + OPERATION_WINDOW_MS,
+            };
+            assert!(
+                cache
+                    .begin(
+                        of("peer", "a"),
+                        "process-1",
+                        &start,
+                        [2; 32],
+                        change_subtitle(),
+                        now,
+                    )
+                    .is_ok(),
+                "the playback was refused"
+            );
+        }
+    }
+
+    /// A retry after a lost reply gets the report's `Done` for 30 s: run
+    /// again, it would be `StaleProgress`.
+    #[test]
+    fn a_report_s_outcome_is_replayed_for_30_s_then_dropped() {
+        for report in progress_reports() {
+            let cache = Operations::default();
+            let mut op = operation();
+            op.expires_at_ms = 1 + OPERATION_WINDOW_MS;
+            let invocation = cache
+                .begin(of("peer", "a"), "process-1", &op, [1; 32], SMALL_REPLY, 1)
+                .unwrap();
+            cache.finish(
+                "peer",
+                &op.id,
+                invocation.execute.unwrap(),
+                Response::Ok(Reply::Done).into(),
+                kept_ms(&report),
+                1,
+            );
+            let replayed = |now| {
+                let found = cache.lookup("peer", "process-1", &op, [1; 32], now);
+                found.unwrap().map(|i| i.outcome.borrow().clone())
+            };
+            assert_eq!(
+                (replayed(1 + 29_000), replayed(1 + 31_000)),
+                (Some(Some(Response::Ok(Reply::Done).into())), None)
+            );
+        }
+    }
+
+    /// A refused report holds nothing: its retry runs again.
+    #[test]
+    fn a_refused_report_is_not_kept() {
+        let [report, _] = progress_reports();
+        let cache = Operations::default();
+        let op = operation();
+        let invocation = cache
+            .begin(of("peer", "a"), "process-1", &op, [1; 32], SMALL_REPLY, 1)
+            .unwrap();
+        cache.finish(
+            "peer",
+            &op.id,
+            invocation.execute.unwrap(),
+            Response::Err(Error::StaleProgress).into(),
+            kept_ms(&report),
+            1,
+        );
+        let found = cache.lookup("peer", "process-1", &op, [1; 32], 2).unwrap();
+        assert!(found.is_none());
+    }
+
+    /// Any other mutation's outcome stays as long as its operation.
+    #[test]
+    fn only_progress_is_kept_briefly() {
+        let mark = Request::MarkWatched {
+            id: spoolframe_types::MediaId::new(
+                spoolframe_types::Namespace::Plex,
+                spoolframe_types::MediaKind::Movie,
+                "1",
+            )
+            .unwrap(),
+        };
+        assert_eq!(kept_ms(&mark), None);
     }
 
     #[test]
@@ -939,6 +1110,7 @@ mod tests {
             &op.id,
             invocation.execute.unwrap(),
             Response::Ok(Reply::Done).into(),
+            None,
             1,
         );
         assert!(
@@ -961,7 +1133,14 @@ mod tests {
             let invocation = anonymous
                 .begin(at("peer"), "process-1", &op, [1; 32], SMALL_REPLY, 1)
                 .unwrap();
-            anonymous.finish("peer", &op.id, invocation.execute.unwrap(), logged_in(), 1);
+            anonymous.finish(
+                "peer",
+                &op.id,
+                invocation.execute.unwrap(),
+                logged_in(),
+                None,
+                1,
+            );
         }
         op.id = "overflow".into();
         assert!(matches!(
@@ -1020,7 +1199,14 @@ mod tests {
             .unwrap();
         assert!(duplicate.execute.is_none());
         let reply: RpcReply = Response::Ok(Reply::Done).into();
-        cache.finish("endpoint", &op.id, first.execute.unwrap(), reply.clone(), 2);
+        cache.finish(
+            "endpoint",
+            &op.id,
+            first.execute.unwrap(),
+            reply.clone(),
+            None,
+            2,
+        );
         duplicate.outcome.changed().await.unwrap();
         assert_eq!(*duplicate.outcome.borrow(), Some(reply.clone()));
         let replay = cache

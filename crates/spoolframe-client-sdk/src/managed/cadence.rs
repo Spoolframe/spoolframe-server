@@ -2,7 +2,8 @@
 //! player says it does ([`ManagedPlayback::set_state`]).
 //!
 //! The SDK reports where the player is every 10 s while it plays, at
-//! once when it moves backwards, and when it pauses. The server ends a
+//! once when it moves backwards, and when it pauses. The positions an app
+//! gives itself ([`ManagedPlayback::report_position`]) go at that pace too. The server ends a
 //! playback it has not heard from for a while; until it keeps paused
 //! playbacks itself, a paused one reports again every 60 s, and a
 //! converted one that reads nothing (its buffer is full) reads a byte.
@@ -41,7 +42,8 @@ enum Tick {
 
 impl ManagedPlayback {
     /// How often a playing playback reports where it is: what play
-    /// history asks for, one report crediting at most 30 s of play.
+    /// history asks for, one report crediting at most 30 s of play, and
+    /// what the server's operations pool can take.
     pub const PROGRESS_EVERY: Duration = Duration::from_secs(10);
     /// How often an idle playback is used, so the server does not end it.
     pub const KEEP_ALIVE: Duration = Duration::from_secs(60);
@@ -49,7 +51,7 @@ impl ManagedPlayback {
     pub const REFILL_AFTER: Duration = Duration::from_secs(120);
     /// A move back of more than this is a seek back, reported at once;
     /// less is a player's jitter.
-    const BACKWARDS: Duration = Duration::from_secs(1);
+    pub(super) const BACKWARDS: Duration = Duration::from_secs(1);
 
     /// What the player does now: call it from the player's own ticks,
     /// and on every play, pause and seek. The SDK reports from it, at a
@@ -87,6 +89,7 @@ impl ManagedPlayback {
         }
         if report {
             state.pending = Some(pos);
+            state.report_now = true;
             self.0.notify.notify_one();
         }
         Ok(())

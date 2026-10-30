@@ -379,6 +379,11 @@ struct State {
     selection: Option<Selection>,
     options: PlaybackOptions,
     pending: Option<Duration>,
+    /// When a report was last sent: a report waits its turn from then
+    /// ([`ManagedPlayback::report_position`]).
+    reported: Option<Instant>,
+    /// `pending` does not wait its turn: a seek, a pause, a new playback.
+    report_now: bool,
     /// Where the viewer last was: reported, sought to, or where a subtitle
     /// change restarted the encode. A resume starts there.
     position: Option<Duration>,
@@ -449,6 +454,16 @@ pub fn moves_player(before: &Playback, after: &Playback) -> bool {
 }
 
 impl State {
+    /// How long `pending` waits for its turn.
+    fn report_wait(&self) -> Duration {
+        match self.reported {
+            Some(reported) if self.pending.is_some() && !self.report_now => (reported
+                + ManagedPlayback::PROGRESS_EVERY)
+                .saturating_duration_since(Instant::now()),
+            _ => Duration::ZERO,
+        }
+    }
+
     /// The playback as it is now: the generation goes up where it moves
     /// the player ([`moves_player`]), in `generation` too.
     fn set_playback(&mut self, next: Playback, generation: &AtomicU64) {
@@ -797,6 +812,8 @@ impl ManagedPlayback {
                 selection,
                 options,
                 pending: None,
+                reported: None,
+                report_now: false,
                 position: None,
                 segments: Vec::new(),
                 generation: 0,
@@ -862,6 +879,20 @@ impl ManagedPlayback {
             loop {
                 notify.notified().await;
                 tokio::time::sleep(Duration::from_millis(250)).await;
+                // Its turn, or sooner: each notice looks again, and the
+                // playback's drop is one.
+                loop {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let wait = inner.state.lock().report_wait();
+                    drop(inner);
+                    if wait.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        () = notify.notified() => {}
+                    }
+                }
                 let Some(inner) = weak.upgrade() else { break };
                 if let Err(error) = ManagedPlayback(inner.clone()).flush().await {
                     let _ = inner.errors.send(error);
@@ -972,9 +1003,18 @@ impl ManagedPlayback {
     pub fn errors(&self) -> broadcast::Receiver<SdkError> {
         self.0.errors.subscribe()
     }
-    /// Where the player is. Reports are coalesced and sent in the
-    /// background; a resume starts the new playback here. While a seek is
-    /// in flight ([`Self::seek_started`]) it is the seek's target.
+    /// Where the player is: call it on every tick, as often as you like.
+    /// A resume starts the new playback at the last one said.
+    ///
+    /// Each report sent holds one of the user's operations on the server
+    /// for a while, so it is sent in the background, the first at once
+    /// and then the newest every [`Self::PROGRESS_EVERY`]; a move back of
+    /// more than a second and a seek ([`Self::seek_started`]) do not wait.
+    /// None is lost: ticks that stop (a pause) have the last one sent
+    /// when its turn comes, and [`Self::flush`], [`Self::finish`],
+    /// [`Self::close`] and dropping it send it at once.
+    ///
+    /// While a seek is in flight the position is the seek's target.
     pub fn report_position(&self, position: Duration) -> Result<(), SdkError> {
         let mut state = self.0.state.lock();
         let (position, _) = state.gate.position(position);
@@ -983,6 +1023,12 @@ impl ManagedPlayback {
         }
         if let Some(ended) = &state.ended {
             return Err(ended.clone());
+        }
+        if state
+            .position
+            .is_some_and(|before| position + Self::BACKWARDS < before)
+        {
+            state.report_now = true;
         }
         state.pending = Some(position);
         state.position = Some(position);
@@ -1025,6 +1071,13 @@ impl ManagedPlayback {
         let Some((handle, position)) = report else {
             return Ok(());
         };
+        // On the try, not on success: one refused (RateLimited) waits
+        // its turn too.
+        {
+            let mut state = self.0.state.lock();
+            state.reported = Some(Instant::now());
+            state.report_now = false;
+        }
         if let Err(error) = self.0.backend.progress(&handle, position).await {
             let mut state = self.0.state.lock();
             if !state.closed && state.pending.is_none() {
@@ -1135,7 +1188,10 @@ impl ManagedPlayback {
     /// [`seek_gate::SEEK_LANDED`] of the target, or after
     /// [`seek_gate::SEEK_GIVE_UP`].
     pub fn seek_started(&self, target: Duration) {
-        self.0.state.lock().gate.started(target);
+        let mut state = self.0.state.lock();
+        state.gate.started(target);
+        // The next position said goes out at once: the seek's.
+        state.report_now = true;
     }
 
     /// The player's seek is done: its positions count again.
@@ -1666,6 +1722,7 @@ impl ManagedPlayback {
             // watching) before the player reports again.
             if state.pending.is_none() && state.position.is_some() {
                 state.pending = state.position;
+                state.report_now = true;
                 self.0.notify.notify_one();
             }
         }
@@ -2717,6 +2774,111 @@ mod tests {
         assert_eq!(next.handle.0, "2");
         assert_eq!(*b.events.lock(), vec!["progress:2:10"]);
         p.close().await.unwrap();
+    }
+
+    /// An app reports on every tick, as often as it likes: the server
+    /// hears the first at once, then one in each PROGRESS_EVERY, the
+    /// newest. Each report holds an operation on the server, and a user
+    /// may hold few of them.
+    #[tokio::test(start_paused = true)]
+    async fn ticks_however_fast_are_sent_once_per_progress_every() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        for tick in 0..42 {
+            p.report_position(Duration::from_millis(tick * 500))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(
+            progress(&b),
+            ["progress:1:0", "progress:1:10", "progress:1:20"]
+        );
+        assert_eq!(p.last_position(), Some(Duration::from_millis(20_500)));
+    }
+
+    /// A move back is the viewer's: it does not wait its turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_back_is_sent_at_once() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.report_position(Duration::from_secs(100)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        p.report_position(Duration::from_secs(50)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(progress(&b), ["progress:1:100", "progress:1:50"]);
+    }
+
+    /// A player's jitter backwards is no seek, and waits its turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_little_move_back_waits_its_turn() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.report_position(Duration::from_secs(100)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        p.report_position(Duration::from_millis(99_500)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(progress(&b), ["progress:1:100"]);
+    }
+
+    /// A seek is sent at its target at once, and once: the ticks while it
+    /// lands say the same place.
+    #[tokio::test(start_paused = true)]
+    async fn a_seek_is_sent_at_once_and_its_ticks_wait() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.report_position(Duration::from_secs(100)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        p.seek_started(Duration::from_secs(300));
+        for _ in 0..3 {
+            p.report_position(Duration::from_secs(100)).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(progress(&b), ["progress:1:100", "progress:1:300"]);
+    }
+
+    /// An app that stops ticking (a pause) loses nothing: what it said
+    /// last goes out when its turn comes.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_tick_goes_out_after_the_ticks_stop() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.report_position(Duration::from_secs(1)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        p.report_position(Duration::from_secs(2)).unwrap();
+        p.report_position(Duration::from_secs(3)).unwrap();
+        tokio::time::sleep(ManagedPlayback::PROGRESS_EVERY).await;
+        assert_eq!(progress(&b), ["progress:1:1", "progress:1:3"]);
+    }
+
+    /// `flush` does not wait its turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_sends_a_report_waiting_its_turn() {
+        let b = Arc::new(Backend::default());
+        let p = open(b.clone()).await;
+        p.report_position(Duration::from_secs(1)).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        p.report_position(Duration::from_secs(5)).unwrap();
+        p.flush().await.unwrap();
+        assert_eq!(progress(&b), ["progress:1:1", "progress:1:5"]);
+    }
+
+    /// Nor does closing it, or dropping it: nothing reported is lost.
+    #[tokio::test(start_paused = true)]
+    async fn closing_or_dropping_sends_a_report_waiting_its_turn() {
+        let closed = Arc::new(Backend::default());
+        let dropped = Arc::new(Backend::default());
+        for (b, close) in [(&closed, true), (&dropped, false)] {
+            let p = open(b.clone()).await;
+            p.report_position(Duration::from_secs(1)).unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            p.report_position(Duration::from_secs(5)).unwrap();
+            if close {
+                p.close().await.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(progress(&closed), ["progress:1:1", "progress:1:5"]);
+        assert_eq!(progress(&dropped), ["progress:1:1", "progress:1:5"]);
     }
 
     fn progress(b: &Backend) -> Vec<String> {

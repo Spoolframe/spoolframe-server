@@ -122,7 +122,7 @@ pub enum SdkError {
     /// invite is still unused.
     #[error("that username is taken")]
     UsernameTaken,
-    #[error("too many failed sign-ins; try again in {} s", retry_after.as_secs())]
+    #[error("too many requests; try again in {} s", retry_after.as_secs())]
     RateLimited { retry_after: Duration },
     /// One reason per stream that this device cannot play.
     #[error("cannot play: {}", reasons.join("; "))]

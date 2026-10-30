@@ -1094,6 +1094,7 @@ impl ClientProtocol {
         let session = wire.envelope.session.clone();
         if let Some(send) = invocation.execute {
             let operations = operations.clone();
+            let kept_ms = crate::operations::kept_ms(&wire.envelope.request);
             // In the request's span: a spawned task starts with none, and
             // what the execution did (a Plex request, its log lines) went
             // to Tempo as traces of their own, the request's span empty.
@@ -1105,6 +1106,7 @@ impl ClientProtocol {
                     &operation.id,
                     send,
                     reply,
+                    kept_ms,
                     crate::operations::now_ms(),
                 );
             });

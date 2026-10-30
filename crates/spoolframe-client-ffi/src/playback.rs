@@ -633,8 +633,11 @@ impl SpoolPlayback {
         })
     }
 
-    /// Where the player is: on every tick, as often as it likes. Sent in
-    /// the background, a few at a time; `flush` sends the last now.
+    /// Where the player is: on every tick, as often as it likes. The first
+    /// is sent at once, then the newest every 10 s; a move back or a seek
+    /// (`seek_started`) does not wait, and nothing is lost: when the ticks
+    /// stop the last goes out at its turn, and `flush`, `finish`, `stop`
+    /// and dropping it send it now. Call `flush` on pause.
     pub fn report_position(&self, position: Duration) -> Result<(), SpoolError> {
         Ok(self.managed()?.report_position(position)?)
     }

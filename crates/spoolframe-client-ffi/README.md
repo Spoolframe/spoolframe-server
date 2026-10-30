@@ -134,8 +134,9 @@ back), as a `SpoolPlayback`. Its `info().url` is
 subtitle menu depend on that shape.
 
 A `SpoolPlayback` is one item playing, and its controls:
-`report_position` on every player tick (sent in the background, a few
-at a time) and `flush` on pause; `change_quality`, `change_subtitle`
+`report_position` on every player tick (the first sent at once, then
+the newest every 10 s, a move back or a seek at once) and `flush` on
+pause; `change_quality`, `change_subtitle`
 and `limit`, each the new plan to switch to or `None`; `read_subtitle`
 for a subtitle that comes as a file (waited for up to 30 s while the
 server reads it as text); `finish(position)` or `stop` at the end, and

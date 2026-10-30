@@ -256,8 +256,13 @@ Disconnecting, or cancelling the reply stream, does not cancel an
 admitted mutation. Reusing an id with another request is
 `OperationConflict`.
 
-An operation lives at most 15 minutes (`rpc::OPERATION_WINDOW_MS`). The
-cache holds 4096 entries and 64 MiB of serialized outcomes. A pending
+An operation lives at most 15 minutes (`rpc::OPERATION_WINDOW_MS`), and
+its outcome is kept until then, but for a progress report
+(`UpdatePlaybackProgress`, `UpdateWatchProgress`): that outcome is
+replayed for 30 s after it is known, or until the operation expires if
+that is sooner, and one that changed nothing (an error) is not kept. A
+retry later than that runs again; a playback report is then
+`StaleProgress`, its sequence having been used. The cache holds 4096 entries and 64 MiB of serialized outcomes. A pending
 operation reserves what its kind of reply can take: 1 MiB for
 `StartPlayback`, `ChangeSubtitle` and `SeekPlayback`, 64 KiB for passkey
 ceremony options, 16 KiB for the rest; a finished one counts its

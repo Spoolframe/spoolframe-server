@@ -10,6 +10,17 @@ The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates
 with a 0.16 server.
 
+- Server: a progress report's outcome (`UpdatePlaybackProgress`,
+  `UpdateWatchProgress`) is kept 30 s, not its operation's 15 minutes, and
+  a refused one not at all. Each held an operation against its user's
+  share of 512, so a player reporting often, or a few on one account,
+  had their reports and new playbacks refused. Old clients gain too.
+- SDK: `ManagedPlayback::report_position` (FFI too) takes every tick and
+  sends the first at once, then the newest every 10 s, a move back or a
+  seek at once. It sent one every 250 ms. Nothing reported is lost.
+- Protocol and SDK: `RateLimited` says "too many requests", not "too many
+  failed logins" or "too many failed sign-ins": it is any request the
+  server refuses for now.
 - Protocol: `PROTOCOL_VERSION` stays 1. Every change below is a new
   optional field, a new event or a request behind a feature, so neither
   side needs the other updated. A new reply field is `serde(default)`,
