@@ -37,7 +37,7 @@
   `toString()` (the Rust `Display`) and `message()`.
   `tests/bindings.rs` compiles the Kotlin with kotlinc against JNA and
   kotlinx-coroutines, and typechecks the Swift with swiftc on Linux;
-  devenv's ci profile carries both, and the jars through Nix.
+  devenv's ci-test profile (the CI test shards') carries both, and the jars through Nix.
 
 ## 0.16.4-beta.1 (2026-10-29)
 

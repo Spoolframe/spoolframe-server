@@ -179,9 +179,11 @@ jobs:
           name: test-archive
           path: target
 
+      # ci-test: the ci profile with kotlinc, a JDK and Swift, which the
+      # FFI's bindings test compiles with (devenv.nix).
       - name: ci:test-shard
-        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
-        run: devenv --no-tui tasks run --profile ci ci:test-shard
+        shell: devenv --no-tui shell --profile ci-test -- bash -eo pipefail {0}
+        run: devenv --no-tui tasks run --profile ci-test ci:test-shard
 
       - name: Publish JUnit results
         if: always()

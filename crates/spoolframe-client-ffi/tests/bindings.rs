@@ -4,7 +4,7 @@
 //! and no config of the app's. And they compile: the Kotlin with kotlinc
 //! against JNA and kotlinx-coroutines, the Swift (on Linux) typechecked
 //! with swiftc, so a name UniFFI makes that clashes with Kotlin's, JNA's
-//! or Swift's fails here rather than in an app's build. devenv's ci
+//! or Swift's fails here rather than in an app's build. devenv's ci-test
 //! profile gives the compilers and `SPOOLFRAME_KOTLIN_CLASSPATH` and
 //! `SPOOLFRAME_SWIFT_INCLUDE`; without them the compiling tests say so
 //! and pass, except under CI, where they fail.
@@ -39,7 +39,8 @@ fn cdylib() -> Utf8PathBuf {
     path
 }
 
-fn generated(dir: &Utf8PathBuf) -> Vec<String> {
+/// Every file under `dir`, in path order.
+fn generated(dir: &Utf8PathBuf) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![dir.clone().into_std_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -48,7 +49,7 @@ fn generated(dir: &Utf8PathBuf) -> Vec<String> {
             if path.is_dir() {
                 stack.push(path);
             } else {
-                files.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                files.push(path);
             }
         }
     }
@@ -60,6 +61,9 @@ fn generate_into(name: &str, language: TargetLanguage) -> Vec<String> {
     let out_dir = out_dir(name);
     generate_in(&out_dir, language);
     generated(&out_dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
 }
 
 fn generate_in(out_dir: &Utf8PathBuf, language: TargetLanguage) {
@@ -77,32 +81,22 @@ fn generate_in(out_dir: &Utf8PathBuf, language: TargetLanguage) {
 
 /// The files under `dir` ending in `ext`, in path order.
 fn sources(dir: &Utf8PathBuf, ext: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let mut stack = vec![dir.clone().into_std_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == ext) {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    files
+    generated(dir)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|e| e == ext))
+        .collect()
 }
 
-/// `name` from the environment, as devenv's ci profile sets it; `None`
+/// `name` from the environment, as devenv's ci-test profile sets it; `None`
 /// (said on stderr) without it, outside CI, where it must be set.
 fn from_ci_profile(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(value) => Some(value),
         Err(_) if std::env::var_os("CI").is_some() => {
-            panic!("{name} is unset: run under `devenv shell --profile ci`")
+            panic!("{name} is unset: run under `devenv shell --profile ci-test`")
         }
         Err(_) => {
-            eprintln!("{name} is unset (devenv's ci profile sets it): not compiled");
+            eprintln!("{name} is unset (devenv's ci-test profile sets it): not compiled");
             None
         }
     }
@@ -176,6 +170,12 @@ fn kotlin_bindings_compile() {
 /// crate's C header through its module map.
 #[test]
 fn swift_bindings_typecheck() {
+    // The ci-test profile gives swiftc its Foundation on Linux only; the
+    // Apple apps' own builds compile it on macOS.
+    if !cfg!(target_os = "linux") {
+        eprintln!("the Swift is typechecked on Linux only: not typechecked");
+        return;
+    }
     let Some(include) = from_ci_profile("SPOOLFRAME_SWIFT_INCLUDE") else {
         return;
     };
