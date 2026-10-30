@@ -251,10 +251,13 @@ pub struct PasskeyInfo {
     /// What its user called it; an app passkey's is the device's (the web
     /// UI shows it as "Spoolframe app · \<name\>").
     pub name: String,
-    /// Unix seconds.
-    pub created_at: i64,
+    /// Unix seconds on the wire.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub created_at: std::time::SystemTime,
     /// `None` if it has never signed them in.
-    pub last_used_at: Option<i64>,
+    // Read as none when left out, as a plain `Option` was.
+    #[serde(default, with = "spoolframe_types::serde_time::unix_seconds::option")]
+    pub last_used_at: Option<std::time::SystemTime>,
     /// The relying party it was made for: the server's app relying party
     /// ([`ServerId::rp_id`]), [`LEGACY_APP_RP_ID`], or the host of the
     /// server's web UI.

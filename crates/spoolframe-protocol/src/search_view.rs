@@ -2,9 +2,9 @@
 //! once: the "Play from" choices, one server's results, "See all 23" and
 //! "3 from Severance are under the show".
 
-use spoolframe_types::{Item, LibraryServer, MediaId, SearchKind, SearchScope};
+use spoolframe_types::{Item, LibraryServer, MediaId, SearchKind};
 
-use crate::search::{Copies, SearchCounts, SearchGroup, SearchHit, SearchResults, TopResult};
+use crate::search::{Copies, SearchCounts, SearchGroup, SearchResult, SearchResults, TopResult};
 
 /// One copy of a title, as the Play from list shows it
 /// ([`Copies::choices`]).
@@ -55,17 +55,6 @@ pub struct HiddenUnder {
     pub shows: Vec<String>,
 }
 
-/// The scope whose count a kind's "See all" names, for the kinds that
-/// have one.
-fn scope_of(kind: SearchKind) -> Option<SearchScope> {
-    match kind {
-        SearchKind::Movies => Some(SearchScope::Movies),
-        SearchKind::Shows => Some(SearchScope::Shows),
-        SearchKind::Episodes => Some(SearchScope::Episodes),
-        _ => None,
-    }
-}
-
 impl<T> SearchResults<T> {
     fn group(&self, kind: SearchKind) -> Option<&SearchGroup<T>> {
         self.groups.iter().find(|g| g.kind == kind)
@@ -78,22 +67,26 @@ impl<T> SearchResults<T> {
         let group = self.group(kind).filter(|g| g.more)?;
         group
             .total
-            .or_else(|| scope_of(kind).and_then(|scope| self.counts.of(scope)))
+            .or_else(|| kind.scope().and_then(|scope| self.counts.of(scope)))
     }
 }
 
-impl SearchResults<Item> {
+impl SearchResults<SearchResult> {
     /// The episodes `kind`'s group left under their show, with the shows'
     /// titles (the top match's too); `None` when none were.
     pub fn hidden_under(&self, kind: SearchKind) -> Option<HiddenUnder> {
-        hidden_under(self, kind, |item| item)
-    }
-}
-
-impl SearchResults<SearchHit> {
-    /// As [`SearchResults::hidden_under`], of hits.
-    pub fn hidden_under(&self, kind: SearchKind) -> Option<HiddenUnder> {
-        hidden_under(self, kind, |hit| &hit.item)
+        let count = self.group(kind).map(|g| g.hidden).filter(|n| *n > 0)?;
+        let mut shows: Vec<String> = self
+            .group(SearchKind::Shows)
+            .map(|g| g.items.iter().map(|r| r.item.title().to_owned()).collect())
+            .unwrap_or_default();
+        if let Some(TopResult::Item(top)) = &self.top
+            && let Item::Show(show) = &top.item
+            && !shows.contains(&show.title)
+        {
+            shows.push(show.title.clone());
+        }
+        Some(HiddenUnder { count, shows })
     }
 
     /// Only the hits from paired server `origin` (its server id), or the
@@ -103,39 +96,57 @@ impl SearchResults<SearchHit> {
     /// left when it had no more to show, else not known. Episodes hidden
     /// under their show stay hidden only while a show is left to hold
     /// them.
-    pub fn only_from(&self, origin: Option<&str>) -> Self {
-        let keep = |hit: &SearchHit| hit.origin.as_ref().map(|s| s.server_id.as_str()) == origin;
+    pub fn only_from(self, origin: Option<&str>) -> Self {
+        let keep = |hit: &SearchResult| hit.origin() == origin;
         let people = origin.is_none();
-        let top = match &self.top {
-            Some(TopResult::Item(hit)) if keep(hit) => Some(TopResult::Item(hit.clone())),
-            Some(TopResult::Person(person)) if people => Some(TopResult::Person(person.clone())),
+        let top = match self.top {
+            Some(TopResult::Item(hit)) if keep(&hit) => Some(TopResult::Item(hit)),
+            Some(TopResult::Person(person)) if people => Some(TopResult::Person(person)),
             _ => None,
         };
-        let top_is = |kind: SearchKind| match &top {
-            Some(TopResult::Item(hit)) => kind_of(&hit.item) == Some(kind),
-            Some(TopResult::Person(_)) => kind == SearchKind::People,
-            None => false,
-        };
-        let shows_left = top_is(SearchKind::Shows)
+        let top_is_show =
+            matches!(&top, Some(TopResult::Item(hit)) if matches!(hit.item, Item::Show(_)));
+        let shows_left = top_is_show
             || self
                 .groups
                 .iter()
                 .any(|g| g.kind == SearchKind::Shows && g.items.iter().any(keep));
         let groups: Vec<_> = self
             .groups
-            .iter()
+            .into_iter()
             .map(|g| {
-                let items: Vec<SearchHit> = g.items.iter().filter(|h| keep(h)).cloned().collect();
-                let people = if people { g.people.clone() } else { Vec::new() };
+                let items: Vec<SearchResult> = g.items.into_iter().filter(keep).collect();
+                let people = if people { g.people } else { Vec::new() };
                 let hidden = if shows_left { g.hidden } else { 0 };
-                let shown = (items.len() + people.len()) as u32;
                 SearchGroup {
                     kind: g.kind,
-                    total: (!g.more).then_some(shown + u32::from(top_is(g.kind)) + hidden),
+                    total: None,
                     items,
                     people,
                     more: g.more,
                     hidden,
+                }
+            })
+            .collect();
+        // The top match counted once: a top person the SDK also lists in
+        // People is counted there.
+        let top_kind = match &top {
+            Some(TopResult::Item(hit)) => kind_of(&hit.item),
+            Some(TopResult::Person(_)) => Some(SearchKind::People),
+            None => None,
+        };
+        let top_listed = matches!(&top, Some(TopResult::Person(person))
+            if groups.iter().any(|g| g.kind == SearchKind::People
+                && g.people.iter().any(|p| p.id == person.id)));
+        let unlisted = top_kind.filter(|_| !top_listed);
+        let top_unlisted = |kind: SearchKind| unlisted == Some(kind);
+        let groups: Vec<_> = groups
+            .into_iter()
+            .map(|g| {
+                let shown = (g.items.len() + g.people.len()) as u32;
+                SearchGroup {
+                    total: (!g.more).then_some(shown + u32::from(top_unlisted(g.kind)) + g.hidden),
+                    ..g
                 }
             })
             .collect();
@@ -145,7 +156,7 @@ impl SearchResults<SearchHit> {
                 .filter(|g| kinds.contains(&g.kind))
                 .map(|g| g.items.len() + g.people.len() + g.hidden as usize)
                 .sum();
-            listed as u32 + kinds.iter().filter(|k| top_is(**k)).count() as u32
+            listed as u32 + kinds.iter().filter(|k| top_unlisted(**k)).count() as u32
         };
         let movies = count(&[SearchKind::Movies]);
         let shows = count(&[SearchKind::Shows]);
@@ -153,8 +164,6 @@ impl SearchResults<SearchHit> {
         let music = count(&[SearchKind::Artists, SearchKind::Albums, SearchKind::Tracks]);
         let persons = count(&[SearchKind::People]);
         SearchResults {
-            top,
-            groups,
             counts: SearchCounts {
                 all: Some(movies + shows + episodes + music + persons),
                 movies: Some(movies),
@@ -162,13 +171,10 @@ impl SearchResults<SearchHit> {
                 episodes: Some(episodes),
                 music: Some(music),
             },
+            top,
+            groups,
             year: self.year,
-            without_year: self
-                .without_year
-                .iter()
-                .filter(|h| keep(h))
-                .cloned()
-                .collect(),
+            without_year: self.without_year.into_iter().filter(keep).collect(),
         }
     }
 }
@@ -184,25 +190,6 @@ fn kind_of(item: &Item) -> Option<SearchKind> {
         Item::Track(_) => SearchKind::Tracks,
         Item::Season(_) => return None,
     })
-}
-
-fn hidden_under<T>(
-    results: &SearchResults<T>,
-    kind: SearchKind,
-    item: impl Fn(&T) -> &Item,
-) -> Option<HiddenUnder> {
-    let count = results.group(kind).map(|g| g.hidden).filter(|n| *n > 0)?;
-    let mut shows: Vec<String> = results
-        .group(SearchKind::Shows)
-        .map(|g| g.items.iter().map(|i| item(i).title().to_owned()).collect())
-        .unwrap_or_default();
-    if let Some(TopResult::Item(top)) = &results.top
-        && let Item::Show(show) = item(top)
-        && !shows.contains(&show.title)
-    {
-        shows.push(show.title.clone());
-    }
-    Some(HiddenUnder { count, shows })
 }
 
 #[cfg(test)]
@@ -329,13 +316,14 @@ mod tests {
         })
     }
 
-    fn hit(item: Item, origin: Option<&str>) -> SearchHit {
-        SearchHit {
+    fn hit(item: Item, origin: Option<&str>) -> SearchResult {
+        crate::SearchHit {
             play_from: item.id().clone(),
             origin: origin.map(|o| server(o, true)),
             also_on: Vec::new(),
             item,
         }
+        .into()
     }
 
     fn group<T>(kind: SearchKind, items: Vec<T>) -> SearchGroup<T> {
@@ -370,13 +358,13 @@ mod tests {
             },
             ..SearchResults::default()
         };
-        let sa = results.only_from(Some("sa"));
+        let sa = results.clone().only_from(Some("sa"));
         assert!(sa.top.is_some());
         assert_eq!(sa.groups[0].items.len(), 1);
         assert_eq!((sa.counts.movies, sa.counts.all), (Some(2), Some(2)));
         // The group had no more: what is left is all of it, top included.
         assert_eq!(sa.groups[0].total, Some(2));
-        let home = results.only_from(None);
+        let home = results.clone().only_from(None);
         assert!(home.top.is_none());
         assert_eq!(home.counts.movies, Some(1));
     }
@@ -392,15 +380,47 @@ mod tests {
 
     #[test]
     fn people_count_for_the_users_own_server_only() {
-        let mut people = group(SearchKind::People, Vec::<SearchHit>::new());
+        let mut people = group(SearchKind::People, Vec::<SearchResult>::new());
         people.people = vec![person()];
         let results = SearchResults {
             groups: vec![people],
             ..SearchResults::default()
         };
-        assert_eq!(results.only_from(None).counts.all, Some(1));
-        let sa = results.only_from(Some("sa"));
+        assert_eq!(results.clone().only_from(None).counts.all, Some(1));
+        let sa = results.clone().only_from(Some("sa"));
         assert_eq!((sa.counts.all, sa.groups[0].people.len()), (Some(0), 0));
+    }
+
+    /// A top person also listed in People (as the SDK lists them) is
+    /// counted once.
+    #[test]
+    fn a_top_person_listed_in_people_is_counted_once() {
+        let mut people = group(SearchKind::People, Vec::<SearchResult>::new());
+        people.people = vec![person()];
+        let results = SearchResults {
+            top: Some(TopResult::Person(person())),
+            groups: vec![people],
+            ..SearchResults::default()
+        };
+        let own = results.clone().only_from(None);
+        assert_eq!((own.counts.all, own.groups[0].total), (Some(1), Some(1)));
+    }
+
+    /// The same person by id, though their item count differs between
+    /// the top and People, is one person: counted once.
+    #[test]
+    fn a_top_person_is_known_in_people_by_id() {
+        let mut people = group(SearchKind::People, Vec::<SearchResult>::new());
+        people.people = vec![spoolframe_types::Person {
+            count: Some(4),
+            ..person()
+        }];
+        let results = SearchResults {
+            top: Some(TopResult::Person(person())),
+            groups: vec![people],
+            ..SearchResults::default()
+        };
+        assert_eq!(results.clone().only_from(None).counts.all, Some(1));
     }
 
     #[test]
@@ -414,9 +434,12 @@ mod tests {
             ],
             ..SearchResults::default()
         };
-        assert_eq!(results.only_from(Some("sa")).groups[1].hidden, 3);
-        assert_eq!(results.only_from(Some("sa")).counts.episodes, Some(3));
-        assert_eq!(results.only_from(None).groups[1].hidden, 0);
+        assert_eq!(results.clone().only_from(Some("sa")).groups[1].hidden, 3);
+        assert_eq!(
+            results.clone().only_from(Some("sa")).counts.episodes,
+            Some(3)
+        );
+        assert_eq!(results.clone().only_from(None).groups[1].hidden, 0);
     }
 
     #[test]
@@ -443,8 +466,11 @@ mod tests {
         let mut episodes = group(SearchKind::Episodes, Vec::new());
         episodes.hidden = 3;
         let results = SearchResults {
-            top: Some(TopResult::Item(show("Severance"))),
-            groups: vec![group(SearchKind::Shows, vec![show("Silo")]), episodes],
+            top: Some(TopResult::Item(show("Severance").into())),
+            groups: vec![
+                group(SearchKind::Shows, vec![show("Silo").into()]),
+                episodes,
+            ],
             ..SearchResults::default()
         };
         assert_eq!(

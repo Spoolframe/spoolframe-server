@@ -140,6 +140,46 @@ pub struct Copies {
     pub play_from: MediaId,
 }
 
+/// An item a search found, as a client shows both a plain search's and a
+/// federated one's: the item, and where it is from with its title's
+/// other copies when the search was across paired servers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct SearchResult {
+    pub item: Item,
+    /// Where it is from, its other copies and the copy that plays; `None`
+    /// from a search of this server alone, where it is this server's own.
+    pub copies: Option<Copies>,
+}
+
+impl SearchResult {
+    /// The paired server it is from, by its server id; `None` for this
+    /// server's own.
+    pub fn origin(&self) -> Option<&str> {
+        let origin = self.copies.as_ref()?.origin.as_ref()?;
+        Some(origin.server_id.as_str())
+    }
+}
+
+impl From<Item> for SearchResult {
+    fn from(item: Item) -> Self {
+        Self { item, copies: None }
+    }
+}
+
+impl From<SearchHit> for SearchResult {
+    fn from(hit: SearchHit) -> Self {
+        Self {
+            item: hit.item,
+            copies: Some(Copies {
+                origin: hit.origin,
+                also_on: hit.also_on,
+                play_from: hit.play_from,
+            }),
+        }
+    }
+}
+
 /// One copy of a title, on one server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]

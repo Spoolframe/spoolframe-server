@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{
-    ClientCapabilities, DisplayCapabilities, Item, Library, LibraryId, Marker, MediaId,
+    ClientCapabilities, DisplayCapabilities, Item, Library, LibraryId, Markers, MediaId,
     MediaTracks, PersonId, Platform, Role, SubtitleFormat, TrackPreferences,
 };
 
@@ -1868,7 +1868,7 @@ pub enum Reply {
         children: Vec<Item>,
         /// The item's intro and credits, in order of start; empty
         /// for an item that has none.
-        markers: Vec<Marker>,
+        markers: Markers,
         /// The playlists the user sees that hold it: a movie,
         /// episode or track itself; any of a season's or a show's
         /// episodes; any of an album's or an artist's tracks. Empty when
@@ -1926,7 +1926,16 @@ pub enum Reply {
         /// The item's intro and credits, as in `Item`, so a player needs
         /// no second request for them. Their times are the item's own,
         /// wherever the playback starts.
-        markers: Vec<Marker>,
+        markers: Markers,
+        /// The item's running time, when the server knows it, so a player
+        /// needs no second request for it either. Absent from an older
+        /// server's reply. `duration_ms` on the wire.
+        #[serde(
+            default,
+            rename = "duration_ms",
+            with = "spoolframe_types::serde_time::millis::option"
+        )]
+        duration: Option<std::time::Duration>,
     },
     /// A seek restarted the encode: reads name this epoch from offset 0.
     PlaybackSeeked {
@@ -2293,8 +2302,9 @@ pub struct DeviceInfo {
     /// What kind of client it runs, as its `Hello` said; `None` for a
     /// device not seen since before the server kept it.
     pub platform: Option<Platform>,
-    /// Unix seconds.
-    pub last_seen_at: i64,
+    /// Unix seconds on the wire.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub last_seen_at: std::time::SystemTime,
     /// The user's PIN is asked for on it.
     pub pin_required: bool,
     /// It may resume the user without a password.
@@ -2318,8 +2328,9 @@ pub struct DeviceSignInRequest {
     /// name ([`Platform::label`], "Apple TV app"), so the approver knows
     /// which device asks.
     pub platform: Platform,
-    /// Unix seconds.
-    pub requested_at: i64,
+    /// Unix seconds on the wire.
+    #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
+    pub requested_at: std::time::SystemTime,
     /// The device asked to be remembered: the approval says "This
     /// device will be remembered", ticked, and the approver may untick it.
     pub remember: bool,
@@ -2363,6 +2374,30 @@ pub enum AddressNetwork {
     /// address and warn as for [`AddressNetwork::Internet`].
     #[serde(other)]
     Unknown,
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl DeviceAddress {
+    /// On the server's own machine or its network: the approval says
+    /// where it asked from rather than warn.
+    pub fn is_local(&self) -> bool {
+        matches!(
+            self.network,
+            AddressNetwork::Loopback | AddressNetwork::Local
+        )
+    }
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl DeviceSignInRequest {
+    /// It asked from the server's machine or network
+    /// ([`DeviceAddress::is_local`]); false where the server couldn't
+    /// tell, which the approval warns about as for one far away.
+    pub fn is_local(&self) -> bool {
+        self.requested_from
+            .as_ref()
+            .is_some_and(DeviceAddress::is_local)
+    }
 }
 
 /// One live session, without its token.

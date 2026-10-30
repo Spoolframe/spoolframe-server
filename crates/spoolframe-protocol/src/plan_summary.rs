@@ -4,19 +4,24 @@
 use spoolframe_types::{AudioCodec, Delivery, SubtitleFormat, VideoCodec};
 
 use crate::playback::{
-    AudioAction, ConvertedVideo, PlannedSubtitle, PlaybackPlan, SubtitleAction, SubtitleDelivery,
+    AudioAction, ConvertedVideo, PlannedSubtitle, PlaybackPlan, Rung, SubtitleAction,
+    SubtitleDelivery,
 };
 
 /// What kind of play a plan is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PlanKind {
     /// The file as it is.
     Direct,
-    /// Converted with every stream copied: a new container, nothing
-    /// encoded. A ladder with an encoded rung is not one.
+    /// Converted with the picture and sound copied: a new container,
+    /// nothing encoded. A text subtitle converted (to WebVTT for HLS) or
+    /// read from a bitmap one (OCR) is still a remux: the picture and
+    /// sound are the file's, and OCR takes the server little CPU. A
+    /// ladder with an encoded rung is not one.
     Remux,
-    /// Converted with something encoded, or a subtitle converted, burned
-    /// in or read as text.
+    /// Converted with the video or audio encoded, or a subtitle burned in
+    /// (which encodes the video).
     Convert,
     /// The client cannot play this selection: see `reasons`.
     Unsupported,
@@ -102,6 +107,67 @@ pub struct PlanSummary {
     pub tone_mapped: bool,
 }
 
+/// The parts of a plan a player reads, by value.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl PlaybackPlan {
+    /// What kind of play it is ([`PlaybackPlan::summary`]'s).
+    pub fn kind(&self) -> PlanKind {
+        self.summary().kind
+    }
+
+    /// A converted plan's video: copied or encoded; `None` for any other
+    /// plan, or no video.
+    pub fn converted_video(&self) -> Option<ConvertedVideo> {
+        match self {
+            PlaybackPlan::Converted { video, .. } => *video,
+            _ => None,
+        }
+    }
+
+    /// What a converted plan does to the audio; `None` for any other
+    /// plan, or no audio.
+    pub fn audio_action(&self) -> Option<AudioAction> {
+        match self {
+            PlaybackPlan::Converted { audio, .. } => audio.map(|a| a.action),
+            _ => None,
+        }
+    }
+
+    /// What a converted plan does to the subtitle; `None` for any other
+    /// plan, or none picked.
+    pub fn subtitle_action(&self) -> Option<SubtitleAction> {
+        match self {
+            PlaybackPlan::Converted { subtitle, .. } => subtitle.map(|s| s.action),
+            _ => None,
+        }
+    }
+
+    /// The subtitle is drawn into the video: the player shows none of
+    /// its own, and turning it off plans again.
+    pub fn burns_in_subtitle(&self) -> bool {
+        matches!(self.subtitle_action(), Some(SubtitleAction::BurnIn { .. }))
+    }
+}
+
+/// [`PlaybackPlan`]'s borrowing reads, owned, for Swift and Kotlin under
+/// the same names.
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl PlaybackPlan {
+    /// [`PlaybackPlan::ladder`].
+    #[uniffi::method(name = "ladder")]
+    pub fn ladder_owned(&self) -> Vec<Rung> {
+        self.ladder().to_vec()
+    }
+
+    /// [`PlaybackPlan::source_codec`].
+    #[uniffi::method(name = "source_codec")]
+    pub fn source_codec_owned(&self) -> Option<String> {
+        self.source_codec().map(str::to_owned)
+    }
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl PlaybackPlan {
     /// The lines the server encodes the picture to, for a quality
     /// picker's "Auto (720p)"; `None` where the picture is the file's
@@ -113,6 +179,17 @@ impl PlaybackPlan {
                 ..
             } => Some(*height),
             _ => None,
+        }
+    }
+}
+
+impl PlaybackPlan {
+    /// The encodes an HLS player switches between, highest first; empty
+    /// for one encode, or a plan that isn't converted.
+    pub fn ladder(&self) -> &[Rung] {
+        match self {
+            PlaybackPlan::Converted { ladder, .. } => ladder,
+            _ => &[],
         }
     }
 
@@ -201,8 +278,8 @@ impl PlaybackPlan {
                         .iter()
                         .all(|r| !matches!(r.video, Some(ConvertedVideo::Encode { .. })));
                 let copies_audio = audio.is_none_or(|a| a.copied);
-                let copies_subtitle = subtitle.is_none_or(|s| s.how == SubtitleHow::Copy);
-                let kind = if copies_video && copies_audio && copies_subtitle {
+                let burns_subtitle = subtitle.is_some_and(|s| s.how == SubtitleHow::BurnIn);
+                let kind = if copies_video && copies_audio && !burns_subtitle {
                     PlanKind::Remux
                 } else {
                     PlanKind::Convert
@@ -333,6 +410,69 @@ mod tests {
             max_bitrate: 1_000_000,
             video,
         }
+    }
+
+    /// A player reads a plan's parts without matching on it: a burned-in
+    /// subtitle over an encode in a ladder.
+    #[test]
+    fn a_plan_s_parts_read_by_value() {
+        let burn = SubtitleAction::BurnIn {
+            format: SubtitleFormat::Pgs,
+        };
+        let ladder = vec![rung(1080, None), rung(720, None)];
+        let plan = converted(
+            Some(encode_video(1080, false)),
+            Some(copy_audio()),
+            Some(burn),
+            ladder.clone(),
+        );
+        assert_eq!(
+            (
+                plan.kind(),
+                plan.converted_video(),
+                plan.audio_action(),
+                plan.subtitle_action(),
+                plan.burns_in_subtitle(),
+                plan.ladder(),
+            ),
+            (
+                PlanKind::Convert,
+                Some(encode_video(1080, false)),
+                Some(copy_audio().action),
+                Some(burn),
+                true,
+                ladder.as_slice(),
+            )
+        );
+    }
+
+    #[test]
+    fn a_direct_play_has_no_converted_parts() {
+        let plan = PlaybackPlan::Direct {
+            container: Container::Matroska,
+            video: Some(VideoCodec::Hevc),
+            audio: None,
+            subtitle: None,
+            source_codec: Some("hvc1.2.4.L153.B0".into()),
+        };
+        assert_eq!(
+            (
+                plan.kind(),
+                plan.converted_video(),
+                plan.subtitle_action(),
+                plan.burns_in_subtitle(),
+                plan.ladder().is_empty(),
+                plan.source_codec(),
+            ),
+            (
+                PlanKind::Direct,
+                None,
+                None,
+                false,
+                true,
+                Some("hvc1.2.4.L153.B0"),
+            )
+        );
     }
 
     #[test]
@@ -501,8 +641,12 @@ mod tests {
                     format: Some(format),
                 })
             );
-            // Anything but a copy is work on the server.
-            assert_eq!(s.kind, PlanKind::Convert, "{how:?}");
+            // Only a burn-in touches the picture.
+            let kind = match how {
+                SubtitleHow::BurnIn => PlanKind::Convert,
+                _ => PlanKind::Remux,
+            };
+            assert_eq!(s.kind, kind, "{how:?}");
         }
     }
 

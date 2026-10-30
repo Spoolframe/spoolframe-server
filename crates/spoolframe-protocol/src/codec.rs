@@ -176,6 +176,13 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     ciborium::from_reader(bytes).map_err(|e| CodecError::Decode(e.to_string()))
 }
 
+/// For tests: `value` comes back from a frame as it went in.
+#[cfg(test)]
+pub(crate) fn round_trip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(value: T) {
+    let bytes = encode(&value).unwrap();
+    assert_eq!(decode::<T>(&bytes).unwrap(), value);
+}
+
 /// The most characters of a request's `type` that [`request_type`] and
 /// [`rpc_request_type`] read: a client chooses it, up to a whole frame of
 /// it, and every type the protocol has is far shorter.

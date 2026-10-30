@@ -16,8 +16,8 @@ uniffi = ["dep:uniffi"]
 
 [dependencies]
 serde = { workspace = true }
+# The simple enums' wire names, and a sort's or filter's settings string
+# (wire.rs).
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 uniffi = { workspace = true, optional = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }

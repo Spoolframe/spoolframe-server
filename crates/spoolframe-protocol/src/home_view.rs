@@ -2,7 +2,7 @@
 //! next as one row, and what a TV's Top Shelf or Watch Next shows.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use spoolframe_types::{Item, MediaId};
 
@@ -88,11 +88,10 @@ impl HomeScreen {
             .collect()
     }
 
-    /// What a TV's Top Shelf or Watch Next shows at `now` (Unix
-    /// seconds): Continue watching viewed lately, then Up next of shows
+    /// What a TV's Top Shelf or Watch Next shows at `now`: Continue watching viewed lately, then Up next of shows
     /// not already continued, then Recently added, films and shows only,
     /// each show once (an episode or a season stands for its show).
-    pub fn featured(&self, now: i64, limits: FeaturedLimits) -> Vec<Featured> {
+    pub fn featured(&self, now: SystemTime, limits: FeaturedLimits) -> Vec<Featured> {
         let mut picked: Vec<Featured> = Vec::new();
         let mut seen = HashSet::new();
         let mut add = |item: &Item, row, picked: &mut Vec<Featured>| {
@@ -108,11 +107,18 @@ impl HomeScreen {
         let viewed = |item: &Item| item.playback().and_then(|p| p.last_viewed_at);
         // From a server that does not say when, all are taken as recent.
         let timed = self.continue_watching.iter().any(|i| viewed(i).is_some());
-        let within = limits.continue_within.as_secs() as i64;
         let recent = self
             .continue_watching
             .iter()
-            .filter(|i| !timed || viewed(i).is_some_and(|at| now - at < within))
+            .filter(|i| {
+                !timed
+                    || viewed(i).is_some_and(|at| {
+                        // A time ahead of `now` (another clock) is recent.
+                        now.duration_since(at)
+                            .ok()
+                            .is_none_or(|ago| ago < limits.continue_within)
+                    })
+            })
             .take(limits.continue_watching);
         for item in recent {
             add(item, FeaturedRow::ContinueWatching, &mut picked);
@@ -141,12 +147,13 @@ impl HomeScreen {
 mod tests {
     use super::*;
     use spoolframe_types::{Episode, MediaKind, Movie, Namespace, PlaybackState};
+    use std::time::UNIX_EPOCH;
 
     fn id(kind: MediaKind, key: &str) -> MediaId {
         MediaId::new(Namespace::Plex, kind, key).unwrap()
     }
 
-    fn movie(key: &str, viewed: Option<i64>) -> Item {
+    fn movie(key: &str, viewed: Option<SystemTime>) -> Item {
         Item::Movie(Movie {
             id: id(MediaKind::Movie, key),
             title: key.into(),
@@ -219,11 +226,11 @@ mod tests {
 
     #[test]
     fn featured_takes_what_was_continued_lately_then_up_next_then_added() {
-        let now = 1_000_000;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
         let h = home(
             vec![
-                movie("lately", Some(now - 3600)),
-                movie("long ago", Some(now - 72 * 3600)),
+                movie("lately", Some(now - Duration::from_secs(3600))),
+                movie("long ago", Some(now - Duration::from_secs(72 * 3600))),
                 episode("s", 4),
             ],
             vec![episode("s", 5), episode("t", 1)],
@@ -246,7 +253,10 @@ mod tests {
     #[test]
     fn up_next_of_a_show_already_continued_is_not_featured_again() {
         let h = home(vec![episode("s", 4)], vec![episode("s", 5)], Vec::new());
-        let featured = h.featured(0, FeaturedLimits::default());
+        let featured = h.featured(
+            spoolframe_types::serde_time::unix_seconds::from_wire(0),
+            FeaturedLimits::default(),
+        );
         assert_eq!(featured.len(), 1);
         assert_eq!(featured[0].row, FeaturedRow::ContinueWatching);
     }
@@ -259,7 +269,10 @@ mod tests {
             vec![episode("s", 9), movie("new", None)],
         );
         let titles: Vec<_> = h
-            .featured(0, FeaturedLimits::default())
+            .featured(
+                spoolframe_types::serde_time::unix_seconds::from_wire(0),
+                FeaturedLimits::default(),
+            )
             .iter()
             .map(|f| f.item.title().to_owned())
             .collect();
@@ -275,6 +288,12 @@ mod tests {
             artwork: Vec::new(),
         });
         let h = home(Vec::new(), Vec::new(), vec![track]);
-        assert!(h.featured(0, FeaturedLimits::default()).is_empty());
+        assert!(
+            h.featured(
+                spoolframe_types::serde_time::unix_seconds::from_wire(0),
+                FeaturedLimits::default()
+            )
+            .is_empty()
+        );
     }
 }

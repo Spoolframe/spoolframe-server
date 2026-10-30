@@ -133,7 +133,8 @@ fn watched(kind: LibraryKind) -> bool {
 impl Section {
     fn browsing(&self, kind: LibraryKind) -> Browsing {
         let sorts = SortKey::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|&key| match key {
                 SortKey::LastPlayed => watched(kind),
                 key => sort_field(key, &self.sorts).is_some(),

@@ -69,7 +69,7 @@ pub fn credits_to_end(markers: &[Marker]) -> Option<Duration> {
     markers
         .iter()
         .filter(|m| m.kind == MarkerKind::Credits && m.to_end)
-        .map(|m| Duration::from_millis(m.start_ms))
+        .map(|m| m.start)
         .min()
 }
 

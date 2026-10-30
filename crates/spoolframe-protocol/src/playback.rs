@@ -67,9 +67,11 @@ impl Default for Quality {
 pub struct Selection {
     /// `None`: the file's default audio track.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub audio: Option<u32>,
     /// `None`: no subtitles.
     #[serde(deserialize_with = "spoolframe_types::required::option")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub subtitle: Option<u32>,
 }
 

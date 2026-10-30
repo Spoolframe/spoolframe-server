@@ -573,7 +573,12 @@ fn Markers(markers: Vec<Marker>, duration: Option<u64>, server: String) -> Eleme
         .filter(|m| m.kind != MarkerKind::Unknown)
         .collect();
     let total = duration
-        .or_else(|| shown.iter().map(|m| m.end_ms).max())
+        .or_else(|| {
+            shown
+                .iter()
+                .map(|m| spoolframe_types::serde_time::millis::to_wire(m.end))
+                .max()
+        })
         .unwrap_or(0);
     rsx! {
         section { class: "card",

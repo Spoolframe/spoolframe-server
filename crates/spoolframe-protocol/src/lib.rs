@@ -76,8 +76,8 @@ pub use portable::{
 };
 pub use previews::{PreviewTile, Previews};
 pub use search::{
-    Copies, SearchCounts, SearchGroup, SearchHit, SearchRequest, SearchResults, TitleCopy,
-    TopResult,
+    Copies, SearchCounts, SearchGroup, SearchHit, SearchRequest, SearchResult, SearchResults,
+    TitleCopy, TopResult,
 };
 pub use search_view::{HiddenUnder, PlayFromChoice};
 pub use server_id::{APP_RP_DOMAIN, InvalidServerId, SERVER_ID_LEN, ServerId};

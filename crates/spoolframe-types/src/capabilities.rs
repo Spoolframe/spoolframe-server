@@ -49,6 +49,8 @@ impl DisplayCapabilities {
             bit_depth: None,
             hdr: Some(hdr),
             video_codecs: None,
+            height: None,
+            frame_rate: None,
         }
     }
 }
@@ -57,8 +59,10 @@ impl ClientCapabilities {
     /// What `decoders` play on `display`: PCM is always played (every
     /// player outputs it), hardware decoders are only those it plays, no
     /// delivery said is range reads then a progressive stream, and the
-    /// screen's HDR and bit depth are the video limits. No height or
-    /// bitrate limit: the bitrate is the app's setting.
+    /// screen's HDR and bit depth are the video limits. No height, frame
+    /// rate or bitrate limit: these are the decoders' limits, and the
+    /// screen's mode goes with each plan ([`ClientCapabilities::with_display`]);
+    /// the bitrate is the app's setting.
     pub fn from_decoders(decoders: Decoders, display: &DisplayCapabilities) -> Self {
         let Decoders {
             video,
@@ -98,18 +102,17 @@ impl ClientCapabilities {
 
     /// The iOS app's probe, for any platform: `player`'s fixed lists (its
     /// audio, containers, subtitles, delivery, and the video it plays in
-    /// software), plus each codec of `hardware` (what decodes in
-    /// hardware, as the platform says), on `display`. `probe_codec` is
+    /// software), plus each codec of its `hardware_video` (what decodes
+    /// in hardware, as the platform says), on `display`. `probe_codec` is
     /// asked about each of [`candidate_codec_strings`]. The bit depth is
     /// 10 where HEVC decodes in hardware (Main 10), else 8, unless
     /// `display` says its own.
     pub fn probe(
         probe_codec: &dyn CodecProbe,
-        hardware: &[VideoCodec],
         display: &DisplayCapabilities,
         player: Decoders,
     ) -> Self {
-        let hardware: BTreeSet<VideoCodec> = hardware.iter().copied().collect();
+        let hardware = player.hardware_video.clone().unwrap_or_default();
         let mut video = player.video;
         video.extend(hardware.iter().copied());
         let video_codecs = candidate_codec_strings()
@@ -185,9 +188,142 @@ pub fn candidate_codec_strings() -> Vec<String> {
     out
 }
 
+impl VideoCodec {
+    /// The codec of an Android `MediaCodec` MIME type (`video/hevc`), as
+    /// `MediaCodecList` names its decoders; `None` for one Spoolframe has
+    /// no name for.
+    pub fn for_mime(mime: &str) -> Option<Self> {
+        Some(match mime {
+            "video/avc" => Self::H264,
+            "video/hevc" => Self::Hevc,
+            "video/av01" => Self::Av1,
+            "video/x-vnd.on2.vp9" => Self::Vp9,
+            "video/x-vnd.on2.vp8" => Self::Vp8,
+            "video/mpeg2" => Self::Mpeg2,
+            "video/mp4v-es" => Self::Mpeg4,
+            "video/wvc1" => Self::Vc1,
+            _ => return None,
+        })
+    }
+}
+
+impl AudioCodec {
+    /// The codec of an Android `MediaCodec` MIME type (`audio/eac3`), as
+    /// `MediaCodecList` names its decoders; `None` for one Spoolframe has
+    /// no name for. E-AC-3 with Atmos (JOC) is E-AC-3, and DTS-HD is DTS:
+    /// the core is what plays.
+    pub fn for_mime(mime: &str) -> Option<Self> {
+        Some(match mime {
+            "audio/mp4a-latm" => Self::Aac,
+            "audio/ac3" => Self::Ac3,
+            "audio/eac3" | "audio/eac3-joc" => Self::Eac3,
+            "audio/vnd.dts" | "audio/vnd.dts.hd" => Self::Dts,
+            "audio/true-hd" => Self::TrueHd,
+            "audio/flac" => Self::Flac,
+            "audio/alac" => Self::Alac,
+            "audio/opus" => Self::Opus,
+            "audio/vorbis" => Self::Vorbis,
+            "audio/mpeg" => Self::Mp3,
+            "audio/raw" => Self::Pcm,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_s_decoder_types_name_their_codecs() {
+        assert_eq!(
+            (
+                VideoCodec::for_mime("video/hevc"),
+                VideoCodec::for_mime("video/dolby-vision"),
+                AudioCodec::for_mime("audio/eac3-joc"),
+                AudioCodec::for_mime("audio/vnd.dts.hd"),
+                AudioCodec::for_mime("audio/3gpp"),
+            ),
+            (
+                Some(VideoCodec::Hevc),
+                None,
+                Some(AudioCodec::Eac3),
+                Some(AudioCodec::Dts),
+                None
+            )
+        );
+    }
+
+    /// The probe says the decoders' limits only: the screen's mode is
+    /// not Hello's, so a TV that signs in at 1080p is not held there.
+    #[test]
+    fn a_probe_leaves_the_screen_s_mode_to_each_plan() {
+        let display = DisplayCapabilities {
+            height: Some(1080),
+            frame_rate: Some(60),
+            ..DisplayCapabilities::for_hdr(false, false)
+        };
+        let limits = ClientCapabilities::probe(&|_: &str| true, &display, apple_tv())
+            .max_video
+            .unwrap();
+        assert_eq!((limits.height, limits.frame_rate), (None, None));
+    }
+
+    /// Signed in on a 1080p screen, switched to 2160p since: a decoder
+    /// that plays 2160 gets 2160 at the next plan.
+    #[test]
+    fn a_screen_switched_up_since_the_sign_in_plays_its_new_mode() {
+        let hello = ClientCapabilities::probe(
+            &|_: &str| true,
+            &DisplayCapabilities {
+                height: Some(1080),
+                ..DisplayCapabilities::for_hdr(false, false)
+            },
+            apple_tv(),
+        );
+        let at_2160 = DisplayCapabilities {
+            height: Some(2160),
+            ..DisplayCapabilities::for_hdr(false, false)
+        };
+        let limits = hello.with_display(Some(&at_2160)).max_video.unwrap();
+        assert_eq!(limits.height, Some(2160));
+    }
+
+    #[test]
+    fn a_display_without_a_mode_keeps_hello_s_height_and_frame_rate() {
+        let mut hello = ClientCapabilities::from_decoders(
+            apple_tv(),
+            &DisplayCapabilities::for_hdr(false, false),
+        );
+        hello.max_video.as_mut().unwrap().height = Some(2160);
+        let at_1080 = DisplayCapabilities {
+            height: Some(1080),
+            ..DisplayCapabilities::for_hdr(true, false)
+        };
+        let heights = [&DisplayCapabilities::for_hdr(true, false), &at_1080]
+            .map(|display| hello.with_display(Some(display)).max_video.unwrap().height);
+        assert_eq!(heights, [Some(2160), Some(1080)]);
+    }
+
+    /// A 4K screen does not raise a 1080p decoder's limit: the lower of
+    /// the two holds.
+    #[test]
+    fn a_display_s_mode_never_raises_hello_s_limits() {
+        let mut hello = ClientCapabilities::from_decoders(
+            apple_tv(),
+            &DisplayCapabilities::for_hdr(false, false),
+        );
+        let limits = hello.max_video.as_mut().unwrap();
+        limits.height = Some(1080);
+        limits.frame_rate = Some(30);
+        let at_2160_60 = DisplayCapabilities {
+            height: Some(2160),
+            frame_rate: Some(60),
+            ..DisplayCapabilities::for_hdr(true, false)
+        };
+        let limits = hello.with_display(Some(&at_2160_60)).max_video.unwrap();
+        assert_eq!((limits.height, limits.frame_rate), (Some(1080), Some(30)));
+    }
 
     #[test]
     fn hdr_on_is_hdr10_and_hlg_and_dolby_vision_only_when_asked() {
@@ -231,6 +367,14 @@ mod tests {
         assert_eq!(caps.max_bitrate, None);
     }
 
+    /// `player`, decoding `codecs` in hardware.
+    fn hardware(player: Decoders, codecs: &[VideoCodec]) -> Decoders {
+        Decoders {
+            hardware_video: Some(codecs.iter().copied().collect()),
+            ..player
+        }
+    }
+
     /// An Apple TV's lists: AAC, E-AC-3 and the rest, MP4, WebVTT, HLS.
     fn apple_tv() -> Decoders {
         Decoders {
@@ -248,9 +392,11 @@ mod tests {
     fn a_probe_asks_the_player_for_each_codec_string() {
         let caps = ClientCapabilities::probe(
             &|codec: &str| codec.starts_with("hvc1.2.4.L"),
-            &[VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1],
             &DisplayCapabilities::for_hdr(true, false),
-            apple_tv(),
+            hardware(
+                apple_tv(),
+                &[VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1],
+            ),
         );
         assert_eq!(
             caps.video,
@@ -271,12 +417,11 @@ mod tests {
 
     #[test]
     fn a_probe_is_10_bit_only_where_hevc_decodes_in_hardware() {
-        let depth = |hardware: &[VideoCodec]| {
+        let depth = |decoded: &[VideoCodec]| {
             ClientCapabilities::probe(
                 &|_: &str| true,
-                hardware,
                 &DisplayCapabilities::for_hdr(true, false),
-                apple_tv(),
+                hardware(apple_tv(), decoded),
             )
             .max_video
             .unwrap()
@@ -287,9 +432,8 @@ mod tests {
         assert!(
             !ClientCapabilities::probe(
                 &|_: &str| true,
-                &[VideoCodec::H264],
                 &DisplayCapabilities::for_hdr(true, false),
-                apple_tv(),
+                hardware(apple_tv(), &[VideoCodec::H264]),
             )
             .decodes_in_hardware(VideoCodec::Hevc)
         );

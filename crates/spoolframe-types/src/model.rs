@@ -4,15 +4,15 @@
 //! `playback` is filled in by the server for the session's own user; it
 //! never comes from Plex.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::AudioCodec;
 use crate::date::CalendarDate;
-use crate::duration_ms;
 use crate::id::{ArtworkId, LibraryId, MediaId, PersonId};
 use crate::search::PersonRole;
+use crate::serde_time;
 
 /// What a library holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -77,10 +77,10 @@ pub struct Artwork {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaybackState {
     /// Where playback stopped, or `None` if it never started.
-    #[serde(with = "duration_ms::option")]
+    #[serde(with = "serde_time::millis::option_required")]
     pub position: Option<Duration>,
     pub watched: bool,
-    /// When the user last viewed it, Unix seconds: their last progress
+    /// When the user last viewed it (Unix seconds on the wire): their last progress
     /// report on it from any device, or its last mark as watched or
     /// unwatched. Filled where its reply says so (Home's rows, an item's
     /// details); `None` elsewhere, and for an item never viewed.
@@ -88,18 +88,18 @@ pub struct PlaybackState {
     /// This and the two below are read as none when left out: the SDK
     /// keeps an item with its download, and a download kept by an older
     /// SDK lacks the keys.
-    #[serde(default)]
-    pub last_viewed_at: Option<i64>,
+    #[serde(default, with = "serde_time::unix_seconds::option")]
+    pub last_viewed_at: Option<SystemTime>,
     /// How many times the user played it through: their counted plays
     /// from any device. Filled where its reply says so (an
     /// item's details, Recently played); 0 elsewhere.
     #[serde(default)]
     pub play_count: u32,
-    /// When the user last played it, Unix seconds: the end of their
+    /// When the user last played it (Unix seconds on the wire): the end of their
     /// latest counted play. Filled where `play_count` is; `None` for an
     /// item never played.
-    #[serde(default)]
-    pub last_played_at: Option<i64>,
+    #[serde(default, with = "serde_time::unix_seconds::option")]
+    pub last_played_at: Option<SystemTime>,
 }
 
 impl PlaybackState {
@@ -157,7 +157,7 @@ pub struct Movie {
     /// The age rating as the catalog has it ("R", "TV-MA"), shown as
     /// is; `None` when it has none.
     pub content_rating: Option<String>,
-    #[serde(with = "duration_ms::option")]
+    #[serde(with = "serde_time::millis::option_required")]
     pub duration: Option<Duration>,
     /// Who is in it and who directed it (see [`CastMember`]).
     #[serde(default)]
@@ -239,7 +239,7 @@ pub struct Episode {
     pub year: Option<u16>,
     /// The day it first aired, `"YYYY-MM-DD"`.
     pub air_date: Option<CalendarDate>,
-    #[serde(with = "duration_ms::option")]
+    #[serde(with = "serde_time::millis::option_required")]
     pub duration: Option<Duration>,
     /// Who is in it and who directed it (see [`CastMember`]): the
     /// episode's own, which may leave out the show's regulars. Left out,
@@ -330,7 +330,7 @@ pub struct Track {
     /// Samples per second, in Hz (44_100, 96_000); known where
     /// `bit_depth` is.
     pub sample_rate: Option<u32>,
-    #[serde(with = "duration_ms::option")]
+    #[serde(with = "serde_time::millis::option_required")]
     pub duration: Option<Duration>,
     /// Its album's cover as the poster, and its artist's background.
     pub artwork: Vec<Artwork>,
@@ -355,14 +355,71 @@ pub enum MarkerKind {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Marker {
     pub kind: MarkerKind,
-    /// Where it starts, in milliseconds from the start of the item.
-    pub start_ms: u64,
-    /// Where it ends. On a marker that runs to the end this may be a
-    /// little off the item's duration, either way: go by `to_end`.
-    pub end_ms: u64,
+    /// Where it starts, from the start of the item (`start_ms` on the
+    /// wire).
+    #[serde(rename = "start_ms", with = "serde_time::millis")]
+    pub start: Duration,
+    /// Where it ends (`end_ms` on the wire). On a marker that runs to the
+    /// end this may be a little off the item's duration, either way: go
+    /// by `to_end`.
+    #[serde(rename = "end_ms", with = "serde_time::millis")]
+    pub end: Duration,
     /// Nothing follows it: credits with no scene after them. The catalog
-    /// says so; it is never worked out from `end_ms` and the duration.
+    /// says so; it is never worked out from `end` and the duration.
     pub to_end: bool,
+}
+
+/// An item's markers, in order of start, without the kinds this build
+/// does not know: one from a newer server (`MarkerKind::Unknown`), which
+/// an app shows nothing for, is left out as the list is read. The same
+/// list as `Vec<Marker>` on the wire and to Swift and Kotlin.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Markers(Vec<Marker>);
+
+impl Markers {
+    pub fn into_vec(self) -> Vec<Marker> {
+        self.0
+    }
+}
+
+impl From<Vec<Marker>> for Markers {
+    fn from(mut markers: Vec<Marker>) -> Self {
+        markers.retain(|m| m.kind != MarkerKind::Unknown);
+        Self(markers)
+    }
+}
+
+impl<'de> Deserialize<'de> for Markers {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::<Marker>::deserialize(d).map(Self::from)
+    }
+}
+
+impl std::ops::Deref for Markers {
+    type Target = [Marker];
+
+    fn deref(&self) -> &[Marker] {
+        &self.0
+    }
+}
+
+impl IntoIterator for Markers {
+    type Item = Marker;
+    type IntoIter = std::vec::IntoIter<Marker>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Markers {
+    type Item = &'a Marker;
+    type IntoIter = std::slice::Iter<'a, Marker>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// Any one item a catalog returns. On the wire it is the item's own object
@@ -460,6 +517,19 @@ pub enum Caption {
     Length(Duration),
 }
 
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl Item {
+    /// Its length, for the kinds that play.
+    pub fn duration(&self) -> Option<Duration> {
+        match self {
+            Item::Movie(m) => m.duration,
+            Item::Episode(e) => e.duration,
+            Item::Track(t) => t.duration,
+            _ => None,
+        }
+    }
+}
+
 impl Item {
     /// What a card says under its title on `today`; `None` for an artist
     /// or where nothing is known.
@@ -510,6 +580,24 @@ impl Item {
         }
     }
 
+    /// Its artwork, whatever kind it is.
+    pub fn artwork(&self) -> &[Artwork] {
+        match self {
+            Item::Movie(m) => &m.artwork,
+            Item::Show(s) => &s.artwork,
+            Item::Season(s) => &s.artwork,
+            Item::Episode(e) => &e.artwork,
+            Item::Artist(a) => &a.artwork,
+            Item::Album(a) => &a.artwork,
+            Item::Track(t) => &t.artwork,
+        }
+    }
+
+    /// Its first artwork of `kind`: what a row or a page shows.
+    pub fn artwork_of(&self, kind: ArtworkKind) -> Option<&Artwork> {
+        self.artwork().iter().find(|a| a.kind == kind)
+    }
+
     /// The user's progress on a film, an episode or a track; `None` for
     /// the kinds that do not play themselves.
     pub fn playback(&self) -> Option<&PlaybackState> {
@@ -517,16 +605,6 @@ impl Item {
             Item::Movie(m) => Some(&m.playback),
             Item::Episode(e) => Some(&e.playback),
             Item::Track(t) => Some(&t.playback),
-            _ => None,
-        }
-    }
-
-    /// Its length, for the kinds that play.
-    pub fn duration(&self) -> Option<Duration> {
-        match self {
-            Item::Movie(m) => m.duration,
-            Item::Episode(e) => e.duration,
-            Item::Track(t) => t.duration,
             _ => None,
         }
     }
@@ -556,6 +634,7 @@ impl Item {
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
+    use std::time::UNIX_EPOCH;
 
     use serde::de::DeserializeOwned;
 
@@ -698,18 +777,6 @@ mod tests {
     }
 
     #[test]
-    fn durations_are_whole_milliseconds_on_the_wire() {
-        let json = serde_json::to_value(halfway()).unwrap();
-        assert_eq!(json["position"], 2_220_500);
-    }
-
-    #[test]
-    fn an_unstarted_item_has_a_null_position() {
-        let json = serde_json::to_value(PlaybackState::default()).unwrap();
-        assert!(json["position"].is_null());
-    }
-
-    #[test]
     fn a_track_s_format_is_plain_numbers_on_the_wire() {
         let track = Track {
             id: media(MediaKind::Track, "224630"),
@@ -751,35 +818,6 @@ mod tests {
             serde_json::to_string(&LibraryKind::Movies).unwrap(),
             r#""movies""#
         );
-    }
-
-    #[test]
-    fn a_marker_is_milliseconds_and_a_snake_case_kind_on_the_wire() {
-        let marker = Marker {
-            kind: MarkerKind::Credits,
-            start_ms: 2_662_962,
-            end_ms: 2_709_958,
-            to_end: true,
-        };
-        assert_eq!(
-            serde_json::to_value(marker).unwrap(),
-            serde_json::json!({
-                "kind": "credits",
-                "start_ms": 2_662_962,
-                "end_ms": 2_709_958,
-                "to_end": true,
-            })
-        );
-        round_trip(marker);
-    }
-
-    #[test]
-    fn a_marker_kind_from_a_newer_server_is_unknown() {
-        let marker: Marker = serde_json::from_str(
-            r#"{"kind": "recap", "start_ms": 0, "end_ms": 30000, "to_end": false}"#,
-        )
-        .unwrap();
-        assert_eq!(marker.kind, MarkerKind::Unknown);
     }
 
     #[test]
@@ -1063,6 +1101,94 @@ mod tests {
             artwork: Vec::new(),
             playback,
         })
+    }
+
+    /// Markers and watch times keep their wire names and units: `_ms`
+    /// spans, a position in whole milliseconds (`null` unstarted) and Unix
+    /// seconds.
+    #[test]
+    fn markers_and_watch_times_keep_their_wire_form() {
+        let marker = Marker {
+            kind: MarkerKind::Intro,
+            start: Duration::from_millis(258_865),
+            end: Duration::from_millis(319_865),
+            to_end: false,
+        };
+        let state = PlaybackState {
+            last_viewed_at: Some(UNIX_EPOCH + Duration::from_secs(1_761_700_000)),
+            play_count: 2,
+            last_played_at: Some(UNIX_EPOCH + Duration::from_secs(1_761_600_000)),
+            ..PlaybackState::default()
+        };
+        assert_eq!(
+            (
+                serde_json::to_value(marker).unwrap(),
+                serde_json::to_value(&state).unwrap(),
+                serde_json::to_value(halfway()).unwrap()["position"].clone(),
+            ),
+            (
+                serde_json::json!({
+                    "kind": "intro", "start_ms": 258_865, "end_ms": 319_865, "to_end": false
+                }),
+                serde_json::json!({
+                    "position": null, "watched": false, "last_viewed_at": 1_761_700_000,
+                    "play_count": 2, "last_played_at": 1_761_600_000
+                }),
+                serde_json::json!(2_220_500),
+            )
+        );
+        round_trip(marker);
+        round_trip(state);
+    }
+
+    #[test]
+    fn a_marker_list_leaves_out_kinds_this_build_does_not_know() {
+        let listed: Markers = serde_json::from_value(serde_json::json!([
+            { "kind": "recap", "start_ms": 0, "end_ms": 60_000, "to_end": false },
+            { "kind": "intro", "start_ms": 60_000, "end_ms": 90_000, "to_end": false },
+        ]))
+        .unwrap();
+        let intro = Marker {
+            kind: MarkerKind::Intro,
+            start: Duration::from_millis(60_000),
+            end: Duration::from_millis(90_000),
+            to_end: false,
+        };
+        assert_eq!(*listed, [intro]);
+        assert_eq!(
+            serde_json::to_value(&listed).unwrap()[0]["start_ms"],
+            60_000
+        );
+    }
+
+    #[test]
+    fn an_item_s_artwork_of_a_kind_is_its_first_one() {
+        let art = |kind, path: &str| Artwork {
+            id: ArtworkId::new(Namespace::Plex, path).unwrap(),
+            kind,
+        };
+        let Item::Movie(mut movie) = alien(PlaybackState::default(), None) else {
+            unreachable!()
+        };
+        movie.artwork = vec![
+            art(ArtworkKind::Background, "/bg"),
+            art(ArtworkKind::Poster, "/p1"),
+            art(ArtworkKind::Poster, "/p2"),
+        ];
+        let item = Item::Movie(movie);
+        assert_eq!(
+            [
+                ArtworkKind::Poster,
+                ArtworkKind::Background,
+                ArtworkKind::Thumb
+            ]
+            .map(|kind| item.artwork_of(kind).cloned()),
+            [
+                Some(art(ArtworkKind::Poster, "/p1")),
+                Some(art(ArtworkKind::Background, "/bg")),
+                None
+            ]
+        );
     }
 
     fn at(secs: u64, watched: bool) -> PlaybackState {

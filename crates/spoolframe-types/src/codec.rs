@@ -144,10 +144,11 @@ vocabulary!(
 /// limit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoLimits {
-    /// Lines, e.g. 1080.
+    /// Lines, e.g. 1080. At Hello, what the decoders take: the screen's
+    /// mode goes with each plan ([`DisplayCapabilities::height`]).
     #[serde(deserialize_with = "crate::required::option")]
     pub height: Option<u32>,
-    /// Frames per second.
+    /// Frames per second. At Hello, what the decoders take, as `height`.
     #[serde(deserialize_with = "crate::required::option")]
     pub frame_rate: Option<u32>,
     /// Bits per sample, e.g. 8 for a client without 10-bit decoding.
@@ -223,21 +224,55 @@ pub struct DisplayCapabilities {
     /// `None` then.
     #[serde(default)]
     pub video_codecs: Option<BTreeSet<String>>,
+    /// As [`VideoLimits::height`], the screen's mode now: a TV set to
+    /// 1080p is not sent 4K. It lowers Hello's (the decoders') limit,
+    /// never raises it; `None` keeps Hello's. It may be left out.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// As [`VideoLimits::frame_rate`], the mode's refresh rate. `None`
+    /// keeps Hello's. It may be left out.
+    #[serde(default)]
+    pub frame_rate: Option<u32>,
+}
+
+/// A height or frame rate as a limit: 0 lines or 0 frames a second is a
+/// value not said, not a cap, which would convert everything to nothing.
+fn said(limit: Option<u32>) -> Option<u32> {
+    limit.filter(|v| *v > 0)
+}
+
+/// The lower of two limits, `None` being none: either one where only one
+/// is set.
+fn lower(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (said(a), said(b)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 impl ClientCapabilities {
-    /// These capabilities with `display`'s HDR formats and bit depth in
-    /// place of [`ClientCapabilities::max_video`]'s; unchanged without a
-    /// `display`.
+    /// The capabilities a plan reads: these, with `display`'s HDR formats
+    /// and bit depth in place of [`ClientCapabilities::max_video`]'s, and
+    /// its height and frame rate as limits where it says them, never above
+    /// Hello's. With or without a `display`, a height or frame rate of 0
+    /// is read as not said: the limits it gives never hold a 0.
     pub fn with_display(&self, display: Option<&DisplayCapabilities>) -> ClientCapabilities {
         let mut caps = self.clone();
         if let Some(display) = display {
             let limits = caps.max_video.get_or_insert_with(VideoLimits::default);
             limits.hdr = display.hdr.clone();
             limits.bit_depth = display.bit_depth;
+            // The screen's mode lowers Hello's limits, never raises them:
+            // a 4K TV does not lift a 1080p decoder's cap.
+            limits.height = lower(limits.height, display.height);
+            limits.frame_rate = lower(limits.frame_rate, display.frame_rate);
             if display.video_codecs.is_some() {
                 caps.video_codecs = display.video_codecs.clone();
             }
+        }
+        if let Some(limits) = caps.max_video.as_mut() {
+            limits.height = said(limits.height);
+            limits.frame_rate = said(limits.frame_rate);
         }
         caps
     }
@@ -300,6 +335,8 @@ mod tests {
             bit_depth: Some(8),
             hdr: Some(BTreeSet::new()),
             video_codecs: None,
+            height: None,
+            frame_rate: None,
         };
         let now = hello.with_display(Some(&sdr));
         assert_eq!(
@@ -315,6 +352,61 @@ mod tests {
         // A client with no limits at Hello gets the display's.
         let unlimited = ClientCapabilities::default().with_display(Some(&sdr));
         assert_eq!(unlimited.max_video.unwrap().hdr, Some(BTreeSet::new()));
+    }
+
+    /// Hello's height or frame rate of 0, with no display, is not said
+    /// either: the limits a plan reads never hold a 0.
+    #[test]
+    fn hello_at_zero_with_no_display_is_no_limit() {
+        let hello = ClientCapabilities {
+            max_video: Some(VideoLimits {
+                height: Some(0),
+                frame_rate: Some(0),
+                bit_depth: Some(10),
+                hdr: None,
+            }),
+            ..ClientCapabilities::default()
+        };
+        assert_eq!(
+            hello.with_display(None).max_video,
+            Some(VideoLimits {
+                height: None,
+                frame_rate: None,
+                bit_depth: Some(10),
+                hdr: None,
+            })
+        );
+    }
+
+    /// A height or frame rate of 0 is a screen that did not say, on
+    /// either side: it caps nothing, rather than every plan at 0 lines.
+    #[test]
+    fn a_display_at_zero_changes_no_limit() {
+        let limits = |height, frame_rate| ClientCapabilities {
+            max_video: Some(VideoLimits {
+                height,
+                frame_rate,
+                ..VideoLimits::default()
+            }),
+            ..ClientCapabilities::default()
+        };
+        let mode = |height, frame_rate| DisplayCapabilities {
+            height,
+            frame_rate,
+            ..DisplayCapabilities::default()
+        };
+        let limited = |caps: ClientCapabilities, display| {
+            let video = caps.with_display(Some(&display)).max_video.unwrap();
+            (video.height, video.frame_rate)
+        };
+        assert_eq!(
+            [
+                limited(limits(Some(2160), Some(60)), mode(Some(0), Some(0))),
+                limited(limits(None, None), mode(Some(0), Some(0))),
+                limited(limits(Some(0), Some(0)), mode(Some(1080), Some(30))),
+            ],
+            [(Some(2160), Some(60)), (None, None), (Some(1080), Some(30))]
+        );
     }
 
     #[test]
@@ -403,6 +495,8 @@ mod tests {
             bit_depth: Some(8),
             hdr: Some(BTreeSet::new()),
             video_codecs: None,
+            height: None,
+            frame_rate: None,
         };
         assert_eq!(
             hello.with_display(Some(&sdr)).video_codecs,

@@ -5,20 +5,20 @@
 //! Audio and subtitle codecs stay on the server, where the playback
 //! planner uses them; a client chooses an audio language, not a codec.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use crate::browse::{DynamicRange, Resolution};
 use crate::codec::{Container, HdrFormat, VideoCodec};
-use crate::duration_ms;
+use crate::serde_time;
 
 /// The tracks of one media file. A track is identified by its position in
 /// its list, which is stable for as long as the file does not change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MediaTracks {
-    #[serde(with = "duration_ms::option")]
+    #[serde(with = "serde_time::millis::option_required")]
     pub duration: Option<Duration>,
     /// The file's container, from the server's own probe of it. `None`
     /// only where nothing was probed.
@@ -139,6 +139,16 @@ pub struct SubtitleTrack {
     /// `timing` is.
     #[serde(default)]
     pub download: Option<SubtitleDownload>,
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl SubtitleTrack {
+    /// Shown even with subtitles off: the file's forced flag, or a role
+    /// read as forced from the title. Where the two disagree, either
+    /// says so.
+    pub fn is_forced(&self) -> bool {
+        self.forced || self.role == SubtitleRole::Forced
+    }
 }
 
 /// A subtitle site the server searches and downloads from. On the wire
@@ -361,9 +371,9 @@ pub struct SubtitleTiming {
     /// Who set the offset last, by display name; `None` while no one has.
     #[serde(deserialize_with = "crate::required::option")]
     pub offset_by: Option<String>,
-    /// When, Unix seconds.
-    #[serde(deserialize_with = "crate::required::option")]
-    pub offset_at: Option<i64>,
+    /// When (Unix seconds on the wire).
+    #[serde(with = "serde_time::unix_seconds::option_required")]
+    pub offset_at: Option<SystemTime>,
 }
 
 impl SubtitleTiming {
@@ -372,13 +382,19 @@ impl SubtitleTiming {
     /// One press of a player's ± control, ms.
     pub const OFFSET_STEP_MS: i64 = 100;
 
-    /// The offset `steps` presses of the ± control from this one
-    /// (negative: earlier), held within [`SubtitleTiming::MAX_OFFSET_MS`].
-    pub fn offset_stepped(&self, steps: i64) -> i64 {
+    /// The offset `steps` presses of the ± control from `offset_ms`
+    /// (negative: earlier), held within [`SubtitleTiming::MAX_OFFSET_MS`]:
+    /// for a player that keeps the offset alone, without the timing.
+    pub fn step_offset(offset_ms: i64, steps: i64) -> i64 {
         steps
             .saturating_mul(Self::OFFSET_STEP_MS)
-            .saturating_add(self.offset_ms)
+            .saturating_add(offset_ms)
             .clamp(-Self::MAX_OFFSET_MS, Self::MAX_OFFSET_MS)
+    }
+
+    /// [`SubtitleTiming::step_offset`] from this timing's offset.
+    pub fn offset_stepped(&self, steps: i64) -> i64 {
+        Self::step_offset(self.offset_ms, steps)
     }
 }
 
@@ -491,6 +507,23 @@ mod tests {
             download: None,
         };
         crate::test_support::assert_each_required(&subtitle, &["role"]);
+    }
+
+    #[test]
+    fn a_track_is_forced_by_its_flag_or_its_role() {
+        let track = |forced, role| SubtitleTrack {
+            forced,
+            role,
+            ..sidecar(None)
+        };
+        assert_eq!(
+            [
+                track(true, SubtitleRole::Full).is_forced(),
+                track(false, SubtitleRole::Forced).is_forced(),
+                track(false, SubtitleRole::Sdh).is_forced(),
+            ],
+            [true, true, false]
+        );
     }
 
     fn sidecar(timing: Option<SubtitleTiming>) -> SubtitleTrack {
@@ -627,7 +660,7 @@ mod tests {
             },
             offset_ms: 1_500,
             offset_by: Some("Alice".into()),
-            offset_at: Some(1_760_000_000),
+            offset_at: Some(std::time::UNIX_EPOCH + Duration::from_secs(1_760_000_000)),
         };
         let json = serde_json::to_value(sidecar(Some(timing.clone()))).unwrap();
         assert_eq!(json["timing"]["sync"]["state"], "synced");
@@ -650,6 +683,13 @@ mod tests {
         assert_eq!(timing(599_950).offset_stepped(1), 600_000);
         assert_eq!(timing(-599_950).offset_stepped(-3), -600_000);
         assert_eq!(timing(0).offset_stepped(i64::MAX), 600_000);
+    }
+
+    #[test]
+    fn an_offset_alone_steps_as_a_timing_s_does() {
+        assert_eq!(SubtitleTiming::step_offset(1_500, 1), 1_600);
+        assert_eq!(SubtitleTiming::step_offset(-599_950, -3), -600_000);
+        assert_eq!(SubtitleTiming::step_offset(i64::MIN, -1), -600_000);
     }
 
     #[test]

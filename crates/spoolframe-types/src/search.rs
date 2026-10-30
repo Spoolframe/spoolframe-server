@@ -50,6 +50,19 @@ pub enum SearchKind {
     Episodes,
 }
 
+impl SearchKind {
+    /// The scope whose count a "See all" of this kind names, for the
+    /// kinds that have one.
+    pub fn scope(self) -> Option<SearchScope> {
+        match self {
+            SearchKind::Movies => Some(SearchScope::Movies),
+            SearchKind::Shows => Some(SearchScope::Shows),
+            SearchKind::Episodes => Some(SearchScope::Episodes),
+            _ => None,
+        }
+    }
+}
+
 /// What a person did in the items they are found for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]

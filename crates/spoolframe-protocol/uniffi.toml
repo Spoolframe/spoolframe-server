@@ -5,3 +5,12 @@
 [bindings.kotlin.rename]
 # SpoolException.PairingRefused, the case that carries it, hides it there.
 PairingRefused = "PairingRefusal"
+
+# Swift's names where UniFFI's clash with the Apple app's or the SDKs'
+# (sf-ios). UniFFI names a type inside an Option or a list by the using
+# crate's table, so every crate's gives them all. AudioCodec and
+# Container keep theirs: UniFFI 0.32 lowers a method's receiver by the
+# Rust name, so a renamed type's wire_name() would not compile.
+[bindings.swift.rename]
+Quality = "PlanQuality"
+Plan = "PlaybackPlanKind"

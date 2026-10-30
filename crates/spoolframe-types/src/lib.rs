@@ -12,7 +12,6 @@ pub mod capabilities;
 pub mod codec;
 pub mod codec_string;
 pub mod date;
-mod duration_ms;
 pub mod id;
 pub mod language;
 pub mod media;
@@ -22,10 +21,14 @@ pub mod preferences;
 pub mod required;
 pub mod role;
 pub mod search;
+pub mod serde_time;
 #[cfg(test)]
 mod test_support;
 #[cfg(feature = "uniffi")]
+mod uniffi_methods;
+#[cfg(feature = "uniffi")]
 mod uniffi_types;
+pub mod wire;
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
@@ -50,8 +53,8 @@ pub use media::{
 };
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, Caption, CastMember, Episode, Item, Library, LibraryKind,
-    LibraryServer, Marker, MarkerKind, Movie, PlaybackState, Progress, Season, Show, Track,
-    YearsAired,
+    LibraryServer, Marker, MarkerKind, Markers, Movie, PlaybackState, Progress, Season, Show,
+    Track, YearsAired,
 };
 pub use platform::Platform;
 pub use preferences::{

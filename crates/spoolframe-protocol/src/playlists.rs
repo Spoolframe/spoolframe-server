@@ -26,8 +26,11 @@ pub const MAX_ART_PIXELS: u64 = 40_000_000;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Kinds {
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub movies: bool,
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub episodes: bool,
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub tracks: bool,
 }
 
@@ -432,9 +435,11 @@ pub struct PlaylistPage {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PlaySettings {
     /// Play in a shuffled order: every playable entry once per round.
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub shuffle: bool,
     pub repeat: Repeat,
     /// Pass entries whose item the user has watched.
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub skip_watched: bool,
 }
 
@@ -468,7 +473,7 @@ pub enum Repeat {
 pub struct PlaylistNext {
     pub entry: EntryId,
     pub item: spoolframe_types::Item,
-    pub markers: Vec<spoolframe_types::Marker>,
+    pub markers: spoolframe_types::Markers,
     /// A track in the user's Liked: the now-playing heart.
     pub liked: bool,
 }

@@ -266,6 +266,21 @@ impl PairingRefused {
     }
 }
 
+impl PairingRefused {
+    /// What to show: the same text as its `Display`.
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// [`PairingRefused::message`], for Swift and Kotlin. A free function, not
+/// a method: UniFFI 0.32's Kotlin lowers a method's receiver by the type's
+/// Rust name, which the Kotlin rename (`PairingRefusal`) leaves undefined.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn pairing_refused_message(refused: PairingRefused) -> String {
+    refused.message()
+}
+
 impl fmt::Display for PairingRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -466,15 +481,7 @@ pub enum PeerReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec;
-
-    fn round_trip<T>(value: T)
-    where
-        T: Serialize + serde::de::DeserializeOwned + PartialEq + fmt::Debug,
-    {
-        let bytes = codec::encode(&value).unwrap();
-        assert_eq!(codec::decode::<T>(&bytes).unwrap(), value);
-    }
+    use crate::codec::{self, round_trip};
 
     /// A request naming a paired server's item anywhere names one; a
     /// search for text that only starts like an id does not.

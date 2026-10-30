@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use crate::TrackPreferencesInfo;
-use crate::codec::{self, CodecError, MAX_FRAME};
+use crate::codec::{self, CodecError, MAX_FRAME, round_trip};
 use crate::{
     AudioAction, BitmapSubtitles, ChosenTracks, ConvertedAudio, ConvertedSubtitle, ConvertedVideo,
     Quality, SubtitleAction, TrackReason,
@@ -35,11 +35,6 @@ use spoolframe_types::{
     Movie, Namespace, Person, PersonId, PersonRole, PlaybackState, SearchKind, SearchScope,
 };
 
-fn round_trip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T) {
-    let bytes = codec::encode(&value).unwrap();
-    assert_eq!(codec::decode::<T>(&bytes).unwrap(), value);
-}
-
 fn movie() -> Item {
     Item::Movie(Movie {
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -59,14 +54,14 @@ fn markers() -> Vec<Marker> {
     vec![
         Marker {
             kind: MarkerKind::Intro,
-            start_ms: 258_865,
-            end_ms: 319_865,
+            start: std::time::Duration::from_millis(258_865),
+            end: std::time::Duration::from_millis(319_865),
             to_end: false,
         },
         Marker {
             kind: MarkerKind::Credits,
-            start_ms: 2_662_962,
-            end_ms: 2_709_958,
+            start: std::time::Duration::from_millis(2_662_962),
+            end: std::time::Duration::from_millis(2_709_958),
             to_end: true,
         },
     ]
@@ -135,7 +130,7 @@ fn an_item_s_copies_are_left_out_when_there_are_none() {
     let item = |copies| Reply::Item {
         item: movie(),
         children: Vec::new(),
-        markers: Vec::new(),
+        markers: spoolframe_types::Markers::default(),
         playlists: Vec::new(),
         liked: None,
         liked_children: Vec::new(),
@@ -466,8 +461,8 @@ fn every_reply_round_trips() {
                 PasskeyInfo {
                     id: "AQID".into(),
                     name: "Alice's iPhone".into(),
-                    created_at: 1,
-                    last_used_at: Some(2),
+                    created_at: spoolframe_types::serde_time::unix_seconds::from_wire(1),
+                    last_used_at: Some(spoolframe_types::serde_time::unix_seconds::from_wire(2)),
                     rp_id: "spoolframe.app".into(),
                     app: true,
                     usable_here: true,
@@ -475,7 +470,7 @@ fn every_reply_round_trips() {
                 PasskeyInfo {
                     id: "BAUG".into(),
                     name: "YubiKey".into(),
-                    created_at: 3,
+                    created_at: spoolframe_types::serde_time::unix_seconds::from_wire(3),
                     last_used_at: None,
                     rp_id: "media.example.org".into(),
                     app: false,
@@ -495,7 +490,7 @@ fn every_reply_round_trips() {
             allow_credential_ids: Vec::new(),
         }),
         Reply::Previews(crate::Previews {
-            interval_ms: 10_000,
+            interval: std::time::Duration::from_millis(10_000),
             tile_width: 320,
             tile_height: 134,
             columns: 10,
@@ -523,7 +518,7 @@ fn every_reply_round_trips() {
             device_name: Some("Living room TV".into()),
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
-            requested_at: 1_790_000_000,
+            requested_at: spoolframe_types::serde_time::unix_seconds::from_wire(1_790_000_000),
             remember: true,
             requested_from: Some(crate::DeviceAddress {
                 address: "192.168.86.20".into(),
@@ -534,7 +529,7 @@ fn every_reply_round_trips() {
             device_name: None,
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
-            requested_at: 1_790_000_000,
+            requested_at: spoolframe_types::serde_time::unix_seconds::from_wire(1_790_000_000),
             remember: false,
             requested_from: None,
         }),
@@ -570,7 +565,7 @@ fn every_reply_round_trips() {
         Reply::Item {
             item: movie(),
             children: Vec::new(),
-            markers: markers(),
+            markers: markers().into(),
             playlists: Vec::new(),
             liked: None,
             liked_children: Vec::new(),
@@ -579,7 +574,7 @@ fn every_reply_round_trips() {
         Reply::Item {
             item: movie(),
             children: Vec::new(),
-            markers: Vec::new(),
+            markers: spoolframe_types::Markers::default(),
             playlists: vec![crate::playlists::PlaylistRef {
                 id: "0192f1c4-5b6e-7a3d-9c41-2e8f7b6a5d4c".into(),
                 name: "Heists".into(),
@@ -612,7 +607,7 @@ fn every_reply_round_trips() {
                 endpoint_id: "ab".repeat(32),
                 name: Some("Living room TV".into()),
                 platform: Some(spoolframe_types::Platform::Tvos),
-                last_seen_at: 1_790_000_000,
+                last_seen_at: spoolframe_types::serde_time::unix_seconds::from_wire(1_790_000_000),
                 pin_required: true,
                 trusted: true,
                 auto_login: false,
@@ -625,7 +620,9 @@ fn every_reply_round_trips() {
                 username: Some("alice".into()),
                 email: Some("alice@example.com".into()),
                 by_config: false,
-                linked_at: Some(1_790_000_000),
+                linked_at: Some(spoolframe_types::serde_time::unix_seconds::from_wire(
+                    1_790_000_000,
+                )),
                 last_sync: Some(crate::PlexSyncSummary {
                     at: 1_790_000_100,
                     libraries: 2,
@@ -671,7 +668,8 @@ fn every_reply_round_trips() {
                 audio: TrackReason::Preferences,
                 subtitle: TrackReason::Override,
             }),
-            markers: markers(),
+            markers: markers().into(),
+            duration: None,
         },
         Reply::TrackPreferences(TrackPreferencesInfo {
             preferences: TrackPreferences::default(),
@@ -1737,6 +1735,8 @@ fn a_start_playback_s_display_round_trips() {
         bit_depth: Some(10),
         hdr: Some([spoolframe_types::HdrFormat::Hdr10].into()),
         video_codecs: None,
+        height: None,
+        frame_rate: None,
     };
     let request = Request::StartPlayback {
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -1792,8 +1792,22 @@ fn playback_started(markers: Vec<Marker>) -> Reply {
         size: 12_345,
         chosen: None,
         epoch: 0,
-        markers,
+        markers: markers.into(),
+        duration: None,
     }
+}
+
+/// A started playback's running time keeps its wire name and unit,
+/// `duration_ms` (its markers' are spoolframe-types').
+#[test]
+fn spans_and_times_keep_their_wire_form() {
+    let mut started = playback_started(markers());
+    if let Reply::PlaybackStarted { duration, .. } = &mut started {
+        *duration = Some(Duration::from_millis(7_020_000));
+    }
+    let json = serde_json::to_value(&started).unwrap();
+    assert_eq!(json["duration_ms"], 7_020_000);
+    round_trip(Response::Ok(started));
 }
 
 /// An older server's replies were once read with no markers; since
@@ -1818,12 +1832,27 @@ fn an_older_server_s_replies_without_markers_do_not_decode() {
     }
 }
 
+/// A started playback's markers leave out a kind from a newer server, as
+/// an item's do.
+#[test]
+fn a_started_playback_leaves_out_a_marker_kind_it_does_not_know() {
+    let mut json = serde_json::to_value(playback_started(markers())).unwrap();
+    json["markers"][1]["kind"] = "recap".into();
+    let Reply::PlaybackStarted {
+        markers: started, ..
+    } = codec::decode(&codec::encode(&json).unwrap()).unwrap()
+    else {
+        panic!("not a started playback")
+    };
+    assert_eq!(*started, markers()[..1]);
+}
+
 #[test]
 fn an_older_client_reads_an_item_that_has_markers() {
     let bytes = codec::encode(&Reply::Item {
         item: movie(),
         children: Vec::new(),
-        markers: markers(),
+        markers: markers().into(),
         playlists: Vec::new(),
         liked: None,
         liked_children: Vec::new(),
@@ -1834,6 +1863,43 @@ fn an_older_client_reads_an_item_that_has_markers() {
         panic!("not an item")
     };
     assert_eq!((item, children), (movie(), Vec::new()));
+}
+
+/// The started-playback reply as it was before its `duration_ms`.
+mod before_duration {
+    use crate::{ChosenTracks, PlaybackHandle, PlaybackPlan};
+    use serde::{Deserialize, Serialize};
+    use spoolframe_types::Marker;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum Reply {
+        PlaybackStarted {
+            handle: PlaybackHandle,
+            plan: PlaybackPlan,
+            size: u64,
+            chosen: Option<ChosenTracks>,
+            epoch: u32,
+            markers: Vec<Marker>,
+        },
+    }
+}
+
+#[test]
+fn an_older_server_s_started_playback_has_no_running_time() {
+    let bytes = codec::encode(&before_duration::Reply::PlaybackStarted {
+        handle: crate::PlaybackHandle("h".into()),
+        plan: PlaybackPlan::Unsupported { reasons: vec![] },
+        size: 12_345,
+        chosen: None,
+        epoch: 0,
+        markers: markers(),
+    })
+    .unwrap();
+    let Reply::PlaybackStarted { duration, .. } = codec::decode(&bytes).unwrap() else {
+        panic!("not a started playback")
+    };
+    assert_eq!(duration, None);
 }
 
 #[test]
@@ -1857,60 +1923,6 @@ fn a_whole_subtitle_chunk_fits_a_frame() {
         version: u64::MAX,
     });
     assert!(codec::encode(&reply).unwrap().len() < MAX_FRAME as usize);
-}
-
-/// A marker kind from a newer server does not cost the client the item or
-/// its other markers.
-#[test]
-fn a_marker_kind_from_a_newer_server_is_unknown() {
-    #[derive(Serialize)]
-    struct NewerMarker {
-        kind: &'static str,
-        start_ms: u64,
-        end_ms: u64,
-        to_end: bool,
-    }
-    #[derive(Serialize)]
-    struct NewerItem {
-        #[serde(rename = "type")]
-        kind: &'static str,
-        item: Item,
-        children: Vec<Item>,
-        markers: Vec<NewerMarker>,
-        playlists: Vec<crate::playlists::PlaylistRef>,
-        liked: Option<crate::playlists::Liked>,
-        liked_children: Vec<MediaId>,
-    }
-    let bytes = codec::encode(&NewerItem {
-        kind: "item",
-        item: movie(),
-        children: Vec::new(),
-        playlists: Vec::new(),
-        liked: None,
-        liked_children: Vec::new(),
-        markers: vec![
-            NewerMarker {
-                kind: "recap",
-                start_ms: 0,
-                end_ms: 45_000,
-                to_end: false,
-            },
-            NewerMarker {
-                kind: "intro",
-                start_ms: 45_000,
-                end_ms: 105_000,
-                to_end: false,
-            },
-        ],
-    })
-    .unwrap();
-    let Reply::Item { markers, .. } = codec::decode(&bytes).unwrap() else {
-        panic!("not an item")
-    };
-    assert_eq!(
-        markers.iter().map(|m| m.kind).collect::<Vec<_>>(),
-        [MarkerKind::Unknown, MarkerKind::Intro]
-    );
 }
 
 /// A resume makes a session and a trust change can end them: neither may be
@@ -2100,7 +2112,7 @@ fn a_reply_missing_a_field_is_refused() {
         &Reply::Item {
             item: movie(),
             children: Vec::new(),
-            markers: Vec::new(),
+            markers: spoolframe_types::Markers::default(),
             playlists: Vec::new(),
             liked: None,
             liked_children: Vec::new(),
@@ -2136,7 +2148,7 @@ fn a_reply_missing_a_field_is_refused() {
             endpoint_id: "ab".into(),
             name: None,
             platform: None,
-            last_seen_at: 0,
+            last_seen_at: spoolframe_types::serde_time::unix_seconds::from_wire(0),
             pin_required: false,
             trusted: false,
             auto_login: false,
@@ -2149,7 +2161,7 @@ fn a_reply_missing_a_field_is_refused() {
             device_name: None,
             client_name: "spoolframe-tvos".into(),
             platform: spoolframe_types::Platform::Tvos,
-            requested_at: 0,
+            requested_at: spoolframe_types::serde_time::unix_seconds::from_wire(0),
             remember: false,
             requested_from: None,
         },
@@ -3188,7 +3200,7 @@ mod playlists {
             Reply::PlaylistItem(crate::playlists::PlaylistNext {
                 entry: 3,
                 item: movie(),
-                markers: markers(),
+                markers: markers().into(),
                 liked: true,
             }),
             Reply::PlaylistFinished,
@@ -3263,7 +3275,9 @@ mod playlists {
     fn a_last_view_round_trips_and_is_null_when_unknown() {
         let mut seen = movie();
         if let spoolframe_types::Item::Movie(m) = &mut seen {
-            m.playback.last_viewed_at = Some(1_791_000_000);
+            m.playback.last_viewed_at = Some(
+                spoolframe_types::serde_time::unix_seconds::from_wire(1_791_000_000),
+            );
         }
         let json = serde_json::to_value(&seen).unwrap();
         assert_eq!(json["playback"]["last_viewed_at"], 1_791_000_000);
@@ -3308,7 +3322,7 @@ mod playlists {
         let item = Reply::Item {
             item: movie(),
             children: Vec::new(),
-            markers: Vec::new(),
+            markers: spoolframe_types::Markers::default(),
             playlists: Vec::new(),
             liked: Some(crate::playlists::Liked::Some),
             liked_children: vec![track.clone()],
@@ -3420,7 +3434,7 @@ mod playlists {
         let without = Reply::Item {
             item: movie(),
             children: Vec::new(),
-            markers: Vec::new(),
+            markers: spoolframe_types::Markers::default(),
             playlists: Vec::new(),
             liked: None,
             liked_children: Vec::new(),
@@ -3486,7 +3500,9 @@ mod play_history {
         let mut played = movie();
         if let Item::Movie(m) = &mut played {
             m.playback.play_count = 2;
-            m.playback.last_played_at = Some(1_791_000_000);
+            m.playback.last_played_at = Some(
+                spoolframe_types::serde_time::unix_seconds::from_wire(1_791_000_000),
+            );
         }
         let json = serde_json::to_value(&played).unwrap();
         assert_eq!(json["playback"]["play_count"], 2);
@@ -3517,7 +3533,9 @@ fn subtitle_timing_round_trips() {
         sync: spoolframe_types::SubtitleSync::Uncertain { score: 12 },
         offset_ms: -1_500,
         offset_by: Some("Alice".into()),
-        offset_at: Some(1_760_000_000),
+        offset_at: Some(spoolframe_types::serde_time::unix_seconds::from_wire(
+            1_760_000_000,
+        )),
     };
     for request in [
         Request::SyncSubtitle {
@@ -4618,4 +4636,34 @@ fn watch_changed_has_its_wire_name() {
         serde_json::json!({"type": "watch_changed", "items": ["plex:movie:1"]})
     );
     round_trip(event);
+}
+
+/// Only an address on the server's machine or network is local; a request
+/// the server couldn't place is not.
+#[test]
+fn a_sign_in_request_is_local_only_from_the_server_s_network() {
+    use crate::{AddressNetwork, DeviceSignInRequest};
+    let from = |network| crate::DeviceAddress {
+        address: "192.168.86.20".into(),
+        network,
+    };
+    let request = |requested_from| DeviceSignInRequest {
+        device_name: None,
+        client_name: "spoolframe-tvos".into(),
+        platform: spoolframe_types::Platform::Tvos,
+        requested_at: spoolframe_types::serde_time::unix_seconds::from_wire(0),
+        remember: false,
+        requested_from,
+    };
+    assert_eq!(
+        [
+            from(AddressNetwork::Loopback).is_local(),
+            from(AddressNetwork::Local).is_local(),
+            from(AddressNetwork::Internet).is_local(),
+            from(AddressNetwork::Unknown).is_local(),
+            request(Some(from(AddressNetwork::Local))).is_local(),
+            request(None).is_local(),
+        ],
+        [true, true, false, false, true, false]
+    );
 }

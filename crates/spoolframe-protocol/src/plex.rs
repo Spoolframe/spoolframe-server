@@ -15,8 +15,11 @@ pub struct PlexLink {
     /// Linked by the server's config file, as the Plex servers' owner:
     /// only that file can unlink it, not the web UI.
     pub by_config: bool,
-    /// When it was linked, Unix seconds; `None` for the config's.
-    pub linked_at: Option<i64>,
+    /// When it was linked (Unix seconds on the wire); `None` for the
+    /// config's.
+    // Read as none when left out, as a plain `Option` was.
+    #[serde(default, with = "spoolframe_types::serde_time::unix_seconds::option")]
+    pub linked_at: Option<std::time::SystemTime>,
     /// The user's last sync run since the server started, if any.
     pub last_sync: Option<PlexSyncSummary>,
     /// A sync run of theirs is going on now.

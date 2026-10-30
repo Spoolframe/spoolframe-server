@@ -261,15 +261,15 @@ async fn an_episode_comes_with_its_intro_and_credits() {
         [
             Marker {
                 kind: MarkerKind::Intro,
-                start_ms: 258_865,
-                end_ms: 319_865,
+                start: std::time::Duration::from_millis(258_865),
+                end: std::time::Duration::from_millis(319_865),
                 to_end: false,
             },
             Marker {
                 kind: MarkerKind::Credits,
-                start_ms: 2_815_419,
+                start: std::time::Duration::from_millis(2_815_419),
                 // 1 ms past the episode's duration, as Plex has it.
-                end_ms: 2_852_689,
+                end: std::time::Duration::from_millis(2_852_689),
                 to_end: true,
             },
         ]
@@ -309,8 +309,8 @@ async fn a_marker_that_cannot_be_read_is_left_out_and_the_item_loads() {
         got.markers,
         [Marker {
             kind: MarkerKind::Intro,
-            start_ms: 30_000,
-            end_ms: 90_000,
+            start: std::time::Duration::from_millis(30_000),
+            end: std::time::Duration::from_millis(90_000),
             to_end: false,
         }]
     );

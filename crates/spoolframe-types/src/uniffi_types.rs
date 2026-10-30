@@ -2,7 +2,7 @@
 //! the calendar date as the strings they are on the wire, so a foreign
 //! language holds the same text the protocol sends and parses nothing.
 
-use crate::{ArtworkId, CalendarDate, LibraryId, MediaId, PersonId};
+use crate::{ArtworkId, CalendarDate, LibraryId, Marker, Markers, MediaId, PersonId};
 
 uniffi::custom_type!(MediaId, String, {
     lower: |id| id.to_string(),
@@ -22,6 +22,12 @@ uniffi::custom_type!(ArtworkId, String, {
 uniffi::custom_type!(PersonId, String, {
     lower: |id| id.to_string(),
     try_lift: |text| Ok(text.parse()?),
+});
+
+// A plain list of markers to Swift and Kotlin.
+uniffi::custom_type!(Markers, Vec<Marker>, {
+    lower: |markers| markers.into_vec(),
+    try_lift: |markers| Ok(Markers::from(markers)),
 });
 
 // `YYYY-MM-DD`.

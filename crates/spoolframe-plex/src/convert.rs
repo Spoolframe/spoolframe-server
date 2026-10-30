@@ -285,13 +285,13 @@ pub fn markers(m: &Metadata) -> Vec<Marker> {
             }
             Some(Marker {
                 kind,
-                start_ms: marker.start_time_offset,
-                end_ms: marker.end_time_offset,
+                start: std::time::Duration::from_millis(marker.start_time_offset),
+                end: std::time::Duration::from_millis(marker.end_time_offset),
                 to_end: marker.is_final,
             })
         })
         .collect();
-    markers.sort_by_key(|marker| marker.start_ms);
+    markers.sort_by_key(|marker| marker.start);
     markers
 }
 

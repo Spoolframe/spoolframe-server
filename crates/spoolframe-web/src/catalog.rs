@@ -765,11 +765,12 @@ pub fn marker_name(kind: MarkerKind) -> &'static str {
 /// A marker's line: "0:42 – 1:32 · 50 s", or for credits that run out,
 /// "47:10 – 50:04 · to the end".
 pub fn marker_line(m: &Marker) -> String {
-    let range = format!("{} – {}", clock(m.start_ms), clock(m.end_ms));
+    let ms = spoolframe_types::serde_time::millis::to_wire;
+    let range = format!("{} – {}", clock(ms(m.start)), clock(ms(m.end)));
     if m.to_end {
         format!("{range} · to the end")
     } else {
-        format!("{range} · {}", length(m.end_ms.saturating_sub(m.start_ms)))
+        format!("{range} · {}", length(ms(m.end.saturating_sub(m.start))))
     }
 }
 
@@ -779,9 +780,11 @@ pub fn marker_span(m: &Marker, duration_ms: u64) -> (f64, f64) {
     if duration_ms == 0 {
         return (0.0, 0.0);
     }
-    let at = |ms: u64| (ms.min(duration_ms) as f64) * 100.0 / duration_ms as f64;
-    let start = at(m.start_ms);
-    let end = if m.to_end { 100.0 } else { at(m.end_ms) };
+    let at = |d: std::time::Duration| {
+        (d.as_millis().min(u128::from(duration_ms)) as f64) * 100.0 / duration_ms as f64
+    };
+    let start = at(m.start);
+    let end = if m.to_end { 100.0 } else { at(m.end) };
     (start, (end - start).max(0.5))
 }
 
@@ -1167,15 +1170,15 @@ mod tests {
     fn markers_read_as_the_board_writes_them() {
         let intro = Marker {
             kind: MarkerKind::Intro,
-            start_ms: 42_000,
-            end_ms: 92_000,
+            start: std::time::Duration::from_millis(42_000),
+            end: std::time::Duration::from_millis(92_000),
             to_end: false,
         };
         assert_eq!(marker_line(&intro), "0:42 – 1:32 · 50 s");
         let credits = Marker {
             kind: MarkerKind::Credits,
-            start_ms: 2_830_000,
-            end_ms: 3_004_513,
+            start: std::time::Duration::from_millis(2_830_000),
+            end: std::time::Duration::from_millis(3_004_513),
             to_end: true,
         };
         assert_eq!(marker_line(&credits), "47:10 – 50:04 · to the end");

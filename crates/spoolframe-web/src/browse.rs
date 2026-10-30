@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn a_sort_reads_back_from_its_address() {
-        for key in SortKey::ALL {
+        for &key in SortKey::ALL {
             for descending in [false, true] {
                 let sort = ItemSort { key, descending };
                 assert_eq!(sort_from_name(&sort_name(sort)), Some(sort));

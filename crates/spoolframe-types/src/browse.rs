@@ -49,18 +49,6 @@ pub enum SortKey {
 }
 
 impl SortKey {
-    /// Every key this build knows, in the order a client lists them.
-    pub const ALL: [SortKey; 8] = [
-        SortKey::Title,
-        SortKey::Released,
-        SortKey::Added,
-        SortKey::LastPlayed,
-        SortKey::Rating,
-        SortKey::AudienceRating,
-        SortKey::Duration,
-        SortKey::Size,
-    ];
-
     /// Its name on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -79,7 +67,7 @@ impl SortKey {
     /// The key named `name` on the wire; `None` for one this build does
     /// not know.
     pub fn parse(name: &str) -> Option<SortKey> {
-        SortKey::ALL.into_iter().find(|k| k.as_str() == name)
+        SortKey::from_wire_name(name)
     }
 }
 
@@ -92,6 +80,7 @@ pub struct ItemSort {
     pub key: SortKey,
     /// Largest, newest or last first. Missing values stay last either way.
     #[serde(default)]
+    #[cfg_attr(feature = "uniffi", uniffi(default = false))]
     pub descending: bool,
 }
 
@@ -195,14 +184,7 @@ impl Resolution {
     /// The class named `name` on the wire; `None` for one this build
     /// does not know.
     pub fn parse(name: &str) -> Option<Resolution> {
-        [
-            Resolution::Uhd,
-            Resolution::FullHd,
-            Resolution::Hd,
-            Resolution::Sd,
-        ]
-        .into_iter()
-        .find(|r| r.as_str() == name)
+        Resolution::from_wire_name(name)
     }
 }
 
@@ -232,24 +214,31 @@ pub enum DynamicRange {
 pub struct ItemFilter {
     /// The session user's watch state of it; never another user's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
     pub watched: Vec<WatchedState>,
     /// Any of these genres, by the catalog's names, as
     /// [`ItemFilterValues::genres`] lists them; case aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
     pub genres: Vec<String>,
     /// Its year is this or later. A decade is `1990` to `1999`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub year_from: Option<u16>,
     /// Its year is this or earlier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub year_to: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
     pub resolutions: Vec<Resolution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
     pub dynamic_ranges: Vec<DynamicRange>,
     /// Any of these age ratings, as the catalog has them ("PG-13",
     /// "TV-MA"); case aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
     pub content_ratings: Vec<String>,
 }
 
@@ -471,6 +460,19 @@ impl ItemFilterValues {
             }
         }
         keys
+    }
+
+    /// These values without any this build does not know: no `Unknown`
+    /// sort key, filter part, resolution or range, and each sort key
+    /// once. What the SDK hands an app, which offers only what it can
+    /// name.
+    pub fn known(mut self) -> Self {
+        self.sorts = self.sort_keys();
+        self.filters.retain(|p| *p != FilterPart::Unknown);
+        self.resolutions.retain(|c| c.value != Resolution::Unknown);
+        self.dynamic_ranges
+            .retain(|c| c.value != DynamicRange::Unknown);
+        self
     }
 
     /// The decades the library has, newest first, for the year filter:
@@ -698,6 +700,40 @@ mod tests {
             ],
             ..ItemFilterValues::default()
         }
+    }
+
+    /// A newer server's values this build can't name never reach an app.
+    #[test]
+    fn only_the_values_this_build_knows_are_kept() {
+        let mut from_newer = values();
+        from_newer.filters.push(FilterPart::Unknown);
+        from_newer.resolutions.push(Counted {
+            value: Resolution::Unknown,
+            count: Some(3),
+        });
+        from_newer.dynamic_ranges.push(Counted {
+            value: DynamicRange::Unknown,
+            count: None,
+        });
+        let known = from_newer.known();
+        assert_eq!(
+            (
+                known.sorts,
+                known.filters,
+                known.resolutions.len(),
+                known.dynamic_ranges.len()
+            ),
+            (
+                vec![SortKey::Title, SortKey::Added],
+                vec![
+                    FilterPart::Genres,
+                    FilterPart::Resolutions,
+                    FilterPart::DynamicRanges
+                ],
+                1,
+                1
+            )
+        );
     }
 
     #[test]
