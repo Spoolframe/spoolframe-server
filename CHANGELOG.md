@@ -10,7 +10,8 @@
   SDK's README says how) and has a version before crates.io's index and
   the kellnr proxy's cache do. The dependencies stay crates.io ones, so
   the crates.io packages are unchanged. `scripts/publish-changed.sh` takes
-  `--registry` and `--index`.
+  `--registry` (the index from cargo's config), and publishes to Coldsteel
+  with the siblings resolved from Coldsteel itself, verify-built.
 
 - The admin Server page, `spoolframe-server --version` and MCP's server
   info list the regular protocol features the server has

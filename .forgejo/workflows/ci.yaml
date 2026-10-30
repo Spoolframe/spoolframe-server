@@ -63,6 +63,12 @@ jobs:
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:static
 
+      # scripts/publish-changed.sh, which only master's publish job runs,
+      # tested on every change: a fixture workspace against a fake index.
+      - name: publish-changed tests
+        shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
+        run: bash scripts/tests/publish-changed.sh
+
       # kache (the coldsteel profile, devenv.nix) queues uploads in a daemon,
       # and the job's container may go before it drains them.
       - name: kache flush

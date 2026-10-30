@@ -46,22 +46,29 @@
 # that workspace's devenv shell so `cargo publish`'s verify build has the
 # right native deps), curl, jq, date (GNU, to read crates.io's retry time).
 #
-# A crate goes to the Coldsteel registry with `--no-verify`: its
-# dependencies on its siblings are crates.io dependencies (the apps patch
-# them to the Coldsteel copies), and before the crates.io run that follows
-# a new version is not on crates.io yet for a verify build to find. The
-# crates.io run verify-builds the same sources.
+# The crates depend on each other as crates.io crates (the apps patch
+# them to the Coldsteel copies). To another registry than crates.io, a
+# version runs first, when crates.io does not have it yet, so `cargo
+# publish` there resolves the siblings from that registry itself: each
+# sibling already on it at its version is patched to it (`--config
+# patch.crates-io.<crate>`), for the packaged Cargo.lock and the verify
+# build. In dependency order, a crate's siblings are published before it.
+# Only those already on it are patched: cargo refuses a patch whose
+# version the registry lacks. cargo records the patches the workspace
+# itself does not use in Cargo.lock (`[[patch.unused]]`), so that publish
+# cannot be `--locked`: the lock is checked without them first, and put
+# back after.
 #
 # Usage:
-#   publish-changed.sh [--publish] [--registry NAME] [--index URL] [--]
+#   publish-changed.sh [--publish] [--registry NAME] [--]
 #                      <workspace-root> [<workspace-root> ...]
 #
 # Options:
 #   --registry NAME  The registry to compare with and publish to: crates-io
-#                    (the default) or a registry .cargo/config.toml names
-#                    (coldsteel).
-#   --index URL      Its sparse index, without `sparse+`; for crates-io,
-#                    https://index.crates.io unless given.
+#                    (the default) or one cargo's config names (coldsteel).
+#                    Its sparse index is cargo's: CARGO_REGISTRIES_<NAME>_INDEX,
+#                    else [registries.<name>] in the first workspace root's
+#                    .cargo/config.toml.
 #   --publish        Actually run `cargo publish` for crates found absent
 #                    from the index. Requires the registry's token, as
 #                    cargo reads it: CARGO_REGISTRY_TOKEN for crates-io,
@@ -87,8 +94,12 @@ REGISTRY_NAME="crates-io"
 INDEX_BASE=""
 # What every publishable crate's `publish` must be, sorted.
 PUBLISH_TO='["coldsteel","crates-io"]'
-# A refused publish is tried this many times in all.
+# A refused publish is tried this many times in all: to crates.io, and to
+# another registry.
 PUBLISH_ATTEMPTS=8
+OTHER_ATTEMPTS=3
+# Between tries to another registry.
+OTHER_WAIT=10
 # Without a time in crates.io's answer: its rate for new crates.
 RATE_LIMIT_WAIT=600
 # Never wait longer than this for one rate limit, whatever crates.io says.
@@ -97,7 +108,7 @@ RATE_LIMIT_WAIT_MAX=1800
 DEP_WAIT=30
 
 usage() {
-    sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,89p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 publish=0
@@ -111,10 +122,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --registry)
             REGISTRY_NAME="${2:?--registry needs a name}"
-            shift 2
-            ;;
-        --index)
-            INDEX_BASE="${2:?--index needs a URL}"
             shift 2
             ;;
         -h|--help)
@@ -144,21 +151,15 @@ if [[ ${#roots[@]} -eq 0 ]]; then
     exit 1
 fi
 
-if [[ -z "$INDEX_BASE" ]]; then
-    if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
-        INDEX_BASE="https://index.crates.io"
-    else
-        echo "Error: --registry $REGISTRY_NAME needs --index <its sparse index URL>." >&2
-        exit 1
-    fi
-fi
-INDEX_BASE="${INDEX_BASE%/}"
+
+# CARGO_REGISTRIES_<NAME>_..., as cargo spells a registry's variables.
+REGISTRY_VAR="CARGO_REGISTRIES_$(tr '[:lower:]-' '[:upper:]_' <<<"$REGISTRY_NAME")"
 
 # The variable cargo reads the registry's token from.
 if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
     TOKEN_VAR="CARGO_REGISTRY_TOKEN"
 else
-    TOKEN_VAR="CARGO_REGISTRIES_$(tr '[:lower:]-' '[:upper:]_' <<<"$REGISTRY_NAME")_TOKEN"
+    TOKEN_VAR="${REGISTRY_VAR}_TOKEN"
 fi
 
 if [[ "$publish" -eq 1 && -z "${!TOKEN_VAR:-}" ]]; then
@@ -172,6 +173,34 @@ for bin in cargo curl jq date; do
         exit 1
     fi
 done
+
+# config_index ROOT
+# `index` under [registries.<name>] in ROOT's .cargo/config.toml; empty
+# where it has none.
+config_index() {
+    local config="$1/.cargo/config.toml"
+    [[ -f "$config" ]] || return 0
+    awk -v section="[registries.$REGISTRY_NAME]" '
+        /^[[:space:]]*\[/ { inside = ($0 == section) }
+        inside && /^[[:space:]]*index[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+        }
+    ' "$config"
+}
+
+# The registry's sparse index, as cargo has it.
+if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
+    INDEX_BASE="https://index.crates.io"
+else
+    index_var="${REGISTRY_VAR}_INDEX"
+    INDEX_BASE="${!index_var:-$(config_index "${roots[0]}")}"
+    if [[ "$INDEX_BASE" != sparse+* ]]; then
+        echo "Error: no sparse index for registry $REGISTRY_NAME: set $index_var or [registries.$REGISTRY_NAME] index = \"sparse+...\" in ${roots[0]}/.cargo/config.toml (found: '${INDEX_BASE}')." >&2
+        exit 1
+    fi
+    INDEX_BASE="${INDEX_BASE#sparse+}"
+fi
+INDEX_BASE="${INDEX_BASE%/}"
 
 # Sparse index path for a crate name, per Cargo's registry index format:
 # https://doc.rust-lang.org/cargo/reference/registries.html#index-format
@@ -259,9 +288,54 @@ rate_limit_wait() {
     fi
 }
 
+# publish_other ROOT NAME VERSION SIBLING...
+# `cargo publish` to a registry other than crates.io, its SIBLINGS on it
+# patched to it, verify-built. Tried again, up to OTHER_ATTEMPTS in all,
+# unless the version is on the index after all (an upload whose answer was
+# lost); hard-exits past the last.
+publish_other() {
+    local root="$1" name="$2" vers="$3" attempt sibling
+    shift 3
+    # `version` is process_workspace's, each sibling's workspace version:
+    # not a name to take for a local here.
+    local -a patches=()
+    for sibling in "$@"; do
+        if version_published "$sibling" "${version[$sibling]}"; then
+            patches+=(--config "patch.crates-io.$sibling.registry=\"$REGISTRY_NAME\""
+                      --config "patch.crates-io.$sibling.version=\"=${version[$sibling]}\"")
+        fi
+    done
+    if ! (cd "$root" && cargo metadata --locked --format-version 1 >/dev/null); then
+        echo "Error: Cargo.lock in $root is not up to date" >&2
+        exit 1
+    fi
+    local lock kept
+    lock="$root/Cargo.lock"
+    kept=$(mktemp)
+    cp "$lock" "$kept"
+    for ((attempt = 1; attempt <= OTHER_ATTEMPTS; attempt++)); do
+        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" "${patches[@]}"); then
+            cp "$kept" "$lock"
+            rm -f "$kept"
+            return 0
+        fi
+        cp "$kept" "$lock"
+        if version_published "$name" "$vers"; then
+            rm -f "$kept"
+            return 0
+        fi
+        if ((attempt < OTHER_ATTEMPTS)); then
+            echo "  [retry]   $name $vers: $REGISTRY_NAME refused it (attempt $attempt of $OTHER_ATTEMPTS); waiting ${OTHER_WAIT}s"
+            sleep "$OTHER_WAIT"
+        fi
+    done
+    rm -f "$kept"
+    echo "Error: cargo publish to $REGISTRY_NAME failed for $name $vers in $root" >&2
+    exit 1
+}
+
 # publish_crate ROOT NAME VERSION
-# `cargo publish` to the registry. To another than crates.io: once,
-# without a verify build (see the header). To crates.io: tried again — up to PUBLISH_ATTEMPTS in
+# `cargo publish` to crates.io, tried again — up to PUBLISH_ATTEMPTS in
 # all — when crates.io rate-limits it, or when the dependency it was just
 # preceded by is not found yet through the source cargo resolves with.
 # Any other failure, or one of those past the last attempt, hard-exits.
@@ -271,13 +345,6 @@ rate_limit_wait() {
 # the upload go to crates.io itself rather than to the replacement.
 publish_crate() {
     local root="$1" name="$2" version="$3" attempt log wait
-    if [[ "$REGISTRY_NAME" != "crates-io" ]]; then
-        if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked --no-verify); then
-            return 0
-        fi
-        echo "Error: cargo publish to $REGISTRY_NAME failed for $name $version in $root" >&2
-        exit 1
-    fi
     log=$(mktemp)
     for ((attempt = 1; attempt <= PUBLISH_ATTEMPTS; attempt++)); do
         if (cd "$root" && cargo publish --registry "$REGISTRY_NAME" -p "$name" --locked) 2>&1 | tee "$log"; then
@@ -464,7 +531,11 @@ process_workspace() {
         fi
 
         echo "  [publish] $n $v"
-        publish_crate "$root" "$n" "$v"
+        if [[ "$REGISTRY_NAME" == "crates-io" ]]; then
+            publish_crate "$root" "$n" "$v"
+        else
+            publish_other "$root" "$n" "$v" "${order[@]}"
+        fi
         wait_for_index "$n" "$v"
     done
 }

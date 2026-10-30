@@ -59,24 +59,39 @@ but committed, and `ci:style` fails when it is stale.
 ## Publishing the crates
 
 `.forgejo/workflows/publish.yaml` runs `scripts/publish-changed.sh` on every
-push to `master`. It publishes to crates.io, in dependency order, each crate
-with `publish = ["crates-io"]` whose version is not there yet:
-spoolframe-types, -protocol, -policy, -client-sdk, -test-dir and
--hls-bridge. test-dir is only a dev-dependency of the SDK, but cargo needs
-it on crates.io to publish the SDK. A crate without an explicit `publish`
-stops the script.
+push to `master`, once for each registry: the Coldsteel registry (kellnr,
+`https://cargo.coldsteel.casa`) first, then crates.io. Each run publishes,
+in dependency order, each crate with `publish = ["crates-io", "coldsteel"]`
+whose version is not on that registry yet: spoolframe-types, -protocol,
+-policy, -client-sdk, -client-ffi, -test-dir and -hls-bridge. test-dir is
+only a dev-dependency of the SDK, but cargo needs it on the registry to
+publish the SDK. A crate without exactly that `publish` pair (or `publish =
+false`) stops the script.
 
-To see what it would publish:
+The apps take the crates from Coldsteel during development, by patching each
+spoolframe crate to it (the SDK's README). The crates depend on each other
+as crates.io crates, so the Coldsteel run patches the siblings already on
+Coldsteel to it for the publish: a new version is not on crates.io yet when
+it runs.
+
+To see what each would publish:
 
 ```bash
-devenv shell -- scripts/publish-changed.sh .
+devenv shell -- scripts/publish-changed.sh --registry coldsteel .
+devenv shell -- scripts/publish-changed.sh --registry crates-io .
 ```
 
-- The token is the `CARGO_REGISTRY_TOKEN` secret: a crates.io API token
-  with the publish-new and publish-update scopes, for `spoolframe-*`.
+- The Coldsteel run reads the index from `.cargo/config.toml`
+  (`[registries.coldsteel]`) and the token from the
+  `CARGO_REGISTRIES_COLDSTEEL_TOKEN` secret: an API token from the kellnr
+  web UI. A failed Coldsteel publish does not stop crates.io's; the job
+  goes red after it.
+- The crates.io token is the `CARGO_REGISTRY_TOKEN` secret: a crates.io API
+  token with the publish-new and publish-update scopes, for `spoolframe-*`.
 - crates.io rate-limits new crates (a few, then about one every 10
   minutes). The script waits and retries, and logs each wait.
 - A missed or failed publish heals on the next push to `master`.
+- `scripts/tests/publish-changed.sh` tests the script (CI's lint job).
 
 ## Images
 
