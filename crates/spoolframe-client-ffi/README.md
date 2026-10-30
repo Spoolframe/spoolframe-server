@@ -39,7 +39,8 @@ Everything is typed. Nothing is passed as JSON.
   `CoreStorage` and `AppSecurityKey` are traits the app implements. Or, for `CoreStorage`, `FileStorage(root,
   cipher)`: a file per key under `root`, each written whole and renamed
   into place, the secrets sealed by the app's `SecretCipher` (`seal`,
-  `unseal`; on Android a Keystore key).
+  `unseal`; on Android a Keystore key). Open it with
+  `SpoolClient.openFiles`: on Android, `open` aborts the app.
 
 The bindings are one file per crate: `spoolframe_client_ffi`,
 `spoolframe_client_sdk`, `spoolframe_protocol` and `spoolframe_types`.
@@ -193,7 +194,7 @@ Coldsteel copy:
 
 ```toml
 [patch.crates-io]
-spoolframe-client-ffi = { version = "=0.17.0-beta.1", registry = "coldsteel" }
+spoolframe-client-ffi = { version = "=0.17.0-beta.2", registry = "coldsteel" }
 # and spoolframe-types, -protocol, -policy, -client-sdk, -hls-bridge
 ```
 

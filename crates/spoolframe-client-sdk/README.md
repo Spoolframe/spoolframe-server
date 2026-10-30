@@ -16,6 +16,12 @@ spoolframe-client-sdk = "0.16"
 # spoolframe-client-sdk = { version = "0.16", features = ["media-readers"] }
 ```
 
+The wire protocol is stable: an app and a server of different releases
+still talk to each other. This crate's API follows semver but is not
+stable: each minor release (0.17 → 0.18) can break it, while patch
+releases on one minor line do not. Read the CHANGELOG's BREAKING entries
+before moving to a new minor.
+
 The SDK runs on Tokio. Then add the noq-proto patch below to your
 workspace.
 
@@ -37,14 +43,14 @@ Coldsteel copy, at the same exact version:
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = "=0.17.0-beta.1"
+spoolframe-client-sdk = "=0.17.0-beta.2"
 
 [patch.crates-io]
-spoolframe-types = { version = "=0.17.0-beta.1", registry = "coldsteel" }
-spoolframe-protocol = { version = "=0.17.0-beta.1", registry = "coldsteel" }
-spoolframe-policy = { version = "=0.17.0-beta.1", registry = "coldsteel" }
-spoolframe-client-sdk = { version = "=0.17.0-beta.1", registry = "coldsteel" }
-spoolframe-hls-bridge = { version = "=0.17.0-beta.1", registry = "coldsteel" }
+spoolframe-types = { version = "=0.17.0-beta.2", registry = "coldsteel" }
+spoolframe-protocol = { version = "=0.17.0-beta.2", registry = "coldsteel" }
+spoolframe-policy = { version = "=0.17.0-beta.2", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.17.0-beta.2", registry = "coldsteel" }
+spoolframe-hls-bridge = { version = "=0.17.0-beta.2", registry = "coldsteel" }
 ```
 
 The Coldsteel copies depend on each other as crates.io crates, and a

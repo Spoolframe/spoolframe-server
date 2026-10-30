@@ -16,7 +16,7 @@ use crate::pairing::{SpoolPairing, SpoolPairingOffer};
 use crate::portable::SpoolPortable;
 use crate::runtime::run;
 use crate::session::SpoolSession;
-use crate::storage::{Bridge, CoreStorage};
+use crate::storage::{Bridge, CoreStorage, FileStorage};
 use crate::values::{DeviceCapabilities, ScreenCapabilities};
 
 /// What the app says about this device.
@@ -120,13 +120,8 @@ fn session(session: sdk::Session) -> Arc<SpoolSession> {
     Arc::new(SpoolSession::new(session))
 }
 
-#[uniffi::export]
 impl SpoolClient {
-    /// Open this device: its key from `storage` (made on first start), and
-    /// an endpoint that listens for servers on the LAN without announcing
-    /// itself.
-    #[uniffi::constructor]
-    pub async fn open(
+    async fn open_on(
         storage: Arc<dyn CoreStorage>,
         device: DeviceSpec,
     ) -> Result<Arc<Self>, SpoolError> {
@@ -150,6 +145,33 @@ impl SpoolClient {
         let storage: Arc<dyn sdk::Storage> = Arc::new(Bridge(storage));
         let client = run(sdk::Client::open_with_options(storage, device, options)).await?;
         Ok(Arc::new(Self { client }))
+    }
+}
+
+#[uniffi::export]
+impl SpoolClient {
+    /// Open this device: its key from `storage` (made on first start), and
+    /// an endpoint that listens for servers on the LAN without announcing
+    /// itself.
+    #[uniffi::constructor]
+    pub async fn open(
+        storage: Arc<dyn CoreStorage>,
+        device: DeviceSpec,
+    ) -> Result<Arc<Self>, SpoolError> {
+        Self::open_on(storage, device).await
+    }
+
+    /// `open` on the crate's own [`FileStorage`]. On Android use this, not
+    /// `open`: there a `FileStorage` given as a `CoreStorage` is called
+    /// through Kotlin, and its cipher's callback, nested in that call,
+    /// detaches the thread under the Kotlin frame and ART aborts. Here the
+    /// cipher is the one callback.
+    #[uniffi::constructor]
+    pub async fn open_files(
+        storage: Arc<FileStorage>,
+        device: DeviceSpec,
+    ) -> Result<Arc<Self>, SpoolError> {
+        Self::open_on(storage, device).await
     }
 
     /// Show a pairing code as this device, called `name`: only with
@@ -800,6 +822,7 @@ impl PendingSignIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{SecretCipher, StorageFailure};
     use crate::values::DeviceCapabilities;
 
     fn device(catalog_cache: Option<u32>) -> DeviceSpec {
@@ -814,6 +837,39 @@ mod tests {
             downloads_dir: None,
             catalog_cache,
         }
+    }
+
+    struct PlainCipher;
+
+    impl SecretCipher for PlainCipher {
+        fn seal(&self, _name: String, plain: Vec<u8>) -> Result<Vec<u8>, StorageFailure> {
+            Ok(plain)
+        }
+
+        fn unseal(&self, _name: String, sealed: Vec<u8>) -> Result<Vec<u8>, StorageFailure> {
+            Ok(sealed)
+        }
+    }
+
+    /// `open_files` reads the device key through the storage it was given:
+    /// a second start is the same device.
+    #[tokio::test]
+    async fn opening_on_file_storage_keeps_the_device() {
+        let dir =
+            std::env::temp_dir().join(format!("spoolframe-ffi-open-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.display().to_string();
+        let storage = || FileStorage::new(root.clone(), Arc::new(PlainCipher)).unwrap();
+
+        let first = SpoolClient::open_files(storage(), device(None))
+            .await
+            .unwrap();
+        let second = SpoolClient::open_files(storage(), device(None))
+            .await
+            .unwrap();
+
+        assert_eq!(first.id(), second.id());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The app turns the catalog cache on with a capacity; off by default.

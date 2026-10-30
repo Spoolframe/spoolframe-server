@@ -99,6 +99,12 @@ The client SDK is on crates.io as
 Read its [README](crates/spoolframe-client-sdk/README.md) first: it
 explains one `[patch]` line an app should add.
 
+The wire protocol is stable: an app and a server of different releases
+still talk to each other. The SDK's Rust, Kotlin and Swift API follows
+semver but is not stable: each minor release (0.17 → 0.18) can break it,
+while patch releases on one minor line do not. Read the CHANGELOG's
+BREAKING entries before moving to a new minor.
+
 ## License
 
 The server crates are AGPL-3.0-or-later. The protocol, types, client SDK and

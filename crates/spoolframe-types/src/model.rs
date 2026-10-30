@@ -517,7 +517,6 @@ pub enum Caption {
     Length(Duration),
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl Item {
     /// Its length, for the kinds that play.
     pub fn duration(&self) -> Option<Duration> {

@@ -166,6 +166,20 @@ fn kotlin_bindings_compile() {
     succeeds(kotlinc);
 }
 
+/// What the Apple app adds to `Item`: SwiftUI lists need it Identifiable,
+/// and Swift refuses a property beside a method of the same name.
+const ITEM_IS_IDENTIFIABLE: &str = "
+import Foundation
+
+extension Item: Identifiable {
+    public var id: MediaId { itemId() }
+    public var title: String { itemTitle() }
+    public var artwork: [Artwork] { itemArtwork() }
+    public var playback: PlaybackState? { itemPlayback() }
+    public var duration: TimeInterval? { itemDuration() }
+}
+";
+
 /// Every crate's Swift as one module, as the Apple apps build it, each
 /// crate's C header through its module map.
 #[test]
@@ -181,6 +195,7 @@ fn swift_bindings_typecheck() {
     };
     let dir = out_dir("swift-typechecked");
     generate_in(&dir, TargetLanguage::Swift);
+    std::fs::write(dir.join("Identifiable.swift"), ITEM_IS_IDENTIFIABLE).unwrap();
     let mut swiftc = Command::new("swiftc");
     swiftc.args([
         "-typecheck",
@@ -209,6 +224,7 @@ const APP_CALLS: &[&str] = &[
     "wireName",
     "sortKeyFromWireName",
     "allSortKeys",
+    "openFiles",
     "allAudioCodecs",
     "subtitleModeFromWireName",
     "allBitmapPreferences",
@@ -216,11 +232,11 @@ const APP_CALLS: &[&str] = &[
     "itemSortFromSettings",
     "itemFilterFromSettings",
     // Item and plan accessors.
-    "id",
-    "title",
-    "artwork",
-    "duration",
-    "playback",
+    "itemId",
+    "itemTitle",
+    "itemArtwork",
+    "itemDuration",
+    "itemPlayback",
     "kind",
     "ladder",
     "sourceCodec",
