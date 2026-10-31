@@ -284,6 +284,12 @@ pub enum SpoolError {
     /// than read the old one's.
     #[error("the playback was planned again: follow the new plan")]
     Replanned,
+    /// A read of a progressive conversion's output before what is still
+    /// kept (from `kept_from`): the player started over, say from 0. Its
+    /// bytes are gone: `SpoolPlayback.seek` to where the viewer is, and
+    /// read the new encode.
+    #[error("read at {offset}, behind what the reader keeps (from {kept_from})")]
+    ReadBehind { offset: u64, kept_from: u64 },
     /// The loopback bridge the player reads from couldn't start.
     #[cfg(feature = "hls-bridge")]
     #[error("the player bridge can't start: {message}")]
@@ -440,6 +446,7 @@ impl From<SdkError> for SpoolError {
             SdkError::PlaybackRestarted { epoch } => Self::PlaybackRestarted { epoch },
             SdkError::PlaybackResumed { at } => Self::PlaybackResumed { at },
             SdkError::Replanned => Self::Replanned,
+            SdkError::ReadBehind { offset, kept_from } => Self::ReadBehind { offset, kept_from },
             SdkError::ProfileLocked => Self::ProfileLocked,
             SdkError::NoOfflinePin => Self::NoOfflinePin,
             SdkError::InvalidInput(message) => Self::InvalidInput { message },

@@ -193,10 +193,8 @@ impl ByteSource for ProgressiveReader {
             if ready > 0 && enough {
                 let bytes = state.copy(offset, length.min(ready));
                 let Some(bytes) = bytes else {
-                    return Err(BackendError::Protocol(format!(
-                        "read at {offset}, behind what the reader keeps"
-                    ))
-                    .into());
+                    let kept_from = state.chunks.front().map_or(state.end, |(start, _)| *start);
+                    return Err(BackendError::ReadBehind { offset, kept_from }.into());
                 };
                 state.playhead = offset + bytes.len() as u64;
                 state.trim();
@@ -466,6 +464,24 @@ mod tests {
                 .unwrap()
                 .len() as u64;
         }
+    }
+
+    /// A player with no length to seek in starts over from byte 0, which
+    /// went behind it long ago: it is told so by name, to restart the
+    /// encode, not with a protocol failure.
+    #[test]
+    fn a_read_behind_what_is_kept_says_where_that_begins() {
+        let (_dir, path, _) = media_file("progressive-behind", 3 * CHUNK as usize);
+        let (session, handle, _) = converted(path, 3 * CHUNK);
+        let reader = ProgressiveReader::for_test(session, handle, 0, thread_spawn(), None);
+        read_all_to(&reader, CHUNK + 2 * KEEP_BEHIND);
+        assert_eq!(
+            reader.read_reporting(0, 10, &mut |_| {}),
+            Err(ReadError::Backend(BackendError::ReadBehind {
+                offset: 0,
+                kept_from: CHUNK
+            }))
+        );
     }
 
     #[test]

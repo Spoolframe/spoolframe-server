@@ -186,6 +186,13 @@ pub enum SdkError {
     /// ([`crate::ManagedPlayback::snapshot`]) with a new reader.
     #[error("the playback was planned again: follow the new plan")]
     Replanned,
+    /// A read of a progressive conversion's output before what the reader
+    /// still keeps (`kept_from`): it reads in order, and the bytes behind
+    /// the demuxer are let go. A player that starts over gets no more of
+    /// them. To go back, restart the encode there
+    /// ([`crate::ManagedPlayback::seek`]) and read the new one from 0.
+    #[error("read at {offset}, behind what the reader keeps (from {kept_from})")]
+    ReadBehind { offset: u64, kept_from: u64 },
     /// This profile is locked on this device: ask for its PIN and
     /// [`crate::Session::unlock`]. The profile's [`crate::Session::user`]
     /// from [`crate::Client::profiles`] says `locked` before anything is

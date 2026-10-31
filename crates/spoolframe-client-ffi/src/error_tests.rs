@@ -71,6 +71,10 @@ fn every_variant() -> Vec<SdkError> {
             at: Duration::from_secs(90),
         },
         SdkError::Replanned,
+        SdkError::ReadBehind {
+            offset: 0,
+            kept_from: 4_194_304,
+        },
         SdkError::ProfileLocked,
         SdkError::NoOfflinePin,
         SdkError::InvalidInput("a PIN is 4 to 8 digits".into()),
