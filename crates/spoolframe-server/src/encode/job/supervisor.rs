@@ -246,6 +246,8 @@ pub(super) enum Ended {
     ScratchFull,
     /// ffmpeg could not be run again, decoding in software.
     NotRelaunched,
+    /// A seek past the last frame: nothing to encode, the stream's end.
+    NoFrames,
 }
 
 /// One ffmpeg spawned, its output pipes taken: to watch.
@@ -287,6 +289,12 @@ pub(super) fn driver_fault(ended: &Ended) -> bool {
 /// frame having reached them. Said at `-loglevel error`.
 const NO_FRAMES: &str = "A hardware frames reference is required";
 
+/// Whether a run that `ended` so could be one that found no frame: ffmpeg
+/// exited non-zero by itself.
+fn failed_for_no_frame(ended: &Ended) -> bool {
+    matches!(ended, Ended::Exited(status) if exit_blames_gpu(status))
+}
+
 /// Whether a run that `ended` so may have failed for decoding on the GPU:
 /// it exited non-zero, or stalled. A run ended by a signal (the kernel's
 /// OOM killer, an operator, or the server stopping it) says nothing about
@@ -305,12 +313,8 @@ impl Supervisor {
         // run started, never twice, whichever ffmpeg encoded it.
         let mut counted_ms = self.start_ms;
         let mut ended = self.watch(launched, &mut counted_ms).await;
-        if self.found_no_frame() {
-            tracing::info!(
-                pid = self.pid(),
-                start_ms = self.start_ms,
-                "a run found no frame where it started; nothing is wrong with the GPU"
-            );
+        if failed_for_no_frame(&ended) && self.no_frame_said() > 0 {
+            ended = self.no_frame(ended, &mut counted_ms).await;
             self.conclude(ended);
             return;
         }
@@ -372,18 +376,48 @@ impl Supervisor {
         self.conclude(ended);
     }
 
-    /// The run sought past the last frame: an encoder that takes its
-    /// device from the frames was opened with none. Not `Could not open
-    /// encoder before EOF`, which a refused size says too. From the start
-    /// it would mean the GPU decoded nothing, which is the GPU's.
-    fn found_no_frame(&self) -> bool {
-        self.start_ms > 0
-            && self
-                .shared
-                .stderr
-                .lock()
-                .iter()
-                .any(|line| line.contains(NO_FRAMES))
+    /// How many times ffmpeg said a run from a seek found no frame: an
+    /// encoder that takes its device from the frames was opened with none.
+    /// Not `Could not open encoder before EOF`, which a refused size says
+    /// too. None from the start: there it means the GPU decoded nothing,
+    /// which is the GPU's, and the file's to remember.
+    fn no_frame_said(&self) -> usize {
+        if self.start_ms == 0 {
+            return 0;
+        }
+        let kept = self.shared.stderr.lock();
+        kept.iter().filter(|l| l.contains(NO_FRAMES)).count()
+    }
+
+    /// A run from a seek that `ended` having found no frame. Decoded on the
+    /// GPU, that may be the GPU's: it runs once more, decoding in software,
+    /// and one failure at one place is not remembered against the file.
+    /// The fallback keeps the GPU encoder, so with no frame there either
+    /// it fails the same way: the seek was past the end of the stream, and
+    /// that is its end, not a failure. No other encoder would do better.
+    async fn no_frame(&mut self, ended: Ended, counted_ms: &mut u64) -> Ended {
+        let said = self.no_frame_said();
+        let decoded_on_gpu = self.shared.hardware_decode.load(Ordering::Relaxed);
+        let mut ended = ended;
+        if decoded_on_gpu {
+            let Some(fallback) = self.fallback.take() else {
+                return ended;
+            };
+            if !self.nothing_written().await {
+                return ended;
+            }
+            let launched = self.relaunch(&fallback);
+            ended = self.watch_again(launched, counted_ms).await;
+            if !failed_for_no_frame(&ended) || self.no_frame_said() == said {
+                return ended;
+            }
+        }
+        tracing::info!(
+            pid = self.pid(),
+            start_ms = self.start_ms,
+            "a run found no frame where it started: the stream ends here"
+        );
+        Ended::NoFrames
     }
 
     /// [`Supervisor::attempt`], then what a crash says of its card
@@ -628,11 +662,13 @@ impl Supervisor {
             Ended::Stalled => "stalled",
             Ended::ScratchFull => "scratch_full",
             Ended::NotRelaunched => "not_relaunched",
+            Ended::NoFrames => "no_frames",
         };
         let encoded_ms = self.progress.borrow().encoded_ms;
         self.shared.end(outcome, self.start_ms, encoded_ms, None);
         match ended {
             Ended::Exited(Ok(status)) if status.success() => self.finish(Ok(())),
+            Ended::NoFrames => self.finish(Ok(())),
             Ended::Exited(Ok(status)) => {
                 // A failed run holds nothing: its place in the budget goes
                 // to the next job, not to the playback until it is dropped.

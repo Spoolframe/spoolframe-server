@@ -668,71 +668,118 @@ fn made_by(decoder: crate::encode::Decoder) -> Made {
     }
 }
 
-/// A run from `start_ms` that said `said` on the GPU and exited 234, as
-/// `hevc_vaapi` does with no frame to open on: whether the film was
-/// remembered, and the command it ended on.
-async fn failing_at(test: &str, said: &str, start_ms: u64) -> (bool, Vec<String>) {
-    let script = decoding(&format!("echo '{said}' >&2; exit 234"));
-    let (jobs, tmp) = jobs(test, &script, 1, Duration::from_secs(60)).await;
+const NO_FRAME: &str =
+    "[hevc_vaapi] A hardware frames reference is required to associate the encoding device.";
+
+/// How a run ended that stand-in ffmpeg `script` ran from `start_ms`.
+struct Failed {
+    remembered: bool,
+    done: Result<(), String>,
+    command: Vec<String>,
+    bytes: u64,
+}
+
+async fn run_at(test: &str, script: &str, run: impl Fn(&Path, &Path) -> Run, at: u64) -> Failed {
+    let (jobs, tmp) = jobs(test, script, 1, Duration::from_secs(60)).await;
     let film = tmp.as_ref().join("film.mkv");
     let dir = jobs.dir().join("h/0");
     let file = dir.join("out.mkv");
     let job = jobs
         .start(
             dir,
-            gpu_run(&file, &film),
+            run(&file, &film),
             Written::Progressive { file: file.clone() },
             Load::Gpu,
             0,
             0,
-            start_ms,
+            at,
             None,
         )
         .unwrap();
-    let _ = done(&job).await;
-    (jobs.hardware_decode_failed(&film), job.command())
+    let done = done(&job).await;
+    Failed {
+        remembered: jobs.hardware_decode_failed(&film),
+        done,
+        command: job.command(),
+        bytes: job.progress().borrow().bytes,
+    }
 }
 
-/// A seek past the last frame: ffmpeg opens the encoder at the end of
-/// the file with no frame. The GPU did nothing wrong: the film isn't
-/// remembered, and no other run is tried.
+/// A run from `start_ms` that said `said` on the GPU and exited 234, as
+/// `hevc_vaapi` does with no frame to open on.
+async fn failing_at(test: &str, said: &str, start_ms: u64) -> Failed {
+    let script = decoding(&format!("echo '{said}' >&2; exit 234"));
+    run_at(test, &script, gpu_run, start_ms).await
+}
+
+/// A seek where the GPU decoded no frame, and software does: the viewer
+/// gets the seek, and the film isn't remembered for one failure there.
 #[tokio::test]
-async fn a_seek_that_finds_no_frame_is_not_held_against_the_film() {
-    let (remembered, command) = failing_at(
-        "gpu-no-frames",
-        "[hevc_vaapi] A hardware frames reference is required to associate the encoding device.",
-        30_000,
-    )
-    .await;
+async fn a_seek_the_gpu_found_no_frame_for_runs_once_more_in_software() {
+    let run = failing_at("gpu-no-frames", NO_FRAME, 30_000).await;
     assert_eq!(
-        (remembered, command.last().map(String::as_str)),
-        (false, Some("hw"))
+        (
+            run.remembered,
+            run.done,
+            run.command.last() != Some(&"hw".to_owned()),
+            run.bytes
+        ),
+        (false, Ok(()), true, 3)
+    );
+}
+
+/// Past the last frame software finds none either, and the encoder still
+/// opens with none: the stream is over, and that is no failure.
+#[tokio::test]
+async fn a_run_software_finds_no_frame_for_either_ends_as_finished() {
+    let script = format!("echo '{NO_FRAME}' >&2; exit 234");
+    let run = run_at("no-frames-at-all", &script, gpu_run, 30_000).await;
+    assert_eq!((run.remembered, run.done, run.bytes), (false, Ok(()), 0));
+}
+
+/// Decoding in software from the first, there is no second try to make.
+#[tokio::test]
+async fn a_software_decode_that_finds_no_frame_ends_as_finished() {
+    let script = format!("echo '{NO_FRAME}' >&2; exit 234");
+    let software = |file: &Path, _: &Path| Run {
+        args: vec![file.display().to_string()],
+        gpu: GpuUse::Vaapi,
+        made: Some(made_by(crate::encode::Decoder::Software)),
+        ..Run::default()
+    };
+    let run = run_at("no-frames-software", &script, software, 30_000).await;
+    assert_eq!((run.done, run.command.len()), (Ok(()), 2));
+}
+
+/// No frame is no encoder's fault: the next ones aren't tried.
+#[tokio::test]
+async fn a_run_that_finds_no_frame_tries_no_other_encoder() {
+    let fails = format!("echo '{NO_FRAME}' >&2; exit 234");
+    let script = aborting(&fails, "", "");
+    let amd = |file: &Path, _: &Path| amd_run(file, None);
+    let run = run_at("no-frames-encoders", &script, amd, 30_000).await;
+    assert_eq!(
+        (run.done, run.command.last().map(String::as_str)),
+        (Ok(()), Some("amd"))
     );
 }
 
 /// From the start, no frame says the GPU decoded none.
 #[tokio::test]
 async fn a_run_from_the_start_with_no_frame_is_held_against_the_film() {
-    let (remembered, _) = failing_at(
-        "gpu-no-frames-start",
-        "[hevc_vaapi] A hardware frames reference is required to associate the encoding device.",
-        0,
-    )
-    .await;
-    assert!(remembered);
+    assert!(
+        failing_at("gpu-no-frames-start", NO_FRAME, 0)
+            .await
+            .remembered
+    );
 }
 
 /// `Could not open encoder before EOF` alone says nothing: an encoder
 /// that refuses a size says it too, with frames there.
 #[tokio::test]
 async fn a_seek_the_gpu_failed_is_held_against_the_film() {
-    let (remembered, _) = failing_at(
-        "gpu-seek-fails",
-        "[hevc_vaapi] Could not open encoder before EOF",
-        30_000,
-    )
-    .await;
-    assert!(remembered);
+    let said = "[hevc_vaapi] Could not open encoder before EOF";
+    assert!(failing_at("gpu-seek-fails", said, 30_000).await.remembered);
 }
 
 /// The stand-in: `on_gpu` when the last argument is `hw`, else writes

@@ -381,12 +381,13 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
     assert_eq!(decoded(&out).unwrap(), (72, 480));
 }
 
-/// A run started past a film's last frame, real ffmpeg on a real encoder:
-/// it fails, with no frame to open the encoder on, and the GPU isn't to
-/// blame. The length is left out here, as a descriptor may leave it out,
-/// for the server's own clamp not to save it.
+/// A run started past a film's last frame, real ffmpeg on a real encoder,
+/// as a descriptor with no length lets it (the server's clamp saves the
+/// rest): no frame to open the encoder on, on the GPU or decoded in
+/// software, so the stream is over. It finishes, and the GPU isn't to
+/// blame.
 #[tokio::test]
-async fn a_run_past_the_last_frame_is_not_held_against_the_film() {
+async fn a_run_past_the_last_frame_finishes_and_is_not_held_against_the_film() {
     let dir = fresh_dir("vaapi-past-end").await;
     let Some(gpu) = gpu_or_skip("vaapi-past-end", &dir).await else {
         return;
@@ -461,12 +462,11 @@ async fn a_run_past_the_last_frame_is_not_held_against_the_film() {
     .expect("the job never ended")
     .unwrap()
     .clone();
-    assert!(
-        matches!(ended.done, Some(Err(_))) && !jobs.hardware_decode_failed(&film),
-        "{:?} {:?}",
-        ended.done,
-        job.stderr()
-    );
+    assert_eq!(ended.done, Some(Ok(())), "{:?}", job.stderr());
+    assert!(!jobs.hardware_decode_failed(&film));
+    assert!(!job.command().iter().any(|a| a == "-hwaccel"));
+    // A reader opens it, then finds the end of the stream at 0.
+    assert_eq!(std::fs::metadata(&out).map(|m| m.len()).ok(), Some(0));
 }
 
 /// With GPU filters on, a 10-bit HDR10 HEVC source is tone mapped on the
