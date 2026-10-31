@@ -124,6 +124,10 @@ spoolframe-protocol = { workspace = true, features = ["soft-key"] }
 # Its live checks of the stranger limits, run against a test server (PX-11).
 spoolframe-probe = { workspace = true }
 webauthn-authenticator-rs = { workspace = true }
+# Signs with the private key of the passkey webauthn-rs 0.5.5 stored
+# (tests/fixtures/webauthn-0.5.5.json): its soft token's file does not load
+# in a later version.
+p256 = { workspace = true }
 # The stand-in OpenID Connect provider's token times (P3-04).
 chrono = { workspace = true }
 # A CP-1251 subtitle for the download tests (PX-02).

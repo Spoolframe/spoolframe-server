@@ -3,16 +3,23 @@
 
 use std::net::SocketAddr;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonrpsee::ws_client::WsClient;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{DerSignature, SigningKey};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use spoolframe_admin_api::{AdminApiClient, MeApiClient, NewUser, Role, error_code};
 use webauthn_authenticator_rs::AuthenticatorBackend;
 use webauthn_authenticator_rs::softtoken::SoftToken;
 use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
 use webauthn_rs_proto::UserVerificationPolicy;
 
-use crate::admin::{CODE, anonymous, code, creds, server_at, server_at_behind, setup, with_token};
-use crate::support::logs;
+use crate::admin::{
+    CODE, anonymous, code, creds, serve_beside, server_at, server_at_behind, setup, with_token,
+};
+use crate::support::{TestServer, fresh_dir, logs};
 
 /// Where browsers reach the test servers: the relying party.
 pub(crate) const ORIGIN: &str = "https://media.example.org";
@@ -1024,4 +1031,167 @@ async fn a_passkey_signed_on_another_localhost_port_signs_no_one_in() {
     .await
     .unwrap();
     assert_refused(refused).await;
+}
+
+/// A passkey as webauthn-rs 0.5.5 kept it, in the `passkeys` table of every
+/// server of 0.16 and before, with the private key of the soft token that
+/// made it. `tests/fixtures/webauthn-0.5.5.json` was written by that
+/// version and is never written again: a change to how a credential is
+/// read fails here, not for a user who can no longer sign in.
+pub(crate) struct KeptPasskey {
+    pub(crate) id: Vec<u8>,
+    pub(crate) handle: String,
+    pub(crate) credential: String,
+    key: SigningKey,
+}
+
+/// A key's answer to a challenge, as an authenticator gives it.
+pub(crate) struct Assertion {
+    pub(crate) authenticator_data: Vec<u8>,
+    pub(crate) client_data_json: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+}
+
+impl KeptPasskey {
+    pub(crate) fn new() -> Self {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../fixtures/webauthn-0.5.5.json")).unwrap();
+        let passkey = &fixture["passkey"];
+        let bytes = |at: &Value| URL_SAFE_NO_PAD.decode(at.as_str().unwrap()).unwrap();
+        Self {
+            id: bytes(&passkey["credential_id"]),
+            handle: fixture["user_handle"].as_str().unwrap().to_owned(),
+            credential: passkey["credential"].as_str().unwrap().to_owned(),
+            key: SigningKey::from_slice(&bytes(&passkey["private_key"])).unwrap(),
+        }
+    }
+
+    /// Keep it as `username`'s, under `rp_id`, as the store has it.
+    pub(crate) async fn keep(&self, server: &TestServer, username: &str, rp_id: &str) {
+        let user = server.store.user_by_name(username).await.unwrap().unwrap();
+        let id = URL_SAFE_NO_PAD.encode(&self.id);
+        assert_eq!(
+            server
+                .store
+                .passkey_user_handle(user.id, &self.handle)
+                .await
+                .unwrap(),
+            self.handle
+        );
+        server
+            .store
+            .add_passkey(user.id, &id, "Kept", &self.credential, rp_id)
+            .await
+            .unwrap();
+    }
+
+    /// `challenge` signed for `rp_id` at `origin`, with its user verified
+    /// and its signature counter at 1.
+    pub(crate) fn sign(&self, rp_id: &str, origin: &str, challenge: &[u8]) -> Assertion {
+        Self::sign_with(&self.key, rp_id, origin, challenge)
+    }
+
+    /// As [`KeptPasskey::sign`], with a key that is not the passkey's.
+    pub(crate) fn forge(&self, rp_id: &str, origin: &str, challenge: &[u8]) -> Assertion {
+        Self::sign_with(
+            &SigningKey::from_slice(&[0x11; 32]).unwrap(),
+            rp_id,
+            origin,
+            challenge,
+        )
+    }
+
+    fn sign_with(key: &SigningKey, rp_id: &str, origin: &str, challenge: &[u8]) -> Assertion {
+        let client_data_json = json!({
+            "type": "webauthn.get",
+            "challenge": URL_SAFE_NO_PAD.encode(challenge),
+            "origin": origin,
+            "crossOrigin": false,
+        })
+        .to_string()
+        .into_bytes();
+        let mut authenticator_data = Sha256::digest(rp_id).to_vec();
+        // User present and verified.
+        authenticator_data.push(0x05);
+        authenticator_data.extend_from_slice(&1_u32.to_be_bytes());
+        let signed = [
+            authenticator_data.as_slice(),
+            Sha256::digest(&client_data_json).as_slice(),
+        ]
+        .concat();
+        let signature: DerSignature = key.sign(&signed);
+        Assertion {
+            authenticator_data,
+            client_data_json,
+            signature: signature.as_bytes().to_vec(),
+        }
+    }
+
+    /// What the browser sends for `assertion`.
+    fn from_browser(&self, assertion: &Assertion) -> Value {
+        let id = URL_SAFE_NO_PAD.encode(&self.id);
+        let handle: uuid::Uuid = self.handle.parse().unwrap();
+        json!({
+            "id": id,
+            "rawId": id,
+            "response": {
+                "authenticatorData": URL_SAFE_NO_PAD.encode(&assertion.authenticator_data),
+                "clientDataJSON": URL_SAFE_NO_PAD.encode(&assertion.client_data_json),
+                "signature": URL_SAFE_NO_PAD.encode(&assertion.signature),
+                "userHandle": URL_SAFE_NO_PAD.encode(handle.as_bytes()),
+            },
+            "extensions": {},
+            "type": "public-key",
+        })
+    }
+}
+
+/// A server at [`ORIGIN`] with `alice`, who has [`KeptPasskey`].
+async fn server_with_a_kept_passkey(test: &str) -> (TestServer, SocketAddr, KeptPasskey) {
+    let server = TestServer::start_with(fresh_dir(test).await, Default::default()).await;
+    server.add_user("alice", PASSWORD, Some("Alice")).await;
+    let addr = serve_beside(&server, ORIGIN).await;
+    let kept = KeptPasskey::new();
+    kept.keep(&server, "alice", RP_ID).await;
+    (server, addr, kept)
+}
+
+/// A sign-in begun now, with what is in the store as an earlier version
+/// left it. It signs alice in, and the credential is stored again as it
+/// was, its counter moved on: a server that is rolled back reads it too.
+#[tokio::test]
+async fn a_passkey_webauthn_0_5_5_stored_signs_in() {
+    let (server, addr, kept) = server_with_a_kept_passkey("passkey-kept").await;
+    let (ceremony, options) = begin(addr).await;
+    let challenge = URL_SAFE_NO_PAD
+        .decode(options["publicKey"]["challenge"].as_str().unwrap())
+        .unwrap();
+    let signed = kept.from_browser(&kept.sign(RP_ID, ORIGIN, &challenge));
+
+    let signed_in = finish(addr, &ceremony, signed).await;
+
+    assert_eq!(signed_in.status(), reqwest::StatusCode::OK);
+    assert_eq!(who(addr, &cookie(&signed_in)).await["username"], "alice");
+    let id = URL_SAFE_NO_PAD.encode(&kept.id);
+    let stored = server.store.passkey(&id).await.unwrap().unwrap();
+    let mut expected: Value = serde_json::from_str(&kept.credential).unwrap();
+    expected["cred"]["counter"] = json!(1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored.credential).unwrap(),
+        expected
+    );
+}
+
+/// The stored public key is what decides it: signed with another key, the
+/// same sign-in is refused.
+#[tokio::test]
+async fn a_passkey_webauthn_0_5_5_stored_answers_only_to_its_key() {
+    let (_server, addr, kept) = server_with_a_kept_passkey("passkey-kept-key").await;
+    let (ceremony, options) = begin(addr).await;
+    let challenge = URL_SAFE_NO_PAD
+        .decode(options["publicKey"]["challenge"].as_str().unwrap())
+        .unwrap();
+    let forged = kept.from_browser(&kept.forge(RP_ID, ORIGIN, &challenge));
+
+    assert_refused(finish(addr, &ceremony, forged).await).await;
 }

@@ -21,6 +21,7 @@ use webauthn_authenticator_rs::softtoken::SoftToken;
 use webauthn_rs::prelude::Url;
 
 use crate::admin::{anonymous, creds, serve_beside, with_token};
+use crate::passkeys::{Assertion, KeptPasskey};
 use crate::support::{ServerOptions, TestClient, TestServer, fresh_dir, logs};
 
 const PASSWORD: &str = "correct horse";
@@ -1358,6 +1359,62 @@ async fn age(server: &TestServer, session: &SessionId) {
         &hash,
     )
     .await;
+}
+
+/// A passkey webauthn-rs 0.5.5 stored, on a sign-in begun now: the
+/// challenge made from the server's id and nonce is the one that counts.
+#[tokio::test]
+async fn an_app_passkey_webauthn_0_5_5_stored_signs_in() {
+    let server = server("app-passkey-kept").await;
+    let kept = KeptPasskey::new();
+    let rp_id = server.server_id.rp_id();
+    kept.keep(&server, "alice", &rp_id).await;
+    let tv = device(&server, "Living room TV").await;
+    let request = begin_sign_in(&tv, None).await;
+
+    let signed_in = finish_sign_in(
+        &tv,
+        kept_answer(
+            &kept,
+            kept.sign(&rp_id, &request.origin, &request.challenge),
+        ),
+    )
+    .await;
+
+    session_of(signed_in);
+}
+
+#[tokio::test]
+async fn an_app_passkey_webauthn_0_5_5_stored_answers_only_to_its_key() {
+    let server = server("app-passkey-kept-key").await;
+    let kept = KeptPasskey::new();
+    let rp_id = server.server_id.rp_id();
+    kept.keep(&server, "alice", &rp_id).await;
+    let tv = device(&server, "Living room TV").await;
+    let request = begin_sign_in(&tv, None).await;
+
+    let forged = finish_sign_in(
+        &tv,
+        kept_answer(
+            &kept,
+            kept.forge(&rp_id, &request.origin, &request.challenge),
+        ),
+    )
+    .await;
+
+    assert_eq!(forged, REFUSED);
+}
+
+/// What the app sends for `assertion`, of [`KeptPasskey`].
+fn kept_answer(kept: &KeptPasskey, assertion: Assertion) -> FinishPasskeySignIn {
+    let handle: uuid::Uuid = kept.handle.parse().unwrap();
+    FinishPasskeySignIn {
+        credential_id: kept.id.clone(),
+        authenticator_data: assertion.authenticator_data,
+        client_data_json: assertion.client_data_json,
+        signature: assertion.signature,
+        user_handle: Some(handle.as_bytes().to_vec()),
+    }
 }
 
 /// Run `query` on the server's database, as a hand edit would.

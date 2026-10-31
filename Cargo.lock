@@ -7645,6 +7645,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "p256 0.14.0",
  "parking_lot",
  "portmapper",
  "prost",

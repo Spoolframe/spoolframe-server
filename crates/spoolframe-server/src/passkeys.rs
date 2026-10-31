@@ -615,6 +615,98 @@ mod tests {
         Passkeys::new(&origins, &ServerId::from_bytes([0; 10]))
     }
 
+    /// What webauthn-rs 0.5.5 wrote: a registration and sign-ins begun and
+    /// answered, and what it stored. Written once by that version, with
+    /// the soft token and with an RS256 key signed by hand, as Windows
+    /// Hello makes them: attestation none, backed up.
+    fn fixture() -> (serde_json::Value, RelyingParty) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/webauthn-0.5.5.json")).unwrap();
+        let party = RelyingParty::at(
+            fixture["rp_id"].as_str().unwrap(),
+            fixture["origin"].as_str().unwrap(),
+        )
+        .unwrap();
+        (fixture, party)
+    }
+
+    fn from<T: serde::de::DeserializeOwned>(json: &serde_json::Value) -> T {
+        serde_json::from_value(json.clone()).unwrap()
+    }
+
+    fn kept(at: &serde_json::Value) -> Passkey {
+        serde_json::from_str(at.as_str().unwrap()).unwrap()
+    }
+
+    /// A ceremony state lives in memory, so none outlives a restart; this
+    /// still pins that the new version reads the shape. What it stores is
+    /// byte for byte what 0.5.5 stored for the same answer.
+    #[test]
+    fn a_registration_webauthn_0_5_5_began_finishes_and_stores_the_same() {
+        let (fixture, party) = fixture();
+        let made: RegisterPublicKeyCredential = from(&fixture["registration"]["made"]);
+        let state: PasskeyRegistration = from(&fixture["registration"]["state"]);
+
+        let (id, json) = party.made(&made, &state).unwrap();
+
+        assert_eq!(id, fixture["passkey"]["credential_id"].as_str().unwrap());
+        assert_eq!(json, fixture["passkey"]["credential"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_sign_in_webauthn_0_5_5_began_finishes_with_its_stored_key() {
+        let (fixture, party) = fixture();
+        let signed: PublicKeyCredential = from(&fixture["sign_in"]["signed"]);
+        let state: DiscoverableAuthentication = from(&fixture["sign_in"]["state"]);
+        let passkey = kept(&fixture["passkey"]["credential"]);
+
+        let (handle, _) = party
+            .webauthn
+            .identify_discoverable_authentication(&signed)
+            .unwrap();
+        assert_eq!(handle.to_string(), fixture["user_handle"].as_str().unwrap());
+        let done = party
+            .webauthn
+            .finish_discoverable_authentication(&signed, state, &[DiscoverableKey::from(&passkey)])
+            .unwrap();
+
+        assert_eq!(done.cred_id(), passkey.cred_id());
+    }
+
+    #[test]
+    fn an_rs256_passkey_webauthn_0_5_5_stored_verifies() {
+        let (fixture, party) = fixture();
+        let signed: PublicKeyCredential = from(&fixture["rs256"]["signed"]);
+        let state: DiscoverableAuthentication = from(&fixture["rs256"]["state"]);
+        let passkey = kept(&fixture["rs256"]["credential"]);
+
+        let done = party
+            .webauthn
+            .finish_discoverable_authentication(&signed, state, &[DiscoverableKey::from(&passkey)])
+            .unwrap();
+
+        assert_eq!(done.counter(), 5);
+    }
+
+    #[test]
+    fn an_rs256_passkey_webauthn_0_5_5_stored_refuses_a_changed_signature() {
+        let (fixture, party) = fixture();
+        let mut signed: PublicKeyCredential = from(&fixture["rs256"]["signed"]);
+        let state: DiscoverableAuthentication = from(&fixture["rs256"]["state"]);
+        let passkey = kept(&fixture["rs256"]["credential"]);
+        let mut signature = signed.response.signature.to_vec();
+        signature[0] ^= 1;
+        signed.response.signature = signature.into();
+
+        let done = party.webauthn.finish_discoverable_authentication(
+            &signed,
+            state,
+            &[DiscoverableKey::from(&passkey)],
+        );
+
+        assert!(done.is_err());
+    }
+
     #[test]
     fn the_relying_party_is_the_public_url_s_host() {
         let passkeys = party(Origins::Exactly("https://media.example.org".into()));

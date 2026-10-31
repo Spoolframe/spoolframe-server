@@ -718,6 +718,69 @@ mod tests {
             .unwrap();
     }
 
+    /// What webauthn-rs 0.5.5 wrote (see `crate::passkeys`' tests).
+    fn fixture() -> (serde_json::Value, RelyingParty) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/webauthn-0.5.5.json")).unwrap();
+        let party = RelyingParty::at(
+            fixture["rp_id"].as_str().unwrap(),
+            fixture["origin"].as_str().unwrap(),
+        )
+        .unwrap();
+        (fixture, party)
+    }
+
+    fn bytes(at: &serde_json::Value) -> Vec<u8> {
+        URL_SAFE_NO_PAD.decode(at.as_str().unwrap()).unwrap()
+    }
+
+    /// [`with_challenge`] depends on the state's shape, so the shape of a
+    /// state 0.5.5 wrote is what it is run on: finished with what was
+    /// signed for the derived challenge, and refused without it.
+    #[test]
+    fn a_sign_in_state_webauthn_0_5_5_wrote_takes_the_derived_challenge() {
+        let (fixture, party) = fixture();
+        let fixed = &fixture["app_sign_in"];
+        let signed = asserted(&FinishPasskeySignIn {
+            credential_id: bytes(&fixed["signed"]["credential_id"]),
+            authenticator_data: bytes(&fixed["signed"]["authenticator_data"]),
+            client_data_json: bytes(&fixed["signed"]["client_data_json"]),
+            signature: bytes(&fixed["signed"]["signature"]),
+            user_handle: None,
+        });
+        let unchanged: DiscoverableAuthentication =
+            serde_json::from_value(fixed["state"].clone()).unwrap();
+        let state = with_challenge(copy(&unchanged), "ast", &bytes(&fixed["challenge"])).unwrap();
+        let passkey: Passkey =
+            serde_json::from_str(fixture["passkey"]["credential"].as_str().unwrap()).unwrap();
+        let keys = [DiscoverableKey::from(&passkey)];
+
+        assert!(
+            party
+                .webauthn
+                .finish_discoverable_authentication(&signed, unchanged, &keys)
+                .is_err()
+        );
+        party
+            .webauthn
+            .finish_discoverable_authentication(&signed, state, &keys)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_registration_state_webauthn_0_5_5_wrote_takes_the_derived_challenge() {
+        let (fixture, party) = fixture();
+        let fixed = &fixture["app_registration"];
+        let made: RegisterPublicKeyCredential =
+            serde_json::from_value(fixed["made"].clone()).unwrap();
+        let unchanged: PasskeyRegistration =
+            serde_json::from_value(fixed["state"].clone()).unwrap();
+        let state = with_challenge(copy(&unchanged), "rs", &bytes(&fixed["challenge"])).unwrap();
+
+        assert!(party.made(&made, &unchanged).is_err());
+        party.made(&made, &state).unwrap();
+    }
+
     /// A state without the slot is an error, never a state with the
     /// challenge webauthn-rs made.
     #[test]
