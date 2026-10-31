@@ -164,6 +164,10 @@ impl PlaybackBackend for Routed {
     fn route(&self) -> Option<RemoteMode> {
         self.route.lock().as_ref().map(|r| r.mode)
     }
+    /// Home: the next item picks a route of its own.
+    fn next_session(&self) -> Option<Session> {
+        Some(self.home.clone())
+    }
     /// None followed: the playback picks its server once, at start, and a
     /// paired server's events name its own item, not the `fed:` id.
     fn subtitle_timings(

@@ -44,19 +44,29 @@ impl ManagedPlayback {
 
     /// [`Self::open_after`] this playback, through its own backend: the
     /// next item for an app that holds the playback but not the session
-    /// ([`Session::open_playback_next`] for one that does).
+    /// ([`Session::open_playback_next`] for one that does). A session's
+    /// playback opens it as that does: a backend of one route is the
+    /// playing item's alone, and starting another on it would take its
+    /// route from under it and report the next by its id.
     pub async fn open_next(
         &self,
         item: MediaId,
         selection: Option<Selection>,
         options: PlaybackOptions,
     ) -> Result<Self, SdkError> {
-        Self::open_after(self.0.backend.clone(), item, self, selection, options).await
+        match self.0.backend.next_session() {
+            Some(session) => {
+                session
+                    .open_playback_next(&item, self, selection, options)
+                    .await
+            }
+            None => Self::open_after(self.0.backend.clone(), item, self, selection, options).await,
+        }
     }
 }
 
 impl Session {
-    /// [`Session::open_playback`] for the item after `after`, which
+    /// [`Session::open_any_playback`] for the item after `after`, which
     /// plays, as [`ManagedPlayback::open_after`]: to play gapless, or to
     /// have the next ready.
     pub async fn open_playback_next(
@@ -67,7 +77,7 @@ impl Session {
         options: PlaybackOptions,
     ) -> Result<ManagedPlayback, SdkError> {
         open_next(after, || {
-            self.open_playback(item, selection, options.clone())
+            self.open_any_playback(item, selection, options.clone())
         })
         .await
     }

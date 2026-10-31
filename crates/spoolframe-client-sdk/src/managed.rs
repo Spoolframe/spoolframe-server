@@ -204,6 +204,12 @@ pub trait PlaybackBackend: Send + Sync + 'static {
             .await
             .map(ChunkStream::from)
     }
+    /// The session the item after this backend's playback opens through
+    /// ([`ManagedPlayback::open_next`]); `None` opens it through this
+    /// backend.
+    fn next_session(&self) -> Option<Session> {
+        None
+    }
     // The six below have no default: playback reaches each of them
     // (the subtitle file, a stall, a track change, a re-plan), and a
     // default that refused would compile and only fail mid-playback. A
@@ -250,6 +256,9 @@ fn no_hls() -> SdkError {
 
 #[async_trait]
 impl PlaybackBackend for Session {
+    fn next_session(&self) -> Option<Session> {
+        Some(self.clone())
+    }
     async fn start(
         &self,
         item: &MediaId,

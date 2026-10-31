@@ -18,6 +18,17 @@ with a 0.16 server.
   encode. A run past the last frame all the same (no known length) runs
   once more decoding in software, then ends as the stream's end. It no
   longer marks the file as CPU-decoded or tries other encoders.
+- SDK: `PlayerSession::for_session(session)` opens each item with
+  `Session::open_any_playback`, so a paired server's item plays by its
+  route, `ManagedPlayback::route` and `proxied` say which, and its
+  progress goes to the user's own server by the `fed:` id.
+  `PlayerSession::new(backend)` stays, and has no routes.
+  `Session::open_playback_next` now opens as `open_any_playback` does.
+  `ManagedPlayback::open_next` on a session's playback does the same: on
+  a paired server's item it took the route from the item playing, whose
+  reads then failed, and reported the next item by the first's id.
+  `PlaybackBackend::next_session` has a default, so a backend of an app's
+  own changes nothing.
 - FFI: `SpoolPlayback.seek(target)` seeks a progressive conversion, which
   had no way to through the FFI: the server encodes again from `target`,
   and the answer is the new plan to rebuild from, read from offset 0. For

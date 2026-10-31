@@ -1,7 +1,7 @@
 //! One player's playbacks, one after another ([`PlayerSession`]).
 
 use super::{ManagedPlayback, RestartCause};
-use crate::{Playback, PlaybackBackend, PlaybackOptions, SdkError};
+use crate::{Playback, PlaybackBackend, PlaybackOptions, SdkError, Session};
 use parking_lot::Mutex;
 use spoolframe_protocol::Selection;
 use spoolframe_types::MediaId;
@@ -23,8 +23,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone)]
 pub struct PlayerSession(Arc<Inner>);
 
+/// How a player's items open.
+enum Opener {
+    /// All through one backend: a mock, or an app's own.
+    Backend(Arc<dyn PlaybackBackend>),
+    /// Each by what it is: a paired server's by its route.
+    Session(Session),
+}
+
+impl Opener {
+    async fn open(
+        &self,
+        item: MediaId,
+        selection: Option<Selection>,
+        options: PlaybackOptions,
+    ) -> Result<ManagedPlayback, SdkError> {
+        match self {
+            Self::Backend(backend) => {
+                ManagedPlayback::open(backend.clone(), item, selection, options).await
+            }
+            Self::Session(session) => session.open_any_playback(&item, selection, options).await,
+        }
+    }
+}
+
 struct Inner {
-    backend: Arc<dyn PlaybackBackend>,
+    opener: Opener,
     /// Held through each step, so they run in order.
     line: tokio::sync::Mutex<()>,
     /// One more for each start and end asked: a start whose number is not
@@ -40,9 +64,22 @@ struct Playing {
 }
 
 impl PlayerSession {
+    /// A player whose items all open through `backend`. A paired server's
+    /// item has no route this way ([`Self::for_session`]).
     pub fn new(backend: Arc<dyn PlaybackBackend>) -> Self {
+        Self::with(Opener::Backend(backend))
+    }
+
+    /// A player whose items open as [`Session::open_any_playback`] opens
+    /// them: a paired server's carries its route
+    /// ([`ManagedPlayback::route`]), and its progress goes home.
+    pub fn for_session(session: Session) -> Self {
+        Self::with(Opener::Session(session))
+    }
+
+    fn with(opener: Opener) -> Self {
         Self(Arc::new(Inner {
-            backend,
+            opener,
             line: tokio::sync::Mutex::new(()),
             asked: AtomicU64::new(0),
             current: Mutex::new(None),
@@ -70,8 +107,7 @@ impl PlayerSession {
             if this.0.asked.load(Ordering::SeqCst) != mine {
                 return Err(SdkError::PlaybackClosed);
             }
-            let playback =
-                ManagedPlayback::open(this.0.backend.clone(), item, selection, options).await?;
+            let playback = this.0.opener.open(item, selection, options).await?;
             if this.0.asked.load(Ordering::SeqCst) != mine {
                 // Overtaken while it was asked: it never plays.
                 let _ = playback.close().await;

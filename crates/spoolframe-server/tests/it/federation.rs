@@ -2008,6 +2008,16 @@ pub(crate) mod app {
         username: &str,
         experimental: Experimental,
     ) -> (Client, Session) {
+        signed_in_playing(server, username, experimental, mkv_capabilities()).await
+    }
+
+    /// [`signed_in`], on a device that plays what `capabilities` say.
+    pub(crate) async fn signed_in_playing(
+        server: &TestServer,
+        username: &str,
+        experimental: Experimental,
+        capabilities: spoolframe_types::ClientCapabilities,
+    ) -> (Client, Session) {
         let options = ClientOptions {
             lan_discovery: false,
             experimental,
@@ -2018,7 +2028,7 @@ pub(crate) mod app {
             client_name: "sdk-test".into(),
             client_version: "0".into(),
             platform: spoolframe_client_sdk::types::Platform::Ios,
-            capabilities: mkv_capabilities(),
+            capabilities,
         };
         let client = Client::open_with_options(Arc::new(MemoryStorage::default()), device, options)
             .await
@@ -5658,6 +5668,240 @@ mod replica {
                 "SB carried none of it"
             );
             playback.close().await.unwrap();
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// A track of SA's, shared and its file written: what plays after
+        /// the film, which is alone in its library.
+        async fn sa_s_track(pair: &Pair) -> MediaId {
+            pair.sa.catalog.serve_music();
+            pair.share("plex:2").await;
+            pair.refresh().await;
+            pair.sa.write_episode("33");
+            pair.fed(&MediaId::new(Namespace::Plex, MediaKind::Track, "33").unwrap())
+        }
+
+        /// Bob's app, which plays the film and the track's stand-in file.
+        async fn bob_s_app(
+            pair: &Pair,
+        ) -> (
+            spoolframe_client_sdk::Client,
+            spoolframe_client_sdk::Session,
+        ) {
+            let mut capabilities = mkv_capabilities();
+            capabilities
+                .video
+                .insert(spoolframe_types::VideoCodec::H264);
+            capabilities
+                .audio
+                .insert(spoolframe_types::AudioCodec::Eac3);
+            super::super::app::signed_in_playing(
+                &pair.sb,
+                "bob",
+                super::super::app::FEDERATION,
+                capabilities,
+            )
+            .await
+        }
+
+        /// Whether SB keeps Bob's place in `item`.
+        async fn keeps_place(pair: &Pair, item: &MediaId) -> bool {
+            let bob = pair.sb.store.user_by_name("bob").await.unwrap().unwrap().id;
+            let principal = spoolframe_server::principal::Principal::LocalUser(bob);
+            let kept = pair
+                .sb
+                .store
+                .watch_states(principal, &[item.to_string()])
+                .await
+                .unwrap();
+            !kept.is_empty()
+        }
+
+        /// A player opened on the session plays SA's film as
+        /// `open_any_playback` does: by its route, read from SA, its
+        /// progress going to SB by the `fed:` id.
+        #[tokio::test]
+        async fn a_player_session_plays_sa_s_film_by_its_route() {
+            use spoolframe_client_sdk::{PlaybackOptions, PlayerSession, RemoteMode};
+            let pair = Pair::start("fed-media-player-route").await;
+            let (file, _) = shared(&pair).await;
+            let (client, bob) =
+                super::super::app::signed_in(&pair.sb, "bob", super::super::app::FEDERATION).await;
+            let alien = pair.fed(movie().id());
+            let player = PlayerSession::for_session(bob.clone());
+            let playback = player
+                .start(alien.clone(), None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(playback.route(), Some(RemoteMode::Direct));
+            assert_eq!(playback.read(0, 4096).await.unwrap(), file[..4096]);
+            playback
+                .report_position(std::time::Duration::from_secs(600))
+                .unwrap();
+            playback.flush().await.unwrap();
+            assert!(keeps_place(&pair, &alien).await, "SB keeps the place");
+            assert_eq!(pair.sa.debug.list().open.len(), 1, "SA plays it");
+            assert!(
+                pair.sb.debug.list().open.is_empty(),
+                "SB carried none of it"
+            );
+            player.end().await;
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// The user's own server's item has no route to carry.
+        #[tokio::test]
+        async fn a_player_session_plays_sb_s_own_film_with_no_route() {
+            use spoolframe_client_sdk::{PlaybackOptions, PlayerSession};
+            let sb = TestServer::start_with(
+                fresh_dir("fed-media-player-own").await,
+                ServerOptions {
+                    federation: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
+            let file = sb.write_media(1 << 20);
+            sb.add_user("bob", "correct horse", None).await;
+            let (client, bob) =
+                super::super::app::signed_in(&sb, "bob", super::super::app::FEDERATION).await;
+            let player = PlayerSession::for_session(bob);
+            let playback = player
+                .start(movie().id().clone(), None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(playback.route(), None);
+            assert!(!playback.proxied());
+            assert_eq!(playback.read(0, 4096).await.unwrap(), file[..4096]);
+            assert_eq!(sb.debug.list().open.len(), 1, "SB plays it");
+            player.end().await;
+            client.close().await;
+            sb.stop().await;
+        }
+
+        /// What replaces a paired server's item takes its own route, and
+        /// is not reported by the first's id; the one before stops at the
+        /// server that played it.
+        #[tokio::test]
+        async fn a_player_session_s_replacement_plays_by_its_own_route() {
+            use spoolframe_client_sdk::{PlaybackOptions, PlayerSession, RemoteMode};
+            let pair = Pair::start("fed-media-player-replace").await;
+            shared(&pair).await;
+            let (client, bob) = bob_s_app(&pair).await;
+            let film = pair.fed(movie().id());
+            let track = sa_s_track(&pair).await;
+            let player = PlayerSession::for_session(bob.clone());
+            player
+                .start(film.clone(), None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            let replaced = player
+                .start(track.clone(), None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(replaced.route(), Some(RemoteMode::Direct));
+            assert_eq!(pair.sa.debug.list().open.len(), 1, "the film stopped on SA");
+            replaced
+                .report_position(std::time::Duration::from_secs(60))
+                .unwrap();
+            replaced.flush().await.unwrap();
+            assert!(!keeps_place(&pair, &film).await, "not by the film's id");
+            player.end().await;
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// A start overtaken by the next is never opened on either server,
+        /// and an end after that stops the last at SA.
+        #[tokio::test]
+        async fn a_player_session_keeps_the_order_of_paired_items() {
+            use spoolframe_client_sdk::{PlaybackOptions, PlayerSession, RemoteMode, SdkError};
+            let pair = Pair::start("fed-media-player-order").await;
+            shared(&pair).await;
+            let (client, bob) = bob_s_app(&pair).await;
+            let film = pair.fed(movie().id());
+            let track = sa_s_track(&pair).await;
+            let player = PlayerSession::for_session(bob);
+            let overtaken = player.start(film, None, PlaybackOptions::default());
+            let last = player.start(track, None, PlaybackOptions::default());
+            assert_eq!(overtaken.await.err(), Some(SdkError::PlaybackClosed));
+            let last = last.await.unwrap();
+            assert_eq!(last.route(), Some(RemoteMode::Direct));
+            assert_eq!(pair.sa.debug.list().open.len(), 1, "only the last plays");
+            assert!(
+                player
+                    .current()
+                    .is_some_and(|p| p.snapshot().handle == last.snapshot().handle)
+            );
+            player.end().await;
+            assert!(player.current().is_none());
+            assert!(pair.sa.debug.list().open.is_empty(), "ended on SA");
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// The next of a paired server's item, opened by the session:
+        /// it has a route of its own, and what plays keeps its.
+        #[tokio::test]
+        async fn the_session_s_next_paired_item_plays_by_its_route() {
+            use spoolframe_client_sdk::{PlaybackOptions, PlayerSession, RemoteMode};
+            let pair = Pair::start("fed-media-next-session").await;
+            let (file, _) = shared(&pair).await;
+            let (client, bob) = bob_s_app(&pair).await;
+            let film = pair.fed(movie().id());
+            let track = sa_s_track(&pair).await;
+            let player = PlayerSession::for_session(bob.clone());
+            let playing = player
+                .start(film, None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(playing.read(0, 4096).await.unwrap(), file[..4096]);
+            let next = bob
+                .open_playback_next(&track, &playing, None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(next.route(), Some(RemoteMode::Direct));
+            assert!(
+                pair.sb.debug.list().open.is_empty(),
+                "SB carried none of it"
+            );
+            next.close().await.unwrap();
+            player.end().await;
+            client.close().await;
+            pair.stop().await;
+        }
+
+        /// The next, opened by a playback that plays by a route: the next
+        /// is not reported by the film's `fed:` id (a track keeps no place
+        /// of its own), and the one playing still reads over its route.
+        #[tokio::test]
+        async fn a_routed_playback_s_next_keeps_each_item_on_its_own_route() {
+            use spoolframe_client_sdk::{PlaybackOptions, PlayerSession, RemoteMode};
+            let pair = Pair::start("fed-media-next-playback").await;
+            let (file, _) = shared(&pair).await;
+            let (client, bob) = bob_s_app(&pair).await;
+            let film = pair.fed(movie().id());
+            let track = sa_s_track(&pair).await;
+            let player = PlayerSession::for_session(bob.clone());
+            let playing = player
+                .start(film.clone(), None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(playing.read(0, 4096).await.unwrap(), file[..4096]);
+            let next = playing
+                .open_next(track.clone(), None, PlaybackOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(next.route(), Some(RemoteMode::Direct));
+            assert_eq!(playing.read(4096, 4096).await.unwrap(), file[4096..8192]);
+            next.report_position(std::time::Duration::from_secs(60))
+                .unwrap();
+            next.flush().await.unwrap();
+            assert!(!keeps_place(&pair, &film).await, "not by the film's id");
+            next.close().await.unwrap();
+            player.end().await;
             client.close().await;
             pair.stop().await;
         }
