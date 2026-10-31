@@ -24,6 +24,7 @@ pub const UP_NEXT_LEAD: Duration = Duration::from_secs(30);
 
 /// A button over the video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum MarkerOffer {
     /// Seek to the intro's end.
     SkipIntro { to: Duration },
@@ -116,6 +117,7 @@ pub fn credits_start(markers: &[Marker]) -> Option<Duration> {
 
 /// What the player does at a position ([`MarkerTracker::on_position`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum MarkerAction {
     /// Show this button, or none: sent only when it changes.
     Offer(Option<MarkerOffer>),

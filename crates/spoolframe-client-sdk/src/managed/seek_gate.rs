@@ -31,7 +31,7 @@ struct Seek {
 /// One player's seek gate ([`crate::ManagedPlayback::seek_started`], a
 /// local file's controller).
 #[derive(Default)]
-pub(crate) struct SeekGate {
+pub struct SeekGate {
     seeking: Option<Seek>,
     /// The player's last position, as given.
     last: Option<Duration>,
@@ -40,7 +40,7 @@ pub(crate) struct SeekGate {
 impl SeekGate {
     /// The player seeks to `target`: its positions are the old place's
     /// until it lands.
-    pub(crate) fn started(&mut self, target: Duration) {
+    pub fn started(&mut self, target: Duration) {
         self.seeking = Some(Seek {
             target,
             began: Instant::now(),
@@ -50,7 +50,7 @@ impl SeekGate {
     }
 
     /// The player says its seek is done: its positions count again.
-    pub(crate) fn done(&mut self) {
+    pub fn done(&mut self) {
         self.seeking = None;
     }
 
@@ -59,7 +59,7 @@ impl SeekGate {
     /// target, not settled. A seek is over once a new position lands
     /// within [`SEEK_LANDED`] of its target, or plays on [`SEEK_LANDED`]
     /// past where the seek went, or after [`SEEK_GIVE_UP`].
-    pub(crate) fn position(&mut self, at: Duration) -> (Duration, bool) {
+    pub fn position(&mut self, at: Duration) -> (Duration, bool) {
         self.last = Some(at);
         let Some(mut seek) = self.seeking else {
             return (at, true);

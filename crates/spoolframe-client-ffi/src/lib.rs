@@ -31,6 +31,7 @@ mod events;
 mod extras;
 mod features;
 mod invites;
+mod markers;
 mod paired;
 mod pairing;
 mod playback;
@@ -60,6 +61,7 @@ pub use events::{
     ProfileNotice, ProfileWatch, SubtitleTimingNotice, SubtitleTimingWatch, UplinkShare,
 };
 pub use features::{InvitePasskeysApi, NextEpisodesApi};
+pub use markers::SpoolMarkers;
 pub use pairing::{Connected, Paired, PairedServer, SpoolPairing, SpoolPairingOffer};
 pub use playback::{PlaybackStart, PlaybackSubtitle, SpoolPlayback, SubtitleEntry};
 pub use portable::{

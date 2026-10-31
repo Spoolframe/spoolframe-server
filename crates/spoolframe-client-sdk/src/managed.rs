@@ -1209,7 +1209,7 @@ impl ManagedPlayback {
 
     /// The player at `at` through the seek gate: where it is for the
     /// progress and the markers, and whether that is settled.
-    pub(crate) fn gated(&self, at: Duration) -> (Duration, bool) {
+    pub fn gated(&self, at: Duration) -> (Duration, bool) {
         self.0.state.lock().gate.position(at)
     }
 

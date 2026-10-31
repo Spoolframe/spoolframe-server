@@ -217,6 +217,7 @@ pub use markers::{
     UP_NEXT_LEAD, UP_NEXT_MIN_LENGTH, credits_start,
 };
 pub mod tracks;
+pub use managed::seek_gate::SeekGate;
 pub use managed::{
     ManagedPlayback, PlaybackBackend, PlaybackEvent, PlaybackShare, PlaybackStopped, PlayerSession,
     PlayerState, Replan, RestartCause, SegmentStream, ShareWatch, SubtitleFile, WeakPlayback,
