@@ -175,11 +175,27 @@ pub(super) fn rung_video(
     }
 }
 
+/// How far before an item's end a run starts at the latest. Container
+/// durations overstate the video, by an audio tail or a stream cut short
+/// (`ENDED_SHORT`), and a run with no frame fails on a GPU encoder: seconds,
+/// not a frame. Equal to the clients' `SEEK_GIVE_UP`: a player landing here
+/// has its seek over by then, and the viewer still sees the last moments.
+/// A short item keeps a tenth instead ([`last_start`]): its last seconds
+/// are most of it, and frames are there to seek to.
+pub(super) const END_MARGIN: Duration = Duration::from_secs(5);
+
+/// The latest a run of an item `length` long starts.
+fn last_start(length: Duration) -> Duration {
+    length.saturating_sub(END_MARGIN.min(length / 10))
+}
+
 pub(super) fn playback_seek(
     segments: Option<&Segments>,
     start: Option<Duration>,
     video: Option<ConvertedVideo>,
+    duration: Option<Duration>,
 ) -> (Option<Duration>, u32) {
+    let start = start.map(|at| duration.map_or(at, |length| at.min(last_start(length))));
     match (segments, start) {
         (Some(segments), Some(at)) => {
             let n = segments
@@ -612,11 +628,73 @@ mod tests {
         );
         // A position 5 s in is in segment 3, 4 to 8 s: written from 0.
         let at = Some(Duration::from_secs(5));
-        assert_eq!(playback_seek(Some(&encoded), at, video), (None, 1));
+        assert_eq!(playback_seek(Some(&encoded), at, video, None), (None, 1));
         let at = Some(Duration::from_secs(13));
         assert_eq!(
-            playback_seek(Some(&encoded), at, video),
+            playback_seek(Some(&encoded), at, video, None),
             (Some(Duration::from_secs(8)), 4)
+        );
+    }
+
+    fn secs(n: u64) -> Option<Duration> {
+        Some(Duration::from_secs(n))
+    }
+
+    /// Scrubbing to the end, or a resume there, finds no frame to encode:
+    /// the viewer gets the last seconds instead, then the end of stream.
+    #[test]
+    fn a_progressive_run_starts_short_of_the_end() {
+        let length = secs(1300);
+        let start = |at| playback_seek(None, at, None, length).0;
+        assert_eq!(
+            (start(secs(1300)), start(secs(4000))),
+            (
+                secs(1300 - END_MARGIN.as_secs()),
+                secs(1300 - END_MARGIN.as_secs())
+            )
+        );
+    }
+
+    #[test]
+    fn a_run_short_of_the_margin_stays_where_it_was_asked() {
+        let at = secs(1300 - END_MARGIN.as_secs());
+        assert_eq!(playback_seek(None, at, None, secs(1300)), (at, 0));
+    }
+
+    /// Nothing says where the end is: the run goes where it is asked.
+    #[test]
+    fn with_no_length_a_run_starts_where_it_is_asked() {
+        assert_eq!(playback_seek(None, secs(4000), None, None), (secs(4000), 0));
+    }
+
+    /// A 3 s clip keeps its seeks: a tenth of it, not the 5 s it lacks.
+    #[test]
+    fn a_short_item_keeps_a_tenth_of_itself() {
+        let length = secs(3);
+        assert_eq!(
+            (
+                playback_seek(None, secs(3), None, length).0,
+                playback_seek(None, secs(2), None, length).0
+            ),
+            (Some(Duration::from_millis(2_700)), secs(2))
+        );
+    }
+
+    /// A segment that starts in the last seconds may hold no frame: an
+    /// HLS seek to the end goes to the segment the margin falls in.
+    #[test]
+    fn an_hls_seek_to_the_end_starts_in_the_segment_short_of_the_end() {
+        let encoded = Segments::encoded(60_000);
+        let video = Some(ConvertedVideo::Encode {
+            codec: spoolframe_types::VideoCodec::H264,
+            height: 720,
+            max_bitrate: None,
+            tone_map: false,
+        });
+        let at = secs(60 - END_MARGIN.as_secs());
+        assert_eq!(
+            playback_seek(Some(&encoded), secs(60), video, secs(60)),
+            playback_seek(Some(&encoded), at, video, None)
         );
     }
 }

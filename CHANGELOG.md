@@ -9,6 +9,11 @@ with a 0.16 server.
 - Server: passkeys moved to webauthn-rs 0.6.2, which verifies with RustCrypto,
   so the server no longer links OpenSSL and a build needs none. Stored
   passkeys keep working as they are. New passkeys may also be ES384.
+- Server: a conversion seeked or resumed at an item's end starts up to
+  5 s before it (a tenth of a short item), so the viewer gets the last
+  seconds and then the end, where a GPU encode failed with no frame to
+  encode. A run past the last frame all the same (no known length) no
+  longer marks the file as CPU-decoded or tries other encoders.
 - FFI: `SpoolPlayback.seek(target)` seeks a progressive conversion, which
   had no way to through the FFI: the server encodes again from `target`,
   and the answer is the new plan to rebuild from, read from offset 0. For

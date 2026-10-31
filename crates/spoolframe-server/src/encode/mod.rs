@@ -443,7 +443,12 @@ impl Conversion {
             let first_video = rung_video(*video, ladder, start_rung);
             // An HLS start begins at the segment the position falls in, sought
             // as the rung it starts on is: a copy only at a keyframe.
-            let (start, first_segment) = playback_seek(segments.as_ref(), start, first_video);
+            let (start, first_segment) = playback_seek(
+                segments.as_ref(),
+                start,
+                first_video,
+                source.descriptor.duration,
+            );
             // The GPU is picked for an encode (PGPU-05): a remux ladder that
             // starts on its copy has its encodes picked for, its highest.
             let encoded = (0..ladder.len() as u32)
@@ -1282,7 +1287,9 @@ impl Conversion {
     pub fn seek(&self, position: Duration) -> Result<u32, JobError> {
         let rung = self.rung();
         let video = rung_video(self.video, &self.ladder, rung);
-        let (start, number) = playback_seek(self.segments.as_ref(), Some(position), video);
+        let duration = self.descriptor.duration;
+        let (start, number) =
+            playback_seek(self.segments.as_ref(), Some(position), video, duration);
         self.restart(start.unwrap_or(Duration::ZERO), number)
     }
 
