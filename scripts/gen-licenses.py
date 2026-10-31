@@ -36,8 +36,8 @@ What is listed is what the server ships:
   not linked into the server; they are listed because the server's image
   ships them.
 
-The C libraries the server links from the host (OpenSSL, libucl) are not
-listed: Nix and the distributions that ship them carry their notices.
+The C library the server links from the host (libucl) is not listed: Nix
+and the distributions that ship it carry its notices.
 
 Groups: this workspace's crates are "spoolframe", every other crate is
 "crates", the model "models", the programs "programs", and the web app's

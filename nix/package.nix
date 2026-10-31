@@ -7,7 +7,6 @@
   lib,
   pkg-config,
   libucl,
-  openssl,
   makeWrapper,
   # nix/ffmpeg.nix: nixpkgs' ffmpeg-headless with libplacebo (PGPU-04).
   ffmpeg,
@@ -60,10 +59,9 @@
     strictDeps = true;
     pname = "spoolframe-server";
     version = (lib.importTOML ../Cargo.toml).workspace.package.version;
-    # uclicious-libucl-sys links libucl via pkg-config; so does
-    # openssl-sys OpenSSL, for webauthn-rs (passkeys, P3-05).
+    # uclicious-libucl-sys links libucl via pkg-config.
     nativeBuildInputs = [pkg-config];
-    buildInputs = [libucl openssl];
+    buildInputs = [libucl];
   };
 
   # Build dependencies separately for caching. noq-proto comes from git

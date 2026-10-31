@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, DiscoverableAuthentication, DiscoverableKey, Passkey,
-    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
-    RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
+    CreationChallengeResponse, DiscoverableAuthentication, Passkey, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
+    Webauthn, WebauthnBuilder, WebauthnError,
 };
 use webauthn_rs_proto::{
     AuthenticatorSelectionCriteria, ResidentKeyRequirement, UserVerificationPolicy,
@@ -225,7 +225,7 @@ impl RelyingParty {
         let mut passkey = credential(record).map_err(|e| SignInError::Internal(e.to_string()))?;
         let verified = self
             .webauthn
-            .finish_discoverable_authentication(signed, state, &[DiscoverableKey::from(&passkey)])
+            .finish_discoverable_authentication_v2(signed, state, &passkey)
             .map_err(|e| match e {
                 WebauthnError::CredentialPossibleCompromise => refused(
                     "the signature counter went backwards: there may be a copy of this passkey",
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(handle.to_string(), fixture["user_handle"].as_str().unwrap());
         let done = party
             .webauthn
-            .finish_discoverable_authentication(&signed, state, &[DiscoverableKey::from(&passkey)])
+            .finish_discoverable_authentication_v2(&signed, state, &passkey)
             .unwrap();
 
         assert_eq!(done.cred_id(), passkey.cred_id());
@@ -682,7 +682,7 @@ mod tests {
 
         let done = party
             .webauthn
-            .finish_discoverable_authentication(&signed, state, &[DiscoverableKey::from(&passkey)])
+            .finish_discoverable_authentication_v2(&signed, state, &passkey)
             .unwrap();
 
         assert_eq!(done.counter(), 5);
@@ -694,15 +694,11 @@ mod tests {
         let mut signed: PublicKeyCredential = from(&fixture["rs256"]["signed"]);
         let state: DiscoverableAuthentication = from(&fixture["rs256"]["state"]);
         let passkey = kept(&fixture["rs256"]["credential"]);
-        let mut signature = signed.response.signature.to_vec();
-        signature[0] ^= 1;
-        signed.response.signature = signature.into();
+        signed.response.signature[0] ^= 1;
 
-        let done = party.webauthn.finish_discoverable_authentication(
-            &signed,
-            state,
-            &[DiscoverableKey::from(&passkey)],
-        );
+        let done = party
+            .webauthn
+            .finish_discoverable_authentication_v2(&signed, state, &passkey);
 
         assert!(done.is_err());
     }

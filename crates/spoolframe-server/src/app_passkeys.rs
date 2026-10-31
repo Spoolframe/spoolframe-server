@@ -598,10 +598,10 @@ fn with_challenge<T: Serialize + DeserializeOwned>(
 fn registered(made: &FinishPasskeyRegistration) -> RegisterPublicKeyCredential {
     RegisterPublicKeyCredential {
         id: URL_SAFE_NO_PAD.encode(&made.credential_id),
-        raw_id: made.credential_id.clone().into(),
+        raw_id: made.credential_id.clone(),
         response: AuthenticatorAttestationResponseRaw {
-            attestation_object: made.attestation_object.clone().into(),
-            client_data_json: made.client_data_json.clone().into(),
+            attestation_object: made.attestation_object.clone(),
+            client_data_json: made.client_data_json.clone(),
             transports: None,
         },
         type_: "public-key".to_owned(),
@@ -612,12 +612,12 @@ fn registered(made: &FinishPasskeyRegistration) -> RegisterPublicKeyCredential {
 fn asserted(signed: &FinishPasskeySignIn) -> PublicKeyCredential {
     PublicKeyCredential {
         id: URL_SAFE_NO_PAD.encode(&signed.credential_id),
-        raw_id: signed.credential_id.clone().into(),
+        raw_id: signed.credential_id.clone(),
         response: AuthenticatorAssertionResponseRaw {
-            authenticator_data: signed.authenticator_data.clone().into(),
-            client_data_json: signed.client_data_json.clone().into(),
-            signature: signed.signature.clone().into(),
-            user_handle: signed.user_handle.clone().map(Into::into),
+            authenticator_data: signed.authenticator_data.clone(),
+            client_data_json: signed.client_data_json.clone(),
+            signature: signed.signature.clone(),
+            user_handle: signed.user_handle.clone(),
         },
         extensions: Default::default(),
         type_: "public-key".to_owned(),
@@ -629,7 +629,7 @@ mod tests {
     use serde_json::json;
     use webauthn_authenticator_rs::AuthenticatorBackend as _;
     use webauthn_authenticator_rs::softtoken::SoftToken;
-    use webauthn_rs::prelude::{DiscoverableKey, Passkey, Url};
+    use webauthn_rs::prelude::{Passkey, Url};
 
     use super::*;
 
@@ -666,7 +666,7 @@ mod tests {
         let unchanged = copy(&state);
         let state = with_challenge(state, "rs", &challenge).unwrap();
         let mut options = creation.public_key;
-        options.challenge = challenge.clone().into();
+        options.challenge = challenge.clone();
         let made = token
             .perform_register(origin.clone(), options, 60_000)
             .unwrap();
@@ -705,16 +705,15 @@ mod tests {
             signature: signed.response.signature.to_vec(),
             user_handle: Some(handle.as_bytes().to_vec()),
         });
-        let keys = [DiscoverableKey::from(&passkey)];
         assert!(
             party
                 .webauthn
-                .finish_discoverable_authentication(&signed, unchanged, &keys)
+                .finish_discoverable_authentication_v2(&signed, unchanged, &passkey)
                 .is_err()
         );
         party
             .webauthn
-            .finish_discoverable_authentication(&signed, state, &keys)
+            .finish_discoverable_authentication_v2(&signed, state, &passkey)
             .unwrap();
     }
 
@@ -753,17 +752,16 @@ mod tests {
         let state = with_challenge(copy(&unchanged), "ast", &bytes(&fixed["challenge"])).unwrap();
         let passkey: Passkey =
             serde_json::from_str(fixture["passkey"]["credential"].as_str().unwrap()).unwrap();
-        let keys = [DiscoverableKey::from(&passkey)];
 
         assert!(
             party
                 .webauthn
-                .finish_discoverable_authentication(&signed, unchanged, &keys)
+                .finish_discoverable_authentication_v2(&signed, unchanged, &passkey)
                 .is_err()
         );
         party
             .webauthn
-            .finish_discoverable_authentication(&signed, state, &keys)
+            .finish_discoverable_authentication_v2(&signed, state, &passkey)
             .unwrap();
     }
 

@@ -7,14 +7,13 @@
   spoolframe,
   pkg-config,
   libucl,
-  openssl,
 }:
 craneLib.buildPackage {
   inherit (spoolframe) src version cargoArtifacts;
   pname = "spoolframe-probe";
   strictDeps = true;
   nativeBuildInputs = [pkg-config];
-  buildInputs = [libucl openssl];
+  buildInputs = [libucl];
   cargoExtraArgs = "--locked -p spoolframe-probe";
   doCheck = false;
   meta.mainProgram = "spoolframe-probe";

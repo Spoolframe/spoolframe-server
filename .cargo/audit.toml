@@ -3,7 +3,8 @@
 # two lists the same.
 [advisories]
 ignore = [
-  # rsa: verifies OIDC ID token signatures only; no private-key operation.
+  # rsa 0.9 and 0.10.0-rc: verify OIDC ID token and passkey signatures only;
+  # no private-key operation.
   "RUSTSEC-2023-0071",
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",

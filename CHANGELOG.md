@@ -6,6 +6,9 @@ The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates
 with a 0.16 server.
 
+- Server: passkeys moved to webauthn-rs 0.6.2, which verifies with RustCrypto,
+  so the server no longer links OpenSSL and a build needs none. Stored
+  passkeys keep working as they are. New passkeys may also be ES384.
 - FFI: `SpoolPlayback.seek(target)` seeks a progressive conversion, which
   had no way to through the FFI: the server encodes again from `target`,
   and the answer is the new plan to rebuild from, read from offset 0. For

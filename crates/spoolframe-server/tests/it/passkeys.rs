@@ -79,7 +79,7 @@ impl Authenticator {
             .unwrap();
         let made = serde_json::to_value(made).unwrap();
         self.stored
-            .push((made["rawId"].clone(), serde_json::to_value(handle).unwrap()));
+            .push((made["rawId"].clone(), URL_SAFE_NO_PAD.encode(handle).into()));
         made
     }
 
@@ -1128,7 +1128,7 @@ impl KeptPasskey {
     }
 
     /// What the browser sends for `assertion`.
-    fn from_browser(&self, assertion: &Assertion) -> Value {
+    fn browser_answer(&self, assertion: &Assertion) -> Value {
         let id = URL_SAFE_NO_PAD.encode(&self.id);
         let handle: uuid::Uuid = self.handle.parse().unwrap();
         json!({
@@ -1166,7 +1166,7 @@ async fn a_passkey_webauthn_0_5_5_stored_signs_in() {
     let challenge = URL_SAFE_NO_PAD
         .decode(options["publicKey"]["challenge"].as_str().unwrap())
         .unwrap();
-    let signed = kept.from_browser(&kept.sign(RP_ID, ORIGIN, &challenge));
+    let signed = kept.browser_answer(&kept.sign(RP_ID, ORIGIN, &challenge));
 
     let signed_in = finish(addr, &ceremony, signed).await;
 
@@ -1191,7 +1191,7 @@ async fn a_passkey_webauthn_0_5_5_stored_answers_only_to_its_key() {
     let challenge = URL_SAFE_NO_PAD
         .decode(options["publicKey"]["challenge"].as_str().unwrap())
         .unwrap();
-    let forged = kept.from_browser(&kept.forge(RP_ID, ORIGIN, &challenge));
+    let forged = kept.browser_answer(&kept.forge(RP_ID, ORIGIN, &challenge));
 
     assert_refused(finish(addr, &ceremony, forged).await).await;
 }

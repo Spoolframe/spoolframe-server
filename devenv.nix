@@ -90,8 +90,6 @@ in {
     jq
     pkg-config
     libucl
-    # webauthn-rs (passkeys, P3-05) verifies signatures with OpenSSL.
-    openssl
     # ffprobe, which the server runs on every media file it serves (P1-06),
     # and ffmpeg: the package's, with libplacebo (PGPU-04), so the tone map
     # tests run here as they run on a host.

@@ -107,8 +107,8 @@ socket2 = "0.6"
 # zeroize a signing key when dropped.
 ed25519-dalek = "3"
 # A security key as an identity's root (P7-08): P-256 ECDSA, the one
-# algorithm FIDO2 keys all sign with. 0.13, the version already in the
-# graph through webauthn.
+# algorithm FIDO2 keys all sign with. 0.14, the version already in the
+# graph through webauthn-rs.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 # The recovery phrase: BIP-39, its English wordlist and checksum (CC0).
 # `zeroize` clears a parsed phrase when dropped.
@@ -119,13 +119,13 @@ getrandom = "0.4"
 zeroize = "1"
 
 # Passkeys (P3-05). `conditional-ui` is the feature the username-less
-# (discoverable) sign-in sits behind. It links OpenSSL.
+# (discoverable) sign-in sits behind.
 # `danger-allow-state-serialisation` lets an app passkey ceremony's state
 # take the challenge made from the server's id and nonce (PX-10): webauthn-rs
 # only makes random ones. The states still never leave the server.
-webauthn-rs = { version = "0.5.5", features = ["conditional-ui", "danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.6.2", features = ["conditional-ui", "danger-allow-state-serialisation"] }
 # For the option types webauthn-rs does not re-export.
-webauthn-rs-proto = "0.5.5"
+webauthn-rs-proto = "0.6.2"
 # User ids (P3-20): UUIDv7, time-ordered so they still sort by creation.
 # Already in the build through webauthn-rs.
 uuid = { version = "1.27", default-features = false, features = ["std", "v7"] }
@@ -138,7 +138,7 @@ openidconnect = { version = "4", default-features = false }
 # The stand-in provider's ID token times, in tests (openidconnect's own).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # The software authenticator the passkey tests sign with.
-webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softtoken"] }
+webauthn-authenticator-rs = { version = "0.6.2", default-features = false, features = ["softtoken"] }
 
 # The admin API: JSON-RPC over WebSocket, as kiln and scribe
 # serve theirs. Crates opt into server/client features.

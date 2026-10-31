@@ -53,11 +53,14 @@ ignore = [
   # library an app links or the server.
   { id = "RUSTSEC-2026-0374", reason = "basic-toml is read only by askama's derive macro, at build time, in the optional bindings generator" },
   # rsa: the Marvin timing attack recovers a private key from many timed
-  # decryptions or signatures. Here rsa comes in only through openidconnect
-  # to verify a provider's RS256 ID token signatures with its public keys;
-  # the server holds no RSA private key and does no RSA private-key
-  # operation. No fixed rsa release exists.
-  { id = "RUSTSEC-2023-0071", reason = "rsa is used only to verify OIDC ID token signatures (public keys); no private-key operations" },
+  # decryptions or signatures. Here rsa comes in twice: 0.9 through
+  # openidconnect, to verify a provider's RS256 ID token signatures, and
+  # 0.10.0-rc.19 through crypto-glue, webauthn-rs 0.6's crypto, to verify
+  # RS256 passkey assertions, both with public keys. webauthn-rs 0.6 takes
+  # no released 0.10; crypto-glue 0.2.2 needs ^0.10.0-rc.18. The server
+  # holds no RSA private key and does no RSA private-key operation. No
+  # fixed rsa release exists.
+  { id = "RUSTSEC-2023-0071", reason = "rsa is used only to verify OIDC ID token and passkey signatures (public keys); no private-key operations" },
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
   # (through iroh's netlink-packet-core); none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the server" },
