@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{ChosenTracks, Selection, TrackReason};
 use spoolframe_types::language::{of_tag, same_language};
-use spoolframe_types::preferences::ORIGINAL_LANGUAGE;
+use spoolframe_types::preferences::{DEVICE_LANGUAGE, ORIGINAL_LANGUAGE};
 use spoolframe_types::{
     AudioRole, AudioTrack, MediaTracks, SdhPreference, SubtitleMode, SubtitleRole, SubtitleTrack,
     TrackPreferences,
@@ -65,29 +65,49 @@ impl TrackOverride {
     }
 }
 
-/// The preferences of a viewer who saved none, on a device in `language`
-/// ([`of_tag`]): that language is their one preferred audio language. The
-/// file's default where it has no track in it, as with no device language
-/// at all.
-pub fn unsaved(language: Option<&str>) -> TrackPreferences {
-    let mut preferences = TrackPreferences::default();
-    preferences.audio.languages = language.and_then(of_tag).into_iter().collect();
-    preferences
+/// The languages `wanted` asks for, in order: [`ORIGINAL_LANGUAGE`] as
+/// `original` and [`DEVICE_LANGUAGE`] as `device` (a language, not a tag).
+/// Either is left out where it is `None`, so a list that names only that
+/// comes back empty: mind that that is not a list saved empty.
+pub fn resolved<'a>(
+    wanted: &'a [String],
+    original: Option<&'a str>,
+    device: Option<&'a str>,
+) -> Vec<&'a str> {
+    wanted
+        .iter()
+        .filter_map(|language| match language.as_str() {
+            ORIGINAL_LANGUAGE => original,
+            DEVICE_LANGUAGE => device,
+            language => Some(language),
+        })
+        .collect()
 }
 
 /// The tracks to play from `tracks`, for a viewer with `preferences` and
-/// maybe an `override_` for this series or movie.
+/// maybe an `override_` for this series or movie, on a device whose
+/// `Hello.language` is `device`. With nothing saved, or none of what is
+/// saved in the file, the device's language plays no part: only a saved
+/// [`DEVICE_LANGUAGE`] brings it in.
 pub fn choose(
     tracks: &MediaTracks,
     preferences: &TrackPreferences,
     override_: Option<&TrackOverride>,
+    device: Option<&str>,
 ) -> ChosenTracks {
-    let (audio, audio_reason) = choose_audio(tracks, preferences, override_);
+    let device = device.and_then(of_tag);
+    let device = device.as_deref();
+    let (audio, audio_reason) = choose_audio(tracks, preferences, override_, device);
     let audio_language = audio
         .and_then(|i| tracks.audio[i].language.as_deref())
         .map(str::to_owned);
-    let (subtitle, subtitle_reason) =
-        choose_subtitle(tracks, preferences, override_, audio_language.as_deref());
+    let (subtitle, subtitle_reason) = choose_subtitle(
+        tracks,
+        preferences,
+        override_,
+        audio_language.as_deref(),
+        device,
+    );
     ChosenTracks {
         selection: Selection {
             audio: audio.map(|i| i as u32),
@@ -110,6 +130,7 @@ fn choose_audio(
     tracks: &MediaTracks,
     preferences: &TrackPreferences,
     override_: Option<&TrackOverride>,
+    device: Option<&str>,
 ) -> (Option<usize>, TrackReason) {
     let all: Vec<usize> = (0..tracks.audio.len()).collect();
     if all.is_empty() {
@@ -134,15 +155,7 @@ fn choose_audio(
     let original = original_language(&tracks.audio);
     let mut candidates = all.clone();
     let mut reason = TrackReason::FileDefault;
-    for wanted in &preferences.audio.languages {
-        let wanted = if wanted == ORIGINAL_LANGUAGE {
-            match original {
-                Some(language) => language,
-                None => continue,
-            }
-        } else {
-            wanted.as_str()
-        };
+    for wanted in resolved(&preferences.audio.languages, original, device) {
         let in_language: Vec<usize> = all
             .iter()
             .copied()
@@ -174,7 +187,7 @@ fn choose_audio(
 }
 
 /// The language of the file's default audio track, or of its first.
-fn original_language(audio: &[AudioTrack]) -> Option<&str> {
+pub fn original_language(audio: &[AudioTrack]) -> Option<&str> {
     audio
         .iter()
         .find(|a| a.default)
@@ -194,6 +207,7 @@ fn choose_subtitle(
     preferences: &TrackPreferences,
     override_: Option<&TrackOverride>,
     audio_language: Option<&str>,
+    device: Option<&str>,
 ) -> (Option<usize>, TrackReason) {
     let subtitles = &tracks.subtitles;
     if subtitles.is_empty() {
@@ -213,10 +227,12 @@ fn choose_subtitle(
     }
 
     let wanted = &preferences.subtitles;
+    // Empty as saved, not as resolved: `device` with no language is left
+    // out and matches nothing, it does not turn into the audio's language.
     let languages: Vec<&str> = if wanted.languages.is_empty() {
         audio_language.into_iter().collect()
     } else {
-        wanted.languages.iter().map(String::as_str).collect()
+        resolved(&wanted.languages, None, device)
     };
     match wanted.mode {
         SubtitleMode::Off => (None, TrackReason::NotWanted),

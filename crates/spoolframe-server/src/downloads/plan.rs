@@ -28,11 +28,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::tracks::{choose, original_language, resolved};
 use spoolframe_media::ocr::Ocr;
 use spoolframe_media::{MediaDescriptor, SubtitleKind, SubtitleSource, SubtitleStream, codecs};
 use spoolframe_protocol::downloads::DownloadTracks;
-use spoolframe_types::language::same_language;
-use spoolframe_types::preferences::ORIGINAL_LANGUAGE;
+use spoolframe_types::language::{of_tag, same_language};
 use spoolframe_types::{
     BitmapPreference, ClientCapabilities, Container, HdrFormat, TrackPreferences, VideoCodec,
     VideoLimits,
@@ -355,32 +355,22 @@ pub fn profile(
 /// and one more in another of their audio languages when the file has
 /// one; every text subtitle in their subtitle languages (their audio
 /// languages when they set none), and the subtitle playback would pick.
+/// `device`: the device's language, as `Hello` says it.
 pub fn preferred(
     descriptor: &MediaDescriptor,
     preferences: &TrackPreferences,
     override_: Option<&crate::tracks::TrackOverride>,
+    device: Option<&str>,
 ) -> Tracks {
     let tracks = descriptor.tracks();
-    let chosen = crate::tracks::choose(&tracks, preferences, override_).selection;
-    let original = tracks
-        .audio
-        .iter()
-        .find(|a| a.default)
-        .or(tracks.audio.first())
-        .and_then(|a| a.language.clone());
-    let resolve = |wanted: &String| {
-        if wanted == ORIGINAL_LANGUAGE {
-            original.clone()
-        } else {
-            Some(wanted.clone())
-        }
-    };
-    let audio_languages: Vec<String> = preferences
-        .audio
-        .languages
-        .iter()
-        .filter_map(resolve)
-        .collect();
+    let chosen = choose(&tracks, preferences, override_, device).selection;
+    let device = device.and_then(of_tag);
+    let device = device.as_deref();
+    let audio_languages = resolved(
+        &preferences.audio.languages,
+        original_language(&tracks.audio),
+        device,
+    );
     let mut audio: Vec<u32> = chosen.audio.into_iter().collect();
     let first_language = chosen
         .audio
@@ -411,7 +401,7 @@ pub fn preferred(
     let subtitle_languages = if preferences.subtitles.languages.is_empty() {
         audio_languages
     } else {
-        preferences.subtitles.languages.clone()
+        resolved(&preferences.subtitles.languages, None, device)
     };
     let mut subtitles: Vec<u32> = (0..descriptor.subtitles.len() as u32)
         .filter(|&i| {
@@ -510,6 +500,7 @@ mod tests {
     use spoolframe_types::{AudioRole, SubtitleRole};
 
     use super::*;
+    use spoolframe_types::preferences::DEVICE_LANGUAGE;
 
     fn audio(index: u32, codec: &str) -> AudioStream {
         AudioStream {
@@ -896,7 +887,7 @@ mod tests {
     #[test]
     fn the_preferred_choice_is_two_audio_languages_and_their_text_subtitles() {
         assert_eq!(
-            preferred(&bilingual(), &preferring(&["en", "fr"], &[]), None),
+            preferred(&bilingual(), &preferring(&["en", "fr"], &[]), None, None),
             Tracks::Chosen {
                 audio: vec![0, 1],
                 subtitles: vec![0, 2],
@@ -907,10 +898,40 @@ mod tests {
     #[test]
     fn the_preferred_subtitles_follow_the_subtitle_languages_when_set() {
         assert_eq!(
-            preferred(&bilingual(), &preferring(&["en"], &["de"]), None),
+            preferred(&bilingual(), &preferring(&["en"], &["de"]), None, None),
             Tracks::Chosen {
                 audio: vec![0],
                 subtitles: vec![3],
+            }
+        );
+    }
+
+    #[test]
+    fn the_preferred_choice_goes_by_the_device_for_device_languages() {
+        let device = preferring(&[DEVICE_LANGUAGE], &[DEVICE_LANGUAGE]);
+        assert_eq!(
+            preferred(&bilingual(), &device, None, Some("fr-CA")),
+            Tracks::Chosen {
+                audio: vec![1],
+                subtitles: vec![2],
+            }
+        );
+    }
+
+    /// As in playback: `device` with no language is no empty list, and
+    /// does not fall to the audio's languages.
+    #[test]
+    fn the_preferred_subtitles_are_none_for_device_with_no_language() {
+        assert_eq!(
+            preferred(
+                &bilingual(),
+                &preferring(&["en"], &[DEVICE_LANGUAGE]),
+                None,
+                None
+            ),
+            Tracks::Chosen {
+                audio: vec![0],
+                subtitles: Vec::new(),
             }
         );
     }

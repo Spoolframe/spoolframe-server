@@ -14,6 +14,10 @@ use spoolframe_admin_api::{
 /// What stands for the item's original language in an audio list.
 pub const ORIGINAL: &str = "original";
 
+/// What stands for each device's own language in a list. An app sets it;
+/// the card shows it.
+pub const DEVICE: &str = "device";
+
 /// The languages the card offers, by ISO 639-2 code: the ones most
 /// libraries have tracks in. Any other a device set is still shown.
 pub const LANGUAGES: &[(&str, &str)] = &[
@@ -46,6 +50,9 @@ pub const LANGUAGES: &[(&str, &str)] = &[
 pub fn language_name(code: &str) -> String {
     if code == ORIGINAL {
         return "Original language".into();
+    }
+    if code == DEVICE {
+        return "Device language".into();
     }
     LANGUAGES
         .iter()
@@ -250,6 +257,20 @@ mod tests {
 
     fn list(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|c| (*c).to_owned()).collect()
+    }
+
+    /// An app saves `device`; the card reads it as words, kept as it is.
+    #[test]
+    fn a_saved_device_language_reads_as_words() {
+        assert_eq!(
+            languages_line(&list(&["device", "eng"])),
+            "Device language, then English"
+        );
+        assert!(
+            audio_choices(&list(&["device"]))
+                .iter()
+                .any(|(value, label)| value == "device" && label == "Device language")
+        );
     }
 
     #[test]

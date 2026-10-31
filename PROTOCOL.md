@@ -151,16 +151,13 @@ The server keeps at most 128 characters (`MAX_HELLO_TEXT`) of each of
 `Hello`'s strings.
 
 `Hello.language`, optional, is the device's language as BCP 47 (`en-US`).
-A viewer with no saved track preferences and no pick for the film then
-hears it as if they had saved that one language: its primary subtag
-(`en`, which matches a track's `eng`), the file's default where it has no
-such track, forced subtitles following the track chosen. Anything saved
-wins, even preferences with no languages. `und`, `mul`, `mis`, `zxx`, a
-private tag and anything else that names no language count as saying
-nothing. It chooses a download's first choice of tracks the same way.
-`GetTrackPreferences` still answers what was saved: the device's language
-is not a preference. In the SDK it is `ClientOptions.language`, and
-`DeviceSpec.language` over FFI.
+It chooses nothing by itself: a viewer with nothing saved gets the file's
+default audio, and forced subtitles in that track's language, on any
+device. It is what the `device` language in track preferences stands for
+(below). Only its primary subtag counts (`en`, which matches a track's
+`eng`); `und`, `mul`, `mis`, `zxx`, a private tag and anything else that
+names no language count as saying nothing. In the SDK it is
+`ClientOptions.language`, and `DeviceSpec.language` over FFI.
 
 ### RPC framing
 
@@ -1634,6 +1631,23 @@ pictures are shown whatever it says. The admin API's
 `SetTrackPreferences` and `me.setTrackPreferences` take the bare
 preferences. The SDK's `Session::track_preferences` returns
 `TrackPreferencesInfo`.
+
+`audio.languages` and `subtitles.languages` hold ISO 639 codes in order.
+Audio also takes `original`, the file's default track's language, and
+both take `device`, the language of the `Hello` of the connection the
+choosing is for. That one is kept and answered as the word `device`, so
+one setting, kept per user, means each device's own language. A `device`
+with no language to go by is skipped, as is `original` with none, and the
+next in the list counts. It is not an empty list: `subtitles.languages`
+of `["device"]` on a device that says no language matches nothing, and
+shows no subtitles in `always` or `foreign_only`, where `[]` means the
+audio's language. `forced_only` goes by the audio's language in any case.
+
+Audio and subtitles fall back apart. German wanted of a file with none
+plays its default track (`chosen.audio` `file_default`), and English
+subtitles wanted of that file still show. `chosen.audio` is `preferences`
+only when a language in the list found its track. A download's first
+choice of tracks goes by the same rules.
 
 ## Paused playback and the idle limit
 
@@ -3927,9 +3941,11 @@ SB's is not passed on.
   user's track preferences on SB, as `SetTrackPreferences` takes them:
   kept with the token and the session it opens, they choose a play's
   tracks on SA when the play sends no selection, as SB would; SA has
-  none of the user's own. Left out when the user saved none: SA then goes
-  by the `language` of the `Hello` of the connection the play is on,
-  which a play SB proxies has not got. Or `assertion_refused {reason}`: `not_shared`
+  none of the user's own. A `device` language among them goes as it is,
+  and SA resolves it by the `Hello` of the connection the play is on: the
+  device's when it plays from SA itself. A play SB proxies is on SB's own
+  connection, whose `Hello` says no language, so `device` is skipped
+  there, whatever the device told SB. Or `assertion_refused {reason}`: `not_shared`
   (the item is in no library shared with SB, or is not SA's own),
   `invalid_user`, `invalid_device`, `invalid_scope` (also for an item
   that does not play: a show, a season, an artist, an album) or

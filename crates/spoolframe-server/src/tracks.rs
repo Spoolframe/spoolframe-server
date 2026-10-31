@@ -18,9 +18,9 @@ pub async fn override_scope(catalog: &dyn Catalog, id: &MediaId) -> Result<Strin
 }
 
 #[cfg(test)]
-use spoolframe_protocol::{Selection, TrackReason};
+use spoolframe_protocol::{ChosenTracks, Selection, TrackReason};
 #[cfg(test)]
-use spoolframe_types::preferences::ORIGINAL_LANGUAGE;
+use spoolframe_types::preferences::{DEVICE_LANGUAGE, ORIGINAL_LANGUAGE};
 #[cfg(test)]
 use spoolframe_types::{
     AudioRole, AudioTrack, MediaTracks, SdhPreference, SubtitleMode, SubtitleRole, SubtitleTrack,
@@ -40,6 +40,15 @@ mod tests {
     use crate::store::tests::test_store;
     use crate::store::users::LocalUserId;
     use crate::test_support::{FakeCatalog, episode};
+
+    /// As a device that says no language.
+    fn choose(
+        tracks: &MediaTracks,
+        preferences: &TrackPreferences,
+        override_: Option<&TrackOverride>,
+    ) -> ChosenTracks {
+        super::choose(tracks, preferences, override_, None)
+    }
 
     const ALICE: Principal = Principal::LocalUser(LocalUserId::from_uuid(uuid::Uuid::from_u128(1)));
 
@@ -327,9 +336,10 @@ mod tests {
         assert_eq!(chosen.subtitle, TrackReason::NoneMatched);
     }
 
-    /// Saw on an English TV: its default track is Italian.
+    /// Saw: its default track is the Italian dub, with English subtitles
+    /// of both kinds and Italian forced ones.
     fn saw() -> MediaTracks {
-        let track = |language: &str, default| AudioTrack {
+        let audio = |language: &str, default| AudioTrack {
             language: Some(language.into()),
             title: None,
             channels: Some(6),
@@ -337,49 +347,113 @@ mod tests {
             role: AudioRole::Main,
         };
         MediaTracks {
-            audio: vec![track("ita", true), track("eng", false)],
+            audio: vec![audio("ita", true), audio("eng", false)],
+            subtitles: vec![
+                subtitle("eng", SubtitleRole::Full),
+                subtitle("eng", SubtitleRole::Sdh),
+                subtitle("ita", SubtitleRole::Forced),
+                subtitle("ita", SubtitleRole::Full),
+            ],
             ..MediaTracks::default()
         }
     }
 
+    fn wanting(audio: &[&str], mode: SubtitleMode, subtitles: &[&str]) -> TrackPreferences {
+        let mut preferences = TrackPreferences::default();
+        preferences.audio.languages = audio.iter().map(|&l| l.into()).collect();
+        preferences.subtitles.mode = mode;
+        preferences.subtitles.languages = subtitles.iter().map(|&l| l.into()).collect();
+        preferences
+    }
+
+    /// The tracks for a viewer wanting `preferences` on a device in `tag`.
+    fn on_device(preferences: &TrackPreferences, tag: Option<&str>) -> ChosenTracks {
+        super::choose(&saw(), preferences, None, tag)
+    }
+
+    /// The film as it was made, in the viewer's language beneath it, the
+    /// kind of subtitles their SDH setting asks.
     #[test]
-    fn with_nothing_saved_the_device_s_language_is_heard() {
-        let chosen = choose(&saw(), &unsaved(Some("en-US")), None);
+    fn original_audio_with_device_subtitles_on_saw_is_italian_with_english() {
+        let mut preferences = wanting(
+            &[ORIGINAL_LANGUAGE],
+            SubtitleMode::ForeignOnly,
+            &[DEVICE_LANGUAGE],
+        );
+        for (sdh, subtitle) in [(SdhPreference::Accept, 0), (SdhPreference::Prefer, 1)] {
+            preferences.subtitles.sdh = sdh;
+            let chosen = on_device(&preferences, Some("en-US"));
+            assert_eq!(chosen.selection.audio, Some(0));
+            assert_eq!(chosen.audio, TrackReason::Preferences);
+            assert_eq!(chosen.selection.subtitle, Some(subtitle), "{sdh:?}");
+        }
+    }
+
+    #[test]
+    fn device_audio_on_saw_on_an_english_tv_is_english() {
+        let preferences = wanting(&[DEVICE_LANGUAGE], SubtitleMode::Off, &[]);
+        let chosen = on_device(&preferences, Some("en-US"));
         assert_eq!(chosen.selection.audio, Some(1));
         assert_eq!(chosen.audio, TrackReason::Preferences);
     }
 
+    /// `device` is not "the audio's language": with no language it can
+    /// match nothing, though the Italian subtitles are there.
     #[test]
-    fn a_device_language_the_file_lacks_plays_the_file_s_default() {
-        let chosen = choose(&saw(), &unsaved(Some("fr-FR")), None);
+    fn device_subtitles_with_no_language_sent_show_none() {
+        for mode in [SubtitleMode::Always, SubtitleMode::ForeignOnly] {
+            for tag in [None, Some("und")] {
+                let chosen = on_device(&wanting(&[], mode, &[DEVICE_LANGUAGE]), tag);
+                assert_eq!(chosen.selection.subtitle, None, "{mode:?}, {tag:?}");
+                assert_eq!(chosen.subtitle, TrackReason::NoneMatched);
+            }
+        }
+    }
+
+    /// A list that says nothing is still the audio's language.
+    #[test]
+    fn empty_subtitle_languages_stay_the_audio_s_on_any_device() {
+        let chosen = on_device(&wanting(&[], SubtitleMode::Always, &[]), Some("en-US"));
+        assert_eq!(chosen.selection.subtitle, Some(3));
+    }
+
+    /// `device` with no language is skipped, as `original` is, and the
+    /// next one counts.
+    #[test]
+    fn device_audio_with_no_language_goes_on_to_the_next() {
+        let preferences = wanting(&[DEVICE_LANGUAGE, "eng"], SubtitleMode::Off, &[]);
+        assert_eq!(on_device(&preferences, None).selection.audio, Some(1));
+    }
+
+    /// Each falls back by itself: German the file lacks leaves its default
+    /// audio, and the subtitles still go by the device, or the reverse.
+    #[test]
+    fn audio_and_subtitles_fall_back_apart() {
+        let chosen = on_device(
+            &wanting(&["ger"], SubtitleMode::Always, &[DEVICE_LANGUAGE]),
+            Some("en-US"),
+        );
         assert_eq!(chosen.selection.audio, Some(0));
         assert_eq!(chosen.audio, TrackReason::FileDefault);
-    }
-
-    #[test]
-    fn no_device_language_is_as_before() {
-        assert_eq!(unsaved(None), TrackPreferences::default());
-        assert_eq!(unsaved(Some("und")), TrackPreferences::default());
-    }
-
-    #[test]
-    fn a_device_language_keeps_the_avoided_roles() {
-        assert_eq!(
-            unsaved(Some("en-US")).audio.avoid,
-            TrackPreferences::default().audio.avoid
+        assert_eq!(chosen.selection.subtitle, Some(0));
+        let chosen = on_device(
+            &wanting(&[DEVICE_LANGUAGE], SubtitleMode::Always, &["eng"]),
+            Some("de-DE"),
         );
+        assert_eq!(chosen.selection.audio, Some(0));
+        assert_eq!(chosen.audio, TrackReason::FileDefault);
+        assert_eq!(chosen.selection.subtitle, Some(0));
     }
 
-    /// Forced subtitles follow the track chosen, as for a saved language.
+    /// A device's `und` is no language, and no match for a track's `und`.
     #[test]
-    fn forced_subtitles_follow_the_device_s_language() {
-        let tracks = b99();
-        let chosen = choose(&tracks, &unsaved(Some("de-AT")), None);
-        let subtitle = &tracks.subtitles[chosen.selection.subtitle.unwrap() as usize];
-        assert_eq!(
-            (subtitle.language.as_deref(), subtitle.role),
-            (Some("ger"), SubtitleRole::Forced)
-        );
+    fn a_tag_that_names_no_language_matches_no_track() {
+        let mut tracks = saw();
+        tracks.audio[1].language = Some("und".into());
+        let preferences = wanting(&[DEVICE_LANGUAGE], SubtitleMode::Off, &[]);
+        let chosen = super::choose(&tracks, &preferences, None, Some("und"));
+        assert_eq!(chosen.selection.audio, Some(0));
+        assert_eq!(chosen.audio, TrackReason::FileDefault);
     }
 
     /// A foreign film with an English commentary: the viewer who avoids
@@ -388,7 +462,7 @@ mod tests {
     fn a_language_only_an_avoided_role_speaks_is_passed_over() {
         let mut tracks = saw();
         tracks.audio[1].role = AudioRole::Commentary;
-        let chosen = choose(&tracks, &unsaved(Some("en-US")), None);
+        let chosen = choose(&tracks, &wanting(&["eng"], SubtitleMode::Off, &[]), None);
         assert_eq!(chosen.selection.audio, Some(0));
         assert_eq!(chosen.audio, TrackReason::FileDefault);
     }

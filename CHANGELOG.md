@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.17.0-beta.5 (2026-10-30)
+## 0.17.0-beta.6 (2026-10-30)
 
-A beta. Its images are under its own tags alone (`0.17.0-beta.5`,
+A beta. Its images are under its own tags alone (`0.17.0-beta.6`,
 `-slim`, `-nvidia`/`-cpu`, each with its build's commit too): `latest`
 and `0.16` stay on 0.16.3, and no `0.17` tag is made until 0.17.0.
 
@@ -35,12 +35,16 @@ with a 0.16 server.
 - Server: a tone map is held to what its output is worth, at any quality,
   not the HDR file's rate: 28 Mbit/s at 2160p in HEVC or AV1 and 9 at
   1080p, 42 and 13.5 in H.264. The file's rate stays the cap under that.
-- Protocol and SDK: a viewer with no saved track preferences hears a film
-  in the device's language where it has it, on every client that says
-  one, else its default track. `Hello.language` (BCP 47, optional),
-  `ClientOptions.language` and `DeviceSpec.language`; an app that says
-  none gets what it got. Forced subtitles follow, and a download's first
-  choice of tracks too. Anything saved wins, even with no languages.
+- Protocol and SDK: `device`, a new value in `audio.languages` and
+  `subtitles.languages` (`DEVICE_LANGUAGE`): the device's own language, for
+  one setting per user that suits each of their devices. `Hello.language`
+  (BCP 47, optional), `ClientOptions.language` and `DeviceSpec.language`
+  say it. It is kept and answered as `device`, and playback and a
+  download's first choice of tracks resolve it. With no language from the
+  client it is skipped, and `subtitles.languages` of `["device"]` then
+  shows none, where `[]` is the audio's language. An app that says none and
+  a viewer who saved nothing get what they got: the file's default. A play
+  a paired server proxies has no language to go by.
 - Server: a preferred language with only an avoided role in a file (an
   English commentary on an Italian film) is passed over, as the
   preferences' `avoid` says, where it picked the commentary.
@@ -60,6 +64,23 @@ with a 0.16 server.
 - SDK: `ManagedPlayback::report_position` (FFI too) takes every tick and
   sends the first at once, then the newest every 10 s, a move back or a
   seek at once. It sent one every 250 ms. Nothing reported is lost.
+- SDK: `PlaybackController` gathers a converted stream's seeks on any
+  executor, as its docs said. Polled off a Tokio runtime (a GTK main
+  loop's `spawn_future_local`), a seek panicked with "no reactor running".
+  An app that enters a runtime around each poll need not any more.
+- SDK: `PlaybackController::position(at)` gives what a scrubber shows, as
+  `LocalController::position` does: a seek's target while it is in flight,
+  a converted restart's until the new encode plays.
+  `ManagedPlayback::position(at)` (FFI too) is the same for an app with no
+  controller, through the seek gate.
+- SDK: `PlaybackController` and `LocalController` have `undoable()`, so a
+  view that comes after an intro was skipped can tell whether to show Undo.
+- SDK: `PlayerSession::start` and `end` count from the call, not the
+  first poll, and their futures own what they need. On a multi-worker
+  runtime a start and the next could swap: the newer was closed as
+  overtaken, or the older ended it, and nothing played. A request now ends
+  only what was asked before it. Call them where the viewer asks: called
+  inside a spawned task, they are in the order the tasks run.
 - Protocol and SDK: `RateLimited` says "too many requests", not "too many
   failed logins" or "too many failed sign-ins": it is any request the
   server refuses for now.
@@ -172,6 +193,11 @@ with a 0.16 server.
   download's, are a `Markers`: a list that leaves out kinds this build
   does not know, as it is read or built (`MarkerKind::Unknown` stays,
   for a marker read on its own). `SortKey::ALL` is a slice.
+- BREAKING (SDK): `PlaybackController::undo_skip` and
+  `LocalController::undo_skip` return `Option<Duration>`, where the undo
+  goes back to, not `bool`, so a scrubber on a converted stream can move
+  before the new encode plays. `.is_some()` is the old answer. A failed
+  playback has none, where it said true and sought nowhere.
 
 - New: an admin can delete a user (`admin.userDelete`, Delete on the
   user's page): their sessions, ways to sign in, devices' trust and

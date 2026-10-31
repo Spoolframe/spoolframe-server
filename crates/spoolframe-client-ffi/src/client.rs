@@ -50,9 +50,8 @@ pub struct DeviceSpec {
     /// suggestion.
     #[uniffi(default = None)]
     pub catalog_cache: Option<u32>,
-    /// The device's language, as BCP 47 (`en-US`): a viewer with no saved
-    /// track preferences hears a film in it where the film has it. `None`:
-    /// the file's default track.
+    /// The device's language, as BCP 47 (`en-US`): what a saved `device`
+    /// in track preferences stands for. It chooses nothing by itself.
     #[uniffi(default = None)]
     pub language: Option<String>,
 }

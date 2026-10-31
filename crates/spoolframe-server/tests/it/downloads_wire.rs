@@ -936,10 +936,11 @@ async fn options(client: &TestClient, session: &SessionId) -> DownloadOptionsInf
     }
 }
 
-/// A download's first choice is what playback would pick: the device's
-/// language, with nothing saved.
+/// A download's first choice is what playback would pick: the file's
+/// default with nothing saved, whatever the device, and the device's
+/// language once `device` is.
 #[tokio::test]
-async fn with_nothing_saved_the_options_prefer_the_device_s_language() {
+async fn the_options_prefer_the_device_s_language_only_when_saved() {
     let server = server("downloads-wire-language", ServerOptions::default()).await;
     std::fs::create_dir_all(server.media.parent().unwrap()).unwrap();
     let status = std::process::Command::new("ffmpeg")
@@ -962,6 +963,18 @@ async fn with_nothing_saved_the_options_prefer_the_device_s_language() {
         .hello_speaking(Default::default(), &[], Some("en-US"))
         .await;
     let session = client.login("alice", PASSWORD).await;
+    assert_eq!(
+        options(&client, &session).await.preferred,
+        DownloadTracks::Chosen {
+            audio: vec![0],
+            subtitles: Vec::new()
+        }
+    );
+    let mut preferences = spoolframe_types::TrackPreferences::default();
+    preferences.audio.languages = vec![spoolframe_types::preferences::DEVICE_LANGUAGE.into()];
+    client
+        .call(Some(&session), Request::SetTrackPreferences { preferences })
+        .await;
     assert_eq!(
         options(&client, &session).await.preferred,
         DownloadTracks::Chosen {

@@ -1477,10 +1477,10 @@ pub struct Hello {
         skip_serializing_if = "Features::is_empty"
     )]
     pub features: Features,
-    /// The device's language, as BCP 47 (`en-US`). A viewer with no saved
-    /// track preferences hears it where a file has it. Left out when the
-    /// app says nothing, as an older client does; an older server ignores
-    /// it.
+    /// The device's language, as BCP 47 (`en-US`): what a saved `device`
+    /// in track preferences stands for. It chooses nothing by itself.
+    /// Left out when the app says nothing, as an older client does; an
+    /// older server ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }

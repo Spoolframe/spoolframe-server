@@ -662,6 +662,13 @@ impl SpoolPlayback {
         }
     }
 
+    /// Where the player is for a scrubber, the player at `at`: the target
+    /// of a seek (`seek_started`) until it lands. `at` once the playback
+    /// is over.
+    pub fn position(&self, at: Duration) -> Duration {
+        self.managed().map_or(at, |managed| managed.position(at))
+    }
+
     /// Send the position reported last now: on pause.
     pub async fn flush(&self) -> Result<(), SpoolError> {
         let managed = self.managed()?;

@@ -140,10 +140,19 @@ impl Core {
     }
 
     /// Undo the intro skipped by itself in the last few seconds: back
-    /// where it was, with `seek`. False when there is none to undo.
-    fn undo_skip(&self, seek: impl Fn(Duration)) -> bool {
+    /// where it was, with `seek`. Where that is, or `None` when there is
+    /// none to undo.
+    fn undo_skip(&self, seek: impl Fn(Duration)) -> Option<Duration> {
         let back = self.markers.borrow_mut().as_mut().and_then(|t| t.undo());
-        back.inspect(|at| seek(*at)).is_some()
+        back.inspect(|at| seek(*at))
+    }
+
+    /// Whether the intro skipped by itself can still be undone.
+    fn undoable(&self) -> bool {
+        self.markers
+            .borrow()
+            .as_ref()
+            .is_some_and(MarkerTracker::undoable)
     }
 
     fn set_has_next(&self, has_next: bool) {
@@ -243,10 +252,30 @@ impl PlaybackController {
         self.0.core.on_position(at, settled, |to| self.0.seek(to))
     }
 
+    /// Whether the intro skipped by itself can still be undone
+    /// ([`Self::undo_skip`]): for a view that comes after the skip, and has
+    /// missed its [`MarkerAction::AutoSkip`], to show Undo or not.
+    pub fn undoable(&self) -> bool {
+        self.0.stage.get() != Stage::Failed && self.0.core.undoable()
+    }
+
     /// Undo the intro skipped by itself in the last few seconds: back
-    /// where it was. False when there is none to undo.
-    pub fn undo_skip(&self) -> bool {
+    /// where it was. Where that is, for a scrubber that cannot wait for a
+    /// converted stream's new encode; `None` when there is none to undo.
+    pub fn undo_skip(&self) -> Option<Duration> {
+        // A failed playback seeks no more: no target to promise.
+        if self.0.stage.get() == Stage::Failed {
+            return None;
+        }
         self.0.core.undo_skip(|at| self.0.seek(at))
+    }
+
+    /// Where the player is for the app's own progress (a scrubber), the
+    /// player at `at`: a seek's target while the seek is in flight, a
+    /// converted restart's until the new encode plays. As
+    /// [`LocalController::position`].
+    pub fn position(&self, at: Duration) -> Duration {
+        self.0.position(at).0
     }
 
     /// Whether something follows the item: the credits' button is Next.
@@ -352,8 +381,13 @@ impl LocalController {
         self.gate.borrow_mut().done();
     }
 
+    /// As [`PlaybackController::undoable`].
+    pub fn undoable(&self) -> bool {
+        self.core.undoable()
+    }
+
     /// As [`PlaybackController::undo_skip`].
-    pub fn undo_skip(&self) -> bool {
+    pub fn undo_skip(&self) -> Option<Duration> {
         self.core.undo_skip(|at| self.seek_to(at))
     }
 
@@ -508,6 +542,8 @@ mod tests {
         starts: AtomicU32,
         /// Each seek takes this long on the link.
         seek_takes: Mutex<Duration>,
+        /// Seeks are refused.
+        seek_refused: AtomicBool,
     }
 
     #[async_trait]
@@ -573,6 +609,9 @@ mod tests {
             self.seeks.lock().push(at.as_secs());
             let takes = *self.seek_takes.lock();
             tokio::time::sleep(takes).await;
+            if self.seek_refused.load(SeqCst) {
+                return Err(SdkError::InvalidInput("no seeking here".into()));
+            }
             Ok(self.epoch.fetch_add(1, SeqCst) + 1)
         }
         /// A new encode with the subtitle, as a converted playback's.
@@ -682,6 +721,62 @@ mod tests {
 
     fn took(player: &Player) -> Vec<String> {
         std::mem::take(&mut *player.0.borrow_mut())
+    }
+
+    /// A main loop with no Tokio runtime, as GTK's: what it is given is
+    /// polled on this thread.
+    #[derive(Default)]
+    struct PlainLoop(Rc<RefCell<Vec<LocalBoxFuture<'static, ()>>>>);
+
+    impl PlainLoop {
+        fn spawn(&self) -> LocalSpawn {
+            let queue = self.0.clone();
+            Rc::new(move |future| queue.borrow_mut().push(future))
+        }
+
+        /// Poll what it has until `done`.
+        fn run_until(&self, done: impl Fn() -> bool) {
+            struct Unpark(std::thread::Thread);
+            impl std::task::Wake for Unpark {
+                fn wake(self: Arc<Self>) {
+                    self.0.unpark();
+                }
+            }
+            let waker = Arc::new(Unpark(std::thread::current())).into();
+            let mut cx = std::task::Context::from_waker(&waker);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "never done");
+                let mut polled = std::mem::take(&mut *self.0.borrow_mut());
+                polled.retain_mut(|future| future.as_mut().poll(&mut cx).is_pending());
+                self.0.borrow_mut().append(&mut polled);
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// The gather's timer is the playback's: polled from a thread with no
+    /// Tokio runtime, a converted stream's seek restarts. It panicked with
+    /// "no reactor running".
+    #[test]
+    fn a_seek_gathers_on_a_thread_with_no_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = Arc::new(Server::default());
+        server.converted.store(true, SeqCst);
+        let playback = runtime.block_on(start(&server));
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let main_loop = PlainLoop::default();
+        let player = Rc::new(Player::default());
+        let c = PlaybackController::new(playback, player.clone(), main_loop.spawn(), None, true);
+        took(&player);
+        c.seek_coalesced(Duration::from_secs(100));
+        main_loop.run_until(|| !c.restarting());
+        assert_eq!(*server.seeks.lock(), [100]);
+        assert_eq!(took(&player), ["stop", "load:1:1:None", "play"]);
     }
 
     /// Scrubbing a converted stream: three seeks inside 250 ms are one
@@ -876,7 +971,7 @@ mod tests {
                     to: Duration::from_secs(90)
                 }));
                 assert_eq!(took(&player), ["seek:90"]);
-                assert!(c.undo_skip());
+                assert_eq!(c.undo_skip(), Some(Duration::from_secs(66)));
                 assert_eq!(took(&player), ["seek:66"]);
                 // Skipped once: back in the intro it is offered, not skipped.
                 let again = c.on_position(Duration::from_secs(67));
@@ -934,6 +1029,57 @@ mod tests {
                         to: Duration::from_secs(90)
                     }))]
                 );
+            })
+            .await;
+    }
+
+    /// A scrubber shows a direct seek's target until it lands, and then
+    /// the player again.
+    #[tokio::test(start_paused = true)]
+    async fn the_position_is_a_direct_seek_s_target_until_it_lands() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server = Arc::new(Server::default());
+                let player = Rc::new(Player::default());
+                let c = PlaybackController::new(
+                    start(&server).await,
+                    player.clone(),
+                    local(),
+                    None,
+                    true,
+                );
+                assert_eq!(c.position(secs(10)), secs(10));
+                c.seek_coalesced(secs(90));
+                assert_eq!(c.position(secs(10)), secs(90));
+                assert_eq!(c.position(secs(91)), secs(91));
+            })
+            .await;
+    }
+
+    /// While a converted stream restarts the old encode still plays: the
+    /// position is the restart's target from the seek on, each newer seek's
+    /// as it comes, and the player's once the new encode is there.
+    #[tokio::test(start_paused = true)]
+    async fn the_position_is_a_restart_s_target_until_the_new_encode_plays() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server = Arc::new(Server::default());
+                server.converted.store(true, SeqCst);
+                let player = Rc::new(Player::default());
+                let c = PlaybackController::new(
+                    start(&server).await,
+                    player.clone(),
+                    local(),
+                    None,
+                    true,
+                );
+                c.seek_coalesced(secs(100));
+                assert_eq!(c.position(secs(10)), secs(100));
+                c.seek_coalesced(secs(200));
+                assert_eq!(c.position(secs(10)), secs(200));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(!c.restarting());
+                assert_eq!(c.position(secs(201)), secs(201));
             })
             .await;
     }
@@ -1024,8 +1170,104 @@ mod tests {
                 })
         );
         assert_eq!(*sought.borrow(), [62, 90]);
-        assert!(c.undo_skip());
+        assert_eq!(c.undo_skip(), Some(Duration::from_secs(62)));
         assert_eq!(*sought.borrow(), [62, 90, 62]);
+    }
+
+    /// A view that comes late can ask whether to show Undo: yes from the
+    /// skip, no once undone.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_skip_is_undoable_until_it_is_undone() {
+        let c = local_at(Rc::default()).with_markers(intro());
+        c.length_known(secs(1800));
+        assert!(!c.undoable());
+        c.on_position(secs(62));
+        assert!(c.undoable());
+        c.undo_skip();
+        assert!(!c.undoable());
+    }
+
+    /// The same, and the window closes by itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_skip_is_undoable_for_its_window() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server = Arc::new(Server::default());
+                let player = Rc::new(Player::default());
+                let c = PlaybackController::new(
+                    start(&server).await,
+                    player.clone(),
+                    local(),
+                    None,
+                    true,
+                )
+                .with_markers(intro());
+                c.length_known(secs(1800));
+                assert!(!c.undoable());
+                c.on_position(secs(62));
+                assert!(c.undoable());
+                tokio::time::advance(crate::markers::UNDO_WINDOW).await;
+                assert!(!c.undoable());
+                assert_eq!(c.undo_skip(), None);
+            })
+            .await;
+    }
+
+    /// Undone on a converted stream, the target is known at once, and the
+    /// scrubber can go there while the old encode still plays.
+    #[tokio::test(start_paused = true)]
+    async fn an_undo_on_a_converted_stream_gives_its_target_at_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server = Arc::new(Server::default());
+                server.converted.store(true, SeqCst);
+                let player = Rc::new(Player::default());
+                let c = PlaybackController::new(
+                    start(&server).await,
+                    player.clone(),
+                    local(),
+                    None,
+                    true,
+                )
+                .with_markers(intro());
+                c.length_known(secs(1800));
+                c.on_position(secs(62));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(c.position(secs(90)), secs(90));
+                assert_eq!(c.undo_skip(), Some(secs(62)));
+                assert_eq!(c.position(secs(90)), secs(62));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(*server.seeks.lock(), [90, 62]);
+            })
+            .await;
+    }
+
+    /// A failed playback seeks no more: there is nothing to undo, and no
+    /// target to give.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_playback_has_no_undo() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server = Arc::new(Server::default());
+                server.converted.store(true, SeqCst);
+                let player = Rc::new(Player::default());
+                let c = PlaybackController::new(
+                    start(&server).await,
+                    player.clone(),
+                    local(),
+                    None,
+                    true,
+                )
+                .with_markers(intro());
+                c.length_known(secs(1800));
+                server.seek_refused.store(true, SeqCst);
+                c.on_position(secs(62));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(took(&player).iter().any(|e| e.starts_with("failed")));
+                assert!(!c.undoable());
+                assert_eq!(c.undo_skip(), None);
+            })
+            .await;
     }
 
     /// The server ended the playback and the SDK started it again: the

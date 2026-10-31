@@ -318,6 +318,23 @@ async fn positions_during_a_seek_report_its_target() {
     );
 }
 
+/// A scrubber goes by the seek's target while the player still says where
+/// it was, and by the player once the seek is done.
+#[tokio::test]
+async fn the_position_is_a_seek_s_target_until_it_is_done() {
+    let backend = Arc::new(Backend::default());
+    let playback = playing(backend, snapshot());
+    playback.report_position(Duration::from_secs(65)).unwrap();
+    playback.seek_started(Duration::from_secs(300));
+    let during = playback.position(Duration::from_secs(65));
+    playback.seek_done();
+    let after = playback.position(Duration::from_secs(296));
+    assert_eq!(
+        (during, after),
+        (Duration::from_secs(300), Duration::from_secs(296))
+    );
+}
+
 #[tokio::test]
 async fn a_subtitle_change_moves_the_player_to_the_new_encode() {
     let backend = Arc::new(Backend {

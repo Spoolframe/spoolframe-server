@@ -101,6 +101,14 @@ async fn start(client: &TestClient, session: &SessionId) -> Response {
 /// capped. The second of its playbacks is not refused.
 #[tokio::test]
 async fn a_connection_with_one_path_and_none_selected_is_judged_by_that_path() {
+    // In a namespace of its own, so ::1 is there even where the host or
+    // CI's container has no IPv6.
+    if !support::private_netns(
+        module_path!(),
+        "a_connection_with_one_path_and_none_selected_is_judged_by_that_path",
+    ) {
+        return;
+    }
     let server = one_stream("uplink-unselected", UplinkSettings::default()).await;
     let (_old, new, session) = second_socket(&server).await;
     for _ in 0..2 {
@@ -116,6 +124,14 @@ async fn a_connection_with_one_path_and_none_selected_is_judged_by_that_path() {
 /// is judged, not assumed.
 #[tokio::test]
 async fn an_unselected_path_off_the_lan_is_held_to_the_wan_limit() {
+    // In a namespace of its own, so ::1 is there even where the host or
+    // CI's container has no IPv6.
+    if !support::private_netns(
+        module_path!(),
+        "an_unselected_path_off_the_lan_is_held_to_the_wan_limit",
+    ) {
+        return;
+    }
     let wan = UplinkSettings {
         wan_prefixes: vec!["127.0.0.0/8".parse().unwrap()],
         ..UplinkSettings::default()

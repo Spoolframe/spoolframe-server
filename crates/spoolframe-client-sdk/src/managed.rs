@@ -1199,6 +1199,14 @@ impl ManagedPlayback {
         self.0.state.lock().gate.done();
     }
 
+    /// Where the player is for the app's own progress (a scrubber), the
+    /// player at `at`: a seek's target ([`Self::seek_started`]) until it
+    /// lands. Takes the same ticks as [`Self::report_position`], before or
+    /// after it, in any number.
+    pub fn position(&self, at: Duration) -> Duration {
+        self.gated(at).0
+    }
+
     /// The player at `at` through the seek gate: where it is for the
     /// progress and the markers, and whether that is settled.
     pub(crate) fn gated(&self, at: Duration) -> (Duration, bool) {
@@ -1211,9 +1219,11 @@ impl ManagedPlayback {
     }
 
     /// Wait `time` on the playback's runtime, from any thread or
-    /// executor: the timer is the runtime's.
+    /// executor: the timer is the runtime's. The sleep is made in the
+    /// task, as making one needs a runtime and the caller may have none.
     pub(crate) async fn delay(&self, time: Duration) {
-        let _ = self.0.runtime.spawn(tokio::time::sleep(time)).await;
+        let sleep = async move { tokio::time::sleep(time).await };
+        let _ = self.0.runtime.spawn(sleep).await;
     }
 
     /// Fetch what the keeper is missing of the file, a piece at a time,
@@ -2667,6 +2677,19 @@ mod tests {
         drop(runtime);
     }
 
+    /// The player's seek holds the position at its target until it lands.
+    #[tokio::test]
+    async fn the_position_goes_through_the_seek_gate() {
+        let p = open(Arc::new(Backend::default())).await;
+        p.seek_started(Duration::from_secs(300));
+        assert_eq!(
+            p.position(Duration::from_secs(65)),
+            Duration::from_secs(300)
+        );
+        p.seek_done();
+        assert_eq!(p.position(Duration::from_secs(65)), Duration::from_secs(65));
+    }
+
     #[test]
     fn a_link_under_what_the_segments_need_is_too_slow() {
         // Four 6 s segments of 6 MB: 8 Mbit/s.
@@ -3273,6 +3296,101 @@ mod tests {
             Some("2".into())
         );
         assert!(b.events.lock().contains(&"stop:1".into()));
+    }
+
+    fn start_of(
+        session: &PlayerSession,
+    ) -> impl Future<Output = Result<ManagedPlayback, SdkError>> {
+        session.start(item(), None, PlaybackOptions::default())
+    }
+
+    /// Two starts asked in turn and polled the other way round, as a
+    /// multi-worker runtime can: the second was asked last, so it plays and
+    /// the first is overtaken, not the other way, and the first's turn
+    /// does not end what the second opened.
+    #[tokio::test]
+    async fn the_newer_start_plays_though_it_is_polled_first() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        let first = start_of(&session);
+        let second = start_of(&session);
+        let (second, first) = futures_util::future::join(second, first).await;
+        assert_eq!(first.err(), Some(SdkError::PlaybackClosed));
+        let second = second.unwrap().snapshot().handle.0;
+        assert_eq!(
+            session.current().map(|p| p.snapshot().handle.0),
+            Some(second.clone())
+        );
+        assert!(!b.events.lock().contains(&format!("stop:{second}")));
+    }
+
+    /// A start, then an end polled first: it was asked last, so nothing
+    /// plays.
+    #[tokio::test]
+    async fn an_end_polled_before_the_start_it_followed_still_ends_it() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        let start = start_of(&session);
+        let end = session.end();
+        let ((), start) = futures_util::future::join(end, start).await;
+        assert_eq!(start.err(), Some(SdkError::PlaybackClosed));
+        assert!(session.current().is_none());
+    }
+
+    /// An end, then a start polled first: the end comes to what the start
+    /// was asked after, not to the start.
+    #[tokio::test]
+    async fn a_start_polled_before_the_end_it_followed_still_plays() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        let end = session.end();
+        let start = start_of(&session);
+        let (start, ()) = futures_util::future::join(start, end).await;
+        let handle = start.unwrap().snapshot().handle.0;
+        assert_eq!(
+            session.current().map(|p| p.snapshot().handle.0),
+            Some(handle)
+        );
+    }
+
+    /// A request counts from when it is asked, polled or not: one dropped
+    /// unpolled overtakes the start before it, as it would have played, and
+    /// holds up nothing after it.
+    #[tokio::test]
+    async fn a_start_dropped_unpolled_overtakes_but_holds_up_nothing() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        let first = start_of(&session);
+        drop(start_of(&session));
+        assert_eq!(first.await.err(), Some(SdkError::PlaybackClosed));
+        assert!(session.current().is_none());
+        let third = start_of(&session).await.unwrap().snapshot().handle.0;
+        assert_eq!(
+            session.current().map(|p| p.snapshot().handle.0),
+            Some(third)
+        );
+    }
+
+    /// An end still ends what plays, though the start asked after it was
+    /// dropped and will never do it.
+    #[tokio::test]
+    async fn an_end_followed_by_a_dropped_start_still_ends() {
+        let b = Arc::new(Backend::default());
+        let session = PlayerSession::new(b.clone());
+        start_of(&session).await.unwrap();
+        let end = session.end();
+        drop(start_of(&session));
+        end.await;
+        assert!(session.current().is_none());
+    }
+
+    /// Each can be spawned as it is, so it is numbered before it is.
+    #[test]
+    fn a_start_and_an_end_need_no_session_to_outlive_them() {
+        fn spawnable(_: impl Future + Send + 'static) {}
+        let session = PlayerSession::new(Arc::new(Backend::default()));
+        spawnable(session.start(item(), None, PlaybackOptions::default()));
+        spawnable(session.end());
     }
 
     /// A new start stops what played, after its last report, before it

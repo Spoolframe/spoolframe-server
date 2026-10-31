@@ -159,9 +159,8 @@ pub struct ClientOptions {
     /// twice.
     pub catalog_cache: Option<crate::CacheConfig>,
     /// The device's language, as BCP 47 (`en-US`), sent in each
-    /// connection's `Hello`: a viewer with no saved track preferences
-    /// hears a film in it where the film has it. `None` by default, and
-    /// then the file's default track plays.
+    /// connection's `Hello`: what a saved `device` in track preferences
+    /// stands for. It chooses nothing by itself.
     pub language: Option<String>,
 }
 

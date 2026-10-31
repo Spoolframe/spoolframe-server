@@ -281,6 +281,11 @@ fn going_by<P>(paths: impl IntoIterator<Item = P>, selected: impl Fn(&P) -> bool
     others.find(selected)
 }
 
+/// The device's language, as this connection's `Hello` says it (BCP 47).
+fn device_language(state: &ConnectionState) -> Option<&str> {
+    state.hello.get().and_then(|h| h.language.as_deref())
+}
+
 /// [`going_by`] on `connection` now, as the log names it; `none` when it
 /// is not known.
 fn path_now(connection: &iroh::endpoint::Connection, uplink: &crate::uplink::Uplink) -> String {
@@ -6651,7 +6656,7 @@ impl ClientProtocol {
             return music_download_options(&descriptor, class);
         }
         let store = self.store();
-        let preferences = self.track_preferences(state, who).await?;
+        let preferences = self.track_preferences(who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = store
             .track_override(principal, &scope)
@@ -6661,6 +6666,7 @@ impl ClientProtocol {
             &descriptor,
             &preferences,
             override_.as_ref(),
+            device_language(state),
         ));
         let caps = device_caps
             .or_else(|| capabilities(state, None))
@@ -6766,17 +6772,21 @@ impl ClientProtocol {
             message: "a choice of tracks this server does not know".into(),
         })?;
         let (path, descriptor) = self.describe(id).await?;
-        let preferences = self.track_preferences(state, who).await?;
+        let preferences = self.track_preferences(who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = self
             .store()
             .track_override(principal, &scope)
             .await
             .map_err(internal)?;
-        let default_subtitle =
-            crate::tracks::choose(&descriptor.tracks(), &preferences, override_.as_ref())
-                .selection
-                .subtitle;
+        let default_subtitle = crate::tracks::choose(
+            &descriptor.tracks(),
+            &preferences,
+            override_.as_ref(),
+            device_language(state),
+        )
+        .selection
+        .subtitle;
         let caps = device_caps.or_else(|| capabilities(state, None));
         let media_id = id.to_string();
         let prepared = self
@@ -7084,13 +7094,18 @@ impl ClientProtocol {
             return Ok((selection, None));
         }
         let store = self.store();
-        let preferences = self.track_preferences(state, who).await?;
+        let preferences = self.track_preferences(who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = store
             .track_override(who.principal(), &scope)
             .await
             .map_err(internal)?;
-        let chosen = tracks::choose(&descriptor.tracks(), &preferences, override_.as_ref());
+        let chosen = tracks::choose(
+            &descriptor.tracks(),
+            &preferences,
+            override_.as_ref(),
+            device_language(state),
+        );
         Ok((chosen.selection, Some(chosen)))
     }
 
@@ -7104,40 +7119,22 @@ impl ClientProtocol {
         if let Some(asked) = planner::Bitmap::asked(requested) {
             return Ok(asked);
         }
-        let preferences = self.saved_track_preferences(who).await?;
-        Ok(planner::Bitmap::Preferred(
-            preferences.unwrap_or_default().subtitles.bitmap,
-        ))
+        let preferences = self.track_preferences(who).await?;
+        Ok(planner::Bitmap::Preferred(preferences.subtitles.bitmap))
     }
 
-    /// The track preferences `who` plays by on this connection: what they
-    /// saved, else the device's language ([`tracks::unsaved`]). A saved
-    /// row wins even when its languages are empty.
+    /// `who`'s track preferences: a paired server's user's as their own
+    /// server gave them with the play token (P8-04), this server having
+    /// none of theirs; anyone else's as kept here.
     async fn track_preferences(
         &self,
-        state: &ConnectionState,
         who: &Who,
     ) -> Result<spoolframe_types::TrackPreferences, Error> {
-        let language = state.hello.get().and_then(|h| h.language.as_deref());
-        Ok(self
-            .saved_track_preferences(who)
-            .await?
-            .unwrap_or_else(|| tracks::unsaved(language)))
-    }
-
-    /// `who`'s saved track preferences: a paired server's user's as their
-    /// own server gave them with the play token (P8-04), this server
-    /// having none of theirs; anyone else's as kept here. `None` where
-    /// they saved none.
-    async fn saved_track_preferences(
-        &self,
-        who: &Who,
-    ) -> Result<Option<spoolframe_types::TrackPreferences>, Error> {
         match who {
-            Who::Remote(remote) => Ok(remote.preferences.clone()),
+            Who::Remote(remote) => Ok(remote.preferences.clone().unwrap_or_default()),
             _ => self
                 .store()
-                .saved_track_preferences(who.principal())
+                .track_preferences(who.principal())
                 .await
                 .map_err(internal),
         }

@@ -5872,27 +5872,39 @@ mod replica {
             pair.stop().await;
         }
 
-        /// Bob saved nothing on SB, so SB says nothing, and SA goes by the
-        /// language of the device in front of it: French, which is not
-        /// the film's default.
+        /// A play SB proxies is on SB's connection to SA, whose `Hello` says
+        /// no language, whatever the device says to SB: `device` is skipped,
+        /// and the film's default plays.
         #[tokio::test]
-        async fn sa_chooses_by_the_device_s_language_when_bob_saved_nothing() {
+        async fn a_play_sb_proxies_has_no_device_language() {
+            use spoolframe_protocol::TrackReason;
             let sa = ServerOptions {
                 ffprobe_fixture: "mkv-hevc-pgs.json",
                 ..ServerOptions::default()
             };
-            let pair = Pair::start_both("fed-device-language", sa, ServerOptions::default()).await;
+            let pair = Pair::start_both("fed-device-proxied", sa, ServerOptions::default()).await;
             let (_, bob) = shared(&pair).await;
-            let device = pair.sa.client().await;
+            let mut preferences = spoolframe_types::TrackPreferences::default();
+            preferences.audio.languages =
+                vec![spoolframe_types::preferences::DEVICE_LANGUAGE.into()];
+            pair.sb
+                .store
+                .set_track_preferences(
+                    spoolframe_server::principal::Principal::LocalUser(bob),
+                    &preferences,
+                )
+                .await
+                .unwrap();
+            let device = pair.sb.client().await;
             let mut capabilities = mkv_capabilities();
-            capabilities.audio.insert(spoolframe_types::AudioCodec::Ac3);
+            capabilities
+                .audio
+                .insert(spoolframe_types::AudioCodec::TrueHd);
             device
                 .hello_speaking(capabilities, &[FEDERATION], Some("fr-CA"))
                 .await;
-            let session = redeemed(&device, &token(&pair, bob, &device).await)
-                .await
-                .session;
-            let mut request = start(movie().id());
+            let session = device.login("bob", "correct horse").await;
+            let mut request = start(&pair.fed(movie().id()));
             if let Request::StartPlayback { selection, .. } = &mut request {
                 *selection = None;
             }
@@ -5903,7 +5915,64 @@ mod replica {
                 }) => chosen,
                 other => panic!("did not start: {other:?}"),
             };
+            assert_eq!(chosen.audio, TrackReason::FileDefault, "{chosen:?}");
+            pair.stop().await;
+        }
+
+        /// Bob's choice of `device` is kept on SB and goes to SA as it is:
+        /// SA goes by the language of the device in front of it, French,
+        /// which is not the film's default. With nothing saved the default
+        /// plays, on the same device.
+        #[tokio::test]
+        async fn sa_resolves_bob_s_device_language_by_the_device_it_serves() {
+            let sa = ServerOptions {
+                ffprobe_fixture: "mkv-hevc-pgs.json",
+                ..ServerOptions::default()
+            };
+            let pair = Pair::start_both("fed-device-language", sa, ServerOptions::default()).await;
+            let (_, bob) = shared(&pair).await;
+            let device = pair.sa.client().await;
+            let mut capabilities = mkv_capabilities();
+            capabilities.audio.insert(spoolframe_types::AudioCodec::Ac3);
+            capabilities
+                .audio
+                .insert(spoolframe_types::AudioCodec::TrueHd);
+            device
+                .hello_speaking(capabilities, &[FEDERATION], Some("fr-CA"))
+                .await;
+            let play = async || {
+                let session = redeemed(&device, &token(&pair, bob, &device).await)
+                    .await
+                    .session;
+                let mut request = start(movie().id());
+                if let Request::StartPlayback { selection, .. } = &mut request {
+                    *selection = None;
+                }
+                match device.call(Some(&session), request).await {
+                    Response::Ok(Reply::PlaybackStarted {
+                        chosen: Some(chosen),
+                        ..
+                    }) => chosen,
+                    other => panic!("did not start: {other:?}"),
+                }
+            };
+            use spoolframe_protocol::TrackReason;
+            let chosen = play().await;
+            assert_eq!(chosen.audio, TrackReason::FileDefault, "{chosen:?}");
+            let mut preferences = spoolframe_types::TrackPreferences::default();
+            preferences.audio.languages =
+                vec![spoolframe_types::preferences::DEVICE_LANGUAGE.into()];
+            pair.sb
+                .store
+                .set_track_preferences(
+                    spoolframe_server::principal::Principal::LocalUser(bob),
+                    &preferences,
+                )
+                .await
+                .unwrap();
+            let chosen = play().await;
             assert_eq!(chosen.selection.audio, Some(3), "{chosen:?}");
+            assert_eq!(chosen.audio, TrackReason::Preferences, "{chosen:?}");
             pair.stop().await;
         }
 

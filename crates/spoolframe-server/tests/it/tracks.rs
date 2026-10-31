@@ -8,6 +8,7 @@
 use spoolframe_protocol::{
     ChosenTracks, Reply, Request, Response, Selection, SessionId, TrackPreferencesInfo, TrackReason,
 };
+use spoolframe_types::preferences::DEVICE_LANGUAGE;
 use spoolframe_types::{
     MediaId, MediaKind, Namespace, SdhPreference, SubtitleMode, SubtitleRole, TrackPreferences,
 };
@@ -76,15 +77,54 @@ async fn heard(client: &TestClient, session: &SessionId) -> (Option<String>, Tra
     (tracks.audio[picked].language.clone(), chosen.audio)
 }
 
+/// The device's language is no stand-in for preferences: a German TV
+/// with nothing saved plays the file's default, as any other device.
 #[tokio::test]
-async fn with_nothing_saved_the_device_s_language_chooses_the_audio() {
+async fn with_nothing_saved_the_file_s_default_plays() {
     let (server, _, _) = ready("tracks-device-language").await;
     let (tv, on_tv) = speaking(&server, Some("de-DE")).await;
     assert_eq!(
         heard(&tv, &on_tv).await,
-        (Some("ger".into()), TrackReason::Preferences)
+        (Some("eng".into()), TrackReason::FileDefault)
     );
     tv.close().await;
+}
+
+/// `device` is kept as it is, one setting for the user, and each device
+/// hears its own language: a German TV German, one that says none the
+/// file's default.
+#[tokio::test]
+async fn saved_device_audio_goes_by_each_connection_s_language() {
+    let (server, _, _) = ready("tracks-device-saved").await;
+    let (tv, on_tv) = speaking(&server, Some("de-DE")).await;
+    let (phone, on_phone) = speaking(&server, None).await;
+    let mut preferences = TrackPreferences::default();
+    preferences.audio.languages = vec![DEVICE_LANGUAGE.into()];
+    preferences.subtitles.languages = vec![DEVICE_LANGUAGE.into()];
+    done(
+        &tv,
+        &on_tv,
+        Request::SetTrackPreferences {
+            preferences: preferences.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        heard(&tv, &on_tv).await,
+        (Some("ger".into()), TrackReason::Preferences)
+    );
+    assert_eq!(
+        heard(&phone, &on_phone).await,
+        (Some("eng".into()), TrackReason::FileDefault)
+    );
+    let Response::Ok(Reply::TrackPreferences(info)) =
+        tv.call(Some(&on_tv), Request::GetTrackPreferences).await
+    else {
+        panic!("no preferences");
+    };
+    assert_eq!(info.preferences, preferences);
+    tv.close().await;
+    phone.close().await;
 }
 
 /// `ClientOptions::language` reaches `Hello`.
@@ -111,6 +151,9 @@ async fn an_app_s_language_is_said_by_the_sdk() {
         .await
         .unwrap();
     let session = crate::federation::app::sign_in(&client, &server, "alice").await;
+    let mut preferences = TrackPreferences::default();
+    preferences.audio.languages = vec![DEVICE_LANGUAGE.into()];
+    session.set_track_preferences(&preferences).await.unwrap();
     let plan = session.playback_plan(&episode("12"), None).await.unwrap();
     assert_eq!(plan.chosen.map(|c| c.audio), Some(TrackReason::Preferences));
     client.close().await;
@@ -120,27 +163,6 @@ async fn an_app_s_language_is_said_by_the_sdk() {
 async fn an_older_client_that_says_no_language_gets_the_file_s_default() {
     let (server, _, _) = ready("tracks-no-language").await;
     let (tv, on_tv) = speaking(&server, None).await;
-    assert_eq!(
-        heard(&tv, &on_tv).await,
-        (Some("eng".into()), TrackReason::FileDefault)
-    );
-    tv.close().await;
-}
-
-/// Saved with no language at all: the viewer asked for the file's default,
-/// and the device has no say.
-#[tokio::test]
-async fn a_saved_row_wins_over_the_device_s_language() {
-    let (server, _, _) = ready("tracks-saved-wins").await;
-    let (tv, on_tv) = speaking(&server, Some("de-DE")).await;
-    done(
-        &tv,
-        &on_tv,
-        Request::SetTrackPreferences {
-            preferences: TrackPreferences::default(),
-        },
-    )
-    .await;
     assert_eq!(
         heard(&tv, &on_tv).await,
         (Some("eng".into()), TrackReason::FileDefault)

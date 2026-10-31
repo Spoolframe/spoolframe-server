@@ -7408,7 +7408,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-admin-api"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "jsonrpsee",
  "serde",
@@ -7418,7 +7418,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-catalog"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "async-trait",
  "spoolframe-types",
@@ -7427,7 +7427,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-ffi"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "async-trait",
  "camino",
@@ -7448,7 +7448,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7483,7 +7483,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-federation"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "async-trait",
  "iroh",
@@ -7497,7 +7497,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-hls-bridge"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7515,7 +7515,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-media"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "alass-core",
  "async-trait",
@@ -7541,7 +7541,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-plex"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7564,7 +7564,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -7573,7 +7573,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-probe"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -7591,7 +7591,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -7612,7 +7612,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-server"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7693,7 +7693,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -7701,7 +7701,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -7711,7 +7711,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-web"
-version = "0.17.0-beta.5"
+version = "0.17.0-beta.6"
 dependencies = [
  "dioxus",
  "dioxus-fullstack",

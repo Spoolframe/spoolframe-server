@@ -9,6 +9,12 @@ use crate::media::AudioRole;
 /// language of the file's default audio track.
 pub const ORIGINAL_LANGUAGE: &str = "original";
 
+/// A language code that stands for the device's language: the one the
+/// connection's `Hello.language` says, at each choosing. Kept as it is, so
+/// a viewer's one setting means each of their devices' own language. Left
+/// out where the client says none.
+pub const DEVICE_LANGUAGE: &str = "device";
+
 /// Every field is required on the wire: a peer that leaves one out
 /// is refused, not filled in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,8 +27,8 @@ pub struct TrackPreferences {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AudioPreferences {
-    /// ISO 639 codes in order of preference, or [`ORIGINAL_LANGUAGE`].
-    /// Empty: the file's default track.
+    /// ISO 639 codes in order of preference, or [`ORIGINAL_LANGUAGE`] or
+    /// [`DEVICE_LANGUAGE`]. Empty: the file's default track.
     pub languages: Vec<String>,
     /// Roles never chosen while another track is left.
     pub avoid: Vec<AudioRole>,
@@ -41,7 +47,9 @@ impl Default for AudioPreferences {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SubtitlePreferences {
     pub mode: SubtitleMode,
-    /// ISO 639 codes in order of preference. Empty: the audio's language.
+    /// ISO 639 codes in order of preference, or [`DEVICE_LANGUAGE`].
+    /// Empty: the audio's language. A list of only [`DEVICE_LANGUAGE`] on
+    /// a device that says none matches nothing, and is not empty.
     pub languages: Vec<String>,
     pub sdh: SdhPreference,
     /// How picture subtitles (PGS, VobSub, DVB) are shown when the app
