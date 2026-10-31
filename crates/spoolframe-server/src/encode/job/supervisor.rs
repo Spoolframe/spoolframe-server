@@ -283,6 +283,10 @@ pub(super) fn driver_fault(ended: &Ended) -> bool {
         if matches!(status.signal(), Some(libc::SIGABRT | libc::SIGSEGV | libc::SIGBUS)))
 }
 
+/// What VA-API's encoders say when opened at the end of the input, no
+/// frame having reached them. Said at `-loglevel error`.
+const NO_FRAMES: &str = "A hardware frames reference is required";
+
 /// Whether a run that `ended` so may have failed for decoding on the GPU:
 /// it exited non-zero, or stalled. A run ended by a signal (the kernel's
 /// OOM killer, an operator, or the server stopping it) says nothing about
@@ -301,6 +305,15 @@ impl Supervisor {
         // run started, never twice, whichever ffmpeg encoded it.
         let mut counted_ms = self.start_ms;
         let mut ended = self.watch(launched, &mut counted_ms).await;
+        if self.found_no_frame() {
+            tracing::info!(
+                pid = self.pid(),
+                start_ms = self.start_ms,
+                "a run found no frame where it started; nothing is wrong with the GPU"
+            );
+            self.conclude(ended);
+            return;
+        }
         if decode_failed(&ended) && self.shared.hardware_decode.load(Ordering::Relaxed) {
             if let Some(fallback) = &self.fallback
                 && self.decode_failures.remember(&fallback.file)
@@ -357,6 +370,20 @@ impl Supervisor {
             }
         }
         self.conclude(ended);
+    }
+
+    /// The run sought past the last frame: an encoder that takes its
+    /// device from the frames was opened with none. Not `Could not open
+    /// encoder before EOF`, which a refused size says too. From the start
+    /// it would mean the GPU decoded nothing, which is the GPU's.
+    fn found_no_frame(&self) -> bool {
+        self.start_ms > 0
+            && self
+                .shared
+                .stderr
+                .lock()
+                .iter()
+                .any(|line| line.contains(NO_FRAMES))
     }
 
     /// [`Supervisor::attempt`], then what a crash says of its card

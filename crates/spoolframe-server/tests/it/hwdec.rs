@@ -381,6 +381,94 @@ async fn a_gpu_decode_that_fails_at_once_finishes_in_software() {
     assert_eq!(decoded(&out).unwrap(), (72, 480));
 }
 
+/// A run started past a film's last frame, real ffmpeg on a real encoder:
+/// it fails, with no frame to open the encoder on, and the GPU isn't to
+/// blame. The length is left out here, as a descriptor may leave it out,
+/// for the server's own clamp not to save it.
+#[tokio::test]
+async fn a_run_past_the_last_frame_is_not_held_against_the_film() {
+    let dir = fresh_dir("vaapi-past-end").await;
+    let Some(gpu) = gpu_or_skip("vaapi-past-end", &dir).await else {
+        return;
+    };
+    let (film, descriptor) = clip(&dir, &gpu.sandbox, "yuv420p").await;
+    let jobs = Jobs::new(
+        JobLimits {
+            budget: Units::jobs(1),
+            max_remux: 1,
+            max_gpu_jobs: 1,
+            scratch_dir: dir.join("scratch"),
+            scratch_limit_bytes: 1 << 30,
+            read_ahead: Duration::from_secs(600),
+            copy_segment_secs: 2,
+            stalled_after: Duration::from_secs(60),
+            gpu_filters: false,
+            tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
+            video_codecs: spoolframe_server::config::DEFAULT_VIDEO_CODECS.to_vec(),
+        },
+        Tool::new("ffmpeg", gpu.sandbox.clone()),
+    )
+    .unwrap();
+    let job_dir = jobs.dir().join("h/0");
+    let out = job_dir.join("out.mkv");
+    let on_gpu = EncodeSpec {
+        start: Some(Duration::from_secs(30)),
+        ..spec(&film, &descriptor, &gpu, true, false, &out)
+    };
+    let args = ffmpeg_args(&on_gpu).unwrap();
+    let software = ffmpeg_args(&EncodeSpec {
+        hardware_decode: false,
+        ..on_gpu.clone()
+    })
+    .unwrap();
+    let job = jobs
+        .start(
+            job_dir,
+            Run {
+                args,
+                inputs: vec![film.clone()],
+                reads: Vec::new(),
+                gpu: GpuUse::Vaapi,
+                vulkan: None,
+                fallback: Some(Fallback {
+                    args: software,
+                    gpu: GpuUse::Vaapi,
+                    file: film.clone(),
+                    made: None,
+                }),
+                made: None,
+                other_encoders: Vec::new(),
+                alone: false,
+                card: None,
+                ffmpeg: None,
+                aligned_until: None,
+                span: None,
+            },
+            Written::Progressive { file: out.clone() },
+            Load::Gpu,
+            0,
+            0,
+            30_000,
+            None,
+        )
+        .unwrap();
+    let mut progress = job.progress();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(60),
+        progress.wait_for(|p| p.done.is_some()),
+    )
+    .await
+    .expect("the job never ended")
+    .unwrap()
+    .clone();
+    assert!(
+        matches!(ended.done, Some(Err(_))) && !jobs.hardware_decode_failed(&film),
+        "{:?} {:?}",
+        ended.done,
+        job.stderr()
+    );
+}
+
 /// With GPU filters on, a 10-bit HDR10 HEVC source is tone mapped on the
 /// GPU to 8-bit SDR, where the driver can (Intel's iHD). Mesa's VA-API
 /// cannot: skipped there, saying so, as the server would tone map on the

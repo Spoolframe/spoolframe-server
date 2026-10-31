@@ -668,6 +668,73 @@ fn made_by(decoder: crate::encode::Decoder) -> Made {
     }
 }
 
+/// A run from `start_ms` that said `said` on the GPU and exited 234, as
+/// `hevc_vaapi` does with no frame to open on: whether the film was
+/// remembered, and the command it ended on.
+async fn failing_at(test: &str, said: &str, start_ms: u64) -> (bool, Vec<String>) {
+    let script = decoding(&format!("echo '{said}' >&2; exit 234"));
+    let (jobs, tmp) = jobs(test, &script, 1, Duration::from_secs(60)).await;
+    let film = tmp.as_ref().join("film.mkv");
+    let dir = jobs.dir().join("h/0");
+    let file = dir.join("out.mkv");
+    let job = jobs
+        .start(
+            dir,
+            gpu_run(&file, &film),
+            Written::Progressive { file: file.clone() },
+            Load::Gpu,
+            0,
+            0,
+            start_ms,
+            None,
+        )
+        .unwrap();
+    let _ = done(&job).await;
+    (jobs.hardware_decode_failed(&film), job.command())
+}
+
+/// A seek past the last frame: ffmpeg opens the encoder at the end of
+/// the file with no frame. The GPU did nothing wrong: the film isn't
+/// remembered, and no other run is tried.
+#[tokio::test]
+async fn a_seek_that_finds_no_frame_is_not_held_against_the_film() {
+    let (remembered, command) = failing_at(
+        "gpu-no-frames",
+        "[hevc_vaapi] A hardware frames reference is required to associate the encoding device.",
+        30_000,
+    )
+    .await;
+    assert_eq!(
+        (remembered, command.last().map(String::as_str)),
+        (false, Some("hw"))
+    );
+}
+
+/// From the start, no frame says the GPU decoded none.
+#[tokio::test]
+async fn a_run_from_the_start_with_no_frame_is_held_against_the_film() {
+    let (remembered, _) = failing_at(
+        "gpu-no-frames-start",
+        "[hevc_vaapi] A hardware frames reference is required to associate the encoding device.",
+        0,
+    )
+    .await;
+    assert!(remembered);
+}
+
+/// `Could not open encoder before EOF` alone says nothing: an encoder
+/// that refuses a size says it too, with frames there.
+#[tokio::test]
+async fn a_seek_the_gpu_failed_is_held_against_the_film() {
+    let (remembered, _) = failing_at(
+        "gpu-seek-fails",
+        "[hevc_vaapi] Could not open encoder before EOF",
+        30_000,
+    )
+    .await;
+    assert!(remembered);
+}
+
 /// The stand-in: `on_gpu` when the last argument is `hw`, else writes
 /// `abc` to the first and reports a second encoded.
 fn decoding(on_gpu: &str) -> String {
