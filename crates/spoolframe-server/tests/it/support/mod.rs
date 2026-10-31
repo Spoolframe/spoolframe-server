@@ -1960,6 +1960,16 @@ impl TestClient {
         capabilities: ClientCapabilities,
         experimental: &[&str],
     ) -> ServerInfo {
+        self.hello_speaking(capabilities, experimental, None).await
+    }
+
+    /// [`TestClient::hello_naming`], from a device in `language`.
+    pub async fn hello_speaking(
+        &self,
+        capabilities: ClientCapabilities,
+        experimental: &[&str],
+        language: Option<&str>,
+    ) -> ServerInfo {
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "test".into(),
@@ -1969,6 +1979,7 @@ impl TestClient {
             capabilities: Some(capabilities),
             experimental: experimental.iter().map(|n| n.to_string()).collect(),
             features: spoolframe_protocol::Features::empty(),
+            language: language.map(str::to_owned),
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -1995,6 +2006,7 @@ impl TestClient {
             capabilities: None,
             experimental: Vec::new(),
             features,
+            language: None,
         };
         match self.call(None, Request::Hello(hello)).await {
             Response::Ok(Reply::ServerInfo(info)) => info,
@@ -2029,6 +2041,7 @@ impl TestClient {
                 capabilities,
                 experimental: Vec::new(),
                 features: spoolframe_protocol::Features::empty(),
+                language: None,
             }),
         )
         .await

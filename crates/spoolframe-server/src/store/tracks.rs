@@ -59,12 +59,24 @@ impl Store {
         &self,
         principal: Principal,
     ) -> Result<TrackPreferences, StoreError> {
+        Ok(self
+            .saved_track_preferences(principal)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// `principal`'s preferences as they saved them: `None` with no row,
+    /// or one that cannot be read.
+    pub async fn saved_track_preferences(
+        &self,
+        principal: Principal,
+    ) -> Result<Option<TrackPreferences>, StoreError> {
         let json: Option<String> =
             sqlx::query_scalar("SELECT preferences FROM track_preferences WHERE principal = ?1")
                 .bind(principal.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(json.and_then(|j| parse_preferences(&j)).unwrap_or_default())
+        Ok(json.and_then(|j| parse_preferences(&j)))
     }
 
     pub async fn set_track_preferences(

@@ -273,6 +273,7 @@ async fn app_from(server: &TestServer, app: &TestClient) -> TestClient {
         capabilities: None,
         experimental: vec![FEDERATION.into()],
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     };
     assert!(matches!(
         device.call(None, Request::Hello(hello)).await,
@@ -695,6 +696,7 @@ async fn sa_plans_the_download_for_the_device_sb_names() {
         capabilities: None,
         experimental: vec![FEDERATION.into()],
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     };
     assert!(matches!(
         iphone.call(None, Request::Hello(hello)).await,
@@ -853,6 +855,7 @@ async fn say_hello(client: &TestClient) {
         capabilities: None,
         experimental: vec![FEDERATION.into()],
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,

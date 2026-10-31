@@ -108,6 +108,7 @@ impl ServerConnection {
         device: &Device,
         experimental: crate::Experimental,
         features: Features,
+        language: Option<&str>,
         timeouts: &Timeouts,
     ) -> Result<Self, DialFailed> {
         let expected: EndpointId = addr.id;
@@ -128,9 +129,17 @@ impl ServerConnection {
                 }
                 Ok(Ok(conn)) => conn,
             };
-        Self::greet(conn, expected, device, experimental, features, timeouts)
-            .await
-            .map_err(|(error, stage)| DialFailed { error, stage })
+        Self::greet(
+            conn,
+            expected,
+            device,
+            experimental,
+            features,
+            language,
+            timeouts,
+        )
+        .await
+        .map_err(|(error, stage)| DialFailed { error, stage })
     }
 
     /// Say `Hello` on `conn`, just made to `expected`, and check the answer.
@@ -140,6 +149,7 @@ impl ServerConnection {
         device: &Device,
         experimental: crate::Experimental,
         features: Features,
+        language: Option<&str>,
         timeouts: &Timeouts,
     ) -> Result<Self, (SdkError, DialStage)> {
         let unreachable = |e: String| SdkError::Unreachable(format!("{expected}: {e}"));
@@ -171,6 +181,7 @@ impl ServerConnection {
             experimental: experimental.names(),
             // The answer names those of them the server has.
             features,
+            language: language.map(str::to_owned),
         });
         // A server that takes the connection and then says nothing is as
         // unreachable as one that never answered the dial.

@@ -431,6 +431,7 @@ async fn an_older_offline_watch_loses_to_the_newer_one_on_the_server() {
         capabilities: None,
         experimental: Vec::new(),
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     };
     other.call(None, Request::Hello(hello)).await;
     let token = other.login("alice", PASSWORD).await;

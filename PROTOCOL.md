@@ -105,6 +105,7 @@ them. A few fields may still be left out, each for a reason of its own:
 | `ClientCapabilities.hardware_video` | `null` | "does not say" is its meaning |
 | `ClientCapabilities.video_codecs`, `DisplayCapabilities.video_codecs` | `null` | as `hardware_video` |
 | `display` on `PlaybackPlan`, `StartPlayback`, `ChangeSubtitle`, `ChangeQuality` | `null` | `null` keeps `Hello`'s |
+| `Hello.language` | `null` | as `hardware_video`; an older client says nothing |
 | `source_codec` on a `direct` or `converted` plan | `null` | for a client's log |
 | `year`, `air_date` on an item; `release_date` on a movie; `last_aired` on a show; `bit_rate` on a file and its video | `null` | the SDK keeps items with a download, and reads back what it kept before |
 | `cast` on a movie, show and episode | `[]` | as `year` |
@@ -148,6 +149,18 @@ this `Unsupported` as `SdkError::UpdateRequired { server_protocol: None
 `protocol_version`, `server_version`, `auth_methods` and `web_url`.
 The server keeps at most 128 characters (`MAX_HELLO_TEXT`) of each of
 `Hello`'s strings.
+
+`Hello.language`, optional, is the device's language as BCP 47 (`en-US`).
+A viewer with no saved track preferences and no pick for the film then
+hears it as if they had saved that one language: its primary subtag
+(`en`, which matches a track's `eng`), the file's default where it has no
+such track, forced subtitles following the track chosen. Anything saved
+wins, even preferences with no languages. `und`, `mul`, `mis`, `zxx`, a
+private tag and anything else that names no language count as saying
+nothing. It chooses a download's first choice of tracks the same way.
+`GetTrackPreferences` still answers what was saved: the device's language
+is not a preference. In the SDK it is `ClientOptions.language`, and
+`DeviceSpec.language` over FFI.
 
 ### RPC framing
 
@@ -3914,7 +3927,9 @@ SB's is not passed on.
   user's track preferences on SB, as `SetTrackPreferences` takes them:
   kept with the token and the session it opens, they choose a play's
   tracks on SA when the play sends no selection, as SB would; SA has
-  none of the user's own. Or `assertion_refused {reason}`: `not_shared`
+  none of the user's own. Left out when the user saved none: SA then goes
+  by the `language` of the `Hello` of the connection the play is on,
+  which a play SB proxies has not got. Or `assertion_refused {reason}`: `not_shared`
   (the item is in no library shared with SB, or is not SA's own),
   `invalid_user`, `invalid_device`, `invalid_scope` (also for an item
   that does not play: a show, a season, an artist, an album) or

@@ -2027,7 +2027,7 @@ pub(crate) mod app {
         (client, session)
     }
 
-    pub(super) async fn sign_in(client: &Client, server: &TestServer, username: &str) -> Session {
+    pub(crate) async fn sign_in(client: &Client, server: &TestServer, username: &str) -> Session {
         let port = server
             .server
             .addr()
@@ -2837,6 +2837,7 @@ mod replica {
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
             features: spoolframe_protocol::Features::empty(),
+            language: None,
         };
         app.call(None, Request::Hello(hello)).await;
         pair.sb.add_user("bob", "correct horse", None).await;
@@ -4395,6 +4396,7 @@ mod replica {
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
             features: spoolframe_protocol::Features::empty(),
+            language: None,
         };
         app.call(None, Request::Hello(hello)).await;
         let bob = app.login("bob", "correct horse").await;
@@ -5104,6 +5106,7 @@ mod replica {
                 capabilities: Some(mkv_capabilities()),
                 experimental: experimental.iter().map(|n| (*n).to_owned()).collect(),
                 features: spoolframe_protocol::Features::empty(),
+                language: None,
             };
             let timing = [
                 (
@@ -5208,6 +5211,7 @@ mod replica {
                 capabilities: Some(mkv_capabilities()),
                 experimental: vec![FEDERATION.into()],
                 features: spoolframe_protocol::Features::empty(),
+                language: None,
             };
             assert!(matches!(
                 asking.call(None, Request::Hello(hello)).await,
@@ -5865,6 +5869,41 @@ mod replica {
                 Some("fre"),
                 "{chosen:?}"
             );
+            pair.stop().await;
+        }
+
+        /// Bob saved nothing on SB, so SB says nothing, and SA goes by the
+        /// language of the device in front of it: French, which is not
+        /// the film's default.
+        #[tokio::test]
+        async fn sa_chooses_by_the_device_s_language_when_bob_saved_nothing() {
+            let sa = ServerOptions {
+                ffprobe_fixture: "mkv-hevc-pgs.json",
+                ..ServerOptions::default()
+            };
+            let pair = Pair::start_both("fed-device-language", sa, ServerOptions::default()).await;
+            let (_, bob) = shared(&pair).await;
+            let device = pair.sa.client().await;
+            let mut capabilities = mkv_capabilities();
+            capabilities.audio.insert(spoolframe_types::AudioCodec::Ac3);
+            device
+                .hello_speaking(capabilities, &[FEDERATION], Some("fr-CA"))
+                .await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let mut request = start(movie().id());
+            if let Request::StartPlayback { selection, .. } = &mut request {
+                *selection = None;
+            }
+            let chosen = match device.call(Some(&session), request).await {
+                Response::Ok(Reply::PlaybackStarted {
+                    chosen: Some(chosen),
+                    ..
+                }) => chosen,
+                other => panic!("did not start: {other:?}"),
+            };
+            assert_eq!(chosen.selection.audio, Some(3), "{chosen:?}");
             pair.stop().await;
         }
 

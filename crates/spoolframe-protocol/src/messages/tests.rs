@@ -182,6 +182,7 @@ fn hello() -> Hello {
         }),
         experimental: Vec::new(),
         features: crate::Features::empty(),
+        language: None,
     }
 }
 
@@ -2897,6 +2898,24 @@ mod experimental_features {
     fn a_hello_round_trips_with_and_without_the_features_it_asks_for() {
         round_trip(Request::Hello(asking(&[])));
         round_trip(Request::Hello(asking(&[HTTP_PLAYBACK, "teleport"])));
+    }
+
+    #[test]
+    fn a_hello_round_trips_its_language() {
+        round_trip(Request::Hello(Hello {
+            language: Some("en-US".into()),
+            ..hello()
+        }));
+    }
+
+    #[test]
+    fn a_hello_s_language_is_cut_as_its_other_strings_are() {
+        let long = Hello {
+            language: Some("x".repeat(MAX_HELLO_TEXT + 1)),
+            ..hello()
+        };
+        let kept = long.within_bounds().language.unwrap();
+        assert_eq!(kept.chars().count(), MAX_HELLO_TEXT);
     }
 
     #[test]

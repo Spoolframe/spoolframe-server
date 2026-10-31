@@ -158,6 +158,11 @@ pub struct ClientOptions {
     /// Off (`None`) by default: an app with a cache of its own would read
     /// twice.
     pub catalog_cache: Option<crate::CacheConfig>,
+    /// The device's language, as BCP 47 (`en-US`), sent in each
+    /// connection's `Hello`: a viewer with no saved track preferences
+    /// hears a film in it where the film has it. `None` by default, and
+    /// then the file's default track plays.
+    pub language: Option<String>,
 }
 
 impl Default for ClientOptions {
@@ -170,6 +175,7 @@ impl Default for ClientOptions {
             features: Features::all(),
             downloads_dir: None,
             catalog_cache: None,
+            language: None,
         }
     }
 }
@@ -228,6 +234,8 @@ pub(crate) struct Inner {
     pub(crate) experimental: crate::Experimental,
     /// The regular features named in each `Hello`.
     pub(crate) features: Features,
+    /// The device's language, said in each `Hello`.
+    pub(crate) language: Option<String>,
     pub(crate) discovery: Discovery,
     /// Addresses the app gave for servers, and invites' hints.
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
@@ -371,6 +379,7 @@ impl Client {
             features,
             downloads_dir,
             catalog_cache,
+            language,
         } = options;
         let relay_policy = Arc::new(RelayPolicy::new(relays));
         let reach = Arc::new(ReachLog::default());
@@ -445,6 +454,7 @@ impl Client {
                 timeouts,
                 experimental,
                 features,
+                language,
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
@@ -2174,6 +2184,7 @@ impl Client {
             &self.inner.device,
             self.inner.experimental,
             self.inner.features,
+            self.inner.language.as_deref(),
             &self.inner.timeouts,
         )
         .await;

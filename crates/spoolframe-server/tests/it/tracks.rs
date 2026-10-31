@@ -53,6 +53,101 @@ async fn chosen(client: &TestClient, session: &SessionId, id: &MediaId) -> Chose
     }
 }
 
+/// A client signed in as alice, whose `Hello` says `language`.
+async fn speaking(server: &TestServer, language: Option<&str>) -> (TestClient, SessionId) {
+    let client = server.client().await;
+    client
+        .hello_speaking(mkv_capabilities(), &[], language)
+        .await;
+    let session = client.login("alice", "correct horse").await;
+    (client, session)
+}
+
+/// The language of the audio track chosen for episode 12.
+async fn heard(client: &TestClient, session: &SessionId) -> (Option<String>, TrackReason) {
+    let chosen = chosen(client, session, &episode("12")).await;
+    let Response::Ok(Reply::Tracks(tracks)) = client
+        .call(Some(session), Request::Tracks { id: episode("12") })
+        .await
+    else {
+        panic!("no tracks");
+    };
+    let picked = chosen.selection.audio.unwrap() as usize;
+    (tracks.audio[picked].language.clone(), chosen.audio)
+}
+
+#[tokio::test]
+async fn with_nothing_saved_the_device_s_language_chooses_the_audio() {
+    let (server, _, _) = ready("tracks-device-language").await;
+    let (tv, on_tv) = speaking(&server, Some("de-DE")).await;
+    assert_eq!(
+        heard(&tv, &on_tv).await,
+        (Some("ger".into()), TrackReason::Preferences)
+    );
+    tv.close().await;
+}
+
+/// `ClientOptions::language` reaches `Hello`.
+#[tokio::test]
+async fn an_app_s_language_is_said_by_the_sdk() {
+    use std::sync::Arc;
+
+    use spoolframe_client_sdk::{Client, ClientOptions, Device, MemoryStorage};
+
+    let (server, _, _) = ready("tracks-sdk-language").await;
+    let options = ClientOptions {
+        lan_discovery: false,
+        language: Some("de-DE".into()),
+        ..ClientOptions::default()
+    };
+    let device = Device {
+        name: "TV".into(),
+        client_name: "sdk-test".into(),
+        client_version: "0".into(),
+        platform: spoolframe_client_sdk::types::Platform::Android,
+        capabilities: mkv_capabilities(),
+    };
+    let client = Client::open_with_options(Arc::new(MemoryStorage::default()), device, options)
+        .await
+        .unwrap();
+    let session = crate::federation::app::sign_in(&client, &server, "alice").await;
+    let plan = session.playback_plan(&episode("12"), None).await.unwrap();
+    assert_eq!(plan.chosen.map(|c| c.audio), Some(TrackReason::Preferences));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn an_older_client_that_says_no_language_gets_the_file_s_default() {
+    let (server, _, _) = ready("tracks-no-language").await;
+    let (tv, on_tv) = speaking(&server, None).await;
+    assert_eq!(
+        heard(&tv, &on_tv).await,
+        (Some("eng".into()), TrackReason::FileDefault)
+    );
+    tv.close().await;
+}
+
+/// Saved with no language at all: the viewer asked for the file's default,
+/// and the device has no say.
+#[tokio::test]
+async fn a_saved_row_wins_over_the_device_s_language() {
+    let (server, _, _) = ready("tracks-saved-wins").await;
+    let (tv, on_tv) = speaking(&server, Some("de-DE")).await;
+    done(
+        &tv,
+        &on_tv,
+        Request::SetTrackPreferences {
+            preferences: TrackPreferences::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        heard(&tv, &on_tv).await,
+        (Some("eng".into()), TrackReason::FileDefault)
+    );
+    tv.close().await;
+}
+
 async fn done(client: &TestClient, session: &SessionId, request: Request) {
     assert_eq!(
         client.call(Some(session), request).await,

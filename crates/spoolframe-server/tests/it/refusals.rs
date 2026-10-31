@@ -685,6 +685,7 @@ fn hello_of(revision: u32) -> Request {
         capabilities: None,
         experimental: Vec::new(),
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     })
 }
 

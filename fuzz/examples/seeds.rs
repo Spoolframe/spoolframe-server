@@ -55,6 +55,7 @@ fn requests() -> Vec<(&'static str, RpcRequest)> {
                     device_name: Some("laptop".into()),
                     capabilities: Some(Default::default()),
                     experimental: Vec::new(),
+                    language: None,
                 }),
                 None,
             ),

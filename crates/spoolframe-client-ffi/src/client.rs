@@ -50,6 +50,11 @@ pub struct DeviceSpec {
     /// suggestion.
     #[uniffi(default = None)]
     pub catalog_cache: Option<u32>,
+    /// The device's language, as BCP 47 (`en-US`): a viewer with no saved
+    /// track preferences hears a film in it where the film has it. `None`:
+    /// the file's default track.
+    #[uniffi(default = None)]
+    pub language: Option<String>,
 }
 
 /// The protocol version this core speaks, for Settings › About beside
@@ -75,6 +80,7 @@ fn options_of(device: &DeviceSpec) -> sdk::ClientOptions {
         catalog_cache: device.catalog_cache.map(|capacity| sdk::CacheConfig {
             capacity: capacity as usize,
         }),
+        language: device.language.clone(),
         ..sdk::ClientOptions::default()
     }
 }
@@ -836,6 +842,7 @@ mod tests {
             experimental: Experimental::default(),
             downloads_dir: None,
             catalog_cache,
+            language: None,
         }
     }
 
@@ -873,6 +880,15 @@ mod tests {
     }
 
     /// The app turns the catalog cache on with a capacity; off by default.
+    #[test]
+    fn a_device_says_its_language() {
+        let spec = DeviceSpec {
+            language: Some("en-US".into()),
+            ..device(None)
+        };
+        assert_eq!(options_of(&spec).language.as_deref(), Some("en-US"));
+    }
+
     #[test]
     fn a_device_asks_for_the_catalog_cache_by_its_capacity() {
         assert_eq!(

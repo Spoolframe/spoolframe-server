@@ -51,6 +51,7 @@ pub(crate) async fn hello(client: &TestClient, platform: Platform) {
         capabilities: None,
         experimental: Vec::new(),
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -866,6 +867,7 @@ async fn h264_only(server: &TestServer) -> (TestClient, SessionId) {
         capabilities: Some(caps),
         experimental: Vec::new(),
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     };
     assert!(matches!(
         client.call(None, Request::Hello(hello)).await,
@@ -932,6 +934,42 @@ async fn options(client: &TestClient, session: &SessionId) -> DownloadOptionsInf
         Response::Ok(Reply::DownloadOptions(options)) => options,
         other => panic!("no options: {other:?}"),
     }
+}
+
+/// A download's first choice is what playback would pick: the device's
+/// language, with nothing saved.
+#[tokio::test]
+async fn with_nothing_saved_the_options_prefer_the_device_s_language() {
+    let server = server("downloads-wire-language", ServerOptions::default()).await;
+    std::fs::create_dir_all(server.media.parent().unwrap()).unwrap();
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000"])
+        .args(["-map", "0:v", "-map", "1:a", "-map", "2:a"])
+        .args([
+            "-t", "4", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-c:a", "aac",
+        ])
+        .args(["-metadata:s:a:0", "language=ita"])
+        .args(["-metadata:s:a:1", "language=eng"])
+        .arg(&server.media)
+        .status()
+        .expect("ffmpeg runs");
+    assert!(status.success(), "ffmpeg could not make the film");
+    let client = server.client().await;
+    client
+        .hello_speaking(Default::default(), &[], Some("en-US"))
+        .await;
+    let session = client.login("alice", PASSWORD).await;
+    assert_eq!(
+        options(&client, &session).await.preferred,
+        DownloadTracks::Chosen {
+            audio: vec![1],
+            subtitles: Vec::new()
+        }
+    );
+    server.stop().await;
 }
 
 #[tokio::test]

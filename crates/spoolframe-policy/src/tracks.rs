@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::{ChosenTracks, Selection, TrackReason};
-use spoolframe_types::language::same_language;
+use spoolframe_types::language::{of_tag, same_language};
 use spoolframe_types::preferences::ORIGINAL_LANGUAGE;
 use spoolframe_types::{
     AudioRole, AudioTrack, MediaTracks, SdhPreference, SubtitleMode, SubtitleRole, SubtitleTrack,
@@ -65,6 +65,16 @@ impl TrackOverride {
     }
 }
 
+/// The preferences of a viewer who saved none, on a device in `language`
+/// ([`of_tag`]): that language is their one preferred audio language. The
+/// file's default where it has no track in it, as with no device language
+/// at all.
+pub fn unsaved(language: Option<&str>) -> TrackPreferences {
+    let mut preferences = TrackPreferences::default();
+    preferences.audio.languages = language.and_then(of_tag).into_iter().collect();
+    preferences
+}
+
 /// The tracks to play from `tracks`, for a viewer with `preferences` and
 /// maybe an `override_` for this series or movie.
 pub fn choose(
@@ -119,7 +129,8 @@ fn choose_audio(
         }
     }
 
-    // 1. The first preferred language the file has.
+    // 1. The first preferred language the file has, in a role not avoided:
+    // an English commentary on an Italian film is no English film.
     let original = original_language(&tracks.audio);
     let mut candidates = all.clone();
     let mut reason = TrackReason::FileDefault;
@@ -136,10 +147,11 @@ fn choose_audio(
             .iter()
             .copied()
             .filter(|&i| {
-                tracks.audio[i]
-                    .language
-                    .as_deref()
-                    .is_some_and(|l| same_language(l, wanted))
+                let a = &tracks.audio[i];
+                !preferences.audio.avoid.contains(&a.role)
+                    && a.language
+                        .as_deref()
+                        .is_some_and(|l| same_language(l, wanted))
             })
             .collect();
         if !in_language.is_empty() {

@@ -467,6 +467,7 @@ fn hello_full(
         capabilities,
         experimental: Vec::new(),
         features: spoolframe_protocol::Features::empty(),
+        language: None,
     })
 }
 

@@ -16,6 +16,15 @@ with a 0.16 server.
   app, and `Session::backdrop` fetches an image with its faces. Apps
   come later. The server's binary grows by about 17 MB, on or off: the
   model and tract, and the licences page gains a Models group.
+- Protocol and SDK: a viewer with no saved track preferences hears a film
+  in the device's language where it has it, on every client that says
+  one, else its default track. `Hello.language` (BCP 47, optional),
+  `ClientOptions.language` and `DeviceSpec.language`; an app that says
+  none gets what it got. Forced subtitles follow, and a download's first
+  choice of tracks too. Anything saved wins, even with no languages.
+- Server: a preferred language with only an avoided role in a file (an
+  English commentary on an Italian film) is passed over, as the
+  preferences' `avoid` says, where it picked the commentary.
 - Server: MP3 is no longer copied into HLS, even for a client that lists
   it: AVPlayer refuses it in fragmented MP4 at once (CoreMedia -16170),
   and the server's HLS is always fragmented MP4. It is encoded, AAC first,

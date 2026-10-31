@@ -4022,7 +4022,9 @@ impl ClientProtocol {
                     });
                 }
                 let (_, descriptor) = self.describe(&id).await?;
-                let (selection, chosen) = self.selection(&who, &id, &descriptor, selection).await?;
+                let (selection, chosen) = self
+                    .selection(state, &who, &id, &descriptor, selection)
+                    .await?;
                 let bitmap = self.bitmap(&who, bitmap).await?;
                 Ok(Reply::PlaybackPlan {
                     plan: planner::plan(
@@ -4093,8 +4095,9 @@ impl ClientProtocol {
                         onward_share,
                     );
                     let (path, descriptor) = self.describe(&id).await?;
-                    let (selection, chosen) =
-                        self.selection(&who, &id, &descriptor, selection).await?;
+                    let (selection, chosen) = self
+                        .selection(state, &who, &id, &descriptor, selection)
+                        .await?;
                     let bitmap = self.bitmap(&who, bitmap).await?;
                     let planned = self
                         .planned(
@@ -6606,7 +6609,7 @@ impl ClientProtocol {
             return music_download_options(&descriptor, class);
         }
         let store = self.store();
-        let preferences = self.track_preferences(who).await?;
+        let preferences = self.track_preferences(state, who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = store
             .track_override(principal, &scope)
@@ -6721,7 +6724,7 @@ impl ClientProtocol {
             message: "a choice of tracks this server does not know".into(),
         })?;
         let (path, descriptor) = self.describe(id).await?;
-        let preferences = self.track_preferences(who).await?;
+        let preferences = self.track_preferences(state, who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = self
             .store()
@@ -7029,6 +7032,7 @@ impl ClientProtocol {
     /// ones the principal's preferences and override choose (P1-20).
     async fn selection(
         &self,
+        state: &ConnectionState,
         who: &Who,
         id: &MediaId,
         descriptor: &MediaDescriptor,
@@ -7038,7 +7042,7 @@ impl ClientProtocol {
             return Ok((selection, None));
         }
         let store = self.store();
-        let preferences = self.track_preferences(who).await?;
+        let preferences = self.track_preferences(state, who).await?;
         let scope = self.override_scope(id).await?;
         let override_ = store
             .track_override(who.principal(), &scope)
@@ -7058,22 +7062,40 @@ impl ClientProtocol {
         if let Some(asked) = planner::Bitmap::asked(requested) {
             return Ok(asked);
         }
-        let preferences = self.track_preferences(who).await?;
-        Ok(planner::Bitmap::Preferred(preferences.subtitles.bitmap))
+        let preferences = self.saved_track_preferences(who).await?;
+        Ok(planner::Bitmap::Preferred(
+            preferences.unwrap_or_default().subtitles.bitmap,
+        ))
     }
 
-    /// `who`'s track preferences: a paired server's user's as their own
-    /// server gave them with the play token (P8-04), this server having
-    /// none of theirs; anyone else's as kept here.
+    /// The track preferences `who` plays by on this connection: what they
+    /// saved, else the device's language ([`tracks::unsaved`]). A saved
+    /// row wins even when its languages are empty.
     async fn track_preferences(
         &self,
+        state: &ConnectionState,
         who: &Who,
     ) -> Result<spoolframe_types::TrackPreferences, Error> {
+        let language = state.hello.get().and_then(|h| h.language.as_deref());
+        Ok(self
+            .saved_track_preferences(who)
+            .await?
+            .unwrap_or_else(|| tracks::unsaved(language)))
+    }
+
+    /// `who`'s saved track preferences: a paired server's user's as their
+    /// own server gave them with the play token (P8-04), this server
+    /// having none of theirs; anyone else's as kept here. `None` where
+    /// they saved none.
+    async fn saved_track_preferences(
+        &self,
+        who: &Who,
+    ) -> Result<Option<spoolframe_types::TrackPreferences>, Error> {
         match who {
-            Who::Remote(remote) => Ok(remote.preferences.clone().unwrap_or_default()),
+            Who::Remote(remote) => Ok(remote.preferences.clone()),
             _ => self
                 .store()
-                .track_preferences(who.principal())
+                .saved_track_preferences(who.principal())
                 .await
                 .map_err(internal),
         }

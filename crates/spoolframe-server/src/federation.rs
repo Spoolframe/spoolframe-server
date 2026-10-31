@@ -742,6 +742,7 @@ impl Federation {
             capabilities: None,
             experimental: vec![spoolframe_protocol::experimental::FEDERATION.into()],
             features: spoolframe_protocol::Features::empty(),
+            language: None,
         }
     }
 

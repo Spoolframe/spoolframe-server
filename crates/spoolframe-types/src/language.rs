@@ -78,6 +78,20 @@ pub fn iso639_2(code: &str) -> String {
         .map_or(code, |codes| codes[1].to_owned())
 }
 
+/// The language a device's tag names, as [`bcp47`] writes it: `en-US`, and
+/// `en_US` as a POSIX locale has it, are `en`. `None` for a tag that names
+/// none (`und`, `mul`, `mis`, `zxx`), a private one (`x-foo`) or anything
+/// else that is no language: a track tagged `und` must not match it.
+pub fn of_tag(tag: &str) -> Option<String> {
+    let primary = tag.split(['-', '_']).next()?;
+    let language = (2..=3).contains(&primary.len())
+        && primary.bytes().all(|b| b.is_ascii_alphabetic())
+        && !["und", "mul", "mis", "zxx"]
+            .iter()
+            .any(|none| primary.eq_ignore_ascii_case(none));
+    language.then(|| bcp47(primary))
+}
+
 /// Whether two language codes name the same language.
 pub fn same_language(a: &str, b: &str) -> bool {
     canonical(a) == canonical(b)
@@ -86,6 +100,27 @@ pub fn same_language(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_s_tag_is_its_language() {
+        for (tag, language) in [
+            ("en-US", "en"),
+            ("EN_us", "en"),
+            ("it", "it"),
+            ("zh-Hant-TW", "zh"),
+            ("deu-DE", "de"),
+            ("sco", "sco"),
+        ] {
+            assert_eq!(of_tag(tag).as_deref(), Some(language), "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_tag_that_names_no_language_is_none() {
+        for tag in ["", "und", "UND-US", "mul", "x-private", "C", "POSIX", "e1"] {
+            assert_eq!(of_tag(tag), None, "{tag}");
+        }
+    }
 
     #[test]
     fn spellings_of_one_language_are_the_same() {

@@ -96,6 +96,7 @@ mod tests {
             capabilities: caps,
             experimental: Vec::new(),
             features: spoolframe_protocol::Features::empty(),
+            language: None,
         }
     }
 

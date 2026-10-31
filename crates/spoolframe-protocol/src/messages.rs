@@ -1477,6 +1477,12 @@ pub struct Hello {
         skip_serializing_if = "Features::is_empty"
     )]
     pub features: Features,
+    /// The device's language, as BCP 47 (`en-US`). A viewer with no saved
+    /// track preferences hears it where a file has it. Left out when the
+    /// app says nothing, as an older client does; an older server ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
@@ -1495,6 +1501,9 @@ impl Hello {
         cut(&mut self.client_version);
         if let Some(name) = &mut self.device_name {
             cut(name);
+        }
+        if let Some(language) = &mut self.language {
+            cut(language);
         }
         self.experimental.truncate(crate::experimental::MAX_ASKED);
         for name in &mut self.experimental {

@@ -327,6 +327,72 @@ mod tests {
         assert_eq!(chosen.subtitle, TrackReason::NoneMatched);
     }
 
+    /// Saw on an English TV: its default track is Italian.
+    fn saw() -> MediaTracks {
+        let track = |language: &str, default| AudioTrack {
+            language: Some(language.into()),
+            title: None,
+            channels: Some(6),
+            default,
+            role: AudioRole::Main,
+        };
+        MediaTracks {
+            audio: vec![track("ita", true), track("eng", false)],
+            ..MediaTracks::default()
+        }
+    }
+
+    #[test]
+    fn with_nothing_saved_the_device_s_language_is_heard() {
+        let chosen = choose(&saw(), &unsaved(Some("en-US")), None);
+        assert_eq!(chosen.selection.audio, Some(1));
+        assert_eq!(chosen.audio, TrackReason::Preferences);
+    }
+
+    #[test]
+    fn a_device_language_the_file_lacks_plays_the_file_s_default() {
+        let chosen = choose(&saw(), &unsaved(Some("fr-FR")), None);
+        assert_eq!(chosen.selection.audio, Some(0));
+        assert_eq!(chosen.audio, TrackReason::FileDefault);
+    }
+
+    #[test]
+    fn no_device_language_is_as_before() {
+        assert_eq!(unsaved(None), TrackPreferences::default());
+        assert_eq!(unsaved(Some("und")), TrackPreferences::default());
+    }
+
+    #[test]
+    fn a_device_language_keeps_the_avoided_roles() {
+        assert_eq!(
+            unsaved(Some("en-US")).audio.avoid,
+            TrackPreferences::default().audio.avoid
+        );
+    }
+
+    /// Forced subtitles follow the track chosen, as for a saved language.
+    #[test]
+    fn forced_subtitles_follow_the_device_s_language() {
+        let tracks = b99();
+        let chosen = choose(&tracks, &unsaved(Some("de-AT")), None);
+        let subtitle = &tracks.subtitles[chosen.selection.subtitle.unwrap() as usize];
+        assert_eq!(
+            (subtitle.language.as_deref(), subtitle.role),
+            (Some("ger"), SubtitleRole::Forced)
+        );
+    }
+
+    /// A foreign film with an English commentary: the viewer who avoids
+    /// commentaries hears the film, whichever language they prefer.
+    #[test]
+    fn a_language_only_an_avoided_role_speaks_is_passed_over() {
+        let mut tracks = saw();
+        tracks.audio[1].role = AudioRole::Commentary;
+        let chosen = choose(&tracks, &unsaved(Some("en-US")), None);
+        assert_eq!(chosen.selection.audio, Some(0));
+        assert_eq!(chosen.audio, TrackReason::FileDefault);
+    }
+
     /// A pick on episode 12 is kept for its show, so episode 13 (the same
     /// tracks) is chosen by it, until it is cleared from either episode.
     #[tokio::test]

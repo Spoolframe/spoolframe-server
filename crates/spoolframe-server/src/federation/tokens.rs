@@ -163,10 +163,11 @@ impl Federation {
             .ok_or_else(|| AssertError::NotFederated(item.clone()))?;
         let dialed = self.links.pinned(peer).ok_or(AssertError::Offline)?;
         // SA chooses the tracks by them, as this server would: it has none
-        // of the user's own.
+        // of the user's own. None saved says so, for SA to go by the
+        // device's language, as this server would.
         let preferences = self
             .store()
-            .track_preferences(Principal::LocalUser(user))
+            .saved_track_preferences(Principal::LocalUser(user))
             .await?;
         let granted = dialed
             .assert_user(AssertUser {
@@ -178,7 +179,7 @@ impl Federation {
                 client_endpoint: device.to_string(),
                 item: remote.to_string(),
                 scope,
-                preferences: Some(preferences),
+                preferences,
                 download,
             })
             .await;
