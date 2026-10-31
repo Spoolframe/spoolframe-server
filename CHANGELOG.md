@@ -29,6 +29,8 @@ with a 0.16 server.
   reads then failed, and reported the next item by the first's id.
   `PlaybackBackend::next_session` has a default, so a backend of an app's
   own changes nothing.
+- SDK: a progressive reader that a seek replaced says so at DEBUG, not
+  WARN, where every seek logged a failed read. Real failures stay WARN.
 - FFI: `SpoolPlayback.seek(target)` seeks a progressive conversion, which
   had no way to through the FFI: the server encodes again from `target`,
   and the answer is the new plan to rebuild from, read from offset 0. For

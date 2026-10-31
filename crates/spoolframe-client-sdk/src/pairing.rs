@@ -873,4 +873,4 @@ async fn pair(
 
 #[cfg(test)]
 #[path = "pairing_tests.rs"]
-mod tests;
+pub(crate) mod tests;

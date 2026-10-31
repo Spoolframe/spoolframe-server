@@ -541,7 +541,7 @@ async fn text_that_is_not_a_pairing_code_is_refused_before_dialling() {
 
 /// What the log gets, as text.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Captured(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Captured {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -569,7 +569,7 @@ const ALONE: &str = "SPOOLFRAME_TEST_ALONE";
 /// site, for every thread, whether its lines are wanted, and a call site
 /// another test reached first, with no subscriber, stays off for this
 /// test's too.
-fn alone(test: &str) -> bool {
+pub(crate) fn alone(test: &str) -> bool {
     if std::env::var_os(ALONE).is_some() {
         return true;
     }

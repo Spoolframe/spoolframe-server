@@ -339,7 +339,11 @@ impl Shared {
                     state.complete = chunk.complete && state.end >= chunk.size;
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "reading the converted output failed");
+                    if moved_on(&error) {
+                        tracing::debug!(error = %error, "the converted output moved on");
+                    } else {
+                        tracing::warn!(error = %error, "reading the converted output failed");
+                    }
                     state.failed = Some(error);
                     state.fetching = false;
                     drop(state);
@@ -351,6 +355,18 @@ impl Shared {
             self.changed.notify_all();
         }
     }
+}
+
+/// `error` says the playback moved on, as each seek does to the reader it
+/// replaces: the read's own end, not a failure.
+fn moved_on(error: &BackendError) -> bool {
+    matches!(
+        error,
+        BackendError::PlaybackRestarted { .. }
+            | BackendError::PlaybackResumed { .. }
+            | BackendError::RevisionConflict { .. }
+            | BackendError::Replanned
+    )
 }
 
 #[cfg(test)]
@@ -506,6 +522,45 @@ mod tests {
             reader.read_reporting(0, 10, &mut |_| {}),
             Err(ReadError::Flushing)
         );
+    }
+
+    /// Every seek leaves its old reader to fail like this: not worth a
+    /// WARN in an app's log.
+    #[test]
+    fn a_replaced_encode_is_no_warning() {
+        if !crate::pairing::tests::alone("progressive::tests::a_replaced_encode_is_no_warning") {
+            return;
+        }
+        let captured = crate::pairing::tests::Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        // The fetch logs on the test runtime's threads.
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let (_dir, path, _) = media_file("progressive-quiet", 1_000);
+        let (session, handle, _) = converted(path, 10);
+        ready(session.seek_playback(&handle, Duration::from_secs(60))).unwrap();
+        let reader = ProgressiveReader::for_test(session, handle, 0, thread_spawn(), None);
+        let read = reader.read_reporting(0, 10, &mut |_| {});
+        let log = String::from_utf8(captured.0.lock().clone()).unwrap();
+        assert_eq!((read.is_err(), log), (true, String::new()));
+    }
+
+    /// Any other failure stays a WARN: only what a move of the player
+    /// explains is expected.
+    #[test]
+    fn only_a_moved_playback_is_an_expected_failure() {
+        let moved = [
+            BackendError::PlaybackRestarted { epoch: 1 },
+            BackendError::PlaybackResumed { at: Duration::ZERO },
+            BackendError::RevisionConflict { revision: 1 },
+            BackendError::Replanned,
+        ];
+        assert!(moved.iter().all(moved_on));
+        assert!(!moved_on(&BackendError::Protocol("short read".into())));
+        assert!(!moved_on(&BackendError::PlaybackExpired));
     }
 
     #[test]

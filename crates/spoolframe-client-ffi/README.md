@@ -193,6 +193,14 @@ func seek(to: TimeInterval) async throws {
 - A failed seek leaves the player on the encode it had, reading on.
 - Call `seek_done` once the player plays there.
 
+A `Duration` can't be negative, here or anywhere in the API, and the
+check is in the generated bindings, before this crate runs: Swift's
+stops the app with `Invalid duration, must be non-negative`, and Kotlin's
+throws. So clamp what the app works out itself, `max(0, position - 10)`,
+before a `seek`. UniFFI has no setting for it: `Duration` is
+a built-in type, not a custom one, and a wrapper type for every time in
+the API would cost Rust callers more than the clamp costs an app.
+
 A read before what the reader keeps (1 MiB behind the last read) gets
 `ReadBehind { offset, kept_from }`: the player started over, as Media3
 does with no seek map, and those bytes are gone. Call `seek` with where
