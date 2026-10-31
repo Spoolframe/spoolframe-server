@@ -659,6 +659,19 @@ fn text_formats(container: Container) -> &'static [SubtitleFormat] {
     }
 }
 
+/// Whether `codec` may be copied into HLS, for a client that plays it.
+/// Not MP3: Apple's HLS takes it only as packed audio or in TS, and
+/// AVPlayer fails on it in fragmented MP4 at once (CoreMedia -16170), with
+/// CODECS `mp4a.40.34`. It holds for every client, and for every HLS
+/// whatever its `container` says, as ffmpeg's HLS output is always
+/// fragmented MP4 (`encode::args`): a plan has no platform to tell Apple
+/// by, no other player needs MP3 there, and an old app is mended with no
+/// word from it. Only a client that cannot take the file by range pays,
+/// with an AAC encode.
+fn copied_in_hls(codec: AudioCodec) -> bool {
+    codec != AudioCodec::Mp3
+}
+
 fn converted(
     descriptor: &MediaDescriptor,
     caps: &ClientCapabilities,
@@ -736,9 +749,21 @@ fn converted(
         })
     );
 
+    // Listed or not: the fit is for the file played as it is, which stays
+    // allowed.
+    let audio_copied = audio.is_some_and(|index| {
+        let codec = codecs::audio_codec(&descriptor.audio[index].codec);
+        let refused = delivery == Delivery::Hls && !copied_in_hls(codec);
+        if refused && fit.audio.is_empty() {
+            reasons.push(format!(
+                "audio {index}: {codec} does not go in fragmented MP4 HLS; encoded"
+            ));
+        }
+        fit.audio.is_empty() && !refused
+    });
     let audio = match audio {
         None => None,
-        Some(index) if fit.audio.is_empty() => Some(ConvertedAudio {
+        Some(index) if audio_copied => Some(ConvertedAudio {
             index: index as u32,
             action: AudioAction::Copy {
                 codec: codecs::audio_codec(&descriptor.audio[index].codec),
@@ -1841,6 +1866,104 @@ mod tests {
                 "container: matroska not supported",
                 "audio 0: dts not supported"
             ]
+        );
+    }
+
+    /// `audio` as a client that plays MP3 and takes `delivery`: a song,
+    /// no picture, in an MP3 file.
+    fn song_for(delivery: Vec<Delivery>, containers: &[Container]) -> PlaybackPlan {
+        let song = MediaDescriptor {
+            container: "mp3".into(),
+            duration: Some(Duration::from_secs(200)),
+            bit_rate: Some(320_000),
+            video: None,
+            audio: vec![AudioStream {
+                channels: Some(2),
+                ..audio(0, "mp3", true)
+            }],
+            subtitles: Vec::new(),
+        };
+        let mut caps = avplayer();
+        caps.audio.insert(AudioCodec::Mp3);
+        caps.containers = containers.iter().copied().collect();
+        caps.delivery = delivery;
+        plan_with(&song, Some(&caps), picked(0, None), &dev_encoders())
+    }
+
+    /// sf-ios, "Black Neon": `copy:mp3` in fMP4 HLS, master CODECS
+    /// "mp4a.40.34", and AVPlayer fails at once with CoreMedia -16170.
+    #[test]
+    fn a_song_in_mp3_over_hls_is_encoded_though_the_client_lists_mp3() {
+        let plan = song_for(vec![Delivery::Hls], &[Container::Mp4]);
+        let PlaybackPlan::Converted { audio, reasons, .. } = plan else {
+            panic!("not converted: {plan:?}");
+        };
+        assert_eq!(
+            audio.map(|a| a.action),
+            Some(AudioAction::Encode {
+                codec: AudioCodec::Aac,
+                channels: 2,
+                bitrate: 192_000,
+            })
+        );
+        assert!(reasons.iter().any(|r| r.contains("mp3")), "{reasons:?}");
+    }
+
+    /// The client's container changes nothing: ffmpeg's HLS output is
+    /// fragmented MP4 whatever the plan says (`args::argv`).
+    #[test]
+    fn mp3_is_encoded_over_hls_labelled_ts_too() {
+        let plan = song_for(vec![Delivery::Hls], &[Container::MpegTs]);
+        let PlaybackPlan::Converted { audio, .. } = plan else {
+            panic!("not converted: {plan:?}");
+        };
+        assert!(
+            matches!(
+                audio.map(|a| a.action),
+                Some(AudioAction::Encode {
+                    codec: AudioCodec::Aac,
+                    ..
+                })
+            ),
+            "{audio:?}"
+        );
+    }
+
+    #[test]
+    fn a_film_s_mp3_is_encoded_over_hls_and_its_video_still_copied() {
+        let mut film = dts_aac_pgs();
+        film.audio = vec![audio(1, "mp3", true)];
+        let mut caps = avplayer();
+        caps.audio.insert(AudioCodec::Mp3);
+        let (_, _, video, audio, _, _) = converted(plan_with(
+            &film,
+            Some(&caps),
+            picked(0, None),
+            &dev_encoders(),
+        ));
+        assert!(matches!(video, ConvertedVideo::Copy { .. }), "{video:?}");
+        assert!(
+            matches!(audio.action, AudioAction::Encode { .. }),
+            "{audio:?}"
+        );
+    }
+
+    /// Only HLS refuses it: the MP3 file itself still plays by range.
+    #[test]
+    fn an_mp3_file_played_by_range_stays_as_it_is() {
+        let plan = song_for(vec![Delivery::Range], &[Container::Mp3]);
+        assert!(
+            matches!(
+                plan,
+                PlaybackPlan::Direct {
+                    audio: Some(PlannedAudio {
+                        codec: AudioCodec::Mp3,
+                        ..
+                    }),
+                    ..
+                }
+            ),
+            "{plan:?}"
         );
     }
 

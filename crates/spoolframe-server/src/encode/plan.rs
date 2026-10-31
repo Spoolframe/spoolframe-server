@@ -53,9 +53,10 @@ pub(super) fn keyframe_cuts(
 /// with AC-3 or E-AC-3, copied or encoded, whose MP4 sample entry is made
 /// from their first packets (ffmpeg refuses the header: "Cannot write
 /// moov atom before AC3 packets"). The rest, checked with ffmpeg 8.1: AAC,
-/// FLAC, ALAC, Opus and MP3. Any other conversion of a copied video is cut
-/// by the HLS muxer at every keyframe, which writes its header after the
-/// first packets.
+/// FLAC, ALAC and Opus. MP3 is no HLS track at all (the planner's
+/// `copied_in_hls`). Any other conversion of a copied video is cut by the
+/// HLS muxer at every keyframe, which writes its header after the first
+/// packets.
 pub(super) fn header_first(descriptor: &MediaDescriptor, audio: Option<ConvertedAudio>) -> bool {
     let record = descriptor
         .video
@@ -65,11 +66,7 @@ pub(super) fn header_first(descriptor: &MediaDescriptor, audio: Option<Converted
         None => true,
         Some(AudioAction::Copy { codec } | AudioAction::Encode { codec, .. }) => matches!(
             codec,
-            AudioCodec::Aac
-                | AudioCodec::Flac
-                | AudioCodec::Alac
-                | AudioCodec::Opus
-                | AudioCodec::Mp3
+            AudioCodec::Aac | AudioCodec::Flac | AudioCodec::Alac | AudioCodec::Opus
         ),
         Some(AudioAction::Unknown) => false,
     };

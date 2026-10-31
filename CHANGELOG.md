@@ -16,6 +16,10 @@ with a 0.16 server.
   app, and `Session::backdrop` fetches an image with its faces. Apps
   come later. The server's binary grows by about 17 MB, on or off: the
   model and tract, and the licences page gains a Models group.
+- Server: MP3 is no longer copied into HLS, even for a client that lists
+  it: AVPlayer refuses it in fragmented MP4 at once (CoreMedia -16170),
+  and the server's HLS is always fragmented MP4. It is encoded, AAC first,
+  for every client. An MP3 file played by range stays as it is.
 - Server: a copied video resumed or sought onto a very short segment with
   its audio encoded as E-AC-3 played nothing: `init.mp4` was cut before the
   audio's first packet. A run now starts on a segment of at least 500 ms,
