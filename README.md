@@ -16,7 +16,7 @@ nix build .#docker && ./result | docker load
 docker run -d --name spoolframe \
   -v spoolframe:/var/lib/spoolframe -v /srv/media:/srv/media:ro \
   -p 7420:7420/udp -p 7421:7421 \
-  ghcr.io/spoolframe/spoolframe-server:0.17.0
+  ghcr.io/spoolframe/spoolframe-server:0.16.3
 docker logs spoolframe   # the web UI's address and the setup code
 ```
 
@@ -32,18 +32,18 @@ wizard.
 
 ### Pick a tag for your GPU
 
-The tags share every layer except the GPU drivers. `:0.17.0` and
-`:0.17.0-slim` are for x86-64 and arm64 (Docker picks the host's);
+The tags share every layer except the GPU drivers. `:0.16.3` and
+`:0.16.3-slim` are for x86-64 and arm64 (Docker picks the host's);
 `-nvidia` and `-cpu` are x86-64 only.
-`:0.17` and `:latest` (each also with `-slim`, `-nvidia` and `-cpu`)
-follow the newest release; pin `:0.17.0` to stay on one.
+`:0.16` and `:latest` (each also with `-slim`, `-nvidia` and `-cpu`)
+follow the newest release; pin `:0.16.3` to stay on one.
 
 | Tag | For | Size |
 |---|---|---|
-| `:0.17.0` (`.#docker`) | Any GPU, or if you are not sure: AMD, Intel, NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2) | ~1.5 GiB |
-| `:0.17.0-slim` (`.#docker-slim`) | A recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | ~640 MiB |
-| `:0.17.0-nvidia` (`.#docker-nvidia`) | NVIDIA | ~500 MiB |
-| `:0.17.0-cpu` | No GPU. The same image as `-nvidia`. | ~500 MiB |
+| `:0.16.3` (`.#docker`) | Any GPU, or if you are not sure: AMD, Intel, NVIDIA, VMs (virgl), Docker Desktop on Windows (WSL2) | ~1.5 GiB |
+| `:0.16.3-slim` (`.#docker-slim`) | A recent AMD or Intel GPU (radeonsi, RADV, ANV, iHD) | ~640 MiB |
+| `:0.16.3-nvidia` (`.#docker-nvidia`) | NVIDIA | ~500 MiB |
+| `:0.16.3-cpu` | No GPU. The same image as `-nvidia`. | ~500 MiB |
 
 **AMD or Intel:** pass the render node with `--device /dev/dri/renderD128`
 and add its group with `--group-add` (often `render`).
@@ -62,7 +62,7 @@ takes about 6 cores per stream.
 The server reads one UCL file. To print every key with its default:
 
 ```bash
-docker run --rm ghcr.io/spoolframe/spoolframe-server:0.17.0 config defaults
+docker run --rm ghcr.io/spoolframe/spoolframe-server:0.16.3 config defaults
 ```
 
 Without a config, or without a `plex` section, the server starts "not set

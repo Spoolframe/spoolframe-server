@@ -1182,9 +1182,8 @@ struct HevcLevel {
 }
 
 /// HEVC's levels at Main tier, lowest first: ITU-T H.265 Annex A, MaxLumaPs
-/// from Table A.8 and MaxBR from Table A.9. What an encoder labels a stream
-/// comes from its size and bitrate, not its frame rate: ffmpeg's
-/// `ff_h265_guess_level`, for hevc_vaapi, and MaxLumaSr is left out for it.
+/// from Table A.8 and MaxBR from Table A.9. MaxLumaSr is left out: the
+/// measurements here are all at 24 fps, and frame rate's part is not known.
 /// Measured with hevc_vaapi on an RX 7900 (ffmpeg 9.0.2): 3840x2160 at 25
 /// Mbit/s is L150, at 40 L153, at 60 L156 and at 83 L183; 1920x1080 at 12
 /// is L120 and at 20 L123. Tiers above Main are not listed: no encoder here
