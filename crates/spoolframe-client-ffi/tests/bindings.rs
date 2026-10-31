@@ -156,6 +156,7 @@ fn kotlin_bindings_compile() {
     };
     let dir = out_dir("kotlin-compiled");
     generate_in(&dir, TargetLanguage::Kotlin);
+    std::fs::write(dir.join("Markers.kt"), MARKERS_IN_KOTLIN).unwrap();
     let mut kotlinc = Command::new("kotlinc");
     kotlinc
         .arg("-cp")
@@ -165,6 +166,93 @@ fn kotlin_bindings_compile() {
         .args(sources(&dir, "kt"));
     succeeds(kotlinc);
 }
+
+/// A player's tick and its buttons, as the README shows them: the names
+/// and the shapes of the actions, on what an app compiles.
+const MARKERS_IN_KOTLIN: &str = "
+import java.time.Duration
+import uniffi.spoolframe_client_ffi.SpoolMarkers
+import uniffi.spoolframe_client_ffi.SpoolPlayback
+import uniffi.spoolframe_client_ffi.undoWindow
+import uniffi.spoolframe_client_sdk.MarkerAction
+import uniffi.spoolframe_client_sdk.MarkerOffer
+import uniffi.spoolframe_types.Marker
+
+fun follow(playback: SpoolPlayback): SpoolMarkers =
+    playback.followMarkers(hasNext = false, autoSkip = true, upNextCard = true)
+
+fun offline(markers: List<Marker>): SpoolMarkers =
+    SpoolMarkers(markers, hasNext = false, autoSkip = true, upNextCard = true)
+
+fun tick(markers: SpoolMarkers, at: Duration, length: Duration?, seek: (Duration) -> Unit) {
+    for (action in markers.onPosition(at, length)) {
+        when (action) {
+            is MarkerAction.AutoSkip -> {
+                seek(action.to)
+                println(undoWindow())
+            }
+            is MarkerAction.Offer -> when (val offer = action.v1) {
+                is MarkerOffer.SkipIntro -> println(offer.to)
+                is MarkerOffer.SkipCredits -> println(offer.to)
+                MarkerOffer.Next -> println(\"next\")
+                null -> println(\"none\")
+            }
+            is MarkerAction.UpNext -> println(action.v1)
+        }
+    }
+}
+
+fun press(markers: SpoolMarkers, seek: (Duration) -> Unit) {
+    markers.skip()?.let(seek)
+    if (markers.undoable()) markers.undoSkip()?.let(seek)
+    println(markers.position(Duration.ZERO))
+    markers.seekStarted(Duration.ZERO)
+    markers.seekDone()
+    markers.setHasNext(true)
+    markers.setAutoSkip(false)
+}
+";
+
+/// The same in Swift.
+const MARKERS_IN_SWIFT: &str = "
+import Foundation
+
+func follow(_ playback: SpoolPlayback) -> SpoolMarkers {
+    playback.followMarkers(hasNext: false, autoSkip: true, upNextCard: true)
+}
+
+func offline(_ markers: [Marker]) -> SpoolMarkers {
+    SpoolMarkers(markers: markers, hasNext: false, autoSkip: true, upNextCard: true)
+}
+
+func tick(_ markers: SpoolMarkers, at: TimeInterval, length: TimeInterval?, seek: (TimeInterval) -> Void) {
+    for action in markers.onPosition(at: at, length: length) {
+        switch action {
+        case .autoSkip(let to):
+            seek(to)
+            print(undoWindow())
+        case .offer(.skipIntro(let to)?), .offer(.skipCredits(let to)?):
+            print(to)
+        case .offer(.next?):
+            print(\"next\")
+        case .offer(nil):
+            print(\"none\")
+        case .upNext(let shows):
+            print(shows)
+        }
+    }
+}
+
+func press(_ markers: SpoolMarkers, seek: (TimeInterval) -> Void) {
+    if let to = markers.skip() { seek(to) }
+    if markers.undoable(), let back = markers.undoSkip() { seek(back) }
+    print(markers.position(at: 0))
+    markers.seekStarted(target: 0)
+    markers.seekDone()
+    markers.setHasNext(hasNext: true)
+    markers.setAutoSkip(autoSkip: false)
+}
+";
 
 /// What the Apple app adds to `Item`: SwiftUI lists need it Identifiable,
 /// and Swift refuses a property beside a method of the same name.
@@ -196,6 +284,7 @@ fn swift_bindings_typecheck() {
     let dir = out_dir("swift-typechecked");
     generate_in(&dir, TargetLanguage::Swift);
     std::fs::write(dir.join("Identifiable.swift"), ITEM_IS_IDENTIFIABLE).unwrap();
+    std::fs::write(dir.join("Markers.swift"), MARKERS_IN_SWIFT).unwrap();
     let mut swiftc = Command::new("swiftc");
     swiftc.args([
         "-typecheck",

@@ -6,6 +6,15 @@ The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates
 with a 0.16 server.
 
+- FFI: `SpoolMarkers`, so Android and Apple get skip markers and undo, as
+  the Rust controllers have them. `SpoolPlayback.follow_markers` makes one
+  for a playback, `SpoolMarkers.new` for a file on the device. The app
+  feeds it the player's positions (`on_position`) and gets `MarkerAction`s:
+  a `MarkerOffer` to show, an intro skipped by itself, Up next. `skip`
+  gives a pressed button's target; `undoable`, `undo_skip` and
+  `undo_window` undo an intro skipped by itself, `undo_skip` with the place
+  to seek back to. The app seeks its own player. SDK: `SeekGate` and
+  `ManagedPlayback::gated` are public, for a tracker outside the SDK.
 - Experimental `smart-crop` (`experimental.smart_crop`, off by default,
   applies after a restart): the server finds the faces in each backdrop
   with YuNet, on the CPU, once per image, and an app that names the

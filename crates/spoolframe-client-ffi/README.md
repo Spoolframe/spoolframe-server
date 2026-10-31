@@ -34,8 +34,8 @@ Everything is typed. Nothing is passed as JSON.
   search's); `only_from(origin)` narrows it to one server for a chip,
   counted again, and `see_all_count(kind)` is the number "See all" names.
 - `SpoolClient` (the device), `SpoolSession` (a user on a server),
-  `SpoolPlayback` (one item playing), `SpoolPortable` (portable
-  identities), `SpoolPairing` and `SpoolPairingOffer` are objects;
+  `SpoolPlayback` (one item playing), `SpoolMarkers` (its skip buttons),
+  `SpoolPortable` (portable identities), `SpoolPairing` and `SpoolPairingOffer` are objects;
   `CoreStorage` and `AppSecurityKey` are traits the app implements. Or, for `CoreStorage`, `FileStorage(root,
   cipher)`: a file per key under `root`, each written whole and renamed
   into place, the secrets sealed by the app's `SecretCipher` (`seal`,
@@ -150,6 +150,54 @@ discontinuity, AVPlayer's seek completion handler). Until then the
 player's positions are still the old place's, so `report_position` saves
 `target` instead. Without `seek_done` the seek is over once a position
 lands within 2 s of the target, or after 5 s.
+
+`SpoolMarkers` follows an item's markers for a player the app drives
+itself: Skip Intro, Skip Credits, Next, Up next, and intros that skip by
+themselves, which the viewer can undo. `SpoolPlayback.follow_markers`
+makes it for a playback, sharing the playback's seeks; `SpoolMarkers.new`
+makes it for a file on this device, played with no `SpoolPlayback`, and
+then `seek_started` and `seek_done` go to it. Feed it the player's tick.
+Its calls never block. It seeks nothing: where it gives a target the app
+seeks the player there, and the target counts as a seek from then.
+
+```kotlin
+val markers = playback.followMarkers(hasNext = false, autoSkip = true, upNextCard = true)
+
+// On each tick; the length is null until the player knows it.
+for (action in markers.onPosition(at, length)) when (action) {
+    is MarkerAction.AutoSkip -> { player.seekTo(action.to.toMillis()); showUndo(undoWindow()) }
+    is MarkerAction.Offer -> showButton(action.v1) // SkipIntro, SkipCredits, Next, or null
+    is MarkerAction.UpNext -> showUpNext(action.v1)
+}
+
+markers.skip()?.let { player.seekTo(it.toMillis()) } // the button, pressed
+markers.undoSkip()?.let { player.seekTo(it.toMillis()) } // Undo, pressed
+```
+
+```swift
+let markers = playback.followMarkers(hasNext: false, autoSkip: true, upNextCard: true)
+
+for action in markers.onPosition(at: time, length: duration) {
+    switch action {
+    case .autoSkip(let to): seek(to: to); showUndo(for: undoWindow())
+    case .offer(let offer): button = offer // .skipIntro, .skipCredits, .next, or nil
+    case .upNext(let shows): upNextShown = shows
+    }
+}
+
+if let to = markers.skip() { seek(to: to) } // the button, pressed
+if let back = markers.undoSkip() { seek(to: back) } // Undo, pressed
+```
+
+`skip()` gives the target of the skip button showing, and `None` for Next,
+which is the app's to play. Only an intro skipped by itself can be undone,
+for `undo_window()` (5 s); `undoable()` tells a view that comes later
+whether to show Undo. An intro is skipped by itself once, only with the
+length known and where a seek has landed, so call `seek_started` for a
+resume. `set_has_next` when the next episode is found later, and
+`set_auto_skip` when the setting changes. `position(at)` is for a scrubber.
+Once its playback is over it gives no skip or undo, and it never keeps a
+playback open.
 
 The screen's mode is a planning input, not a sign-in one: a TV switches
 between a 1080p UI mode and a 4K mode for the film, and the sign-in is
@@ -299,5 +347,5 @@ the bridge's URLs, and `tests/bindings.rs`, which generates the Swift and
 Kotlin bindings from the crate's cdylib and checks every crate's files
 are there. In devenv's `ci-test` profile, which brings `kotlinc`, a JDK
 and Swift, it also compiles every crate's Kotlin together and typechecks
-the Swift as one module (on Linux); elsewhere those two tests say so and
-pass.
+the Swift as one module (on Linux), each with an app's use of
+`SpoolMarkers`; elsewhere those two tests say so and pass.
