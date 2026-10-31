@@ -6,6 +6,16 @@ The client crates' Rust API breaks (BREAKING below); the wire does not,
 so 0.16 apps keep working with this server, and apps on these crates
 with a 0.16 server.
 
+- FFI: `SpoolPlayback.seek(target)` seeks a progressive conversion, which
+  had no way to through the FFI: the server encodes again from `target`,
+  and the answer is the new plan to rebuild from, read from offset 0. For
+  a direct play or HLS it is `None`, nothing sent, and the player seeks,
+  so a seek, a skip or an undo is one call on any plan. Seeks within
+  250 ms gather into one, the others `Cancelled`. A read in flight is
+  `Replanned`. `SpoolError.PlaybackRestarted` no longer reaches a read
+  whose encode the server replaced just before the player moved: that is
+  `Replanned` too. SDK and FFI: a read before what a progressive reader
+  keeps is `ReadBehind { offset, kept_from }`, not `Protocol`.
 - FFI: `SpoolMarkers`, so Android and Apple get skip markers and undo, as
   the Rust controllers have them. `SpoolPlayback.follow_markers` makes one
   for a playback, `SpoolMarkers.new` for a file on the device. The app

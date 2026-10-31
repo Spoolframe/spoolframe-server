@@ -171,6 +171,8 @@ fn kotlin_bindings_compile() {
 /// and the shapes of the actions, on what an app compiles.
 const MARKERS_IN_KOTLIN: &str = "
 import java.time.Duration
+import uniffi.spoolframe_client_ffi.PlaybackStart
+import uniffi.spoolframe_client_ffi.SpoolException
 import uniffi.spoolframe_client_ffi.SpoolMarkers
 import uniffi.spoolframe_client_ffi.SpoolPlayback
 import uniffi.spoolframe_client_ffi.undoWindow
@@ -210,6 +212,27 @@ fun press(markers: SpoolMarkers, seek: (Duration) -> Unit) {
     markers.seekDone()
     markers.setHasNext(true)
     markers.setAutoSkip(false)
+}
+
+suspend fun seek(
+    playback: SpoolPlayback,
+    to: Duration,
+    inPlayer: (Duration) -> Unit,
+    rebuild: (PlaybackStart) -> Unit,
+) {
+    val start = try {
+        playback.seek(to)
+    } catch (e: SpoolException.Cancelled) {
+        return
+    }
+    if (start == null) inPlayer(to) else rebuild(start)
+}
+
+fun read(playback: SpoolPlayback, offset: ULong, length: ULong): ByteArray? = try {
+    playback.read(offset, length)
+} catch (e: SpoolException.ReadBehind) {
+    println(e.offset.toString() + e.keptFrom.toString())
+    null
 }
 ";
 
@@ -251,6 +274,31 @@ func press(_ markers: SpoolMarkers, seek: (TimeInterval) -> Void) {
     markers.seekDone()
     markers.setHasNext(hasNext: true)
     markers.setAutoSkip(autoSkip: false)
+}
+
+func seek(
+    _ playback: SpoolPlayback,
+    to: TimeInterval,
+    inPlayer: (TimeInterval) -> Void,
+    rebuild: (PlaybackStart) -> Void
+) async throws {
+    do {
+        if let start = try await playback.seek(target: to) {
+            rebuild(start)
+        } else {
+            inPlayer(to)
+        }
+    } catch SpoolError.Cancelled {
+    }
+}
+
+func read(_ playback: SpoolPlayback, offset: UInt64, length: UInt64) throws -> Data? {
+    do {
+        return try playback.read(offset: offset, length: length)
+    } catch SpoolError.ReadBehind(let offset, let keptFrom) {
+        print(offset + keptFrom)
+        return nil
+    }
 }
 ";
 

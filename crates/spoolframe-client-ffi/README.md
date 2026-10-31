@@ -151,6 +151,53 @@ player's positions are still the old place's, so `report_position` saves
 `target` instead. Without `seek_done` the seek is over once a position
 lands within 2 s of the target, or after 5 s.
 
+A progressive conversion can't seek in its bytes: its output has no
+length, and a byte offset means nothing to the next encode. So every seek
+goes through `seek(target)`, one call whatever the plan, which counts as
+`seek_started`. `None` is a direct play or an HLS conversion: nothing was
+sent, and the app seeks its player. On a progressive conversion the
+server encodes again from `target`, and the answer is the new plan:
+
+```kotlin
+suspend fun seek(to: Duration) {
+    val start = try {
+        playback.seek(to)
+    } catch (e: SpoolException.Cancelled) {
+        return // a newer seek took its place
+    }
+    if (start == null) player.seekTo(to.toMillis()) else rebuildMedia(start)
+}
+```
+
+```swift
+func seek(to: TimeInterval) async throws {
+    do {
+        if let start = try await playback.seek(target: to) {
+            rebuildMedia(start)
+        } else {
+            player.seek(to: to)
+        }
+    } catch SpoolError.Cancelled {
+        // A newer seek took its place.
+    }
+}
+```
+
+- The next `read` is at offset 0, of the new encode. Its times are the
+  item's own, from `target`, not from 0.
+- A read in flight, and a read of the old media after, gets `Replanned`,
+  as for any new plan; `Cancelled` while `set_flushing(true)` holds, so
+  clear that before reading again.
+- Seeks within 250 ms gather into the last, one restart. The ones it
+  replaced get `Cancelled` and need nothing.
+- A failed seek leaves the player on the encode it had, reading on.
+- Call `seek_done` once the player plays there.
+
+A read before what the reader keeps (1 MiB behind the last read) gets
+`ReadBehind { offset, kept_from }`: the player started over, as Media3
+does with no seek map, and those bytes are gone. Call `seek` with where
+the viewer is.
+
 `SpoolMarkers` follows an item's markers for a player the app drives
 itself: Skip Intro, Skip Credits, Next, Up next, and intros that skip by
 themselves, which the viewer can undo. `SpoolPlayback.follow_markers`
@@ -158,20 +205,21 @@ makes it for a playback, sharing the playback's seeks; `SpoolMarkers.new`
 makes it for a file on this device, played with no `SpoolPlayback`, and
 then `seek_started` and `seek_done` go to it. Feed it the player's tick.
 Its calls never block. It seeks nothing: where it gives a target the app
-seeks the player there, and the target counts as a seek from then.
+seeks there with `SpoolPlayback.seek`, as above (the player, for a file
+on this device), and the target counts as a seek from then.
 
 ```kotlin
 val markers = playback.followMarkers(hasNext = false, autoSkip = true, upNextCard = true)
 
 // On each tick; the length is null until the player knows it.
 for (action in markers.onPosition(at, length)) when (action) {
-    is MarkerAction.AutoSkip -> { player.seekTo(action.to.toMillis()); showUndo(undoWindow()) }
+    is MarkerAction.AutoSkip -> { seek(action.to); showUndo(undoWindow()) }
     is MarkerAction.Offer -> showButton(action.v1) // SkipIntro, SkipCredits, Next, or null
     is MarkerAction.UpNext -> showUpNext(action.v1)
 }
 
-markers.skip()?.let { player.seekTo(it.toMillis()) } // the button, pressed
-markers.undoSkip()?.let { player.seekTo(it.toMillis()) } // Undo, pressed
+markers.skip()?.let { seek(it) } // the button, pressed
+markers.undoSkip()?.let { seek(it) } // Undo, pressed
 ```
 
 ```swift
@@ -221,7 +269,8 @@ no bridge: it builds with `--no-default-features`, opens with
 threads: every read blocks until the bytes are here. A direct play's
 file or a progressive conversion's output is `read(offset, length)`,
 with `size`, `content_type`, and `set_flushing` to let a waiting read
-go. A conversion's HLS is read by name instead: `open_resource(path)`
+go; a progressive conversion is read in order, and `seek` is how it
+moves. A conversion's HLS is read by name instead: `open_resource(path)`
 reads `master.m3u8`, or a name a playlist gives, whole (its type and
 length), and `read_resource(path, offset, length)` reads ranges of the
 one opened last, so Media3's ranges in one segment are one fetch. The
@@ -348,4 +397,4 @@ Kotlin bindings from the crate's cdylib and checks every crate's files
 are there. In devenv's `ci-test` profile, which brings `kotlinc`, a JDK
 and Swift, it also compiles every crate's Kotlin together and typechecks
 the Swift as one module (on Linux), each with an app's use of
-`SpoolMarkers`; elsewhere those two tests say so and pass.
+`SpoolMarkers` and `seek`; elsewhere those two tests say so and pass.
