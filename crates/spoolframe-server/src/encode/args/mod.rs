@@ -168,22 +168,25 @@ fn only_forced_keyframes(encoder: &str) -> Vec<String> {
     args
 }
 
-/// For an HLS run of an encoded video from a seek, a copied audio track
-/// cut to start where the video does. A seek lands the demuxer on the
+/// For a run of an encoded video from a seek, a copied audio track cut
+/// to start where the video does. A seek lands the demuxer on the
 /// source's keyframe before the time, and a copied track starts there,
 /// up to a source GOP early (1.6 s in American Sniper, 10 s in a film
-/// keyed that rarely), while the decoded video starts at the time. The
-/// HLS muxer measures its cuts from the first packet it gets, the audio:
-/// its thresholds came that much early, so a cut landed on whatever
-/// keyframe came first past one, and with a lead over a segment's length
-/// the run began with a segment of audio alone and every number after it
-/// was one off the playlist. The `noise` filter drops the packets before
-/// the time: the rest keep their own times (`-copyts`), where an output
-/// `-ss` would move them back to 0.
+/// keyed that rarely), while the decoded video starts at the time. Read
+/// as it comes (progressive), that sound plays over a frozen first frame:
+/// 3.26 s on an Android TV. The HLS muxer measures its cuts from the
+/// first packet it gets, the audio: its thresholds came that much early,
+/// so a cut landed on whatever keyframe came first past one, and with a
+/// lead over a segment's length the run began with a segment of audio
+/// alone and every number after it was one off the playlist. The `noise`
+/// filter drops the packets before the time: the rest keep their own
+/// times (`-copyts`), where an output `-ss` would move them back to 0. A
+/// copied picture starts at that keyframe, as its sound does. A run maps
+/// one audio track, and `-bsf:a` covers whatever it maps.
 fn copied_audio_from_start(spec: &EncodeSpec<'_>) -> Vec<String> {
     let encoded = matches!(spec.video, Some(ConvertedVideo::Encode { .. }));
-    match (&spec.output, spec.start) {
-        (Output::Hls { .. }, Some(start)) if encoded && !start.is_zero() => vec![
+    match spec.start {
+        Some(start) if encoded && !start.is_zero() => vec![
             s("-bsf:a"),
             // `\,`: a bare comma would end the filter's options.
             format!("noise=drop=lt(pts*tb\\,{})", seconds(start)),

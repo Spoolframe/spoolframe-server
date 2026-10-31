@@ -2152,6 +2152,29 @@ fn a_resumed_encode_s_copied_audio_starts_at_the_seek() {
     }
 }
 
+/// A progressive run starts its picture at the seek too: sound from the
+/// source's keyframe before it plays over a frozen first frame. A copied
+/// picture starts at that keyframe, and the sound must stay with it.
+#[test]
+fn a_progressive_seek_s_copied_audio_starts_with_an_encoded_picture() {
+    let (film, enc) = (film(), encoders(false));
+    let run = |video, start: Option<Duration>| {
+        let mut spec = spec(&film, &enc, video, COPY_DTS, None, progressive());
+        spec.start = start;
+        ffmpeg_args(&spec).unwrap()
+    };
+    let at = Some(Duration::from_secs(240));
+    let args = run(TONE_MAPPED_H264, at);
+    assert_eq!(
+        after(&args, "-bsf:a"),
+        "noise=drop=lt(pts*tb\\,240.000)",
+        "{args:?}"
+    );
+    for args in [run(TONE_MAPPED_H264, None), run(COPY_HEVC, at)] {
+        assert!(!args.contains(&s("-bsf:a")), "{args:?}");
+    }
+}
+
 /// A remux ladder's encoded rung (PX-21) cuts where the copy does: a
 /// keyframe forced at each of the copy's cuts from the run's start on,
 /// the encoder's own keyframes (scene cuts, a GOP's end) off, and the

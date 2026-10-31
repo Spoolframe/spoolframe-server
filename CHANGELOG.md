@@ -9,6 +9,9 @@ with a 0.16 server.
 - Server: passkeys moved to webauthn-rs 0.6.2, which verifies with RustCrypto,
   so the server no longer links OpenSSL and a build needs none. Stored
   passkeys keep working as they are. New passkeys may also be ES384.
+- Server: after a seek on a progressive encode with copied audio, the
+  sound starts with the picture, as on HLS. It came up to a source GOP
+  early, and an Android TV held a frozen first frame for 3 s under it.
 - Server: a conversion seeked or resumed at an item's end starts up to
   5 s before it (a tenth of a short item), so the viewer gets the last
   seconds and then the end, where a GPU encode failed with no frame to

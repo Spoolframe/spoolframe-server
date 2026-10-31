@@ -237,6 +237,96 @@ fn decodes(dir: &Path, numbers: &[u32]) -> bool {
     out.status.success() && errors == 0
 }
 
+/// The first audio packet's time, ms.
+fn first_audio(path: &Path) -> i64 {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let time = text.lines().next().expect("audio packets");
+    let time = time.trim_end_matches(',').parse::<f64>().unwrap();
+    (time * 1000.0).round() as i64
+}
+
+/// A progressive seek in a film keyed every 10 s: without the cut its
+/// copied audio starts seconds early, and plays over a frozen first frame.
+/// The formats films copy, as ffmpeg's encoders make them here: within a
+/// packet of the target, and still decoding.
+#[tokio::test]
+async fn a_progressive_seek_s_copied_audio_starts_at_its_target() {
+    let dir = scratch("copied-audio").await;
+    let source = film(
+        dir.as_ref(),
+        "keyed.mkv",
+        20,
+        &["-preset", "ultrafast", "-g", "240", "-keyint_min", "240"],
+    );
+    let encoders = Encoders::software_baseline();
+    let at = Duration::from_secs(14);
+    for (name, codec, encoder) in [
+        ("aac", AudioCodec::Aac, "copy"),
+        ("ac3", AudioCodec::Ac3, "ac3"),
+        ("eac3", AudioCodec::Eac3, "eac3"),
+        ("truehd", AudioCodec::TrueHd, "truehd"),
+    ] {
+        let film = dir.as_ref().join(format!("{name}.mkv"));
+        let refs = ["-i", source.to_str().unwrap(), "-c:v", "copy", "-c:a"];
+        let strict = ["-strict", "-2", "-ac", "2", film.to_str().unwrap()];
+        ffmpeg(&[&refs[..], &[encoder], &strict].concat());
+        let (descriptor, _) = read(&film).await;
+        let out = dir.as_ref().join(format!("{name}-out.mkv"));
+        let args = ffmpeg_args(&EncodeSpec {
+            inputs: Inputs::film(&film),
+            descriptor: &descriptor,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 90,
+                max_bitrate: None,
+                tone_map: false,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 0,
+                action: AudioAction::Copy { codec },
+            }),
+            subtitle: None,
+            encoders: &encoders,
+            vaapi_device: Path::new(""),
+            hardware_decode: false,
+            gpu_filters: false,
+            tone_map: ToneMapSetting::Auto,
+            start: Some(at),
+            output: Output::Progressive { file: out.clone() },
+        })
+        .unwrap();
+        ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        let target = at.as_millis() as i64;
+        let first = first_audio(&out);
+        assert!(
+            (target - 43..target + 100).contains(&first),
+            "{name}: audio starts at {first} ms"
+        );
+        let picture = frames(&out)[0].0;
+        assert!(
+            (target..target + 100).contains(&picture),
+            "{name}: {picture}"
+        );
+        let decoded = Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success() && decoded.stderr.is_empty(),
+            "{name}: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+    }
+}
+
 async fn scratch(test: &str) -> spoolframe_test_dir::TestDir {
     spoolframe_test_dir::TestDir::new(&format!("spoolframe-segment-muxer-{test}")).await
 }
