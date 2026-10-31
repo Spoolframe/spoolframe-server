@@ -985,6 +985,12 @@ with a 0.16 server.
   true one. One frame through the encoder reads it, the first time a
   size, rate and depth is asked for; a card at its limit, or a probe that
   fails, leaves the guess for that playlist.
+- Server: burning a picture subtitle (PGS, VobSub) into a film whose audio
+  is TrueHD no longer scales a canvas for each audio packet. A 4K film failed
+  with `Cannot allocate memory` at the sandbox's limit, and the same graph
+  took 1.4 GiB and ran at twice real time instead of half.
+- Server: a run that ran out of memory no longer marks the file as
+  CPU-decoded, and from a seek it fails instead of ending as the stream's end.
 
 ## 0.16.3 (2026-10-28)
 

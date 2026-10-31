@@ -289,6 +289,12 @@ pub(super) fn driver_fault(ended: &Ended) -> bool {
 /// frame having reached them. Said at `-loglevel error`.
 const NO_FRAMES: &str = "A hardware frames reference is required";
 
+/// What ffmpeg says of an allocation refused, wherever it was: mostly the
+/// run's `RLIMIT_DATA`, which says nothing of the GPU or of the film's end.
+/// A filter that fails so leaves the encoder with no frame, and
+/// [`NO_FRAMES`] said after it means only that.
+const OUT_OF_MEMORY: &str = "Cannot allocate memory";
+
 /// Whether a run that `ended` so could be one that found no frame: ffmpeg
 /// exited non-zero by itself.
 fn failed_for_no_frame(ended: &Ended) -> bool {
@@ -313,13 +319,14 @@ impl Supervisor {
         // run started, never twice, whichever ffmpeg encoded it.
         let mut counted_ms = self.start_ms;
         let mut ended = self.watch(launched, &mut counted_ms).await;
-        if failed_for_no_frame(&ended) && self.no_frame_said() > 0 {
+        if failed_for_no_frame(&ended) && !self.out_of_memory() && self.no_frame_said() > 0 {
             ended = self.no_frame(ended, &mut counted_ms).await;
             self.conclude(ended);
             return;
         }
         if decode_failed(&ended) && self.shared.hardware_decode.load(Ordering::Relaxed) {
             if let Some(fallback) = &self.fallback
+                && !self.out_of_memory()
                 && self.decode_failures.remember(&fallback.file)
             {
                 tracing::warn!(
@@ -389,6 +396,12 @@ impl Supervisor {
         kept.iter().filter(|l| l.contains(NO_FRAMES)).count()
     }
 
+    /// Whether ffmpeg said an allocation was refused.
+    fn out_of_memory(&self) -> bool {
+        let kept = self.shared.stderr.lock();
+        kept.iter().any(|l| l.contains(OUT_OF_MEMORY))
+    }
+
     /// A run from a seek that `ended` having found no frame. Decoded on the
     /// GPU, that may be the GPU's: it runs once more, decoding in software,
     /// and one failure at one place is not remembered against the file.
@@ -408,7 +421,8 @@ impl Supervisor {
             }
             let launched = self.relaunch(&fallback);
             ended = self.watch_again(launched, counted_ms).await;
-            if !failed_for_no_frame(&ended) || self.no_frame_said() == said {
+            if !failed_for_no_frame(&ended) || self.no_frame_said() == said || self.out_of_memory()
+            {
                 return ended;
             }
         }

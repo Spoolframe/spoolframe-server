@@ -2494,6 +2494,135 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
     server.stop().await;
 }
 
+/// ffmpeg sends a picture track's canvas again for every packet it reads
+/// from the film, so an overlay is not left waiting for the next cue. A
+/// track of 1200 packets a second, as TrueHD's is, sent that many a
+/// second of film through the scale to the video's size: 19 GiB of 4K
+/// canvases queued at a 4K film's 12 frames a second, and past
+/// `RLIMIT_DATA`, ENOMEM. Counted after the scale, in the real graph. With
+/// no B-frames: a canvas is sent only for a packet later than the last,
+/// and their times keep x264's video ahead of the audio read after it.
+#[tokio::test]
+async fn pictures_burned_in_are_not_scaled_for_every_packet_of_the_film() {
+    use spoolframe_media::Prober;
+    use spoolframe_media::encoders::{AudioEncoder, Encoders, ToneMapSetting, VideoEncoder};
+    use spoolframe_media::sandbox::{Sandbox, Tool};
+    use spoolframe_protocol::{
+        AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, SubtitleAction,
+    };
+    use spoolframe_server::encode::args::{EncodeSpec, Inputs, Output, ffmpeg_args};
+    use spoolframe_types::{AudioCodec, SubtitleFormat, VideoCodec};
+
+    const SECS: u32 = 12;
+    let (server, client, _session) = ready("burn-in-heartbeats", unthrottled(), SECS).await;
+    let many = server.media.with_extension("packets.mkv");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&server.media)
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .args(["-af", "asetnsamples=n=40:p=0"])
+        .arg(&many)
+        .status()
+        .expect("ffmpeg runs");
+    assert!(status.success(), "ffmpeg could not rewrite the audio");
+    std::fs::rename(&many, &server.media).unwrap();
+    server.add_pgs(&[("Hello there", 1_000, 3_500)]);
+
+    let prober = Prober::new(
+        Tool::new("ffprobe", Sandbox::off()),
+        Prober::DEFAULT_TIMEOUT,
+    );
+    let descriptor = prober.describe(&server.media).await.unwrap();
+    let encoders = Encoders {
+        video: vec![VideoEncoder {
+            codec: VideoCodec::H264,
+            name: "libx264".into(),
+            hardware: None,
+        }],
+        audio: vec![AudioEncoder {
+            codec: AudioCodec::Aac,
+            name: "aac".into(),
+        }],
+        hardware_decoders: Vec::new(),
+        gpu_tonemap: false,
+        gpu_overlay: false,
+        cuda_scale: false,
+        cuda_overlay: false,
+        libplacebo: Vec::new(),
+        ten_bit: Vec::new(),
+        unusable: Vec::new(),
+        failed: Vec::new(),
+    };
+    let file = server.media.with_extension("burned.mkv");
+    let args = ffmpeg_args(&EncodeSpec {
+        inputs: Inputs::film(&server.media),
+        descriptor: &descriptor,
+        video: Some(ConvertedVideo::Encode {
+            codec: VideoCodec::H264,
+            height: 360,
+            max_bitrate: None,
+            tone_map: false,
+        }),
+        audio: Some(ConvertedAudio {
+            index: 0,
+            action: AudioAction::Encode {
+                codec: AudioCodec::Aac,
+                channels: 2,
+                bitrate: 128_000,
+            },
+        }),
+        subtitle: Some(ConvertedSubtitle {
+            index: 0,
+            action: SubtitleAction::BurnIn {
+                format: SubtitleFormat::Pgs,
+            },
+        }),
+        encoders: &encoders,
+        vaapi_device: Path::new("/dev/dri/renderD128"),
+        hardware_decode: false,
+        gpu_filters: false,
+        tone_map: ToneMapSetting::Auto,
+        start: None,
+        output: Output::Progressive { file },
+    })
+    .unwrap();
+    assert!(
+        args.iter().any(|arg| arg.contains("[subs];")),
+        "no pictures laid over: {args:?}"
+    );
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| match arg.as_str() {
+            "error" => "info".to_owned(),
+            _ => arg.replace("[subs];", ",showinfo[subs];"),
+        })
+        .collect();
+    let run = std::process::Command::new("ffmpeg")
+        .args(&args)
+        .output()
+        .expect("ffmpeg runs");
+    let said = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{said}");
+    let scaled = said
+        .lines()
+        .filter(|line| line.contains("showinfo") && line.contains(" n:"))
+        .count();
+    assert!(scaled > 0, "nothing reached the overlay: {said}");
+    assert!(
+        scaled <= 26 * SECS as usize,
+        "{scaled} canvases scaled in a film of {SECS} s"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
 /// Start the film at `start_ms` with a PGS file beside it burned in, and
 /// read it whole: the output, and the time of its first packet.
 async fn burned_pgs_sidecar(test: &str, start_ms: Option<u64>) -> (TestServer, PathBuf, f64) {

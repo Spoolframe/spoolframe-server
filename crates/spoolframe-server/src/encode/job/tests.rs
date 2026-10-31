@@ -782,6 +782,27 @@ async fn a_seek_the_gpu_failed_is_held_against_the_film() {
     assert!(failing_at("gpu-seek-fails", said, 30_000).await.remembered);
 }
 
+/// What ffmpeg says for a limit reached, wherever it hit it.
+const OUT_OF_MEMORY: &str = "[fc#0] Error while filtering: Cannot allocate memory";
+
+/// Memory says nothing of the GPU: the run goes again in software, and
+/// the film's next run may still decode on the GPU.
+#[tokio::test]
+async fn a_run_out_of_memory_is_not_held_against_the_film() {
+    let run = failing_at("gpu-out-of-memory", OUT_OF_MEMORY, 0).await;
+    assert_eq!((run.remembered, run.done, run.bytes), (false, Ok(()), 3));
+}
+
+/// A filter that fails opens the encoder with no frame too, and VA-API's
+/// says so as past the last frame: that is a failure, not the stream's end.
+#[tokio::test]
+async fn a_seek_out_of_memory_is_no_end_of_the_stream() {
+    let script = format!("echo '{OUT_OF_MEMORY}' >&2; echo '{NO_FRAME}' >&2; exit 244");
+    let run = run_at("out-of-memory-at-all", &script, gpu_run, 30_000).await;
+    assert!(run.done.is_err(), "ended as the stream's end");
+    assert!(!run.remembered);
+}
+
 /// The stand-in: `on_gpu` when the last argument is `hw`, else writes
 /// `abc` to the first and reports a second encoded.
 fn decoding(on_gpu: &str) -> String {
