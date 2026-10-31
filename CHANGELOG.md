@@ -16,6 +16,15 @@ with a 0.16 server.
   app, and `Session::backdrop` fetches an image with its faces. Apps
   come later. The server's binary grows by about 17 MB, on or off: the
   model and tract, and the licences page gains a Models group.
+- Server: an HEVC encode keeps to the highest level the device lists in
+  `video_codecs`: its bitrate to the level's Main tier maximum, and its
+  size to the level's picture size. Saw at Original on the Android TV
+  was given 83 Mbit/s, which hevc_vaapi labels level 6.1, over what the
+  TV's decoder declares. Nothing changes for a client that lists no HEVC
+  string. Ladders keep to it too. H.264 and AV1 are not held to theirs.
+- Server: a tone map is held to what its output is worth, at any quality,
+  not the HDR file's rate: 28 Mbit/s at 2160p in HEVC or AV1 and 9 at
+  1080p, 42 and 13.5 in H.264. The file's rate stays the cap under that.
 - Protocol and SDK: a viewer with no saved track preferences hears a film
   in the device's language where it has it, on every client that says
   one, else its default track. `Hello.language` (BCP 47, optional),

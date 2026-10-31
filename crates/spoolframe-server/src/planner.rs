@@ -42,7 +42,7 @@ use spoolframe_protocol::{
 };
 use spoolframe_types::{
     AudioCodec, BitmapPreference, ClientCapabilities, CodecString, Container, Delivery, HdrFormat,
-    SubtitleFormat, VideoCodec,
+    SubtitleFormat, Tier, VideoCodec,
 };
 
 /// How a picked bitmap subtitle is shown: as the client asked, or, when it
@@ -867,18 +867,16 @@ pub fn plan_for(
     else {
         return plan;
     };
-    let tallest = caps
-        .max_video
-        .as_ref()
-        .and_then(|limits| limits.height)
-        .map_or(source.height, |max| source.height.min(max));
+    let ceiling = encode_ceiling(source, codec, tone_map, caps);
+    let tallest = ceiling.height;
     let audio_bits = audio_bits(audio.as_ref());
     // The top rung: the source's own rate, or what its height is worth,
-    // under the app's own cap.
+    // under the app's own cap and what the device takes.
     let source_bits = descriptor
         .bit_rate
         .map(|bits| bits.saturating_sub(audio_bits))
         .unwrap_or_else(|| worth(tallest, codec));
+    let source_bits = lower(Some(source_bits), ceiling.bits).unwrap_or(source_bits);
     // Under the uplink share too (PX-46): the ladder's top is what this
     // playback may take of it.
     let own = lower(caps.max_bitrate, share);
@@ -932,8 +930,8 @@ fn remux_ladder(
     let Ok(ConvertedVideo::Encode {
         codec,
         height: tallest,
+        max_bitrate,
         tone_map,
-        ..
     }) = encode_video(source, descriptor.bit_rate, caps, encoders, audio.as_ref())
     else {
         return plan;
@@ -943,12 +941,15 @@ fn remux_ladder(
         .bit_rate
         .map(|bits| bits.saturating_sub(audio_bits))
         .unwrap_or_else(|| worth(source.height, codec));
+    // Half the copy, or all an encode of it may be: a copy keeps its own
+    // level, which an encode's cap need not reach.
+    let top = max_bitrate.map_or(copy_bits / 2, |bits| bits.min(copy_bits / 2));
     // At most one rung fewer than a ladder, spread over the same span
     // to the floor: cut from a ladder of `MAX_RUNGS`, a fast copy's lost
     // its floor (32 Mbit/s: 16, 6.35 and 2.52, nothing under 1).
-    let under: Vec<Rung> = rungs_of(copy_bits / 2, tallest, codec, MAX_RUNGS - 1)
+    let under: Vec<Rung> = rungs_of(top, tallest, codec, MAX_RUNGS - 1)
         .into_iter()
-        .filter(|r| r.max_bitrate <= copy_bits / 2)
+        .filter(|r| r.max_bitrate <= top)
         .map(|r| Rung {
             video: Some(ConvertedVideo::Encode {
                 codec,
@@ -1068,9 +1069,6 @@ fn encode_video(
     audio: Option<&ConvertedAudio>,
 ) -> Result<ConvertedVideo, String> {
     let limits = caps.max_video.clone().unwrap_or_default();
-    let height = limits
-        .height
-        .map_or(video.height, |max| video.height.min(max));
     // 8-bit output where the client asks for it.
     let eight_bit = limits.bit_depth.is_some_and(|b| b < 10);
     // The HDR an encode of it keeps (Dolby Vision's base layer's), where
@@ -1108,15 +1106,18 @@ fn encode_video(
     // which no encoder needs and hevc_nvenc refuses, and an encoder left
     // to its own rate made 33 Mbit/s of a 17 Mbit/s file.
     let audio_bits = audio_bits(audio);
+    let ceiling = encode_ceiling(video, codec, tone_map, caps);
     let source_bits = bit_rate
         .map(|bits| bits.saturating_sub(audio_bits))
         .unwrap_or_else(|| worth(video.height, codec))
         .min(MAX_ENCODE_BITRATE);
+    let source_bits = lower(Some(source_bits), ceiling.bits).unwrap_or(source_bits);
     let max_bitrate = caps.max_bitrate.map_or(source_bits, |max| {
         max.saturating_sub(audio_bits).min(source_bits)
     });
     let max_bitrate = Some(max_bitrate.max(500_000));
     // A low cap is spent on fewer pixels, not on a blurred large picture.
+    let height = ceiling.height;
     let height = max_bitrate.map_or(height, |bits| height.min(height_for(bits, codec)));
     Ok(ConvertedVideo::Encode {
         codec,
@@ -1124,6 +1125,130 @@ fn encode_video(
         max_bitrate,
         tone_map,
     })
+}
+
+/// What an encode of `video` in `codec` may reach for `caps`, at any
+/// quality and on any rung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ceiling {
+    /// The tallest picture: the source's, under the screen's and the
+    /// device's level.
+    height: u32,
+    /// The most bits per second of video, where there is a limit other
+    /// than the source's own rate.
+    bits: Option<u64>,
+}
+
+/// [`Ceiling`] for an encode of `video` in `codec` for `caps`, tone mapped
+/// or not. A client that lists no level of the codec is held to none.
+/// A tone map is held to [`TONE_MAP_WORTH`] of [`worth`] for the picture
+/// it makes, at any quality: 28 Mbit/s at 2160p in HEVC or AV1 and 9 at
+/// 1080p; in H.264, 42 and 13.5. The source's rate paid for an HDR master's
+/// 10 bits and its grain, which an 8-bit picture no longer has.
+fn encode_ceiling(
+    video: &VideoStream,
+    codec: VideoCodec,
+    tone_map: bool,
+    caps: &ClientCapabilities,
+) -> Ceiling {
+    let shown = caps.max_video.as_ref().and_then(|limits| limits.height);
+    let height = shown.map_or(video.height, |max| video.height.min(max));
+    let level = (codec == VideoCodec::Hevc)
+        .then(|| listed_hevc_level(caps, video.hdr.is_some() && !tone_map))
+        .flatten();
+    let height = level.map_or(height, |l| height_within(video, height, l.max_luma_ps));
+    let output = tone_map.then(|| worth(height, codec) * TONE_MAP_WORTH.0 / TONE_MAP_WORTH.1);
+    Ceiling {
+        height,
+        bits: lower(level.map(|l| l.max_bits), output),
+    }
+}
+
+/// What a tone map may spend, as a fraction of what its height is worth
+/// ([`worth`]): half as much again, as `Original` asks for more than the
+/// generous encode that is, yet well under Saw's 83 Mbit/s. A GPU encoding
+/// at that rate had no speed to spare.
+const TONE_MAP_WORTH: (u64, u64) = (3, 2);
+
+/// One level of HEVC, Main tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HevcLevel {
+    /// `general_level_idc`: 30 times the level.
+    idc: u8,
+    /// MaxLumaPs: the most luma samples in a picture.
+    max_luma_ps: u64,
+    /// MaxBR for Main and Main 10 (CpbVclFactor 1000), bits per second.
+    max_bits: u64,
+}
+
+/// HEVC's levels at Main tier, lowest first: ITU-T H.265 Annex A, MaxLumaPs
+/// from Table A.8 and MaxBR from Table A.9. What an encoder labels a stream
+/// comes from its size and bitrate, not its frame rate: ffmpeg's
+/// `ff_h265_guess_level`, for hevc_vaapi, and MaxLumaSr is left out for it.
+/// Measured with hevc_vaapi on an RX 7900 (ffmpeg 9.0.2): 3840x2160 at 25
+/// Mbit/s is L150, at 40 L153, at 60 L156 and at 83 L183; 1920x1080 at 12
+/// is L120 and at 20 L123. Tiers above Main are not listed: no encoder here
+/// writes one.
+const HEVC_LEVELS: [HevcLevel; 13] = {
+    const fn level(idc: u8, max_luma_ps: u64, max_kbits: u64) -> HevcLevel {
+        HevcLevel {
+            idc,
+            max_luma_ps,
+            max_bits: max_kbits * 1000,
+        }
+    }
+    [
+        level(30, 36_864, 128),
+        level(60, 122_880, 1_500),
+        level(63, 245_760, 3_000),
+        level(90, 552_960, 6_000),
+        level(93, 983_040, 10_000),
+        level(120, 2_228_224, 12_000),
+        level(123, 2_228_224, 20_000),
+        level(150, 8_912_896, 25_000),
+        level(153, 8_912_896, 40_000),
+        level(156, 8_912_896, 60_000),
+        level(180, 35_651_584, 60_000),
+        level(183, 35_651_584, 120_000),
+        level(186, 35_651_584, 240_000),
+    ]
+};
+
+/// The highest level at which `caps` lists an encode's HEVC at Main tier,
+/// Main 10 for `ten_bit` and else Main; `None` where it lists none.
+fn listed_hevc_level(caps: &ClientCapabilities, ten_bit: bool) -> Option<HevcLevel> {
+    let (profile, compatibility) = if ten_bit { (2, 4) } else { (1, 6) };
+    let lists = |level: &HevcLevel| {
+        caps.plays_codec_string(&CodecString::Hevc {
+            in_band: false,
+            profile_space: 0,
+            profile,
+            compatibility,
+            tier: Tier::Main,
+            level: level.idc,
+            constraints: [0; 6],
+        }) == Some(true)
+    };
+    HEVC_LEVELS.iter().rev().copied().find(lists)
+}
+
+/// Picture widths to fall back on, widest first, when a size is over a
+/// level: `height` alone would leave a 2.4:1 film 2592 wide at 1080.
+const LEVEL_WIDTHS: [u64; 6] = [3840, 1920, 1280, 960, 640, 480];
+
+/// `height`, or the tallest of [`LEVEL_WIDTHS`] under it, whichever first
+/// makes a picture of `video`'s shape of at most `max_luma_ps` samples.
+fn height_within(video: &VideoStream, height: u32, max_luma_ps: u64) -> u32 {
+    let (width_of, tall) = (u64::from(video.width), u64::from(video.height).max(1));
+    let fits = |h: u64| h * (h * width_of / tall) <= max_luma_ps;
+    if fits(u64::from(height)) {
+        return height;
+    }
+    LEVEL_WIDTHS
+        .iter()
+        .map(|width| (width * tall / width_of.max(1)) & !1)
+        .find(|&h| fits(h))
+        .map_or(height, |h| h as u32)
 }
 
 /// The most rungs an HLS ladder has (PX-21).
@@ -2254,6 +2379,8 @@ mod tests {
     fn progressive_encode_cap_on_a_fast_lan(bit_rate: Option<u64>) -> u64 {
         let mut source = hevc_dts();
         source.bit_rate = bit_rate;
+        // SDR: a tone map has a cap of its own.
+        source.video.as_mut().unwrap().hdr = None;
         let caps = ClientCapabilities {
             delivery: vec![Delivery::Range, Delivery::Progressive],
             ..caps()
@@ -2710,9 +2837,9 @@ mod tests {
                 // The server's first choice the client plays: h264_vaapi.
                 codec: VideoCodec::H264,
                 height: 1080,
-                // No limit from the app: the file's 40 Mbit/s less the
-                // copied audio.
-                max_bitrate: Some(40_000_000 - COPIED_AUDIO_BITS),
+                // No limit from the app, and under the file's 40 Mbit/s:
+                // what SDR at 1080p is worth.
+                max_bitrate: Some(13_500_000),
                 tone_map: true,
             }
         );
@@ -3164,6 +3291,154 @@ mod tests {
                 .5
                 .contains(&"video: hvc1.2.4.L186.B0 not supported".to_owned())
         );
+    }
+
+    /// Saw (plex:movie:232260): 4K HDR10 HEVC at Main 10, high tier, 83.5
+    /// Mbit/s, which no TV here lists, so it is encoded.
+    fn saw() -> MediaDescriptor {
+        let mut d = with_string(hevc_dts(), "hvc1.2.4.H153.90");
+        d.bit_rate = Some(83_500_000);
+        d
+    }
+
+    /// How `d` is planned for `caps` at `quality`, on a GPU that encodes
+    /// HEVC in 10 bits.
+    fn on_tv(
+        d: &MediaDescriptor,
+        caps: &ClientCapabilities,
+        quality: Quality,
+        wan: bool,
+    ) -> PlaybackPlan {
+        super::plan_for(
+            d,
+            Some(caps),
+            quality,
+            None,
+            wan,
+            picked(1, None),
+            Bitmap::Preferred(BitmapPreference::Text),
+            &gpu_encoders(
+                &[
+                    (VideoCodec::Hevc, "hevc_vaapi"),
+                    (VideoCodec::H264, "libx264"),
+                ],
+                &["hevc_vaapi"],
+            ),
+            &Ocr::disabled(),
+        )
+    }
+
+    /// An encode's height, cap and tone map at Original.
+    fn original(d: &MediaDescriptor, caps: &ClientCapabilities) -> (u32, u64, bool) {
+        match video_of(on_tv(d, caps, Quality::Original, false)) {
+            ConvertedVideo::Encode {
+                height,
+                max_bitrate,
+                tone_map,
+                ..
+            } => (height, max_bitrate.unwrap(), tone_map),
+            other => panic!("not an encode: {other:?}"),
+        }
+    }
+
+    /// The Android TV: Saw at Original was given the source's 82.9 Mbit/s,
+    /// which hevc_vaapi labels level 6.1, over what the decoder declares.
+    #[test]
+    fn an_encode_keeps_to_the_level_the_device_lists() {
+        let tv = listing_tv(&["hvc1.2.4.L153.B0"]);
+        assert_eq!(original(&saw(), &tv), (2160, 40_000_000, false));
+        let tv = listing_tv(&["hvc1.2.4.L150.B0", "hvc1.2.4.L123.B0"]);
+        assert_eq!(original(&saw(), &tv), (2160, 25_000_000, false));
+    }
+
+    /// Level 4.1 takes 2,228,224 luma samples a picture, and 4K is over
+    /// four times that.
+    #[test]
+    fn a_level_too_low_for_the_size_lowers_the_size_too() {
+        let tv = listing_tv(&["hvc1.2.4.L123.B0"]);
+        assert_eq!(original(&saw(), &tv), (1080, 20_000_000, false));
+    }
+
+    /// At height 1080 a 2.4:1 film is 2592 wide, over level 4.1.
+    #[test]
+    fn a_wide_film_is_sized_by_its_samples_not_its_height() {
+        let mut wide = saw();
+        let video = wide.video.as_mut().unwrap();
+        video.height = 1600;
+        let mut tv = listing_tv(&["hvc1.2.4.L123.B0"]);
+        tv.max_video.as_mut().unwrap().height = Some(1080);
+        assert_eq!(original(&wide, &tv).0, 800);
+    }
+
+    /// The encode's own profile's level is the one that counts: a device
+    /// may list Main higher than Main 10.
+    #[test]
+    fn an_hdr_encode_is_held_to_main_10_s_level() {
+        let tv = listing_tv(&["hvc1.1.6.L186.B0", "hvc1.2.4.L150.B0"]);
+        assert_eq!(original(&saw(), &tv).1, 25_000_000);
+    }
+
+    #[test]
+    fn a_client_that_lists_no_levels_gets_the_source_s_rate() {
+        let tv = ClientCapabilities {
+            video_codecs: None,
+            max_bitrate: Some(70_000_000),
+            ..listing_tv(&[])
+        };
+        assert_eq!(original(&saw(), &tv), (2160, 69_360_000, false));
+    }
+
+    /// `Auto` ladders run from the app's cap, not the plan's: the top rung
+    /// must keep to the level too.
+    #[test]
+    fn a_ladder_s_top_keeps_to_the_level() {
+        let tv = listing_tv(&["hvc1.2.4.L153.B0"]);
+        let plan = on_tv(&saw(), &tv, on_link(10_000_000), false);
+        let rungs = ladder_of(&plan);
+        assert_eq!(rungs[0].max_bitrate, 40_000_000, "{rungs:?}");
+    }
+
+    #[test]
+    fn a_remux_ladder_s_encodes_keep_to_the_level() {
+        let tv = listing_tv(&["hvc1.2.4.L153.B0"]);
+        let copied = with_string(saw(), "hvc1.2.4.L153.B0");
+        let plan = on_tv(&copied, &tv, auto(1_000_000_000), true);
+        let rungs = ladder_of(&plan);
+        assert_eq!(rungs[0].video, None, "the copy on top: {rungs:?}");
+        assert_eq!(rungs[1].max_bitrate, 40_000_000, "{rungs:?}");
+    }
+
+    /// Saw at Original on an SDR screen: 83 Mbit/s kept a 10-bit HDR
+    /// master's grain for an 8-bit picture.
+    #[test]
+    fn a_tone_map_at_original_is_held_to_what_its_output_is_worth() {
+        let sdr = showing(&[]);
+        assert_eq!(original(&saw(), &sdr), (2160, 27_999_999, true));
+    }
+
+    #[test]
+    fn a_tone_map_s_cap_follows_the_picture_it_makes() {
+        let mut tv = showing(&[]);
+        tv.max_video.as_mut().unwrap().height = Some(1080);
+        assert_eq!(original(&saw(), &tv), (1080, 9_000_000, true));
+    }
+
+    #[test]
+    fn a_tone_map_under_its_cap_keeps_the_source_s_rate() {
+        let mut lean = saw();
+        lean.bit_rate = Some(17_000_000);
+        assert_eq!(
+            original(&lean, &showing(&[])),
+            (2160, 17_000_000 - COPIED_AUDIO_BITS, true)
+        );
+    }
+
+    /// A ladder is planned apart from the single encode: its top too.
+    #[test]
+    fn a_tone_map_s_ladder_starts_at_its_cap() {
+        let plan = on_tv(&saw(), &showing(&[]), on_link(10_000_000), false);
+        let rungs = ladder_of(&plan);
+        assert_eq!(rungs[0].max_bitrate, 27_999_999, "{rungs:?}");
     }
 
     /// A source whose string was not read (no record) is judged as
