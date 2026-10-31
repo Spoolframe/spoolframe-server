@@ -1,5 +1,5 @@
 //! Watch state changed on another device (feature
-//! `spoolframe:watch-events`).
+//! `spoolframe:october-2026`).
 
 use spoolframe_types::MediaId;
 

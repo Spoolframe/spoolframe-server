@@ -49,7 +49,7 @@ use spoolframe_types::Role;
 
 use crate::client::{Client, newest_first, parse_id, same_server};
 use crate::connection::ServerConnection;
-use crate::gate::{Gate, InvitePasskeys, Invited};
+use crate::gate::{Gate, Invited, October2026};
 use crate::invite_admin::InviteKind;
 use crate::portable::PortableUserId;
 use crate::servers::{self, SavedServer};
@@ -608,7 +608,7 @@ impl Client {
     /// Feature `G`'s calls for invite `link`'s server, before an account:
     /// the server is reached, and they are [`SdkError::FeatureOff`] if it
     /// did not name `G`. Nothing else is sent. For an account with no
-    /// password, [`Invited<InvitePasskeys>`]; off, offer a password
+    /// password, [`Invited<October2026>`]; off, offer a password
     /// ([`Client::redeem_invite`]).
     pub async fn invited<G: Gate>(&self, link: &str) -> Result<Invited<G>, SdkError> {
         let (invite, id) = parsed(link)?;
@@ -824,7 +824,7 @@ fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
     }
 }
 
-impl Invited<InvitePasskeys> {
+impl Invited<October2026> {
     /// Begin making an account with the invite's code and an app passkey,
     /// with no password: what the platform's passkey API makes the passkey
     /// with, for `username`, shown as `display_name` or the username.

@@ -626,7 +626,7 @@ mod tests {
         };
         assert_eq!(missing.kind(), ErrorKind::ServerTooOld);
         let off = SdkError::FeatureOff {
-            feature: spoolframe_protocol::Feature::NextEpisodes,
+            feature: spoolframe_protocol::Feature::October2026,
         };
         assert_eq!(off.kind(), ErrorKind::ServerTooOld);
         let older = SdkError::UpdateRequired {

@@ -48,14 +48,10 @@ macro_rules! feature {
 }
 
 feature!(
-    /// `spoolframe:next-episode`: what plays after an episode
-    /// ([`On<NextEpisodes>`]).
-    NextEpisodes = Feature::NextEpisodes
-);
-feature!(
-    /// `spoolframe:invite-passkeys`: an account made with an invite and
-    /// an app passkey, with no password ([`Invited<InvitePasskeys>`]).
-    InvitePasskeys = Feature::InvitePasskeys
+    /// `spoolframe:october-2026`: what plays after an episode
+    /// ([`On<October2026>`]), and an account made with an invite and an
+    /// app passkey, with no password ([`Invited<October2026>`]).
+    October2026 = Feature::October2026
 );
 
 /// Feature `G`'s calls in a session: [`crate::Session::feature`]. Cheap
@@ -156,7 +152,7 @@ impl Session {
     }
 }
 
-impl On<NextEpisodes> {
+impl On<October2026> {
     /// The episode to play after episode `item`: with
     /// [`NextMode::InOrder`] the one right after it, with
     /// [`NextMode::FirstUnwatched`] the first after it the user has not

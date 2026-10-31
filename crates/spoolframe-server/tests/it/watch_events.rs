@@ -1,4 +1,4 @@
-//! `WatchChanged` (feature `spoolframe:watch-events`): a change to a
+//! `WatchChanged` (feature `spoolframe:october-2026`): a change to a
 //! user's watch state is told to their other connections that named the
 //! feature, and to no other.
 
@@ -48,7 +48,7 @@ async fn device(server: &TestServer, username: &str, named: Features) -> Device 
 }
 
 fn watching() -> Features {
-    Features::only(Feature::WatchEvents)
+    Features::only(Feature::October2026)
 }
 
 /// The next `WatchChanged` on `events` within `wait`, past the others.
@@ -310,7 +310,7 @@ async fn the_sdk_passes_a_change_on() {
         .sign_in(&server.server.id().to_string(), "alice", PASSWORD, false)
         .await
         .unwrap();
-    assert!(alice.has_feature(Feature::WatchEvents));
+    assert!(alice.has_feature(Feature::October2026));
     let mut events = client.watch_events();
     // Acting as alice on its connection from its first request.
     alice.whoami().await.unwrap();

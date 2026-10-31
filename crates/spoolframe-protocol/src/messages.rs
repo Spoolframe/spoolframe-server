@@ -149,7 +149,7 @@ pub enum Request {
     /// as `LoginPassword` does.
     RedeemInvite(RedeemInvite),
     /// Begin making an account with an invite's code and an app passkey,
-    /// no password (feature `spoolframe:invite-passkeys`): `PasskeyRegistrationBegun`, a nonce, as
+    /// no password (feature `spoolframe:october-2026`): `PasskeyRegistrationBegun`, a nonce, as
     /// for `BeginPasskeyRegistration`, for the account `username` is to
     /// be. The code and username are checked as `RedeemInvite` checks
     /// them, with its errors; nothing is made or used up yet. The
@@ -157,7 +157,7 @@ pub enum Request {
     /// replaces it. On the strangers' budget, as redeeming is.
     BeginInvitePasskey(BeginInvitePasskey),
     /// Finish it with the passkey the platform made (feature
-    /// `spoolframe:invite-passkeys`): the
+    /// `spoolframe:october-2026`): the
     /// account is made with the invite's role, its one way to sign in the
     /// passkey, one use of the invite taken, and the device signed in:
     /// `LoggedIn`, trusted when `remember`. Only the device that began it,
@@ -284,7 +284,7 @@ pub enum Request {
         id: MediaId,
     },
     /// The episode to play after episode `item` (feature
-    /// `spoolframe:next-episode`): `NextEpisode`, filled as `Item`'s
+    /// `spoolframe:october-2026`): `NextEpisode`, filled as `Item`'s
     /// children are, and `None` at the show's end. `in_order` is the
     /// one right after it; `first_unwatched` the first after it the user
     /// has not watched. Specials (season 0) are in the order only when
@@ -297,7 +297,7 @@ pub enum Request {
         specials: bool,
     },
     /// What a show's Continue goes to (feature
-    /// `spoolframe:next-episode`): `NextEpisode`, the first episode in
+    /// `spoolframe:october-2026`): `NextEpisode`, the first episode in
     /// progress, else the first the user has not watched, specials left
     /// out, else `None`. An item that is not a show is `InvalidInput`.
     ShowNext {
@@ -1307,9 +1307,9 @@ impl Request {
     /// feature, or none, on purpose.
     pub fn feature(&self) -> Option<Feature> {
         match self {
-            Request::BeginInvitePasskey(_) => Some(Feature::InvitePasskeys),
-            Request::RedeemInviteWithPasskey(_) => Some(Feature::InvitePasskeys),
-            Request::NextEpisode { .. } | Request::ShowNext { .. } => Some(Feature::NextEpisodes),
+            Request::BeginInvitePasskey(_) => Some(Feature::October2026),
+            Request::RedeemInviteWithPasskey(_) => Some(Feature::October2026),
+            Request::NextEpisode { .. } | Request::ShowNext { .. } => Some(Feature::October2026),
             Request::Hello { .. }
             | Request::AuthMethods
             | Request::LoginPassword { .. }
@@ -2815,7 +2815,7 @@ pub enum Event {
     /// it; the next request in one is `Unauthenticated`. Leave the profile,
     /// and offer to sign in again only if the user is not deleted. Only to
     /// that user's connections, and sent only to a connection where the
-    /// `spoolframe:profile-events` feature is on (both sides named it).
+    /// `spoolframe:october-2026` feature is on (both sides named it).
     ProfileRemoved { user: String },
     /// Local user `user`'s PIN changed: set, changed or removed, by them on
     /// another device or by an admin. `required` is whether they have a PIN
@@ -2823,7 +2823,7 @@ pub enum Event {
     /// the PIN is asked for; one that kept the old PIN to check offline
     /// forgets it. Only to that user's connections, not the one that made
     /// the change, and sent only to a connection where the
-    /// `spoolframe:profile-events` feature is on (both sides named it).
+    /// `spoolframe:october-2026` feature is on (both sides named it).
     PinChanged { user: String, required: bool },
     /// The user's watch state of `items` changed on another connection:
     /// marked watched or unwatched (a season's or a show's id marks its
@@ -2831,7 +2831,7 @@ pub enum Event {
     /// from offline, or played into progress, to watched, or stopped (not
     /// each progress report). Read again what shows them (Home, an item's page). Only
     /// to that user's other connections, and sent only to a connection
-    /// where the `spoolframe:watch-events` feature is on (both sides
+    /// where the `spoolframe:october-2026` feature is on (both sides
     /// named it).
     WatchChanged { items: Vec<MediaId> },
     /// An event type this build does not know; ignore it.

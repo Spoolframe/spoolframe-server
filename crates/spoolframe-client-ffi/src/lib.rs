@@ -60,7 +60,7 @@ pub use events::{
     LibrariesNotice, LibrariesWatch, PlaybackShareWatch, PlaylistNotice, PlaylistWatch,
     ProfileNotice, ProfileWatch, SubtitleTimingNotice, SubtitleTimingWatch, UplinkShare,
 };
-pub use features::{InvitePasskeysApi, NextEpisodesApi};
+pub use features::{October2026Api, October2026InvitedApi};
 pub use markers::SpoolMarkers;
 pub use pairing::{Connected, Paired, PairedServer, SpoolPairing, SpoolPairingOffer};
 pub use playback::{PlaybackStart, PlaybackSubtitle, SpoolPlayback, SubtitleEntry};

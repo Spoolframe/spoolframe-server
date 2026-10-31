@@ -1,14 +1,13 @@
 //! The protocol's regular features, and the calls each gates. A
 //! feature's calls cross as an object of their own, got only when the
-//! feature is on: in a session, `next_episodes()` for `NextEpisodes`
-//! (`spoolframe:next-episode`); before one, for an invite's server,
-//! `SpoolClient.invite_passkeys(link)` for `InvitePasskeys`
-//! (`spoolframe:invite-passkeys`). Off, the first is `None` and the
-//! second `FeatureOff`, and nothing gated is sent.
+//! feature is on: in a session, `october_2026()`; before one, for an
+//! invite's server, `SpoolClient.invited_october_2026(link)`, both of
+//! `spoolframe:october-2026`. Off, the first is `None` and the second
+//! `FeatureOff`, and nothing gated is sent.
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::gate::{InvitePasskeys, NextEpisodes};
+use spoolframe_client_sdk::gate::October2026;
 use spoolframe_client_sdk::types::{Item, MediaId};
 use spoolframe_client_sdk::{
     self as sdk, Feature, FinishPasskeyRegistration, NextMode, PasskeyCreation,
@@ -19,12 +18,12 @@ use crate::error::SpoolError;
 use crate::runtime::run;
 use crate::session::SpoolSession;
 
-/// The calls of `spoolframe:next-episode`.
+/// The calls of `spoolframe:october-2026` in a session.
 #[derive(uniffi::Object)]
-pub struct NextEpisodesApi(sdk::On<NextEpisodes>);
+pub struct October2026Api(sdk::On<October2026>);
 
 #[uniffi::export]
-impl NextEpisodesApi {
+impl October2026Api {
     /// The episode after `item`, in order or the first unwatched;
     /// specials only with `specials`. `None` at the show's end.
     pub async fn next_episode(
@@ -44,13 +43,13 @@ impl NextEpisodesApi {
     }
 }
 
-/// The calls of `spoolframe:invite-passkeys`, for one invite's server:
+/// The calls of `spoolframe:october-2026`, for one invite's server:
 /// an account made with the invite and an app passkey, no password.
 #[derive(uniffi::Object)]
-pub struct InvitePasskeysApi(sdk::Invited<InvitePasskeys>);
+pub struct October2026InvitedApi(sdk::Invited<October2026>);
 
 #[uniffi::export]
-impl InvitePasskeysApi {
+impl October2026InvitedApi {
     /// The invite link it was made for.
     pub fn link(&self) -> String {
         self.0.link().to_owned()
@@ -92,13 +91,13 @@ impl SpoolSession {
         self.session.has_feature(feature)
     }
 
-    /// Next episodes and Show next; `None` when the feature is off for
+    /// `spoolframe:october-2026`: next episodes and Show next; `None` when the feature is off for
     /// this connection (an older server, or one without it).
-    pub fn next_episodes(&self) -> Option<Arc<NextEpisodesApi>> {
+    pub fn october_2026(&self) -> Option<Arc<October2026Api>> {
         self.session
-            .feature::<NextEpisodes>()
+            .feature::<October2026>()
             .ok()
-            .map(|on| Arc::new(NextEpisodesApi(on)))
+            .map(|on| Arc::new(October2026Api(on)))
     }
 }
 
@@ -107,12 +106,12 @@ impl SpoolClient {
     /// Making an account with invite `link`'s code and an app passkey:
     /// its server is reached, and `FeatureOff` when it does not have the
     /// feature (offer a password instead).
-    pub async fn invite_passkeys(
+    pub async fn invited_october_2026(
         &self,
         link: String,
-    ) -> Result<Arc<InvitePasskeysApi>, SpoolError> {
+    ) -> Result<Arc<October2026InvitedApi>, SpoolError> {
         let client = self.client.clone();
-        let invited = run(async move { client.invited::<InvitePasskeys>(&link).await }).await?;
-        Ok(Arc::new(InvitePasskeysApi(invited)))
+        let invited = run(async move { client.invited::<October2026>(&link).await }).await?;
+        Ok(Arc::new(October2026InvitedApi(invited)))
     }
 }

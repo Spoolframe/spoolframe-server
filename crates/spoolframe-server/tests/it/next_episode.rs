@@ -1,11 +1,11 @@
 //! What plays after an episode, and where a show's Continue goes (feature
-//! `spoolframe:next-episode`), over the PMS of `watch::pms_with_a_show`:
+//! `spoolframe:october-2026`), over the PMS of `watch::pms_with_a_show`:
 //! specials 201, season 1 (211, 212) and season 2 (221, 222).
 
 use std::sync::Arc;
 
 use spoolframe_client_ffi::SpoolSession;
-use spoolframe_client_sdk::gate::NextEpisodes;
+use spoolframe_client_sdk::gate::October2026;
 use spoolframe_client_sdk::{MemoryStorage, NextMode};
 use spoolframe_plex::PlexCatalog;
 use spoolframe_protocol::{Error, Feature, Features, Reply, Request, Response, SessionId};
@@ -43,9 +43,9 @@ async fn server(test: &str) -> (TestServer, MockServer) {
 async fn alice(server: &TestServer) -> (TestClient, SessionId) {
     let tv = server.client().await;
     let info = tv
-        .hello_with_features(Features::only(Feature::NextEpisodes))
+        .hello_with_features(Features::only(Feature::October2026))
         .await;
-    assert!(info.features.contains(Feature::NextEpisodes));
+    assert!(info.features.contains(Feature::October2026));
     let session = tv.login("alice", "correct horse").await;
     (tv, session)
 }
@@ -248,7 +248,7 @@ async fn the_sdk_asks_through_the_feature() {
         )
         .await
         .unwrap();
-    let next = alice.feature::<NextEpisodes>().unwrap();
+    let next = alice.feature::<October2026>().unwrap();
 
     let after = next
         .next_episode(&episode(212), NextMode::InOrder, false)
@@ -277,8 +277,8 @@ async fn the_ffi_asks_through_the_feature() {
         .await
         .unwrap();
     let alice = SpoolSession::from(alice);
-    assert!(alice.has_feature(Feature::NextEpisodes));
-    let next = alice.next_episodes().unwrap();
+    assert!(alice.has_feature(Feature::October2026));
+    let next = alice.october_2026().unwrap();
 
     let after = next
         .next_episode(episode(212), NextMode::InOrder, false)
@@ -293,7 +293,7 @@ async fn the_ffi_asks_through_the_feature() {
 
 /// An app that did not ask for the feature gets no object for its calls.
 #[tokio::test]
-async fn the_ffi_has_no_next_episodes_with_the_feature_off() {
+async fn the_ffi_has_no_october_2026_with_the_feature_off() {
     let (server, _pms) = server("next-ffi-off").await;
     let id = server.server.id().to_string();
     let client = spoolframe_client_sdk::Client::open_with_options(
@@ -324,8 +324,61 @@ async fn the_ffi_has_no_next_episodes_with_the_feature_off() {
         .unwrap();
     let alice = SpoolSession::from(alice);
 
-    assert!(!alice.has_feature(Feature::NextEpisodes));
-    assert!(alice.next_episodes().is_none());
+    assert!(!alice.has_feature(Feature::October2026));
+    assert!(alice.october_2026().is_none());
     client.close().await;
+    server.stop().await;
+}
+
+/// Alice on a device whose `Hello` named `name`, as it goes on the wire:
+/// a name this build no longer has can be written no other way.
+async fn alice_naming(server: &TestServer, name: &str) -> (TestClient, SessionId) {
+    let tv = server.client().await;
+    let hello = serde_json::json!({
+        "session": null,
+        "request": {
+            "type": "hello",
+            "protocol_version": spoolframe_protocol::PROTOCOL_VERSION,
+            "client_name": "test",
+            "client_version": "0",
+            "platform": "linux",
+            "device_name": null,
+            "capabilities": null,
+            "features": [name],
+        },
+    });
+    assert!(matches!(
+        tv.send(&hello).await,
+        Response::Ok(Reply::ServerInfo(_))
+    ));
+    let session = tv.login("alice", "correct horse").await;
+    (tv, session)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_naming_only_an_old_feature_is_refused() {
+    let (server, _pms) = server("next-old-names").await;
+    for name in [
+        "spoolframe:profile-events",
+        "spoolframe:watch-events",
+        "spoolframe:next-episode",
+        "spoolframe:invite-passkeys",
+    ] {
+        let (tv, session) = alice_naming(&server, name).await;
+        let asked = Request::ShowNext { show: show() };
+        let answer = tv.call(Some(&session), asked).await;
+        assert!(
+            matches!(answer, Response::Err(Error::Unsupported { .. })),
+            "{name}: {answer:?}"
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_naming_october_2026_is_served() {
+    let (server, _pms) = server("next-october-2026").await;
+    let (tv, session) = alice_naming(&server, "spoolframe:october-2026").await;
+    assert_eq!(show_next(&tv, &session).await, id(211));
     server.stop().await;
 }

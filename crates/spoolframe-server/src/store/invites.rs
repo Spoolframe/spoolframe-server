@@ -531,7 +531,7 @@ impl Store {
     }
 
     /// Make the account `made` names with its invite and its app passkey
-    /// (feature `spoolframe:invite-passkeys`), and take one of the invite's
+    /// (feature `spoolframe:october-2026`), and take one of the invite's
     /// uses, in one transaction, as [`Store::redeem_invite`] does: the
     /// passkey is the account's one way to sign in, with no password.
     pub async fn redeem_invite_with_passkey(

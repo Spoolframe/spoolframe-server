@@ -1,7 +1,7 @@
 //! Changes to a signed-in user's profile, from [`crate::Client::profile_events`]:
 //! what a "Who's watching" screen and the profile shown follow. The
 //! server tells some (`ProfileRemoved`, `PinChanged`, with
-//! `spoolframe:profile-events` on); the others the SDK learns from a
+//! `spoolframe:october-2026` on); the others the SDK learns from a
 //! call's answer.
 
 use tokio::sync::broadcast::{Receiver, error::RecvError};

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::gate::InvitePasskeys;
+use spoolframe_client_sdk::gate::October2026;
 use spoolframe_client_sdk::invite::Invite;
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
 use spoolframe_client_sdk::{
@@ -49,7 +49,7 @@ fn link(stub: &Stub) -> String {
 }
 
 const OFF: SdkError = SdkError::FeatureOff {
-    feature: Feature::InvitePasskeys,
+    feature: Feature::October2026,
 };
 
 /// A server that does not have the feature: refused after its `Hello`,
@@ -59,7 +59,7 @@ async fn a_server_without_the_feature_is_sent_none_of_its_requests() {
     let stub = Stub::start().await;
     let client = client(Features::all()).await;
 
-    let refused = client.invited::<InvitePasskeys>(&link(&stub)).await;
+    let refused = client.invited::<October2026>(&link(&stub)).await;
 
     assert_eq!(refused.unwrap_err(), OFF);
     assert_eq!(stub.count("hello"), 1);
@@ -75,7 +75,7 @@ async fn a_feature_the_app_did_not_name_is_off() {
     stub.have_features(Features::all());
     let client = client(Features::empty()).await;
 
-    let refused = client.invited::<InvitePasskeys>(&link(&stub)).await;
+    let refused = client.invited::<October2026>(&link(&stub)).await;
 
     assert_eq!(refused.unwrap_err(), OFF);
     client.close().await;
@@ -89,10 +89,7 @@ async fn a_feature_gone_off_since_stops_its_request_unsent() {
     let stub = Stub::start().await;
     stub.have_features(Features::all());
     let client = client(Features::all()).await;
-    let invited = client
-        .invited::<InvitePasskeys>(&link(&stub))
-        .await
-        .unwrap();
+    let invited = client.invited::<October2026>(&link(&stub)).await.unwrap();
     // The server restarts as one without it.
     stub.have_features(Features::empty());
     stub.close_open_connections();

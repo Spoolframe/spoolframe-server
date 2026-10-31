@@ -103,8 +103,7 @@ mod tests {
             lines,
             [
                 "client protocol: 1",
-                "features: spoolframe:profile-events, spoolframe:watch-events, \
-                 spoolframe:next-episode, spoolframe:invite-passkeys",
+                "features: spoolframe:october-2026",
                 "experimental features on: none",
             ]
         );
@@ -143,13 +142,7 @@ mod tests {
             lines.next(),
             Some(format!("client protocol: {PROTOCOL_VERSION}").as_str())
         );
-        assert_eq!(
-            lines.next(),
-            Some(
-                "features: spoolframe:profile-events, spoolframe:watch-events, \
-                 spoolframe:next-episode, spoolframe:invite-passkeys"
-            )
-        );
+        assert_eq!(lines.next(), Some("features: spoolframe:october-2026"));
         assert_eq!(
             lines.next(),
             Some(

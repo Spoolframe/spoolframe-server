@@ -2374,7 +2374,7 @@ fn a_redemption_keeps_its_code_and_password_out_of_debug_output() {
 }
 
 /// An account made with an invite and a passkey: both halves before any
-/// session, of feature `spoolframe:invite-passkeys`, never retried, the
+/// session, of feature `spoolframe:october-2026`, never retried, the
 /// code out of `Debug`.
 #[test]
 fn an_invite_redeemed_with_a_passkey_round_trips_and_hides_its_code() {
@@ -2399,7 +2399,7 @@ fn an_invite_redeemed_with_a_passkey_round_trips_and_hides_its_code() {
     ] {
         round_trip(request.clone());
         assert!(request.is_pre_auth());
-        assert_eq!(request.feature(), Some(crate::Feature::InvitePasskeys));
+        assert_eq!(request.feature(), Some(crate::Feature::October2026));
         assert!(!crate::policy::retry_safe(&request));
         let bytes = codec::encode(&RequestEnvelope {
             session: None,
@@ -2982,7 +2982,7 @@ mod experimental_features {
     /// peer sends.
     #[test]
     fn regular_features_go_as_names_and_none_is_no_field() {
-        let on = Feature::ProfileEvents | Feature::InvitePasskeys;
+        let on: crate::Features = Feature::October2026.into();
         let listed = ServerInfo {
             features: on,
             ..info(Vec::new())
@@ -2993,11 +2993,7 @@ mod experimental_features {
             panic!("{value:?}");
         };
         assert!(fields.iter().any(|(k, v)| k.as_text() == Some("features")
-            && *v
-                == ciborium::Value::Array(vec![
-                    "spoolframe:profile-events".into(),
-                    "spoolframe:invite-passkeys".into(),
-                ])));
+            && *v == ciborium::Value::Array(vec!["spoolframe:october-2026".into()])));
         let none: ciborium::Value =
             ciborium::from_reader(codec::encode(&info(Vec::new())).unwrap().as_slice()).unwrap();
         let ciborium::Value::Map(fields) = none else {
@@ -4623,7 +4619,7 @@ mod item_sort_filter {
 }
 
 /// The next episode's names are promised to the web UI: they never
-/// change. Both requests are of feature `spoolframe:next-episode`,
+/// change. Both requests are of feature `spoolframe:october-2026`,
 /// read-only, and answered by `next_episode`, `null` at a show's end.
 #[test]
 fn the_next_episode_s_wire_names_are_fixed() {
@@ -4662,7 +4658,7 @@ fn the_next_episode_s_wire_names_are_fixed() {
     );
     for request in [next, show_next] {
         round_trip(request.clone());
-        assert_eq!(request.feature(), Some(crate::Feature::NextEpisodes));
+        assert_eq!(request.feature(), Some(crate::Feature::October2026));
         assert!(crate::policy::retry_safe(&request));
     }
     let none = Reply::NextEpisode { item: None };

@@ -168,7 +168,7 @@ watch!(
 
 #[uniffi::export]
 impl SpoolClient {
-    /// Profile events (`spoolframe:profile-events`): a PIN set or
+    /// Profile events (`spoolframe:october-2026`): a PIN set or
     /// cleared, a profile removed, a session ended, as servers say.
     pub fn watch_profiles(&self) -> Arc<ProfileWatch> {
         ProfileWatch::new(self.client.profile_events())

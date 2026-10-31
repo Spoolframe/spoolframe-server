@@ -1,6 +1,6 @@
 //! Profile events (`ProfileRemoved`, `PinChanged`) over a real Iroh
 //! connection: each change to a user's profile is told to the connections
-//! acting as them that named `spoolframe:profile-events`, and to no
+//! acting as them that named `spoolframe:october-2026`, and to no
 //! other. And an admin deleting a user (`admin.userDelete`): their
 //! devices told, the viewers of their playlists told, and the refusals.
 
@@ -81,7 +81,7 @@ struct Device {
 }
 
 async fn device(server: &TestServer, username: &str) -> Device {
-    device_naming(server, username, Features::only(Feature::ProfileEvents)).await
+    device_naming(server, username, Features::only(Feature::October2026)).await
 }
 
 /// [`device`], its `Hello` naming the regular features `named`.

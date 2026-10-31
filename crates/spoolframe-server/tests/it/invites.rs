@@ -1823,7 +1823,7 @@ mod sdk {
         let mut app = crate::app_passkeys::App::new();
 
         let invited = client
-            .invited::<spoolframe_client_sdk::gate::InvitePasskeys>(link)
+            .invited::<spoolframe_client_sdk::gate::October2026>(link)
             .await
             .unwrap();
         let creation = invited
@@ -1833,7 +1833,7 @@ mod sdk {
         assert_eq!(creation.user_name, "pia @ Home Media");
         let made = app.create(&creation, "Pia's iPhone");
         let session = invited.redeem_invite_passkey(made, false).await.unwrap();
-        assert!(session.has_feature(spoolframe_client_sdk::Feature::InvitePasskeys));
+        assert!(session.has_feature(spoolframe_client_sdk::Feature::October2026));
 
         assert_eq!(
             (
@@ -1860,7 +1860,7 @@ mod sdk {
         let mut passkeys = crate::app_passkeys::App::new();
 
         let invited = app
-            .invite_passkeys(created.share_link.clone())
+            .invited_october_2026(created.share_link.clone())
             .await
             .unwrap();
         assert_eq!(invited.link(), created.share_link);
@@ -1871,7 +1871,7 @@ mod sdk {
         let made = passkeys.create(&creation, "Pia's iPhone");
         let session = invited.redeem_invite_passkey(made, false).await.unwrap();
 
-        assert!(session.has_feature(spoolframe_client_sdk::Feature::InvitePasskeys));
+        assert!(session.has_feature(spoolframe_client_sdk::Feature::October2026));
         assert_eq!(session.user().username, "pia");
         client.close().await;
         invites.server.stop().await;
@@ -1897,7 +1897,7 @@ mod sdk {
         let app = SpoolClient::from(client.clone());
 
         let refused = app
-            .invite_passkeys(created.share_link.clone())
+            .invited_october_2026(created.share_link.clone())
             .await
             .err()
             .unwrap();
@@ -1906,7 +1906,7 @@ mod sdk {
             (refused.clone(), refused.kind()),
             (
                 SpoolError::FeatureOff {
-                    feature: spoolframe_client_sdk::Feature::InvitePasskeys
+                    feature: spoolframe_client_sdk::Feature::October2026
                 },
                 spoolframe_client_sdk::ErrorKind::ServerTooOld
             )
@@ -2341,7 +2341,7 @@ mod sdk {
 }
 
 /// An account made with an invite and an app passkey, no password:
-/// feature `spoolframe:invite-passkeys`.
+/// feature `spoolframe:october-2026`.
 mod with_passkey {
     use super::*;
     use crate::app_passkeys::App;
@@ -2354,9 +2354,9 @@ mod with_passkey {
     async fn stranger(invites: &Invites) -> TestClient {
         let device = invites.server.client().await;
         let info = device
-            .hello_with_features(Features::only(Feature::InvitePasskeys))
+            .hello_with_features(Features::only(Feature::October2026))
             .await;
-        assert!(info.features.contains(Feature::InvitePasskeys));
+        assert!(info.features.contains(Feature::October2026));
         device
     }
 

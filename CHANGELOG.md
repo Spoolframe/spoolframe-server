@@ -106,30 +106,33 @@ with a 0.16 server.
   server sends its events and answers its requests only there, and a
   feature's request on another connection is `Unsupported`. On the wire
   a feature is its `spoolframe:` name; in code it is `Feature`, and a
-  set of them `Features`. The four are `spoolframe:profile-events`,
-  `spoolframe:watch-events`, `spoolframe:next-episode` and
-  `spoolframe:invite-passkeys`. The experimental features stay as they
-  were, in `Hello.experimental`.
-- Protocol: profile events (`spoolframe:profile-events`): a user's
+  set of them `Features`. There is one, `spoolframe:october-2026`
+  (`Feature::October2026`), which holds everything below that needs one:
+  `ProfileRemoved`, `PinChanged`, `WatchChanged`, `NextEpisode`,
+  `ShowNext`, `BeginInvitePasskey` and `RedeemInviteWithPasskey`. The
+  scheme is dated: later additions get a new dated name, and a name stays
+  once added. The experimental features stay as they were, in
+  `Hello.experimental`.
+- Protocol: profile events (`spoolframe:october-2026`): a user's
   devices are told `ProfileRemoved { user }` when the user is disabled,
   deleted or leaves, or (that device alone) when the device is forgotten
   for them, and `PinChanged { user, required }` when the user sets,
   changes or removes their PIN on another device, or an admin clears
   it, or (that device alone) the user or an admin turns the PIN on or
   off for a device.
-- Protocol: watch events (`spoolframe:watch-events`): a user's other
+- Protocol: watch events (`spoolframe:october-2026`): a user's other
   devices are told `WatchChanged { items }` for a mark, a card hidden
   from or put back on Home, an offline sync, and a playback coming into
   progress, watched or stopped (not each progress report), never the
   connection that made it.
 - Protocol: what plays after an episode, and where a show's Continue
-  goes, are asked of the server (`spoolframe:next-episode`):
+  goes, are asked of the server (`spoolframe:october-2026`):
   `NextEpisode { item, mode, specials }`, `mode` `in_order` or
   `first_unwatched`, and `ShowNext { show }`, the first episode in
   progress else the first unwatched. Both answer `NextEpisode { item }`,
   `None` at the end.
 - Protocol: an invite can make an account whose one way to sign in is
-  an app passkey, with no password (`spoolframe:invite-passkeys`):
+  an app passkey, with no password (`spoolframe:october-2026`):
   `BeginInvitePasskey { code, username, display_name }` begins the
   passkey's registration for the account to be, after the invite and
   username are checked as `RedeemInvite` checks them, and
@@ -247,10 +250,10 @@ with a 0.16 server.
   - Features: the protocol's `Feature` crosses, and
     `SpoolSession.has_feature(feature)` says whether one is on. A
     feature's calls are an object got only with it on:
-    `SpoolSession.next_episodes()` (`NextEpisodesApi`: `next_episode`,
-    `show_next`; `None` when off) and `SpoolClient.invite_passkeys(link)`
-    (`InvitePasskeysApi`: `link`, `begin_invite_passkey`,
-    `redeem_invite_passkey`), which throws `SpoolError.FeatureOff
+    `SpoolSession.october_2026()` (`October2026Api`: `next_episode`,
+    `show_next`; `None` when off) and
+    `SpoolClient.invited_october_2026(link)` (`October2026InvitedApi`:
+    `link`, `begin_invite_passkey`, `redeem_invite_passkey`), which throws `SpoolError.FeatureOff
     { feature }` when the invite's server does not have it. `NextMode`
     crosses.
   - A playback is a `SpoolPlayback` object: `play` and `open_playback`
@@ -484,8 +487,8 @@ with a 0.16 server.
   `Client::invited::<G>(link)` (`Invited<G>`), each
   `SdkError::FeatureOff` when it is off, with nothing sent. A feature's
   request the server refuses is `SdkError::NotOnServer { request }`.
-  `On<NextEpisodes>` has `next_episode(&item, NextMode, specials)` and
-  `show_next(&show)`; `Client::invited::<InvitePasskeys>(link)` has
+  `On<October2026>` has `next_episode(&item, NextMode, specials)` and
+  `show_next(&show)`; `Client::invited::<October2026>(link)` has
   `begin_invite_passkey(username, display_name)` and
   `redeem_invite_passkey(made, remember)`, which save the server as
   `redeem_invite` does.

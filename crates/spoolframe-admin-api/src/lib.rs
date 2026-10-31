@@ -982,7 +982,7 @@ pub struct ServerStatus {
     /// PROTOCOL_VERSION`): an app speaks this one or is refused.
     pub protocol_version: u32,
     /// The regular features this server has, by their `spoolframe:`
-    /// names (`spoolframe:watch-events`): each is on for an app that
+    /// names (`spoolframe:october-2026`): each is on for an app that
     /// names it too.
     pub features: Vec<String>,
     /// The experimental features turned on here, each by its setting

@@ -77,7 +77,7 @@ use spoolframe_types::Delivery;
 /// client's `Hello` named. A feature not here is off for every
 /// connection, though this build knows its name.
 pub(crate) fn features() -> Features {
-    Feature::ProfileEvents | Feature::InvitePasskeys | Feature::NextEpisodes | Feature::WatchEvents
+    Feature::October2026.into()
 }
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -1208,7 +1208,7 @@ impl ClientProtocol {
                     .hello(connection.stable_id(), endpoint.clone(), hello);
                 let agreed = hello.features & features();
                 self.features.note(connection.stable_id(), agreed);
-                profile_events = agreed.contains(Feature::ProfileEvents);
+                profile_events = agreed.contains(Feature::October2026);
                 // As for the events stream: closed meanwhile, the
                 // accept loop's closed() may have come first.
                 if connection.close_reason().is_some() {
@@ -5362,7 +5362,7 @@ impl ClientProtocol {
     }
 
     /// Begin making an account with an invite and an app passkey
-    /// (feature `spoolframe:invite-passkeys`) on this connection's
+    /// (feature `spoolframe:october-2026`) on this connection's
     /// endpoint: the code and username checked as a redemption checks
     /// them, then the ceremony.
     async fn begin_invite_passkey(

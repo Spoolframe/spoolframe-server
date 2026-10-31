@@ -215,7 +215,7 @@ async fn next_news<T: Clone>(
 
 /// Tell each change to a user's watch state that clients show
 /// ([`crate::watch::WatchChange::shown`]) to the user's connections with
-/// `spoolframe:watch-events` on, but the one it came through, until
+/// `spoolframe:october-2026` on, but the one it came through, until
 /// `news` ends.
 pub(crate) async fn tell_watch_news(
     mut news: tokio::sync::broadcast::Receiver<crate::watch::WatchChange>,
@@ -228,7 +228,7 @@ pub(crate) async fn tell_watch_news(
             continue;
         }
         for id in users.of(&told.principal) {
-            if Some(id) != told.from && features.has(id, Feature::WatchEvents) {
+            if Some(id) != told.from && features.has(id, Feature::October2026) {
                 streams.send(
                     id,
                     Event::WatchChanged {
@@ -577,7 +577,7 @@ impl ProfileNews {
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileTeller {
     pub users: ConnectionUsers,
-    /// Told only where `spoolframe:profile-events` is on.
+    /// Told only where `spoolframe:october-2026` is on.
     pub features: ConnectionFeatures,
     pub connections: Connections,
     pub streams: EventStreams,
@@ -633,13 +633,13 @@ impl ProfileTellers {
     }
 
     /// The connections acting as `user` now that named
-    /// `spoolframe:profile-events`, each held open.
+    /// `spoolframe:october-2026`, each held open.
     pub(crate) fn ticket(&self, user: LocalUserId) -> ProfileTicket {
         let principal = Principal::LocalUser(user);
         let mut reached = Vec::new();
         for teller in self.0.lock().iter() {
             for id in teller.users.of(&principal) {
-                if !teller.features.has(id, Feature::ProfileEvents) {
+                if !teller.features.has(id, Feature::October2026) {
                     continue;
                 }
                 reached.push(Reached {

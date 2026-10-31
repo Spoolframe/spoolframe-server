@@ -660,7 +660,7 @@ impl Client {
 
     /// Every change to a profile signed in on this device, on any
     /// server: the user removed from this device or their PIN changed, as
-    /// a server tells it with `spoolframe:profile-events` on
+    /// a server tells it with `spoolframe:october-2026` on
     /// ([`crate::ClientOptions::features`] names it by default), and a
     /// session ended or a password to change, as a call's answer
     /// says. A "Who's watching" screen, and the profile shown, follow them.
@@ -671,7 +671,7 @@ impl Client {
 
     /// Every change to a signed-in user's watch state made on another
     /// device, on any server, as a server tells it with
-    /// `spoolframe:watch-events` on ([`crate::ClientOptions::features`]
+    /// `spoolframe:october-2026` on ([`crate::ClientOptions::features`]
     /// names it by default). This device's own changes are not told.
     /// Changes while not connected are not seen: read again on
     /// connecting.

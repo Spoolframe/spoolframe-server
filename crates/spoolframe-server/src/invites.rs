@@ -317,7 +317,7 @@ fn outcome(redeemed: Redeemed) -> Result<(LocalUserId, Role), RedeemError> {
 }
 
 /// Check what `request` asks for, to begin making its account with a
-/// passkey (feature `spoolframe:invite-passkeys`), from a device whose
+/// passkey (feature `spoolframe:october-2026`), from a device whose
 /// guesses are counted as `endpoint`'s, as [`redeem`] checks it: the
 /// hash of its code, and the username, normalized. A username someone
 /// has is `UsernameTaken` now, and may be taken by the finish. Nothing is

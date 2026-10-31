@@ -215,9 +215,9 @@ The server pushes `Event`s on the events stream, without being asked:
 | `server_addresses { addrs, relays, lookup }` | Where the server can be reached. See "Server addresses". |
 | `playback_share { handle, max_bitrate }` | A playback's share of the WAN uplink moved. See "The WAN uplink budget". |
 | `playback_ended { handle, error }` | Experimental (`federation`): a paired server's item's playback ended other than by the client's stop; `error` is what its next use is told. See "Proxy mode". |
-| `profile_removed { user }` | Sent only to a connection where the `spoolframe:profile-events` feature is on (both sides named it): local user `user` (a user id, as `WhoAmI` names it) is gone from this device. See "Profile events". |
-| `pin_changed { user, required }` | Sent only to a connection where the `spoolframe:profile-events` feature is on (both sides named it): local user `user`'s PIN was set, changed or removed. See "Profile events". |
-| `watch_changed { items }` | Sent only to a connection where the `spoolframe:watch-events` feature is on (both sides named it): the user's watch state of `items` changed on another of their connections. See "Watch events". |
+| `profile_removed { user }` | Sent only to a connection where the `spoolframe:october-2026` feature is on (both sides named it): local user `user` (a user id, as `WhoAmI` names it) is gone from this device. See "Profile events". |
+| `pin_changed { user, required }` | Sent only to a connection where the `spoolframe:october-2026` feature is on (both sides named it): local user `user`'s PIN was set, changed or removed. See "Profile events". |
+| `watch_changed { items }` | Sent only to a connection where the `spoolframe:october-2026` feature is on (both sides named it): the user's watch state of `items` changed on another of their connections. See "Watch events". |
 
 An event a client does not know decodes as `Unknown`; ignore it.
 
@@ -226,7 +226,7 @@ An event a client does not know decodes as `Unknown`; ignore it.
 A server tells a user's devices when their profile changes elsewhere.
 Each event goes to the connections that act as the user (that made a
 request in one of their sessions), and is sent only to a connection
-where the `spoolframe:profile-events` feature is on (both sides named
+where the `spoolframe:october-2026` feature is on (both sides named
 it).
 
 - `profile_removed { user }`: an admin disabled or deleted the user
@@ -456,7 +456,7 @@ These are the only requests served without a session
 | Device approval | `BeginDeviceSignIn { remember }`, `AwaitDeviceSignIn { request }` |
 | App passkey | `BeginPasskeySignIn { username }`, `FinishPasskeySignIn { signed, remember }` |
 | Trusted device | `TrustedProfiles`, `ResumeProfile { user_id }` |
-| Invite | `RedeemInvite`, `BeginInvitePasskey`, `RedeemInviteWithPasskey` (`spoolframe:invite-passkeys`), `RedeemPortableInvite`, `LookupInvite { code }` |
+| Invite | `RedeemInvite`, `BeginInvitePasskey`, `RedeemInviteWithPasskey` (`spoolframe:october-2026`), `RedeemPortableInvite`, `LookupInvite { code }` |
 | Portable credential | `BeginPortableSignIn`, `FinishPortableSignIn` |
 | Portable identity records | `IdentityRecord { user }`, `IdentityRecordByHandle { handle }` |
 | Pairing through a server | `OfferPairing`, `FetchPairing`, `AnswerPairing`, `CollectPairing` |
@@ -890,7 +890,7 @@ connection.
 
 ### Joining with a passkey
 
-With feature `spoolframe:invite-passkeys` on for the connection (both
+With feature `spoolframe:october-2026` on for the connection (both
 sides named it), an invite makes an account whose one way to sign in is
 an app passkey, with no password. On a connection without it, both
 requests are `unsupported`. The device begins, before any session:
@@ -1071,11 +1071,11 @@ link as the user pasted or opened it:
   as a password sign-in's. A refused redemption saves nothing. Its
   refusals are `InviteInvalid`, `InviteExpired`, `InviteExhausted`,
   `UsernameTaken`, `InvalidInput` and `RateLimited`.
-- `invited::<InvitePasskeys>(link) -> Invited<InvitePasskeys>`, then its
+- `invited::<October2026>(link) -> Invited<October2026>`, then its
   `begin_invite_passkey(username, display_name) -> PasskeyCreation` and
   `redeem_invite_passkey(made, remember) -> Session`: joining with a
   passkey, as `redeem_invite` joins, the session kept as a passkey
-  sign-in's. A server without `spoolframe:invite-passkeys` is
+  sign-in's. A server without `spoolframe:october-2026` is
   `FeatureOff` from `invited`, and nothing is sent: offer a password.
 - `look_up_invite(link) -> InviteLookup`: "Got an invite?". It connects as
   `connect_invite` does and sends `lookup_invite`: `server` is the
@@ -1692,7 +1692,7 @@ item's progress over. Either brings a card removed from Home back.
 
 ## Watch events
 
-With feature `spoolframe:watch-events` on for the connection (both sides
+With feature `spoolframe:october-2026` on for the connection (both sides
 named it), a connection is told `watch_changed { items }` when the
 user's watch state changes on another of their connections: a mark
 (`items` the id marked, a season or show standing for its episodes), a
@@ -1803,10 +1803,10 @@ it is off, with nothing sent. A request of a feature that went off since
 
 | Feature | Brings |
 |---|---|
-| `spoolframe:profile-events` | `profile_removed` and `pin_changed` |
-| `spoolframe:invite-passkeys` | `begin_invite_passkey` and `redeem_invite_with_passkey` |
-| `spoolframe:watch-events` | `watch_changed` |
-| `spoolframe:next-episode` | `next_episode` and `show_next` |
+| `spoolframe:october-2026` | `profile_removed`, `pin_changed`, `watch_changed`, `next_episode`, `show_next`, `begin_invite_passkey` and `redeem_invite_with_passkey` |
+
+The names are dated: a feature is what was added by its date. Later
+additions get a new dated name, and a name stays once added.
 
 A new reply field needs neither. It is `serde(default)`, so a reply from
 an older server decodes. Where its absence means something other than
@@ -2078,7 +2078,7 @@ SDK: `Session::share_candidates(id, query, offset, limit)` returns the
 
 ## The next episode
 
-With feature `spoolframe:next-episode` on for the connection (both
+With feature `spoolframe:october-2026` on for the connection (both
 sides named it), a client asks the server what plays after an episode,
 and where a show's Continue goes, rather than walking the show itself.
 On a connection without it, both are `unsupported`. The names are
@@ -2107,7 +2107,7 @@ item filled with the user's watch state as `Item`'s children are.
 An episode the user may not see is `null`. Both are reads, retried on a
 new connection as any read is.
 
-SDK: `session.feature::<NextEpisodes>()` gives `On<NextEpisodes>`
+SDK: `session.feature::<October2026>()` gives `On<October2026>`
 (`FeatureOff` without the feature), whose `next_episode(&item, mode,
 specials)` and `show_next(&show)` return `Option<Item>`.
 

@@ -107,7 +107,7 @@ fn every_variant() -> Vec<SdkError> {
             request: "DeleteUser".into(),
         },
         SdkError::FeatureOff {
-            feature: sdk::Feature::NextEpisodes,
+            feature: sdk::Feature::October2026,
         },
         SdkError::PlaylistReadOnly,
         SdkError::KindNotAllowed {

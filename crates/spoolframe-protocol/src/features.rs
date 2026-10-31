@@ -14,8 +14,12 @@
 //! means something else than its default. Nothing is decided from a
 //! version number. Unlike the experimental features
 //! ([`crate::experimental`]), these are ordinary protocol, with its
-//! stability, and a server that has one always names it when asked. A
-//! name stays once added.
+//! stability, and a server that has one always names it when asked.
+//!
+//! The scheme is dated: a feature is what was added by its date, whatever
+//! the mix, so a client names one thing for all of it. Later additions get
+//! a new dated name; the one a release has shipped never changes what it
+//! holds, and a name stays once added.
 //!
 //! [`Hello::features`]: crate::Hello::features
 //! [`ServerInfo::features`]: crate::ServerInfo::features
@@ -29,15 +33,11 @@ use enumset::{EnumSet, EnumSetType};
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[non_exhaustive]
 pub enum Feature {
-    /// `ProfileRemoved` and `PinChanged` on the events stream.
-    ProfileEvents,
-    /// `WatchChanged` on the events stream.
-    WatchEvents,
-    /// `NextEpisode` and `ShowNext`.
-    NextEpisodes,
-    /// `BeginInvitePasskey` and `RedeemInviteWithPasskey`: an account
-    /// made with an invite and an app passkey.
-    InvitePasskeys,
+    /// `spoolframe:october-2026`: `ProfileRemoved`, `PinChanged` and
+    /// `WatchChanged` on the events stream, `NextEpisode`, `ShowNext`, and
+    /// `BeginInvitePasskey` and `RedeemInviteWithPasskey`, an account made
+    /// with an invite and an app passkey.
+    October2026,
 }
 
 /// A set of features: [`Features::all`] is every one this build knows,
@@ -49,10 +49,7 @@ impl Feature {
     /// Its name on the wire: the one place the names are written.
     pub const fn name(self) -> &'static str {
         match self {
-            Feature::ProfileEvents => "spoolframe:profile-events",
-            Feature::WatchEvents => "spoolframe:watch-events",
-            Feature::NextEpisodes => "spoolframe:next-episode",
-            Feature::InvitePasskeys => "spoolframe:invite-passkeys",
+            Feature::October2026 => "spoolframe:october-2026",
         }
     }
 
@@ -140,28 +137,24 @@ mod tests {
     /// What is on for a connection: those both sides named.
     #[test]
     fn on_is_what_both_named() {
-        let client = Feature::ProfileEvents | Feature::InvitePasskeys;
-        let server = Feature::InvitePasskeys | Feature::WatchEvents;
-        assert_eq!(client & server, Feature::InvitePasskeys);
-        assert!((client & Features::empty()).is_empty());
+        let both = Features::only(Feature::October2026);
+        assert_eq!(both & both, both);
+        assert!((both & Features::empty()).is_empty());
     }
 
     /// Only names cross the wire, in JSON and in CBOR.
     #[test]
     fn a_set_goes_as_the_list_of_its_names() {
-        let set = Named(Feature::ProfileEvents | Feature::InvitePasskeys);
+        let set = Named(Feature::October2026.into());
         assert_eq!(
             serde_json::to_value(&set).unwrap(),
-            serde_json::json!(["spoolframe:profile-events", "spoolframe:invite-passkeys"])
+            serde_json::json!(["spoolframe:october-2026"])
         );
         let cbor = crate::codec::encode(&set).unwrap();
         let value: ciborium::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
         assert_eq!(
             value,
-            ciborium::Value::Array(vec![
-                "spoolframe:profile-events".into(),
-                "spoolframe:invite-passkeys".into(),
-            ])
+            ciborium::Value::Array(vec!["spoolframe:october-2026".into()])
         );
         assert_eq!(crate::codec::decode::<Named>(&cbor).unwrap(), set);
     }
@@ -169,13 +162,13 @@ mod tests {
     /// A name this build does not know is skipped; the rest are read.
     #[test]
     fn an_unknown_name_is_skipped() {
-        let names = vec!["spoolframe:teleport", "spoolframe:watch-events"];
+        let names = vec!["spoolframe:teleport", "spoolframe:october-2026"];
         let read: Named = serde_json::from_value(serde_json::json!(names)).unwrap();
-        assert_eq!(read, Named(Feature::WatchEvents.into()));
+        assert_eq!(read, Named(Feature::October2026.into()));
         let cbor = crate::codec::encode(&names).unwrap();
         assert_eq!(
             crate::codec::decode::<Named>(&cbor).unwrap(),
-            Named(Feature::WatchEvents.into())
+            Named(Feature::October2026.into())
         );
     }
 }

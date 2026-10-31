@@ -93,7 +93,7 @@ pub struct AppPasskeys {
     /// session begins one, so they are as many as the sessions at most.
     confirms: Mutex<HashMap<String, (Confirm, Instant)>>,
     /// Accounts begun with an invite and a passkey (feature
-    /// `spoolframe:invite-passkeys`), by the endpoint that began them: one
+    /// `spoolframe:october-2026`), by the endpoint that began them: one
     /// at a time each, as sign-ins.
     invites: Mutex<HashMap<String, (InviteRegistration, Instant)>>,
     /// What ceremonies expire by (PX-09).
@@ -338,7 +338,7 @@ impl AppPasskeys {
     /// `display_name`, on `endpoint` with this server's endpoint id
     /// `server`, called `server_name`, with the invite whose code hashes to
     /// `code_hash` and an app passkey (feature
-    /// `spoolframe:invite-passkeys`). The account's id and user handle are
+    /// `spoolframe:october-2026`). The account's id and user handle are
     /// chosen now; nothing is kept but the ceremony. The
     /// invite and the username are the caller's to check. A registration
     /// the endpoint began before is dropped.
