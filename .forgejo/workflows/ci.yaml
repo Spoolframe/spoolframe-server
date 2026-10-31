@@ -83,8 +83,8 @@ jobs:
           kache daemon stop || true
 
   # The tests are built once, instrumented for coverage, into a nextest
-  # archive (ci:test-archive). Three jobs then each run a third of it at
-  # once (`--partition count:N/3`, round-robin, so each test runs once and
+  # archive (ci:test-archive). Five jobs then each run a fifth of it at
+  # once (`--partition count:N/5`, round-robin, so each test runs once and
   # none twice), from the archive, with no compiling. A workspace that
   # does not build fails here, once.
   build:
@@ -145,13 +145,13 @@ jobs:
           retention-days: 1
 
   test:
-    name: "test (${{ matrix.partition }}/3)"
+    name: "test (${{ matrix.partition }}/5)"
     needs: [build]
     runs-on: beefy
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3]
+        partition: [1, 2, 3, 4, 5]
     # The LAN tests (crates/spoolframe-server/tests/it/lan.rs) run in a
     # private network namespace: `unshare` then `ip`. Under podman's default
     # seccomp profile unshare(CLONE_NEWUSER) needs CAP_SYS_ADMIN, so the
@@ -160,7 +160,7 @@ jobs:
     container:
       options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
     env:
-      NEXTEST_PARTITION: count:${{ matrix.partition }}/3
+      NEXTEST_PARTITION: count:${{ matrix.partition }}/5
     steps:
       - uses: actions/checkout@v4
       # GitHub's API limit for Nix's github: inputs: a read-only GH_PAT
@@ -197,14 +197,14 @@ jobs:
         uses: actions/action-junit-report@v4
         with:
           report_paths: target/nextest/ci/junit.xml
-          check_name: tests (${{ matrix.partition }}/3)
+          check_name: tests (${{ matrix.partition }}/5)
           fail_on_failure: true
           require_tests: false
           comment: true
           updateComment: true
           detailed_summary: true
 
-      # v3, as above. The coverage job below merges the thirds' lcov.
+      # v3, as above. The coverage job below merges the shards' lcov.
       - name: Upload coverage + test artifacts
         if: always()
         uses: actions/upload-artifact@v3
@@ -215,9 +215,9 @@ jobs:
             target/lcov.info
           if-no-files-found: ignore
 
-  # One coverage report for the PR: each third's lcov covers only the
+  # One coverage report for the PR: each shard's lcov covers only the
   # tests it ran, so they are merged (lcov -a sums the hits) before the
-  # report. Only when every third passed: a failed or cancelled third's
+  # report. Only when every shard passed: a failed or cancelled shard's
   # lcov is missing or partial, and a report built from it says less was
   # covered than is.
   coverage:
@@ -243,9 +243,9 @@ jobs:
       - name: Download test artifacts
         uses: actions/download-artifact@v3
         with:
-          path: thirds
+          path: shards
 
-      # Only the thirds that wrote lcov: genhtml errors on no input.
+      # Only the shards that wrote lcov: genhtml errors on no input.
       - name: Merge lcov
         id: merge
         shell: bash
@@ -255,11 +255,11 @@ jobs:
           echo "$LCOV_BIN" >> "$GITHUB_PATH"
           "$LCOV_BIN/genhtml" --version | head -1
           args=()
-          for f in thirds/tests-*/lcov.info; do
+          for f in shards/tests-*/lcov.info; do
             [ -s "$f" ] && args+=(-a "$f")
           done
           if [ "${#args[@]}" -eq 0 ]; then
-            echo "no lcov from any third"
+            echo "no lcov from any shard"
             exit 0
           fi
           mkdir -p target
