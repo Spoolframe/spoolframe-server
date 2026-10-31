@@ -1683,6 +1683,17 @@ impl TestServer {
     /// [`Self::loopback_client`] at `loopback`, `::1` for IPv6: it dials
     /// the server's port of that family.
     pub async fn loopback_client_at(&self, loopback: std::net::IpAddr) -> TestClient {
+        self.loopback_device(iroh::SecretKey::generate(), loopback)
+            .await
+    }
+
+    /// [`Self::loopback_client_at`] on another socket of the device whose
+    /// key is `key`.
+    pub async fn loopback_device(
+        &self,
+        key: iroh::SecretKey,
+        loopback: std::net::IpAddr,
+    ) -> TestClient {
         let server = self.server.addr();
         let port = server
             .ip_addrs()
@@ -1690,6 +1701,7 @@ impl TestServer {
             .expect("the server has an address of that family")
             .port();
         let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(key)
             .relay_mode(RelayMode::Disabled)
             .clear_ip_transports()
             .bind_addr(std::net::SocketAddr::from((loopback, 0)))

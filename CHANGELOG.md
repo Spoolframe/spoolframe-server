@@ -16,6 +16,12 @@ with a 0.16 server.
   app, and `Session::backdrop` fetches an image with its faces. Apps
   come later. The server's binary grows by about 17 MB, on or off: the
   model and tract, and the licences page gains a Models group.
+- Server: a connection with one path open and none selected is judged by
+  that path, for the WAN limit and the log, where it counted as off the
+  LAN. iroh selects a path per device, so an app that reconnected from a
+  new port while its old connection lingered played on the LAN as WAN
+  (`path=none wan=true`), held to the WAN share. With several open and
+  none selected it stays off the LAN.
 - Server: an HEVC encode keeps to the highest level the device lists in
   `video_codecs`: its bitrate to the level's Main tier maximum, and its
   size to the level's picture size. Saw at Original on the Android TV

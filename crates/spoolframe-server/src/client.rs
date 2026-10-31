@@ -157,7 +157,8 @@ struct ConnectionState {
     locks: parking_lot::Mutex<Locks>,
     /// The paths its packets went by, as the log names them (`lan`,
     /// `direct` or `relay`, and where), the one now last: a relay, then a
-    /// direct path, is a hole punched. Empty before iroh selects one.
+    /// direct path, is a hole punched. Empty before one is known
+    /// ([`going_by`]).
     paths: parking_lot::Mutex<Vec<String>>,
     /// Changes of its path since it opened, every one: the link lines
     /// count them per interval, where the log of each is coalesced.
@@ -174,7 +175,7 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
-    /// The path now, for the log; `none` before one is selected.
+    /// The path now, for the log; `none` while it is not known.
     fn path(&self) -> String {
         self.paths
             .lock()
@@ -212,7 +213,8 @@ impl ConnectionState {
             );
             *counted = (sent.max(counted.0), received.max(counted.1));
         }
-        if rtt && let Some(path) = connection.paths().iter().find(|p| p.is_selected()) {
+        let paths = connection.paths();
+        if rtt && let Some(path) = going_by(paths.iter(), |p| p.is_selected()) {
             let kind =
                 crate::link_stats::PathKind::of(&path_name(path.remote_addr(), &self.uplink));
             self.metrics.link_rtt(kind, path.rtt());
@@ -250,10 +252,43 @@ fn path_name(addr: &iroh::TransportAddr, uplink: &crate::uplink::Uplink) -> Stri
     }
 }
 
-/// Whether a path named by [`path_name`] is on the LAN (PX-46); before
-/// one is selected, `none`, it is not.
+/// Whether a path named by [`path_name`] is on the LAN (PX-46); `none`,
+/// a path not known, is not.
 fn on_lan(path: &str) -> bool {
     path.starts_with("lan ")
+}
+
+/// The path a connection's packets go by, of its open `paths`: the one
+/// iroh selected, else the only one open, which has nowhere else to send
+/// them. iroh selects a path per device, not per connection: a connection
+/// none of whose paths is the device's selected one, as after an app
+/// reconnects from a new port while its old connection lingers, shows none
+/// selected, with no event, until the old one goes, minutes later at
+/// times. With several open and none selected it is not known which is in
+/// use, a relay is often one of them, and the answer is `None`: never LAN.
+/// A path's own address is all that makes it so, by [`on_lan`], and the
+/// only path of a device off the LAN is judged off the LAN.
+fn going_by<P>(paths: impl IntoIterator<Item = P>, selected: impl Fn(&P) -> bool) -> Option<P> {
+    let mut paths = paths.into_iter();
+    let first = paths.next()?;
+    if selected(&first) {
+        return Some(first);
+    }
+    let mut others = paths.peekable();
+    if others.peek().is_none() {
+        return Some(first);
+    }
+    others.find(selected)
+}
+
+/// [`going_by`] on `connection` now, as the log names it; `none` when it
+/// is not known.
+fn path_now(connection: &iroh::endpoint::Connection, uplink: &crate::uplink::Uplink) -> String {
+    let paths = connection.paths();
+    going_by(paths.iter(), |p| p.is_selected()).map_or_else(
+        || "none".into(),
+        |path| path_name(path.remote_addr(), uplink),
+    )
 }
 
 /// Follow the path `connection`'s packets go by, into `state`, and log
@@ -275,19 +310,26 @@ async fn log_paths(
             event = events.next() => event,
             _ = &mut closed => return,
         };
-        let remote_addr = match event {
-            None => return,
-            Some(PathEvent::Selected { remote_addr, .. }) => remote_addr,
-            Some(_) => continue,
+        let Some(event) = event else {
+            return;
         };
         let Some(state) = state.upgrade() else {
             return;
         };
-        let selected = path_name(&remote_addr, &state.uplink);
+        // Any other event may have left one path open, or taken away the
+        // one this connection went by; the list says, as a lagged stream's
+        // events do not.
+        let selected = match event {
+            PathEvent::Selected { remote_addr, .. } => path_name(&remote_addr, &state.uplink),
+            _ => match connection.upgrade() {
+                Some(connection) => path_now(&connection, &state.uplink),
+                None => return,
+            },
+        };
         let before = {
             let mut paths = state.paths.lock();
             let before = paths.last().cloned();
-            if before.as_deref() == Some(selected.as_str()) {
+            if before.as_deref().unwrap_or("none") == selected {
                 continue;
             }
             if paths.len() < LOGGED_PATHS {
@@ -323,7 +365,7 @@ async fn log_paths(
     }
 }
 
-/// Read `connection`'s counters and its selected path now, for
+/// Read `connection`'s counters and the path it goes by now, for
 /// [`watch_link`].
 fn link_reading(
     connection: &iroh::endpoint::Connection,
@@ -337,15 +379,15 @@ fn link_reading(
     };
     let mut congestion_events = 0;
     for p in paths.iter() {
+        congestion_events += p.stats().congestion_events;
+    }
+    if let Some(p) = going_by(paths.iter(), |p| p.is_selected()) {
         let s = p.stats();
-        congestion_events += s.congestion_events;
-        if p.is_selected() {
-            path.name = path_name(p.remote_addr(), &state.uplink);
-            path.kind = crate::link_stats::PathKind::of(&path.name);
-            path.rtt = s.rtt;
-            path.cwnd = s.cwnd;
-            path.mtu = s.current_mtu;
-        }
+        path.name = path_name(p.remote_addr(), &state.uplink);
+        path.kind = crate::link_stats::PathKind::of(&path.name);
+        path.rtt = s.rtt;
+        path.cwnd = s.cwnd;
+        path.mtu = s.current_mtu;
     }
     let counters = crate::link_stats::Counters {
         sent_bytes: stats.udp_tx.bytes,
@@ -7266,20 +7308,15 @@ impl ProtocolHandler for ClientProtocol {
         // Every connection starts anonymous, and most that stay so are an
         // app checking in: INFO is for the sign-in, and the disconnect.
         tracing::debug!(endpoint = %endpoint.fmt_short(), known, remote = !remote.is_empty(), "client connected");
+        // Before the paths are read, so no change after it goes unseen.
+        let path_events = connection.path_events();
+        let path = path_now(&connection, &self.services.uplink);
         let state = Arc::new(ConnectionState {
             number: self.services.playbacks.connection_opened(),
             peer,
             hello: OnceLock::new(),
             locks: parking_lot::Mutex::default(),
-            paths: parking_lot::Mutex::new(
-                connection
-                    .paths()
-                    .iter()
-                    .find(|p| p.is_selected())
-                    .map(|p| path_name(p.remote_addr(), &self.services.uplink))
-                    .into_iter()
-                    .collect(),
-            ),
+            paths: parking_lot::Mutex::new((path != "none").then_some(path).into_iter().collect()),
             switches: std::sync::atomic::AtomicU64::new(0),
             path_log: parking_lot::Mutex::default(),
             uplink: self.services.uplink.clone(),
@@ -7292,7 +7329,7 @@ impl ProtocolHandler for ClientProtocol {
         }
         tokio::spawn(log_paths(
             connection.weak_handle(),
-            connection.path_events(),
+            path_events,
             Arc::downgrade(&state),
         ));
         tokio::spawn(watch_link(
@@ -7473,7 +7510,7 @@ fn lan_address(
     uplink: &crate::uplink::Uplink,
 ) -> Option<std::net::IpAddr> {
     let paths = connection.paths();
-    let path = paths.iter().find(|path| path.is_selected())?;
+    let path = going_by(paths.iter(), |path| path.is_selected())?;
     let iroh::TransportAddr::Ip(remote) = path.remote_addr() else {
         return None;
     };
@@ -7507,14 +7544,11 @@ fn route_from(remote: std::net::SocketAddr) -> Option<std::net::IpAddr> {
 /// The address `connection` reaches the server from now, if it is an IP
 /// path; `None` through a relay (P6-03), which hides it.
 fn remote_ip(connection: &Connection) -> Option<std::net::IpAddr> {
-    connection
-        .paths()
-        .iter()
-        .find(|path| path.is_selected())
-        .and_then(|path| match path.remote_addr() {
-            iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
-            _ => None,
-        })
+    let paths = connection.paths();
+    going_by(paths.iter(), |path| path.is_selected()).and_then(|path| match path.remote_addr() {
+        iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+        _ => None,
+    })
 }
 
 /// The size of each part of a resource sent: what one write waits on.
@@ -9270,6 +9304,30 @@ fn capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_path_selected_is_the_one_gone_by() {
+        let open = [(1, false), (2, true), (3, false)];
+        assert_eq!(going_by(open, |p| p.1), Some((2, true)));
+        assert_eq!(going_by([(2, true), (3, false)], |p| p.1), Some((2, true)));
+    }
+
+    #[test]
+    fn with_none_selected_the_only_path_open_is_the_one_gone_by() {
+        assert_eq!(going_by([(1, false)], |p| p.1), Some((1, false)));
+    }
+
+    /// A LAN path beside a relay, with none selected, may not be what
+    /// carries the film: it is no reason to spare it the WAN limit.
+    #[test]
+    fn with_none_selected_of_several_no_path_is_known() {
+        assert_eq!(going_by([(1, false), (2, false)], |p| p.1), None);
+    }
+
+    #[test]
+    fn with_no_path_open_none_is_known() {
+        assert_eq!(going_by([(1, false); 0], |p| p.1), None);
+    }
 
     /// An ended session leaves nothing in a connection's locks: a paired
     /// server's connection, kept for many plays, does not grow with them
