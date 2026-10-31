@@ -15,6 +15,10 @@ with a 0.16 server.
   `undo_window` undo an intro skipped by itself, `undo_skip` with the place
   to seek back to. The app seeks its own player. SDK: `SeekGate` and
   `ManagedPlayback::gated` are public, for a tracker outside the SDK.
+- SDK: `Session::follow_playing` (`PlaylistCursor::playing`) follows a
+  playlist from an entry already playing, a restored queue or an entry
+  from `play_playlist`, and sends nothing. `follow_playlist` plays its first
+  entry, which moved the server's place and dealt a new shuffle round.
 - Experimental `smart-crop` (`experimental.smart_crop`, off by default,
   applies after a restart): the server finds the faces in each backdrop
   with YuNet, on the CPU, once per image, and an app that names the

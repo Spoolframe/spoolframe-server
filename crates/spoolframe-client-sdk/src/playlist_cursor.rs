@@ -179,6 +179,19 @@ impl Session {
     ) -> Result<PlaylistCursor, SdkError> {
         PlaylistCursor::start(Arc::new(self.clone()), id, from, settings, random_below).await
     }
+
+    /// Follow playlist `id` from `entry`, already playing: a queue
+    /// restored, or an entry from [`Self::play_playlist`]. Nothing is
+    /// sent: playing it again would move the server's place and deal a new
+    /// shuffle round.
+    pub fn follow_playing(
+        &self,
+        id: &str,
+        entry: impl Into<PlaylistEntry>,
+        settings: PlaySettings,
+    ) -> PlaylistCursor {
+        PlaylistCursor::playing(Arc::new(self.clone()), id, entry.into(), settings)
+    }
 }
 
 /// A number below `n`, from the OS.
@@ -215,8 +228,33 @@ impl PlaylistCursor {
             }
         };
         let first = source.play(id, from, settings).await?;
-        let lineup: Vec<PlaylistEntry> = first.into_iter().map(entry_of).collect();
-        let cursor = Self {
+        let lineup: Vec<PlaylistEntry> = first.into_iter().map(PlaylistEntry::from).collect();
+        let cursor = Self::at(source, id, lineup, settings);
+        if cursor.current().is_some() {
+            let _turn = cursor.calls.lock().await;
+            cursor.top_up().await?;
+        }
+        Ok(cursor)
+    }
+
+    /// [`Session::follow_playing`] over `source`.
+    pub fn playing(
+        source: Arc<dyn PlaylistSource>,
+        id: &str,
+        entry: PlaylistEntry,
+        settings: PlaySettings,
+    ) -> Self {
+        Self::at(source, id, vec![entry], settings)
+    }
+
+    /// A cursor on the first of `lineup`, which the server's place is at.
+    fn at(
+        source: Arc<dyn PlaylistSource>,
+        id: &str,
+        lineup: Vec<PlaylistEntry>,
+        settings: PlaySettings,
+    ) -> Self {
+        Self {
             source,
             id: id.to_owned(),
             state: Mutex::new(State {
@@ -228,12 +266,7 @@ impl PlaylistCursor {
             }),
             calls: tokio::sync::Mutex::new(()),
             saves: AtomicU64::new(0),
-        };
-        if cursor.current().is_some() {
-            let _turn = cursor.calls.lock().await;
-            cursor.top_up().await?;
         }
-        Ok(cursor)
     }
 
     pub fn id(&self) -> &str {
@@ -281,13 +314,17 @@ impl PlaylistCursor {
         let Some(next) = self.source.next_after(&self.id, after).await? else {
             return Ok(None);
         };
-        let mut state = self.state.lock();
-        let keep = state.at + 1;
-        state.lineup.truncate(keep);
-        state.lineup.push(entry_of(next));
-        state.at += 1;
-        state.told = Some(state.at);
-        Ok(state.current().cloned())
+        {
+            let mut state = self.state.lock();
+            let keep = state.at + 1;
+            state.lineup.truncate(keep);
+            state.lineup.push(next.into());
+            state.at += 1;
+            state.told = Some(state.at);
+        }
+        // A cursor on an entry already playing has read nothing yet.
+        self.top_up().await?;
+        Ok(self.current())
     }
 
     /// Plays `entry` now: the server's place and round start there, and
@@ -303,7 +340,7 @@ impl PlaylistCursor {
             };
             let keep = state.at + 1;
             state.lineup.truncate(keep);
-            state.lineup.push(entry_of(first));
+            state.lineup.push(first.into());
             state.at = state.lineup.len() - 1;
             state.told = Some(state.at);
         }
@@ -506,15 +543,6 @@ fn with_note(entries: Vec<PlaylistEntry>) -> UpNext {
         false => UpNextNote::None,
     };
     UpNext { entries, note }
-}
-
-fn entry_of(next: PlaylistNext) -> PlaylistEntry {
-    PlaylistEntry {
-        entry: next.entry,
-        item: next.item,
-        unavailable: false,
-        liked: next.liked,
-    }
 }
 
 #[cfg(test)]
@@ -760,6 +788,58 @@ pub(crate) mod tests {
         assert_eq!(cursor.current().map(|e| e.entry), Some(1));
         assert_eq!(cursor.ahead().len(), 4);
         assert_eq!(server.calls(), ["play None", "upcoming"]);
+    }
+
+    /// Entry 3 playing since `play_playlist`: the server's place is there.
+    fn already_playing(server: &Arc<Server>) -> PlaylistCursor {
+        server.state.lock().0 = Some(3);
+        let entry = server.entries[2].clone();
+        PlaylistCursor::playing(server.clone(), "p", entry, PlaySettings::default())
+    }
+
+    #[test]
+    fn an_entry_already_playing_is_followed_with_nothing_sent() {
+        let server = Server::new(5);
+        let cursor = already_playing(&server);
+        assert_eq!(cursor.current().map(|e| e.entry), Some(3));
+        assert_eq!(server.calls(), [] as [String; 0]);
+    }
+
+    #[tokio::test]
+    async fn from_an_entry_already_playing_moving_on_tells_the_place() {
+        let server = Server::new(5);
+        let cursor = already_playing(&server);
+        assert_eq!(cursor.advance().await.unwrap().map(|e| e.entry), Some(4));
+        assert_eq!(server.calls()[0], "next after 3");
+        assert_eq!(server.state.lock().0, Some(4));
+    }
+
+    /// Nothing was read of what comes up: moving on reads it.
+    #[tokio::test]
+    async fn from_an_entry_already_playing_moving_on_fills_the_lineup() {
+        let server = Server::new(6);
+        let cursor = already_playing(&server);
+        cursor.advance().await.unwrap();
+        assert_eq!(cursor.ahead().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn from_an_entry_already_playing_a_pick_plays_it() {
+        let server = Server::new(5);
+        let cursor = already_playing(&server);
+        assert_eq!(cursor.current().map(|e| e.entry), Some(3));
+        assert_eq!(cursor.pick(5).await.unwrap().map(|e| e.entry), Some(5));
+        assert_eq!(server.calls(), ["play Some(5)", "upcoming"]);
+    }
+
+    /// Up next is a read: it moves nothing.
+    #[tokio::test]
+    async fn from_an_entry_already_playing_up_next_reads_what_comes() {
+        let server = Server::new(5);
+        let cursor = already_playing(&server);
+        let up = cursor.up_next(10).await.unwrap();
+        assert_eq!(entries(&up), [4, 5]);
+        assert_eq!(server.state.lock().0, Some(3));
     }
 
     #[tokio::test]

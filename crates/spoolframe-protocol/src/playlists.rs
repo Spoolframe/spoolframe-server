@@ -478,6 +478,18 @@ pub struct PlaylistNext {
     pub liked: bool,
 }
 
+impl From<PlaylistNext> for PlaylistEntry {
+    /// The server only ever answers with an entry that plays.
+    fn from(next: PlaylistNext) -> Self {
+        Self {
+            entry: next.entry,
+            item: next.item,
+            unavailable: false,
+            liked: next.liked,
+        }
+    }
+}
+
 /// What importing the user's Plex playlists made, or would make
 /// (`ImportPlexPlaylists`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
