@@ -6,36 +6,68 @@
 //! positions and does what it says. Its calls are cheap and never block,
 //! so a tick can make them on the main thread.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use spoolframe_client_sdk::types::Marker;
 use spoolframe_client_sdk::{
-    MarkerAction, MarkerOffer, MarkerOptions, MarkerTracker, Markers, SeekGate, UNDO_WINDOW,
+    ManagedPlayback, MarkerAction, MarkerOffer, MarkerOptions, MarkerTracker, Markers, SeekGate,
+    UNDO_WINDOW,
 };
+
+use crate::playback::SpoolPlayback;
 
 /// Where the player is while it seeks.
 enum Gate {
     /// A file on this device: there is no playback to hold a gate.
     Own(Mutex<SeekGate>),
+    /// The playback's, which `seek_started` on it and `report_position`
+    /// share. Weak: a forgotten object must not keep the playback open.
+    Playback(Weak<SpoolPlayback>),
 }
 
 impl Gate {
+    /// The playback, while it is open.
+    fn managed(playback: &Weak<SpoolPlayback>) -> Option<ManagedPlayback> {
+        playback.upgrade()?.managed().ok()
+    }
+
+    /// Whether the player can no longer seek: its playback is over.
+    fn over(&self) -> bool {
+        match self {
+            Self::Own(_) => false,
+            Self::Playback(playback) => Self::managed(playback).is_none(),
+        }
+    }
+
     fn position(&self, at: Duration) -> (Duration, bool) {
         match self {
             Self::Own(gate) => gate.lock().expect("never poisoned").position(at),
+            Self::Playback(playback) => {
+                Self::managed(playback).map_or((at, false), |managed| managed.gated(at))
+            }
         }
     }
 
     fn started(&self, target: Duration) {
         match self {
             Self::Own(gate) => gate.lock().expect("never poisoned").started(target),
+            Self::Playback(playback) => {
+                if let Some(managed) = Self::managed(playback) {
+                    managed.seek_started(target);
+                }
+            }
         }
     }
 
     fn done(&self) {
         match self {
             Self::Own(gate) => gate.lock().expect("never poisoned").done(),
+            Self::Playback(playback) => {
+                if let Some(managed) = Self::managed(playback) {
+                    managed.seek_done();
+                }
+            }
         }
     }
 }
@@ -48,7 +80,8 @@ struct State {
 
 /// Follows the position through an item's markers: what to show, and
 /// when to skip an intro by itself. One per item played; its tick is
-/// `on_position`. The object seeks nothing: where it gives a target
+/// `on_position`. Made by `SpoolPlayback.follow_markers`, or `new` for a
+/// file on this device. The object seeks nothing: where it gives a target
 /// (`MarkerAction::AutoSkip`, `skip`, `undo_skip`) the app seeks the
 /// player there, and it counts as a seek in flight from then.
 #[derive(uniffi::Object)]
@@ -58,6 +91,17 @@ pub struct SpoolMarkers {
 }
 
 impl SpoolMarkers {
+    pub(crate) fn of_playback(
+        playback: &Arc<SpoolPlayback>,
+        markers: Vec<Marker>,
+        has_next: bool,
+        auto_skip: bool,
+        up_next_card: bool,
+    ) -> Self {
+        let gate = Gate::Playback(Arc::downgrade(playback));
+        Self::with_gate(markers, has_next, auto_skip, up_next_card, gate)
+    }
+
     fn with_gate(
         markers: Vec<Marker>,
         has_next: bool,
@@ -121,6 +165,9 @@ impl SpoolMarkers {
     /// player. `None` with no skip showing; `Next` is the app's own to do.
     /// A pressed skip cannot be undone.
     pub fn skip(&self) -> Option<Duration> {
+        if self.gate.over() {
+            return None;
+        }
         let to = match self.state().offered? {
             MarkerOffer::SkipIntro { to } | MarkerOffer::SkipCredits { to } => to,
             MarkerOffer::Next => return None,
@@ -132,13 +179,17 @@ impl SpoolMarkers {
     /// Whether the intro skipped by itself can still be undone (`undo_skip`):
     /// for a view that comes after the skip, or a tick hiding Undo.
     pub fn undoable(&self) -> bool {
-        self.state().tracker.undoable()
+        !self.gate.over() && self.state().tracker.undoable()
     }
 
     /// Undo the intro skipped by itself in the last `undo_window()`: where
     /// to seek the player back to, at once known for the scrubber. `None`
     /// with none to undo. The intro is then offered, not skipped again.
     pub fn undo_skip(&self) -> Option<Duration> {
+        // A playback that is over seeks no more: no target to promise.
+        if self.gate.over() {
+            return None;
+        }
         let back = self.state().tracker.undo()?;
         self.gate.started(back);
         Some(back)

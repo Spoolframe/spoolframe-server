@@ -25,6 +25,7 @@ use spoolframe_hls_bridge::{Kind, MenuEntry, SdkSource, Stream};
 
 use crate::error::SpoolError;
 use crate::events::PlaybackShareWatch;
+use crate::markers::SpoolMarkers;
 use crate::reader::PlaybackReader;
 use crate::resources::{PlaybackResource, bridge};
 use crate::runtime::{block, run};
@@ -322,7 +323,7 @@ impl SpoolPlayback {
         }
     }
 
-    fn managed(&self) -> Result<sdk::ManagedPlayback, SpoolError> {
+    pub(crate) fn managed(&self) -> Result<sdk::ManagedPlayback, SpoolError> {
         Ok(self.registered()?.managed.clone())
     }
 
@@ -710,6 +711,27 @@ impl SpoolPlayback {
         if let Some(stream) = self.registered().ok().and_then(|p| p.stream.clone()) {
             stream.set_menu(entries.into_iter().map(Into::into).collect());
         }
+    }
+
+    /// Follow the item's markers (`info().markers`) as the player plays,
+    /// through this playback's seeks: `seek_started` here or on the object
+    /// is one seek. Hold the object as long as the playback; it does not
+    /// keep the playback open, and gives no skip or undo once it is over.
+    /// `has_next`, `auto_skip`, `up_next_card` as `SpoolMarkers.new`.
+    pub fn follow_markers(
+        self: Arc<Self>,
+        has_next: bool,
+        auto_skip: bool,
+        up_next_card: bool,
+    ) -> Arc<SpoolMarkers> {
+        let markers = self.info().markers;
+        Arc::new(SpoolMarkers::of_playback(
+            &self,
+            markers,
+            has_next,
+            auto_skip,
+            up_next_card,
+        ))
     }
 
     /// The server's admin stopped the playback: the player says it ended

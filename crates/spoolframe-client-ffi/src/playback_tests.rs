@@ -212,6 +212,19 @@ fn playing(backend: Arc<Backend>, playback: sdk::Playback) -> Arc<SpoolPlayback>
 }
 
 /// A direct play with an external subtitle: one that comes as a file.
+/// A movie with an intro from 60 s to 90 s.
+fn with_an_intro() -> sdk::Playback {
+    sdk::Playback {
+        markers: vec![Marker {
+            kind: sdk::types::MarkerKind::Intro,
+            start: Duration::from_secs(60),
+            end: Duration::from_secs(90),
+            to_end: false,
+        }],
+        ..snapshot()
+    }
+}
+
 fn with_external_subtitle() -> sdk::Playback {
     let mut playback = snapshot();
     if let PlaybackPlan::Direct { subtitle, .. } = &mut playback.plan {
@@ -592,4 +605,107 @@ async fn a_direct_playback_is_served_as_its_file_on_loopback() {
         "{url}"
     );
     unregister(&opened.playback.token);
+}
+
+const LENGTH: Option<Duration> = Some(Duration::from_secs(1800));
+
+fn auto_skipped(actions: &[sdk::MarkerAction]) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, sdk::MarkerAction::AutoSkip { .. }))
+}
+
+#[tokio::test]
+async fn a_playback_s_markers_are_followed_from_its_info() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let markers = playback.clone().follow_markers(false, true, true);
+    assert_eq!(
+        markers.on_position(Duration::from_secs(61), LENGTH),
+        [sdk::MarkerAction::AutoSkip {
+            to: Duration::from_secs(90)
+        }]
+    );
+}
+
+/// A seek the app told the playback (Android's engine does) holds the
+/// markers too, so no second call is needed.
+#[tokio::test]
+async fn a_seek_told_the_playback_holds_the_markers() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let markers = playback.clone().follow_markers(false, true, true);
+    playback.seek_started(Duration::from_secs(300));
+    assert_eq!(
+        markers.position(Duration::from_secs(61)),
+        Duration::from_secs(300)
+    );
+    assert!(!auto_skipped(
+        &markers.on_position(Duration::from_secs(61), LENGTH)
+    ));
+}
+
+/// The automatic skip is the playback's seek too: `report_position` saves
+/// the target while the player still says the intro.
+#[tokio::test]
+async fn an_automatic_skip_holds_the_playback_s_position_at_its_target() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let markers = playback.clone().follow_markers(false, true, true);
+    markers.on_position(Duration::from_secs(61), LENGTH);
+    assert_eq!(
+        playback.position(Duration::from_secs(61)),
+        Duration::from_secs(90)
+    );
+    assert_eq!(markers.undo_skip(), Some(Duration::from_secs(61)));
+    assert_eq!(
+        playback.position(Duration::from_secs(90)),
+        Duration::from_secs(61)
+    );
+}
+
+/// A re-plan moves the player to another token: the same playback, so
+/// the same gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_markers_keep_following_through_a_new_plan() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let markers = playback.clone().follow_markers(false, true, true);
+    plan_again_behind(&playback).await;
+    playback.clone().follow_replan().await.unwrap().unwrap();
+    playback.seek_started(Duration::from_secs(300));
+    assert_eq!(
+        markers.position(Duration::from_secs(61)),
+        Duration::from_secs(300)
+    );
+}
+
+/// A playback that is over seeks no more: no skip, no undo, no target.
+#[tokio::test]
+async fn a_finished_playback_has_no_skip_or_undo() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let markers = playback.clone().follow_markers(false, true, true);
+    assert!(auto_skipped(
+        &markers.on_position(Duration::from_secs(61), LENGTH)
+    ));
+    playback.stop().await;
+    assert!(!markers.undoable());
+    assert_eq!(markers.undo_skip(), None);
+    assert_eq!(markers.skip(), None);
+}
+
+#[tokio::test]
+async fn a_finished_playback_skips_nothing_by_itself() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let markers = playback.clone().follow_markers(false, true, true);
+    playback.stop().await;
+    assert!(!auto_skipped(
+        &markers.on_position(Duration::from_secs(61), LENGTH)
+    ));
+}
+
+/// Forgotten by the app, the object must not hold the playback open.
+#[tokio::test]
+async fn the_markers_do_not_keep_a_playback_open() {
+    let playback = playing(Arc::new(Backend::default()), with_an_intro());
+    let token = playback.token();
+    let _markers = playback.clone().follow_markers(false, true, true);
+    drop(playback);
+    assert!(registered(&token).is_none());
 }
