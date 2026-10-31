@@ -795,6 +795,46 @@ async fn a_seek_restarts_a_progressive_conversion_at_its_target() {
     );
 }
 
+/// Polls `work` on this thread, as an app's own executor does: no Tokio
+/// runtime here, unlike a `#[tokio::test]`.
+fn on_an_app_s_thread<T>(work: impl std::future::Future<Output = T>) -> T {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut work = std::pin::pin!(work);
+    loop {
+        if let std::task::Poll::Ready(done) = work.as_mut().poll(&mut context) {
+            return done;
+        }
+        std::thread::park();
+    }
+}
+
+/// Kotlin and Swift poll `seek` on their own threads, off the runtime: a
+/// panic there aborts the app.
+#[test]
+fn a_seek_needs_no_runtime_on_the_app_s_thread() {
+    let backend = Arc::new(Backend::default());
+    let for_playing = backend.clone();
+    let playback =
+        crate::runtime::block(
+            async move { playing(for_playing, converted(Delivery::Progressive)) },
+        );
+    let moved = on_an_app_s_thread(playback.seek(Duration::from_secs(300)));
+    assert_eq!(
+        (
+            moved.is_ok_and(|start| start.is_some()),
+            backend.seeks.lock().unwrap().clone()
+        ),
+        (true, vec![Duration::from_secs(300)])
+    );
+}
+
 /// The old encode's offsets mean nothing now: the next read is at 0, of
 /// the new encode, whatever the reader had read.
 #[tokio::test(flavor = "multi_thread")]

@@ -625,7 +625,9 @@ impl SpoolPlayback {
             return Ok(None);
         }
         let seek = self.seeks.fetch_add(1, Ordering::SeqCst) + 1;
-        run(tokio::time::sleep(SEEK_GATHER)).await;
+        // Built inside `run`: a sleep needs the runtime, and this is polled
+        // on the app's own thread.
+        run(async { tokio::time::sleep(SEEK_GATHER).await }).await;
         if self.seeks.load(Ordering::SeqCst) != seek {
             return Err(SpoolError::Cancelled);
         }
