@@ -82,8 +82,9 @@ struct State {
 /// when to skip an intro by itself. One per item played; its tick is
 /// `on_position`. Made by `SpoolPlayback.follow_markers`, or `new` for a
 /// file on this device. The object seeks nothing: where it gives a target
-/// (`MarkerAction::AutoSkip`, `skip`, `undo_skip`) the app seeks the
-/// player there, and it counts as a seek in flight from then.
+/// (`MarkerAction::AutoSkip`, `skip`, `undo_skip`) the app seeks there
+/// (`SpoolPlayback.seek`, which restarts a progressive conversion; for a
+/// file, its player), and it counts as a seek in flight from then.
 #[derive(uniffi::Object)]
 pub struct SpoolMarkers {
     state: Mutex<State>,

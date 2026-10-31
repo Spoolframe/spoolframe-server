@@ -8,6 +8,8 @@ use super::*;
 use sdk::{Chunk, PlaybackBackend, PlaybackChange, PlaybackHandle, SdkError};
 use spoolframe_client_sdk::types::Container;
 
+const MIB: u64 = 1024 * 1024;
+
 /// A direct play's server.
 #[derive(Default)]
 struct Backend {
@@ -22,6 +24,18 @@ struct Backend {
     expire: std::sync::atomic::AtomicBool,
     /// Playbacks started: each under a handle of its own.
     starts: std::sync::atomic::AtomicU32,
+    /// Where it was asked to seek: each a new encode, its epoch the count.
+    seeks: Mutex<Vec<Duration>>,
+    /// Seeks wait on this: the server is slow to answer.
+    seek_held: tokio::sync::Mutex<()>,
+    /// Seeks are refused.
+    seek_refused: std::sync::atomic::AtomicBool,
+    /// A conversion's output, this long so far, in 2 MiB chunks of its
+    /// epoch; `None`: two bytes.
+    output: Option<u64>,
+    /// The first encode's reads find it replaced: the server has the seek
+    /// and the SDK hasn't its answer.
+    replaced: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -50,9 +64,24 @@ impl PlaybackBackend for Backend {
         &self,
         _: &PlaybackHandle,
         epoch: u32,
-        _: u64,
+        offset: u64,
         _: u64,
     ) -> Result<Chunk, SdkError> {
+        if epoch == 0 && self.replaced.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SdkError::PlaybackRestarted { epoch: 1 });
+        }
+        if let Some(output) = self.output {
+            let got = output.saturating_sub(offset).min(2 * MIB);
+            if got == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return Ok(Chunk {
+                bytes: vec![epoch as u8; got as usize],
+                size: offset + got,
+                complete: false,
+                epoch,
+            });
+        }
         Ok(Chunk {
             bytes: vec![epoch as u8],
             size: 2,
@@ -76,8 +105,14 @@ impl PlaybackBackend for Backend {
             epoch,
         })
     }
-    async fn seek(&self, _: &PlaybackHandle, _: Duration) -> Result<u32, SdkError> {
-        Ok(1)
+    async fn seek(&self, _: &PlaybackHandle, at: Duration) -> Result<u32, SdkError> {
+        let _held = self.seek_held.lock().await;
+        if self.seek_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SdkError::Busy);
+        }
+        let mut seeks = self.seeks.lock().unwrap();
+        seeks.push(at);
+        Ok(seeks.len() as u32)
     }
     async fn subtitle(
         &self,
@@ -164,6 +199,23 @@ fn snapshot() -> sdk::Playback {
         epoch: 0,
         markers: vec![],
         duration: None,
+    }
+}
+
+/// A conversion, read as `delivery` gives it.
+fn converted(delivery: Delivery) -> sdk::Playback {
+    sdk::Playback {
+        plan: PlaybackPlan::Converted {
+            delivery,
+            container: Container::Matroska,
+            video: None,
+            audio: None,
+            subtitle: None,
+            ladder: Vec::new(),
+            reasons: Vec::new(),
+            source_codec: None,
+        },
+        ..snapshot()
     }
 }
 
@@ -708,4 +760,257 @@ async fn the_markers_do_not_keep_a_playback_open() {
     let _markers = playback.clone().follow_markers(false, true, true);
     drop(playback);
     assert!(registered(&token).is_none());
+}
+
+/// `read` as a player's loading thread calls it.
+async fn read_at(
+    playback: &Arc<SpoolPlayback>,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, SpoolError> {
+    let reading = playback.clone();
+    tokio::task::spawn_blocking(move || reading.read(offset, length))
+        .await
+        .unwrap()
+}
+
+/// Wait for `seeking`, a condition a spawned seek makes true.
+async fn until(seeking: impl Fn() -> bool) {
+    while !seeking() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seek_restarts_a_progressive_conversion_at_its_target() {
+    let backend = Arc::new(Backend::default());
+    let playback = playing(backend.clone(), converted(Delivery::Progressive));
+    let moved = playback.clone().seek(Duration::from_secs(300)).await;
+    assert_eq!(
+        (
+            moved.is_ok_and(|start| start.is_some()),
+            backend.seeks.lock().unwrap().clone()
+        ),
+        (true, vec![Duration::from_secs(300)])
+    );
+}
+
+/// The old encode's offsets mean nothing now: the next read is at 0, of
+/// the new encode, whatever the reader had read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_after_a_seek_is_the_new_encode_from_its_start() {
+    let playback = playing(Arc::default(), converted(Delivery::Progressive));
+    let before = (
+        read_at(&playback, 0, 1).await,
+        read_at(&playback, 1, 1).await,
+    );
+    playback
+        .clone()
+        .seek(Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert_eq!(
+        (before, read_at(&playback, 0, 1).await),
+        ((Ok(vec![0]), Ok(vec![0])), Ok(vec![1]))
+    );
+}
+
+/// A read waiting for the old encode is let go with the case every other
+/// move of the player gives, for the same answer: `info()`, new media.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_waiting_through_a_seek_is_told_replanned() {
+    let backend = Arc::new(Backend {
+        output: Some(0),
+        ..Default::default()
+    });
+    let playback = playing(backend, converted(Delivery::Progressive));
+    let reading = playback.clone();
+    let read = tokio::task::spawn_blocking(move || reading.read(0, 1));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let moved = playback.clone().seek(Duration::from_secs(300)).await;
+    let read = tokio::time::timeout(Duration::from_secs(5), read).await;
+    // A read still waiting on the old encode must not outlive the test.
+    playback.set_flushing(true);
+    assert_eq!(
+        (moved.is_ok(), read.map(Result::unwrap)),
+        (true, Ok(Err(SpoolError::Replanned)))
+    );
+}
+
+/// The server has replaced the encode and the seek's answer is on its
+/// way: a read that gets there first says the same, not
+/// `PlaybackRestarted`, once the player has moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_ahead_of_the_seek_s_answer_is_told_replanned() {
+    let backend = Arc::new(Backend::default());
+    let playback = playing(backend.clone(), converted(Delivery::Progressive));
+    let held = backend.seek_held.lock().await;
+    let seeking = tokio::spawn(playback.clone().seek(Duration::from_secs(300)));
+    until(|| playback.moving.try_lock().is_err()).await;
+    backend
+        .replaced
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let reading = playback.clone();
+    let read = tokio::task::spawn_blocking(move || reading.read(0, 1));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(held);
+    let moved = seeking.await.unwrap();
+    assert_eq!(
+        (moved.is_ok_and(|s| s.is_some()), read.await.unwrap()),
+        (true, Err(SpoolError::Replanned))
+    );
+}
+
+/// What Android TV hit: the player starts over from byte 0 once it is
+/// gone. It is told by name, and a seek gets it reading again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_behind_the_reader_is_told_so_and_a_seek_reads_again() {
+    let backend = Arc::new(Backend {
+        output: Some(6 * MIB),
+        ..Default::default()
+    });
+    let playback = playing(backend, converted(Delivery::Progressive));
+    read_at(&playback, 3 * MIB + 2, 1).await.unwrap();
+    let behind = read_at(&playback, 0, 1).await;
+    playback
+        .clone()
+        .seek(Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert_eq!(
+        (behind, read_at(&playback, 0, 1).await),
+        (
+            Err(SpoolError::ReadBehind {
+                offset: 0,
+                kept_from: 2 * MIB
+            }),
+            Ok(vec![1])
+        )
+    );
+}
+
+/// The app makes one call for every plan: `None` is its own player's seek
+/// to make, and nothing goes to the server. The seek holds the position
+/// all the same.
+#[tokio::test]
+async fn a_direct_or_hls_play_leaves_the_seek_to_its_player() {
+    for playback in [snapshot(), converted(Delivery::Hls)] {
+        let backend = Arc::new(Backend::default());
+        let playback = playing(backend.clone(), playback);
+        playback.report_position(Duration::from_secs(65)).unwrap();
+        let moved = playback.clone().seek(Duration::from_secs(300)).await;
+        assert_eq!(
+            (
+                moved.map(|start| start.is_none()),
+                backend.seeks.lock().unwrap().clone(),
+                playback.position(Duration::from_secs(65))
+            ),
+            (Ok(true), vec![], Duration::from_secs(300))
+        );
+    }
+}
+
+/// A held button or a scrubber: one restart, at the last target. The
+/// seeks it replaced are `Cancelled`, for the app to drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn seeks_in_a_row_gather_into_the_last() {
+    let backend = Arc::new(Backend::default());
+    let playback = playing(backend.clone(), converted(Delivery::Progressive));
+    let first = tokio::spawn(playback.clone().seek(Duration::from_secs(10)));
+    until(|| playback.seeks.load(Ordering::SeqCst) == 1).await;
+    let last = playback.clone().seek(Duration::from_secs(20)).await;
+    assert_eq!(
+        (
+            first.await.unwrap().map(|_| ()),
+            last.is_ok_and(|s| s.is_some()),
+            backend.seeks.lock().unwrap().clone()
+        ),
+        (
+            Err(SpoolError::Cancelled),
+            true,
+            vec![Duration::from_secs(20)]
+        )
+    );
+}
+
+/// A seek the server refuses moves nothing: the player reads on, and its
+/// positions count again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_seek_leaves_the_player_where_it_was() {
+    let backend = Arc::new(Backend {
+        seek_refused: true.into(),
+        ..Default::default()
+    });
+    let playback = playing(backend, converted(Delivery::Progressive));
+    let before = playback.token();
+    playback.report_position(Duration::from_secs(65)).unwrap();
+    let moved = playback.clone().seek(Duration::from_secs(300)).await;
+    assert_eq!(
+        (
+            moved.map(|_| ()),
+            playback.token() == before,
+            playback.position(Duration::from_secs(65)),
+            read_at(&playback, 0, 1).await
+        ),
+        (
+            Err(SpoolError::Busy),
+            true,
+            Duration::from_secs(65),
+            Ok(vec![0])
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_playback_seeks_no_more() {
+    let backend = Arc::new(Backend::default());
+    let playback = playing(backend.clone(), converted(Delivery::Progressive));
+    playback.stop().await;
+    let moved = playback.clone().seek(Duration::from_secs(300)).await;
+    assert_eq!(moved.map(|_| ()), Err(SpoolError::PlaybackExpired));
+}
+
+/// A marker's target goes through `seek` like any other: the skip, then
+/// its undo, each restart the encode, and the object still follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skip_and_its_undo_restart_a_conversion() {
+    let backend = Arc::new(Backend::default());
+    let intro = sdk::Playback {
+        plan: converted(Delivery::Progressive).plan,
+        ..with_an_intro()
+    };
+    let playback = playing(backend.clone(), intro);
+    let markers = playback.clone().follow_markers(false, true, true);
+    let skipped = markers.on_position(Duration::from_secs(61), LENGTH);
+    let to = Duration::from_secs(90);
+    assert_eq!(skipped, [sdk::MarkerAction::AutoSkip { to }]);
+    playback.clone().seek(to).await.unwrap().unwrap();
+    let during = markers.position(Duration::from_secs(61));
+    let back = markers.undo_skip().unwrap();
+    playback.clone().seek(back).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            during,
+            back,
+            markers.position(Duration::from_secs(90)),
+            backend.seeks.lock().unwrap().clone()
+        ),
+        (to, Duration::from_secs(61), back, vec![to, back])
+    );
+}
+
+/// The button pressed is no different.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pressed_skip_restarts_a_conversion() {
+    let backend = Arc::new(Backend::default());
+    let intro = sdk::Playback {
+        plan: converted(Delivery::Progressive).plan,
+        ..with_an_intro()
+    };
+    let playback = playing(backend.clone(), intro);
+    let markers = playback.clone().follow_markers(false, false, true);
+    markers.on_position(Duration::from_secs(61), LENGTH);
+    let to = markers.skip().unwrap();
+    playback.clone().seek(to).await.unwrap().unwrap();
+    assert_eq!(backend.seeks.lock().unwrap().clone(), vec![to]);
 }

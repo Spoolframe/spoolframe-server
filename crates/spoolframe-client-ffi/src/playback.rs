@@ -13,10 +13,11 @@
 //! one the app asked for (quality, subtitles, a slow link).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use spoolframe_client_sdk::driver::SEEK_GATHER;
 use spoolframe_client_sdk::types::{Delivery, Marker, MediaId, SubtitleFormat};
 use spoolframe_client_sdk::{
     self as sdk, ChosenTracks, HttpPlayback, PlaybackPlan, PlaybackQuality, Selection,
@@ -213,6 +214,16 @@ fn hls(plan: &PlaybackPlan) -> bool {
     )
 }
 
+fn progressive(plan: &PlaybackPlan) -> bool {
+    matches!(
+        plan,
+        PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            ..
+        }
+    )
+}
+
 /// A plan of a playback just opened under its token.
 pub(crate) struct Opened {
     pub(crate) playback: Arc<Registered>,
@@ -251,6 +262,9 @@ pub struct SpoolPlayback {
     /// one move at a time, so two callers that both find the plan stale
     /// make one new plan, and the second finds the player already on it.
     moving: tokio::sync::Mutex<()>,
+    /// One more for each seek of a progressive conversion: a seek still
+    /// gathering sees a newer one replace it.
+    seeks: AtomicU64,
     /// Served on the loopback bridge: each plan it moves to is served
     /// there too. Set before `url` serves, so a move meanwhile serves its
     /// new plan.
@@ -290,6 +304,7 @@ impl SpoolPlayback {
                 ended: false,
             }),
             moving: tokio::sync::Mutex::new(()),
+            seeks: AtomicU64::new(0),
             #[cfg(feature = "hls-bridge")]
             served,
         })
@@ -356,11 +371,20 @@ impl SpoolPlayback {
     /// What a call on the plan `seen` that failed with `error` tells the
     /// player. A stale plan's read moves the player to the new plan and
     /// says `Replanned`; so does a plan closed because another caller
-    /// moved the player on.
+    /// moved the player on, or an encode replaced before the player moved.
     fn failed(self: &Arc<Self>, seen: Arc<Registered>, error: SpoolError) -> SpoolError {
         match error {
             SpoolError::Replanned => self.replanned(seen),
             SpoolError::PlaybackExpired if !self.on(&seen) => SpoolError::Replanned,
+            // The server has a new encode and its answer is on the way (a
+            // seek): this waits for the player to move, and says so.
+            SpoolError::PlaybackRestarted { .. } | SpoolError::PlaybackResumed { .. } => {
+                match block(self.clone().follow(seen)) {
+                    Ok(Some(_)) => SpoolError::Replanned,
+                    Ok(None) => error,
+                    Err(error) => error,
+                }
+            }
             error => error,
         }
     }
@@ -496,10 +520,12 @@ impl SpoolPlayback {
     /// progressive conversion's output; none at the end. Blocks until
     /// they are here. `Cancelled` while `set_flushing(true)` holds. One
     /// the admin stopped is `PlaybackStopped`. One that moved on (planned
-    /// again, or started again by the SDK after the server ended it) is
-    /// `Replanned`, the player already moved to the playback as it is:
-    /// build the media again from `info()`, where the viewer was. An HLS
-    /// conversion is read by name (`open_resource`).
+    /// again, sought, or started again by the SDK after the server ended
+    /// it) is `Replanned`, the player already moved to the playback as it
+    /// is: build the media again from `info()`, where the viewer was. A
+    /// progressive conversion reads in order: an `offset` before what is
+    /// kept, a player starting over, is `ReadBehind`, and `seek` is the way
+    /// back. An HLS conversion is read by name (`open_resource`).
     pub fn read(self: Arc<Self>, offset: u64, length: u64) -> Result<Vec<u8>, SpoolError> {
         let (seen, reader) = self.reader()?;
         reader
@@ -569,6 +595,52 @@ impl SpoolPlayback {
     pub async fn follow_replan(self: Arc<Self>) -> Result<Option<PlaybackStart>, SpoolError> {
         let seen = self.registered()?;
         self.follow(seen).await
+    }
+
+    /// The viewer seeks to `target`: a scrubber, a skip button, an Undo.
+    /// One call whatever the plan, and it counts as `seek_started`.
+    ///
+    /// `None`: a direct play or an HLS conversion, which the player seeks
+    /// by itself: seek it, and call `seek_done` as ever. Nothing was sent.
+    ///
+    /// A progressive conversion can't seek in its bytes, so the server
+    /// encodes again from `target`: the new plan to switch to. Build the
+    /// media again from it and read from offset 0: the old encode's
+    /// offsets mean nothing now, and the new one's times are the item's
+    /// own, from `target`. A read in flight gets `Replanned`, or `Cancelled`
+    /// while `set_flushing(true)` holds; leave that before reading again.
+    /// `seek_done` once the player plays there.
+    ///
+    /// Seeks within 250 ms gather into the last, as the SDK's controller
+    /// does: the ones it replaced get `Cancelled`, and need nothing. A seek
+    /// that fails leaves the player on the encode it had, read on as
+    /// before.
+    pub async fn seek(
+        self: Arc<Self>,
+        target: Duration,
+    ) -> Result<Option<PlaybackStart>, SpoolError> {
+        let managed = self.managed()?;
+        managed.seek_started(target);
+        if !progressive(&managed.snapshot().plan) {
+            return Ok(None);
+        }
+        let seek = self.seeks.fetch_add(1, Ordering::SeqCst) + 1;
+        run(tokio::time::sleep(SEEK_GATHER)).await;
+        if self.seeks.load(Ordering::SeqCst) != seek {
+            return Err(SpoolError::Cancelled);
+        }
+        let moved = self
+            .clone()
+            .replan(
+                None,
+                move |playback| async move { playback.seek(target).await },
+            )
+            .await;
+        // A newer seek holds its own target.
+        if moved.is_err() && self.seeks.load(Ordering::SeqCst) == seek {
+            managed.seek_done();
+        }
+        moved
     }
 
     /// The viewer picked `quality` at `position`: the server plans it
@@ -644,7 +716,7 @@ impl SpoolPlayback {
     }
 
     /// The player's seek to `target` begins: its own scrubber, or a seek
-    /// the app asked of it. Until it lands its positions are the old
+    /// the app asked of it (`seek` says this itself). Until it lands its positions are the old
     /// place's, so `report_position` saves `target` meanwhile. Call
     /// `seek_done` from the player's own seek-complete signal (Media3's
     /// position discontinuity, AVPlayer's seek completion handler).
