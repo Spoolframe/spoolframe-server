@@ -734,14 +734,16 @@ mod tests {
         };
         let sweep = tokio::spawn(sweep(Arc::downgrade(&cache), pace, None));
         let faces = cache.faces().unwrap();
+        let last = backdrop(ITEMS - 1);
+        // A scan counts before its faces are kept, so wait for both.
         for _ in 0..600 {
-            if faces.scanned() == u64::from(ITEMS) {
+            if faces.scanned() == u64::from(ITEMS) && faces.known(&last).await.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(faces.scanned(), u64::from(ITEMS));
-        assert_eq!(faces.known(&backdrop(ITEMS - 1)).await.unwrap().len(), 1);
+        assert_eq!(faces.known(&last).await.unwrap().len(), 1);
         assert_eq!(catalog.asked.lock().len(), ITEMS as usize);
         sweep.abort();
     }
