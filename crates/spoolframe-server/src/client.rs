@@ -258,6 +258,14 @@ fn on_lan(path: &str) -> bool {
     path.starts_with("lan ")
 }
 
+/// A re-plan's `wan` on the wire: whether the connection's path is off the
+/// LAN now, as the planner and the per-stream cap take it. Not whether the
+/// playback holds a share: one that started on the LAN and moved off it
+/// holds none, and is planned off the LAN all the same.
+fn wan_verdict(state: &ConnectionState) -> Option<bool> {
+    Some(!on_lan(&state.path()))
+}
+
 /// The path a connection's packets go by, of its open `paths`: the one
 /// iroh selected, else the only one open, which has nowhere else to send
 /// them. iroh selects a path per device, not per connection: a connection
@@ -2723,7 +2731,11 @@ impl ClientProtocol {
             let before = remote.revision();
             let asked = request.clone();
             let answered = remote.control(request).await;
-            let answered = self.remote_answered(&handle, answered);
+            let mut answered = self.remote_answered(&handle, answered);
+            // SA's is of this server's link to it, as at the start.
+            if let Ok(Reply::PlaybackChanged { wan, .. }) = &mut answered {
+                *wan = wan_verdict(state);
+            }
             // A re-plan is kept here as SA made it: the Playback page and
             // the HTTP port read this server's playback.
             if let Ok(Reply::PlaybackChanged { plan, size, .. }) = &answered {
@@ -4361,7 +4373,7 @@ impl ClientProtocol {
                         epoch: 0,
                         markers: markers.into(),
                         duration,
-                        wan: None,
+                        wan: Some(admission_held),
                     })
                 }
                 .await;
@@ -4437,7 +4449,7 @@ impl ClientProtocol {
                     plan,
                     size,
                     epoch,
-                    wan: None,
+                    wan: wan_verdict(state),
                 })
             }
             Request::ChangeQuality {
@@ -4488,7 +4500,7 @@ impl ClientProtocol {
                         plan,
                         size: playback.size,
                         epoch: epoch_now,
-                        wan: None,
+                        wan: wan_verdict(state),
                     });
                 }
                 // A plan nothing plays under is `CannotPlay` from here, and
@@ -4535,7 +4547,7 @@ impl ClientProtocol {
                     plan,
                     size,
                     epoch,
-                    wan: None,
+                    wan: wan_verdict(state),
                 })
             }
             Request::StopPlayback { handle } => {
@@ -6922,6 +6934,7 @@ impl ClientProtocol {
         // The leg to the device is this server's uplink, as any play's
         // (PX-46); SA plans within this server's share as well as its own.
         let admission = self.reserve_uplink(state, who)?;
+        let admission_held = admission.is_some();
         // The per-stream cap goes to SA as part of the share: SA holds
         // Auto to it, and a quality the viewer chose there is SA's to cap.
         let share = admission.as_ref().and_then(|a| a.share());
@@ -7015,7 +7028,9 @@ impl ClientProtocol {
             epoch,
             markers: markers.into(),
             duration,
-            wan: None,
+            // Of the device's link to this server, the one it can see. SA's
+            // answer is of this server's link to SA.
+            wan: Some(admission_held),
         })
     }
 

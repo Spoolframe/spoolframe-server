@@ -3076,6 +3076,34 @@ async fn a_direct_play_on_a_link_found_slow_is_planned_again_as_an_encode() {
     server.stop().await;
 }
 
+/// A re-plan that restarts the playback as an encode says the server's
+/// verdict too.
+#[tokio::test]
+async fn a_re_plan_to_an_encode_says_it_is_on_the_lan() {
+    let (server, client, session) = ready_for_range("link-limit-verdict").await;
+    let (handle, _) = start_for(&client, &session, Quality::default()).await;
+    let response = client
+        .call(
+            Some(&session),
+            Request::ChangeQuality {
+                handle,
+                quality: on_link(SLOW_LINK),
+                bitmap: Default::default(),
+                position_ms: 4_000,
+                display: None,
+                onward_share: None,
+            },
+        )
+        .await;
+    let Response::Ok(Reply::PlaybackChanged { plan, wan, .. }) = response else {
+        panic!("not changed: {response:?}");
+    };
+    assert!(encoded_video(&plan).is_some(), "{plan:?}");
+    assert_eq!(wan, Some(false));
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_link_fast_enough_leaves_the_playback_as_it_is() {
     let (server, client, session) = ready_for_range("link-limit-fast").await;

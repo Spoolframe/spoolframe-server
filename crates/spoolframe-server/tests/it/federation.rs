@@ -7117,6 +7117,90 @@ mod replica {
             pair.stop().await;
         }
 
+        /// Through SB the verdict is SB's, of the device's own link to it:
+        /// here SB counts the device off its LAN, and SA, which sees only
+        /// SB, on its. A re-plan SA answers is told the same.
+        #[tokio::test]
+        async fn a_proxied_play_says_sb_s_verdict_not_sa_s() {
+            let pair = Pair::start_with(
+                "fed-media-proxy-verdict",
+                ServerOptions {
+                    uplink: spoolframe_server::uplink::UplinkSettings {
+                        wan_prefixes: ["127.0.0.0/8", "::1/128"]
+                            .iter()
+                            .map(|n| n.parse().unwrap())
+                            .collect(),
+                        ..Default::default()
+                    },
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
+            shared(&pair).await;
+            let device = pair.sb.loopback_client().await;
+            device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            let bob = device.login("bob", "correct horse").await;
+            let (handle, wan) = match device
+                .call(Some(&bob), start(&pair.fed(movie().id())))
+                .await
+            {
+                Response::Ok(Reply::PlaybackStarted { handle, wan, .. }) => (handle, wan),
+                other => panic!("did not start through SB: {other:?}"),
+            };
+            assert_eq!(wan, Some(true));
+            let changed = device
+                .call(
+                    Some(&bob),
+                    Request::ChangeQuality {
+                        handle,
+                        quality: Default::default(),
+                        bitmap: Default::default(),
+                        position_ms: 1_000,
+                        display: None,
+                        onward_share: None,
+                    },
+                )
+                .await;
+            let Response::Ok(Reply::PlaybackChanged { wan, .. }) = changed else {
+                panic!("not changed: {changed:?}");
+            };
+            assert_eq!(wan, Some(true));
+            pair.stop().await;
+        }
+
+        /// A device that reached SA with its token plays as any device of
+        /// SA's: the verdict is SA's, of that device's link to it.
+        #[tokio::test]
+        async fn a_direct_remote_play_says_sa_s_verdict() {
+            let pair = Pair::start_both(
+                "fed-media-direct-verdict",
+                ServerOptions {
+                    uplink: spoolframe_server::uplink::UplinkSettings {
+                        wan_prefixes: ["127.0.0.0/8", "::1/128"]
+                            .iter()
+                            .map(|n| n.parse().unwrap())
+                            .collect(),
+                        ..Default::default()
+                    },
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            let (_, bob) = shared(&pair).await;
+            let device = pair.sa.loopback_client().await;
+            device.hello_naming(mkv_capabilities(), &[FEDERATION]).await;
+            let session = redeemed(&device, &token(&pair, bob, &device).await)
+                .await
+                .session;
+            let response = device.call(Some(&session), start(movie().id())).await;
+            let Response::Ok(Reply::PlaybackStarted { wan, .. }) = response else {
+                panic!("did not start: {response:?}");
+            };
+            assert_eq!(wan, Some(true));
+            pair.stop().await;
+        }
+
         /// SB keeps its connection to SA only while a play needs it, and a
         /// while after: once its plays stop it is closed after the idle
         /// time. An unpairing closes it at once, and ends the plays on it.

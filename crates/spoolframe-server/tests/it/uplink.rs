@@ -5,7 +5,15 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::sdk::{client_on, settled_path};
 use crate::support::{self, ServerOptions, TestClient, TestServer, mkv_capabilities, movie};
+use spoolframe_client_sdk::{
+    BitmapSubtitles, Client, ConnectionPath, MemoryStorage, PlaybackOptions, PlaybackQuality,
+    Session,
+};
 use spoolframe_protocol::{Error, PlaybackPlan, Reply, Request, Response, Selection, SessionId};
 use spoolframe_server::uplink::UplinkSettings;
 
@@ -148,6 +156,115 @@ async fn an_unselected_path_off_the_lan_is_held_to_the_wan_limit() {
         matches!(second, Response::Err(Error::WanStreamsFull { .. })),
         "{second:?}"
     );
+}
+
+/// Alice's session through the SDK on a server run with `settings`, its
+/// path chosen, so the server has it to judge.
+async fn signed_in(test: &str, settings: UplinkSettings) -> (TestServer, Client, Session) {
+    let server = TestServer::start_with(
+        support::fresh_dir(test).await,
+        ServerOptions {
+            uplink: settings,
+            ..Default::default()
+        },
+    )
+    .await;
+    server.write_media(1000);
+    server.add_user("alice", "correct horse", None).await;
+    let client = client_on(&server, &Arc::new(MemoryStorage::default())).await;
+    let alice = client
+        .sign_in(
+            &server.server.id().to_string(),
+            "alice",
+            "correct horse",
+            false,
+        )
+        .await
+        .unwrap();
+    settled_path(&alice, Duration::from_secs(5)).await;
+    (server, client, alice)
+}
+
+/// The test's loopback, listed as an operator lists a WireGuard peer.
+fn loopback_listed_as_wan() -> UplinkSettings {
+    UplinkSettings {
+        wan_prefixes: vec!["127.0.0.0/8".parse().unwrap(), "::1/128".parse().unwrap()],
+        ..UplinkSettings::default()
+    }
+}
+
+/// A WireGuard peer: an address the device sees as private, which the
+/// server's `wan_prefixes` lists. The device's own reading stays `Lan`;
+/// the playback says what the server counted, at its start and on each
+/// re-plan.
+#[tokio::test]
+async fn a_private_address_in_wan_prefixes_is_told_as_off_the_lan() {
+    // In a namespace of its own, where loopback is the only way there: on
+    // the host the SDK may go by another of the server's addresses.
+    if !support::private_netns(
+        module_path!(),
+        "a_private_address_in_wan_prefixes_is_told_as_off_the_lan",
+    ) {
+        return;
+    }
+    let (server, client, alice) = signed_in("uplink-verdict-wan", loopback_listed_as_wan()).await;
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(playback.snapshot().wan, Some(true));
+    assert!(
+        matches!(alice.connection_path(), ConnectionPath::Lan { .. }),
+        "{:?}",
+        alice.connection_path()
+    );
+    let handle = playback.snapshot().handle;
+    // The same plan, by the path that sends nothing new to the player.
+    let same = alice
+        .change_quality(
+            &handle,
+            PlaybackQuality::Auto,
+            BitmapSubtitles::Auto,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.wan, Some(true));
+    let subtitle = alice
+        .change_subtitle(&handle, None, BitmapSubtitles::Auto, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(subtitle.wan, Some(true));
+    client.close().await;
+    server.stop().await;
+}
+
+/// The same device with nothing listed is on the LAN, and is told so: not
+/// `None`, which is an older server's.
+#[tokio::test]
+async fn a_plain_lan_play_is_told_as_on_the_lan() {
+    // As above, the same device on the same path.
+    if !support::private_netns(module_path!(), "a_plain_lan_play_is_told_as_on_the_lan") {
+        return;
+    }
+    let (server, client, alice) = signed_in("uplink-verdict-lan", UplinkSettings::default()).await;
+    let playback = alice
+        .open_playback(movie().id(), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(playback.snapshot().wan, Some(false));
+    let same = alice
+        .change_quality(
+            &playback.snapshot().handle,
+            PlaybackQuality::Auto,
+            BitmapSubtitles::Auto,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.wan, Some(false));
+    client.close().await;
+    server.stop().await;
 }
 
 /// `settings` with one stream at most, a budget it fits, and alice.

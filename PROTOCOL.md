@@ -112,6 +112,7 @@ them. A few fields may still be left out, each for a reason of its own:
 | `last_viewed_at`, `play_count`, `last_played_at` on a playback state; `timing`, `download` on a subtitle track | `null`, 0 | as `year`; a server sends them always |
 | `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent | stored as JSON by servers and devices; left out when empty |
 | `expected_size` on a download, `cause` on a failed one | `null`, `other` | the SDK keeps them with a download |
+| `wan` on `PlaybackStarted`, `PlaybackChanged` | `null` | an older server has no such field; a newer one always sends it |
 | the experimental features' fields (`federation`'s `unavailable`, `servers`, a library's `server`, `copies`; `smart-crop`'s `faces` on an artwork reply) | none | left out for a client without the feature |
 
 ## Connections and streams
@@ -1566,6 +1567,19 @@ ranges that both hold the address, the longer prefix decides, and
   events stream, a few seconds after the last start or end. A client in
   `auto` re-plans with `ChangeQuality` (the same `auto`, at its
   position), which the server plans under the new share.
+- `PlaybackStarted` and `PlaybackChanged` carry `wan`: `true` when the
+  server counts the device off its LAN by the rules above, `false` when
+  not. It is how the app shows a device the server counts off the LAN
+  at a private address (a WireGuard peer in `wan_prefixes`), which the
+  device can't tell from its own address. It is the value the server
+  acted on: at a start, whether it took a place in the budget; on a
+  re-plan, the path as the planner takes it then. A connection whose
+  path isn't known yet counts off the LAN, so it says `true`. A path
+  that moves between replies is told at the next reply, not by an event.
+  `SeekPlayback`'s reply has no `wan`: a seek plans nothing. Through a
+  paired server (proxy mode) it is that server's own, of the device's
+  link to it, not the origin's. A device playing from the origin itself
+  gets the origin's, of its link there.
 
 ### SDK
 
@@ -1581,6 +1595,9 @@ ranges that both hold the address, the longer prefix decides, and
 - On `Event::PlaybackShare` for its handle, a managed playback in `auto`
   re-plans with `change_quality(Auto, position)`.
 - `SdkError::WanStreamsFull { max }`.
+- `Playback.wan`, kept from each `PlaybackStarted` and `PlaybackChanged`,
+  a re-plan to the same plan too. `ConnectionPath` stays what the device
+  sees: a private address is `Lan` there whatever the server counted.
 
 ## Picture subtitles
 
@@ -4092,10 +4109,12 @@ plain `StartPlayback` of the `fed:` id. SB then:
   SB's share of its own uplink, so SA plans within the smaller of that
   and its own share;
 - answers the device `PlaybackStarted` with a handle of its own, SA's
-  plan, size, chosen tracks, epoch and markers.
+  plan, size, chosen tracks, epoch and markers, and its own `wan`, of
+  the device's link to it (SA's is of SB's link to SA).
 
 The playback's re-plans, seeks, manifests and subtitle reads pass
-through to SA, and its media reads are relayed as they arrive. Each
+through to SA, and its media reads are relayed as they arrive; a
+`PlaybackChanged` reaches the device with SB's `wan` in place of SA's. Each
 `ChangeQuality` and `ChangeSubtitle` SB passes on carries `onward_share`
 again, as SB's share is then: a share that drops mid-play (the device
 re-plans on SB's `PlaybackShare`) is planned under on SA. SB's

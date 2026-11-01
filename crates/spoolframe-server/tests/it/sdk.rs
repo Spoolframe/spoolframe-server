@@ -270,7 +270,7 @@ async fn an_app_sorts_and_filters_a_library_by_what_it_offers() {
 /// `session`'s connection path once a direct path is selected, or whatever it is
 /// after `within`: right after a sign-in iroh may not have selected a
 /// path yet.
-async fn settled_path(session: &Session, within: Duration) -> ConnectionPath {
+pub(crate) async fn settled_path(session: &Session, within: Duration) -> ConnectionPath {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         let path = session.connection_path();
