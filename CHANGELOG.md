@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.1 (2026-11-01)
 
 - Server: `PlaybackStarted` and `PlaybackChanged` carry `wan`, whether the
   server counts the device off its LAN, so an app can show it. The device
