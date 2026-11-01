@@ -8,13 +8,19 @@
   has a private address, and the overlay said LAN. Through a paired
   server, the verdict is that server's, of the device's link to it, not
   the origin's. An older server sends no `wan`, an older app ignores it.
-- SDK (BREAKING for code that builds these structs, such as an app's own
-  `PlaybackBackend`): `Playback.wan` and `PlaybackChange.wan`,
+- SDK: `Playback.wan` and `PlaybackChange.wan`,
   `Option<bool>`, kept current on `ManagedPlayback` across re-plans,
   a re-plan to the same plan too. `None` is an older server.
   `ConnectionPath` is unchanged, and its docs now say that `Lan` is a
   private address as this device sees it, not the server's verdict.
 - FFI: `SpoolPlayback.wan()` is that verdict, for a diagnostics overlay.
+- SDK and FFI: a play can say how it is converted, whichever way
+  `Device::capabilities` lists first. `PlaybackOptions::delivery` takes a
+  new `ConversionDelivery` (`Hls` or `Progressive`), and the FFI's
+  `open_playback` and `play` take it as `delivery`, left out by default,
+  for a Settings toggle that applies from the next play. It holds through
+  the playback's re-plans and restarts. A file the device plays is still
+  played as it is. No wire change.
 
 ## 0.17.0 (2026-10-31)
 

@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use spoolframe_client_sdk::types::MediaId;
-use spoolframe_client_sdk::{PlaybackQuality, Selection};
+use spoolframe_client_sdk::{ConversionDelivery, PlaybackQuality, Selection};
 use tokio::net::TcpListener;
 
 use crate::error::SpoolError;
@@ -35,6 +35,7 @@ pub(crate) static LISTENER: tokio::sync::Mutex<Option<(u16, tokio::task::AbortHa
 impl SpoolSession {
     /// Start playing `id` for a URL player: `open_playback`, served on
     /// the loopback bridge, at `info().url`.
+    #[uniffi::method(default(delivery = None))]
     pub async fn play(
         &self,
         id: MediaId,
@@ -42,10 +43,11 @@ impl SpoolSession {
         tracks: Option<Selection>,
         quality: PlaybackQuality,
         display: Option<ScreenCapabilities>,
+        delivery: Option<ConversionDelivery>,
     ) -> Result<Arc<SpoolPlayback>, SpoolError> {
         let session = self.session.clone();
         let opened = run(async move {
-            let opened = open(session, id, start, tracks, quality, display).await?;
+            let opened = open(session, id, start, tracks, quality, display, delivery).await?;
             serve_opened(opened).await
         })
         .await?;

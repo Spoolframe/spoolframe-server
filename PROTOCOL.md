@@ -1441,8 +1441,9 @@ With `null`, `Hello`'s apply.
 re-plan of it. `display` applies over it. Left out (the key is not
 sent), `Hello`'s apply, as before. A server that plays on to one of its
 own devices (a paired server's proxy, [below](#proxy-mode)) has the plan
-made for that device, whatever its own `Hello` said. An app has no need
-for it.
+made for that device, whatever its own `Hello` said. An app sends it to
+change one thing for one play, such as the order of `delivery`, with the
+rest as `Hello` said it.
 
 ## Output codecs and HDR
 

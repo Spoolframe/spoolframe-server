@@ -178,8 +178,10 @@ import uniffi.spoolframe_client_ffi.SpoolPlayback
 import uniffi.spoolframe_client_ffi.SpoolSession
 import uniffi.spoolframe_client_ffi.undoWindow
 import uniffi.spoolframe_client_sdk.ConnectionPath
+import uniffi.spoolframe_client_sdk.ConversionDelivery
 import uniffi.spoolframe_client_sdk.MarkerAction
 import uniffi.spoolframe_client_sdk.MarkerOffer
+import uniffi.spoolframe_client_sdk.PlaybackQuality
 import uniffi.spoolframe_types.Marker
 
 fun follow(playback: SpoolPlayback): SpoolMarkers =
@@ -250,6 +252,28 @@ fun read(playback: SpoolPlayback, offset: ULong, length: ULong): ByteArray? = tr
     println(e.offset.toString() + e.keptFrom.toString())
     null
 }
+
+// A Settings toggle, read at each play; an app with no such setting
+// leaves `delivery` out.
+suspend fun playAsSet(
+    session: SpoolSession,
+    id: String,
+    progressive: Boolean?,
+): SpoolPlayback = session.openPlayback(
+    id,
+    null,
+    null,
+    PlaybackQuality.Auto,
+    null,
+    delivery = when (progressive) {
+        true -> ConversionDelivery.PROGRESSIVE
+        false -> ConversionDelivery.HLS
+        null -> null
+    },
+)
+
+suspend fun playAsListed(session: SpoolSession, id: String): SpoolPlayback =
+    session.openPlayback(id, null, null, PlaybackQuality.Auto, null)
 ";
 
 /// The same in Swift.
@@ -327,6 +351,22 @@ func read(_ playback: SpoolPlayback, offset: UInt64, length: UInt64) throws -> D
         print(offset + keptFrom)
         return nil
     }
+}
+
+// A Settings toggle, read at each play; an app with no such setting
+// leaves `delivery` out.
+func playAsSet(
+    _ session: SpoolSession,
+    _ id: MediaId,
+    progressive: Bool?
+) async throws -> SpoolPlayback {
+    let delivery: ConversionDelivery? = progressive.map { $0 ? .progressive : .hls }
+    return try await session.openPlayback(
+        id: id, start: nil, tracks: nil, quality: .auto, display: nil, delivery: delivery)
+}
+
+func playAsListed(_ session: SpoolSession, _ id: MediaId) async throws -> SpoolPlayback {
+    try await session.openPlayback(id: id, start: nil, tracks: nil, quality: .auto, display: nil)
 }
 ";
 

@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_client_sdk::types::{
-    CalendarDate, ClientCapabilities, Item, PersonRole, PlaybackState, VideoCodec,
+    AudioCodec, CalendarDate, ClientCapabilities, Container, Delivery, Item, PersonRole,
+    PlaybackState, VideoCodec,
 };
 use spoolframe_client_sdk::{
-    ArtworkSize, BitmapSubtitles, Client, ConnectionPath, ConnectionState, Device, MAX_READ,
-    ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions, PlaybackPlan,
-    ProfileSignIn, SdkError, Selection, Session, SignInMethod, Storage, TopResult,
+    ArtworkSize, BitmapSubtitles, Client, ConnectionPath, ConnectionState, ConversionDelivery,
+    Device, MAX_READ, ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions,
+    PlaybackPlan, PlaybackQuality, PlayerSession, ProfileSignIn, SdkError, Selection, Session,
+    SignInMethod, Storage, TopResult,
 };
 use spoolframe_server::admission::Admission;
 use support::{
@@ -133,6 +135,7 @@ async fn a_share_watch_ends_once_the_playback_and_client_are_dropped() {
             None,
             None,
             spoolframe_client_sdk::PlaybackQuality::default(),
+            None,
             None,
         )
         .await
@@ -1086,6 +1089,219 @@ async fn a_converted_playback_reads_to_complete_and_seeks() {
         alice.read_chunk(&playback.handle, 1, 0, 1024).await,
         Err(SdkError::PlaybackExpired)
     );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A device that takes both ways of a conversion, in `order`, and not
+/// the AC-3 sound of the film (H.264 in Matroska): every play of it is
+/// converted.
+fn takes_both(order: [Delivery; 2]) -> ClientCapabilities {
+    ClientCapabilities {
+        containers: [Container::Mp4, Container::MpegTs, Container::Matroska].into(),
+        delivery: order.into(),
+        ..support::hls_capabilities()
+    }
+}
+
+/// The way `playback` is converted; `None` if it plays the file.
+fn converted_by(plan: &PlaybackPlan) -> Option<Delivery> {
+    match plan {
+        PlaybackPlan::Converted { delivery, .. } => Some(*delivery),
+        _ => None,
+    }
+}
+
+fn delivering(delivery: ConversionDelivery) -> PlaybackOptions {
+    PlaybackOptions {
+        delivery: Some(delivery),
+        ..PlaybackOptions::default()
+    }
+}
+
+/// Hello lists HLS first; the viewer's setting takes progressive, and
+/// its bytes are there to read.
+#[tokio::test]
+async fn a_play_may_take_the_way_hello_lists_second_progressive() {
+    let (server, client, alice) = converting(
+        "sdk-delivery-progressive",
+        takes_both([Delivery::Hls, Delivery::Progressive]),
+        false,
+    )
+    .await;
+    let playback = alice
+        .start_playback_with(
+            movie().id(),
+            None,
+            delivering(ConversionDelivery::Progressive),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        converted_by(&playback.plan),
+        Some(Delivery::Progressive),
+        "{:?}",
+        playback.plan
+    );
+    assert!(
+        !read_all(&alice, &playback.handle, playback.epoch)
+            .await
+            .is_empty()
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// And the other way about: Hello lists progressive first, the setting
+/// takes HLS.
+#[tokio::test]
+async fn a_play_may_take_the_way_hello_lists_second_hls() {
+    let (server, client, alice) = converting(
+        "sdk-delivery-hls",
+        takes_both([Delivery::Progressive, Delivery::Hls]),
+        false,
+    )
+    .await;
+    let playback = alice
+        .start_playback_with(movie().id(), None, delivering(ConversionDelivery::Hls))
+        .await
+        .unwrap();
+    assert_eq!(
+        converted_by(&playback.plan),
+        Some(Delivery::Hls),
+        "{:?}",
+        playback.plan
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The setting is about conversions alone: a device that plays the film
+/// plays it, since the rest of what Hello said goes with the setting,
+/// and the conversion a quality then forces follows the setting, as does
+/// the re-plan a track change makes after it.
+#[tokio::test]
+async fn a_delivery_changes_no_direct_play_and_outlives_re_plans() {
+    let (server, client, alice) = converting(
+        "sdk-delivery-replan",
+        ClientCapabilities {
+            audio: [AudioCodec::Aac, AudioCodec::Ac3].into(),
+            containers: [Container::Matroska, Container::Mp4].into(),
+            delivery: vec![Delivery::Range, Delivery::Hls, Delivery::Progressive],
+            ..support::hls_capabilities()
+        },
+        false,
+    )
+    .await;
+    let playback = alice
+        .open_playback(
+            movie().id(),
+            None,
+            PlaybackOptions {
+                quality: PlaybackQuality::Original,
+                ..delivering(ConversionDelivery::Progressive)
+            },
+        )
+        .await
+        .unwrap();
+    let plan = playback.snapshot().plan;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    let changed = playback
+        .change_quality(PlaybackQuality::Bitrate(200_000), Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        converted_by(&changed.plan),
+        Some(Delivery::Progressive),
+        "{:?}",
+        changed.plan
+    );
+    let changed = playback
+        .change_subtitle(None, BitmapSubtitles::Auto, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        converted_by(&changed.plan),
+        Some(Delivery::Progressive),
+        "{:?}",
+        changed.plan
+    );
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// Every way an app opens a play takes it: what it opens with, what it
+/// opens next and a player opened on the session.
+#[tokio::test]
+async fn every_way_of_opening_takes_the_delivery() {
+    let (server, client, alice) = converting(
+        "sdk-delivery-opens",
+        takes_both([Delivery::Hls, Delivery::Progressive]),
+        false,
+    )
+    .await;
+    let options = delivering(ConversionDelivery::Progressive);
+    let player = PlayerSession::for_session(alice.clone());
+    let playing = player
+        .start(movie().id().clone(), None, options.clone())
+        .await
+        .unwrap();
+    let plan = playing.snapshot().plan;
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    let next = alice
+        .open_playback_next(movie().id(), &playing, None, options.clone())
+        .await
+        .unwrap();
+    let plan = next.snapshot().plan;
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    next.close().await.unwrap();
+    player.end().await;
+    let any = alice
+        .open_any_playback(movie().id(), None, options)
+        .await
+        .unwrap();
+    let plan = any.snapshot().plan;
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    any.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// As an app reaches it: the FFI's `delivery`, on its opening call and
+/// through a change of quality there.
+#[tokio::test]
+async fn the_ffi_s_delivery_reaches_the_plan() {
+    use spoolframe_client_ffi::SpoolSession;
+
+    let (server, client, alice) = converting(
+        "sdk-delivery-ffi",
+        takes_both([Delivery::Hls, Delivery::Progressive]),
+        false,
+    )
+    .await;
+    let session = SpoolSession::from(alice);
+    let opened = session
+        .open_playback(
+            movie().id().clone(),
+            None,
+            None,
+            PlaybackQuality::Auto,
+            None,
+            Some(ConversionDelivery::Progressive),
+        )
+        .await
+        .unwrap();
+    let plan = opened.info().plan;
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    let changed = opened
+        .clone()
+        .change_quality(PlaybackQuality::Bitrate(200_000), Duration::ZERO)
+        .await
+        .unwrap();
+    let plan = changed.map_or_else(|| opened.info().plan, |start| start.plan);
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    drop((opened, session));
     client.close().await;
     server.stop().await;
 }

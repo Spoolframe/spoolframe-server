@@ -20,7 +20,8 @@ use std::time::Duration;
 use spoolframe_client_sdk::driver::SEEK_GATHER;
 use spoolframe_client_sdk::types::{Delivery, Marker, MediaId, SubtitleFormat};
 use spoolframe_client_sdk::{
-    self as sdk, ChosenTracks, HttpPlayback, PlaybackPlan, PlaybackQuality, Selection,
+    self as sdk, ChosenTracks, ConversionDelivery, HttpPlayback, PlaybackPlan, PlaybackQuality,
+    Selection,
 };
 use spoolframe_hls_bridge::{Kind, MenuEntry, SdkSource, Stream};
 
@@ -881,7 +882,10 @@ impl SpoolSession {
     /// `None`, the tracks the server picks from the user's preferences,
     /// for a player that reads it itself: no URL. `display`: the screen for
     /// this playback, kept for its re-plans; `None` sends
-    /// `SpoolClient.set_display`'s.
+    /// `SpoolClient.set_display`'s. `delivery`: how a conversion of it
+    /// reaches the device, kept for its re-plans and restarts; `None` is
+    /// the first way `DeviceSpec.capabilities` lists.
+    #[uniffi::method(default(delivery = None))]
     pub async fn open_playback(
         &self,
         id: MediaId,
@@ -889,8 +893,17 @@ impl SpoolSession {
         tracks: Option<Selection>,
         quality: PlaybackQuality,
         display: Option<ScreenCapabilities>,
+        delivery: Option<ConversionDelivery>,
     ) -> Result<Arc<SpoolPlayback>, SpoolError> {
-        let opening = open(self.session.clone(), id, start, tracks, quality, display);
+        let opening = open(
+            self.session.clone(),
+            id,
+            start,
+            tracks,
+            quality,
+            display,
+            delivery,
+        );
         let opened = run(opening).await?;
         Ok(SpoolPlayback::new(opened))
     }
@@ -904,11 +917,13 @@ pub(crate) async fn open(
     tracks: Option<Selection>,
     quality: PlaybackQuality,
     display: Option<ScreenCapabilities>,
+    delivery: Option<ConversionDelivery>,
 ) -> Result<RegisteredPlayback, SpoolError> {
     let options = sdk::PlaybackOptions {
         start,
         quality,
         display: display.map(Into::into),
+        delivery,
         ..Default::default()
     };
     // A paired server's item plays from that server or through the

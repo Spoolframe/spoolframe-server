@@ -154,9 +154,9 @@ pub use watch_events::WatchEvent;
 // Playlists' wire types, as the calls take and return them.
 pub use servers::{ServerEntry, display_host};
 pub use session::{
-    ActiveProfile, Chunk, ChunkStream, ItemDetail, ItemsPage, Plan, Playback, PlaybackChange,
-    PlaybackOptions, PlaybackQuality, ProfileSignIn, Reauth, SavedProfile, Session, SignInMethod,
-    Subtitle,
+    ActiveProfile, Chunk, ChunkStream, ConversionDelivery, ItemDetail, ItemsPage, Plan, Playback,
+    PlaybackChange, PlaybackOptions, PlaybackQuality, ProfileSignIn, Reauth, SavedProfile, Session,
+    SignInMethod, Subtitle,
 };
 pub use spoolframe_protocol::playlists::{
     Builtin, EntryId, ItemKind, Kinds, Liked, PinNote, PinNoteReason, PlaySettings, PlaylistEdit,

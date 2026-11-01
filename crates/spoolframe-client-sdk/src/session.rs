@@ -17,8 +17,9 @@ use spoolframe_protocol::{
     SessionId, SessionInfo, TrackPreferencesInfo, UserSummary,
 };
 use spoolframe_types::{
-    ArtworkId, DisplayCapabilities, Item, ItemFilter, ItemFilterValues, ItemSort, Library,
-    LibraryId, Marker, MediaId, MediaTracks, PersonId, SubtitleFormat, TrackPreferences,
+    ArtworkId, ClientCapabilities, Delivery, DisplayCapabilities, Item, ItemFilter,
+    ItemFilterValues, ItemSort, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId,
+    SubtitleFormat, TrackPreferences,
 };
 
 use crate::client::Client;
@@ -256,6 +257,47 @@ pub struct PlaybackOptions {
     /// `None`: the screen as the app says it ([`crate::Client::set_display`]),
     /// read again at each re-plan, so a mode switched since counts.
     pub display: Option<DisplayCapabilities>,
+    /// How a conversion of this playback reaches the device, over the
+    /// order of the device's capabilities ([`crate::Device::capabilities`]).
+    /// Given, it holds for the life of the playback, its re-plans and
+    /// restarts too. The device's other capabilities stay as they are, so
+    /// a file it plays is still played as it is. `None`: the first way the
+    /// device's capabilities list. [`Session::playback_plan_on`] has no such
+    /// word on the wire: its plan is for the device's own order.
+    pub delivery: Option<ConversionDelivery>,
+}
+
+/// How a conversion reaches the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ConversionDelivery {
+    /// HLS playlists and segments.
+    Hls,
+    /// One stream written as it is encoded.
+    Progressive,
+}
+
+/// What `StartPlayback` says the device takes, where it differs from
+/// Hello's `device`: the server takes a play's capabilities whole, in
+/// place of Hello's, so all of `device` goes with `delivery` first in its
+/// list. The planner converts by the list's first way it knows, and plays
+/// a file as it is while the list has [`Delivery::Range`]. `None` for no
+/// `delivery`: Hello's apply.
+fn with_delivery(
+    device: &ClientCapabilities,
+    delivery: Option<ConversionDelivery>,
+) -> Option<ClientCapabilities> {
+    let chosen = match delivery? {
+        ConversionDelivery::Hls => Delivery::Hls,
+        ConversionDelivery::Progressive => Delivery::Progressive,
+    };
+    let mut delivery = device.deliveries();
+    delivery.retain(|way| *way != chosen);
+    delivery.insert(0, chosen);
+    Some(ClientCapabilities {
+        delivery,
+        ..device.clone()
+    })
 }
 
 /// The quality a viewer chooses for a playback. The app's own
@@ -1201,7 +1243,7 @@ impl Session {
             bitmap: options.bitmap,
             quality: self.wire_quality(options.quality),
             display: options.display.or_else(|| self.client.display()),
-            capabilities: None,
+            capabilities: with_delivery(&self.client.inner.device.capabilities, options.delivery),
             onward_share: None,
         };
         match self.call(request).await? {
@@ -2361,6 +2403,45 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+
+    fn device(delivery: Vec<Delivery>) -> ClientCapabilities {
+        ClientCapabilities {
+            video: [spoolframe_types::VideoCodec::H264].into(),
+            delivery,
+            max_bitrate: Some(8_000_000),
+            ..ClientCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn no_delivery_leaves_hello_s_capabilities_to_the_server() {
+        let device = device(vec![Delivery::Hls, Delivery::Progressive]);
+        assert_eq!(with_delivery(&device, None), None);
+    }
+
+    #[test]
+    fn a_delivery_goes_first_and_the_rest_of_the_device_goes_with_it() {
+        let device = device(vec![Delivery::Range, Delivery::Hls, Delivery::Progressive]);
+        let sent = with_delivery(&device, Some(ConversionDelivery::Progressive));
+        assert_eq!(
+            sent,
+            Some(ClientCapabilities {
+                delivery: vec![Delivery::Progressive, Delivery::Range, Delivery::Hls],
+                ..device
+            })
+        );
+    }
+
+    /// An empty list means range reads: a delivery added to it must not
+    /// turn every direct play into a conversion.
+    #[test]
+    fn a_device_that_listed_no_way_in_keeps_its_range_reads() {
+        let sent = with_delivery(&device(Vec::new()), Some(ConversionDelivery::Hls));
+        assert_eq!(
+            sent.map(|caps| caps.delivery),
+            Some(vec![Delivery::Hls, Delivery::Range])
+        );
+    }
 
     #[tokio::test]
     async fn sessions_kept_before_profiles_were_are_automatic() {

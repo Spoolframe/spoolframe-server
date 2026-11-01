@@ -3727,6 +3727,7 @@ mod tests {
                 start: Some(Duration::from_secs(5)),
                 bitmap: BitmapSubtitles::Text,
                 display: Some(sdr_display()),
+                delivery: Some(crate::ConversionDelivery::Progressive),
                 ..PlaybackOptions::default()
             };
             ManagedPlayback::open(server.clone(), item(), Some(selection), options)
@@ -3748,6 +3749,11 @@ mod tests {
             assert_eq!(options.start, Some(Duration::from_secs(600)));
             // And for the screen it started for (PGPU-06).
             assert_eq!(options.display, Some(sdr_display()));
+            // And the way it was to be converted.
+            assert_eq!(
+                options.delivery,
+                Some(crate::ConversionDelivery::Progressive)
+            );
         }
 
         /// The new playback knows where the viewer is, for Continue

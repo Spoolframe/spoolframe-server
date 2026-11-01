@@ -263,6 +263,27 @@ the screen as it is now with `SpoolClient.set_display(ScreenCapabilities)`
 change; every plan, open and re-plan that names no display of its own
 sends it, so a mode switch counts from the next plan. `None` forgets it.
 
+A setting between HLS and progressive goes with each play: `delivery` on
+`open_playback` and `play` (`ConversionDelivery.HLS` or `.PROGRESSIVE` in
+Kotlin, `.hls` or `.progressive` in Swift). It holds for that playback,
+through its re-plans and restarts, and the next play reads the setting
+again; left out, or `None`, the first way `DeviceSpec.capabilities` lists
+applies. It is about conversions: a file the device plays is still played
+as it is, and the rest of `DeviceSpec.capabilities` stays. `plan` has no
+`delivery`, so the plan it shows is by the device's own order.
+
+```kotlin
+val delivery = if (settings.progressive) ConversionDelivery.PROGRESSIVE
+    else ConversionDelivery.HLS
+val playback = session.openPlayback(id, start, tracks, quality, null, delivery = delivery)
+```
+
+```swift
+let delivery: ConversionDelivery = settings.progressive ? .progressive : .hls
+let playback = try await session.openPlayback(
+    id: id, start: start, tracks: tracks, quality: quality, display: nil, delivery: delivery)
+```
+
 The SDK may plan a playback again behind the player (an Auto playback
 on a slow link, or its share of the uplink moved). The object follows
 it: a read of the old plan's bytes answers `Replanned` once, the object

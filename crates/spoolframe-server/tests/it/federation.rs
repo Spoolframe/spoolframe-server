@@ -5672,6 +5672,76 @@ mod replica {
             pair.stop().await;
         }
 
+        /// A delivery chosen for a paired server's film holds by either
+        /// route: on a session of SA's own, and through SB, which passes
+        /// the device's capabilities on to SA.
+        #[tokio::test]
+        async fn a_paired_server_s_film_takes_the_delivery_by_either_route() {
+            use spoolframe_client_sdk::{
+                ConversionDelivery, PlaybackOptions, PlaybackPlan, RemoteMode,
+            };
+            use spoolframe_types::{ClientCapabilities, Delivery};
+            let pair = Pair::start_both(
+                "fed-media-delivery",
+                ServerOptions {
+                    real_media: true,
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            pair.share("plex:1").await;
+            pair.refresh().await;
+            pair.sa.generate_media(4, "libx264", "aac");
+            pair.sb.add_user("bob", "correct horse", None).await;
+            // The film's Matroska is no container of the device's.
+            let capabilities = ClientCapabilities {
+                delivery: vec![Delivery::Hls, Delivery::Progressive],
+                ..crate::support::hls_capabilities()
+            };
+            let (client, bob) = super::super::app::signed_in_playing(
+                &pair.sb,
+                "bob",
+                super::super::app::FEDERATION,
+                capabilities,
+            )
+            .await;
+            let alien = pair.fed(movie().id());
+            let options = || PlaybackOptions {
+                delivery: Some(ConversionDelivery::Progressive),
+                ..PlaybackOptions::default()
+            };
+            let progressive = |plan: &PlaybackPlan| {
+                matches!(
+                    plan,
+                    PlaybackPlan::Converted {
+                        delivery: Delivery::Progressive,
+                        ..
+                    }
+                )
+            };
+            let direct = bob
+                .open_any_playback(&alien, None, options())
+                .await
+                .unwrap();
+            assert_eq!(direct.route(), Some(RemoteMode::Direct));
+            let plan = direct.snapshot().plan;
+            assert!(progressive(&plan), "{plan:?}");
+            direct.close().await.unwrap();
+            let through = bob
+                .start_proxied_playback(&alien, None, options())
+                .await
+                .unwrap();
+            assert_eq!(through.mode, RemoteMode::Proxied);
+            assert!(
+                progressive(&through.playback.plan),
+                "{:?}",
+                through.playback.plan
+            );
+            client.close().await;
+            pair.stop().await;
+        }
+
         /// A track of SA's, shared and its file written: what plays after
         /// the film, which is alone in its library.
         async fn sa_s_track(pair: &Pair) -> MediaId {
