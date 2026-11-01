@@ -136,6 +136,7 @@ impl TestBackend {
             } else {
                 direct_plan()
             },
+            wan: None,
         }
     }
     pub async fn start_playback(
@@ -274,6 +275,7 @@ impl PlaybackBackend for TestBackend {
             },
             size: 0,
             epoch: 1,
+            wan: None,
         })
     }
     fn shares(&self) -> Option<tokio::sync::broadcast::Receiver<crate::managed::PlaybackShare>> {

@@ -102,6 +102,7 @@ impl PlaybackBackend for Hls {
             plan,
             size: 0,
             epoch: 1,
+            wan: None,
         })
     }
     async fn subtitle(
@@ -174,6 +175,7 @@ fn snapshot() -> sdk::Playback {
         epoch: 0,
         markers: vec![],
         duration: None,
+        wan: None,
     }
 }
 

@@ -1859,6 +1859,7 @@ impl ManagedPlayback {
             plan: changed.plan,
             size: changed.size,
             epoch: changed.epoch,
+            wan: changed.wan,
             ..state.playback.clone()
         };
         state.set_playback(next, &self.0.generation);
@@ -1926,7 +1927,7 @@ impl ManagedPlayback {
             Err(error) => return Err(error),
         };
         if changed.plan == p.plan && changed.epoch == p.epoch {
-            return Ok(p);
+            return Ok(self.same_plan(changed.wan));
         }
         let mut state = self.0.state.lock();
         // A new encode under the same handle.
@@ -1934,6 +1935,7 @@ impl ManagedPlayback {
             plan: changed.plan,
             size: changed.size,
             epoch: changed.epoch,
+            wan: changed.wan,
             ..state.playback.clone()
         };
         state.set_playback(next, &self.0.generation);
@@ -2031,13 +2033,15 @@ impl ManagedPlayback {
         state.options.quality = quality;
         state.position = Some(position);
         if changed.plan == p.plan && changed.epoch == p.epoch {
-            return Ok(state.playback.clone());
+            drop(state);
+            return Ok(self.same_plan(changed.wan));
         }
         // A new encode under the same handle.
         let next = Playback {
             plan: changed.plan,
             size: changed.size,
             epoch: changed.epoch,
+            wan: changed.wan,
             ..state.playback.clone()
         };
         state.set_playback(next, &self.0.generation);
@@ -2046,6 +2050,21 @@ impl ManagedPlayback {
         self.0.changed.send_replace(next.clone());
         Ok(next)
     }
+    /// A re-plan that came back the same: nothing moves, and the playback
+    /// takes the server's verdict of this answer ([`Playback::wan`]), told
+    /// to [`Self::changes`] when it is another.
+    fn same_plan(&self, wan: Option<bool>) -> Playback {
+        let mut state = self.0.state.lock();
+        let told = state.playback.wan != wan;
+        state.playback.wan = wan;
+        let now = state.playback.clone();
+        drop(state);
+        if told {
+            self.0.changed.send_replace(now.clone());
+        }
+        now
+    }
+
     /// Report `final_position` and stop. A playback the server had ended
     /// is resumed to take the position (Continue watching), then stopped.
     pub async fn finish(&self, final_position: Duration) -> Result<(), SdkError> {
@@ -2271,6 +2290,8 @@ mod tests {
         copy_subtitle: std::sync::atomic::AtomicBool,
         /// The server's subtitle timing changes, once a test sends some.
         timings: Mutex<Option<broadcast::Sender<crate::SubtitleTimingEvent>>>,
+        /// The server's verdict on each re-plan.
+        wan: Mutex<Option<bool>>,
     }
     use std::sync::atomic::Ordering::SeqCst;
     fn item() -> MediaId {
@@ -2291,6 +2312,7 @@ mod tests {
             epoch: 0,
             markers: vec![],
             duration: None,
+            wan: None,
         }
     }
     #[test]
@@ -2440,6 +2462,7 @@ mod tests {
                 plan: playback(1).plan,
                 size: 100,
                 epoch: 0,
+                wan: *self.wan.lock(),
             })
         }
         fn route(&self) -> Option<crate::RemoteMode> {
@@ -2567,6 +2590,28 @@ mod tests {
     /// Auto. A share event that arrived while the pick was on the server
     /// found the playback still in Auto and queued a re-plan for Auto
     /// behind it; the re-plan must not undo the pick.
+    /// A device that moved off the LAN and re-plans to the same plan:
+    /// nothing moves for the player, and the server's verdict is the new
+    /// one all the same, told to a watcher.
+    #[tokio::test]
+    async fn a_re_plan_to_the_same_plan_takes_the_server_s_verdict() {
+        let backend = Arc::new(Backend::default());
+        *backend.wan.lock() = Some(true);
+        let p = open(backend).await;
+        assert_eq!(p.snapshot().wan, None);
+        let mut changes = p.changes();
+        let generation = p.generation();
+        let same = p
+            .change_quality(PlaybackQuality::Auto, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(same.wan, Some(true));
+        assert_eq!(p.snapshot().wan, Some(true));
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(changes.borrow_and_update().wan, Some(true));
+        assert_eq!(p.generation(), generation);
+    }
+
     #[tokio::test]
     async fn a_share_queued_behind_a_quality_pick_does_not_undo_it() {
         let b = Arc::new(Backend::default());
@@ -3598,6 +3643,7 @@ mod tests {
                         plan: self.plan.lock().clone().expect("started"),
                         size: 0,
                         epoch,
+                        wan: None,
                     }),
                     // What the plan becomes is not what these tests look at.
                     None => Err(SdkError::Busy),

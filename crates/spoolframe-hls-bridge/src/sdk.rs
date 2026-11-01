@@ -189,6 +189,7 @@ mod tests {
             epoch,
             markers: Vec::new(),
             duration: None,
+            wan: None,
         }
     }
 

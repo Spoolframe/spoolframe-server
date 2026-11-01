@@ -208,6 +208,7 @@ impl Lying {
                 epoch: 0,
                 markers: spoolframe_types::Markers::default(),
                 duration: None,
+                wan: None,
             },
             Request::Ping => Reply::Pong,
             _ => Reply::Done,

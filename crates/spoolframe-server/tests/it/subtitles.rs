@@ -670,6 +670,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
         plan: PlaybackPlan::Direct { subtitle, .. },
         size: same_size,
         epoch: 0,
+        ..
     }) = response
     else {
         panic!("not changed in place: {response:?}");

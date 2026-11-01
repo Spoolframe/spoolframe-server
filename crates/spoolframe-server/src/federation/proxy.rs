@@ -623,6 +623,8 @@ impl Federation {
                     epoch,
                     markers,
                     duration,
+                    // Of this server's own link to SA: not the device's.
+                    wan: _,
                 }) => {
                     play.handle = handle;
                     play.revision = AtomicU64::new(revision);

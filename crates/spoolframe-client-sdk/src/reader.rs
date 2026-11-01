@@ -851,6 +851,7 @@ mod tests {
             epoch: 0,
             markers: Vec::new(),
             duration: None,
+            wan: None,
         };
         let reader = MediaReader::for_test(
             session,

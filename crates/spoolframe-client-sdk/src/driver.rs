@@ -583,6 +583,7 @@ mod tests {
                 epoch: 0,
                 markers: Vec::new(),
                 duration: None,
+                wan: None,
             })
         }
         async fn read(&self, h: &PlaybackHandle, _: u64, _: u64) -> Result<Vec<u8>, SdkError> {
@@ -632,6 +633,7 @@ mod tests {
                 plan: p.plan,
                 size: p.size,
                 epoch: self.epoch.fetch_add(1, SeqCst) + 1,
+                wan: None,
             })
         }
         async fn progress(&self, _: &PlaybackHandle, _: Duration) -> Result<(), SdkError> {

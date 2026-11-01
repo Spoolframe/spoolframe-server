@@ -64,6 +64,7 @@ fn snapshot() -> Playback {
         handle: PlaybackHandle("test-playback".into()),
         plan: sdk::PlaybackPlan::Direct { container: types::Container::Mp4, video: None, audio: None, subtitle: None, source_codec: None },
         size: 2, chosen: None, epoch: 0, markers: vec![], duration: None,
+        wan: None,
     }
 }
 

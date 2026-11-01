@@ -4361,6 +4361,7 @@ impl ClientProtocol {
                         epoch: 0,
                         markers: markers.into(),
                         duration,
+                        wan: None,
                     })
                 }
                 .await;
@@ -4432,7 +4433,12 @@ impl ClientProtocol {
                 );
                 drop(replaced);
                 tracing::info!(id = %playback.item, epoch, "playback's subtitle changed");
-                Ok(Reply::PlaybackChanged { plan, size, epoch })
+                Ok(Reply::PlaybackChanged {
+                    plan,
+                    size,
+                    epoch,
+                    wan: None,
+                })
             }
             Request::ChangeQuality {
                 handle,
@@ -4482,6 +4488,7 @@ impl ClientProtocol {
                         plan,
                         size: playback.size,
                         epoch: epoch_now,
+                        wan: None,
                     });
                 }
                 // A plan nothing plays under is `CannotPlay` from here, and
@@ -4524,7 +4531,12 @@ impl ClientProtocol {
                     source_codec = plan.source_codec().unwrap_or("unknown"),
                     "playback planned again for its quality"
                 );
-                Ok(Reply::PlaybackChanged { plan, size, epoch })
+                Ok(Reply::PlaybackChanged {
+                    plan,
+                    size,
+                    epoch,
+                    wan: None,
+                })
             }
             Request::StopPlayback { handle } => {
                 // Its session and endpoint were checked above, with its
@@ -7003,6 +7015,7 @@ impl ClientProtocol {
             epoch,
             markers: markers.into(),
             duration,
+            wan: None,
         })
     }
 

@@ -262,6 +262,7 @@ fn responses() -> Vec<(&'static str, RpcResponse)> {
                     },
                     size: 0,
                     epoch: 1,
+                    wan: Some(true),
                 })),
             },
         ),

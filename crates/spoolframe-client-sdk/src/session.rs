@@ -215,6 +215,17 @@ pub struct Playback {
     pub markers: Vec<Marker>,
     /// The item's running time, when the server knows it.
     pub duration: Option<Duration>,
+    /// Whether the server counts this device off its LAN, as of this
+    /// start or the last re-plan: `Some(true)`, it holds the play to its
+    /// uplink; `Some(false)`, it does not. Show this for what the server
+    /// counted: it knows `network.wan_prefixes`, and
+    /// [`crate::ConnectionPath`] is only the address as this device sees
+    /// it, so a WireGuard address the server lists there is
+    /// [`crate::ConnectionPath::Lan`] and `Some(true)`. It is the verdict
+    /// of the server this session talks to: the paired server on a direct
+    /// route, the user's own on a proxied one. `None`: an older server,
+    /// which does not say.
+    pub wan: Option<bool>,
 }
 
 /// A playback after [`Session::change_subtitle`].
@@ -225,6 +236,8 @@ pub struct PlaybackChange {
     pub size: u64,
     /// As [`Playback::epoch`]; 0 for direct play.
     pub epoch: u32,
+    /// As [`Playback::wan`], as of this re-plan.
+    pub wan: Option<bool>,
 }
 
 /// How to start a playback, beyond its tracks.
@@ -1200,6 +1213,7 @@ impl Session {
                 epoch,
                 markers,
                 duration,
+                wan,
             } => Ok(Playback {
                 handle,
                 plan,
@@ -1208,6 +1222,7 @@ impl Session {
                 epoch,
                 markers: markers.into_vec(),
                 duration,
+                wan,
             }),
             other => Err(unexpected(other)),
         }
@@ -1780,9 +1795,17 @@ impl Session {
             onward_share: None,
         };
         match self.call(request).await? {
-            Reply::PlaybackChanged { plan, size, epoch } => {
-                Ok(PlaybackChange { plan, size, epoch })
-            }
+            Reply::PlaybackChanged {
+                plan,
+                size,
+                epoch,
+                wan,
+            } => Ok(PlaybackChange {
+                plan,
+                size,
+                epoch,
+                wan,
+            }),
             other => Err(unexpected(other)),
         }
     }
@@ -1875,9 +1898,17 @@ impl Session {
             onward_share: None,
         };
         match self.call(request).await? {
-            Reply::PlaybackChanged { plan, size, epoch } => {
-                Ok(PlaybackChange { plan, size, epoch })
-            }
+            Reply::PlaybackChanged {
+                plan,
+                size,
+                epoch,
+                wan,
+            } => Ok(PlaybackChange {
+                plan,
+                size,
+                epoch,
+                wan,
+            }),
             other => Err(unexpected(other)),
         }
     }

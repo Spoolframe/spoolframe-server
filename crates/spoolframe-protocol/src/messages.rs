@@ -1945,6 +1945,12 @@ pub enum Reply {
             with = "spoolframe_types::serde_time::millis::option"
         )]
         duration: Option<std::time::Duration>,
+        /// Whether this server counts the device off its LAN (PX-46): its
+        /// verdict on the path it goes by, from `network.lan_prefixes` and
+        /// `network.wan_prefixes` too, which the device cannot see. Absent
+        /// from an older server's reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wan: Option<bool>,
     },
     /// A seek restarted the encode: reads name this epoch from offset 0.
     PlaybackSeeked {
@@ -1969,6 +1975,9 @@ pub enum Reply {
         plan: PlaybackPlan,
         size: u64,
         epoch: u32,
+        /// As `PlaybackStarted`'s, as this re-plan was made.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wan: Option<bool>,
     },
     /// An HLS playlist, as text.
     Manifest {

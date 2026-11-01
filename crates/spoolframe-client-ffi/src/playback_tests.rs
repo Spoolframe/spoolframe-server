@@ -20,6 +20,8 @@ struct Backend {
     /// A subtitle change encodes again (a conversion's); else it plays
     /// on as it is (a direct play's).
     reencodes: bool,
+    /// The server's verdict on a subtitle change.
+    wan: Option<bool>,
     /// The next read finds the playback ended on the server.
     expire: std::sync::atomic::AtomicBool,
     /// Playbacks started: each under a handle of its own.
@@ -124,6 +126,7 @@ impl PlaybackBackend for Backend {
             plan: snapshot().plan,
             size: 2,
             epoch: u32::from(self.reencodes),
+            wan: self.wan,
         })
     }
     /// Planned again: the file in another container.
@@ -137,6 +140,7 @@ impl PlaybackBackend for Backend {
             plan: replanned().plan,
             size: 2,
             epoch: 0,
+            wan: None,
         })
     }
     async fn progress(&self, _: &PlaybackHandle, position: Duration) -> Result<(), SdkError> {
@@ -199,6 +203,7 @@ fn snapshot() -> sdk::Playback {
         epoch: 0,
         markers: vec![],
         duration: None,
+        wan: None,
     }
 }
 
@@ -314,6 +319,25 @@ async fn an_opened_playback_has_no_url_and_reads_its_file() {
         .await
         .unwrap();
     assert_eq!((playback.info().url, bytes), (None, Ok(vec![1, 1])));
+}
+
+/// A re-plan that leaves the player where it is moves no `PlaybackStart`,
+/// and the overlay reads the server's verdict of it all the same.
+#[tokio::test]
+async fn a_re_plan_that_moves_nothing_still_updates_the_verdict() {
+    let backend = Arc::new(Backend {
+        wan: Some(true),
+        ..Backend::default()
+    });
+    let playback = playing(backend, snapshot());
+    assert_eq!(playback.wan(), None);
+    let moved = playback
+        .clone()
+        .change_subtitle(None, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(moved.is_none());
+    assert_eq!(playback.wan(), Some(true));
 }
 
 #[tokio::test]

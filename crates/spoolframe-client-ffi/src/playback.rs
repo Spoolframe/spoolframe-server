@@ -516,6 +516,17 @@ impl SpoolPlayback {
         (*start).clone()
     }
 
+    /// Whether the server counts this device off its LAN, for an overlay:
+    /// its verdict, as of the start or the last re-plan, and the one to
+    /// show. `SpoolSession.connection_path()` is only the address as this
+    /// device sees it, which can't tell a WireGuard peer the server lists
+    /// in `network.wan_prefixes`. On a proxied play it is the user's own
+    /// server's, of this device's link to it. `None`: an older server.
+    pub fn wan(&self) -> Option<bool> {
+        let plan = self.current.lock().expect("never poisoned").plan.clone();
+        plan.managed.snapshot().wan
+    }
+
     /// Up to `length` bytes from `offset` of a direct play's file or a
     /// progressive conversion's output; none at the end. Blocks until
     /// they are here. `Cancelled` while `set_flushing(true)` holds. One

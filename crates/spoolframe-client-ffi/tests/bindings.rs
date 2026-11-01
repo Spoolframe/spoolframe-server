@@ -175,7 +175,9 @@ import uniffi.spoolframe_client_ffi.PlaybackStart
 import uniffi.spoolframe_client_ffi.SpoolException
 import uniffi.spoolframe_client_ffi.SpoolMarkers
 import uniffi.spoolframe_client_ffi.SpoolPlayback
+import uniffi.spoolframe_client_ffi.SpoolSession
 import uniffi.spoolframe_client_ffi.undoWindow
+import uniffi.spoolframe_client_sdk.ConnectionPath
 import uniffi.spoolframe_client_sdk.MarkerAction
 import uniffi.spoolframe_client_sdk.MarkerOffer
 import uniffi.spoolframe_types.Marker
@@ -226,6 +228,20 @@ suspend fun seek(
         return
     }
     if (start == null) inPlayer(to) else rebuild(start)
+}
+
+fun overlayLink(playback: SpoolPlayback, session: SpoolSession): String {
+    val counted = when (playback.wan()) {
+        true -> \"WAN\"
+        false -> \"LAN\"
+        null -> null
+    }
+    return counted ?: when (session.connectionPath()) {
+        is ConnectionPath.Lan -> \"private address\"
+        is ConnectionPath.Direct -> \"direct\"
+        ConnectionPath.Relay -> \"relay\"
+        ConnectionPath.Unknown -> \"unknown\"
+    }
 }
 
 fun read(playback: SpoolPlayback, offset: ULong, length: ULong): ByteArray? = try {
@@ -289,6 +305,18 @@ func seek(
             inPlayer(to)
         }
     } catch SpoolError.Cancelled {
+    }
+}
+
+func overlayLink(_ playback: SpoolPlayback, _ session: SpoolSession) -> String {
+    if let wan = playback.wan() {
+        return wan ? \"WAN\" : \"LAN\"
+    }
+    switch session.connectionPath() {
+    case .lan: return \"private address\"
+    case .direct: return \"direct\"
+    case .relay: return \"relay\"
+    case .unknown: return \"unknown\"
     }
 }
 

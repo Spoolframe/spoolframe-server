@@ -645,6 +645,7 @@ fn every_reply_round_trips() {
             },
             size: 0,
             epoch: 3,
+            wan: None,
         },
         Reply::Manifest {
             text: "#EXTM3U\n".into(),
@@ -671,6 +672,7 @@ fn every_reply_round_trips() {
             }),
             markers: markers().into(),
             duration: None,
+            wan: None,
         },
         Reply::TrackPreferences(TrackPreferencesInfo {
             preferences: TrackPreferences::default(),
@@ -1864,6 +1866,7 @@ fn playback_started(markers: Vec<Marker>) -> Reply {
         epoch: 0,
         markers: markers.into(),
         duration: None,
+        wan: None,
     }
 }
 
@@ -1970,6 +1973,81 @@ fn an_older_server_s_started_playback_has_no_running_time() {
         panic!("not a started playback")
     };
     assert_eq!(duration, None);
+}
+
+/// The replies that carry `wan`, as they were before it.
+mod before_wan {
+    use crate::{ChosenTracks, PlaybackHandle, PlaybackPlan};
+    use serde::{Deserialize, Serialize};
+    use spoolframe_types::Marker;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum Reply {
+        PlaybackStarted {
+            handle: PlaybackHandle,
+            plan: PlaybackPlan,
+            size: u64,
+            chosen: Option<ChosenTracks>,
+            epoch: u32,
+            markers: Vec<Marker>,
+            duration_ms: Option<u64>,
+        },
+        PlaybackChanged {
+            plan: PlaybackPlan,
+            size: u64,
+            epoch: u32,
+        },
+    }
+}
+
+#[test]
+fn an_older_server_s_playback_replies_have_no_wan_verdict() {
+    let plan = || PlaybackPlan::Unsupported { reasons: vec![] };
+    let started = codec::encode(&before_wan::Reply::PlaybackStarted {
+        handle: crate::PlaybackHandle("h".into()),
+        plan: plan(),
+        size: 1,
+        chosen: None,
+        epoch: 0,
+        markers: markers(),
+        duration_ms: None,
+    })
+    .unwrap();
+    let Reply::PlaybackStarted { wan, .. } = codec::decode(&started).unwrap() else {
+        panic!("not a started playback")
+    };
+    assert_eq!(wan, None);
+    let changed = codec::encode(&before_wan::Reply::PlaybackChanged {
+        plan: plan(),
+        size: 1,
+        epoch: 0,
+    })
+    .unwrap();
+    let Reply::PlaybackChanged { wan, .. } = codec::decode(&changed).unwrap() else {
+        panic!("not a changed playback")
+    };
+    assert_eq!(wan, None);
+}
+
+/// A verdict is sent either way, `false` too; no verdict is no field, and
+/// an older client reads a reply that has one.
+#[test]
+fn the_wan_verdict_is_sent_only_when_there_is_one() {
+    let with = |verdict| {
+        let mut started = playback_started(markers());
+        if let Reply::PlaybackStarted { wan, .. } = &mut started {
+            *wan = verdict;
+        }
+        started
+    };
+    let json = |verdict| serde_json::to_value(with(verdict)).unwrap();
+    assert_eq!(json(Some(true))["wan"], true);
+    assert_eq!(json(Some(false))["wan"], false);
+    assert!(json(None).get("wan").is_none());
+    round_trip(Response::Ok(with(Some(true))));
+    let bytes = codec::encode(&with(Some(true))).unwrap();
+    assert!(codec::decode::<before_wan::Reply>(&bytes).is_ok());
 }
 
 #[test]
