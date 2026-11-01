@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Server: `PlaybackStarted` and `PlaybackChanged` carry `wan`, whether the
+  server counts the device off its LAN, so an app can show it. The device
+  can't work that out: a WireGuard peer listed in `network.wan_prefixes`
+  has a private address, and the overlay said LAN. Through a paired
+  server, the verdict is that server's, of the device's link to it, not
+  the origin's. An older server sends no `wan`, an older app ignores it.
+- SDK (BREAKING for code that builds these structs, such as an app's own
+  `PlaybackBackend`): `Playback.wan` and `PlaybackChange.wan`,
+  `Option<bool>`, kept current on `ManagedPlayback` across re-plans,
+  a re-plan to the same plan too. `None` is an older server.
+  `ConnectionPath` is unchanged, and its docs now say that `Lan` is a
+  private address as this device sees it, not the server's verdict.
+- FFI: `SpoolPlayback.wan()` is that verdict, for a diagnostics overlay.
+
 ## 0.17.0 (2026-10-31)
 
 The client crates' Rust API breaks (BREAKING below); the wire does not,

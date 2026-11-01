@@ -291,6 +291,28 @@ reaches it, else through the user's own (`PlaybackStart.proxied`). That
 routing (`federation.rs`) moves into the SDK as
 `Session::open_any_playback`.
 
+For a diagnostics overlay, show `SpoolPlayback.wan()` first: `true`, the
+server counts this device off its LAN; `false`, it does not; `nil` or
+`null`, an older server, which does not say. It is the server's verdict,
+kept current across re-plans, and it can differ from
+`SpoolSession.connection_path()`, which is only the address as this
+device sees it: `Lan` is any private address, a WireGuard peer the
+server lists in `network.wan_prefixes` too. Show `connection_path()` for
+how the packets go (the address, a relay). On a proxied play `wan()` is
+the user's own server's, of this device's link to it.
+
+```kotlin
+val link = when (playback.wan()) {
+    true -> "WAN"
+    false -> "LAN"
+    null -> "not told"
+}
+```
+
+```swift
+let link = playback.wan().map { $0 ? "WAN" : "LAN" } ?? "not told"
+```
+
 ## From the Coldsteel registry
 
 During development, take this crate and the SDK crates under it from the

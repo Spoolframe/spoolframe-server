@@ -158,6 +158,15 @@ attempts cleanup; call `finish` or `close` before shutting down Tokio to
 await it reliably. Construct an owner in a Tokio runtime (`adopt` also
 requires an entered runtime).
 
+For a diagnostics overlay, `snapshot().wan` is the server's verdict:
+`Some(true)`, it counts this device off its LAN; `Some(false)`, it does
+not; `None`, an older server, which does not say. It stays current across
+re-plans and restarts, and `changes()` tells when it moves. Show it for
+what the server counted. `Session::connection_path` shows how the
+packets go, but its `Lan` is only a private address as this device sees
+it, which can be a WireGuard peer the server lists in
+`network.wan_prefixes`.
+
 ### When the server ends a playback
 
 The server ends a playback after a long pause, when it restarts, or when the

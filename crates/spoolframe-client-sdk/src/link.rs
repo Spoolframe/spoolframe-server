@@ -79,11 +79,16 @@ pub enum ConnectionState {
 /// Iroh says whether its selected path is a relay or an IP address, not
 /// how an IP path came about, so a hole punched through NAT and an open
 /// port look the same. What the address is does tell the local network
-/// apart: `Lan` is a private, link-local or loopback address.
+/// apart: `Lan` is a private, link-local or loopback address, as this
+/// device sees it. It is not what the server counted: the server also goes
+/// by `network.lan_prefixes` and `network.wan_prefixes`, which a device
+/// can't see, so a WireGuard peer it counts off the LAN is `Lan` here. To
+/// show what the server counted, use [`crate::Playback::wan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ConnectionPath {
-    /// Straight to the server on the local network.
+    /// Straight to the server at a private address, as this device sees
+    /// it: on the local network, or on a VPN.
     Lan { addr: SocketAddr },
     /// Straight to a public address, across the internet: through an open
     /// port or a hole punched in NAT.
