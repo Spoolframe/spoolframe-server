@@ -5742,6 +5742,84 @@ mod replica {
             pair.stop().await;
         }
 
+        /// A play's list holds for a paired server's film by either route:
+        /// the file's AC-3, which Hello lists, is encoded to the list's one
+        /// codec.
+        #[tokio::test]
+        async fn a_paired_server_s_film_takes_the_audio_list_by_either_route() {
+            use spoolframe_client_sdk::{
+                PlaybackAudio, PlaybackOptions, PlaybackPlan, PlaybackQuality, RemoteMode,
+            };
+            use spoolframe_types::{AudioCodec, ClientCapabilities, Container};
+            let pair = Pair::start_both(
+                "fed-media-audio",
+                ServerOptions {
+                    real_media: true,
+                    ..ServerOptions::default()
+                },
+                ServerOptions::default(),
+            )
+            .await;
+            pair.share("plex:1").await;
+            pair.refresh().await;
+            pair.sa.generate_media(4, "libx264", "ac3");
+            pair.sb.add_user("bob", "correct horse", None).await;
+            let capabilities = ClientCapabilities {
+                containers: [Container::Matroska, Container::Mp4, Container::MpegTs].into(),
+                audio: [AudioCodec::Aac, AudioCodec::Ac3].into(),
+                ..crate::support::hls_capabilities()
+            };
+            let (client, bob) = super::super::app::signed_in_playing(
+                &pair.sb,
+                "bob",
+                super::super::app::FEDERATION,
+                capabilities,
+            )
+            .await;
+            let alien = pair.fed(movie().id());
+            let options = || PlaybackOptions {
+                quality: PlaybackQuality::Original,
+                audio: Some(PlaybackAudio {
+                    codecs: [AudioCodec::Aac].into(),
+                    max_channels: None,
+                }),
+                ..PlaybackOptions::default()
+            };
+            let encoded = |plan: &PlaybackPlan| {
+                matches!(
+                    plan,
+                    PlaybackPlan::Converted { audio: Some(audio), .. }
+                        if matches!(
+                            audio.action,
+                            spoolframe_client_sdk::AudioAction::Encode {
+                                codec: AudioCodec::Aac,
+                                ..
+                            }
+                        )
+                )
+            };
+            let direct = bob
+                .open_any_playback(&alien, None, options())
+                .await
+                .unwrap();
+            assert_eq!(direct.route(), Some(RemoteMode::Direct));
+            let plan = direct.snapshot().plan;
+            assert!(encoded(&plan), "{plan:?}");
+            direct.close().await.unwrap();
+            let through = bob
+                .start_proxied_playback(&alien, None, options())
+                .await
+                .unwrap();
+            assert_eq!(through.mode, RemoteMode::Proxied);
+            assert!(
+                encoded(&through.playback.plan),
+                "{:?}",
+                through.playback.plan
+            );
+            client.close().await;
+            pair.stop().await;
+        }
+
         /// A track of SA's, shared and its file written: what plays after
         /// the film, which is alone in its library.
         async fn sa_s_track(pair: &Pair) -> MediaId {

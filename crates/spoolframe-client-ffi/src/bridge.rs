@@ -21,11 +21,11 @@ use spoolframe_client_sdk::{ConversionDelivery, PlaybackQuality, Selection};
 use tokio::net::TcpListener;
 
 use crate::error::SpoolError;
-use crate::playback::{RegisteredPlayback, SpoolPlayback, open, registered};
+use crate::playback::{RegisteredPlayback, SpoolPlayback, open, play_options, registered};
 use crate::resources::bridge;
 use crate::runtime::run;
 use crate::session::SpoolSession;
-use crate::values::ScreenCapabilities;
+use crate::values::{AudioOutput, ScreenCapabilities};
 
 /// The listening socket's port, and its accept loop.
 pub(crate) static LISTENER: tokio::sync::Mutex<Option<(u16, tokio::task::AbortHandle)>> =
@@ -35,7 +35,8 @@ pub(crate) static LISTENER: tokio::sync::Mutex<Option<(u16, tokio::task::AbortHa
 impl SpoolSession {
     /// Start playing `id` for a URL player: `open_playback`, served on
     /// the loopback bridge, at `info().url`.
-    #[uniffi::method(default(delivery = None))]
+    #[uniffi::method(default(delivery = None, audio = None))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn play(
         &self,
         id: MediaId,
@@ -44,10 +45,12 @@ impl SpoolSession {
         quality: PlaybackQuality,
         display: Option<ScreenCapabilities>,
         delivery: Option<ConversionDelivery>,
+        audio: Option<AudioOutput>,
     ) -> Result<Arc<SpoolPlayback>, SpoolError> {
         let session = self.session.clone();
+        let options = play_options(start, quality, display, delivery, audio);
         let opened = run(async move {
-            let opened = open(session, id, start, tracks, quality, display, delivery).await?;
+            let opened = open(session, id, tracks, options).await?;
             serve_opened(opened).await
         })
         .await?;

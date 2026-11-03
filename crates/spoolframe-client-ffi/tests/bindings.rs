@@ -171,6 +171,8 @@ fn kotlin_bindings_compile() {
 /// and the shapes of the actions, on what an app compiles.
 const MARKERS_IN_KOTLIN: &str = "
 import java.time.Duration
+import uniffi.spoolframe_client_ffi.AudioOutput
+import uniffi.spoolframe_client_ffi.DeviceCapabilities
 import uniffi.spoolframe_client_ffi.PlaybackStart
 import uniffi.spoolframe_client_ffi.SpoolException
 import uniffi.spoolframe_client_ffi.SpoolMarkers
@@ -182,6 +184,7 @@ import uniffi.spoolframe_client_sdk.ConversionDelivery
 import uniffi.spoolframe_client_sdk.MarkerAction
 import uniffi.spoolframe_client_sdk.MarkerOffer
 import uniffi.spoolframe_client_sdk.PlaybackQuality
+import uniffi.spoolframe_types.AudioCodec
 import uniffi.spoolframe_types.Marker
 
 fun follow(playback: SpoolPlayback): SpoolMarkers =
@@ -274,6 +277,38 @@ suspend fun playAsSet(
 
 suspend fun playAsListed(session: SpoolSession, id: String): SpoolPlayback =
     session.openPlayback(id, null, null, PlaybackQuality.Auto, null)
+
+// Settings > Passthrough, read at each play: on, what the receiver takes
+// joins the list and the receiver's channels replace the device's; off,
+// the list is what the device decodes itself; Auto leaves `audio` out.
+suspend fun playPassingThrough(
+    session: SpoolSession,
+    id: String,
+    device: DeviceCapabilities,
+    decoded: List<AudioCodec>,
+    always: Boolean?,
+): SpoolPlayback {
+    val audio = when (always) {
+        true -> AudioOutput(device.audio + listOf(AudioCodec.EAC3, AudioCodec.TRUE_HD), maxChannels = 8u)
+        false -> AudioOutput(decoded)
+        null -> null
+    }
+    return session.openPlayback(id, null, null, PlaybackQuality.Auto, null, audio = audio)
+}
+
+suspend fun playDecodedProgressively(
+    session: SpoolSession,
+    id: String,
+    decoded: List<AudioCodec>,
+): SpoolPlayback = session.play(
+    id,
+    null,
+    null,
+    PlaybackQuality.Auto,
+    null,
+    delivery = ConversionDelivery.PROGRESSIVE,
+    audio = AudioOutput(decoded),
+)
 ";
 
 /// The same in Swift.
@@ -367,6 +402,35 @@ func playAsSet(
 
 func playAsListed(_ session: SpoolSession, _ id: MediaId) async throws -> SpoolPlayback {
     try await session.openPlayback(id: id, start: nil, tracks: nil, quality: .auto, display: nil)
+}
+
+// Settings > Passthrough, read at each play: on, what the receiver takes
+// joins the list and the receiver's channels replace the device's; off,
+// the list is what the device decodes itself; Auto leaves `audio` out.
+func playPassingThrough(
+    _ session: SpoolSession,
+    _ id: MediaId,
+    device: DeviceCapabilities,
+    decoded: [AudioCodec],
+    always: Bool?
+) async throws -> SpoolPlayback {
+    let audio: AudioOutput? = always.map { on in
+        on
+            ? AudioOutput(codecs: device.audio + [.eac3, .trueHd], maxChannels: 8)
+            : AudioOutput(codecs: decoded)
+    }
+    return try await session.openPlayback(
+        id: id, start: nil, tracks: nil, quality: .auto, display: nil, audio: audio)
+}
+
+func playDecodedProgressively(
+    _ session: SpoolSession,
+    _ id: MediaId,
+    decoded: [AudioCodec]
+) async throws -> SpoolPlayback {
+    try await session.play(
+        id: id, start: nil, tracks: nil, quality: .auto, display: nil,
+        delivery: .progressive, audio: AudioOutput(codecs: decoded))
 }
 ";
 

@@ -3728,6 +3728,10 @@ mod tests {
                 bitmap: BitmapSubtitles::Text,
                 display: Some(sdr_display()),
                 delivery: Some(crate::ConversionDelivery::Progressive),
+                audio: Some(crate::PlaybackAudio {
+                    codecs: [spoolframe_types::AudioCodec::Aac].into(),
+                    max_channels: Some(6),
+                }),
                 ..PlaybackOptions::default()
             };
             ManagedPlayback::open(server.clone(), item(), Some(selection), options)
@@ -3754,6 +3758,9 @@ mod tests {
                 options.delivery,
                 Some(crate::ConversionDelivery::Progressive)
             );
+            // And the sound it may carry.
+            assert_eq!(s.starts.lock()[0].1.audio, options.audio);
+            assert!(options.audio.is_some());
         }
 
         /// The new playback knows where the viewer is, for Continue

@@ -12,10 +12,10 @@ use spoolframe_client_sdk::types::{
     PlaybackState, VideoCodec,
 };
 use spoolframe_client_sdk::{
-    ArtworkSize, BitmapSubtitles, Client, ConnectionPath, ConnectionState, ConversionDelivery,
-    Device, MAX_READ, ManifestKind, MemoryStorage, PinProof, PlaybackHandle, PlaybackOptions,
-    PlaybackPlan, PlaybackQuality, PlayerSession, ProfileSignIn, SdkError, Selection, Session,
-    SignInMethod, Storage, TopResult,
+    ArtworkSize, AudioAction, BitmapSubtitles, Client, ConnectionPath, ConnectionState,
+    ConversionDelivery, Device, MAX_READ, ManifestKind, MemoryStorage, PinProof, PlaybackAudio,
+    PlaybackHandle, PlaybackOptions, PlaybackPlan, PlaybackQuality, PlayerSession, ProfileSignIn,
+    SdkError, Selection, Session, SignInMethod, Storage, TopResult,
 };
 use spoolframe_server::admission::Admission;
 use support::{
@@ -135,6 +135,7 @@ async fn a_share_watch_ends_once_the_playback_and_client_are_dropped() {
             None,
             None,
             spoolframe_client_sdk::PlaybackQuality::default(),
+            None,
             None,
             None,
         )
@@ -1289,6 +1290,7 @@ async fn the_ffi_s_delivery_reaches_the_plan() {
             PlaybackQuality::Auto,
             None,
             Some(ConversionDelivery::Progressive),
+            None,
         )
         .await
         .unwrap();
@@ -1302,6 +1304,354 @@ async fn the_ffi_s_delivery_reaches_the_plan() {
     let plan = changed.map_or_else(|| opened.info().plan, |start| start.plan);
     assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
     drop((opened, session));
+    client.close().await;
+    server.stop().await;
+}
+
+/// As an app reaches it: the FFI's `audio`, with `delivery`, on its
+/// opening call, through a change of quality there, and on a URL player's
+/// `play`.
+#[tokio::test]
+async fn the_ffi_s_audio_reaches_the_plan() {
+    use spoolframe_client_ffi::SpoolSession;
+    use spoolframe_client_ffi::values::AudioOutput;
+
+    let (server, client, alice) = converting(
+        "sdk-audio-ffi",
+        sounding(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        false,
+    )
+    .await;
+    let session = SpoolSession::from(alice);
+    let audio = || AudioOutput {
+        codecs: vec![AudioCodec::Aac],
+        max_channels: None,
+    };
+    let opened = session
+        .open_playback(
+            movie().id().clone(),
+            None,
+            None,
+            PlaybackQuality::Original,
+            None,
+            Some(ConversionDelivery::Progressive),
+            Some(audio()),
+        )
+        .await
+        .unwrap();
+    let plan = opened.info().plan;
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    let changed = opened
+        .clone()
+        .change_quality(PlaybackQuality::Bitrate(200_000), Duration::ZERO)
+        .await
+        .unwrap();
+    let plan = changed.map_or_else(|| opened.info().plan, |start| start.plan);
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    let played = session
+        .play(
+            movie().id().clone(),
+            None,
+            None,
+            PlaybackQuality::Original,
+            None,
+            None,
+            Some(audio()),
+        )
+        .await
+        .unwrap();
+    let plan = played.info().plan;
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    drop((opened, played, session));
+    client.close().await;
+    server.stop().await;
+}
+
+/// A device whose Hello lists `audio`, for the film (H.264 and AC-3 in
+/// Matroska): the rest of the film it takes, so sound alone decides.
+fn sounding(audio: &[AudioCodec]) -> ClientCapabilities {
+    ClientCapabilities {
+        audio: audio.iter().copied().collect(),
+        containers: [Container::Matroska, Container::Mp4, Container::MpegTs].into(),
+        delivery: vec![Delivery::Range, Delivery::Hls, Delivery::Progressive],
+        ..support::hls_capabilities()
+    }
+}
+
+/// A play of the file as it is, whatever the link, with `audio`.
+fn original_with(audio: &[AudioCodec]) -> PlaybackOptions {
+    PlaybackOptions {
+        quality: PlaybackQuality::Original,
+        audio: Some(PlaybackAudio {
+            codecs: audio.iter().copied().collect(),
+            max_channels: None,
+        }),
+        ..PlaybackOptions::default()
+    }
+}
+
+fn original() -> PlaybackOptions {
+    PlaybackOptions {
+        quality: PlaybackQuality::Original,
+        ..PlaybackOptions::default()
+    }
+}
+
+/// What a conversion does to the sound; `None` if it plays the file.
+fn converted_audio(plan: &PlaybackPlan) -> Option<AudioAction> {
+    match plan {
+        PlaybackPlan::Converted { audio, .. } => audio.map(|a| a.action),
+        _ => None,
+    }
+}
+
+fn encodes(plan: &PlaybackPlan, wanted: AudioCodec) -> bool {
+    matches!(converted_audio(plan), Some(AudioAction::Encode { codec, .. }) if codec == wanted)
+}
+
+fn copies(plan: &PlaybackPlan, wanted: AudioCodec) -> bool {
+    matches!(converted_audio(plan), Some(AudioAction::Copy { codec }) if codec == wanted)
+}
+
+/// Passthrough off: Hello lists AC-3, the receiver path that took it is
+/// not in use, and the play's list leaves it out. What Hello says would
+/// play as it is, with sound the player can't render.
+#[tokio::test]
+async fn a_play_s_list_drops_a_codec_and_the_plan_encodes_it() {
+    let (server, client, alice) = converting(
+        "sdk-audio-drop",
+        sounding(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        false,
+    )
+    .await;
+    let as_hello = alice
+        .open_playback(movie().id(), None, original())
+        .await
+        .unwrap();
+    let plan = as_hello.snapshot().plan;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    as_hello.close().await.unwrap();
+
+    let playback = alice
+        .open_playback(movie().id(), None, original_with(&[AudioCodec::Aac]))
+        .await
+        .unwrap();
+    let plan = playback.snapshot().plan;
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// Passthrough on: Hello has no AC-3, the receiver does, and the play's
+/// list adds it. The file plays as it is, and a conversion a quality
+/// forces copies the sound.
+#[tokio::test]
+async fn a_play_s_list_adds_a_codec_and_it_is_copied() {
+    let (server, client, alice) =
+        converting("sdk-audio-add", sounding(&[AudioCodec::Aac]), false).await;
+    let as_hello = alice
+        .open_playback(movie().id(), None, original())
+        .await
+        .unwrap();
+    let plan = as_hello.snapshot().plan;
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    as_hello.close().await.unwrap();
+
+    let playback = alice
+        .open_playback(
+            movie().id(),
+            None,
+            original_with(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        )
+        .await
+        .unwrap();
+    let plan = playback.snapshot().plan;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    let changed = playback
+        .change_quality(PlaybackQuality::Bitrate(200_000), Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(copies(&changed.plan, AudioCodec::Ac3), "{:?}", changed.plan);
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// The list is the play's, not the plan's: a change of quality and of
+/// subtitle plan by it, and Hello's AC-3 stays out.
+#[tokio::test]
+async fn a_play_s_list_outlives_re_plans() {
+    let (server, client, alice) = converting(
+        "sdk-audio-replan",
+        sounding(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        false,
+    )
+    .await;
+    let playback = alice
+        .open_playback(movie().id(), None, original_with(&[AudioCodec::Aac]))
+        .await
+        .unwrap();
+    let changed = playback
+        .change_quality(PlaybackQuality::Bitrate(200_000), Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(
+        encodes(&changed.plan, AudioCodec::Aac),
+        "{:?}",
+        changed.plan
+    );
+    let changed = playback
+        .change_subtitle(None, BitmapSubtitles::Auto, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(
+        encodes(&changed.plan, AudioCodec::Aac),
+        "{:?}",
+        changed.plan
+    );
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// One capabilities object: the way of converting and the sound both
+/// reach the plan.
+#[tokio::test]
+async fn a_play_s_list_combines_with_a_delivery() {
+    let (server, client, alice) = converting(
+        "sdk-audio-delivery",
+        ClientCapabilities {
+            audio: [AudioCodec::Aac, AudioCodec::Ac3].into(),
+            ..takes_both([Delivery::Hls, Delivery::Progressive])
+        },
+        false,
+    )
+    .await;
+    let playback = alice
+        .open_playback(
+            movie().id(),
+            None,
+            PlaybackOptions {
+                delivery: Some(ConversionDelivery::Progressive),
+                ..original_with(&[AudioCodec::Aac])
+            },
+        )
+        .await
+        .unwrap();
+    let plan = playback.snapshot().plan;
+    assert_eq!(converted_by(&plan), Some(Delivery::Progressive), "{plan:?}");
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    playback.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// Every way an app opens a play takes it.
+#[tokio::test]
+async fn every_way_of_opening_takes_the_list() {
+    let (server, client, alice) = converting(
+        "sdk-audio-opens",
+        sounding(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        false,
+    )
+    .await;
+    let options = original_with(&[AudioCodec::Aac]);
+    let player = PlayerSession::for_session(alice.clone());
+    let playing = player
+        .start(movie().id().clone(), None, options.clone())
+        .await
+        .unwrap();
+    let plan = playing.snapshot().plan;
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    let next = alice
+        .open_playback_next(movie().id(), &playing, None, options.clone())
+        .await
+        .unwrap();
+    let plan = next.snapshot().plan;
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    next.close().await.unwrap();
+    player.end().await;
+    let any = alice
+        .open_any_playback(movie().id(), None, options)
+        .await
+        .unwrap();
+    let plan = any.snapshot().plan;
+    assert!(encodes(&plan, AudioCodec::Aac), "{plan:?}");
+    any.close().await.unwrap();
+    client.close().await;
+    server.stop().await;
+}
+
+/// An empty list is no codec, not the device's list: with sound in the
+/// file there is nothing to send it as, and the app is told.
+#[tokio::test]
+async fn an_empty_list_cannot_play_a_file_with_sound() {
+    let (server, client, alice) = converting(
+        "sdk-audio-empty",
+        sounding(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        false,
+    )
+    .await;
+    let opened = alice
+        .open_playback(movie().id(), None, original_with(&[]))
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(opened, Err(SdkError::CannotPlay { .. })),
+        "{opened:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The planner holds every codec to the one channel limit, so a list
+/// that adds a receiver's codec says the receiver's channels too.
+#[tokio::test]
+async fn a_play_s_channels_stand_in_for_the_device_s() {
+    let (server, client, alice) = converting(
+        "sdk-audio-channels",
+        ClientCapabilities {
+            max_audio_channels: Some(2),
+            ..sounding(&[AudioCodec::Aac])
+        },
+        false,
+    )
+    .await;
+    server.generate_surround_media(12, "libx264", "ac3");
+    let held = alice
+        .open_playback(
+            movie().id(),
+            None,
+            original_with(&[AudioCodec::Aac, AudioCodec::Ac3]),
+        )
+        .await
+        .unwrap();
+    let plan = held.snapshot().plan;
+    assert!(
+        matches!(
+            converted_audio(&plan),
+            Some(AudioAction::Encode { channels: 2, .. })
+        ),
+        "{plan:?}"
+    );
+    held.close().await.unwrap();
+
+    let options = PlaybackOptions {
+        audio: Some(PlaybackAudio {
+            codecs: [AudioCodec::Aac, AudioCodec::Ac3].into(),
+            max_channels: Some(6),
+        }),
+        ..original()
+    };
+    let raised = alice
+        .open_playback(movie().id(), None, options)
+        .await
+        .unwrap();
+    let plan = raised.snapshot().plan;
+    assert!(matches!(plan, PlaybackPlan::Direct { .. }), "{plan:?}");
+    raised.close().await.unwrap();
     client.close().await;
     server.stop().await;
 }

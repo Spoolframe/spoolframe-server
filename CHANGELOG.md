@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- SDK: a play can say what sound it may carry, in place of the device's
+  capabilities, for a Passthrough setting. `PlaybackOptions::audio` takes a
+  new `PlaybackAudio`: `codecs`, which replaces the device's list, and
+  `max_channels`, which replaces its limit, or keeps it when `None`. A file
+  whose audio is not listed is converted, a codec added is copied. It holds
+  through re-plans and restarts, on every way of opening, and combines with
+  `delivery`. An empty list means no codec, so a file with sound is
+  `CannotPlay`. No wire or server change: it goes in
+  `StartPlayback.capabilities`.
+- FFI: `open_playback` and `play` take that as `audio`, a new `AudioOutput`
+  record, left out by default: existing calls are unchanged.
+- Server: the `playback planned again for its quality` log line has a
+  `delivery` field, as `playback started` has, so a re-plan's delivery can
+  be read from the log.
+
 ## 0.17.1 (2026-11-01)
 
 - Server: `PlaybackStarted` and `PlaybackChanged` carry `wan`, whether the

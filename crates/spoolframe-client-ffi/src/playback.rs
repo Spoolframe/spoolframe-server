@@ -32,7 +32,7 @@ use crate::reader::PlaybackReader;
 use crate::resources::{PlaybackResource, bridge};
 use crate::runtime::{block, run};
 use crate::session::SpoolSession;
-use crate::values::ScreenCapabilities;
+use crate::values::{AudioOutput, ScreenCapabilities};
 
 /// A playback as it plays now, for the player.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -884,8 +884,11 @@ impl SpoolSession {
     /// this playback, kept for its re-plans; `None` sends
     /// `SpoolClient.set_display`'s. `delivery`: how a conversion of it
     /// reaches the device, kept for its re-plans and restarts; `None` is
-    /// the first way `DeviceSpec.capabilities` lists.
-    #[uniffi::method(default(delivery = None))]
+    /// the first way `DeviceSpec.capabilities` lists. `audio`: the sound
+    /// it may carry, in place of `DeviceSpec.capabilities`', kept as
+    /// `delivery` is and sent with it; `None` is the device's.
+    #[uniffi::method(default(delivery = None, audio = None))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_playback(
         &self,
         id: MediaId,
@@ -894,18 +897,29 @@ impl SpoolSession {
         quality: PlaybackQuality,
         display: Option<ScreenCapabilities>,
         delivery: Option<ConversionDelivery>,
+        audio: Option<AudioOutput>,
     ) -> Result<Arc<SpoolPlayback>, SpoolError> {
-        let opening = open(
-            self.session.clone(),
-            id,
-            start,
-            tracks,
-            quality,
-            display,
-            delivery,
-        );
-        let opened = run(opening).await?;
+        let options = play_options(start, quality, display, delivery, audio);
+        let opened = run(open(self.session.clone(), id, tracks, options)).await?;
         Ok(SpoolPlayback::new(opened))
+    }
+}
+
+/// What `open_playback` and `play` take, as the SDK does.
+pub(crate) fn play_options(
+    start: Option<Duration>,
+    quality: PlaybackQuality,
+    display: Option<ScreenCapabilities>,
+    delivery: Option<ConversionDelivery>,
+    audio: Option<AudioOutput>,
+) -> sdk::PlaybackOptions {
+    sdk::PlaybackOptions {
+        start,
+        quality,
+        display: display.map(Into::into),
+        delivery,
+        audio: audio.map(Into::into),
+        ..Default::default()
     }
 }
 
@@ -913,19 +927,9 @@ impl SpoolSession {
 pub(crate) async fn open(
     session: sdk::Session,
     id: MediaId,
-    start: Option<Duration>,
     tracks: Option<Selection>,
-    quality: PlaybackQuality,
-    display: Option<ScreenCapabilities>,
-    delivery: Option<ConversionDelivery>,
+    options: sdk::PlaybackOptions,
 ) -> Result<RegisteredPlayback, SpoolError> {
-    let options = sdk::PlaybackOptions {
-        start,
-        quality,
-        display: display.map(Into::into),
-        delivery,
-        ..Default::default()
-    };
     // A paired server's item plays from that server or through the
     // user's own, and its progress goes to the user's own.
     let managed = session.open_any_playback(&id, tracks, options).await?;

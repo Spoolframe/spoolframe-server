@@ -669,6 +669,79 @@ async fn what_a_mutation_does_is_in_its_request_s_span() {
     );
 }
 
+/// A re-plan's log line says how it is delivered, as a start's does, so
+/// a switch to a conversion can be read from the log.
+#[tokio::test]
+async fn a_change_of_quality_logs_its_delivery() {
+    if !support::alone("telemetry::a_change_of_quality_logs_its_delivery") {
+        return;
+    }
+    use spoolframe_types::{AudioCodec, ClientCapabilities, Container, Delivery};
+
+    let traced = Traced::start_with(
+        "trace-replan-delivery",
+        ServerOptions {
+            real_media: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await;
+    traced.server.generate_media(4, "libx264", "aac");
+    let (client, session) = traced
+        .alice_on(ClientCapabilities {
+            audio: [AudioCodec::Aac].into(),
+            containers: [Container::Matroska, Container::Mp4].into(),
+            delivery: vec![Delivery::Range, Delivery::Progressive],
+            ..support::hls_capabilities()
+        })
+        .await;
+    let handle = start_playback(&client, &session).await;
+    let changed = client
+        .call(
+            Some(&session),
+            Request::ChangeQuality {
+                handle,
+                quality: spoolframe_protocol::Quality::Bitrate {
+                    max_bitrate: 200_000,
+                },
+                bitmap: Default::default(),
+                position_ms: 0,
+                display: None,
+                onward_share: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(changed, Response::Ok(Reply::PlaybackChanged { .. })),
+        "{changed:?}"
+    );
+    let planned_line = |logs: &[ExportLogsServiceRequest]| {
+        logs.iter()
+            .flat_map(|r| &r.resource_logs)
+            .flat_map(|r| &r.scope_logs)
+            .flat_map(|s| &s.log_records)
+            .find(|r| {
+                matches!(
+                    r.body.as_ref().and_then(|b| b.value.as_ref()),
+                    Some(any_value::Value::StringValue(s))
+                        if s == "playback planned again for its quality"
+                )
+            })
+            .cloned()
+    };
+    until("the re-plan's log line arrives", || {
+        planned_line(&traced.received.logs.lock()).is_some()
+    })
+    .await;
+    let planned = planned_line(&traced.received.logs.lock()).expect("the re-plan's log line");
+    assert_eq!(
+        attribute(&planned.attributes, "delivery").as_deref(),
+        Some("progressive"),
+        "{:?}",
+        planned.attributes
+    );
+}
+
 /// Whether `span` is about the playback whose `playback` span is
 /// `playback`: its id, and a link to that span.
 fn about(span: &Span, playback: &Span) -> bool {

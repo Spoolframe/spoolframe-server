@@ -4539,6 +4539,7 @@ impl ClientProtocol {
                     epoch,
                     ?quality,
                     plan = %decided.kind,
+                    delivery = %decided.delivery,
                     video = %decided.video,
                     source_codec = plan.source_codec().unwrap_or("unknown"),
                     "playback planned again for its quality"

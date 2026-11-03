@@ -1274,6 +1274,22 @@ impl TestServer {
         self.generate(secs, video, audio, "0");
     }
 
+    /// As [`TestServer::generate_media`], its sound six channels.
+    pub fn generate_surround_media(&self, secs: u32, video: &str, audio: &str) {
+        std::fs::create_dir_all(self.media.parent().unwrap()).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+            .args(["-t", &secs.to_string(), "-pix_fmt", "yuv420p", "-g", "50"])
+            .args(["-sc_threshold", "0"])
+            .args(["-c:v", video, "-c:a", audio, "-ac", "6"])
+            .arg(&self.media)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "ffmpeg could not make the test media");
+    }
+
     /// As [`TestServer::generate_media`], keyed every 10 s instead of 2 s,
     /// as some encodes are: a seek lands up to 10 s before where it aims.
     pub fn generate_media_keyed_every_ten_seconds(&self, secs: u32, video: &str, audio: &str) {

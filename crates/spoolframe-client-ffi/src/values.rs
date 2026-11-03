@@ -73,6 +73,29 @@ pub struct ScreenCapabilities {
     pub max_frame_rate: Option<u32>,
 }
 
+/// `PlaybackAudio`: the sound one play may carry, in place of
+/// `DeviceCapabilities`' `audio` and `max_audio_channels`, for a setting
+/// such as Passthrough. A file whose audio isn't in `codecs`, or has more
+/// channels than `max_channels`, is converted.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AudioOutput {
+    /// All the codecs it takes. Empty means none, not the device's: a
+    /// file with sound is then `SpoolError.CannotPlay`.
+    pub codecs: Vec<AudioCodec>,
+    /// `None` keeps the device's.
+    #[uniffi(default = None)]
+    pub max_channels: Option<u32>,
+}
+
+impl From<AudioOutput> for sdk::PlaybackAudio {
+    fn from(a: AudioOutput) -> Self {
+        Self {
+            codecs: set(a.codecs),
+            max_channels: a.max_channels,
+        }
+    }
+}
+
 fn set<T: Ord>(list: Vec<T>) -> BTreeSet<T> {
     list.into_iter().collect()
 }

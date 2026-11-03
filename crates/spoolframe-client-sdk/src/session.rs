@@ -2,6 +2,7 @@
 //! sessions share the device's connection to that server; every call says
 //! which session it is made in.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use spoolframe_protocol::{
     SessionId, SessionInfo, TrackPreferencesInfo, UserSummary,
 };
 use spoolframe_types::{
-    ArtworkId, ClientCapabilities, Delivery, DisplayCapabilities, Item, ItemFilter,
+    ArtworkId, AudioCodec, ClientCapabilities, Delivery, DisplayCapabilities, Item, ItemFilter,
     ItemFilterValues, ItemSort, Library, LibraryId, Marker, MediaId, MediaTracks, PersonId,
     SubtitleFormat, TrackPreferences,
 };
@@ -265,6 +266,31 @@ pub struct PlaybackOptions {
     /// device's capabilities list. [`Session::playback_plan_on`] has no such
     /// word on the wire: its plan is for the device's own order.
     pub delivery: Option<ConversionDelivery>,
+    /// The sound this playback may carry, in place of the device's
+    /// capabilities ([`crate::Device::capabilities`]): a setting for the
+    /// receiver, say. Given, it holds for the life of the playback, its
+    /// re-plans and restarts too, and goes with `delivery`. `None`: the
+    /// device's. [`Session::playback_plan_on`] has no such word on the wire:
+    /// its plan is for the device's own list.
+    pub audio: Option<PlaybackAudio>,
+}
+
+/// The sound one playback may carry. A file whose picked audio track is
+/// not in `codecs`, or has more than `max_channels`, is not played as it is:
+/// the planner encodes that track to what is listed, and copies the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackAudio {
+    /// All the codecs it takes, in place of
+    /// [`ClientCapabilities::audio`]: one the device listed and this does
+    /// not is not sent, and one this adds is copied. Empty means no codec,
+    /// as it does in `ClientCapabilities`, not "the device's": a file with
+    /// no sound still plays, and one with sound is
+    /// [`SdkError::CannotPlay`], as there is nothing to encode it to.
+    pub codecs: BTreeSet<AudioCodec>,
+    /// In place of [`ClientCapabilities::max_audio_channels`], which the
+    /// planner holds every codec to: a receiver may take more than the
+    /// device itself. `None` keeps the device's.
+    pub max_channels: Option<u32>,
 }
 
 /// How a conversion reaches the device.
@@ -279,25 +305,33 @@ pub enum ConversionDelivery {
 
 /// What `StartPlayback` says the device takes, where it differs from
 /// Hello's `device`: the server takes a play's capabilities whole, in
-/// place of Hello's, so all of `device` goes with `delivery` first in its
-/// list. The planner converts by the list's first way it knows, and plays
-/// a file as it is while the list has [`Delivery::Range`]. `None` for no
-/// `delivery`: Hello's apply.
-fn with_delivery(
+/// place of Hello's, so all of `device` goes, with `delivery` first in its
+/// list and `audio` over its sound. The planner converts by the list's
+/// first way it knows, and plays a file as it is while the list has
+/// [`Delivery::Range`]. `None` for neither: Hello's apply.
+fn play_capabilities(
     device: &ClientCapabilities,
     delivery: Option<ConversionDelivery>,
+    audio: Option<PlaybackAudio>,
 ) -> Option<ClientCapabilities> {
-    let chosen = match delivery? {
-        ConversionDelivery::Hls => Delivery::Hls,
-        ConversionDelivery::Progressive => Delivery::Progressive,
-    };
-    let mut delivery = device.deliveries();
-    delivery.retain(|way| *way != chosen);
-    delivery.insert(0, chosen);
-    Some(ClientCapabilities {
-        delivery,
-        ..device.clone()
-    })
+    if delivery.is_none() && audio.is_none() {
+        return None;
+    }
+    let mut caps = device.clone();
+    if let Some(delivery) = delivery {
+        let chosen = match delivery {
+            ConversionDelivery::Hls => Delivery::Hls,
+            ConversionDelivery::Progressive => Delivery::Progressive,
+        };
+        caps.delivery = device.deliveries();
+        caps.delivery.retain(|way| *way != chosen);
+        caps.delivery.insert(0, chosen);
+    }
+    if let Some(audio) = audio {
+        caps.audio = audio.codecs;
+        caps.max_audio_channels = audio.max_channels.or(caps.max_audio_channels);
+    }
+    Some(caps)
 }
 
 /// The quality a viewer chooses for a playback. The app's own
@@ -1243,7 +1277,11 @@ impl Session {
             bitmap: options.bitmap,
             quality: self.wire_quality(options.quality),
             display: options.display.or_else(|| self.client.display()),
-            capabilities: with_delivery(&self.client.inner.device.capabilities, options.delivery),
+            capabilities: play_capabilities(
+                &self.client.inner.device.capabilities,
+                options.delivery,
+                options.audio,
+            ),
             onward_share: None,
         };
         match self.call(request).await? {
@@ -2416,13 +2454,13 @@ mod tests {
     #[test]
     fn no_delivery_leaves_hello_s_capabilities_to_the_server() {
         let device = device(vec![Delivery::Hls, Delivery::Progressive]);
-        assert_eq!(with_delivery(&device, None), None);
+        assert_eq!(play_capabilities(&device, None, None), None);
     }
 
     #[test]
     fn a_delivery_goes_first_and_the_rest_of_the_device_goes_with_it() {
         let device = device(vec![Delivery::Range, Delivery::Hls, Delivery::Progressive]);
-        let sent = with_delivery(&device, Some(ConversionDelivery::Progressive));
+        let sent = play_capabilities(&device, Some(ConversionDelivery::Progressive), None);
         assert_eq!(
             sent,
             Some(ClientCapabilities {
@@ -2436,11 +2474,83 @@ mod tests {
     /// turn every direct play into a conversion.
     #[test]
     fn a_device_that_listed_no_way_in_keeps_its_range_reads() {
-        let sent = with_delivery(&device(Vec::new()), Some(ConversionDelivery::Hls));
+        let sent = play_capabilities(&device(Vec::new()), Some(ConversionDelivery::Hls), None);
         assert_eq!(
             sent.map(|caps| caps.delivery),
             Some(vec![Delivery::Hls, Delivery::Range])
         );
+    }
+
+    fn surround(max_channels: Option<u32>) -> PlaybackAudio {
+        PlaybackAudio {
+            codecs: [AudioCodec::Aac, AudioCodec::Eac3].into(),
+            max_channels,
+        }
+    }
+
+    #[test]
+    fn audio_replaces_the_device_s_list_and_the_rest_of_the_device_goes_with_it() {
+        let device = ClientCapabilities {
+            audio: [AudioCodec::Aac, AudioCodec::Ac3].into(),
+            max_audio_channels: Some(2),
+            ..device(vec![Delivery::Range, Delivery::Hls])
+        };
+        let sent = play_capabilities(&device, None, Some(surround(Some(6))));
+        assert_eq!(
+            sent,
+            Some(ClientCapabilities {
+                audio: [AudioCodec::Aac, AudioCodec::Eac3].into(),
+                max_audio_channels: Some(6),
+                ..device
+            })
+        );
+    }
+
+    #[test]
+    fn audio_that_says_no_channels_keeps_the_device_s() {
+        let device = ClientCapabilities {
+            max_audio_channels: Some(2),
+            ..device(vec![Delivery::Hls])
+        };
+        let sent = play_capabilities(&device, None, Some(surround(None)));
+        assert_eq!(sent.and_then(|caps| caps.max_audio_channels), Some(2));
+    }
+
+    /// One capabilities object: neither overwrites the other's part.
+    #[test]
+    fn a_delivery_and_audio_go_in_one_object() {
+        let device = device(vec![Delivery::Hls, Delivery::Progressive]);
+        let sent = play_capabilities(
+            &device,
+            Some(ConversionDelivery::Progressive),
+            Some(surround(None)),
+        );
+        assert_eq!(
+            sent,
+            Some(ClientCapabilities {
+                audio: [AudioCodec::Aac, AudioCodec::Eac3].into(),
+                delivery: vec![Delivery::Progressive, Delivery::Hls],
+                ..device
+            })
+        );
+    }
+
+    /// `None` leaves the device's list; an empty list is a list.
+    #[test]
+    fn an_empty_list_is_sent_as_no_codec() {
+        let empty = PlaybackAudio {
+            codecs: BTreeSet::new(),
+            max_channels: None,
+        };
+        let sent = play_capabilities(
+            &ClientCapabilities {
+                audio: [AudioCodec::Aac].into(),
+                ..device(vec![Delivery::Hls])
+            },
+            None,
+            Some(empty),
+        );
+        assert_eq!(sent.map(|caps| caps.audio), Some(BTreeSet::new()));
     }
 
     #[tokio::test]

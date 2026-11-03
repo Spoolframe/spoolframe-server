@@ -284,6 +284,46 @@ let playback = try await session.openPlayback(
     id: id, start: start, tracks: tracks, quality: quality, display: nil, delivery: delivery)
 ```
 
+A setting that changes the sound the device takes, such as Passthrough,
+goes with each play too: `audio` on `open_playback` and `play`, an
+`AudioOutput`. Its `codecs` replace `DeviceSpec.capabilities`' audio list
+for that playback, and `max_channels` replaces its `max_audio_channels`,
+which the server holds every codec to; `None` keeps the device's. So a
+codec a receiver takes but the device can't decode needs its channels
+said too. A file whose audio isn't listed is converted, where the device's
+list would have played it; a codec added is copied. It holds through
+re-plans and restarts and goes with `delivery`. Left out, or `None`, the
+device's list applies. An empty `codecs` means no codec, not the device's:
+a file with sound is `CannotPlay`, and one without plays. Nothing is added
+to the list, `Pcm` included, so start from the device's. `plan` has no
+`audio`, so the plan it shows is by the device's own list.
+
+```kotlin
+val audio = when (settings.passthrough) {
+    Passthrough.ALWAYS -> AudioOutput(
+        capabilities.audio + listOf(AudioCodec.EAC3, AudioCodec.TRUE_HD),
+        maxChannels = 8u,
+    )
+    Passthrough.NEVER -> AudioOutput(decoded) // what the sink itself decodes
+    Passthrough.AUTO -> null
+}
+val playback = session.openPlayback(id, start, tracks, quality, null, audio = audio)
+```
+
+```swift
+let audio: AudioOutput?
+switch settings.passthrough {
+case .always:
+    audio = AudioOutput(codecs: capabilities.audio + [.eac3, .trueHd], maxChannels: 8)
+case .never:
+    audio = AudioOutput(codecs: decoded) // what the sink itself decodes
+case .auto:
+    audio = nil
+}
+let playback = try await session.openPlayback(
+    id: id, start: start, tracks: tracks, quality: quality, display: nil, audio: audio)
+```
+
 The SDK may plan a playback again behind the player (an Auto playback
 on a slow link, or its share of the uplink moved). The object follows
 it: a read of the old plan's bytes answers `Replanned` once, the object
