@@ -68,15 +68,13 @@ pub(super) fn cpu_graph(
     {
         match (&picked.source, picked.kind) {
             (source_of, SubtitleKind::Bitmap) => {
+                let pictures = pictures_input(spec, source_of)?;
                 // Pictures go over the picture, their canvas scaled to it
                 // first: Blu-ray PGS is 1080p even over 4K video, and
                 // unscaled it would land small in the top left.
                 source = format!(
-                    "{}scale={}:{}[subs];[0:{}][subs]overlay",
-                    pictures(spec, source_of)?,
-                    stream.width,
-                    stream.height,
-                    stream.index
+                    "[{pictures}]scale={}:{}[subs];[0:{}][subs]overlay",
+                    stream.width, stream.height, stream.index
                 );
             }
             (_, SubtitleKind::Text) => chain.push(text_burn_in(spec, sub.index, picked)?),
@@ -153,8 +151,8 @@ pub(super) fn gpu_graph(
     Ok(match burned(spec)? {
         Some(track) => {
             let pictures = format!(
-                "{}scale={}:{},format=rgba,hwupload[subs];",
-                pictures(spec, &track.source)?,
+                "[{}]scale={}:{},format=rgba,hwupload[subs];",
+                pictures_input(spec, &track.source)?,
                 stream.width,
                 stream.height
             );
@@ -221,9 +219,9 @@ pub(super) fn cuda_graph(
         Some(track) => {
             let (width, height) = scaled(stream.width, stream.height, height);
             format!(
-                "{}scale={width}:{height},format=yuva420p,hwupload[subs];\
+                "[{}]scale={width}:{height},format=yuva420p,hwupload[subs];\
                  {video}{scale}[main];[main][subs]overlay_cuda[v]",
-                pictures(spec, &track.source)?,
+                pictures_input(spec, &track.source)?,
             )
         }
         None if options.is_empty() => format!("{video}null[v]"),
@@ -390,8 +388,8 @@ pub(super) fn libplacebo_graph(
             let (width, height) = scaled(stream.width, stream.height, height);
             let tail = tail.map_or_else(String::new, |tail| format!(",{tail}"));
             format!(
-                "{}scale={width}:{height}[subs];{video}{}[main];[main][subs]overlay{tail}[v]",
-                pictures(spec, &track.source)?,
+                "[{}]scale={width}:{height}[subs];{video}{}[main];[main][subs]overlay{tail}[v]",
+                pictures_input(spec, &track.source)?,
                 head.join(",")
             )
         }
@@ -402,28 +400,6 @@ pub(super) fn libplacebo_graph(
             head.extend(tail.map(s));
             format!("{video}{}[v]", head.join(","))
         }
-    })
-}
-
-/// At most one canvas of an embedded track each 40 ms of film. ffmpeg sends
-/// a picture track's canvas again for every packet it reads from the file,
-/// so that an overlay is not left waiting for the next cue: audio's packets
-/// too, and TrueHD's 1200 a second made 1000 canvases a second of film.
-/// Each one scaled to the video, a 4K film with a TrueHD track came to 24 GiB
-/// of `RLIMIT_DATA` and half speed, measured; thinned, 6 GiB and twice speed.
-/// Dropped, not paced with `fps`, which would duplicate a sparse track's
-/// canvases: a cue dropped here comes again with the next packet.
-pub(super) const FEWER_CANVASES: &str =
-    "select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,0.04)'";
-
-/// The start of a filter chain on a subtitle's pictures, ready for the next
-/// filter. A file of its own has no film's packets to resend its canvas:
-/// each picture is a cue that comes once, and all of them are kept.
-fn pictures(spec: &EncodeSpec<'_>, source: &SubtitleSource) -> Result<String, String> {
-    let input = pictures_input(spec, source)?;
-    Ok(match source {
-        SubtitleSource::Embedded { .. } => format!("[{input}]{FEWER_CANVASES},"),
-        SubtitleSource::External { .. } => format!("[{input}]"),
     })
 }
 

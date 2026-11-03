@@ -2494,14 +2494,17 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
     server.stop().await;
 }
 
-/// ffmpeg sends a picture track's canvas again for every packet it reads
-/// from the film, so an overlay is not left waiting for the next cue. A
-/// track of 1200 packets a second, as TrueHD's is, sent that many a
+/// Stock ffmpeg sends a picture track's canvas again for every packet it
+/// reads from the film, so an overlay is not left waiting for the next cue.
+/// A track of 1200 packets a second, as TrueHD's is, sent that many a
 /// second of film through the scale to the video's size: 19 GiB of 4K
 /// canvases queued at a 4K film's 12 frames a second, and past
-/// `RLIMIT_DATA`, ENOMEM. Counted after the scale, in the real graph. With
-/// no B-frames: a canvas is sent only for a packet later than the last,
-/// and their times keep x264's video ahead of the audio read after it.
+/// `RLIMIT_DATA`, ENOMEM. The ffmpeg this repo packages sends one only when
+/// the graph asks (`nix/ffmpeg.nix`, Jellyfin's 0058), and the graph has no
+/// filter of its own against it, so this fails on stock ffmpeg. Counted
+/// after the scale, in the real graph. With no B-frames: a canvas is sent
+/// only for a packet later than the last, and their times keep x264's
+/// video ahead of the audio read after it.
 #[tokio::test]
 async fn pictures_burned_in_are_not_scaled_for_every_packet_of_the_film() {
     use spoolframe_media::Prober;
@@ -2617,7 +2620,7 @@ async fn pictures_burned_in_are_not_scaled_for_every_packet_of_the_film() {
     assert!(scaled > 0, "nothing reached the overlay: {said}");
     assert!(
         scaled <= 26 * SECS as usize,
-        "{scaled} canvases scaled in a film of {SECS} s"
+        "{scaled} canvases scaled in a film of {SECS} s: is this nix/ffmpeg.nix's ffmpeg?"
     );
     client.close().await;
     server.stop().await;

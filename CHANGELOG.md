@@ -25,6 +25,13 @@
   is made, so a new album shows on the read after. Over 200 entries,
   `playable` counts a track's file only once its page is read, as All's
   does. No wire change.
+- Server: the packaged ffmpeg takes four of Jellyfin's patches. `hevc_vaapi`
+  on AMD writes a true header into live Matroska. libplacebo's SDR tone map
+  no longer carries HDR10 metadata. A burned-in picture cue shows on its
+  first frame, and a 4K film with TrueHD uses about 60% of the memory; the
+  graph's own limit of one canvas each 40 ms is gone, so a stock ffmpeg has
+  none. `tonemap_vaapi` takes HDR10 with no mastering data, which has not
+  been run: no Intel GPU to hand.
 
 ## 0.17.1 (2026-11-01)
 

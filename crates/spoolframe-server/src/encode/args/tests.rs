@@ -343,10 +343,7 @@ fn an_nvenc_encode_decodes_on_nvdec_with_a_cpu_tone_map_and_burn_in() {
     }
     assert_eq!(
         after(&args, "-filter_complex"),
-        format!(
-            "[0:2]{FEWER_CANVASES},scale=3840:2160[subs];\
-             [0:0][subs]overlay,{TONE_MAP},scale=-2:1080[v]"
-        )
+        format!("[0:2]scale=3840:2160[subs];[0:0][subs]overlay,{TONE_MAP},scale=-2:1080[v]")
     );
     assert!(has(&args, &["-c:v", "h264_nvenc"]));
     assert_eq!(
@@ -655,7 +652,7 @@ fn an_nvenc_encode_scales_on_cuda_with_gpu_filters_on() {
 #[test]
 fn an_nvenc_encode_burns_pictures_in_on_cuda() {
     let (film, enc) = (sdr_4k(8), cuda(true, true));
-    for (index, pictures) in [(0, format!("[0:2]{FEWER_CANVASES},")), (3, s("[1:0]"))] {
+    for (index, pictures) in [(0, "0:2"), (3, "1:0")] {
         let mut spec = filtered(
             &film,
             &enc,
@@ -688,7 +685,7 @@ fn an_nvenc_encode_burns_pictures_in_on_cuda() {
         assert_eq!(
             after(&args, "-filter_complex"),
             format!(
-                "{pictures}scale=1920:1080,format=yuva420p,hwupload[subs];\
+                "[{pictures}]scale=1920:1080,format=yuva420p,hwupload[subs];\
                  [0:0]scale_cuda=w=-2:h=1080:format=yuv420p[main];\
                  [main][subs]overlay_cuda[v]"
             )
@@ -776,10 +773,7 @@ fn an_hdr_source_on_nvenc_filters_all_on_the_cpu() {
     assert!(!args.contains(&s("-hwaccel_output_format")), "{args:?}");
     assert_eq!(
         after(&args, "-filter_complex"),
-        format!(
-            "[0:2]{FEWER_CANVASES},scale=3840:2160[subs];\
-             [0:0][subs]overlay,{TONE_MAP},scale=-2:1080[v]"
-        )
+        format!("[0:2]scale=3840:2160[subs];[0:0][subs]overlay,{TONE_MAP},scale=-2:1080[v]")
     );
     assert_eq!(
         cpu_instead_of_gpu(&spec),
@@ -877,10 +871,7 @@ fn the_cuda_path_s_fallback_is_the_cpu_chain() {
     assert!(!args.iter().any(|a| a.contains("cuda")), "{args:?}");
     assert_eq!(
         after(&args, "-filter_complex"),
-        format!(
-            "[0:2]{FEWER_CANVASES},scale=3840:2160[subs];\
-             [0:0][subs]overlay,scale=-2:1080,format=yuv420p[v]"
-        )
+        "[0:2]scale=3840:2160[subs];[0:0][subs]overlay,scale=-2:1080,format=yuv420p[v]"
     );
     assert!(has(&args, &["-c:v", "h264_nvenc"]));
     assert_eq!(made(&spec).burn_in, FilterOn::Cpu);
@@ -1225,7 +1216,7 @@ fn with_gpu_filters_on_a_driver_that_cannot_tone_map_leaves_it_to_the_cpu() {
 fn with_gpu_filters_on_pictures_are_burned_in_on_the_gpu_where_its_driver_can() {
     let (film, enc) = (film(), with_filters(false, true));
     // Embedded PGS, then an external one: the second input.
-    for (index, pictures) in [(0, format!("[0:2]{FEWER_CANVASES},")), (3, s("[1:0]"))] {
+    for (index, pictures) in [(0, "0:2"), (3, "1:0")] {
         let mut spec = spec(
             &film,
             &enc,
@@ -1262,7 +1253,7 @@ fn with_gpu_filters_on_pictures_are_burned_in_on_the_gpu_where_its_driver_can() 
         assert_eq!(
             after(&args, "-filter_complex"),
             format!(
-                "{pictures}scale=3840:2160,format=rgba,hwupload[subs];\
+                "[{pictures}]scale=3840:2160,format=rgba,hwupload[subs];\
                  [0:0][subs]overlay_vaapi,scale_vaapi=w=-2:h=1080:format=nv12[v]"
             )
         );
@@ -1835,7 +1826,7 @@ fn a_pgs_burn_in_overlays_the_pictures() {
     let graph = after(&args, "-filter_complex");
     assert_eq!(
         graph,
-        format!("[0:2]{FEWER_CANVASES},scale=3840:2160[subs];[0:0][subs]overlay,format=yuv420p[v]")
+        "[0:2]scale=3840:2160[subs];[0:0][subs]overlay,format=yuv420p[v]"
     );
     // Burned in: not also a subtitle stream.
     assert!(!args.contains(&s("-c:s")));
@@ -3043,8 +3034,8 @@ fn burn_in_with_libplacebo_is_laid_over_its_output_on_the_cpu() {
     assert_eq!(
         after(&ffmpeg_args(&pictures).unwrap(), "-filter_complex"),
         format!(
-            "[0:2]{FEWER_CANVASES},scale=1920:1080[subs];\
-             [0:0]{PLACEBO_1080},hwdownload,format=nv12[main];[main][subs]overlay[v]"
+            "[0:2]scale=1920:1080[subs];[0:0]{PLACEBO_1080},hwdownload,format=nv12[main];\
+             [main][subs]overlay[v]"
         )
     );
     let made = made(&pictures);

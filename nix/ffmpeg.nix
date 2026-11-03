@@ -22,8 +22,19 @@
       # hevc_vaapi's extradata is not what Mesa's encoder codes to: since
       # 24.3 (c43f8cb0, MR !30927) radeonsi writes its own VPS/SPS/PPS, so
       # an `hvc1` record built from ffmpeg's plays green, and no flag or
-      # filter avoids it. mesa#15529. Live Matroska can't rewrite its
-      # header: CodecPrivate stays false beside true in-band sets.
+      # filter avoids it. mesa#15529. This builds the record from the
+      # stream, whatever Mesa writes; live Matroska can't rewrite its
+      # header, which the next patch makes true instead.
       ./ffmpeg-hevc-record-from-stream.patch
+      # The rest are Jellyfin's (each file says which, and what is cut).
+      # AMD: extradata with the values radeonsi writes, on Mesa as it is
+      # today.
+      ./ffmpeg-jellyfin-0086-amd-hevc-extradata.patch
+      # A picture subtitle's canvas sent again only when the graph asks.
+      ./ffmpeg-jellyfin-0058-sub2video-canvases.patch
+      # No HDR10 metadata on libplacebo's SDR output.
+      ./ffmpeg-jellyfin-0085-libplacebo-side-data.patch
+      # tonemap_vaapi without HDR10 metadata. Untested: no Intel GPU here.
+      ./ffmpeg-jellyfin-0070-tonemap-vaapi-no-metadata.patch
     ];
 })
