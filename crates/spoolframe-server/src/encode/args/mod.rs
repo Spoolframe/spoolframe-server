@@ -294,6 +294,11 @@ pub struct EncodeSpec<'a> {
     /// How HDR is tone mapped (`transcode.tone_map`, PGPU-04).
     pub tone_map: ToneMapSetting,
     pub start: Option<Duration>,
+    /// Where the film is read from when that is before `start`: the
+    /// picture cue on screen there ([`crate::encode::cues`]). Frames up to
+    /// `start` are dropped after the overlay, so the cue is drawn on the
+    /// first.
+    pub cue_from: Option<Duration>,
     pub output: Output,
 }
 

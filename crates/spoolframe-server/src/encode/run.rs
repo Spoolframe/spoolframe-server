@@ -12,6 +12,7 @@ use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::Delivery;
 
 use super::args::{Cuts, Decode, EncodeSpec, Inputs, Output, decode, ffmpeg_args};
+use super::cues;
 use super::job::{EncodeJob, Fallback, JobError, Jobs, OtherEncoder, Run, Slot, Written};
 use super::pick::RunOn;
 use crate::playback::PlaybackTrace;
@@ -143,7 +144,7 @@ pub(super) fn spawn(
         }
     };
     let (gpu_filters, tone_map) = jobs.filters();
-    let spec = EncodeSpec {
+    let mut spec = EncodeSpec {
         inputs,
         descriptor,
         video,
@@ -155,8 +156,13 @@ pub(super) fn spawn(
         gpu_filters,
         tone_map,
         start,
+        cue_from: None,
         output,
     };
+    // ffmpeg reads the job's links (PX-11 finding 34): the conversion's
+    // directory, and the files they lead to, bound in confined.
+    let read = run_inputs(inputs)?;
+    spec.cue_from = cues::cue_from(&spec, jobs.ffmpeg(), dir, &read);
     let args = ffmpeg_args(&spec).map_err(JobError::Prepare)?;
     for why in args::cpu_instead_of_gpu(&spec) {
         if jobs.first_note(why) {
@@ -186,9 +192,6 @@ pub(super) fn spawn(
         0
     };
     let start_ms = start.map_or(0, |s| s.as_millis() as u64);
-    // ffmpeg reads the job's links (PX-11 finding 34): the conversion's
-    // directory, and the files they lead to, bound in confined.
-    let read = run_inputs(inputs)?;
     let load = load(video, audio, gpu_encode, args::all_on_gpu(&spec));
     let span = conversion_span(
         &why,

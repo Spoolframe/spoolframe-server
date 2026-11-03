@@ -191,6 +191,7 @@ pub fn planning_spec<'a>(
         gpu_filters,
         tone_map: ToneMapSetting::Auto,
         start: None,
+        cue_from: None,
         output: Output::Progressive {
             file: PathBuf::new(),
         },
@@ -377,7 +378,7 @@ pub(super) fn kept_transfer(stream: &VideoStream) -> Option<&'static str> {
 }
 
 /// The subtitle track burned in, if one is.
-pub(super) fn burned<'a>(spec: &EncodeSpec<'a>) -> Result<Option<&'a SubtitleStream>, String> {
+pub(crate) fn burned<'a>(spec: &EncodeSpec<'a>) -> Result<Option<&'a SubtitleStream>, String> {
     match spec.subtitle {
         Some(
             sub @ ConvertedSubtitle {

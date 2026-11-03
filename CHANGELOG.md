@@ -32,6 +32,11 @@
   graph's own limit of one canvas each 40 ms is gone, so a stock ffmpeg has
   none. `tonemap_vaapi` takes HDR10 with no mastering data, which has not
   been run: no Intel GPU to hand.
+- Server: a seek into a burned-in picture subtitle shows the cue on the
+  first frame. A cue that began before the keyframe at the seek used to be
+  lost until the next one. The film is now read from the cue's start, up to
+  15 s back, and frames up to the target are dropped. The look for the cue
+  waits 2 s at most, and if it fails the seek goes on without it.
 
 ## 0.17.1 (2026-11-01)
 

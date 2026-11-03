@@ -80,6 +80,7 @@ pub(crate) fn prepare(
         gpu_filters,
         tone_map,
         start: None,
+        cue_from: None,
         output: Output::Progressive {
             file: track.part.to_path_buf(),
         },

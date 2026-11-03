@@ -252,6 +252,7 @@ mod tests {
                 gpu_filters: false,
                 tone_map: ToneMapSetting::Auto,
                 start: None,
+                cue_from: None,
                 output: Output::Progressive {
                     file: "/optimized/making/t1.mkv.part".into(),
                 },

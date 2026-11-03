@@ -189,6 +189,7 @@ fn spec<'a>(
         gpu_filters: false,
         tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
         start: None,
+        cue_from: None,
         output: Output::Progressive {
             file: out.to_path_buf(),
         },

@@ -83,14 +83,13 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
         ));
     }
 
-    let seek = |args: &mut Vec<String>| {
-        if let Some(start) = spec.start {
-            args.extend([s("-ss"), seconds(start)]);
-        }
-    };
     for input in ffmpeg_inputs(spec) {
-        if input.sought {
-            seek(&mut args);
+        let from = match input.what {
+            Input::Film => spec.cue_from.or(spec.start),
+            _ => spec.start,
+        };
+        if let (true, Some(from)) = (input.sought, from) {
+            args.extend([s("-ss"), seconds(from)]);
         }
         args.extend([s("-i"), s(input.path.display())]);
     }
@@ -158,6 +157,16 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
                         let mut steps = vaapi_steps((stream.width, stream.height), (w, h));
                         steps.push(format!("scale_vaapi=w={w}:h={h}"));
                         format!("{graph},{}[v]", steps.join(","))
+                    }
+                    None => graph,
+                };
+                // Read from a cue: the frames up to the start go here, past
+                // the overlay. An output `-ss` would move every time back
+                // to 0, and a copied track's not at all.
+                let graph = match spec.cue_from.and(spec.start) {
+                    Some(start) => {
+                        let graph = graph.strip_suffix("[v]").unwrap_or(&graph);
+                        format!("{graph},trim=start={}[v]", seconds(start))
                     }
                     None => graph,
                 };
@@ -369,15 +378,19 @@ fn output_args(spec: &EncodeSpec<'_>, args: &mut Vec<String>) -> Result<(), Stri
                 // Silence from the run's start puts a packet first.
                 // `first_pts` counts samples at the rate set here; the run's
                 // times are the film's own from a seek (`-copyts`).
+                let mut filters = Vec::new();
+                if let Some(start) = spec.cue_from.and(spec.start) {
+                    filters.push(format!("atrim=start={}", seconds(start)));
+                }
                 if let Output::Hls {
                     pad_audio: true, ..
                 } = spec.output
                 {
                     let from = spec.start.map_or(0, |at| at.as_millis()) * 48;
-                    args.extend([
-                        s("-af"),
-                        format!("aresample=48000:async=1:first_pts={from}"),
-                    ]);
+                    filters.push(format!("aresample=48000:async=1:first_pts={from}"));
+                }
+                if !filters.is_empty() {
+                    args.extend([s("-af"), filters.join(",")]);
                 }
             }
             AudioAction::Unknown => return Err(s("an audio action this build does not know")),

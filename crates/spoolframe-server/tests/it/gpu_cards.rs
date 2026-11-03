@@ -144,6 +144,7 @@ async fn each_card_is_found_classified_and_encodes_confined() {
             gpu_filters: false,
             tone_map: ToneMapSetting::Auto,
             start: None,
+            cue_from: None,
             output: Output::Progressive { file: out.clone() },
         };
         let place = placement(&spec).expect("H.264 encodes somewhere");
@@ -203,6 +204,7 @@ async fn each_card_is_found_classified_and_encodes_confined() {
             gpu_filters: true,
             tone_map: ToneMapSetting::Libplacebo,
             start: None,
+            cue_from: None,
             output: Output::Progressive { file: out.clone() },
         };
         let place = placement(&spec).expect("H.264 encodes somewhere");

@@ -185,6 +185,7 @@ fn run_as(
         gpu_filters: false,
         tone_map: ToneMapSetting::Auto,
         start,
+        cue_from: None,
         output: Output::Hls {
             dir: dir.to_path_buf(),
             start_number: from,
@@ -298,6 +299,7 @@ async fn a_progressive_seek_s_copied_audio_starts_at_its_target() {
             gpu_filters: false,
             tone_map: ToneMapSetting::Auto,
             start: Some(at),
+            cue_from: None,
             output: Output::Progressive { file: out.clone() },
         })
         .unwrap();
@@ -323,6 +325,97 @@ async fn a_progressive_seek_s_copied_audio_starts_at_its_target() {
             decoded.status.success() && decoded.stderr.is_empty(),
             "{name}: {}",
             String::from_utf8_lossy(&decoded.stderr)
+        );
+    }
+}
+
+/// A run read from a cue before its target starts where one read from the
+/// target does, sound and picture, progressive and HLS, with real ffmpeg.
+#[tokio::test]
+async fn a_run_from_a_cue_starts_at_its_target() {
+    let dir = scratch("from-a-cue").await;
+    let film = film(
+        dir.as_ref(),
+        "keyed.mkv",
+        20,
+        &["-preset", "ultrafast", "-g", "24", "-keyint_min", "24"],
+    );
+    let (descriptor, _) = read(&film).await;
+    let encoders = Encoders::software_baseline();
+    let segments = Segments::encoded(20_000);
+    let video = ConvertedVideo::Encode {
+        codec: VideoCodec::H264,
+        height: 90,
+        max_bitrate: None,
+        tone_map: false,
+    };
+    let (start, from) = (1..)
+        .map(|n| run_at(&segments, n, Some(video)))
+        .find(|(start, _)| start.is_some())
+        .unwrap();
+    let target = start.unwrap().as_millis() as i64;
+    let cue = start.unwrap() - Duration::from_secs(3);
+    let encoded = ConvertedAudio {
+        index: 0,
+        action: AudioAction::Encode {
+            codec: AudioCodec::Aac,
+            channels: 2,
+            bitrate: 128_000,
+        },
+    };
+    for (name, cue_from, audio) in [
+        ("plain", None, AAC),
+        ("cue", Some(cue), AAC),
+        ("cue-encoded", Some(cue), encoded),
+    ] {
+        let args = |output| {
+            ffmpeg_args(&EncodeSpec {
+                inputs: Inputs::film(&film),
+                descriptor: &descriptor,
+                video: Some(video),
+                audio: Some(audio),
+                subtitle: None,
+                encoders: &encoders,
+                vaapi_device: Path::new(""),
+                hardware_decode: false,
+                gpu_filters: false,
+                tone_map: ToneMapSetting::Auto,
+                start,
+                cue_from,
+                output,
+            })
+            .unwrap()
+        };
+        let out = dir.as_ref().join(format!("{name}.mkv"));
+        let progressive = args(Output::Progressive { file: out.clone() });
+        ffmpeg(&progressive.iter().map(String::as_str).collect::<Vec<_>>());
+        let (sound, picture) = (first_audio(&out), frames(&out)[0].0);
+        assert!(
+            (target - 43..target + 100).contains(&sound),
+            "{name}: {sound}"
+        );
+        assert!(
+            (target..target + 100).contains(&picture),
+            "{name}: {picture}"
+        );
+
+        let hls = dir.as_ref().join(name);
+        std::fs::create_dir_all(&hls).unwrap();
+        let args = args(Output::Hls {
+            dir: hls.clone(),
+            start_number: from,
+            cuts: keyframe_cuts(Some(video), Some(video), Some(&segments)),
+            pad_audio: audio == encoded,
+        });
+        ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        let list = std::fs::read_to_string(hls.join(super::args::PLAYLIST)).unwrap();
+        let numbers: Vec<u32> = listed_segments(&list).iter().map(|&(n, _)| n).collect();
+        assert_eq!(numbers.first(), Some(&from), "{name}: {list}");
+        assert!(decodes(&hls, &numbers), "{name}");
+        let picture = frames(&hls.join("stream.mp4"))[0].0;
+        assert!(
+            (target..target + 100).contains(&picture),
+            "{name} HLS: {picture}"
         );
     }
 }

@@ -252,6 +252,7 @@ async fn each_tone_map_this_host_runs_makes_sdr_bt709() {
             gpu_filters: true,
             tone_map: method.setting,
             start: None,
+            cue_from: None,
             output: Output::Progressive { file: out.clone() },
         };
         let place = placement(&spec).expect("an encoder");

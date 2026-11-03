@@ -153,6 +153,7 @@ fn spec<'a>(
         gpu_filters: false,
         tone_map: ToneMapSetting::Auto,
         start: None,
+        cue_from: None,
         output,
     }
 }
@@ -1908,6 +1909,37 @@ fn an_external_pgs_copy_is_a_second_input_with_its_times_kept() {
         ]
     ));
     assert!(has(&args, &["-map", "1:0", "-c:s", "copy"]));
+}
+
+/// A seek into a cue reads the film from the cue, for its picture, and
+/// keeps only what comes from the target on.
+#[test]
+fn a_seek_into_a_picture_cue_reads_from_the_cue_and_drops_up_to_the_target() {
+    let (film, enc) = (film(), encoders(false));
+    let video = ConvertedVideo::Encode {
+        codec: VideoCodec::H264,
+        height: 2160,
+        max_bitrate: None,
+        tone_map: false,
+    };
+    let burn = ConvertedSubtitle {
+        index: 0,
+        action: SubtitleAction::BurnIn {
+            format: SubtitleFormat::Pgs,
+        },
+    };
+    let mut spec = spec(&film, &enc, video, COPY_DTS, Some(burn), progressive());
+    spec.start = Some(Duration::from_millis(363_500));
+    spec.cue_from = Some(Duration::from_millis(362_737));
+    let args = ffmpeg_args(&spec).unwrap();
+    assert!(has(
+        &args,
+        &["-ss", "362.737", "-i", "/media/Film.mkv", "-copyts"]
+    ));
+    assert_eq!(
+        after(&args, "-filter_complex"),
+        "[0:2]scale=3840:2160[subs];[0:0][subs]overlay,format=yuv420p,trim=start=363.500[v]"
+    );
 }
 
 #[test]

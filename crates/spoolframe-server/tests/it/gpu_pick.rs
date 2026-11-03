@@ -167,6 +167,7 @@ async fn each_job_runs_on_the_gpu_that_does_the_most_of_it() {
                 gpu_filters: true,
                 tone_map: spoolframe_media::encoders::ToneMapSetting::Auto,
                 start: None,
+                cue_from: None,
                 output: Output::Progressive { file: out.clone() },
             };
             let place = placement(&spec).expect("H.264 encodes somewhere");

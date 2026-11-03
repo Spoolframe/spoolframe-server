@@ -3,6 +3,7 @@
 
 pub mod args;
 mod codec_strings;
+mod cues;
 pub mod hls;
 pub mod job;
 pub mod pick;
@@ -479,6 +480,7 @@ impl Conversion {
                     gpu_filters,
                     tone_map,
                     start: None,
+                    cue_from: None,
                     output: Output::Progressive {
                         file: PathBuf::new(),
                     },
@@ -741,6 +743,7 @@ impl Conversion {
             gpu_filters,
             tone_map: tone_map_setting,
             start: None,
+            cue_from: None,
             output: Output::Progressive {
                 file: PathBuf::new(),
             },
@@ -786,6 +789,7 @@ impl Conversion {
             gpu_filters,
             tone_map,
             start: None,
+            cue_from: None,
             output: Output::Hls {
                 dir: self.dir.clone(),
                 start_number: 1,

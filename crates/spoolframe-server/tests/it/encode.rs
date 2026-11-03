@@ -2593,6 +2593,7 @@ async fn pictures_burned_in_are_not_scaled_for_every_packet_of_the_film() {
         gpu_filters: false,
         tone_map: ToneMapSetting::Auto,
         start: None,
+        cue_from: None,
         output: Output::Progressive { file },
     })
     .unwrap();

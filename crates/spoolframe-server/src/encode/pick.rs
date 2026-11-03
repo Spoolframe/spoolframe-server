@@ -810,6 +810,7 @@ mod tests {
             hardware_decode: true,
             gpu_filters: false,
             start: None,
+            cue_from: None,
             output: Output::Progressive {
                 file: PathBuf::from("out.mkv"),
             },
