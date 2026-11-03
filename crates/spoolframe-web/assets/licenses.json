@@ -9817,6 +9817,21 @@
 "version": "7.360.1"
 },
 {
+"copyright": [
+"Copyright (c) 2020 Intel Corporation"
+],
+"group": "programs",
+"license": "MIT",
+"name": "libvpl",
+"ships": [
+"server"
+],
+"texts": {
+"MIT": 1
+},
+"version": "2.16.0"
+},
+{
 "copyright": [],
 "group": "programs",
 "license": "Apache-2.0",

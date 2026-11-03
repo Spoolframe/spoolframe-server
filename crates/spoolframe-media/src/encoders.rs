@@ -28,8 +28,10 @@ pub enum Hardware {
     Vaapi,
     /// NVIDIA.
     Nvenc,
-    /// Intel Quick Sync through oneVPL. nixpkgs' ffmpeg-headless does not
-    /// build it; Intel GPUs encode through VA-API instead.
+    /// Intel Quick Sync through oneVPL: the packaged ffmpeg has libvpl on
+    /// x86 (`nix/ffmpeg.nix`, PGPU-07), and Intel's runtime for it
+    /// (vpl-gpu-rt, Tiger Lake on) is the image's or the host's. Tried on
+    /// Intel cards only (`gpus::select`), after VA-API.
     Qsv,
 }
 

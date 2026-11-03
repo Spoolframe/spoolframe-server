@@ -43,6 +43,14 @@
   had been tried. A device waiting on a replaced code is told it expired.
 - Server: `zstd` is 0.13.4 and `zstd-safe` 7.4.0, the backports `foyer`
   0.22.6 accepts. `zstd-sys` stays at 2.1.2.
+- Server: the packaged ffmpeg has Intel's Quick Sync on x86: `h264_qsv`,
+  `hevc_qsv` and `av1_qsv`, through libvpl. The full and slim images carry
+  Intel's runtime for it (Tiger Lake and later), 14 MiB more; the NVIDIA
+  image grows 1.3 MiB. Detection tries Quick Sync on Intel cards only,
+  after VA-API, so a machine with no Intel GPU finds the same encoders as
+  before. On NixOS, add `pkgs.vpl-gpu-rt` to
+  `hardware.graphics.extraPackages`. Quick Sync has not been run on Intel
+  hardware: no Intel GPU to hand.
 
 ## 0.17.1 (2026-11-01)
 

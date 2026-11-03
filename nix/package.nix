@@ -108,8 +108,8 @@ in
       # binary's PATH rather than relying on the host having them.
       # nixpkgs' ffmpeg-headless has VA-API, NVENC (the CUDA driver is
       # loaded at run time) and Vulkan; nix/ffmpeg.nix adds libplacebo for
-      # the HDR tone map on the GPU (PGPU-04). QSV is the one it lacks, and
-      # Intel GPUs encode through VA-API.
+      # the HDR tone map on the GPU (PGPU-04) and, on x86, libvpl for QSV
+      # (PGPU-07), whose runtime the image or the host brings.
       nativeBuildInputs =
         commonArgs.nativeBuildInputs
         ++ [

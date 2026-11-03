@@ -9,11 +9,32 @@
 # versions). ffmpeg-full has both, but its closure is 1.4 GiB; this one's
 # is 330.5 MiB, against ffmpeg-headless' 305.4 MiB (nixpkgs' 9.0.1,
 # 2026-10-09).
+#
+# And libvpl, Intel's oneVPL dispatcher, for Quick Sync (PGPU-07): the
+# `*_qsv` encoders and decoders. It is x86 only, as Intel's GPUs and their
+# runtime (vpl-gpu-rt) are, so an arm64 build is unchanged. The dispatcher
+# finds the runtime at run time: nixpkgs' looks in /run/opengl-driver/lib
+# (NixOS's `hardware.graphics.extraPackages`), and the image names it in
+# ONEVPL_SEARCH_PATH (nix/docker.nix). Not withMfx, the old Media SDK:
+# nixpkgs refuses both, and libvpl's dispatcher loads the old runtime too.
+# The closure went from 328.0 to 329.3 MiB with it (9.0.2, 2026-11-02).
 {
+  lib,
+  stdenv,
   ffmpeg-headless,
+  libvpl,
   shaderc,
 }:
-(ffmpeg-headless.override {withPlacebo = true;}).overrideAttrs (old: {
+(ffmpeg-headless.override {
+  withPlacebo = true;
+  withVpl = stdenv.hostPlatform.isx86_64;
+  # Without its examples (sample videos and their sources): 19 MiB of
+  # nixpkgs' libvpl's 19.4, in every image.
+  libvpl = libvpl.overrideAttrs (old: {
+    cmakeFlags = (old.cmakeFlags or []) ++ [(lib.cmakeBool "INSTALL_EXAMPLES" false)];
+  });
+})
+.overrideAttrs (old: {
   # configure probes for `glslc` (shaderc's) on PATH at build time.
   nativeBuildInputs = (old.nativeBuildInputs or []) ++ [shaderc];
   patches =

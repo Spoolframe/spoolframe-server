@@ -739,7 +739,15 @@ in {
           options = {
             api = lib.mkOption {
               type = lib.types.enum ["nvenc" "vaapi" "qsv"];
-              description = "The API: NVIDIA's NVENC, VA-API (AMD, Intel), or Intel's Quick Sync.";
+              description = ''
+                The API: NVIDIA's NVENC, VA-API (AMD, Intel), or Intel's
+                Quick Sync. Quick Sync needs Intel's runtime where the
+                packaged ffmpeg's libvpl looks, the system's driver
+                directory: `pkgs.vpl-gpu-rt` (Tiger Lake on) in
+                {option}`hardware.graphics.extraPackages`, beside
+                `intel-media-driver`. Without it, Quick Sync is found
+                unusable at start.
+              '';
             };
             pick = lib.mkOption {
               type = lib.types.nullOr (lib.types.enum ["all" "best" "dgpu" "igpu"]);

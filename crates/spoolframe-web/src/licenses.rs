@@ -870,6 +870,7 @@ mod tests {
                 ("FFmpeg", "GPL-3.0-or-later", vec![Ship::Server]),
                 ("Tesseract", "Apache-2.0", vec![Ship::Server]),
                 ("libplacebo", "LGPL-2.1-or-later", vec![Ship::Server]),
+                ("libvpl", "MIT", vec![Ship::Server]),
             ]
         );
     }

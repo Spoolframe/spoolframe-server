@@ -31,7 +31,7 @@ What is listed is what the server ships:
   embeds, from scripts/licenses/yunet.LICENSE.
 
 - The programs the server runs (programs): FFmpeg, built with libplacebo
-  (nix/ffmpeg.nix), and Tesseract (nix/package.nix), as nixpkgs builds
+  and, on x86, libvpl (nix/ffmpeg.nix), and Tesseract (nix/package.nix), as nixpkgs builds
   them at the revision flake.lock pins. They run as separate programs,
   not linked into the server; they are listed because the server's image
   ships them.
@@ -102,11 +102,15 @@ TAILWIND = "4.3.3"
 # --enable-gpl and --enable-version3 (and x264, x265, xvid, vid.stab):
 # GPL-3.0-or-later as built, which its meta.license lists and the built
 # `ffmpeg -L` says. libplacebo (pkgs/by-name/li/libplacebo, what FFmpeg
-# 6.1 and later take) is lgpl21Plus. Tesseract (tesseract5.nix) is asl20.
+# 6.1 and later take) is lgpl21Plus. libvpl (pkgs/by-name/li/libvpl,
+# Intel's QSV dispatcher, linked on x86) is mit. Tesseract (tesseract5.nix)
+# is asl20. Intel's QSV runtime (vpl-gpu-rt), which libvpl loads, is a GPU
+# driver the image carries, as Mesa and iHD are: not listed.
 PROGRAMS_NIXPKGS = "5adc50831c259f87faeb09ddf930d43597197473"
 PROGRAMS = [
     ("FFmpeg", "9.0.2", "GPL-3.0-or-later", ["Copyright (c) 2000-2026 the FFmpeg developers"]),
     ("libplacebo", "7.360.1", "LGPL-2.1-or-later", []),
+    ("libvpl", "2.16.0", "MIT", ["Copyright (c) 2020 Intel Corporation"]),
     ("Tesseract", "5.5.3", "Apache-2.0", []),
 ]
 
@@ -421,7 +425,7 @@ def model(text_id):
 
 
 def programs(text_id):
-    """FFmpeg, libplacebo and Tesseract: what the server runs, as nixpkgs
+    """FFmpeg, libplacebo, libvpl and Tesseract: what the server runs, as nixpkgs
     builds them. --check fails when the nixpkgs flake.lock pins, or the
     way the build takes them, is no longer what PROGRAMS was read from."""
     with open(os.path.join(ROOT, "flake.lock"), encoding="utf-8") as f:
@@ -430,12 +434,12 @@ def programs(text_id):
     pinned = lock["nodes"][node]["locked"].get("rev")
     if pinned != PROGRAMS_NIXPKGS:
         sys.exit(f"gen-licenses: flake.lock pins nixpkgs {pinned}, PROGRAMS was read at "
-                 f"{PROGRAMS_NIXPKGS}: check FFmpeg's, libplacebo's and Tesseract's versions and "
+                 f"{PROGRAMS_NIXPKGS}: check FFmpeg's, libplacebo's, libvpl's and Tesseract's versions and "
                  "licenses there (ffmpeg's configure flags too) and update PROGRAMS_NIXPKGS")
     ffmpeg = read(os.path.join(ROOT, "nix", "ffmpeg.nix"))
-    if "ffmpeg-headless.override {withPlacebo = true;}" not in ffmpeg:
-        sys.exit("gen-licenses: nix/ffmpeg.nix no longer builds ffmpeg-headless with libplacebo: "
-                 "update PROGRAMS")
+    if not all(f in ffmpeg for f in ["ffmpeg-headless.override {", "withPlacebo = true;", "withVpl = "]):
+        sys.exit("gen-licenses: nix/ffmpeg.nix no longer builds ffmpeg-headless with libplacebo "
+                 "and libvpl: update PROGRAMS")
     if "tesseract.override" not in read(os.path.join(ROOT, "nix", "package.nix")):
         sys.exit("gen-licenses: nix/package.nix no longer runs nixpkgs' tesseract: update PROGRAMS")
     return [{"name": name, "version": version, "group": "programs", "ships": ["server"],

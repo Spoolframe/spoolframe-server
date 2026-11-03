@@ -1177,9 +1177,21 @@ const KEPT: &[&str] = &[
     // one, as RADV alone beside NVIDIA's.
     "VK_DRIVER_FILES",
     "VK_ICD_FILENAMES",
+    // Where libvpl's dispatcher finds Intel's QSV runtime (PGPU-07): the
+    // image names it here (nix/docker.nix).
+    "ONEVPL_SEARCH_PATH",
 ];
 
 fn environment(sandbox: &Inner, jail: &Jail) -> Vec<(OsString, OsString)> {
+    environment_from(sandbox, jail, |key| std::env::var_os(key))
+}
+
+/// [`environment`], with `server` for the server's own environment.
+fn environment_from(
+    sandbox: &Inner,
+    jail: &Jail,
+    server: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(OsString, OsString)> {
     // An NVIDIA run on one card (PGPU-05) sees that card alone: the
     // server's own CUDA_VISIBLE_DEVICES, if it has one, is not kept then.
     let cuda = match (jail.gpu, sandbox.gpu.cuda_visible) {
@@ -1189,7 +1201,7 @@ fn environment(sandbox: &Inner, jail: &Jail) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = KEPT
         .iter()
         .filter(|key| cuda.is_none() || **key != "CUDA_VISIBLE_DEVICES")
-        .filter_map(|key| Some((OsString::from(key), std::env::var_os(key)?)))
+        .filter_map(|key| Some((OsString::from(key), server(key)?)))
         .collect();
     if let Some(index) = cuda {
         env.push(("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into()));
@@ -1211,7 +1223,7 @@ fn environment(sandbox: &Inner, jail: &Jail) -> Vec<(OsString, OsString)> {
     // is then the last line on stderr, which is what a failed run reports.
     // Into the run's own directory instead. Only when the server itself has
     // the variable: a release build never does, and no other tool reads it.
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some()
+    if server("LLVM_PROFILE_FILE").is_some()
         && let Some(dir) = jail.writes.first()
     {
         env.push((
@@ -1997,6 +2009,34 @@ mod tests {
         );
         assert!(nvidia.of(GpuUse::Vaapi).is_empty());
         assert_eq!(nvidia.cuda_visible, Some(1));
+    }
+
+    /// PGPU-07: a run is told where Intel's QSV runtime is, as the image
+    /// tells the server, and still nothing the server's environment holds
+    /// for itself.
+    #[test]
+    fn a_run_is_told_where_the_qsv_runtime_is() {
+        let server = |key: &str| match key {
+            "ONEVPL_SEARCH_PATH" => Some(OsString::from("/nix/store/x-vpl-gpu-rt/lib")),
+            "SF_ENV_PLEX_TOKEN" => Some(OsString::from("secret")),
+            _ => None,
+        };
+        let env: Vec<(OsString, OsString)> = environment_from(
+            &Sandbox::off().0,
+            &Jail::new(Limits::PROBE).gpu(GpuUse::Vaapi),
+            server,
+        );
+        assert!(
+            env.contains(&(
+                "ONEVPL_SEARCH_PATH".into(),
+                "/nix/store/x-vpl-gpu-rt/lib".into()
+            )),
+            "{env:?}"
+        );
+        assert!(
+            !env.iter().any(|(key, _)| key == "SF_ENV_PLEX_TOKEN"),
+            "{env:?}"
+        );
     }
 
     /// An NVIDIA card's run is shown that card alone by CUDA; a VA-API or

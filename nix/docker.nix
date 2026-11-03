@@ -11,7 +11,8 @@
 #   CPU, no Mesa; the NVIDIA Container Toolkit brings the host's driver in.
 #   Released under `<version>-cpu` too, for machines with no GPU.
 #
-# All three run NVIDIA's GPUs: the toolkit's driver, mounted in.
+# All three run NVIDIA's GPUs: the toolkit's driver, mounted in. Full and
+# slim carry Intel's Quick Sync runtime too (PGPU-07), on x86.
 #
 # A script that streams the image to stdout (dockerTools.streamLayeredImage):
 # nothing lands in the store but the script, and the layers split along store
@@ -34,6 +35,11 @@
   intel-media-driver,
   # i965, Intel's older one (up to Coffee Lake), in the full image.
   intel-vaapi-driver,
+  # Intel's oneVPL runtime (libmfx-gen), which ffmpeg's libvpl dispatcher
+  # loads for QSV (PGPU-07), from Tiger Lake on, over iHD. The older Media
+  # SDK runtime, for the GPUs before it, is not carried: those encode
+  # through VA-API.
+  vpl-gpu-rt,
   # NVIDIA's Vulkan and GLX library (libGLX_nvidia) links libX11 and
   # libXext, and its Vulkan driver dlopens glvnd's libEGL.so.1, failing
   # vkCreateInstance without it (found on fulcrum with strace: the loader
@@ -60,6 +66,19 @@
     .${
       variant
     };
+  # Where libvpl's dispatcher finds the QSV runtime: ONEVPL_SEARCH_PATH
+  # (its other places are LD_LIBRARY_PATH, /usr/lib and the like, and
+  # /run/opengl-driver/lib, which are NVIDIA's or the host's here). Not on
+  # an image without iHD, which the runtime drives the GPU through.
+  qsvRuntimes =
+    {
+      full = intel [vpl-gpu-rt];
+      slim = intel [vpl-gpu-rt];
+      nvidia = [];
+    }
+    .${
+      variant
+    };
   # What the NixOS module's defaults would set, so the published ports are
   # known. The file layer is not locked: the web UI can change either, and
   # a config mounted over this file replaces it.
@@ -71,11 +90,11 @@
   # The layers: the server's closure (it, ffmpeg, tesseract, glibc, …)
   # first, by popularity, in up to 96 layers (it has about 140 paths, so the
   # least popular share one); then the GPU drivers (Mesa, the VA-API drivers,
-  # libXext) and what only they need, in up to 20; then the rest (the config,
-  # certificates, time zones, passwd), one a layer. The server's closure is
-  # the same graph in all three images, and so are the last ones, so their
-  # layers are the same, digests and all: the images differ in the drivers'
-  # layers only. Left to itself, streamLayeredImage ranks all of an image's
+  # the QSV runtime, libXext) and what only they need, in up to 20; then the
+  # rest (the config, certificates, time zones, passwd), one a layer. The
+  # server's closure is the same graph in all three images, and so are the
+  # last ones, so their layers are the same, digests and all: the images
+  # differ in the drivers' layers only. Left to itself, streamLayeredImage ranks all of an image's
   # paths together and merges the least popular past maxLayers, which put
   # different paths together in different images. Docker takes up to 125
   # layers.
@@ -88,7 +107,7 @@
       [
         "pipe"
         [
-          ["subcomponent_out" (map toString (vaapiDrivers ++ [libxext]))]
+          ["subcomponent_out" (map toString (vaapiDrivers ++ qsvRuntimes ++ [libxext]))]
           ["over" "main" ["pipe" [["popularity_contest"] ["limit_layers" 20]]]]
           ["over" "rest" ["popularity_contest"]]
         ]
@@ -215,7 +234,10 @@ in
         ]
         # The VA-API drivers: /run/opengl-driver/lib is NVIDIA's.
         ++ lib.optional (vaapiDrivers != [])
-        "LIBVA_DRIVERS_PATH=${lib.concatMapStringsSep ":" (d: "${d}/lib/dri") vaapiDrivers}";
+        "LIBVA_DRIVERS_PATH=${lib.concatMapStringsSep ":" (d: "${d}/lib/dri") vaapiDrivers}"
+        # Kept in the media sandbox's runs, which read the store.
+        ++ lib.optional (qsvRuntimes != [])
+        "ONEVPL_SEARCH_PATH=${lib.concatMapStringsSep ":" (d: "${d}/lib") qsvRuntimes}";
       ExposedPorts = {
         "7420/udp" = {};
         "7421/tcp" = {};
