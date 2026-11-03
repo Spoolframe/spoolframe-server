@@ -383,7 +383,7 @@ Coldsteel copy:
 
 ```toml
 [patch.crates-io]
-spoolframe-client-ffi = { version = "=0.17.1", registry = "coldsteel" }
+spoolframe-client-ffi = { version = "=0.17.2", registry = "coldsteel" }
 # and spoolframe-types, -protocol, -policy, -client-sdk, -hls-bridge
 ```
 
@@ -392,7 +392,7 @@ To try a PR before it merges, take the build of its commit. It needs no
 
 ```toml
 [dependencies]
-spoolframe-client-ffi = { version = "=0.17.1-gab12d3b", registry = "coldsteel" }
+spoolframe-client-ffi = { version = "=0.17.2-gab12d3b", registry = "coldsteel" }
 ```
 
 ## Building

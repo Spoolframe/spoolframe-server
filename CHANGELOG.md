@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.2 (2026-11-01)
 
 - SDK: a play can say what sound it may carry, in place of the device's
   capabilities, for a Passthrough setting. `PlaybackOptions::audio` takes a

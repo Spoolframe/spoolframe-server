@@ -43,14 +43,14 @@ Coldsteel copy, at the same exact version:
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = "=0.17.1"
+spoolframe-client-sdk = "=0.17.2"
 
 [patch.crates-io]
-spoolframe-types = { version = "=0.17.1", registry = "coldsteel" }
-spoolframe-protocol = { version = "=0.17.1", registry = "coldsteel" }
-spoolframe-policy = { version = "=0.17.1", registry = "coldsteel" }
-spoolframe-client-sdk = { version = "=0.17.1", registry = "coldsteel" }
-spoolframe-hls-bridge = { version = "=0.17.1", registry = "coldsteel" }
+spoolframe-types = { version = "=0.17.2", registry = "coldsteel" }
+spoolframe-protocol = { version = "=0.17.2", registry = "coldsteel" }
+spoolframe-policy = { version = "=0.17.2", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.17.2", registry = "coldsteel" }
+spoolframe-hls-bridge = { version = "=0.17.2", registry = "coldsteel" }
 ```
 
 The Coldsteel copies depend on each other as crates.io crates, and a
@@ -71,7 +71,7 @@ registry on the dependency:
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = { version = "=0.17.1-gab12d3b", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.17.2-gab12d3b", registry = "coldsteel" }
 ```
 
 Always use `=`. `"0.17"` does not match a PR build, but
