@@ -37,6 +37,8 @@
   lost until the next one. The film is now read from the cue's start, up to
   15 s back, and frames up to the target are dropped. The look for the cue
   waits 2 s at most, and if it fails the seek goes on without it.
+- Server: `zstd` is 0.13.4 and `zstd-safe` 7.4.0, the backports `foyer`
+  0.22.6 accepts. `zstd-sys` stays at 2.1.2.
 
 ## 0.17.1 (2026-11-01)
 
