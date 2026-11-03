@@ -37,6 +37,10 @@
   lost until the next one. The film is now read from the cue's start, up to
   15 s back, and frames up to the target are dropped. The look for the cue
   waits 2 s at most, and if it fails the seek goes on without it.
+- Server: a device that opens its sign-in code again gets a new code in
+  place of the old one. Each visit used to leave a code waiting for 5
+  minutes, and the fourth was refused as too many tries, though nothing
+  had been tried. A device waiting on a replaced code is told it expired.
 - Server: `zstd` is 0.13.4 and `zstd-safe` 7.4.0, the backports `foyer`
   0.22.6 accepts. `zstd-sys` stays at 2.1.2.
 

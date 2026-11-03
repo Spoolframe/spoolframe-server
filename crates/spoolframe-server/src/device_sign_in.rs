@@ -35,7 +35,9 @@ pub const LIFETIME: Duration = Duration::from_secs(5 * 60);
 /// any idle timeout between the TV and the server.
 pub const AWAIT: Duration = spoolframe_protocol::policy::wait::SIGN_IN;
 
-/// Sign-ins one device may have pending at once.
+/// Sign-ins one device may have under way at once. A device shows one
+/// code at a time, so one it begins again replaces its codes still
+/// waiting: only those being approved count against this.
 pub const MAX_PENDING_PER_DEVICE: usize = 3;
 
 /// Sign-ins pending at once on the server (PX-10, finding 16). Anyone can
@@ -284,6 +286,16 @@ impl Inner {
         let live = &self.by_request;
         self.by_code.retain(|_, request| live.contains_key(request));
     }
+
+    /// Drop `endpoint`'s codes still waiting; one dropped tells its wait
+    /// it expired. One being approved is left to finish.
+    fn replace_waiting(&mut self, endpoint: &str) {
+        self.by_request.retain(|_, p| {
+            p.waiting.endpoint != endpoint || !matches!(*p.state.borrow(), State::Waiting)
+        });
+        let live = &self.by_request;
+        self.by_code.retain(|_, request| live.contains_key(request));
+    }
 }
 
 #[derive(Debug)]
@@ -327,10 +339,14 @@ impl DeviceSignIns {
         inner
     }
 
-    /// Begin a sign-in for `waiting.endpoint`; `None` if it already has
-    /// [`MAX_PENDING_PER_DEVICE`] pending, or the server [`MAX_PENDING`].
+    /// Begin a sign-in for `waiting.endpoint`, in place of its codes still
+    /// waiting; `None` if it already has [`MAX_PENDING_PER_DEVICE`] being
+    /// approved, or the server [`MAX_PENDING`].
     pub fn begin(&self, waiting: Waiting) -> Option<Started> {
         let mut inner = self.lock();
+        // Its old codes left on screen each time someone looked at the
+        // ways to sign in, and three used up the device for 5 minutes.
+        inner.replace_waiting(&waiting.endpoint);
         if inner.by_request.len() >= MAX_PENDING {
             return None;
         }
@@ -621,14 +637,51 @@ mod tests {
         assert_eq!(sign_ins.claim(&started.code, None).unwrap().endpoint, "tv");
     }
 
+    /// Looking through the ways to sign in shows a code each time: the
+    /// device always gets one, and only the newest can be approved.
     #[test]
-    fn a_device_has_few_pending() {
+    fn a_device_beginning_again_replaces_its_waiting_code() {
         let sign_ins = DeviceSignIns::default();
+        let first = sign_ins.begin(tv("tv")).unwrap();
+        let mut last = None;
+        for _ in 0..=MAX_PENDING_PER_DEVICE {
+            last = sign_ins.begin(tv("tv"));
+        }
+        let last = last.expect("a code each time");
+        assert!(sign_ins.lookup(&first.code).is_none());
+        assert!(sign_ins.lookup(&last.code).is_some());
+        assert!(sign_ins.begin(tv("other tv")).is_some());
+        assert!(
+            sign_ins.lookup(&last.code).is_some(),
+            "another's is its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_waiting_on_a_replaced_code_is_told_it_expired() {
+        let sign_ins = DeviceSignIns::default();
+        let first = sign_ins.begin(tv("tv")).unwrap();
+        sign_ins.begin(tv("tv")).unwrap();
+        assert_eq!(
+            sign_ins.wait(&first.request, "tv", AWAIT).await,
+            Outcome::Expired
+        );
+    }
+
+    /// One being approved is left to finish, and those count: a device
+    /// still has few sign-ins under way.
+    #[test]
+    fn a_device_has_few_sign_ins_being_approved() {
+        let sign_ins = DeviceSignIns::default();
+        let mut claimed = Vec::new();
         for _ in 0..MAX_PENDING_PER_DEVICE {
-            assert!(sign_ins.begin(tv("tv")).is_some());
+            let started = sign_ins.begin(tv("tv")).unwrap();
+            sign_ins.claim(&started.code, None).unwrap();
+            claimed.push(started.request);
         }
         assert!(sign_ins.begin(tv("tv")).is_none());
-        assert!(sign_ins.begin(tv("other tv")).is_some());
+        let inner = sign_ins.lock();
+        assert!(claimed.iter().all(|r| inner.by_request.contains_key(r)));
     }
 
     #[test]
