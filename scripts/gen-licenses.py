@@ -106,7 +106,7 @@ TAILWIND = "4.3.3"
 # Intel's QSV dispatcher, linked on x86) is mit. Tesseract (tesseract5.nix)
 # is asl20. Intel's QSV runtime (vpl-gpu-rt), which libvpl loads, is a GPU
 # driver the image carries, as Mesa and iHD are: not listed.
-PROGRAMS_NIXPKGS = "5adc50831c259f87faeb09ddf930d43597197473"
+PROGRAMS_NIXPKGS = "e62746b0b472753ef019baceab6f1e2e52014980"
 PROGRAMS = [
     ("FFmpeg", "9.0.2", "GPL-3.0-or-later", ["Copyright (c) 2000-2026 the FFmpeg developers"]),
     ("libplacebo", "7.360.1", "LGPL-2.1-or-later", []),
