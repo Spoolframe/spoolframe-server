@@ -16,6 +16,15 @@
 - Server: the `playback planned again for its quality` log line has a
   `delivery` field, as `playback started` has, so a re-plan's delivery can
   be read from the log.
+- Server: a large playlist opens fast. All of 15,929 tracks took 3 to 12 s
+  after a minute away and now takes under 0.1 s: reads never wait for the
+  music libraries to be listed once a list exists, that list is made at
+  start and on a catalog change, and a page asks Plex once, not once per
+  entry. A stored playlist of 15,000 tracks went from over a minute to
+  under 0.3 s. A read past a list's minute gets that list while the next
+  is made, so a new album shows on the read after. Over 200 entries,
+  `playable` counts a track's file only once its page is read, as All's
+  does. No wire change.
 
 ## 0.17.1 (2026-11-01)
 

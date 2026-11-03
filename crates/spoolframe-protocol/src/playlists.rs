@@ -419,7 +419,8 @@ pub struct PlaylistPage {
     pub total: u32,
     /// How many of them can be played now: `total` less the unavailable.
     /// All's is `total`: its files are looked at only as they
-    /// are listed and played, not all at every read.
+    /// are listed and played, not all at every read. So too a track's in
+    /// any playlist over 200 entries, off the page read.
     pub playable: u32,
     /// The user's place: the entry playing or last played, which
     /// `PlayPlaylist` without `from` goes on from; `None` to start at the

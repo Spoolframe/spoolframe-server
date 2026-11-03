@@ -1315,6 +1315,7 @@ async fn run(
         .with_catalog_changes(live.changes())
         .with_covers(covers),
     );
+    playlists.keep_all_listed();
     // Covers whose playlists went while the server was down, or with a
     // user who left, and uploads a crash left.
     match playlists.sweep_covers().await {

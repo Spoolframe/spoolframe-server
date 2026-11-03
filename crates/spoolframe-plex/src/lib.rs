@@ -30,10 +30,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use reqwest::StatusCode;
 use spoolframe_catalog::{
-    Browsing, Catalog, CatalogError, Facts, Found, Image, ItemPage, ItemQuery, ItemWithChildren,
-    Listed, Page, PreviewFrames, SearchQuery, UnavailableFile,
+    Browsing, Catalog, CatalogError, Facts, Found, Image, ItemFile, ItemPage, ItemQuery,
+    ItemWithChildren, Listed, Page, PreviewFrames, SearchQuery, UnavailableFile,
 };
 use spoolframe_types::{
     ArtworkId, CalendarDate, Item, ItemFilterValues, Library, LibraryId, LibraryKind, MediaId,
@@ -595,6 +596,70 @@ impl PlexCatalog {
     }
 
     /// Every item in a listing, or the first one that does not convert.
+    /// One request's worth of [`Catalog::items_with_files`]. Plex lists
+    /// the keys it has of `/library/metadata/1,2,3`, each with its file.
+    /// Left out, for [`Catalog::item`] to say why: what is not asked of
+    /// Plex alike, and whatever would be an error asked alone.
+    async fn some_items(&self, ids: &[MediaId]) -> HashMap<MediaId, ItemFile> {
+        let keys: Vec<&str> = ids
+            .iter()
+            .filter(|id| playable(id.kind()))
+            .filter_map(|id| plex_key(id.namespace(), id.key(), id).ok())
+            .collect();
+        if keys.is_empty() {
+            return HashMap::new();
+        }
+        let call = Call::get(format!("/library/metadata/{}", keys.join(",")));
+        let container = match self.fetch(&call).await {
+            Ok(container) => container,
+            Err(e) => {
+                tracing::debug!(error = %e, items = keys.len(), "cannot look items up at one go");
+                return HashMap::new();
+            }
+        };
+        let asked: HashSet<&MediaId> = ids.iter().collect();
+        let (section, title) = (
+            &container.library_section_id,
+            &container.library_section_title,
+        );
+        let mut found = Vec::with_capacity(container.metadata.len());
+        for m in &container.metadata {
+            // The reply's own section is its first item's alone.
+            if !self.serves(m.library_section_id.as_ref().or(section.as_ref())) {
+                continue;
+            }
+            let Ok(mut item) = convert::item(m) else {
+                continue;
+            };
+            convert::add_cast(&mut item, m);
+            let files: Vec<PathBuf> = convert::media_files(m)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            // A key is one sequence for all kinds: it may be another's now.
+            if !asked.contains(item.id()) || files.is_empty() {
+                continue;
+            }
+            let library = m.library_section_title.clone().or_else(|| title.clone());
+            found.push((item, library, files));
+        }
+        let paths = self.paths.clone();
+        // Each file is opened, over a network mount as often as not.
+        let opened = tokio::task::spawn_blocking(move || {
+            let readable = |library: Option<&str>, file: &PathBuf| {
+                paths.map(library, file).problem().is_none()
+            };
+            found
+                .into_iter()
+                .map(|(item, library, files)| {
+                    let readable = files.iter().all(|f| readable(library.as_deref(), f));
+                    (item.id().clone(), ItemFile { item, readable })
+                })
+                .collect()
+        });
+        opened.await.unwrap_or_default()
+    }
+
     fn items_of(&self, call: &Call<'_>, metadata: &[Metadata]) -> Result<Vec<Item>, CatalogError> {
         metadata
             .iter()
@@ -603,6 +668,13 @@ impl PlexCatalog {
             .map_err(|e| self.converted(call, e))
     }
 }
+
+/// The most items asked of a PMS in one request: its URL stays short, and
+/// a reply of 200 took Nimble's PMS 61 ms, as 500 took 227 ms.
+const ITEMS_AT_ONCE: usize = 200;
+
+/// The most of those requests at once.
+const ITEM_REQUESTS: usize = 4;
 
 /// One library section of a PMS, whatever it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -804,6 +876,14 @@ fn has_children(kind: MediaKind) -> bool {
 }
 
 /// The kinds Plex finds intros and credits in.
+/// Whether an item of `kind` has a file of its own.
+fn playable(kind: MediaKind) -> bool {
+    matches!(
+        kind,
+        MediaKind::Movie | MediaKind::Episode | MediaKind::Track
+    )
+}
+
 fn has_markers(kind: MediaKind) -> bool {
     matches!(kind, MediaKind::Movie | MediaKind::Episode)
 }
@@ -959,13 +1039,17 @@ impl Catalog for PlexCatalog {
     }
 
     /// One listing of the section's tracks (`type=10`), page by page,
-    /// where walking its albums is a request each (PX-43).
+    /// where walking its albums is a request each (PX-43). Without guids
+    /// and summaries, which a track does not hold and which take the PMS
+    /// half of the walk's time.
     async fn tracks(&self, library: &LibraryId) -> Result<Vec<Item>, CatalogError> {
         let key = plex_key(library.namespace(), library.key(), library)?;
         if !self.serves(Some(&SectionKey(key.to_owned()))) {
             return Err(CatalogError::NotServed(library.to_string()));
         }
-        let listed = self.listed(key, "10", &[]).await?;
+        let listed = self
+            .walked(key, "10", &[("excludeFields", "summary")])
+            .await?;
         let call = Call::get(format!("/library/sections/{key}/all")).about(library);
         Ok(self
             .items_of(&call, &listed)?
@@ -1003,6 +1087,19 @@ impl Catalog for PlexCatalog {
         external_ids: &[String],
     ) -> Result<Option<MediaId>, CatalogError> {
         self.find_guid(kind, external_ids).await
+    }
+
+    /// A request per [`ITEMS_AT_ONCE`] items, a few at a time.
+    async fn items_with_files(&self, ids: &[MediaId]) -> HashMap<MediaId, ItemFile> {
+        let asking: Vec<_> = ids
+            .chunks(ITEMS_AT_ONCE)
+            .map(|ids| self.some_items(ids))
+            .collect();
+        let found: Vec<HashMap<MediaId, ItemFile>> = stream::iter(asking)
+            .buffer_unordered(ITEM_REQUESTS)
+            .collect()
+            .await;
+        found.into_iter().flatten().collect()
     }
 
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError> {
@@ -1116,10 +1213,7 @@ impl Catalog for PlexCatalog {
     }
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
-        if !matches!(
-            id.kind(),
-            MediaKind::Movie | MediaKind::Episode | MediaKind::Track
-        ) {
+        if !playable(id.kind()) {
             return Err(CatalogError::NotPlayable(id.clone()));
         }
         let fetched = self.metadata(id, false).await?;

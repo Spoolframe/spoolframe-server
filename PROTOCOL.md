@@ -1918,6 +1918,9 @@ playable".
 - An item still in the library whose file cannot be read now (a drive
   offline, a file moved) is listed with `unavailable: true`, counted in
   `total` and not in `playable`, and skipped when the playlist plays.
+  Of a playlist over 200 entries, a track's file is looked at when its
+  page is read: `playable` takes the rest for readable, so it may differ
+  from page to page. `unavailable` on the entries listed is always so.
 - An item that left the library drops out of the playlist. One whose
   key changed (Plex rebuilt the library) is followed to its new key,
   keeping its entry id and place.
@@ -2335,9 +2338,10 @@ has none.
 - Liked holds the tracks the user liked, newest first. Its owner moves
   and removes its entries with `EditPlaylist`; an `Add` there is
   `InvalidInput`, as a track gets in by being liked.
-- All is every track the user may see, worked out from the library at
-  each read and play, never stored: a newly scanned album is in it at
-  once. It is read-only (`PlaylistReadOnly`). Its entry ids are its
+- All is every track the user may see, worked out from a list of the
+  library, never stored. A read past a minute after that list was made
+  is answered from it while the next is made: a newly scanned album is
+  in All from the read after. It is read-only (`PlaylistReadOnly`). Its entry ids are its
   tracks' (the same for the same track, at 2^62 and above), so a place
   and a shuffled round survive a scan; its `playable` is its `total`, as
   its files are looked at only as they are listed and played.

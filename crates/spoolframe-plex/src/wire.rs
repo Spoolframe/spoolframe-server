@@ -223,6 +223,9 @@ pub struct Metadata {
     /// search) have it on every item.
     #[serde(rename = "librarySectionID", default)]
     pub library_section_id: Option<SectionKey>,
+    /// That library's title, where a reply's items are from several and
+    /// the reply's own title is its first item's.
+    pub library_section_title: Option<String>,
     /// The intros, credits and the like Plex found in the item; only on
     /// single-item responses asked with `includeMarkers=1`, and absent
     /// without Plex Pass or with detection off. Each is read as a

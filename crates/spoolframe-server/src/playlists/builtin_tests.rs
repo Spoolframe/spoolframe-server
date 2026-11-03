@@ -493,7 +493,8 @@ async fn one_user_s_likes_are_not_another_s() {
 
 /// The ticket: All holds every track the user may see and none they may
 /// not, and a new album is in it after a scan with no edit, once its
-/// tracks were listed longer ago than they are kept for.
+/// tracks were listed longer ago than they are kept for and the list
+/// was made again.
 #[tokio::test]
 async fn all_is_every_track_one_may_see_and_follows_a_scan() {
     let h = harness("all").await;
@@ -508,11 +509,19 @@ async fn all_is_every_track_one_may_see_and_follows_a_scan() {
     tokio::time::advance(ALL_KEPT_FOR).await;
     tokio::time::resume();
     let all = h.builtin(&h.alice, Builtin::All).await;
-    let page = h
-        .playlists
-        .get(&h.alice, &all.id, 0, MAX_PAGE)
-        .await
-        .unwrap();
+    let reads = async {
+        loop {
+            let got = h.playlists.get(&h.alice, &all.id, 0, MAX_PAGE);
+            let page = got.await.unwrap();
+            if page.total != 12 {
+                return page;
+            }
+            // Listed behind the read that found the list old.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    let waits_for = std::time::Duration::from_secs(10);
+    let page = tokio::time::timeout(waits_for, reads).await.unwrap();
     assert_eq!((page.total, page.playable), (15, 15));
     assert!(
         page.entries

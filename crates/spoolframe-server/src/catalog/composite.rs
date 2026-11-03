@@ -15,14 +15,15 @@
 //! that need it: its libraries stay listed, and opening one says it is
 //! unavailable, while search and Home go on with the others.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
     Browse, Browsing, Catalog, CatalogError, Facts, Found, FoundGroup, Image, Inspect, Inspected,
-    ItemPage, ItemQuery, ItemWithChildren, LibraryCheck, Listed, MissingFile, Page, PreviewFrames,
-    Reach, Row, RowPage, SearchQuery,
+    ItemFile, ItemPage, ItemQuery, ItemWithChildren, LibraryCheck, Listed, MissingFile, Page,
+    PreviewFrames, Reach, Row, RowPage, SearchQuery,
 };
 use spoolframe_plex::{Dated, PlexCatalog};
 use spoolframe_types::{
@@ -681,6 +682,34 @@ impl Catalog for Composite {
             .map_err(|e| named(e, &local, id))
     }
 
+    /// Each server's asked of its own; a paired server's items are not
+    /// answered for here.
+    async fn items_with_files(&self, ids: &[MediaId]) -> HashMap<MediaId, ItemFile> {
+        let mut by_server: HashMap<&str, Vec<MediaId>> = HashMap::new();
+        for id in ids {
+            if self.federated(id.namespace(), id).is_none() {
+                let (server, local) = ids::media_local(id);
+                by_server.entry(server).or_default().push(local);
+            }
+        }
+        let asking = by_server.into_iter().filter_map(|(server, local)| {
+            let source = self.server(server)?;
+            Some(async move {
+                let found = source.catalog.items_with_files(&local).await;
+                found.into_values().map(|file| {
+                    let item = ids::item(server, file.item);
+                    let readable = file.readable;
+                    (item.id().clone(), ItemFile { item, readable })
+                })
+            })
+        });
+        futures_util::future::join_all(asking)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     async fn preview_frames(&self, id: &MediaId) -> Result<Option<PreviewFrames>, CatalogError> {
         if let Some(peers) = self.federated(id.namespace(), id) {
             return peers?.preview_frames(id).await;
@@ -932,6 +961,50 @@ mod tests {
 
     fn keys(items: &[Item]) -> Vec<String> {
         items.iter().map(|i| i.id().key().to_owned()).collect()
+    }
+
+    /// A second server's items are asked of it under its own keys, and
+    /// come back under Spoolframe's; a paired server's are left alone.
+    #[tokio::test]
+    async fn many_items_are_asked_of_the_server_each_is_on() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let track = |key: &str| {
+            serde_json::json!({ "MediaContainer": { "Metadata": [{
+                "ratingKey": key,
+                "key": format!("/library/metadata/{key}"),
+                "type": "track",
+                "title": "A",
+                "parentRatingKey": "20",
+                "grandparentRatingKey": "10",
+                "Media": [{ "Part": [{ "file": "/nowhere.flac" }] }],
+            }]}})
+        };
+        let source = async |id: &str, key: &str| {
+            let server = MockServer::start().await;
+            Mock::given(path(format!("/library/metadata/{key}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(track(key)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let catalog = PlexCatalog::new(server.uri().parse().unwrap(), None).unwrap();
+            let source = PlexSource {
+                id: id.into(),
+                name: id.into(),
+                catalog: Arc::new(catalog),
+            };
+            (server, source)
+        };
+        let (_first, one) = source(FIRST_PLEX_SERVER, "1").await;
+        let (_second, two) = source("two", "2").await;
+        let composite = Composite::new(vec![one, two], None);
+        let first: MediaId = "plex:track:1".parse().unwrap();
+        let second = ids::media("two", "plex:track:2".parse().unwrap());
+        let found = composite
+            .items_with_files(&[first.clone(), second.clone()])
+            .await;
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[&first].item.id(), &first);
+        assert_eq!(found[&second].item.id(), &second);
     }
 
     #[test]

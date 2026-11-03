@@ -17,8 +17,8 @@
 //! time they are needed: Liked, the tracks they liked, kept as any
 //! playlist's entries are; and All, every track they may see, whose
 //! entries are never kept but worked out from the catalog's tracks, as
-//! listed within the last minute, so a newly scanned album is in it
-//! within that and no edit is made (`ALL_KEPT_FOR`). All has a row all
+//! last listed, so a newly scanned album is in it from the read after the
+//! list's time is up and no edit is made (`ALL_KEPT_FOR`). All has a row all
 //! the same, for the user's place, settings and pin. Neither is renamed,
 //! shared or deleted, and All is not edited: `spoolframe_policy`'s
 //! `builtin_*`. They are listed only while a music library is served.
@@ -259,22 +259,28 @@ type Mosaics = parking_lot::Mutex<
 
 /// How long All's tracks (PX-43), as listed from the music libraries,
 /// are used before they are listed again: a newly scanned album is in All
-/// within this, as a new episode is on Home within the catalog's own
-/// [`KEPT_FOR`](crate::catalog::replies::KEPT_FOR). Listing every track of
-/// a large library takes the Plex servers seconds, too long to do at each
-/// page read and play. A replaced catalog lists them again at once.
+/// from the first read after this, as a new episode is on Home within the
+/// catalog's own [`KEPT_FOR`](crate::catalog::replies::KEPT_FOR). Listing
+/// every track of a large library takes the Plex servers seconds, too long
+/// for any read to wait for, so a list this old is still read while the
+/// next is made. A replaced catalog's reads wait for its own list.
 const ALL_KEPT_FOR: std::time::Duration = crate::catalog::replies::KEPT_FOR;
 
 /// Every track of the music libraries served, with no duplicates, in
 /// All's order, as last listed: one list for every user, each seeing of
-/// it what [`ItemVisibility`] lets them.
+/// it what [`ItemVisibility`] lets them. Clones share the list.
+#[derive(Clone)]
 struct AllTracks {
+    catalog: Arc<dyn Catalog>,
     /// Bumped as the catalog is replaced; without, only [`ALL_KEPT_FOR`]
     /// ends a list.
     changes: Option<tokio::sync::watch::Receiver<u64>>,
-    /// Held while the libraries are listed, so reads at once list them
-    /// once.
-    kept: tokio::sync::Mutex<Option<KeptTracks>>,
+    /// Locked only to look at or swap: a read never waits on a listing
+    /// while there is a list to read.
+    kept: Arc<parking_lot::Mutex<Option<KeptTracks>>>,
+    /// Held while the libraries are listed, so they are listed once
+    /// however many read at once.
+    listing: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// All's tracks, when they were listed, and under which catalog.
@@ -286,16 +292,123 @@ struct KeptTracks {
 }
 
 impl AllTracks {
-    fn new() -> Self {
+    fn new(catalog: Arc<dyn Catalog>) -> Self {
         Self {
+            catalog,
             changes: None,
-            kept: tokio::sync::Mutex::new(None),
+            kept: Arc::default(),
+            listing: Arc::default(),
         }
     }
 
     /// The catalog's generation now: 0 without a signal.
     fn generation(&self) -> u64 {
         self.changes.as_ref().map_or(0, |c| *c.borrow())
+    }
+
+    /// The tracks: as last listed under the catalog now, however long ago,
+    /// and else listed now.
+    async fn tracks(&self) -> Result<Arc<[Item]>, PlaylistsError> {
+        if let Some(tracks) = self.usable() {
+            return Ok(tracks);
+        }
+        let _listing = self.listing.lock().await;
+        // Listed while this read waited its turn.
+        if let Some(tracks) = self.usable() {
+            return Ok(tracks);
+        }
+        self.list().await
+    }
+
+    /// The list kept under the catalog now, having it listed again behind
+    /// the caller when it is old.
+    fn usable(&self) -> Option<Arc<[Item]>> {
+        let generation = self.generation();
+        let kept = self.kept.lock();
+        let kept = kept.as_ref().filter(|k| k.generation == generation)?;
+        if kept.at.elapsed() >= ALL_KEPT_FOR {
+            self.list_behind();
+        }
+        Some(kept.tracks.clone())
+    }
+
+    /// List in a task of its own, unless a listing is under way.
+    fn list_behind(&self) {
+        let Ok(listing) = self.listing.clone().try_lock_owned() else {
+            return;
+        };
+        let all = self.clone();
+        tokio::spawn(async move {
+            all.list_logged().await;
+            drop(listing);
+        });
+    }
+
+    /// [`Self::list`] with no reader to tell how it went. A list there is
+    /// stays; the next read past its time tries again.
+    async fn list_logged(&self) {
+        match self.list().await {
+            Ok(_) | Err(PlaylistsError::Catalog(CatalogError::NotSetUp)) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot list All's tracks now"),
+        }
+    }
+
+    /// List the tracks and keep them. The caller holds `listing`.
+    async fn list(&self) -> Result<Arc<[Item]>, PlaylistsError> {
+        // Read before listing: a catalog replaced while listing makes
+        // the list stale at once.
+        let generation = self.generation();
+        let at = tokio::time::Instant::now();
+        let tracks: Arc<[Item]> = self.listed().await?.into();
+        *self.kept.lock() = Some(KeptTracks {
+            at,
+            generation,
+            tracks: tracks.clone(),
+        });
+        Ok(tracks)
+    }
+
+    /// Every track from the catalog now, in All's order: the libraries a
+    /// few at once.
+    async fn listed(&self) -> Result<Vec<Item>, PlaylistsError> {
+        let music: Vec<_> = self
+            .catalog
+            .libraries()
+            .await?
+            .into_iter()
+            .filter(|library| library.kind == LibraryKind::Music)
+            .map(|library| library.id)
+            .collect();
+        let listed: Vec<Vec<Item>> = stream::iter(music)
+            .map(|library| async move {
+                match self.catalog.tracks(&library).await {
+                    Ok(found) => Ok(found),
+                    // Taken out of the config since it was listed.
+                    Err(CatalogError::NotServed(_)) => Ok(Vec::new()),
+                    Err(e) => Err(PlaylistsError::from(e)),
+                }
+            })
+            // In the libraries' order, so the first of an item listed twice
+            // is kept, as before.
+            .buffered(CATALOG_FETCHES)
+            .try_collect()
+            .await?;
+        let mut tracks: Vec<Item> = listed.into_iter().flatten().collect();
+        let mut seen = HashSet::new();
+        tracks.retain(|t| matches!(t, Item::Track(_)) && seen.insert(t.id().clone()));
+        // Stable: who may see what is filtered from this order after.
+        tracks.sort_by_cached_key(|t| match t {
+            Item::Track(t) => (
+                t.artist_name.as_deref().unwrap_or_default().to_lowercase(),
+                t.album_title.as_deref().unwrap_or_default().to_lowercase(),
+                t.album_id.to_string(),
+                t.disc.unwrap_or(1),
+                t.track.unwrap_or(u32::MAX),
+                t.title.to_lowercase(),
+            ),
+            _ => Default::default(),
+        });
+        Ok(tracks)
     }
 }
 
@@ -358,6 +471,7 @@ impl Playlists {
         visibility: Arc<dyn ItemVisibility>,
     ) -> Self {
         Self {
+            all: AllTracks::new(catalog.clone()),
             store,
             catalog,
             watch,
@@ -365,7 +479,6 @@ impl Playlists {
             news: tokio::sync::broadcast::Sender::new(NEWS),
             covers: None,
             mosaics: Mosaics::default(),
-            all: AllTracks::new(),
             seeds: Arc::new(|| getrandom::u64().expect("the OS gives random bytes")),
         }
     }
@@ -387,6 +500,25 @@ impl Playlists {
     pub fn with_catalog_changes(mut self, changes: tokio::sync::watch::Receiver<u64>) -> Self {
         self.all.changes = Some(changes);
         self
+    }
+
+    /// List All's tracks now, and again each time the catalog is replaced,
+    /// so the first to open it does not wait for them. Reads past
+    /// [`ALL_KEPT_FOR`] list them too, behind the read.
+    pub fn keep_all_listed(&self) {
+        let all = self.all.clone();
+        tokio::spawn(async move {
+            let mut changes = all.changes.clone();
+            loop {
+                let listing = all.listing.lock().await;
+                all.list_logged().await;
+                drop(listing);
+                let Some(changes) = &mut changes else { return };
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
     }
 
     /// Keep uploaded covers in `covers` (PX-53).
@@ -613,29 +745,43 @@ impl Playlists {
             let tracks = self.seen_tracks(actor, &all);
             let (start, end) = cut(tracks.len(), offset, limit);
             // Its files are looked at as they are listed and played, not
-            // the whole library's at every read; a few at once, as a
-            // playlist's own entries are.
+            // the whole library's at every read.
             let shown: Vec<Item> = tracks[start..end].iter().map(|&t| t.clone()).collect();
-            let page: Vec<PlaylistEntry> = stream::iter(shown)
-                .map(|item| async move {
-                    Ok::<_, PlaylistsError>(PlaylistEntry {
-                        entry: policy::all_entry(&item.id().to_string()),
-                        unavailable: self.unavailable(item.id()).await?,
-                        item,
-                        liked: false,
-                    })
+            let mut page: Vec<PlaylistEntry> = shown
+                .into_iter()
+                .map(|item| PlaylistEntry {
+                    entry: policy::all_entry(&item.id().to_string()),
+                    item,
+                    unavailable: false,
+                    liked: false,
                 })
-                .buffered(CATALOG_FETCHES)
-                .try_collect()
-                .await?;
+                .collect();
+            self.look_at_files(&mut page).await?;
             let total = tracks.len() as u32;
             (page, start, total, total)
         } else {
-            let mut entries = self.entries(actor, &row).await?;
+            let stored = self.store.playlist_entries(&row.id).await?;
+            // What every row of a long playlist is costs seconds of a Plex
+            // server at each page. A track on All's list needs no asking:
+            // it is there, and its file is looked at if its page is read.
+            let all = (stored.len() > MAX_PAGE as usize)
+                .then(|| self.all.usable())
+                .flatten();
+            let listed: HashMap<&MediaId, &Item> = all
+                .iter()
+                .flat_map(|all| all.iter())
+                .map(|track| (track.id(), track))
+                .collect();
+            let mut entries = self.entries_of(actor, &row, stored, &listed).await?;
             let total = entries.len() as u32;
-            let playable = entries.iter().filter(|e| !e.unavailable).count() as u32;
             let (start, end) = cut(entries.len(), offset, limit);
-            (entries.drain(start..end).collect(), start, total, playable)
+            let mut page: Vec<PlaylistEntry> = entries.drain(start..end).collect();
+            if !listed.is_empty() {
+                self.look_at_files(&mut page).await?;
+            }
+            let playable = entries.iter().chain(&page).filter(|e| !e.unavailable);
+            let playable = playable.count() as u32;
+            (page, start, total, playable)
         };
         let liked = self.store.liked_media(&principal).await?;
         for entry in &mut page {
@@ -695,70 +841,9 @@ impl Playlists {
     }
 
     /// Every track in the music libraries served, each once, by artist,
-    /// album, disc and track: as listed within [`ALL_KEPT_FOR`] under the
-    /// catalog now, else listed now.
+    /// album, disc and track: as [`AllTracks`] has them.
     async fn all_tracks(&self) -> Result<Arc<[Item]>, PlaylistsError> {
-        let mut kept = self.all.kept.lock().await;
-        // Read before listing: a catalog replaced while listing makes
-        // the list stale at once.
-        let generation = self.all.generation();
-        if let Some(k) = kept.as_ref()
-            && k.generation == generation
-            && k.at.elapsed() < ALL_KEPT_FOR
-        {
-            return Ok(k.tracks.clone());
-        }
-        let at = tokio::time::Instant::now();
-        let tracks: Arc<[Item]> = self.list_all_tracks().await?.into();
-        *kept = Some(KeptTracks {
-            at,
-            generation,
-            tracks: tracks.clone(),
-        });
-        Ok(tracks)
-    }
-
-    /// [`Self::all_tracks`], listed from the catalog now: the libraries a
-    /// few at once.
-    async fn list_all_tracks(&self) -> Result<Vec<Item>, PlaylistsError> {
-        let music: Vec<_> = self
-            .catalog
-            .libraries()
-            .await?
-            .into_iter()
-            .filter(|library| library.kind == LibraryKind::Music)
-            .map(|library| library.id)
-            .collect();
-        let listed: Vec<Vec<Item>> = stream::iter(music)
-            .map(|library| async move {
-                match self.catalog.tracks(&library).await {
-                    Ok(found) => Ok(found),
-                    // Taken out of the config since it was listed.
-                    Err(CatalogError::NotServed(_)) => Ok(Vec::new()),
-                    Err(e) => Err(PlaylistsError::from(e)),
-                }
-            })
-            // In the libraries' order, so the first of an item listed twice
-            // is kept, as before.
-            .buffered(CATALOG_FETCHES)
-            .try_collect()
-            .await?;
-        let mut tracks: Vec<Item> = listed.into_iter().flatten().collect();
-        let mut seen = HashSet::new();
-        tracks.retain(|t| matches!(t, Item::Track(_)) && seen.insert(t.id().clone()));
-        // Stable: who may see what is filtered from this order after.
-        tracks.sort_by_cached_key(|t| match t {
-            Item::Track(t) => (
-                t.artist_name.as_deref().unwrap_or_default().to_lowercase(),
-                t.album_title.as_deref().unwrap_or_default().to_lowercase(),
-                t.album_id.to_string(),
-                t.disc.unwrap_or(1),
-                t.track.unwrap_or(u32::MAX),
-                t.title.to_lowercase(),
-            ),
-            _ => Default::default(),
-        });
-        Ok(tracks)
+        self.all.tracks().await
     }
 
     /// The entries `row` plays, in order: its own, or All's worked out
@@ -798,9 +883,43 @@ impl Playlists {
         row: &PlaylistRow,
     ) -> Result<Vec<PlaylistEntry>, PlaylistsError> {
         let stored = self.store.playlist_entries(&row.id).await?;
+        self.entries_of(actor, row, stored, &HashMap::new()).await
+    }
+
+    /// [`Self::entries`] of the rows `stored`. Those whose item is in
+    /// `listed` are taken as it is, their files for readable, unasked.
+    async fn entries_of(
+        &self,
+        actor: &Actor,
+        row: &PlaylistRow,
+        stored: Vec<EntryRow>,
+        listed: &HashMap<&MediaId, &Item>,
+    ) -> Result<Vec<PlaylistEntry>, PlaylistsError> {
+        let ids: Vec<MediaId> = stored
+            .iter()
+            .filter_map(|e| e.media_id.parse().ok())
+            .filter(|id| !listed.contains_key(id))
+            .collect();
+        let files = &self.catalog.items_with_files(&ids).await;
         let resolved: Vec<(EntryRow, Resolved)> = stream::iter(stored)
             .map(|entry| async move {
-                let resolved = self.resolve(&entry).await?;
+                // What is not answered for is what needs care: moved, gone,
+                // not served, a paired server's.
+                let id = entry.media_id.parse::<MediaId>().ok();
+                let resolved = match id.as_ref().map(|id| (listed.get(id), files.get(id))) {
+                    Some((Some(&item), _)) => Resolved::Here {
+                        item: item.clone(),
+                        markers: Vec::new(),
+                        unavailable: false,
+                    },
+                    Some((_, Some(file))) => Resolved::Here {
+                        item: file.item.clone(),
+                        // Asked for only by what plays an entry.
+                        markers: Vec::new(),
+                        unavailable: !file.readable,
+                    },
+                    _ => self.resolve(&entry).await?,
+                };
                 Ok::<_, PlaylistsError>((entry, resolved))
             })
             .buffered(CATALOG_FETCHES)
@@ -901,6 +1020,36 @@ impl Playlists {
             Err(CatalogError::NotServed(_)) => Ok(Resolved::Hidden),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Set whether each of `page`'s files can be read now, and fill in
+    /// what a listing leaves out: at one go where the catalog can, else a
+    /// few at once.
+    async fn look_at_files(&self, page: &mut [PlaylistEntry]) -> Result<(), PlaylistsError> {
+        let ids: Vec<MediaId> = page.iter().map(|e| e.item.id().clone()).collect();
+        let files = &self.catalog.items_with_files(&ids).await;
+        let looking: Vec<_> = ids
+            .iter()
+            .map(|id| async move {
+                match files.get(id) {
+                    Some(file) => Ok(!file.readable),
+                    None => self.unavailable(id).await,
+                }
+            })
+            .collect();
+        let unavailable: Vec<bool> = stream::iter(looking)
+            .buffered(CATALOG_FETCHES)
+            .try_collect()
+            .await?;
+        for (entry, unavailable) in page.iter_mut().zip(unavailable) {
+            entry.unavailable = unavailable;
+            // All's list is a listing, with no stream details: what was
+            // asked of the file has them.
+            if let Some(file) = files.get(entry.item.id()) {
+                entry.item = file.item.clone();
+            }
+        }
+        Ok(())
     }
 
     /// Whether `id`'s file cannot be read now; a paired server's item

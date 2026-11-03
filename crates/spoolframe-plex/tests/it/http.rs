@@ -5,7 +5,7 @@ use spoolframe_plex::{PathMap, PathMapping, PlexCatalog};
 use spoolframe_types::{
     Item, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Namespace,
 };
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> String {
@@ -1384,6 +1384,125 @@ async fn a_music_library_s_tracks_are_one_listing() {
         .await
         .unwrap_err();
     assert!(matches!(unserved, CatalogError::NotServed(_)), "{unserved}");
+}
+
+/// A walk of every track is the slowest thing asked of a PMS: 45% of it
+/// is the guids, which no item takes, and summaries too are left out.
+#[tokio::test]
+async fn a_music_library_s_tracks_are_asked_without_what_a_track_does_not_hold() {
+    let server = MockServer::start().await;
+    Mock::given(path("/library/sections/12/all"))
+        .and(query_param("excludeFields", "summary"))
+        .and(query_param_is_missing("includeGuids"))
+        .respond_with(json("section-leaves-track"))
+        .mount(&server)
+        .await;
+    let music = LibraryId::new(Namespace::Plex, "12").unwrap();
+    assert_eq!(catalog(&server).tracks(&music).await.unwrap().len(), 2);
+}
+
+/// A track in `section` of `title`, at `file`.
+fn track_at(key: &str, section: u32, title: &str, file: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ratingKey": key,
+        "key": format!("/library/metadata/{key}"),
+        "type": "track",
+        "title": format!("Track {key}"),
+        "parentRatingKey": "20",
+        "grandparentRatingKey": "10",
+        "librarySectionID": section,
+        "librarySectionTitle": title,
+        "Media": [{ "id": 1, "Part": [{ "id": 2, "file": file, "size": 1 }] }],
+    })
+}
+
+fn items_reply(
+    first_section: u32,
+    first_title: &str,
+    items: &[serde_json::Value],
+) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "MediaContainer": {
+        "size": items.len(),
+        "librarySectionID": first_section,
+        "librarySectionTitle": first_title,
+        "Metadata": items,
+    }}))
+}
+
+/// A page's items are one request, not one each. Plex leaves out a key
+/// it does not have; its reply names only the first item's section, so
+/// each item's mapping is by its own.
+#[tokio::test]
+async fn many_items_and_their_files_are_one_request() {
+    let dir = spoolframe_test_dir::TestDir::new("plex-items-with-files").await;
+    std::fs::write(dir.as_ref().join("here.flac"), b"").unwrap();
+    let server = MockServer::start().await;
+    Mock::given(path("/library/metadata/1,2,3,4"))
+        .respond_with(items_reply(
+            7,
+            "Other",
+            &[
+                track_at("1", 12, "Music", "/plex/here.flac"),
+                track_at("2", 12, "Music", "/plex/missing.flac"),
+                track_at("3", 7, "Other", "/plex/here.flac"),
+            ],
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let found = catalog(&server)
+        .with_paths(PathMap::new(vec![PathMapping {
+            library: Some("Music".into()),
+            from: "/plex".into(),
+            to: dir.as_ref().to_owned(),
+        }]))
+        .items_with_files(&["1", "2", "3", "4"].map(|key| id(MediaKind::Track, key)))
+        .await;
+    let readable = |key| found.get(&id(MediaKind::Track, key)).map(|f| f.readable);
+    assert_eq!(readable("1"), Some(true));
+    assert_eq!(readable("2"), Some(false), "mapped, not there");
+    assert_eq!(readable("3"), Some(false), "no mapping for its section");
+    assert_eq!(readable("4"), None, "Plex did not list it");
+}
+
+/// What one asked alone would call not served, or another kind since,
+/// is left to be asked alone.
+#[tokio::test]
+async fn items_not_served_or_of_another_kind_now_are_left_out_of_many() {
+    let server = MockServer::start().await;
+    let mut reused = track_at("2", 12, "Music", "/plex/a.flac");
+    reused["type"] = "album".into();
+    Mock::given(path("/library/metadata/1,2,3"))
+        .respond_with(items_reply(
+            12,
+            "Music",
+            &[
+                track_at("1", 12, "Music", "/plex/a.flac"),
+                reused,
+                track_at("3", 7, "Other", "/plex/a.flac"),
+            ],
+        ))
+        .mount(&server)
+        .await;
+    let found = catalog(&server)
+        .serving(Some(["12".to_owned()].into()))
+        .items_with_files(&["1", "2", "3"].map(|key| id(MediaKind::Track, key)))
+        .await;
+    assert_eq!(
+        found.keys().collect::<Vec<_>>(),
+        [&id(MediaKind::Track, "1")]
+    );
+}
+
+/// A PMS that does not answer says nothing of any of them.
+#[tokio::test]
+async fn many_items_a_pms_does_not_answer_for_are_left_out() {
+    let server = MockServer::start().await;
+    let found = catalog(&server)
+        .items_with_files(&[id(MediaKind::Track, "1")])
+        .await;
+    assert!(found.is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 /// PX-43's import: the tracks the account rated, asked of each music

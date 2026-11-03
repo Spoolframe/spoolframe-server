@@ -100,11 +100,23 @@ impl PlexCatalog {
         plex_type: &str,
         filters: &[(&str, &str)],
     ) -> Result<Vec<Metadata>, CatalogError> {
+        let asked = [&[("includeGuids", "1")], filters].concat();
+        self.walked(section, plex_type, &asked).await
+    }
+
+    /// A section's items of `plex_type`, page by page, with `query` asked
+    /// of each page.
+    pub(crate) async fn walked(
+        &self,
+        section: &str,
+        plex_type: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Vec<Metadata>, CatalogError> {
         let mut all = Vec::new();
         loop {
             let mut call = Call::get(format!("/library/sections/{section}/all"));
-            call.query = vec![("type", plex_type), ("includeGuids", "1")];
-            call.query.extend_from_slice(filters);
+            call.query = vec![("type", plex_type)];
+            call.query.extend_from_slice(query);
             call.headers = vec![
                 ("X-Plex-Container-Start", all.len().to_string()),
                 ("X-Plex-Container-Size", PAGE.to_string()),

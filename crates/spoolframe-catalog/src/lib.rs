@@ -17,6 +17,7 @@ pub use inspect::{
 };
 pub use search::{Found, FoundGroup, SearchQuery, episode_ids, interleave};
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -29,6 +30,13 @@ use spoolframe_types::{
 use CatalogError::CannotBrowse;
 
 /// Which slice of a library to list.
+/// An item, and whether its file can be read now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemFile {
+    pub item: Item,
+    pub readable: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Page {
     /// How many items to skip.
@@ -381,6 +389,16 @@ pub trait Catalog: Send + Sync {
     /// The local path of the item's media file: what the catalog reports,
     /// mapped to this host, and checked to be a readable file.
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError>;
+
+    /// Those of `ids` this catalog can answer for at one go, each with
+    /// whether its file can be read: what [`Catalog::item`] and
+    /// [`Catalog::media_path`] would say of it, for a playlist's page or
+    /// list, where asking each is a request per entry. An id left out says
+    /// nothing, not even that it is gone: it is asked alone. A catalog that
+    /// cannot answer for many at once leaves them all out.
+    async fn items_with_files(&self, _ids: &[MediaId]) -> HashMap<MediaId, ItemFile> {
+        HashMap::new()
+    }
 
     /// The most recently added items, newest first, at most `limit`.
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError>;

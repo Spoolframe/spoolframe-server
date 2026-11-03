@@ -9,13 +9,14 @@ pub mod ids;
 pub mod replies;
 
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use spoolframe_catalog::{
-    Browsing, Catalog, CatalogError, Facts, Found, Image, ItemPage, ItemQuery, ItemWithChildren,
-    Listed, Page, PreviewFrames, Reach, SearchQuery,
+    Browsing, Catalog, CatalogError, Facts, Found, Image, ItemFile, ItemPage, ItemQuery,
+    ItemWithChildren, Listed, Page, PreviewFrames, Reach, SearchQuery,
 };
 use spoolframe_plex::PlexCatalog;
 use spoolframe_types::{
@@ -306,6 +307,14 @@ impl Catalog for LiveCatalog {
 
     async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
         self.current()?.media_path(id).await
+    }
+
+    /// Not kept, as a file's path is not: a read of it checks the file.
+    async fn items_with_files(&self, ids: &[MediaId]) -> HashMap<MediaId, ItemFile> {
+        match self.current() {
+            Ok(catalog) => catalog.items_with_files(ids).await,
+            Err(_) => HashMap::new(),
+        }
     }
 
     async fn recently_added(&self, limit: u32) -> Result<Vec<Item>, CatalogError> {
