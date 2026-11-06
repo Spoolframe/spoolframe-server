@@ -258,6 +258,14 @@ fn on_lan(path: &str) -> bool {
     path.starts_with("lan ")
 }
 
+/// Whether a change of path from `before` to `now` (both named by
+/// [`path_name`]) is a move onto the LAN: `none`, the path not known
+/// after a reconnect (#4), a relay or a direct path off the LAN, then a
+/// LAN one.
+fn reached_lan(before: &str, now: &str) -> bool {
+    !on_lan(before) && on_lan(now)
+}
+
 /// A re-plan's `wan` on the wire: whether the connection's path is off the
 /// LAN now, as the planner and the per-stream cap take it. Not whether the
 /// playback holds a share: one that started on the LAN and moved off it
@@ -309,8 +317,13 @@ fn path_now(connection: &iroh::endpoint::Connection, uplink: &crate::uplink::Upl
 /// to a direct path is a hole punched), else at DEBUG, as most
 /// connections are an app checking in. The disconnect line names them
 /// all either way.
+///
+/// A move onto the LAN from a path that was not lets go of the WAN
+/// places its playbacks hold ([`reached_lan`]), by `stable_id`, the
+/// connection the uplink knows them by.
 async fn log_paths(
     connection: iroh::endpoint::WeakConnectionHandle,
+    stable_id: usize,
     mut events: iroh::endpoint::PathEventStream,
     state: std::sync::Weak<ConnectionState>,
 ) {
@@ -353,6 +366,9 @@ async fn log_paths(
             before.unwrap_or_else(|| "none".into())
         };
         state.path_is(&selected);
+        if reached_lan(&before, &selected) {
+            state.uplink.moved_onto_lan(stable_id);
+        }
         state
             .switches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7355,6 +7371,7 @@ impl ProtocolHandler for ClientProtocol {
         }
         tokio::spawn(log_paths(
             connection.weak_handle(),
+            connection.stable_id(),
             path_events,
             Arc::downgrade(&state),
         ));
@@ -9348,6 +9365,28 @@ mod tests {
     #[test]
     fn with_none_selected_of_several_no_path_is_known() {
         assert_eq!(going_by([(1, false), (2, false)], |p| p.1), None);
+    }
+
+    /// A path that turns out to be the LAN after none was known (#4), or
+    /// after a relay or the WAN, is a move onto it; a LAN path moving to
+    /// another LAN path, or off the LAN, is not.
+    #[test]
+    fn a_path_known_to_be_the_lan_after_one_that_was_not_is_reached() {
+        assert!(reached_lan("none", "lan 192.168.1.5:4433"));
+        assert!(reached_lan(
+            "relay https://relay.example/",
+            "lan 192.168.1.5:4433"
+        ));
+        assert!(reached_lan(
+            "direct 203.0.113.9:4433",
+            "lan 192.168.1.5:4433"
+        ));
+        assert!(!reached_lan("lan 192.168.1.5:4433", "lan 192.168.1.6:4433"));
+        assert!(!reached_lan(
+            "lan 192.168.1.5:4433",
+            "relay https://relay.example/"
+        ));
+        assert!(!reached_lan("none", "direct 203.0.113.9:4433"));
     }
 
     #[test]

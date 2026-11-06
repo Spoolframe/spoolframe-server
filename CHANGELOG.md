@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Server: a play started just after a reconnect no longer stays counted
+  off the LAN (#4). While the device's old connection lingers, iroh
+  selects none of the new one's paths, so the play was admitted as WAN,
+  held to the per-stream cap and a share of the budget, and its `wan` said
+  so. Once the path turns out to be the LAN, the playback lets go of its
+  WAN place; when a budget or cap held it, it is told it has no share
+  (`PlaybackShare` with no `max_bitrate`), and the device's re-plan is a
+  LAN one with `wan: false`. No wire change.
+
 ## 0.17.2 (2026-11-01)
 
 - SDK: a play can say what sound it may carry, in place of the device's

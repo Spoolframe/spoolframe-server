@@ -257,6 +257,9 @@ pub struct Uplink {
     /// one's class, by its ticket. They count against `max_streams` and in
     /// the shares, so two starts at once cannot both take the last place.
     pending: Mutex<HashMap<u64, Class>>,
+    /// Playbacks whose connection moved onto the LAN, to be told they
+    /// have no share now ([`Uplink::moved_onto_lan`]).
+    lifted: Mutex<Vec<Told>>,
     next_ticket: std::sync::atomic::AtomicU64,
     /// Download reads off the LAN being sent ([`DownloadSlot`]).
     download_reads: std::sync::atomic::AtomicUsize,
@@ -286,6 +289,7 @@ impl Uplink {
             subnets: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            lifted: Mutex::new(Vec::new()),
             next_ticket: std::sync::atomic::AtomicU64::new(0),
             download_reads: std::sync::atomic::AtomicUsize::new(0),
             changed: Arc::new(tokio::sync::Notify::new()),
@@ -435,10 +439,49 @@ impl Uplink {
         self.streams.lock().len()
     }
 
+    /// Connection `connection`'s path is on the LAN now, after one that
+    /// was not (#4): its WAN playbacks let go of their places and shares.
+    /// A play started just after a reconnect is admitted as WAN while
+    /// iroh selects none of the connection's paths, until the old
+    /// connection times out; this undoes that once the path is known.
+    /// When a limit held them (a budget or a per-stream cap), each is
+    /// told it has none ([`Uplink::rebalance`]), so its device plans
+    /// again and the re-plan is a LAN one. The others' shares are worked
+    /// out again too.
+    pub fn moved_onto_lan(&self, connection: usize) {
+        let settings = self.settings.read().clone();
+        let limited = settings.budget.is_some() || settings.per_stream.is_some();
+        let mut streams = self.streams.lock();
+        let moved: Vec<String> = streams
+            .iter()
+            .filter(|(_, s)| s.connection == connection)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        for handle in &moved {
+            streams.remove(handle);
+        }
+        drop(streams);
+        if limited {
+            self.lifted
+                .lock()
+                .extend(moved.into_iter().map(|handle| Told {
+                    handle,
+                    connection,
+                    max_bitrate: None,
+                }));
+        }
+        self.changed.notify_one();
+    }
+
     /// Work the shares out again, and note what each playback whose
-    /// share moved by [`HYSTERESIS`] or more is to be told.
+    /// share moved by [`HYSTERESIS`] or more is to be told, after the
+    /// ones moved onto the LAN ([`Uplink::moved_onto_lan`]).
     pub fn rebalance(&self) -> Vec<Told> {
         let settings = self.settings.read().clone();
+        let mut told = std::mem::take(&mut *self.lifted.lock());
         let mut streams = self.streams.lock();
         let mut handles: Vec<String> = streams.keys().cloned().collect();
         handles.sort();
@@ -452,7 +495,6 @@ impl Uplink {
                     .collect()
             }
         };
-        let mut told = Vec::new();
         for (handle, share) in handles.into_iter().zip(now) {
             let stream = streams.get_mut(&handle).expect("listed above");
             if worth_telling(stream.told, share) {
@@ -678,6 +720,54 @@ mod tests {
         assert_eq!(uplink.wan_streams(), 1);
         drop(slots);
         assert!(uplink.reserve_download().is_ok());
+    }
+
+    /// A play admitted as WAN just after a reconnect (#4), whose path
+    /// turns out to be the LAN, lets go of its place and is told it has
+    /// no share; the other connection's playback gets the whole budget.
+    #[test]
+    fn a_connection_moved_onto_the_lan_lets_go_of_its_wan_playbacks() {
+        let uplink = Uplink::new(UplinkSettings {
+            budget: Some(8_000_000),
+            max_streams: Some(2),
+            ..UplinkSettings::default()
+        });
+        uplink.started("home", Class::Owner, 1, Some(4_000_000));
+        uplink.started("away", Class::Owner, 2, Some(4_000_000));
+        uplink.moved_onto_lan(1);
+        assert_eq!(uplink.wan_streams(), 1);
+        assert_eq!(uplink.share_of("home"), None);
+        assert_eq!(
+            uplink.rebalance(),
+            vec![
+                Told {
+                    handle: "home".into(),
+                    connection: 1,
+                    max_bitrate: None,
+                },
+                Told {
+                    handle: "away".into(),
+                    connection: 2,
+                    max_bitrate: Some(8_000_000),
+                },
+            ]
+        );
+        assert!(uplink.rebalance().is_empty(), "told once");
+    }
+
+    /// With no budget and no per-stream cap, nothing held the play back:
+    /// its place is let go, and it is not planned again for nothing.
+    #[test]
+    fn with_no_limit_a_move_onto_the_lan_only_frees_the_place() {
+        let uplink = Uplink::new(UplinkSettings {
+            max_streams: Some(1),
+            ..UplinkSettings::default()
+        });
+        uplink.started("home", Class::Guest, 1, None);
+        assert!(uplink.admit(Class::Guest).is_err());
+        uplink.moved_onto_lan(1);
+        assert!(uplink.admit(Class::Guest).is_ok());
+        assert!(uplink.rebalance().is_empty());
     }
 
     const MBIT: u64 = 1_000_000;
