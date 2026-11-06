@@ -490,6 +490,22 @@ const HEVC_KEPT: ConvertedVideo = ConvertedVideo::Encode {
     tone_map: false,
 };
 
+/// hevc_vaapi leaves the source's A/53 captions out and keeps HDR: with
+/// them, radeonsi spent 15 ms of CPU a frame on the SEI, and a 4K
+/// WEB-DL took 80 to 95 s to its first segment. Other encoders are left
+/// as they are.
+#[test]
+fn hevc_on_vaapi_leaves_the_captions_out_of_its_sei() {
+    let film = film();
+    let vaapi = encoders(true);
+    let args = ffmpeg_args(&spec_with(&film, &vaapi, HEVC_KEPT, None)).unwrap();
+    assert!(has(&args, &["-c:v", "hevc_vaapi"]), "{args:?}");
+    assert_eq!(after(&args, "-sei"), "hdr");
+    let cpu = encoders(false);
+    let args = ffmpeg_args(&spec_with(&film, &cpu, HEVC_KEPT, None)).unwrap();
+    assert!(!args.iter().any(|a| a == "-sei"), "{args:?}");
+}
+
 /// HDR10 HEVC decoded on the GPU and kept: scaled in 10 bits on it,
 /// encoded Main 10, the HDR colours said.
 #[test]

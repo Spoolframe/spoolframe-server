@@ -168,6 +168,22 @@ fn only_forced_keyframes(encoder: &str) -> Vec<String> {
     args
 }
 
+/// The SEI an encode leaves out. hevc_vaapi writes the source's CEA-608
+/// captions (A/53) into every frame by default, and Mesa's radeonsi
+/// parses each frame's packed SEI at about 15 ms of CPU a frame: a 4K
+/// WEB-DL with captions encoded at 1.6 fps, 80 to 95 s to a first
+/// segment, while the same frames without them took 0.5 s for 3 s of
+/// film. The captions are not wanted either: HLS variants declare
+/// `CLOSED-CAPTIONS=NONE`, and a client lists its subtitles from
+/// `Tracks`. HDR metadata stays. h264_vaapi writes them too but is fast
+/// on the same frames; av1_vaapi has no such option.
+fn no_caption_sei(encoder: &str) -> Vec<String> {
+    match encoder {
+        "hevc_vaapi" => vec![s("-sei"), s("hdr")],
+        _ => Vec::new(),
+    }
+}
+
 /// For a run of an encoded video from a seek, a copied audio track cut
 /// to start where the video does. A seek lands the demuxer on the
 /// source's keyframe before the time, and a copied track starts there,

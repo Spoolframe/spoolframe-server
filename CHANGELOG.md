@@ -28,6 +28,14 @@
   1.18 with the new one, so the old declaration was half again over what
   any encode reached. libx264 averages a little under the cap with the
   smaller buffer (0.86 against 0.96 of it); VA-API stays at it.
+- Server: an HEVC encode on AMD graphics no longer crawls on a film with
+  closed captions. hevc_vaapi wrote the source's CEA-608 captions (A/53)
+  into every frame, and Mesa's radeonsi spends about 15 ms of CPU a frame
+  parsing them: a 4K WEB-DL with captions encoded at 1.6 fps, and a
+  change to 8 Mbps on Android TV took 80 to 95 s to its first picture
+  against 3 s for a direct play. hevc_vaapi now writes only the HDR SEI
+  (`-sei hdr`); 3 s of the same film encode in 0.5 s instead of 44 s.
+  Nothing is lost: HLS variants already say `CLOSED-CAPTIONS=NONE`.
 
 ## 0.17.2 (2026-11-01)
 

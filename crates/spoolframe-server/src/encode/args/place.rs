@@ -763,6 +763,7 @@ pub(crate) fn probe_args(spec: &EncodeSpec<'_>, file: &Path) -> Option<Vec<Strin
         ]);
     }
     args.extend(only_forced_keyframes(&encoder.name));
+    args.extend(no_caption_sei(&encoder.name));
     if codec == VideoCodec::Hevc {
         args.extend([s("-tag:v"), s("hvc1")]);
     }

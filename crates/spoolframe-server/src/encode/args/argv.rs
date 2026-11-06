@@ -214,6 +214,7 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
                     } => {
                         args.extend([s("-force_key_frames"), keyframes_at(cuts, spec.start)]);
                         args.extend(only_forced_keyframes(&encoder.name));
+                        args.extend(no_caption_sei(&encoder.name));
                     }
                     // A keyframe at every cut and nowhere else, so HLS
                     // cuts land on the grid. The muxer cuts at the first
@@ -226,6 +227,7 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
                     Output::Hls { .. } => {
                         args.extend([s("-force_key_frames"), forced_keyframes(from_start(spec))]);
                         args.extend(only_forced_keyframes(&encoder.name));
+                        args.extend(no_caption_sei(&encoder.name));
                     }
                     Output::Progressive { .. } => {}
                 }
