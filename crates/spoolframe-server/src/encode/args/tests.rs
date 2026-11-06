@@ -1795,7 +1795,7 @@ fn a_vaapi_encode_scales_tone_maps_and_uploads_last() {
     assert!(has(
         &args,
         &[
-            "-b:v", "8000000", "-maxrate", "8000000", "-bufsize", "16000000"
+            "-b:v", "8000000", "-maxrate", "8000000", "-bufsize", "8000000"
         ]
     ));
 }

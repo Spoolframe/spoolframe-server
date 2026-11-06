@@ -334,13 +334,16 @@ impl Rate {
         }
     }
 
-    /// A video encode capped at `cap` (`-maxrate cap -bufsize 2×cap`): a
+    /// A video encode capped at `cap` (`-maxrate cap -bufsize cap`): a
     /// segment holds at most its time at the cap plus the full buffer, and
     /// the shortest, the first ([`FIRST_SEGMENT_SECS`], PX-26), has the
-    /// most over its time: twice the cap at 2 s.
+    /// most over its time: 1.5 times the cap at 2 s. A bound, not a guess:
+    /// AVPlayer refuses a segment over `BANDWIDTH`. Measured at a cap of
+    /// 7.36 Mbit/s on a 1080p film (#2), the worst 2 s held 1.17 times it
+    /// on hevc_vaapi and 1.18 on libx264.
     fn capped(cap: u64) -> Self {
         Self {
-            peak: cap.saturating_add(cap.saturating_mul(2) / u64::from(FIRST_SEGMENT_SECS)),
+            peak: cap.saturating_add(cap / u64::from(FIRST_SEGMENT_SECS)),
             average: cap,
         }
     }
@@ -1280,8 +1283,8 @@ mod tests {
     }
 
     /// A capped encode's segments can run over its cap by what the
-    /// encoder's buffer holds, twice the cap, spread over the shortest
-    /// segment: the first, 2 s (PX-26).
+    /// encoder's buffer holds, the cap's one second, spread over the
+    /// shortest segment: the first, 2 s (PX-26). Not twice the cap (#2).
     #[test]
     fn a_capped_encode_declares_its_cap_and_its_buffer() {
         let video = Some(ConvertedVideo::Encode {
@@ -1299,7 +1302,7 @@ mod tests {
             },
         });
         let text = multivariant_playlist(&film("bt709"), video, (None, None), aac, None);
-        assert_eq!(bandwidths(&text), (12_000_000 + 220_000, Some(6_200_000)));
+        assert_eq!(bandwidths(&text), (9_000_000 + 220_000, Some(6_200_000)));
     }
 
     #[test]

@@ -19,6 +19,15 @@
   TV's kernel and the server's NIC dropped none. A server that set
   `"cubic"`, in its file or by saving the web UI's Remote access page,
   keeps it. Applies after a restart.
+- Server: a capped encode's HLS `BANDWIDTH` is 1.5 times its cap, not
+  twice (#2). The peak is a bound AVPlayer holds every segment to, made of
+  the cap plus the encoder's buffer over the 2 s first segment; the
+  buffer (`-bufsize`) is now one second of the cap, not two. Measured at a
+  cap of 7.36 Mbit/s on a 1080p film, the worst 2 s held 1.19 times the
+  cap on hevc_vaapi and 1.43 on libx264 with the old buffer, and 1.17 and
+  1.18 with the new one, so the old declaration was half again over what
+  any encode reached. libx264 averages a little under the cap with the
+  smaller buffer (0.86 against 0.96 of it); VA-API stays at it.
 
 ## 0.17.2 (2026-11-01)
 

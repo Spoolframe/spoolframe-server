@@ -198,8 +198,10 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
                         s(rate),
                         s("-maxrate"),
                         s(rate),
+                        // One second of the cap: what the HLS playlist declares as its
+                        // peak counts on it (hls.rs, `Rate::capped`, #2).
                         s("-bufsize"),
-                        s(rate.saturating_mul(2)),
+                        s(rate),
                     ]);
                 }
                 match &spec.output {

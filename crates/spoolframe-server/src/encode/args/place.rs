@@ -756,8 +756,10 @@ pub(crate) fn probe_args(spec: &EncodeSpec<'_>, file: &Path) -> Option<Vec<Strin
             s(rate),
             s("-maxrate"),
             s(rate),
+            // One second of the cap: what the HLS playlist declares as its
+            // peak counts on it (hls.rs, `Rate::capped`, #2).
             s("-bufsize"),
-            s(rate.saturating_mul(2)),
+            s(rate),
         ]);
     }
     args.extend(only_forced_keyframes(&encoder.name));
