@@ -2224,8 +2224,9 @@ pub struct NetworkConfig {
     /// The WAN uplink budget and its share (PX-46).
     #[ucl(default)]
     pub uplink: UplinkConfig,
-    /// How QUIC paths share the link: `"cubic"` (the default) or `"bbr"`,
-    /// which holds its rate on a lossy link such as cellular. Every path,
+    /// How QUIC paths share the link: `"bbr"` (the default), which paces
+    /// by the speed it measures and holds its rate on a lossy link such as
+    /// cellular, or `"cubic"`, which backs off on every lost packet. Every path,
     /// LAN ones too: noq picks one controller for all of them.
     #[ucl(default)]
     pub congestion_control: Option<String>,
@@ -2670,8 +2671,8 @@ impl NetworkConfig {
         let pkarr = self.pkarr()?;
         let own_relays = self.own_relays()?;
         let congestion = match self.congestion_control.as_deref().map(str::trim) {
-            None | Some("cubic") => crate::network::CongestionControl::Cubic,
-            Some("bbr") => crate::network::CongestionControl::Bbr,
+            Some("cubic") => crate::network::CongestionControl::Cubic,
+            None | Some("bbr") => crate::network::CongestionControl::Bbr,
             Some(other) => {
                 return Err(ConfigError::Invalid {
                     key: "network.congestion_control",
@@ -4962,9 +4963,9 @@ mod tests {
     }
 
     #[test]
-    fn congestion_control_is_cubic_unless_bbr_is_asked() {
+    fn congestion_control_is_bbr_unless_cubic_is_asked() {
         use crate::network::CongestionControl;
-        assert_eq!(congestion("").unwrap(), CongestionControl::Cubic);
+        assert_eq!(congestion("").unwrap(), CongestionControl::Bbr);
         assert_eq!(
             congestion(r#"congestion_control = "cubic";"#).unwrap(),
             CongestionControl::Cubic

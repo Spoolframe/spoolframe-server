@@ -114,11 +114,13 @@ network {
   # record is public: it holds the relays and public addresses only,
   # never a LAN one.
   pkarr = "off";
-  # How the server paces what it sends: "cubic" (the default) backs off on
-  # every lost packet; "bbr" paces by the speed it measures, and keeps it
-  # on a lossy link such as cellular. One choice for every connection,
-  # home ones too. Applies after a restart.
-  congestion_control = "cubic";
+  # How the server paces what it sends: "bbr" (the default) paces by the
+  # speed it measures, keeps it on a lossy link such as cellular, and does
+  # not send a Wi-Fi access point more than it passes on; "cubic" backs off
+  # on every lost packet, and on a home network sends bursts a Wi-Fi access
+  # point drops. One choice for every connection, home ones too. Applies
+  # after a restart.
+  congestion_control = "bbr";
   # Announce the server on the LAN over mDNS, so clients find it.
   mdns = true;
   # The UDP port the setup wizard's search for Plex servers on the LAN

@@ -375,12 +375,12 @@ in {
     congestionControl = lib.mkOption {
       type = lib.types.nullOr (lib.types.enum ["cubic" "bbr"]);
       default = null;
-      example = "bbr";
+      example = "cubic";
       description = ''
         How the server paces what it sends (`network.congestion_control`):
         "cubic" backs off on every lost packet; "bbr" paces by the speed it
         measures and keeps it on a lossy link such as cellular. One choice
-        for every connection. Null leaves it to the web UI (cubic until set
+        for every connection. Null leaves it to the web UI (bbr until set
         there). Applies after a restart.
       '';
     };

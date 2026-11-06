@@ -642,7 +642,7 @@ fn UplinkFields(
     let mut congestion = use_signal(|| {
         let saved = text(&settings, CONGESTION);
         if saved.is_empty() {
-            "cubic".to_owned()
+            "bbr".to_owned()
         } else {
             saved
         }
@@ -790,15 +790,15 @@ fn UplinkFields(
                 div { class: "wan-part",
                     span { class: "flex flex-col gap-0.5",
                         b { class: "text-[15px]", "Congestion control" }
-                        span { class: "text-[13px] text-ctp-subtext0", "How the server paces what it sends. Cubic backs off on every lost packet; BBR paces by the speed it measures, and keeps it on a lossy link such as cellular. It applies to every connection, home ones too, after a restart." }
+                        span { class: "text-[13px] text-ctp-subtext0", "How the server paces what it sends. BBR paces by the speed it measures, and keeps it on a lossy link such as cellular; Cubic backs off on every lost packet, and on a home network sends bursts a Wi-Fi access point drops. It applies to every connection, home ones too, after a restart." }
                     }
                     select {
                         class: "pref-select",
                         disabled: locked(&settings, CONGESTION),
                         value: "{congestion}",
                         onchange: move |e| congestion.set(e.value()),
-                        option { value: "cubic", "Cubic (the default)" }
-                        option { value: "bbr", "BBR" }
+                        option { value: "bbr", "BBR (the default)" }
+                        option { value: "cubic", "Cubic" }
                     }
                     Note { settings: settings.clone(), setting: CONGESTION, on_changed: move |_| on_reload.call(()) }
                 }

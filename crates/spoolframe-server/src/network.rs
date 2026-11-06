@@ -89,11 +89,15 @@ impl Pkarr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CongestionControl {
     /// noq's default, and iroh's: backs off on every loss, which on a
-    /// lossy cellular link holds a window of a few dozen KB.
-    #[default]
+    /// lossy cellular link holds a window of a few dozen KB. On a LAN path
+    /// of a few ms it grows a window of 1 to 2 MB and sends it in bursts
+    /// at line rate, which a Wi-Fi access point drops: 16% of the packets
+    /// to a Google TV on Wi-Fi were lost, where BBR lost 0.5% (#3).
     Cubic,
-    /// BBR (v3): paces by the rate and round trip it measures, not by
-    /// loss, so a lossy link keeps its throughput.
+    /// BBR (v3), the default: paces by the rate and round trip it
+    /// measures, not by loss, so a lossy link keeps its throughput and a
+    /// Wi-Fi access point is not sent more than it passes on.
+    #[default]
     Bbr,
 }
 

@@ -10,6 +10,15 @@
   WAN place; when a budget or cap held it, it is told it has no share
   (`PlaybackShare` with no `max_bitrate`), and the device's re-plan is a
   LAN one with `wan: false`. No wire change.
+- Server: `network.congestion_control` defaults to `"bbr"`, not `"cubic"`
+  (#3). The `lost_pct` the link log showed while a buffer filled was real
+  loss, not the reading: on a LAN path of a few ms, cubic grew a window of
+  1 to 2 MB and sent it in bursts at line rate, which the Wi-Fi access
+  point dropped. To a Google TV on Wi-Fi, the same film lost 16% of its
+  packets (median of 10 s intervals) under cubic and 0.5% under BBR; the
+  TV's kernel and the server's NIC dropped none. A server that set
+  `"cubic"`, in its file or by saving the web UI's Remote access page,
+  keeps it. Applies after a restart.
 
 ## 0.17.2 (2026-11-01)
 
