@@ -8,6 +8,12 @@ would report it; the server maps /data to the media directory given here
 (plex.pathMappings). With --library bob, it is Bob's Movies instead: his
 copy of Alice's first film and another of its title (fake_plex.bobs_library).
 
+With --catalog FILE it serves a library read from FILE instead, for a demo
+server (`devenv up demo`): JSON with `name` (the server's friendlyName),
+`sections` as SECTIONS, and `items`, each shaped as /library/metadata
+returns it, plus an `_images` object naming the local file of its `thumb`
+and `art` (served at those keys, and never sent as JSON).
+
 Paging comes as Plex sends it: X-Plex-Container-Start and -Size, as headers
 or in the query. An endpoint not modelled answers an empty container, as a
 PMS with nothing to say would; an item it does not have is a 404.
@@ -197,11 +203,22 @@ LIBRARIES = {
 }
 
 
+def catalog(path):
+    """A library read from `path` (see --catalog): its name, sections and
+    items by ratingKey."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    items = {int(item["ratingKey"]): item for item in data["items"]}
+    return data.get("name", "Fake Plex"), data["sections"], items
+
+
 class Plex:
-    def __init__(self, media_dir, poster, name):
-        sections, items = LIBRARIES[name]
-        self.sections = sections
-        self.items = items()
+    def __init__(self, media_dir, poster, name, catalog_file=None):
+        if catalog_file:
+            self.name, self.sections, self.items = catalog(catalog_file)
+        else:
+            sections, items = LIBRARIES[name]
+            self.name, self.sections, self.items = "Fake Plex", sections, items()
         self.poster = poster
         for item in self.items.values():
             for version in item.get("Media", []):
@@ -232,10 +249,38 @@ class Plex:
         )
 
 
+def public(item):
+    """`item` as Plex sends it: without the local files of its images."""
+    return {k: v for k, v in item.items() if k != "_images"}
+
+
 def container(metadata=None, **extra):
-    body = {"size": len(metadata or []), "Metadata": metadata or []}
+    metadata = [public(m) for m in metadata or []]
+    body = {"size": len(metadata), "Metadata": metadata}
     body.update(extra)
     return {"MediaContainer": body}
+
+
+# What a section sorts by (/library/sections/{key}/sorts), as Plex names
+# the fields; a show section sorts by its latest episode's date added.
+SORTS = {
+    "movie": ["titleSort", "addedAt", "originallyAvailableAt", "rating",
+              "audienceRating", "duration"],
+    "show": ["titleSort", "addedAt", "episode.addedAt", "originallyAvailableAt",
+             "rating", "audienceRating"],
+}
+
+
+def sorted_by(items, sort):
+    """`items` in the order of Plex's `sort` parameter: fields, each
+    `:desc` or not, the first deciding and the rest breaking ties."""
+    for part in reversed([p for p in sort.split(",") if p]):
+        field, _, direction = part.partition(":")
+        field = {"titleSort": "title", "episode.addedAt": "addedAt"}.get(field, field)
+        items = sorted(items, key=lambda i: (i.get(field) is None, i.get(field) or 0
+                                             if field != "title" else i["title"].lower()),
+                       reverse=direction == "desc")
+    return items
 
 
 def page(items, start, size):
@@ -281,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts == []:
             return self.send_json(container(
-                friendlyName="Fake Plex", version="1.40.0.0000", machineIdentifier=MACHINE))
+                friendlyName=plex.name, version="1.40.0.0000", machineIdentifier=MACHINE))
         if parts == ["identity"]:
             return self.send_json(container(machineIdentifier=MACHINE, version="1.40.0.0000"))
         if parts == ["library", "sections"]:
@@ -298,6 +343,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.not_found()
             kind = TYPES.get((query.get("type") or [None])[0])
             items = plex.in_section(parts[2], kind)
+            sort = (query.get("sort") or [None])[0]
+            if sort:
+                items = sorted_by(items, sort)
             guid = (query.get("guid") or [None])[0]
             if guid is not None:
                 items = [i for i in items if i.get("guid") == guid
@@ -305,6 +353,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(container(
                 page(items, start, size), totalSize=len(items),
                 librarySectionID=int(section["key"]), librarySectionTitle=section["title"]))
+        if len(parts) == 4 and parts[:2] == ["library", "sections"] and parts[3] == "sorts":
+            section = plex.section(parts[2])
+            if section is None:
+                return self.not_found()
+            directories = [{"key": k, "title": k} for k in SORTS.get(section["type"], [])]
+            return self.send_json({"MediaContainer": {
+                "size": len(directories), "Directory": directories}})
         if len(parts) == 4 and parts[:2] == ["library", "sections"] and parts[3] == "search":
             # A title search: the words in the title, of the type, in the
             # year if one is given.
@@ -347,10 +402,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(container(
                 page(leaves, start, size), totalSize=len(leaves), **section))
         if len(rest) == 3 and rest[1] in ("thumb", "art"):
-            with open(plex.poster, "rb") as f:
+            path = item.get("_images", {}).get(rest[1], plex.poster)
+            if not os.path.exists(path):
+                return self.not_found()
+            with open(path, "rb") as f:
                 data = f.read()
+            kind = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(
+                os.path.splitext(path)[1].lower(), "image/png")
             self.send_response(200)
-            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -365,9 +425,10 @@ def main():
     parser.add_argument("--media-dir", required=True, help="what /data is on the server")
     parser.add_argument("--library", choices=sorted(LIBRARIES), default="alice",
                         help="whose library it serves; empty: no sections")
+    parser.add_argument("--catalog", help="a library from this JSON file instead (a demo)")
     args = parser.parse_args()
     poster = os.path.join(args.media_dir, "poster.png")
-    Handler.plex = Plex(args.media_dir, poster, args.library)
+    Handler.plex = Plex(args.media_dir, poster, args.library, args.catalog)
     server = ThreadingHTTPServer((args.listen, args.port), Handler)
     sys.stderr.write("fake-plex: listening on %s:%d\n" % (args.listen, args.port))
     server.serve_forever()
