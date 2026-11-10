@@ -209,7 +209,7 @@ pub fn with_quality(
         caps.max_bitrate = Some(caps.max_bitrate.map_or(chosen, |own| own.min(chosen)));
     }
     // The app's word, held to what any stream could need: an encode's
-    // -bufsize is twice it, and u64::MAX of it is no bitrate.
+    // -bufsize is one second of it, and u64::MAX of it is no bitrate.
     caps.max_bitrate = caps.max_bitrate.map(|bits| bits.min(MAX_BITRATE));
     caps
 }

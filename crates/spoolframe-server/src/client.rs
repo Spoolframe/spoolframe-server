@@ -4322,6 +4322,11 @@ impl ClientProtocol {
                     // follow once starts settle.
                     if let Some(admission) = admission {
                         admission.started(&handle.0, connection.stable_id());
+                        // The path may have turned out to be the LAN since the place
+                        // was reserved (#4): log_paths found no stream to let go then.
+                        if on_lan(&state.path()) {
+                            self.services.uplink.moved_onto_lan(connection.stable_id());
+                        }
                     }
                     if let Who::Remote(_) = &who {
                         self.remote_plays
@@ -7022,6 +7027,11 @@ impl ClientProtocol {
         );
         if let Some(admission) = admission {
             admission.started(&handle.0, connection.stable_id());
+            // The path may have turned out to be the LAN since the place
+            // was reserved (#4): log_paths found no stream to let go then.
+            if on_lan(&state.path()) {
+                self.services.uplink.moved_onto_lan(connection.stable_id());
+            }
         }
         tokio::spawn(follow_remote(
             Arc::downgrade(&remote),
