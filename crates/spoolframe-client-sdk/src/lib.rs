@@ -89,6 +89,9 @@ pub use whos_watching::{
 };
 // Downloads for offline viewing, and their wire types.
 pub use downloads::{
+    AddonFormat, AddonKind, AddonState, DownloadAddon, DownloadTrack, DownloadTrackSource,
+};
+pub use downloads::{
     Applied, BatchStart, ChildPlan, DownloadAction, DownloadLibrary, DownloadList, DownloadedShow,
     DownloadsHere, FailedChild, ProfileHere, REFRESH_EVERY, RefreshMissed, RefreshReport,
     RunProgress, RunTally, SkipReason, SkippedChild, UNITS_PER_DOWNLOAD,
@@ -116,9 +119,9 @@ pub use lan_servers::LanServerInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
 pub use spoolframe_protocol::downloads::{
-    DownloadFailure, DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState,
-    DownloadTracks, FailureRemedy, FileTracks, LeftOutSubtitle, OfflineWatchOutcome,
-    OriginalDownload,
+    AddonAudio, AddonSubtitle, DownloadAddonOptions, DownloadFailure, DownloadFile,
+    DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, FailureRemedy, FileTracks,
+    LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
 };
 pub use spoolframe_protocol::federation::{PairingRefused, PeerServer};
 pub use spoolframe_protocol::{Feature, Features, NextMode};

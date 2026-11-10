@@ -3,14 +3,16 @@
 //! feature is on: in a session, `october_2026()`; before one, for an
 //! invite's server, `SpoolClient.invited_october_2026(link)`, both of
 //! `spoolframe:october-2026`. Off, the first is `None` and the second
-//! `FeatureOff`, and nothing gated is sent.
+//! `FeatureOff`, and nothing gated is sent. `download_addons()` is
+//! `spoolframe:download-addons`'s, as `october_2026()` is.
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::gate::October2026;
+use spoolframe_client_sdk::gate::{DownloadAddons, October2026};
 use spoolframe_client_sdk::types::{Item, MediaId};
 use spoolframe_client_sdk::{
-    self as sdk, Feature, FinishPasskeyRegistration, NextMode, PasskeyCreation,
+    self as sdk, DownloadAddonOptions, DownloadTrack, Feature, FinishPasskeyRegistration,
+    LocalDownload, NextMode, PasskeyCreation,
 };
 
 use crate::client::SpoolClient;
@@ -41,6 +43,56 @@ impl October2026Api {
         let on = self.0.clone();
         Ok(run(async move { on.show_next(&show).await }).await?)
     }
+}
+
+/// The calls of `spoolframe:download-addons` in a session: subtitles and
+/// audio tracks added to a download without fetching the film again.
+#[derive(uniffi::Object)]
+pub struct DownloadAddonsApi(sdk::On<DownloadAddons>);
+
+#[uniffi::export]
+impl DownloadAddonsApi {
+    /// What may be added to a download of film or episode `id`, and why
+    /// a track may not.
+    pub async fn options(&self, id: MediaId) -> Result<DownloadAddonOptions, SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.download_addon_options(&id).await }).await?)
+    }
+
+    /// Subtitle `subtitle` (its place in the item's tracks) of `id`, whole,
+    /// as WebVTT text, waiting while the server reads pictures as text.
+    pub async fn read_track_subtitle(
+        &self,
+        id: MediaId,
+        subtitle: u32,
+    ) -> Result<String, SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.read_track_subtitle(&id, subtitle).await }).await?)
+    }
+
+    /// Add `subtitles` and `audio` (places in the item's tracks) to
+    /// download `key`, this session's user's: each subtitle is fetched in
+    /// the call; each audio track is queued for the download manager,
+    /// which goes on from what arrived after a cut or a restart, and this
+    /// returns once it is. Calling it again for a failed or paused audio
+    /// track retries it. The download's `addons` say where each is.
+    pub async fn add_tracks(
+        &self,
+        key: String,
+        audio: Vec<u32>,
+        subtitles: Vec<u32>,
+    ) -> Result<LocalDownload, SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.add_tracks(&key, audio, subtitles).await }).await?)
+    }
+}
+
+/// Every track a player of `download` may offer, the file's and the
+/// add-ons here, as one list: the file's audio, the audio added, the
+/// file's subtitles, the subtitles added.
+#[uniffi::export]
+pub fn download_tracks_with_addons(download: LocalDownload) -> Vec<DownloadTrack> {
+    download.tracks_with_addons()
 }
 
 /// The calls of `spoolframe:october-2026`, for one invite's server:
@@ -98,6 +150,15 @@ impl SpoolSession {
             .feature::<October2026>()
             .ok()
             .map(|on| Arc::new(October2026Api(on)))
+    }
+
+    /// `spoolframe:download-addons`: subtitles and audio tracks added to a
+    /// download; `None` when the feature is off for this connection.
+    pub fn download_addons(&self) -> Option<Arc<DownloadAddonsApi>> {
+        self.session
+            .feature::<DownloadAddons>()
+            .ok()
+            .map(|on| Arc::new(DownloadAddonsApi(on)))
     }
 }
 

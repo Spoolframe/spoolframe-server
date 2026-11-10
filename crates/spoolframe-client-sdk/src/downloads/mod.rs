@@ -40,6 +40,7 @@
 //! the views show, and locks a profile whose PIN is asked for here until
 //! [`Downloads::unlock_offline`].
 
+pub(crate) mod addons;
 mod background;
 mod batch;
 mod library;
@@ -52,6 +53,7 @@ mod store;
 mod view;
 mod writer;
 
+pub use addons::{AddonFormat, AddonKind, AddonState, DownloadAddon};
 pub use background::{
     REFRESH_EVERY, RefreshMissed, RefreshReport, RunProgress, RunTally, UNITS_PER_DOWNLOAD,
 };
@@ -64,7 +66,7 @@ pub use music::{
     MusicQuality, MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark,
     OfflineMusic, OfflinePlaylist, OfflineTrack, SyncedPlay,
 };
-pub use view::{Applied, DownloadAction, DownloadList};
+pub use view::{Applied, DownloadAction, DownloadList, DownloadTrack, DownloadTrackSource};
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -304,6 +306,10 @@ pub struct LocalDownload {
     /// When it was started, by this device's clock.
     #[serde(with = "spoolframe_types::serde_time::unix_seconds")]
     pub created_at: SystemTime,
+    /// Subtitles and audio tracks added to it since
+    /// ([`Downloads::add_tracks`]), each with its file once here.
+    #[serde(default)]
+    pub addons: Vec<DownloadAddon>,
 }
 
 /// A download changed: what [`Client::download_events`] gives.
@@ -520,19 +526,27 @@ impl Downloads {
         Ok(shared.view(&m))
     }
 
-    /// Stop moving download `key` until [`Downloads::resume`]. What
-    /// arrived is kept.
+    /// Stop moving download `key`, and its audio add-ons under way,
+    /// until [`Downloads::resume`]. What arrived is kept. A finished
+    /// download with add-ons under way pauses them alone.
     pub async fn pause(&self, key: &str) -> Result<LocalDownload, SdkError> {
         self.find(key)?;
         let shared = self.shared();
         let m = shared
             .update(key, |m| {
-                if !m.phase.is_active() {
+                if !m.under_way() {
                     return Err(SdkError::InvalidInput(format!(
                         "download {key} is not under way"
                     )));
                 }
-                m.phase = DownloadPhase::Paused;
+                if m.phase.is_active() {
+                    m.phase = DownloadPhase::Paused;
+                }
+                for a in &mut m.addons {
+                    if a.addon.kind == AddonKind::Audio && a.addon.state.is_moving() {
+                        a.addon.state = AddonState::Paused;
+                    }
+                }
                 Ok(())
             })
             .await?;
@@ -540,14 +554,38 @@ impl Downloads {
         Ok(shared.view(&m))
     }
 
-    /// Go on with paused download `key`.
+    /// Go on with paused download `key`, and its paused add-ons, from
+    /// what arrived.
     pub async fn resume(&self, key: &str) -> Result<LocalDownload, SdkError> {
-        self.restart(
-            key,
-            |phase| matches!(phase, DownloadPhase::Paused),
-            "paused",
-        )
-        .await
+        self.find(key)?;
+        let shared = self.shared();
+        let m = shared
+            .update(key, |m| {
+                let paused = |a: &addons::StoredAddon| a.addon.state == AddonState::Paused;
+                if m.phase != DownloadPhase::Paused && !m.addons.iter().any(paused) {
+                    return Err(SdkError::InvalidInput(format!(
+                        "download {key} is not paused"
+                    )));
+                }
+                if m.phase == DownloadPhase::Paused {
+                    m.phase = DownloadPhase::Preparing {
+                        server: DownloadState::Waiting,
+                    };
+                }
+                for a in m.addons.iter_mut().filter(|a| paused(a)) {
+                    a.addon.state = AddonState::Preparing {
+                        server: DownloadState::Waiting,
+                    };
+                }
+                m.note = None;
+                Ok(())
+            })
+            .await?;
+        shared.stopping.lock().remove(key);
+        shared.retry_at.lock().remove(key);
+        shared.check_at.lock().remove(key);
+        shared.wake.notify_one();
+        Ok(shared.view(&m))
     }
 
     /// Try failed download `key` again: it is prepared again on the
@@ -657,6 +695,10 @@ impl Downloads {
             && let Some(id) = &m.id
         {
             manager::cancel_if_reachable(&self.client, shared, &m, id).await;
+        }
+        // Its audio add-ons not here yet too: nothing else holds them.
+        for id in addons::unfinished_ids(&m) {
+            manager::cancel_if_reachable(&self.client, shared, &m, &id).await;
         }
         let mut m = m;
         let removed = {
@@ -962,6 +1004,8 @@ pub(crate) struct Shared {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The follower ([`music::follow_while_connected`]).
     follower: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The add-ons being fetched now ([`Downloads::add_tracks`]).
+    addons_running: Mutex<addons::Running>,
 }
 
 impl Shared {
@@ -995,6 +1039,7 @@ impl Shared {
             closed: watch::Sender::new(false),
             task: Mutex::default(),
             follower: Mutex::default(),
+            addons_running: Mutex::default(),
         })
     }
 
@@ -1218,6 +1263,18 @@ impl Shared {
                 m.note.clone()
             },
             created_at: serde_time::unix_seconds::from_wire(m.created_at),
+            addons: {
+                let running = self.addons_running.lock();
+                let dir = store.dir(m);
+                m.addons
+                    .iter()
+                    .map(|a| {
+                        let a = &a.addon;
+                        let here = running.contains(&(m.key.clone(), a.kind, a.place));
+                        a.view(&dir, here)
+                    })
+                    .collect()
+            },
         }
     }
 

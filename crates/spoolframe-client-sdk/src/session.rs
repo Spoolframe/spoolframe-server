@@ -568,6 +568,57 @@ impl SubtitleChunks for PlaybackSubtitle<'_> {
     }
 }
 
+/// A film's or an episode's subtitle as WebVTT, outside a playback
+/// (`ReadTrackSubtitle`, feature `spoolframe:download-addons`).
+struct TrackSubtitle<'a> {
+    session: &'a Session,
+    id: &'a MediaId,
+    subtitle: u32,
+}
+
+impl SubtitleChunks for TrackSubtitle<'_> {
+    async fn chunk(&self, offset: u64, version: Option<u64>) -> Result<SubtitleChunk, SdkError> {
+        let request = Request::ReadTrackSubtitle {
+            id: self.id.clone(),
+            subtitle: self.subtitle,
+            offset,
+            version,
+        };
+        match self.session.call(request).await? {
+            Reply::SubtitleChunk {
+                format,
+                bytes,
+                total,
+                version,
+            } => Ok(SubtitleChunk {
+                format,
+                bytes,
+                total,
+                version,
+            }),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+impl Session {
+    /// Subtitle `subtitle` of `id` read whole as `ReadTrackSubtitle`
+    /// answers it, once: [`SdkError::SubtitleNotReady`] while the server
+    /// reads pictures as text. The gate's call waits that out.
+    pub(crate) async fn track_subtitle(
+        &self,
+        id: &MediaId,
+        subtitle: u32,
+    ) -> Result<Subtitle, SdkError> {
+        read_whole(&TrackSubtitle {
+            session: self,
+            id,
+            subtitle,
+        })
+        .await
+    }
+}
+
 /// One signed-in user on one server. Cheap to clone.
 #[derive(Clone)]
 pub struct Session {

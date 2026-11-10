@@ -37,6 +37,7 @@ fn download(key: &str, phase: DownloadPhase) -> LocalDownload {
         watch: LocalWatch::default(),
         note: None,
         created_at: spoolframe_types::serde_time::unix_seconds::from_wire(1),
+        addons: Vec::new(),
     }
 }
 

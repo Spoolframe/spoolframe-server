@@ -2994,10 +2994,16 @@ SDK: `session.feature::<DownloadAddons>()` gives `On<DownloadAddons>`
 answers the options and `read_track_subtitle(&id, subtitle)` the whole
 WebVTT text, waiting while pictures are read. `Downloads::add_tracks(key,
 &on, audio, subtitles)` adds them to a download kept on the device: each
-subtitle saved as WebVTT, each audio track fetched as a download is,
-its SHA-256 checked. They are kept in the download's own directory, and
-go when it goes. `LocalDownload::addons` lists them with their state,
-and `DownloadEvent::Changed` tells when one lands or fails.
+subtitle is saved as WebVTT in the call; each audio track is queued for
+the download manager, which fetches it as it does a film, going on from
+the bytes kept after a cut or a restart, its SHA-256 checked. Asked again,
+a failed or paused track goes on from what arrived. Pausing, resuming and
+deleting the download do the same to its add-ons. They are kept in the
+download's own directory, and go when it goes. `LocalDownload::addons`
+lists them with their state, and `DownloadEvent::Changed` tells each
+move. `LocalDownload::tracks_with_addons` lists, of each kind, the
+file's tracks in its order, then the add-ons in the order added; each
+names its place in the item's tracks.
 
 ## Portable identities
 

@@ -16,6 +16,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use iroh::EndpointId;
+use spoolframe_protocol::downloads::DownloadAddonOptions;
 use spoolframe_protocol::invite::Invite;
 use spoolframe_protocol::{Feature, NextMode, Reply, Request};
 use spoolframe_types::{Item, MediaId};
@@ -52,6 +53,13 @@ feature!(
     /// ([`On<October2026>`]), and an account made with an invite and an
     /// app passkey, with no password ([`Invited<October2026>`]).
     October2026 = Feature::October2026
+);
+
+feature!(
+    /// `spoolframe:download-addons`: subtitles and audio tracks added to
+    /// a download without fetching the film again
+    /// ([`On<DownloadAddons>`], and [`crate::Downloads::add_tracks`]).
+    DownloadAddons = Feature::DownloadAddons
 );
 
 /// Feature `G`'s calls in a session: [`crate::Session::feature`]. Cheap
@@ -185,6 +193,79 @@ impl On<October2026> {
         match self.session.call(request).await? {
             Reply::NextEpisode { item } => Ok(item),
             other => Err(crate::session::unexpected(other)),
+        }
+    }
+}
+
+/// How long [`On::read_track_subtitle`] waits between two asks while the
+/// server reads pictures as text.
+const NOT_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long [`On::read_track_subtitle`] waits in all for pictures read as
+/// text: a film's take minutes, one at a time on the server.
+const NOT_READY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+impl On<DownloadAddons> {
+    /// [`crate::Downloads::add_tracks`] of this session's client: for an
+    /// app that holds the feature's calls alone (a UniFFI binding). The
+    /// audio is queued for the download manager; the subtitles are fetched
+    /// in the call.
+    pub async fn add_tracks(
+        &self,
+        key: &str,
+        audio: Vec<u32>,
+        subtitles: Vec<u32>,
+    ) -> Result<crate::LocalDownload, SdkError> {
+        self.session
+            .client
+            .downloads()
+            .add_tracks(key, self, audio, subtitles)
+            .await
+    }
+
+    /// What may be added to a download of film or episode `id`: each
+    /// audio track with its file's size, and each subtitle, with why one
+    /// cannot be added. A paired server's item is
+    /// [`SdkError::Unsupported`].
+    pub async fn download_addon_options(
+        &self,
+        id: &MediaId,
+    ) -> Result<DownloadAddonOptions, SdkError> {
+        match self
+            .session
+            .call(Request::DownloadAddonOptions { id: id.clone() })
+            .await?
+        {
+            Reply::DownloadAddonOptions(options) => Ok(options),
+            other => Err(crate::session::unexpected(other)),
+        }
+    }
+
+    /// Subtitle `subtitle` (its place in the item's tracks) of film or
+    /// episode `id`, whole, as WebVTT text: on an Apple device, timed to
+    /// the download's MP4. Waits, asking again every few seconds, while
+    /// the server reads pictures as text; past half an hour it is
+    /// [`SdkError::SubtitleNotReady`].
+    pub async fn read_track_subtitle(
+        &self,
+        id: &MediaId,
+        subtitle: u32,
+    ) -> Result<String, SdkError> {
+        let deadline = tokio::time::Instant::now() + NOT_READY_LIMIT;
+        loop {
+            match self.session.track_subtitle(id, subtitle).await {
+                Ok(read) => {
+                    return String::from_utf8(read.bytes).map_err(|_| {
+                        SdkError::Protocol("a WebVTT subtitle that is not UTF-8".into())
+                    });
+                }
+                Err(SdkError::SubtitleNotReady { .. })
+                    if tokio::time::Instant::now() + NOT_READY_WAIT < deadline =>
+                {
+                    tokio::time::sleep(NOT_READY_WAIT).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 }

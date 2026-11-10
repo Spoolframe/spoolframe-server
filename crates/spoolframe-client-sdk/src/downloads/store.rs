@@ -211,6 +211,10 @@ pub(crate) struct Manifest {
     /// clock: the cache lets the least recently played go first.
     #[serde(default)]
     pub last_played_at: Option<i64>,
+    /// A film's or an episode's add-ons (`spoolframe:download-addons`),
+    /// their paths from its directory. None in one kept before them.
+    #[serde(default)]
+    pub addons: Vec<super::addons::StoredAddon>,
 }
 
 impl Manifest {
@@ -224,6 +228,11 @@ impl Manifest {
     /// Kept from listening only: in the cache, under its cap.
     pub fn cached_only(&self) -> bool {
         !self.holds.is_empty() && self.holds.iter().all(Hold::is_listening)
+    }
+
+    /// Under way: the manager moves it, or an audio add-on of it.
+    pub fn under_way(&self) -> bool {
+        self.phase.is_active() || self.addons.iter().any(|a| a.addon.state.is_moving())
     }
 
     /// Held by `user_id`, or for every profile (kept from listening).
@@ -560,7 +569,7 @@ impl Store {
     /// Write `m`, whole or not at all.
     pub fn write(&self, m: &Manifest) -> std::io::Result<()> {
         write_json(&self.dir(m).join(MANIFEST), m)?;
-        self.note(m, m.phase.is_active());
+        self.note(m, m.under_way());
         self.list(m, true);
         Ok(())
     }
@@ -585,7 +594,7 @@ impl Store {
         let active = active.get_or_insert_with(|| {
             self.scan()
                 .into_iter()
-                .filter(|m| m.phase.is_active())
+                .filter(Manifest::under_way)
                 .map(|m| (m.created_at, m.place, m.key))
                 .collect()
         });
@@ -606,7 +615,7 @@ impl Store {
         // Read while the lock is held: a write meanwhile notes itself
         // after this.
         self.change_active(|active| {
-            if !self.find(key).is_some_and(|m| m.phase.is_active()) {
+            if !self.find(key).is_some_and(|m| m.under_way()) {
                 active.retain(|(_, _, k)| k != key);
             }
         });
@@ -741,6 +750,7 @@ impl Store {
             album: None,
             artist: None,
             last_played_at: None,
+            addons: Vec::new(),
         }
     }
 
@@ -1093,7 +1103,7 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use spoolframe_types::{MediaKind, Movie, Namespace, PlaybackState};
 
@@ -1112,7 +1122,7 @@ mod tests {
         })
     }
 
-    fn manifest(key: &str, created_at: i64) -> Manifest {
+    pub(crate) fn manifest(key: &str, created_at: i64) -> Manifest {
         Store::manifest(
             EntryKind::Film,
             key.into(),
@@ -1632,6 +1642,37 @@ mod tests {
         std::fs::create_dir_all(store.dir(&m)).unwrap();
         std::fs::write(store.dir(&m).join(MANIFEST), json.to_string()).unwrap();
         assert_eq!(store.find("ab12").map(|m| m.expected_size), Some(None));
+    }
+
+    /// A manifest kept before add-ons, with no `addons`, is read with
+    /// none, at the same version.
+    #[test]
+    fn a_manifest_kept_before_add_ons_reads_with_none() {
+        let store = store("before-addons");
+        let mut m = manifest("ab12", 1);
+        m.addons.push(super::super::addons::StoredAddon {
+            addon: super::super::DownloadAddon {
+                kind: super::super::AddonKind::Subtitle,
+                place: 0,
+                path: Some("addons/sub-0.vtt".into()),
+                format: super::super::AddonFormat::WebVtt,
+                language: None,
+                state: super::super::AddonState::Ready,
+                received: 0,
+                size: None,
+            },
+            id: None,
+            sha256: None,
+        });
+        store.write(&m).unwrap();
+        assert_eq!(store.find("ab12").map(|m| m.addons.len()), Some(1));
+        let path = store.dir(&m).join(MANIFEST);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("addons");
+        std::fs::write(&path, json.to_string()).unwrap();
+        let read = store.find("ab12").expect("still read");
+        assert_eq!((read.addons.len(), read.version), (0, VERSION));
     }
 
     /// A newer build's entry (a kind this one does not know, or a later

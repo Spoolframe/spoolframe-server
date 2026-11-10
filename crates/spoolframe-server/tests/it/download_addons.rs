@@ -16,7 +16,7 @@ use crate::support::{ServerOptions, TestClient, TestServer, movie};
 /// Write the movie: 4 s of H.264 with a DTS 5.1 track and a French AAC
 /// stereo one, and an English SubRip cue from 0.5 s to 1.5 s, in
 /// Matroska, every stream's timestamps moved to start at 10 s.
-fn write_offset_film(server: &TestServer) {
+pub(crate) fn write_offset_film(server: &TestServer) {
     let dir = server.media.parent().unwrap();
     std::fs::create_dir_all(dir).unwrap();
     let srt = dir.join("cue.srt");

@@ -75,6 +75,7 @@ mod relay_access;
 mod relays;
 mod reload;
 mod sdk;
+mod sdk_download_addons;
 mod sdk_downloads;
 mod sdk_music;
 mod search;

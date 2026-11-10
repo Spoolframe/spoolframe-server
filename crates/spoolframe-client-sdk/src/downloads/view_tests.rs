@@ -64,6 +64,7 @@ fn download(phase: DownloadPhase) -> LocalDownload {
         watch: LocalWatch::default(),
         note: None,
         created_at: spoolframe_types::serde_time::unix_seconds::from_wire(1),
+        addons: Vec::new(),
     }
 }
 
@@ -312,4 +313,73 @@ fn the_list_follows_the_events() {
     assert_eq!(list.apply(&removed), Applied::Nothing);
     let keys: Vec<_> = list.downloads.iter().map(|d| d.key.as_str()).collect();
     assert_eq!(keys, ["k2"]);
+}
+
+/// sf-ios maps AVFoundation's options by this: of each kind, the file's
+/// tracks first in the file's order, then the add-ons in the order they
+/// were added (not by place); a place is the index into the item's
+/// tracks. The add-on still coming, and the one of a track the file
+/// carries, are left out.
+#[test]
+fn the_tracks_with_add_ons_are_the_file_s_then_those_added_in_order() {
+    use crate::downloads::{AddonFormat, AddonKind, AddonState, DownloadAddon};
+    let added = |kind, place, state| DownloadAddon {
+        kind,
+        place,
+        path: Some(format!("/d/addons/{place}")),
+        format: match kind {
+            AddonKind::Audio => AddonFormat::M4a,
+            AddonKind::Subtitle => AddonFormat::WebVtt,
+        },
+        language: None,
+        state,
+        received: 0,
+        size: None,
+    };
+    // The item: audio en, fr, de; subtitles en, es. The file: fr, es.
+    let mut d = with_file(download(DownloadPhase::Done));
+    d.tracks.audio.push(audio("it"));
+    d.addons = vec![
+        added(AddonKind::Subtitle, 0, AddonState::Ready),
+        added(AddonKind::Audio, 3, AddonState::Ready),
+        added(
+            AddonKind::Audio,
+            0,
+            AddonState::Transferring { done_percent: None },
+        ),
+        added(AddonKind::Audio, 1, AddonState::Ready),
+        added(AddonKind::Audio, 2, AddonState::Ready),
+    ];
+    let listed: Vec<_> = d
+        .tracks_with_addons()
+        .into_iter()
+        .map(|t| {
+            let at = match t.source {
+                DownloadTrackSource::InFile { index } => format!("file {index}"),
+                DownloadTrackSource::Addon { path, .. } => path,
+            };
+            (t.kind, t.place, t.language.unwrap_or_default(), at)
+        })
+        .collect();
+    let row =
+        |kind, place, language: &str, at: &str| (kind, place, language.to_owned(), at.to_owned());
+    assert_eq!(
+        listed,
+        [
+            row(AddonKind::Audio, 1, "fr", "file 0"),
+            row(AddonKind::Audio, 3, "it", "/d/addons/3"),
+            row(AddonKind::Audio, 2, "de", "/d/addons/2"),
+            row(AddonKind::Subtitle, 1, "es", "file 0"),
+            row(AddonKind::Subtitle, 0, "en", "/d/addons/0"),
+        ]
+    );
+    // Each place is the index into the item's tracks: its language is
+    // that track's.
+    for track in d.tracks_with_addons() {
+        let item = match track.kind {
+            AddonKind::Audio => d.tracks.audio[track.place as usize].language.clone(),
+            AddonKind::Subtitle => d.tracks.subtitles[track.place as usize].language.clone(),
+        };
+        assert_eq!(track.language, item);
+    }
 }

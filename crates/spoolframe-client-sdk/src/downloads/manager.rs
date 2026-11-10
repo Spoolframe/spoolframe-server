@@ -27,9 +27,9 @@ const READ: u64 = 8 << 20;
 /// most this much is read again after a crash.
 const SYNC_EVERY: u64 = 64 << 20;
 /// Room left free beside a download, on top of its size.
-const HEADROOM: u64 = 1 << 30;
+pub(super) const HEADROOM: u64 = 1 << 30;
 /// How often a download being prepared is asked about, events or not.
-const POLL: Duration = Duration::from_secs(5);
+pub(super) const POLL: Duration = Duration::from_secs(5);
 /// The first wait before trying a download again, doubling to
 /// [`LONGEST_WAIT`].
 const FIRST_WAIT: Duration = Duration::from_secs(1);
@@ -153,7 +153,7 @@ fn next(shared: &Shared) -> Next {
 }
 
 /// What one step of a download came to.
-enum Step {
+pub(super) enum Step {
     /// Go on with the next step at once.
     Continue,
     /// Let go of it: it is done, failed, paused or gone, or the client is
@@ -173,14 +173,16 @@ async fn drive(client: &Client, shared: &Arc<Shared>, key: &str) {
         let Some(store) = &shared.store else {
             return;
         };
-        let Some(m) = store.find(key).filter(|m| m.phase.is_active()) else {
+        let Some(m) = store.find(key).filter(Manifest::under_way) else {
             store.recheck(key);
             return;
         };
         let step = match session_for(client, shared, &m.server, &m.user_id).await {
             Ok(session) => match m.phase {
                 DownloadPhase::Preparing { .. } => preparing(shared, &session, m).await,
-                _ => transferring(shared, &session, m).await,
+                DownloadPhase::Transferring => transferring(shared, &session, m).await,
+                // The film is not moving: its add-ons are.
+                _ => super::addons::step(shared, &session, m).await,
             },
             Err(e) => Err(e),
         };
@@ -228,14 +230,7 @@ pub(super) async fn session_for(
 /// when it may pass by itself, else fail it, saying why.
 async fn failed(shared: &Shared, key: &str, error: SdkError) {
     let note = match &error {
-        SdkError::Unreachable(_)
-        | SdkError::TimedOut(_)
-        | SdkError::Busy
-        | SdkError::Unavailable(_)
-        | SdkError::RateLimited { .. }
-        | SdkError::ServerRestarted
-        | SdkError::ProfileLocked
-        | SdkError::DownloadNotReady => Some(format!("Waiting for the server: {error}")),
+        e if !waits(e) => None,
         SdkError::SignInRequired => {
             if let Some(m) = shared.store.as_ref().and_then(|s| s.find(key))
                 && let Ok(server) = parse_id(&m.server)
@@ -244,7 +239,7 @@ async fn failed(shared: &Shared, key: &str, error: SdkError) {
             }
             Some("Sign in to the server again to go on".to_owned())
         }
-        _ => None,
+        _ => Some(format!("Waiting for the server: {error}")),
     };
     match note {
         Some(note) => {
@@ -281,9 +276,26 @@ async fn failed(shared: &Shared, key: &str, error: SdkError) {
     }
 }
 
+/// Whether a download (or an add-on) that met `error` waits and tries
+/// again, as it may pass by itself; else it fails.
+pub(super) fn waits(error: &SdkError) -> bool {
+    matches!(
+        error,
+        SdkError::Unreachable(_)
+            | SdkError::TimedOut(_)
+            | SdkError::Busy
+            | SdkError::Unavailable(_)
+            | SdkError::RateLimited { .. }
+            | SdkError::ServerRestarted
+            | SdkError::ProfileLocked
+            | SdkError::DownloadNotReady
+            | SdkError::SignInRequired
+    )
+}
+
 /// The cause of a download failed for `error`: talking to the server
 /// (an answer cut off or one that made no sense) is the network's.
-fn cause_of(error: &SdkError) -> DownloadFailure {
+pub(super) fn cause_of(error: &SdkError) -> DownloadFailure {
     if error.is_transport() || matches!(error, SdkError::Protocol(_)) {
         DownloadFailure::Network
     } else {
@@ -294,7 +306,7 @@ fn cause_of(error: &SdkError) -> DownloadFailure {
 /// The phase of a download that needs `needed` bytes free where
 /// `available` are: failed for room, with how much more, when they are
 /// not.
-fn no_room(needed: u64, available: u64) -> Option<DownloadPhase> {
+pub(super) fn no_room(needed: u64, available: u64) -> Option<DownloadPhase> {
     let short = needed.checked_sub(available).filter(|&short| short > 0)?;
     Some(DownloadPhase::Failed {
         reason: format!(
@@ -327,7 +339,7 @@ pub(super) async fn prepare(
     }
 }
 
-async fn status(session: &Session, id: &str) -> Result<DownloadInfo, SdkError> {
+pub(super) async fn status(session: &Session, id: &str) -> Result<DownloadInfo, SdkError> {
     let request = Request::DownloadStatus {
         ids: vec![id.to_owned()],
     };
@@ -706,7 +718,11 @@ async fn remote_source(session: &Session, m: &Manifest, id: &str) -> Option<crat
 
 /// One read of download `id` from `offset`: the file's size as the server
 /// told it, and the bytes.
-async fn read(session: &Session, id: &str, offset: u64) -> Result<(u64, Vec<u8>), SdkError> {
+pub(super) async fn read(
+    session: &Session,
+    id: &str,
+    offset: u64,
+) -> Result<(u64, Vec<u8>), SdkError> {
     let request = ResourceRequest::Download {
         session: session.token.clone(),
         id: id.to_owned(),
@@ -809,7 +825,7 @@ async fn finish(
 }
 
 /// `CancelDownload`: one the server no longer has is gone already.
-async fn cancel(session: &Session, id: &str) -> Result<(), SdkError> {
+pub(super) async fn cancel(session: &Session, id: &str) -> Result<(), SdkError> {
     match session
         .call(Request::CancelDownload { id: id.to_owned() })
         .await

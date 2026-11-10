@@ -9,7 +9,33 @@ use spoolframe_protocol::Selection;
 use spoolframe_protocol::downloads::{DownloadFailure, DownloadState, DownloadTracks};
 use spoolframe_types::MediaTracks;
 
-use super::{DownloadEvent, DownloadPhase, LocalDownload};
+use super::{AddonFormat, AddonKind, AddonState, DownloadEvent, DownloadPhase, LocalDownload};
+
+/// A track a download's player may offer
+/// ([`LocalDownload::tracks_with_addons`]): one in its file, or one added
+/// to it since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DownloadTrack {
+    pub kind: AddonKind,
+    /// Its place in the item's tracks.
+    pub place: u32,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub source: DownloadTrackSource,
+}
+
+/// Where a [`DownloadTrack`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum DownloadTrackSource {
+    /// In the download's file: `index` among its audio tracks or its
+    /// subtitles, in the file's order.
+    InFile { index: u32 },
+    /// An add-on's file at `path`: an audio file to merge into the
+    /// film's movie, or WebVTT for the app to draw.
+    Addon { path: String, format: AddonFormat },
+}
 
 /// What an app may offer for a download, by its phase
 /// ([`LocalDownload::actions`]), in the order to show them.
@@ -179,6 +205,70 @@ impl LocalDownload {
                 SubtitleHandling::Embedded(s as usize)
             }),
         }
+    }
+
+    /// Every track a player of it may offer, the file's and the add-ons
+    /// here, as one list, audio first, then subtitles. Of each kind: the
+    /// tracks in the file first, in the file's order (`InFile { index }`
+    /// is that order, as AVFoundation lists the file's options), then the
+    /// add-ons in the order they were added ([`LocalDownload::addons`]'s
+    /// order; one added again keeps its first place). Each names its
+    /// `place`, the index into [`LocalDownload::tracks`]'s `audio` or
+    /// `subtitles`. An add-on of a track the file carries is left out, as
+    /// is one not [`AddonState::Ready`].
+    pub fn tracks_with_addons(&self) -> Vec<DownloadTrack> {
+        let (audio, subtitles) = self.places();
+        let mut tracks = Vec::new();
+        for (kind, in_file) in [(AddonKind::Audio, audio), (AddonKind::Subtitle, subtitles)] {
+            let label = |place: u32| match kind {
+                AddonKind::Audio => self
+                    .tracks
+                    .audio
+                    .get(place as usize)
+                    .map(|t| (t.language.clone(), t.title.clone())),
+                AddonKind::Subtitle => self
+                    .tracks
+                    .subtitles
+                    .get(place as usize)
+                    .map(|t| (t.language.clone(), t.title.clone())),
+            };
+            for (index, &place) in in_file.iter().enumerate() {
+                let Some((language, title)) = label(place) else {
+                    continue;
+                };
+                tracks.push(DownloadTrack {
+                    kind,
+                    place,
+                    language,
+                    title,
+                    source: DownloadTrackSource::InFile {
+                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                    },
+                });
+            }
+            let added = self
+                .addons
+                .iter()
+                .filter(|a| a.kind == kind && a.state == AddonState::Ready)
+                .filter(|a| !in_file.contains(&a.place));
+            for addon in added {
+                let (Some(path), Some((language, title))) = (&addon.path, label(addon.place))
+                else {
+                    continue;
+                };
+                tracks.push(DownloadTrack {
+                    kind,
+                    place: addon.place,
+                    language,
+                    title,
+                    source: DownloadTrackSource::Addon {
+                        path: path.clone(),
+                        format: addon.format,
+                    },
+                });
+            }
+        }
+        tracks
     }
 
     /// The places, in the item's tracks, of the audio and subtitles in the

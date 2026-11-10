@@ -20,6 +20,30 @@
   that starts at 10 s has an MP4 whose tracks begin at 10 s after an empty
   edit. So on an Apple device the WebVTT cues are moved by the film's
   start, ffprobe's `start_time`, to land on that timeline.
+- Added, SDK: `On<DownloadAddons>` (`session.feature::<DownloadAddons>()`)
+  with `download_addon_options`, `read_track_subtitle` (the whole WebVTT,
+  waiting while pictures are read) and `add_tracks`;
+  `Downloads::add_tracks(key, &on, audio, subtitles)` fetches each
+  subtitle as WebVTT in the call, and queues each audio track for the
+  download manager, which moves it as it moves a film: prepared on the
+  server, read from the bytes kept (each read saved, so a cut or a
+  restart goes on from there, which hotel and phone networks need for a
+  200 to 600 MB track), checked by its SHA-256, then let go of on the
+  server. Calling it again for a failed or paused track retries it from
+  what arrived. Pausing, resuming and deleting the download do the same to
+  its add-ons, and the files live in its own `addons/`, so deleting it
+  deletes them. `LocalDownload::addons` lists them (`DownloadAddon` with
+  `received` and `size`, `AddonKind`, `AddonFormat`, and `AddonState`:
+  `Preparing`, `Transferring`, `Paused`, `Ready`, `Failed` with a cause),
+  and `DownloadEvent::Changed` tells each move. A manifest from before
+  reads with none; its version is unchanged.
+  `LocalDownload::tracks_with_addons` lists the file's tracks and the
+  add-ons here as one list (`DownloadTrack`): of each kind, the file's in
+  its order, then the add-ons in the order added; each `place` is the
+  index into the item's `tracks`.
+- Added, FFI: `SpoolSession.download_addons()` gives a `DownloadAddonsApi`
+  (`options`, `read_track_subtitle`, `add_tracks`), `None` when the
+  feature is off; `download_tracks_with_addons(download)`.
 - Server: a play started just after a reconnect no longer stays counted
   off the LAN (#4). While the device's old connection lingers, iroh
   selects none of the new one's paths, so the play was admitted as WAN,
