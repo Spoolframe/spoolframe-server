@@ -16,6 +16,7 @@ mod cli;
 mod confirm;
 mod connection_log;
 mod device_sign_in;
+mod download_addons;
 mod downloads;
 mod downloads_wire;
 mod encode;

@@ -24,7 +24,7 @@ use crate::encode::job::{
     Jobs, drain_stderr, jail, keep, launch, link, out_time_us, signal, stopped,
 };
 use crate::optimized::CopyFiles;
-use crate::optimized::mux::{MuxFormat, MuxInputs, MuxPicks, mux_args_as};
+use crate::optimized::mux::{MuxFormat, MuxInputs, MuxPicks, mux_args_as, tags};
 
 /// A subtitle from a file of its own, for one run.
 #[derive(Debug, Clone)]
@@ -161,6 +161,60 @@ pub(super) async fn write_music(
     }
     args.extend(["-c", "copy", "-map_metadata", "0"].map(String::from));
     args.extend(BITEXACT_ARGS.map(String::from));
+    args.extend([
+        String::from("-f"),
+        format.muxer().to_owned(),
+        part.display().to_string(),
+    ]);
+    remux(run, &reads, &args, progress, stop).await
+}
+
+/// Write film `run`'s one audio track, the first of `run.picks.audio`, as
+/// an add-on (`spoolframe:download-addons`) into `part` as `format`: from
+/// the copy's stored track when it has one, else from the film. It keeps
+/// the film's timestamps (`-copyts`), as the film's download does, so it
+/// lines up with the film; the track's language and title are said for
+/// it, as a stored track has none. Nothing encoded.
+pub(super) async fn write_addon(
+    run: &Run<'_>,
+    format: MusicFormat,
+    part: &Path,
+    progress: impl Fn(Option<f64>),
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), RunError> {
+    let place = run
+        .picks
+        .audio
+        .as_ref()
+        .and_then(|picked| picked.first())
+        .copied()
+        .unwrap_or(0);
+    let Some(track) = run.descriptor.audio.get(place as usize) else {
+        return Err(RunError::Failed(format!(
+            "the film has no audio track {place}"
+        )));
+    };
+    let (input, mut reads) = begin(run)?;
+    let mut args: Vec<String> = QUIET_ARGS.map(String::from).to_vec();
+    args.extend(PROGRESS_ARGS.map(String::from));
+    args.extend([String::from("-i"), input.display().to_string()]);
+    let audio = match run.stored.audio.get(&track.index) {
+        Some(stored) => {
+            let at = run.dir.join(format!("audio-{}.mkv", track.index));
+            bring(stored, &at, false, &mut reads).map_err(prepare)?;
+            args.extend([String::from("-i"), at.display().to_string()]);
+            "1:a:0".to_owned()
+        }
+        None => format!("0:{}", track.index),
+    };
+    args.extend([String::from("-copyts"), String::from("-map"), audio]);
+    args.extend(tags(0, &track.language, &track.title));
+    args.extend(["-disposition:0", "default", "-c", "copy"].map(String::from));
+    args.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(String::from));
+    args.extend(BITEXACT_ARGS.map(String::from));
+    if format == MusicFormat::Mp4 {
+        args.extend(["-movflags", "+faststart"].map(String::from));
+    }
     args.extend([
         String::from("-f"),
         format.muxer().to_owned(),

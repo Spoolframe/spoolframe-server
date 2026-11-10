@@ -148,7 +148,7 @@ fn disposition(forced: bool, default: bool) -> &'static str {
 
 /// `-metadata:s:<at>` for a track's language and title. The language as
 /// ISO 639-2: a file beside the media is often named in two letters.
-fn tags(at: usize, language: &Option<String>, title: &Option<String>) -> Vec<String> {
+pub(crate) fn tags(at: usize, language: &Option<String>, title: &Option<String>) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(language) = language {
         args.extend([

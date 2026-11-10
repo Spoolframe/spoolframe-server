@@ -62,6 +62,7 @@ use crate::store::{Store, StoreError};
 use crate::subtitle_sync::SubtitleTimings;
 use crate::subtitles::{Subtitles, TextSource, TextState};
 
+pub mod addon;
 pub mod followed;
 pub mod music;
 pub mod plan;
@@ -279,6 +280,19 @@ pub struct MusicRequest<'a> {
     pub descriptor: &'a MediaDescriptor,
     pub class: DeviceClass,
     pub quality: MusicQuality,
+}
+
+/// A film's audio track asked for as an add-on
+/// (`spoolframe:download-addons`).
+#[derive(Debug, Clone)]
+pub struct AddonRequest<'a> {
+    pub principal: Principal,
+    pub media_id: &'a str,
+    pub media: &'a Path,
+    pub descriptor: &'a MediaDescriptor,
+    pub class: DeviceClass,
+    /// The track's place in the descriptor's audio.
+    pub audio: u32,
 }
 
 /// A download prepared.
@@ -499,6 +513,9 @@ enum Writes {
     Film(MuxFormat),
     /// A track (PX-51), its tags and cover.
     Track(MusicFormat),
+    /// A film's audio track as an add-on (`spoolframe:download-addons`):
+    /// the one track `picks.audio` names, with the film's timestamps.
+    Addon(MusicFormat),
 }
 
 impl Writes {
@@ -516,7 +533,7 @@ impl Writes {
         match self {
             Self::Film(MuxFormat::Matroska) => "mkv",
             Self::Film(MuxFormat::Mp4 { .. }) => "mp4",
-            Self::Track(format) => format.extension(),
+            Self::Track(format) | Self::Addon(format) => format.extension(),
         }
     }
 }
@@ -546,6 +563,14 @@ struct RequestKey<'a> {
 struct MusicKey {
     class: &'static str,
     music: MusicQuality,
+}
+
+/// An audio add-on's request as the database keeps it: never the same as
+/// a film's, so it is a download of its own.
+#[derive(Serialize)]
+struct AddonKey {
+    class: &'static str,
+    addon_audio: u32,
 }
 
 impl Downloads {
@@ -894,6 +919,81 @@ impl Downloads {
                 media_id: request.media_id,
                 request: request_text,
                 container: planned.container,
+                left_out: Vec::new(),
+                carried,
+                expected_size,
+            },
+            job,
+        )
+        .await
+    }
+
+    /// Prepare `request`, a film's audio track as a file of its own
+    /// (`spoolframe:download-addons`), as [`Downloads::prepare`] does a
+    /// film: as [`addon::audio`] says, a download of its own.
+    pub async fn prepare_audio_addon(
+        &self,
+        request: AddonRequest<'_>,
+    ) -> Result<Prepared, DownloadError> {
+        let class = request.class;
+        let place = request.audio;
+        let planned = addon::audio(request.descriptor, class, place)?;
+        let stamp = crate::files::stamp_text(request.media)
+            .await
+            .map_err(DownloadError::Media)?;
+        let expected_size = addon::estimate(request.descriptor, place, &planned.decision);
+        let mut parts = vec![
+            "audio-addon:1".to_owned(),
+            request.media.display().to_string(),
+            stamp.clone(),
+            class.as_str().to_owned(),
+            format!("audio:{place}"),
+            format!("{:?}", planned.decision),
+            format!("{:?}", planned.format),
+        ];
+        let (copy, converts) = self
+            .copy_for(
+                request.media_id,
+                request.media,
+                &stamp,
+                &planned.decision,
+                &mut parts,
+            )
+            .await?;
+        let container = planned.format.container();
+        let carried = Carried {
+            audio: vec![place],
+            subtitles: Vec::new(),
+            container: Some(container),
+        };
+        let request_text = serde_json::to_string(&AddonKey {
+            class: class.as_str(),
+            addon_audio: place,
+        })
+        .expect("a request is JSON");
+        let job = Job {
+            key: crate::files::hash_parts(&parts).to_hex().to_string(),
+            media: request.media.to_path_buf(),
+            stamp,
+            descriptor: request.descriptor.clone(),
+            decision: planned.decision,
+            copy,
+            converts,
+            writes: Writes::Addon(planned.format),
+            picks: MuxPicks {
+                audio: Some(vec![place]),
+                subtitles: Some(Vec::new()),
+                default_subtitle: DefaultSubtitle::Only(None),
+            },
+            sidecars: Vec::new(),
+            ocr: Vec::new(),
+        };
+        self.register(
+            Asked {
+                principal: request.principal,
+                media_id: request.media_id,
+                request: request_text,
+                container,
                 left_out: Vec::new(),
                 carried,
                 expected_size,
@@ -1551,6 +1651,9 @@ impl Inner {
             Writes::Film(format) => write::write(&run, format, &part, progress, cancelled).await?,
             Writes::Track(format) => {
                 write::write_music(&run, format, &part, progress, cancelled).await?;
+            }
+            Writes::Addon(format) => {
+                write::write_addon(&run, format, &part, progress, cancelled).await?;
             }
         }
         drop(lease);

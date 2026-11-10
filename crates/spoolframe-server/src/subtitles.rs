@@ -198,6 +198,15 @@ impl Subtitles {
         &self.ocr
     }
 
+    /// When the film at `path` starts ([`ocr::start_time`]): what its
+    /// text, which counts from that start, is moved by to be on the
+    /// timeline of a download's MP4, which keeps the film's timestamps.
+    pub async fn start_time(&self, path: &Path) -> Result<std::time::Duration, String> {
+        ocr::start_time(&self.ffprobe, path)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Where the text of `source` is, as playback debug shows it (P3-15):
     /// unlike [`Subtitles::text`], looking starts nothing.
     pub async fn peek(&self, source: TextSource<'_>) -> TextPeek {

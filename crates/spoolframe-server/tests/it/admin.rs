@@ -284,7 +284,10 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
         status.protocol_version,
         spoolframe_protocol::PROTOCOL_VERSION
     );
-    assert_eq!(status.features, ["spoolframe:october-2026"]);
+    assert_eq!(
+        status.features,
+        ["spoolframe:october-2026", "spoolframe:download-addons"]
+    );
     assert_eq!(status.experimental_features, ["http-playback"]);
     // Nothing detected in tests: the software baseline.
     assert_eq!(status.transcoding.video_encoders, ["libx264"]);

@@ -323,6 +323,37 @@ pub async fn read_track_json(
     Ok(succeeded(output, "ffprobe")?.stdout)
 }
 
+/// When `input`'s first stream starts, as ffprobe reads its format's
+/// `start_time`: 0 for most films, seconds or hours in for an MPEG-TS
+/// recording, or a Matroska file written with an offset. A file that does
+/// not say, or says less than 0, starts at 0.
+pub async fn start_time(ffprobe: &Tool, input: &Path) -> Result<Duration, OcrError> {
+    let mut command = spawnable(ffprobe, Jail::new(Limits::PROBE).media(input)).await?;
+    command
+        .args(["-v", "error", "-show_entries", "format=start_time"])
+        .args(["-of", "json"])
+        .arg(input);
+    let output = run(command, "ffprobe", Feed::Nothing, MAX_STDERR, PROBE_TIMEOUT).await?;
+    let json = succeeded(output, "ffprobe")?.stdout;
+    Ok(start_of(&json))
+}
+
+/// How long [`start_time`] waits for ffprobe: it reads only the header.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`start_time`] of ffprobe's JSON.
+fn start_of(json: &[u8]) -> Duration {
+    #[derive(serde::Deserialize)]
+    struct Probed {
+        format: Option<ProbedFormat>,
+    }
+    serde_json::from_slice::<Probed>(json)
+        .ok()
+        .and_then(|p| p.format?.start_time?.parse::<f64>().ok())
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .map_or(Duration::ZERO, Duration::from_secs_f64)
+}
+
 /// ffprobe's JSON for one stream's packets, with `-show_data`.
 #[derive(serde::Deserialize)]
 struct Probed {
@@ -762,6 +793,27 @@ pub(crate) fn last_line(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A file's start, read from ffprobe's JSON: none, or less than 0,
+    /// is 0.
+    #[test]
+    fn a_file_s_start_is_its_format_s_start_time() {
+        let of = |json: &str| super::start_of(json.as_bytes());
+        assert_eq!(
+            [
+                of(r#"{"format": {"start_time": "10.000000"}}"#),
+                of(r#"{"format": {"start_time": "-0.021000"}}"#),
+                of(r#"{"format": {}}"#),
+                of("not json"),
+            ],
+            [
+                std::time::Duration::from_secs(10),
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            ]
+        );
+    }
+
     use super::*;
 
     fn sh(script: &str) -> Command {

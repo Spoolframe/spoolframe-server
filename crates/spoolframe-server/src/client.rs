@@ -77,7 +77,7 @@ use spoolframe_types::Delivery;
 /// client's `Hello` named. A feature not here is off for every
 /// connection, though this build knows its name.
 pub(crate) fn features() -> Features {
-    Feature::October2026.into()
+    Feature::October2026 | Feature::DownloadAddons
 }
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -2660,6 +2660,20 @@ impl ClientProtocol {
         ) {
             downloads_offered(hello)?;
         }
+        // Download add-ons, on the same platforms, and of this server's
+        // own items only: a paired server's would be planned and read
+        // there, which its proxy does not do (yet).
+        if let Request::DownloadAddonOptions { id }
+        | Request::ReadTrackSubtitle { id, .. }
+        | Request::PrepareAudioAddon { id, .. } = &request
+        {
+            downloads_offered(hello)?;
+            if id.remote().is_some() {
+                return Err(Error::Unsupported {
+                    request: "download add-ons of a paired server's item".into(),
+                });
+            }
+        }
         if federation.is_some() {
             self.federation_listeners.note(connection.stable_id(), ());
         }
@@ -2800,12 +2814,6 @@ impl ClientProtocol {
             });
         }
         match request {
-            // Not offered yet (`features()`): never reached.
-            Request::DownloadAddonOptions { .. }
-            | Request::ReadTrackSubtitle { .. }
-            | Request::PrepareAudioAddon { .. } => Err(Error::Unsupported {
-                request: "download add-ons".into(),
-            }),
             Request::ActivateProfile => {
                 state.locks.lock().activate(&session);
                 Ok(Reply::Done)
@@ -3936,21 +3944,9 @@ impl ClientProtocol {
             }
             Request::Tracks { id } => {
                 let (_, descriptor) = self.describe(&id).await?;
-                let mut tracks = descriptor.tracks();
-                let timings = self.services.subtitle_timings.timings(&descriptor).await;
-                for (track, timing) in tracks.subtitles.iter_mut().zip(timings) {
-                    track.timing = timing;
-                }
-                let downloads = self
-                    .services
-                    .subtitle_downloads
-                    .downloads(&id, &descriptor, &who.actor())
+                self.item_tracks(&id, &descriptor, &who)
                     .await
-                    .map_err(internal)?;
-                for (track, download) in tracks.subtitles.iter_mut().zip(downloads) {
-                    track.download = download;
-                }
-                Ok(Reply::Tracks(tracks))
+                    .map(Reply::Tracks)
             }
             // A paired server's item: its server searches and keeps the
             // file, as it plans the play (P8-07).
@@ -5058,6 +5054,28 @@ impl ClientProtocol {
                     .map(Reply::Download)
                     .map_err(proxy_error)
             }
+            Request::DownloadAddonOptions { id } => self
+                .download_addon_options(&who, &id)
+                .await
+                .map(Reply::DownloadAddonOptions),
+            Request::ReadTrackSubtitle {
+                id,
+                subtitle,
+                offset,
+                version,
+            } => {
+                let reply = self
+                    .read_track_subtitle(hello, &id, subtitle, offset, version)
+                    .await;
+                if reply.is_ok() {
+                    self.services.metrics.subtitle_reads.inc();
+                }
+                reply
+            }
+            Request::PrepareAudioAddon { id, audio } => self
+                .prepare_audio_addon(hello, &who, &id, audio)
+                .await
+                .map(Reply::Download),
             Request::DownloadOptions { id, device } => self
                 .download_options(state, hello, &who, &id, device.as_ref())
                 .await
@@ -6216,6 +6234,17 @@ impl ClientProtocol {
         stream: &SubtitleStream,
         to: SubtitleFormat,
     ) -> Sidecar {
+        let state = self.text_of(path, stream, to).await;
+        Sidecar::Made { state, format: to }
+    }
+
+    /// [`ClientProtocol::read_as_text`]'s text, being made or made.
+    async fn text_of(
+        &self,
+        path: &Path,
+        stream: &SubtitleStream,
+        to: SubtitleFormat,
+    ) -> watch::Receiver<TextState> {
         // A synced or offset subtitle (PX-03) is made from what it is
         // served as.
         let served;
@@ -6230,12 +6259,10 @@ impl ClientProtocol {
             }
             SubtitleSource::Embedded { .. } => stream,
         };
-        let state = self
-            .services
+        self.services
             .subtitles
             .text(TextSource { path, stream, to })
-            .await;
-        Sidecar::Made { state, format: to }
+            .await
     }
 
     /// The plan for a playback on this connection: off the LAN or not as
@@ -6855,6 +6882,158 @@ impl ClientProtocol {
                 tracks,
                 bitmap: preferences.subtitles.bitmap,
                 default_subtitle,
+            })
+            .await;
+        prepared_info(prepared, class)
+    }
+
+    /// Item `id`'s tracks, as `Tracks` answers: `descriptor`'s, each
+    /// subtitle with its timing (PX-03) and, for `who`, where it was
+    /// downloaded from (PX-02).
+    async fn item_tracks(
+        &self,
+        id: &MediaId,
+        descriptor: &MediaDescriptor,
+        who: &Who,
+    ) -> Result<spoolframe_types::MediaTracks, Error> {
+        let mut tracks = descriptor.tracks();
+        let timings = self.services.subtitle_timings.timings(descriptor).await;
+        for (track, timing) in tracks.subtitles.iter_mut().zip(timings) {
+            track.timing = timing;
+        }
+        let downloads = self
+            .services
+            .subtitle_downloads
+            .downloads(id, descriptor, &who.actor())
+            .await
+            .map_err(internal)?;
+        for (track, download) in tracks.subtitles.iter_mut().zip(downloads) {
+            track.download = download;
+        }
+        Ok(tracks)
+    }
+
+    /// What `who` may add to a download of film or episode `id`
+    /// (`spoolframe:download-addons`): each audio track with its file's
+    /// size, and each subtitle, with why one cannot be read as WebVTT.
+    async fn download_addon_options(
+        &self,
+        who: &Who,
+        id: &MediaId,
+    ) -> Result<spoolframe_protocol::downloads::DownloadAddonOptions, Error> {
+        use crate::downloads::addon;
+        use spoolframe_protocol::downloads::{AddonAudio, AddonSubtitle, DownloadAddonOptions};
+        addon_item(id)?;
+        let (_, descriptor) = self.describe(id).await?;
+        let tracks = self.item_tracks(id, &descriptor, who).await?;
+        // The class does not change a size: a converted track's rate is
+        // the same on both.
+        let audio = (0..descriptor.audio.len() as u32)
+            .map(|track| {
+                let size = addon::audio(&descriptor, crate::downloads::DeviceClass::Apple, track)
+                    .ok()
+                    .and_then(|plan| addon::estimate(&descriptor, track, &plan.decision));
+                AddonAudio {
+                    track,
+                    size,
+                    left_out: None,
+                }
+            })
+            .collect();
+        let ocr = self.services.subtitles.ocr();
+        let subtitles = descriptor
+            .subtitles
+            .iter()
+            .enumerate()
+            .map(|(track, stream)| AddonSubtitle {
+                track: track as u32,
+                left_out: addon::subtitle_left_out(stream, ocr),
+            })
+            .collect();
+        Ok(DownloadAddonOptions {
+            tracks,
+            audio,
+            subtitles,
+        })
+    }
+
+    /// One chunk of subtitle `subtitle` of film or episode `id` as WebVTT
+    /// (`spoolframe:download-addons`), as `ReadSubtitle` reads one: made
+    /// as a playback's would be (converted, read as it is served, or read
+    /// as text from pictures), and on an Apple device moved later by the
+    /// film's start, onto the timeline of its MP4, which keeps the
+    /// film's timestamps.
+    async fn read_track_subtitle(
+        &self,
+        hello: &spoolframe_protocol::Hello,
+        id: &MediaId,
+        subtitle: u32,
+        offset: u64,
+        version: Option<u64>,
+    ) -> Result<Reply, Error> {
+        let class = downloads_offered(hello)?;
+        addon_item(id)?;
+        let (path, descriptor) = self.describe(id).await?;
+        let stream =
+            descriptor
+                .subtitles
+                .get(subtitle as usize)
+                .ok_or_else(|| Error::InvalidInput {
+                    message: format!("subtitle {subtitle}: no such track"),
+                })?;
+        if let Some(reason) =
+            crate::downloads::addon::subtitle_left_out(stream, self.services.subtitles.ocr())
+        {
+            return Err(Error::InvalidInput { message: reason });
+        }
+        let text = read_text(self.text_of(&path, stream, SubtitleFormat::WebVtt).await).await?;
+        let start = match class {
+            crate::downloads::DeviceClass::Apple => self
+                .services
+                .subtitles
+                .start_time(&path)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(%id, error = %e, "cannot read a film's start");
+                    Error::Unavailable {
+                        message: "the media file could not be read".into(),
+                    }
+                })?,
+            crate::downloads::DeviceClass::Linux => Duration::ZERO,
+        };
+        let (bytes, total, version) = read_moved_subtitle(&text, offset, version, start).await?;
+        Ok(Reply::SubtitleChunk {
+            format: SubtitleFormat::WebVtt,
+            bytes,
+            total,
+            version,
+        })
+    }
+
+    /// Prepare `who`'s audio track `audio` of film or episode `id` as a
+    /// file of its own (`spoolframe:download-addons`): a download like any
+    /// other, for this connection's device.
+    async fn prepare_audio_addon(
+        &self,
+        hello: &spoolframe_protocol::Hello,
+        who: &Who,
+        id: &MediaId,
+        audio: u32,
+    ) -> Result<spoolframe_protocol::downloads::DownloadInfo, Error> {
+        let class = downloads_offered(hello)?;
+        addon_item(id)?;
+        let (path, descriptor) = self.describe(id).await?;
+        let media_id = id.to_string();
+        let prepared = self
+            .services
+            .downloads
+            .prepare_audio_addon(crate::downloads::AddonRequest {
+                principal: who.principal(),
+                media_id: &media_id,
+                media: &path,
+                descriptor: &descriptor,
+                class,
+                audio,
             })
             .await;
         prepared_info(prepared, class)
@@ -8061,6 +8240,17 @@ fn downloadable(id: &MediaId) -> Result<Downloadable, Error> {
     Ok(Downloadable::Track)
 }
 
+/// A film or an episode has add-ons (`spoolframe:download-addons`);
+/// nothing else.
+fn addon_item(id: &MediaId) -> Result<(), Error> {
+    match downloadable(id)? {
+        Downloadable::Film => Ok(()),
+        Downloadable::Track => Err(Error::InvalidInput {
+            message: "only films and episodes have download add-ons".into(),
+        }),
+    }
+}
+
 fn no_such_download() -> Error {
     Error::NotFound {
         what: "download".into(),
@@ -8864,6 +9054,63 @@ async fn read_subtitle(
         chunk.read_to_end(&mut bytes).await.map_err(unreadable)?;
     }
     Ok((bytes, total, now))
+}
+
+/// One chunk of WebVTT file `path` as [`read_subtitle`] reads it, every
+/// cue moved later by `by` (a film's start, for a download's MP4). The
+/// file is read whole, as a subtitle is small, and moved; the version is
+/// the file's and the move's, so a film whose start is read otherwise
+/// later is another file to the client.
+async fn read_moved_subtitle(
+    path: &Path,
+    offset: u64,
+    version: Option<u64>,
+    by: Duration,
+) -> Result<(Vec<u8>, u64, u64), Error> {
+    if by.is_zero() {
+        return read_subtitle(path, offset, version).await;
+    }
+    let unreadable = |e: String| {
+        tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
+        Error::Unavailable {
+            message: "the subtitle file could not be read".into(),
+        }
+    };
+    let mut file = crate::files::open_regular(path)
+        .await
+        .map_err(|e| unreadable(e.to_string()))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| unreadable(e.to_string()))?;
+    let by_ms = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+    let now = {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&subtitle_version(&metadata).to_le_bytes());
+        hash.update(&by_ms.to_le_bytes());
+        let mut first = [0; 8];
+        first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
+        u64::from_le_bytes(first)
+    };
+    if version.is_some_and(|read| read != now) {
+        return Err(Error::SubtitleChanged);
+    }
+    let mut text = Vec::new();
+    file.read_to_end(&mut text)
+        .await
+        .map_err(|e| unreadable(e.to_string()))?;
+    let moved = spoolframe_media::subsync::shift(
+        &text,
+        spoolframe_media::subsync::TextFormat::WebVtt,
+        by_ms,
+    )
+    .map_err(|e| unreadable(e.to_string()))?;
+    let total = moved.len() as u64;
+    let from = usize::try_from(offset.min(total)).unwrap_or(moved.len());
+    let to = from
+        .saturating_add(SUBTITLE_CHUNK as usize)
+        .min(moved.len());
+    Ok((moved[from..to].to_vec(), total, now))
 }
 
 /// A value that names a subtitle file as it is now: another one once the

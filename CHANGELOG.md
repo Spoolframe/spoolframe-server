@@ -10,6 +10,16 @@
   its own, a download like any other. AVFoundation merges an audio-only
   M4A into the film, but shows no cues of a merged `mov_text` track, so
   the app draws WebVTT itself. See PROTOCOL.md's Download add-ons.
+- Added, server: download add-ons for its own films and episodes, on the
+  platforms that have downloads; a paired server's item is `unsupported`.
+  A subtitle is converted, read as it is served (synced or offset), or
+  read from pictures, as for a playback. An audio track is copied into an
+  M4A (Apple) or a Matroska audio file (Linux) when the device plays its
+  codec, else converted by the same copy a film's download uses. The M4A
+  keeps the film's timestamps, as the film's MP4 does (`-copyts`): a film
+  that starts at 10 s has an MP4 whose tracks begin at 10 s after an empty
+  edit. So on an Apple device the WebVTT cues are moved by the film's
+  start, ffprobe's `start_time`, to land on that timeline.
 - Server: a play started just after a reconnect no longer stays counted
   off the LAN (#4). While the device's old connection lingers, iroh
   selects none of the new one's paths, so the play was admitted as WAN,
