@@ -43,6 +43,11 @@
   only the first subtitle (and the first audio). The default is the first
   picked track the file marks default, else the first picked. Downloads
   made before stay as they are.
+- Server: a download's preferred subtitles include the device's language
+  when the viewer set no subtitle languages. They followed the audio
+  languages alone, so an anime in Japanese on an English iPad ticked no
+  subtitle, and the iOS app's season downloads, which start each episode
+  with the preferred tracks, carried none.
 
 ## 0.17.2 (2026-11-01)
 

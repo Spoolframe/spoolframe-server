@@ -354,7 +354,8 @@ pub fn profile(
 /// playback would pick for the viewer's `preferences` (and `override_`),
 /// and one more in another of their audio languages when the file has
 /// one; every text subtitle in their subtitle languages (their audio
-/// languages when they set none), and the subtitle playback would pick.
+/// languages and the device's when they set none), and the subtitle
+/// playback would pick.
 /// `device`: the device's language, as `Hello` says it.
 pub fn preferred(
     descriptor: &MediaDescriptor,
@@ -399,7 +400,17 @@ pub fn preferred(
         });
     audio.extend(second.map(|i| i as u32));
     let subtitle_languages = if preferences.subtitles.languages.is_empty() {
-        audio_languages
+        // The device's language too: a film heard in another, as an anime
+        // in Japanese on an English iPad, wants the device's subtitles,
+        // and the audio languages alone ticked none, so the download
+        // carried none.
+        let mut languages = audio_languages;
+        if let Some(device) = device
+            && !languages.iter().any(|l| same_language(l, device))
+        {
+            languages.push(device);
+        }
+        languages
     } else {
         resolved(&preferences.subtitles.languages, None, device)
     };
@@ -893,6 +904,23 @@ mod tests {
                 subtitles: vec![0, 2],
             }
         );
+    }
+
+    /// Japanese audio on an English device, with no subtitle languages
+    /// set: the English subtitles are ticked. Before, the subtitles
+    /// followed the audio languages alone, none matched Japanese, and the
+    /// download carried no subtitle.
+    #[test]
+    fn with_no_subtitle_languages_the_devices_subtitles_are_preferred() {
+        let mut anime = film(MKV, "h264", &["aac"]);
+        anime.audio[0].language = Some("jpn".into());
+        anime.subtitles = vec![sub(2, "subrip", "eng"), sub(3, "subrip", "ind")];
+        let Tracks::Chosen { subtitles, .. } =
+            preferred(&anime, &preferring(&["ja"], &[]), None, Some("en-US"))
+        else {
+            panic!("a choice");
+        };
+        assert_eq!(subtitles, vec![0]);
     }
 
     #[test]
