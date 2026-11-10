@@ -219,21 +219,43 @@ pub fn mux_args_as(
         }
         at += 1;
     }
-    for (position, track) in descriptor.audio.iter().enumerate() {
-        if picks
+    let audio_picked = |position: usize| {
+        picks
             .audio
             .as_ref()
-            .is_some_and(|p| !p.contains(&(position as u32)))
-        {
+            .is_none_or(|p| p.contains(&(position as u32)))
+    };
+    // An MP4 has exactly one default audio track: with more than one, as
+    // a Matroska source often marks every one, ffmpeg's MP4 muxer puts
+    // each track of every kind in an alternate group of its own, and
+    // AVFoundation then offers only the first subtitle. The first picked
+    // track the file marks default, else the first picked.
+    let mp4_default_audio = mp4
+        .then(|| {
+            let picked = || (0..descriptor.audio.len()).filter(|&p| audio_picked(p));
+            picked()
+                .find(|&p| descriptor.audio[p].default)
+                .or_else(|| picked().next())
+        })
+        .flatten();
+    for (position, track) in descriptor.audio.iter().enumerate() {
+        if !audio_picked(position) {
             continue;
         }
         let (map, stored) = inputs.audio(track.index);
         args.extend([s("-map"), map]);
         if stored {
             args.extend(tags(at, &track.language, &track.title));
+        }
+        let default = match mp4_default_audio {
+            Some(chosen) => Some(chosen == position),
+            // Matroska: a copied track keeps the file's flags.
+            None => stored.then_some(track.default),
+        };
+        if let Some(default) = default {
             args.extend([
                 format!("-disposition:{at}"),
-                s(if track.default { "default" } else { "0" }),
+                s(if default { "default" } else { "0" }),
             ]);
         }
         at += 1;
@@ -454,6 +476,49 @@ mod tests {
 
     fn film_alone() -> MuxInputs {
         MuxInputs::new(Path::new("/media/film.mkv"), &CopyFiles::default())
+    }
+
+    /// The film with both audio tracks marked default, as Matroska files
+    /// often are, muxed to MP4 with `picks`.
+    fn mp4_of_two_defaults(picks: &MuxPicks) -> Vec<String> {
+        let mut film = film();
+        for track in &mut film.audio {
+            track.default = true;
+        }
+        let format = MuxFormat::Mp4 { hvc1: false };
+        mux_args_as(&film, &film_alone(), picks, format, Path::new("/out.mp4"))
+    }
+
+    /// Two default audio tracks put every MP4 track in a group of its
+    /// own, and AVFoundation offered one subtitle of three: the first
+    /// stays default, the other is not, copied as both are.
+    #[test]
+    fn an_mp4_has_one_default_audio_track() {
+        let args = mp4_of_two_defaults(&MuxPicks::ALL);
+        assert!(has(&args, &["-disposition:1", "default"]), "{args:?}");
+        assert!(has(&args, &["-disposition:2", "0"]), "{args:?}");
+    }
+
+    /// The French track alone is the default when it is the one picked.
+    #[test]
+    fn an_mp4_of_one_picked_track_makes_it_the_default() {
+        let mut film = film();
+        film.audio[1].default = false;
+        let picks = MuxPicks {
+            audio: Some(vec![1]),
+            ..MuxPicks::ALL
+        };
+        let format = MuxFormat::Mp4 { hvc1: false };
+        let args = mux_args_as(&film, &film_alone(), &picks, format, Path::new("/out.mp4"));
+        assert!(has(&args, &["-disposition:1", "default"]), "{args:?}");
+    }
+
+    /// Matroska keeps a copied track's own flags: no disposition is said
+    /// for the French track (output 2), only for the stored DTS.
+    #[test]
+    fn matroska_leaves_a_copied_audio_tracks_flags_alone() {
+        let args = args(&MuxPicks::ALL);
+        assert!(!args.iter().any(|a| a == "-disposition:2"), "{args:?}");
     }
 
     #[test]

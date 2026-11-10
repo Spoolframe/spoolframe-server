@@ -36,6 +36,13 @@
   against 3 s for a direct play. hevc_vaapi now writes only the HDR SEI
   (`-sei hdr`); 3 s of the same film encode in 0.5 s instead of 44 s.
   Nothing is lost: HLS variants already say `CLOSED-CAPTIONS=NONE`.
+- Server: an MP4 download has exactly one default audio track, so iPhone
+  and iPad offer all its subtitles. A Matroska source often marks every
+  audio track default; copied as they were, ffmpeg's MP4 muxer put each
+  track in an alternate group of its own, and AVFoundation then offered
+  only the first subtitle (and the first audio). The default is the first
+  picked track the file marks default, else the first picked. Downloads
+  made before stay as they are.
 
 ## 0.17.2 (2026-11-01)
 
