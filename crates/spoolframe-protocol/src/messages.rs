@@ -1252,6 +1252,48 @@ pub enum Request {
         liked: Vec<crate::downloads::OfflineLike>,
     },
 
+    /// What may be added to a download of film or episode `id` without
+    /// fetching the film again (feature `spoolframe:download-addons`):
+    /// `DownloadAddonOptions`, each audio track with its file's size, and
+    /// each subtitle, with why one cannot be added. As `DownloadOptions`
+    /// for who may and from where; a paired server's item is
+    /// `Unsupported`.
+    DownloadAddonOptions {
+        id: MediaId,
+    },
+    /// One chunk of subtitle `subtitle` (its place in `Tracks`) of film or
+    /// episode `id` as WebVTT, outside any playback (feature
+    /// `spoolframe:download-addons`): `SubtitleChunk`, read as
+    /// `ReadSubtitle`'s are, from `offset` with the first chunk's
+    /// `version`. Text is converted; a subtitle file beside the film or
+    /// downloaded from a subtitle site is as it is served, synced or
+    /// offset; pictures are read as text, and the answer is
+    /// `SubtitleNotReady` until that is done: ask again. On an Apple
+    /// device the cues are on the timeline of the MP4 the server
+    /// downloads, which keeps the film's timestamps: a film whose first
+    /// frame is at 10 s has its cues 10 s later than the film's own
+    /// subtitle file says. As `DownloadAddonOptions` for who may.
+    ReadTrackSubtitle {
+        id: MediaId,
+        subtitle: u32,
+        offset: u64,
+        version: Option<u64>,
+    },
+    /// Prepare audio track `audio` (its place in `Tracks`) of film or
+    /// episode `id` as a file of its own (feature
+    /// `spoolframe:download-addons`): `Download`, a download like any
+    /// other, which `DownloadStatus`, the `download` read,
+    /// `CancelDownload` and `DownloadChanged` all name. An M4A on an
+    /// Apple device, a Matroska audio file (`.mka`) on Linux; the track
+    /// as it is when the device plays its codec, else converted as a
+    /// download's would be. It carries the track's language, and the
+    /// film's timestamps, as the film's download does. As
+    /// `DownloadAddonOptions` for who may.
+    PrepareAudioAddon {
+        id: MediaId,
+        audio: u32,
+    },
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -1310,6 +1352,9 @@ impl Request {
             Request::BeginInvitePasskey(_) => Some(Feature::October2026),
             Request::RedeemInviteWithPasskey(_) => Some(Feature::October2026),
             Request::NextEpisode { .. } | Request::ShowNext { .. } => Some(Feature::October2026),
+            Request::DownloadAddonOptions { .. }
+            | Request::ReadTrackSubtitle { .. }
+            | Request::PrepareAudioAddon { .. } => Some(Feature::DownloadAddons),
             Request::Hello { .. }
             | Request::AuthMethods
             | Request::LoginPassword { .. }
@@ -1989,7 +2034,8 @@ pub enum Reply {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
-    /// The chunk of a subtitle file that `ReadSubtitle` asked for.
+    /// The chunk of a subtitle file that `ReadSubtitle` or
+    /// `ReadTrackSubtitle` asked for.
     SubtitleChunk {
         format: SubtitleFormat,
         #[serde(with = "serde_bytes")]
@@ -2127,8 +2173,10 @@ pub enum Reply {
     ShareCandidates(crate::playlists::ShareCandidatePage),
     /// What the device may download of an item (`DownloadOptions`).
     DownloadOptions(crate::downloads::DownloadOptionsInfo),
-    /// A download prepared (`PrepareDownload`).
+    /// A download prepared (`PrepareDownload`, `PrepareAudioAddon`).
     Download(crate::downloads::DownloadInfo),
+    /// What may be added to a download (`DownloadAddonOptions`).
+    DownloadAddonOptions(crate::downloads::DownloadAddonOptions),
     /// Downloads, in the order asked (`DownloadStatus`): each the user
     /// has, and the ids asked for that they have not. A device treats a
     /// gone download as cancelled: preparing it again brings it back.

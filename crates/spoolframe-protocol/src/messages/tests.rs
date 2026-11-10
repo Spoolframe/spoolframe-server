@@ -4829,3 +4829,60 @@ fn a_sign_in_request_is_local_only_from_the_server_s_network() {
         [true, true, false, false, true, false]
     );
 }
+
+/// The download add-ons' names are promised to the apps: they never
+/// change. Each request is of feature `spoolframe:download-addons` and
+/// safe to send again; the subtitle comes back as `ReadSubtitle`'s does.
+#[test]
+fn the_download_addons_wire_names_are_fixed() {
+    use crate::downloads::{AddonAudio, AddonSubtitle, DownloadAddonOptions};
+    let film = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+    let options = Request::DownloadAddonOptions { id: film.clone() };
+    let subtitle = Request::ReadTrackSubtitle {
+        id: film.clone(),
+        subtitle: 2,
+        offset: 0,
+        version: None,
+    };
+    let audio = Request::PrepareAudioAddon { id: film, audio: 1 };
+    assert_eq!(
+        [&options, &subtitle, &audio].map(|r| serde_json::to_value(r).unwrap()),
+        [
+            serde_json::json!({"type": "download_addon_options", "id": "plex:movie:1"}),
+            serde_json::json!({
+                "type": "read_track_subtitle", "id": "plex:movie:1",
+                "subtitle": 2, "offset": 0, "version": null,
+            }),
+            serde_json::json!({"type": "prepare_audio_addon", "id": "plex:movie:1", "audio": 1}),
+        ]
+    );
+    for request in [options, subtitle, audio] {
+        round_trip(request.clone());
+        assert_eq!(request.feature(), Some(crate::Feature::DownloadAddons));
+        assert!(crate::policy::retry_safe(&request));
+    }
+    let reply = Reply::DownloadAddonOptions(DownloadAddonOptions {
+        tracks: spoolframe_types::MediaTracks::default(),
+        audio: vec![AddonAudio {
+            track: 0,
+            size: Some(380_000_000),
+            left_out: None,
+        }],
+        subtitles: vec![AddonSubtitle {
+            track: 1,
+            left_out: Some("teletext cannot be read as text".into()),
+        }],
+    });
+    let mut wire = serde_json::to_value(&reply).unwrap();
+    assert!(wire["tracks"].is_object(), "{wire}");
+    wire.as_object_mut().unwrap().remove("tracks");
+    assert_eq!(
+        wire,
+        serde_json::json!({
+            "type": "download_addon_options",
+            "audio": [{"track": 0, "size": 380_000_000, "left_out": null}],
+            "subtitles": [{"track": 1, "left_out": "teletext cannot be read as text"}],
+        })
+    );
+    round_trip(reply);
+}

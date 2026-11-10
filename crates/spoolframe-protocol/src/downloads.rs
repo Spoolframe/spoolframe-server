@@ -21,6 +21,12 @@
 //! (an artist, a playlist, Liked) is asked with
 //! [`crate::Request::MusicDownloadChanges`], and what it played offline
 //! sent with [`crate::Request::SyncOfflinePlays`].
+//!
+//! With `spoolframe:download-addons`, a device adds tracks to a download
+//! it has ([`crate::Request::DownloadAddonOptions`]): a subtitle read as
+//! WebVTT ([`crate::Request::ReadTrackSubtitle`]), and an audio track
+//! downloaded as a file of its own ([`crate::Request::PrepareAudioAddon`]),
+//! which is a download like any other.
 
 use serde::{Deserialize, Serialize};
 use spoolframe_types::{ClientCapabilities, Container, MediaId, MediaTracks, Platform};
@@ -164,6 +170,48 @@ pub struct DownloadOptionsInfo {
     /// About each option: `Original` first, then each of `profiles` in
     /// its order. Films and episodes only: empty for a track.
     pub estimates: Vec<DownloadEstimate>,
+}
+
+/// What may be added to a download of an item without fetching the film
+/// again (`DownloadAddonOptions`, feature `spoolframe:download-addons`):
+/// each audio track as a file of its own, and each subtitle as WebVTT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DownloadAddonOptions {
+    /// The item's tracks, as `Tracks` gives them: what `track` names by
+    /// place.
+    pub tracks: MediaTracks,
+    /// Every audio track, in `tracks.audio`'s order.
+    pub audio: Vec<AddonAudio>,
+    /// Every subtitle, in `tracks.subtitles`'s order.
+    pub subtitles: Vec<AddonSubtitle>,
+}
+
+/// An audio track as an add-on (`PrepareAudioAddon`): an M4A on an Apple
+/// device, a Matroska audio file on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct AddonAudio {
+    /// Its place in `Tracks`' `audio`.
+    pub track: u32,
+    /// About how many bytes its file is; `None` when the server cannot
+    /// tell (a lossless track, or a film whose length is not known).
+    pub size: Option<u64>,
+    /// Why it cannot be an add-on, said to the user as it is; `None`
+    /// when it can.
+    pub left_out: Option<String>,
+}
+
+/// A subtitle as an add-on (`ReadTrackSubtitle`), always WebVTT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct AddonSubtitle {
+    /// Its place in `Tracks`' `subtitles`.
+    pub track: u32,
+    /// Why it cannot be an add-on (teletext or CEA-608 the server cannot
+    /// read, pictures in a language it cannot read as text), said to the
+    /// user as it is; `None` when it can.
+    pub left_out: Option<String>,
 }
 
 /// About one download option (`DownloadOptions`): how large it is and

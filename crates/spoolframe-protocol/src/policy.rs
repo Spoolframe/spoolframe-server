@@ -32,6 +32,8 @@ pub fn server_wait(request: &Request) -> Duration {
     match request {
         Request::AwaitDeviceSignIn { .. } => wait::SIGN_IN,
         Request::ReadSubtitle { .. } | Request::ReadSubtitleSegment { .. } => wait::READ,
+        // A probe of the file for its track, then a wait as a read's.
+        Request::ReadTrackSubtitle { .. } => wait::PROBE + wait::READ,
         Request::Tracks { .. }
         | Request::PlaybackPlan { .. }
         | Request::SetTrackOverride { .. }
@@ -42,6 +44,8 @@ pub fn server_wait(request: &Request) -> Duration {
         // Each probes the file to plan the download.
         | Request::DownloadOptions { .. }
         | Request::PrepareDownload { .. }
+        | Request::DownloadAddonOptions { .. }
+        | Request::PrepareAudioAddon { .. }
         // An artist's albums are read one by one from the catalog.
         | Request::MusicDownloadChanges { .. } => wait::PROBE,
         Request::SearchSubtitles { .. } | Request::DownloadSubtitle { .. } => wait::SUBTITLE_SITE,
@@ -138,6 +142,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::PrepareDownload { .. }
         | Request::DownloadStatus { .. }
         | Request::CancelDownload { .. }
+        // Reads; an audio add-on prepared twice is one download, as
+        // `PrepareDownload`'s.
+        | Request::DownloadAddonOptions { .. }
+        | Request::ReadTrackSubtitle { .. }
+        | Request::PrepareAudioAddon { .. }
         // Newest wins: an entry written once is older the second time.
         | Request::SyncOfflineWatch { .. }
         // A read; a play is recorded once by its track and time,

@@ -49,7 +49,7 @@ be updated together. The changes per revision are in
   [playlist covers](#playlist-covers) and
   [up next in a playlist](#up-next-in-a-playlist)
 - [Sorting and filtering a library](#sorting-and-filtering-a-library)
-- [Downloads](#downloads)
+- [Downloads](#downloads) and [download add-ons](#download-add-ons)
 - [Portable identities](#portable-identities)
 - [Faces in backdrops](#faces-in-backdrops) (experimental)
 - [Federation](#federation) (experimental):
@@ -1822,9 +1822,12 @@ it is off, with nothing sent. A request of a feature that went off since
 | Feature | Brings |
 |---|---|
 | `spoolframe:october-2026` | `profile_removed`, `pin_changed`, `watch_changed`, `next_episode`, `show_next`, `begin_invite_passkey` and `redeem_invite_with_passkey` |
+| `spoolframe:download-addons` | `download_addon_options`, `read_track_subtitle` and `prepare_audio_addon` ([download add-ons](#download-add-ons)) |
 
 The names are dated: a feature is what was added by its date. Later
-additions get a new dated name, and a name stays once added.
+additions get a new dated name, and a name stays once added. One is
+not: `spoolframe:download-addons` is named for what it brings, by the
+user's choice, so an app can name it on its own.
 
 A new reply field needs neither. It is `serde(default)`, so a reply from
 an older server decodes. Where its absence means something other than
@@ -2928,6 +2931,73 @@ The outcomes, one per play and one per like, in order, are as
 newer change for: show the server's), `not_tracked` (not a track, or
 not on the server), or `unknown`. At most 500 plays and likes together.
 Both requests may be sent again on a new connection.
+
+## Download add-ons
+
+With feature `spoolframe:download-addons` on for the connection (both
+sides named it), a device adds subtitles and audio tracks to a download
+it has, without fetching the film again. The name is not dated, by the
+user's choice. On a connection without it, the three requests are
+`unsupported`; so they are on a platform that has no downloads, as
+`download_options` is, and for a paired server's item. The names are
+fixed.
+
+```json
+{"type": "download_addon_options", "id": "plex:movie:42"}
+{"type": "read_track_subtitle", "id": "plex:movie:42", "subtitle": 3,
+ "offset": 0, "version": null}
+{"type": "prepare_audio_addon", "id": "plex:movie:42", "audio": 1}
+```
+
+- `download_addon_options` is answered `{"type":
+  "download_addon_options", "tracks": Tracks, "audio": [...],
+  "subtitles": [...]}`: the item's tracks as `tracks` gives them, then
+  one entry per audio track, `{"track": n, "size": bytes | null,
+  "left_out": reason | null}`, and one per subtitle, `{"track": n,
+  "left_out": reason | null}`. `size` is about how large the audio
+  file is, `null` where the server cannot tell (a lossless track, or a
+  film whose length is not known). `left_out` says, to the user as it
+  is, why a track cannot be added: teletext or CEA-608 the server cannot
+  read, pictures in a language it cannot read as text.
+- `read_track_subtitle` reads one subtitle as WebVTT, outside any
+  playback, in chunks as `read_subtitle` does, answered
+  `subtitle_chunk` (`format` always `webvtt`): read from the end of each
+  chunk with the first chunk's `version` until `total` bytes are read.
+  A text track is converted; a subtitle file beside the film, or one
+  downloaded from a subtitle site, is read as it is served, synced or
+  offset. Pictures are read as text first, and the answer is
+  `subtitle_not_ready` with `done_percent` until that is done: ask again
+  in a few seconds.
+- `prepare_audio_addon` is answered `download`: a download like any
+  other, which `download_status`, `cancel_download`, the `download`
+  read and `download_changed` all name. Its file is the one track: an
+  M4A on an Apple device, a Matroska audio file on Linux. A codec the
+  device plays is copied as it is; another is converted as a download's
+  would be (E-AC-3, or AAC where the server has no E-AC-3 encoder), and
+  shares the converted track with the film's download. The track's
+  language is in the file. `file.container` is `mp4` or `matroska`, and
+  `file.tracks.audio` names the one track.
+
+Timing. A download's MP4 keeps the film's timestamps: a film whose
+first frame is at 10 s (an MPEG-TS recording, a Matroska file with an
+offset) is an MP4 whose tracks begin at 10 s, after an empty edit. The
+audio add-on keeps them too, so it lines up with the film's own audio.
+On an Apple device the WebVTT cues are on that timeline: moved later by
+the film's start, so a cue the film's subtitle shows 2 s in is at 12 s.
+On Linux, whose players count from a Matroska file's first frame, the
+cues are as the film's subtitle has them.
+
+All three are reads, retried on a new connection as any read is.
+
+SDK: `session.feature::<DownloadAddons>()` gives `On<DownloadAddons>`
+(`FeatureOff` without the feature), whose `download_addon_options(&id)`
+answers the options and `read_track_subtitle(&id, subtitle)` the whole
+WebVTT text, waiting while pictures are read. `Downloads::add_tracks(key,
+&on, audio, subtitles)` adds them to a download kept on the device: each
+subtitle saved as WebVTT, each audio track fetched as a download is,
+its SHA-256 checked. They are kept in the download's own directory, and
+go when it goes. `LocalDownload::addons` lists them with their state,
+and `DownloadEvent::Changed` tells when one lands or fails.
 
 ## Portable identities
 

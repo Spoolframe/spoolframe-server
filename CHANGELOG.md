@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added, protocol: feature `spoolframe:download-addons`, so an iOS app
+  adds subtitles and audio tracks to a download without fetching the film
+  again. `download_addon_options` lists what may be added and why a track
+  may not; `read_track_subtitle` reads any subtitle as WebVTT outside a
+  playback; `prepare_audio_addon` prepares one audio track as a file of
+  its own, a download like any other. AVFoundation merges an audio-only
+  M4A into the film, but shows no cues of a merged `mov_text` track, so
+  the app draws WebVTT itself. See PROTOCOL.md's Download add-ons.
 - Server: a play started just after a reconnect no longer stays counted
   off the LAN (#4). While the device's old connection lingers, iroh
   selects none of the new one's paths, so the play was admitted as WAN,

@@ -2800,6 +2800,12 @@ impl ClientProtocol {
             });
         }
         match request {
+            // Not offered yet (`features()`): never reached.
+            Request::DownloadAddonOptions { .. }
+            | Request::ReadTrackSubtitle { .. }
+            | Request::PrepareAudioAddon { .. } => Err(Error::Unsupported {
+                request: "download add-ons".into(),
+            }),
             Request::ActivateProfile => {
                 state.locks.lock().activate(&session);
                 Ok(Reply::Done)

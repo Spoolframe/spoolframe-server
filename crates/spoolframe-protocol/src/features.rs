@@ -38,6 +38,15 @@ pub enum Feature {
     /// `BeginInvitePasskey` and `RedeemInviteWithPasskey`, an account made
     /// with an invite and an app passkey.
     October2026,
+    /// `spoolframe:download-addons`: `DownloadAddonOptions`,
+    /// `ReadTrackSubtitle` and `PrepareAudioAddon`, a subtitle as WebVTT
+    /// and an audio track as a file of its own, added to a download the
+    /// device has without fetching the film again.
+    ///
+    /// Not dated, unlike the scheme above says: the user chose this name
+    /// on purpose (2026-11-09), as a feature of its own that a client may
+    /// name without the rest of a month's.
+    DownloadAddons,
 }
 
 /// A set of features: [`Features::all`] is every one this build knows,
@@ -50,6 +59,7 @@ impl Feature {
     pub const fn name(self) -> &'static str {
         match self {
             Feature::October2026 => "spoolframe:october-2026",
+            Feature::DownloadAddons => "spoolframe:download-addons",
         }
     }
 
@@ -132,6 +142,15 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), Features::all().len());
         assert_eq!(Feature::of("spoolframe:teleport"), None);
+    }
+
+    /// The download add-ons' name is fixed: an app names it as it is.
+    #[test]
+    fn download_addons_is_named_as_the_apps_name_it() {
+        assert_eq!(
+            Feature::of("spoolframe:download-addons"),
+            Some(Feature::DownloadAddons)
+        );
     }
 
     /// What is on for a connection: those both sides named.
