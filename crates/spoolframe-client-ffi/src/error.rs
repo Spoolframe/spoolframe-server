@@ -60,11 +60,17 @@ pub enum SpoolError {
     /// and `trust_new_identity(saved, now)` if the user says so.
     /// `server_id` is the saved server's pinned server id, to say which
     /// server it is.
+    /// `saved_fingerprint` and `now_fingerprint` are the two keys', to
+    /// show side by side. `look_up_server` says it too, before dialling,
+    /// when the address typed was a saved server's and now names another
+    /// key.
     #[error("server {saved} answered with another key, {now}")]
     IdentityChanged {
         saved: String,
         now: String,
         server_id: Option<String>,
+        saved_fingerprint: String,
+        now_fingerprint: String,
     },
     /// A saved server's key answered with another server id: not the same
     /// server. Refused, with no accepting it: remove the server, and add
@@ -87,6 +93,18 @@ pub enum SpoolError {
     SignInRequired,
     #[error("the username or password is wrong")]
     InvalidCredentials,
+    /// `look_up_server` was given an `http://` address: refused before
+    /// any request. Only HTTPS (or no scheme) is looked up.
+    #[error("only https:// addresses can be looked up")]
+    NotHttps,
+    /// `look_up_server`'s address answered, but has no Spoolframe document:
+    /// another site, or a server that doesn't publish itself outside.
+    #[error("{address} is not a Spoolframe server, or it is not published")]
+    NotASpoolframeServer { address: String },
+    /// `look_up_server`'s address answered with a document that can't be
+    /// used; `reason` says why.
+    #[error("the server's document cannot be read: {reason}")]
+    MalformedServerDocument { reason: String },
     /// What was pasted or opened isn't an invite link.
     #[error("this isn't a Spoolframe invite")]
     NotAnInvite,
@@ -409,6 +427,8 @@ impl From<SdkError> for SpoolError {
                 now,
                 server_id,
             } => Self::IdentityChanged {
+                saved_fingerprint: fingerprint_of(&saved),
+                now_fingerprint: fingerprint_of(&now),
                 saved,
                 now,
                 server_id,
@@ -428,6 +448,11 @@ impl From<SdkError> for SpoolError {
             SdkError::WrongServer { expected, actual } => Self::WrongServer { expected, actual },
             SdkError::SignInRequired => Self::SignInRequired,
             SdkError::InvalidCredentials => Self::InvalidCredentials,
+            SdkError::NotHttps => Self::NotHttps,
+            SdkError::NotASpoolframeServer { address } => Self::NotASpoolframeServer { address },
+            SdkError::MalformedServerDocument { reason } => {
+                Self::MalformedServerDocument { reason }
+            }
             SdkError::NotAnInvite => Self::NotAnInvite,
             SdkError::NotAnInviteCode => Self::NotAnInviteCode,
             SdkError::InviteInvalid => Self::InviteInvalid,
@@ -578,3 +603,8 @@ pub(crate) fn invalid(what: &str, e: impl std::fmt::Display) -> SpoolError {
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod tests;
+
+/// Key `id`'s fingerprint, as `ServerEntry::fingerprint` shows it.
+fn fingerprint_of(id: &str) -> String {
+    spoolframe_protocol::fingerprint::of_hex(id).unwrap_or_default()
+}

@@ -1113,6 +1113,82 @@ is another server, whatever its name; one that answers with a saved
 server's server id is that server with a new key, `IdentityChanged`,
 before any account is made.
 
+
+### Adding a server by its address
+
+A person who cannot paste a link (a TV with a remote) types the server's
+web address instead: `sf.example.org`. Iroh dials by key, so the key
+comes from a document the server publishes there, on the listener
+`admin.public_url` points at (`spoolframe_protocol::well_known`):
+
+```text
+GET https://sf.example.org/.well-known/spoolframe
+```
+
+```json
+{"endpoint_id": "3f9a…a0f1", "name": "Home Media",
+ "addrs": ["203.0.113.24:41641"],
+ "relays": ["https://relay.home-media.example"],
+ "lookup": null}
+```
+
+It is what an invite link with no code says of the server: its key, its
+name, the addresses a signed-in device is told, its relays and its pkarr
+lookup. No secret, no authentication, and `Cache-Control: public,
+max-age=300`. Only public addresses are listed: never a private
+(RFC 1918), loopback, link-local, unique-local (`fc00::/7`) or CGNAT
+(`100.64.0.0/10`) one, so the document never shows the home network's
+layout. With `network.publish_lookup_private = true` it lists every
+address a signed-in device is told but loopback, for a server whose
+public name resolves to a private or VPN address; anyone who asks then
+learns them. Without `admin.public_url`, or with
+`network.publish_lookup = false`, the answer is 404: the server is not
+meant to be found from outside. While the endpoint is starting it is
+503.
+
+The SDK's `Client::look_up_server(address)` (FFI
+`SpoolClient::look_up_server`):
+
+1. Reads the address: trimmed; with no scheme, `https://`; a path, query
+   or fragment dropped, as the document is always at the origin's root;
+   a port kept; the host lowercased. `http://` is refused before any
+   request (`NotHttps`): the key in the document is what the device
+   dials, and over plain HTTP anyone on the path could name their own.
+   Anything that is not a host is `InvalidInput`.
+2. Fetches it over HTTPS (TLS as the endpoint's, webpki roots), in at
+   most 10 s, reading at most 64 KiB. No answer, DNS or TLS failure, or
+   a 5xx is `Unreachable` (`TimedOut` for the clock); a 404, or a page
+   that is not a JSON object with `endpoint_id`, is
+   `NotASpoolframeServer`; a document whose key is not one or whose
+   fields do not read is `MalformedServerDocument`.
+3. Takes its hints as an invite's: at most 32 addresses and 32 http(s)
+   relays, an http(s) lookup. They join what the server is dialled with
+   for the app's run, and relays it names are chosen for it.
+4. Answers `ServerLookup { endpoint_id, name, fingerprint, addrs,
+   relays, lookup }`. Nothing is saved or dialled.
+
+The app then runs the usual `connect(endpoint_id)` (the QUIC handshake
+proves the key), shows the fingerprint, and `pin(endpoint_id,
+verified)`. Pinning saves the document's hints with the server as saving
+an invite's server does: relays named choose relays for it
+(`use_relays = Some(true)`), whatever the device's own setting. It also
+keeps the address it was looked up at. The key came from the address the
+user typed, so the fingerprint proves only that the server answering
+holds the key the document named; the user compares it with the one the
+server's web UI shows before saying it is verified.
+
+A later lookup at the same address that names another key than the
+server saved there is `IdentityChanged { saved, now, server_id }`
+(the FFI's also with `saved_fingerprint` and `now_fingerprint`; the
+SDK's `SdkError::fingerprints()`), before anything is dialled. Its
+hints are taken all the same, so `trust_new_identity(saved, now)`
+approves the new key if the user says so; nothing approves it otherwise.
+
+A saved server may also have the user's own addresses
+(`set_server_addresses(endpoint_id, addrs)`), kept with it and dialled
+beside what the server tells, which never replaces them; empty clears
+them.
+
 ## Relay access
 
 A relay of the server's own (`spoolframe-server relay run`) asks the main

@@ -2185,6 +2185,22 @@ pub struct NetworkConfig {
     /// it without being told its address. On unless set to `false`.
     #[ucl(default)]
     pub mdns: Option<bool>,
+    /// Answer `GET /.well-known/spoolframe` on the web UI's
+    /// `admin.public_url` with the server's key, name, relays, lookup and
+    /// public addresses: what an invite link says of it, with no code. A
+    /// device then adds the server by its address alone, as typed on a TV.
+    /// Anyone who knows the address can read it. On unless set to
+    /// `false`; without `admin.public_url` there is no document either way.
+    #[ucl(default)]
+    pub publish_lookup: Option<bool>,
+    /// List the server's private addresses in that document too: the
+    /// home network's (RFC 1918), a VPN's or CGNAT's (`100.64.0.0/10`),
+    /// IPv6 unique-local and link-local ones, as a signed-in device is
+    /// told them. Anyone who asks then learns the home and VPN networks'
+    /// addresses. For a server whose public name resolves to a private or
+    /// VPN address. Off unless set to `true`; loopback is never listed.
+    #[ucl(default)]
+    pub publish_lookup_private: Option<bool>,
     /// The UDP port Plex's LAN discovery (GDM) searches from, which each
     /// PMS answers to. A host firewall drops those answers unless it is
     /// open: it cannot match them to a search sent to a multicast group.
@@ -2657,6 +2673,19 @@ impl NetworkConfig {
     }
 
     /// How to build the endpoint.
+    /// Which addresses `/.well-known/spoolframe` lists, if it answers
+    /// at all (`network.publish_lookup`, `network.publish_lookup_private`).
+    pub fn lookup_document(&self) -> crate::admin::LookupDocument {
+        match (
+            self.publish_lookup.unwrap_or(true),
+            self.publish_lookup_private.unwrap_or(false),
+        ) {
+            (false, _) => crate::admin::LookupDocument::Off,
+            (true, false) => crate::admin::LookupDocument::Public,
+            (true, true) => crate::admin::LookupDocument::WithPrivate,
+        }
+    }
+
     pub fn endpoint_options(&self) -> Result<EndpointOptions, ConfigError> {
         if let Some(old) = &self.relay {
             return Err(ConfigError::Invalid {
@@ -4535,6 +4564,31 @@ mod tests {
             .unwrap();
             let options = config.network.endpoint_options().unwrap();
             assert_eq!(read(&options), expected, "{network}");
+        }
+    }
+
+    /// The document at `/.well-known/spoolframe` is on, with public
+    /// addresses only, unless set otherwise.
+    #[test]
+    fn the_lookup_document_is_public_only_unless_set() {
+        use crate::admin::LookupDocument;
+        for (network, expected) in [
+            ("", LookupDocument::Public),
+            ("publish_lookup = false;", LookupDocument::Off),
+            (
+                "publish_lookup = false; publish_lookup_private = true;",
+                LookupDocument::Off,
+            ),
+            (
+                "publish_lookup_private = true;",
+                LookupDocument::WithPrivate,
+            ),
+        ] {
+            let config = plex(&format!(
+                r#"plex {{ url = "http://nas:32400"; }} network {{ {network} }}"#
+            ))
+            .unwrap();
+            assert_eq!(config.network.lookup_document(), expected, "{network}");
         }
     }
 

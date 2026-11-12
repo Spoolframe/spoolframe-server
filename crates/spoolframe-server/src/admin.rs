@@ -237,6 +237,36 @@ pub struct StatusSource {
     /// The experimental features on (PX-49), fixed at start as the
     /// settings that turn them on need a restart.
     experimental: Vec<&'static str>,
+    /// What `/.well-known/spoolframe` answers.
+    lookup_document: LookupDocument,
+}
+
+/// What `/.well-known/spoolframe` answers (`network.publish_lookup`,
+/// `network.publish_lookup_private`), given `admin.public_url`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LookupDocument {
+    /// 404, as without `admin.public_url`.
+    Off,
+    /// The document, with the public addresses only.
+    #[default]
+    Public,
+    /// The document, with every address a signed-in device is told but
+    /// loopback: the home and VPN networks' too.
+    WithPrivate,
+}
+
+impl LookupDocument {
+    /// Whether the document lists `ip`.
+    pub fn lists(self, ip: std::net::IpAddr) -> bool {
+        match self {
+            LookupDocument::Off => false,
+            LookupDocument::Public => crate::wan::not_public(ip).is_none(),
+            LookupDocument::WithPrivate => {
+                let ip = ip.to_canonical();
+                !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+            }
+        }
+    }
 }
 
 /// The default of `previews.workers` on this machine, as the settings page
@@ -272,7 +302,14 @@ impl StatusSource {
             ocr_languages: Vec::new(),
             web_urls: OnceLock::new(),
             experimental: Vec::new(),
+            lookup_document: LookupDocument::default(),
         }
+    }
+
+    /// What `/.well-known/spoolframe` answers.
+    pub fn with_lookup_document(mut self, document: LookupDocument) -> Self {
+        self.lookup_document = document;
+        self
     }
 
     /// The experimental features on, as the client protocol's `Hello`
@@ -867,6 +904,26 @@ impl AdminApi {
     /// What a signed-out page shows and says: the server's name, and the
     /// public URL to send a browser to when its own address cannot keep
     /// the session cookie (plain HTTP on a real host).
+    /// The document at `/.well-known/spoolframe`, for a device that has
+    /// only this server's address: what an invite link says of it, with
+    /// no code, with the addresses `network.publish_lookup_private` lets
+    /// it list. `Err(false)` without `admin.public_url`, or with
+    /// `network.publish_lookup` off, where the server is not meant to be
+    /// found from outside; `Err(true)` while the
+    /// endpoint is starting.
+    pub(crate) async fn server_document(
+        &self,
+    ) -> Result<spoolframe_protocol::well_known::ServerDocument, bool> {
+        let listed = self.status.lookup_document;
+        if self.public_url.is_none() || listed == LookupDocument::Off {
+            return Err(false);
+        }
+        let mut invite = self.status.invite().await.ok_or(true)?;
+        // Never the home network's layout, unless the operator said so.
+        invite.addrs.retain(|addr| listed.lists(addr.ip()));
+        Ok(spoolframe_protocol::well_known::ServerDocument::of(&invite))
+    }
+
     pub(crate) fn site(&self) -> serde_json::Value {
         json!({
             "name": self.status.name.get(),
@@ -4888,6 +4945,62 @@ impl AdminApi {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lookup_document_tests {
+    use super::LookupDocument;
+
+    fn listed(document: LookupDocument) -> Vec<&'static str> {
+        [
+            "203.0.114.7",
+            "2a01:4f8::7",
+            "192.168.1.10",
+            "10.0.0.2",
+            "172.16.0.1",
+            "100.64.1.1",
+            "169.254.1.1",
+            "fd00::1",
+            "fe80::1",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+        ]
+        .into_iter()
+        .filter(|ip| document.lists(ip.parse().unwrap()))
+        .collect()
+    }
+
+    #[test]
+    fn by_default_only_public_addresses_are_listed() {
+        assert_eq!(
+            listed(LookupDocument::Public),
+            ["203.0.114.7", "2a01:4f8::7"]
+        );
+    }
+
+    #[test]
+    fn with_private_on_every_address_but_loopback_is_listed() {
+        assert_eq!(
+            listed(LookupDocument::WithPrivate),
+            [
+                "203.0.114.7",
+                "2a01:4f8::7",
+                "192.168.1.10",
+                "10.0.0.2",
+                "172.16.0.1",
+                "100.64.1.1",
+                "169.254.1.1",
+                "fd00::1",
+                "fe80::1",
+            ]
+        );
+    }
+
+    #[test]
+    fn off_lists_nothing() {
+        assert!(listed(LookupDocument::Off).is_empty());
     }
 }
 

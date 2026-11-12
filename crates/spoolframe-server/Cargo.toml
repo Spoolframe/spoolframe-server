@@ -114,7 +114,8 @@ wiremock = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 cargo_metadata = { workspace = true }
 m3u8-rs = { workspace = true }
-spoolframe-client-sdk = { workspace = true }
+# `test-http-lookup`: a test server is looked up over plain HTTP.
+spoolframe-client-sdk = { workspace = true, features = ["test-http-lookup"] }
 # The feature-gated calls as the apps make them, through the FFI's objects.
 spoolframe-client-ffi = { path = "../spoolframe-client-ffi" }
 # Signs the portable credentials and states the store tests check (P7-02).

@@ -689,11 +689,20 @@ impl Client {
         invite: &Invite,
         id: EndpointId,
     ) -> Result<Arc<ServerConnection>, SdkError> {
+        self.take_hints(invite, id);
+        self.hold_token(invite).await;
+        self.link(id).connection(self).await
+    }
+
+    /// `invite`'s hints for server `id` join what it is dialled with, for
+    /// as long as the app runs: its addresses, its lookup and its relays.
+    /// A typed address's document ([`Client::look_up_server`]) is taken
+    /// the same way.
+    pub(crate) fn take_hints(&self, invite: &Invite, id: EndpointId) {
         self.hint_addrs(id, &invite.addrs);
         if let Some(url) = &invite.lookup {
             self.look_up_at(url);
         }
-        self.hold_token(invite).await;
         // Named by the invite: dialled even with no address or relay, the
         // lookup (or a hint learned since) the way to it.
         self.inner.invite_relays.lock().entry(id).or_default();
@@ -701,13 +710,13 @@ impl Client {
             // Acting on an invite whose link names relays is consent to
             // them: the server is reached through them for the rest of the
             // run, whatever the client's relays, and saving it
-            // (`save_invited`) keeps that as its choice.
+            // (`save_invited`, or `pin` after a lookup) keeps that as its
+            // choice.
             self.inner.relay_policy.choose(id, Some(true));
             let mut invited = self.inner.invite_relays.lock();
             let known = invited.entry(id).or_default();
             *known = newest_first(&invite.relays, known, MAX_HINTS);
         }
-        self.link(id).connection(self).await
     }
 
     /// `addrs` join the addresses server `id` is dialled at, newest first;
@@ -805,7 +814,7 @@ fn refuse_another_key(
 /// `invite`'s hints, joining `server`'s: its addresses as told ones, its
 /// lookup, and its relays beside those the server told (not into a list
 /// the user edited), chosen for it.
-fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
+pub(crate) fn hint(server: &mut SavedServer, invite: &Invite, now: u64) {
     server.hinted(invite.addrs.iter().copied(), now);
     if invite.lookup.is_some() {
         server.lookup = invite.lookup.clone();
@@ -1046,6 +1055,7 @@ mod tests {
             advertised_addrs: Vec::new(),
             relays: Vec::new(),
             relays_edited: false,
+            user_addrs: Vec::new(),
             advertised_at: None,
             fingerprint: String::new(),
             server_id: None,

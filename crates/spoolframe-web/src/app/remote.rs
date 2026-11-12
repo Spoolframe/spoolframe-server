@@ -494,12 +494,20 @@ fn listed(settings: &Settings, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Switch `key`'s value now, `default` when unset.
+fn switch_value(settings: &Settings, key: &str, default: bool) -> bool {
+    value(settings, key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
 /// A list's value at Save, beside what `key` has now.
 fn list_change(settings: &Settings, key: &str, items: &[String]) -> Option<serde_json::Value> {
     list_setting(string_values(items), entry(settings, key))
 }
 
-/// Relays (P6-03, P6-04) and the pkarr record (P6-05): the other ways in
+/// Relays (P6-03, P6-04), the pkarr record (P6-05) and the document at
+/// the public URL that finds the server by its address: the other ways in
 /// besides a public address, a card of their own with its own Save.
 #[component]
 fn RelayFields(
@@ -516,6 +524,12 @@ fn RelayFields(
     let pkarr_fixed = locked(&settings, "network.pkarr");
     let mut pkarr = use_signal(|| pkarr_saved);
     let pkarr_url = use_signal(|| pkarr_url_saved);
+    let lookup_saved = switch_value(&settings, "network.publish_lookup", true);
+    let lookup_fixed = locked(&settings, "network.publish_lookup");
+    let publish_lookup = use_signal(|| lookup_saved);
+    let private_saved = switch_value(&settings, "network.publish_lookup_private", false);
+    let private_fixed = locked(&settings, "network.publish_lookup_private");
+    let publish_private = use_signal(|| private_saved);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
     let s = settings.clone();
@@ -539,6 +553,16 @@ fn RelayFields(
                 list_change(&s, "network.own_relays", &own()),
             ),
             ("network.pkarr", Some(pkarr_value)),
+            (
+                "network.publish_lookup",
+                (publish_lookup() != lookup_saved)
+                    .then(|| serde_json::Value::Bool(publish_lookup())),
+            ),
+            (
+                "network.publish_lookup_private",
+                (publish_private() != private_saved)
+                    .then(|| serde_json::Value::Bool(publish_private())),
+            ),
         ];
         busy.set(true);
         spawn(async move {
@@ -606,13 +630,31 @@ fn RelayFields(
                 }
                 Note { settings: settings.clone(), setting: "network.pkarr", on_changed: move |_| on_reload.call(()) }
             }
+            div { class: "wan-part",
+                PartHead {
+                    title: "Find the server by its address",
+                    about: if publish_lookup() { "On: with a public URL set, the server answers /.well-known/spoolframe there with its key, name, relays and public addresses, so a device (a TV, say) adds it by its address alone. Anyone who knows the address can read it." } else { "Off: devices add the server from an invite or on your network only. The address answers 404." },
+                    on: publish_lookup,
+                    disabled: lookup_fixed,
+                }
+                Note { settings: settings.clone(), setting: "network.publish_lookup", on_changed: move |_| on_reload.call(()) }
+            }
+            div { class: "wan-part",
+                PartHead {
+                    title: "List private addresses there too",
+                    about: if publish_private() { "On: the document also lists your home network’s, VPN’s and CGNAT addresses and IPv6 local ones. Anyone who asks learns them. For a server whose public name resolves to a private or VPN address. Loopback is never listed." } else { "Off: public addresses only, so the document never shows your home or VPN network." },
+                    on: publish_private,
+                    disabled: private_fixed || !publish_lookup(),
+                }
+                Note { settings: settings.clone(), setting: "network.publish_lookup_private", on_changed: move |_| on_reload.call(()) }
+            }
             if let Some(text) = error() {
                 Alert { text }
             }
             div { class: "wizard-foot",
                 span { class: "wizard-foot-end",
                     button { class: "btn-dialog btn-dialog-grey", disabled: busy(), onclick: move |_| on_reload.call(()), "Discard" }
-                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || (relays_fixed && own_fixed && pkarr_fixed), onclick: move |_| on_save.call(()), "Save" }
+                    button { class: "btn-dialog btn-dialog-primary", disabled: busy() || (relays_fixed && own_fixed && pkarr_fixed && lookup_fixed && private_fixed), onclick: move |_| on_save.call(()), "Save" }
                 }
             }
         }

@@ -240,6 +240,12 @@ pub(crate) struct Inner {
     pub(crate) manual: Mutex<HashMap<EndpointId, Vec<SocketAddr>>>,
     /// Invites' relays, for a server not saved yet.
     pub(crate) invite_relays: Mutex<HashMap<EndpointId, Vec<String>>>,
+    /// Servers looked up at a typed address this run
+    /// ([`Client::look_up_server`]): the origin, and the document's
+    /// hints as an invite link with no code, which pinning saves.
+    pub(crate) looked_up: Mutex<HashMap<EndpointId, (String, spoolframe_protocol::invite::Invite)>>,
+    /// Whether `http://` addresses may be looked up: only a test's.
+    pub(crate) http_lookups: std::sync::atomic::AtomicBool,
     /// The plays holding each paired server's relays with a play token:
     /// its relays leave the relay map once none does.
     play_relays: Mutex<HashMap<EndpointId, usize>>,
@@ -457,6 +463,8 @@ impl Client {
                 discovery,
                 manual: Mutex::default(),
                 invite_relays: Mutex::default(),
+                looked_up: Mutex::default(),
+                http_lookups: std::sync::atomic::AtomicBool::new(false),
                 play_relays: Mutex::default(),
                 lookups: Mutex::default(),
                 relays,
@@ -590,6 +598,7 @@ impl Client {
             advertised_addrs: s.advertised_addrs,
             relays: s.relays,
             relays_edited: s.relays_edited,
+            user_addrs: s.user_addrs,
             use_relays: s.use_relays,
         }
     }
@@ -824,6 +833,7 @@ impl Client {
             let mut saved = servers::load(storage).await?;
             if let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) {
                 server.set_verified(verified);
+                self.apply_looked_up(id, server);
                 let entry = self.saved_entry(server.clone(), self.inner.discovery.get(&id));
                 servers::save(storage, &saved).await?;
                 self.inner.discovery.changed();
@@ -852,6 +862,7 @@ impl Client {
             verified,
         );
         server.connected_over(conn.selected_addr());
+        self.apply_looked_up(id, &mut server);
         let mut saved = servers::load(storage).await?;
         // Nor this way, by a new key that says it is a saved server.
         if let Some(old) = same_server(&saved, id, &conn.info.server_id) {
@@ -909,6 +920,11 @@ impl Client {
         let Some(at) = saved.iter().position(|s| s.endpoint_id == saved_id) else {
             return Err(SdkError::UnknownServer(saved_id.to_owned()));
         };
+        // Still the server looked up there, now under its new key; and a
+        // lookup's hints for the new key, as pinning saves them.
+        server.looked_up_at = saved[at].looked_up_at.clone();
+        server.user_addrs = saved[at].user_addrs.clone();
+        self.apply_looked_up(new, &mut server);
         tracing::warn!(
             old = saved_id,
             new = new_id,
@@ -984,6 +1000,7 @@ impl Client {
             advertised_at: saved.and_then(|s| s.advertised_at.map(servers::time)),
             use_relays: saved.and_then(|s| s.use_relays),
             relays_edited: saved.is_some_and(|s| s.relays_edited),
+            user_addrs: saved.map(|s| s.user_addrs.clone()).unwrap_or_default(),
         }
     }
 
@@ -1147,6 +1164,40 @@ impl Client {
                 ));
             }
             self.look_up_fallback(server);
+            servers::save(storage, &saved).await?;
+        }
+        if let Some(link) = self.inner.links.lock().remove(&id) {
+            link.close();
+        }
+        self.inner.discovery.changed();
+        Ok(())
+    }
+
+    /// Saved server `endpoint_id`'s own addresses from now on: where the
+    /// user knows it is (a port forward, a fixed public IP), kept with it
+    /// and dialled beside what the server tells, which never replaces
+    /// them. Empty clears them. Each once, at most
+    /// [`spoolframe_protocol::invite::MAX_HINTS`]. Used from the next
+    /// connection: an open one is closed. [`SdkError::NotPinned`] for a
+    /// server not saved.
+    pub async fn set_server_addresses(
+        &self,
+        endpoint_id: &str,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<(), SdkError> {
+        let id = parse_id(endpoint_id)?;
+        {
+            let storage = self.inner.storage.as_ref();
+            let _saving = self.inner.saving.lock().await;
+            let mut saved = servers::load(storage).await?;
+            let Some(server) = saved.iter_mut().find(|s| s.endpoint_id == endpoint_id) else {
+                return Err(SdkError::NotPinned(endpoint_id.to_owned()));
+            };
+            let addrs = newest_first(&addrs, &[], spoolframe_protocol::invite::MAX_HINTS);
+            if server.user_addrs == addrs {
+                return Ok(());
+            }
+            server.user_addrs = addrs;
             servers::save(storage, &saved).await?;
         }
         if let Some(link) = self.inner.links.lock().remove(&id) {
@@ -2171,6 +2222,7 @@ impl Client {
         }
         let addrs = listed([
             manual.unwrap_or_default(),
+            pinned.map(|s| s.user_addrs.clone()).unwrap_or_default(),
             heard.map(|h| h.addrs).unwrap_or_default(),
             pinned.map(SavedServer::addrs).unwrap_or_default(),
         ]);
@@ -2817,6 +2869,7 @@ fn heard_entry(id: EndpointId, h: Heard) -> ServerEntry {
         server_id: None,
         use_relays: None,
         relays_edited: false,
+        user_addrs: Vec::new(),
     }
 }
 

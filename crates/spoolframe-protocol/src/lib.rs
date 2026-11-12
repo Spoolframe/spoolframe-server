@@ -38,6 +38,7 @@ pub mod search;
 mod search_view;
 pub mod server_id;
 pub mod streams;
+pub mod well_known;
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();

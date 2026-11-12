@@ -152,6 +152,18 @@ pub(crate) struct SavedServer {
     /// its server's list leaves out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_path: Option<SocketAddr>,
+    /// The user's own addresses for it
+    /// ([`crate::Client::set_server_addresses`]): dialled beside what the
+    /// server tells, and never aged, capped or replaced by it. Absent from
+    /// the file: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_addrs: Vec<SocketAddr>,
+    /// The web origin it was looked up at when it was pinned
+    /// ([`crate::Client::look_up_server`]), `https://host[:port]`: a later
+    /// lookup there that names another key is
+    /// [`crate::SdkError::IdentityChanged`]. Absent from the file: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looked_up_at: Option<String>,
 }
 
 /// n0's public pkarr relay, where a server with `network.pkarr = "n0"`
@@ -220,6 +232,8 @@ impl SavedServer {
             use_relays: None,
             relays_edited: false,
             last_path: None,
+            user_addrs: Vec::new(),
+            looked_up_at: None,
         };
         server.saw(addrs, now);
         server
@@ -406,7 +420,7 @@ pub(crate) fn now() -> u64 {
 
 /// `relays` as a server's relay list: each once, at most [`MAX_HINTS`],
 /// only plain http(s) URLs.
-fn relay_list(relays: Vec<String>) -> Vec<String> {
+pub(crate) fn relay_list(relays: Vec<String>) -> Vec<String> {
     let urls: Vec<String> = relays.into_iter().filter(|r| is_relay_url(r)).collect();
     crate::client::newest_first(&urls, &[], MAX_HINTS)
 }
@@ -441,6 +455,10 @@ pub struct ServerEntry {
     /// `relays` is the user's ([`crate::Client::set_server_relay_urls`]):
     /// what the server advertises does not change it.
     pub relays_edited: bool,
+    /// The user's own addresses for it
+    /// ([`crate::Client::set_server_addresses`]), dialled beside
+    /// `addrs`. Empty for none, and for a server not saved.
+    pub user_addrs: Vec<SocketAddr>,
     /// When that event came, to the second, for "as of" text. `None` if
     /// none has.
     pub advertised_at: Option<SystemTime>,
@@ -603,6 +621,8 @@ mod tests {
                     use_relays: None,
                     relays_edited: false,
                     last_path: None,
+                    user_addrs: Vec::new(),
+                    looked_up_at: None,
                 },
                 SavedServer {
                     name: "Cabin".into(),
@@ -621,6 +641,8 @@ mod tests {
                     use_relays: None,
                     relays_edited: false,
                     last_path: None,
+                    user_addrs: Vec::new(),
+                    looked_up_at: None,
                 },
             ]
         );

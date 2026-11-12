@@ -58,6 +58,7 @@ mod refusals;
 mod relay_policy;
 mod search_result;
 mod server_events;
+mod server_lookup;
 mod servers;
 mod session;
 mod sign_in_rules;
@@ -118,6 +119,7 @@ pub use invites::{
 pub use lan_servers::LanServerInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
 pub use link_meter::LinkMeter;
+pub use server_lookup::ServerLookup;
 pub use spoolframe_protocol::downloads::{
     AddonAudio, AddonSubtitle, DownloadAddonOptions, DownloadFailure, DownloadFile,
     DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, FailureRemedy, FileTracks,

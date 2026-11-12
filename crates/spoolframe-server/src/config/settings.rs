@@ -84,6 +84,8 @@ pub const SETTINGS: &[Setting] = &[
     restart("network.pkarr"),
     restart("network.own_relays"),
     restart("network.mdns"),
+    restart("network.publish_lookup"),
+    restart("network.publish_lookup_private"),
     live("network.plex_discovery_port"),
     restart("network.announce.add"),
     restart("network.announce.ignore"),

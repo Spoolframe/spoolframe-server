@@ -54,6 +54,12 @@ pub enum SdkError {
     /// name. Show both fingerprints; [`crate::Client::trust_new_identity`]
     /// if the user says so, which keeps the server id. `server_id` is the
     /// saved server's pinned server id, `None` while none is pinned yet.
+    /// [`SdkError::fingerprints`] are the two keys' fingerprints, to show
+    /// side by side (the FFI's error carries them as fields).
+    ///
+    /// [`crate::Client::look_up_server`] says it too, before anything is
+    /// dialled, when the address typed is one a saved server was looked up
+    /// at and its document now names another key.
     #[error("server {saved} answered with another key, {now}")]
     IdentityChanged {
         saved: String,
@@ -98,6 +104,25 @@ pub enum SdkError {
     SignInRequired,
     #[error("the username or password is wrong")]
     InvalidCredentials,
+    /// The address typed for [`crate::Client::look_up_server`] is an
+    /// `http://` one: refused before any request, as the key the document
+    /// names is what the device dials. Say the address must be HTTPS
+    /// (or typed with no scheme).
+    #[error("only https:// addresses can be looked up")]
+    NotHttps,
+    /// The address typed for [`crate::Client::look_up_server`] answered,
+    /// but not as a Spoolframe server: no document at
+    /// `/.well-known/spoolframe` (a 404, or a page that is not one). It is
+    /// another site, or a Spoolframe server that does not publish itself
+    /// outside its home (no `admin.public_url`, or
+    /// `network.publish_lookup` off). `address` is the origin asked.
+    #[error("{address} is not a Spoolframe server, or it is not published")]
+    NotASpoolframeServer { address: String },
+    /// The address typed for [`crate::Client::look_up_server`] answered
+    /// with a Spoolframe document that cannot be used (a key that is not
+    /// one, a field of the wrong type, too large); `reason` says which.
+    #[error("the server's document cannot be read: {reason}")]
+    MalformedServerDocument { reason: String },
     /// The text is not a Spoolframe invite link: checked before
     /// anything is sent. Say so under the paste field.
     #[error("this isn't a Spoolframe invite")]
@@ -470,6 +495,17 @@ pub enum ErrorKind {
 }
 
 impl SdkError {
+    /// For [`SdkError::IdentityChanged`], the saved key's fingerprint and
+    /// the new key's, as [`crate::ServerEntry::fingerprint`] shows them;
+    /// `None` for any other error.
+    pub fn fingerprints(&self) -> Option<(String, String)> {
+        let SdkError::IdentityChanged { saved, now, .. } = self else {
+            return None;
+        };
+        let print = |id: &str| spoolframe_protocol::fingerprint::of_hex(id).unwrap_or_default();
+        Some((print(saved), print(now)))
+    }
+
     /// The connection failed under a request: it was not answered in
     /// time, or its stream broke. The connection may be dead.
     pub fn is_transport(&self) -> bool {

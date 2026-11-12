@@ -123,6 +123,18 @@ network {
   congestion_control = "bbr";
   # Announce the server on the LAN over mDNS, so clients find it.
   mdns = true;
+  # With admin.public_url set, answer https://<that host>/.well-known/spoolframe
+  # with this server's key, name, relays and public addresses: what an
+  # invite link says of it, with no code. A device (a TV, say) then adds
+  # the server by its address alone. Anyone who knows the address can
+  # read it. Off: 404, as without public_url. Applies after a restart.
+  publish_lookup = true;
+  # List the private addresses in that document too: the home network's,
+  # a VPN's or CGNAT's (100.64.0.0/10), IPv6 unique-local and link-local
+  # ones. Anyone who asks then learns your home and VPN networks'
+  # addresses. Turn it on when your public name resolves to a private or
+  # VPN address. Loopback is never listed. Applies after a restart.
+  publish_lookup_private = false;
   # The UDP port the setup wizard's search for Plex servers on the LAN
   # (Plex's GDM) is sent from. Each Plex server answers to it, and a host
   # firewall drops those answers unless the port is open: it cannot match

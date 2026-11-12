@@ -157,6 +157,8 @@
       ${lib.optionalString cfg.plexDiscovery.enable "plex_discovery_port = ${toString cfg.plexDiscovery.port};"}
       ${lib.optionalString (cfg.relays != []) "relays = ${quote cfg.relays};"}
       ${lib.optionalString (cfg.pkarr != "off") "pkarr = ${quote cfg.pkarr};"}
+      publish_lookup = ${lib.boolToString cfg.publishLookup};
+      publish_lookup_private = ${lib.boolToString cfg.publishLookupPrivate};
       ${lib.optionalString (cfg.ownRelays != []) "own_relays = ${quote cfg.ownRelays};"}
       ${lib.optionalString (cfg.wan != null) wanConfig}
       ${lib.optionalString (cfg.lanPrefixes != []) "lan_prefixes = ${quote cfg.lanPrefixes};"}
@@ -347,6 +349,32 @@ in {
         reaches it, as after the public IP changed. `"off"`, `"n0"`
         (dns.iroh.link), or your own pkarr relay's URL. Not needed with
         relays on.
+      '';
+    };
+
+    publishLookup = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        With `admin.public_url` set, answer
+        `https://<that host>/.well-known/spoolframe` with the server's key,
+        name, relays and public addresses (`network.publish_lookup`): what
+        an invite link says of it, with no code, so a device adds the
+        server by its address alone. Anyone who knows the address can read
+        it. Off: 404.
+      '';
+    };
+
+    publishLookupPrivate = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        List the private addresses in that document too
+        (`network.publish_lookup_private`): the home network's, a VPN's or
+        CGNAT's, IPv6 unique-local and link-local ones. Anyone who asks
+        then learns the home and VPN networks' addresses. For a server
+        whose public name resolves to a private or VPN address. Loopback
+        is never listed.
       '';
     };
 

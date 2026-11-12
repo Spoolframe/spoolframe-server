@@ -963,6 +963,7 @@ async fn run(
         StatusSource::new(name.clone(), server_id.clone(), transcoding.clone())
             .with_jobs(jobs.clone())
             .with_mdns(endpoint_options.mdns)
+            .with_lookup_document(config.network.lookup_document())
             .with_experimental(spoolframe_server::protocol_info::experimental_on(
                 http_playback.listen.is_some(),
                 config.experimental.federation(),

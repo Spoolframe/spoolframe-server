@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Added, server: `GET /.well-known/spoolframe` on the web UI's
+  `admin.public_url`, what an invite link says of the server with no
+  code: its key, name, relays, lookup and public addresses, so a device
+  adds it by its address alone. 404 without `public_url` or with
+  `network.publish_lookup = false` (on by default).
+  `network.publish_lookup_private` (off by default) lists the home and
+  VPN networks' addresses too, never loopback. Both are on the web UI's
+  remote access page and in the NixOS module (`publishLookup`,
+  `publishLookupPrivate`). See PROTOCOL.md's Adding a server by its
+  address.
+- Added, SDK: `Client::look_up_server(address)` (FFI `look_up_server`),
+  answering `ServerLookup { endpoint_id, name, fingerprint, addrs,
+  relays, lookup }` over HTTPS only; then `connect` and `pin` as usual,
+  and pinning keeps the document's hints and relays choice as saving an
+  invite's server does. New errors `NotHttps`, `NotASpoolframeServer`
+  and `MalformedServerDocument`. The FFI's `IdentityChanged` carries
+  `saved_fingerprint` and `now_fingerprint` (the SDK's
+  `SdkError::fingerprints()`), and a lookup at an address a saved server
+  was found at that names another key says it too.
+  `Client::set_server_addresses(endpoint_id, addrs)` (FFI with strings)
+  keeps the user's own addresses for a saved server, dialled beside what
+  it tells; `ServerEntry::user_addrs` lists them.
 - Fixed, server: a file whose TrueHD track ffprobe 8.1 reports with no
   sample format (common in Blu-ray remuxes) is read again. The whole file
   was "could not be read": no download, no play.

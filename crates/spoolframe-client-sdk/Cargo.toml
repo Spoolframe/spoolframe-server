@@ -14,6 +14,10 @@ media-readers = []
 # UniFFI's traits on the public types an app sees, for
 # spoolframe-client-ffi. Off by default: the server never builds UniFFI.
 uniffi = ["dep:uniffi", "spoolframe-protocol/uniffi", "spoolframe-types/uniffi"]
+# Lets a test look a server up over plain HTTP
+# (`Client::allow_http_lookups`), as a test server has no certificate.
+# Never on in an app: the key in the document is what the device dials.
+test-http-lookup = []
 
 [dependencies]
 # The PIN checked offline, hashed as the server hashes it.
@@ -41,6 +45,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+# Fetches a server's document at the address a person typed
+# (`Client::look_up_server`). Already in the build through iroh, with the
+# same features; the TLS config is the endpoint's own (webpki roots,
+# aws-lc-rs), so no other provider or verifier is set up.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uniffi = { workspace = true, optional = true }

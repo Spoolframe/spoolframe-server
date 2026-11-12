@@ -15,7 +15,7 @@ use spoolframe_server::network::Relay;
 use crate::support::{self, ServerOptions, TestServer};
 
 /// A relay on loopback, and its URL.
-async fn relay() -> (RelayServer, url::Url) {
+pub(crate) async fn relay() -> (RelayServer, url::Url) {
     let mut config = ServerConfig::default();
     config.relay = Some(RelayConfig::new((Ipv4Addr::LOCALHOST, 0)));
     let relay = RelayServer::spawn(config).await.unwrap();
@@ -25,7 +25,7 @@ async fn relay() -> (RelayServer, url::Url) {
 
 /// A server whose only relay is `url`, once it has taken it as its home
 /// relay: until then it cannot be reached through it.
-async fn server_on(test: &str, url: &url::Url) -> TestServer {
+pub(crate) async fn server_on(test: &str, url: &url::Url) -> TestServer {
     let options = ServerOptions {
         relays: vec![Relay::Custom(url.clone())],
         ..ServerOptions::default()
@@ -69,7 +69,7 @@ async fn device(relays: bool) -> Client {
 /// A device with relays `relays`, over `storage`: the same device (its
 /// key, saved servers) as every other opened over it, but a new endpoint,
 /// with no path from an earlier run.
-async fn device_on(relays: bool, storage: Arc<MemoryStorage>) -> Client {
+pub(crate) async fn device_on(relays: bool, storage: Arc<MemoryStorage>) -> Client {
     let options = ClientOptions {
         lan_discovery: false,
         relays,
@@ -152,7 +152,11 @@ async fn saved_through_relay(server: &TestServer, relays: bool) -> Arc<MemorySto
 /// reaches saved `server`: through its relay only, every address saved
 /// for it forgotten first (on loopback a relayed connection finds the
 /// direct path, and the address it reached is saved).
-async fn reaches(storage: Arc<MemoryStorage>, relays: bool, server: &TestServer) -> bool {
+pub(crate) async fn reaches(
+    storage: Arc<MemoryStorage>,
+    relays: bool,
+    server: &TestServer,
+) -> bool {
     forget_addresses(&storage).await;
     let client = device_on(relays, storage).await;
     let id = server.server.id().to_string();
@@ -173,6 +177,7 @@ async fn forget_addresses(storage: &MemoryStorage) {
     for server in &mut servers {
         server["known_addrs"] = serde_json::json!([]);
         server["advertised_addrs"] = serde_json::json!([]);
+        server.as_object_mut().unwrap().remove("last_path");
     }
     let bytes = serde_json::to_vec(&servers).unwrap();
     storage.set_data(keys::SERVERS, Some(bytes)).await.unwrap();

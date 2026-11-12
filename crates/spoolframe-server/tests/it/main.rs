@@ -80,6 +80,7 @@ mod sdk_downloads;
 mod sdk_music;
 mod search;
 mod server_addresses;
+mod server_lookup;
 mod server_pin;
 mod sessions;
 mod settings;

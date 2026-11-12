@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use spoolframe_client_sdk::{
     self as sdk, ConnectionState, Experimental, FinishPasskeySignIn, InviteInfo, InviteLookup,
-    LanServerInfo, PasskeyRequest, Reachability, ServerEntry, ServerEvent, TrustedProfile,
-    types::Platform,
+    LanServerInfo, PasskeyRequest, Reachability, ServerEntry, ServerEvent, ServerLookup,
+    TrustedProfile, types::Platform,
 };
 use tokio::sync::Mutex;
 
@@ -323,6 +323,20 @@ impl SpoolClient {
         Ok(run(async move { client.set_server_relay_urls(&endpoint_id, relays).await }).await?)
     }
 
+    /// Saved server `endpoint_id`'s own addresses ("ip:port"), as the
+    /// user types them: dialled beside what the server tells, which never
+    /// replaces them. Empty clears them. `InvalidInput` for one that
+    /// isn't "ip:port"; `NotPinned` for a server not saved.
+    pub async fn set_server_addresses(
+        &self,
+        endpoint_id: String,
+        addrs: Vec<String>,
+    ) -> Result<(), SpoolError> {
+        let addrs = self::addrs(&addrs)?;
+        let client = self.client.clone();
+        Ok(run(async move { client.set_server_addresses(&endpoint_id, addrs).await }).await?)
+    }
+
     /// Forget a saved server and its sessions.
     pub async fn forget(&self, endpoint_id: String) -> Result<(), SpoolError> {
         let client = self.client.clone();
@@ -548,6 +562,21 @@ impl SpoolClient {
                 .await
         })
         .await?)
+    }
+
+    /// Add a server by the address typed (`sf.example.org`): fetch its
+    /// document over HTTPS and say its key, fingerprint and name. Nothing
+    /// is saved or dialled; go on with `connect(endpoint_id)`, show the
+    /// fingerprint, then `pin(endpoint_id, verified)`. The key came from
+    /// the address typed, so the fingerprint is to be checked against the
+    /// server's web UI before saying verified. Errors: `InvalidInput`
+    /// (not an address), `NotHttps`, `Unreachable` / `TimedOut`,
+    /// `NotASpoolframeServer`, `MalformedServerDocument`, and
+    /// `IdentityChanged` when a saved server looked up at this address
+    /// now has another key (`trust_new_identity(saved, now)` approves it).
+    pub async fn look_up_server(&self, address: String) -> Result<ServerLookup, SpoolError> {
+        let client = self.client.clone();
+        Ok(run(async move { client.look_up_server(&address).await }).await?)
     }
 
     /// The servers heard on this network just now, saved or not, in

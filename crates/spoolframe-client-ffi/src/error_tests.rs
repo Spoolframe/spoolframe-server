@@ -47,6 +47,13 @@ fn every_variant() -> Vec<SdkError> {
         },
         SdkError::SignInRequired,
         SdkError::InvalidCredentials,
+        SdkError::NotHttps,
+        SdkError::NotASpoolframeServer {
+            address: "https://example.org".into(),
+        },
+        SdkError::MalformedServerDocument {
+            reason: "no key".into(),
+        },
         SdkError::NotAnInvite,
         SdkError::NotAnInviteCode,
         SdkError::InviteInvalid,
@@ -210,14 +217,16 @@ fn every_variant_reads_as_the_sdk_reads_it() {
 fn fields_cross_as_values() {
     assert_eq!(
         SpoolError::from(SdkError::IdentityChanged {
-            saved: "a".into(),
-            now: "b".into(),
-            server_id: Some("abcd".into()),
+            saved: "ab".repeat(32),
+            now: "cd".repeat(32),
+            server_id: Some("abcd".into())
         }),
         SpoolError::IdentityChanged {
-            saved: "a".into(),
-            now: "b".into(),
+            saved: "ab".repeat(32),
+            now: "cd".repeat(32),
             server_id: Some("abcd".into()),
+            saved_fingerprint: spoolframe_protocol::fingerprint::of_hex(&"ab".repeat(32)).unwrap(),
+            now_fingerprint: spoolframe_protocol::fingerprint::of_hex(&"cd".repeat(32)).unwrap(),
         }
     );
     assert_eq!(

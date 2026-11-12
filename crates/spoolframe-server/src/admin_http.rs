@@ -468,6 +468,7 @@ fn router(
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/metrics", get(metrics_page))
+        .route(spoolframe_protocol::well_known::PATH, get(server_document))
         .with_state(api)
         // The socket: `/jsonrpc` for the web UI, and any other path's
         // upgrade too, which is where the CLI has always connected. Except
@@ -532,7 +533,10 @@ async fn security_headers(req: Request, next: Next) -> Response<Body> {
         .get(header::CONTENT_TYPE)
         .and_then(|t| t.to_str().ok())
         .is_some_and(|t| t.starts_with("application/json"));
-    if path.starts_with("/auth/") || path == "/jsonrpc" || json {
+    // The server's own document names no one, and says it may be kept
+    // a while ([`server_document`]).
+    let public = path == spoolframe_protocol::well_known::PATH;
+    if path.starts_with("/auth/") || path == "/jsonrpc" || (json && !public) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     response
@@ -1414,6 +1418,32 @@ fn is_raster(content_type: &str) -> bool {
 /// off, so the listener does not even say it could; refused from anywhere
 /// else. The caller is who a trusted proxy says it carries: a proxy on
 /// this machine does not make the Internet loopback.
+/// `GET /.well-known/spoolframe`: what an invite link says of this
+/// server, for a device that has only its address (typed on a TV, say)
+/// and needs its key to dial. Anyone may read it: it is what any invite
+/// link carries, with no code. Kept for a few minutes. 404 without
+/// `admin.public_url`, where the server is not meant to be found from
+/// outside; 503 while its endpoint starts.
+async fn server_document(State(api): State<AdminApi>) -> Response<Body> {
+    use spoolframe_protocol::well_known::MAX_AGE_SECS;
+    match api.server_document().await {
+        Ok(doc) => (
+            [(
+                header::CACHE_CONTROL,
+                format!("public, max-age={MAX_AGE_SECS}"),
+            )],
+            axum::Json(doc),
+        )
+            .into_response(),
+        Err(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(true) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
+        )
+            .into_response(),
+    }
+}
+
 async fn metrics_page(State(api): State<AdminApi>, req: Request) -> Response<Body> {
     let Some(metrics) = api.metrics().filter(|m| m.access().enabled()) else {
         return StatusCode::NOT_FOUND.into_response();
