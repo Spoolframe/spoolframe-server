@@ -23,6 +23,10 @@ output with `serde_json::from_slice::<FfProbe>`.
   (was a required `String`). ffprobe's JSON leaves it out for a codec it
   does not know (`print_str_opt`), so upstream failed the whole file on
   one such stream.
+- An audio stream's `sample_fmt` is `Option<String>` (was a required
+  `String`). ffprobe 8.1 leaves it out of a TrueHD track it has not
+  decoded far enough to know, so upstream failed the whole file: every
+  Blu-ray remux with TrueHD first was "could not be read".
 - `Stream::extradata` (`Option<String>`, absent by default) is added:
   ffprobe prints a stream's codec record with `-show_data`, as a hex
   dump. Spoolframe reads it to tell whether an H.264 or HEVC record holds

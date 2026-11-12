@@ -698,6 +698,25 @@ mod tests {
         assert_eq!(d.audio[0].codec, "unknown");
     }
 
+    /// ffprobe 8.1 leaves `sample_fmt` out of a TrueHD track it did not
+    /// decode far enough to know it (a Blu-ray remux's first track, often):
+    /// the file is still readable, the track still audio.
+    #[test]
+    fn an_audio_track_with_no_sample_format_is_still_read() {
+        let path = format!(
+            "{}/tests/fixtures/mp4-h264-aac.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for stream in json["streams"].as_array_mut().unwrap() {
+            stream.as_object_mut().unwrap().remove("sample_fmt");
+        }
+        let probe: FfProbe = serde_json::from_value(json).unwrap();
+        let d = MediaDescriptor::from_probe(&probe);
+        assert_eq!(d.audio.len(), 1);
+    }
+
     #[test]
     fn standalone_subtitle_files_parse() {
         // Upstream easy-ffprobe fails on these (no start_pts); the vendored

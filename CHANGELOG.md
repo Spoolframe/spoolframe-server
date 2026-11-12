@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed, server: a file whose TrueHD track ffprobe 8.1 reports with no
+  sample format (common in Blu-ray remuxes) is read again. The whole file
+  was "could not be read": no download, no play.
 - Added, protocol: feature `spoolframe:download-addons`, so an iOS app
   adds subtitles and audio tracks to a download without fetching the film
   again. `download_addon_options` lists what may be added and why a track

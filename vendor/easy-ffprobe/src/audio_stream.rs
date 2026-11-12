@@ -45,7 +45,11 @@ pub struct AudioStream {
     /// flt: Floating point
     /// dbl: Double precision floating point
     /// todo: enum
-    pub sample_fmt: String,
+    ///
+    /// Absent for a track ffprobe did not decode far enough to know it
+    /// (TrueHD in a Blu-ray remux, with ffprobe 8.1).
+    #[serde(default)]
+    pub sample_fmt: Option<String>,
     /// The sample rate of the audio stream.
     /// eg. 44100 Hz
     #[serde(deserialize_with = "string_to_int")]
