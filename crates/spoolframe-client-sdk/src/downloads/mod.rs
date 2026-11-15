@@ -554,7 +554,9 @@ impl Downloads {
     }
 
     /// Go on with paused download `key`, and its paused add-ons, from
-    /// what arrived.
+    /// what arrived. One the server failed while it was paused (its file
+    /// removed a day after its last read) is prepared anew, as on
+    /// [`Downloads::retry`].
     pub async fn resume(&self, key: &str) -> Result<LocalDownload, SdkError> {
         self.find(key)?;
         let shared = self.shared();
@@ -577,6 +579,7 @@ impl Downloads {
                     };
                 }
                 m.note = None;
+                m.asked = true;
                 Ok(())
             })
             .await?;
@@ -600,13 +603,9 @@ impl Downloads {
                         "download {key} is not failed"
                     )));
                 }
-                // Failed by the server: prepared anew, not asked about
-                // ([`manager::device_failed`]).
-                if let DownloadPhase::Failed { cause, .. } = &m.phase
-                    && !manager::device_failed(cause)
-                {
-                    m.id = None;
-                }
+                // Failed by the server: prepared anew once the server says
+                // so again ([`manager::prepare_anew`]).
+                m.asked = true;
                 if !m.phase.is_active() {
                     m.phase = DownloadPhase::Preparing {
                         server: DownloadState::Waiting,

@@ -119,6 +119,9 @@
   was "could not be read": no download, no play.
 - Fixed, SDK: Retry on a download (or audio add-on) whose server copy
   expired or failed now prepares it again, rather than failing at once.
+  So does Resume on a download paused while its server copy expired:
+  it no longer goes straight to Failed. A failure the server reports
+  with no Resume or Retry behind it still ends the download, as before.
 - Added, protocol: feature `spoolframe:download-addons`, so an iOS app
   adds subtitles and audio tracks to a download without fetching the film
   again. `download_addon_options` lists what may be added and why a track

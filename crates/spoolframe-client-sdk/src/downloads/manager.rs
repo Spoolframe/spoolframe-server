@@ -513,6 +513,9 @@ async fn preparing(shared: &Shared, session: &Session, m: Manifest) -> Result<St
             Err(SdkError::NotFound(_)) => {
                 prepare(session, m.item.id(), &m.source, &m.chosen).await?
             }
+            Ok(info) if prepare_anew(m.asked, &info.state) => {
+                prepare(session, m.item.id(), &m.source, &m.chosen).await?
+            }
             other => other?,
         },
         None => prepare(session, m.item.id(), &m.source, &m.chosen).await?,
@@ -528,6 +531,8 @@ async fn preparing(shared: &Shared, session: &Session, m: Manifest) -> Result<St
                 take(m, info);
                 m.username = session.user().username.clone();
                 m.note = None;
+                // Answered: a later failure is the server's last word.
+                m.asked = false;
             }
             Ok(())
         })
@@ -835,6 +840,16 @@ pub(super) fn device_failed(cause: &DownloadFailure) -> bool {
     )
 }
 
+/// Whether a download the server answered `state` for is prepared anew:
+/// the user asked it to go on (Resume, Retry), and the server failed it
+/// itself (its file removed a day after its last read, its conversion
+/// stopped, its source gone), so asking about that id again would only
+/// hear it again. Once only: the asking is taken with the answer, and a
+/// failure with no one asking is the download's end.
+pub(super) fn prepare_anew(asked: bool, state: &DownloadState) -> bool {
+    asked && matches!(state, DownloadState::Failed { cause, .. } if !device_failed(cause))
+}
+
 /// Download `key` is `failed`, a [`DownloadPhase::Failed`].
 async fn fail(shared: &Shared, key: &str, failed: DownloadPhase) -> Result<Step, SdkError> {
     shared
@@ -1003,6 +1018,27 @@ pub(super) async fn sync(shared: &Shared, session: &Session) -> Result<Vec<Synce
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a user's ask, and only a failure of the server's own, prepares
+    /// a download anew: a device's failure is asked about again, and no
+    /// failure is gone round again with no one asking.
+    #[test]
+    fn a_server_failure_is_prepared_anew_only_when_asked() {
+        let failed = |cause| DownloadState::Failed {
+            reason: "gone".into(),
+            cause,
+        };
+        let expired = failed(DownloadFailure::Other);
+        assert_eq!(
+            [
+                prepare_anew(true, &expired),
+                prepare_anew(false, &expired),
+                prepare_anew(true, &failed(DownloadFailure::Network)),
+                prepare_anew(true, &DownloadState::Waiting),
+            ],
+            [true, false, false, false]
+        );
+    }
 
     /// sf-ios, 2026-10-21: album tracks sat waiting behind an episode the
     /// server took half an hour to convert. One still being made lets the

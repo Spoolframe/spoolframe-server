@@ -377,23 +377,14 @@ async fn expired(server: &TestServer) {
     }
 }
 
-/// The owner's iPad, build 97: a download whose server file was removed
-/// a day after its last read failed ("prepare it again"), and Retry
-/// asked the server about the same download, heard the same failure and
-/// failed at once. Retried, it is prepared anew and arrives.
-#[tokio::test]
-async fn a_download_whose_server_file_expired_is_prepared_anew_on_retry() {
-    let server = server("sdk-download-retry-expired").await;
-    write_offset_film(&server);
-    let dir = TestDir::new("spoolframe-sdk-download-retry-expired").await;
-    let storage = Arc::new(MemoryStorage::default());
-    let client = phone(&server, &storage, &dir).await;
-    let id = server.server.id().to_string();
-    let session = client.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
-    let downloads = client.downloads();
-    let key = downloads
+/// Start the film's download (its FLAC track) on `client`, and wait
+/// until its first piece is here: transferring.
+async fn transferring(client: &Client, session: &Session) -> String {
+    let mut events = client.download_events();
+    let key = client
+        .downloads()
         .start(
-            &session,
+            session,
             movie().id(),
             DownloadSource::Original,
             DownloadTracks::Chosen {
@@ -404,13 +395,100 @@ async fn a_download_whose_server_file_expired_is_prepared_anew_on_retry() {
         .await
         .unwrap()
         .key;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("no piece arrived")
+            .unwrap();
+        if let DownloadEvent::Changed(d) = event
+            && d.key == key
+            && d.phase == DownloadPhase::Transferring
+            && d.received > 0
+        {
+            return key;
+        }
+    }
+}
+
+/// sf-ios on Nimble: a download paused while it came, whose server file
+/// was removed a day after its last read while it was paused, failed at
+/// once on Resume ("prepare it again"). Resumed, it is prepared anew and
+/// arrives, as on Retry.
+#[tokio::test]
+async fn a_paused_download_whose_server_file_expired_is_prepared_anew_on_resume() {
+    let server = server("sdk-download-resume-expired").await;
+    write_long_flac_film(&server);
+    let dir = TestDir::new("spoolframe-sdk-download-resume-expired").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = phone(&server, &storage, &dir).await;
+    let id = server.server.id().to_string();
+    let session = client.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
+    let key = transferring(&client, &session).await;
+    let downloads = client.downloads();
     downloads.pause(&key).await.unwrap();
     expired(&server).await;
     downloads.resume(&key).await.unwrap();
     settled(&client).await;
+    let then = downloads.get(&key).unwrap().phase;
+    assert_eq!(then, DownloadPhase::Done, "{then:?}");
+    client.close().await;
+    server.stop().await;
+}
+
+/// The manifest of download `key` under `dir`, as JSON, and where it is.
+fn manifest(dir: &Path, key: &str) -> (std::path::PathBuf, serde_json::Value) {
+    fn find(dir: &Path, key: &str) -> Option<(std::path::PathBuf, serde_json::Value)> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find(&path, key) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == "manifest.json") {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if json["key"] == key {
+                    return Some((path, json));
+                }
+            }
+        }
+        None
+    }
+    find(dir, key).expect("the download's manifest")
+}
+
+/// Asked about with no one asking (the app opened again on a download
+/// left preparing), a download the server failed stays failed: it is not
+/// prepared anew behind the user's back. Retry, which the user asks for,
+/// prepares it anew, and it arrives.
+#[tokio::test]
+async fn a_server_failure_with_no_one_asking_stays_failed_until_retry() {
+    let server = server("sdk-download-retry-expired").await;
+    write_long_flac_film(&server);
+    let dir = TestDir::new("spoolframe-sdk-download-retry-expired").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let first = phone(&server, &storage, &dir).await;
+    let id = server.server.id().to_string();
+    let session = first.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
+    let key = transferring(&first, &session).await;
+    first.downloads().pause(&key).await.unwrap();
+    first.close().await;
+    expired(&server).await;
+    // Left preparing, as by a check the app made by itself, no Resume.
+    let (path, mut json) = manifest(&dir, &key);
+    json["phase"] = serde_json::to_value(DownloadPhase::Preparing {
+        server: spoolframe_client_sdk::DownloadState::Waiting,
+    })
+    .unwrap();
+    std::fs::write(&path, json.to_string()).unwrap();
+
+    let again = phone(&server, &storage, &dir).await;
+    settled(&again).await;
+    let downloads = again.downloads();
     let failed = downloads.get(&key).unwrap().phase;
     downloads.retry(&key).await.unwrap();
-    settled(&client).await;
+    settled(&again).await;
     let then = downloads.get(&key).unwrap().phase;
     assert_eq!(
         (
@@ -420,7 +498,7 @@ async fn a_download_whose_server_file_expired_is_prepared_anew_on_retry() {
         (true, &DownloadPhase::Done),
         "{failed:?} then {then:?}"
     );
-    client.close().await;
+    again.close().await;
     server.stop().await;
 }
 

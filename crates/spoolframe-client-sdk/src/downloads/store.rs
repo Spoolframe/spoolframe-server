@@ -196,6 +196,11 @@ pub(crate) struct Manifest {
     watch: Option<LocalWatch>,
     /// Why it is not moving, while it waits to try again.
     pub note: Option<String>,
+    /// The user asked it to go on (Resume, Retry): the next time the
+    /// server is asked about it, a failure of the server's own prepares it
+    /// anew, once ([`super::manager::prepare_anew`]).
+    #[serde(default)]
+    pub asked: bool,
     /// Unix seconds, by this device's clock.
     pub created_at: i64,
     /// Its place among what was started with it, in the same second: an
@@ -797,6 +802,7 @@ impl Store {
                 server: spoolframe_protocol::downloads::DownloadState::Waiting,
             },
             note: None,
+            asked: false,
             created_at,
             place: 0,
             album: None,
