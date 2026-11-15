@@ -103,7 +103,7 @@ mod tests {
             lines,
             [
                 "client protocol: 1",
-                "features: spoolframe:october-2026, spoolframe:download-addons",
+                "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics",
                 "experimental features on: none",
             ]
         );
@@ -144,7 +144,9 @@ mod tests {
         );
         assert_eq!(
             lines.next(),
-            Some("features: spoolframe:october-2026, spoolframe:download-addons")
+            Some(
+                "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics"
+            )
         );
         assert_eq!(
             lines.next(),

@@ -77,7 +77,7 @@ use spoolframe_types::Delivery;
 /// client's `Hello` named. A feature not here is off for every
 /// connection, though this build knows its name.
 pub(crate) fn features() -> Features {
-    Feature::October2026 | Feature::DownloadAddons
+    Feature::October2026 | Feature::DownloadAddons | Feature::Diagnostics
 }
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -2562,6 +2562,60 @@ impl ClientProtocol {
             relayed.length,
             ResourceBody::Relayed(relayed.stream, None),
         ))
+    }
+
+    /// Keep an app's diagnostics for the admins (`SendDiagnostics`): a
+    /// part over its limit is refused whole, and a session sends one a
+    /// minute.
+    async fn keep_diagnostics(
+        &self,
+        connection: &Connection,
+        hello: &spoolframe_protocol::Hello,
+        session: &SessionId,
+        who: &Who,
+        report: spoolframe_protocol::diagnostics::DiagnosticsReport,
+    ) -> Result<Reply, Error> {
+        use crate::store::diagnostics::{KeepError, Sender};
+        if let Some(message) = report.refusal() {
+            return Err(Error::InvalidInput { message });
+        }
+        let user_name = match who {
+            Who::Local(user) => user.username.clone(),
+            Who::Portable(user) => user.display_name.clone(),
+            // A paired server's token reaches its item and nothing else.
+            Who::Remote(_) => return Err(Error::Unauthenticated),
+        };
+        let sender = Sender {
+            principal: who.principal(),
+            user_name,
+            endpoint_id: connection.remote_id().to_string(),
+            device_name: hello.device_name.clone(),
+            session_hash: crate::auth::SessionToken(session.0.clone()).hash(),
+        };
+        match self
+            .services
+            .auth
+            .store()
+            .keep_diagnostics(&sender, &report)
+            .await
+        {
+            Ok(id) => {
+                tracing::info!(
+                    %id,
+                    user = %sender.principal,
+                    device = %sender.endpoint_id,
+                    model = %report.device_model,
+                    app = %format_args!("{} {}", report.app_name, report.app_version),
+                    log_bytes = report.log.len(),
+                    "diagnostics received"
+                );
+                Ok(Reply::DiagnosticsSent { id })
+            }
+            Err(KeepError::TooSoon { retry_after }) => Err(Error::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            }),
+            Err(KeepError::Store(e)) => Err(internal(e)),
+        }
     }
 
     /// Fill in `principal`'s watch state on `items`, in one lookup.
@@ -5173,6 +5227,10 @@ impl ClientProtocol {
                 } else {
                     Err(no_such_download())
                 }
+            }
+            Request::SendDiagnostics { report } => {
+                self.keep_diagnostics(connection, hello, &session, &who, report)
+                    .await
             }
             Request::SyncOfflineWatch {
                 device_now,

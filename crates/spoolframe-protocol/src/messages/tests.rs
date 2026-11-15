@@ -4892,3 +4892,42 @@ fn the_download_addons_wire_names_are_fixed() {
     );
     round_trip(reply);
 }
+
+/// The diagnostics' names are promised to the apps: they never change.
+/// The request is of feature `spoolframe:diagnostics`, and never sent
+/// again by itself: a second would be a second report.
+#[test]
+fn the_diagnostics_wire_names_are_fixed() {
+    use crate::diagnostics::DiagnosticsReport;
+    let request = Request::SendDiagnostics {
+        report: DiagnosticsReport {
+            device_model: "iPhone16,2".into(),
+            os_name: "iOS".into(),
+            os_version: "26.1".into(),
+            app_name: "Spoolframe".into(),
+            app_version: "1.4.0".into(),
+            log: "12:00:01 play".into(),
+            note: None,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::json!({
+            "type": "send_diagnostics",
+            "report": {
+                "device_model": "iPhone16,2", "os_name": "iOS", "os_version": "26.1",
+                "app_name": "Spoolframe", "app_version": "1.4.0",
+                "log": "12:00:01 play", "note": null,
+            },
+        })
+    );
+    round_trip(request.clone());
+    assert_eq!(request.feature(), Some(crate::Feature::Diagnostics));
+    assert!(!crate::policy::retry_safe(&request));
+    let reply = Reply::DiagnosticsSent { id: "r1".into() };
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap(),
+        serde_json::json!({"type": "diagnostics_sent", "id": "r1"})
+    );
+    round_trip(reply);
+}

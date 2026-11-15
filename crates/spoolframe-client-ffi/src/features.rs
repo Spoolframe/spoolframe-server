@@ -4,15 +4,16 @@
 //! invite's server, `SpoolClient.invited_october_2026(link)`, both of
 //! `spoolframe:october-2026`. Off, the first is `None` and the second
 //! `FeatureOff`, and nothing gated is sent. `download_addons()` is
-//! `spoolframe:download-addons`'s, as `october_2026()` is.
+//! `spoolframe:download-addons`'s, as `october_2026()` is, and
+//! `diagnostics()` `spoolframe:diagnostics`'s.
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::gate::{DownloadAddons, October2026};
+use spoolframe_client_sdk::gate::{Diagnostics, DownloadAddons, October2026};
 use spoolframe_client_sdk::types::{Item, MediaId};
 use spoolframe_client_sdk::{
-    self as sdk, DownloadAddonOptions, DownloadTrack, Feature, FinishPasskeyRegistration,
-    LocalDownload, NextMode, PasskeyCreation,
+    self as sdk, DiagnosticsReport, DownloadAddonOptions, DownloadTrack, Feature,
+    FinishPasskeyRegistration, LocalDownload, NextMode, PasskeyCreation,
 };
 
 use crate::client::SpoolClient;
@@ -87,6 +88,29 @@ impl DownloadAddonsApi {
     }
 }
 
+/// The calls of `spoolframe:diagnostics` in a session: the app's
+/// playback log sent to the server for its admins to read.
+#[derive(uniffi::Object)]
+pub struct DiagnosticsApi(sdk::On<Diagnostics>);
+
+#[uniffi::export]
+impl DiagnosticsApi {
+    /// Send `report`, and the id the server keeps it under. A log over
+    /// 960 KiB is `InvalidInput` and nothing is sent: keep its newest
+    /// lines. One a minute; another sooner is `RateLimited`.
+    pub async fn send(&self, report: DiagnosticsReport) -> Result<String, SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.send_diagnostics(&report).await }).await?)
+    }
+}
+
+/// The most bytes of a report's log (`DiagnosticsApi::send`): trim the
+/// log to its newest lines to fit.
+#[uniffi::export]
+pub fn diagnostics_log_limit() -> u64 {
+    sdk::diagnostics::MAX_LOG_BYTES as u64
+}
+
 /// Every track a player of `download` may offer, the file's and the
 /// add-ons here, as one list: the file's audio, the audio added, the
 /// file's subtitles, the subtitles added.
@@ -159,6 +183,15 @@ impl SpoolSession {
             .feature::<DownloadAddons>()
             .ok()
             .map(|on| Arc::new(DownloadAddonsApi(on)))
+    }
+
+    /// `spoolframe:diagnostics`: the playback log sent to the server's
+    /// admins; `None` when the feature is off for this connection.
+    pub fn diagnostics(&self) -> Option<Arc<DiagnosticsApi>> {
+        self.session
+            .feature::<Diagnostics>()
+            .ok()
+            .map(|on| Arc::new(DiagnosticsApi(on)))
     }
 }
 

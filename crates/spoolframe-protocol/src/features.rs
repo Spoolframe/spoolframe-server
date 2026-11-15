@@ -47,6 +47,12 @@ pub enum Feature {
     /// on purpose (2026-11-09), as a feature of its own that a client may
     /// name without the rest of a month's.
     DownloadAddons,
+    /// `spoolframe:diagnostics`: `SendDiagnostics`, an app's playback log
+    /// and what it runs on, kept on the server for its admins to read.
+    ///
+    /// Not dated, as `spoolframe:download-addons` is not: a feature of its
+    /// own that an app names without the rest of a month's.
+    Diagnostics,
 }
 
 /// A set of features: [`Features::all`] is every one this build knows,
@@ -60,6 +66,7 @@ impl Feature {
         match self {
             Feature::October2026 => "spoolframe:october-2026",
             Feature::DownloadAddons => "spoolframe:download-addons",
+            Feature::Diagnostics => "spoolframe:diagnostics",
         }
     }
 
@@ -150,6 +157,15 @@ mod tests {
         assert_eq!(
             Feature::of("spoolframe:download-addons"),
             Some(Feature::DownloadAddons)
+        );
+    }
+
+    /// The diagnostics' name is fixed: an app names it as it is.
+    #[test]
+    fn diagnostics_is_named_as_the_apps_name_it() {
+        assert_eq!(
+            Feature::of("spoolframe:diagnostics"),
+            Some(Feature::Diagnostics)
         );
     }
 

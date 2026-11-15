@@ -744,6 +744,9 @@
   .whitespace-pre-line {
     white-space: pre-line;
   }
+  .whitespace-pre-wrap {
+    white-space: pre-wrap;
+  }
   .text-\[\#e5a00d\] {
     color: #e5a00d;
   }
@@ -4643,6 +4646,28 @@
   }
   .log-text {
     color: var(--ctp-text);
+    overflow-wrap: anywhere;
+  }
+  .diag-log {
+    margin: 0;
+    padding: 10px 14px;
+    font: 12.5px/1.5 var(--font-mono);
+    color: var(--ctp-text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .diag-meta {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 8px 18px;
+    margin: 0;
+    font-size: 14px;
+  }
+  .diag-meta dt {
+    color: var(--ctp-subtext0);
+  }
+  .diag-meta dd {
+    margin: 0;
     overflow-wrap: anywhere;
   }
   .log-tail {

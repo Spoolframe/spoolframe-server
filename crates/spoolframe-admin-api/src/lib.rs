@@ -39,6 +39,8 @@ pub use federation::{
     ExpectedKey, GrantEntry, PairLookup, PeerDetail, PeerEntry, PeerKey, PlayDay, ReceivedLibrary,
     WithdrawnLibrary,
 };
+mod diagnostics;
+pub use diagnostics::{DiagnosticsDetail, DiagnosticsSummary};
 mod optimized;
 pub use optimized::{
     OptimizedCopy, OptimizedCopyDeleted, OptimizedCopyState, OptimizedDeleted, OptimizedOverview,
@@ -284,6 +286,8 @@ pub mod error_code {
     /// server (P8-01): the held keys changed since they were listed.
     /// Nothing changed; list them again.
     pub const KEY_NOT_HELD: i32 = -32039;
+    /// No diagnostics report has that id: it was deleted, or pruned.
+    pub const NO_SUCH_REPORT: i32 = -32040;
 }
 
 /// Invites (P6-01): what an admin makes and sees of them.
@@ -4832,6 +4836,21 @@ pub trait AdminApi {
         id: String,
         pinned: bool,
     ) -> jsonrpsee::core::RpcResult<OptimizedRequest>;
+
+    /// Server › Diagnostics: the reports apps sent (`SendDiagnostics`),
+    /// newest first, without their logs. Each device's newest 20 are
+    /// kept, none older than 30 days.
+    #[method(name = "diagnosticsList", with_extensions)]
+    async fn diagnostics_list(&self) -> jsonrpsee::core::RpcResult<Vec<DiagnosticsSummary>>;
+
+    /// Report `id`, with its note and log. `NO_SUCH_REPORT` for an id it
+    /// does not keep.
+    #[method(name = "diagnostics", with_extensions)]
+    async fn diagnostics(&self, id: String) -> jsonrpsee::core::RpcResult<DiagnosticsDetail>;
+
+    /// Delete report `id`. `NO_SUCH_REPORT` for an id it does not keep.
+    #[method(name = "diagnosticsDelete", with_extensions)]
+    async fn diagnostics_delete(&self, id: String) -> jsonrpsee::core::RpcResult<()>;
 }
 
 /// What was `serde(default)` before PX-15 is required: a server and a web
@@ -4862,6 +4881,34 @@ mod required_field_tests {
                 "{field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn diagnostics() {
+        let summary = DiagnosticsSummary {
+            id: "r".into(),
+            user_id: "local:u".into(),
+            user_name: "alice".into(),
+            device_name: None,
+            endpoint_id: "e".into(),
+            device_model: "iPhone16,2".into(),
+            os_name: "iOS".into(),
+            os_version: "26.1".into(),
+            app_name: "Spoolframe".into(),
+            app_version: "1.4.0".into(),
+            received_at: 1,
+            log_bytes: 2,
+            has_note: false,
+        };
+        assert_each_required(&summary, &["deviceName"]);
+        assert_each_required(
+            &DiagnosticsDetail {
+                summary,
+                note: None,
+                log: String::new(),
+            },
+            &["note"],
+        );
     }
 
     /// PX-42.

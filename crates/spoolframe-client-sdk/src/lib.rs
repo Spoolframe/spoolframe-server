@@ -125,6 +125,8 @@ pub use spoolframe_protocol::downloads::{
     DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, FailureRemedy, FileTracks,
     LeftOutSubtitle, OfflineWatchOutcome, OriginalDownload,
 };
+// Diagnostics sent to the server (`On<Diagnostics>`), and their limits.
+pub use spoolframe_protocol::diagnostics::{self, DiagnosticsReport};
 pub use spoolframe_protocol::federation::{PairingRefused, PeerServer};
 pub use spoolframe_protocol::{Feature, Features, NextMode};
 // Pairing a guest onto this device by QR code.

@@ -16,6 +16,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use iroh::EndpointId;
+use spoolframe_protocol::diagnostics::DiagnosticsReport;
 use spoolframe_protocol::downloads::DownloadAddonOptions;
 use spoolframe_protocol::invite::Invite;
 use spoolframe_protocol::{Feature, NextMode, Reply, Request};
@@ -60,6 +61,12 @@ feature!(
     /// a download without fetching the film again
     /// ([`On<DownloadAddons>`], and [`crate::Downloads::add_tracks`]).
     DownloadAddons = Feature::DownloadAddons
+);
+
+feature!(
+    /// `spoolframe:diagnostics`: an app's playback log sent to its server
+    /// for the admins to read ([`On<Diagnostics>`]).
+    Diagnostics = Feature::Diagnostics
 );
 
 /// Feature `G`'s calls in a session: [`crate::Session::feature`]. Cheap
@@ -266,6 +273,31 @@ impl On<DownloadAddons> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+}
+
+impl On<Diagnostics> {
+    /// Send `report` to the server for its admins to read, and the id it
+    /// is kept under. A part over its limit
+    /// ([`spoolframe_protocol::diagnostics`]: the log at most 960 KiB) is
+    /// [`SdkError::InvalidInput`], and nothing is sent: trim the log to
+    /// its newest lines. The server takes one a minute from a session;
+    /// another sooner is [`SdkError::RateLimited`]. Never sent again by
+    /// itself.
+    pub async fn send_diagnostics(&self, report: &DiagnosticsReport) -> Result<String, SdkError> {
+        if let Some(why) = report.refusal() {
+            return Err(SdkError::InvalidInput(why));
+        }
+        match self
+            .session
+            .call(Request::SendDiagnostics {
+                report: report.clone(),
+            })
+            .await?
+        {
+            Reply::DiagnosticsSent { id } => Ok(id),
+            other => Err(crate::session::unexpected(other)),
         }
     }
 }

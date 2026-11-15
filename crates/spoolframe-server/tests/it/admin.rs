@@ -286,7 +286,11 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
     );
     assert_eq!(
         status.features,
-        ["spoolframe:october-2026", "spoolframe:download-addons"]
+        [
+            "spoolframe:october-2026",
+            "spoolframe:download-addons",
+            "spoolframe:diagnostics"
+        ]
     );
     assert_eq!(status.experimental_features, ["http-playback"]);
     // Nothing detected in tests: the software baseline.

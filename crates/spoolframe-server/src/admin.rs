@@ -80,6 +80,8 @@ use spoolframe_plex::account::{PinState, PlexTv};
 
 #[path = "admin_catalog.rs"]
 mod catalog;
+#[path = "admin_diagnostics.rs"]
+mod diagnostics;
 #[path = "admin_federation.rs"]
 mod federation;
 #[path = "admin_optimized.rs"]
@@ -4684,6 +4686,30 @@ impl AdminApiServer for AdminApi {
     ) -> RpcResult<spoolframe_admin_api::OptimizedRequest> {
         let admin = self.admin(ext).await?;
         self.pin_optimized_request(&admin, &id, pinned).await
+    }
+
+    async fn diagnostics_list(
+        &self,
+        ext: &Extensions,
+    ) -> RpcResult<Vec<spoolframe_admin_api::DiagnosticsSummary>> {
+        self.admin(ext).await?;
+        self.diagnostics_rows().await
+    }
+
+    async fn diagnostics(
+        &self,
+        ext: &Extensions,
+        id: String,
+    ) -> RpcResult<spoolframe_admin_api::DiagnosticsDetail> {
+        self.admin(ext).await?;
+        self.diagnostics_detail(&id).await
+    }
+
+    async fn diagnostics_delete(&self, ext: &Extensions, id: String) -> RpcResult<()> {
+        let admin = self.admin(ext).await?;
+        self.diagnostics_remove(&id).await?;
+        tracing::info!(%id, admin = %admin.user, "diagnostics report deleted");
+        Ok(())
     }
 }
 

@@ -1294,6 +1294,17 @@ pub enum Request {
         audio: u32,
     },
 
+    /// Keep `report` for the server's admins to read (feature
+    /// `spoolframe:diagnostics`): `DiagnosticsSent`, with its id. Any
+    /// signed-in user may, a paired server's token may not. A part over
+    /// its limit (`crate::diagnostics`) is `InvalidInput`, saying which:
+    /// nothing is cut. One a minute from a session; another sooner is
+    /// `RateLimited`. Not sent again by itself: a second is a second
+    /// report.
+    SendDiagnostics {
+        report: crate::diagnostics::DiagnosticsReport,
+    },
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -1355,6 +1366,7 @@ impl Request {
             Request::DownloadAddonOptions { .. }
             | Request::ReadTrackSubtitle { .. }
             | Request::PrepareAudioAddon { .. } => Some(Feature::DownloadAddons),
+            Request::SendDiagnostics { .. } => Some(Feature::Diagnostics),
             Request::Hello { .. }
             | Request::AuthMethods
             | Request::LoginPassword { .. }
@@ -2177,6 +2189,11 @@ pub enum Reply {
     Download(crate::downloads::DownloadInfo),
     /// What may be added to a download (`DownloadAddonOptions`).
     DownloadAddonOptions(crate::downloads::DownloadAddonOptions),
+    /// A report kept (`SendDiagnostics`): its id, which the admin's pages
+    /// show beside it.
+    DiagnosticsSent {
+        id: String,
+    },
     /// Downloads, in the order asked (`DownloadStatus`): each the user
     /// has, and the ids asked for that they have not. A device treats a
     /// gone download as cancelled: preparing it again brings it back.

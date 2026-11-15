@@ -2,6 +2,21 @@
 
 ## 0.17.3 (2026-11-15)
 
+- Added, protocol: feature `spoolframe:diagnostics`, so an app sends its
+  playback log to its server from Settings › About › "Send diagnostics".
+  `send_diagnostics` carries the device model, OS and app name and
+  version, the log and an optional note, and answers the report's id.
+  The log is at most 960 KiB, as a request is one frame of 1 MiB; a
+  report over a limit is refused whole, never cut. One a minute from a
+  session; each device's newest 20 are kept, for 30 days. See
+  PROTOCOL.md's Sending diagnostics.
+- Added, SDK: `On<Diagnostics>::send_diagnostics(&DiagnosticsReport)`
+  (FFI `SpoolSession::diagnostics()`, `DiagnosticsApi::send(report)`,
+  and `diagnostics_log_limit()`).
+- Added, web UI and admin API: Server › Diagnostics lists the reports,
+  and a report's page shows its log, with Download as .txt and Delete.
+  `admin.diagnosticsList`, `admin.diagnostics` and
+  `admin.diagnosticsDelete`; `NO_SUCH_REPORT` (-32040).
 - Security, server: rmcp, the MCP server library, goes from 3.5.0 to
   3.10.0, which fixes RUSTSEC-2026-0457, RUSTSEC-2026-0461 and
   RUSTSEC-2026-0462.

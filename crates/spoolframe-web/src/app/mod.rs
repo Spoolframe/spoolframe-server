@@ -10,6 +10,7 @@ mod codecs;
 mod connect;
 mod connected;
 mod device;
+mod diagnostics;
 mod experimental;
 mod federation;
 mod gpus;
@@ -48,6 +49,7 @@ use catalog_item::CatalogItem;
 use connect::Connect;
 use connected::AuditPageView;
 use device::DeviceApproval;
+use diagnostics::{DiagnosticsPage, DiagnosticsReport};
 use federation::{Federation, FederationPeer};
 use invites::Invites;
 use libraries::{AddLibrary, Libraries};
@@ -141,6 +143,11 @@ enum Route {
             PlaybackPage {},
             #[route("/playback/:id")]
             PlaybackDetail { id: String },
+            // What apps sent from "Send diagnostics", and one report.
+            #[route("/diagnostics")]
+            DiagnosticsPage {},
+            #[route("/diagnostics/:id")]
+            DiagnosticsReport { id: String },
             // The optimized copies, their profiles and budget (PX-37).
             #[route("/optimized")]
             OptimizedPage {},
@@ -1470,6 +1477,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Federation {} | Route::FederationPeer { .. } => "Federation",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
+        Route::DiagnosticsPage {} | Route::DiagnosticsReport { .. } => "Diagnostics",
         Route::AuditPageView {} => "Audit",
         Route::PlaybackPage {} | Route::PlaybackDetail { .. } => "Playback",
         Route::OptimizedPage {} => "Optimized",
@@ -1683,8 +1691,8 @@ pub(super) async fn federation_on() -> bool {
 }
 
 /// Server's sub-pages in the sidebar, one step in: Activity (P3-14),
-/// Playback (P3-15), Optimized (PX-37), Logs (P3-14), Libraries (P3-11)
-/// and Settings.
+/// Playback (P3-15), Optimized (PX-37), Logs (P3-14), Diagnostics, Audit
+/// (PX-42), Libraries (P3-11) and Settings.
 fn server_links(route: &Route) -> Element {
     let pages = [
         (
@@ -1706,6 +1714,14 @@ fn server_links(route: &Route) -> Element {
             Route::LogsPage {},
             "Logs",
             matches!(route, Route::LogsPage {}),
+        ),
+        (
+            Route::DiagnosticsPage {},
+            "Diagnostics",
+            matches!(
+                route,
+                Route::DiagnosticsPage {} | Route::DiagnosticsReport { .. }
+            ),
         ),
         (
             Route::AuditPageView {},

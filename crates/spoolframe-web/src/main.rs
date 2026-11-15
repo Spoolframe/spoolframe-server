@@ -19,6 +19,8 @@ mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod connect;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod diagnostics;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod experimental;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod federation;

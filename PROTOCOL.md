@@ -51,6 +51,7 @@ be updated together. The changes per revision are in
 - [Sorting and filtering a library](#sorting-and-filtering-a-library)
   and [search groups](#search-groups)
 - [Downloads](#downloads) and [download add-ons](#download-add-ons)
+- [Sending diagnostics](#sending-diagnostics)
 - [Portable identities](#portable-identities)
 - [Faces in backdrops](#faces-in-backdrops) (experimental)
 - [Federation](#federation) (experimental):
@@ -1901,11 +1902,13 @@ it is off, with nothing sent. A request of a feature that went off since
 |---|---|
 | `spoolframe:october-2026` | `profile_removed`, `pin_changed`, `watch_changed`, `next_episode`, `show_next`, `begin_invite_passkey` and `redeem_invite_with_passkey` |
 | `spoolframe:download-addons` | `download_addon_options`, `read_track_subtitle` and `prepare_audio_addon` ([download add-ons](#download-add-ons)) |
+| `spoolframe:diagnostics` | `send_diagnostics` ([sending diagnostics](#sending-diagnostics)) |
 
 The names are dated: a feature is what was added by its date. Later
-additions get a new dated name, and a name stays once added. One is
-not: `spoolframe:download-addons` is named for what it brings, by the
-user's choice, so an app can name it on its own.
+additions get a new dated name, and a name stays once added. Two are
+not: `spoolframe:download-addons` and `spoolframe:diagnostics` are
+named for what they bring, by the user's choice, so an app can name
+each on its own.
 
 A new reply field needs neither. It is `serde(default)`, so a reply from
 an older server decodes. Where its absence means something other than
@@ -3116,6 +3119,49 @@ lists them with their state, and `DownloadEvent::Changed` tells each
 move. `LocalDownload::tracks_with_addons` lists, of each kind, the
 file's tracks in its order, then the add-ons in the order added; each
 names its place in the item's tracks.
+
+## Sending diagnostics
+
+With feature `spoolframe:diagnostics` on for the connection, an app
+sends its playback log and what it runs on to the server, for the
+server's admins to read (Settings › About › "Send diagnostics"). On a
+connection without it the request is `unsupported`. Any signed-in user
+may send one; a paired server's token may not. The names are fixed.
+
+```json
+{"type": "send_diagnostics", "report": {
+  "device_model": "iPhone16,2", "os_name": "iOS", "os_version": "26.1",
+  "app_name": "Spoolframe", "app_version": "1.4.0 (212)",
+  "log": "…", "note": "It froze at the credits"}}
+```
+
+It is answered `{"type": "diagnostics_sent", "id": id}`, the id the
+admin's pages show it under. `note` is what the user wrote, or `null`.
+
+A request is one frame of at most 1 MiB, so a report has limits below
+that, in bytes of UTF-8 (`spoolframe_protocol::diagnostics`): `log` at
+most 960 KiB (983,040), `note` at most 8 KiB, and each name and
+version at most 256. A report over any of them is refused whole,
+`invalid_input` naming the part and its size; nothing is cut, so what
+the admin reads is what the app sent. The app trims its own log,
+keeping the newest lines.
+
+A session sends one a minute. Another sooner is `rate_limited`, with
+`retry_after_ms` until it may. The server keeps each device's newest 20
+reports, none older than 30 days, with the user, the device's key and
+name from its `Hello`, and when it arrived. It is not retried on a new
+connection: a second would be a second report.
+
+SDK: `session.feature::<Diagnostics>()` gives `On<Diagnostics>`, whose
+`send_diagnostics(&report)` answers the id. A report over a limit is
+`InvalidInput` before anything is sent. FFI: `SpoolSession::diagnostics()`
+is `DiagnosticsApi`, `None` without the feature, with `send(report)`;
+`diagnostics_log_limit()` is the log's limit.
+
+Admins read them in the web UI's Server › Diagnostics, or with the admin
+API's `admin.diagnosticsList` (newest first, no logs),
+`admin.diagnostics(id)` and `admin.diagnosticsDelete(id)`;
+`NO_SUCH_REPORT` for an id it does not keep.
 
 ## Portable identities
 

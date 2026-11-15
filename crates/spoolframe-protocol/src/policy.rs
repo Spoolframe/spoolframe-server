@@ -249,6 +249,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::NextInPlaylist { .. }
         // Imported twice is made twice.
         | Request::ImportPlexPlaylists { .. }
+        // A second is a second report, and one a minute is allowed.
+        | Request::SendDiagnostics { .. }
         | Request::Unknown => false,
     }
 }

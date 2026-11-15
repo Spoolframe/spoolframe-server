@@ -3922,6 +3922,31 @@
     color: var(--ctp-text);
     overflow-wrap: anywhere;
   }
+  /* Server › Diagnostics: a report's log as the app sent it, lines kept
+     as they are and wrapped, in the Logs page's box. */
+  .diag-log {
+    margin: 0;
+    padding: 10px 14px;
+    font: 12.5px/1.5 var(--font-mono);
+    color: var(--ctp-text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  /* What a report says of itself: names, then values. */
+  .diag-meta {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 8px 18px;
+    margin: 0;
+    font-size: 14px;
+  }
+  .diag-meta dt {
+    color: var(--ctp-subtext0);
+  }
+  .diag-meta dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
   .log-tail {
     padding: 8px 14px;
     font: 12px var(--font-mono);
