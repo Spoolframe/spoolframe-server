@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.3 (2026-11-15)
 
 - Security, server: rmcp, the MCP server library, goes from 3.5.0 to
   3.10.0, which fixes RUSTSEC-2026-0457, RUSTSEC-2026-0461 and
