@@ -101,7 +101,7 @@ pub fn estimate(descriptor: &MediaDescriptor, place: u32, decision: &Decision) -
         },
     };
     let length = descriptor.duration?;
-    u64::try_from(u128::from(rate) * length.as_millis() / 1000 / 8).ok()
+    super::bytes_at(rate, length)
 }
 
 /// Why subtitle `stream` cannot be read as WebVTT, said to the user; `None`

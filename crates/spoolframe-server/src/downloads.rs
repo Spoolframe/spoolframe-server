@@ -97,6 +97,11 @@ fn note_read(last: Option<i64>, now: i64) -> bool {
 }
 
 /// The bytes of `media`, the file a download is made from.
+/// The bytes `rate` (bit/s) comes to over `length`; `None` past `u64`.
+fn bytes_at(rate: u64, length: Duration) -> Option<u64> {
+    u64::try_from(u128::from(rate) * length.as_millis() / 1000 / 8).ok()
+}
+
 async fn media_size(media: &Path) -> Result<u64, DownloadError> {
     Ok(tokio::fs::metadata(media)
         .await
@@ -550,6 +555,27 @@ struct Asked<'a> {
     expected_size: Option<u64>,
 }
 
+/// What [`Downloads::prepare_one_audio`] registers.
+struct OneAudio<'a> {
+    tag: &'static str,
+    principal: Principal,
+    media_id: &'a str,
+    media: &'a Path,
+    descriptor: &'a MediaDescriptor,
+    class: DeviceClass,
+    stamp: String,
+    /// What tells this request from another of the same media in the job's key.
+    kind: String,
+    /// The planned file format, as the job's key says it.
+    format: String,
+    decision: Decision,
+    request_text: String,
+    container: Container,
+    writes: Writes,
+    audio: u32,
+    expected_size: Option<u64>,
+}
+
 /// The request as the database keeps it: the same one is the same id.
 #[derive(Serialize)]
 struct RequestKey<'a> {
@@ -867,64 +893,29 @@ impl Downloads {
             &planned.decision,
             media_size(request.media).await?,
         );
-        let mut parts = vec![
-            "music-download:1".to_owned(),
-            request.media.display().to_string(),
-            stamp.clone(),
-            class.as_str().to_owned(),
-            request.quality.as_str().to_owned(),
-            format!("{:?}", planned.decision),
-            format!("{:?}", planned.format),
-        ];
-        let (copy, converts) = self
-            .copy_for(
-                request.media_id,
-                request.media,
-                &stamp,
-                &planned.decision,
-                &mut parts,
-            )
-            .await?;
-        let carried = Carried {
-            audio: vec![0],
-            subtitles: Vec::new(),
-            container: Some(planned.container),
-        };
         let request_text = serde_json::to_string(&MusicKey {
             class: class.as_str(),
             music: request.quality,
         })
         .expect("a request is JSON");
-        let job = Job {
-            key: crate::files::hash_parts(&parts).to_hex().to_string(),
-            media: request.media.to_path_buf(),
+        self.prepare_one_audio(OneAudio {
+            tag: "music-download:1",
+            principal: request.principal,
+            media_id: request.media_id,
+            media: request.media,
+            descriptor: request.descriptor,
+            class,
             stamp,
-            descriptor: request.descriptor.clone(),
+            kind: request.quality.as_str().to_owned(),
+            format: format!("{:?}", planned.format),
             decision: planned.decision,
-            copy,
-            converts,
+            request_text,
+            container: planned.container,
             // As it is, the file is the track's own: nothing written.
             writes: Writes::Track(planned.format.unwrap_or(MusicFormat::Matroska)),
-            picks: MuxPicks {
-                audio: Some(vec![0]),
-                subtitles: Some(Vec::new()),
-                default_subtitle: DefaultSubtitle::Only(None),
-            },
-            sidecars: Vec::new(),
-            ocr: Vec::new(),
-        };
-        self.register(
-            Asked {
-                principal: request.principal,
-                media_id: request.media_id,
-                request: request_text,
-                container: planned.container,
-                left_out: Vec::new(),
-                carried,
-                expected_size,
-            },
-            job,
-        )
+            audio: 0,
+            expected_size,
+        })
         .await
     }
 
@@ -942,46 +933,69 @@ impl Downloads {
             .await
             .map_err(DownloadError::Media)?;
         let expected_size = addon::estimate(request.descriptor, place, &planned.decision);
-        let mut parts = vec![
-            "audio-addon:1".to_owned(),
-            request.media.display().to_string(),
-            stamp.clone(),
-            class.as_str().to_owned(),
-            format!("audio:{place}"),
-            format!("{:?}", planned.decision),
-            format!("{:?}", planned.format),
-        ];
-        let (copy, converts) = self
-            .copy_for(
-                request.media_id,
-                request.media,
-                &stamp,
-                &planned.decision,
-                &mut parts,
-            )
-            .await?;
-        let container = planned.format.container();
-        let carried = Carried {
-            audio: vec![place],
-            subtitles: Vec::new(),
-            container: Some(container),
-        };
         let request_text = serde_json::to_string(&AddonKey {
             class: class.as_str(),
             addon_audio: place,
         })
         .expect("a request is JSON");
+        self.prepare_one_audio(OneAudio {
+            tag: "audio-addon:1",
+            principal: request.principal,
+            media_id: request.media_id,
+            media: request.media,
+            descriptor: request.descriptor,
+            class,
+            stamp,
+            kind: format!("audio:{place}"),
+            format: format!("{:?}", planned.format),
+            decision: planned.decision,
+            request_text,
+            container: planned.format.container(),
+            writes: Writes::Addon(planned.format),
+            audio: place,
+            expected_size,
+        })
+        .await
+    }
+
+    /// Register a download of one audio track on its own, which a track
+    /// (PX-51) and a film's audio add-on both are: only the key, the file
+    /// written and the track picked differ, as `one` says.
+    async fn prepare_one_audio(&self, one: OneAudio<'_>) -> Result<Prepared, DownloadError> {
+        let mut parts = vec![
+            one.tag.to_owned(),
+            one.media.display().to_string(),
+            one.stamp.clone(),
+            one.class.as_str().to_owned(),
+            one.kind,
+            format!("{:?}", one.decision),
+            one.format,
+        ];
+        let (copy, converts) = self
+            .copy_for(
+                one.media_id,
+                one.media,
+                &one.stamp,
+                &one.decision,
+                &mut parts,
+            )
+            .await?;
+        let carried = Carried {
+            audio: vec![one.audio],
+            subtitles: Vec::new(),
+            container: Some(one.container),
+        };
         let job = Job {
             key: crate::files::hash_parts(&parts).to_hex().to_string(),
-            media: request.media.to_path_buf(),
-            stamp,
-            descriptor: request.descriptor.clone(),
-            decision: planned.decision,
+            media: one.media.to_path_buf(),
+            stamp: one.stamp,
+            descriptor: one.descriptor.clone(),
+            decision: one.decision,
             copy,
             converts,
-            writes: Writes::Addon(planned.format),
+            writes: one.writes,
             picks: MuxPicks {
-                audio: Some(vec![place]),
+                audio: Some(vec![one.audio]),
                 subtitles: Some(Vec::new()),
                 default_subtitle: DefaultSubtitle::Only(None),
             },
@@ -990,13 +1004,13 @@ impl Downloads {
         };
         self.register(
             Asked {
-                principal: request.principal,
-                media_id: request.media_id,
-                request: request_text,
-                container,
+                principal: one.principal,
+                media_id: one.media_id,
+                request: one.request_text,
+                container: one.container,
                 left_out: Vec::new(),
                 carried,
-                expected_size,
+                expected_size: one.expected_size,
             },
             job,
         )

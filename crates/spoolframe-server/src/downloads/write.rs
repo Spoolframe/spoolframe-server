@@ -130,6 +130,23 @@ pub(super) async fn write(
     remux(run, &reads, &args, progress, stop).await
 }
 
+/// The map spec of audio `stream`: the copy's stored track, brought as a
+/// second input to `args`, when it has one, else the file's own.
+fn audio_input(
+    run: &Run<'_>,
+    stream: u32,
+    args: &mut Vec<String>,
+    reads: &mut Vec<PathBuf>,
+) -> Result<String, RunError> {
+    let Some(stored) = run.stored.audio.get(&stream) else {
+        return Ok(format!("0:{stream}"));
+    };
+    let at = run.dir.join(format!("audio-{stream}.mkv"));
+    bring(stored, &at, false, reads).map_err(prepare)?;
+    args.extend([String::from("-i"), at.display().to_string()]);
+    Ok("1:a:0".to_owned())
+}
+
 /// Write track `run` (PX-51) into `part` as `format`: its audio from the
 /// copy's stored track when it has one, else from the file, with the
 /// file's tags and its cover where `format` takes one. Nothing encoded.
@@ -145,15 +162,7 @@ pub(super) async fn write_music(
     args.extend(PROGRESS_ARGS.map(String::from));
     args.extend([String::from("-i"), input.display().to_string()]);
     let stream = run.descriptor.audio.first().map_or(0, |a| a.index);
-    let audio = match run.stored.audio.get(&stream) {
-        Some(stored) => {
-            let at = run.dir.join(format!("audio-{stream}.mkv"));
-            bring(stored, &at, false, &mut reads).map_err(prepare)?;
-            args.extend([String::from("-i"), at.display().to_string()]);
-            "1:a:0".to_owned()
-        }
-        None => format!("0:{stream}"),
-    };
+    let audio = audio_input(run, stream, &mut args, &mut reads)?;
     args.extend([String::from("-map"), audio]);
     if format.takes_cover() {
         // The cover is a picture stream of the file's, when it has one.
@@ -198,15 +207,7 @@ pub(super) async fn write_addon(
     let mut args: Vec<String> = QUIET_ARGS.map(String::from).to_vec();
     args.extend(PROGRESS_ARGS.map(String::from));
     args.extend([String::from("-i"), input.display().to_string()]);
-    let audio = match run.stored.audio.get(&track.index) {
-        Some(stored) => {
-            let at = run.dir.join(format!("audio-{}.mkv", track.index));
-            bring(stored, &at, false, &mut reads).map_err(prepare)?;
-            args.extend([String::from("-i"), at.display().to_string()]);
-            "1:a:0".to_owned()
-        }
-        None => format!("0:{}", track.index),
-    };
+    let audio = audio_input(run, track.index, &mut args, &mut reads)?;
     args.extend([String::from("-copyts"), String::from("-map"), audio]);
     args.extend(tags(0, &track.language, &track.title));
     args.extend(["-disposition:0", "default", "-c", "copy"].map(String::from));

@@ -193,16 +193,7 @@ pub(crate) fn input_video_args(spec: &EncodeSpec<'_>) -> Result<Vec<String>, Str
                     }
                 }
                 if let Some(rate) = max_bitrate {
-                    args.extend([
-                        s("-b:v"),
-                        s(rate),
-                        s("-maxrate"),
-                        s(rate),
-                        // One second of the cap: what the HLS playlist declares as its
-                        // peak counts on it (hls.rs, `Rate::capped`, #2).
-                        s("-bufsize"),
-                        s(rate),
-                    ]);
+                    args.extend(capped_rate_args(rate));
                 }
                 // Every output: a progressive encode crawled on radeonsi too.
                 args.extend(no_caption_sei(&encoder.name));

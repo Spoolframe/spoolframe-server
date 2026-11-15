@@ -42,6 +42,9 @@ const MAX_MAKING: usize = 64;
 /// Tracks remembered as failed at once (review 2026-10-11 M14).
 const MAX_FAILED: usize = 4096;
 
+/// The most films whose start is kept ([`Subtitles::start_time`]).
+const MAX_STARTS: usize = 1024;
+
 /// The most the cache's texts take on disk (review 2026-10-11 M15). A
 /// film's track is some 100 KB, so this is thousands of tracks; past it
 /// the least recently used go, oldest by modification time, which a read
@@ -117,6 +120,11 @@ pub struct Subtitles {
     /// ones), in its hidden state directory: read by ffmpeg through the
     /// directory, as no file there may be an input.
     own_dir: Option<PathBuf>,
+    /// Each film's start as last probed, with the file's stamp it was
+    /// probed at: a client reads a subtitle in chunks, and each would
+    /// run ffprobe again. A changed file (another stamp) is probed
+    /// again. At most [`MAX_STARTS`].
+    starts: Mutex<HashMap<PathBuf, (String, std::time::Duration)>>,
 }
 
 /// Text recognition's work now, and since the server started (P3-14).
@@ -174,6 +182,7 @@ impl Subtitles {
             ocr_done: Counter::default(),
             ocr_failed: Counter::default(),
             own_dir: None,
+            starts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -201,10 +210,29 @@ impl Subtitles {
     /// When the film at `path` starts ([`ocr::start_time`]): what its
     /// text, which counts from that start, is moved by to be on the
     /// timeline of a download's MP4, which keeps the film's timestamps.
+    ///
+    /// Kept while the file keeps its size and modification time, so a
+    /// subtitle read in chunks probes the film once.
     pub async fn start_time(&self, path: &Path) -> Result<std::time::Duration, String> {
-        ocr::start_time(&self.ffprobe, path)
+        // A stamp that cannot be read is no memo: the probe says why.
+        let stamp = crate::files::stamp_text(path).await.ok();
+        if let Some(stamp) = &stamp
+            && let Some((known, start)) = self.starts.lock().get(path)
+            && known == stamp
+        {
+            return Ok(*start);
+        }
+        let start = ocr::start_time(&self.ffprobe, path)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(stamp) = stamp {
+            let mut starts = self.starts.lock();
+            if starts.len() >= MAX_STARTS && !starts.contains_key(path) {
+                starts.clear();
+            }
+            starts.insert(path.to_path_buf(), (stamp, start));
+        }
+        Ok(start)
     }
 
     /// Where the text of `source` is, as playback debug shows it (P3-15):

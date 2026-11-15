@@ -4323,12 +4323,7 @@ impl ClientProtocol {
                     // Counted off the LAN from now (PX-46): the others' shares
                     // follow once starts settle.
                     if let Some(admission) = admission {
-                        admission.started(&handle.0, connection.stable_id());
-                        // The path may have turned out to be the LAN since the place
-                        // was reserved (#4): log_paths found no stream to let go then.
-                        if on_lan(&state.path()) {
-                            self.services.uplink.moved_onto_lan(connection.stable_id());
-                        }
+                        admission.started(&handle.0, connection.stable_id(), on_lan(&state.path()));
                     }
                     if let Who::Remote(_) = &who {
                         self.remote_plays
@@ -7211,12 +7206,7 @@ impl ClientProtocol {
             },
         );
         if let Some(admission) = admission {
-            admission.started(&handle.0, connection.stable_id());
-            // The path may have turned out to be the LAN since the place
-            // was reserved (#4): log_paths found no stream to let go then.
-            if on_lan(&state.path()) {
-                self.services.uplink.moved_onto_lan(connection.stable_id());
-            }
+            admission.started(&handle.0, connection.stable_id(), on_lan(&state.path()));
         }
         tokio::spawn(follow_remote(
             Arc::downgrade(&remote),
@@ -9028,22 +9018,13 @@ async fn read_subtitle(
     offset: u64,
     version: Option<u64>,
 ) -> Result<(Vec<u8>, u64, u64), Error> {
+    let (mut file, metadata, now) = open_versioned(path, version, None).await?;
     let unreadable = |e: std::io::Error| {
         tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
         Error::Unavailable {
             message: "the subtitle file could not be read".into(),
         }
     };
-    let mut file = crate::files::open_regular(path).await.map_err(unreadable)?;
-    // Of the open file, not of the path: the version is of the file the
-    // bytes below come from, whatever the path names by then. It is taken
-    // before the bytes, so a write during the read gives the next chunk's
-    // request a version that no longer holds.
-    let metadata = file.metadata().await.map_err(unreadable)?;
-    let now = subtitle_version(&metadata);
-    if version.is_some_and(|read| read != now) {
-        return Err(Error::SubtitleChanged);
-    }
     let total = metadata.len();
     let mut bytes = Vec::new();
     if offset < total {
@@ -9054,6 +9035,36 @@ async fn read_subtitle(
         chunk.read_to_end(&mut bytes).await.map_err(unreadable)?;
     }
     Ok((bytes, total, now))
+}
+
+/// Open subtitle file `path` and say its version: of the open file, not
+/// of the path, so it is of the file the bytes come from, whatever the
+/// path names by then. It is taken before the bytes, so a write during
+/// the read gives the next chunk's request a version that no longer
+/// holds. `moved_by` (ms) is a move of the cues, which is part of the
+/// version. With the `version` of an earlier chunk, a file that is not
+/// that one any more is `SubtitleChanged`, and none of it is read.
+async fn open_versioned(
+    path: &Path,
+    version: Option<u64>,
+    moved_by: Option<i64>,
+) -> Result<(tokio::fs::File, std::fs::Metadata, u64), Error> {
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %path.display(), error = %e, "cannot read a subtitle");
+        Error::Unavailable {
+            message: "the subtitle file could not be read".into(),
+        }
+    };
+    let file = crate::files::open_regular(path).await.map_err(unreadable)?;
+    let metadata = file.metadata().await.map_err(unreadable)?;
+    let mut now = subtitle_version(&metadata);
+    if let Some(by_ms) = moved_by {
+        now = hash_u64(&[now, by_ms as u64]);
+    }
+    if version.is_some_and(|read| read != now) {
+        return Err(Error::SubtitleChanged);
+    }
+    Ok((file, metadata, now))
 }
 
 /// One chunk of WebVTT file `path` as [`read_subtitle`] reads it, every
@@ -9076,25 +9087,8 @@ async fn read_moved_subtitle(
             message: "the subtitle file could not be read".into(),
         }
     };
-    let mut file = crate::files::open_regular(path)
-        .await
-        .map_err(|e| unreadable(e.to_string()))?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|e| unreadable(e.to_string()))?;
     let by_ms = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
-    let now = {
-        let mut hash = blake3::Hasher::new();
-        hash.update(&subtitle_version(&metadata).to_le_bytes());
-        hash.update(&by_ms.to_le_bytes());
-        let mut first = [0; 8];
-        first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
-        u64::from_le_bytes(first)
-    };
-    if version.is_some_and(|read| read != now) {
-        return Err(Error::SubtitleChanged);
-    }
+    let (mut file, _, now) = open_versioned(path, version, Some(by_ms)).await?;
     let mut text = Vec::new();
     file.read_to_end(&mut text)
         .await
@@ -9113,25 +9107,30 @@ async fn read_moved_subtitle(
     Ok((moved[from..to].to_vec(), total, now))
 }
 
+/// The first eight bytes of the hash of `parts`, each as its bytes.
+fn hash_u64(parts: &[u64]) -> u64 {
+    let mut hash = blake3::Hasher::new();
+    for part in parts {
+        hash.update(&part.to_le_bytes());
+    }
+    let mut first = [0; 8];
+    first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
 /// A value that names a subtitle file as it is now: another one once the
 /// file is written again (its length or its modification time changes) or
 /// replaced (another inode). A hash, so that a client learns nothing of
 /// the server's disk from it.
 fn subtitle_version(metadata: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    let mut hash = blake3::Hasher::new();
-    for part in [
+    hash_u64(&[
         metadata.dev(),
         metadata.ino(),
         metadata.len(),
         metadata.mtime() as u64,
         metadata.mtime_nsec() as u64,
-    ] {
-        hash.update(&part.to_le_bytes());
-    }
-    let mut first = [0; 8];
-    first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
-    u64::from_le_bytes(first)
+    ])
 }
 
 /// WebVTT segment `n` of an HLS playback's subtitle rendition (P2-07),

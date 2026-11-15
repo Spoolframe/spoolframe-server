@@ -33,6 +33,24 @@ pub const SEGMENT_SECS: u32 = 6;
 /// player waits for before the first frame. See `hls::Segments::encoded`.
 pub const FIRST_SEGMENT_SECS: u32 = 2;
 
+/// How many seconds of a capped video's cap its rate buffer holds
+/// (`-bufsize`). What the HLS playlist declares as a segment's peak
+/// counts on it (hls.rs, `Rate::capped`, #2).
+pub(crate) const BUFFER_SECS: u64 = 1;
+
+/// A video encode capped at `rate` bit/s: its target, its peak and its
+/// buffer ([`BUFFER_SECS`] of it).
+pub(crate) fn capped_rate_args(rate: u64) -> [String; 6] {
+    [
+        s("-b:v"),
+        s(rate),
+        s("-maxrate"),
+        s(rate),
+        s("-bufsize"),
+        s(rate.saturating_mul(BUFFER_SECS)),
+    ]
+}
+
 /// ffmpeg's own list of the segments it has finished, in the job's
 /// directory: the HLS muxer's playlist, or the segment muxer's list.
 pub const PLAYLIST: &str = "ffmpeg.m3u8";

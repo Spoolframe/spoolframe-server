@@ -751,16 +751,7 @@ pub(crate) fn probe_args(spec: &EncodeSpec<'_>, file: &Path) -> Option<Vec<Strin
         args.extend([s("-profile:v"), s("main10")]);
     }
     if let Some(rate) = max_bitrate {
-        args.extend([
-            s("-b:v"),
-            s(rate),
-            s("-maxrate"),
-            s(rate),
-            // One second of the cap: what the HLS playlist declares as its
-            // peak counts on it (hls.rs, `Rate::capped`, #2).
-            s("-bufsize"),
-            s(rate),
-        ]);
+        args.extend(capped_rate_args(rate));
     }
     args.extend(only_forced_keyframes(&encoder.name));
     args.extend(no_caption_sei(&encoder.name));

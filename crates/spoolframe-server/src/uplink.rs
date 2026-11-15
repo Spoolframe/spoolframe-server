@@ -74,9 +74,14 @@ impl Admission {
     }
 
     /// The playback `handle` opened on `connection`: its place is its own.
-    pub fn started(self, handle: &str, connection: usize) {
+    /// `on_lan` says the path may have turned out to be the LAN since the
+    /// place was reserved (#4): `log_paths` found no stream to let go then.
+    pub fn started(self, handle: &str, connection: usize, on_lan: bool) {
         self.uplink
             .started(handle, self.class, connection, self.share);
+        if on_lan {
+            self.uplink.moved_onto_lan(connection);
+        }
         // Dropped here: the place is let go after the stream holds one.
     }
 }
@@ -926,7 +931,7 @@ mod tests {
         assert!(matches!(up.reserve(Class::Guest), Err(Full { max: 2 })));
         drop(first);
         let again = up.reserve(Class::Guest).unwrap();
-        again.started("b", 2);
+        again.started("b", 2, false);
         assert_eq!(up.wan_streams(), 2);
         assert!(matches!(up.reserve(Class::Guest), Err(Full { max: 2 })));
     }

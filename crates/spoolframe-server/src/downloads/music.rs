@@ -312,7 +312,7 @@ pub fn estimate(
         return Some(size);
     }
     let length = descriptor.duration?;
-    u64::try_from(u128::from(rate) * length.as_millis() / 1000 / 8).ok()
+    super::bytes_at(rate, length)
 }
 
 #[cfg(test)]

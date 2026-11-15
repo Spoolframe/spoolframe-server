@@ -41,7 +41,7 @@ use spoolframe_media::{KeyframeTimes, MAX_DURATION, MediaDescriptor, SubtitleStr
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo};
 use spoolframe_types::{AudioCodec, CodecString, VideoCodec, language};
 
-use super::args::{FIRST_SEGMENT_SECS, SEGMENT_SECS};
+use super::args::{BUFFER_SECS, FIRST_SEGMENT_SECS, SEGMENT_SECS};
 
 /// The shortest last segment kept on its own.
 const TAIL_MS: u64 = 500;
@@ -334,7 +334,7 @@ impl Rate {
         }
     }
 
-    /// A video encode capped at `cap` (`-maxrate cap -bufsize cap`): a
+    /// A video encode capped at `cap` (`-maxrate cap`, a buffer of [`BUFFER_SECS`] of it): a
     /// segment holds at most its time at the cap plus the full buffer, and
     /// the shortest, the first ([`FIRST_SEGMENT_SECS`], PX-26), has the
     /// most over its time: 1.5 times the cap at 2 s. A bound, not a guess:
@@ -343,7 +343,8 @@ impl Rate {
     /// on hevc_vaapi and 1.18 on libx264.
     fn capped(cap: u64) -> Self {
         Self {
-            peak: cap.saturating_add(cap / u64::from(FIRST_SEGMENT_SECS)),
+            peak: cap
+                .saturating_add(cap.saturating_mul(BUFFER_SECS) / u64::from(FIRST_SEGMENT_SECS)),
             average: cap,
         }
     }
