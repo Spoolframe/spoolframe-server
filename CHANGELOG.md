@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.4 (2026-11-15)
 
 - Security, SDK: an app now resolves rusqlite 0.43 and libsqlite3-sys
   0.40, which fixes RUSTSEC-2026-0459 (CVE-2026-119375, SQLite before
