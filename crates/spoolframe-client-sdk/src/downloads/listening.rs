@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use spoolframe_protocol::PlaybackPlan;
 use spoolframe_protocol::downloads::{DownloadFile, DownloadSource, DownloadTracks, FileTracks};
@@ -40,14 +40,12 @@ pub(crate) struct Keeper {
     /// How the playback is delivered, set once it is open ([`Keeper::attach`]).
     kind: OnceLock<Kind>,
     /// Given up on, or kept: nothing more is taken. Read without the lock,
-    /// so a read that brings nothing to keep costs nothing.
-    done: AtomicBool,
+    /// so a read that brings nothing to keep costs nothing; shared with
+    /// the playback's [`SegmentFeed`].
+    done: Arc<AtomicBool>,
     /// How many media segments an HLS play's media playlist lists, once it
     /// was read; 0 before.
     segments: AtomicUsize,
-    /// Where an HLS play's reads are handed, to be written off the read
-    /// path ([`Keeper::offer_segment`]).
-    feed: OnceLock<mpsc::Sender<Piece>>,
     state: tokio::sync::Mutex<State>,
 }
 
@@ -175,14 +173,61 @@ pub(crate) struct SegmentRead<'a> {
 }
 
 /// A [`SegmentRead`], its bytes copied, on its way to the writer.
-struct Piece {
-    generation: u64,
-    variant: u32,
-    n: u32,
-    offset: u64,
-    bytes: Vec<u8>,
-    size: u64,
-    complete: bool,
+#[derive(Debug)]
+pub(crate) struct Piece {
+    pub generation: u64,
+    pub variant: u32,
+    pub n: u32,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub size: u64,
+    pub complete: bool,
+}
+
+/// Where an HLS play's segment reads are handed, to be written off the
+/// read path: held by the playback, not the keeper. The task that writes
+/// them owns the keeper, so the reads it took are written, and a track
+/// read whole is kept, after the playback is let go; it ends once the
+/// playback (this sender) is gone and every read is written. A track not
+/// whole then leaves no part: the keeper's drop removes it.
+pub(crate) struct SegmentFeed {
+    send: mpsc::Sender<Piece>,
+    /// The keeper's: given up on, or kept.
+    done: Arc<AtomicBool>,
+}
+
+impl SegmentFeed {
+    /// A feed whose reads go to the returned receiver alone, `depth` of
+    /// them at most: what a test of the reads it is handed reads.
+    #[cfg(test)]
+    pub(crate) fn detached(depth: usize) -> (Self, mpsc::Receiver<Piece>) {
+        let (send, receive) = mpsc::channel(depth);
+        let done = Arc::new(AtomicBool::new(false));
+        (Self { send, done }, receive)
+    }
+
+    /// An HLS play read part of a segment ([`SegmentRead`]), or learned
+    /// that it is whole (no bytes): handed on, never waited for. When too
+    /// many wait, the track is not kept. Nothing is copied once the
+    /// keeper is done.
+    pub(crate) fn offer(&self, read: SegmentRead<'_>) {
+        if self.done.load(Ordering::Relaxed) {
+            return;
+        }
+        let piece = Piece {
+            generation: read.generation,
+            variant: read.variant,
+            n: read.n,
+            offset: read.offset,
+            bytes: read.bytes.to_vec(),
+            size: read.size,
+            complete: read.complete,
+        };
+        if self.send.try_send(piece).is_err() {
+            tracing::debug!("a track's segments came faster than kept: not kept");
+            self.done.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// What a segment read means for the file.
@@ -313,36 +358,41 @@ impl Keeper {
             id: id.clone(),
             from_start: options.start.is_none_or(|start| start.is_zero()),
             kind: OnceLock::new(),
-            done: AtomicBool::new(false),
+            done: Arc::new(AtomicBool::new(false)),
             segments: AtomicUsize::new(0),
-            feed: OnceLock::new(),
             state: tokio::sync::Mutex::new(State::Idle),
         }))
     }
 
     /// The playback is open, planned as `plan`: what it keeps follows
-    /// from it. An HLS play's reads are written by a task on `runtime`,
-    /// which ends with the keeper.
-    pub(crate) fn attach(self: &Arc<Self>, plan: &PlaybackPlan, runtime: &tokio::runtime::Handle) {
+    /// from it. For an HLS play, the feed its segment reads go to, which
+    /// the playback holds: a task on `runtime` writes them
+    /// ([`SegmentFeed`]).
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        plan: &PlaybackPlan,
+        runtime: &tokio::runtime::Handle,
+    ) -> Option<SegmentFeed> {
         let kind = Kind::of(plan);
         let _ = self.kind.set(kind);
         if kind == Kind::Other {
             self.done.store(true, Ordering::Relaxed);
         }
         if kind != Kind::Hls || !self.from_start {
-            return;
+            return None;
         }
         let (send, mut receive) = mpsc::channel(FEED_DEPTH);
-        let _ = self.feed.set(send);
-        let keeper: Weak<Self> = Arc::downgrade(self);
+        // The task owns the keeper, and the playback the sender: no cycle.
+        let keeper = self.clone();
         runtime.spawn(async move {
             while let Some(piece) = receive.recv().await {
-                let Some(keeper) = keeper.upgrade() else {
-                    return;
-                };
                 keeper.segment(piece).await;
             }
         });
+        Some(SegmentFeed {
+            send,
+            done: self.done.clone(),
+        })
     }
 
     /// The media playlist of an HLS play lists `n` segments.
@@ -421,32 +471,6 @@ impl Keeper {
         self.wrote(&mut state, wrote).await;
     }
 
-    /// An HLS play read part of a segment ([`SegmentRead`]): handed on to
-    /// be written, off the read path. When too many wait, the track is
-    /// not kept. Nothing is copied once the keeper is done, or for a play
-    /// it does not keep.
-    pub(crate) fn offer_segment(&self, read: SegmentRead<'_>) {
-        if self.done.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(feed) = self.feed.get() else {
-            return;
-        };
-        let piece = Piece {
-            generation: read.generation,
-            variant: read.variant,
-            n: read.n,
-            offset: read.offset,
-            bytes: read.bytes.to_vec(),
-            size: read.size,
-            complete: read.complete,
-        };
-        if feed.try_send(piece).is_err() {
-            tracing::debug!(id = %self.id, "a track's segments came faster than kept: not kept");
-            self.done.store(true, Ordering::Relaxed);
-        }
-    }
-
     /// Write an HLS play's `piece`. Kept once the init segment and every
     /// media segment the playlist lists are written, in order, from one
     /// encode; a segment skipped, a read from another encode or rung, or
@@ -454,7 +478,7 @@ impl Keeper {
     async fn segment(&self, piece: Piece) {
         let mut state = self.state.lock().await;
         if self.done.load(Ordering::Relaxed) {
-            // Given up on by `offer_segment`: its part goes now.
+            // Given up on by the feed: its part goes now.
             if matches!(*state, State::Writing { .. }) {
                 self.give_up(&mut state);
             }
@@ -475,7 +499,9 @@ impl Keeper {
         // Where the file has got to, before the piece moves it.
         let at = order.at();
         let mut wrote = match order.take(&piece) {
-            Step::Nothing => return,
+            // Nothing to write, but the file may be whole now: a read that
+            // only learned its segment is, or the playlist read since.
+            Step::Nothing => Ok(()),
             Step::GiveUp => {
                 self.give_up(&mut state);
                 return;
@@ -770,6 +796,16 @@ mod tests {
             piece(0, 0, b"init", 4),
         ];
         assert_eq!(written(&pieces).as_deref(), Some(&b"init"[..]));
+    }
+
+    /// A segment whose last bytes came before it was finished is whole
+    /// once an answer with no bytes says so.
+    #[test]
+    fn an_answer_with_no_bytes_finishes_its_segment() {
+        let mut growing = piece(0, 0, b"init", 4);
+        growing.complete = false;
+        let pieces = [growing, piece(0, 4, b"", 4), piece(1, 0, b"aa", 2)];
+        assert_eq!(written(&pieces).as_deref(), Some(&b"initaa"[..]));
     }
 
     #[test]

@@ -527,6 +527,8 @@ struct Inner {
     gone: watch::Sender<()>,
     /// What keeps a track's bytes as they are read.
     keeper: std::sync::OnceLock<Arc<crate::downloads::Keeper>>,
+    /// Where an HLS play's segment reads go to be kept.
+    segment_feed: std::sync::OnceLock<crate::downloads::SegmentFeed>,
     /// The read ahead of a kept track's file was started.
     reading_ahead: std::sync::atomic::AtomicBool,
     /// True once its player read a byte, or it ended or was closed: what
@@ -852,6 +854,7 @@ impl ManagedPlayback {
             runtime: tokio::runtime::Handle::current(),
             gone: watch::Sender::new(()),
             keeper: std::sync::OnceLock::new(),
+            segment_feed: std::sync::OnceLock::new(),
             reading_ahead: std::sync::atomic::AtomicBool::new(false),
             settled: watch::Sender::new(false),
         });
@@ -1421,8 +1424,8 @@ impl ManagedPlayback {
         size: u64,
         complete: bool,
     ) {
-        if let Some(keeper) = self.0.keeper.get() {
-            keeper.offer_segment(crate::downloads::SegmentRead {
+        if let Some(feed) = self.0.segment_feed.get() {
+            feed.offer(crate::downloads::SegmentRead {
                 generation: opened.generation,
                 variant,
                 n,
@@ -1473,7 +1476,7 @@ impl ManagedPlayback {
             (body, opened)
         };
         self.read_now();
-        Ok(SegmentStream {
+        let stream = SegmentStream {
             playback: self.clone(),
             body,
             variant,
@@ -1482,7 +1485,9 @@ impl ManagedPlayback {
             at,
             opened,
             counted: false,
-        })
+        };
+        stream.tee_answer();
+        Ok(stream)
     }
 
     /// Segment `n` of rung `variant` was opened from 0 under `opened`.
@@ -2179,7 +2184,9 @@ impl Session {
         let playback =
             ManagedPlayback::open(Arc::new(self.clone()), item.clone(), selection, options).await?;
         if let Some(keeper) = keeper {
-            keeper.attach(&playback.snapshot().plan, &playback.0.runtime);
+            if let Some(feed) = keeper.attach(&playback.snapshot().plan, &playback.0.runtime) {
+                let _ = playback.0.segment_feed.set(feed);
+            }
             let _ = playback.0.keeper.set(keeper);
         }
         Ok(playback)
@@ -2207,6 +2214,18 @@ pub struct SegmentStream {
 }
 
 impl SegmentStream {
+    /// Tell the keeper what the answer says before any byte of it: the
+    /// segment's size and whether it is whole. A segment whose last bytes
+    /// came while it was being written is whole at a later answer that
+    /// carries none, and a bridge may end it without reading that.
+    fn tee_answer(&self) {
+        let (size, complete) = (self.body.size, self.body.complete);
+        let at = self.offset;
+        let (opened, variant, n) = (&self.opened, self.variant, self.n);
+        self.playback
+            .tee_segment(opened, variant, n, at, &[], size, complete);
+    }
+
     /// The bytes this answer carries.
     pub fn sent(&self) -> u64 {
         self.body.sent
@@ -2293,7 +2312,7 @@ impl SegmentStream {
         let body = playback
             .open_rest(&p, self.variant, self.n, offset, length, self.at)
             .await?;
-        Ok(SegmentStream {
+        let stream = SegmentStream {
             playback: playback.clone(),
             body,
             variant: self.variant,
@@ -2302,7 +2321,9 @@ impl SegmentStream {
             at: self.at,
             opened: self.opened.clone(),
             counted: false,
-        })
+        };
+        stream.tee_answer();
+        Ok(stream)
     }
 }
 
@@ -2343,6 +2364,8 @@ mod tests {
         timings: Mutex<Option<broadcast::Sender<crate::SubtitleTimingEvent>>>,
         /// The server's verdict on each re-plan.
         wan: Mutex<Option<bool>>,
+        /// HLS segment answers, in turn.
+        segments: Mutex<VecDeque<Chunk>>,
     }
     use std::sync::atomic::Ordering::SeqCst;
     fn item() -> MediaId {
@@ -2445,6 +2468,20 @@ mod tests {
             } else {
                 Ok(vec![42])
             }
+        }
+        async fn read_segment(
+            &self,
+            _: &PlaybackHandle,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u64,
+            _: u64,
+        ) -> Result<Chunk, SdkError> {
+            self.segments
+                .lock()
+                .pop_front()
+                .ok_or_else(|| SdkError::NotFound("no more segment answers".into()))
         }
         async fn read_chunk(
             &self,
@@ -2550,6 +2587,40 @@ mod tests {
             ))
         }
     }
+    /// A segment whose last bytes came while it was written is whole at
+    /// a later answer with none: the keeper is told so, by that answer
+    /// alone, though the bridge reads no byte of it.
+    #[tokio::test]
+    async fn an_answer_with_no_bytes_tells_the_keeper_its_segment_is_whole() {
+        let b = Arc::new(Backend::default());
+        b.segments.lock().extend([
+            Chunk {
+                bytes: b"abc".to_vec(),
+                size: 3,
+                complete: false,
+                epoch: 0,
+            },
+            Chunk {
+                bytes: Vec::new(),
+                size: 3,
+                complete: true,
+                epoch: 0,
+            },
+        ]);
+        let p = open(b).await;
+        let (feed, mut pieces) = crate::downloads::SegmentFeed::detached(8);
+        let _ = p.0.segment_feed.set(feed);
+        let mut stream = p.segment_stream(0, 1, 0, 1 << 20).await.unwrap();
+        while stream.next().await.unwrap().is_some() {}
+        let rest = stream.reopen(1 << 20).await.unwrap();
+        drop((rest, stream, p));
+        let mut told = Vec::new();
+        while let Some(piece) = pieces.recv().await {
+            told.push((piece.offset, piece.bytes.len(), piece.size, piece.complete));
+        }
+        assert_eq!(told.last(), Some(&(3, 0, 3, true)), "{told:?}");
+    }
+
     async fn open(b: Arc<Backend>) -> ManagedPlayback {
         ManagedPlayback::open(b, item(), None, PlaybackOptions::default())
             .await

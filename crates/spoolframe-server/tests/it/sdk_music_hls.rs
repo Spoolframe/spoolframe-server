@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
 use spoolframe_client_sdk::{
-    Client, Device, ManagedPlayback, MemoryStorage, OfflineMark, PlaybackOptions, PlaybackPlan,
-    Session,
+    Client, Device, ManagedPlayback, ManifestKind, MemoryStorage, OfflineMark, PlaybackOptions,
+    PlaybackPlan, Session,
 };
 use spoolframe_hls_bridge::{Bridge, Kind, SdkSource, Stream};
 use spoolframe_test_dir::TestDir;
@@ -299,6 +299,40 @@ async fn two_overlapping_plays_each_keep_their_own_track() {
         ),
         (Some(true), Some(true))
     );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A track read whole and let go at once, its last reads still waiting to
+/// be written: they are written, and the track is kept.
+#[tokio::test]
+async fn a_track_let_go_right_after_its_last_segment_is_kept() {
+    let server = music_server("sdk-music-hls-let-go").await;
+    write_long_flac(&server, "32");
+    let dir = TestDir::new("spoolframe-sdk-music-hls-let-go").await;
+    let client = iphone_client(&server, &dir).await;
+    let session = alice(&server, &client).await;
+    let playback = session
+        .open_playback(&track_id("32"), None, PlaybackOptions::default())
+        .await
+        .unwrap();
+    let media = playback.manifest(ManifestKind::Media, 0).await.unwrap();
+    let segments = media.lines().filter(|l| l.starts_with("#EXTINF:")).count() as u32;
+    let mut served = Vec::new();
+    for n in 0..=segments {
+        let mut stream = playback
+            .segment_stream(0, n, 0, spoolframe_hls_bridge::SEGMENT_MAX)
+            .await
+            .unwrap();
+        while let Some(bytes) = stream.next().await.unwrap() {
+            served.extend(bytes);
+        }
+    }
+    // Let go with no await between: the writer has not run since the
+    // last reads were handed to it.
+    drop(playback);
+    let kept = kept_file(&client, "32").await;
+    assert_eq!(kept.map(|k| k == served), Some(true));
     client.close().await;
     server.stop().await;
 }
