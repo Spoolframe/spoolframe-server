@@ -23,7 +23,7 @@ use spoolframe_types::{AudioCodec, Container};
 
 use crate::downloads_wire::{PASSWORD, server};
 use crate::music_downloads::{alice as alice_actor, track_file, track_id, write_flac};
-use crate::support::{ServerOptions, TestServer};
+use crate::support::{ServerOptions, TestServer, pinned_sdk_client, settled};
 
 /// A server whose three tracks (32 and 33 of Discovery, 35 of Homework)
 /// are FLAC files with a cover, with posters, its music served as a
@@ -69,15 +69,7 @@ async fn device_with(
     storage: &Arc<MemoryStorage>,
     downloads: &Path,
 ) -> Client {
-    let client = Client::open_with_options(storage.clone(), linux(), options(downloads))
-        .await
-        .unwrap();
-    let id = server.server.id().to_string();
-    let addrs = server.server.addr().ip_addrs().copied().collect();
-    client.add_address(&id, addrs).unwrap();
-    client.connect(&id).await.unwrap();
-    client.pin(&id, true).await.unwrap();
-    client
+    pinned_sdk_client(server, storage, linux(), options(downloads)).await
 }
 
 async fn device(server: &TestServer, storage: &Arc<MemoryStorage>, downloads: &Path) -> Client {
@@ -89,17 +81,6 @@ async fn alice(server: &TestServer, client: &Client) -> Session {
         .sign_in(&server.server.id().to_string(), "alice", PASSWORD, false)
         .await
         .unwrap()
-}
-
-/// Until nothing is left to move, within 2 minutes.
-async fn settled(client: &Client) {
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        client.downloads().run_until_done(),
-    )
-    .await
-    .expect("the downloads never settled")
-    .unwrap();
 }
 
 /// Play track `key` as a player would: `whole`, every byte from the
@@ -151,6 +132,19 @@ fn offline(client: &Client, server: &TestServer, session_user: &str) -> OfflineM
     client
         .downloads()
         .offline_music(&server.server.id().to_string(), session_user)
+}
+
+/// Playlist `id` as offline lists it: every playlist the user sees is
+/// listed, in the server's order, so not always first.
+fn downloaded_playlist<'a>(
+    music: &'a OfflineMusic,
+    id: &str,
+) -> &'a spoolframe_client_sdk::OfflinePlaylist {
+    music
+        .playlists
+        .iter()
+        .find(|p| p.target == MusicTarget::Playlist { id: id.to_owned() })
+        .expect("the playlist is listed offline")
 }
 
 /// The bytes of track `key`'s source file.
@@ -637,7 +631,8 @@ async fn a_downloaded_playlist_s_added_track_comes_down_and_a_removed_one_goes_u
     downloads.sync_music(&session).await.unwrap();
     settled(&client).await;
     let changed = kept();
-    let listed = offline(&client, &server, &user).playlists[0]
+    let music = offline(&client, &server, &user);
+    let listed = downloaded_playlist(&music, &made.id)
         .tracks
         .iter()
         .map(|t| t.item.id().key().to_owned())
@@ -1004,7 +999,8 @@ async fn a_track_added_to_a_downloaded_playlist_comes_down_while_connected() {
         .await
         .unwrap();
     followed_to(&client, &["32", "35"]).await;
-    let listed = &offline(&client, &server, &user).playlists[0];
+    let music = offline(&client, &server, &user);
+    let listed = downloaded_playlist(&music, &playlist);
     assert_eq!(
         (
             first,
@@ -1087,7 +1083,7 @@ async fn a_track_removed_from_a_downloaded_playlist_goes_while_connected_unless_
         (
             first,
             file_35.exists(),
-            music.playlists[0].tracks.len(),
+            downloaded_playlist(&music, &playlist).tracks.len(),
             marks(&music),
             connected(&client, &server),
         ),
@@ -1190,7 +1186,11 @@ async fn a_track_liked_elsewhere_comes_down_while_connected() {
     assert_eq!(
         (
             first,
-            offline(&client, &server, &user).playlists[0]
+            offline(&client, &server, &user)
+                .playlists
+                .iter()
+                .find(|p| p.target == MusicTarget::Liked)
+                .expect("Liked is listed offline")
                 .tracks
                 .iter()
                 .map(|t| t.item.id().key().to_owned())
@@ -1242,6 +1242,75 @@ async fn a_music_download_is_told_as_its_tracks_move_and_ends_done() {
     );
     let now = client.downloads().music_downloads().remove(0);
     assert_eq!((now.phase, now.done, now.failed), (MusicPhase::Done, 2, 0));
+    client.close().await;
+    server.stop().await;
+}
+
+/// Alice's "Road trip" as offline lists it: its total, how many are here,
+/// and its tracks' keys; `None` until it is listed with its tracks.
+fn road_trip_offline(
+    client: &Client,
+    server: &TestServer,
+    user: &str,
+) -> Option<(u32, u32, Vec<String>)> {
+    let music = offline(client, server, user);
+    let p = music.playlists.iter().find(|p| p.name == "Road trip")?;
+    (!p.entries.is_empty()).then(|| {
+        (
+            p.total,
+            p.on_device,
+            p.entries
+                .iter()
+                .map(|e| e.item.id().key().to_owned())
+                .collect(),
+        )
+    })
+}
+
+/// With no app call, a signed-in device keeps every playlist the user
+/// sees with its tracks, though none was opened or downloaded: listed
+/// offline with nothing here. An edit from elsewhere is read again.
+#[tokio::test]
+async fn a_playlist_never_opened_is_kept_for_offline_and_read_again_when_it_changes() {
+    let server = music_server("sdk-music-playlist-cache").await;
+    let (playlist, revision) = road_trip(&server, &["32", "33"]).await;
+    let dir = TestDir::new("spoolframe-sdk-music-playlist-cache").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = device(&server, &storage, &dir).await;
+    let session = alice(&server, &client).await;
+    let user = session.user().user_id.clone();
+    let kept = eventually(Duration::from_secs(30), || {
+        road_trip_offline(&client, &server, &user).is_some()
+    })
+    .await;
+    let first = road_trip_offline(&client, &server, &user);
+
+    let actor = alice_actor(&server).await;
+    server
+        .playlists
+        .edit(
+            &actor,
+            &playlist,
+            revision,
+            vec![PlaylistEdit::Add {
+                id: track_id("35"),
+                before: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let reread = eventually(Duration::from_secs(30), || {
+        road_trip_offline(&client, &server, &user).is_some_and(|(total, _, _)| total == 3)
+    })
+    .await;
+    assert_eq!(
+        (kept, first, reread),
+        (
+            true,
+            Some((2, 0, vec!["32".to_owned(), "33".to_owned()])),
+            true
+        )
+    );
     client.close().await;
     server.stop().await;
 }

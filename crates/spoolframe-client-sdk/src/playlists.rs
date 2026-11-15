@@ -103,17 +103,22 @@ impl Session {
         .await
     }
 
-    async fn playlists_fresh(&self) -> Result<PlaylistList, SdkError> {
-        match self.call(Request::ListPlaylists).await? {
+    /// The list read from the server, kept for offline
+    /// ([`crate::downloads::playlist_cache`]).
+    pub(crate) async fn playlists_fresh(&self) -> Result<PlaylistList, SdkError> {
+        let writer = self.offline_writer();
+        let list = match self.call(Request::ListPlaylists).await? {
             Reply::Playlists {
                 playlists,
                 pin_notes,
-            } => Ok(PlaylistList {
+            } => PlaylistList {
                 playlists,
                 pin_notes,
-            }),
-            other => Err(unexpected(other)),
-        }
+            },
+            other => return Err(unexpected(other)),
+        };
+        self.client.inner.downloads.playlists_listed(&writer, &list);
+        Ok(list)
     }
 
     /// Playlist `id` and a page of its entries, from `offset`, at most
@@ -142,7 +147,22 @@ impl Session {
         .await
     }
 
+    /// A page read from the server, kept for offline
+    /// ([`crate::downloads::playlist_cache`]).
     async fn playlist_fresh(
+        &self,
+        id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<PlaylistPage, SdkError> {
+        let writer = self.offline_writer();
+        let page = self.playlist_raw(id, offset, limit).await?;
+        self.client.inner.downloads.playlist_read(&writer, &page);
+        Ok(page)
+    }
+
+    /// A page read from the server, and nothing more.
+    pub(crate) async fn playlist_raw(
         &self,
         id: &str,
         offset: u32,
@@ -403,8 +423,12 @@ impl Session {
         let request = Request::Like {
             items: items.to_vec(),
         };
+        let writer = self.offline_writer();
         match self.liked_call(request).await? {
-            Reply::PlaylistInfo(liked) => Ok(liked),
+            Reply::PlaylistInfo(liked) => {
+                self.hearts_sent(&writer, items, true);
+                Ok(liked)
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -415,10 +439,29 @@ impl Session {
         let request = Request::Unlike {
             items: items.to_vec(),
         };
+        let writer = self.offline_writer();
         match self.liked_call(request).await? {
-            Reply::PlaylistInfo(liked) => Ok(liked),
+            Reply::PlaylistInfo(liked) => {
+                self.hearts_sent(&writer, items, false);
+                Ok(liked)
+            }
             other => Err(unexpected(other)),
         }
+    }
+
+    /// The tracks of `items` are `liked` now: kept for offline. An
+    /// album's tracks are learned when Liked is read again.
+    fn hearts_sent(
+        &self,
+        writer: &crate::downloads::playlist_cache::Writer,
+        items: &[MediaId],
+        liked: bool,
+    ) {
+        let tracks = items
+            .iter()
+            .filter(|id| id.kind() == spoolframe_types::MediaKind::Track)
+            .map(|id| (id.clone(), liked));
+        self.client.inner.downloads.learn_hearts(writer, tracks);
     }
 }
 

@@ -102,7 +102,7 @@ fn request(query: &str, scope: SearchScope) -> SearchRequest {
 }
 
 fn title(item: &Item) -> &str {
-    super::title(item)
+    item.title()
 }
 
 /// Every item in the results: the top match, then each group's.

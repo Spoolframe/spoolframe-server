@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Security, server: rmcp, the MCP server library, goes from 3.5.0 to
+  3.10.0, which fixes RUSTSEC-2026-0457, RUSTSEC-2026-0461 and
+  RUSTSEC-2026-0462.
+- Changed, server: the admin API (jsonrpsee 0.26) drops a connection's
+  pending calls when it closes, and closes a connection that sends no
+  request in its first 30 seconds. The admin CLI now asks for the
+  password before it connects, so a slow prompt no longer costs the
+  connection.
+- Added, SDK: every playlist a profile sees is kept for offline with its
+  tracks and cover, by the SDK itself while signed in, so
+  `Downloads::offline_music` lists them all, not only those downloaded.
+  `OfflinePlaylist` gains `summary`, `downloaded`, `total`, `on_device`,
+  `entries` (`OfflinePlaylistEntry { item, on_device: TrackOnDevice,
+  liked, track }`, `TrackOnDevice` `Downloaded`, `Kept` or `Absent`) and
+  `cover`. Hearts are kept as they are learned, so `OfflineTrack::liked`
+  is known for any track read online. `Client::search_offline_playlists`
+  (FFI `SpoolClient::search_offline_playlists`) finds them by name.
+  Every entry is kept, however long the playlist; `entries` holds the
+  first 1,000 and `Downloads::offline_playlist_entries` (FFI
+  `SpoolClient::offline_playlist_entries`) pages them all. Kept, with the
+  offline search index, in an SQLite database per server and profile
+  (`offline.sqlite3`); forgetting a server or profile deletes it.
+- Added, SDK: `Client::search_offline(server, user_id, request)` (FFI
+  `SpoolClient::search_offline(server, user_id, query, limit, scope,
+  kind)`), search with no server over what the profile holds on this
+  device: downloaded films and episodes, their shows, and the music kept
+  here. The same `SearchResults` as `Session::search`, ranked by the
+  server's rules, now shared in `spoolframe_protocol::search_rank`. Words
+  match the start of words in the title (or show, album, artist), with
+  case, accents and punctuation folded. People and playlists are not
+  searched offline.
 - Added, server: `GET /.well-known/spoolframe` on the web UI's
   `admin.public_url`, what an invite link says of the server with no
   code: its key, name, relays, lookup and public addresses, so a device
@@ -27,6 +58,8 @@
 - Fixed, server: a file whose TrueHD track ffprobe 8.1 reports with no
   sample format (common in Blu-ray remuxes) is read again. The whole file
   was "could not be read": no download, no play.
+- Fixed, SDK: Retry on a download (or audio add-on) whose server copy
+  expired or failed now prepares it again, rather than failing at once.
 - Added, protocol: feature `spoolframe:download-addons`, so an iOS app
   adds subtitles and audio tracks to a download without fetching the film
   again. `download_addon_options` lists what may be added and why a track

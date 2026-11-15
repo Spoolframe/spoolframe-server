@@ -761,6 +761,11 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                     id: playlist.clone(),
                 },
             );
+            if let Some(inner) = client.upgrade() {
+                inner
+                    .downloads
+                    .playlist_changed(id, &playlist, Some(revision));
+            }
             tell_playlists(
                 client,
                 id,
@@ -778,6 +783,9 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
                     id: playlist.clone(),
                 },
             );
+            if let Some(inner) = client.upgrade() {
+                inner.downloads.playlist_changed(id, &playlist, None);
+            }
             tell_playlists(client, id, crate::PlaylistChange::Gone { id: playlist });
         }
         Event::PinsChanged => tell_playlists(client, id, crate::PlaylistChange::PinsChanged),
@@ -785,6 +793,9 @@ async fn apply(event: Event, id: EndpointId, client: &Weak<Inner>) -> std::ops::
         Event::LikedChanged => {
             clear_catalog(client, id, crate::catalog_cache::Clear::Items);
             tell_music(client, id, Followed::Liked);
+            if let Some(inner) = client.upgrade() {
+                inner.downloads.liked_changed(id);
+            }
         }
         Event::ServerAddresses {
             addrs,

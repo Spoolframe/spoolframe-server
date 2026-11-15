@@ -105,7 +105,7 @@ pub use downloads::{
 pub use downloads::{
     AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicPhase,
     MusicQuality, MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark,
-    OfflineMusic, OfflinePlaylist, OfflineTrack, SyncedPlay,
+    OfflineMusic, OfflinePlaylist, OfflinePlaylistEntry, OfflineTrack, SyncedPlay, TrackOnDevice,
 };
 pub use error::{ErrorKind, SdkError};
 pub use experimental::{Experimental, HttpPlayback, HttpPlaybackRefusal};

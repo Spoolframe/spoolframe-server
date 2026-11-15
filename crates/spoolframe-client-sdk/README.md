@@ -223,6 +223,46 @@ alone. On iOS, call `run_until_done` from a background task, give the free
 space the system counts with `set_free_space`, and exclude the directory
 from backup.
 
+### Playlists and hearts with no server
+
+While a profile is signed in, the SDK keeps every playlist it sees for
+offline by itself: after each read of the playlists list (its own on each
+connect, at most every 5 minutes, or the app's), it reads each playlist
+whose tracks are not kept or changed revision, one at a time in the
+background, and its cover; `PlaylistChanged`, `PlaylistGone` and
+`LikedChanged` read the one named again. Nothing is read on a metered
+network unless cellular downloads are allowed. `Downloads::offline_music`
+then lists every playlist in the server's order, each with `total`,
+`on_device` (0: grey it out) and `entries` marked `Downloaded`, `Kept` or
+`Absent`, and its `cover` on disk. Each track's heart is kept too, so
+`OfflineTrack::liked` is known offline. Every entry of every playlist is
+kept, however long; `OfflinePlaylist::entries` holds the first 1,000, and
+`Downloads::offline_playlist_entries(server, user_id, playlist, offset,
+limit)` pages them all. Forgetting the server or the profile removes them.
+
+All of this, and the offline search index, is in one SQLite database per
+server and profile, `<downloads_dir>/<server>/<user>/offline.sqlite3`
+(bundled SQLite, so FTS5 is there on every platform), opened when first
+needed. A new one deletes the JSON files earlier builds kept and indexes
+the downloads already there.
+
+### Search with no server
+
+`Client::search_offline(server, user_id, request)` (FFI
+`SpoolClient::search_offline`) answers a `SearchRequest` from what that
+profile holds on this device, with no network and no `Session`: films and
+episodes downloaded whole, the shows of those episodes, and the artists,
+albums and tracks kept here. It returns the same `SearchResults` as
+`Session::search`, ranked by the server's rules (an exact title, then one
+that starts with the query), with scope, kind ("See all"), limit and a
+trailing year honoured, so the search screen needs no other code. Each
+word typed must start a word of the title, an episode's show, a track's
+album or artist, or an album's artist; case, accents and punctuation do
+not count. People and `request.library` are not searched offline;
+`Client::search_offline_playlists(server, user_id, query)` finds the
+playlists kept, those with nothing here too. A locked profile is
+`ProfileLocked`.
+
 ## noq-proto: add the patch to your app
 
 iroh's QUIC state machine, noq-proto 1.4.0, closes a connection with "too

@@ -4,12 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use spoolframe_client_sdk::types::{Item, MediaId, MediaTracks};
+use spoolframe_client_sdk::types::{Item, MediaId, MediaTracks, SearchKind, SearchScope};
 use spoolframe_client_sdk::{
     self as sdk, CacheSpace, DownloadAction, DownloadFailure, DownloadLibrary, DownloadOptionsInfo,
     DownloadSettings, DownloadSource, DownloadSpace, DownloadTracks, DownloadsHere, ErrorKind,
     FailureRemedy, LocalDownload, MusicDownload, MusicSynced, MusicTarget, NetworkKind,
-    OfflineMusic, RefreshReport, RunEnd, RunProgress, Selection, SkippedChild, SyncedWatch,
+    OfflineMusic, OfflinePlaylist, OfflinePlaylistEntry, RefreshReport, RunEnd, RunProgress,
+    Selection, SkippedChild, SyncedWatch,
 };
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
@@ -18,7 +19,7 @@ use crate::client::SpoolClient;
 use crate::error::SpoolError;
 use crate::runtime::run;
 use crate::session::SpoolSession;
-use crate::values::count;
+use crate::values::{SearchResults, count};
 
 /// A download changed.
 // No box: UniFFI passes enum fields by value, and a notice is sent at most
@@ -69,6 +70,63 @@ impl SpoolClient {
     /// `user_id`'s music on `server` playable here.
     pub fn offline_music(&self, server: String, user_id: String) -> OfflineMusic {
         self.client.downloads().offline_music(&server, &user_id)
+    }
+
+    /// Search what `user_id` of `server` holds on this device, with no
+    /// server: the same results as `SpoolSession::search`, from the
+    /// downloads and the music kept here. People, playlists and a
+    /// library are not searched offline.
+    pub fn search_offline(
+        &self,
+        server: String,
+        user_id: String,
+        query: String,
+        limit: u32,
+        scope: SearchScope,
+        kind: Option<SearchKind>,
+    ) -> Result<SearchResults, SpoolError> {
+        let request = sdk::SearchRequest {
+            query,
+            limit,
+            scope,
+            kind,
+            library: None,
+        };
+        let results = self.client.search_offline(&server, &user_id, request)?;
+        Ok(sdk::search_results(results).into())
+    }
+
+    /// The playlists of `user_id` on `server` whose name `query` finds,
+    /// with no server: those with nothing here too (`on_device` 0, to
+    /// grey them), best first.
+    pub fn search_offline_playlists(
+        &self,
+        server: String,
+        user_id: String,
+        query: String,
+    ) -> Result<Vec<OfflinePlaylist>, SpoolError> {
+        Ok(self
+            .client
+            .search_offline_playlists(&server, &user_id, &query)?)
+    }
+
+    /// Entries of playlist `playlist_id` offline, from `offset`, at most
+    /// `limit`: every one of a playlist longer than its `entries` hold.
+    pub fn offline_playlist_entries(
+        &self,
+        server: String,
+        user_id: String,
+        playlist_id: String,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<OfflinePlaylistEntry> {
+        self.client.downloads().offline_playlist_entries(
+            &server,
+            &user_id,
+            &playlist_id,
+            offset,
+            limit,
+        )
     }
 
     pub fn download_space(&self) -> Result<DownloadSpace, SpoolError> {

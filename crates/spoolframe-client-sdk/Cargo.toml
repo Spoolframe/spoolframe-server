@@ -52,6 +52,13 @@ parking_lot = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# The offline database: playlists, hearts and the search index
+# (downloads/local_db.rs). 0.39 pairs with libsqlite3-sys 0.37, the one
+# sqlx brings in for the server, so the tree has one SQLite; bundled, so
+# every platform has FTS5.
+rusqlite = { version = "0.39", features = ["bundled"] }
+# Folds accents for search with no server (`Client::search_offline`).
+unicode-normalization = "0.1.25"
 uniffi = { workspace = true, optional = true }
 # The pkarr relays servers are looked up at.
 url = { workspace = true }

@@ -35,6 +35,7 @@ pub mod relay_access;
 pub mod resource;
 pub mod rpc;
 pub mod search;
+pub mod search_rank;
 mod search_view;
 pub mod server_id;
 pub mod streams;

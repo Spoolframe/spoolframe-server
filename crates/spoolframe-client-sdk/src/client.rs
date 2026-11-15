@@ -1052,7 +1052,12 @@ impl Client {
             link.close();
         }
         let _saving = self.inner.saving.lock().await;
-        self.forget_saved(id).await
+        self.forget_saved(id).await?;
+        self.inner
+            .downloads
+            .forget_playlists(endpoint_id, None)
+            .await;
+        Ok(())
     }
 
     /// The user of session `token`, `username`, left server `server`:
@@ -1070,6 +1075,10 @@ impl Client {
         let _saving = self.inner.saving.lock().await;
         let mut stored = session::load(storage, &server).await?;
         stored.retain(|s| s.token.as_deref() != Some(token.0.as_str()) && s.username != username);
+        self.inner
+            .downloads
+            .forget_playlists(&server.to_string(), Some(username))
+            .await;
         if stored.is_empty() {
             return self.forget_saved(server).await;
         }
@@ -1741,7 +1750,12 @@ impl Client {
     pub async fn forget_profile(&self, endpoint_id: &str, username: &str) -> Result<(), SdkError> {
         let server = parse_id(endpoint_id)?;
         self.update_sessions(server, |stored| stored.retain(|s| s.username != username))
-            .await
+            .await?;
+        self.inner
+            .downloads
+            .forget_playlists(&server.to_string(), Some(username))
+            .await;
+        Ok(())
     }
 
     /// Forget the session `token` on `server`, profile and all.
