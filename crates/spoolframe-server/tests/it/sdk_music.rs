@@ -1252,7 +1252,7 @@ fn road_trip_offline(
     client: &Client,
     server: &TestServer,
     user: &str,
-) -> Option<(u32, u32, Vec<String>)> {
+) -> Option<(Option<u32>, u32, Vec<String>)> {
     let music = offline(client, server, user);
     let p = music.playlists.iter().find(|p| p.name == "Road trip")?;
     (!p.entries.is_empty()).then(|| {
@@ -1300,14 +1300,14 @@ async fn a_playlist_never_opened_is_kept_for_offline_and_read_again_when_it_chan
         .await
         .unwrap();
     let reread = eventually(Duration::from_secs(30), || {
-        road_trip_offline(&client, &server, &user).is_some_and(|(total, _, _)| total == 3)
+        road_trip_offline(&client, &server, &user).is_some_and(|(total, _, _)| total == Some(3))
     })
     .await;
     assert_eq!(
         (kept, first, reread),
         (
             true,
-            Some((2, 0, vec!["32".to_owned(), "33".to_owned()])),
+            Some((Some(2), 0, vec!["32".to_owned(), "33".to_owned()])),
             true
         )
     );

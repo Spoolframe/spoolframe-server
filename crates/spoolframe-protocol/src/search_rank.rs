@@ -115,8 +115,11 @@ impl Ranker {
 
     /// What a client is shown of `found`, the matches for `query` (its
     /// text and the year taken off it). `totals` has each kind's count,
-    /// the other scopes' too when they were counted. A show's own
-    /// episodes are quiet under any of its other copies (`copies`).
+    /// the other scopes' too when they were counted. In `All`, an episode
+    /// whose show is listed in the shows group (or any of that show's
+    /// other copies, `copies`) is quiet: counted in `hidden`, not listed.
+    /// One whose show is the top match is listed. A group with no item is
+    /// left out, but for a "See all".
     pub fn group(
         &self,
         request: &SearchRequest,
@@ -145,15 +148,12 @@ impl Ranker {
             Some(TopResult::Person(person)) => Some(&person.id),
             _ => None,
         };
-        let shows: HashSet<MediaId> = found
-            .iter()
-            .filter(|g| g.kind == SearchKind::Shows)
-            .flat_map(|g| g.items.iter().map(|i| i.id().clone()))
-            .flat_map(|id| {
-                let more = copies.get(&id).cloned().unwrap_or_default();
-                std::iter::once(id).chain(more)
-            })
-            .collect();
+        // The shows listed in the shows group, with their other copies:
+        // what a show's own episodes are under in `All`. Filled as that
+        // group is made, before the episodes' (`found` is in kind order,
+        // shows first); the top match is in no group, so its episodes are
+        // listed.
+        let mut shows: HashSet<MediaId> = HashSet::new();
 
         let mut groups = Vec::new();
         for Matched {
@@ -181,11 +181,19 @@ impl Ranker {
             };
             items.truncate(cap);
             people.truncate(cap);
+            if kind == SearchKind::Shows {
+                for id in items.iter().map(Item::id) {
+                    shows.insert(id.clone());
+                    shows.extend(copies.get(id).cloned().unwrap_or_default());
+                }
+            }
             let shown = items.len() + people.len();
             let available = usize::try_from(total)
                 .unwrap_or(usize::MAX)
                 .saturating_sub(removed + hidden);
-            if shown == 0 && hidden == 0 && !see_all {
+            // A group is shown only with something in it; "See all" is
+            // its group, empty or not.
+            if shown == 0 && !see_all {
                 continue;
             }
             let more = available > shown;

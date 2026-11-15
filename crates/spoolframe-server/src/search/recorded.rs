@@ -13,7 +13,7 @@ use spoolframe_types::{ArtworkKind, Item, Person, SearchKind, SearchScope};
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::{search, this_year};
+use super::{QUIET_EPISODES, search, this_year};
 use crate::catalog::{Composite, LiveCatalog};
 
 #[derive(Deserialize)]
@@ -165,7 +165,7 @@ async fn a_library_returns_only_its_items() {
 }
 
 #[tokio::test]
-async fn a_show_is_the_top_match_and_its_episodes_are_left_out_of_all() {
+async fn a_show_is_the_top_match_and_its_episodes_are_listed_quietly_in_all() {
     let searcher = Searcher::start(&["letterkenny"]).await;
     let results = searcher
         .search(request("letterkenny", SearchScope::All))
@@ -173,9 +173,15 @@ async fn a_show_is_the_top_match_and_its_episodes_are_left_out_of_all() {
     assert!(
         matches!(&results.top, Some(TopResult::Item(Item::Show(s))) if s.title == "Letterkenny")
     );
+    // The top match is in no shows row: its episodes are listed, quiet
+    // (at most three), not hidden under it.
     let episodes = group(&results, SearchKind::Episodes).unwrap();
-    assert!(episodes.items.is_empty(), "{:?}", episodes.items);
-    assert_eq!(episodes.hidden, 3);
+    assert_eq!(
+        (episodes.items.len(), episodes.hidden),
+        (QUIET_EPISODES, 0),
+        "{:?}",
+        episodes.items
+    );
     // In their own scope they are all there.
     let results = searcher
         .search(request("letterkenny", SearchScope::Episodes))
@@ -192,7 +198,8 @@ async fn a_show_beats_its_own_episode_of_the_same_name() {
     assert!(
         matches!(&results.top, Some(TopResult::Item(Item::Show(s))) if s.title == "The Sopranos")
     );
-    assert_eq!(group(&results, SearchKind::Episodes).unwrap().hidden, 1);
+    let episodes = group(&results, SearchKind::Episodes).unwrap();
+    assert_eq!((episodes.items.len(), episodes.hidden), (1, 0));
 }
 
 #[tokio::test]

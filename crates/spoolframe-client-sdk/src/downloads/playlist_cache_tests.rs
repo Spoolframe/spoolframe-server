@@ -275,7 +275,7 @@ fn offline_every_playlist_is_listed_with_how_many_of_its_tracks_are_here() {
         &page(summary("p2", "Gym", 1), &["4", "5"], &[]),
     );
     let music = device.shared.offline_music(&device.server(), "user");
-    let shown: Vec<(String, u32, u32, Vec<TrackOnDevice>)> = music
+    let shown: Vec<(String, u32, Option<u32>, Vec<TrackOnDevice>)> = music
         .playlists
         .iter()
         .map(|p| {
@@ -293,7 +293,7 @@ fn offline_every_playlist_is_listed_with_how_many_of_its_tracks_are_here() {
             (
                 "Road Trip".to_owned(),
                 2,
-                3,
+                Some(3),
                 vec![
                     TrackOnDevice::Downloaded,
                     TrackOnDevice::Kept,
@@ -303,7 +303,7 @@ fn offline_every_playlist_is_listed_with_how_many_of_its_tracks_are_here() {
             (
                 "Gym".to_owned(),
                 0,
-                2,
+                Some(2),
                 vec![TrackOnDevice::Absent, TrackOnDevice::Absent]
             ),
         ]
@@ -411,11 +411,36 @@ fn offline_search_finds_a_playlist_with_nothing_here() {
         "cafe",
     )
     .unwrap();
-    let shown: Vec<(&str, u32, u32)> = found
+    let shown: Vec<(&str, u32, Option<u32>)> = found
         .iter()
         .map(|p| (p.name.as_str(), p.on_device, p.total))
         .collect();
-    assert_eq!(shown, [("Café Gym", 0, 1)]);
+    assert_eq!(shown, [("Café Gym", 0, Some(1))]);
+}
+
+/// A playlist whose entries were never read here has no count: it is not
+/// one read and found empty.
+#[test]
+fn a_playlist_never_read_here_has_no_total_and_one_read_empty_has_zero() {
+    let device = device("unread");
+    device.listed(vec![
+        summary("p1", "Black Neon", 1),
+        summary("p2", "Black Empty", 1),
+    ]);
+    device.shared.playlist_read(
+        &device.shared.writer(server(), "user", "alice"),
+        &page(summary("p2", "Black Empty", 1), &[], &[]),
+    );
+    let found = super::super::offline_search::search_playlists(
+        &device.shared,
+        &device.server(),
+        "user",
+        "black",
+    )
+    .unwrap();
+    let shown: Vec<(&str, Option<u32>)> =
+        found.iter().map(|p| (p.name.as_str(), p.total)).collect();
+    assert_eq!(shown, [("Black Neon", None), ("Black Empty", Some(0))]);
 }
 
 /// A playlist of any length is kept whole and read a page at a time.
@@ -458,7 +483,7 @@ fn a_playlist_of_200k_entries_is_kept_and_paged() {
             keys.len(),
             keys[0].as_str()
         ),
-        (N, INLINE_ENTRIES, 10, "199990")
+        (Some(N), INLINE_ENTRIES, 10, "199990")
     );
 }
 

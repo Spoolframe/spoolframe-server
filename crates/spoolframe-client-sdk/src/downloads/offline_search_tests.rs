@@ -277,8 +277,12 @@ fn an_episode_is_found_by_its_show_s_title_and_its_show_with_it() {
         .iter()
         .find(|g| g.kind == SearchKind::Episodes)
         .unwrap();
-    // Under its show in All, and found under the Episodes scope.
-    assert_eq!(episodes.hidden, 1);
+    // Listed in All, its show being the top match and in no shows row;
+    // and found under the Episodes scope.
+    let listed: Vec<String> = episodes.items.iter().map(|i| i.id().to_string()).collect();
+    assert_eq!(listed, ["plex:episode:9"]);
+    assert_eq!(episodes.hidden, 0);
+    assert!(results.groups.iter().all(|g| !g.items.is_empty()));
     let scoped = device.search(
         "user",
         SearchRequest {
@@ -465,8 +469,8 @@ fn a_deleted_download_leaves_the_search() {
             shown(&device.search("user", all("breaking"))),
         ),
         (
-            // The show on top, its episode under it.
-            (vec!["plex:movie:1".to_owned()], 1),
+            // The show on top, its episode listed.
+            (vec!["plex:movie:1".to_owned()], 2),
             Vec::<String>::new(),
             Vec::<String>::new()
         )

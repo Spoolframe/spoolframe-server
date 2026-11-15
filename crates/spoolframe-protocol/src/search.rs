@@ -201,7 +201,9 @@ pub enum TopResult<T = Item> {
     Person(Person),
 }
 
-/// One kind's results.
+/// One kind's results. A group is in the results only with an item or a
+/// person in it, but for a "See all" (`kind`), whose group is there empty
+/// or not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchGroup<T = Item> {
     pub kind: SearchKind,
@@ -218,9 +220,11 @@ pub struct SearchGroup<T = Item> {
     /// counted only when every one of them is here (`more` is false):
     /// Plex lists them only up to the limit.
     pub total: Option<u32>,
-    /// Episodes left out because their show is in the shows group (only
-    /// in `All`, where episodes are quiet), for "3 from Severance are
-    /// under the show". A group may be here with only this.
+    /// Episodes left out because their show is listed in the shows group
+    /// (only in `All`, where episodes are quiet), for "3 from Severance
+    /// are under the show". The top match is in no group: its own
+    /// episodes are listed, not hidden. Never the group's only content: a
+    /// group whose every episode is hidden is left out.
     pub hidden: u32,
 }
 

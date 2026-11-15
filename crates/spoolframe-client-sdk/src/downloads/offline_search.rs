@@ -59,9 +59,10 @@ impl Client {
 
 impl Client {
     /// The playlists of `user_id` on `server` whose name `query` finds,
-    /// with no server: every playlist read while online, those with
+    /// with no server: every playlist listed while online, those with
     /// nothing here too (their [`OfflinePlaylist::on_device`] is 0: show
-    /// them greyed), and those downloaded. Matched as
+    /// them greyed), and those downloaded. One whose entries were never
+    /// read here has no [`OfflinePlaylist::total`]: not known, not empty. Matched as
     /// [`Client::search_offline`] matches titles; best first (the exact
     /// name, then one that starts with the query), then in the server's
     /// order. The playlists' group of an offline search screen: a

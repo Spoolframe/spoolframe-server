@@ -428,7 +428,10 @@ pub struct OfflinePlaylist {
     /// A music download holds it ([`Downloads::start_music`]).
     pub downloaded: bool,
     /// How many tracks it has, here or not ("12 of 22 on this iPhone").
-    pub total: u32,
+    /// `None` until its entries are read once on this device (online, by
+    /// the SDK) and with no download of it here: not known, which is not
+    /// empty. `Some(0)` is a playlist read and found empty.
+    pub total: Option<u32>,
     /// How many of `entries` are on this device: 0 to grey it out.
     pub on_device: u32,
     /// Its first tracks as last read (at most
@@ -1767,7 +1770,7 @@ fn offline_playlists(
         let kept = data.kept;
         let target = target_of(&kept.summary);
         let stored = downloaded.iter().find(|d| d.target == target);
-        let (entries, total, on_device): (Vec<OfflinePlaylistEntry>, u32, usize) =
+        let (entries, total, on_device): (Vec<OfflinePlaylistEntry>, Option<u32>, usize) =
             match (&kept.read_at, stored) {
                 // Not read yet: what the download holds, as far as known here.
                 (None, Some(d)) => {
@@ -1775,13 +1778,15 @@ fn offline_playlists(
                     let n = entries.len();
                     (
                         entries,
-                        u32::try_from(d.tracks.len()).unwrap_or(u32::MAX),
+                        Some(u32::try_from(d.tracks.len()).unwrap_or(u32::MAX)),
                         n,
                     )
                 }
-                _ => (
+                // Listed, never read: how many it has is not known here.
+                (None, None) => (Vec::new(), None, 0),
+                (Some(_), _) => (
                     data.inline.iter().map(entry).collect(),
-                    kept.total,
+                    Some(kept.total),
                     data.here
                         .iter()
                         .filter(|id| by_track.contains_key(id))
@@ -1815,7 +1820,7 @@ fn offline_playlists(
             tracks: here_of(&d.tracks),
             summary: None,
             downloaded: true,
-            total: u32::try_from(d.tracks.len()).unwrap_or(u32::MAX),
+            total: Some(u32::try_from(d.tracks.len()).unwrap_or(u32::MAX)),
             on_device: u32::try_from(entries.len()).unwrap_or(u32::MAX),
             entries,
             cover: None,

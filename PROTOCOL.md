@@ -49,6 +49,7 @@ be updated together. The changes per revision are in
   [playlist covers](#playlist-covers) and
   [up next in a playlist](#up-next-in-a-playlist)
 - [Sorting and filtering a library](#sorting-and-filtering-a-library)
+  and [search groups](#search-groups)
 - [Downloads](#downloads) and [download add-ons](#download-add-ons)
 - [Portable identities](#portable-identities)
 - [Faces in backdrops](#faces-in-backdrops) (experimental)
@@ -2427,6 +2428,19 @@ none. A paired server's (`fed:`) film, show or artist carries the
 added date, ratings and size it sent; its other items carry only the
 external ids. `total` on a page already counts what the filter keeps,
 for "37 of 412".
+
+## Search groups
+
+`Search` answers a top match and a group per kind (P3-09); the server
+and the SDK's offline search group by the same rules
+(`spoolframe_protocol::search_rank`). In the `all` scope episodes are
+quiet: at most three are listed, last, and an episode whose show is
+listed in the shows group is left out and counted in that group's
+`hidden` ("2 from Severance are under the show"). The top match is in
+no group, so a show that is the top match does not hide its episodes:
+they are listed. A group is returned only with an item or a person in
+it; one emptied by the top match or by `hidden` is left out. A "See
+all" (`kind`) returns its group even when empty.
 
 ## Liked and All
 

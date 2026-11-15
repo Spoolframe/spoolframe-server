@@ -650,27 +650,77 @@ mod tests {
         assert!(!movies.more);
     }
 
+    /// "2 from Letterkenny Live are under the show": a show listed in the
+    /// shows group holds its own episodes in `All`.
     #[test]
-    fn in_all_a_show_s_own_episodes_are_left_out_and_counted() {
+    fn in_all_a_listed_show_s_own_episodes_are_left_out_and_counted() {
         let results = grouped(
             &request(SearchScope::All, None, 10),
             "letterkenny",
             vec![
-                found(SearchKind::Shows, vec![show("5", "Letterkenny")]),
+                found(
+                    SearchKind::Shows,
+                    vec![show("5", "Letterkenny"), show("4", "Letterkenny Live")],
+                ),
                 found(
                     SearchKind::Episodes,
                     vec![
-                        episode("6", "Letterkenny Talent Show", "5"),
-                        episode("7", "The Letterkenny Leave", "5"),
+                        episode("6", "Letterkenny Talent Show", "4"),
+                        episode("7", "The Letterkenny Leave", "4"),
                         episode("8", "Letterkenny Problems", "99"),
                     ],
                 ),
             ],
         );
+        assert_eq!(top_item(&results), "plex:show:5");
+        let shows = of(&results, SearchKind::Shows).unwrap();
+        assert_eq!(keys(&shows.items), ["plex:show:4"]);
         let episodes = of(&results, SearchKind::Episodes).unwrap();
         assert_eq!(keys(&episodes.items), ["plex:episode:8"]);
         assert_eq!(episodes.hidden, 2);
         assert!(!episodes.more);
+    }
+
+    /// The top match is no shows group: its episodes are listed, as there
+    /// is no row they would be under.
+    #[test]
+    fn in_all_the_top_match_show_s_own_episodes_are_listed() {
+        let results = grouped(
+            &request(SearchScope::All, None, 10),
+            "black",
+            vec![
+                found(SearchKind::Shows, vec![show("5", "Black Sails")]),
+                found(SearchKind::Episodes, vec![episode("6", "II.", "5")]),
+            ],
+        );
+        assert_eq!(top_item(&results), "plex:show:5");
+        let episodes = of(&results, SearchKind::Episodes).unwrap();
+        assert_eq!(keys(&episodes.items), ["plex:episode:6"]);
+        assert_eq!(episodes.hidden, 0);
+    }
+
+    /// A group is there only with an item: one whose only item is the top
+    /// match, or whose items are all under their show, is left out.
+    #[test]
+    fn in_all_a_group_with_no_items_is_left_out() {
+        let results = grouped(
+            &request(SearchScope::All, None, 10),
+            "letterkenny",
+            vec![
+                found(
+                    SearchKind::Shows,
+                    vec![show("5", "Letterkenny"), show("4", "Letterkenny Live")],
+                ),
+                found(
+                    SearchKind::Episodes,
+                    vec![episode("6", "Letterkenny Talent Show", "4")],
+                ),
+                found(SearchKind::Movies, vec![movie("1", "Letterkenny", 2016)]),
+            ],
+        );
+        let kinds: Vec<_> = results.groups.iter().map(|g| g.kind).collect();
+        assert_eq!(kinds, [SearchKind::Shows, SearchKind::Movies]);
+        assert!(results.groups.iter().all(|g| !g.items.is_empty()));
     }
 
     #[test]

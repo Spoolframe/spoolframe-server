@@ -13,7 +13,8 @@
 - Added, SDK: every playlist a profile sees is kept for offline with its
   tracks and cover, by the SDK itself while signed in, so
   `Downloads::offline_music` lists them all, not only those downloaded.
-  `OfflinePlaylist` gains `summary`, `downloaded`, `total`, `on_device`,
+  `OfflinePlaylist` gains `summary`, `downloaded`, `total` (`None` until
+  its entries are read here once, so never read is not empty), `on_device`,
   `entries` (`OfflinePlaylistEntry { item, on_device: TrackOnDevice,
   liked, track }`, `TrackOnDevice` `Downloaded`, `Kept` or `Absent`) and
   `cover`. Hearts are kept as they are learned, so `OfflineTrack::liked`
@@ -67,6 +68,13 @@
   clients ignore the fields. See PROTOCOL.md's Merging libraries.
   `ItemsPage::total` was always the count the filter keeps; its doc now
   says so.
+- Changed, server and SDK: in a search's `all` scope, a show that is the
+  top match no longer hides its own episodes: they are listed in the
+  episodes group. Only a show listed in the shows group hides them
+  (`hidden`). A group with no items is no longer returned; a "See all"
+  still returns its own. Searching "black" offline found Black Sails as
+  the top match and an episodes group with no items, its one downloaded
+  episode hidden under a show listed nowhere.
 - Added, SDK: `Client::look_up_server(address)` (FFI `look_up_server`),
   answering `ServerLookup { endpoint_id, name, fingerprint, addrs,
   relays, lookup }` over HTTPS only; then `connect` and `pin` as usual,
