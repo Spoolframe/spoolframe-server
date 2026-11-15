@@ -49,7 +49,7 @@ be updated together. The changes per revision are in
   [playlist covers](#playlist-covers) and
   [up next in a playlist](#up-next-in-a-playlist)
 - [Sorting and filtering a library](#sorting-and-filtering-a-library)
-  and [search groups](#search-groups)
+- [Search groups](#search-groups)
 - [Downloads](#downloads) and [download add-ons](#download-add-ons)
 - [Sending diagnostics](#sending-diagnostics)
 - [Portable identities](#portable-identities)

@@ -194,6 +194,10 @@ pub(crate) struct SegmentFeed {
     send: mpsc::Sender<Piece>,
     /// The keeper's: given up on, or kept.
     done: Arc<AtomicBool>,
+    /// A read found the queue full and was not handed on: nothing more is.
+    /// The writer still writes what is queued, which may be the whole
+    /// track, and gives up only if it was not.
+    overflowed: Arc<AtomicBool>,
 }
 
 impl SegmentFeed {
@@ -202,16 +206,24 @@ impl SegmentFeed {
     #[cfg(test)]
     pub(crate) fn detached(depth: usize) -> (Self, mpsc::Receiver<Piece>) {
         let (send, receive) = mpsc::channel(depth);
-        let done = Arc::new(AtomicBool::new(false));
-        (Self { send, done }, receive)
+        let (done, overflowed) = Default::default();
+        (
+            Self {
+                send,
+                done,
+                overflowed,
+            },
+            receive,
+        )
     }
 
     /// An HLS play read part of a segment ([`SegmentRead`]), or learned
     /// that it is whole (no bytes): handed on, never waited for. When too
-    /// many wait, the track is not kept. Nothing is copied once the
-    /// keeper is done.
+    /// many wait, nothing more is handed on, and the track is kept only if
+    /// what was is all of it. Nothing is copied once the keeper is done,
+    /// or after that.
     pub(crate) fn offer(&self, read: SegmentRead<'_>) {
-        if self.done.load(Ordering::Relaxed) {
+        if self.done.load(Ordering::Relaxed) || self.overflowed.load(Ordering::Relaxed) {
             return;
         }
         let piece = Piece {
@@ -224,8 +236,8 @@ impl SegmentFeed {
             complete: read.complete,
         };
         if self.send.try_send(piece).is_err() {
-            tracing::debug!("a track's segments came faster than kept: not kept");
-            self.done.store(true, Ordering::Relaxed);
+            tracing::debug!("a track's segments came faster than kept: no more are");
+            self.overflowed.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -290,7 +302,9 @@ impl SegmentOrder {
             };
             held.extend_from_slice(new);
             self.held += new.len();
-            *done = whole(held.len());
+            // Whole once is whole: a slower read of the same segment,
+            // opened before the encode finished it, says complete false.
+            *done |= whole(held.len());
             return if self.held > PENDING_MAX {
                 Step::GiveUp
             } else {
@@ -384,14 +398,25 @@ impl Keeper {
         let (send, mut receive) = mpsc::channel(FEED_DEPTH);
         // The task owns the keeper, and the playback the sender: no cycle.
         let keeper = self.clone();
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let gave_out = overflowed.clone();
         runtime.spawn(async move {
             while let Some(piece) = receive.recv().await {
                 keeper.segment(piece).await;
+                // Past an overflow nothing more comes: once what was queued
+                // is written, the track is whole or it never will be.
+                if gave_out.load(Ordering::Relaxed) && receive.is_empty() {
+                    break;
+                }
+            }
+            if gave_out.load(Ordering::Relaxed) {
+                keeper.abandon().await;
             }
         });
         Some(SegmentFeed {
             send,
             done: self.done.clone(),
+            overflowed,
         })
     }
 
@@ -478,10 +503,6 @@ impl Keeper {
     async fn segment(&self, piece: Piece) {
         let mut state = self.state.lock().await;
         if self.done.load(Ordering::Relaxed) {
-            // Given up on by the feed: its part goes now.
-            if matches!(*state, State::Writing { .. }) {
-                self.give_up(&mut state);
-            }
             return;
         }
         if matches!(*state, State::Idle) {
@@ -602,6 +623,15 @@ impl Keeper {
         }
         if matches!(state, State::Writing { sink, .. } if sink.writer.is_complete()) {
             self.keep(state).await;
+        }
+    }
+
+    /// Its feed overflowed and what it queued is written: a track not
+    /// whole by now never will be, and its part goes.
+    async fn abandon(&self) {
+        let mut state = self.state.lock().await;
+        if matches!(*state, State::Writing { .. }) {
+            self.give_up(&mut state);
         }
     }
 
@@ -806,6 +836,25 @@ mod tests {
         growing.complete = false;
         let pieces = [growing, piece(0, 4, b"", 4), piece(1, 0, b"aa", 2)];
         assert_eq!(written(&pieces).as_deref(), Some(&b"initaa"[..]));
+    }
+
+    /// Two reads of a segment read ahead, one opened before the encode
+    /// finished it: the slower one's last bytes do not make it unfinished
+    /// again, and it follows the one before it.
+    #[test]
+    fn a_segment_read_ahead_whole_stays_whole() {
+        let mut init = piece(0, 0, b"in", 4);
+        init.complete = false;
+        let mut slower = piece(1, 1, b"a", 2);
+        slower.complete = false;
+        let pieces = [
+            init,
+            piece(1, 0, b"aa", 2),
+            slower,
+            piece(0, 2, b"it", 4),
+            piece(2, 0, b"bb", 2),
+        ];
+        assert_eq!(written(&pieces).as_deref(), Some(&b"initaabb"[..]));
     }
 
     #[test]

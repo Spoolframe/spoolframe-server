@@ -336,3 +336,73 @@ async fn a_track_let_go_right_after_its_last_segment_is_kept() {
     client.close().await;
     server.stop().await;
 }
+
+/// Segment `n` of `playback`, read whole with `read_segment`, from 0.
+async fn read_whole(playback: &ManagedPlayback, n: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = playback
+            .read_segment(0, n, bytes.len() as u64, spoolframe_client_sdk::MAX_READ)
+            .await
+            .unwrap();
+        let empty = chunk.bytes.is_empty();
+        bytes.extend(chunk.bytes);
+        if chunk.complete && bytes.len() as u64 == chunk.size {
+            return bytes;
+        }
+        if empty {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// The whole track's reads queued, then one read again more than the
+/// queue holds: what was queued is written, and the track is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_track_queued_whole_is_kept_though_a_read_again_overflowed() {
+    let server = music_server("sdk-music-hls-overflow").await;
+    write_long_flac(&server, "32");
+    let dir = TestDir::new("spoolframe-sdk-music-hls-overflow").await;
+    let client = iphone_client(&server, &dir).await;
+    let session = alice(&server, &client).await;
+    // The playback, and with it the keeper's writer, on a runtime of its
+    // own, driven only once the test says: until then the reads queue.
+    let (opened, playback) = tokio::sync::oneshot::channel();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let opener = session.clone();
+    let writer = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let playback = runtime.block_on(async {
+            opener
+                .open_playback(&track_id("32"), None, PlaybackOptions::default())
+                .await
+                .unwrap()
+        });
+        opened.send(playback).unwrap();
+        wait.recv().unwrap();
+        runtime.block_on(async { stopped.await.unwrap() });
+    });
+    let playback = playback.await.unwrap();
+    let media = playback.manifest(ManifestKind::Media, 0).await.unwrap();
+    let segments = media.lines().filter(|l| l.starts_with("#EXTINF:")).count() as u32;
+    let mut served = Vec::new();
+    for n in 0..=segments {
+        served.extend(read_whole(&playback, n).await);
+    }
+    // Segment 1 read again, past what the queue holds.
+    for _ in 0..80 {
+        read_whole(&playback, 1).await;
+    }
+    go.send(()).unwrap();
+    let kept = kept_file(&client, "32").await;
+    drop(playback);
+    stop.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(kept.map(|k| k == served), Some(true));
+    client.close().await;
+    server.stop().await;
+}
