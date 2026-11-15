@@ -69,8 +69,7 @@ impl Music {
 
     fn artist() -> Item {
         Item::Artist(Artist {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Artist, 1),
             name: "Daft Punk".into(),
             summary: None,
@@ -80,8 +79,7 @@ impl Music {
 
     fn album(key: u32) -> Item {
         Item::Album(Album {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Album, key),
             artist_id: id(MediaKind::Artist, 1),
             artist_name: Some("Daft Punk".into()),
@@ -94,9 +92,7 @@ impl Music {
 
     fn track(album: u32, number: u32) -> Item {
         Item::Track(Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Track, album + number),
             album_id: id(MediaKind::Album, album),
             artist_id: id(MediaKind::Artist, 1),

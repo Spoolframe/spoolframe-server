@@ -53,6 +53,9 @@ pub enum Previous {
 }
 
 /// A heading of the Up next list.
+// A few headings a list, so their size does not matter; an album unboxed
+// keeps the pattern apps match on.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueueHeading {
     /// Over the hand-added items.
@@ -548,9 +551,7 @@ mod tests {
 
     fn song(name: &str) -> Item {
         Item::Track(Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Track, name),
             album_id: id(MediaKind::Album, "1"),
             artist_id: id(MediaKind::Artist, "1"),
@@ -575,8 +576,7 @@ mod tests {
 
     fn album(title: &str) -> Album {
         Album {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Album, title),
             artist_id: id(MediaKind::Artist, "1"),
             artist_name: None,

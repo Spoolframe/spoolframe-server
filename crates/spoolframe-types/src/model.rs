@@ -140,36 +140,15 @@ pub struct Progress {
     pub watched: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What an app that merges several servers' libraries sorts by and
+/// matches copies by, on every kind but a season; each field is `None`
+/// (or empty) where the catalog does not say, as for a show's size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct Movie {
-    pub id: MediaId,
-    pub title: String,
-    /// The year it came out: the catalog's own, else `release_date`'s.
-    pub year: Option<u16>,
-    /// The day it came out, `"YYYY-MM-DD"`.
-    ///
-    /// This and `cast` are read as `None` and no one when left out, though
-    /// every server sends them: the SDK keeps an item with its download,
-    /// and a download kept by an older SDK lacks the keys.
-    pub release_date: Option<CalendarDate>,
-    pub summary: Option<String>,
-    /// The age rating as the catalog has it ("R", "TV-MA"), shown as
-    /// is; `None` when it has none.
-    pub content_rating: Option<String>,
-    #[serde(with = "serde_time::millis::option_required")]
-    pub duration: Option<Duration>,
-    /// Who is in it and who directed it (see [`CastMember`]).
-    #[serde(default)]
-    pub cast: Vec<CastMember>,
+pub struct MergeFacts {
     /// When the server's catalog added it (Unix seconds on the wire), as
-    /// the `added` sort ([`crate::SortKey::Added`]) orders by; `None` where
-    /// the catalog does not say.
-    ///
-    /// This and the fields to `external_ids` are what an app that merges
-    /// several servers' libraries sorts by and matches copies by. Each is
-    /// left out of the wire when it has none, and is none from an older
-    /// server.
+    /// the `added` sort ([`crate::SortKey::Added`]) orders by. A show's is
+    /// Plex's date for the show, which its `added` sort orders by.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -196,11 +175,46 @@ pub struct Movie {
     /// Plex's own (`plex://movie/…`), and its agents' where the catalog
     /// has them: `imdb://tt0078748`, `tmdb://348`, `tvdb://…`, and
     /// MusicBrainz's `mbid://…` for music. Two servers' copies of one
-    /// title share some, where both catalogs matched it. Empty where the
-    /// catalog has none.
+    /// title share some, where both catalogs matched it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "uniffi", uniffi(default = []))]
     pub external_ids: Vec<String>,
+}
+
+impl MergeFacts {
+    /// Nothing known: left out of the wire.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct Movie {
+    pub id: MediaId,
+    pub title: String,
+    /// The year it came out: the catalog's own, else `release_date`'s.
+    pub year: Option<u16>,
+    /// The day it came out, `"YYYY-MM-DD"`.
+    ///
+    /// This and `cast` are read as `None` and no one when left out, though
+    /// every server sends them: the SDK keeps an item with its download,
+    /// and a download kept by an older SDK lacks the keys.
+    pub release_date: Option<CalendarDate>,
+    pub summary: Option<String>,
+    /// The age rating as the catalog has it ("R", "TV-MA"), shown as
+    /// is; `None` when it has none.
+    pub content_rating: Option<String>,
+    #[serde(with = "serde_time::millis::option_required")]
+    pub duration: Option<Duration>,
+    /// Who is in it and who directed it (see [`CastMember`]).
+    #[serde(default)]
+    pub cast: Vec<CastMember>,
+    /// What an app merging several servers' libraries sorts by and
+    /// matches copies by ([`MergeFacts`]). Left out of the wire when it
+    /// holds nothing, and read as nothing from an older server.
+    #[serde(default, skip_serializing_if = "MergeFacts::is_empty")]
+    pub merge: MergeFacts,
     pub artwork: Vec<Artwork>,
     pub playback: PlaybackState,
 }
@@ -236,27 +250,11 @@ pub struct Show {
     /// Who is in it and who directed it (see [`CastMember`]).
     #[serde(default)]
     pub cast: Vec<CastMember>,
-    /// When the server's catalog added it, as [`Movie::added_at`]: Plex's
-    /// date for the show, which its `added` sort orders by.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "serde_time::unix_seconds::option"
-    )]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub added_at: Option<SystemTime>,
-    /// As [`Movie::rating_tenths`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub rating_tenths: Option<u16>,
-    /// As [`Movie::audience_rating_tenths`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub audience_rating_tenths: Option<u16>,
-    /// As [`Movie::external_ids`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
-    pub external_ids: Vec<String>,
+    /// What an app merging several servers' libraries sorts by and
+    /// matches copies by ([`MergeFacts`]). Left out of the wire when it
+    /// holds nothing, and read as nothing from an older server.
+    #[serde(default, skip_serializing_if = "MergeFacts::is_empty")]
+    pub merge: MergeFacts,
     pub artwork: Vec<Artwork>,
 }
 
@@ -306,30 +304,11 @@ pub struct Episode {
     /// no one, as [`Movie::cast`].
     #[serde(default)]
     pub cast: Vec<CastMember>,
-    /// When the server's catalog added it, as [`Movie::added_at`].
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "serde_time::unix_seconds::option"
-    )]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub added_at: Option<SystemTime>,
-    /// As [`Movie::rating_tenths`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub rating_tenths: Option<u16>,
-    /// As [`Movie::audience_rating_tenths`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub audience_rating_tenths: Option<u16>,
-    /// Its file's size in bytes: its first version's first part.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub size: Option<u64>,
-    /// As [`Movie::external_ids`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
-    pub external_ids: Vec<String>,
+    /// What an app merging several servers' libraries sorts by and
+    /// matches copies by ([`MergeFacts`]). Left out of the wire when it
+    /// holds nothing, and read as nothing from an older server.
+    #[serde(default, skip_serializing_if = "MergeFacts::is_empty")]
+    pub merge: MergeFacts,
     pub artwork: Vec<Artwork>,
     pub playback: PlaybackState,
 }
@@ -365,18 +344,11 @@ pub struct Artist {
     pub id: MediaId,
     pub name: String,
     pub summary: Option<String>,
-    /// When the server's catalog added it, as [`Movie::added_at`].
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "serde_time::unix_seconds::option"
-    )]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub added_at: Option<SystemTime>,
-    /// As [`Movie::external_ids`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
-    pub external_ids: Vec<String>,
+    /// What an app merging several servers' libraries sorts by and
+    /// matches copies by ([`MergeFacts`]). Left out of the wire when it
+    /// holds nothing, and read as nothing from an older server.
+    #[serde(default, skip_serializing_if = "MergeFacts::is_empty")]
+    pub merge: MergeFacts,
     pub artwork: Vec<Artwork>,
 }
 
@@ -394,18 +366,11 @@ pub struct Album {
     /// does not say: Plex counts them on the album itself, not in
     /// listings or search.
     pub track_count: Option<u32>,
-    /// When the server's catalog added it, as [`Movie::added_at`].
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "serde_time::unix_seconds::option"
-    )]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub added_at: Option<SystemTime>,
-    /// As [`Movie::external_ids`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
-    pub external_ids: Vec<String>,
+    /// What an app merging several servers' libraries sorts by and
+    /// matches copies by ([`MergeFacts`]). Left out of the wire when it
+    /// holds nothing, and read as nothing from an older server.
+    #[serde(default, skip_serializing_if = "MergeFacts::is_empty")]
+    pub merge: MergeFacts,
     pub artwork: Vec<Artwork>,
 }
 
@@ -440,22 +405,11 @@ pub struct Track {
     pub sample_rate: Option<u32>,
     #[serde(with = "serde_time::millis::option_required")]
     pub duration: Option<Duration>,
-    /// When the server's catalog added it, as [`Movie::added_at`].
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "serde_time::unix_seconds::option"
-    )]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub added_at: Option<SystemTime>,
-    /// Its file's size in bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
-    pub size: Option<u64>,
-    /// As [`Movie::external_ids`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "uniffi", uniffi(default = []))]
-    pub external_ids: Vec<String>,
+    /// What an app merging several servers' libraries sorts by and
+    /// matches copies by ([`MergeFacts`]). Left out of the wire when it
+    /// holds nothing, and read as nothing from an older server.
+    #[serde(default, skip_serializing_if = "MergeFacts::is_empty")]
+    pub merge: MergeFacts,
     /// Its album's cover as the poster, and its artist's background.
     pub artwork: Vec<Artwork>,
     pub playback: PlaybackState,
@@ -651,6 +605,33 @@ impl Item {
             _ => None,
         }
     }
+
+    /// What a merged library sorts and matches it by; `None` for a
+    /// season, which has none.
+    pub fn merge(&self) -> Option<&MergeFacts> {
+        match self {
+            Item::Movie(m) => Some(&m.merge),
+            Item::Show(s) => Some(&s.merge),
+            Item::Episode(e) => Some(&e.merge),
+            Item::Artist(a) => Some(&a.merge),
+            Item::Album(a) => Some(&a.merge),
+            Item::Track(t) => Some(&t.merge),
+            Item::Season(_) => None,
+        }
+    }
+
+    /// [`Item::merge`], to change.
+    pub fn merge_mut(&mut self) -> Option<&mut MergeFacts> {
+        match self {
+            Item::Movie(m) => Some(&mut m.merge),
+            Item::Show(s) => Some(&mut s.merge),
+            Item::Episode(e) => Some(&mut e.merge),
+            Item::Artist(a) => Some(&mut a.merge),
+            Item::Album(a) => Some(&mut a.merge),
+            Item::Track(t) => Some(&mut t.merge),
+            Item::Season(_) => None,
+        }
+    }
 }
 
 impl Item {
@@ -837,11 +818,7 @@ mod tests {
     #[test]
     fn items_from_a_server_without_cast_or_dates_still_decode() {
         let movie = Movie {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Movie, "10"),
             title: "Alien".into(),
             year: Some(1979),
@@ -862,10 +839,7 @@ mod tests {
         assert_eq!((older.release_date, older.cast), (None, Vec::new()));
 
         let show = Show {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Show, "20"),
             title: "The Expanse".into(),
             year: Some(2015),
@@ -886,11 +860,7 @@ mod tests {
         assert_eq!((older.last_aired, older.cast), (None, Vec::new()));
 
         let episode = Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Episode, "22"),
             show_id: media(MediaKind::Show, "20"),
             show_title: None,
@@ -916,9 +886,7 @@ mod tests {
     #[test]
     fn a_track_s_format_is_plain_numbers_on_the_wire() {
         let track = Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Track, "224630"),
             album_id: media(MediaKind::Album, "224629"),
             artist_id: media(MediaKind::Artist, "224303"),
@@ -963,10 +931,7 @@ mod tests {
     #[test]
     fn an_item_carries_its_kind_on_the_wire() {
         let item = Item::Show(Show {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Show, "20"),
             title: "The Expanse".into(),
             year: None,
@@ -998,11 +963,7 @@ mod tests {
         };
         crate::test_support::assert_each_required(&season, &["show_title"]);
         let episode = Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Episode, "22"),
             show_id: media(MediaKind::Show, "20"),
             show_title: None,
@@ -1021,8 +982,7 @@ mod tests {
         };
         crate::test_support::assert_each_required(&episode, &["show_title"]);
         let album = Album {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Album, "30"),
             artist_id: media(MediaKind::Artist, "31"),
             artist_name: None,
@@ -1039,11 +999,7 @@ mod tests {
     #[test]
     fn an_episode_from_a_server_without_air_dates_still_decodes() {
         let episode = Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Episode, "22"),
             show_id: media(MediaKind::Show, "20"),
             show_title: None,
@@ -1072,10 +1028,7 @@ mod tests {
     /// "Today" for a show's years: 14 October 2026.
     fn years(year: Option<u16>, last_aired: Option<(u16, u8, u8)>) -> Option<String> {
         let show = Show {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Show, "20"),
             title: "Andor".into(),
             year,
@@ -1093,10 +1046,7 @@ mod tests {
     #[test]
     fn a_show_s_years_come_in_parts() {
         let show = |last: (u16, u8, u8)| Show {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Show, "20"),
             title: "Andor".into(),
             year: Some(2022),
@@ -1164,11 +1114,7 @@ mod tests {
             server: None,
         });
         round_trip(Movie {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Movie, "10"),
             title: "Alien".into(),
             year: Some(1979),
@@ -1181,10 +1127,7 @@ mod tests {
             playback: halfway(),
         });
         round_trip(Show {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Show, "20"),
             title: "The Expanse".into(),
             year: Some(2015),
@@ -1205,11 +1148,7 @@ mod tests {
             artwork: Vec::new(),
         });
         round_trip(Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Episode, "22"),
             show_id: media(MediaKind::Show, "20"),
             show_title: Some("The Expanse".into()),
@@ -1227,16 +1166,14 @@ mod tests {
             playback: PlaybackState::default(),
         });
         round_trip(Artist {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Artist, "30"),
             name: "Boards of Canada".into(),
             summary: None,
             artwork: poster(),
         });
         round_trip(Album {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Album, "31"),
             artist_id: media(MediaKind::Artist, "30"),
             artist_name: Some("Boards of Canada".into()),
@@ -1246,9 +1183,7 @@ mod tests {
             artwork: poster(),
         });
         round_trip(Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Track, "32"),
             album_id: media(MediaKind::Album, "31"),
             artist_id: media(MediaKind::Artist, "30"),
@@ -1275,11 +1210,7 @@ mod tests {
 
     fn alien(playback: PlaybackState, duration: Option<Duration>) -> Item {
         Item::Movie(Movie {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Movie, "10"),
             title: "Alien".into(),
             year: Some(1979),
@@ -1457,8 +1388,7 @@ mod tests {
     #[test]
     fn an_artist_has_a_title_but_no_progress() {
         let show = Item::Artist(Artist {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: media(MediaKind::Artist, "30"),
             name: "Daft Punk".into(),
             summary: None,

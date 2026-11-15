@@ -1132,15 +1132,10 @@ impl Client {
                 return Ok(());
             }
             server.use_relays = relays;
-            self.look_up_fallback(server);
             servers::save(storage, &saved).await?;
         }
         self.inner.relay_policy.choose(id, relays);
-        if let Some(link) = self.inner.links.lock().remove(&id) {
-            link.close();
-        }
-        self.inner.discovery.changed();
-        Ok(())
+        self.relays_changed(|server| *server == id).await
     }
 
     /// Whether servers with no choice of their own
@@ -1161,20 +1156,27 @@ impl Client {
         if !policy.set_default(relays) {
             return Ok(());
         }
-        let following: Vec<Arc<Link>> = {
-            let mut links = self.inner.links.lock();
-            let ids: Vec<EndpointId> = links
-                .keys()
-                .filter(|id| policy.follows_default(id))
-                .copied()
-                .collect();
-            ids.iter().filter_map(|id| links.remove(id)).collect()
-        };
-        for link in following {
+        self.relays_changed(|server| policy.follows_default(server))
+            .await
+    }
+
+    /// After a relay choice changed for the servers `affected` names: each
+    /// one's open connection closes, so the next request dials with the
+    /// new choice; a saved server with relays on now and no relay or
+    /// lookup known is looked up at n0's, as at open; and the server list
+    /// is told.
+    async fn relays_changed(&self, affected: impl Fn(&EndpointId) -> bool) -> Result<(), SdkError> {
+        // Taken out under the lock, closed after it is let go.
+        let closed: Vec<Arc<Link>> = self
+            .inner
+            .links
+            .lock()
+            .extract_if(|id, _| affected(id))
+            .map(|(_, link)| link)
+            .collect();
+        for link in closed {
             link.close();
         }
-        // On now, a saved server with no relay or lookup known is found
-        // at n0's again, as at open.
         for server in servers::load(self.inner.storage.as_ref()).await? {
             self.look_up_fallback(&server);
         }

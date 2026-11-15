@@ -444,11 +444,7 @@ mod tests {
 
     fn movie(key: &str) -> Item {
         Item::Movie(Movie {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Movie, key),
             title: key.into(),
             year: None,
@@ -638,11 +634,7 @@ mod tests {
 
     fn episode(season: u32, n: u32, position: Option<u64>, watched: bool) -> Item {
         Item::Episode(Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Episode, &format!("{season}x{n}")),
             show_id: id(MediaKind::Show, "s"),
             show_title: None,
@@ -778,9 +770,7 @@ mod tests {
 
     fn track(key: &str, album: &str) -> Item {
         Item::Track(Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Track, key),
             album_id: id(MediaKind::Album, album),
             artist_id: id(MediaKind::Artist, "a"),
@@ -801,8 +791,7 @@ mod tests {
 
     fn album(key: &str) -> Item {
         Item::Album(Album {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Album, key),
             artist_id: id(MediaKind::Artist, "a"),
             artist_name: None,
@@ -816,8 +805,7 @@ mod tests {
     /// An artist "a" of albums "x" (two tracks) and "y" (one).
     fn catalog() -> HashMap<MediaId, ItemDetail> {
         let artist = Item::Artist(Artist {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Artist, "a"),
             name: "A".into(),
             summary: None,
@@ -862,8 +850,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
         let keys = ["1", "2", "3", "4", "5", "6"];
         let artist = Item::Artist(Artist {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Artist, "a"),
             name: "A".into(),
             summary: None,

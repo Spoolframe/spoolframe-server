@@ -624,11 +624,7 @@ mod tests {
         PlaylistEntry {
             entry: n,
             item: Item::Episode(Episode {
-                added_at: None,
-                rating_tenths: None,
-                audience_rating_tenths: None,
-                size: None,
-                external_ids: Vec::new(),
+                merge: Default::default(),
                 id: id(MediaKind::Episode, n.to_string()),
                 show_id: id(MediaKind::Show, "s".into()),
                 show_title: None,

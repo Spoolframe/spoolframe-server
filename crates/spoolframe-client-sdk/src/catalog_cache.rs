@@ -652,11 +652,7 @@ mod tests {
     fn episode() -> Item {
         use spoolframe_types::{Episode, MediaKind, PlaybackState};
         Item::Episode(Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Episode, "e1"),
             show_id: id(MediaKind::Show, "s"),
             show_title: None,

@@ -731,9 +731,7 @@ mod tests {
     fn a_card_caption_is_the_items_own() {
         let today = spoolframe_types::CalendarDate::new(2026, 10, 14).unwrap();
         let track = spoolframe_types::Item::Track(spoolframe_types::Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: "plex:track:1".parse().unwrap(),
             album_id: "plex:album:1".parse().unwrap(),
             artist_id: "plex:artist:1".parse().unwrap(),

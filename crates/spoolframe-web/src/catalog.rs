@@ -895,10 +895,7 @@ mod tests {
 
     fn show() -> Item {
         Item::Show(Show {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: "plex:show:52011".parse().unwrap(),
             title: "Severance".into(),
             year: Some(2022),
@@ -1010,11 +1007,7 @@ mod tests {
         show.leaves = Some(46);
         assert_eq!(subtitle(&show), "4 seasons · 46 episodes");
         let episode = row(Item::Episode(Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: "plex:episode:61374".parse().unwrap(),
             show_id: "plex:show:52011".parse().unwrap(),
             show_title: Some("Severance".into()),

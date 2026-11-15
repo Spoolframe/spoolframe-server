@@ -53,8 +53,8 @@ pub use media::{
 };
 pub use model::{
     Album, Artist, Artwork, ArtworkKind, Caption, CastMember, Episode, Item, Library, LibraryKind,
-    LibraryServer, Marker, MarkerKind, Markers, Movie, PlaybackState, Progress, Season, Show,
-    Track, YearsAired,
+    LibraryServer, Marker, MarkerKind, Markers, MergeFacts, Movie, PlaybackState, Progress, Season,
+    Show, Track, YearsAired,
 };
 pub use platform::Platform;
 pub use preferences::{

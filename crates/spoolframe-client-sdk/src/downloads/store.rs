@@ -1162,11 +1162,7 @@ pub(crate) mod tests {
 
     fn movie() -> Item {
         Item::Movie(Movie {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
             title: "Alien".into(),
             year: Some(1979),

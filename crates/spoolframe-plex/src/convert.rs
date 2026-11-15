@@ -5,15 +5,14 @@
 
 use std::time::Duration;
 
+use spoolframe_types::serde_time::unix_seconds;
 use spoolframe_types::{
     Album, Artist, Artwork, ArtworkId, ArtworkKind, AudioCodec, CalendarDate, CastMember, Episode,
-    Item, Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, Movie,
-    Namespace, PersonRole, PlaybackState, Season, Show, Track,
+    Item, Library, LibraryId, LibraryKind, Marker, MarkerKind, MediaId, MediaKind, MergeFacts,
+    Movie, Namespace, PersonRole, PlaybackState, Season, Show, Track,
 };
 
 use serde::Deserialize;
-
-use spoolframe_catalog::Facts;
 
 use crate::wire::{self, Directory, Metadata};
 
@@ -132,11 +131,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             content_rating: content_rating(m),
             duration: duration(m),
             cast: Vec::new(),
-            added_at: added_at(m),
-            rating_tenths: m.rating.and_then(Facts::tenths),
-            audience_rating_tenths: m.audience_rating.and_then(Facts::tenths),
-            size: size(m),
-            external_ids: external_ids(m),
+            merge: merge(m),
             artwork: artwork(m, ArtworkKind::Poster)?,
             playback: PlaybackState::default(),
         }),
@@ -150,10 +145,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             genres: m.genres.iter().map(|g| g.tag.clone()).collect(),
             last_aired: None,
             cast: Vec::new(),
-            added_at: added_at(m),
-            rating_tenths: m.rating.and_then(Facts::tenths),
-            audience_rating_tenths: m.audience_rating.and_then(Facts::tenths),
-            external_ids: external_ids(m),
+            merge: merge(m),
             artwork: artwork(m, ArtworkKind::Poster)?,
         }),
         MediaKind::Season => Item::Season(Season {
@@ -180,11 +172,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             air_date: m.originally_available_at,
             duration: duration(m),
             cast: Vec::new(),
-            added_at: added_at(m),
-            rating_tenths: m.rating.and_then(Facts::tenths),
-            audience_rating_tenths: m.audience_rating.and_then(Facts::tenths),
-            size: size(m),
-            external_ids: external_ids(m),
+            merge: merge(m),
             // An episode's thumb is a still from it, not a poster; its
             // poster is its season's, else its show's.
             artwork: with_poster(
@@ -198,8 +186,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             id,
             name: m.title.clone(),
             summary: summary(m),
-            added_at: added_at(m),
-            external_ids: external_ids(m),
+            merge: merge(m),
             artwork: artwork(m, ArtworkKind::Poster)?,
         }),
         MediaKind::Album => Item::Album(Album {
@@ -209,8 +196,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             title: m.title.clone(),
             year: m.year,
             track_count: m.leaf_count,
-            added_at: added_at(m),
-            external_ids: external_ids(m),
+            merge: merge(m),
             artwork: artwork(m, ArtworkKind::Poster)?,
         }),
         MediaKind::Track => Item::Track(Track {
@@ -238,9 +224,7 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
             bit_depth: audio_stream(m).and_then(|s| s.bit_depth),
             sample_rate: audio_stream(m).and_then(|s| s.sampling_rate),
             duration: duration(m),
-            added_at: added_at(m),
-            size: size(m),
-            external_ids: external_ids(m),
+            merge: merge(m),
             // The album's cover is the poster, as on the album; Plex
             // gives a track its album's as its own thumb too. `art` is
             // the artist's background.
@@ -259,16 +243,17 @@ pub fn item(m: &Metadata) -> Result<Item, ConvertError> {
     })
 }
 
-/// When Plex added the item; `None` for a time before the epoch.
-fn added_at(m: &Metadata) -> Option<std::time::SystemTime> {
-    let secs = u64::try_from(m.added_at?).ok()?;
-    std::time::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
-}
-
-/// The size of the item's first version's first file, as
-/// [`crate::browse::facts`] has it for the `size` sort.
-fn size(m: &Metadata) -> Option<u64> {
-    m.media.first()?.parts.first()?.size
+/// What a merged library sorts and matches `m` by: the values the sorts
+/// order by ([`crate::browse::facts`]), and its stable ids.
+fn merge(m: &Metadata) -> MergeFacts {
+    let facts = crate::browse::facts(m);
+    MergeFacts {
+        added_at: facts.added_at.and_then(unix_seconds::try_from_wire),
+        rating_tenths: facts.rating_tenths,
+        audience_rating_tenths: facts.audience_rating_tenths,
+        size: facts.size,
+        external_ids: external_ids(m),
+    }
 }
 
 /// The item's stable ids: Plex's guid, then the other agents'. Local-only
@@ -1086,13 +1071,16 @@ mod tests {
         let Item::Movie(movie) = item(&m).unwrap() else {
             panic!("not a movie")
         };
-        assert_eq!(movie.added_at, at(1_507_951_743));
+        assert_eq!(movie.merge.added_at, at(1_507_951_743));
         assert_eq!(
-            (movie.rating_tenths, movie.audience_rating_tenths),
+            (
+                movie.merge.rating_tenths,
+                movie.merge.audience_rating_tenths
+            ),
             (Some(79), Some(80))
         );
-        assert_eq!(movie.size, Some(4_100_000_000));
-        assert_eq!(movie.external_ids, external_ids(&m));
+        assert_eq!(movie.merge.size, Some(4_100_000_000));
+        assert_eq!(movie.merge.external_ids, external_ids(&m));
     }
 
     #[test]
@@ -1104,7 +1092,10 @@ mod tests {
             panic!("not a movie")
         };
         assert_eq!(
-            (movie.rating_tenths, movie.audience_rating_tenths),
+            (
+                movie.merge.rating_tenths,
+                movie.merge.audience_rating_tenths
+            ),
             (None, None)
         );
     }
@@ -1114,38 +1105,53 @@ mod tests {
         let Item::Show(show) = only_item("metadata-show") else {
             panic!("not a show")
         };
-        assert_eq!(show.added_at, at(1_720_224_129));
-        assert_eq!(show.external_ids[0], "plex://show/5d9c083d7b5c2e001e6578f9");
-        assert!(show.external_ids.contains(&"tvdb://272644".to_owned()));
+        assert_eq!(show.merge.added_at, at(1_720_224_129));
+        assert_eq!(
+            show.merge.external_ids[0],
+            "plex://show/5d9c083d7b5c2e001e6578f9"
+        );
+        assert!(
+            show.merge
+                .external_ids
+                .contains(&"tvdb://272644".to_owned())
+        );
         let Item::Episode(episode) = only_item("metadata-episode") else {
             panic!("not an episode")
         };
-        assert_eq!(episode.added_at, at(1_720_224_129));
-        assert!(episode.external_ids.contains(&"tvdb://4961780".to_owned()));
+        assert_eq!(episode.merge.added_at, at(1_720_224_129));
+        assert!(
+            episode
+                .merge
+                .external_ids
+                .contains(&"tvdb://4961780".to_owned())
+        );
         let Item::Artist(artist) = only_item("metadata-artist") else {
             panic!("not an artist")
         };
-        assert_eq!(artist.added_at, at(1_758_693_234));
+        assert_eq!(artist.merge.added_at, at(1_758_693_234));
         assert!(
             artist
+                .merge
                 .external_ids
                 .contains(&"mbid://c98d40fd-f6cf-4b26-883e-eaa515ee2851".to_owned())
         );
         let Item::Album(album) = only_item("metadata-album") else {
             panic!("not an album")
         };
-        assert_eq!(album.added_at, at(1_758_698_249));
+        assert_eq!(album.merge.added_at, at(1_758_698_249));
         assert!(
             album
+                .merge
                 .external_ids
                 .contains(&"mbid://10cd56cf-7f76-408f-bde6-8008014e9cc9".to_owned())
         );
         let Item::Track(track) = only_item("metadata-track") else {
             panic!("not a track")
         };
-        assert_eq!(track.added_at, at(1_758_698_249));
+        assert_eq!(track.merge.added_at, at(1_758_698_249));
         assert!(
             track
+                .merge
                 .external_ids
                 .contains(&"mbid://d3f3bf31-5955-4c00-8083-eaecaaf4fee8".to_owned())
         );

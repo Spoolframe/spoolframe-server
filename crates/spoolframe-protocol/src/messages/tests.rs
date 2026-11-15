@@ -37,11 +37,7 @@ use spoolframe_types::{
 
 fn movie() -> Item {
     Item::Movie(Movie {
-        added_at: None,
-        rating_tenths: None,
-        audience_rating_tenths: None,
-        size: None,
-        external_ids: Vec::new(),
+        merge: Default::default(),
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
         title: "Alien".into(),
         year: Some(1979),
@@ -4930,4 +4926,34 @@ fn the_diagnostics_wire_names_are_fixed() {
         serde_json::json!({"type": "diagnostics_sent", "id": "r1"})
     );
     round_trip(reply);
+}
+
+/// An item with nothing for a merged library encodes as it did before
+/// `merge`: no such key, and a map of known length (a flattened struct
+/// would make it one of unknown length, changing every item's bytes).
+#[test]
+fn an_item_without_merge_facts_encodes_as_before_them() {
+    let bytes = codec::encode(&movie()).unwrap();
+    assert!(!bytes.windows(5).any(|w| w == b"merge"));
+    assert_eq!(bytes[0] & 0xE0, 0xA0, "a map");
+    assert_ne!(bytes[0], 0xBF, "of known length");
+}
+
+#[test]
+fn an_item_s_merge_facts_round_trip() {
+    let Item::Movie(movie) = movie() else {
+        unreachable!()
+    };
+    let item = Item::Movie(spoolframe_types::Movie {
+        merge: spoolframe_types::MergeFacts {
+            added_at: Some(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            rating_tenths: Some(98),
+            audience_rating_tenths: Some(94),
+            size: Some(4_100_000_000),
+            external_ids: vec!["tmdb://348".into()],
+        },
+        ..movie
+    });
+    let back: Item = codec::decode(&codec::encode(&item).unwrap()).unwrap();
+    assert_eq!(back, item);
 }

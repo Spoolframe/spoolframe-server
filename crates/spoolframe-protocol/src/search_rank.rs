@@ -148,12 +148,18 @@ impl Ranker {
             Some(TopResult::Person(person)) => Some(&person.id),
             _ => None,
         };
-        // The shows listed in the shows group, with their other copies:
-        // what a show's own episodes are under in `All`. Filled as that
-        // group is made, before the episodes' (`found` is in kind order,
-        // shows first); the top match is in no group, so its episodes are
-        // listed.
-        let mut shows: HashSet<MediaId> = HashSet::new();
+        // The shows the shows group lists, with their other copies: what a
+        // show's own episodes are under in `All`. The top match is in no
+        // group, so its episodes are listed.
+        let shows: HashSet<MediaId> = found
+            .iter()
+            .filter(|g| g.kind == SearchKind::Shows)
+            .flat_map(|g| self.listed(&g.items, top_item, &text, limit))
+            .flat_map(|id| {
+                let more = copies.get(id).cloned().unwrap_or_default();
+                std::iter::once(id.clone()).chain(more)
+            })
+            .collect();
 
         let mut groups = Vec::new();
         for Matched {
@@ -181,12 +187,6 @@ impl Ranker {
             };
             items.truncate(cap);
             people.truncate(cap);
-            if kind == SearchKind::Shows {
-                for id in items.iter().map(Item::id) {
-                    shows.insert(id.clone());
-                    shows.extend(copies.get(id).cloned().unwrap_or_default());
-                }
-            }
             let shown = items.len() + people.len();
             let available = usize::try_from(total)
                 .unwrap_or(usize::MAX)
@@ -218,6 +218,21 @@ impl Ranker {
             year,
             without_year,
         }
+    }
+
+    /// The ids a group of `items` lists, as [`Self::group`] makes it with
+    /// nothing hidden: the top match left out, best first (stable within a
+    /// tier), at most `cap`.
+    fn listed<'a>(
+        &self,
+        items: &'a [Item],
+        top: Option<&MediaId>,
+        text: &str,
+        cap: usize,
+    ) -> Vec<&'a MediaId> {
+        let mut kept: Vec<&Item> = items.iter().filter(|i| Some(i.id()) != top).collect();
+        kept.sort_by_cached_key(|i| self.tier(i, text));
+        kept.into_iter().take(cap).map(Item::id).collect()
     }
 
     /// Up to [`WITHOUT_YEAR`] of `any_year` that are not of `year` and not

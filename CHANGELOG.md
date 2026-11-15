@@ -68,15 +68,14 @@
   it. It was read only at open, so "Try through a relay" and Settings ›
   Connection needed a restart. The SDK does not save it: the app keeps it
   and passes it as `ClientOptions::relays` (FFI `DeviceSpec.relays`).
-- Added, protocol and server: items carry what an app that merges
-  several servers' libraries sorts and matches by. `added_at` (Unix
-  seconds, as the `added` sort) and `external_ids` (`plex://…`,
-  `imdb://…`, `tmdb://…`, `tvdb://…`, `mbid://…`) on movies, shows,
-  episodes, artists, albums and tracks; `rating_tenths` and
-  `audience_rating_tenths` (0 to 100, as the `rating` and
-  `audience_rating` sorts) on movies, shows and episodes; `size` (bytes,
-  the first file) on movies, episodes and tracks. Each is left out when
-  the catalog has none. Library pages, sorted pages and Home's recently
+- Added, protocol and server: every item but a season carries what an
+  app that merges several servers' libraries sorts and matches by, in
+  `merge` (`MergeFacts`; `Item::merge()`): `added_at` (Unix seconds, as
+  the `added` sort), `rating_tenths` and `audience_rating_tenths` (0 to
+  100, as the `rating` and `audience_rating` sorts), `size` (bytes, the
+  first file, as the `size` sort) and `external_ids` (`plex://…`,
+  `imdb://…`, `tmdb://…`, `tvdb://…`, `mbid://…`). Each is left out when
+  the catalog has none, and `merge` when it has none of them. Library pages, sorted pages and Home's recently
   added now ask Plex for its agents' ids (`includeGuids`). A paired
   server's film, show or artist carries the added date, ratings and
   size it sent; its other items only the ids. No feature to name: older

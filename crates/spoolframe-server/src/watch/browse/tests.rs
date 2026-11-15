@@ -83,11 +83,7 @@ fn tv() -> Library {
 fn film(key: &str) -> Item {
     let (_, title, _, year) = FILMS.iter().find(|f| f.0 == key).unwrap();
     Item::Movie(Movie {
-        added_at: None,
-        rating_tenths: None,
-        audience_rating_tenths: None,
-        size: None,
-        external_ids: Vec::new(),
+        merge: Default::default(),
         id: movie_id(key),
         title: (*title).into(),
         year: Some(*year),
@@ -104,10 +100,7 @@ fn film(key: &str) -> Item {
 fn series(key: &str) -> Item {
     let (_, title, _) = SHOWS.iter().find(|s| s.0 == key).unwrap();
     Item::Show(Show {
-        added_at: None,
-        rating_tenths: None,
-        audience_rating_tenths: None,
-        external_ids: Vec::new(),
+        merge: Default::default(),
         id: show_id(key),
         title: (*title).into(),
         year: None,

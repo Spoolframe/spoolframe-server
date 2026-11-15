@@ -455,16 +455,19 @@ async fn a_library_page_s_items_carry_what_a_merged_library_sorts_and_matches_by
         panic!("{items:?}");
     };
     assert_eq!(
-        movie.added_at,
+        movie.merge.added_at,
         Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
     );
     assert_eq!(
-        (movie.rating_tenths, movie.audience_rating_tenths),
+        (
+            movie.merge.rating_tenths,
+            movie.merge.audience_rating_tenths
+        ),
         (Some(98), Some(94))
     );
-    assert_eq!(movie.size, Some(4_100_000_000));
+    assert_eq!(movie.merge.size, Some(4_100_000_000));
     assert_eq!(
-        movie.external_ids,
+        movie.merge.external_ids,
         ["plex://movie/Alien", "imdb://tt0078748", "tmdb://348"]
     );
     // A sorted page is Plex's listing too, with its sort.

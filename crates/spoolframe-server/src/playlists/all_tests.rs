@@ -111,9 +111,7 @@ impl Big {
         let artist = (t * 7919) % 50;
         let album = artist * 1000 + (t / 12) % 20;
         Item::Track(Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: MediaId::new(
                 Namespace::Plex,
                 MediaKind::Track,

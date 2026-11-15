@@ -517,10 +517,7 @@ fn index_manifest(tx: &Transaction, m: &Manifest) -> rusqlite::Result<()> {
         Item::Episode(e) => {
             let show = m.show.clone().unwrap_or_else(|| {
                 Item::Show(Show {
-                    added_at: None,
-                    rating_tenths: None,
-                    audience_rating_tenths: None,
-                    external_ids: Vec::new(),
+                    merge: Default::default(),
                     id: e.show_id.clone(),
                     title: e.show_title.clone().unwrap_or_default(),
                     year: None,
@@ -560,8 +557,7 @@ fn index_manifest(tx: &Transaction, m: &Manifest) -> rusqlite::Result<()> {
         Item::Track(t) => {
             let artist = m.artist.clone().unwrap_or_else(|| {
                 Item::Artist(Artist {
-                    added_at: None,
-                    external_ids: Vec::new(),
+                    merge: Default::default(),
                     id: t.artist_id.clone(),
                     name: t.artist_name.clone().unwrap_or_default(),
                     summary: None,
@@ -571,8 +567,7 @@ fn index_manifest(tx: &Transaction, m: &Manifest) -> rusqlite::Result<()> {
             let artist_name = artist.title().to_owned();
             let album = m.album.clone().unwrap_or_else(|| {
                 Item::Album(Album {
-                    added_at: None,
-                    external_ids: Vec::new(),
+                    merge: Default::default(),
                     id: t.album_id.clone(),
                     artist_id: t.artist_id.clone(),
                     artist_name: Some(artist_name.clone()),

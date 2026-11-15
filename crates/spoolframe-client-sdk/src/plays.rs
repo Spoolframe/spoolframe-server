@@ -78,8 +78,7 @@ fn recent_albums(played: &[Item], limit: usize) -> Vec<Album> {
             continue;
         }
         albums.push(Album {
-            added_at: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: track.album_id.clone(),
             artist_id: track.artist_id.clone(),
             artist_name: track.artist_name.clone(),
@@ -104,9 +103,7 @@ mod tests {
 
     fn track(key: &str, album: &str, album_title: Option<&str>) -> Item {
         Item::Track(Track {
-            added_at: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Track, key),
             album_id: id(MediaKind::Album, album),
             artist_id: id(MediaKind::Artist, "1"),

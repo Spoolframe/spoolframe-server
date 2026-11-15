@@ -278,11 +278,7 @@ mod tests {
 
     fn movie(key: &str) -> Item {
         Item::Movie(Movie {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Movie, key),
             title: key.into(),
             year: None,
@@ -298,11 +294,7 @@ mod tests {
 
     fn episode(key: &str) -> Item {
         Item::Episode(Episode {
-            added_at: None,
-            rating_tenths: None,
-            audience_rating_tenths: None,
-            size: None,
-            external_ids: Vec::new(),
+            merge: Default::default(),
             id: id(MediaKind::Episode, key),
             show_id: id(MediaKind::Show, "s"),
             show_title: None,
@@ -347,10 +339,7 @@ mod tests {
             let all: Vec<Item> = match library.key() {
                 "films" => (0..450).map(|n| movie(&format!("m{n}"))).collect(),
                 "shows" => vec![Item::Show(Show {
-                    added_at: None,
-                    rating_tenths: None,
-                    audience_rating_tenths: None,
-                    external_ids: Vec::new(),
+                    merge: Default::default(),
                     id: id(MediaKind::Show, "s"),
                     title: "s".into(),
                     year: None,
@@ -363,8 +352,7 @@ mod tests {
                     artwork: Vec::new(),
                 })],
                 _ => vec![Item::Artist(Artist {
-                    added_at: None,
-                    external_ids: Vec::new(),
+                    merge: Default::default(),
                     id: id(MediaKind::Artist, "a"),
                     name: "a".into(),
                     summary: None,
