@@ -48,6 +48,43 @@ async fn a_saved_connected_server_shows_its_dial_and_live_path() {
     stub.stop().await;
 }
 
+/// The device's relay switch, changed while running: a saved server with
+/// no choice of its own follows it at once and its connection is closed
+/// (the next request dials again); one with a choice keeps both.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_s_relays_move_every_server_without_a_choice_at_once() {
+    let (follows, chose) = (Stub::start().await, Stub::start().await);
+    let client = client().await;
+    for stub in [&follows, &chose] {
+        client.add_address(&stub.id(), stub.addrs()).unwrap();
+        client.connect(&stub.id()).await.unwrap();
+        client.pin(&stub.id(), true).await.unwrap();
+    }
+    client
+        .set_server_relays(&chose.id(), Some(true))
+        .await
+        .unwrap();
+    client.connect(&chose.id()).await.unwrap();
+    assert!(client.relays());
+
+    client.set_relays(false).await.unwrap();
+    assert!(!client.relays());
+    let reach = client.reachability(&follows.id()).await.unwrap();
+    assert!(!reach.relays_effective);
+    assert_eq!(reach.use_relays, None);
+    assert!(reach.live.is_empty(), "closed: {:?}", reach.live);
+    let reach = client.reachability(&chose.id()).await.unwrap();
+    assert!(reach.relays_effective);
+    assert!(!reach.live.is_empty(), "kept open");
+
+    client.set_relays(true).await.unwrap();
+    let reach = client.reachability(&follows.id()).await.unwrap();
+    assert!(reach.relays_effective);
+    client.connect(&follows.id()).await.unwrap();
+    follows.stop().await;
+    chose.stop().await;
+}
+
 /// It answered, and refused: the stage says so, and the error is the one
 /// the app was given.
 #[tokio::test(flavor = "multi_thread")]

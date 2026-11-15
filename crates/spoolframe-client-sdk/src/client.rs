@@ -133,9 +133,9 @@ pub struct ClientOptions {
     /// addresses and no relay is contacted for it, unless the server has a
     /// choice of its own ([`Client::set_server_relays`]; redeeming or
     /// saving an invite whose link names relays chooses them: accepting
-    /// the invite is consent to that server's relays). It is fixed for the
-    /// life of the [`Client`]: an app whose user changes it opens a new
-    /// one.
+    /// the invite is consent to that server's relays). The value at open:
+    /// [`Client::set_relays`] changes it while running. The SDK does not
+    /// save it; the app keeps the user's switch and passes it here.
     pub relays: bool,
     /// The experimental features to ask every server for, in each
     /// connection's `Hello`; none by default. Whether a server
@@ -251,10 +251,8 @@ pub(crate) struct Inner {
     play_relays: Mutex<HashMap<EndpointId, usize>>,
     /// The pkarr relays servers are looked up at.
     lookups: Mutex<std::collections::HashSet<String>>,
-    /// [`ClientOptions::relays`].
-    pub(crate) relays: bool,
     /// Which servers are reached through relays: their choices, and
-    /// [`ClientOptions::relays`] for the rest.
+    /// the client's ([`Client::relays`]) for the rest.
     pub(crate) relay_policy: Arc<RelayPolicy>,
     /// What lookups answered and how dials went, for
     /// [`Client::reachability`].
@@ -467,7 +465,6 @@ impl Client {
                 http_lookups: std::sync::atomic::AtomicBool::new(false),
                 play_relays: Mutex::default(),
                 lookups: Mutex::default(),
-                relays,
                 relay_policy,
                 reach,
                 lan_discovery,
@@ -1109,8 +1106,8 @@ impl Client {
     }
 
     /// Whether saved server `endpoint_id` is reached through relays: `Some`
-    /// whatever [`ClientOptions::relays`] says, `None` as it says. Saved
-    /// with the server, and used from the next connection: an open one is
+    /// whatever the client's says, `None` as it says ([`Client::relays`]).
+    /// Saved with the server, and used from the next connection: an open one is
     /// closed, and the next request dials again. [`SdkError::NotPinned`]
     /// for a server not saved.
     ///
@@ -1141,6 +1138,45 @@ impl Client {
         self.inner.relay_policy.choose(id, relays);
         if let Some(link) = self.inner.links.lock().remove(&id) {
             link.close();
+        }
+        self.inner.discovery.changed();
+        Ok(())
+    }
+
+    /// Whether servers with no choice of their own
+    /// ([`Client::set_server_relays`]) are reached through relays:
+    /// [`ClientOptions::relays`], or what [`Client::set_relays`] set since.
+    pub fn relays(&self) -> bool {
+        self.inner.relay_policy.default()
+    }
+
+    /// The device's relay switch from now on: every server with no choice
+    /// of its own ([`Client::set_server_relays`] `None`) follows it at
+    /// once, as that setter's server does: its open connection is
+    /// closed, and the next request dials again. A server with a choice
+    /// keeps it and its connection. Not saved: the app keeps the switch
+    /// and passes it as [`ClientOptions::relays`] at the next open.
+    pub async fn set_relays(&self, relays: bool) -> Result<(), SdkError> {
+        let policy = &self.inner.relay_policy;
+        if !policy.set_default(relays) {
+            return Ok(());
+        }
+        let following: Vec<Arc<Link>> = {
+            let mut links = self.inner.links.lock();
+            let ids: Vec<EndpointId> = links
+                .keys()
+                .filter(|id| policy.follows_default(id))
+                .copied()
+                .collect();
+            ids.iter().filter_map(|id| links.remove(id)).collect()
+        };
+        for link in following {
+            link.close();
+        }
+        // On now, a saved server with no relay or lookup known is found
+        // at n0's again, as at open.
+        for server in servers::load(self.inner.storage.as_ref()).await? {
+            self.look_up_fallback(&server);
         }
         self.inner.discovery.changed();
         Ok(())
@@ -2555,7 +2591,7 @@ impl Client {
     /// found again if it publishes there, without first reaching it on
     /// the LAN to hear its new relays.
     pub(crate) fn look_up_fallback(&self, server: &SavedServer) {
-        if server.needs_n0_lookup(self.inner.relays) {
+        if server.needs_n0_lookup(self.inner.relay_policy.default()) {
             self.look_up_at(servers::N0_LOOKUP);
         }
     }

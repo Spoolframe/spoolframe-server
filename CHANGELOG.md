@@ -43,6 +43,15 @@
   remote access page and in the NixOS module (`publishLookup`,
   `publishLookupPrivate`). See PROTOCOL.md's Adding a server by its
   address.
+- Added, SDK: `Client::set_relays(bool)` and `Client::relays()` (FFI
+  `SpoolClient::set_relays`, `relays`): the device's "Use relays" switch,
+  changed while running. Every saved server with no choice of its own
+  follows it at once, as `set_server_relays` does for one: its open
+  connection closes and the next request dials again, and
+  `Reachability::relays_effective` says so. A server with a choice keeps
+  it. It was read only at open, so "Try through a relay" and Settings ›
+  Connection needed a restart. The SDK does not save it: the app keeps it
+  and passes it as `ClientOptions::relays` (FFI `DeviceSpec.relays`).
 - Added, SDK: `Client::look_up_server(address)` (FFI `look_up_server`),
   answering `ServerLookup { endpoint_id, name, fingerprint, addrs,
   relays, lookup }` over HTTPS only; then `connect` and `pin` as usual,

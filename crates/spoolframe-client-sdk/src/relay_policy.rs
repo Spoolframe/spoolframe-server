@@ -1,5 +1,6 @@
 //! Which servers this device reaches through relays: a choice per server,
-//! the client's [`crate::ClientOptions::relays`] where there is none.
+//! the client's ([`crate::ClientOptions::relays`], then
+//! [`crate::Client::set_relays`]) where there is none.
 //!
 //! The endpoint itself always has relays as a way to dial (an empty relay
 //! map: no home relay, nothing contacted at start, never probed), so the
@@ -26,22 +27,42 @@ use crate::reachability::{self, LookupOutcome, ReachLog};
 /// The relay choice of every server that has one, and the client's.
 #[derive(Debug)]
 pub(crate) struct RelayPolicy {
-    /// [`crate::ClientOptions::relays`]: for a server with no choice.
-    default: bool,
+    /// The client's: for a server with no choice. Changed while running
+    /// by [`crate::Client::set_relays`].
+    default: AtomicBool,
     chosen: RwLock<HashMap<EndpointId, bool>>,
 }
 
 impl RelayPolicy {
     pub(crate) fn new(default: bool) -> Self {
         Self {
-            default,
+            default: AtomicBool::new(default),
             chosen: RwLock::default(),
         }
     }
 
     /// Whether `id` is reached through relays.
     pub(crate) fn allows(&self, id: &EndpointId) -> bool {
-        self.chosen.read().get(id).copied().unwrap_or(self.default)
+        self.chosen
+            .read()
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| self.default())
+    }
+
+    /// The client's choice: what a server with none of its own follows.
+    pub(crate) fn default(&self) -> bool {
+        self.default.load(Ordering::Relaxed)
+    }
+
+    /// The client's choice from now on; whether it changed.
+    pub(crate) fn set_default(&self, relays: bool) -> bool {
+        self.default.swap(relays, Ordering::Relaxed) != relays
+    }
+
+    /// Whether `id` has no choice of its own, and so follows the client's.
+    pub(crate) fn follows_default(&self, id: &EndpointId) -> bool {
+        !self.chosen.read().contains_key(id)
     }
 
     /// `id`'s choice from now on; `None` follows the client's.
@@ -175,6 +196,24 @@ mod tests {
         assert!(!on.allows(&id(1)));
         on.choose(id(1), None);
         assert!(on.allows(&id(1)));
+    }
+
+    #[test]
+    fn a_new_default_moves_every_server_without_a_choice_and_no_other() {
+        let policy = RelayPolicy::new(true);
+        policy.choose(id(1), Some(true));
+        policy.choose(id(2), Some(false));
+        assert!(policy.set_default(false));
+        assert!(!policy.default());
+        assert!(!policy.allows(&id(3)));
+        assert!(policy.allows(&id(1)));
+        assert!(!policy.allows(&id(2)));
+        assert!(!policy.set_default(false), "no change");
+        assert!(policy.set_default(true));
+        assert!(policy.allows(&id(3)));
+        assert!(!policy.allows(&id(2)));
+        assert!(policy.follows_default(&id(3)));
+        assert!(!policy.follows_default(&id(1)));
     }
 
     /// A lookup that knows no server.

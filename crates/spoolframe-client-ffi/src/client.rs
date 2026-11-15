@@ -32,7 +32,8 @@ pub struct DeviceSpec {
     /// What this device's player can play.
     pub capabilities: DeviceCapabilities,
     /// Reach servers through the relays they name when they can't be
-    /// dialled directly. Fixed until the app next starts.
+    /// dialled directly. The value at start: `set_relays` changes it while
+    /// running. The core does not save it; the app does.
     pub relays: bool,
     /// What experimental features to ask servers for: playbacks over
     /// their own HTTP port too, for AirPlay (`http_playback`), and paired
@@ -298,6 +299,21 @@ impl SpoolClient {
     pub async fn reachability(&self, endpoint_id: String) -> Result<Reachability, SpoolError> {
         let client = self.client.clone();
         Ok(run(async move { client.reachability(&endpoint_id).await }).await?)
+    }
+
+    /// The device's "Use relays" now: what every server with no choice of
+    /// its own (`set_server_relays` `None`) follows.
+    pub fn relays(&self) -> bool {
+        self.client.relays()
+    }
+
+    /// The device's "Use relays" from now on, at once: every server with
+    /// no choice of its own follows it, its open connection closes and the
+    /// next request dials again. One with a choice keeps it. Not saved:
+    /// the app keeps it and passes it as `DeviceSpec.relays` next start.
+    pub async fn set_relays(&self, relays: bool) -> Result<(), SpoolError> {
+        let client = self.client.clone();
+        Ok(run(async move { client.set_relays(relays).await }).await?)
     }
 
     /// Saved server `endpoint_id`'s "Use relays": `None` follows the

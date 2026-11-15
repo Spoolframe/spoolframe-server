@@ -482,7 +482,7 @@ impl Client {
         }
         let device = EndpointId::from_bytes(&link.endpoint)
             .map_err(|_| PairingError::NotALink(LinkError::Damaged("not an endpoint id")))?;
-        let relays = if self.inner.relays {
+        let relays = if self.inner.relay_policy.default() {
             link.relays
                 .iter()
                 .filter_map(|r| r.parse::<RelayUrl>().ok())

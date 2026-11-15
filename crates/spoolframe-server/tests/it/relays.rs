@@ -227,6 +227,32 @@ async fn a_device_with_relays_off_never_reaches_a_server_without_a_choice_throug
     drop(relay);
 }
 
+/// The device's relays turned on while it runs ("Try through a relay"):
+/// a server with no choice of its own that it could not reach is
+/// reached through its relay at once, with no new client.
+#[tokio::test]
+async fn turning_the_device_s_relays_on_reaches_a_server_without_a_choice_at_once() {
+    let (relay, url) = relay().await;
+    let server = server_on("relay-default-live", &url).await;
+    let id = server.server.id().to_string();
+    let storage = saved_through_relay(&server, true).await;
+    let client = device_on(true, storage.clone()).await;
+    client.set_server_relays(&id, None).await.unwrap();
+    client.close().await;
+    forget_addresses(&storage).await;
+
+    let client = device_on(false, storage).await;
+    assert!(matches!(
+        client.connect(&id).await,
+        Err(SdkError::Unreachable(_))
+    ));
+    client.set_relays(true).await.unwrap();
+    client.connect(&id).await.unwrap();
+    client.close().await;
+    server.stop().await;
+    drop(relay);
+}
+
 /// The relays a server is reached through are the user's once edited:
 /// a dead one alone does not reach it, and empty gives the list back.
 #[tokio::test]
