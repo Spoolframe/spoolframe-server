@@ -91,9 +91,7 @@ pub fn PlaybackPage() -> Element {
     let shown = seen();
     let live = updated_line(false, clock(), shown.as_ref().map(|(_, at)| *at));
     let count = shown.as_ref().map_or(0, |(l, _)| l.open.len());
-    let forbidden = error()
-        .as_ref()
-        .is_some_and(|e| e.code == spoolframe_admin_api::error_code::FORBIDDEN);
+    let forbidden = error().as_ref().is_some_and(ApiError::is_forbidden);
     rsx! {
         div { class: "flex flex-col gap-[22px] max-md:gap-3.5",
             div { class: "page-head",
@@ -108,7 +106,7 @@ pub fn PlaybackPage() -> Element {
                 "Everything playing on this server, with the plan the server made and why. Open one for its streams, the conversion's command line and its reads. To see the plan for something before anyone plays it, open the item in a library and use its Debug tab."
             }
             if forbidden {
-                Forbidden {}
+                Forbidden { what: "playback" }
             } else if let Some(e) = error() {
                 Alert { text: format!("Not updating: {}", e.explain()) }
             }
@@ -313,9 +311,7 @@ pub fn PlaybackDetail(id: String) -> Element {
         }
     });
     let asking = use_signal(|| None::<Ask>);
-    let forbidden = error()
-        .as_ref()
-        .is_some_and(|e| e.code == spoolframe_admin_api::error_code::FORBIDDEN);
+    let forbidden = error().as_ref().is_some_and(ApiError::is_forbidden);
     rsx! {
         div { class: "flex flex-col gap-[22px] max-md:gap-3.5",
             Link { class: "flex items-center gap-1 text-sm no-underline", to: Route::PlaybackPage {},
@@ -323,7 +319,7 @@ pub fn PlaybackDetail(id: String) -> Element {
                 "Playback"
             }
             if forbidden {
-                Forbidden {}
+                Forbidden { what: "playback" }
             } else if let Some(e) = error() {
                 Alert { text: e.explain() }
             }

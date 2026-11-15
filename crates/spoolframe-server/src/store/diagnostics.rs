@@ -1,6 +1,6 @@
 //! Diagnostics apps sent (`SendDiagnostics`): kept for the admins to
 //! read, one a minute from a session, the newest [`KEEP_PER_DEVICE`] of
-//! each device, for [`KEEP_FOR`] at most.
+//! each device, for [`KEEP_FOR_SECS`] at most.
 
 use std::time::Duration;
 
@@ -14,12 +14,12 @@ use crate::principal::Principal;
 /// each failed play keeps its latest.
 pub const KEEP_PER_DEVICE: i64 = 20;
 
-/// How long a report is kept.
-pub const KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// How long a report is kept, in seconds: 30 days.
+pub const KEEP_FOR_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// One report a session may send in this long, so an app's bug cannot
-/// fill the disk.
-pub const ONE_EACH: Duration = Duration::from_secs(60);
+/// One report a session may send in this many seconds, so an app's bug
+/// cannot fill the disk.
+pub const ONE_EACH_SECS: i64 = 60;
 
 /// Who sent a report, and from where, as it arrived.
 #[derive(Debug, Clone)]
@@ -56,42 +56,32 @@ pub struct DiagnosticsRow {
     pub received_at: i64,
 }
 
-/// Why a report was not kept.
-#[derive(Debug, thiserror::Error)]
-pub enum KeepError {
-    /// The session sent one less than [`ONE_EACH`] ago.
-    #[error("one diagnostics report a minute; try again in {retry_after:?}")]
-    TooSoon { retry_after: Duration },
-    #[error(transparent)]
-    Store(#[from] StoreError),
+/// A report kept, with its log.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DiagnosticsWithLog {
+    #[sqlx(flatten)]
+    pub row: DiagnosticsRow,
+    pub log: String,
 }
 
-impl From<sqlx::Error> for KeepError {
-    fn from(e: sqlx::Error) -> Self {
-        Self::Store(e.into())
-    }
-}
-
-/// The row's columns, the log's length for the log. A literal, for
-/// `concat!`.
+/// The row's columns. A literal, for `concat!`.
 macro_rules! columns {
     () => {
         "id, principal, user_name, endpoint_id, device_name, device_model, os_name, \
-         os_version, app_name, app_version, note, length(CAST(log AS BLOB)) AS log_bytes, \
-         received_at"
+         os_version, app_name, app_version, note, log_bytes, received_at"
     };
 }
 
 impl Store {
-    /// Keep `report` from `sender`, and its id; [`KeepError::TooSoon`]
-    /// when the session sent one less than [`ONE_EACH`] ago. Then the
+    /// Keep `report` from `sender`: `Ok(id)`, or `Err(retry_after)` when
+    /// the session sent one less than [`ONE_EACH_SECS`] ago. Then the
     /// device's beyond its newest [`KEEP_PER_DEVICE`], and every report
-    /// older than [`KEEP_FOR`], are deleted.
+    /// older than [`KEEP_FOR_SECS`], are deleted.
     pub async fn keep_diagnostics(
         &self,
         sender: &Sender,
         report: &DiagnosticsReport,
-    ) -> Result<String, KeepError> {
+    ) -> Result<Result<String, Duration>, StoreError> {
         let now = self.now();
         let id = Uuid::now_v7().hyphenated().to_string();
         let mut tx = self.pool.begin().await?;
@@ -100,10 +90,10 @@ impl Store {
         let kept = sqlx::query(
             "INSERT INTO diagnostics_reports (id, principal, user_name, endpoint_id, \
              device_name, session_hash, device_model, os_name, os_version, app_name, \
-             app_version, note, log, received_at) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14 \
+             app_version, note, log, log_bytes, received_at) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15 \
              WHERE NOT EXISTS (SELECT 1 FROM diagnostics_reports \
-             WHERE session_hash = ?6 AND received_at > ?14 - ?15)",
+             WHERE session_hash = ?6 AND received_at > ?15 - ?16)",
         )
         .bind(&id)
         .bind(sender.principal.to_string())
@@ -118,8 +108,9 @@ impl Store {
         .bind(&report.app_version)
         .bind(&report.note)
         .bind(&report.log)
+        .bind(report.log.len() as i64)
         .bind(now)
-        .bind(ONE_EACH.as_secs() as i64)
+        .bind(ONE_EACH_SECS)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -130,10 +121,10 @@ impl Store {
             .bind(&sender.session_hash)
             .fetch_one(&mut *tx)
             .await?;
-            let next = last.unwrap_or(now) + ONE_EACH.as_secs() as i64;
-            return Err(KeepError::TooSoon {
-                retry_after: Duration::from_secs(next.saturating_sub(now).max(1) as u64),
-            });
+            let next = last.unwrap_or(now) + ONE_EACH_SECS;
+            return Ok(Err(Duration::from_secs(
+                next.saturating_sub(now).max(1) as u64
+            )));
         }
         sqlx::query(
             "DELETE FROM diagnostics_reports WHERE endpoint_id = ?1 AND id NOT IN \
@@ -144,51 +135,40 @@ impl Store {
         .bind(KEEP_PER_DEVICE)
         .execute(&mut *tx)
         .await?;
-        prune(&mut tx, now).await?;
+        sqlx::query("DELETE FROM diagnostics_reports WHERE received_at <= ?1")
+            .bind(now - KEEP_FOR_SECS)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(Ok(id))
     }
 
-    /// Delete the reports older than [`KEEP_FOR`]; how many went.
-    pub async fn prune_diagnostics(&self) -> Result<u64, StoreError> {
-        let mut conn = self.pool.acquire().await?;
-        Ok(prune(&mut conn, self.now()).await?)
-    }
-
-    /// Every report kept, newest first, without their logs.
+    /// Every report younger than [`KEEP_FOR_SECS`], newest first, without
+    /// their logs. One older is pruned by the next report kept.
     pub async fn diagnostics_list(&self) -> Result<Vec<DiagnosticsRow>, StoreError> {
         Ok(sqlx::query_as(concat!(
             "SELECT ",
             columns!(),
-            " FROM diagnostics_reports ORDER BY received_at DESC, id DESC"
+            " FROM diagnostics_reports WHERE received_at > ?1 \
+             ORDER BY received_at DESC, id DESC"
         ))
+        .bind(self.now() - KEEP_FOR_SECS)
         .fetch_all(&self.pool)
         .await?)
     }
 
-    /// Report `id` and its log, if it is kept.
-    pub async fn diagnostics(
-        &self,
-        id: &str,
-    ) -> Result<Option<(DiagnosticsRow, String)>, StoreError> {
-        let Some(row) = sqlx::query_as::<_, DiagnosticsRow>(concat!(
+    /// Report `id` with its log, if it is kept and younger than
+    /// [`KEEP_FOR_SECS`].
+    pub async fn diagnostics(&self, id: &str) -> Result<Option<DiagnosticsWithLog>, StoreError> {
+        Ok(sqlx::query_as(concat!(
             "SELECT ",
             columns!(),
-            " FROM diagnostics_reports WHERE id = ?1"
+            ", log FROM diagnostics_reports WHERE id = ?1 AND received_at > ?2"
         ))
         .bind(id)
+        .bind(self.now() - KEEP_FOR_SECS)
         .fetch_optional(&self.pool)
-        .await?
-        else {
-            return Ok(None);
-        };
-        let log: Option<String> =
-            sqlx::query_scalar("SELECT log FROM diagnostics_reports WHERE id = ?1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-        // Deleted between the two reads: gone.
-        Ok(log.map(|log| (row, log)))
+        .await?)
     }
 
     /// Delete report `id`; whether it was there.
@@ -200,16 +180,16 @@ impl Store {
             .rows_affected()
             > 0)
     }
-}
 
-async fn prune(conn: &mut sqlx::SqliteConnection, now: i64) -> Result<u64, sqlx::Error> {
-    Ok(
-        sqlx::query("DELETE FROM diagnostics_reports WHERE received_at <= ?1")
-            .bind(now - KEEP_FOR.as_secs() as i64)
-            .execute(conn)
-            .await?
-            .rows_affected(),
-    )
+    /// How many reports the database holds, listed or not: what pruning
+    /// left.
+    #[cfg(test)]
+    async fn diagnostics_held(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM diagnostics_reports")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +227,7 @@ mod tests {
         let id = store
             .keep_diagnostics(&from, &report("héllo\n"))
             .await
+            .unwrap()
             .unwrap();
         let listed = store.diagnostics_list().await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -257,7 +238,8 @@ mod tests {
         assert_eq!(row.note.as_deref(), Some("froze"));
         // Bytes, not characters.
         assert_eq!(row.log_bytes, 7);
-        let (read, log) = store.diagnostics(&id).await.unwrap().unwrap();
+        let read = store.diagnostics(&id).await.unwrap().unwrap();
+        let (read, log) = (read.row, read.log);
         assert_eq!((&read, log.as_str()), (row, "héllo\n"));
         assert!(store.delete_diagnostics(&id).await.unwrap());
         assert!(!store.delete_diagnostics(&id).await.unwrap());
@@ -268,20 +250,29 @@ mod tests {
     async fn a_session_sends_one_a_minute() {
         let store = test_store("diagnostics-rate").await;
         let from = sender("d1", "s1");
-        store.keep_diagnostics(&from, &report("1")).await.unwrap();
+        store
+            .keep_diagnostics(&from, &report("1"))
+            .await
+            .unwrap()
+            .unwrap();
         store.clock().advance(Duration::from_secs(59));
         let refused = store.keep_diagnostics(&from, &report("2")).await;
         assert!(
-            matches!(refused, Err(KeepError::TooSoon { retry_after }) if retry_after == Duration::from_secs(1)),
+            matches!(refused, Ok(Err(retry_after)) if retry_after == Duration::from_secs(1)),
             "{refused:?}"
         );
         // Another session on the same device is not held back by it.
         store
             .keep_diagnostics(&sender("d1", "s2"), &report("3"))
             .await
+            .unwrap()
             .unwrap();
         store.clock().advance(Duration::from_secs(1));
-        store.keep_diagnostics(&from, &report("4")).await.unwrap();
+        store
+            .keep_diagnostics(&from, &report("4"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(store.diagnostics_list().await.unwrap().len(), 3);
     }
 
@@ -293,6 +284,7 @@ mod tests {
             let id = store
                 .keep_diagnostics(&sender("d1", &format!("s{n}")), &report("x"))
                 .await
+                .unwrap()
                 .unwrap();
             ids.push(id);
             store.clock().advance(Duration::from_secs(1));
@@ -301,6 +293,7 @@ mod tests {
         store
             .keep_diagnostics(&sender("d2", "other"), &report("x"))
             .await
+            .unwrap()
             .unwrap();
         let listed: Vec<_> = store
             .diagnostics_list()
@@ -318,32 +311,44 @@ mod tests {
     #[tokio::test]
     async fn nothing_older_than_thirty_days_is_kept() {
         let store = test_store("diagnostics-age").await;
+        let keep_for = Duration::from_secs(KEEP_FOR_SECS as u64);
         let old = store
             .keep_diagnostics(&sender("d1", "s1"), &report("old"))
             .await
+            .unwrap()
             .unwrap();
-        store.clock().advance(KEEP_FOR - Duration::from_secs(1));
+        store.clock().advance(keep_for - Duration::from_secs(1));
         let young = store
             .keep_diagnostics(&sender("d2", "s2"), &report("young"))
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(store.prune_diagnostics().await.unwrap(), 0);
+        let listed = |store: &Store| {
+            let store = store.clone();
+            async move {
+                let ids: Vec<_> = store
+                    .diagnostics_list()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect();
+                ids
+            }
+        };
+        assert_eq!(listed(&store).await, [young.clone(), old.clone()]);
         store.clock().advance(Duration::from_secs(1));
+        // Past its time, it is no longer listed or read, though held.
+        assert_eq!(listed(&store).await, std::slice::from_ref(&young));
+        assert_eq!(store.diagnostics(&old).await.unwrap(), None);
+        assert_eq!(store.diagnostics_held().await, 2);
         // A report from anywhere prunes every device's.
         store
             .keep_diagnostics(&sender("d3", "s3"), &report("new"))
             .await
-            .unwrap();
-        let ids: Vec<_> = store
-            .diagnostics_list()
-            .await
             .unwrap()
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        assert!(!ids.contains(&old), "{ids:?}");
-        assert!(ids.contains(&young), "{ids:?}");
-        store.clock().advance(KEEP_FOR);
-        assert_eq!(store.prune_diagnostics().await.unwrap(), 2);
+            .unwrap();
+        assert_eq!(store.diagnostics_held().await, 2);
+        assert!(listed(&store).await.contains(&young));
     }
 }

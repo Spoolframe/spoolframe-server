@@ -53,9 +53,7 @@ pub fn OptimizedPage() -> Element {
     let toast = use_signal(|| None::<Said>);
     let shown = seen();
     let live = updated_line(false, clock(), shown.as_ref().map(|(_, at)| *at));
-    let forbidden = error()
-        .as_ref()
-        .is_some_and(|e| e.code == spoolframe_admin_api::error_code::FORBIDDEN);
+    let forbidden = error().as_ref().is_some_and(ApiError::is_forbidden);
     let off = error().as_ref().is_some_and(|e| is_off(e.code));
     let on_done = move |said: Option<Result<String, String>>| {
         open.set(None);
@@ -78,7 +76,7 @@ pub fn OptimizedPage() -> Element {
                 "Converted copies the server keeps, so a film is converted once and played or downloaded from the copy after. Copies are made in a profile and shared by every user; binge-ahead's are marked ahead. Over the budget, outdated and ahead copies go first, then the least recently used. A copy being read or pinned stays."
             }
             if forbidden {
-                Forbidden {}
+                Forbidden { what: "the optimized copies" }
             } else if off {
                 p { class: "m-0 max-w-[820px] text-sm text-ctp-subtext0", "{OFF_TEXT}" }
             } else if let Some(e) = error() {

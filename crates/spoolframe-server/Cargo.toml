@@ -118,6 +118,10 @@ m3u8-rs = { workspace = true }
 spoolframe-client-sdk = { workspace = true, features = ["test-http-lookup"] }
 # The feature-gated calls as the apps make them, through the FFI's objects.
 spoolframe-client-ffi = { path = "../spoolframe-client-ffi" }
+# The bridge as the Apple app serves a playback: `SdkSource` over the
+# SDK's managed playback. Tests only: the server's own bridge has no
+# `sdk` (portable_root_boundary).
+spoolframe-hls-bridge = { workspace = true, features = ["http", "sdk"] }
 # Signs the portable credentials and states the store tests check (P7-02).
 ed25519-dalek = { workspace = true }
 # A software security key root for the P7-08 tests.

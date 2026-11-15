@@ -6,30 +6,30 @@ use jsonrpsee::types::ErrorObjectOwned;
 use spoolframe_admin_api::{DiagnosticsDetail, DiagnosticsSummary, error_code};
 
 use super::{AdminApi, error, internal};
-use crate::store::diagnostics::DiagnosticsRow;
+use crate::store::diagnostics::{DiagnosticsRow, DiagnosticsWithLog};
 
 impl AdminApi {
     pub(super) async fn diagnostics_rows(&self) -> RpcResult<Vec<DiagnosticsSummary>> {
-        let store = self.auth.store();
-        // Pruned here too, so none past its time is listed while no app
-        // sends one.
-        store.prune_diagnostics().await.map_err(internal)?;
-        let rows = store.diagnostics_list().await.map_err(internal)?;
-        Ok(rows.into_iter().map(summary).collect())
+        let rows = self
+            .auth
+            .store()
+            .diagnostics_list()
+            .await
+            .map_err(internal)?;
+        Ok(rows.iter().map(summary).collect())
     }
 
     pub(super) async fn diagnostics_detail(&self, id: &str) -> RpcResult<DiagnosticsDetail> {
-        let (row, log) = self
+        let DiagnosticsWithLog { row, log } = self
             .auth
             .store()
             .diagnostics(id)
             .await
             .map_err(internal)?
             .ok_or_else(|| no_such_report(id))?;
-        let note = row.note.clone();
         Ok(DiagnosticsDetail {
-            summary: summary(row),
-            note,
+            summary: summary(&row),
+            note: row.note,
             log,
         })
     }
@@ -49,19 +49,19 @@ impl AdminApi {
     }
 }
 
-fn summary(row: DiagnosticsRow) -> DiagnosticsSummary {
+fn summary(row: &DiagnosticsRow) -> DiagnosticsSummary {
     DiagnosticsSummary {
         has_note: row.note.is_some(),
-        id: row.id,
-        user_id: row.principal,
-        user_name: row.user_name,
-        device_name: row.device_name,
-        endpoint_id: row.endpoint_id,
-        device_model: row.device_model,
-        os_name: row.os_name,
-        os_version: row.os_version,
-        app_name: row.app_name,
-        app_version: row.app_version,
+        id: row.id.clone(),
+        user_id: row.principal.clone(),
+        user_name: row.user_name.clone(),
+        device_name: row.device_name.clone(),
+        endpoint_id: row.endpoint_id.clone(),
+        device_model: row.device_model.clone(),
+        os_name: row.os_name.clone(),
+        os_version: row.os_version.clone(),
+        app_name: row.app_name.clone(),
+        app_version: row.app_version.clone(),
         received_at: row.received_at,
         log_bytes: u64::try_from(row.log_bytes).unwrap_or(0),
     }

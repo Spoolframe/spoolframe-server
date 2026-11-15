@@ -185,7 +185,7 @@ async fn audit(offset: u32) -> Result<AuditPage, ApiError> {
 }
 
 /// The browser's local date and time of Unix seconds `at`.
-fn when(at: i64) -> String {
+pub(super) fn when(at: i64) -> String {
     js_sys::Date::new(&JsValue::from_f64(at as f64 * 1000.0))
         .to_locale_string("default", &JsValue::UNDEFINED)
         .into()

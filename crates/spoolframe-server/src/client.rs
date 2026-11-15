@@ -2575,7 +2575,7 @@ impl ClientProtocol {
         who: &Who,
         report: spoolframe_protocol::diagnostics::DiagnosticsReport,
     ) -> Result<Reply, Error> {
-        use crate::store::diagnostics::{KeepError, Sender};
+        use crate::store::diagnostics::Sender;
         if let Some(message) = report.refusal() {
             return Err(Error::InvalidInput { message });
         }
@@ -2598,6 +2598,7 @@ impl ClientProtocol {
             .store()
             .keep_diagnostics(&sender, &report)
             .await
+            .map_err(internal)?
         {
             Ok(id) => {
                 tracing::info!(
@@ -2611,10 +2612,9 @@ impl ClientProtocol {
                 );
                 Ok(Reply::DiagnosticsSent { id })
             }
-            Err(KeepError::TooSoon { retry_after }) => Err(Error::RateLimited {
+            Err(retry_after) => Err(Error::RateLimited {
                 retry_after_ms: retry_after.as_millis() as u64,
             }),
-            Err(KeepError::Store(e)) => Err(internal(e)),
         }
     }
 

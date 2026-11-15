@@ -148,13 +148,13 @@ pub(super) fn KindIcon(kind: LibraryKind, #[props(default = 22)] size: u32) -> E
 }
 
 /// The board's "Only admins can see the catalog": what a consumer who
-/// opens a catalog link sees.
+/// opens an admin's link sees, `what` the page holds ("the catalog").
 #[component]
-pub(super) fn Forbidden() -> Element {
+pub(super) fn Forbidden(what: &'static str) -> Element {
     rsx! {
         section { class: "card empty max-w-[460px] self-center",
             span { class: "text-ctp-yellow", icons::Lock { size: 26 } }
-            b { "Only admins can see the catalog" }
+            b { "Only admins can see {what}" }
             span { "Ask an admin if you think you need it." }
             Link { class: "btn", to: Route::Profile {}, "Go to My profile" }
         }
@@ -204,7 +204,7 @@ pub(super) fn Unreachable(error: ApiError, on_retry: EventHandler<()>) -> Elemen
 #[component]
 fn Failed(error: ApiError, on_retry: EventHandler<()>) -> Element {
     match error.code {
-        error_code::FORBIDDEN => rsx! { Forbidden {} },
+        error_code::FORBIDDEN => rsx! { Forbidden { what: "the catalog" } },
         error_code::UNAVAILABLE => rsx! { Unreachable { error, on_retry } },
         _ => rsx! { super::Alert { text: error.explain() } },
     }

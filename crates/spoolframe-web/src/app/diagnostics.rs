@@ -3,14 +3,14 @@
 //! from what, its note, and its log in a scrolling block, Download and
 //! Delete, Delete asked first.
 
-use dioxus::prelude::*;
-use spoolframe_admin_api::{AdminApiClient, DiagnosticsDetail as Detail, DiagnosticsSummary};
-use wasm_bindgen::{JsCast, JsValue};
-
 use super::catalog::Forbidden;
+use super::connected::when;
+use super::logs::save_file;
 use super::{Alert, Route, icons, now_ms, rpc};
 use crate::diagnostics::{device_line, download_name, download_text, size_line, software_line};
 use crate::logic::{ApiError, ago};
+use dioxus::prelude::*;
+use spoolframe_admin_api::{AdminApiClient, DiagnosticsDetail as Detail, DiagnosticsSummary};
 
 async fn list() -> Result<Vec<DiagnosticsSummary>, ApiError> {
     let client = rpc::client().await?;
@@ -20,34 +20,6 @@ async fn list() -> Result<Vec<DiagnosticsSummary>, ApiError> {
 async fn one(id: String) -> Result<Detail, ApiError> {
     let client = rpc::client().await?;
     client.diagnostics(id).await.map_err(rpc::error)
-}
-
-/// The browser's local date and time of Unix seconds `at`.
-fn when(at: i64) -> String {
-    js_sys::Date::new(&JsValue::from_f64(at as f64 * 1000.0))
-        .to_locale_string("default", &JsValue::UNDEFINED)
-        .into()
-}
-
-/// Save `text` as a file called `name`, as a link to it clicked would.
-fn save_file(name: &str, text: &str) -> Result<(), JsValue> {
-    let parts = js_sys::Array::of1(&JsValue::from_str(text));
-    let options = web_sys::BlobPropertyBag::new();
-    options.set_type("text/plain;charset=utf-8");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
-    let document = web_sys::window()
-        .and_then(|w| w.document())
-        .ok_or_else(|| JsValue::from_str("no document"))?;
-    let link: web_sys::HtmlAnchorElement = document.create_element("a")?.unchecked_into();
-    link.set_href(&url);
-    link.set_download(name);
-    link.click();
-    web_sys::Url::revoke_object_url(&url)
-}
-
-fn forbidden(e: &ApiError) -> bool {
-    e.code == spoolframe_admin_api::error_code::FORBIDDEN
 }
 
 /// Server › Diagnostics: every report kept, newest first.
@@ -67,7 +39,7 @@ pub fn DiagnosticsPage() -> Element {
             }
             match current {
                 None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
-                Some(Err(e)) if forbidden(&e) => rsx! { Forbidden {} },
+                Some(Err(e)) if e.is_forbidden() => rsx! { Forbidden { what: "diagnostics" } },
                 Some(Err(e)) => rsx! { Alert { text: e.explain() } },
                 Some(Ok(rows)) if rows.is_empty() => rsx! {
                     section { class: "card empty",
@@ -136,7 +108,7 @@ pub fn DiagnosticsReport(id: String) -> Element {
             }
             match current {
                 None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
-                Some(Err(e)) if forbidden(&e) => rsx! { Forbidden {} },
+                Some(Err(e)) if e.is_forbidden() => rsx! { Forbidden { what: "diagnostics" } },
                 Some(Err(e)) => rsx! { Alert { text: e.explain() } },
                 Some(Ok(detail)) => {
                     let s = detail.summary.clone();

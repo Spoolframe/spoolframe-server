@@ -43,6 +43,15 @@ pub struct DiagnosticsReport {
     pub note: Option<String>,
 }
 
+/// A text's length, for `Debug` in place of the text.
+struct Bytes(usize);
+
+impl fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
 impl fmt::Debug for DiagnosticsReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiagnosticsReport")
@@ -51,14 +60,8 @@ impl fmt::Debug for DiagnosticsReport {
             .field("os_version", &self.os_version)
             .field("app_name", &self.app_name)
             .field("app_version", &self.app_version)
-            .field("log", &format_args!("<{} bytes>", self.log.len()))
-            .field(
-                "note",
-                &self
-                    .note
-                    .as_ref()
-                    .map(|n| format_args!("<{} bytes>", n.len()).to_string()),
-            )
+            .field("log", &Bytes(self.log.len()))
+            .field("note", &self.note.as_ref().map(|n| Bytes(n.len())))
             .finish()
     }
 }
@@ -68,32 +71,25 @@ impl DiagnosticsReport {
     /// named, with its size and the limit. What the server refuses with
     /// `InvalidInput`, and the SDK before sending.
     pub fn refusal(&self) -> Option<String> {
-        let fields = [
-            ("device_model", &self.device_model),
-            ("os_name", &self.os_name),
-            ("os_version", &self.os_version),
-            ("app_name", &self.app_name),
-            ("app_version", &self.app_version),
+        let parts = [
+            ("device_model", self.device_model.len(), MAX_FIELD_BYTES),
+            ("os_name", self.os_name.len(), MAX_FIELD_BYTES),
+            ("os_version", self.os_version.len(), MAX_FIELD_BYTES),
+            ("app_name", self.app_name.len(), MAX_FIELD_BYTES),
+            ("app_version", self.app_version.len(), MAX_FIELD_BYTES),
+            ("log", self.log.len(), MAX_LOG_BYTES),
+            (
+                "note",
+                self.note.as_ref().map_or(0, String::len),
+                MAX_NOTE_BYTES,
+            ),
         ];
-        for (name, value) in fields {
-            if value.len() > MAX_FIELD_BYTES {
-                return Some(over(name, value.len(), MAX_FIELD_BYTES));
-            }
-        }
-        if self.log.len() > MAX_LOG_BYTES {
-            return Some(over("log", self.log.len(), MAX_LOG_BYTES));
-        }
-        if let Some(note) = &self.note
-            && note.len() > MAX_NOTE_BYTES
-        {
-            return Some(over("note", note.len(), MAX_NOTE_BYTES));
-        }
-        None
+        parts.into_iter().find(|&(_, len, max)| len > max).map(|(name, len, max)| {
+            format!(
+                "the diagnostics' {name} is {len} bytes; at most {max} are sent: keep the newest"
+            )
+        })
     }
-}
-
-fn over(name: &str, len: usize, max: usize) -> String {
-    format!("the diagnostics' {name} is {len} bytes; at most {max} are sent: keep the newest")
 }
 
 #[cfg(test)]

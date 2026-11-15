@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::{ClientCapabilities, Platform};
 use spoolframe_client_sdk::{
-    Client, Device, ManagedPlayback, ManifestKind, MemoryStorage, OfflineMark, PlaybackOptions,
-    PlaybackPlan, SdkError, Session,
+    Client, Device, ManagedPlayback, MemoryStorage, OfflineMark, PlaybackOptions, PlaybackPlan,
+    Session,
 };
-use spoolframe_hls_bridge::{Bridge, Kind, Stream};
+use spoolframe_hls_bridge::{Bridge, Kind, SdkSource, Stream};
 use spoolframe_test_dir::TestDir;
 use spoolframe_types::{AudioCodec, Container, Delivery};
 
@@ -51,126 +51,6 @@ fn write_long_flac(server: &TestServer, key: &str) {
     assert!(status.success(), "ffmpeg could not make the track");
 }
 
-/// The bridge's source over the SDK's managed playback, as the app's
-/// (`spoolframe_hls_bridge::SdkSource`) is: not that type, whose `sdk`
-/// feature here would put the SDK in the server's own build.
-struct Served(ManagedPlayback);
-
-fn bridge_error(e: SdkError) -> spoolframe_hls_bridge::Error {
-    spoolframe_hls_bridge::Error::Other(e.to_string())
-}
-
-impl spoolframe_hls_bridge::Source for Served {
-    type Snapshot = spoolframe_client_sdk::Playback;
-    type Segment = ServedSegment;
-
-    fn changes(&self) -> tokio::sync::watch::Receiver<Self::Snapshot> {
-        self.0.changes()
-    }
-
-    fn replanned(&self) -> bool {
-        false
-    }
-
-    async fn read(
-        &self,
-        offset: u64,
-        length: u64,
-    ) -> Result<Vec<u8>, spoolframe_hls_bridge::Error> {
-        self.0.read(offset, length).await.map_err(bridge_error)
-    }
-
-    async fn manifest(
-        &self,
-        kind: spoolframe_hls_bridge::ManifestKind,
-        variant: u32,
-    ) -> Result<String, spoolframe_hls_bridge::Error> {
-        let kind = match kind {
-            spoolframe_hls_bridge::ManifestKind::Multivariant => ManifestKind::Multivariant,
-            spoolframe_hls_bridge::ManifestKind::Media => ManifestKind::Media,
-            spoolframe_hls_bridge::ManifestKind::Subtitles => ManifestKind::Subtitles,
-        };
-        self.0.manifest(kind, variant).await.map_err(bridge_error)
-    }
-
-    async fn read_segment(
-        &self,
-        variant: u32,
-        n: u32,
-        offset: u64,
-        length: u64,
-    ) -> Result<spoolframe_hls_bridge::Chunk, spoolframe_hls_bridge::Error> {
-        let chunk = self
-            .0
-            .read_segment(variant, n, offset, length)
-            .await
-            .map_err(bridge_error)?;
-        Ok(spoolframe_hls_bridge::Chunk {
-            bytes: chunk.bytes,
-            size: chunk.size,
-            complete: chunk.complete,
-            epoch: chunk.epoch,
-        })
-    }
-
-    async fn segment_stream(
-        &self,
-        variant: u32,
-        n: u32,
-        offset: u64,
-        length: u64,
-    ) -> Result<ServedSegment, spoolframe_hls_bridge::Error> {
-        Ok(ServedSegment(
-            self.0
-                .segment_stream(variant, n, offset, length)
-                .await
-                .map_err(bridge_error)?,
-        ))
-    }
-
-    async fn read_subtitle_segment(
-        &self,
-        n: u32,
-    ) -> Result<spoolframe_hls_bridge::Subtitle, spoolframe_hls_bridge::Error> {
-        let subtitle = self
-            .0
-            .read_subtitle_segment(n)
-            .await
-            .map_err(bridge_error)?;
-        Ok(spoolframe_hls_bridge::Subtitle {
-            bytes: subtitle.bytes,
-        })
-    }
-}
-
-struct ServedSegment(spoolframe_client_sdk::SegmentStream);
-
-impl spoolframe_hls_bridge::Segment for ServedSegment {
-    fn sent(&self) -> u64 {
-        self.0.sent()
-    }
-
-    fn size(&self) -> u64 {
-        self.0.size()
-    }
-
-    fn complete(&self) -> bool {
-        self.0.complete()
-    }
-
-    fn epoch(&self) -> u32 {
-        self.0.epoch()
-    }
-
-    async fn next(&mut self) -> Result<Option<Vec<u8>>, spoolframe_hls_bridge::Error> {
-        self.0.next().await.map_err(bridge_error)
-    }
-
-    async fn reopen(&self, length: u64) -> Result<Self, spoolframe_hls_bridge::Error> {
-        Ok(Self(self.0.reopen(length).await.map_err(bridge_error)?))
-    }
-}
-
 /// A playback of track `key` served on `bridge`, at `base` (its URL
 /// without the file name).
 struct Play {
@@ -179,7 +59,7 @@ struct Play {
     base: String,
 }
 
-async fn open(session: &Session, bridge: &Bridge<Served>, addr: &str, key: &str) -> Play {
+async fn open(session: &Session, bridge: &Bridge<SdkSource>, addr: &str, key: &str) -> Play {
     let playback = session
         .open_playback(&track_id(key), None, PlaybackOptions::default())
         .await
@@ -196,7 +76,7 @@ async fn open(session: &Session, bridge: &Bridge<Served>, addr: &str, key: &str)
         playback.snapshot().plan
     );
     let token = bridge.register(Stream::new(
-        Served(playback.clone()),
+        SdkSource::new(playback.clone(), playback.snapshot().plan),
         Kind::hls(),
         None,
         Default::default(),
@@ -209,7 +89,7 @@ async fn open(session: &Session, bridge: &Bridge<Served>, addr: &str, key: &str)
 }
 
 /// A bridge served on a loopback port, and its address.
-async fn bridge() -> (Bridge<Served>, String) {
+async fn bridge() -> (Bridge<SdkSource>, String) {
     let bridge = Bridge::new();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -381,7 +261,7 @@ async fn two_overlapping_plays_each_keep_their_own_track() {
         .await
         .unwrap();
     let token = bridge.register(Stream::new(
-        Served(next.clone()),
+        SdkSource::new(next.clone(), next.snapshot().plan),
         Kind::hls(),
         None,
         Default::default(),

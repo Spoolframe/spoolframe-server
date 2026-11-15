@@ -22,6 +22,8 @@ CREATE TABLE diagnostics_reports (
     app_version TEXT NOT NULL,
     note TEXT,
     log TEXT NOT NULL,
+    -- The log's length in bytes, so the list never reads the log.
+    log_bytes INTEGER NOT NULL,
     -- Unix seconds.
     received_at INTEGER NOT NULL
 );

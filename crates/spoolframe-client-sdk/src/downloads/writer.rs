@@ -19,6 +19,9 @@ pub(crate) struct BlockWriter {
     have: Vec<(u64, u64)>,
     /// Bytes written since the last [`BlockWriter::sync`].
     unsynced: u64,
+    /// Each write is flushed, for a read of the part that may follow
+    /// ([`BlockWriter::unflushed`] turns it off).
+    flush_each: bool,
 }
 
 /// Why [`BlockWriter::finish`] kept no file.
@@ -62,7 +65,15 @@ impl BlockWriter {
                 Vec::new()
             },
             unsynced: 0,
+            flush_each: true,
         })
+    }
+
+    /// This writer with no flush after each write: for a part nothing
+    /// reads until it is whole. [`BlockWriter::sync`] flushes it.
+    pub fn unflushed(mut self) -> Self {
+        self.flush_each = false;
+        self
     }
 
     /// Write `bytes` at `offset`. A block past the end is refused; one
@@ -82,7 +93,9 @@ impl BlockWriter {
         self.file.write_all(bytes).await?;
         // Done, not only handed to tokio's file: a read of the part may
         // follow (a track read ahead, played from it).
-        self.file.flush().await?;
+        if self.flush_each {
+            self.file.flush().await?;
+        }
         self.unsynced += bytes.len() as u64;
         self.add(offset, end);
         Ok(())
@@ -165,6 +178,7 @@ impl BlockWriter {
     /// Put what was written on disk: after this, [`BlockWriter::contiguous`]
     /// is safe to save as what a reopen keeps.
     pub async fn sync(&mut self) -> std::io::Result<()> {
+        self.file.flush().await?;
         self.file.sync_data().await?;
         self.unsynced = 0;
         Ok(())

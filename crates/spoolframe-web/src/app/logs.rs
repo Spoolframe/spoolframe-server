@@ -57,7 +57,7 @@ fn local(at: i64) -> i64 {
 }
 
 /// Save `text` as a file called `name`, as a link to it clicked would.
-fn save_file(name: &str, text: &str) -> Result<(), JsValue> {
+pub(super) fn save_file(name: &str, text: &str) -> Result<(), JsValue> {
     let parts = js_sys::Array::of1(&JsValue::from_str(text));
     let options = web_sys::BlobPropertyBag::new();
     options.set_type("text/plain;charset=utf-8");

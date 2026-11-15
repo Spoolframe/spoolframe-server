@@ -64,7 +64,7 @@ pub fn CatalogItem(library: String, id: String, tab: String) -> Element {
             div { class: "flex flex-col gap-[22px]",
                 Crumbs { library_id: library.clone(), library: None, trail: Vec::new(), here: None }
                 match error.code {
-                    spoolframe_admin_api::error_code::FORBIDDEN => rsx! { Forbidden {} },
+                    spoolframe_admin_api::error_code::FORBIDDEN => rsx! { Forbidden { what: "the catalog" } },
                     spoolframe_admin_api::error_code::UNAVAILABLE => rsx! {
                         Unreachable { error, on_retry: move |_| loaded.restart() }
                     },

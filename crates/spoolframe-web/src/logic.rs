@@ -67,6 +67,11 @@ impl ApiError {
         }
     }
 
+    /// The caller is not allowed: an admin's page opened by a consumer.
+    pub fn is_forbidden(&self) -> bool {
+        self.code == error_code::FORBIDDEN
+    }
+
     /// What to tell the person.
     pub fn explain(&self) -> String {
         match self.code {
