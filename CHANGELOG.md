@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Security, SDK: an app now resolves rusqlite 0.43 and libsqlite3-sys
+  0.40, which fixes RUSTSEC-2026-0459 (CVE-2026-119375, SQLite before
+  3.54.0). The SDK asks for rusqlite `>=0.39, <0.44` instead of 0.39, so
+  an app's build, with no sqlx in it, takes the newest. cargo deny and
+  osv-scanner in an app's CI pass again. No API changed: the SDK uses
+  only what both ends share, and CI tests it against the newest
+  (`scripts/sdk-newest-sqlite.sh`). The server's own build still carries
+  libsqlite3-sys 0.37, as sqlx 0.9 caps it below 0.38; it moves once sqlx
+  lifts that cap.
+
 ## 0.17.3 (2026-11-15)
 
 - Added, protocol: feature `spoolframe:diagnostics`, so an app sends its

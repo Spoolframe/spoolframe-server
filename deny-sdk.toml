@@ -59,7 +59,7 @@ ignore = [
   # >= 0.30.1, < 0.38, and `links = "sqlite3"` allows one in the tree.
   # Drop this once sqlx allows libsqlite3-sys >= 0.39; rusqlite then goes
   # to 0.41.
-  { id = "RUSTSEC-2026-0459", reason = "SQLite < 3.54.0 needs a crafted database plus a mismatched -wal file opened by our process; our databases are private files; sqlx 0.9 pins libsqlite3-sys < 0.38" },
+  { id = "RUSTSEC-2026-0459", reason = "SQLite < 3.54.0 needs a crafted database plus a mismatched -wal file opened by our process; our databases are private files; sqlx 0.9 pins libsqlite3-sys < 0.38 in this workspace's lock; the SDK's rusqlite range lets an app resolve rusqlite 0.43 / libsqlite3-sys 0.40, which has the fix (scripts/sdk-newest-sqlite.sh)" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and

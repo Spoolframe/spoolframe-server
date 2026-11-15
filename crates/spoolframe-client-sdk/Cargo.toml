@@ -53,10 +53,17 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 tokio = { workspace = true }
 tracing = { workspace = true }
 # The offline database: playlists, hearts and the search index
-# (downloads/local_db.rs). 0.39 pairs with libsqlite3-sys 0.37, the one
-# sqlx brings in for the server, so the tree has one SQLite; bundled, so
-# every platform has FTS5.
-rusqlite = { version = "0.39", features = ["bundled"] }
+# (downloads/local_db.rs); bundled, so every platform has FTS5.
+#
+# A range, not one version. libsqlite3-sys `links = "sqlite3"`, so a tree
+# has one copy. The server's sqlx (sqlx-sqlite 0.9) caps it below 0.38, so
+# this workspace resolves rusqlite 0.39 / libsqlite3-sys 0.37 and ignores
+# RUSTSEC-2026-0459 for it (deny.toml, audit.toml). An app, which has no
+# sqlx, resolves the newest in range: rusqlite 0.43 / libsqlite3-sys 0.40,
+# which has the fix. The SDK uses only the API both ends share, and CI
+# tests it against the newest (scripts/sdk-newest-sqlite.sh). Raise the
+# floor once sqlx lifts its cap.
+rusqlite = { version = ">=0.39, <0.44", features = ["bundled"] }
 # Folds accents for search with no server (`Client::search_offline`).
 unicode-normalization = "0.1.25"
 uniffi = { workspace = true, optional = true }
