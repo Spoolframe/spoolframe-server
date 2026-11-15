@@ -79,6 +79,7 @@ mod sdk;
 mod sdk_download_addons;
 mod sdk_downloads;
 mod sdk_music;
+mod sdk_music_hls;
 mod search;
 mod server_addresses;
 mod server_lookup;

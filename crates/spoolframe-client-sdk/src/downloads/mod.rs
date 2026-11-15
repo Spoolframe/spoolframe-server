@@ -62,7 +62,7 @@ pub use background::{
 };
 pub use batch::{BatchStart, ChildPlan, FailedChild, SkipReason, SkippedChild};
 pub use library::{DownloadLibrary, DownloadedShow, DownloadsHere, ProfileHere};
-pub(crate) use listening::Keeper;
+pub(crate) use listening::{Keeper, SegmentRead};
 pub(crate) use lock::Locks;
 pub use music::{
     AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicPhase,

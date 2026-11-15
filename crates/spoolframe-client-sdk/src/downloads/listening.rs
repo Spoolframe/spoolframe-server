@@ -4,13 +4,17 @@
 //! second transfer.
 //!
 //! What is kept is what was streamed: the file itself for a direct play
-//! (range reads, in any order, as the player seeks), or the conversion's
+//! (range reads, in any order, as the player seeks), the conversion's
 //! output for a progressive one (in order, from its start; a seek starts
-//! a new encode and nothing is kept of it). A track skipped part-way
-//! leaves nothing: its part is removed with the playback. A part is
+//! a new encode and nothing is kept of it), or an HLS remux's segments as
+//! the HLS bridge serves them to AVPlayer (the init segment, then every
+//! media segment in order, one encode's: together a fragmented MP4 of
+//! the whole track). A track skipped part-way, or an HLS play that skipped
+//! a segment, leaves nothing: its part is removed with the playback. A part is
 //! never gone on with after the client stops (the ranges are not saved):
 //! the manager removes them all at its start.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use spoolframe_protocol::PlaybackPlan;
@@ -49,6 +53,20 @@ enum State {
         container: Container,
         epoch: u32,
     },
+    /// An HLS play's segments, written in order as each is read whole:
+    /// the init segment (0), then media segments 1, 2, … of one encode.
+    Segments {
+        writer: BlockWriter,
+        part: std::path::PathBuf,
+        /// The encode (the playback's generation) and the rung read.
+        generation: u64,
+        variant: u32,
+        /// The next segment to write, and where in the file it goes.
+        next: u32,
+        written: u64,
+        /// Segments from `next` on, read so far, until they are written.
+        pending: BTreeMap<u32, Pending>,
+    },
     /// Kept, here: reads are played from it.
     Kept(std::path::PathBuf),
     /// Given up on: nothing more is written.
@@ -57,6 +75,36 @@ enum State {
 
 /// How much a read ahead asks for at once.
 const AHEAD: u64 = 1 << 20;
+
+/// How far past the next segment to write a segment may be read: a
+/// player reads one or two ahead; one further on skipped some.
+const SEGMENTS_AHEAD: u32 = 4;
+
+/// The most bytes of segments held while an earlier one is read.
+const PENDING_MAX: usize = 64 << 20;
+
+/// A segment of an HLS play being read.
+#[derive(Default)]
+struct Pending {
+    bytes: Vec<u8>,
+    /// Read whole: the encode had finished it, and every byte is here.
+    whole: bool,
+}
+
+/// What an HLS play read of a segment: `bytes` at `offset` of segment `n`
+/// of rung `variant`, in the encode of `generation`; the segment is
+/// `size` bytes so far, all of it once `complete`. `segments`: how many
+/// media segments the media playlist lists, once it was read.
+pub(crate) struct SegmentRead<'a> {
+    pub generation: u64,
+    pub variant: u32,
+    pub n: u32,
+    pub offset: u64,
+    pub bytes: &'a [u8],
+    pub size: u64,
+    pub complete: bool,
+    pub segments: Option<usize>,
+}
 
 impl Keeper {
     /// A keeper of `id` played in `session` with `options`, when it is a
@@ -182,6 +230,106 @@ impl Keeper {
         }
     }
 
+    /// An HLS play of `plan` read part of a segment ([`SegmentRead`]).
+    /// Kept once the init segment and every media segment the playlist
+    /// lists are written, in order, from one encode; a segment skipped, a
+    /// read from another encode or rung, or a read from inside a segment
+    /// not yet read up to there, keeps nothing.
+    pub(crate) async fn segment(&self, plan: &PlaybackPlan, read: SegmentRead<'_>) {
+        let PlaybackPlan::Converted {
+            delivery: Delivery::Hls,
+            ..
+        } = plan
+        else {
+            return;
+        };
+        let mut state = self.state.lock().await;
+        if matches!(*state, State::Idle) {
+            *state = match self.from_start.then(|| self.open(u64::MAX)) {
+                Some(open) => match open.await {
+                    Some((writer, part)) => State::Segments {
+                        writer,
+                        part,
+                        generation: read.generation,
+                        variant: read.variant,
+                        next: 0,
+                        written: 0,
+                        pending: BTreeMap::new(),
+                    },
+                    None => State::Over,
+                },
+                None => State::Over,
+            };
+        }
+        let State::Segments {
+            writer,
+            generation,
+            variant,
+            next,
+            written,
+            pending,
+            ..
+        } = &mut *state
+        else {
+            return;
+        };
+        if read.generation != *generation || read.variant != *variant {
+            self.give_up(&mut state).await;
+            return;
+        }
+        // Read again: written already.
+        if read.n < *next {
+            return;
+        }
+        if read.n > *next + SEGMENTS_AHEAD {
+            self.give_up(&mut state).await;
+            return;
+        }
+        let segment = pending.entry(read.n).or_default();
+        let have = segment.bytes.len() as u64;
+        if read.offset > have {
+            self.give_up(&mut state).await;
+            return;
+        }
+        // What this read adds past what is here: a read again from 0, or
+        // one that overlaps, brings the same bytes of the same encode.
+        let new = (have - read.offset) as usize;
+        if new < read.bytes.len() {
+            segment.bytes.extend_from_slice(&read.bytes[new..]);
+        }
+        segment.whole = read.complete && segment.bytes.len() as u64 == read.size;
+        if pending.values().map(|p| p.bytes.len()).sum::<usize>() > PENDING_MAX {
+            self.give_up(&mut state).await;
+            return;
+        }
+        let mut failed = None;
+        while pending.get(next).is_some_and(|p| p.whole) {
+            let segment = pending.remove(next).expect("present");
+            if let Err(e) = writer.write_at(*written, &segment.bytes).await {
+                failed = Some(e);
+                break;
+            }
+            *written += segment.bytes.len() as u64;
+            *next += 1;
+        }
+        let mut done = match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        // The init segment and every media segment: the whole track.
+        if done.is_ok() && read.segments.is_some_and(|n| *next as usize == n + 1) {
+            done = writer.set_size(*written);
+        }
+        if let Err(e) = done {
+            tracing::debug!(error = %e, "a track is not kept from listening");
+            self.give_up(&mut state).await;
+            return;
+        }
+        if writer.is_complete() {
+            self.keep(&mut state).await;
+        }
+    }
+
     /// `length` bytes at `offset` of a direct play's file, if they are
     /// here: read ahead, or the track kept whole. A read past the end is
     /// cut at it.
@@ -224,7 +372,10 @@ impl Keeper {
     }
 
     async fn give_up(&self, state: &mut State) {
-        if let State::Direct { part, .. } | State::Progressive { part, .. } = &*state {
+        if let State::Direct { part, .. }
+        | State::Progressive { part, .. }
+        | State::Segments { part, .. } = &*state
+        {
             let _ = tokio::fs::remove_file(part).await;
         }
         *state = State::Over;
@@ -246,6 +397,8 @@ impl Keeper {
                 container,
                 ..
             } => (writer, part, container, false),
+            // Fragmented MP4: the server's HLS segments always are.
+            State::Segments { writer, part, .. } => (writer, part, Container::Mp4, false),
             State::Idle | State::Kept(_) | State::Over => return,
         };
         match self.kept(writer, &part, container, direct).await {
@@ -356,7 +509,9 @@ async fn read_range(path: &std::path::Path, offset: u64, length: u64) -> std::io
 impl Drop for Keeper {
     fn drop(&mut self) {
         // Skipped part-way: what was written goes.
-        if let State::Direct { part, .. } | State::Progressive { part, .. } = &*self.state.get_mut()
+        if let State::Direct { part, .. }
+        | State::Progressive { part, .. }
+        | State::Segments { part, .. } = &*self.state.get_mut()
         {
             let _ = std::fs::remove_file(part);
         }

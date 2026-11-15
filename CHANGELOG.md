@@ -102,6 +102,14 @@
   `Client::set_server_addresses(endpoint_id, addrs)` (FFI with strings)
   keeps the user's own addresses for a saved server, dialled beside what
   it tells; `ServerEntry::user_addrs` lists them.
+- Fixed, SDK: on Apple, tracks are kept from listening again. Music
+  plays there as an HLS remux through the SDK's HLS bridge, whose
+  segment reads never reached the track's keeper, so nothing was kept
+  ("Kept from listening · Zero kB"). The bridge's segments now go to the
+  keeper of their own playback: the init segment and every media segment,
+  in order, from one encode, are kept as the track's file, a fragmented
+  MP4 that plays from disk. A play that skips a segment, or stops
+  part-way, keeps nothing, as before.
 - Fixed, server: a file whose TrueHD track ffprobe 8.1 reports with no
   sample format (common in Blu-ray remuxes) is read again. The whole file
   was "could not be read": no download, no play.

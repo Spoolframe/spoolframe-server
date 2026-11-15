@@ -1376,9 +1376,10 @@ impl ManagedPlayback {
             self.opened_segment(variant, n, &opened);
             self.read_now();
             self.segment_read(n, 0, chunk.bytes.len() as u64, chunk.size, chunk.complete);
+            self.keep_segment(&opened, variant, n, 0, &chunk).await;
             return Ok(chunk);
         }
-        let (p, _) = self.rest_of(variant, n, at)?;
+        let (p, opened) = self.rest_of(variant, n, at)?;
         match backend
             .read_segment(&p.handle, p.epoch, variant, n, offset, length)
             .await
@@ -1391,10 +1392,69 @@ impl ManagedPlayback {
                 self.read_now();
                 let read = chunk.bytes.len() as u64;
                 self.segment_read(n, offset, read, chunk.size, chunk.complete);
+                self.keep_segment(&opened, variant, n, offset, &chunk).await;
                 Ok(chunk)
             }
             answer => answer,
         }
+    }
+
+    /// Hand what a read of segment `n` brought to the track's keeper,
+    /// with the encode it was opened in: an HLS play is kept as the
+    /// bridge serves it, its segments in order.
+    async fn keep_segment(
+        &self,
+        opened: &Opened,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        chunk: &Chunk,
+    ) {
+        self.keep_piece(
+            opened,
+            variant,
+            n,
+            offset,
+            &chunk.bytes,
+            (chunk.size, chunk.complete),
+        )
+        .await;
+    }
+
+    /// [`Self::keep_segment`] of `bytes` at `offset`; `(size, complete)`
+    /// as the segment's answer says.
+    async fn keep_piece(
+        &self,
+        opened: &Opened,
+        variant: u32,
+        n: u32,
+        offset: u64,
+        bytes: &[u8],
+        (size, complete): (u64, bool),
+    ) {
+        let Some(keeper) = self.0.keeper.get() else {
+            return;
+        };
+        let (plan, segments) = {
+            let state = self.0.state.lock();
+            let segments = (!state.segments.is_empty()).then_some(state.segments.len());
+            (state.playback.plan.clone(), segments)
+        };
+        keeper
+            .segment(
+                &plan,
+                crate::downloads::SegmentRead {
+                    generation: opened.generation,
+                    variant,
+                    n,
+                    offset,
+                    bytes,
+                    size,
+                    complete,
+                    segments,
+                },
+            )
+            .await;
     }
 
     /// [`Self::read_segment`], its bytes handed on as they arrive:
@@ -2206,6 +2266,13 @@ impl SegmentStream {
             return Err(self.playback.segment_moved_on(&self.opened, self.at));
         }
         let piece = self.body.next().await?;
+        if let Some(bytes) = &piece {
+            let offset = self.offset + self.body.received() - bytes.len() as u64;
+            let answer = (self.body.size, self.body.complete);
+            self.playback
+                .keep_piece(&self.opened, self.variant, self.n, offset, bytes, answer)
+                .await;
+        }
         // Counted at the read that hands on a whole segment's last byte: a
         // consumer that stops once it has the length it promised (the
         // iOS bridge's hyper does) never reads the end. The end counts it

@@ -28,7 +28,7 @@ use crate::support::{ServerOptions, TestServer, pinned_sdk_client, settled};
 /// A server whose three tracks (32 and 33 of Discovery, 35 of Homework)
 /// are FLAC files with a cover, with posters, its music served as a
 /// library (Liked), and alice and bob.
-async fn music_server(test: &str) -> TestServer {
+pub(crate) async fn music_server(test: &str) -> TestServer {
     let server = server(test, ServerOptions::default()).await;
     server.catalog.show_posters();
     server.catalog.serve_music();
@@ -53,7 +53,7 @@ fn linux() -> Device {
     }
 }
 
-fn options(downloads: &Path) -> ClientOptions {
+pub(crate) fn options(downloads: &Path) -> ClientOptions {
     ClientOptions {
         lan_discovery: false,
         relays: false,
@@ -76,7 +76,7 @@ async fn device(server: &TestServer, storage: &Arc<MemoryStorage>, downloads: &P
     device_with(server, storage, downloads).await
 }
 
-async fn alice(server: &TestServer, client: &Client) -> Session {
+pub(crate) async fn alice(server: &TestServer, client: &Client) -> Session {
     client
         .sign_in(&server.server.id().to_string(), "alice", PASSWORD, false)
         .await
@@ -102,7 +102,7 @@ async fn play(session: &Session, key: &str, whole: bool) {
 }
 
 /// Whether `check` holds within `limit`, asked every 50 ms.
-async fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
+pub(crate) async fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
         if check() {
@@ -116,7 +116,7 @@ async fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
 }
 
 /// The tracks of `music`, by key, with their marks.
-fn marks(music: &OfflineMusic) -> Vec<(String, OfflineMark)> {
+pub(crate) fn marks(music: &OfflineMusic) -> Vec<(String, OfflineMark)> {
     let mut marks: Vec<(String, OfflineMark)> = music
         .artists
         .iter()
@@ -128,7 +128,7 @@ fn marks(music: &OfflineMusic) -> Vec<(String, OfflineMark)> {
     marks
 }
 
-fn offline(client: &Client, server: &TestServer, session_user: &str) -> OfflineMusic {
+pub(crate) fn offline(client: &Client, server: &TestServer, session_user: &str) -> OfflineMusic {
     client
         .downloads()
         .offline_music(&server.server.id().to_string(), session_user)
