@@ -125,10 +125,11 @@ pub fn interfaces() -> Vec<Interface> {
     found
 }
 
-/// Docker's bridges, its networks', their veth pairs' and libvirt's
-/// bridges: on the host only, never reached from another device. Not told
-/// unless [`Announce::interfaces`] names them.
-pub const VIRTUAL_INTERFACES: &[&str] = &["docker*", "br-*", "veth*", "virbr*"];
+/// Docker's bridges, its networks', their veth pairs', libvirt's, Podman's
+/// (podman0, and one per network or CI job) and CNI's: on the host only,
+/// never reached from another device. Not told unless
+/// [`Announce::interfaces`] names them.
+pub const VIRTUAL_INTERFACES: &[&str] = &["docker*", "br-*", "veth*", "virbr*", "podman*", "cni*"];
 
 /// `network.announce`, checked. The default tells every address the
 /// endpoint has that another device may reach, but those on virtual
@@ -432,6 +433,29 @@ mod tests {
                 addr("10.10.0.2:7420"),
                 addr("[2001:db8::5]:7420"),
             ]
+        );
+    }
+
+    /// Podman's bridges (podman0, and a CI runner's per-job podman1) and
+    /// CNI's (cni0, cni-podman0) are no more reachable than Docker's: a
+    /// device that dials 10.88.0.1 waits it out before the next address.
+    #[test]
+    fn podman_and_cni_bridges_are_not_told_without_settings() {
+        let direct = vec![
+            addr("192.168.86.5:7420"),
+            addr("10.88.0.1:7420"),
+            addr("10.89.0.1:7420"),
+            addr("10.22.0.1:7420"),
+        ];
+        let interfaces = vec![
+            interface("enp5s0", &["192.168.86.5"]),
+            interface("podman0", &["10.88.0.1"]),
+            interface("podman1", &["10.89.0.1"]),
+            interface("cni0", &["10.22.0.1"]),
+        ];
+        assert_eq!(
+            Announce::default().told(&direct, &bound(), &interfaces),
+            [addr("192.168.86.5:7420")]
         );
     }
 

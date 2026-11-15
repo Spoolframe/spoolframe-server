@@ -158,7 +158,7 @@ network {
   # VM bridges are on that list too: no device reaches those, and on most
   # devices 172.17.0.1 is their own docker0. Told are the addresses on
   # `interfaces` (each interface when empty, but the virtual ones:
-  # "docker*", "br-*", "veth*" and "virbr*"), less those on
+  # "docker*", "br-*", "veth*", "virbr*", "podman*" and "cni*"), less those on
   # `ignore_interfaces`, less those in `ignore`, plus `add`. A virtual
   # interface is told only when `interfaces` names it ("docker0"). An
   # `add` address is told even when an ignore matches it. Interface names

@@ -17,6 +17,11 @@
   and a report's page shows its log, with Download as .txt and Delete.
   `admin.diagnosticsList`, `admin.diagnostics` and
   `admin.diagnosticsDelete`; `NO_SUCH_REPORT` (-32040).
+- Changed, server: Podman's and CNI's bridges (`podman*`, `cni*`) are
+  virtual interfaces too, with Docker's and libvirt's: their addresses
+  are no longer told to devices or published in
+  `/.well-known/spoolframe` unless `network.announce.interfaces` names
+  them. A device no longer waits out 10.88.0.1 before the next address.
 - Security, server: rmcp, the MCP server library, goes from 3.5.0 to
   3.10.0, which fixes RUSTSEC-2026-0457, RUSTSEC-2026-0461 and
   RUSTSEC-2026-0462.

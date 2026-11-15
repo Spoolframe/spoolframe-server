@@ -1200,7 +1200,7 @@ fn AnnounceFields(
                 span { class: "flex flex-col gap-0.5",
                     b { class: "text-[15px]", "Addresses devices are told" }
                     span { class: "text-[13px] text-ctp-subtext0",
-                        "A signed-in device is told the server’s address on each network interface, but container and VM bridges (docker*, br-*, veth*, virbr*), which no device reaches. Narrow or add to that here. Interface names take * and ?."
+                        "A signed-in device is told the server’s address on each network interface, but container and VM bridges (docker*, br-*, veth*, virbr*, podman*, cni*), which no device reaches. Narrow or add to that here. Interface names take * and ?."
                     }
                 }
             }
