@@ -554,6 +554,9 @@ pub(crate) mod tests {
     fn track(n: u64) -> Item {
         let id = |kind, key: &str| MediaId::new(Namespace::Plex, kind, key).unwrap();
         Item::Track(Track {
+            added_at: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Track, &n.to_string()),
             album_id: id(MediaKind::Album, "1"),
             artist_id: id(MediaKind::Artist, "1"),

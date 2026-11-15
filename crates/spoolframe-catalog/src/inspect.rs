@@ -263,6 +263,11 @@ mod tests {
     #[test]
     fn an_episode_is_under_its_season_and_show() {
         let episode = Item::Episode(Episode {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Episode, "3"),
             show_id: id(MediaKind::Show, "1"),
             show_title: None,

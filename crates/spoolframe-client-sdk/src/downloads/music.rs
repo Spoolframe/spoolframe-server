@@ -2253,6 +2253,9 @@ mod tests {
 
     fn track(key: &str) -> Item {
         Item::Track(Track {
+            added_at: None,
+            size: None,
+            external_ids: Vec::new(),
             id: MediaId::new(Namespace::Plex, MediaKind::Track, key).unwrap(),
             album_id: MediaId::new(Namespace::Plex, MediaKind::Album, "31").unwrap(),
             artist_id: MediaId::new(Namespace::Plex, MediaKind::Artist, "30").unwrap(),

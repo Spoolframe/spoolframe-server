@@ -425,6 +425,11 @@ mod tests {
 
     fn movie(key: &str, title: &str, year: u16) -> Item {
         Item::Movie(Movie {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id("movie", key),
             title: title.into(),
             year: Some(year),
@@ -440,6 +445,10 @@ mod tests {
 
     fn show(key: &str, title: &str) -> Item {
         Item::Show(Show {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            external_ids: Vec::new(),
             id: id("show", key),
             title: title.into(),
             year: None,
@@ -455,6 +464,11 @@ mod tests {
 
     fn episode(key: &str, title: &str, show: &str) -> Item {
         Item::Episode(Episode {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id("episode", key),
             show_id: id("show", show),
             show_title: None,
@@ -559,6 +573,8 @@ mod tests {
                 found(
                     SearchKind::Artists,
                     vec![Item::Artist(Artist {
+                        added_at: None,
+                        external_ids: Vec::new(),
                         id: id("artist", "1"),
                         name: "The Cure".into(),
                         summary: None,
@@ -821,6 +837,8 @@ mod tests {
                 found(
                     SearchKind::Artists,
                     vec![Item::Artist(Artist {
+                        added_at: None,
+                        external_ids: Vec::new(),
                         id: id("artist", "1"),
                         name: "Madonna".into(),
                         summary: None,

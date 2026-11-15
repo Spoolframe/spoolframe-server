@@ -265,6 +265,11 @@ mod tests {
     fn every_id_in_an_item_names_its_server() {
         let id = |kind, key: &str| MediaId::new(Namespace::Plex, kind, key).unwrap();
         let episode = Item::Episode(Episode {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Episode, "3"),
             show_id: id(MediaKind::Show, "1"),
             show_title: None,
@@ -301,6 +306,11 @@ mod tests {
     #[test]
     fn a_cast_member_s_id_and_photo_name_the_item_s_server() {
         let movie = Item::Movie(Movie {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "3").unwrap(),
             title: "Alien".into(),
             year: None,
@@ -332,6 +342,9 @@ mod tests {
     fn a_track_s_cover_names_its_server() {
         let id = |kind, key: &str| MediaId::new(Namespace::Plex, kind, key).unwrap();
         let track = Item::Track(Track {
+            added_at: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Track, "3"),
             album_id: id(MediaKind::Album, "2"),
             artist_id: id(MediaKind::Artist, "1"),

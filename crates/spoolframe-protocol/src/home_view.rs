@@ -155,6 +155,11 @@ mod tests {
 
     fn movie(key: &str, viewed: Option<SystemTime>) -> Item {
         Item::Movie(Movie {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Movie, key),
             title: key.into(),
             year: None,
@@ -173,6 +178,11 @@ mod tests {
 
     fn episode(show: &str, n: u32) -> Item {
         Item::Episode(Episode {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Episode, &format!("{show}{n}")),
             show_id: id(MediaKind::Show, show),
             show_title: Some(show.into()),
@@ -282,6 +292,8 @@ mod tests {
     #[test]
     fn music_is_never_featured() {
         let track = Item::Artist(spoolframe_types::Artist {
+            added_at: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Artist, "1"),
             name: "A".into(),
             summary: None,

@@ -683,6 +683,10 @@ mod tests {
     fn entries(ids: &[u64]) -> Vec<PlaylistEntryInfo> {
         // Any item: only the entries' ids are read.
         let film = spoolframe_admin_api::Item::Show(spoolframe_admin_api::Show {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            external_ids: Vec::new(),
             id: "plex:show:1".parse().unwrap(),
             title: "Brooklyn Nine-Nine".into(),
             year: Some(2013),

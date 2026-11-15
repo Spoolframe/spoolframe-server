@@ -288,6 +288,11 @@ mod tests {
 
     fn movie(id: MediaId, title: &str) -> Item {
         Item::Movie(Movie {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id,
             title: title.into(),
             year: None,
@@ -303,6 +308,10 @@ mod tests {
 
     fn show(title: &str) -> Item {
         Item::Show(Show {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            external_ids: Vec::new(),
             id: MediaId::new(Namespace::Plex, MediaKind::Show, title).unwrap(),
             title: title.into(),
             year: None,

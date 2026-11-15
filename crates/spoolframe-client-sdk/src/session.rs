@@ -157,7 +157,8 @@ pub(crate) async fn save(
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ItemsPage {
     pub items: Vec<Item>,
-    /// How many items the library has in all.
+    /// How many items the page's filter keeps in all, across every page
+    /// (the "37" of "37 of 412"); without a filter, the library's count.
     pub total: u32,
     /// Experimental (`federation`): the items listed that are no
     /// longer available, their paired server unpaired or their library

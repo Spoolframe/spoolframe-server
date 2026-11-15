@@ -37,6 +37,11 @@ use spoolframe_types::{
 
 fn movie() -> Item {
     Item::Movie(Movie {
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        size: None,
+        external_ids: Vec::new(),
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
         title: "Alien".into(),
         year: Some(1979),
@@ -1845,7 +1850,8 @@ mod before_markers {
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum Reply {
         Item {
-            item: Item,
+            // Boxed as the item grew; the same on the wire.
+            item: Box<Item>,
             children: Vec<Item>,
         },
         PlaybackStarted {
@@ -1888,7 +1894,7 @@ fn spans_and_times_keep_their_wire_form() {
 #[test]
 fn an_older_server_s_replies_without_markers_do_not_decode() {
     let item = codec::encode(&before_markers::Reply::Item {
-        item: movie(),
+        item: Box::new(movie()),
         children: Vec::new(),
     })
     .unwrap();
@@ -1935,7 +1941,7 @@ fn an_older_client_reads_an_item_that_has_markers() {
     let before_markers::Reply::Item { item, children } = codec::decode(&bytes).unwrap() else {
         panic!("not an item")
     };
-    assert_eq!((item, children), (movie(), Vec::new()));
+    assert_eq!((*item, children), (movie(), Vec::new()));
 }
 
 /// The started-playback reply as it was before its `duration_ms`.

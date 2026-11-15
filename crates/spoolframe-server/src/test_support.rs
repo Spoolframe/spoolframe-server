@@ -323,6 +323,11 @@ fn with_id(item: Item, id: &MediaId) -> Item {
 
 pub fn movie() -> Item {
     Item::Movie(Movie {
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        size: None,
+        external_ids: Vec::new(),
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
         title: "Alien".into(),
         year: Some(1979),
@@ -355,6 +360,11 @@ pub fn movie() -> Item {
 /// the first copy's external ids.
 pub fn second_copy() -> Item {
     Item::Movie(Movie {
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        size: None,
+        external_ids: Vec::new(),
         id: MediaId::new(Namespace::Plex, MediaKind::Movie, "2").unwrap(),
         title: "Alien (4K)".into(),
         year: Some(1979),
@@ -376,6 +386,10 @@ fn media(kind: MediaKind, key: &str) -> MediaId {
 /// (episodes 12 and 13) and season 2 (episode 15).
 pub fn show() -> Item {
     Item::Show(Show {
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        external_ids: Vec::new(),
         id: media(MediaKind::Show, "10"),
         title: "The Expanse".into(),
         year: Some(2015),
@@ -403,6 +417,11 @@ fn season(key: &str, number: u32) -> Item {
 /// Episode `key`: number `episode` of season `season` (`season_key`).
 pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
     Item::Episode(Episode {
+        added_at: None,
+        rating_tenths: None,
+        audience_rating_tenths: None,
+        size: None,
+        external_ids: Vec::new(),
         id: media(MediaKind::Episode, key),
         show_id: media(MediaKind::Show, "10"),
         show_title: Some("The Expanse".into()),
@@ -426,6 +445,8 @@ pub fn episode(key: &str, season_key: &str, season: u32, episode: u32) -> Item {
 /// `plex:album:34` (1997: track 35).
 pub fn artist() -> Item {
     Item::Artist(Artist {
+        added_at: None,
+        external_ids: Vec::new(),
         id: media(MediaKind::Artist, "30"),
         name: "Daft Punk".into(),
         summary: None,
@@ -440,6 +461,8 @@ pub fn album(key: &str) -> Item {
         ("Homework", 1997)
     };
     Item::Album(Album {
+        added_at: None,
+        external_ids: Vec::new(),
         id: media(MediaKind::Album, key),
         artist_id: media(MediaKind::Artist, "30"),
         artist_name: Some("Daft Punk".into()),
@@ -453,6 +476,9 @@ pub fn album(key: &str) -> Item {
 /// Track `key`, number `number` of album `album`.
 pub fn track(key: &str, album: &str, number: u32) -> Item {
     Item::Track(Track {
+        added_at: None,
+        size: None,
+        external_ids: Vec::new(),
         id: media(MediaKind::Track, key),
         album_id: media(MediaKind::Album, album),
         artist_id: media(MediaKind::Artist, "30"),

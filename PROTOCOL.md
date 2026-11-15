@@ -113,6 +113,7 @@ them. A few fields may still be left out, each for a reason of its own:
 | `root`, `genesis` on a device credential and a `root` tie proof; `signer`, `roots_added`, `roots_removed` on an identity state | absent | stored as JSON by servers and devices; left out when empty |
 | `expected_size` on a download, `cause` on a failed one | `null`, `other` | the SDK keeps them with a download |
 | `wan` on `PlaybackStarted`, `PlaybackChanged` | `null` | an older server has no such field; a newer one always sends it |
+| `added_at`, `rating_tenths`, `audience_rating_tenths`, `size`, `external_ids` on an item ([merging libraries](#merging-libraries)) | `null`, `[]` | left out when the catalog has none; an older server has no such field |
 | the experimental features' fields (`federation`'s `unavailable`, `servers`, a library's `server`, `copies`; `smart-crop`'s `faces` on an artwork reply) | none | left out for a client without the feature |
 
 ## Connections and streams
@@ -2405,6 +2406,27 @@ walk, no first-page cost. A page of a 300,000-film cache takes about
 SDK: `Session::items_sorted(library, offset, limit, sort, filter)`
 returns an `ItemsPage`, and `Session::item_filter_values(library)` the
 `ItemFilterValues`.
+
+### Merging libraries
+
+An app that shows one Movies, TV Shows or Music list from several
+servers pages each server's library and merges the pages itself. To
+order them as one and show a title two servers have once, items carry
+what the sort keys order by, wherever the server lists them (library
+pages, search, Home's rows, an item's own read):
+
+| Field | On | What |
+|---|---|---|
+| `added_at` | movie, show, episode, artist, album, track | Unix seconds: when the catalog added it, as `added` orders by. A show's is Plex's date for the show. |
+| `rating_tenths`, `audience_rating_tenths` | movie, show, episode | 0 to 100: the ratings `rating` and `audience_rating` order by, in tenths (7.9 is 79). |
+| `size` | movie, episode, track | Bytes: its first version's first file, as `size` orders by. |
+| `external_ids` | movie, show, episode, artist, album, track | Its stable ids as `scheme://id`: Plex's own (`plex://movie/…`) wherever it is listed, and its agents' (`imdb://tt0078748`, `tmdb://348`, `tvdb://…`, `mbid://…` for music) on library pages, search, Home's recently added and an item's own read. Two servers' copies of a title share some of them where both catalogs matched it. |
+
+Each is left out when the catalog has none, and an older server sends
+none. A paired server's (`fed:`) film, show or artist carries the
+added date, ratings and size it sent; its other items carry only the
+external ids. `total` on a page already counts what the filter keeps,
+for "37 of 412".
 
 ## Liked and All
 

@@ -548,6 +548,9 @@ mod tests {
 
     fn song(name: &str) -> Item {
         Item::Track(Track {
+            added_at: None,
+            size: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Track, name),
             album_id: id(MediaKind::Album, "1"),
             artist_id: id(MediaKind::Artist, "1"),
@@ -572,6 +575,8 @@ mod tests {
 
     fn album(title: &str) -> Album {
         Album {
+            added_at: None,
+            external_ids: Vec::new(),
             id: id(MediaKind::Album, title),
             artist_id: id(MediaKind::Artist, "1"),
             artist_name: None,

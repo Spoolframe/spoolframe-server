@@ -186,12 +186,16 @@ fn shown(results: &SearchResults) -> Vec<String> {
 
 fn music(device: &Device) {
     let artist = Item::Artist(Artist {
+        added_at: None,
+        external_ids: Vec::new(),
         id: id(MediaKind::Artist, "30"),
         name: "Sigur Rós".into(),
         summary: None,
         artwork: Vec::new(),
     });
     let album = Item::Album(Album {
+        added_at: None,
+        external_ids: Vec::new(),
         id: id(MediaKind::Album, "31"),
         artist_id: id(MediaKind::Artist, "30"),
         artist_name: Some("Sigur Rós".into()),
@@ -201,6 +205,9 @@ fn music(device: &Device) {
         artwork: Vec::new(),
     });
     let track = Item::Track(Track {
+        added_at: None,
+        size: None,
+        external_ids: Vec::new(),
         id: id(MediaKind::Track, "32"),
         album_id: id(MediaKind::Album, "31"),
         artist_id: id(MediaKind::Artist, "30"),

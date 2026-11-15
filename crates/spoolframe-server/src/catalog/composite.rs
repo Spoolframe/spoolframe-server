@@ -946,6 +946,11 @@ mod tests {
 
     fn movie(key: &str) -> Item {
         Item::Movie(Movie {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: format!("plex:movie:{key}").parse().unwrap(),
             title: key.into(),
             year: None,

@@ -8,7 +8,7 @@
 //! not shared), a track's audio facts (the origin plans every play), and
 //! playback state (the caching server keeps its own users').
 
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use spoolframe_catalog::Facts;
 use spoolframe_protocol::federation::{RemoteArtwork, RemoteArtworkKind, RemoteItem, RemoteKind};
@@ -246,6 +246,13 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
     let duration = remote.duration_ms.map(Duration::from_millis);
     let artwork = local_artwork(origin, &remote.artwork);
     let title = remote.title.clone();
+    // Sent with a film, a show or an artist only (see `remote`); the ids
+    // with every kind.
+    let added_at = remote
+        .added_at
+        .and_then(|at| u64::try_from(at).ok())
+        .and_then(|at| UNIX_EPOCH.checked_add(Duration::from_secs(at)));
+    let external_ids = remote.external_ids.clone();
     Some(match kind {
         MediaKind::Movie => Item::Movie(Movie {
             id,
@@ -256,6 +263,11 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
             content_rating: remote.content_rating.clone(),
             duration,
             cast: Vec::new(),
+            added_at,
+            rating_tenths: remote.rating_tenths,
+            audience_rating_tenths: remote.audience_rating_tenths,
+            size: remote.size,
+            external_ids,
             artwork,
             playback: PlaybackState::default(),
         }),
@@ -269,6 +281,10 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
             genres: remote.genres.clone(),
             last_aired: date,
             cast: Vec::new(),
+            added_at,
+            rating_tenths: remote.rating_tenths,
+            audience_rating_tenths: remote.audience_rating_tenths,
+            external_ids,
             artwork,
         }),
         MediaKind::Season => Item::Season(Season {
@@ -293,6 +309,11 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
             air_date: date,
             duration,
             cast: Vec::new(),
+            added_at,
+            rating_tenths: remote.rating_tenths,
+            audience_rating_tenths: remote.audience_rating_tenths,
+            size: remote.size,
+            external_ids,
             artwork,
             playback: PlaybackState::default(),
         }),
@@ -300,6 +321,8 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
             id,
             name: title,
             summary: remote.summary.clone(),
+            added_at,
+            external_ids,
             artwork,
         }),
         MediaKind::Album => Item::Album(Album {
@@ -309,6 +332,8 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
             title,
             year: remote.year,
             track_count: remote.count,
+            added_at,
+            external_ids,
             artwork,
         }),
         MediaKind::Track => Item::Track(Track {
@@ -325,6 +350,9 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
             bit_depth: None,
             sample_rate: None,
             duration,
+            added_at,
+            size: remote.size,
+            external_ids,
             artwork,
             playback: PlaybackState::default(),
         }),
@@ -339,8 +367,9 @@ mod tests {
     const ORIGIN: &str = "mzxw6ytbojtg633c";
 
     /// What the origin's item becomes here: the same item, every id the
-    /// origin's.
-    fn federated(item: Item) -> Item {
+    /// origin's, with the external ids sent with it.
+    fn federated(item: Item, external_ids: &[&str]) -> Item {
+        let external_ids: Vec<String> = external_ids.iter().map(|&id| id.to_owned()).collect();
         let f = |id: &MediaId| MediaId::federated(ORIGIN, id).unwrap();
         let a = |artwork: Vec<Artwork>| {
             artwork
@@ -355,12 +384,14 @@ mod tests {
             Item::Movie(m) => Item::Movie(Movie {
                 id: f(&m.id),
                 cast: Vec::new(),
+                external_ids,
                 artwork: a(m.artwork),
                 ..m
             }),
             Item::Show(s) => Item::Show(Show {
                 id: f(&s.id),
                 cast: Vec::new(),
+                external_ids,
                 artwork: a(s.artwork),
                 ..s
             }),
@@ -375,17 +406,20 @@ mod tests {
                 show_id: f(&e.show_id),
                 season_id: f(&e.season_id),
                 cast: Vec::new(),
+                external_ids,
                 artwork: a(e.artwork),
                 ..e
             }),
             Item::Artist(x) => Item::Artist(Artist {
                 id: f(&x.id),
+                external_ids,
                 artwork: a(x.artwork),
                 ..x
             }),
             Item::Album(x) => Item::Album(Album {
                 id: f(&x.id),
                 artist_id: f(&x.artist_id),
+                external_ids,
                 artwork: a(x.artwork),
                 ..x
             }),
@@ -393,6 +427,7 @@ mod tests {
                 id: f(&t.id),
                 album_id: f(&t.album_id),
                 artist_id: f(&t.artist_id),
+                external_ids,
                 artwork: a(t.artwork),
                 ..t
             }),
@@ -421,8 +456,45 @@ mod tests {
             let sent = remote(&item, vec!["tmdb://348".into()], &Facts::default());
             assert_eq!(sent.external_ids, ["tmdb://348"]);
             assert_eq!(sent.hash, sent.digest());
-            assert_eq!(local(ORIGIN, &sent), Some(federated(item)));
+            assert_eq!(local(ORIGIN, &sent), Some(federated(item, &["tmdb://348"])));
         }
+    }
+
+    /// What a merged library sorts and matches by comes back on a paired
+    /// server's film, show and artist as the origin sent it.
+    #[test]
+    fn the_added_date_ratings_and_size_come_back_on_a_library_s_top_items() {
+        let facts = Facts {
+            added_at: Some(1_700_000_000),
+            rating_tenths: Some(98),
+            audience_rating_tenths: Some(94),
+            size: Some(50 << 30),
+            ..Facts::default()
+        };
+        let added = Some(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let Some(Item::Movie(film)) = local(ORIGIN, &remote(&movie(), Vec::new(), &facts)) else {
+            panic!("not a film")
+        };
+        assert_eq!(
+            (
+                film.added_at,
+                film.rating_tenths,
+                film.audience_rating_tenths,
+                film.size
+            ),
+            (added, Some(98), Some(94), Some(50 << 30))
+        );
+        let Some(Item::Show(tv)) = local(ORIGIN, &remote(&show(), Vec::new(), &facts)) else {
+            panic!("not a show")
+        };
+        assert_eq!(
+            (tv.added_at, tv.rating_tenths, tv.audience_rating_tenths),
+            (added, Some(98), Some(94))
+        );
+        let Some(Item::Artist(band)) = local(ORIGIN, &remote(&artist(), Vec::new(), &facts)) else {
+            panic!("not an artist")
+        };
+        assert_eq!(band.added_at, added);
     }
 
     /// G8-06: an id that is itself another server's names nothing of the

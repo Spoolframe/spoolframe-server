@@ -1014,6 +1014,11 @@ mod tests {
         let shared = Shared::new(Some(dir));
         let store = shared.store().unwrap();
         let film = Item::Movie(spoolframe_types::Movie {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: MediaId::new(
                 spoolframe_types::Namespace::Plex,
                 spoolframe_types::MediaKind::Movie,
@@ -1227,6 +1232,11 @@ mod tests {
             "u".into(),
             "u".into(),
             Item::Movie(spoolframe_types::Movie {
+                added_at: None,
+                rating_tenths: None,
+                audience_rating_tenths: None,
+                size: None,
+                external_ids: Vec::new(),
                 id: MediaId::new(
                     spoolframe_types::Namespace::Plex,
                     spoolframe_types::MediaKind::Movie,

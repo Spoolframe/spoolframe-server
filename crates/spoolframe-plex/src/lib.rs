@@ -169,6 +169,14 @@ impl<'a> Call<'a> {
         self
     }
 
+    /// Asking a listing for its items' agents' ids (`imdb://…`) too, which
+    /// a PMS sends unasked only for one item read by key: what a client
+    /// matches two servers' copies by ([`convert::external_ids`]).
+    fn with_guids(mut self) -> Self {
+        self.query.push(("includeGuids", "1"));
+        self
+    }
+
     fn describe(&self) -> String {
         format!("GET {}", self.path)
     }
@@ -745,7 +753,7 @@ impl PlexCatalog {
             None => limit,
             Some(_) => limit.saturating_mul(RECENT_WINDOW),
         };
-        let mut call = Call::get("/library/recentlyAdded");
+        let mut call = Call::get("/library/recentlyAdded").with_guids();
         call.headers = vec![
             ("X-Plex-Container-Start", "0".to_owned()),
             ("X-Plex-Container-Size", window.to_string()),
@@ -915,7 +923,9 @@ impl Catalog for PlexCatalog {
         if !self.serves(Some(&SectionKey(key.to_owned()))) {
             return Err(CatalogError::NotServed(library.to_string()));
         }
-        let mut call = Call::get(format!("/library/sections/{key}/all")).about(library);
+        let mut call = Call::get(format!("/library/sections/{key}/all"))
+            .about(library)
+            .with_guids();
         call.headers = vec![
             ("X-Plex-Container-Start", page.offset.to_string()),
             ("X-Plex-Container-Size", page.limit.to_string()),

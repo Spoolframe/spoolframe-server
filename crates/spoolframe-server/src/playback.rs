@@ -2868,6 +2868,11 @@ pub(crate) mod tests {
     #[test]
     fn an_episode_is_shown_by_its_show_season_and_number() {
         let item = Item::Episode(spoolframe_types::Episode {
+            added_at: None,
+            rating_tenths: None,
+            audience_rating_tenths: None,
+            size: None,
+            external_ids: Vec::new(),
             id: "plex:episode:7".parse().unwrap(),
             show_id: "plex:show:1".parse().unwrap(),
             show_title: Some("Severance".into()),

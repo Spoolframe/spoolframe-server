@@ -466,6 +466,8 @@ impl PlexCatalog {
         if slim {
             call.query.push(("excludeElements", WALK_EXCLUDE_ELEMENTS));
             call.query.push(("excludeFields", WALK_EXCLUDE_FIELDS));
+        } else {
+            call = call.with_guids();
         }
         call.headers = vec![
             ("X-Plex-Container-Start", start.to_string()),
@@ -623,7 +625,7 @@ impl PlexCatalog {
             if keys.is_empty() {
                 continue;
             }
-            let call = Call::get(format!("/library/metadata/{}", keys.join(",")));
+            let call = Call::get(format!("/library/metadata/{}", keys.join(","))).with_guids();
             let container = match self.fetch(&call).await {
                 Ok(container) => container,
                 Err(CatalogError::NotFound(_)) => continue,

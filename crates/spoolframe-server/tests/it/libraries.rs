@@ -385,6 +385,109 @@ fn films_and_cabin() -> serde_json::Value {
     ])
 }
 
+/// What an app merging libraries from several servers sorts and matches
+/// by, on each item of a library page: when the catalog added it, its
+/// ratings in tenths, its file's size and its agents' ids. A PMS sends
+/// the agents' ids in a listing only when asked (`includeGuids`).
+#[tokio::test]
+async fn a_library_page_s_items_carry_what_a_merged_library_sorts_and_matches_by() {
+    let tower = pms("Tower", TOWER_SECTIONS, &[]).await;
+    let alien = |guids: bool| {
+        let mut alien = film("11", 1, "Alien", 1_700_000_000).metadata();
+        alien["rating"] = json!(9.8);
+        alien["audienceRating"] = json!(9.4);
+        alien["Media"][0]["Part"][0]["size"] = json!(4_100_000_000u64);
+        if guids {
+            alien["Guid"] = json!([{ "id": "imdb://tt0078748" }, { "id": "tmdb://348" }]);
+        }
+        alien
+    };
+    let listing = |guids| {
+        container(json!({
+            "totalSize": 1, "librarySectionTitle": "Movies", "Metadata": [alien(guids)],
+        }))
+    };
+    for (what, sorts) in [
+        (
+            "sorts",
+            json!([
+                { "key": "titleSort", "title": "Title" },
+                { "key": "addedAt", "title": "Date Added" },
+            ]),
+        ),
+        ("filters", json!([])),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/library/sections/1/{what}")))
+            .respond_with(container(json!({ "Directory": sorts })))
+            .mount(&tower)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/library/sections/1/all"))
+        .and(query_param("includeGuids", "1"))
+        .respond_with(listing(true))
+        .with_priority(1)
+        .mount(&tower)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/1/all"))
+        .respond_with(listing(false))
+        .with_priority(2)
+        .mount(&tower)
+        .await;
+    let file = format!(
+        r#"plex {{ url = "{}"; }} libraries [ {{ name = "Films"; kind = "movies"; plex {{ server = "plex"; section = "1"; }} }} ]"#,
+        tower.uri()
+    );
+    let served = Served::start("merge-facts", &file).await;
+    let request = Request::Items {
+        library: "plex:1".parse().unwrap(),
+        offset: 0,
+        limit: 50,
+        sort: None,
+        filter: None,
+    };
+    let Response::Ok(Reply::Items { items, .. }) = served.call(request).await else {
+        panic!("no page");
+    };
+    let [Item::Movie(movie)] = items.as_slice() else {
+        panic!("{items:?}");
+    };
+    assert_eq!(
+        movie.added_at,
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+    );
+    assert_eq!(
+        (movie.rating_tenths, movie.audience_rating_tenths),
+        (Some(98), Some(94))
+    );
+    assert_eq!(movie.size, Some(4_100_000_000));
+    assert_eq!(
+        movie.external_ids,
+        ["plex://movie/Alien", "imdb://tt0078748", "tmdb://348"]
+    );
+    // A sorted page is Plex's listing too, with its sort.
+    let sorted = Request::Items {
+        library: "plex:1".parse().unwrap(),
+        offset: 0,
+        limit: 50,
+        sort: Some(spoolframe_types::ItemSort {
+            key: spoolframe_types::SortKey::Added,
+            descending: true,
+        }),
+        filter: None,
+    };
+    let items = match served.call(sorted).await {
+        Response::Ok(Reply::Items { items, .. }) => items,
+        other => panic!("no sorted page: {other:?}"),
+    };
+    let [Item::Movie(sorted)] = items.as_slice() else {
+        panic!("{items:?}");
+    };
+    assert_eq!(sorted, movie);
+}
+
 #[tokio::test]
 async fn only_the_chosen_libraries_are_listed_under_their_spoolframe_names() {
     let tower = pms("Tower", TOWER_SECTIONS, TOWER_FILMS).await;
