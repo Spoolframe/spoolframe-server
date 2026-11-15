@@ -5,9 +5,7 @@
 //! start at 10 s.
 
 use spoolframe_protocol::downloads::{AddonAudio, AddonSubtitle, DownloadState};
-use spoolframe_protocol::{
-    Error, Feature, Features, Hello, PROTOCOL_VERSION, Reply, Request, Response, SessionId,
-};
+use spoolframe_protocol::{Error, Feature, Features, Reply, Request, Response, SessionId};
 use spoolframe_types::{Container, Platform};
 
 use crate::downloads_wire::{PASSWORD, events, moves_until_settled, probe, read_from, server};
@@ -52,23 +50,8 @@ async fn alice(
     features: Features,
 ) -> (TestClient, SessionId) {
     let client = server.client().await;
-    let hello = Hello {
-        protocol_version: PROTOCOL_VERSION,
-        client_name: "test".into(),
-        client_version: "0".into(),
-        platform,
-        device_name: None,
-        capabilities: None,
-        experimental: Vec::new(),
-        features,
-        language: None,
-    };
-    match client.call(None, Request::Hello(hello)).await {
-        Response::Ok(Reply::ServerInfo(info)) => {
-            assert_eq!(info.features, features & Features::all());
-        }
-        other => panic!("no ServerInfo: {other:?}"),
-    }
+    let info = client.hello_with_features(platform, features).await;
+    assert_eq!(info.features, features & Features::all());
     let session = client.login("alice", PASSWORD).await;
     (client, session)
 }

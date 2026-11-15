@@ -45,9 +45,12 @@ mod background;
 mod batch;
 mod library;
 mod listening;
+mod local_db;
 mod lock;
 mod manager;
 mod music;
+mod offline_search;
+pub mod playlist_cache;
 mod space;
 mod store;
 mod view;
@@ -64,7 +67,7 @@ pub(crate) use lock::Locks;
 pub use music::{
     AlbumTrack, CacheSpace, DEFAULT_CACHE_MAX_BYTES, DownloadSettings, MusicDownload, MusicPhase,
     MusicQuality, MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark,
-    OfflineMusic, OfflinePlaylist, OfflineTrack, SyncedPlay,
+    OfflineMusic, OfflinePlaylist, OfflinePlaylistEntry, OfflineTrack, SyncedPlay, TrackOnDevice,
 };
 pub use view::{Applied, DownloadAction, DownloadList, DownloadTrack, DownloadTrackSource};
 
@@ -542,11 +545,7 @@ impl Downloads {
                 if m.phase.is_active() {
                     m.phase = DownloadPhase::Paused;
                 }
-                for a in &mut m.addons {
-                    if a.addon.kind == AddonKind::Audio && a.addon.state.is_moving() {
-                        a.addon.state = AddonState::Paused;
-                    }
-                }
+                addons::set_moving(m, &AddonState::Paused);
                 Ok(())
             })
             .await?;
@@ -581,39 +580,32 @@ impl Downloads {
                 Ok(())
             })
             .await?;
-        shared.stopping.lock().remove(key);
-        shared.retry_at.lock().remove(key);
-        shared.check_at.lock().remove(key);
-        shared.wake.notify_one();
+        shared.rouse(key);
         Ok(shared.view(&m))
     }
 
     /// Try failed download `key` again: it is prepared again on the
     /// server, and goes on from what arrived if the file is the same. One
+    /// the server failed (its file removed a day after its last read, its
+    /// conversion stopped) is prepared anew; one failed on this device
+    /// (cut off, no room) goes on with the same server download. One
     /// under way waiting to try again tries now.
     pub async fn retry(&self, key: &str) -> Result<LocalDownload, SdkError> {
-        self.restart(
-            key,
-            |phase| matches!(phase, DownloadPhase::Failed { .. }) || phase.is_active(),
-            "failed",
-        )
-        .await
-    }
-
-    async fn restart(
-        &self,
-        key: &str,
-        may: impl FnOnce(&DownloadPhase) -> bool,
-        not: &str,
-    ) -> Result<LocalDownload, SdkError> {
         self.find(key)?;
         let shared = self.shared();
         let m = shared
             .update(key, |m| {
-                if !may(&m.phase) {
+                if !matches!(m.phase, DownloadPhase::Failed { .. }) && !m.phase.is_active() {
                     return Err(SdkError::InvalidInput(format!(
-                        "download {key} is not {not}"
+                        "download {key} is not failed"
                     )));
+                }
+                // Failed by the server: prepared anew, not asked about
+                // ([`manager::device_failed`]).
+                if let DownloadPhase::Failed { cause, .. } = &m.phase
+                    && !manager::device_failed(cause)
+                {
+                    m.id = None;
                 }
                 if !m.phase.is_active() {
                     m.phase = DownloadPhase::Preparing {
@@ -624,10 +616,7 @@ impl Downloads {
                 Ok(())
             })
             .await?;
-        shared.stopping.lock().remove(key);
-        shared.retry_at.lock().remove(key);
-        shared.check_at.lock().remove(key);
-        shared.wake.notify_one();
+        shared.rouse(key);
         Ok(shared.view(&m))
     }
 
@@ -705,9 +694,7 @@ impl Downloads {
             let _writing = shared.manifests.lock().await;
             store.release(&mut m, hold).map_err(disk)?
         };
-        shared.stopping.lock().remove(&key);
-        shared.retry_at.lock().remove(&key);
-        shared.check_at.lock().remove(&key);
+        shared.forget_timers(&key);
         if removed {
             let _ = shared.events.send(DownloadEvent::Removed { key });
         } else {
@@ -950,7 +937,7 @@ impl Downloads {
 
 /// A server's `DownloadChanged`, for the manager.
 #[derive(Debug, Clone)]
-struct ServerChange {
+pub(super) struct ServerChange {
     server: EndpointId,
     id: String,
 }
@@ -980,8 +967,8 @@ pub(crate) struct Shared {
     /// again; a server event asks about them all at once.
     check_at: Mutex<HashMap<String, tokio::time::Instant>>,
     /// Bytes on disk of the download being transferred, ahead of its
-    /// manifest.
-    received: Mutex<HashMap<String, u64>>,
+    /// manifest: by its key, and an audio add-on's by its place too.
+    received: Mutex<HashMap<(String, Option<u32>), u64>>,
     /// Servers and users whose offline watch is to be sent.
     sync_wanted: Mutex<HashSet<(EndpointId, String)>>,
     /// [`Downloads::set_free_space`].
@@ -1006,16 +993,35 @@ pub(crate) struct Shared {
     follower: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The add-ons being fetched now ([`Downloads::add_tracks`]).
     addons_running: Mutex<addons::Running>,
+    /// What is queued for the playlists kept for offline.
+    playlists: Arc<playlist_cache::Reader>,
+    /// The offline databases ([`local_db`]), with a downloads directory.
+    dbs: Option<Arc<local_db::Dbs>>,
+    /// Their reader ([`playlist_cache::read_while_connected`]).
+    playlist_reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Shared {
     pub(crate) fn new(dir: Option<PathBuf>) -> Arc<Self> {
+        let store = dir.map(|dir| {
+            let store = Store::new(dir);
+            store.migrate();
+            store
+        });
+        let dbs = store.as_ref().map(|store| {
+            let dbs = local_db::Dbs::start(store.clone());
+            // Weak: the databases' thread holds the store, and so this.
+            let weak = Arc::downgrade(&dbs);
+            store.observe(move |m: &Manifest| {
+                if let Some(dbs) = weak.upgrade() {
+                    let (server, id, kind) = (m.server.clone(), m.item.id().clone(), m.kind);
+                    dbs.post(move |local| local.reindex(&server, &id, kind));
+                }
+            });
+            dbs
+        });
         Arc::new(Self {
-            store: dir.map(|dir| {
-                let store = Store::new(dir);
-                store.migrate();
-                store
-            }),
+            store,
             locks: Arc::default(),
             manifests: tokio::sync::Mutex::default(),
             wake: Notify::new(),
@@ -1040,6 +1046,9 @@ impl Shared {
             task: Mutex::default(),
             follower: Mutex::default(),
             addons_running: Mutex::default(),
+            playlists: Arc::default(),
+            playlist_reader: Mutex::default(),
+            dbs,
         })
     }
 
@@ -1050,10 +1059,28 @@ impl Shared {
         if self.store.is_some() {
             *self.task.lock() = Some(tokio::spawn(manager::run(client.clone(), self.clone())));
             *self.follower.lock() = Some(tokio::spawn(music::follow_while_connected(
-                client,
+                client.clone(),
                 self.clone(),
             )));
+            *self.playlist_reader.lock() = Some(tokio::spawn(
+                playlist_cache::read_while_connected(client, self.clone()),
+            ));
         }
+    }
+
+    /// Download `key` is to move now: what held it back is forgotten
+    /// ([`Shared::forget_timers`]) and the manager woken.
+    pub(super) fn rouse(&self, key: &str) {
+        self.forget_timers(key);
+        self.wake.notify_one();
+    }
+
+    /// Forget what holds download `key` back: a stop asked for, a wait to
+    /// try again, and a time to ask about it again.
+    pub(super) fn forget_timers(&self, key: &str) {
+        self.stopping.lock().remove(key);
+        self.retry_at.lock().remove(key);
+        self.check_at.lock().remove(key);
     }
 
     /// Stop the manager: it lets go between two steps, saving where the
@@ -1063,7 +1090,11 @@ impl Shared {
         self.interrupt.send_modify(|n| *n += 1);
         self.wake.notify_one();
         self.follow_wake.notify_one();
-        let tasks = [self.task.lock().take(), self.follower.lock().take()];
+        let tasks = [
+            self.task.lock().take(),
+            self.follower.lock().take(),
+            self.playlist_reader.lock().take(),
+        ];
         for mut task in tasks.into_iter().flatten() {
             if tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await
@@ -1093,6 +1124,7 @@ impl Shared {
         );
         let key = (session.server, session.user.user_id.clone());
         self.sessions.lock().insert(key.clone(), session.parts());
+        self.playlists_due(session.server, &session.user.user_id);
         self.sync_wanted.lock().insert(key);
         self.wake.notify_one();
     }
@@ -1174,8 +1206,12 @@ impl Shared {
             let mut m = store
                 .find(key)
                 .ok_or_else(|| SdkError::NotFound(format!("download {key}")))?;
+            let before = m.clone();
             change(&mut m)?;
-            store.write(&m).map_err(disk)?;
+            // Indexed again only when something it is found by changed.
+            store
+                .write_with(&m, store::searchable_changed(&before, &m))
+                .map_err(disk)?;
             m
         };
         self.emit(&m);
@@ -1265,13 +1301,17 @@ impl Shared {
             created_at: serde_time::unix_seconds::from_wire(m.created_at),
             addons: {
                 let running = self.addons_running.lock();
+                let live = self.received.lock();
                 let dir = store.dir(m);
                 m.addons
                     .iter()
                     .map(|a| {
                         let a = &a.addon;
                         let here = running.contains(&(m.key.clone(), a.kind, a.place));
-                        a.view(&dir, here)
+                        let ahead = (a.kind == AddonKind::Audio)
+                            .then(|| live.get(&(m.key.clone(), Some(a.place))).copied())
+                            .flatten();
+                        a.view(&dir, here, ahead)
                     })
                     .collect()
             },
@@ -1284,7 +1324,7 @@ impl Shared {
         if m.phase == DownloadPhase::Done {
             m.size.unwrap_or(m.offset)
         } else {
-            let live = self.received.lock().get(&m.key).copied();
+            let live = self.received.lock().get(&(m.key.clone(), None)).copied();
             live.unwrap_or(0).max(m.offset)
         }
     }

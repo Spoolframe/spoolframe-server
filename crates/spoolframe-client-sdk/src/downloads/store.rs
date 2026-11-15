@@ -217,6 +217,20 @@ pub(crate) struct Manifest {
     pub addons: Vec<super::addons::StoredAddon>,
 }
 
+/// What the offline search index holds of an entry may differ between
+/// `before` and `after`: finished or not, who holds it, what it is of,
+/// and its file. A move of its place, its plays or an add-on's progress
+/// changes none of it.
+pub(super) fn searchable_changed(before: &Manifest, after: &Manifest) -> bool {
+    (before.phase == DownloadPhase::Done) != (after.phase == DownloadPhase::Done)
+        || before.holds != after.holds
+        || before.item != after.item
+        || before.show != after.show
+        || before.album != after.album
+        || before.artist != after.artist
+        || before.file != after.file
+}
+
 impl Manifest {
     /// Held by `hold` too, once.
     pub fn add_hold(&mut self, hold: &Hold) {
@@ -232,7 +246,7 @@ impl Manifest {
 
     /// Under way: the manager moves it, or an audio add-on of it.
     pub fn under_way(&self) -> bool {
-        self.phase.is_active() || self.addons.iter().any(|a| a.addon.state.is_moving())
+        self.phase.is_active() || super::addons::managed(self).is_some()
     }
 
     /// Held by `user_id`, or for every profile (kept from listening).
@@ -371,6 +385,21 @@ pub(crate) struct Store {
     /// reads only theirs. Read again when another process adds or removes
     /// a download (its [`Index::stamp`] moved).
     items: Arc<Mutex<Option<Index>>>,
+    /// Told of each finished entry written and each entry removed: the
+    /// offline search index follows them ([`super::local_db`]).
+    observer: Arc<Observer>,
+}
+
+/// What is told of an entry written finished, or removed.
+#[derive(Default)]
+pub(crate) struct Observer(std::sync::OnceLock<Observe>);
+
+type Observe = Box<dyn Fn(&Manifest) + Send + Sync>;
+
+impl std::fmt::Debug for Observer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Observer").finish_non_exhaustive()
+    }
 }
 
 /// [`Items`], with what tells that the disk moved under it.
@@ -406,6 +435,19 @@ impl Store {
             active: Arc::default(),
             running: Arc::new(tokio::sync::watch::Sender::new(0)),
             items: Arc::default(),
+            observer: Arc::default(),
+        }
+    }
+
+    /// Tell `observe` of each finished entry written and each removed,
+    /// after it is on the disk. Set once.
+    pub fn observe(&self, observe: impl Fn(&Manifest) + Send + Sync + 'static) {
+        let _ = self.observer.0.set(Box::new(observe));
+    }
+
+    fn told(&self, m: &Manifest) {
+        if let Some(observe) = self.observer.0.get() {
+            observe(m);
         }
     }
 
@@ -568,9 +610,19 @@ impl Store {
 
     /// Write `m`, whole or not at all.
     pub fn write(&self, m: &Manifest) -> std::io::Result<()> {
+        self.write_with(m, true)
+    }
+
+    /// [`Store::write`], telling the observer of a finished entry only
+    /// when `searchable`: something it is found by may have changed
+    /// ([`searchable_changed`]).
+    pub fn write_with(&self, m: &Manifest, searchable: bool) -> std::io::Result<()> {
         write_json(&self.dir(m).join(MANIFEST), m)?;
         self.note(m, m.under_way());
         self.list(m, true);
+        if searchable && m.phase == DownloadPhase::Done {
+            self.told(m);
+        }
         Ok(())
     }
 
@@ -843,6 +895,7 @@ impl Store {
         }
         self.note(m, false);
         self.list(m, false);
+        self.told(m);
         Ok(())
     }
 

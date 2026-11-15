@@ -134,3 +134,85 @@ fn a_watch_sent_leaves_nothing_to_send() {
     stored(&shared, "u1", false);
     assert_eq!(to_send(&shared), Vec::new());
 }
+
+/// An audio track being added to a finished film, moving here.
+fn adding_audio(state: AddonState, received: u64, size: Option<u64>) -> DownloadAddon {
+    DownloadAddon {
+        kind: super::super::AddonKind::Audio,
+        place: 1,
+        path: None,
+        format: super::super::AddonFormat::M4a,
+        language: Some("fre".into()),
+        state,
+        received,
+        size,
+    }
+}
+
+/// An audio add-on coming to a finished film is a background run's to
+/// count: half once the server has made it, then its bytes.
+#[test]
+fn an_audio_add_on_on_a_finished_film_is_counted() {
+    let mut d = download("a", DownloadPhase::Done);
+    d.addons = vec![adding_audio(
+        AddonState::Transferring {
+            done_percent: Some(25),
+        },
+        250,
+        Some(1000),
+    )];
+    let progress = RunTally::new().progress(&[d]);
+    assert_eq!(
+        (
+            progress.completed,
+            progress.total,
+            progress.downloads,
+            progress.moving.map(|d| d.key)
+        ),
+        (625, 1000, 1, Some("a".to_owned()))
+    );
+}
+
+/// The run's count never goes back when a film finishes and an audio
+/// add-on of it starts: they are counted apart.
+#[test]
+fn a_film_then_its_audio_add_on_never_goes_back() {
+    let mut tally = RunTally::new();
+    let mut d = download("a", DownloadPhase::Transferring);
+    d.received = 1000;
+    d.size = Some(1000);
+    let before = tally.progress(std::slice::from_ref(&d)).completed;
+    d.phase = DownloadPhase::Done;
+    d.addons = vec![adding_audio(
+        AddonState::Preparing {
+            server: DownloadState::Waiting,
+        },
+        0,
+        None,
+    )];
+    let after = tally.progress(&[d]);
+    assert_eq!((before, after.completed, after.total), (1000, 1000, 2000));
+}
+
+/// A finished film with an audio track coming is worth background time.
+#[test]
+fn an_audio_add_on_coming_is_worth_background_time() {
+    let shared = store("addon-background");
+    stored(&shared, "u1", false);
+    let store = shared.store().unwrap();
+    let mut m = store.scan().remove(0);
+    let before = Downloads::worth(&shared);
+    m.addons = vec![super::super::addons::StoredAddon {
+        addon: adding_audio(
+            AddonState::Transferring {
+                done_percent: Some(10),
+            },
+            100,
+            Some(1000),
+        ),
+        id: Some("d1".into()),
+        sha256: Some("aa".into()),
+    }];
+    store.write(&m).unwrap();
+    assert_eq!((before, Downloads::worth(&shared)), (false, true));
+}

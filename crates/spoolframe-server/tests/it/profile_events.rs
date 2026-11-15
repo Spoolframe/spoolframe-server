@@ -87,7 +87,9 @@ async fn device(server: &TestServer, username: &str) -> Device {
 /// [`device`], its `Hello` naming the regular features `named`.
 async fn device_naming(server: &TestServer, username: &str, named: Features) -> Device {
     let client = server.client().await;
-    let info = client.hello_with_features(named).await;
+    let info = client
+        .hello_with_features(spoolframe_types::Platform::Linux, named)
+        .await;
     assert_eq!(info.features, named, "the server has them all");
     let mut events = tokio::time::timeout(Duration::from_secs(5), client.conn.accept_uni())
         .await

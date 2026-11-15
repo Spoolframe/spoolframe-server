@@ -19,7 +19,7 @@ use spoolframe_test_dir::TestDir;
 use spoolframe_types::{AudioCodec, Container, VideoCodec};
 
 use crate::download_addons::write_offset_film;
-use crate::support::{ServerOptions, TestServer, fresh_dir, movie};
+use crate::support::{ServerOptions, TestServer, fresh_dir, movie, pinned_sdk_client, settled};
 
 const PASSWORD: &str = "correct horse";
 
@@ -55,8 +55,9 @@ async fn server(test: &str) -> TestServer {
 /// The iPhone over `storage`, keeping downloads in `dir`, with `server`
 /// pinned.
 async fn phone(server: &TestServer, storage: &Arc<MemoryStorage>, dir: &Path) -> Client {
-    let client = Client::open_with_options(
-        storage.clone(),
+    pinned_sdk_client(
+        server,
+        storage,
         iphone(),
         ClientOptions {
             lan_discovery: false,
@@ -66,13 +67,6 @@ async fn phone(server: &TestServer, storage: &Arc<MemoryStorage>, dir: &Path) ->
         },
     )
     .await
-    .unwrap();
-    let id = server.server.id().to_string();
-    let addrs = server.server.addr().ip_addrs().copied().collect();
-    client.add_address(&id, addrs).unwrap();
-    client.connect(&id).await.unwrap();
-    client.pin(&id, true).await.unwrap();
-    client
 }
 
 /// The film downloaded with its audio track `audio` alone, done.
@@ -94,17 +88,6 @@ async fn downloaded(client: &Client, session: &Session, audio: u32) -> LocalDown
     let done = downloads.get(&started.key).unwrap();
     assert_eq!(done.phase, DownloadPhase::Done);
     done
-}
-
-/// Once nothing is left to move, within 2 minutes.
-async fn settled(client: &Client) {
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        client.downloads().run_until_done(),
-    )
-    .await
-    .expect("the downloads never settled")
-    .unwrap();
 }
 
 fn addon(d: &LocalDownload, kind: AddonKind, place: u32) -> &spoolframe_client_sdk::DownloadAddon {
@@ -295,6 +278,205 @@ async fn an_audio_add_on_cut_off_goes_on_from_what_arrived() {
     // Every byte was read once: the film's, then the track's, with
     // nothing read again after the cut.
     assert_eq!(server.downloads.sent(), film_bytes + size);
+    again.close().await;
+    server.stop().await;
+}
+
+/// Codex, PR #72: an audio add-on the server failed (its conversion could
+/// not read the film) was asked about again when added again, and failed
+/// again from the server's same answer. Added again, it is prepared anew
+/// and comes.
+#[tokio::test]
+async fn an_audio_add_on_the_server_failed_is_prepared_anew_when_added_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = server("sdk-download-addons-retry").await;
+    write_offset_film(&server);
+    let dir = TestDir::new("spoolframe-sdk-download-addons-retry").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = phone(&server, &storage, &dir).await;
+    let id = server.server.id().to_string();
+    let session = client.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
+    let key = downloaded(&client, &session, 1).await.key;
+    let downloads = client.downloads();
+    let on = session.feature::<DownloadAddons>().unwrap();
+    let mode = |m| std::fs::set_permissions(&server.media, std::fs::Permissions::from_mode(m));
+
+    mode(0o000).unwrap();
+    downloads
+        .add_tracks(&key, &on, vec![0], Vec::new())
+        .await
+        .unwrap();
+    settled(&client).await;
+    let failed = addon(&downloads.get(&key).unwrap(), AddonKind::Audio, 0)
+        .state
+        .clone();
+    mode(0o644).unwrap();
+    downloads
+        .add_tracks(&key, &on, vec![0], Vec::new())
+        .await
+        .unwrap();
+    settled(&client).await;
+    let then = addon(&downloads.get(&key).unwrap(), AddonKind::Audio, 0)
+        .state
+        .clone();
+    assert_eq!(
+        (
+            matches!(
+                failed,
+                AddonState::Failed {
+                    cause: spoolframe_client_sdk::DownloadFailure::ServerStoppedConverting,
+                    ..
+                }
+            ),
+            &then
+        ),
+        (true, &AddonState::Ready),
+        "{failed:?} then {then:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// The server's files of its downloads, once each is ready, removed as
+/// they are a day after their last read (the store's clock moved on past
+/// it): each such download is failed on the server.
+async fn expired(server: &TestServer) {
+    use spoolframe_server::store::downloads::StoredState;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = server.store.downloads().await.unwrap();
+        if !rows.is_empty()
+            && rows
+                .iter()
+                .all(|r| matches!(r.state, StoredState::Ready { .. }))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server's file was never made"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    server.clock.advance(Duration::from_secs(25 * 60 * 60));
+    // A read under way keeps the file until it ends: swept until it goes.
+    loop {
+        server.downloads.sweep().await.unwrap();
+        let rows = server.store.downloads().await.unwrap();
+        if rows
+            .iter()
+            .all(|r| matches!(r.state, StoredState::Failed { .. }))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server's file was never removed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The owner's iPad, build 97: a download whose server file was removed
+/// a day after its last read failed ("prepare it again"), and Retry
+/// asked the server about the same download, heard the same failure and
+/// failed at once. Retried, it is prepared anew and arrives.
+#[tokio::test]
+async fn a_download_whose_server_file_expired_is_prepared_anew_on_retry() {
+    let server = server("sdk-download-retry-expired").await;
+    write_offset_film(&server);
+    let dir = TestDir::new("spoolframe-sdk-download-retry-expired").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let client = phone(&server, &storage, &dir).await;
+    let id = server.server.id().to_string();
+    let session = client.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
+    let downloads = client.downloads();
+    let key = downloads
+        .start(
+            &session,
+            movie().id(),
+            DownloadSource::Original,
+            DownloadTracks::Chosen {
+                audio: vec![1],
+                subtitles: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .key;
+    downloads.pause(&key).await.unwrap();
+    expired(&server).await;
+    downloads.resume(&key).await.unwrap();
+    settled(&client).await;
+    let failed = downloads.get(&key).unwrap().phase;
+    downloads.retry(&key).await.unwrap();
+    settled(&client).await;
+    let then = downloads.get(&key).unwrap().phase;
+    assert_eq!(
+        (
+            matches!(&failed, DownloadPhase::Failed { reason, .. } if reason.contains("a day after")),
+            &then
+        ),
+        (true, &DownloadPhase::Done),
+        "{failed:?} then {then:?}"
+    );
+    client.close().await;
+    server.stop().await;
+}
+
+/// A download whose server file is removed while it comes (the app was
+/// closed part way, and opened again a day later) is prepared anew as the
+/// next read finds the file gone, and arrives: it does not fail.
+#[tokio::test]
+async fn a_download_whose_server_file_went_mid_transfer_is_prepared_anew() {
+    let server = server("sdk-download-vanished").await;
+    write_long_flac_film(&server);
+    let dir = TestDir::new("spoolframe-sdk-download-vanished").await;
+    let storage = Arc::new(MemoryStorage::default());
+    let first = phone(&server, &storage, &dir).await;
+    let id = server.server.id().to_string();
+    let session = first.sign_in(&id, "alice", PASSWORD, false).await.unwrap();
+    let mut events = first.download_events();
+    let key = first
+        .downloads()
+        .start(
+            &session,
+            movie().id(),
+            DownloadSource::Original,
+            DownloadTracks::Chosen {
+                audio: vec![1],
+                subtitles: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .key;
+    // The first piece is here: quit.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("no piece arrived")
+            .unwrap();
+        if let DownloadEvent::Changed(d) = event
+            && d.key == key
+            && d.phase == DownloadPhase::Transferring
+            && d.received > 0
+        {
+            break;
+        }
+    }
+    first.close().await;
+    expired(&server).await;
+
+    let again = phone(&server, &storage, &dir).await;
+    assert_eq!(
+        again.downloads().get(&key).unwrap().phase,
+        DownloadPhase::Transferring
+    );
+    settled(&again).await;
+    let done = again.downloads().get(&key).unwrap();
+    assert_eq!(done.phase, DownloadPhase::Done, "{:?}", done.phase);
     again.close().await;
     server.stop().await;
 }

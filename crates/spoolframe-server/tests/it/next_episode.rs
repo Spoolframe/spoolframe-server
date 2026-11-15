@@ -43,7 +43,10 @@ async fn server(test: &str) -> (TestServer, MockServer) {
 async fn alice(server: &TestServer) -> (TestClient, SessionId) {
     let tv = server.client().await;
     let info = tv
-        .hello_with_features(Features::only(Feature::October2026))
+        .hello_with_features(
+            spoolframe_types::Platform::Linux,
+            Features::only(Feature::October2026),
+        )
         .await;
     assert!(info.features.contains(Feature::October2026));
     let session = tv.login("alice", "correct horse").await;

@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use super::addons::{self, AddonKind, AddonState, DownloadAddon};
 use super::music;
 use super::{DownloadPhase, DownloadState, Downloads, LocalDownload, Shared};
 use crate::SdkError;
@@ -138,20 +139,23 @@ impl Downloads {
     }
 
     /// A background run ([`Downloads::run_until_cancelled`]) is worth
-    /// asking the system for: a download is coming to this device, or
-    /// being converted with a figure to show, and the network allows
-    /// downloads. Every profile's: a run moves them all.
+    /// asking the system for: a download, or an audio track being added
+    /// to one, is coming to this device or being converted with a figure
+    /// to show, and the network allows downloads. Every profile's: a run
+    /// moves them all.
     pub fn worth_background(&self) -> bool {
-        let shared = self.shared();
+        Self::worth(self.shared())
+    }
+
+    fn worth(shared: &Shared) -> bool {
         let Some(store) = &shared.store else {
             return false;
         };
         !shared.network_held()
-            && store
-                .scan()
-                .iter()
-                .filter(|m| m.phase.is_active())
-                .any(|m| moving(&m.phase))
+            && store.scan().iter().any(|m| {
+                (m.phase.is_active() && moving(&m.phase))
+                    || addons::managed(m).is_some_and(|a| addon_moving(&a.addon.state))
+            })
     }
 }
 
@@ -167,6 +171,27 @@ fn moving(phase: &DownloadPhase) -> bool {
                 },
             }
     )
+}
+
+/// An audio add-on's [`moving`]: coming here, or being converted with a
+/// figure to show.
+fn addon_moving(state: &AddonState) -> bool {
+    matches!(
+        state,
+        AddonState::Transferring { .. }
+            | AddonState::Preparing {
+                server: DownloadState::Converting {
+                    done_percent: Some(_),
+                    ..
+                },
+            }
+    )
+}
+
+/// The audio add-on of `d` the manager moves now, as the app sees it
+/// ([`addons::managed`]).
+fn adding(d: &LocalDownload) -> Option<&DownloadAddon> {
+    d.addons.iter().find(|a| a.is_managed())
 }
 
 /// Units of a background run's progress for each download: the first
@@ -185,7 +210,8 @@ pub struct RunProgress {
     /// [`UNITS_PER_DOWNLOAD`] for each download the run has had under
     /// way.
     pub total: u64,
-    /// Downloads the run has had under way, finished ones too.
+    /// Downloads the run has had under way, finished ones too; an audio
+    /// track added to one counts as one more.
     pub downloads: u32,
     /// The one to name: the first coming here or being converted, else
     /// the first under way. `None` when none is.
@@ -197,7 +223,10 @@ pub struct RunProgress {
 /// back. A new one per run.
 #[derive(Debug, Clone, Default)]
 pub struct RunTally {
-    keys: BTreeSet<String>,
+    /// A download by its key, and an audio add-on by its download's key
+    /// and its place: apart from its download, so the count never goes
+    /// back when a film finishes and an add-on of it starts.
+    keys: BTreeSet<(String, Option<u32>)>,
 }
 
 impl RunTally {
@@ -209,11 +238,45 @@ impl RunTally {
     /// ([`Downloads::list`]): each one under way is counted from now on.
     pub fn progress(&mut self, latest: &[LocalDownload]) -> RunProgress {
         let half = UNITS_PER_DOWNLOAD / 2;
-        for d in latest.iter().filter(|d| d.phase.is_active()) {
-            self.keys.insert(d.key.clone());
+        for d in latest {
+            if d.phase.is_active() {
+                self.keys.insert((d.key.clone(), None));
+            }
+            if let Some(a) = adding(d) {
+                self.keys.insert((d.key.clone(), Some(a.place)));
+            }
         }
+        let fraction = |received: u64, size: Option<u64>| match size {
+            Some(size) if size > 0 => half + (half * received.min(size)) / size,
+            _ => half,
+        };
+        let percent = |p: &Option<u8>| p.map_or(0, |p| u64::from(p.min(100)) * half / 100);
         let mut completed = 0;
-        for key in &self.keys {
+        for (key, place) in &self.keys {
+            if let Some(place) = *place {
+                let addon = latest
+                    .iter()
+                    .find(|d| &d.key == key)
+                    .and_then(|d| d.addons.iter().find(|a| a.is(AddonKind::Audio, place)));
+                completed += match addon.map(|a| (&a.state, a)) {
+                    // Gone: done with, as far as the run goes.
+                    None => UNITS_PER_DOWNLOAD,
+                    Some((
+                        AddonState::Preparing {
+                            server:
+                                DownloadState::Converting { done_percent, .. }
+                                | DownloadState::Writing { done_percent },
+                        },
+                        _,
+                    )) => percent(done_percent),
+                    Some((AddonState::Preparing { .. }, _)) => 0,
+                    Some((AddonState::Transferring { .. } | AddonState::Paused, a)) => {
+                        fraction(a.received, a.size)
+                    }
+                    Some((AddonState::Ready | AddonState::Failed { .. }, _)) => UNITS_PER_DOWNLOAD,
+                };
+                continue;
+            }
             let Some(d) = latest.iter().find(|d| &d.key == key) else {
                 // Gone: done with, as far as the run goes.
                 completed += UNITS_PER_DOWNLOAD;
@@ -225,20 +288,21 @@ impl RunTally {
                 }
                 | DownloadPhase::Preparing {
                     server: DownloadState::Writing { done_percent },
-                } => done_percent.map_or(0, |p| u64::from(p.min(100)) * half / 100),
+                } => percent(done_percent),
                 DownloadPhase::Preparing { .. } => 0,
-                DownloadPhase::Transferring | DownloadPhase::Paused => match d.size {
-                    Some(size) if size > 0 => half + (half * d.received.min(size)) / size,
-                    _ => half,
-                },
+                DownloadPhase::Transferring | DownloadPhase::Paused => fraction(d.received, d.size),
                 DownloadPhase::Done | DownloadPhase::Failed { .. } => UNITS_PER_DOWNLOAD,
             };
         }
         let total = self.keys.len() as u64 * UNITS_PER_DOWNLOAD;
+        let under_way = |d: &&LocalDownload| d.phase.is_active() || adding(d).is_some();
         let moving = latest
             .iter()
-            .find(|d| d.phase.is_active() && moving(&d.phase))
-            .or_else(|| latest.iter().find(|d| d.phase.is_active()))
+            .find(|d| {
+                (d.phase.is_active() && moving(&d.phase))
+                    || adding(d).is_some_and(|a| addon_moving(&a.state))
+            })
+            .or_else(|| latest.iter().find(under_way))
             .cloned();
         RunProgress {
             completed: completed.min(total),

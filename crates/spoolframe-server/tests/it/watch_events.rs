@@ -30,7 +30,9 @@ struct Device {
 /// A device signed in as `username`, its `Hello` naming `named`.
 async fn device(server: &TestServer, username: &str, named: Features) -> Device {
     let client = server.client().await;
-    client.hello_with_features(named).await;
+    client
+        .hello_with_features(spoolframe_types::Platform::Linux, named)
+        .await;
     let mut events = tokio::time::timeout(Duration::from_secs(5), client.conn.accept_uni())
         .await
         .expect("no events stream within 5 s")

@@ -19,7 +19,7 @@
 //! [`DownloadEvent::Changed`](super::DownloadEvent::Changed).
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use spoolframe_protocol::downloads::{DownloadFailure, DownloadInfo, DownloadState};
@@ -105,6 +105,30 @@ pub enum AddonState {
         #[serde(default)]
         cause: DownloadFailure,
     },
+}
+
+impl DownloadAddon {
+    /// The add-on of `kind` at `place`.
+    pub(super) fn is(&self, kind: AddonKind, place: u32) -> bool {
+        self.kind == kind && self.place == place
+    }
+
+    /// An audio add-on under way: the manager's to move
+    /// ([`managed`]).
+    pub(super) fn is_managed(&self) -> bool {
+        self.kind == AddonKind::Audio && self.state.is_moving()
+    }
+}
+
+impl From<DownloadAddon> for StoredAddon {
+    /// Not prepared on the server yet: no id, no SHA-256.
+    fn from(addon: DownloadAddon) -> Self {
+        Self {
+            addon,
+            id: None,
+            sha256: None,
+        }
+    }
 }
 
 impl AddonState {
@@ -198,8 +222,10 @@ impl DownloadAddon {
     /// As an app sees it, of the download at `dir`: its whole path, and a
     /// subtitle left fetching by a call that ended with the client
     /// (`fetching` false) failed. An audio add-on moving is the
-    /// manager's, which goes on with it.
-    pub(super) fn view(&self, dir: &Path, fetching: bool) -> Self {
+    /// manager's, which goes on with it: `live` bytes of it may be here
+    /// ahead of its manifest, and its done percent is of those.
+    pub(super) fn view(&self, dir: &Path, fetching: bool, live: Option<u64>) -> Self {
+        let received = live.unwrap_or(0).max(self.received);
         let state = match &self.state {
             AddonState::Transferring { .. } if self.kind == AddonKind::Subtitle && !fetching => {
                 AddonState::Failed {
@@ -207,6 +233,9 @@ impl DownloadAddon {
                     cause: DownloadFailure::Other,
                 }
             }
+            AddonState::Transferring { .. } => AddonState::Transferring {
+                done_percent: self.size.map(|size| percent(received, size)),
+            },
             state => state.clone(),
         };
         Self {
@@ -215,6 +244,7 @@ impl DownloadAddon {
                 .as_ref()
                 .map(|p| dir.join(p).display().to_string()),
             state,
+            received,
             ..self.clone()
         }
     }
@@ -248,7 +278,10 @@ impl Downloads {
     /// what arrived after a cut or a restart, and tells each move as the
     /// download's [`super::DownloadEvent::Changed`]. One here already is
     /// left as it is; one queued is left in its place; one failed or paused
-    /// is queued again, going on from what arrived (the way to retry it).
+    /// is queued again (the way to retry it). One paused, or failed on this
+    /// device, goes on from what arrived; one the server failed is prepared
+    /// on it anew, keeping what arrived only if the server's new file is
+    /// the same.
     ///
     /// Each subtitle is fetched in the call, as WebVTT, again if it was
     /// here. A track the item does not have is
@@ -288,10 +321,7 @@ impl Downloads {
                     Ok(())
                 })
                 .await?;
-            shared.stopping.lock().remove(key);
-            shared.retry_at.lock().remove(key);
-            shared.check_at.lock().remove(key);
-            shared.wake.notify_one();
+            shared.rouse(key);
         }
         let mut fetching = Fetching {
             shared,
@@ -342,26 +372,31 @@ fn places(mut places: Vec<u32>, len: usize, what: &str) -> Result<Vec<u32>, SdkE
 }
 
 /// Audio add-on `place` of `m` queued for the manager: a new one, or one
-/// failed or paused, which keeps what arrived and its server id. One here
-/// or under way already is left as it is.
+/// failed or paused, which keeps what arrived. One here or under way
+/// already is left as it is.
+///
+/// One paused, or failed on this device ([`manager::device_failed`]), keeps its
+/// server id and goes on from what arrived. One the server failed is
+/// prepared anew: asking about its id again would hear the same failure.
+/// What arrived of it is kept only if the new file is the same one (its
+/// size and SHA-256, checked once the server has it ready).
 fn queue(m: &mut Manifest, place: u32) {
     let waiting = AddonState::Preparing {
         server: DownloadState::Waiting,
     };
-    match m
-        .addons
-        .iter_mut()
-        .find(|a| a.addon.kind == AddonKind::Audio && a.addon.place == place)
-    {
+    match find(m, AddonKind::Audio, place) {
         Some(there) if there.addon.state == AddonState::Ready || there.addon.state.is_moving() => {}
-        Some(there) => there.addon.state = waiting,
+        Some(there) => {
+            if let AddonState::Failed { cause, .. } = &there.addon.state
+                && !manager::device_failed(cause)
+            {
+                there.id = None;
+            }
+            there.addon.state = waiting;
+        }
         None => {
             let addon = DownloadAddon::new(m, AddonKind::Audio, place, waiting);
-            m.addons.push(StoredAddon {
-                addon,
-                id: None,
-                sha256: None,
-            });
+            m.addons.push(addon.into());
         }
     }
 }
@@ -371,18 +406,16 @@ fn queue(m: &mut Manifest, place: u32) {
 fn set(m: &mut Manifest, addon: DownloadAddon) {
     match find(m, addon.kind, addon.place) {
         Some(there) => there.addon = addon,
-        None => m.addons.push(StoredAddon {
-            addon,
-            id: None,
-            sha256: None,
-        }),
+        None => m.addons.push(addon.into()),
     }
 }
 
 fn find(m: &mut Manifest, kind: AddonKind, place: u32) -> Option<&mut StoredAddon> {
-    m.addons
-        .iter_mut()
-        .find(|a| a.addon.kind == kind && a.addon.place == place)
+    m.addons.iter_mut().find(|a| a.addon.is(kind, place))
+}
+
+fn find_ref(m: &Manifest, kind: AddonKind, place: u32) -> Option<&StoredAddon> {
+    m.addons.iter().find(|a| a.addon.is(kind, place))
 }
 
 /// Subtitle `place` of `m` is `fetched` (its file) or failed: kept, and
@@ -433,11 +466,7 @@ async fn subtitle(
 ) -> Result<String, SdkError> {
     let text = session.read_track_subtitle(id, place).await?;
     let path = DownloadAddon::file(AddonKind::Subtitle, place, AddonFormat::WebVtt);
-    let to = store.dir(m).join(&path);
-    let part = to.with_extension("part");
-    std::fs::create_dir_all(to.parent().expect("under the download's directory")).map_err(disk)?;
-    std::fs::write(&part, text.as_bytes()).map_err(disk)?;
-    std::fs::rename(&part, &to).map_err(disk)?;
+    crate::storage::files::write(&store.dir(m).join(&path), text.as_bytes()).map_err(disk)?;
     Ok(path)
 }
 
@@ -453,12 +482,12 @@ async fn prepare(session: &Session, id: &MediaId, place: u32) -> Result<Download
     }
 }
 
-/// Where audio add-on `place`'s bytes are written in `m`'s directory.
-fn part(store: &Store, m: &Manifest, place: u32) -> PathBuf {
-    store
-        .dir(m)
-        .join(ADDONS)
-        .join(format!("audio-{place}.part"))
+/// `m`'s first add-on the manager moves: an audio one under way. A
+/// subtitle is fetched by the call adding it, never by the manager: one
+/// left transferring when that call ended (the client closed) has no
+/// download id, and is shown failed ([`DownloadAddon::view`]).
+pub(super) fn managed(m: &Manifest) -> Option<&StoredAddon> {
+    m.addons.iter().find(|a| a.addon.is_managed())
 }
 
 /// One step of `m`'s first audio add-on under way, for the manager: its
@@ -470,7 +499,7 @@ pub(super) async fn step(
     session: &Session,
     m: Manifest,
 ) -> Result<Step, SdkError> {
-    let Some(addon) = m.addons.iter().find(|a| a.addon.state.is_moving()).cloned() else {
+    let Some(addon) = managed(&m).cloned() else {
         return Ok(Step::Stop);
     };
     let place = addon.addon.place;
@@ -486,6 +515,15 @@ pub(super) async fn step(
             Ok(Step::Continue)
         }
         moved => moved,
+    }
+}
+
+/// Every audio add-on of `m` under way is `state` now: paused with its
+/// download, or failed with it for an error no wait mends (its server
+/// forgotten), so none is left for the manager to take again.
+pub(super) fn set_moving(m: &mut Manifest, state: &AddonState) {
+    for a in m.addons.iter_mut().filter(|a| a.addon.is_managed()) {
+        a.addon.state = state.clone();
     }
 }
 
@@ -571,15 +609,15 @@ async fn preparing(
             a.addon.state = match info.state {
                 DownloadState::Ready { size, sha256 } => {
                     // Another file than the one coming: from the start.
-                    if a.addon.size != Some(size) || a.sha256.as_deref() != Some(sha256.as_str()) {
+                    if manager::other_file((a.addon.size, a.sha256.as_deref()), size, &sha256) {
                         a.addon.received = 0;
                     }
                     a.addon.size = Some(size);
                     a.sha256 = Some(sha256);
                     a.addon.format = AddonFormat::of_audio(info.file.map(|f| f.container));
-                    AddonState::Transferring {
-                        done_percent: Some(percent(a.addon.received, size)),
-                    }
+                    // Its done percent is of what is here, as it is shown
+                    // ([`DownloadAddon::view`]).
+                    AddonState::Transferring { done_percent: None }
                 }
                 DownloadState::Failed { reason, cause } => AddonState::Failed { reason, cause },
                 server => AddonState::Preparing { server },
@@ -588,27 +626,17 @@ async fn preparing(
             Ok(())
         })
         .await?;
-    match m
-        .addons
-        .iter()
-        .find(|a| a.addon.kind == AddonKind::Audio && a.addon.place == place)
-        .map(|a| &a.addon.state)
-    {
+    match find_ref(&m, AddonKind::Audio, place).map(|a| &a.addon.state) {
         Some(AddonState::Preparing { .. }) => {}
         _ => return Ok(Step::Continue),
     }
-    let server = session.server;
-    while let Ok(change) = events.try_recv() {
-        if change.server == server && change.id == id {
-            return Ok(Step::Continue);
-        }
-    }
-    // Still being made: the others go on until it is asked about again.
-    shared
-        .check_at
-        .lock()
-        .insert(m.key.clone(), tokio::time::Instant::now() + manager::POLL);
-    Ok(Step::Stop)
+    Ok(manager::poll_or_wait(
+        shared,
+        &mut events,
+        session.server,
+        &id,
+        &m.key,
+    ))
 }
 
 /// Read `addon`'s file from where it stopped, check it whole and keep it,
@@ -628,7 +656,8 @@ async fn transferring(
     };
     let path = DownloadAddon::file(AddonKind::Audio, place, addon.addon.format);
     let to = store.dir(m).join(&path);
-    let part = part(store, m, place);
+    // Its bytes until it is whole: `addons/audio-<place>.part`.
+    let part = to.with_extension("part");
     std::fs::create_dir_all(to.parent().expect("under the download's directory")).map_err(disk)?;
     let mut writer = BlockWriter::open(&part, size, addon.addon.received)
         .await
@@ -641,7 +670,8 @@ async fn transferring(
         return Ok(Step::Continue);
     }
     // What is on disk, synced, is what the manifest keeps: a cut (or a
-    // crash) goes on from there.
+    // crash) goes on from there. As a film's, it is synced and kept every
+    // [`manager::SYNC_EVERY`]; between, what came is shown from memory.
     let save = |received: u64| {
         let sha256 = sha256.clone();
         shared.update(&m.key, move |m| {
@@ -649,31 +679,38 @@ async fn transferring(
                 && a.sha256.as_deref() == Some(sha256.as_str())
             {
                 a.addon.received = received;
-                if let AddonState::Transferring { .. } = a.addon.state {
-                    a.addon.state = AddonState::Transferring {
-                        done_percent: Some(percent(received, size)),
-                    };
-                }
             }
             Ok(())
         })
     };
+    let live = (m.key.clone(), Some(place));
     while !writer.is_complete() {
         let offset = writer.contiguous();
         if shared.should_stop(&m.key) {
+            writer.sync().await.map_err(disk)?;
+            save(offset).await?;
             return Ok(Step::Stop);
         }
         let (told_size, bytes) = match manager::read(session, &id, offset).await {
             Ok(read) => read,
-            // Gone from the server: prepared again, and the same file goes
-            // on from here.
-            Err(SdkError::NotFound(_)) => return to_prepare(shared, &m.key, place, true).await,
-            Err(SdkError::DownloadNotReady) => {
-                return to_prepare(shared, &m.key, place, false).await;
+            Err(e) => {
+                writer.sync().await.map_err(disk)?;
+                save(offset).await?;
+                return match e {
+                    // Gone from the server, or no longer ready there (its
+                    // file removed a day after its last read, or its media
+                    // changed): prepared anew, as asking about it would
+                    // only hear it failed; the same file goes on from here.
+                    SdkError::NotFound(_) | SdkError::DownloadNotReady => {
+                        to_prepare(shared, &m.key, place, true).await
+                    }
+                    e => Err(e),
+                };
             }
-            Err(e) => return Err(e),
         };
         if told_size != size {
+            writer.sync().await.map_err(disk)?;
+            save(offset).await?;
             return to_prepare(shared, &m.key, place, false).await;
         }
         if bytes.is_empty() {
@@ -682,8 +719,16 @@ async fn transferring(
             )));
         }
         writer.write_at(offset, &bytes).await.map_err(disk)?;
-        writer.sync().await.map_err(disk)?;
-        save(writer.contiguous()).await?;
+        shared
+            .received
+            .lock()
+            .insert(live.clone(), writer.contiguous());
+        if writer.unsynced() >= manager::SYNC_EVERY {
+            writer.sync().await.map_err(disk)?;
+            save(writer.contiguous()).await?;
+        } else {
+            shared.emit(m);
+        }
     }
     match writer.finish(&to, Some(&sha256)).await {
         Ok(()) => {}
@@ -752,7 +797,7 @@ mod tests {
     fn an_app_is_given_an_add_on_s_whole_path() {
         let kept = audio(AddonState::Ready, Some("addons/audio-1.m4a"));
         assert_eq!(
-            kept.view(Path::new("/downloads/abc"), false)
+            kept.view(Path::new("/downloads/abc"), false, None)
                 .path
                 .as_deref(),
             Some("/downloads/abc/addons/audio-1.m4a")
@@ -760,24 +805,78 @@ mod tests {
     }
 
     /// A subtitle left fetching by a call that ended with the client is
-    /// shown failed; an audio add-on under way is the manager's, and stays.
+    /// shown failed; an audio add-on under way is the manager's, and stays,
+    /// with its done percent of the bytes here, those ahead of its
+    /// manifest too.
     #[test]
     fn a_subtitle_left_fetching_is_failed_and_audio_goes_on() {
-        let moving = AddonState::Transferring {
-            done_percent: Some(40),
-        };
+        let moving = AddonState::Transferring { done_percent: None };
         let subtitle = DownloadAddon {
             kind: AddonKind::Subtitle,
             ..audio(moving.clone(), None)
         };
+        let coming = DownloadAddon {
+            received: 10,
+            size: Some(100),
+            ..audio(moving.clone(), None)
+        };
         let dir = Path::new("/d");
+        let shown = coming.view(dir, false, Some(40));
         assert_eq!(
             (
-                matches!(subtitle.view(dir, false).state, AddonState::Failed { .. }),
-                subtitle.view(dir, true).state,
-                audio(moving.clone(), None).view(dir, false).state,
+                matches!(
+                    subtitle.view(dir, false, None).state,
+                    AddonState::Failed { .. }
+                ),
+                subtitle.view(dir, true, None).state,
+                shown.state,
+                shown.received,
             ),
-            (true, moving.clone(), moving)
+            (
+                true,
+                moving,
+                AddonState::Transferring {
+                    done_percent: Some(40)
+                },
+                40
+            )
+        );
+    }
+
+    /// A subtitle left transferring (its call ended with the client) is
+    /// not the manager's: the download is not under way for it, and the
+    /// manager steps the audio add-on after it, not the subtitle forever.
+    #[test]
+    fn a_subtitle_left_transferring_is_not_the_managers() {
+        let moving = AddonState::Transferring {
+            done_percent: Some(40),
+        };
+        let stored = |kind, place, state| StoredAddon {
+            addon: DownloadAddon {
+                kind,
+                place,
+                ..audio(state, None)
+            },
+            id: None,
+            sha256: None,
+        };
+        let mut m = crate::downloads::store::tests::manifest("ab12", 1);
+        m.phase = DownloadPhase::Done;
+        m.addons = vec![stored(AddonKind::Subtitle, 2, moving.clone())];
+        let subtitle_alone = (m.under_way(), managed(&m).map(|a| a.addon.place));
+        m.addons.push(stored(
+            AddonKind::Audio,
+            1,
+            AddonState::Preparing {
+                server: DownloadState::Waiting,
+            },
+        ));
+        assert_eq!(
+            (
+                subtitle_alone,
+                (m.under_way(), managed(&m).map(|a| a.addon.place))
+            ),
+            ((false, None), (true, Some(1)))
         );
     }
 
@@ -813,6 +912,55 @@ mod tests {
         assert_eq!(
             (read.addon.state, read.addon.received, read.id),
             (AddonState::Transferring { done_percent: None }, 0, None)
+        );
+    }
+
+    /// Queued again, an audio add-on the server failed is prepared anew,
+    /// without its server id; one failed on this device keeps it. Both
+    /// keep what arrived until the new file is known.
+    #[test]
+    fn an_add_on_the_server_failed_is_prepared_anew_when_queued_again() {
+        let mut m = crate::downloads::store::tests::manifest("ab12", 1);
+        let failed = |place, cause| StoredAddon {
+            addon: DownloadAddon {
+                kind: AddonKind::Audio,
+                place,
+                received: 7,
+                ..audio(
+                    AddonState::Failed {
+                        reason: "failed".into(),
+                        cause,
+                    },
+                    None,
+                )
+            },
+            id: Some("d1".into()),
+            sha256: Some("aa".into()),
+        };
+        m.addons = vec![
+            failed(1, DownloadFailure::ServerStoppedConverting),
+            failed(2, DownloadFailure::SourceMissing),
+            failed(3, DownloadFailure::Other),
+            failed(4, DownloadFailure::Network),
+            failed(5, DownloadFailure::NoSpace { needed_bytes: 1 }),
+        ];
+        for place in 1..=5 {
+            queue(&mut m, place);
+        }
+        let ids: Vec<_> = m
+            .addons
+            .iter()
+            .map(|a| (a.id.as_deref(), a.addon.received))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (None, 7),
+                (None, 7),
+                (None, 7),
+                (Some("d1"), 7),
+                (Some("d1"), 7)
+            ]
         );
     }
 

@@ -25,7 +25,7 @@ use crate::{SdkError, Session};
 const READ: u64 = 8 << 20;
 /// How much is written between two syncs of the file and its offset: at
 /// most this much is read again after a crash.
-const SYNC_EVERY: u64 = 64 << 20;
+pub(super) const SYNC_EVERY: u64 = 64 << 20;
 /// Room left free beside a download, on top of its size.
 pub(super) const HEADROOM: u64 = 1 << 30;
 /// How often a download being prepared is asked about, events or not.
@@ -177,16 +177,19 @@ async fn drive(client: &Client, shared: &Arc<Shared>, key: &str) {
             store.recheck(key);
             return;
         };
-        let step = match session_for(client, shared, &m.server, &m.user_id).await {
+        // Whether an error fails its audio add-ons as well: one with no
+        // session at all (its server forgotten), or met moving them. One
+        // the film's own step met fails the film alone.
+        let (step, addons_too) = match session_for(client, shared, &m.server, &m.user_id).await {
             Ok(session) => match m.phase {
-                DownloadPhase::Preparing { .. } => preparing(shared, &session, m).await,
-                DownloadPhase::Transferring => transferring(shared, &session, m).await,
+                DownloadPhase::Preparing { .. } => (preparing(shared, &session, m).await, false),
+                DownloadPhase::Transferring => (transferring(shared, &session, m).await, false),
                 // The film is not moving: its add-ons are.
-                _ => super::addons::step(shared, &session, m).await,
+                _ => (super::addons::step(shared, &session, m).await, true),
             },
-            Err(e) => Err(e),
+            Err(e) => (Err(e), true),
         };
-        shared.received.lock().remove(key);
+        shared.received.lock().retain(|(k, _), _| k != key);
         match step {
             Ok(Step::Continue) => {
                 shared.retry_at.lock().remove(key);
@@ -194,7 +197,7 @@ async fn drive(client: &Client, shared: &Arc<Shared>, key: &str) {
             }
             Ok(Step::Stop) => return,
             Err(e) => {
-                failed(shared, key, e).await;
+                failed(shared, key, e, addons_too).await;
                 return;
             }
         }
@@ -228,7 +231,7 @@ pub(super) async fn session_for(
 
 /// What to do after `error` moving download `key`: wait and try again
 /// when it may pass by itself, else fail it, saying why.
-async fn failed(shared: &Shared, key: &str, error: SdkError) {
+async fn failed(shared: &Shared, key: &str, error: SdkError, addons_too: bool) {
     let note = match &error {
         e if !waits(e) => None,
         SdkError::SignInRequired => {
@@ -267,6 +270,18 @@ async fn failed(shared: &Shared, key: &str, error: SdkError) {
                             reason: error.to_string(),
                             cause: cause_of(&error),
                         };
+                    }
+                    // Its audio add-ons under way fail with it: one left
+                    // moving keeps the download under way, and the manager
+                    // would take it again at once, failing the same way.
+                    if addons_too {
+                        super::addons::set_moving(
+                            m,
+                            &super::addons::AddonState::Failed {
+                                reason: error.to_string(),
+                                cause: cause_of(&error),
+                            },
+                        );
                     }
                     m.note = None;
                     Ok(())
@@ -373,7 +388,7 @@ pub(super) fn take(m: &mut Manifest, info: DownloadInfo) {
     }
     m.phase = match info.state {
         DownloadState::Ready { size, sha256 } => {
-            if m.size != Some(size) || m.sha256.as_deref() != Some(sha256.as_str()) {
+            if other_file((m.size, m.sha256.as_deref()), size, &sha256) {
                 m.offset = 0;
             }
             m.size = Some(size);
@@ -438,10 +453,7 @@ pub(super) async fn fetch_artwork(
             if !seen.insert(art.id.clone()) {
                 continue;
             }
-            let file = format!(
-                "{}.jpg",
-                &blake3::hash(art.id.to_string().as_bytes()).to_hex()[..16]
-            );
+            let file = art_file_name(&art.id.to_string());
             let path = dir.join(&file);
             if !kept_art.get(&art.id).is_some_and(|from| reuse(from, &path)) {
                 let bytes = match session.artwork(&art.id, ArtworkSize::Large).await {
@@ -467,6 +479,12 @@ pub(super) async fn fetch_artwork(
         }
     }
     kept
+}
+
+/// The file a picture of artwork `id` is kept as: the same name for the
+/// same artwork, wherever it is kept.
+pub(super) fn art_file_name(id: &str) -> String {
+    format!("{}.jpg", &blake3::hash(id.as_bytes()).to_hex()[..16])
 }
 
 /// `to` is the picture at `from` too: a hard link to it, else a copy.
@@ -519,19 +537,43 @@ async fn preparing(shared: &Shared, session: &Session, m: Manifest) -> Result<St
         DownloadPhase::Preparing { .. } => {}
         _ => return Ok(Step::Stop),
     }
-    // Told it moved while asking: asked again at once.
-    let server = session.server;
+    Ok(poll_or_wait(
+        shared,
+        &mut events,
+        session.server,
+        &id,
+        &m.key,
+    ))
+}
+
+/// Download `key`'s server download `id` on `server` is still being
+/// made. Told it moved while it was asked about (`events`, subscribed
+/// before): asked again at once. Else the others go on until it is asked
+/// about again, after [`POLL`] or a server event.
+pub(super) fn poll_or_wait(
+    shared: &Shared,
+    events: &mut tokio::sync::broadcast::Receiver<super::ServerChange>,
+    server: iroh::EndpointId,
+    id: &str,
+    key: &str,
+) -> Step {
     while let Ok(change) = events.try_recv() {
         if change.server == server && change.id == id {
-            return Ok(Step::Continue);
+            return Step::Continue;
         }
     }
-    // Still being made: the others go on until it is asked about again.
     shared
         .check_at
         .lock()
-        .insert(m.key.clone(), tokio::time::Instant::now() + POLL);
-    Ok(Step::Stop)
+        .insert(key.to_owned(), tokio::time::Instant::now() + POLL);
+    Step::Stop
+}
+
+/// The ready file the server says is another than the one known
+/// (`size`, `sha256`): the bytes here are not of it, and its transfer
+/// starts over.
+pub(super) fn other_file(known: (Option<u64>, Option<&str>), size: u64, sha256: &str) -> bool {
+    known != (Some(size), Some(sha256))
 }
 
 /// Read `m`'s file from where it stopped, check it whole and keep it.
@@ -632,11 +674,15 @@ async fn transferring(
                 writer.sync().await.map_err(disk)?;
                 save(offset).await?;
                 return match e {
-                    // Gone from the server (cancelled, or removed a day
-                    // after its last read): prepared again, and the same
-                    // file goes on from here.
-                    SdkError::NotFound(_) => to_prepare(shared, &m.key, true).await,
-                    SdkError::DownloadNotReady => to_prepare(shared, &m.key, false).await,
+                    // Gone from the server (cancelled, or its rows
+                    // dropped), or no longer ready there (its file removed
+                    // a day after its last read, or its media changed):
+                    // prepared anew, as asking about it would only hear
+                    // it failed. The bytes here are kept if the new file
+                    // is the same ([`take`]).
+                    SdkError::NotFound(_) | SdkError::DownloadNotReady => {
+                        to_prepare(shared, &m.key, true).await
+                    }
                     e => Err(e),
                 };
             }
@@ -656,7 +702,7 @@ async fn transferring(
         shared
             .received
             .lock()
-            .insert(m.key.clone(), writer.contiguous());
+            .insert((m.key.clone(), None), writer.contiguous());
         if writer.unsynced() >= SYNC_EVERY {
             writer.sync().await.map_err(disk)?;
             save(writer.contiguous()).await?;
@@ -772,6 +818,21 @@ async fn to_prepare(shared: &Shared, key: &str, forget: bool) -> Result<Step, Sd
         })
         .await?;
     Ok(Step::Continue)
+}
+
+/// A failure of this device's own, which a server never sends
+/// ([`DownloadFailure::Network`], [`DownloadFailure::NoSpace`]): the
+/// server's download is still good to go on with, by its id. Any other
+/// may be the server's (its file removed a day after its last read, its
+/// conversion stopped, its source gone), and asking about that id again
+/// would only hear it again: a retry prepares it anew. That costs one
+/// call when it was not the server's, which gives the same file again,
+/// and the bytes here are kept when it is the same file ([`take`]).
+pub(super) fn device_failed(cause: &DownloadFailure) -> bool {
+    matches!(
+        cause,
+        DownloadFailure::Network | DownloadFailure::NoSpace { .. }
+    )
 }
 
 /// Download `key` is `failed`, a [`DownloadPhase::Failed`].
@@ -998,6 +1059,56 @@ mod tests {
         // A server event asks about them all again.
         shared.check_at.lock().clear();
         assert_eq!(driven(&shared).as_deref(), Some("aa"));
+    }
+
+    /// Codex, PR #72: a done film whose audio add-on was under way when
+    /// its server was forgotten (no session, for good) kept the add-on
+    /// moving, so the manager took it again at once, round and round.
+    /// The add-on fails with the download's error, and nothing is left
+    /// under way.
+    #[tokio::test]
+    async fn an_add_on_whose_server_is_gone_for_good_fails_with_it() {
+        use super::super::addons::StoredAddon;
+        use super::super::{AddonFormat, AddonKind, AddonState, DownloadAddon};
+        let dir = std::env::temp_dir().join(format!("sf-sdk-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Shared::new(Some(dir));
+        let store = shared.store().unwrap();
+        let mut m = crate::downloads::store::tests::manifest("ab12", 1);
+        m.phase = DownloadPhase::Done;
+        m.addons.push(StoredAddon {
+            addon: DownloadAddon {
+                kind: AddonKind::Audio,
+                place: 1,
+                path: None,
+                format: AddonFormat::M4a,
+                language: None,
+                state: AddonState::Transferring {
+                    done_percent: Some(40),
+                },
+                received: 0,
+                size: None,
+            },
+            id: Some("d1".into()),
+            sha256: None,
+        });
+        store.write(&m).unwrap();
+        failed(
+            &shared,
+            "ab12",
+            SdkError::NotPinned("server-key".into()),
+            true,
+        )
+        .await;
+        let m = store.find("ab12").unwrap();
+        assert_eq!(
+            (
+                m.under_way(),
+                matches!(m.addons[0].addon.state, AddonState::Failed { .. }),
+                m.phase
+            ),
+            (false, true, DownloadPhase::Done)
+        );
     }
 
     /// A picture kept already is linked, not fetched; one whose entry is

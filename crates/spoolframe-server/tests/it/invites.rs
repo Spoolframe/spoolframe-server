@@ -2354,7 +2354,10 @@ mod with_passkey {
     async fn stranger(invites: &Invites) -> TestClient {
         let device = invites.server.client().await;
         let info = device
-            .hello_with_features(Features::only(Feature::October2026))
+            .hello_with_features(
+                spoolframe_types::Platform::Linux,
+                Features::only(Feature::October2026),
+            )
             .await;
         assert!(info.features.contains(Feature::October2026));
         device

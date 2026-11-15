@@ -2018,18 +2018,25 @@ impl TestClient {
     /// `Hello` from a Linux app that names no experimental feature: the
     /// server's info.
     pub async fn hello_info(&self) -> ServerInfo {
-        self.hello_with_features(spoolframe_protocol::Features::empty())
-            .await
+        self.hello_with_features(
+            spoolframe_types::Platform::Linux,
+            spoolframe_protocol::Features::empty(),
+        )
+        .await
     }
 
-    /// `Hello` from a Linux app that names the regular features
+    /// `Hello` from an app on `platform` that names the regular features
     /// `features`: the server's info.
-    pub async fn hello_with_features(&self, features: spoolframe_protocol::Features) -> ServerInfo {
+    pub async fn hello_with_features(
+        &self,
+        platform: spoolframe_types::Platform,
+        features: spoolframe_protocol::Features,
+    ) -> ServerInfo {
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "test".into(),
             client_version: "0".into(),
-            platform: spoolframe_types::Platform::Linux,
+            platform,
             device_name: None,
             capabilities: None,
             experimental: Vec::new(),
@@ -2340,4 +2347,34 @@ mod port_race {
         assert_eq!(tries.load(Ordering::SeqCst), 1);
         assert_eq!(failed, "setup attempt 1 of 3: no database");
     }
+}
+
+/// An SDK client for `device` over `storage` with `options`, told where
+/// `server` is, connected, and with it pinned.
+pub async fn pinned_sdk_client(
+    server: &TestServer,
+    storage: &Arc<spoolframe_client_sdk::MemoryStorage>,
+    device: spoolframe_client_sdk::Device,
+    options: spoolframe_client_sdk::ClientOptions,
+) -> spoolframe_client_sdk::Client {
+    let client = spoolframe_client_sdk::Client::open_with_options(storage.clone(), device, options)
+        .await
+        .unwrap();
+    let id = server.server.id().to_string();
+    let addrs = server.server.addr().ip_addrs().copied().collect();
+    client.add_address(&id, addrs).unwrap();
+    client.connect(&id).await.unwrap();
+    client.pin(&id, true).await.unwrap();
+    client
+}
+
+/// Until `client`'s downloads have nothing left to move, within 2 minutes.
+pub async fn settled(client: &spoolframe_client_sdk::Client) {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        client.downloads().run_until_done(),
+    )
+    .await
+    .expect("the downloads never settled")
+    .unwrap();
 }

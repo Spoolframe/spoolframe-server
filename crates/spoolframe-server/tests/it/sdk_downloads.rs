@@ -18,7 +18,9 @@ use spoolframe_protocol::{Hello, PROTOCOL_VERSION, Reply, Request, Response};
 use spoolframe_test_dir::TestDir;
 use spoolframe_types::{AudioCodec, Container, VideoCodec};
 
-use crate::support::{ServerOptions, TestServer, episode, fresh_dir, movie, show};
+use crate::support::{
+    ServerOptions, TestServer, episode, fresh_dir, movie, pinned_sdk_client, show,
+};
 
 const PASSWORD: &str = "correct horse";
 
@@ -90,15 +92,7 @@ fn options(downloads: &Path, relays: bool) -> ClientOptions {
 /// The device over `storage` keeping downloads in `downloads`, told
 /// where `server` is; it has pinned it once.
 async fn device(server: &TestServer, storage: &Arc<MemoryStorage>, downloads: &Path) -> Client {
-    let client = Client::open_with_options(storage.clone(), linux(), options(downloads, false))
-        .await
-        .unwrap();
-    let id = server.server.id().to_string();
-    let addrs = server.server.addr().ip_addrs().copied().collect();
-    client.add_address(&id, addrs).unwrap();
-    client.connect(&id).await.unwrap();
-    client.pin(&id, true).await.unwrap();
-    client
+    pinned_sdk_client(server, storage, linux(), options(downloads, false)).await
 }
 
 async fn alice(server: &TestServer, client: &Client) -> Session {
@@ -123,13 +117,7 @@ async fn start(client: &Client, session: &Session) -> LocalDownload {
 
 /// Download `key` once nothing is left to move, within 2 minutes.
 async fn settled(client: &Client, key: &str) -> LocalDownload {
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        client.downloads().run_until_done(),
-    )
-    .await
-    .expect("the download never settled")
-    .unwrap();
+    crate::support::settled(client).await;
     client.downloads().get(key).unwrap()
 }
 

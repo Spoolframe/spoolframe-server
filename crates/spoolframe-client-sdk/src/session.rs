@@ -504,6 +504,24 @@ trait SubtitleChunks {
     async fn chunk(&self, offset: u64, version: Option<u64>) -> Result<SubtitleChunk, SdkError>;
 }
 
+/// The subtitle chunk `reply` holds.
+fn chunk_of(reply: Reply) -> Result<SubtitleChunk, SdkError> {
+    match reply {
+        Reply::SubtitleChunk {
+            format,
+            bytes,
+            total,
+            version,
+        } => Ok(SubtitleChunk {
+            format,
+            bytes,
+            total,
+            version,
+        }),
+        other => Err(unexpected(other)),
+    }
+}
+
 /// A subtitle read whole from `source`.
 ///
 /// The server answers `SubtitleChanged` when the file is no longer the
@@ -551,20 +569,7 @@ impl SubtitleChunks for PlaybackSubtitle<'_> {
             offset,
             version,
         };
-        match self.session.call(request).await? {
-            Reply::SubtitleChunk {
-                format,
-                bytes,
-                total,
-                version,
-            } => Ok(SubtitleChunk {
-                format,
-                bytes,
-                total,
-                version,
-            }),
-            other => Err(unexpected(other)),
-        }
+        chunk_of(self.session.call(request).await?)
     }
 }
 
@@ -584,20 +589,7 @@ impl SubtitleChunks for TrackSubtitle<'_> {
             offset,
             version,
         };
-        match self.session.call(request).await? {
-            Reply::SubtitleChunk {
-                format,
-                bytes,
-                total,
-                version,
-            } => Ok(SubtitleChunk {
-                format,
-                bytes,
-                total,
-                version,
-            }),
-            other => Err(unexpected(other)),
-        }
+        chunk_of(self.session.call(request).await?)
     }
 }
 
@@ -646,7 +638,7 @@ pub struct Session {
 pub(crate) struct SessionParts {
     server: EndpointId,
     token: SessionId,
-    user: UserSummary,
+    pub(crate) user: UserSummary,
     can_leave: bool,
 }
 
@@ -1174,6 +1166,36 @@ impl Session {
     }
 
     pub async fn item(&self, id: &MediaId) -> Result<ItemDetail, SdkError> {
+        let writer = self.offline_writer();
+        let detail = self.item_cached(id).await?;
+        // A track's heart, kept for offline.
+        if let (Item::Track(_), Some(liked)) = (&detail.item, detail.liked) {
+            let liked = match liked {
+                spoolframe_protocol::playlists::Liked::All => Some(true),
+                spoolframe_protocol::playlists::Liked::None => Some(false),
+                _ => None,
+            };
+            if let Some(liked) = liked {
+                self.client
+                    .inner
+                    .downloads
+                    .learn_hearts(&writer, [(id.clone(), liked)]);
+            }
+        }
+        Ok(detail)
+    }
+
+    /// The writer of what this session's reads keep for offline, taken
+    /// before the server is asked
+    /// ([`crate::downloads::playlist_cache::Writer`]).
+    pub(crate) fn offline_writer(&self) -> crate::downloads::playlist_cache::Writer {
+        self.client
+            .inner
+            .downloads
+            .writer(self.server, &self.user.user_id, &self.user.username)
+    }
+
+    async fn item_cached(&self, id: &MediaId) -> Result<ItemDetail, SdkError> {
         use crate::catalog_cache::Value;
         let asked = id.clone();
         self.cached(
