@@ -340,8 +340,15 @@ async fn an_audio_add_on_the_server_failed_is_prepared_anew_when_added_again() {
 /// The server's files of its downloads, once each is ready, removed as
 /// they are a day after their last read (the store's clock moved on past
 /// it): each such download is failed on the server.
+///
+/// The clock is moved past each file's last read as the server noted it,
+/// not once: a read the device began before it was paused still comes
+/// (one, of up to 8 MiB), and when it opens after the clock moved, it is
+/// noted then, a day before the file may go. A file read now is kept
+/// until the read ends; the sweep after its end removes it.
 async fn expired(server: &TestServer) {
     use spoolframe_server::store::downloads::StoredState;
+    let day = 24 * 60 * 60;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let rows = server.store.downloads().await.unwrap();
@@ -358,10 +365,7 @@ async fn expired(server: &TestServer) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    server.clock.advance(Duration::from_secs(25 * 60 * 60));
-    // A read under way keeps the file until it ends: swept until it goes.
     loop {
-        server.downloads.sweep().await.unwrap();
         let rows = server.store.downloads().await.unwrap();
         if rows
             .iter()
@@ -369,9 +373,23 @@ async fn expired(server: &TestServer) {
         {
             break;
         }
+        // Past a day after the last read noted: a read noted since the
+        // last move moves it again.
+        let last = rows
+            .iter()
+            .map(|r| r.last_read_at.unwrap_or(r.created_at))
+            .max()
+            .unwrap();
+        let behind = last + day + 1 - server.clock.unix_secs();
+        if behind > 0 {
+            server
+                .clock
+                .advance(Duration::from_secs(behind.unsigned_abs()));
+        }
+        server.downloads.sweep().await.unwrap();
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the server's file was never removed"
+            "the server's file was never removed: {rows:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
