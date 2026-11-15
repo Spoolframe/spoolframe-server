@@ -315,7 +315,10 @@ fn new_password(from_stdin: bool) -> Result<String> {
     Ok(first)
 }
 
-/// The admin's own credentials: from the environment, or prompted.
+/// The admin's own credentials: from the environment, or prompted. Asked
+/// for before the socket is opened: the server closes a connection that
+/// sends nothing in its first 30 s (jsonrpsee 0.26.1), and a prompt can
+/// take longer than that.
 fn admin_credentials() -> Result<Credentials> {
     let username = match std::env::var("SPOOLFRAME_ADMIN_USER") {
         Ok(name) => name,
@@ -379,9 +382,10 @@ pub async fn user(listen: SocketAddr, command: UserCommand) -> Result<()> {
         }
         _ => None,
     };
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -474,9 +478,10 @@ async fn find_device(api: &WsClient, username: &str, device: &str) -> Result<Str
 /// user's, or with `dry_run` print what would change, logged in as an
 /// admin.
 pub async fn plex_sync(listen: SocketAddr, user: Option<String>, dry_run: bool) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -520,9 +525,10 @@ pub async fn plex_sync(listen: SocketAddr, user: Option<String>, dry_run: bool) 
 
 /// Print the server's status, logged in as an admin.
 pub async fn status(listen: SocketAddr) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -805,9 +811,10 @@ async fn run(api: &WsClient, command: UserCommand, new_password: Option<String>)
 /// as an admin. The CLI sends no page origin, so the server records its
 /// invites as made by "server CLI".
 pub async fn invite(listen: SocketAddr, command: InviteCommand) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -869,9 +876,10 @@ async fn run_invite(api: &WsClient, command: InviteCommand) -> Result<()> {
 /// List playlists, or set or remove one's cover (PX-53), as the user who
 /// logs in.
 pub async fn playlist(listen: SocketAddr, command: PlaylistCommand) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -942,9 +950,10 @@ async fn run_playlist(
 
 /// See or change subtitles' timing (PX-03), logged in as an admin.
 pub async fn subtitle(listen: SocketAddr, command: SubtitleCommand) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -1109,9 +1118,10 @@ fn timing_line(t: &spoolframe_admin_api::SubtitleTimingInfo) -> String {
 
 /// List or revoke portable users' grants (P7-06), logged in as an admin.
 pub async fn grant(listen: SocketAddr, command: GrantCommand) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -1181,9 +1191,10 @@ fn when(secs: i64) -> String {
 /// applies it. `value` is JSON (`3`, `true`, `[{"from": "/a", "to": "/b"}]`)
 /// or else a string; `None` unsets.
 pub async fn config_change(listen: SocketAddr, key: &str, value: Option<&str>) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;
@@ -1218,9 +1229,10 @@ pub async fn config_change(listen: SocketAddr, key: &str, value: Option<&str>) -
 /// `config reload` (PX-33): the running server reads its config again,
 /// and what changed is printed as its log says it.
 pub async fn config_reload(listen: SocketAddr) -> Result<()> {
+    let credentials = admin_credentials()?;
     let login = connect(listen, None)
         .await?
-        .login(admin_credentials()?)
+        .login(credentials)
         .await
         .map_err(api_error)?;
     let api = connect(listen, Some(&login.token)).await?;

@@ -47,8 +47,19 @@ ignore = [
   # operation with it, which the Marvin timing attack targets.
   { id = "RUSTSEC-2023-0071", reason = "rsa accepted for signature verification only (public keys); no private-key operations" },
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
-  # (through iroh's netlink-packet-core); none of it is in the binary.
+  # (through iroh's netlink-packet-core 0.8.2); none of it is in the
+  # binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the SDK" },
+  # libsqlite3-sys 0.37 (bundled SQLite below 3.54.0): a crafted database
+  # opened with a mismatched `-wal` file can corrupt memory. It needs both
+  # files planted where our process opens them; our databases (the
+  # server's state, the SDK's offline.sqlite3) are private files of the
+  # server's state directory or the app's sandbox, written only by us.
+  # Not fixable yet: sqlx-sqlite 0.9.0 (its latest) takes libsqlite3-sys
+  # >= 0.30.1, < 0.38, and `links = "sqlite3"` allows one in the tree.
+  # Drop this once sqlx allows libsqlite3-sys >= 0.39; rusqlite then goes
+  # to 0.41.
+  { id = "RUSTSEC-2026-0459", reason = "SQLite < 3.54.0 needs a crafted database plus a mismatched -wal file opened by our process; our databases are private files; sqlx 0.9 pins libsqlite3-sys < 0.38" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and

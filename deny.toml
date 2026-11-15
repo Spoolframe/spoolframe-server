@@ -62,47 +62,27 @@ ignore = [
   # fixed rsa release exists.
   { id = "RUSTSEC-2023-0071", reason = "rsa is used only to verify OIDC ID token and passkey signatures (public keys); no private-key operations" },
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
-  # (through iroh's netlink-packet-core); none of it is in the binary.
+  # (through iroh's netlink-packet-core 0.8.2 and foyer-memory 0.22.6);
+  # none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the server" },
-  # crypto-bigint 0.5: constant-time operations that may branch on secret
-  # values. It now comes in only through openidconnect 4.0.1, whose p256
-  # and p384 0.13 (elliptic-curve) verify ES256 and ES384 ID tokens with
-  # public keys. Our own p256 is 0.14, so the SDK graph is clear. The fix
-  # is crypto-bigint 0.7.6; drop this when openidconnect moves to 0.14.
-  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 comes through p256 0.13 in openidconnect, used only to verify ECDSA signatures (public keys); no secret operations" },
   # block-buffer below 0.12.1: a hasher reused after a panic in the middle
   # of an update may read stale buffer state. Only in the server's graph,
-  # through digest 0.10 in openidconnect 4.0.1, oauth2 5.0.0, sqlx 0.9.0
-  # and soketto 0.8.1, each at its latest release; every block-buffer
-  # below 0.12.1 is affected. The server never reuses a hasher after a
-  # panic. Our own sha2 is 0.11, so the SDK graph is clear.
-  { id = "GHSA-qwgh-2vcv-g2f7", reason = "block-buffer < 0.12.1 comes through digest 0.10 in openidconnect, oauth2, sqlx and soketto, all at their latest; no hasher is reused after a panic" },
-  # zstd 0.13 and zstd-safe 7: stale data across a reused stream context,
-  # Seekable::decompress past the end, and uninitialized memory after a
-  # failed legacy frame. They come only through foyer-storage 0.22.6
-  # (foyer's latest), which uses zstd for its disk tier's optional value
-  # compression. The server's artwork, previews and Plex caches never
-  # turn compression on (foyer's default is none), so no zstd stream is
-  # made or read; it uses no Seekable and no legacy frame. The fixes are
-  # zstd 0.14.3 and zstd-safe 8.2.0, which foyer 0.22 cannot take: drop
-  # these when foyer moves to them.
-  { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 comes only through foyer-storage, whose value compression the server never turns on" },
-  { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 comes only through foyer-storage, which uses no Seekable; its compression is never on here" },
-  { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 comes only through foyer-storage, whose value compression the server never turns on" },
-  # zstd-safe 7's unsound safe API (use-after-free, double free, reads
-  # out of bounds in its contexts, buffers, dictionaries, Seekable and
-  # training): cargo audit reports them, as warnings. Not reachable here
-  # for the same reason: foyer's compression is never on.
-  { id = "RUSTSEC-2026-0395", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0396", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0397", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0399", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0400", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0401", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0402", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0404", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0405", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
-  { id = "RUSTSEC-2026-0406", reason = "unsound zstd-safe 7 API, through foyer-storage only, whose compression the server never turns on" },
+  # through digest 0.10 in openidconnect 4.1.0, oauth2 5.0.0, sqlx 0.9.0,
+  # soketto 0.8.1, and webauthn-rs 0.6.2 (crypto-glue 0.2.2, argon2 0.5,
+  # blake2 0.10), each at its latest release; every block-buffer below
+  # 0.12.1 is affected. The server never reuses a hasher after a panic.
+  # Our own sha2 is 0.11, so the SDK graph is clear.
+  { id = "GHSA-qwgh-2vcv-g2f7", reason = "block-buffer < 0.12.1 comes through digest 0.10 in openidconnect, oauth2, sqlx, soketto and webauthn-rs, all at their latest; no hasher is reused after a panic" },
+  # libsqlite3-sys 0.37 (bundled SQLite below 3.54.0): a crafted database
+  # opened with a mismatched `-wal` file can corrupt memory. It needs both
+  # files planted where our process opens them; our databases (the
+  # server's state, the SDK's offline.sqlite3) are private files of the
+  # server's state directory or the app's sandbox, written only by us.
+  # Not fixable yet: sqlx-sqlite 0.9.0 (its latest) takes libsqlite3-sys
+  # >= 0.30.1, < 0.38, and `links = "sqlite3"` allows one in the tree.
+  # Drop this once sqlx allows libsqlite3-sys >= 0.39; rusqlite then goes
+  # to 0.41.
+  { id = "RUSTSEC-2026-0459", reason = "SQLite < 3.54.0 needs a crafted database plus a mismatched -wal file opened by our process; our databases are private files; sqlx 0.9 pins libsqlite3-sys < 0.38" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and
