@@ -107,7 +107,7 @@ pub use downloads::{
     MusicQuality, MusicSynced, MusicTarget, NetworkKind, OfflineAlbum, OfflineArtist, OfflineMark,
     OfflineMusic, OfflinePlaylist, OfflinePlaylistEntry, OfflineTrack, SyncedPlay, TrackOnDevice,
 };
-pub use error::{ErrorKind, SdkError};
+pub use error::{ErrorKind, LookupFailure, SdkError};
 pub use experimental::{Experimental, HttpPlayback, HttpPlaybackRefusal};
 pub use gate::{Gate, Invited, On};
 pub use invite_admin::{

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Added, SDK: `Client::look_up_server` says why it got no answer, so an
+  app tells "Can't find <address>" from "No answer".
+  `SdkError::ServerLookupFailed { address, reason }` (FFI
+  `SpoolError.ServerLookupFailed`) replaces `Unreachable` and `TimedOut`
+  for a lookup, with `reason` a `LookupFailure`: `NameNotFound` (the
+  name does not resolve), `NoAnswer` (refused, unreachable, or a 5xx),
+  `TimedOut`, or `Tls` (a certificate or handshake failure). Each is
+  read from the failure's causes, not its text: the lookup resolves
+  names itself to tell a missing name apart. An answer that is not a
+  Spoolframe server's is still `NotASpoolframeServer`. `NoAnswer` and
+  `TimedOut` are `ErrorKind::Transport`, as `Unreachable` and
+  `TimedOut` were; `NameNotFound` and `Tls` are `Refused`.
+
 ## 0.17.4 (2026-11-15)
 
 - Security, SDK: an app now resolves rusqlite 0.43 and libsqlite3-sys

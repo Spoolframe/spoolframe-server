@@ -51,6 +51,14 @@ fn every_variant() -> Vec<SdkError> {
         SdkError::NotASpoolframeServer {
             address: "https://example.org".into(),
         },
+        SdkError::ServerLookupFailed {
+            address: "https://example.invalid".into(),
+            reason: sdk::LookupFailure::NameNotFound,
+        },
+        SdkError::ServerLookupFailed {
+            address: "https://example.org".into(),
+            reason: sdk::LookupFailure::NoAnswer,
+        },
         SdkError::MalformedServerDocument {
             reason: "no key".into(),
         },

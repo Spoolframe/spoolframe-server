@@ -1159,9 +1159,14 @@ The SDK's `Client::look_up_server(address)` (FFI
    dials, and over plain HTTP anyone on the path could name their own.
    Anything that is not a host is `InvalidInput`.
 2. Fetches it over HTTPS (TLS as the endpoint's, webpki roots), in at
-   most 10 s, reading at most 64 KiB. No answer, DNS or TLS failure, or
-   a 5xx is `Unreachable` (`TimedOut` for the clock); a 404, or a page
-   that is not a JSON object with `endpoint_id`, is
+   most 10 s, reading at most 64 KiB. With no answer to read it is
+   `ServerLookupFailed { address, reason }`, `reason` one of
+   `NameNotFound` (the name does not resolve: "Can't find <address>"),
+   `NoAnswer` (refused, unreachable, a broken connection, or a 5xx from
+   a proxy whose server is down), `TimedOut`, and `Tls` (a certificate
+   no root signs, another name's or expired, or no TLS there). The
+   reason is read from the failure's causes, never their text. A 404, or
+   a page that is not a JSON object with `endpoint_id`, is
    `NotASpoolframeServer`; a document whose key is not one or whose
    fields do not read is `MalformedServerDocument`.
 3. Takes its hints as an invite's: at most 32 addresses and 32 http(s)

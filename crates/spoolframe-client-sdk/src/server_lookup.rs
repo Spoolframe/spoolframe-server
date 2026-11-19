@@ -39,7 +39,7 @@ use spoolframe_protocol::well_known::{MAX_DOCUMENT, PATH, ServerDocument};
 
 use crate::client::{Client, parse_id};
 use crate::servers::{self, SavedServer};
-use crate::{SdkError, is_invite_link};
+use crate::{LookupFailure, SdkError, is_invite_link};
 
 /// How long a lookup may take, all of it: DNS, TLS, the answer.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -153,15 +153,85 @@ pub(crate) fn http_client(
     tls: impl std::any::Any,
     allow_http: bool,
 ) -> Result<reqwest::Client, SdkError> {
-    reqwest::Client::builder()
+    builder(allow_http)
         .tls_backend_preconfigured(tls)
+        .build()
+        .map_err(|e| SdkError::Unavailable(format!("cannot look servers up: {e}")))
+}
+
+/// [`http_client`] but its TLS.
+fn builder(allow_http: bool) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .https_only(!allow_http)
         .timeout(LOOKUP_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+        .dns_resolver(std::sync::Arc::new(Resolver))
         .user_agent(concat!("spoolframe-client-sdk/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| SdkError::Unavailable(format!("cannot look servers up: {e}")))
+}
+
+/// The system's resolver (getaddrinfo, as reqwest's own), failing with
+/// [`NameNotFound`] so a lookup can tell a name that does not resolve
+/// from a host that does not answer: reqwest's own resolver fails as any
+/// connection does.
+struct Resolver;
+
+/// The name a lookup asked for did not resolve.
+#[derive(Debug, thiserror::Error)]
+#[error("{name} does not resolve")]
+struct NameNotFound {
+    name: String,
+    #[source]
+    error: Option<std::io::Error>,
+}
+
+impl reqwest::dns::Resolve for Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let name = name.as_str().to_owned();
+        Box::pin(async move {
+            // reqwest sets the port of what this answers.
+            let found = tokio::net::lookup_host((name.as_str(), 0))
+                .await
+                .map(|found| found.collect::<Vec<SocketAddr>>());
+            match found {
+                Ok(found) if !found.is_empty() => {
+                    Ok(Box::new(found.into_iter()) as reqwest::dns::Addrs)
+                }
+                Ok(_) => Err(NameNotFound { name, error: None }.into()),
+                Err(error) => Err(NameNotFound {
+                    name,
+                    error: Some(error),
+                }
+                .into()),
+            }
+        })
+    }
+}
+
+/// Why `e`, a lookup's request or body read, failed: by what its causes
+/// are, never by their text.
+fn failure_of(e: &reqwest::Error) -> LookupFailure {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(error) = cause {
+        if error.is::<NameNotFound>() {
+            return LookupFailure::NameNotFound;
+        }
+        if error.is::<rustls::Error>() {
+            return LookupFailure::Tls;
+        }
+        // hyper-rustls hands rustls's error on inside an io::Error (inside
+        // another, by hyper-util), and an io::Error's `source()` is what
+        // it wraps's source, skipping it: the wrapped error is the next.
+        cause = match error.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as _),
+            None => error.source(),
+        };
+    }
+    if e.is_timeout() {
+        LookupFailure::TimedOut
+    } else {
+        LookupFailure::NoAnswer
+    }
 }
 
 /// The document at `url`, of `origin`, fetched with `http`.
@@ -170,19 +240,21 @@ pub(crate) async fn fetch_document(
     url: &str,
     origin: &str,
 ) -> Result<ServerDocument, SdkError> {
+    let failed = |reason| SdkError::ServerLookupFailed {
+        address: origin.to_owned(),
+        reason,
+    };
     let network = |e: reqwest::Error| {
-        tracing::debug!(origin, error = %e, "a server's document did not come");
-        if e.is_timeout() {
-            SdkError::TimedOut(origin.to_owned())
-        } else {
-            SdkError::Unreachable(origin.to_owned())
-        }
+        let reason = failure_of(&e);
+        tracing::debug!(origin, error = %e, ?reason, "a server's document did not come");
+        failed(reason)
     };
     let mut response = http.get(url).send().await.map_err(network)?;
     let status = response.status();
     if status.is_server_error() {
+        // A proxy answering for a server that is down.
         tracing::debug!(origin, %status, "a server's document did not come");
-        return Err(SdkError::Unreachable(origin.to_owned()));
+        return Err(failed(LookupFailure::NoAnswer));
     }
     if !status.is_success() {
         return Err(SdkError::NotASpoolframeServer {
@@ -250,8 +322,11 @@ impl Client {
     /// - [`SdkError::InvalidInput`]: nothing typed, or not a host (another
     ///   scheme, a user name, an invite link); nothing is sent.
     /// - [`SdkError::NotHttps`]: an `http://` address; nothing is sent.
-    /// - [`SdkError::Unreachable`] (no answer, DNS, TLS, the server's
-    ///   5xx) and [`SdkError::TimedOut`]: the network's.
+    /// - [`SdkError::ServerLookupFailed`]: no answer to read, with its
+    ///   [`crate::LookupFailure`]: the name does not resolve
+    ///   (`NameNotFound`), nothing answers or the server behind a proxy is
+    ///   down, a 5xx (`NoAnswer`), not in time (`TimedOut`), or the secure
+    ///   connection failed (`Tls`).
     /// - [`SdkError::NotASpoolframeServer`]: it answered with no document
     ///   (a 404, or another site's page): another site, or a server that
     ///   does not publish itself outside its home.
@@ -543,15 +618,106 @@ mod tests {
         assert_eq!((doc.endpoint_id, doc.name), (id, "Home Media".to_owned()));
     }
 
+    /// What `origin`'s lookup failed with, by `client`; `None` when it
+    /// did not fail so.
+    async fn failure_with(client: &reqwest::Client, origin: &str) -> Option<LookupFailure> {
+        match fetch_document(client, &format!("{origin}{PATH}"), origin).await {
+            Err(SdkError::ServerLookupFailed { address, reason }) => {
+                assert_eq!(address, origin);
+                Some(reason)
+            }
+            other => panic!("{origin}: {other:?}"),
+        }
+    }
+
+    async fn failure(origin: &str) -> Option<LookupFailure> {
+        failure_with(&test_client(), origin).await
+    }
+
     #[tokio::test]
-    async fn no_answer_is_unreachable() {
+    async fn a_name_that_does_not_resolve_is_not_found() {
+        // `.invalid` never resolves (RFC 6761).
+        assert_eq!(
+            failure("https://spoolframe-lookup-test.invalid").await,
+            Some(LookupFailure::NameNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_port_is_no_answer() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
+        assert_eq!(failure(&origin).await, Some(LookupFailure::NoAnswer));
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_no_answer() {
+        let origin = answering(http("502 Bad Gateway", b"")).await;
+        assert_eq!(failure(&origin).await, Some(LookupFailure::NoAnswer));
+    }
+
+    #[tokio::test]
+    async fn plain_http_where_tls_was_asked_for_is_a_tls_failure() {
+        let origin = answering(http("200 OK", b"{}"))
+            .await
+            .replace("http://", "https://");
+        assert_eq!(failure(&origin).await, Some(LookupFailure::Tls));
+    }
+
+    #[tokio::test]
+    async fn a_certificate_no_root_signed_is_a_tls_failure() {
+        let origin = self_signed().await;
+        assert_eq!(failure(&origin).await, Some(LookupFailure::Tls));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_accepts_and_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            // Held open, never read or written.
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let tls = iroh::tls::CaTlsConfig::default()
+            .client_config(iroh::tls::default_provider())
+            .unwrap();
+        let client = builder(true)
+            .timeout(Duration::from_millis(300))
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap();
         assert_eq!(
-            fetch_document(&test_client(), &format!("{origin}{PATH}"), &origin).await,
-            Err(SdkError::Unreachable(origin))
+            failure_with(&client, &origin).await,
+            Some(LookupFailure::TimedOut)
         );
+    }
+
+    /// An HTTPS server on loopback whose certificate no root signed, as a
+    /// server at home with its own certificate has; the origin to ask.
+    async fn self_signed() -> String {
+        use std::sync::Arc;
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certified.cert.der().clone()], key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            // The client refuses the certificate: the handshake fails.
+            let _ = acceptor.accept(socket).await;
+        });
+        format!("https://localhost:{port}")
     }
 
     #[test]

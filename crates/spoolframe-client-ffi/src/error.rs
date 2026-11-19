@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use spoolframe_client_sdk::types::QuotaOf;
 use spoolframe_client_sdk::{
-    self as sdk, CredentialError, ErrorKind, ItemKind, PairingRefused, RootSyncRefused, SdkError,
-    SecurityKeyError, StateError,
+    self as sdk, CredentialError, ErrorKind, ItemKind, LookupFailure, PairingRefused,
+    RootSyncRefused, SdkError, SecurityKeyError, StateError,
 };
 
 use crate::values::count;
@@ -101,6 +101,15 @@ pub enum SpoolError {
     /// another site, or a server that doesn't publish itself outside.
     #[error("{address} is not a Spoolframe server, or it is not published")]
     NotASpoolframeServer { address: String },
+    /// `look_up_server`'s address gave no answer to read, for `reason`:
+    /// `NameNotFound` is "Can't find <address>", `NoAnswer` and `TimedOut`
+    /// are "No answer" (worth trying again), `Tls` is a certificate or
+    /// handshake failure. `address` is the origin asked.
+    #[error("{address}: {reason}")]
+    ServerLookupFailed {
+        address: String,
+        reason: LookupFailure,
+    },
     /// `look_up_server`'s address answered with a document that can't be
     /// used; `reason` says why.
     #[error("the server's document cannot be read: {reason}")]
@@ -450,6 +459,9 @@ impl From<SdkError> for SpoolError {
             SdkError::InvalidCredentials => Self::InvalidCredentials,
             SdkError::NotHttps => Self::NotHttps,
             SdkError::NotASpoolframeServer { address } => Self::NotASpoolframeServer { address },
+            SdkError::ServerLookupFailed { address, reason } => {
+                Self::ServerLookupFailed { address, reason }
+            }
             SdkError::MalformedServerDocument { reason } => {
                 Self::MalformedServerDocument { reason }
             }
@@ -588,6 +600,10 @@ impl SpoolError {
             Self::InviteExpired => SdkError::InviteExpired,
             Self::InviteExhausted => SdkError::InviteExhausted,
             Self::WrongInviteKind => SdkError::WrongInviteKind,
+            Self::ServerLookupFailed { address, reason } => SdkError::ServerLookupFailed {
+                address: address.clone(),
+                reason: *reason,
+            },
             _ => return None,
         })
     }

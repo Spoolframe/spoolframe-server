@@ -50,6 +50,10 @@ parking_lot = { workspace = true }
 # same features; the TLS config is the endpoint's own (webpki roots,
 # aws-lc-rs), so no other provider or verifier is set up.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Only its error type: a lookup's TLS failure is told apart by it
+# (`LookupFailure::Tls`). The same rustls as reqwest's and iroh's; no
+# provider of its own.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 # The offline database: playlists, hearts and the search index
@@ -78,6 +82,13 @@ uuid = { workspace = true }
 netdev = { workspace = true }
 
 [dev-dependencies]
+# A server on loopback with a certificate no root signed, for a lookup's
+# TLS failure (server_lookup.rs). Already in the tree through iroh-relay
+# and hyper-rustls, rcgen with ring as iroh-relay builds it: its aws-lc-rs
+# feature would add a crate to the tree for a test's certificate.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
+tokio-rustls = { version = "0.26", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
 socket2 = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 anyhow = { workspace = true }

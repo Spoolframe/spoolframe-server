@@ -586,8 +586,10 @@ impl SpoolClient {
     /// fingerprint, then `pin(endpoint_id, verified)`. The key came from
     /// the address typed, so the fingerprint is to be checked against the
     /// server's web UI before saying verified. Errors: `InvalidInput`
-    /// (not an address), `NotHttps`, `Unreachable` / `TimedOut`,
-    /// `NotASpoolframeServer`, `MalformedServerDocument`, and
+    /// (not an address), `NotHttps`, `ServerLookupFailed` with its
+    /// `reason` (`NameNotFound`: "Can't find <address>"; `NoAnswer`,
+    /// `TimedOut`: "No answer"; `Tls`), `NotASpoolframeServer` (it
+    /// answered, but not as a Spoolframe server), `MalformedServerDocument`, and
     /// `IdentityChanged` when a saved server looked up at this address
     /// now has another key (`trust_new_identity(saved, now)` approves it).
     pub async fn look_up_server(&self, address: String) -> Result<ServerLookup, SpoolError> {

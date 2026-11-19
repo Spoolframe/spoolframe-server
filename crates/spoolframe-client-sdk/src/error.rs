@@ -118,6 +118,17 @@ pub enum SdkError {
     /// `network.publish_lookup` off). `address` is the origin asked.
     #[error("{address} is not a Spoolframe server, or it is not published")]
     NotASpoolframeServer { address: String },
+    /// The address typed for [`crate::Client::look_up_server`] gave no
+    /// answer to read, for `reason`: say "Can't find <address>" for
+    /// [`LookupFailure::NameNotFound`], "No answer" for the others but
+    /// [`LookupFailure::Tls`]. `address` is the origin asked
+    /// (`https://sf.example.org`). An answer that is not a Spoolframe
+    /// server's is [`SdkError::NotASpoolframeServer`].
+    #[error("{address}: {reason}")]
+    ServerLookupFailed {
+        address: String,
+        reason: LookupFailure,
+    },
     /// The address typed for [`crate::Client::look_up_server`] answered
     /// with a Spoolframe document that cannot be used (a key that is not
     /// one, a field of the wrong type, too large); `reason` says which.
@@ -458,6 +469,30 @@ pub enum SdkError {
     Protocol(String),
 }
 
+/// Why [`crate::Client::look_up_server`] got no answer from the address
+/// typed ([`SdkError::ServerLookupFailed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum LookupFailure {
+    /// The name does not resolve: no such name, no address for it, or no
+    /// DNS reachable. "Can't find <address>": most often a typo.
+    #[error("the name cannot be found")]
+    NameNotFound,
+    /// The name resolved, but nothing answered there: the connection was
+    /// refused or the host unreachable, the connection broke, or the
+    /// server behind a proxy is down (a 5xx). "No answer".
+    #[error("nothing answers there")]
+    NoAnswer,
+    /// It did not answer in time.
+    #[error("no answer in time")]
+    TimedOut,
+    /// The secure connection failed: a certificate no root signs (a
+    /// server's own), one for another name or expired, or no TLS at all
+    /// there. Say the address must have a valid HTTPS certificate.
+    #[error("its secure connection failed")]
+    Tls,
+}
+
 /// What an app does about an [`SdkError`], whichever one it is
 /// ([`SdkError::kind`]). An app that only needs to know whether to try
 /// again, ask for something or say no matches on this; one that says more
@@ -509,7 +544,17 @@ impl SdkError {
     /// The connection failed under a request: it was not answered in
     /// time, or its stream broke. The connection may be dead.
     pub fn is_transport(&self) -> bool {
-        matches!(self, SdkError::TimedOut(_) | SdkError::Unreachable(_))
+        matches!(
+            self,
+            SdkError::TimedOut(_)
+                | SdkError::Unreachable(_)
+                // As the two above were for a lookup before its reasons:
+                // worth trying again as it is.
+                | SdkError::ServerLookupFailed {
+                    reason: LookupFailure::NoAnswer | LookupFailure::TimedOut,
+                    ..
+                }
+        )
     }
 
     /// What an app does about this error ([`ErrorKind`]).
