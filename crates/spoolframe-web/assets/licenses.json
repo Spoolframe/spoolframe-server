@@ -9662,7 +9662,7 @@
 "texts": {
 "MIT": 191
 },
-"version": "4.3.3"
+"version": "4.3.4"
 },
 {
 "copyright": [
@@ -9705,7 +9705,7 @@
 "texts": {
 "LGPL-2.1-or-later": 193
 },
-"version": "7.360.1"
+"version": "7.387.0"
 },
 {
 "copyright": [
@@ -9733,7 +9733,7 @@
 "texts": {
 "Apache-2.0": 0
 },
-"version": "5.5.3"
+"version": "5.5.4"
 }
 ],
 "texts": [

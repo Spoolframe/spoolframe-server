@@ -335,12 +335,12 @@ fn default_clut() -> Clut {
         four: [Colour::default(); 16],
         eight: [Colour::default(); 256],
     };
-    for i in 1..16 {
+    for (i, slot) in clut.four.iter_mut().enumerate().skip(1) {
         let v = if i < 8 { 255 } else { 127 };
-        clut.four[i] = opaque(bit(i, 1, v), bit(i, 2, v), bit(i, 4, v), 255);
+        *slot = opaque(bit(i, 1, v), bit(i, 2, v), bit(i, 4, v), 255);
     }
-    for i in 1..256 {
-        clut.eight[i] = if i < 8 {
+    for (i, slot) in clut.eight.iter_mut().enumerate().skip(1) {
+        *slot = if i < 8 {
             opaque(bit(i, 1, 255), bit(i, 2, 255), bit(i, 4, 255), 63)
         } else {
             let channel = |low: usize, high: usize| -> (u8, u8) {

@@ -28,15 +28,35 @@ fn out_dir(name: &str) -> Utf8PathBuf {
     dir
 }
 
+/// The crate's cdylib, built alongside this test. Cargo's old layout puts it
+/// next to the test in deps/. Cargo 1.100's build-dir layout gives each unit
+/// a directory of its own, `<profile>/build/<package>/<hash>/out/`, and the
+/// test sits in another one: there the newest build of this package wins.
 fn cdylib() -> Utf8PathBuf {
     use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+    let name = format!("{DLL_PREFIX}spoolframe_client_ffi{DLL_SUFFIX}");
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().unwrap()).unwrap();
-    let path = exe
+    let beside = exe
         .parent()
-        .expect("the test is in deps/")
-        .join(format!("{DLL_PREFIX}spoolframe_client_ffi{DLL_SUFFIX}"));
-    assert!(path.exists(), "no cdylib at {path}");
-    path
+        .expect("the test is in a directory")
+        .join(&name);
+    if beside.exists() {
+        return beside;
+    }
+    let units = exe
+        .ancestors()
+        .find(|dir| dir.file_name() == Some("build"))
+        .map(|build| build.join("spoolframe-client-ffi"))
+        .expect("the test is under <profile>/build/");
+    let newest = std::fs::read_dir(&units)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|unit| unit.path().join("out").join(&name))
+        .filter(|path| path.exists())
+        .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok());
+    let path = newest.expect("no cdylib beside the test or under build/");
+    Utf8PathBuf::from_path_buf(path).expect("a UTF-8 path")
 }
 
 /// Every file under `dir`, in path order.

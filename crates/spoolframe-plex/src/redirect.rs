@@ -38,9 +38,8 @@ pub(crate) struct Outside {
 impl Outside {
     fn inner(self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
-        if self.inner {
-            return true;
-        }
+        return self.inner;
+        #[cfg(not(any(test, feature = "test-support")))]
         false
     }
 

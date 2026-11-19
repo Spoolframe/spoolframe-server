@@ -89,7 +89,7 @@ FONT_BUILDS = [os.path.join(ROOT, "devenv.nix"), os.path.join(ROOT, "nix", "pack
 # The Tailwind release scripts/licenses/tailwindcss.LICENSE was read from.
 # When the committed stylesheet's banner names another, --check fails until
 # the file is looked at again.
-TAILWIND = "4.3.3"
+TAILWIND = "4.3.4"
 
 # The programs the server runs, as read in nixpkgs at PROGRAMS_NIXPKGS, the
 # revision flake.lock pinned then: name, version, SPDX id as built, and the
@@ -106,12 +106,12 @@ TAILWIND = "4.3.3"
 # Intel's QSV dispatcher, linked on x86) is mit. Tesseract (tesseract5.nix)
 # is asl20. Intel's QSV runtime (vpl-gpu-rt), which libvpl loads, is a GPU
 # driver the image carries, as Mesa and iHD are: not listed.
-PROGRAMS_NIXPKGS = "e62746b0b472753ef019baceab6f1e2e52014980"
+PROGRAMS_NIXPKGS = "e21fec321d73511849707a7585e4ea155ee4bf40"
 PROGRAMS = [
     ("FFmpeg", "9.0.2", "GPL-3.0-or-later", ["Copyright (c) 2000-2026 the FFmpeg developers"]),
-    ("libplacebo", "7.360.1", "LGPL-2.1-or-later", []),
+    ("libplacebo", "7.387.0", "LGPL-2.1-or-later", []),
     ("libvpl", "2.16.0", "MIT", ["Copyright (c) 2020 Intel Corporation"]),
-    ("Tesseract", "5.5.3", "Apache-2.0", []),
+    ("Tesseract", "5.5.4", "Apache-2.0", []),
 ]
 
 # The face detector's model, in crates/spoolframe-server/assets.

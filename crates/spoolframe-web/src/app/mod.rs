@@ -82,125 +82,134 @@ pub fn launch() {
     dioxus::launch(App);
 }
 
-#[derive(Debug, Clone, Routable, PartialEq)]
-#[rustfmt::skip]
-enum Route {
-    // Signed out: no layout, which would need someone signed in.
-    #[route("/")]
-    Start {},
-    #[route("/login")]
-    Login {},
-    // After signing in with a one-time password an admin reset to: the one
-    // thing that session may do.
-    #[route("/change-password")]
-    ChangePassword {},
-    #[route("/setup")]
-    Setup {},
-    // The wizard's steps after the first admin (P3-10); signed in.
-    #[route("/setup/:step")]
-    Wizard { step: String },
-    // Opened from a device's QR code (P3-05): signs in by itself, and stays
-    // on the code.
-    #[route("/auth/device?:code")]
-    DeviceApproval { code: String },
-    // Where an MCP client's `/authorize` sends its user (PX-42): signs in
-    // by itself, and stays on the request.
-    #[route("/connect?:request")]
-    Connect { request: String },
-    // Where Plex's sign-in ends (P3-10, P3-12): the window it opened in,
-    // which closes itself; the page that opened it is the one waiting.
-    // The server's `forwardUrl` names this path.
-    #[route("/auth/plex")]
-    PlexSignedIn {},
-    #[layout(Shell)]
-        #[nest("/admin")]
-            #[route("/")]
-            AdminHome {},
-            #[route("/users")]
-            Users {},
-            #[route("/users/:username")]
-            UserSessions { username: String },
-            // Invites (P6-01): under Users and devices in the sidebar.
-            #[route("/invites")]
-            Invites {},
-            // Federation (P8-01, experimental): a section of the sidebar
-            // of its own while the server has it on. Its URLs were
-            // top-level already, under Users and devices too.
-            // `tab`: "settings" for its switch and limits; empty for the
-            // paired servers.
-            #[route("/federation?:tab")]
-            Federation { tab: String },
-            // A paired server's own page, linked from its card.
-            #[route("/federation/:id")]
-            FederationPeer { id: String },
-            #[route("/server")]
-            Server {},
-            // Server's sub-pages (P3-14): what it does now, and its log.
-            #[route("/activity")]
-            ActivityPage {},
-            #[route("/logs")]
-            LogsPage {},
-            // What admins did through MCP, and apps connected (PX-42).
-            #[route("/audit")]
-            AuditPageView {},
-            // What plays now, and one playback (P3-15).
-            #[route("/playback")]
-            PlaybackPage {},
-            #[route("/playback/:id")]
-            PlaybackDetail { id: String },
-            // What apps sent from "Send diagnostics", and one report.
-            #[route("/diagnostics")]
-            DiagnosticsPage {},
-            #[route("/diagnostics/:id")]
-            DiagnosticsReport { id: String },
-            // The optimized copies, their profiles and budget (PX-37).
-            #[route("/optimized")]
-            OptimizedPage {},
-            #[route("/libraries")]
-            Libraries {},
-            // `back`: where Cancel and the back link go (the wizard's Plex
-            // step, or Settings › Plex); Libraries when empty.
-            // Server-wide playlists (PX-40): Libraries › Playlists. Before
-            // the library routes, whose `:library` would take the name.
-            #[route("/libraries/playlists")]
-            ServerPlaylists {},
-            #[route("/libraries/add?:back")]
-            AddLibrary { back: String },
-            // A library's items (P3-16): where the table is is in the
-            // address, so a reload or a link opens the same rows. `sort`,
-            // and an item filter in `filter`, sort and filter it as clients
-            // do (crate::browse); a link without them opens as before.
-            #[route("/libraries/:library?:page&:per&:filter&:kind&:q&:sort")]
-            CatalogLibrary { library: String, page: String, per: String, filter: String, kind: String, q: String, sort: String },
-            #[route("/libraries/:library/:id?:tab")]
-            CatalogItem { library: String, id: String, tab: String },
-            // A paired server's library (experimental federation, P8-02),
-            // from the cache: the same paging, sort and filters.
-            #[route("/paired/:library?:page&:per&:filter&:sort")]
-            PairedLibrary { library: String, page: String, per: String, filter: String, sort: String },
-            #[route("/paired/:library/:id")]
-            PairedItem { library: String, id: String },
-            #[route("/settings")]
-            SettingsHome {},
-            // What the server and this web app are built from, and their
-            // licenses; opened from Server. `open`: a component's text.
-            #[route("/licenses?:open")]
-            LicensesPage { open: String },
-            #[route("/settings/:tab")]
-            Settings { tab: String },
-        #[end_nest]
-        #[route("/profile")]
-        Profile {},
-        // My playlists (PX-40): a consumer's Playlists tab, an admin's
-        // sidebar link.
-        #[route("/playlists")]
-        MyPlaylists {},
-        #[route("/playlists/:id")]
-        PlaylistView { id: String },
-    #[end_layout]
-    #[route("/:..rest")]
-    NotFound { rest: Vec<String> },
+// Rust 1.100 sees an unreachable call in the code dioxus 0.7.10's Routable
+// derive generates beside the enum, not in ours, on wasm32: the derive's
+// impls sit outside the enum, so the allow is on this module.
+#[allow(unreachable_code)]
+mod route {
+    use super::*;
+
+    #[derive(Debug, Clone, Routable, PartialEq)]
+    #[rustfmt::skip]
+    pub(crate) enum Route {
+        // Signed out: no layout, which would need someone signed in.
+        #[route("/")]
+        Start {},
+        #[route("/login")]
+        Login {},
+        // After signing in with a one-time password an admin reset to: the one
+        // thing that session may do.
+        #[route("/change-password")]
+        ChangePassword {},
+        #[route("/setup")]
+        Setup {},
+        // The wizard's steps after the first admin (P3-10); signed in.
+        #[route("/setup/:step")]
+        Wizard { step: String },
+        // Opened from a device's QR code (P3-05): signs in by itself, and stays
+        // on the code.
+        #[route("/auth/device?:code")]
+        DeviceApproval { code: String },
+        // Where an MCP client's `/authorize` sends its user (PX-42): signs in
+        // by itself, and stays on the request.
+        #[route("/connect?:request")]
+        Connect { request: String },
+        // Where Plex's sign-in ends (P3-10, P3-12): the window it opened in,
+        // which closes itself; the page that opened it is the one waiting.
+        // The server's `forwardUrl` names this path.
+        #[route("/auth/plex")]
+        PlexSignedIn {},
+        #[layout(Shell)]
+            #[nest("/admin")]
+                #[route("/")]
+                AdminHome {},
+                #[route("/users")]
+                Users {},
+                #[route("/users/:username")]
+                UserSessions { username: String },
+                // Invites (P6-01): under Users and devices in the sidebar.
+                #[route("/invites")]
+                Invites {},
+                // Federation (P8-01, experimental): a section of the sidebar
+                // of its own while the server has it on. Its URLs were
+                // top-level already, under Users and devices too.
+                // `tab`: "settings" for its switch and limits; empty for the
+                // paired servers.
+                #[route("/federation?:tab")]
+                Federation { tab: String },
+                // A paired server's own page, linked from its card.
+                #[route("/federation/:id")]
+                FederationPeer { id: String },
+                #[route("/server")]
+                Server {},
+                // Server's sub-pages (P3-14): what it does now, and its log.
+                #[route("/activity")]
+                ActivityPage {},
+                #[route("/logs")]
+                LogsPage {},
+                // What admins did through MCP, and apps connected (PX-42).
+                #[route("/audit")]
+                AuditPageView {},
+                // What plays now, and one playback (P3-15).
+                #[route("/playback")]
+                PlaybackPage {},
+                #[route("/playback/:id")]
+                PlaybackDetail { id: String },
+                // What apps sent from "Send diagnostics", and one report.
+                #[route("/diagnostics")]
+                DiagnosticsPage {},
+                #[route("/diagnostics/:id")]
+                DiagnosticsReport { id: String },
+                // The optimized copies, their profiles and budget (PX-37).
+                #[route("/optimized")]
+                OptimizedPage {},
+                #[route("/libraries")]
+                Libraries {},
+                // `back`: where Cancel and the back link go (the wizard's Plex
+                // step, or Settings › Plex); Libraries when empty.
+                // Server-wide playlists (PX-40): Libraries › Playlists. Before
+                // the library routes, whose `:library` would take the name.
+                #[route("/libraries/playlists")]
+                ServerPlaylists {},
+                #[route("/libraries/add?:back")]
+                AddLibrary { back: String },
+                // A library's items (P3-16): where the table is is in the
+                // address, so a reload or a link opens the same rows. `sort`,
+                // and an item filter in `filter`, sort and filter it as clients
+                // do (crate::browse); a link without them opens as before.
+                #[route("/libraries/:library?:page&:per&:filter&:kind&:q&:sort")]
+                CatalogLibrary { library: String, page: String, per: String, filter: String, kind: String, q: String, sort: String },
+                #[route("/libraries/:library/:id?:tab")]
+                CatalogItem { library: String, id: String, tab: String },
+                // A paired server's library (experimental federation, P8-02),
+                // from the cache: the same paging, sort and filters.
+                #[route("/paired/:library?:page&:per&:filter&:sort")]
+                PairedLibrary { library: String, page: String, per: String, filter: String, sort: String },
+                #[route("/paired/:library/:id")]
+                PairedItem { library: String, id: String },
+                #[route("/settings")]
+                SettingsHome {},
+                // What the server and this web app are built from, and their
+                // licenses; opened from Server. `open`: a component's text.
+                #[route("/licenses?:open")]
+                LicensesPage { open: String },
+                #[route("/settings/:tab")]
+                Settings { tab: String },
+            #[end_nest]
+            #[route("/profile")]
+            Profile {},
+            // My playlists (PX-40): a consumer's Playlists tab, an admin's
+            // sidebar link.
+            #[route("/playlists")]
+            MyPlaylists {},
+            #[route("/playlists/:id")]
+            PlaylistView { id: String },
+        #[end_layout]
+        #[route("/:..rest")]
+        NotFound { rest: Vec<String> },
+    }
 }
+use route::Route;
 
 impl From<Landing> for Route {
     fn from(landing: Landing) -> Self {
