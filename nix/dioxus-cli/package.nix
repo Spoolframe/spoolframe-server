@@ -11,6 +11,8 @@
   pkg-config,
   cacert,
   openssl,
+  zstd,
+  libgit2,
   rustfmt,
   makeWrapper,
   esbuild,
@@ -50,7 +52,7 @@
         makeWrapper
       ];
 
-      buildInputs = [openssl];
+      buildInputs = [openssl zstd libgit2];
 
       nativeCheckInputs = [rustfmt];
 
