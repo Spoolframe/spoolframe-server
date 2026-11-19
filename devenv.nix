@@ -64,15 +64,16 @@ in {
 
     [profile.default]
     test-threads = "num-cpus"
-    # spoolframe-client-ffi's bindings test reads the crate's own cdylib
-    # (its UniFFI metadata), which no test binary links: the archive
-    # carries it to the shards.
-    archive.include = [
-      { path = "debug/deps/libspoolframe_client_ffi.so", relative-to = "target", depth = 0, on-missing = "error" },
-    ]
 
     [profile.ci]
     test-threads = "num-cpus"
+    # spoolframe-client-ffi's bindings test reads the crate's own cdylib
+    # (its UniFFI metadata), which no test binary links: CI's archive
+    # carries it to the shards. Cargo 1.100's build layout keeps it under
+    # build/<package>/<hash>/out/, so ci:test-archive stages it here first.
+    archive.include = [
+      { path = "debug/libspoolframe_client_ffi.so", relative-to = "target", depth = 0, on-missing = "error" },
+    ]
     fail-fast = false
     status-level = "all"
 
@@ -457,7 +458,19 @@ in {
       # the archive is extracted into it.
       "ci:test-archive" = {
         description = "Build the instrumented tests into target/tests.tar.zst";
-        exec = "cargo llvm-cov nextest-archive --locked --archive-file target/tests.tar.zst";
+        # Cargo 1.100 keeps each unit in build/<package>/<hash>/out/ and does
+        # not copy a test build's cdylib out. The first archive (default
+        # profile, no include) builds the tests; spoolframe-client-ffi's
+        # cdylib is staged; the ci profile's archive, which includes it
+        # (.config/nextest.toml), reuses that build; --no-clean keeps
+        # cargo-llvm-cov from deleting the staged copy as a stale artifact.
+        exec = ''
+          cargo llvm-cov nextest-archive --locked --archive-file target/tests.tar.zst
+          debug=target/llvm-cov-target/debug
+          so=$(ls -t "$debug"/build/spoolframe-client-ffi/*/out/libspoolframe_client_ffi.so | head -n 1)
+          cp "$so" "$debug/libspoolframe_client_ffi.so"
+          cargo llvm-cov nextest-archive --locked --no-clean --profile ci --archive-file target/tests.tar.zst
+        '';
       };
       "ci:test-shard" = {
         description = "Run NEXTEST_PARTITION of target/tests.tar.zst (JUnit + lcov)";

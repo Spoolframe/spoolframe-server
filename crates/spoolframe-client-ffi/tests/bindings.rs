@@ -29,34 +29,39 @@ fn out_dir(name: &str) -> Utf8PathBuf {
 }
 
 /// The crate's cdylib, built alongside this test. Cargo's old layout puts it
-/// next to the test in deps/. Cargo 1.100's build-dir layout gives each unit
-/// a directory of its own, `<profile>/build/<package>/<hash>/out/`, and the
-/// test sits in another one: there the newest build of this package wins.
+/// next to the test in deps/. Cargo 1.100's build layout gives each unit a
+/// directory of its own, `<profile>/build/<package>/<hash>/out/`, with the
+/// test in another one: there the newest build of this package wins. A test
+/// run from CI's nextest archive finds neither, and takes the copy
+/// ci:test-archive staged in `<profile>/` instead.
 fn cdylib() -> Utf8PathBuf {
     use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
     let name = format!("{DLL_PREFIX}spoolframe_client_ffi{DLL_SUFFIX}");
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().unwrap()).unwrap();
-    let beside = exe
-        .parent()
-        .expect("the test is in a directory")
-        .join(&name);
+    let dir = exe.parent().expect("the test is in a directory");
+    let beside = dir.join(&name);
     if beside.exists() {
         return beside;
     }
-    let units = exe
-        .ancestors()
-        .find(|dir| dir.file_name() == Some("build"))
-        .map(|build| build.join("spoolframe-client-ffi"))
-        .expect("the test is under <profile>/build/");
-    let newest = std::fs::read_dir(&units)
+    let build = exe.ancestors().find(|dir| dir.file_name() == Some("build"));
+    let newest = build
+        .and_then(|build| std::fs::read_dir(build.join("spoolframe-client-ffi")).ok())
         .into_iter()
         .flatten()
         .flatten()
         .map(|unit| unit.path().join("out").join(&name))
         .filter(|path| path.exists())
         .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok());
-    let path = newest.expect("no cdylib beside the test or under build/");
-    Utf8PathBuf::from_path_buf(path).expect("a UTF-8 path")
+    if let Some(path) = newest {
+        return Utf8PathBuf::from_path_buf(path).expect("a UTF-8 path");
+    }
+    let staged = build
+        .and_then(|build| build.parent())
+        .map(|profile| profile.join(&name))
+        .filter(|path| path.exists());
+    staged.unwrap_or_else(|| {
+        panic!("no {name} beside {dir}, under build/ or staged in the profile's directory")
+    })
 }
 
 /// Every file under `dir`, in path order.
