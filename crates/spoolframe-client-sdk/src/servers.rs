@@ -110,9 +110,19 @@ pub(crate) struct SavedServer {
     /// not verified.
     #[serde(default)]
     pub verified_at: Option<u64>,
-    /// When it last answered a connect as itself.
+    /// When it last answered a connect as itself: any connect, the
+    /// SDK's own included (a sign-in, a pairing's, a reconnect, a
+    /// refresh). Not which server the person uses: `last_used_at_ms` is.
     #[serde(default)]
     pub last_connected_at: Option<u64>,
+    /// When a person last opened a profile on it from this device
+    /// ([`crate::Client::activate_profile`], which
+    /// [`crate::Client::open_profile`] calls), in Unix milliseconds.
+    /// Nothing else moves it: not a sign-in, a pairing's or a phone's, nor
+    /// a reconnect or a refresh. Milliseconds, so two profiles opened in
+    /// one second still say which came last. Absent from the file: never.
+    #[serde(default)]
+    pub last_used_at_ms: Option<u64>,
     /// The URLs of the relays the server said it uses (revision 7), as its
     /// last `ServerAddresses` event listed them, and an invite's: what
     /// this device dials it through with relays on. Absent from the file:
@@ -225,6 +235,7 @@ impl SavedServer {
             pinned_at: Some(now),
             verified_at: verified.then_some(now),
             last_connected_at: Some(now),
+            last_used_at_ms: None,
             relays: Vec::new(),
             lookup: None,
             advertised_addrs: Vec::new(),
@@ -430,6 +441,18 @@ pub(crate) fn time(secs: u64) -> SystemTime {
     unix_seconds::from_wire(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
+/// Now, in Unix milliseconds.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Unix milliseconds as a time.
+pub(crate) fn time_ms(ms: u64) -> SystemTime {
+    UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
 /// A server this device knows: saved, heard on the LAN, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -484,9 +507,19 @@ pub struct ServerEntry {
     /// "Verify now". `None` while not verified, or when the date
     /// is not known.
     pub verified_at: Option<SystemTime>,
-    /// When it last answered a connect as itself. `None` for a server not
-    /// saved, or when the date is not known.
+    /// When it last answered a connect as itself, by any connect: the
+    /// SDK's own sign-ins, pairings, reconnects and refreshes move it. `None`
+    /// for a server not saved, or when the date is not known. To start on
+    /// the server the person uses, go by `last_used_at`.
     pub last_connected_at: Option<SystemTime>,
+    /// When a person last opened a profile on it from this device
+    /// ([`crate::Client::activate_profile`], which
+    /// [`crate::Client::open_profile`] calls), to the millisecond. Only
+    /// that moves it: not a sign-in (a pairing's, a phone's or the
+    /// person's own), a reconnect or a refresh. `None` for a server not
+    /// saved, or never opened from this device (and for one saved before
+    /// the SDK kept it).
+    pub last_used_at: Option<SystemTime>,
     /// Whether this device reaches it through relays: `Some` its own
     /// choice ([`crate::Client::set_server_relays`], or an invite's), `None`
     /// [`crate::ClientOptions::relays`]. `None` for a server not saved.
@@ -614,6 +647,7 @@ mod tests {
                     pinned_at: None,
                     verified_at: None,
                     last_connected_at: None,
+                    last_used_at_ms: None,
                     relays: Vec::new(),
                     lookup: None,
                     advertised_addrs: Vec::new(),
@@ -634,6 +668,7 @@ mod tests {
                     pinned_at: None,
                     verified_at: None,
                     last_connected_at: None,
+                    last_used_at_ms: None,
                     relays: Vec::new(),
                     lookup: None,
                     advertised_addrs: Vec::new(),
@@ -1195,6 +1230,29 @@ mod tests {
         assert_eq!(servers[0].advertised_addrs, Vec::<SocketAddr>::new());
         assert_eq!(servers[0].advertised_at, None);
         assert_eq!(servers[0].addrs(), [addr("192.168.1.10:4433")]);
+    }
+
+    /// A server saved before the SDK kept when it was last used reads as
+    /// never used; one used since keeps it, to the millisecond.
+    #[tokio::test]
+    async fn a_server_saved_before_last_use_was_kept_was_never_used() {
+        let storage = MemoryStorage::default();
+        let file = format!(
+            r#"[{{"name": "Nimble", "endpoint_id": "{ID}", "server_id": "{SERVER_ID}",
+                 "verified": true, "pinned_at": 1, "verified_at": 1, "last_connected_at": 1}}]"#
+        );
+        storage
+            .set_data(keys::SERVERS, Some(file.into_bytes()))
+            .await
+            .unwrap();
+        let mut servers = load(&storage).await.unwrap();
+        assert_eq!(servers[0].last_used_at_ms, None);
+        servers[0].last_used_at_ms = Some(1_790_000_000_123);
+        save(&storage, &servers).await.unwrap();
+        assert_eq!(
+            load(&storage).await.unwrap()[0].last_used_at_ms,
+            Some(1_790_000_000_123)
+        );
     }
 
     #[test]

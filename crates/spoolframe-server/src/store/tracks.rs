@@ -1,7 +1,8 @@
-//! Track preferences and overrides (P1-20). The choosing is in
-//! `crate::tracks`; this is storage.
+//! Track preferences and overrides (P1-20), and the Home "Recently
+//! played" row's preferences. The choosing is in `crate::tracks` and
+//! `crate::playlists`; this is storage.
 
-use spoolframe_types::TrackPreferences;
+use spoolframe_types::{RecentlyPlayedPreferences, TrackPreferences};
 
 use super::{Store, StoreError};
 use crate::principal::Principal;
@@ -15,23 +16,34 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, json: &str) -> Option<T> {
         .ok()
 }
 
-/// A stored `TrackPreferences` row, which may be from a build before some
-/// of its fields existed (PX-13's `subtitles.bitmap`, for one).
-///
-/// The wire type has no serde defaults (PX-15), so the row is laid over
-/// the defaults first: each key the row has wins, each it lacks takes
-/// `TrackPreferences::default()`'s. This keeps the defaults in one place,
-/// the `Default` impls, rather than in a migration's JSON literal or in a
-/// second set of structs that must follow every new field. Rows are
-/// written whole by `set_track_preferences`, so a read rewrites nothing.
-fn parse_preferences(json: &str) -> Option<TrackPreferences> {
-    parse_over_defaults("track preferences", json)
+/// The tables that keep a principal's preferences as one JSON document,
+/// each read over its type's defaults ([`parse_over_defaults`]).
+#[derive(Debug, Clone, Copy)]
+enum PreferenceTable {
+    Tracks,
+    RecentlyPlayed,
 }
 
-/// A stored document of `what` laid over `T::default()`, as
-/// [`parse_preferences`] lays track preferences: the music preferences
-/// are kept the same way.
-pub(super) fn parse_over_defaults<T>(what: &str, json: &str) -> Option<T>
+impl PreferenceTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tracks => "track_preferences",
+            Self::RecentlyPlayed => "recently_played_preferences",
+        }
+    }
+}
+
+/// A stored preferences document of `what`, which may be from a build
+/// before some of its fields existed (PX-13's `subtitles.bitmap`, for
+/// one), laid over `T::default()`.
+///
+/// The wire types have no serde defaults (PX-15), so the row is laid over
+/// the defaults first: each key the row has wins, each it lacks takes
+/// `T::default()`'s. This keeps the defaults in one place, the `Default`
+/// impls, rather than in a migration's JSON literal or in a second set of
+/// structs that must follow every new field. Rows are written whole, so a
+/// read rewrites nothing.
+fn parse_over_defaults<T>(what: &str, json: &str) -> Option<T>
 where
     T: Default + serde::Serialize + serde::de::DeserializeOwned,
 {
@@ -61,17 +73,57 @@ fn overlay(base: &mut serde_json::Value, top: serde_json::Value) {
 }
 
 impl Store {
+    /// `principal`'s document in `table` (one of [`PreferenceTable`]),
+    /// laid over the defaults; the defaults if they set none.
+    async fn preference_doc<T>(
+        &self,
+        table: PreferenceTable,
+        principal: Principal,
+    ) -> Result<T, StoreError>
+    where
+        T: Default + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let json: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT preferences FROM {} WHERE principal = ?1",
+            table.name()
+        )))
+        .bind(principal.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(json
+            .and_then(|j| parse_over_defaults(table.name(), &j))
+            .unwrap_or_default())
+    }
+
+    /// Keep `doc` whole as `principal`'s in `table`.
+    async fn set_preference_doc<T: serde::Serialize>(
+        &self,
+        table: PreferenceTable,
+        principal: Principal,
+        doc: &T,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(doc).expect("preferences always serialize");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {} (principal, preferences, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (principal) DO UPDATE SET \
+               preferences = excluded.preferences, updated_at = excluded.updated_at",
+            table.name()
+        )))
+        .bind(principal.to_string())
+        .bind(json)
+        .bind(self.now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// The principal's preferences; the defaults if they set none.
     pub async fn track_preferences(
         &self,
         principal: Principal,
     ) -> Result<TrackPreferences, StoreError> {
-        let json: Option<String> =
-            sqlx::query_scalar("SELECT preferences FROM track_preferences WHERE principal = ?1")
-                .bind(principal.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(json.and_then(|j| parse_preferences(&j)).unwrap_or_default())
+        self.preference_doc(PreferenceTable::Tracks, principal)
+            .await
     }
 
     pub async fn set_track_preferences(
@@ -79,19 +131,27 @@ impl Store {
         principal: Principal,
         preferences: &TrackPreferences,
     ) -> Result<(), StoreError> {
-        let json = serde_json::to_string(preferences).expect("preferences always serialize");
-        sqlx::query(
-            "INSERT INTO track_preferences (principal, preferences, updated_at) \
-             VALUES (?1, ?2, ?3) \
-             ON CONFLICT (principal) DO UPDATE SET \
-               preferences = excluded.preferences, updated_at = excluded.updated_at",
-        )
-        .bind(principal.to_string())
-        .bind(json)
-        .bind(self.now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.set_preference_doc(PreferenceTable::Tracks, principal, preferences)
+            .await
+    }
+
+    /// How each kind shows in `principal`'s Home "Recently played" row;
+    /// the defaults if they set none.
+    pub async fn recently_played_preferences(
+        &self,
+        principal: Principal,
+    ) -> Result<RecentlyPlayedPreferences, StoreError> {
+        self.preference_doc(PreferenceTable::RecentlyPlayed, principal)
+            .await
+    }
+
+    pub async fn set_recently_played_preferences(
+        &self,
+        principal: Principal,
+        preferences: &RecentlyPlayedPreferences,
+    ) -> Result<(), StoreError> {
+        self.set_preference_doc(PreferenceTable::RecentlyPlayed, principal, preferences)
+            .await
     }
 
     /// What the principal picked for `scope` (a show or a movie), if

@@ -62,31 +62,54 @@ pub struct WhosWatching {
     pub offline: bool,
 }
 
-/// A server a paired guest could not be signed in to.
+/// A server a paired guest, or a TV a phone signs in, could not be
+/// signed in to.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ServerFailure {
     pub server: String,
     pub kind: ErrorKind,
+    /// Why, typed: "Try again in a few minutes", "Couldn't reach the
+    /// server", and so on.
+    pub reason: crate::phone_sign_in::SignInFailure,
     pub message: String,
 }
 
 impl ServerFailure {
     /// `server` (hex) was not signed in to, for `error`.
     pub(crate) fn new(server: String, error: sdk::SdkError) -> Self {
+        let (reason, _) = crate::phone_sign_in::SignInFailure::of(&sdk::SignInFailure::of(&error));
         let error = SpoolError::from(error);
         Self {
             server,
             kind: error.kind(),
+            reason,
             message: error.to_string(),
         }
     }
 }
 
-/// What `sign_in_paired` did.
+/// What `sign_in_paired` did, and what a phone signed a TV in to
+/// (`SpoolHeldSignIn.confirm`).
 #[derive(uniffi::Record)]
 pub struct PairedSignIn {
+    /// In order: open the first.
     pub sessions: Vec<Arc<SpoolSession>>,
     pub failed: Vec<ServerFailure>,
+}
+
+impl PairedSignIn {
+    pub(crate) fn new(sessions: Vec<sdk::Session>, failed: Vec<(String, sdk::SdkError)>) -> Self {
+        Self {
+            sessions: sessions
+                .into_iter()
+                .map(|s| Arc::new(SpoolSession::new(s)))
+                .collect(),
+            failed: failed
+                .into_iter()
+                .map(|(server, error)| ServerFailure::new(server, error))
+                .collect(),
+        }
+    }
 }
 
 /// One server's sign-in, done.
@@ -117,25 +140,35 @@ impl From<sdk::ServerSignIn> for ServerSignIn {
 
 /// Each server's sign-in as it finishes: `next()` until none.
 #[derive(uniffi::Object)]
-pub struct ServerSignInWatch(Arc<tokio::sync::Mutex<sdk::ServerSignIns>>);
+pub struct ServerSignInWatch {
+    /// What `next` reads, one at a time.
+    reading: Arc<tokio::sync::Mutex<sdk::ServerSignIns>>,
+    /// A copy that only reads the total: never behind a pending `next`.
+    totals: sdk::ServerSignIns,
+}
 
 impl ServerSignInWatch {
     pub(crate) fn new(sign_ins: sdk::ServerSignIns) -> Arc<Self> {
-        Arc::new(Self(Arc::new(tokio::sync::Mutex::new(sign_ins))))
+        Arc::new(Self {
+            totals: sign_ins.clone(),
+            reading: Arc::new(tokio::sync::Mutex::new(sign_ins)),
+        })
     }
 }
 
 #[uniffi::export]
 impl ServerSignInWatch {
-    /// How many servers in all; none until known.
+    /// How many servers in all; none until known. Answers at once, even
+    /// while a `next` waits.
     pub async fn total(&self) -> Option<u32> {
-        let total = self.0.lock().await.total();
-        total.map(|t| u32::try_from(t).unwrap_or(u32::MAX))
+        self.totals
+            .total()
+            .map(|t| u32::try_from(t).unwrap_or(u32::MAX))
     }
 
     /// The next server done; none once all have been given.
     pub async fn next(&self) -> Option<ServerSignIn> {
-        let watch = self.0.clone();
+        let watch = self.reading.clone();
         run(async move { watch.lock().await.next().await })
             .await
             .map(Into::into)
@@ -261,18 +294,7 @@ impl SpoolClient {
             Ok::<_, sdk::SdkError>(client.sign_in_paired(identity, &servers).await)
         })
         .await?;
-        Ok(PairedSignIn {
-            sessions: signed
-                .sessions
-                .into_iter()
-                .map(|s| Arc::new(SpoolSession::new(s)))
-                .collect(),
-            failed: signed
-                .failed
-                .into_iter()
-                .map(|(server, error)| ServerFailure::new(server, error))
-                .collect(),
-        })
+        Ok(PairedSignIn::new(signed.sessions, signed.failed))
     }
 
     /// `sign_in_paired`, each server's result as it finishes; all at
@@ -532,5 +554,60 @@ impl SpoolPortable {
                 join: o.abilities.join,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use spoolframe_client_sdk as sdk;
+
+    use super::ServerSignInWatch;
+
+    /// A TV showing its code, which no phone answers: its sign-ins'
+    /// `next` waits for good.
+    async fn waiting() -> (sdk::Client, sdk::PhoneSignIn) {
+        let tv = sdk::Client::open_with_options(
+            Arc::new(sdk::MemoryStorage::default()),
+            sdk::Device {
+                name: "tv".into(),
+                client_name: "ffi-sign-in-test".into(),
+                client_version: "0".into(),
+                platform: sdk::types::Platform::Tvos,
+                capabilities: Default::default(),
+            },
+            sdk::ClientOptions {
+                lan_discovery: false,
+                relays: false,
+                ..sdk::ClientOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+        (tv, shown)
+    }
+
+    /// `total` answers while a `next` waits, rather than queue behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_total_answers_while_a_next_waits() {
+        let (tv, shown) = waiting().await;
+        let watch = ServerSignInWatch::new(shown.server_sign_ins());
+        let pending = {
+            let watch = watch.clone();
+            tokio::spawn(async move { watch.next().await })
+        };
+        // The next has the reader by now.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let total = tokio::time::timeout(Duration::from_secs(2), watch.total())
+            .await
+            .expect("total waited behind next");
+        assert_eq!(total, None);
+        assert!(!pending.is_finished());
+        pending.abort();
+        drop(shown);
+        tv.close().await;
     }
 }

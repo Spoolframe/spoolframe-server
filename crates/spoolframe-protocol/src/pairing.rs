@@ -259,6 +259,11 @@ pub enum PhoneFrame {
         /// name: `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// What the phone calls itself ("Steve's iPhone"), its device
+        /// name, cut as `name` is. Left out by a phone before it was
+        /// added: `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phone_name: Option<String>,
     },
     /// The root's credential for the key [`DeviceFrame::Key`] gave, the
     /// identity's newest state if the phone has one, and the servers the
@@ -354,6 +359,15 @@ pub enum Refusal {
     /// Something else went wrong on the device: its storage, most likely.
     #[error("the device could not finish pairing")]
     Failed,
+    /// The person at the device turned the pairing down, or left it
+    /// unanswered. A phone before this reads it as unknown, and ends as
+    /// for a frame it cannot read.
+    #[error("the pairing was turned down on the device")]
+    Rejected,
+    /// A reason this build does not know, from a newer device.
+    #[serde(other)]
+    #[error("the device refused the pairing")]
+    Unknown,
 }
 
 fn cut(name: &str) -> String {
@@ -644,6 +658,7 @@ mod tests {
             code: PairingCode::from_bytes([7; 32]),
             identity,
             name: Some("Steve".into()),
+            phone_name: Some("Steve's iPhone".into()),
         };
         let read: PhoneFrame =
             crate::codec::decode(&crate::codec::encode(&hello).unwrap()).unwrap();
@@ -654,12 +669,37 @@ mod tests {
         let ciborium::Value::Map(fields) = &mut value else {
             panic!("a map");
         };
-        fields.retain(|(k, _)| k.as_text() != Some("name"));
+        fields.retain(|(k, _)| !matches!(k.as_text(), Some("name" | "phone_name")));
         let old: PhoneFrame = crate::codec::decode(&crate::codec::encode(&value).unwrap()).unwrap();
         assert!(
-            matches!(old, PhoneFrame::Hello { name: None, .. }),
+            matches!(
+                old,
+                PhoneFrame::Hello {
+                    name: None,
+                    phone_name: None,
+                    ..
+                }
+            ),
             "{old:?}"
         );
+    }
+
+    /// A rejection on the device is its own reason on the wire, and a
+    /// reason a newer device adds reads as unknown.
+    #[test]
+    fn a_rejection_is_its_own_reason() {
+        let rejected = DeviceFrame::Refused {
+            reason: Refusal::Rejected,
+        };
+        assert_eq!(
+            serde_json::to_string(&rejected).unwrap(),
+            r#"{"type":"refused","reason":"rejected"}"#
+        );
+        let read: DeviceFrame =
+            crate::codec::decode(&crate::codec::encode(&rejected).unwrap()).unwrap();
+        assert_eq!(read, rejected);
+        let newer: Refusal = serde_json::from_str(r#""too_tired""#).unwrap();
+        assert_eq!(newer, Refusal::Unknown);
     }
 
     #[test]

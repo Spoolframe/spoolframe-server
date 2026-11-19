@@ -65,12 +65,13 @@ impl ConnectionPath {
 impl PlaybackQuality {
     /// The quality a playback starts with when the viewer picked none:
     /// the device's own `limit` for this network (bits per second) when
-    /// it has one; else Original on a TV box (tvOS), which is always at
-    /// home; else Original at home, Auto away.
+    /// it has one; else Original on a TV box ([`Platform::is_tv`]: tvOS,
+    /// Android TV), which is always at home; else Original at home, Auto
+    /// away.
     pub fn default_for(limit: Option<u64>, platform: Platform, at_home: bool) -> PlaybackQuality {
         match limit.filter(|l| *l > 0) {
             Some(limit) => PlaybackQuality::Bitrate(limit),
-            None if platform == Platform::Tvos || at_home => PlaybackQuality::Original,
+            None if platform.is_tv() || at_home => PlaybackQuality::Original,
             None => PlaybackQuality::Auto,
         }
     }
@@ -120,7 +121,7 @@ impl Session {
     /// TV box.
     pub fn default_quality_here(&self, limit: Option<u64>) -> PlaybackQuality {
         let platform = self.client.inner.device.platform;
-        let decided = limit.is_some_and(|l| l > 0) || platform == Platform::Tvos;
+        let decided = limit.is_some_and(|l| l > 0) || platform.is_tv();
         let at_home = !decided && self.at_home_here();
         PlaybackQuality::default_for(limit, platform, at_home)
     }
@@ -228,6 +229,14 @@ mod tests {
         assert_eq!(
             PlaybackQuality::default_for(Some(8_000_000), Platform::Tvos, false),
             PlaybackQuality::Bitrate(8_000_000)
+        );
+        assert_eq!(
+            PlaybackQuality::default_for(None, Platform::AndroidTv, false),
+            PlaybackQuality::Original
+        );
+        assert_eq!(
+            PlaybackQuality::default_for(None, Platform::Android, false),
+            PlaybackQuality::Auto
         );
     }
 }

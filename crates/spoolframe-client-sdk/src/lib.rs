@@ -80,7 +80,8 @@ pub use catalog_view::{
     AlbumTracks, ItemsSource, LibraryPager, SeasonEpisodes, ShowDetail, ShowTree, WatchScope,
 };
 pub use client::{
-    Client, ClientOptions, Device, DeviceSignIn, STREAM_WINDOW, ServersWatch, WeakClient,
+    Client, ClientOptions, Device, DeviceSignIn, ROUND_RETRY, STREAM_WINDOW, ServersWatch,
+    WeakClient,
 };
 pub use connection::Timeouts;
 pub use profile_store::{ProfileStore, profile_hash};
@@ -118,7 +119,8 @@ pub use invite_admin::{
     InviteCreator, InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite,
 };
 pub use invites::{
-    InviteInfo, InviteLookup, InviteNext, InviteOutcome, InviteRefusal, invite_next, parse_code,
+    InviteInfo, InviteLookup, InviteNext, InviteOutcome, InviteRefusal, PortableInviteRedeemed,
+    invite_next, parse_code,
 };
 pub use lan_servers::LanServerInfo;
 pub use link::{ConnectionPath, ConnectionState, SignOutWatch, StateWatch};
@@ -136,9 +138,9 @@ pub use spoolframe_protocol::{Feature, Features, NextMode};
 // Pairing a guest onto this device by QR code.
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 // Signing a TV in with a phone, by the same QR code.
-pub use held::{HeldOffer, HeldPairing, HeldPhoneSignIn, HeldSignIn};
+pub use held::{HeldOffer, HeldPairing, HeldPhoneSignIn, HeldSignIn, HoldEnd};
 pub use phone_sign_in::{
-    PhoneConnected, PhoneSignIn, PhoneSignedIn, SignInChoice, SignInOffer, SignInOfferOutcome,
+    PhoneConnected, PhoneSignIn, SignInChoice, SignInFailure, SignInOffer, SignInOfferOutcome,
     SignInOfferResult,
 };
 pub use spoolframe_protocol::invite::InviteLinkKind;

@@ -308,18 +308,25 @@ async fn a_phone_cannot_offer_to_itself_or_to_no_key() {
     server.stop().await;
 }
 
-/// A TV holds few sign-ins pending: offers count with its codes.
+/// A TV holds few offers pending, and they are counted apart from its
+/// own codes: offers it never redeemed leave it free to begin its own
+/// sign-in.
 #[tokio::test]
 async fn a_tv_holds_few_offers() {
     let server = server("psi-cap", ServerOptions::default()).await;
     let (phone, session) = phone(&server).await;
     let tv = tv(&server).await;
-    for _ in 0..spoolframe_server::device_sign_in::MAX_PENDING_PER_DEVICE {
+    for _ in 0..spoolframe_server::device_sign_in::MAX_OFFERS_PER_DEVICE {
         offered(&phone, &session, offer(&tv, false)).await;
     }
     assert!(matches!(
         phone.call(Some(&session), offer(&tv, false)).await,
         Response::Err(Error::RateLimited { .. })
+    ));
+    assert!(matches!(
+        tv.call(None, Request::BeginDeviceSignIn { remember: false })
+            .await,
+        Response::Ok(Reply::DeviceSignInStarted { .. })
     ));
     tv.close().await;
     phone.close().await;

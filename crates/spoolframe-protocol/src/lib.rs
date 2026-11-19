@@ -58,7 +58,7 @@ pub use messages::{
     PinProof, PinState, PortableSignIn, PortableTie, RedeemInvite, RedeemInviteWithPasskey,
     RedeemPortableInvite, Reply, Request, RequestEnvelope, Response, SUBTITLE_CHUNK, ServerInfo,
     ServerRow, SessionId, SessionInfo, TrackPreferencesInfo, TrustedProfile, UserSummary,
-    WhoAmIReply,
+    WhoAmIReply, cut,
 };
 pub use passkeys::{
     FinishPasskeyRegistration, FinishPasskeySignIn, LEGACY_APP_RP_ID, MAX_NAME_CHARS, NONCE_LEN,

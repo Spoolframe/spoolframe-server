@@ -15,11 +15,13 @@ use tokio::sync::{oneshot, watch};
 
 use crate::error::SdkError;
 use crate::pairing::{Paired, PairingError, Progress, cancelled};
-use crate::phone_sign_in::{PhoneSignInOutcome, PhoneSignedIn};
+use crate::phone_sign_in::PhoneSignInOutcome;
 use crate::portable::{DevicePublicKey, PortableUserId};
+use crate::whos_watching::PairedSignIn;
 
-/// The TV's answer, sent once. Dropped unsent (every holder gone), the
-/// waiting connection reads it as a rejection.
+/// The TV's answer: the first [`Decision::decide`] is sent, and dropped
+/// undecided (every holder gone) the waiting connection reads it as a
+/// rejection, its sender gone.
 #[derive(Debug)]
 pub(crate) struct Decision(Mutex<Option<oneshot::Sender<bool>>>);
 
@@ -29,14 +31,36 @@ impl Decision {
             let _ = answer.send(confirm);
         }
     }
+
+    /// Whether the app has answered yet.
+    fn decided(&self) -> bool {
+        self.0.lock().is_none()
+    }
 }
 
-/// Where a held value's [`Decision`] waits for the app: the first
-/// [`held`] takes it from the slot, later ones share it while it lives.
+/// How a hold ended without the app's answer: what
+/// [`HeldSignIn::ended`] and [`HeldPairing::ended`] give, so a confirm
+/// page can close itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldEnd {
+    /// The phone hung up while the TV held what it sent.
+    PhoneLeft,
+    /// Nobody answered within two minutes: rejected, as with no.
+    TimedOut,
+    /// The code stopped: cancelled, or its listener dropped.
+    CodeEnded,
+}
+
+/// Where a held value's [`Decision`] waits for the app, in
+/// [`Progress::held`]: kept here until the app first takes it, then only
+/// known here, so that the app's copies alone keep it.
 #[derive(Debug, Clone)]
-pub(crate) struct Hold {
-    slot: Arc<Mutex<Option<Arc<Decision>>>>,
-    shared: Weak<Decision>,
+pub(crate) struct Hold(Arc<Mutex<Claim>>);
+
+#[derive(Debug)]
+enum Claim {
+    Kept(Arc<Decision>),
+    Taken(Weak<Decision>),
 }
 
 impl Hold {
@@ -44,20 +68,24 @@ impl Hold {
     pub(crate) fn new() -> (Self, oneshot::Receiver<bool>) {
         let (answer, answered) = oneshot::channel();
         let decision = Arc::new(Decision(Mutex::new(Some(answer))));
-        let hold = Self {
-            shared: Arc::downgrade(&decision),
-            slot: Arc::new(Mutex::new(Some(decision))),
-        };
-        (hold, answered)
+        (Self(Arc::new(Mutex::new(Claim::Kept(decision)))), answered)
     }
 
-    fn take(&self) -> Arc<Decision> {
-        self.slot
-            .lock()
-            .take()
-            .or_else(|| self.shared.upgrade())
-            // Decided and gone: confirm or reject now reads the end.
-            .unwrap_or_else(|| Arc::new(Decision(Mutex::new(None))))
+    /// The decision, shared with every earlier take while one lives.
+    /// Once every copy is gone it was made (or dropped, a rejection):
+    /// a spent one then, whose confirm or reject reads that end.
+    pub(crate) fn take(&self) -> Arc<Decision> {
+        let mut claim = self.0.lock();
+        match &*claim {
+            Claim::Kept(decision) => {
+                let decision = decision.clone();
+                *claim = Claim::Taken(Arc::downgrade(&decision));
+                decision
+            }
+            Claim::Taken(shared) => shared
+                .upgrade()
+                .unwrap_or_else(|| Arc::new(Decision(Mutex::new(None)))),
+        }
     }
 }
 
@@ -66,43 +94,51 @@ impl Hold {
 pub(crate) enum Held {
     /// A guest's pairing, as it would be installed.
     Guest(Paired),
-    /// A phone's offers.
-    SignIn(Vec<HeldOffer>),
+    /// A phone's offers, and what it calls itself.
+    SignIn {
+        offers: Vec<HeldOffer>,
+        phone_name: Option<String>,
+    },
 }
 
-/// What the code's connection holds, once it does, and its decision: or
-/// the error the code ended with before.
-pub(crate) async fn held(
-    progress: &watch::Receiver<Progress>,
-) -> Result<(Held, Arc<Decision>), SdkError> {
-    let mut watching = progress.clone();
-    let seen = watching
-        .wait_for(|p| p.held.is_some() || p.outcome.is_some())
-        .await;
-    match seen.as_deref() {
-        Ok(Progress {
-            held: Some((held, hold)),
-            ..
-        }) => Ok((held.clone(), hold.take())),
-        Ok(Progress {
-            outcome: Some(Err(e)),
-            ..
-        }) => Err(e.clone()),
-        Ok(Progress { .. }) | Err(_) => Err(cancelled()),
+/// A held value's decision, and the code's progress to read its end
+/// from: what [`HeldPairing`] and [`HeldSignIn`] share.
+struct Pending {
+    decision: Arc<Decision>,
+    progress: watch::Receiver<Progress>,
+}
+
+impl Pending {
+    /// Confirm, and the end once the TV has acted on it.
+    async fn confirm(&self) -> Result<PhoneSignInOutcome, SdkError> {
+        self.decision.decide(true);
+        Progress::outcome(&self.progress).await
     }
-}
 
-/// The end once decided, for a confirm: its value.
-async fn ended(progress: &watch::Receiver<Progress>) -> Result<PhoneSignInOutcome, SdkError> {
-    Progress::outcome(progress).await
-}
+    /// Reject: `Ok` unless it was confirmed first.
+    async fn reject(&self) -> Result<(), SdkError> {
+        self.decision.decide(false);
+        match Progress::outcome(&self.progress).await {
+            Ok(_) => Err(SdkError::InvalidInput("it was confirmed already".into())),
+            Err(_) => Ok(()),
+        }
+    }
 
-/// The end once decided, for a reject: `Ok` unless it was confirmed
-/// first.
-async fn rejected(progress: &watch::Receiver<Progress>) -> Result<(), SdkError> {
-    match ended(progress).await {
-        Ok(_) => Err(SdkError::InvalidInput("it was confirmed already".into())),
-        Err(_) => Ok(()),
+    /// How the hold ended without the app's answer; never, once the app
+    /// answered.
+    async fn ended(&self) -> HoldEnd {
+        let mut progress = self.progress.clone();
+        let end = match progress.wait_for(|p| p.held_end.is_some()).await {
+            Ok(p) => p.held_end,
+            // The code's task is gone (cancelled, or its listener
+            // dropped) with no end recorded: the code ended, unless the
+            // app's own answer ended the hold first.
+            Err(_) => (!self.decision.decided()).then_some(HoldEnd::CodeEnded),
+        };
+        match end {
+            Some(end) => end,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -113,8 +149,7 @@ async fn rejected(progress: &watch::Receiver<Progress>) -> Result<(), SdkError> 
 /// undecided, it rejects.
 pub struct HeldPairing {
     pairing: Paired,
-    decision: Arc<Decision>,
-    progress: watch::Receiver<Progress>,
+    pending: Pending,
 }
 
 impl std::fmt::Debug for HeldPairing {
@@ -141,8 +176,7 @@ impl HeldPairing {
     ) -> Self {
         Self {
             pairing,
-            decision,
-            progress,
+            pending: Pending { decision, progress },
         }
     }
 
@@ -165,6 +199,12 @@ impl HeldPairing {
         self.pairing.name.as_deref()
     }
 
+    /// What the guest's phone calls itself ("Steve's iPhone"), as it
+    /// said; `None` from a phone before it said.
+    pub fn phone_name(&self) -> Option<&str> {
+        self.pairing.phone_name.as_deref()
+    }
+
     /// The servers the guest's phone handed, to be saved on confirm.
     pub fn servers(&self) -> &[PairedServer] {
         &self.pairing.servers
@@ -174,8 +214,7 @@ impl HeldPairing {
     /// is done: [`Paired`], with the servers saved. An error if the
     /// pairing ended meanwhile (the phone went, or no answer in time).
     pub async fn confirm(&self) -> Result<Paired, SdkError> {
-        self.decision.decide(true);
-        match ended(&self.progress).await? {
+        match self.pending.confirm().await? {
             PhoneSignInOutcome::Paired(paired) => Ok(paired),
             PhoneSignInOutcome::SignedIn(_) => Err(cancelled()),
         }
@@ -185,8 +224,14 @@ impl HeldPairing {
     /// ([`PairingError::NotAllowed`] there). The device key made for the
     /// pairing is removed, as for any pairing that does not end paired.
     pub async fn reject(&self) -> Result<(), SdkError> {
-        self.decision.decide(false);
-        rejected(&self.progress).await
+        self.pending.reject().await
+    }
+    /// Once the hold is over without this app's answer: the phone left,
+    /// nobody answered in time, or the code stopped. Close the confirm
+    /// page then. Never resolves once the app confirmed or rejected, so
+    /// race it against the page's own answer.
+    pub async fn ended(&self) -> HoldEnd {
+        self.pending.ended().await
     }
 }
 
@@ -206,22 +251,32 @@ pub struct HeldOffer {
 /// it rejects.
 pub struct HeldSignIn {
     offers: Vec<HeldOffer>,
-    decision: Arc<Decision>,
-    progress: watch::Receiver<Progress>,
+    phone_name: Option<String>,
+    pending: Pending,
 }
 
 impl HeldSignIn {
+    /// What the phone signing the TV in calls itself ("Andrey's iPhone
+    /// wants to sign this TV in"), as it said; `None` from a phone before
+    /// it said.
+    pub fn phone_name(&self) -> Option<&str> {
+        self.phone_name.as_deref()
+    }
+
     /// The servers, in the phone's order.
     pub fn offers(&self) -> &[HeldOffer] {
         &self.offers
     }
 
     /// Save each server and sign in to it, then tell the phone how each
-    /// went: [`PhoneSignedIn`]. [`crate::PhoneSignIn::server_sign_ins`]
-    /// gives each as it finishes meanwhile.
-    pub async fn confirm(&self) -> Result<PhoneSignedIn, SdkError> {
-        self.decision.decide(true);
-        match ended(&self.progress).await? {
+    /// went: [`PairedSignIn`]. Each server is saved, pinned but not
+    /// verified (the phone vouched for it, not this device's owner),
+    /// whether or not its sign-in went through; one saved here already
+    /// is left as it was. [`crate::PhoneSignIn::server_sign_ins`]
+    /// gives each as it finishes meanwhile, and any the phone offers
+    /// after (a server it retries), which are not held again.
+    pub async fn confirm(&self) -> Result<PairedSignIn, SdkError> {
+        match self.pending.confirm().await? {
             PhoneSignInOutcome::SignedIn(signed) => Ok(signed),
             PhoneSignInOutcome::Paired(_) => Err(cancelled()),
         }
@@ -230,8 +285,14 @@ impl HeldSignIn {
     /// Sign in to nothing and save no server; the phone is told each was
     /// declined here. The phone's grants run out on their servers unused.
     pub async fn reject(&self) -> Result<(), SdkError> {
-        self.decision.decide(false);
-        rejected(&self.progress).await
+        self.pending.reject().await
+    }
+    /// Once the hold is over without this app's answer: the phone left,
+    /// nobody answered in time, or the code stopped. Close the confirm
+    /// page then. Never resolves once the app confirmed or rejected, so
+    /// race it against the page's own answer.
+    pub async fn ended(&self) -> HoldEnd {
+        self.pending.ended().await
     }
 }
 
@@ -253,10 +314,10 @@ impl HeldPhoneSignIn {
     ) -> Self {
         match held {
             Held::Guest(pairing) => Self::Guest(HeldPairing::new(pairing, decision, progress)),
-            Held::SignIn(offers) => Self::SignIn(HeldSignIn {
+            Held::SignIn { offers, phone_name } => Self::SignIn(HeldSignIn {
                 offers,
-                decision,
-                progress,
+                phone_name,
+                pending: Pending { decision, progress },
             }),
         }
     }

@@ -43,10 +43,18 @@ pub const LIFETIME: Duration = Duration::from_secs(5 * 60);
 /// any idle timeout between the TV and the server.
 pub const AWAIT: Duration = spoolframe_protocol::policy::wait::SIGN_IN;
 
-/// Sign-ins one device may have under way at once. A device shows one
-/// code at a time, so one it begins again replaces its codes still
-/// waiting: only those being approved count against this.
+/// Sign-ins one device may have under way at once by its own codes. A
+/// device shows one code at a time, so one it begins again replaces its
+/// codes still waiting: only those being approved count against this.
+/// Offers to it do not: someone else makes those, and the device cannot
+/// clear them, so they must never keep it from showing a code.
 pub const MAX_PENDING_PER_DEVICE: usize = 3;
+
+/// Offers one device may have pending at once ([`DeviceSignIns::offer`]),
+/// whoever made them: a phone offering every profile it has on a few
+/// servers, and retrying some, fits; one signed-in user cannot flood a
+/// device it knows the key of.
+pub const MAX_OFFERS_PER_DEVICE: usize = 8;
 
 /// Sign-ins pending at once on the server (PX-10, finding 16). Anyone can
 /// begin one from a new endpoint id; a household has a few devices
@@ -326,6 +334,62 @@ struct Inner {
 }
 
 impl Inner {
+    /// Whether the server, device `endpoint` and, for an offer, the
+    /// offering user `offering` each have room for one more pending
+    /// sign-in: counted in one pass. A device's own codes and the offers
+    /// made to it are counted apart ([`MAX_PENDING_PER_DEVICE`],
+    /// [`MAX_OFFERS_PER_DEVICE`]).
+    fn has_room_for(&self, endpoint: &str, offering: Option<LocalUserId>) -> bool {
+        if self.by_request.len() >= MAX_PENDING {
+            return false;
+        }
+        let (mut codes, mut offers, mut user) = (0, 0, 0);
+        for p in self.by_request.values() {
+            if p.waiting.endpoint == endpoint {
+                // An offer has no code, whatever state it has reached.
+                if p.code.is_some() {
+                    codes += 1;
+                } else {
+                    offers += 1;
+                }
+            }
+            if let Some(offering) = offering {
+                let theirs = matches!(&*p.state.borrow(), State::Offered(g) if g.user == offering);
+                user += usize::from(theirs);
+            }
+        }
+        match offering {
+            None => codes < MAX_PENDING_PER_DEVICE,
+            Some(_) => offers < MAX_OFFERS_PER_DEVICE && user < MAX_OFFERS_PER_USER,
+        }
+    }
+
+    /// Keep a new pending sign-in for `waiting`, in `state`, until
+    /// `expires_at`; its request id.
+    fn insert_pending(
+        &mut self,
+        waiting: Waiting,
+        code: Option<String>,
+        state: State,
+        expires_at: Instant,
+    ) -> String {
+        let request = SessionToken::generate().0;
+        if let Some(code) = &code {
+            self.by_code.insert(code.clone(), request.clone());
+        }
+        self.by_request.insert(
+            request.clone(),
+            Pending {
+                waiting,
+                code,
+                expires_at,
+                state: watch::Sender::new(state),
+                waits: watch::Sender::new(0),
+            },
+        );
+        request
+    }
+
     fn sweep(&mut self, now: Instant) {
         self.by_request.retain(|_, p| p.expires_at > now);
         let live = &self.by_request;
@@ -392,15 +456,7 @@ impl DeviceSignIns {
         // Its old codes left on screen each time someone looked at the
         // ways to sign in, and three used up the device for 5 minutes.
         inner.replace_waiting(&waiting.endpoint);
-        if inner.by_request.len() >= MAX_PENDING {
-            return None;
-        }
-        let pending = inner
-            .by_request
-            .values()
-            .filter(|p| p.waiting.endpoint == waiting.endpoint)
-            .count();
-        if pending >= MAX_PENDING_PER_DEVICE {
+        if !inner.has_room_for(&waiting.endpoint, None) {
             return None;
         }
         let code = loop {
@@ -409,18 +465,8 @@ impl DeviceSignIns {
                 break code;
             }
         };
-        let request = SessionToken::generate().0;
-        inner.by_code.insert(code.clone(), request.clone());
-        inner.by_request.insert(
-            request.clone(),
-            Pending {
-                waiting,
-                code: Some(code.clone()),
-                expires_at: self.clock.now() + self.lifetime,
-                state: watch::Sender::new(State::Waiting),
-                waits: watch::Sender::new(0),
-            },
-        );
+        let expires_at = self.clock.now() + self.lifetime;
+        let request = inner.insert_pending(waiting, Some(code.clone()), State::Waiting, expires_at);
         Some(Started {
             request,
             code,
@@ -431,42 +477,16 @@ impl DeviceSignIns {
     /// Offer `waiting.endpoint` a sign-in as `grant` says, approved in
     /// advance: it redeems it by waiting on the request. Its codes still
     /// waiting are left as they are; `None` if it already has
-    /// [`MAX_PENDING_PER_DEVICE`] sign-ins pending, the offering user
+    /// [`MAX_OFFERS_PER_DEVICE`] offers pending, the offering user
     /// [`MAX_OFFERS_PER_USER`] offers not yet redeemed, or the server
     /// [`MAX_PENDING`]. The request id, which lives [`Self::lifetime`].
     pub fn offer(&self, waiting: Waiting, grant: Grant) -> Option<String> {
         let mut inner = self.lock();
-        if inner.by_request.len() >= MAX_PENDING {
+        if !inner.has_room_for(&waiting.endpoint, Some(grant.user)) {
             return None;
         }
-        let pending = inner
-            .by_request
-            .values()
-            .filter(|p| p.waiting.endpoint == waiting.endpoint)
-            .count();
-        if pending >= MAX_PENDING_PER_DEVICE {
-            return None;
-        }
-        let offered = inner
-            .by_request
-            .values()
-            .filter(|p| matches!(&*p.state.borrow(), State::Offered(g) if g.user == grant.user))
-            .count();
-        if offered >= MAX_OFFERS_PER_USER {
-            return None;
-        }
-        let request = SessionToken::generate().0;
-        inner.by_request.insert(
-            request.clone(),
-            Pending {
-                waiting,
-                code: None,
-                expires_at: self.clock.now() + self.lifetime,
-                state: watch::Sender::new(State::Offered(grant)),
-                waits: watch::Sender::new(0),
-            },
-        );
-        Some(request)
+        let expires_at = self.clock.now() + self.lifetime;
+        Some(inner.insert_pending(waiting, None, State::Offered(grant), expires_at))
     }
 
     /// The device waiting on `code`, if it can still be approved.
@@ -569,7 +589,7 @@ impl DeviceSignIns {
                                 platform: p.waiting.platform,
                                 // The device asked by taking the offer;
                                 // the grant says whether it is trusted.
-                                remember: true,
+                                remember: grant.remember,
                             },
                             grant,
                         };
@@ -749,15 +769,27 @@ mod tests {
         ));
     }
 
-    /// Offers count against the device's sign-ins under way.
+    /// A device holds few offers, whoever makes them.
     #[test]
     fn a_device_holds_few_offers() {
         let sign_ins = DeviceSignIns::default();
-        for _ in 0..MAX_PENDING_PER_DEVICE {
+        for _ in 0..MAX_OFFERS_PER_DEVICE {
             assert!(sign_ins.offer(tv("tv"), grant()).is_some());
         }
         assert!(sign_ins.offer(tv("tv"), grant()).is_none());
         assert!(sign_ins.offer(tv("other tv"), grant()).is_some());
+    }
+
+    /// Offers left unredeemed (turned down on the TV, its screen closed)
+    /// never keep the TV from showing its own code: they are counted
+    /// apart from its codes.
+    #[test]
+    fn offers_never_lock_a_device_out_of_its_own_code() {
+        let sign_ins = DeviceSignIns::default();
+        for _ in 0..MAX_PENDING_PER_DEVICE {
+            assert!(sign_ins.offer(tv("tv"), grant()).is_some());
+        }
+        assert!(sign_ins.begin(tv("tv")).is_some());
     }
 
     /// One user holds few offers, whichever devices they are for; another

@@ -941,18 +941,11 @@ impl ClientProtocol {
             server: self.instance(),
             reply: response,
         };
-        // Whose each rating is goes only to a client that named the
-        // feature; the encode runs here, synchronously, so the context
-        // holds for all of it.
-        let encode = || codec::encode_limited(&response, codec::MAX_REPLY);
-        let encoded = if self
-            .features
-            .has(connection.stable_id(), Feature::RatingSources)
-        {
-            encode()
-        } else {
-            spoolframe_types::without_rating_sources(encode)
-        };
+        let encoded = encode_reply(
+            &response,
+            self.features
+                .has(connection.stable_id(), Feature::RatingSources),
+        );
         let written = match encoded {
             Ok(bytes) => codec::write_encoded_reply(&mut send, &bytes).await,
             Err(e) => Err(e),
@@ -1379,55 +1372,41 @@ impl ClientProtocol {
                     .sign_ins()
                     .wait(&request, &endpoint, device_sign_in::AWAIT)
                     .await;
+                // A phone's offer is redeemed first, made now as its
+                // approval; the wait after finds it decided.
+                let offered = matches!(outcome, Outcome::Offered(_));
+                let outcome = match outcome {
+                    Outcome::Offered(redeeming) => {
+                        match self.services.auth.redeem_offer(&redeeming).await {
+                            Ok(Approval::SignedIn) => Ok(self
+                                .services
+                                .auth
+                                .sign_ins()
+                                .wait(&request, &endpoint, device_sign_in::AWAIT)
+                                .await),
+                            Ok(Approval::Expired) => Ok(Outcome::Expired),
+                            Err(e) => Err(internal(e)),
+                        }
+                    }
+                    outcome => Ok(outcome),
+                };
                 match outcome {
-                    Outcome::Approved(handover) => {
+                    Err(e) => Err(e),
+                    Ok(Outcome::Approved(handover)) => {
                         tracing::info!(
                             %endpoint,
                             remembered = handover.remembered,
+                            offered,
                             "device signed in by approval"
                         );
                         Ok(self
                             .logged_in(connection, handover.token, handover.remembered, false)
                             .await)
                     }
-                    // Made now, as its offer's approval, and handed to the
-                    // wait below, which finds it decided.
-                    Outcome::Offered(redeeming) => {
-                        match self.services.auth.redeem_offer(&redeeming).await {
-                            Ok(Approval::SignedIn) => {
-                                match self
-                                    .services
-                                    .auth
-                                    .sign_ins()
-                                    .wait(&request, &endpoint, device_sign_in::AWAIT)
-                                    .await
-                                {
-                                    Outcome::Approved(handover) => {
-                                        tracing::info!(
-                                            %endpoint,
-                                            remembered = handover.remembered,
-                                            "device signed in by a phone's offer"
-                                        );
-                                        Ok(self
-                                            .logged_in(
-                                                connection,
-                                                handover.token,
-                                                handover.remembered,
-                                                false,
-                                            )
-                                            .await)
-                                    }
-                                    // Another wait of this device's took it.
-                                    _ => Ok(Reply::DeviceSignInPending),
-                                }
-                            }
-                            Ok(Approval::Expired) => Err(Error::DeviceSignInExpired),
-                            Err(e) => Err(internal(e)),
-                        }
-                    }
-                    Outcome::Pending => Ok(Reply::DeviceSignInPending),
-                    Outcome::Denied => Err(Error::DeviceSignInDenied),
-                    Outcome::Expired => Err(Error::DeviceSignInExpired),
+                    // Another wait of this device's took the offer.
+                    Ok(Outcome::Offered(_) | Outcome::Pending) => Ok(Reply::DeviceSignInPending),
+                    Ok(Outcome::Denied) => Err(Error::DeviceSignInDenied),
+                    Ok(Outcome::Expired) => Err(Error::DeviceSignInExpired),
                 }
             }
             Request::BeginPasskeySignIn { username } => {
@@ -5008,12 +4987,7 @@ impl ClientProtocol {
                         message: "sign this device in on another device".into(),
                     });
                 }
-                if let Some((at, _)) = device_name
-                    .char_indices()
-                    .nth(spoolframe_protocol::MAX_HELLO_TEXT)
-                {
-                    device_name.truncate(at);
-                }
+                spoolframe_protocol::cut(&mut device_name);
                 let auth = &self.services.auth;
                 let offered = auth.sign_ins().offer(
                     Waiting {
@@ -5890,6 +5864,8 @@ impl ClientProtocol {
             .await
             .map_err(internal)?
             .is_some();
+        // Access it had already: tied to an account, or granted before.
+        let mut already_granted = tied;
         if !tied {
             let redeemed = crate::invites::redeem_portable(
                 auth,
@@ -5906,11 +5882,23 @@ impl ClientProtocol {
                 granted = matches!(redeemed, crate::store::invites::PortableRedeemed::Granted),
                 "a portable identity redeemed an invite"
             );
+            already_granted = matches!(
+                redeemed,
+                crate::store::invites::PortableRedeemed::AlreadyGranted
+            );
         }
         // Known here now: its states are worth keeping.
         self.keep_states(&credential, &redeem.sign_in.states)
             .await?;
-        self.open_portable(connection, &credential, hello).await
+        let mut reply = self.open_portable(connection, &credential, hello).await?;
+        if let Reply::LoggedIn {
+            already_granted: said,
+            ..
+        } = &mut reply
+        {
+            *said = already_granted;
+        }
+        Ok(reply)
     }
 
     /// The credential `sign_in` proves from `endpoint_id`, with the nonce
@@ -6156,6 +6144,7 @@ impl ClientProtocol {
             session: SessionId(token.0),
             remembered: false,
             password_change_required: false,
+            already_granted: false,
         })
     }
 
@@ -7606,6 +7595,7 @@ impl ClientProtocol {
             session: SessionId(token.0),
             remembered,
             password_change_required,
+            already_granted: false,
         }
     }
 
@@ -9591,6 +9581,24 @@ fn catalog_error(e: CatalogError) -> Error {
     }
 }
 
+/// `response` as it is written to a connection: whose each rating is
+/// (`spoolframe:rating-sources`) left out, wherever in it, unless the
+/// connection has the feature.
+fn encode_reply<T: serde::Serialize>(
+    response: &T,
+    rating_sources: bool,
+) -> Result<Vec<u8>, codec::CodecError> {
+    if rating_sources {
+        codec::encode_limited(response, codec::MAX_REPLY)
+    } else {
+        codec::encode_limited_without(
+            response,
+            &spoolframe_types::RATING_SOURCE_FIELDS,
+            codec::MAX_REPLY,
+        )
+    }
+}
+
 /// Whether `e` says the item is not served now: in a library removed or
 /// never added, on a Plex server no longer configured, or gone. Not a
 /// failure to reach Plex, which says nothing of whether it is served.
@@ -9823,6 +9831,73 @@ fn capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Home's rows nest items two levels down: a film there loses whose
+    /// its ratings are for a connection without the feature, and keeps
+    /// the ratings; with the feature it keeps both.
+    #[test]
+    fn rating_sources_are_left_out_of_a_nested_reply_without_the_feature() {
+        let mut film = crate::test_support::movie();
+        let spoolframe_types::Item::Movie(movie) = &mut film else {
+            unreachable!()
+        };
+        movie.merge.rating_tenths = Some(92);
+        movie.merge.rating_source =
+            spoolframe_types::RatingSource::from_image("rottentomatoes://image.rating.ripe");
+        movie.merge.audience_rating_source =
+            spoolframe_types::RatingSource::from_image("rottentomatoes://image.rating.upright");
+        let home = Response::Ok(Reply::Home(spoolframe_protocol::HomeScreen {
+            continue_watching: vec![film.clone()],
+            ..Default::default()
+        }));
+        let read = |sources| {
+            let bytes = encode_reply(&home, sources).unwrap();
+            match codec::decode::<Response>(&bytes).unwrap() {
+                Response::Ok(Reply::Home(home)) => match &home.continue_watching[..] {
+                    [spoolframe_types::Item::Movie(m)] => m.merge.clone(),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        };
+        let (with, without) = (read(true), read(false));
+        let spoolframe_types::Item::Movie(sent) = &film else {
+            unreachable!()
+        };
+        assert_eq!(with, sent.merge);
+        assert_eq!(
+            (
+                without.rating_source,
+                without.audience_rating_source,
+                without.rating_tenths
+            ),
+            (None, None, Some(92))
+        );
+    }
+
+    /// A reply that carries no rating source goes to a connection
+    /// without the feature as the very bytes of the plain encode: it
+    /// takes the fast path, with no tree built.
+    #[test]
+    fn a_reply_without_sources_is_sent_as_it_encodes() {
+        let mut film = crate::test_support::movie();
+        let spoolframe_types::Item::Movie(movie) = &mut film else {
+            unreachable!()
+        };
+        movie.merge.rating_tenths = Some(92);
+        let home = Response::Ok(Reply::Home(spoolframe_protocol::HomeScreen {
+            continue_watching: vec![film],
+            ..Default::default()
+        }));
+        let plain = codec::encode_limited(&home, codec::MAX_REPLY).unwrap();
+        assert!(
+            !plain
+                .windows(b"rating_source".len())
+                .any(|w| w == b"rating_source")
+        );
+        assert_eq!(encode_reply(&home, false).unwrap(), plain);
+        assert_eq!(encode_reply(&home, true).unwrap(), plain);
+    }
 
     #[test]
     fn the_path_selected_is_the_one_gone_by() {

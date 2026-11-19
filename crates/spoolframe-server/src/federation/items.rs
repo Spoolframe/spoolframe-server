@@ -455,6 +455,30 @@ mod tests {
         }
     }
 
+    /// Whose each rating is goes to the paired server and comes back on
+    /// its film: replication sends it and the cache keeps the item as
+    /// JSON, neither through a client's gate.
+    #[test]
+    fn rating_sources_cross_replication_and_the_cache() {
+        let source =
+            spoolframe_types::RatingSource::from_image("rottentomatoes://image.rating.ripe");
+        let facts = Facts {
+            rating_tenths: Some(92),
+            rating_source: source.clone(),
+            ..Facts::default()
+        };
+        let sent = remote(&movie(), Vec::new(), &facts);
+        let wire = spoolframe_protocol::codec::encode(&sent).unwrap();
+        let replicated: spoolframe_protocol::federation::RemoteItem =
+            spoolframe_protocol::codec::decode(&wire).unwrap();
+        let cached: spoolframe_protocol::federation::RemoteItem =
+            serde_json::from_str(&serde_json::to_string(&replicated).unwrap()).unwrap();
+        let Some(Item::Movie(film)) = local(ORIGIN, &cached) else {
+            panic!("not a film")
+        };
+        assert_eq!(film.merge.rating_source, source);
+    }
+
     /// What a merged library sorts and matches by comes back on a paired
     /// server's film, show and artist as the origin sent it.
     #[test]

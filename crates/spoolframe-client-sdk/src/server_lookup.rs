@@ -171,38 +171,116 @@ fn builder(allow_http: bool) -> reqwest::ClientBuilder {
 }
 
 /// The system's resolver (getaddrinfo, as reqwest's own), failing with
-/// [`NameNotFound`] so a lookup can tell a name that does not resolve
-/// from a host that does not answer: reqwest's own resolver fails as any
-/// connection does.
+/// [`NameNotFound`] only when the resolver says definitely that the name
+/// does not exist, so a lookup can tell a typo from a network without
+/// DNS. Any other failure (`EAI_AGAIN`, no DNS server, a resolver error)
+/// is [`NoDns`], which reads as no answer, worth trying again.
 struct Resolver;
 
-/// The name a lookup asked for did not resolve.
+/// The name a lookup asked for does not exist: the resolver said so
+/// (`EAI_NONAME`, from an NXDOMAIN), or gave no address for it.
 #[derive(Debug, thiserror::Error)]
 #[error("{name} does not resolve")]
 struct NameNotFound {
     name: String,
-    #[source]
-    error: Option<std::io::Error>,
+}
+
+/// The name could not be resolved now, for `code` (a `getaddrinfo`
+/// error): not a sign that it does not exist.
+#[derive(Debug, thiserror::Error)]
+#[error("{name} could not be resolved now (getaddrinfo {code})")]
+struct NoDns {
+    name: String,
+    code: i32,
+}
+
+/// What `getaddrinfo` said of a name.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    Found(Vec<SocketAddr>),
+    /// It definitely does not exist, or has no address.
+    NotFound,
+    /// It could not be resolved now: this `getaddrinfo` error.
+    Failed(i32),
+}
+
+impl Resolved {
+    /// What a `getaddrinfo` answer means: `code` its return, `found` the
+    /// addresses it gave.
+    fn of(code: i32, found: Vec<SocketAddr>) -> Self {
+        match code {
+            0 if found.is_empty() => Self::NotFound,
+            0 => Self::Found(found),
+            libc::EAI_NONAME => Self::NotFound,
+            other => Self::Failed(other),
+        }
+    }
+}
+
+/// `name`'s addresses, by the system's `getaddrinfo`, blocking.
+fn getaddrinfo(name: &str) -> Resolved {
+    let Ok(host) = std::ffi::CString::new(name) else {
+        // A name with a NUL in it names nothing.
+        return Resolved::NotFound;
+    };
+    // SAFETY: an all-zero addrinfo is the "no hints" value; only the
+    // socket type is set.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_socktype = libc::SOCK_STREAM;
+    let mut list: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: `host` is NUL-terminated and outlives the call, `hints` is
+    // a valid addrinfo, and `list` is written only on success.
+    let code = unsafe { libc::getaddrinfo(host.as_ptr(), std::ptr::null(), &hints, &mut list) };
+    let mut found = Vec::new();
+    if code == 0 {
+        let mut at = list;
+        while !at.is_null() {
+            // SAFETY: each node of the list getaddrinfo gave is valid until
+            // freeaddrinfo below.
+            let entry = unsafe { &*at };
+            if !entry.ai_addr.is_null() {
+                match entry.ai_family {
+                    libc::AF_INET => {
+                        // SAFETY: an AF_INET entry's address is a sockaddr_in.
+                        let v4 = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in) };
+                        let ip = std::net::Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr));
+                        found.push(SocketAddr::from((ip, 0)));
+                    }
+                    libc::AF_INET6 => {
+                        // SAFETY: an AF_INET6 entry's address is a sockaddr_in6.
+                        let v6 = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in6) };
+                        let ip = std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr);
+                        found.push(SocketAddr::V6(std::net::SocketAddrV6::new(
+                            ip,
+                            0,
+                            0,
+                            v6.sin6_scope_id,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            at = entry.ai_next;
+        }
+        // SAFETY: `list` came from a successful getaddrinfo, freed once.
+        unsafe { libc::freeaddrinfo(list) };
+    }
+    Resolved::of(code, found)
 }
 
 impl reqwest::dns::Resolve for Resolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let name = name.as_str().to_owned();
         Box::pin(async move {
-            // reqwest sets the port of what this answers.
-            let found = tokio::net::lookup_host((name.as_str(), 0))
+            let asked = name.clone();
+            let resolved = tokio::task::spawn_blocking(move || getaddrinfo(&asked))
                 .await
-                .map(|found| found.collect::<Vec<SocketAddr>>());
-            match found {
-                Ok(found) if !found.is_empty() => {
-                    Ok(Box::new(found.into_iter()) as reqwest::dns::Addrs)
-                }
-                Ok(_) => Err(NameNotFound { name, error: None }.into()),
-                Err(error) => Err(NameNotFound {
-                    name,
-                    error: Some(error),
-                }
-                .into()),
+                .unwrap_or(Resolved::Failed(libc::EAI_FAIL));
+            // reqwest sets the port of what this answers.
+            match resolved {
+                Resolved::Found(found) => Ok(Box::new(found.into_iter()) as reqwest::dns::Addrs),
+                Resolved::NotFound => Err(NameNotFound { name }.into()),
+                Resolved::Failed(code) => Err(NoDns { name, code }.into()),
             }
         })
     }
@@ -632,6 +710,51 @@ mod tests {
 
     async fn failure(origin: &str) -> Option<LookupFailure> {
         failure_with(&test_client(), origin).await
+    }
+
+    /// Only a definite "no such name" is not found: a resolver that
+    /// cannot answer now (no DNS server, a temporary failure) is not a
+    /// typo, and reads as no answer.
+    #[test]
+    fn only_a_definite_no_such_name_is_not_found() {
+        let at = SocketAddr::from(([192, 0, 2, 1], 0));
+        assert_eq!(Resolved::of(0, vec![at]), Resolved::Found(vec![at]));
+        assert_eq!(Resolved::of(0, Vec::new()), Resolved::NotFound);
+        assert_eq!(
+            Resolved::of(libc::EAI_NONAME, Vec::new()),
+            Resolved::NotFound
+        );
+        for code in [
+            libc::EAI_AGAIN,
+            libc::EAI_FAIL,
+            libc::EAI_SYSTEM,
+            libc::EAI_MEMORY,
+        ] {
+            assert_eq!(Resolved::of(code, Vec::new()), Resolved::Failed(code));
+        }
+    }
+
+    /// A name that cannot be resolved now fails as no answer, which is
+    /// worth trying again; one that does not exist, as not found.
+    #[test]
+    fn a_resolver_failure_is_no_answer_and_retryable() {
+        let failed = |reason| SdkError::ServerLookupFailed {
+            address: "https://sf.example.org".into(),
+            reason,
+        };
+        assert!(failed(LookupFailure::NoAnswer).is_transport());
+        assert!(failed(LookupFailure::TimedOut).is_transport());
+        assert!(!failed(LookupFailure::NameNotFound).is_transport());
+        assert_eq!(
+            failed(LookupFailure::NoAnswer).kind(),
+            crate::ErrorKind::Transport
+        );
+        let no_dns: Box<dyn std::error::Error + Send + Sync> = NoDns {
+            name: "sf.example.org".into(),
+            code: libc::EAI_AGAIN,
+        }
+        .into();
+        assert!(!no_dns.is::<NameNotFound>());
     }
 
     #[tokio::test]

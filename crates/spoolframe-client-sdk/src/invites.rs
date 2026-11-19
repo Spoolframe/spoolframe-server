@@ -343,6 +343,17 @@ fn parsed(link: &str) -> Result<(Invite, EndpointId), SdkError> {
     Ok((invite, id))
 }
 
+/// What [`Client::redeem_invite_portable`] did.
+#[derive(Debug, Clone)]
+pub struct PortableInviteRedeemed {
+    /// The identity's session there, kept.
+    pub session: Session,
+    /// The identity had access there already (granted before, or tied to
+    /// an account): the invite kept its use. Say "You already had
+    /// access". False from a server before 0.17.5, which does not say.
+    pub already_granted: bool,
+}
+
 impl Client {
     /// What invite `link` says; nothing is sent or saved.
     /// [`SdkError::NotAnInvite`] for anything that is not one.
@@ -638,12 +649,16 @@ impl Client {
     /// [`SdkError::InvalidCredentials`]; [`SdkError::RateLimited`]. An
     /// identity whose root is not here and that has no credential is
     /// [`SdkError::UnknownIdentity`].
+    ///
+    /// An identity with access there already (granted before, or tied
+    /// to an account) is signed in all the same, and the invite keeps
+    /// its use: [`PortableInviteRedeemed::already_granted`] says so.
     pub async fn redeem_invite_portable(
         &self,
         link: &str,
         identity: PortableUserId,
         display_name: Option<&str>,
-    ) -> Result<Session, SdkError> {
+    ) -> Result<PortableInviteRedeemed, SdkError> {
         let (invite, _) = parsed(link)?;
         let redeemed = self.redeem_portable(link, identity, display_name).await;
         self.drop_token(&invite).await;
@@ -655,7 +670,7 @@ impl Client {
         link: &str,
         identity: PortableUserId,
         display_name: Option<&str>,
-    ) -> Result<Session, SdkError> {
+    ) -> Result<PortableInviteRedeemed, SdkError> {
         let (invite, id) = parsed(link)?;
         let Some(code) = invite.code.clone() else {
             return Err(SdkError::InvalidInput(
@@ -670,16 +685,22 @@ impl Client {
         self.reach_checked(&invite, id).await?;
         let sign_in = self.portable_sign_in(id, identity, display_name).await?;
         let request = Request::RedeemPortableInvite(RedeemPortableInvite { code, sign_in });
-        let token = crate::portable_sign_in::logged_in(self.call(id, None, request).await?)?;
+        let (token, already_granted) =
+            crate::portable_sign_in::logged_in_saying(self.call(id, None, request).await?)?;
         self.save_invite_server(link).await?;
-        self.keep_session_as(
-            id,
-            token,
-            Some(SignInMethod::Portable),
-            false,
-            Some(identity),
-        )
-        .await
+        let session = self
+            .keep_session_as(
+                id,
+                token,
+                Some(SignInMethod::Portable),
+                false,
+                Some(identity),
+            )
+            .await?;
+        Ok(PortableInviteRedeemed {
+            session,
+            already_granted,
+        })
     }
 
     /// The connection to server `id`, dialled with `invite`'s hints too;
@@ -1065,6 +1086,7 @@ mod tests {
             pinned_at: None,
             verified_at: None,
             last_connected_at: None,
+            last_used_at: None,
             use_relays: None,
         };
         let lookup = InviteLookup {

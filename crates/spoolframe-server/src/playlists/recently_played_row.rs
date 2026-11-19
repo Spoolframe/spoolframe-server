@@ -4,17 +4,30 @@
 //! `crate::watch`, because a playlist's card is the playlist as the user
 //! sees it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures_util::{StreamExt, TryStreamExt, stream};
 use spoolframe_protocol::recently_played::RecentCard;
-use spoolframe_types::{Item, MediaId, RecentMusicMode};
+use spoolframe_types::{Item, MediaId, RecentMusicMode, RecentShowsMode};
 
 use super::people::Names;
 use super::{CATALOG_FETCHES, Playlists, PlaylistsError};
 use crate::principal::Actor;
 use crate::store::playlists::PlaylistRow;
 use crate::store::plays::{RowBy, RowCard};
+
+/// The most season-less episodes one read of the row looks up the season
+/// of: a user's plays from before plays kept it, latest first. Each is
+/// looked up once, then kept.
+const SEASON_BACKFILL: u32 = 200;
+
+/// A card as found, before its items are filled. A row's worth, short
+/// lived: an item unboxed keeps the fill a plain borrow.
+#[allow(clippy::large_enum_variant)]
+enum Found {
+    Playlist(String),
+    Item(Item),
+}
 
 impl Playlists {
     /// `actor`'s "Recently played" row: at most `limit` cards, newest
@@ -29,6 +42,7 @@ impl Playlists {
         limit: u32,
         federated: bool,
     ) -> Result<Vec<RecentCard>, PlaylistsError> {
+        let principal = actor.principal.to_string();
         let preferences = self
             .store
             .recently_played_preferences(actor.principal)
@@ -37,14 +51,20 @@ impl Playlists {
             preferences.music,
             RecentMusicMode::Sources | RecentMusicMode::Unknown
         );
-        let seen = if by_source {
+        let seen: HashMap<String, PlaylistRow> = if by_source {
             self.store
-                .playlists_seen_by(&actor.principal.to_string())
+                .playlists_seen_by(&principal)
                 .await?
+                .into_iter()
+                .map(|row| (row.id.clone(), row))
+                .collect()
         } else {
-            Vec::new()
+            HashMap::new()
         };
-        let seen_ids: Vec<String> = seen.iter().map(|row| row.id.clone()).collect();
+        if preferences.shows == RecentShowsMode::Season {
+            self.backfill_seasons(actor).await?;
+        }
+        let seen_ids: Vec<String> = seen.keys().cloned().collect();
         let by = RowBy {
             preferences,
             playlists: &seen_ids,
@@ -53,84 +73,132 @@ impl Playlists {
             .store
             .recently_played_row(actor.principal, by, limit, federated)
             .await?;
-        let pins = self.store.pins(&actor.principal.to_string()).await?;
-        let names = Names::of(&self.store).await?;
-        let made: Vec<Option<RecentCard>> = stream::iter(cards)
-            .map(|card| self.card(actor, card, &seen, &pins, &names))
+        let found: Vec<Option<Found>> = stream::iter(cards)
+            .map(|card| self.find(actor, card, &seen))
             .buffered(CATALOG_FETCHES)
             .try_collect()
             .await?;
         // A season looked up from an older play may be one listed already,
         // at a newer play: it shows there.
         let mut seasons = HashSet::new();
-        Ok(made
+        let mut found: Vec<Found> = found
             .into_iter()
             .flatten()
-            .filter(|card| match card {
-                RecentCard::Season { season } => seasons.insert(season.id.clone()),
+            .filter(|found| match found {
+                Found::Item(Item::Season(season)) => seasons.insert(season.id.clone()),
                 _ => true,
             })
-            .collect())
+            .collect();
+        // Every item's state and plays in one read each.
+        let mut items: Vec<&mut Item> = found
+            .iter_mut()
+            .filter_map(|found| match found {
+                Found::Item(item) => Some(item),
+                Found::Playlist(_) => None,
+            })
+            .collect();
+        self.watch.fill(actor.principal, &mut items).await?;
+        self.watch.fill_plays(actor.principal, &mut items).await?;
+        // The pins and names a playlist's card needs, only if one shows.
+        let (pins, names) = if found.iter().any(|f| matches!(f, Found::Playlist(_))) {
+            let (pins, names) = tokio::join!(self.store.pins(&principal), Names::of(&self.store));
+            (pins?, names?)
+        } else {
+            (Vec::new(), Names::default())
+        };
+        let mut cards = Vec::with_capacity(found.len());
+        for found in found {
+            cards.push(match found {
+                Found::Playlist(id) => {
+                    let row = &seen[&id];
+                    let pinned = pins.iter().position(|p| *p == id).map(|n| n as u32);
+                    let playlist = self.summarized(actor, row, pinned, &names).await?;
+                    RecentCard::Playlist { playlist }
+                }
+                Found::Item(Item::Movie(movie)) => RecentCard::Movie { movie },
+                Found::Item(Item::Show(show)) => RecentCard::Show { show },
+                Found::Item(Item::Season(season)) => RecentCard::Season { season },
+                Found::Item(Item::Episode(episode)) => RecentCard::Episode { episode },
+                Found::Item(Item::Album(album)) => RecentCard::Album { album },
+                Found::Item(Item::Track(track)) => RecentCard::Track { track },
+                Found::Item(Item::Artist(_)) => continue,
+            });
+        }
+        Ok(cards)
     }
 
-    /// `card` as `actor` sees it; `None` when it is not served them now.
-    async fn card(
+    /// Keep the season of `actor`'s plays of episodes that kept none, at
+    /// most [`SEASON_BACKFILL`] of them, each looked up once, in one
+    /// write: so the row groups them by season, and its limit counts
+    /// cards, not plays of one season. An episode not served now stays
+    /// as it is, and shows its own season if it is ever found.
+    async fn backfill_seasons(&self, actor: &Actor) -> Result<(), PlaylistsError> {
+        let episodes = self
+            .store
+            .episodes_without_season(actor.principal, SEASON_BACKFILL)
+            .await?;
+        if episodes.is_empty() {
+            return Ok(());
+        }
+        let found: Vec<Option<(String, String)>> = stream::iter(episodes)
+            .map(|episode| async move {
+                let Ok(id) = episode.parse::<MediaId>() else {
+                    return Ok(None);
+                };
+                match self.catalog.item(&id).await {
+                    Ok(found) => Ok(match found.item {
+                        Item::Episode(e) => Some((episode, e.season_id.to_string())),
+                        _ => None,
+                    }),
+                    Err(e) if crate::client::unserved(&e) => Ok(None),
+                    Err(e) => Err(PlaylistsError::from(e)),
+                }
+            })
+            .buffered(CATALOG_FETCHES)
+            .try_collect()
+            .await?;
+        let seasons: Vec<(String, String)> = found.into_iter().flatten().collect();
+        self.store
+            .note_play_seasons(actor.principal, &seasons)
+            .await?;
+        Ok(())
+    }
+
+    /// What `card` is as `actor` sees it; `None` when it is not served
+    /// them now. A season a play did not keep, and the backfill could not
+    /// find, is looked up from its episode.
+    async fn find(
         &self,
         actor: &Actor,
         card: RowCard,
-        seen: &[PlaylistRow],
-        pins: &[String],
-        names: &Names,
-    ) -> Result<Option<RecentCard>, PlaylistsError> {
-        if let RowCard::Playlist(id) = &card {
-            let Some(row) = seen.iter().find(|row| row.id == *id) else {
-                return Ok(None);
-            };
-            let pinned = pins.iter().position(|p| p == id).map(|n| n as u32);
-            let playlist = self.summarized(actor, row, pinned, names).await?;
-            return Ok(Some(RecentCard::Playlist { playlist }));
-        }
+        seen: &HashMap<String, PlaylistRow>,
+    ) -> Result<Option<Found>, PlaylistsError> {
         let id = match card {
-            RowCard::SeasonOf(episode) => match self.served(actor, &episode).await? {
-                Some(Item::Episode(e)) => e.season_id.to_string(),
-                _ => return Ok(None),
-            },
+            RowCard::Playlist(id) => {
+                return Ok(seen.contains_key(&id).then_some(Found::Playlist(id)));
+            }
+            RowCard::SeasonOf(episode) => {
+                let Some(Item::Episode(e)) = self.served_item(actor, &episode).await? else {
+                    return Ok(None);
+                };
+                e.season_id.to_string()
+            }
             RowCard::Movie(id)
             | RowCard::Show(id)
             | RowCard::Season(id)
             | RowCard::Episode(id)
             | RowCard::Album(id)
-            | RowCard::Track(id)
-            | RowCard::Playlist(id) => id,
+            | RowCard::Track(id) => id,
         };
-        let Some(mut item) = self.served(actor, &id).await? else {
-            return Ok(None);
-        };
-        self.watch.fill(actor.principal, &mut [&mut item]).await?;
-        self.watch
-            .fill_plays(actor.principal, &mut [&mut item])
-            .await?;
-        Ok(match item {
-            Item::Movie(movie) => Some(RecentCard::Movie { movie }),
-            Item::Show(show) => Some(RecentCard::Show { show }),
-            Item::Season(season) => Some(RecentCard::Season { season }),
-            Item::Episode(episode) => Some(RecentCard::Episode { episode }),
-            Item::Album(album) => Some(RecentCard::Album { album }),
-            Item::Track(track) => Some(RecentCard::Track { track }),
-            Item::Artist(_) => None,
-        })
+        Ok(self.served_item(actor, &id).await?.map(Found::Item))
     }
 
-    /// Item `id` as the catalog serves it to `actor` now, if it does.
-    async fn served(&self, actor: &Actor, id: &str) -> Result<Option<Item>, PlaylistsError> {
+    /// Item `id` (as stored) as the catalog serves it to `actor` now, if
+    /// it does.
+    async fn served_item(&self, actor: &Actor, id: &str) -> Result<Option<Item>, PlaylistsError> {
         let Ok(id) = id.parse::<MediaId>() else {
             return Ok(None);
         };
-        let found = match self.catalog.item(&id).await {
-            Ok(found) => found,
-            Err(e) if crate::client::unserved(&e) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(self.may_see(actor, &found.item).then_some(found.item))
+        Ok(self.served(actor, &id).await?.map(|found| found.item))
     }
 }

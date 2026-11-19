@@ -521,6 +521,7 @@ mod tests {
             session: spoolframe_protocol::SessionId("session".into()),
             remembered: false,
             password_change_required: false,
+            already_granted: false,
         })
         .into()
     }

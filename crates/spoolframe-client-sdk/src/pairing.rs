@@ -42,7 +42,7 @@ use tokio::time::Instant;
 
 use crate::client::Client;
 use crate::error::SdkError;
-use crate::held::{self, Held, HeldPairing, Hold};
+use crate::held::{self, Held, HeldPairing, Hold, HoldEnd};
 use crate::phone_sign_in::{PhoneConnected, PhoneSignInOutcome};
 use crate::portable::{DevicePublicKey, GuestServer, Portable, PortableUserId};
 use crate::refusals::{self, Refusals};
@@ -112,7 +112,8 @@ impl From<Refusal> for PairingError {
             Refusal::WrongCode => Self::WrongCode,
             Refusal::Expired => Self::Expired,
             Refusal::CredentialRefused => Self::CredentialRefused,
-            Refusal::Failed => Self::Failed,
+            Refusal::Rejected => Self::Rejected,
+            Refusal::Failed | Refusal::Unknown => Self::Failed,
         }
     }
 }
@@ -128,6 +129,8 @@ pub struct Paired {
     /// What the guest calls the identity, as their phone said:
     /// [`Connected::name`].
     pub name: Option<String>,
+    /// What the guest's phone calls itself: [`Connected::phone_name`].
+    pub phone_name: Option<String>,
     /// The servers the phone signs in to as `identity`, and has
     /// verified, saved on this device now: [`Client::sign_in_portable`] on
     /// each. Saved pinned but not verified, since the guest's phone
@@ -156,17 +159,34 @@ pub struct Connected {
     /// it was sent). The phone's word, not proved: show it beside the
     /// fingerprint, never instead of it.
     pub name: Option<String>,
+    /// What the guest's phone calls itself ("Steve's iPhone"), its
+    /// device name, as it said: `None` from a phone before it said. The
+    /// phone's word, as `name` is.
+    pub phone_name: Option<String>,
 }
 
 impl Connected {
-    fn new(identity: PortableUserId, device_key: DevicePublicKey, name: Option<String>) -> Self {
+    fn new(
+        identity: PortableUserId,
+        device_key: DevicePublicKey,
+        name: Option<String>,
+        phone_name: Option<String>,
+    ) -> Self {
         Self {
             identity,
             device_key,
             fingerprint: device_key.fingerprint(),
             name,
+            phone_name,
         }
     }
+}
+
+/// A name a phone sent, cut as names are; none if it sent none, or an
+/// empty one.
+pub(crate) fn sent_name(name: Option<String>) -> Option<String> {
+    name.map(|n| pairing::cut_name(&n))
+        .filter(|n| !n.is_empty())
 }
 
 /// How far a device's code got, for a pairing or a phone sign-in. Each
@@ -176,6 +196,8 @@ pub(crate) struct Progress {
     pub(crate) connected: Option<PhoneConnected>,
     /// What the phone handed, held for the person at the device.
     pub(crate) held: Option<(Held, Hold)>,
+    /// How the hold ended without the app's answer, if it did.
+    pub(crate) held_end: Option<HoldEnd>,
     pub(crate) outcome: Option<Result<PhoneSignInOutcome, SdkError>>,
 }
 
@@ -206,11 +228,36 @@ impl Progress {
                 paired.identity,
                 paired.device_key,
                 paired.name.clone(),
+                paired.phone_name.clone(),
             ))),
             Ok(Progress {
                 outcome: Some(Ok(PhoneSignInOutcome::SignedIn(_))),
                 ..
             }) => Ok(PhoneConnected::SigningIn),
+            Ok(Progress { .. }) | Err(_) => Err(cancelled()),
+        }
+    }
+
+    /// What the code's connection holds, once it does, and its
+    /// decision: or the error the code ended with before. Every call
+    /// shares one decision; once every copy of it went undecided, it was
+    /// rejected.
+    pub(crate) async fn held(
+        progress: &watch::Receiver<Progress>,
+    ) -> Result<(Held, Arc<crate::held::Decision>), SdkError> {
+        let mut watching = progress.clone();
+        let seen = watching
+            .wait_for(|p| p.held.is_some() || p.outcome.is_some())
+            .await;
+        match seen.as_deref() {
+            Ok(Progress {
+                held: Some((held, hold)),
+                ..
+            }) => Ok((held.clone(), hold.take())),
+            Ok(Progress {
+                outcome: Some(Err(e)),
+                ..
+            }) => Err(e.clone()),
             Ok(Progress { .. }) | Err(_) => Err(cancelled()),
         }
     }
@@ -234,10 +281,7 @@ impl Progress {
 /// Dropping it, or [`Pairing::cancel`], stops the pairing: the device
 /// stops taking pairing connections at once.
 pub struct Pairing {
-    link: String,
-    expires_at: Instant,
-    progress: watch::Receiver<Progress>,
-    task: JoinHandle<()>,
+    listener: Listener,
 }
 
 impl std::fmt::Debug for Pairing {
@@ -252,13 +296,13 @@ impl Pairing {
     /// What the QR code carries: `spoolframe://pair?e=…&c=…&n=…&a=…`. It
     /// holds the one-time code: show it, never log it.
     pub fn link(&self) -> &str {
-        &self.link
+        &self.listener.link
     }
 
     /// How long the code is still good for: until then a phone can start
     /// the pairing; one started finishes after.
     pub fn expires_in(&self) -> Duration {
-        self.expires_at.saturating_duration_since(Instant::now())
+        self.listener.expires_in()
     }
 
     /// The phone that scanned the code, once the device has taken its
@@ -275,7 +319,7 @@ impl Pairing {
     /// it paired is [`Pairing::wait`]'s to say. May be called alongside
     /// [`Pairing::wait`], before or after it, and again.
     pub async fn connected(&self) -> Result<Connected, SdkError> {
-        match Progress::connected(&self.progress).await? {
+        match Progress::connected(&self.listener.progress).await? {
             PhoneConnected::Guest(connected) => Ok(connected),
             // A pairing's code takes no sign-in ALPN.
             PhoneConnected::SigningIn => Err(cancelled()),
@@ -295,41 +339,78 @@ impl Pairing {
     /// with no credential installed, nor a device key made for it. A
     /// later call gives the same pairing, sharing its decision.
     pub async fn wait(&self) -> Result<HeldPairing, SdkError> {
-        match held::held(&self.progress).await? {
+        let progress = &self.listener.progress;
+        match Progress::held(progress).await? {
             (Held::Guest(pairing), decision) => {
-                Ok(HeldPairing::new(pairing, decision, self.progress.clone()))
+                Ok(HeldPairing::new(pairing, decision, progress.clone()))
             }
             // A pairing's code takes no sign-in ALPN.
-            (Held::SignIn(_), _) => Err(cancelled()),
+            (Held::SignIn { .. }, _) => Err(cancelled()),
         }
     }
 
     /// Stop the pairing: the code stops working at once.
     pub fn cancel(&self) {
-        self.task.abort();
+        self.listener.cancel();
     }
 }
 
-/// Whether the person at the device confirmed what is held, within
-/// [`APPROVAL`], with the phone still there: no answer, a holder dropped,
-/// or the phone gone is no.
-pub(crate) async fn confirmed(conn: &Connection, answered: oneshot::Receiver<bool>) -> bool {
+/// What became of what a device holds for its person ([`confirmed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// They confirmed it, with the phone still there.
+    Confirmed,
+    /// They said no, every holder was dropped undecided, or
+    /// [`APPROVAL`] passed with no answer.
+    Rejected,
+    /// The phone hung up first: nobody at the device said anything.
+    PhoneLeft,
+}
+
+/// What the person at the device said of what is held, within
+/// [`APPROVAL`], with the phone still there. A hold that ends without
+/// their answer (the phone left, or no answer in time) says so in
+/// [`Progress::held_end`], for [`crate::HeldSignIn::ended`].
+pub(crate) async fn confirmed(
+    shared: &Shared,
+    conn: &Connection,
+    answered: oneshot::Receiver<bool>,
+) -> Answer {
+    // `None`: the phone hung up first.
     let answer = tokio::select! {
-        answer = tokio::time::timeout(APPROVAL, answered) => answer,
-        _ = conn.closed() => return false,
+        answer = tokio::time::timeout(APPROVAL, answered) => Some(answer),
+        _ = conn.closed() => None,
     };
-    matches!(answer, Ok(Ok(true))) && conn.close_reason().is_none()
+    let (answer, end) = match answer {
+        None => (Answer::PhoneLeft, Some(HoldEnd::PhoneLeft)),
+        Some(_) if conn.close_reason().is_some() => (Answer::PhoneLeft, Some(HoldEnd::PhoneLeft)),
+        Some(Ok(Ok(true))) => (Answer::Confirmed, None),
+        // A no, or every holder dropped undecided: none left to tell.
+        Some(Ok(_)) => (Answer::Rejected, None),
+        Some(Err(_)) => (Answer::Rejected, Some(HoldEnd::TimedOut)),
+    };
+    if let Some(end) = end {
+        shared.progress.send_modify(|p| p.held_end = Some(end));
+    }
+    answer
+}
+
+/// The error a code ends with when the phone hung up while the device
+/// held what it sent.
+pub(crate) fn phone_left() -> SdkError {
+    PairingError::Aborted("the phone left".into()).into()
+}
+
+/// Close our side of `send` and wait, briefly, for the peer to read it
+/// and hang up: the end of every exchange on a code's connection.
+pub(crate) async fn finish_and_wait_closed(conn: &Connection, send: &mut SendStream) {
+    let _ = send.finish();
+    let _ = tokio::time::timeout(STEP, conn.closed()).await;
 }
 
 /// What a pairing stopped before it ended says.
 pub(crate) fn cancelled() -> SdkError {
     PairingError::Aborted("cancelled".into()).into()
-}
-
-impl Drop for Pairing {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 /// The endpoint takes the code's ALPNs while this lives; dropped, it
@@ -371,6 +452,12 @@ pub(crate) struct Shared {
     pub(crate) progress: watch::Sender<Progress>,
     /// Each server a phone sign-in signs in to, as it finishes.
     pub(crate) tally: watch::Sender<crate::server_sign_ins::Tally>,
+    /// A confirmed phone sign-in's rounds are going on, past the code's
+    /// own end: they settle the tally, and keep the outcome current.
+    pub(crate) rounds_open: std::sync::atomic::AtomicBool,
+    /// The code takes phone sign-ins as well as guests: a guest refused
+    /// because guests are off leaves it for a sign-in.
+    takes_sign_ins: bool,
 }
 
 impl Shared {
@@ -431,12 +518,29 @@ impl Shared {
 
 /// A code shown and the task taking connections for it: what a
 /// [`Pairing`] and a [`crate::PhoneSignIn`] are.
+/// Dropped, it stops the task: the code stops working at once.
 pub(crate) struct Listener {
     pub(crate) link: String,
-    pub(crate) expires_at: Instant,
+    expires_at: Instant,
     pub(crate) progress: watch::Receiver<Progress>,
     pub(crate) tally: watch::Receiver<crate::server_sign_ins::Tally>,
-    pub(crate) task: JoinHandle<()>,
+    task: JoinHandle<()>,
+}
+
+impl Listener {
+    pub(crate) fn expires_in(&self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Client {
@@ -474,12 +578,7 @@ impl Client {
             return Err(PairingError::NotAllowed.into());
         }
         let listener = self.listen(name, ttl, vec![PAIR_ALPN.to_vec()], Vec::new())?;
-        Ok(Pairing {
-            link: listener.link,
-            expires_at: listener.expires_at,
-            progress: listener.progress,
-            task: listener.task,
-        })
+        Ok(Pairing { listener })
     }
 
     /// Show a code on this device for `ttl`, taking connections on
@@ -498,6 +597,9 @@ impl Client {
         if live.swap(true, Ordering::SeqCst) {
             return Err(PairingError::AlreadyPairing.into());
         }
+        let takes_sign_ins = alpns
+            .iter()
+            .any(|alpn| alpn == spoolframe_protocol::SIGNIN_ALPN);
         let endpoint = self.inner.endpoint.clone();
         endpoint.set_alpns(alpns);
         let listening = Listening {
@@ -525,6 +627,8 @@ impl Client {
             code: Mutex::new(CodeState::Waiting(code)),
             progress: watch::Sender::new(Progress::default()),
             tally: watch::Sender::new(Default::default()),
+            rounds_open: Default::default(),
+            takes_sign_ins,
         });
         let progress = shared.progress.subscribe();
         let tally = shared.tally.subscribe();
@@ -546,7 +650,18 @@ impl Client {
                 ),
                 Err(e) => tracing::info!(error = %e, "a code ended unused"),
             }
-            shared.progress.send_modify(|p| p.outcome = Some(outcome));
+            // A phone sign-in's rounds set its outcome themselves, and keep
+            // it current: never put the first round's back over it.
+            shared.progress.send_if_modified(|p| {
+                let unset = p.outcome.is_none();
+                if unset {
+                    p.outcome = Some(outcome);
+                }
+                unset
+            });
+            if !shared.rounds_open.load(Ordering::SeqCst) {
+                shared.tally.send_modify(|t| t.settled = true);
+            }
         });
         tracing::info!(expires_in = ?ttl, "showing a pairing code");
         Ok(Listener {
@@ -668,27 +783,20 @@ impl Client {
                 code: link.code,
                 identity,
                 name,
+                phone_name: sent_name(Some(self.inner.device.name.clone())),
             },
         )
         .await
         .map_err(|e| cut(e.to_string()))?;
         match step(STEP, read_frame_within(&mut recv, MAX_FRAME)).await? {
-            DeviceFrame::Key { device_key, name } => {
-                let mut name = name;
-                name.truncate(
-                    name.char_indices()
-                        .nth(pairing::MAX_NAME)
-                        .map_or(name.len(), |(at, _)| at),
-                );
-                Ok(PairingOffer {
-                    identity,
-                    device_key,
-                    device_name: name,
-                    portable,
-                    client: self.clone(),
-                    streams: tokio::sync::Mutex::new(Some(Streams { conn, send, recv })),
-                })
-            }
+            DeviceFrame::Key { device_key, name } => Ok(PairingOffer {
+                identity,
+                device_key,
+                device_name: pairing::cut_name(&name),
+                portable,
+                client: self.clone(),
+                streams: tokio::sync::Mutex::new(Some(Streams { conn, send, recv })),
+            }),
             DeviceFrame::Refused { reason } => {
                 conn.close(0u32.into(), b"refused");
                 Err(PairingError::from(reason).into())
@@ -764,15 +872,57 @@ impl PairingOffer {
         self.identity
     }
 
+    /// The servers this phone could hand the device: each it has
+    /// verified and signs in to as the identity, at most
+    /// [`spoolframe_protocol::pairing::MAX_PAIRED_SERVERS`]. Show them
+    /// ticked; [`PairingOffer::authorize_with`] hands the ones kept.
+    pub async fn servers(&self) -> Result<Vec<PairedServer>, SdkError> {
+        self.client.paired_servers(self.identity).await
+    }
+
     /// Authorize the device: the root signs a credential for its key,
     /// recorded as `label` ([`crate::Portable::issued`]; the device's
     /// name if `None`), and the device installs it with the identity's
-    /// newest state. With them go the servers this phone signs in to as
-    /// the identity, for the device to save and sign in to. Done
-    /// once the device says so. Refused, with nothing sent, if this
+    /// newest state. With them go every one of
+    /// [`PairingOffer::servers`], for the device to save and sign in to.
+    /// Done once the device says so. Refused, with nothing sent, if this
     /// device no longer holds the root ([`PairingError::NoRoot`]). Once
     /// only.
     pub async fn authorize(&self, label: Option<&str>) -> Result<(), SdkError> {
+        let servers = self.servers().await?;
+        self.authorize_handing(label, servers).await
+    }
+
+    /// [`PairingOffer::authorize`], handing only the servers of
+    /// [`PairingOffer::servers`] whose endpoint ids are in `chosen`, in
+    /// that list's order; none hands none. [`SdkError::InvalidInput`],
+    /// with nothing sent, for an id that is not one of them.
+    pub async fn authorize_with(
+        &self,
+        label: Option<&str>,
+        chosen: &[String],
+    ) -> Result<(), SdkError> {
+        let offered = self.servers().await?;
+        if let Some(stray) = chosen
+            .iter()
+            .find(|id| !offered.iter().any(|s| s.endpoint_id == **id))
+        {
+            return Err(SdkError::InvalidInput(format!(
+                "{stray} is not a server this phone can hand over"
+            )));
+        }
+        let servers = offered
+            .into_iter()
+            .filter(|s| chosen.contains(&s.endpoint_id))
+            .collect();
+        self.authorize_handing(label, servers).await
+    }
+
+    async fn authorize_handing(
+        &self,
+        label: Option<&str>,
+        servers: Vec<PairedServer>,
+    ) -> Result<(), SdkError> {
         let Some(Streams {
             conn,
             mut send,
@@ -797,7 +947,6 @@ impl PairingOffer {
             }
         };
         let state = self.portable.identity_state(self.identity).await?;
-        let servers = self.client.paired_servers(self.identity).await?;
         let cut = |e: String| SdkError::from(PairingError::Aborted(e));
         write_frame(
             &mut send,
@@ -829,9 +978,7 @@ impl PairingOffer {
             return Err(PairingError::Aborted("already answered".into()).into());
         };
         let sent = write_frame(&mut send, &PhoneFrame::Declined).await;
-        let _ = send.finish();
-        // Until the device has read it and closed, or briefly.
-        let _ = tokio::time::timeout(STEP, conn.closed()).await;
+        finish_and_wait_closed(&conn, &mut send).await;
         sent.map_err(|e| PairingError::Aborted(e.to_string()).into())
     }
 }
@@ -902,11 +1049,35 @@ async fn handle_pair(shared: &Shared, conn: Connection) -> Option<Result<Paired,
         code,
         identity,
         name,
+        phone_name,
     } = hello
     else {
         shared.refused(&source, None, "no hello");
         return None;
     };
+    // A phone sign-in's code takes guests' dials whether or not guests
+    // are allowed, so a guest with guests off is told so, typed, rather
+    // than failing the handshake. Their dial leaves the code alone: the
+    // same code still signs the TV in from a phone.
+    if shared.takes_sign_ins {
+        match shared.portable.allow_guests().await {
+            Ok(true) => {}
+            Ok(false) => {
+                shared.refused(
+                    &source,
+                    Some(identity),
+                    "guests are not allowed on this device",
+                );
+                refuse(&conn, &mut send, Refusal::NotAllowed).await;
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read whether guests are allowed");
+                refuse(&conn, &mut send, Refusal::Failed).await;
+                return None;
+            }
+        }
+    }
     if let Err((reason, decided)) = shared.take(&code) {
         let why = match reason {
             Refusal::Expired => "the code has expired",
@@ -916,7 +1087,8 @@ async fn handle_pair(shared: &Shared, conn: Connection) -> Option<Result<Paired,
         refuse(&conn, &mut send, reason).await;
         return decided.then(|| Err(PairingError::from(reason).into()));
     }
-    // The owner may have turned guests off since the code was shown.
+    // A pairing's own code: the owner may have turned guests off since it
+    // was shown, which ends it.
     match shared.portable.allow_guests().await {
         Ok(true) => {}
         Ok(false) => {
@@ -933,10 +1105,11 @@ async fn handle_pair(shared: &Shared, conn: Connection) -> Option<Result<Paired,
             return Some(Err(e));
         }
     }
-    let name = name
-        .map(|n| pairing::cut_name(&n))
-        .filter(|n| !n.is_empty());
-    let outcome = pair(shared, &conn, &mut send, &mut recv, identity, name).await;
+    let names = Names {
+        name: sent_name(name),
+        phone_name: sent_name(phone_name),
+    };
+    let outcome = pair(shared, &conn, &mut send, &mut recv, identity, names).await;
     if let Err((Some(reason), _)) = &outcome {
         if *reason == Refusal::CredentialRefused {
             shared.refused(&source, Some(identity), "the credential does not hold here");
@@ -946,11 +1119,16 @@ async fn handle_pair(shared: &Shared, conn: Connection) -> Option<Result<Paired,
     Some(outcome.map_err(|(_, e)| e))
 }
 
+/// What a guest's phone said it and the identity are called.
+struct Names {
+    name: Option<String>,
+    phone_name: Option<String>,
+}
+
 /// Tell the phone why, and wait briefly for it to hang up.
 async fn refuse(conn: &Connection, send: &mut SendStream, reason: Refusal) {
     let _ = write_frame(send, &DeviceFrame::Refused { reason }).await;
-    let _ = send.finish();
-    let _ = tokio::time::timeout(STEP, conn.closed()).await;
+    finish_and_wait_closed(conn, send).await;
 }
 
 /// The rest of a pairing whose code was right: the device's key, the
@@ -963,7 +1141,7 @@ async fn pair(
     send: &mut SendStream,
     recv: &mut RecvStream,
     identity: PortableUserId,
-    name: Option<String>,
+    Names { name, phone_name }: Names,
 ) -> Result<Paired, (Option<Refusal>, SdkError)> {
     let portable = &shared.portable;
     let failed = |e: SdkError| (Some(Refusal::Failed), e);
@@ -985,6 +1163,7 @@ async fn pair(
                 identity,
                 device_key,
                 name.clone(),
+                phone_name.clone(),
             )))
         });
         let answer = step(
@@ -1031,6 +1210,7 @@ async fn pair(
             device_key,
             fingerprint: device_key.fingerprint(),
             name: name.clone(),
+            phone_name: phone_name.clone(),
             servers: servers
                 .iter()
                 .take(spoolframe_protocol::pairing::MAX_PAIRED_SERVERS)
@@ -1041,8 +1221,11 @@ async fn pair(
         shared
             .progress
             .send_modify(|p| p.held = Some((Held::Guest(held), hold)));
-        if !confirmed(conn, answered).await {
-            return Err((Some(Refusal::NotAllowed), held::rejected_here()));
+        match confirmed(shared, conn, answered).await {
+            Answer::Confirmed => {}
+            Answer::Rejected => return Err((Some(Refusal::Rejected), held::rejected_here())),
+            // Nobody to refuse: the phone is gone.
+            Answer::PhoneLeft => return Err((None, phone_left())),
         }
         // The state first: a root it adds may have signed the
         // credential. Nothing half done: a refused credential leaves no
@@ -1057,14 +1240,13 @@ async fn pair(
         write_frame(send, &DeviceFrame::Done)
             .await
             .map_err(|e| aborted(e.to_string()))?;
-        let _ = send.finish();
-        // The phone closes once it has read it.
-        let _ = tokio::time::timeout(STEP, conn.closed()).await;
+        finish_and_wait_closed(conn, send).await;
         Ok(Paired {
             identity,
             device_key,
             fingerprint: device_key.fingerprint(),
             name,
+            phone_name,
             servers,
         })
     }

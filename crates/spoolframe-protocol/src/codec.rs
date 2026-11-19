@@ -58,6 +58,53 @@ pub fn encode_limited<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, 
     Ok(buffer.bytes)
 }
 
+/// [`encode_limited`], with every map entry whose key is one of `keys`
+/// left out, at any depth: a reply with a field the connection did not
+/// agree to (`spoolframe:rating-sources`).
+///
+/// The value is encoded as usual, within `limit`. Only when the bytes
+/// hold one of `keys` (a CBOR text key is its bytes as they are, so a
+/// scan for them misses none, and a stray match only costs the slow
+/// path) are they read into CBOR's own tree, stripped and encoded again:
+/// that covers every shape without knowing any of them, and the tree is
+/// never larger than `limit` allows. A value without them is the very
+/// bytes [`encode_limited`] gives.
+pub fn encode_limited_without<T: Serialize>(
+    value: &T,
+    keys: &[&str],
+    limit: usize,
+) -> Result<Vec<u8>, CodecError> {
+    fn strip(value: &mut ciborium::Value, keys: &[&str]) {
+        match value {
+            ciborium::Value::Map(entries) => {
+                entries.retain(|(key, _)| !key.as_text().is_some_and(|k| keys.contains(&k)));
+                for (_, value) in entries {
+                    strip(value, keys);
+                }
+            }
+            ciborium::Value::Array(values) => {
+                for value in values {
+                    strip(value, keys);
+                }
+            }
+            ciborium::Value::Tag(_, value) => strip(value, keys),
+            _ => {}
+        }
+    }
+    let encoded = encode_limited(value, limit)?;
+    let holds = |key: &str| {
+        encoded
+            .windows(key.len())
+            .any(|window| window == key.as_bytes())
+    };
+    if !keys.iter().any(|key| holds(key)) {
+        return Ok(encoded);
+    }
+    let mut tree: ciborium::Value = decode(&encoded)?;
+    strip(&mut tree, keys);
+    encode_limited(&tree, limit)
+}
+
 /// RPC reply: total encoded length, followed by length-prefixed chunks.
 /// The complete message is checked before any bytes are written.
 pub async fn write_reply<W: AsyncWrite + Unpin, T: Serialize>(
@@ -68,10 +115,8 @@ pub async fn write_reply<W: AsyncWrite + Unpin, T: Serialize>(
     write_encoded_reply(writer, &encoded).await
 }
 
-/// [`write_reply`] of a reply already encoded, with [`encode_limited`]
-/// to [`MAX_REPLY`]: for a server that encodes it in a context of its own
-/// (rating sources left out for a connection without
-/// `spoolframe:rating-sources`).
+/// [`write_reply`] of a reply already encoded to at most [`MAX_REPLY`]:
+/// one encoded with [`encode_limited_without`].
 pub async fn write_encoded_reply<W: AsyncWrite + Unpin>(
     writer: &mut W,
     encoded: &[u8],

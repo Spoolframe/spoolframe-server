@@ -541,6 +541,13 @@ fn every_reply_round_trips() {
             session: SessionId("s".into()),
             remembered: false,
             password_change_required: true,
+            already_granted: false,
+        },
+        Reply::LoggedIn {
+            session: SessionId("s".into()),
+            remembered: true,
+            password_change_required: false,
+            already_granted: true,
         },
         Reply::TrustedProfiles {
             profiles: vec![crate::TrustedProfile {
@@ -5003,4 +5010,30 @@ fn the_phone_sign_in_wire_names_are_fixed() {
         })
     );
     round_trip(reply);
+}
+
+/// `already_granted` is left out when false, so every other sign-in's
+/// reply is as before, and an older server's reads as false.
+#[test]
+fn logged_in_says_already_granted_only_when_it_is() {
+    let reply = |already_granted| Reply::LoggedIn {
+        session: SessionId("s".into()),
+        remembered: false,
+        password_change_required: false,
+        already_granted,
+    };
+    let keys = |reply: &Reply| -> Vec<String> {
+        let value = ciborium::Value::serialized(reply).unwrap();
+        let ciborium::Value::Map(fields) = value else {
+            panic!("not a map: {value:?}");
+        };
+        fields
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_owned))
+            .collect()
+    };
+    assert!(!keys(&reply(false)).contains(&"already_granted".to_owned()));
+    assert!(keys(&reply(true)).contains(&"already_granted".to_owned()));
+    let older = codec::encode(&reply(false)).unwrap();
+    assert_eq!(codec::decode::<Reply>(&older).unwrap(), reply(false));
 }

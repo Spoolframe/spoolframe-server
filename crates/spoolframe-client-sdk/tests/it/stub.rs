@@ -66,6 +66,15 @@ struct State {
     /// The regular features it has, of which `ServerInfo` names those a
     /// `Hello` named.
     features: Mutex<Features>,
+    /// `AwaitDeviceSignIn` is answered (approved) but each of this many
+    /// first answers is lost: its connection is cut before it goes out.
+    lost_answers: std::sync::atomic::AtomicUsize,
+    /// The operation the device sign-in was decided for, once it was:
+    /// only that operation is answered `LoggedIn` (replayed); any other
+    /// finds it handed over already.
+    decided_for: Mutex<Option<String>>,
+    /// Sessions made for device sign-ins.
+    device_sessions: std::sync::atomic::AtomicUsize,
 }
 
 pub struct Stub {
@@ -174,6 +183,19 @@ impl Stub {
     /// Answer again; connections killed stay dead.
     pub fn thaw(&self) {
         self.state.frozen.store(false, Ordering::SeqCst);
+    }
+
+    /// Approve the device sign-in at its first wait, making one session,
+    /// but lose the first `times` answers to it: each connection is cut
+    /// before its answer goes out, as on a link that drops. The answer is
+    /// replayed to the same operation only, as the server does.
+    pub fn approve_and_lose_answers(&self, times: usize) {
+        self.state.lost_answers.store(times, Ordering::SeqCst);
+    }
+
+    /// How many sessions device sign-ins made here.
+    pub fn device_sessions(&self) -> usize {
+        self.state.device_sessions.load(Ordering::SeqCst)
     }
 
     /// Never answer a request of type `kind` (`"libraries"`), as a server
@@ -438,6 +460,51 @@ async fn stream(
         .unwrap_or_default();
     state.requests.lock().push((index, kind.clone()));
     state.invocations.lock().push((kind.clone(), wire.clone()));
+    if kind == "await_device_sign_in" {
+        let operation = wire.operation.as_ref().map(|o| o.id.clone());
+        let decided = {
+            let mut decided = state.decided_for.lock();
+            if decided.is_none() {
+                // The first wait decides it, and makes its one session.
+                *decided = operation.clone();
+                state.device_sessions.fetch_add(1, Ordering::SeqCst);
+            }
+            decided.clone()
+        };
+        let lost = state
+            .lost_answers
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if lost {
+            conn.close(0u32.into(), b"cut");
+            return;
+        }
+        let reply = if decided == operation {
+            Response::Ok(Reply::LoggedIn {
+                session: SessionId("stub-session".into()),
+                remembered: false,
+                password_change_required: false,
+                already_granted: false,
+            })
+        } else {
+            Response::Err(Error::DeviceSignInExpired)
+        };
+        let response = spoolframe_protocol::rpc::RpcResponse {
+            server: spoolframe_protocol::rpc::ServerInstance {
+                id: id.to_string(),
+                time_ms: 1_000_000,
+            },
+            reply: reply.into(),
+        };
+        if spoolframe_protocol::codec::write_reply(&mut send, &response)
+            .await
+            .is_ok()
+        {
+            let _ = send.finish();
+        }
+        let _ = send.stopped().await;
+        return;
+    }
     let silent = dead.load(Ordering::SeqCst)
         || state.frozen.load(Ordering::SeqCst)
         || state.stalled.lock().contains(&kind);
@@ -556,6 +623,7 @@ fn answer(
             }),
             remembered: false,
             password_change_required: login.password == "one-time",
+            already_granted: false,
         },
         Request::ChangePassword(_) => Reply::Done,
         Request::LeaveServer if state.last_admin.load(Ordering::SeqCst) => {

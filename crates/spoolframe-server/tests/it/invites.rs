@@ -691,6 +691,43 @@ mod portable {
         invites.server.stop().await;
     }
 
+    /// A second redeem by an identity granted already says so, and the
+    /// invite keeps its use; the first says nothing of it.
+    #[tokio::test]
+    async fn a_second_redeem_says_already_granted_and_keeps_the_use() {
+        let invites = Invites::start("invite-portable-again").await;
+        let first = invites
+            .create(NewInvite {
+                uses: Some(2),
+                ..guest_invite()
+            })
+            .await;
+        let phone = invites.stranger().await;
+        let already = |response: Response| match response {
+            Response::Ok(Reply::LoggedIn {
+                already_granted, ..
+            }) => already_granted,
+            other => panic!("not signed in: {other:?}"),
+        };
+        assert!(!already(
+            redeem_as_guest(&invites, &phone, &first.code).await
+        ));
+        assert!(already(
+            redeem_as_guest(&invites, &phone, &first.code).await
+        ));
+        let left: Vec<u32> = invites
+            .root
+            .invite_list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|i| i.uses_left)
+            .collect();
+        assert_eq!(left, [1]);
+        assert_eq!(invites.root.grant_list().await.unwrap().len(), 1);
+        invites.server.stop().await;
+    }
+
     #[tokio::test]
     async fn a_code_redeems_only_as_its_kind_and_keeps_its_use() {
         let invites = Invites::start("invite-portable-kind").await;
@@ -1394,6 +1431,148 @@ mod sdk {
         invites.server.stop().await;
     }
 
+    /// A phone joins with a guest invite as its portable identity, in
+    /// the order the phone app calls: read the link, ask the server about
+    /// it, then redeem. The redeem returns the identity's session, within
+    /// a bound, so a wait that never ends fails here.
+    #[tokio::test]
+    async fn a_portable_invite_redeemed_returns_its_session() {
+        let home = invites("sdk-redeem-portable-returns").await;
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        let created = home
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: Some("Sam".into()),
+                uses: None,
+                expires: None,
+                role: None,
+            })
+            .await;
+        phone.read_invite(&created.link).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), phone.look_up_invite(&created.link))
+            .await
+            .expect("looking the invite up hung")
+            .unwrap();
+        let redeemed = tokio::time::timeout(
+            Duration::from_secs(30),
+            phone.redeem_invite_portable(&created.link, identity, Some("Sam")),
+        )
+        .await
+        .expect("redeeming a portable invite hung")
+        .unwrap();
+        assert!(!redeemed.already_granted);
+        let id = home.server.server.id().to_string();
+        assert_eq!(redeemed.session.server(), id);
+        // Kept: the server saved and the identity's profile on it.
+        assert!(phone.server(&id).await.unwrap().is_some_and(|s| s.pinned));
+        assert_eq!(phone.profiles(&id).await.unwrap().len(), 1);
+        phone.close().await;
+        home.server.stop().await;
+    }
+
+    /// Which server a TV starts on goes by `last_used_at`, which only a
+    /// person opening a profile moves: a guest pairing's sign-ins to three
+    /// servers leave it unset on all three, opening a profile sets it on
+    /// that server alone, and a reconnect after leaves it as it was.
+    #[tokio::test]
+    async fn only_opening_a_profile_marks_a_server_used() {
+        let homes = [
+            invites("sdk-last-used-a").await,
+            invites("sdk-last-used-b").await,
+            invites("sdk-last-used-c").await,
+        ];
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        let mut servers = Vec::new();
+        for home in &homes {
+            let created = home
+                .create(NewInvite {
+                    kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                    note: Some("Sam".into()),
+                    uses: None,
+                    expires: None,
+                    role: None,
+                })
+                .await;
+            phone
+                .redeem_invite_portable(&created.link, identity, Some("Sam"))
+                .await
+                .unwrap();
+            servers.push(home.server.server.id().to_string());
+        }
+
+        let tv = support::sdk_client(Arc::new(MemoryStorage::default()), device())
+            .await
+            .unwrap();
+        tv.portable().set_allow_guests(true).await.unwrap();
+        let pairing = tv.start_pairing("Living room TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), identity).await.unwrap();
+        let (authorized, paired) = tokio::join!(offer.authorize(None), async {
+            pairing.wait().await.unwrap().confirm().await
+        });
+        authorized.unwrap();
+        assert_eq!(paired.unwrap().servers.len(), 3);
+        let signed = tv.sign_in_paired(identity, &servers).await;
+        assert_eq!(signed.sessions.len(), 3, "{:?}", signed.failed);
+
+        let used = |tv: Client| async move {
+            let mut used = Vec::new();
+            for entry in tv.servers().await.unwrap() {
+                used.push((
+                    entry.endpoint_id,
+                    entry.last_used_at,
+                    entry.last_connected_at,
+                ));
+            }
+            used.sort();
+            used
+        };
+        // Signed in to all three, connected to all three: used by no one.
+        let before = used(tv.clone()).await;
+        assert_eq!(before.len(), 3);
+        for (id, last_used, last_connected) in &before {
+            assert_eq!(*last_used, None, "{id}");
+            assert!(last_connected.is_some(), "{id}");
+        }
+
+        let session = &signed.sessions[1];
+        let opened = tv
+            .open_profile(&servers[1], &session.user().username)
+            .await
+            .unwrap();
+        let after = used(tv.clone()).await;
+        for (id, last_used, _) in &after {
+            if *id == servers[1] {
+                assert!(last_used.is_some(), "{id}");
+            } else {
+                assert_eq!(*last_used, None, "{id}");
+            }
+        }
+        let opened_at = after
+            .iter()
+            .find(|(id, ..)| *id == servers[1])
+            .and_then(|(_, at, _)| *at);
+
+        // A reconnect: the open connection closed, the next call dials.
+        tv.set_server_relays(&servers[1], Some(false))
+            .await
+            .unwrap();
+        opened.libraries().await.unwrap();
+        let reconnected = used(tv.clone()).await;
+        let now_at = reconnected
+            .iter()
+            .find(|(id, ..)| *id == servers[1])
+            .and_then(|(_, at, _)| *at);
+        assert_eq!(now_at, opened_at);
+
+        tv.close().await;
+        phone.close().await;
+        for home in homes {
+            home.server.stop().await;
+        }
+    }
+
     /// Forgetting a guest on the TV signs it out everywhere it was signed
     /// in as that guest: off "Who's watching" on each server, nothing
     /// opens as it, also once the app starts again on the same storage.
@@ -1445,7 +1624,7 @@ mod sdk {
             assert_eq!(tv.whos_watching(server).await.unwrap().profiles.len(), 1);
         }
 
-        tv.portable().forget_guest(identity).await.unwrap();
+        tv.forget_guest(identity).await.unwrap();
         let gone = |tv: Client| {
             let servers = servers.clone();
             async move {
@@ -1482,6 +1661,46 @@ mod sdk {
     /// guests allowed, pairs with the phone by QR, saves the server the
     /// phone hands it, signs in as the identity and plays. The server
     /// gains a grant, and no user.
+    /// The SDK says when a redeem found the identity granted already,
+    /// and that redeem keeps the invite's use.
+    #[tokio::test]
+    async fn the_sdk_says_an_identity_was_granted_already() {
+        let invites = invites("sdk-portable-again").await;
+        let created = invites
+            .create(NewInvite {
+                kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                note: Some("Sam".into()),
+                uses: Some(2),
+                expires: None,
+                role: None,
+            })
+            .await;
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        let first = phone
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        assert!(!first.already_granted);
+        let again = phone
+            .redeem_invite_portable(&created.link, identity, Some("Sam"))
+            .await
+            .unwrap();
+        assert!(again.already_granted);
+        assert_eq!(again.session.user().user_id, format!("portable:{identity}"));
+        let left: Vec<u32> = invites
+            .root
+            .invite_list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|i| i.uses_left)
+            .collect();
+        assert_eq!(left, [1]);
+        phone.close().await;
+        invites.server.stop().await;
+    }
+
     #[tokio::test]
     async fn a_new_identity_joins_on_the_phone_and_watches_on_the_tv() {
         let invites = invites("sdk-portable-tv").await;
@@ -1508,7 +1727,8 @@ mod sdk {
         let on_phone = phone
             .redeem_invite_portable(&created.link, identity, Some("Sam"))
             .await
-            .unwrap();
+            .unwrap()
+            .session;
         assert_eq!(on_phone.user().user_id, format!("portable:{identity}"));
         assert_eq!(on_phone.user().display_name, "Sam");
 
@@ -1619,7 +1839,8 @@ mod sdk {
         let on_desktop = desktop
             .redeem_invite_portable(&created.link, identity, Some("Sam"))
             .await
-            .unwrap();
+            .unwrap()
+            .session;
         assert_eq!(on_desktop.user().user_id, format!("portable:{identity}"));
 
         // The TV knows the server (a link with no code), and offers.
@@ -2321,7 +2542,8 @@ mod sdk {
         let session = phone
             .redeem_invite_portable(&created.link, identity, Some("Sam"))
             .await
-            .unwrap();
+            .unwrap()
+            .session;
         assert_eq!(session.user().portable_id(), Some(identity));
         invites.server.clock.advance(Duration::from_secs(11 * 60));
         session.leave_server().await.unwrap();

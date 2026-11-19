@@ -675,11 +675,16 @@ profile the phone signs in as.
 
 The QR code is the pairing link ([Pairing](#pairing)), with the same
 one-time code. The TV takes it on two ALPNs while it shows the code, and
-neither after: `spoolframe/signin/1` always, and `spoolframe/pair/1`
-only when it allows guests. A phone signing it in uses the first; a
-guest's phone pairing its own identity uses the second, as before. The
-code goes to whichever presents it first, and an older phone still reads
-the link as a pairing link.
+neither after: `spoolframe/signin/1` and `spoolframe/pair/1`. A phone
+signing it in uses the first; a guest's phone pairing its own identity
+uses the second, as before. The code goes to whichever presents it
+first, and an older phone still reads the link as a pairing link.
+
+With guests off, a guest's `hello` on `spoolframe/pair/1` is answered
+`refused` with `not_allowed` before its code is looked at, and the
+connection ends. The TV makes no key, and the code stays unused for a
+phone signing it in. Before 0.17.5 the TV did not take
+`spoolframe/pair/1` with guests off, so the guest's handshake failed.
 
 The link has `r` only when the TV's app asked for it ("Use relay") and
 the TV has a home relay. The phone dials the TV's key at the `a`
@@ -693,11 +698,15 @@ One bidirectional stream, each frame a client-protocol frame of at most
 
 | # | From | Frame | |
 |---|---|---|---|
-| 1 | phone | `{"type": "hello", "code": bytes(32)}` | |
+| 1 | phone | `{"type": "hello", "code": bytes(32), "name": "<phone's name>"}` | |
 | 2 | TV | `{"type": "device", "name": "<name>", "platform": "tvos", "client_name": "<app>"}` | or `refused` |
-| 3 | phone | `{"type": "offers", "offers": [{"server": {…}, "request": "<id>", "user_name": "<name>"}]}` | or `{"type": "declined"}` |
+| 3 | phone | `{"type": "offers", "offers": [{"server": {…}, "request": "<id>", "user_name": "<name>", "username": "<login>"}]}` | or `{"type": "declined"}` |
 | 4 | TV | `{"type": "done", "results": [{"server": "<64 hex>", "outcome": {"type": "signed_in"}}]}` | |
 
+- `name` in `hello` is what the phone calls itself, its device name
+  ("Andrey's iPhone"), at most 32 characters, for the TV to show with the
+  offers: "Andrey's iPhone wants to sign this TV in". Optional: a phone
+  before it was added leaves it out. The phone's word, not proved.
 - `refused` is `{"type": "refused", "reason": r}`, `r` one of
   `wrong_code`, `expired` and `failed`. The code is taken at `hello` as
   a pairing's is: used up whether it matches or not.
@@ -712,10 +721,31 @@ One bidirectional stream, each frame a client-protocol frame of at most
 - Confirmed, the TV redeems each offer's `request` on its server with
   `AwaitDeviceSignIn`, all at once, and answers once all are done (at
   most a minute each). `results` follows the offers' order; an outcome is
-  `{"type": "signed_in"}` or `{"type": "failed", "reason": "…"}` (at
-  most 200 characters).
+  `{"type": "signed_in"}` or `{"type": "failed", "reason": "…", "kind":
+  k}` (`reason` at most 200 characters). `k` says what kind of failure,
+  for the phone to act on: `rate_limited` (too many sign-ins at once or
+  waiting there), `recent_sign_in_required`, `not_allowed` (a guest, or
+  a role), `feature_off`, `unreachable`, `expired` (the grant ran out
+  before the TV redeemed it) or `refused` (`reason` is the server's
+  words). A TV before `kind` leaves it out, and a kind a phone does not
+  know reads as `refused` with `reason`.
 - Turned down, the TV saves no server, redeems nothing, and answers each
   `{"type": "declined"}`. The grants run out on their servers unused.
+- Confirmed, the TV does not hang up after `done`: the phone may send
+  further `offers` rounds, each answered by its own `done`, until the
+  phone hangs up or sends `declined`, or sends nothing for 2 minutes.
+  This retries a server the phone could not offer at first (it had to
+  confirm it is them) or the TV could not redeem, with no new scan. The
+  person at the TV confirmed this phone signing it in, so a later round
+  is redeemed as it comes, not held again. A profile (server, and the
+  offer's `username`: the account's login, which tells two accounts with
+  one display name apart; a phone before it sends none, and the TV goes
+  by `user_name`) offered again replaces its earlier result and takes no new
+  place: at most 16 profiles in all rounds, and one past that is
+  `failed`. The rounds belong to the confirmed sign-in, not to the code:
+  the TV may stop showing it, or show a new code, while they go on. A TV before rounds hangs up after
+  the first `done`, and the phone's retry then fails as a lost
+  connection.
 - The TV waits 2 minutes for frame 3 and 10 seconds for any other. The
   phone waits for `done` as long as the TV's person and its sign-ins
   may take: 2 minutes, a minute, and 10 seconds.
@@ -740,9 +770,11 @@ and gets `{"type": "device_sign_in_offered", "request": "<id>",
 - signed in within 10 minutes (`recent_sign_in_required`): the app runs
   "Confirm it's you" on that session, then offers again;
 - `device` is an endpoint id, and not the phone's own (`invalid_input`);
-- the TV's and the server's pending sign-ins, which offers count
-  against, and at most 16 offers of one user's not yet redeemed, the
-  most a phone hands a TV at once (`rate_limited`).
+- at most 8 offers pending for one TV, whoever made them, 16 of one
+  user's not yet redeemed (the most a phone hands a TV at once), and the
+  server's pending sign-ins (`rate_limited`). Offers are counted apart
+  from the TV's own codes: offers left unredeemed never keep a TV from
+  beginning its own sign-in.
 
 Each offer is its own sign-in; one refused stops none of the rest. The
 offer is not retry-safe: a second is a second sign-in pending.
@@ -753,7 +785,8 @@ device sign-ins, bound to `device` and with no code. Only that endpoint's
 `device_sign_in_expired`, as for an unknown request. The first wait
 makes the session, as an approval of a code would: bound to the TV,
 resting on how the phone's session signed in, and trusted for the user
-if `remember`, the phone's choice. It answers `logged_in`. The offering
+if `remember`, the phone's choice. By design the approver decides
+trust, as for an approved code: the TV never asks. It answers `logged_in`. The offering
 session must still be live then: one signed out or revoked since leaves
 the offer `device_sign_in_expired`, with nothing made. An offer not
 redeemed within its 5 minutes ends with nothing made.
@@ -771,9 +804,13 @@ TV side:
 - `wait()` gives what the phone handed, held: `HeldPhoneSignIn::SignIn(
   HeldSignIn)` with `offers()` (each a `HeldOffer { server, user_name }`),
   or `::Guest(HeldPairing)` for a guest. Each has `confirm()` and
-  `reject()`; dropped undecided it rejects. `HeldSignIn::confirm()`
-  gives `PhoneSignedIn { sessions, failed }`, the shape of
-  `PairedSignIn`; each session is kept with `SignInMethod::Device`.
+  `reject()`; dropped undecided it rejects. Each has `ended()` too,
+  which resolves once the hold is over without the app's answer, with
+  a `HoldEnd`: `PhoneLeft`, `TimedOut` (2 minutes) or `CodeEnded`
+  (cancelled or dropped), so a confirm page can close itself; it never
+  resolves once the app answered. `HeldSignIn::confirm()`
+  gives `PairedSignIn { sessions, failed }`, as `sign_in_paired`
+  does; each session is kept with `SignInMethod::Device`.
   Rejected, the code ends with `PairingError::Rejected`.
 
 Phone side:
@@ -1129,6 +1166,9 @@ and no use taken; else the new portable session. The credential is
 checked, and counted, as there; then the code, as `redeem_invite` checks
 it (`invite_invalid` counted, `invite_expired`, `invite_exhausted`). An
 identity granted here already keeps its grant, and the invite its use.
+In both of those cases `logged_in` carries `"already_granted": true`, so
+the app can say "You already had access"; otherwise the key is left out
+(an older server never sends it, which reads as false).
 `display_name` is what the grant calls them (`invalid_input` if it is
 not acceptable as a display name).
 
@@ -1295,9 +1335,10 @@ The SDK's `Client::look_up_server(address)` (FFI
 2. Fetches it over HTTPS (TLS as the endpoint's, webpki roots), in at
    most 10 s, reading at most 64 KiB. With no answer to read it is
    `ServerLookupFailed { address, reason }`, `reason` one of
-   `NameNotFound` (the name does not resolve: "Can't find <address>"),
-   `NoAnswer` (refused, unreachable, a broken connection, or a 5xx from
-   a proxy whose server is down), `TimedOut`, and `Tls` (a certificate
+   `NameNotFound` (the resolver says the name does not exist, an
+   NXDOMAIN: "Can't find <address>"), `NoAnswer` (no DNS answer now,
+   refused, unreachable, a broken connection, or a 5xx from a proxy
+   whose server is down), `TimedOut`, and `Tls` (a certificate
    no root signs, another name's or expired, or no TLS there). The
    reason is read from the failure's causes, never their text. A 404, or
    a page that is not a JSON object with `endpoint_id`, is
@@ -3095,7 +3136,8 @@ as one file for the device to keep and play with no server: in original
 quality or in an optimized profile, with the tracks the user picks. An
 iPhone, iPad or Mac (`Hello.platform` `ios` or `macos`) gets MP4, its
 text subtitles as `mov_text`; the Linux app and the CLI (`linux`,
-`cli`) get Matroska. Any other platform (`tvos`, `web`, a platform the
+`cli`) get Matroska. Any other platform (`tvos`, `android`,
+`android_tv`, `xbox`, `web`, a platform the
 server does not know) gets `Unsupported` for every request and the
 read, saying why. Anyone who can play the item may
 download it; nothing expires, and no admin lists who downloaded what.
@@ -3711,9 +3753,11 @@ comes back over a direct Iroh connection between the two, on
 
 Only a device whose owner allows it pairs: the device-local setting
 "guest sign-ins" (`Portable::allow_guests`), off by default. Off, the
-device shows no code, and its endpoint does not accept
+device shows no pairing code, and its endpoint does not accept
 `spoolframe/pair/1`, so a pairing connection fails its handshake: the
-device made no key and contacted nothing. The same setting is meant to
+device made no key and contacted nothing. The exception is a phone
+sign-in's code (see [Signing in with a phone](#signing-in-with-a-phone)):
+while that code shows, a guest is refused `not_allowed` instead. The same setting is meant to
 gate every external principal, federated users included.
 
 The QR code carries a link:
@@ -3744,20 +3788,25 @@ bidirectional stream. Each frame is a client-protocol frame (big-endian
 
 | # | From | Frame | |
 |---|---|---|---|
-| 1 | phone | `{"type": "hello", "code": bytes(32), "identity": "<PortableUserId>", "name": "<name>"}` | |
+| 1 | phone | `{"type": "hello", "code": bytes(32), "identity": "<PortableUserId>", "name": "<name>", "phone_name": "<phone's name>"}` | |
 | 2 | device | `{"type": "key", "device_key": "<64 hex>", "name": "<name>"}` | or `refused` |
 | 3 | phone | `{"type": "credential", "credential": {…}, "state": {…} or null, "servers": [{…}]}` | or `{"type": "declined"}` |
 | 4 | device | `{"type": "done"}` | or `refused` |
 
 `refused` is `{"type": "refused", "reason": r}`, with `r` one of
 `not_allowed` (guest sign-ins were turned off after the code was shown),
-`wrong_code`, `expired`, `credential_refused` and `failed`.
+`wrong_code`, `expired`, `credential_refused`, `failed` and `rejected`
+(the person at the device turned the pairing down, or left it
+unanswered). A phone before `rejected` cannot read it and ends the
+pairing as it does for any frame it cannot read (aborted); a reason a
+phone does not know reads as `failed`.
 
 - `name` in `hello` is what the person calls the identity, at most 32
   characters, for the device to show before they answer ("Check this
   matches Steve's phone"). It is optional: a phone before it was added
   leaves it out, and the device shows the fingerprint alone. It is the
-  phone's word, not proved.
+  phone's word, not proved. `phone_name`, as optional and as unproved, is
+  what the phone calls itself, its device name ("Steve's iPhone").
 - At `hello` the device takes the code: compared in constant time, and
   used up whether it matches or not. A wrong code ends the pairing
   (`wrong_code`); so does a code presented after its 5 minutes
@@ -3808,7 +3857,7 @@ The real owner's phone then fails with `wrong_code`. The TV ends up
 acting as the intruder's portable identity: a guest on it, which is what
 turning guest sign-ins on allows. It never gets anyone else's
 credential, and nothing the device holds is sent. Turning the setting
-off, or forgetting the guest (`Portable::forget_guest`), undoes it.
+off, or forgetting the guest (`Client::forget_guest`), undoes it.
 
 ### Security key roots
 
@@ -4016,11 +4065,15 @@ connects, `connected()` gives the error `wait()` gives (`Expired`,
 `WrongCode`, `NotAllowed`, `Aborted` when cancelled). Once a phone has
 connected, `connected()` gives it however the pairing ends.
 `Portable::guests()` lists the identities held without their root;
-`Portable::forget_guest(id)` signs one out.
+`Client::forget_guest(id)` signs one out.
 
 On the phone: `Client::scan_pairing(link, identity) -> PairingOffer`,
-with `device_name()`, `fingerprint()`, `authorize(label)` and
-`decline()`. The device reaches no relay of its own, so its link has LAN
+with `device_name()`, `fingerprint()`, `servers()`, `authorize(label)`,
+`authorize_with(label, chosen)` and `decline()`. `servers()` lists what
+the phone could hand (servers it verified and signs in to as the
+identity, at most 16); `authorize` hands them all, `authorize_with`
+only those whose endpoint ids are in `chosen`. The frames are unchanged:
+the `credential` frame's `servers` simply holds fewer. The device reaches no relay of its own, so its link has LAN
 addresses only: the phone has to be on the same network.
 
 ### Test vectors

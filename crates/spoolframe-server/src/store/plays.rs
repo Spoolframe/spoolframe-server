@@ -129,57 +129,132 @@ pub struct RowBy<'a> {
     pub playlists: &'a [String],
 }
 
-/// The card of each play of a track, its kind or (with `id`) its id, as
-/// SQL: by where it was started (a playlist of `playlists`, the track
-/// itself when queued by hand, else its album), each track its own, or
-/// each its album.
-fn push_track_card(
-    query: &mut QueryBuilder<Sqlite>,
-    music: RecentMusicMode,
-    playlists: &[String],
-    id: bool,
-) {
-    match music {
-        RecentMusicMode::Tracks => {
-            query.push(if id { "media_id" } else { "'track'" });
-        }
-        RecentMusicMode::Albums => {
-            query.push(if id { "album_id" } else { "'album'" });
-        }
-        RecentMusicMode::Sources | RecentMusicMode::Unknown | RecentMusicMode::Hidden => {
-            query.push("CASE WHEN source_kind = 'queued' THEN ");
-            query.push(if id { "media_id " } else { "'track' " });
-            if !playlists.is_empty() {
-                query.push("WHEN source_kind = 'playlist' AND source_id IN ");
-                push_in_list(query, playlists);
-                query.push(if id {
-                    " THEN source_id "
-                } else {
-                    " THEN 'playlist' "
-                });
-            }
-            query.push(if id {
-                "ELSE album_id END"
-            } else {
-                "ELSE 'album' END"
-            });
-        }
+/// One way a play makes a card: plays that match `when` (and, with
+/// `seen`, whose playlist is one the user sees) make a card tagged `tag`
+/// whose id is column `id`. Both the tag and the id of a play come from
+/// one list of these, so they cannot disagree.
+struct Branch {
+    when: &'static str,
+    seen: bool,
+    tag: &'static str,
+    id: &'static str,
+}
+
+const fn branch(when: &'static str, tag: &'static str, id: &'static str) -> Branch {
+    Branch {
+        when,
+        seen: false,
+        tag,
+        id,
     }
 }
 
-/// The card of each play of an episode, as [`push_track_card`]'s: its
-/// show, its season (looked up when the play did not keep it), or itself.
-fn push_episode_card(query: &mut QueryBuilder<Sqlite>, shows: RecentShowsMode, id: bool) {
-    query.push(match (shows, id) {
-        (RecentShowsMode::Show, false) => "'show'",
-        (RecentShowsMode::Show, true) => "show_id",
-        (RecentShowsMode::Season, false) => {
-            "CASE WHEN season_id IS NULL THEN 'season_of' ELSE 'season' END"
+/// The ways plays make cards under `preferences`, first match wins: no
+/// branch for a hidden kind, which the query leaves out anyway, and none
+/// for a playlist unless the user sees some.
+fn branches(preferences: RecentlyPlayedPreferences, any_seen: bool) -> Vec<Branch> {
+    let mut branches = Vec::new();
+    if preferences.movies != RecentMoviesMode::Hidden {
+        branches.push(branch("kind = 'movie'", "movie", "media_id"));
+    }
+    match preferences.shows {
+        RecentShowsMode::Hidden => {}
+        RecentShowsMode::Show => branches.push(branch("kind = 'episode'", "show", "show_id")),
+        RecentShowsMode::Season => {
+            // A play from before plays kept the season: looked up.
+            branches.push(branch(
+                "kind = 'episode' AND season_id IS NULL",
+                "season_of",
+                "media_id",
+            ));
+            branches.push(branch("kind = 'episode'", "season", "season_id"));
         }
-        (RecentShowsMode::Season, true) => "coalesce(season_id, media_id)",
-        (_, false) => "'episode'",
-        (_, true) => "media_id",
-    });
+        RecentShowsMode::Episode | RecentShowsMode::Unknown => {
+            branches.push(branch("kind = 'episode'", "episode", "media_id"));
+        }
+    }
+    match preferences.music {
+        RecentMusicMode::Hidden => {}
+        RecentMusicMode::Tracks => branches.push(branch("kind = 'track'", "track", "media_id")),
+        RecentMusicMode::Albums => branches.push(branch("kind = 'track'", "album", "album_id")),
+        RecentMusicMode::Sources | RecentMusicMode::Unknown => {
+            branches.push(branch(
+                "kind = 'track' AND source_kind = 'queued'",
+                "track",
+                "media_id",
+            ));
+            if any_seen {
+                branches.push(Branch {
+                    seen: true,
+                    ..branch(
+                        "kind = 'track' AND source_kind = 'playlist'",
+                        "playlist",
+                        "source_id",
+                    )
+                });
+            }
+            // From an album, a playlist not seen, or nowhere.
+            branches.push(branch("kind = 'track'", "album", "album_id"));
+        }
+    }
+    branches
+}
+
+/// The SQL of `branches`' tags (`id` false) or ids, as one CASE.
+fn push_case(
+    query: &mut QueryBuilder<Sqlite>,
+    branches: &[Branch],
+    playlists: &[String],
+    id: bool,
+) {
+    query.push("CASE");
+    for b in branches {
+        query.push(" WHEN ").push(b.when);
+        if b.seen {
+            query.push(" AND source_id IN ");
+            push_in_list(query, playlists);
+        }
+        query.push(" THEN ");
+        if id {
+            query.push(b.id);
+        } else {
+            query.push(format_args!("'{}'", b.tag));
+        }
+    }
+    query.push(" END");
+}
+
+/// The row's query, after `head` (`SELECT `; `EXPLAIN QUERY PLAN SELECT `
+/// in a test): each play's card, grouped, newest first.
+fn row_query(
+    head: &str,
+    principal: Principal,
+    preferences: RecentlyPlayedPreferences,
+    playlists: &[String],
+    kinds: &[&str],
+    limit: u32,
+    federated: bool,
+) -> QueryBuilder<Sqlite> {
+    let branches = branches(preferences, !playlists.is_empty());
+    let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(head);
+    push_case(&mut query, &branches, playlists, false);
+    query.push(", ");
+    push_case(&mut query, &branches, playlists, true);
+    query
+        .push(" AS card_id FROM plays WHERE counted = 1 AND principal = ")
+        .push_bind(principal.to_string())
+        .push(" AND kind IN ");
+    push_in_list(&mut query, kinds.iter().copied());
+    if !federated {
+        query.push(concat!(" AND ", own_item!("media_id")));
+    }
+    query
+        .push(
+            " GROUP BY 1, 2 HAVING card_id IS NOT NULL \
+         ORDER BY max(ended_at) DESC, max(id) DESC LIMIT ",
+        )
+        .push_bind(limit);
+    query
 }
 
 /// An open play as far as it has got.
@@ -465,33 +540,15 @@ impl Store {
         if kinds.is_empty() {
             return Ok(Vec::new());
         }
-        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT ");
-        for id in [false, true] {
-            query.push(if id { ", " } else { "" });
-            query.push(if id {
-                "CASE kind WHEN 'movie' THEN media_id WHEN 'episode' THEN "
-            } else {
-                "CASE kind WHEN 'movie' THEN 'movie' WHEN 'episode' THEN "
-            });
-            push_episode_card(&mut query, preferences.shows, id);
-            query.push(" ELSE ");
-            push_track_card(&mut query, preferences.music, playlists, id);
-            query.push(" END");
-        }
-        query
-            .push(" AS card_id FROM plays WHERE counted = 1 AND principal = ")
-            .push_bind(principal.to_string())
-            .push(" AND kind IN ");
-        push_in_list(&mut query, kinds);
-        if !federated {
-            query.push(concat!(" AND ", own_item!("media_id")));
-        }
-        query
-            .push(
-                " GROUP BY 1, 2 HAVING card_id IS NOT NULL \
-                 ORDER BY max(ended_at) DESC, max(id) DESC LIMIT ",
-            )
-            .push_bind(limit);
+        let mut query = row_query(
+            "SELECT ",
+            principal,
+            preferences,
+            playlists,
+            &kinds,
+            limit,
+            federated,
+        );
         let rows: Vec<(String, String)> = query.build_query_as().fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
@@ -511,40 +568,51 @@ impl Store {
             .collect())
     }
 
-    /// How each kind shows in `principal`'s row; the defaults if they set
-    /// none.
-    pub async fn recently_played_preferences(
+    /// The episodes, at most `limit`, whose counted plays by `principal`
+    /// kept no season (plays from before plays kept it), latest played
+    /// first.
+    pub async fn episodes_without_season(
         &self,
         principal: Principal,
-    ) -> Result<RecentlyPlayedPreferences, StoreError> {
-        let json: Option<String> = sqlx::query_scalar(
-            "SELECT preferences FROM recently_played_preferences WHERE principal = ?1",
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT media_id FROM plays \
+             WHERE principal = ?1 AND kind = 'episode' AND counted = 1 AND season_id IS NULL \
+             GROUP BY media_id ORDER BY max(ended_at) DESC LIMIT ?2",
         )
         .bind(principal.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(json
-            .and_then(|j| super::tracks::parse_over_defaults("recently played preferences", &j))
-            .unwrap_or_default())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
-    pub async fn set_recently_played_preferences(
+    /// Keep each `(episode, season)` of `seasons` as the season of
+    /// `principal`'s plays of that episode that kept none, in one
+    /// transaction.
+    pub async fn note_play_seasons(
         &self,
         principal: Principal,
-        preferences: &RecentlyPlayedPreferences,
+        seasons: &[(String, String)],
     ) -> Result<(), StoreError> {
-        let json = serde_json::to_string(preferences).expect("preferences always serialize");
-        sqlx::query(
-            "INSERT INTO recently_played_preferences (principal, preferences, updated_at) \
-             VALUES (?1, ?2, ?3) \
-             ON CONFLICT (principal) DO UPDATE SET \
-               preferences = excluded.preferences, updated_at = excluded.updated_at",
-        )
-        .bind(principal.to_string())
-        .bind(json)
-        .bind(self.now())
-        .execute(&self.pool)
-        .await?;
+        if seasons.is_empty() {
+            return Ok(());
+        }
+        let principal = principal.to_string();
+        let mut tx = self.pool.begin().await?;
+        for (episode, season) in seasons {
+            sqlx::query(
+                "UPDATE plays SET season_id = ?3 \
+                 WHERE principal = ?1 AND media_id = ?2 AND kind = 'episode' \
+                   AND season_id IS NULL",
+            )
+            .bind(&principal)
+            .bind(episode)
+            .bind(season)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -879,6 +947,35 @@ mod tests {
             movies: RecentMoviesMode::Hidden,
         };
         assert!(row(&store, hidden).await.is_empty());
+    }
+
+    /// The row is read from its covering index alone, one user's
+    /// counted plays: never a scan of every play.
+    #[tokio::test]
+    async fn the_row_is_read_from_its_covering_index() {
+        let store = test_store("plays-row-plan").await;
+        every_kind(&store).await;
+        let playlists = ["p1".to_owned()];
+        let preferences = RecentlyPlayedPreferences::default();
+        let mut query = row_query(
+            "EXPLAIN QUERY PLAN SELECT ",
+            ALICE,
+            preferences,
+            &playlists,
+            &["movie", "episode", "track"],
+            50,
+            false,
+        );
+        let plan: Vec<(i64, i64, i64, String)> =
+            query.build_query_as().fetch_all(&store.pool).await.unwrap();
+        let plan: Vec<String> = plan.into_iter().map(|(_, _, _, step)| step).collect();
+        println!("{}", plan.join("\n"));
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("USING COVERING INDEX plays_row")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|step| step == "SCAN plays"), "{plan:?}");
     }
 
     #[tokio::test]

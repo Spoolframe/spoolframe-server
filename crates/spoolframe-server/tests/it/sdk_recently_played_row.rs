@@ -338,6 +338,76 @@ async fn by_season_each_season_is_one_card() {
             "movie:plex:movie:1"
         ]
     );
+    // The season looked up is kept with its play: not looked up again.
+    let rows = server
+        .store
+        .all_plays(principal(&server, "alice").await)
+        .await
+        .unwrap();
+    let fifteen = rows
+        .iter()
+        .find(|r| r.media_id == media(MediaKind::Episode, "15"))
+        .unwrap();
+    assert_eq!(
+        fifteen.season_id.as_deref(),
+        Some(media(MediaKind::Season, "14").as_str())
+    );
+}
+
+/// Older plays that kept no season are grouped by season before the
+/// row is read: two of one season's episodes are one card, and the
+/// row's limit counts it once, leaving room for the rest.
+#[tokio::test]
+async fn by_season_older_plays_fill_one_slot_not_one_each() {
+    let (server, session, _client, _dir) = signed_in("row-season-backfill").await;
+    played(&server, Of::Track("32", Some(PlaySource::Queued))).await;
+    played(&server, Of::Movie).await;
+    played(&server, Of::Episode("12", None)).await;
+    played(&server, Of::Episode("13", None)).await;
+    set(
+        &session,
+        RecentlyPlayedPreferences {
+            shows: RecentShowsMode::Season,
+            ..Default::default()
+        },
+    )
+    .await;
+    let row: Vec<String> = row_api(&session)
+        .recently_played_row(3)
+        .await
+        .unwrap()
+        .iter()
+        .map(|card| match card {
+            RecentCard::Movie { movie } => format!("movie:{}", movie.id),
+            RecentCard::Season { season } => format!("season:{}", season.id),
+            RecentCard::Track { track } => format!("track:{}", track.id),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        row,
+        [
+            "season:plex:season:11",
+            "movie:plex:movie:1",
+            "track:plex:track:32"
+        ]
+    );
+    // Kept, in one go, before the row was read.
+    let rows = server
+        .store
+        .all_plays(principal(&server, "alice").await)
+        .await
+        .unwrap();
+    for key in ["12", "13"] {
+        let play = rows
+            .iter()
+            .find(|r| r.media_id == media(MediaKind::Episode, key))
+            .unwrap();
+        assert_eq!(
+            play.season_id.as_deref(),
+            Some(media(MediaKind::Season, "11").as_str())
+        );
+    }
 }
 
 /// The same plays by show: one card, at its latest episode.
@@ -471,17 +541,20 @@ async fn a_playback_s_source_is_kept_with_its_play() {
         playback.close().await.unwrap();
     }
     let rows = plays_of(&server, principal(&server, "alice").await, 4).await;
-    let kept: Vec<_> = rows
+    // Each play is opened in the background as its playback starts:
+    // their rows may come in another order.
+    let mut kept: Vec<_> = rows
         .iter()
         .map(|r| (r.source_kind.as_deref(), r.source_id.as_deref()))
         .collect();
+    kept.sort_unstable();
     assert_eq!(
         kept,
         [
+            (None, None),
             (Some("album"), Some("plex:album:31")),
             (Some("playlist"), Some("p1")),
             (Some("queued"), None),
-            (None, None),
         ]
     );
 }

@@ -1768,15 +1768,6 @@ async fn recently_played_preferences() -> Result<RecentlyPlayedPreferences, ApiE
         .map_err(rpc::error)
 }
 
-/// The value at index `value` of `choices`, if it is one.
-fn chosen<T: Copy>(choices: &[(T, &str)], value: &str) -> Option<T> {
-    value
-        .parse()
-        .ok()
-        .and_then(|i: usize| choices.get(i))
-        .map(|(v, _)| *v)
-}
-
 /// Home's "Recently played" row: how music, shows and films each show in
 /// it in every app of the user's, saved as each is chosen. Plays are
 /// recorded and counted whatever it says.
@@ -1814,65 +1805,81 @@ fn RecentlyPlayedRows() -> Element {
                     p { class: "m-0 text-xs text-ctp-subtext0",
                         "What the row shows. Every play still counts, hidden or not."
                     }
-                    div { class: "row",
-                        span { class: "row-what", b { "Music" } }
-                        span { class: "row-do",
-                            select {
-                                class: "pref-select",
-                                aria_label: "Music in Recently played",
-                                disabled: busy(),
-                                onchange: move |e: FormEvent| {
-                                    if let Some(music) = chosen(RECENT_MUSIC, &e.value()) {
-                                        save.call(RecentlyPlayedPreferences { music, ..p });
-                                    }
-                                },
-                                for (i, (_, label)) in RECENT_MUSIC.iter().enumerate() {
-                                    option { value: "{i}", selected: i == music, "{label}" }
-                                }
+                    ChoiceRow {
+                        what: "Music",
+                        labels: labels(RECENT_MUSIC),
+                        selected: music,
+                        busy: busy(),
+                        on_pick: move |i: usize| {
+                            if let Some((music, _)) = RECENT_MUSIC.get(i) {
+                                save.call(RecentlyPlayedPreferences { music: *music, ..p });
                             }
-                        }
+                        },
                     }
-                    div { class: "row",
-                        span { class: "row-what", b { "Shows" } }
-                        span { class: "row-do",
-                            select {
-                                class: "pref-select",
-                                aria_label: "Shows in Recently played",
-                                disabled: busy(),
-                                onchange: move |e: FormEvent| {
-                                    if let Some(shows) = chosen(RECENT_SHOWS, &e.value()) {
-                                        save.call(RecentlyPlayedPreferences { shows, ..p });
-                                    }
-                                },
-                                for (i, (_, label)) in RECENT_SHOWS.iter().enumerate() {
-                                    option { value: "{i}", selected: i == shows, "{label}" }
-                                }
+                    ChoiceRow {
+                        what: "Shows",
+                        labels: labels(RECENT_SHOWS),
+                        selected: shows,
+                        busy: busy(),
+                        on_pick: move |i: usize| {
+                            if let Some((shows, _)) = RECENT_SHOWS.get(i) {
+                                save.call(RecentlyPlayedPreferences { shows: *shows, ..p });
                             }
-                        }
+                        },
                     }
-                    div { class: "row",
-                        span { class: "row-what", b { "Movies" } }
-                        span { class: "row-do",
-                            select {
-                                class: "pref-select",
-                                aria_label: "Movies in Recently played",
-                                disabled: busy(),
-                                onchange: move |e: FormEvent| {
-                                    if let Some(movies) = chosen(RECENT_MOVIES, &e.value()) {
-                                        save.call(RecentlyPlayedPreferences { movies, ..p });
-                                    }
-                                },
-                                for (i, (_, label)) in RECENT_MOVIES.iter().enumerate() {
-                                    option { value: "{i}", selected: i == movies, "{label}" }
-                                }
+                    ChoiceRow {
+                        what: "Movies",
+                        labels: labels(RECENT_MOVIES),
+                        selected: movies,
+                        busy: busy(),
+                        on_pick: move |i: usize| {
+                            if let Some((movies, _)) = RECENT_MOVIES.get(i) {
+                                save.call(RecentlyPlayedPreferences { movies: *movies, ..p });
                             }
-                        }
+                        },
                     }
                 }
             }
         }
         if let Some(text) = failed() {
             Alert { text }
+        }
+    }
+}
+
+/// The labels of `choices`, in order.
+fn labels<T>(choices: &[(T, &'static str)]) -> Vec<&'static str> {
+    choices.iter().map(|(_, label)| *label).collect()
+}
+
+/// One kind's choice for the "Recently played" row: `what` and a select
+/// of `labels`; `on_pick` gets the index picked.
+#[component]
+fn ChoiceRow(
+    what: &'static str,
+    labels: Vec<&'static str>,
+    selected: usize,
+    busy: bool,
+    on_pick: EventHandler<usize>,
+) -> Element {
+    rsx! {
+        div { class: "row",
+            span { class: "row-what", b { "{what}" } }
+            span { class: "row-do",
+                select {
+                    class: "pref-select",
+                    aria_label: "{what} in Recently played",
+                    disabled: busy,
+                    onchange: move |e: FormEvent| {
+                        if let Ok(i) = e.value().parse::<usize>() {
+                            on_pick.call(i);
+                        }
+                    },
+                    for (i, label) in labels.iter().enumerate() {
+                        option { value: "{i}", selected: i == selected, "{label}" }
+                    }
+                }
+            }
         }
     }
 }

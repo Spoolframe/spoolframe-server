@@ -63,7 +63,7 @@ pub use preferences::{
     RecentShowsMode, RecentlyPlayedPreferences, SdhPreference, SubtitleMode, SubtitlePreferences,
     TrackPreferences,
 };
-pub use rating::{RatingProvider, RatingScale, RatingSource, RatingState, without_rating_sources};
+pub use rating::{RATING_SOURCE_FIELDS, RatingProvider, RatingScale, RatingSource, RatingState};
 pub use role::Role;
 pub use search::{Person, PersonRole, SearchKind, SearchScope};
 

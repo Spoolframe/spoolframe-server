@@ -267,6 +267,9 @@ pub(crate) struct Inner {
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Serializes read-modify-write of the saved servers and sessions.
     pub(crate) saving: tokio::sync::Mutex<()>,
+    /// What was last noted of each profile's user ([`Client::note_user`]),
+    /// by server and username: noting the same again touches no storage.
+    pub(crate) noted_users: parking_lot::Mutex<HashMap<(EndpointId, String), (bool, String)>>,
     revisions: Mutex<HashMap<PlaybackKey, RevisionState>>,
     progress_sequences: Mutex<HashMap<PlaybackKey, RevisionState>>,
     activating: tokio::sync::Mutex<()>,
@@ -471,6 +474,7 @@ impl Client {
                 links: Mutex::default(),
                 saves: Mutex::default(),
                 saving: tokio::sync::Mutex::default(),
+                noted_users: Default::default(),
                 revisions: Mutex::default(),
                 progress_sequences: Mutex::default(),
                 activating: tokio::sync::Mutex::default(),
@@ -511,7 +515,6 @@ impl Client {
             .load(client.inner.storage.clone())
             .await?;
         client.inner.downloads.start(Arc::downgrade(&client.inner));
-        client.inner.portable.of(client.downgrade());
         Ok(client)
     }
 
@@ -585,6 +588,7 @@ impl Client {
             pinned_at: s.pinned_at.map(servers::time),
             verified_at: s.verified_at.map(servers::time),
             last_connected_at: s.last_connected_at.map(servers::time),
+            last_used_at: s.last_used_at_ms.map(servers::time_ms),
             server_id: s.server_id,
             endpoint_id: s.endpoint_id,
             name: s.name,
@@ -990,6 +994,7 @@ impl Client {
             pinned_at: saved.and_then(|s| s.pinned_at.map(servers::time)),
             verified_at: saved.and_then(|s| s.verified_at.map(servers::time)),
             last_connected_at: saved.and_then(|s| s.last_connected_at.map(servers::time)),
+            last_used_at: saved.and_then(|s| s.last_used_at_ms.map(servers::time_ms)),
             server_id: Some(conn.info.server_id.clone()),
             advertised_addrs: saved
                 .map(|s| s.advertised_addrs.clone())
@@ -1494,26 +1499,32 @@ impl Client {
     /// once it is over (begin another). Drop the future to stop waiting.
     ///
     /// A connection that dies while waiting is replaced, and each round
-    /// is asked once more on the new one with the same operation id. A
-    /// round the server already answered is not run again: it replays the
-    /// `LoggedIn` it sent, so an approval sent on the dead connection
-    /// still brings its session. A server restarted meanwhile refuses the
-    /// operation instead. [`SdkError::TimedOut`] or
-    /// [`SdkError::Unreachable`] when the new connection fails too: call
-    /// this again with the same `sign_in`, which lives on the server until
-    /// it expires.
+    /// is asked again on the new one with the same operation id, for up
+    /// to [`ROUND_RETRY`] in all. A round the server already answered is
+    /// not run again: it replays the `LoggedIn` it sent, so an approval
+    /// sent on a dead connection still brings its session. A server
+    /// restarted meanwhile refuses the operation instead.
+    /// [`SdkError::TimedOut`] or [`SdkError::Unreachable`] when no
+    /// connection answers in that time: call this again with the same
+    /// `sign_in`, which lives on the server until it expires.
     pub async fn await_device_sign_in(&self, sign_in: &DeviceSignIn) -> Result<Session, SdkError> {
         let server = parse_id(&sign_in.server)?;
-        self.await_device_request(server, &sign_in.request).await
+        let until = tokio::time::Instant::now() + ROUND_RETRY;
+        self.await_device_request_until(server, &sign_in.request, Some(until))
+            .await
     }
 
     /// [`Client::await_device_sign_in`] of device sign-in `request` on
     /// `server`, whether this device began it or a phone offered it
-    /// ([`crate::phone_sign_in`]).
-    pub(crate) async fn await_device_request(
+    /// ([`crate::phone_sign_in`]): each round asked again as the same
+    /// operation on every new connection until `retry_until`
+    /// ([`Client::call_until`]), so a round the server answered on a
+    /// connection that was cut is replayed and its session collected.
+    pub(crate) async fn await_device_request_until(
         &self,
         server: EndpointId,
         request: &str,
+        retry_until: Option<tokio::time::Instant>,
     ) -> Result<Session, SdkError> {
         loop {
             // Each round goes on the connection there is then: it may
@@ -1521,7 +1532,7 @@ impl Client {
             let request = Request::AwaitDeviceSignIn {
                 request: request.to_owned(),
             };
-            match self.call(server, None, request).await? {
+            match self.call_until(server, None, request, retry_until).await? {
                 Response::Ok(Reply::LoggedIn {
                     session,
                     remembered,
@@ -1700,6 +1711,7 @@ impl Client {
     ) -> Result<Option<Vec<Session>>, SdkError> {
         let link = self.link(server);
         let mut profiles = Vec::new();
+        let mut noted = Vec::new();
         let mut asked = false;
         for s in stored.iter_mut() {
             let Some(token) = s.token.clone() else {
@@ -1727,8 +1739,8 @@ impl Client {
                     user,
                     can_leave,
                 })) => {
-                    if s.note_role(&user) {
-                        self.note_role(server, &user).await?;
+                    if s.note_user(&user) {
+                        noted.push(user.clone());
                     }
                     let session = Session {
                         client: self.clone(),
@@ -1756,32 +1768,71 @@ impl Client {
                 Response::Err(e) => return Err(SdkError::from_server(e)),
             }
         }
+        // Every change the server told of, kept in one write. A note
+        // that cannot be written fails nothing: the answer stands, and
+        // the next one notes it again.
+        if !noted.is_empty() {
+            let kept = self
+                .update_sessions(server, |stored| {
+                    for user in &noted {
+                        note_in(stored, user);
+                    }
+                })
+                .await;
+            match kept {
+                Ok(()) => {
+                    for user in &noted {
+                        self.remember_noted(server, user);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%server, error = %e, "what the server said of its profiles was not kept");
+                }
+            }
+        }
         Ok(asked.then_some(profiles))
     }
 
-    /// Keep what the server just said of `user`'s role (and name) on
-    /// their profile for `server`, if one is saved: what
-    /// [`crate::SavedProfile::admin`] says next, also offline.
-    pub(crate) async fn note_role(
+    /// Keep what the server just said of `user`'s role and display name
+    /// on their profile for `server`, if one is saved: what
+    /// [`crate::SavedProfile::admin`] says next, also offline. The same
+    /// as last noted, nothing is read or written. A note that cannot be
+    /// written is logged and fails nothing: it is a cache of the server's
+    /// answer, which stands.
+    pub(crate) async fn note_user(
         &self,
         server: EndpointId,
         user: &spoolframe_protocol::UserSummary,
-    ) -> Result<(), SdkError> {
-        let storage = self.inner.storage.as_ref();
-        let _saving = self.inner.saving.lock().await;
-        let mut stored = session::load(storage, &server).await?;
-        let changed = stored
-            .iter_mut()
-            .find(|s| s.username == user.username)
-            .is_some_and(|s| s.note_role(user));
-        if changed {
-            session::save(storage, &server, &stored).await?;
+    ) {
+        let key = (server, user.username.clone());
+        if self.inner.noted_users.lock().get(&key) == Some(&noted_of(user)) {
+            return;
         }
-        Ok(())
+        let kept = self
+            .update_sessions(server, |stored| {
+                note_in(stored, user);
+            })
+            .await;
+        match kept {
+            Ok(()) => self.remember_noted(server, user),
+            Err(e) => {
+                tracing::warn!(%server, user = user.username, error = %e, "what the server said of a profile was not kept");
+            }
+        }
+    }
+
+    fn remember_noted(&self, server: EndpointId, user: &spoolframe_protocol::UserSummary) {
+        self.inner
+            .noted_users
+            .lock()
+            .insert((server, user.username.clone()), noted_of(user));
     }
 
     /// Select the foreground profile. Listing profiles or making background
     /// requests never switches profiles or revokes another profile's PIN unlock.
+    ///
+    /// The person opened it: its server's [`ServerEntry::last_used_at`]
+    /// is now. This is the only call that moves it.
     pub async fn activate_profile(
         &self,
         profile: &Session,
@@ -1800,11 +1851,31 @@ impl Client {
             )
             .await?
         {
-            Response::Ok(Reply::Done) => Ok(crate::ActiveProfile(profile.clone())),
+            Response::Ok(Reply::Done) => {
+                self.note_used(profile.server).await;
+                Ok(crate::ActiveProfile(profile.clone()))
+            }
             Response::Err(error) => Err(SdkError::from_server(error)),
             Response::Ok(other) => Err(SdkError::Protocol(format!(
                 "ActivateProfile answered {other:?}"
             ))),
+        }
+    }
+
+    /// A person opened a profile on saved server `server` just now: its
+    /// `last_used_at_ms`. One that cannot be written is logged and fails
+    /// nothing: the profile is open all the same.
+    async fn note_used(&self, server: EndpointId) {
+        let now = servers::now_ms();
+        let noted = self
+            .sighted(server, |saved, _| {
+                saved.last_used_at_ms = Some(now);
+                // Not where it is: no new addresses to dial.
+                false
+            })
+            .await;
+        if let Err(e) = noted {
+            tracing::warn!(%server, error = %e, "when the server was last used was not kept");
         }
     }
 
@@ -1833,6 +1904,22 @@ impl Client {
         Ok(())
     }
 
+    /// Sign guest `id` out of this device: its credential, its device key
+    /// and the state it brought go, and so does every session signed in
+    /// as it, on every server, with its profile: off "Who's watching",
+    /// and no longer the profile opened last. Each such session is ended
+    /// on its server too, as far as it can be reached; it is dropped here
+    /// whether or not. The servers stay saved. Other guests are
+    /// untouched. Refused for an identity whose root is here
+    /// ([`crate::Portable::forget`] is for that). Forgetting one not here
+    /// does nothing.
+    pub async fn forget_guest(&self, id: PortableUserId) -> Result<(), SdkError> {
+        self.portable().forget_guest_here(id).await?;
+        self.sign_out_identity(id).await?;
+        tracing::info!(%id, "forgot a guest");
+        Ok(())
+    }
+
     /// Every session kept as portable identity `id`, on every saved
     /// server, ended there as far as the server answers in a few seconds,
     /// and dropped here, profile and all, whether or not; the profile
@@ -1840,37 +1927,55 @@ impl Client {
     pub(crate) async fn sign_out_identity(&self, id: PortableUserId) -> Result<(), SdkError> {
         const SIGN_OUT: Duration = Duration::from_secs(5);
         let storage = self.inner.storage.as_ref();
-        let mut theirs = Vec::new();
-        for saved in servers::load(storage).await? {
-            let Ok(server) = parse_id(&saved.endpoint_id) else {
-                continue;
-            };
-            for s in session::load(storage, &server).await? {
-                if s.portable == Some(id) {
-                    theirs.push((server, s));
-                }
+        let servers: Vec<EndpointId> = servers::load(storage)
+            .await?
+            .iter()
+            .filter_map(|saved| parse_id(&saved.endpoint_id).ok())
+            .collect();
+        // Each server's sessions read at once; theirs kept, by server.
+        let loaded = futures_util::future::join_all(
+            servers.iter().map(|server| session::load(storage, server)),
+        )
+        .await;
+        let mut theirs: Vec<(EndpointId, Vec<StoredSession>)> = Vec::new();
+        for (server, sessions) in servers.into_iter().zip(loaded) {
+            let sessions: Vec<_> = sessions?
+                .into_iter()
+                .filter(|s| s.portable == Some(id))
+                .collect();
+            if !sessions.is_empty() {
+                theirs.push((server, sessions));
             }
         }
         // Ended on every server at once, each given a few seconds.
-        futures_util::future::join_all(theirs.iter().filter_map(|(server, s)| {
-            let token = SessionId(s.token.clone()?);
-            Some(async move {
-                let ended =
-                    tokio::time::timeout(SIGN_OUT, self.call(*server, Some(&token), Request::Logout))
-                        .await;
-                if !matches!(ended, Ok(Ok(_))) {
-                    tracing::info!(%server, user = s.username, "a forgotten guest's session was not ended there; dropped here");
-                }
+        let ending = theirs.iter().flat_map(|(server, sessions)| {
+            sessions.iter().filter_map(move |s| {
+                let token = SessionId(s.token.clone()?);
+                Some(async move {
+                    let ended = tokio::time::timeout(
+                        SIGN_OUT,
+                        self.call(*server, Some(&token), Request::Logout),
+                    )
+                    .await;
+                    if !matches!(ended, Ok(Ok(_))) {
+                        tracing::info!(%server, user = s.username, "a forgotten guest's session was not ended there; dropped here");
+                    }
+                })
             })
-        }))
-        .await;
-        for (server, s) in &theirs {
+        });
+        futures_util::future::join_all(ending).await;
+        for (server, sessions) in &theirs {
             let endpoint_id = server.to_string();
-            self.forget_last(&endpoint_id, &s.username).await?;
-            self.inner
-                .downloads
-                .forget_playlists(&endpoint_id, Some(&s.username))
-                .await;
+            let mut usernames: Vec<&str> = sessions.iter().map(|s| s.username.as_str()).collect();
+            usernames.sort_unstable();
+            usernames.dedup();
+            for username in usernames {
+                self.forget_last(&endpoint_id, username).await?;
+                self.inner
+                    .downloads
+                    .forget_playlists(&endpoint_id, Some(username))
+                    .await;
+            }
             self.update_sessions(*server, |stored| stored.retain(|s| s.portable != Some(id)))
                 .await?;
         }
@@ -1989,6 +2094,21 @@ impl Client {
         session: Option<&SessionId>,
         request: Request,
     ) -> Result<Response, SdkError> {
+        self.call_until(server, session, request, None).await
+    }
+
+    /// [`Client::call`], asked again on a new connection, with the same
+    /// operation id, each time a connection fails under it, until
+    /// `retry_until` (rather than once): the server runs it once, and
+    /// replays its answer to every ask after. Past `retry_until`, the
+    /// transport error.
+    pub(crate) async fn call_until(
+        &self,
+        server: EndpointId,
+        session: Option<&SessionId>,
+        request: Request,
+        retry_until: Option<tokio::time::Instant>,
+    ) -> Result<Response, SdkError> {
         let limit = self.inner.timeouts.of(&request);
         let handle = match &request {
             Request::ChangeSubtitle { handle, .. }
@@ -2032,23 +2152,34 @@ impl Client {
         };
         // The exact invocation, including its server incarnation and expiry,
         // is reused on a reconnect. A restarted server refuses it.
-        let reply = self
-            .on_connection(server, session, true, |conn| {
-                let wire = &wire;
-                async move {
-                    // A feature's calls are reached only through `On` or
-                    // `Invited`; this stops one on a connection where it
-                    // went off since, a reconnect's included, or by a
-                    // path that skipped them.
-                    if let Some(feature) = feature
-                        && !conn.info.features.contains(feature)
-                    {
-                        return Err(SdkError::FeatureOff { feature });
+        let reply = loop {
+            let reply = self
+                .on_connection(server, session, true, |conn| {
+                    let wire = &wire;
+                    async move {
+                        // A feature's calls are reached only through `On` or
+                        // `Invited`; this stops one on a connection where it
+                        // went off since, a reconnect's included, or by a
+                        // path that skipped them.
+                        if let Some(feature) = feature
+                            && !conn.info.features.contains(feature)
+                        {
+                            return Err(SdkError::FeatureOff { feature });
+                        }
+                        conn.call(wire, limit).await
                     }
-                    conn.call(wire, limit).await
+                })
+                .await;
+            match (reply, retry_until) {
+                (Err(e), Some(until))
+                    if e.is_transport() && tokio::time::Instant::now() + ASK_AGAIN < until =>
+                {
+                    tracing::debug!(%server, error = %e, "asking again, as the same operation");
+                    tokio::time::sleep(ASK_AGAIN).await;
                 }
-            })
-            .await?;
+                (reply, _) => break reply?,
+            }
+        };
         if let (Some(revision), Some(session)) = (&reply.playback, session) {
             if let Some(guard) = &mut guard {
                 **guard = Some(revision.revision);
@@ -2886,6 +3017,29 @@ pub(crate) fn listed(groups: impl IntoIterator<Item = Vec<SocketAddr>>) -> Vec<S
     addrs
 }
 
+/// What [`Client::note_user`] keeps of `user`: whether admin, and the
+/// display name.
+fn noted_of(user: &spoolframe_protocol::UserSummary) -> (bool, String) {
+    (
+        user.role == spoolframe_types::Role::Admin,
+        user.display_name.clone(),
+    )
+}
+
+/// Note `user` on their profile among `stored`, if one is there.
+fn note_in(stored: &mut [StoredSession], user: &spoolframe_protocol::UserSummary) {
+    if let Some(s) = stored.iter_mut().find(|s| s.username == user.username) {
+        s.note_user(user);
+    }
+}
+
+/// How long [`Client::call_until`] waits before it asks again.
+const ASK_AGAIN: Duration = Duration::from_millis(500);
+
+/// How long [`Client::await_device_sign_in`] asks a round again on new
+/// connections, as the same operation, before it gives up.
+pub const ROUND_RETRY: Duration = Duration::from_secs(60);
+
 pub(crate) fn parse_id(endpoint_id: &str) -> Result<EndpointId, SdkError> {
     EndpointId::from_str(endpoint_id)
         .map_err(|e| SdkError::UnknownServer(format!("{endpoint_id:?} is not a server key: {e}")))
@@ -2999,6 +3153,7 @@ fn heard_entry(id: EndpointId, h: Heard) -> ServerEntry {
         pinned_at: None,
         verified_at: None,
         last_connected_at: None,
+        last_used_at: None,
         server_id: None,
         use_relays: None,
         relays_edited: false,

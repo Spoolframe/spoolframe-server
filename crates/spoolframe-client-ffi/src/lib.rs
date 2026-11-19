@@ -70,7 +70,7 @@ pub use pairing::{
     Connected, Paired, PairedServer, SpoolHeldPairing, SpoolPairing, SpoolPairingOffer,
 };
 pub use phone_sign_in::{
-    HeldOffer, HeldPhoneSignIn, PhoneConnected, PhoneSignedIn, SignInOfferOutcome,
+    HeldOffer, HeldPhoneSignIn, HoldEnd, PhoneConnected, SignInFailure, SignInOfferOutcome,
     SignInOfferResult, SpoolHeldSignIn, SpoolPhoneSignIn, SpoolSignInChoice, SpoolSignInOffer,
 };
 pub use playback::{PlaybackStart, PlaybackSubtitle, SpoolPlayback, SubtitleEntry};

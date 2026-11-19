@@ -223,8 +223,18 @@ fn add_relays(server: &mut SavedServer, relays: &[String]) {
 
 /// The session a sign-in answered with.
 pub(crate) fn logged_in(response: Response) -> Result<SessionId, SdkError> {
+    Ok(logged_in_saying(response)?.0)
+}
+
+/// [`logged_in`], and whether the identity had access already
+/// (`RedeemPortableInvite`'s `already_granted`).
+pub(crate) fn logged_in_saying(response: Response) -> Result<(SessionId, bool), SdkError> {
     match response {
-        Response::Ok(Reply::LoggedIn { session, .. }) => Ok(session),
+        Response::Ok(Reply::LoggedIn {
+            session,
+            already_granted,
+            ..
+        }) => Ok((session, already_granted)),
         Response::Ok(other) => Err(SdkError::Protocol(format!(
             "a portable sign-in answered {other:?}"
         ))),

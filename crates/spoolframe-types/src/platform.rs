@@ -19,8 +19,12 @@ pub enum Platform {
     /// A command-line or scripted client of the SDK (its examples, tools),
     /// or, for an admin API session, the server's own CLI.
     Cli,
-    /// The Android app, on phones, tablets and Android TV.
+    /// The Android app on phones and tablets; on a TV, from an app
+    /// before it said [`Platform::AndroidTv`], too.
     Android,
+    /// The Android app on Android TV and Google TV (wire `android_tv`).
+    /// A peer before it reads it as [`Platform::Unknown`].
+    AndroidTv,
     /// The Xbox app.
     Xbox,
     /// A client in a browser: a web player's `Hello`, or an admin API
@@ -41,6 +45,7 @@ impl Platform {
             Platform::Macos => "macos",
             Platform::Cli => "cli",
             Platform::Android => "android",
+            Platform::AndroidTv => "android_tv",
             Platform::Xbox => "xbox",
             Platform::Web => "web",
             Platform::Unknown => "unknown",
@@ -57,6 +62,7 @@ impl Platform {
             "macos" => Platform::Macos,
             "cli" => Platform::Cli,
             "android" => Platform::Android,
+            "android_tv" => Platform::AndroidTv,
             "xbox" => Platform::Xbox,
             "web" => Platform::Web,
             _ => Platform::Unknown,
@@ -72,10 +78,17 @@ impl Platform {
             Platform::Macos => "Mac app",
             Platform::Cli => "Command-line client",
             Platform::Android => "Android app",
+            Platform::AndroidTv => "Android TV app",
             Platform::Xbox => "Xbox app",
             Platform::Web => "Web",
             Platform::Unknown => "App",
         }
+    }
+
+    /// A TV box (Apple TV, Android TV): on the couch, at home, with a
+    /// remote, and so playing Original by default.
+    pub fn is_tv(self) -> bool {
+        matches!(self, Platform::Tvos | Platform::AndroidTv)
     }
 }
 
@@ -83,17 +96,28 @@ impl Platform {
 mod tests {
     use super::*;
 
-    const ALL: [Platform; 9] = [
+    const ALL: [Platform; 10] = [
         Platform::Linux,
         Platform::Tvos,
         Platform::Ios,
         Platform::Macos,
         Platform::Cli,
         Platform::Android,
+        Platform::AndroidTv,
         Platform::Xbox,
         Platform::Web,
         Platform::Unknown,
     ];
+
+    #[test]
+    fn android_tv_reads_as_android_tv_and_is_a_tv() {
+        let wire = serde_json::to_value(Platform::AndroidTv).unwrap();
+        assert_eq!(wire, "android_tv");
+        assert_eq!(Platform::AndroidTv.label(), "Android TV app");
+        assert!(Platform::AndroidTv.is_tv());
+        assert!(Platform::Tvos.is_tv());
+        assert!(!Platform::Android.is_tv());
+    }
 
     #[test]
     fn the_stored_name_is_the_wire_name_and_reads_back() {

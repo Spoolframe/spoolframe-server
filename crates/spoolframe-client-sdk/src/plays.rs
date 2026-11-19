@@ -42,7 +42,7 @@ impl Session {
                 total,
                 unavailable,
             }),
-            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+            other => Err(crate::session::unexpected(other)),
         }
     }
 
@@ -80,7 +80,7 @@ impl On<RecentlyPlayedRow> {
                 cards.retain(|card| !matches!(card, RecentCard::Unknown));
                 Ok(cards)
             }
-            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+            other => Err(crate::session::unexpected(other)),
         }
     }
 
@@ -93,7 +93,7 @@ impl On<RecentlyPlayedRow> {
             .await?
         {
             Reply::RecentlyPlayedPreferences { preferences } => Ok(preferences),
-            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+            other => Err(crate::session::unexpected(other)),
         }
     }
 
@@ -109,7 +109,7 @@ impl On<RecentlyPlayedRow> {
             .await?
         {
             Reply::Done => Ok(()),
-            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+            other => Err(crate::session::unexpected(other)),
         }
     }
 }

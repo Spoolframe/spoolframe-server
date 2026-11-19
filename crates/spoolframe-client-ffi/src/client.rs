@@ -105,6 +105,15 @@ pub struct SavedProfileName {
 }
 
 /// This device. One per app.
+/// What `redeem_invite_portable` did.
+#[derive(uniffi::Record)]
+pub struct PortableInviteRedeemed {
+    pub session: Arc<SpoolSession>,
+    /// The identity had access there already (granted before, or tied
+    /// to an account): the invite kept its use. "You already had access."
+    pub already_granted: bool,
+}
+
 #[derive(uniffi::Object)]
 pub struct SpoolClient {
     pub(crate) client: sdk::Client,
@@ -205,7 +214,10 @@ impl SpoolClient {
 
     /// The portable identities on this device.
     pub fn portable(&self) -> Arc<SpoolPortable> {
-        Arc::new(SpoolPortable(self.client.portable()))
+        Arc::new(SpoolPortable(
+            self.client.portable(),
+            Some(self.client.clone()),
+        ))
     }
 
     /// The screen as it is now: its mode (height, frame rate), HDR and bit
@@ -464,12 +476,14 @@ impl SpoolClient {
     /// Redeem a guest invite as portable identity `identity` (hex): the
     /// server grants it access, makes no account; this device's
     /// credential for it signs in. Saves and pins the server.
+    /// `already_granted` says the identity had access there already, and
+    /// the invite kept its use.
     pub async fn redeem_invite_portable(
         &self,
         link: String,
         identity: String,
         display_name: Option<String>,
-    ) -> Result<Arc<SpoolSession>, SpoolError> {
+    ) -> Result<PortableInviteRedeemed, SpoolError> {
         let identity = crate::portable::identity(&identity)?;
         let client = self.client.clone();
         let redeemed = run(async move {
@@ -478,7 +492,10 @@ impl SpoolClient {
                 .await
         })
         .await?;
-        Ok(session(redeemed))
+        Ok(PortableInviteRedeemed {
+            session: session(redeemed.session),
+            already_granted: redeemed.already_granted,
+        })
     }
 
     /// Sign in to `endpoint_id` as portable identity `identity` (hex) with

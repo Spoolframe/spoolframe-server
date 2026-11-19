@@ -5,10 +5,12 @@
 
 mod addresses;
 mod closing;
+mod device_sign_in_replay;
 mod features;
 mod invite_lookup;
 mod lan_info;
 mod leave;
+mod noting;
 mod one_time_password;
 mod playlists;
 mod reachability;

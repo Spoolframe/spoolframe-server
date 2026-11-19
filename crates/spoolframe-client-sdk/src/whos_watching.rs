@@ -261,9 +261,24 @@ impl Client {
         identity: PortableUserId,
         servers: &[String],
     ) -> PairedSignIn {
+        // All at once, as `sign_in_paired_progress` does; the results in
+        // `servers`' order whichever finishes first.
+        let (tally, _) = tokio::sync::watch::channel(Default::default());
+        let signing = servers
+            .iter()
+            .map(|server| {
+                (server.clone(), async move {
+                    crate::server_sign_ins::ServerSignIn {
+                        server: server.clone(),
+                        result: self.sign_in_portable(server, identity).await,
+                    }
+                })
+            })
+            .collect();
+        let results = crate::server_sign_ins::sign_in_each(&tally, signing).await;
         let mut signed = PairedSignIn::default();
-        for server in servers {
-            match self.sign_in_portable(server, identity).await {
+        for (server, result) in servers.iter().zip(results) {
+            match result {
                 Ok(session) => signed.sessions.push(session),
                 Err(error) => signed.failed.push((server.clone(), error)),
             }
@@ -272,10 +287,12 @@ impl Client {
     }
 }
 
-/// What [`Client::sign_in_paired`] did.
-#[derive(Debug, Default)]
+/// What [`Client::sign_in_paired`] did, and what a phone signed a TV in
+/// to ([`crate::HeldSignIn::confirm`]).
+#[derive(Debug, Clone, Default)]
 pub struct PairedSignIn {
-    /// Open the first: its server is the one to show.
+    /// In order (the servers', or the phone's): open the first, its
+    /// server the one to show.
     pub sessions: Vec<Session>,
     /// Each server not signed in to, a hex endpoint id, and why.
     pub failed: Vec<(String, SdkError)>,

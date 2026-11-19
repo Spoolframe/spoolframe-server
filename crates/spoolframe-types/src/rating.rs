@@ -3,8 +3,6 @@
 //! catalog's rating image (Plex's `ratingImage` and `audienceRatingImage`,
 //! such as `rottentomatoes://image.rating.ripe`).
 
-use std::cell::Cell;
-
 use serde::{Deserialize, Serialize};
 
 /// Whose a rating is, and how it reads: its provider, Rotten Tomatoes'
@@ -23,6 +21,11 @@ pub struct RatingSource {
     /// provider or verdict this build does not know.
     pub image: String,
 }
+
+/// The names of `MergeFacts`' rating source fields on the wire: what a
+/// server leaves out of a reply to a connection without
+/// `spoolframe:rating-sources`.
+pub const RATING_SOURCE_FIELDS: [&str; 2] = ["rating_source", "audience_rating_source"];
 
 /// Who rated it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -122,33 +125,6 @@ impl RatingSource {
     }
 }
 
-thread_local! {
-    /// Whether rating sources are left out of what is serialized now
-    /// ([`without_rating_sources`]).
-    static LEFT_OUT: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Run `f` with every [`RatingSource`] left out of what it serializes: a
-/// server encoding a reply for a connection that did not agree to
-/// `spoolframe:rating-sources`. Serialization is synchronous, so the
-/// encode runs wholly inside `f`, on this thread.
-pub fn without_rating_sources<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LEFT_OUT.with(|left| left.set(self.0));
-        }
-    }
-    let _restore = Restore(LEFT_OUT.with(|left| left.replace(true)));
-    f()
-}
-
-/// `skip_serializing_if` of the rating source fields: none to send, or
-/// [`without_rating_sources`] in force.
-pub(crate) fn skip_rating_source(source: &Option<RatingSource>) -> bool {
-    source.is_none() || LEFT_OUT.with(Cell::get)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +191,21 @@ mod tests {
         );
     }
 
+    /// The names a server strips are the fields' own.
+    #[test]
+    fn the_stripped_names_are_merge_facts_fields() {
+        let source = RatingSource::from_image("imdb://image.rating");
+        let facts = crate::MergeFacts {
+            rating_source: source.clone(),
+            audience_rating_source: source,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&facts).unwrap();
+        for name in RATING_SOURCE_FIELDS {
+            assert!(json.get(name).is_some(), "{name}");
+        }
+    }
+
     #[test]
     fn the_wire_names_are_fixed() {
         let source = RatingSource::from_image("rottentomatoes://image.rating.certified").unwrap();
@@ -236,26 +227,5 @@ mod tests {
             (newer.provider, newer.state),
             (RatingProvider::Unknown, Some(RatingState::Unknown))
         );
-    }
-
-    /// Left out while [`without_rating_sources`] runs, and only then; the
-    /// rating itself stays.
-    #[test]
-    fn sources_are_left_out_only_inside_without_rating_sources() {
-        let facts = crate::MergeFacts {
-            rating_tenths: Some(92),
-            rating_source: RatingSource::from_image("rottentomatoes://image.rating.ripe"),
-            ..Default::default()
-        };
-        let without = without_rating_sources(|| serde_json::to_value(&facts).unwrap());
-        let with = serde_json::to_value(&facts).unwrap();
-        assert_eq!(
-            (
-                without.get("rating_source").is_some(),
-                without.get("rating_tenths").is_some()
-            ),
-            (false, true)
-        );
-        assert!(with.get("rating_source").is_some());
     }
 }

@@ -196,7 +196,8 @@ pub enum Request {
     /// server grants them access (no account is made), uses one of the
     /// invite's uses, and signs them in as `FinishPortableSignIn` does:
     /// `LoggedIn`. Someone granted here already keeps their grant, and
-    /// the invite its use.
+    /// the invite its use: `LoggedIn` then says `already_granted`, as it
+    /// does for an identity tied to an account here.
     ///
     /// The code is checked as `RedeemInvite` checks it (`InviteInvalid`,
     /// counted as a wrong guess; `InviteExpired`; `InviteExhausted`); a
@@ -1598,8 +1599,9 @@ pub struct Hello {
 }
 
 /// `text` cut to [`MAX_HELLO_TEXT`] characters: what a server keeps of a
-/// device's strings, and a device of an invite link's name.
-pub(crate) fn cut(text: &mut String) {
+/// device's strings (a `Hello`'s, an offered TV's name), and a device of
+/// an invite link's name.
+pub fn cut(text: &mut String) {
     if let Some((at, _)) = text.char_indices().nth(MAX_HELLO_TEXT) {
         text.truncate(at);
     }
@@ -1940,6 +1942,12 @@ pub enum Reply {
         /// `PasswordChangeRequired` for anything else but `Logout` and
         /// `WhoAmI`, and the device is not trusted.
         password_change_required: bool,
+        /// `RedeemPortableInvite` only: the identity had access here
+        /// already (granted before, or tied to an account), so the
+        /// invite kept its use. Left out when false; absent, from an
+        /// older server, it reads as false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        already_granted: bool,
     },
     /// The users this device is trusted for (`TrustedProfiles`), by
     /// username.

@@ -6,14 +6,14 @@
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::{self as sdk, ErrorKind, types::Platform};
+use spoolframe_client_sdk::{self as sdk, types::Platform};
 
 use crate::client::SpoolClient;
 use crate::error::SpoolError;
 use crate::pairing::{Connected, SpoolHeldPairing};
 use crate::runtime::run;
 use crate::session::SpoolSession;
-use crate::sign_in::{ServerFailure, ServerSignInWatch};
+use crate::sign_in::{PairedSignIn, ServerSignInWatch};
 
 /// A phone that reached the TV's code, before it is done.
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -22,15 +22,6 @@ pub enum PhoneConnected {
     SigningIn,
     /// A guest's phone pairing its own identity: show its fingerprint.
     Guest { connected: Connected },
-}
-
-/// What a phone signed this TV in to. Each server is saved here, pinned
-/// but not verified.
-#[derive(uniffi::Record)]
-pub struct PhoneSignedIn {
-    /// In the phone's order: open the first.
-    pub sessions: Vec<Arc<SpoolSession>>,
-    pub failed: Vec<ServerFailure>,
 }
 
 /// A server a phone offers to sign this TV in to, held.
@@ -50,6 +41,12 @@ pub struct SpoolHeldSignIn(Arc<sdk::HeldSignIn>);
 
 #[uniffi::export]
 impl SpoolHeldSignIn {
+    /// What the phone calls itself: "Andrey's iPhone wants to sign this
+    /// TV in". None from an older phone.
+    pub fn phone_name(&self) -> Option<String> {
+        self.0.phone_name().map(str::to_owned)
+    }
+
     /// The servers, in the phone's order.
     pub fn offers(&self) -> Vec<HeldOffer> {
         self.0
@@ -63,28 +60,47 @@ impl SpoolHeldSignIn {
             .collect()
     }
 
-    /// Save each server and sign in to it.
-    pub async fn confirm(&self) -> Result<PhoneSignedIn, SpoolError> {
+    /// Save each server and sign in to it: in the phone's order. Each
+    /// server is saved here, pinned but not verified.
+    pub async fn confirm(&self) -> Result<PairedSignIn, SpoolError> {
         let held = self.0.clone();
         let signed = run(async move { held.confirm().await }).await?;
-        Ok(PhoneSignedIn {
-            sessions: signed
-                .sessions
-                .into_iter()
-                .map(|s| Arc::new(SpoolSession::new(s)))
-                .collect(),
-            failed: signed
-                .failed
-                .into_iter()
-                .map(|(server, error)| ServerFailure::new(server, error))
-                .collect(),
-        })
+        Ok(PairedSignIn::new(signed.sessions, signed.failed))
     }
 
     /// Sign in to nothing; the phone is told each was declined.
     pub async fn reject(&self) -> Result<(), SpoolError> {
         let held = self.0.clone();
         Ok(run(async move { held.reject().await }).await?)
+    }
+
+    /// Returns once the hold is over without this app's answer, with why:
+    /// close the confirm page then. Never returns once the app confirmed
+    /// or rejected; cancel it with the page.
+    pub async fn ended(&self) -> HoldEnd {
+        let held = self.0.clone();
+        run(async move { held.ended().await }).await.into()
+    }
+}
+
+/// Why a hold ended without the app's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum HoldEnd {
+    /// The phone hung up: "The phone stopped".
+    PhoneLeft,
+    /// Nobody answered within two minutes: it was rejected.
+    TimedOut,
+    /// The code stopped: cancelled, or its screen released.
+    CodeEnded,
+}
+
+impl From<sdk::HoldEnd> for HoldEnd {
+    fn from(end: sdk::HoldEnd) -> Self {
+        match end {
+            sdk::HoldEnd::PhoneLeft => Self::PhoneLeft,
+            sdk::HoldEnd::TimedOut => Self::TimedOut,
+            sdk::HoldEnd::CodeEnded => Self::CodeEnded,
+        }
     }
 }
 
@@ -178,17 +194,58 @@ impl SpoolSignInChoice {
 pub enum SignInOfferOutcome {
     SignedIn,
     /// The phone could not make the sign-in: on `RecentSignInRequired`,
-    /// "Confirm it's you" on the choice's session, then `offer` again.
+    /// "Confirm it's you" on the choice's session, then approve it again
+    /// on the same offer. `message` is what to show.
     NotOffered {
-        kind: ErrorKind,
+        reason: SignInFailure,
         message: String,
     },
-    /// The TV could not redeem it, as the TV said.
+    /// The TV did not sign in, as the TV said (`Declined`: the person at
+    /// the TV turned it down). `message` is what to show.
     Failed {
-        reason: String,
+        reason: SignInFailure,
+        message: String,
     },
+}
+
+/// Why one server did not sign the TV in: for the phone's results and
+/// the TV's failures. The text to show comes with it, as `message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SignInFailure {
+    /// Too many sign-ins at once there, or too many waiting: "Try again
+    /// in a few minutes".
+    RateLimited,
+    /// "Confirm it's you" on the profile's session first.
+    RecentSignInRequired,
+    /// The account may not sign a device in there (a guest, or a role).
+    NotAllowed,
+    /// The server does not take sign-ins from a phone.
+    FeatureOff,
+    /// It could not be reached.
+    Unreachable,
+    /// The server refused it otherwise: `message` is its words.
+    Refused,
     /// The person at the TV turned it down.
     Declined,
+    /// The sign-in ran out before the TV used it.
+    Expired,
+}
+
+impl SignInFailure {
+    /// The reason, and the text to show for it.
+    pub(crate) fn of(failure: &sdk::SignInFailure) -> (Self, String) {
+        let reason = match failure {
+            sdk::SignInFailure::RateLimited => Self::RateLimited,
+            sdk::SignInFailure::RecentSignInRequired => Self::RecentSignInRequired,
+            sdk::SignInFailure::NotAllowed => Self::NotAllowed,
+            sdk::SignInFailure::FeatureOff => Self::FeatureOff,
+            sdk::SignInFailure::Unreachable => Self::Unreachable,
+            sdk::SignInFailure::Refused(_) => Self::Refused,
+            sdk::SignInFailure::Declined => Self::Declined,
+            sdk::SignInFailure::Expired => Self::Expired,
+        };
+        (reason, failure.to_string())
+    }
 }
 
 /// How one server's sign-in went.
@@ -209,15 +266,14 @@ impl From<sdk::SignInOfferResult> for SignInOfferResult {
             user_name: result.user_name,
             outcome: match result.outcome {
                 sdk::SignInOfferOutcome::SignedIn => SignInOfferOutcome::SignedIn,
-                sdk::SignInOfferOutcome::NotOffered(error) => {
-                    let error = SpoolError::from(error);
-                    SignInOfferOutcome::NotOffered {
-                        kind: error.kind(),
-                        message: error.to_string(),
-                    }
+                sdk::SignInOfferOutcome::NotOffered(failure) => {
+                    let (reason, message) = SignInFailure::of(&failure);
+                    SignInOfferOutcome::NotOffered { reason, message }
                 }
-                sdk::SignInOfferOutcome::Failed(reason) => SignInOfferOutcome::Failed { reason },
-                sdk::SignInOfferOutcome::Declined => SignInOfferOutcome::Declined,
+                sdk::SignInOfferOutcome::Failed(failure) => {
+                    let (reason, message) = SignInFailure::of(&failure);
+                    SignInOfferOutcome::Failed { reason, message }
+                }
             },
         }
     }
@@ -287,6 +343,19 @@ impl SpoolSignInOffer {
         let offer = self.0.clone();
         Ok(run(async move { offer.decline().await }).await?)
     }
+
+    /// Done offering: the TV stops waiting for another round. Call it
+    /// when the person leaves the results screen; after a result that
+    /// was not signed in, the TV otherwise waits two minutes for a retry.
+    pub async fn finish(&self) {
+        let offer = self.0.clone();
+        run(async move {
+            offer.finish().await;
+            Ok::<_, sdk::SdkError>(())
+        })
+        .await
+        .ok();
+    }
 }
 
 #[uniffi::export]
@@ -319,6 +388,7 @@ impl SpoolClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_client_sdk::ErrorKind;
 
     fn result(outcome: sdk::SignInOfferOutcome) -> SignInOfferResult {
         sdk::SignInOfferResult {
@@ -343,27 +413,43 @@ mod tests {
             crate::sign_in::ServerSignIn::Failed { failure }
                 if failure.server == "ab".repeat(32)
                     && failure.kind == ErrorKind::NeedsRecentSignIn
+                    && failure.reason == SignInFailure::RecentSignInRequired
         ));
     }
 
-    /// A server that wants "Confirm it's you" says so by its kind, which
-    /// the app checks before it confirms and offers again.
+    /// A server that wants "Confirm it's you" says so by its reason,
+    /// which the app checks before it confirms and offers again; the
+    /// server's own words come with a refusal.
     #[test]
-    fn a_refused_offer_says_its_kind() {
+    fn a_refused_offer_says_its_reason() {
         let refused = result(sdk::SignInOfferOutcome::NotOffered(
-            sdk::SdkError::RecentSignInRequired,
+            sdk::SignInFailure::RecentSignInRequired,
         ));
         assert_eq!(refused.user_name, "Alice");
         assert!(matches!(
             refused.outcome,
             SignInOfferOutcome::NotOffered {
-                kind: ErrorKind::NeedsRecentSignIn,
+                reason: SignInFailure::RecentSignInRequired,
                 ..
             }
         ));
         assert!(matches!(
-            result(sdk::SignInOfferOutcome::Failed("unreachable".into())).outcome,
-            SignInOfferOutcome::Failed { reason } if reason == "unreachable"
+            result(sdk::SignInOfferOutcome::Failed(sdk::SignInFailure::Refused(
+                "no thanks".into()
+            )))
+            .outcome,
+            SignInOfferOutcome::Failed { reason: SignInFailure::Refused, message }
+                if message == "no thanks"
+        ));
+        assert!(matches!(
+            result(sdk::SignInOfferOutcome::Failed(
+                sdk::SignInFailure::Declined
+            ))
+            .outcome,
+            SignInOfferOutcome::Failed {
+                reason: SignInFailure::Declined,
+                ..
+            }
         ));
         assert!(matches!(
             result(sdk::SignInOfferOutcome::SignedIn).outcome,

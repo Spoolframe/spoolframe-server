@@ -2,12 +2,114 @@
 
 ## Unreleased
 
+- Added, SDK: `ServerEntry::last_used_at` (FFI `ServerEntry.last_used_at`),
+  when a person last opened a profile on the server from this device,
+  to the millisecond. `Client::activate_profile` sets it, and so does
+  `open_profile`, which calls it. Nothing else moves it: no sign-in (a
+  pairing's, a phone's or the person's own), no reconnect and no
+  refresh. So an app can start on the server the person uses, where
+  `last_connected_at`, which every connect moves, picked whichever
+  server a pairing signed in to last. A server saved before reads as
+  never used.
+- Fixed, SDK: with guests off, a guest's phone that scanned a TV's
+  phone sign-in code failed the handshake ("peer doesn't support any
+  known protocol"). The TV now takes `spoolframe/pair/1` while a
+  `PhoneSignIn` lives, and refuses the guest `not_allowed`
+  (`PairingError::NotAllowed`, FFI `PairingFailure.NotAllowed`) without
+  making a key or spending the code, which still signs the TV in from a
+  phone. `start_pairing` still refuses to start with guests off.
+- Added, SDK: `HeldSignIn::ended()` and `HeldPairing::ended()` resolve
+  once the hold is over without the app's answer, with why: a
+  `HoldEnd` of `PhoneLeft`, `TimedOut` (no answer in 2 minutes) or
+  `CodeEnded` (the code cancelled or dropped). A confirm page can close
+  itself on it. They never resolve once the app confirmed or rejected.
+  FFI: `SpoolHeldSignIn.ended()` and `SpoolHeldPairing.ended()`, async,
+  giving a `HoldEnd` enum.
+- Changed, SDK: `Client::await_device_sign_in` asks a round again on
+  each new connection, as the same operation, for up to `ROUND_RETRY`
+  (a minute), not just once. An approval whose answer was lost to a cut
+  connection is replayed by the server and still brings its one
+  session. A TV redeeming a phone's offer does the same, within its
+  minute per server.
+- Changed, protocol and SDK: a guest pairing turned down on the device
+  reaches the phone as refusal `rejected` (`PairingError::Rejected`, FFI
+  `PairingFailure.Rejected`), not `not_allowed`, which still means guests
+  are off. A phone before it ends the pairing as aborted. A refusal a
+  phone does not know reads as `failed`.
+- Changed, protocol and SDK: each server that did not sign a TV in says
+  why, typed. `SignInFailure` is one of `RateLimited` (too many at once
+  or waiting there), `RecentSignInRequired`, `NotAllowed` (a guest, or a
+  role), `FeatureOff`, `Unreachable`, `Refused(message)`, `Declined` (on
+  the TV) and `Expired`. `SignInFailure::of(&SdkError)` reads it from an
+  error. `SignInOfferOutcome` is now `SignedIn`, `NotOffered(SignInFailure)`
+  or `Failed(SignInFailure)`, and a TV's decline is
+  `Failed(SignInFailure::Declined)`. On the wire, a `failed` offer
+  outcome carries `kind`; an older TV's reads as `Refused` with its
+  words. FFI: a `SignInFailure` enum. `SignInOfferOutcome.NotOffered`
+  and `Failed` each carry `reason` and `message`, and `Declined` is
+  gone. `ServerFailure` gains `reason`, for a TV's failures and
+  `sign_in_paired`'s alike.
+- Added, protocol and SDK: a phone retries the servers that did not
+  sign the TV in, with no new scan. After the first `done`, the TV
+  keeps the connection and takes further `offers` rounds, each answered
+  by its own `done`, until the phone hangs up, declines or is silent for
+  2 minutes. The person at the TV confirms only the first round. On the
+  phone, `SignInOffer::approve` or `offer`/`send` work again on the same
+  offer while one result was not signed in. `SignInOffer::finish()`
+  (FFI `SpoolSignInOffer.finish()`) tells the TV there is no more.
+  On the TV, `HeldSignIn::confirm` gives the first round (called again,
+  the sign-in as it stands); later rounds come through
+  `PhoneSignIn::server_sign_ins()`, whose `total()` counts each profile
+  once and whose `next()` ends once the phone is done. A retried
+  profile's result replaces its earlier one, and `next()` gives it again
+  as an update. The phone never offers again a profile the TV already
+  signed in to: `approve` and `offer` skip it, and it reads `SignedIn`. A profile is its server
+  and its account, by the offer's new optional `username` (the login),
+  so two accounts sharing a display name are two; from a phone that
+  sends none, the TV goes by the display name. The rounds outlive the
+  `PhoneSignIn`: the app may drop it, or show a new code, once the
+  person at the TV confirmed.
+- Added, protocol and SDK: the TV is told the phone's name. A phone's
+  `hello` on `spoolframe/signin/1` carries `name`, and on
+  `spoolframe/pair/1` `phone_name`: the phone's device name, optional,
+  and left out by an older phone. `HeldSignIn::phone_name()` gives it
+  for "Andrey's iPhone wants to sign this TV in". For a guest,
+  `Connected::phone_name`, `Paired::phone_name` and
+  `HeldPairing::phone_name()` give it. FFI: `SpoolHeldSignIn.phone_name()`,
+  `SpoolHeldPairing.phone_name()`, and `phone_name` on the `Connected`
+  and `Paired` records.
+- Added, protocol, server and SDK: `Platform::AndroidTv` (wire
+  `android_tv`), for the Android app on Android TV and Google TV. Device
+  and session lists call it "Android TV app", and the web's approve page
+  calls it "the TV". Like tvOS, it starts playback at Original quality
+  when the user picked none (`PlaybackQuality::default_for`,
+  `Session::default_quality`), and has no downloads. An older server or
+  app reads `android_tv` as `unknown` ("App"), as for any newer
+  platform. `Platform::is_tv()` says tvOS or Android TV. FFI: the
+  `Platform` enum gains `AndroidTv`.
+- Added, protocol, server and SDK: redeeming a guest invite as an
+  identity that already has access says so. `logged_in` carries
+  `already_granted: true` when the identity was granted before or is
+  tied to an account here, and in both cases the invite keeps its use.
+  The key is left out when false, and an older server's reply reads as
+  false. `Client::redeem_invite_portable` now gives a
+  `PortableInviteRedeemed { session, already_granted }`, not a bare
+  `Session`. FFI: `SpoolClient.redeem_invite_portable` gives a
+  `PortableInviteRedeemed` record.
+- Added, SDK: a phone pairing a guest's device chooses which servers to
+  hand it. `PairingOffer::servers()` lists the candidates (each server
+  the phone verified and signs in to as the identity, at most 16), and
+  `authorize_with(label, chosen)` hands only the endpoint ids in
+  `chosen`, refusing one not listed before anything is sent.
+  `authorize(label)` still hands them all. FFI:
+  `SpoolPairingOffer.servers()` and `authorize_with(label, chosen)`.
 - Added, SDK: `Client::look_up_server` says why it got no answer, so an
   app tells "Can't find <address>" from "No answer".
   `SdkError::ServerLookupFailed { address, reason }` (FFI
   `SpoolError.ServerLookupFailed`) replaces `Unreachable` and `TimedOut`
   for a lookup, with `reason` a `LookupFailure`: `NameNotFound` (the
-  name does not resolve), `NoAnswer` (refused, unreachable, or a 5xx),
+  resolver says the name does not exist), `NoAnswer` (no DNS answer now,
+  refused, unreachable, or a 5xx),
   `TimedOut`, or `Tls` (a certificate or handshake failure). Each is
   read from the failure's causes, not its text: the lookup resolves
   names itself to tell a missing name apart. An answer that is not a
@@ -25,13 +127,15 @@
   signed out meanwhile is refused. The checks are
   `approve_device_sign_in`'s: a local account's session (a portable
   identity's tied one included), a recent sign-in, not the phone itself;
-  one user has at most 16 offers pending.
+  one user has at most 16 offers pending, and one TV at most 8. Offers
+  are counted apart from a TV's own codes, so unredeemed ones never keep
+  it from beginning its own sign-in.
   The phone and the TV talk directly on a new ALPN,
   `spoolframe/signin/1`, with the pairing QR link. See PROTOCOL.md's
   Signing in with a phone.
 - Added, SDK: "Sign in with phone". On the TV,
   `Client::start_phone_sign_in(name, relay)` gives a `PhoneSignIn` to
-  show and `wait()` on: `PhoneSignInOutcome::SignedIn(PhoneSignedIn {
+  show and `wait()` on: `PhoneSignInOutcome::SignedIn(PairedSignIn {
   sessions, failed })`, or `::Paired(Paired)` when a guest's phone
   paired its own identity with the same code (Allow guests on). Signing
   in to an account works with guests off. The code names the TV's relay
@@ -42,8 +146,10 @@
   server first, or `decline()`. Each server's result is a
   `SignInOfferResult`. Also `On<PhoneSignIn>::offer_device_sign_in`.
   The TV saves each server pinned, not verified, as a pairing's.
-- Fixed, SDK: `Portable::forget_guest(id)` also signs the guest out of
-  every server it was signed in to on this device. Its sessions are
+- Fixed, SDK: forgetting a guest also signs it out of every server it
+  was signed in to on this device. It is now `Client::forget_guest(id)`
+  (`Portable::forget_guest` is gone; FFI `SpoolPortable.forget_guest` is
+  unchanged). Its sessions are
   ended on the servers (each given a few seconds) and dropped here
   whether or not a server answers, with their profiles and the profile
   opened last if it was one of them. Before, the guest stayed on "Who's
@@ -56,14 +162,18 @@
   `reject()` installs nothing and tells the phone `NotAllowed`.
   `PhoneSignIn::wait()` gives `HeldPhoneSignIn`: `SignIn(HeldSignIn)`,
   whose `offers()` say who signs the TV in and where, and whose
-  `confirm()` gives `PhoneSignedIn`, or `Guest(HeldPairing)`. A held
+  `confirm()` gives `PairedSignIn`, or `Guest(HeldPairing)`. A held
   value dropped undecided, or left 2 minutes, is a rejection, and the
-  code ends with `PairingError::Rejected`. The phone's `authorize` now
+  code ends with `PairingError::Rejected`. A phone that hangs up while
+  its offers or pairing are held is not: the code ends with
+  `PairingError::Aborted("the phone left")`. The phone's `authorize` now
   waits 2 minutes and 10 seconds for the TV's answer, and
   `SignInOffer::send` 3 minutes and 10 seconds; a sign-in turned down on
   the TV is `SignInOfferOutcome::Declined` for each server (protocol:
   offer outcome `declined`). FFI: `SpoolHeldPairing`, `SpoolHeldSignIn`
-  and `HeldPhoneSignIn`, and `PairingFailure.Rejected`.
+  and `HeldPhoneSignIn`, and `PairingFailure.Rejected`;
+  `SpoolHeldSignIn.confirm()` gives a `PairedSignIn`, the record
+  `sign_in_paired` gives.
 - Added, SDK: each server's sign-in as it finishes, for "Signed in to 2
   of 3". `Client::sign_in_paired_progress(identity, servers)` signs in to
   all at once and gives a `ServerSignIns`: `total()` and `next()`, a

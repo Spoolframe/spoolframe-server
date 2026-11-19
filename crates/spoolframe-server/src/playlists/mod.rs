@@ -535,6 +535,21 @@ impl Playlists {
             && self.visibility.may_see(actor, item)
     }
 
+    /// Item `id` as the catalog serves it to `actor` now, with its
+    /// children and external ids: `None` when it is not in the library,
+    /// not served now, or one `actor` may not see.
+    pub(crate) async fn served(
+        &self,
+        actor: &Actor,
+        id: &MediaId,
+    ) -> Result<Option<ItemWithChildren>, PlaylistsError> {
+        match self.catalog.item(id).await {
+            Ok(found) => Ok(self.may_see(actor, &found.item).then_some(found)),
+            Err(e) if crate::client::unserved(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Every change, as it is made.
     pub fn news(&self) -> tokio::sync::broadcast::Receiver<PlaylistNews> {
         self.news.subscribe()
@@ -1814,15 +1829,9 @@ impl Playlists {
                 left_out.push((title.clone(), "not a movie, episode or track".into()));
                 continue;
             }
-            match self.catalog.item(id).await {
-                Ok(found) if self.may_see(actor, &found.item) => {
-                    entries.push(new_entry(&found.item, found.external_ids));
-                }
-                Ok(_) => left_out.push((title.clone(), "not in this server's libraries".into())),
-                Err(e) if crate::client::unserved(&e) => {
-                    left_out.push((title.clone(), "not in this server's libraries".into()));
-                }
-                Err(e) => return Err(e.into()),
+            match self.served(actor, id).await? {
+                Some(found) => entries.push(new_entry(&found.item, found.external_ids)),
+                None => left_out.push((title.clone(), "not in this server's libraries".into())),
             }
         }
         let count = entries.len() as u32;
@@ -1978,14 +1987,9 @@ impl Playlists {
                         "{id} is not an artist"
                     )));
                 }
-                let found = match self.catalog.item(id).await {
-                    Ok(found) => found,
-                    Err(e) if crate::client::unserved(&e) => return Ok(None),
-                    Err(e) => return Err(e.into()),
-                };
-                if !self.may_see(actor, &found.item) {
+                let Some(found) = self.served(actor, id).await? else {
                     return Ok(None);
-                }
+                };
                 let mut tracks = self.artist_tracks(found).await?;
                 tracks.retain(|t| self.may_see(actor, t));
                 tracks
@@ -2345,18 +2349,14 @@ impl Playlists {
                 left_out.push((title.clone(), "not a track".into()));
                 continue;
             }
-            match self.catalog.item(id).await {
-                Ok(found) if self.may_see(actor, &found.item) => {
+            match self.served(actor, id).await? {
+                Some(found) => {
                     let entry = new_entry(&found.item, found.external_ids);
                     if held.insert(entry.media_id.clone()) {
                         entries.push(entry);
                     }
                 }
-                Ok(_) => left_out.push((title.clone(), "not in this server's libraries".into())),
-                Err(e) if crate::client::unserved(&e) => {
-                    left_out.push((title.clone(), "not in this server's libraries".into()));
-                }
-                Err(e) => return Err(e.into()),
+                None => left_out.push((title.clone(), "not in this server's libraries".into())),
             }
         }
         let count = entries.len() as u32;

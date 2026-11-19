@@ -48,7 +48,7 @@ pub(crate) struct StoredSession {
     #[serde(default)]
     pub portable: Option<PortableUserId>,
     /// The user is the server's admin, as the server last said
-    /// ([`StoredSession::note_role`]). False for a session kept before it
+    /// ([`StoredSession::note_user`]). False for a session kept before it
     /// was.
     #[serde(default)]
     pub admin: bool,
@@ -57,7 +57,7 @@ pub(crate) struct StoredSession {
 impl StoredSession {
     /// Keep what `user` says of the role, and its name: true if either
     /// changed.
-    pub(crate) fn note_role(&mut self, user: &UserSummary) -> bool {
+    pub(crate) fn note_user(&mut self, user: &UserSummary) -> bool {
         let admin = user.role == spoolframe_types::Role::Admin;
         let changed = self.admin != admin || self.display_name != user.display_name;
         self.admin = admin;
@@ -984,7 +984,7 @@ impl Session {
     pub async fn whoami(&self) -> Result<UserSummary, SdkError> {
         match self.call(Request::WhoAmI).await? {
             Reply::WhoAmI(spoolframe_protocol::WhoAmIReply { user, .. }) => {
-                self.client.note_role(self.server, &user).await?;
+                self.client.note_user(self.server, &user).await;
                 Ok(user)
             }
             other => Err(unexpected(other)),

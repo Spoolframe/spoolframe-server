@@ -158,7 +158,7 @@ pub(crate) fn identity(id: &str) -> Result<sdk::PortableUserId, SpoolError> {
 
 /// The portable identities on this device.
 #[derive(uniffi::Object)]
-pub struct SpoolPortable(pub(crate) sdk::Portable);
+pub struct SpoolPortable(pub(crate) sdk::Portable, pub(crate) Option<sdk::Client>);
 
 #[uniffi::export]
 impl SpoolPortable {
@@ -270,11 +270,16 @@ impl SpoolPortable {
             .collect())
     }
 
-    /// Sign guest `id` out of this device: its credential and key go.
+    /// Sign guest `id` out of this device: its credential and key go,
+    /// and its sessions and profiles on every server.
     pub async fn forget_guest(&self, id: String) -> Result<(), SpoolError> {
         let id = identity(&id)?;
-        let portable = self.0.clone();
-        Ok(run(async move { portable.forget_guest(id).await }).await?)
+        let client = self.1.clone().ok_or_else(|| {
+            SpoolError::from(sdk::SdkError::InvalidInput(
+                "no client to forget a guest on".into(),
+            ))
+        })?;
+        Ok(run(async move { client.forget_guest(id).await }).await?)
     }
 
     /// Identity `id`'s newest state here; none when nothing is revoked.
@@ -313,7 +318,10 @@ mod tests {
     /// The frozen derivation: 23 × "abandon" + "art".
     #[tokio::test]
     async fn the_test_vector_recovers_its_id() {
-        let portable = SpoolPortable(sdk::Portable::new(Arc::new(sdk::MemoryStorage::default())));
+        let portable = SpoolPortable(
+            sdk::Portable::new(Arc::new(sdk::MemoryStorage::default())),
+            None,
+        );
         let phrase = format!("{}art", "abandon ".repeat(23));
         let id = portable.recover(phrase, "test".into()).await.unwrap();
         assert_eq!(
@@ -325,7 +333,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_misspelt_word_names_its_position() {
-        let portable = SpoolPortable(sdk::Portable::new(Arc::new(sdk::MemoryStorage::default())));
+        let portable = SpoolPortable(
+            sdk::Portable::new(Arc::new(sdk::MemoryStorage::default())),
+            None,
+        );
         let phrase = format!("{}abandn art", "abandon ".repeat(22));
         let error = portable.recover(phrase, "test".into()).await.unwrap_err();
         assert_eq!(

@@ -474,13 +474,17 @@ pub enum SdkError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum LookupFailure {
-    /// The name does not resolve: no such name, no address for it, or no
-    /// DNS reachable. "Can't find <address>": most often a typo.
+    /// The name does not exist: the resolver said so for certain
+    /// (NXDOMAIN), or it has no address. "Can't find <address>": most
+    /// often a typo. A resolver that cannot answer now (no DNS, a
+    /// temporary failure) is [`LookupFailure::NoAnswer`] instead.
     #[error("the name cannot be found")]
     NameNotFound,
-    /// The name resolved, but nothing answered there: the connection was
-    /// refused or the host unreachable, the connection broke, or the
-    /// server behind a proxy is down (a 5xx). "No answer".
+    /// Nothing answered: the name could not be resolved now (no DNS
+    /// server, a temporary failure), or it resolved but the connection
+    /// was refused or the host unreachable, the connection broke, or the
+    /// server behind a proxy is down (a 5xx). "No answer": worth trying
+    /// again.
     #[error("nothing answers there")]
     NoAnswer,
     /// It did not answer in time.

@@ -391,8 +391,10 @@ impl Client {
             identity,
             device_key,
             fingerprint: device_key.fingerprint(),
-            // A relayed answer does not carry the guest's name.
+            // A relayed answer carries neither the guest's name nor the
+            // phone's.
             name: None,
+            phone_name: None,
             servers,
         })
     }

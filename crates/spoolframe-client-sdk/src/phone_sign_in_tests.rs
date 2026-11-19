@@ -139,20 +139,23 @@ async fn one_code_at_a_time_a_pairing_s_or_a_phone_sign_in_s() {
     .await;
 }
 
-/// Signing in to an account is not a guest's: it works with guests off,
-/// and the guests' ALPN is not taken then.
+/// Signing in to an account is not a guest's: it works with guests off.
+/// A guest's phone that scans the code then is told guests are off,
+/// typed, and its dial spends nothing: no key is made for its identity,
+/// and the same code still signs the TV in.
 #[tokio::test]
-async fn with_guests_off_a_phone_signs_in_and_a_guest_cannot_pair() {
+async fn with_guests_off_a_guest_is_refused_and_the_code_still_signs_in() {
     within(async {
         let tv = tv().await;
         assert!(!tv.portable().allow_guests().await.unwrap());
         let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
         let phone = phone().await;
         let (identity, _) = phone.portable().create("Steve").await.unwrap();
-        assert!(matches!(
-            phone.scan_pairing(shown.link(), identity).await,
-            Err(SdkError::Unreachable(_))
-        ));
+        assert_eq!(
+            pairing_error(phone.scan_pairing(shown.link(), identity).await),
+            PairingError::NotAllowed
+        );
+        assert!(!tv.portable().has_device_key(identity).await.unwrap());
         let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
         assert_eq!(offer.device_name(), "TV");
         offer.decline().await.unwrap();
@@ -246,4 +249,95 @@ async fn a_phone_that_hangs_up_signs_nothing_in() {
         assert!(tv.servers().await.unwrap().is_empty());
     })
     .await;
+}
+
+/// Each server error a sign-in meets reads as the failure the app shows.
+#[test]
+fn a_server_s_error_reads_as_its_failure() {
+    use spoolframe_protocol::features::Feature;
+    let cases = [
+        (
+            SdkError::RateLimited {
+                retry_after: Duration::from_secs(300),
+            },
+            SignInFailure::RateLimited,
+        ),
+        (SdkError::ServerFull, SignInFailure::RateLimited),
+        (
+            SdkError::RecentSignInRequired,
+            SignInFailure::RecentSignInRequired,
+        ),
+        (SdkError::NotForPortableUsers, SignInFailure::NotAllowed),
+        (SdkError::AdminRequired, SignInFailure::NotAllowed),
+        (SdkError::NotAllowed, SignInFailure::NotAllowed),
+        (
+            SdkError::FeatureOff {
+                feature: Feature::PhoneSignIn,
+            },
+            SignInFailure::FeatureOff,
+        ),
+        (
+            SdkError::NotOnServer {
+                request: "offer_device_sign_in".into(),
+            },
+            SignInFailure::FeatureOff,
+        ),
+        (
+            SdkError::Unsupported {
+                feature: "x".into(),
+            },
+            SignInFailure::FeatureOff,
+        ),
+        (
+            SdkError::Unreachable("home".into()),
+            SignInFailure::Unreachable,
+        ),
+        (
+            SdkError::TimedOut("home".into()),
+            SignInFailure::Unreachable,
+        ),
+        (SdkError::SignInExpired, SignInFailure::Expired),
+        (
+            SdkError::Pairing(PairingError::Declined),
+            SignInFailure::Declined,
+        ),
+        (
+            SdkError::Pairing(PairingError::Rejected),
+            SignInFailure::Declined,
+        ),
+        (
+            SdkError::Server("the moon is in the way".into()),
+            SignInFailure::Refused(SdkError::Server("the moon is in the way".into()).to_string()),
+        ),
+    ];
+    for (error, failure) in cases {
+        assert_eq!(SignInFailure::of(&error), failure, "{error:?}");
+    }
+}
+
+/// What the TV says crosses the wire as the same failure; a refusal's
+/// words with it, and a kind from a newer TV (or none, from an older
+/// one) reads as refused with the TV's words.
+#[test]
+fn a_tv_s_failure_crosses_the_wire_whole() {
+    for failure in [
+        SignInFailure::RateLimited,
+        SignInFailure::RecentSignInRequired,
+        SignInFailure::NotAllowed,
+        SignInFailure::FeatureOff,
+        SignInFailure::Unreachable,
+        SignInFailure::Expired,
+        SignInFailure::Refused("no thanks".into()),
+    ] {
+        let OfferOutcome::Failed { reason, kind } =
+            OfferOutcome::failed(failure.kind(), &failure.to_string())
+        else {
+            panic!("a failure");
+        };
+        assert_eq!(SignInFailure::from_wire(kind, reason), failure);
+    }
+    assert_eq!(
+        SignInFailure::from_wire(FailureKind::Unknown, "old words".into()),
+        SignInFailure::Refused("old words".into())
+    );
 }

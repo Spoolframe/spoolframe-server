@@ -143,6 +143,8 @@ async fn the_device_shows_the_fingerprint_the_phone_does_before_authorizing() {
         // Who the guest is, before they answer: "Check this matches
         // Steve's phone".
         assert_eq!(connected.name.as_deref(), Some("Steve"));
+        // And what the phone calls itself, its device name.
+        assert_eq!(connected.phone_name.as_deref(), Some("phone"));
         assert_eq!(connected.device_key, offer.device_key());
         assert_eq!(connected.fingerprint, offer.fingerprint());
         // Nothing authorized yet.
@@ -497,7 +499,7 @@ async fn two_guests_keep_apart_and_one_signs_out_alone() {
         guests.prove(steve, &SERVER, &NONCE).await.unwrap();
         guests.prove(ann, &SERVER, &NONCE).await.unwrap();
 
-        guests.forget_guest(steve).await.unwrap();
+        tv.forget_guest(steve).await.unwrap();
         assert_eq!(
             guests.prove(steve, &SERVER, &NONCE).await.unwrap_err(),
             SdkError::UnknownIdentity(steve.to_string())
@@ -512,7 +514,7 @@ async fn two_guests_keep_apart_and_one_signs_out_alone() {
 async fn an_identity_whose_root_is_here_is_not_forgotten_as_a_guest() {
     let (phone, id) = holder("Steve").await;
     assert!(matches!(
-        phone.portable().forget_guest(id).await,
+        phone.forget_guest(id).await,
         Err(SdkError::InvalidInput(_))
     ));
     assert_eq!(phone.portable().list().await.unwrap().len(), 1);
@@ -772,6 +774,57 @@ async fn the_phone_hands_the_identity_s_servers_and_the_tv_saves_them() {
     .await;
 }
 
+/// The phone lists the servers it could hand, and hands only those the
+/// person kept ticked; one it could not hand is refused, nothing sent.
+#[tokio::test]
+async fn the_tv_gets_only_the_servers_the_phone_chose() {
+    within(async {
+        let (_, tv) = tv().await;
+        let (phone_storage, phone) = open("phone").await;
+        let (id, _) = phone.portable().create("Steve").await.unwrap();
+        let key = |n: u8| iroh::SecretKey::from_bytes(&[n; 32]).public().to_string();
+        let (home, friend) = (key(1), key(2));
+        let at = "127.0.0.1:7420";
+        saved_with_session(&phone_storage, &home, "home-id", at, true, Some(id)).await;
+        saved_with_session(&phone_storage, &friend, "friend-id", at, true, Some(id)).await;
+
+        let pairing = tv.start_pairing("Living room TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), id).await.unwrap();
+        let mut offered: Vec<_> = offer
+            .servers()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.endpoint_id)
+            .collect();
+        offered.sort();
+        let mut both = vec![home.clone(), friend.clone()];
+        both.sort();
+        assert_eq!(offered, both);
+        assert!(matches!(
+            offer.authorize_with(None, &[key(9)]).await,
+            Err(SdkError::InvalidInput(_))
+        ));
+
+        let (authorized, paired) = tokio::join!(
+            offer.authorize_with(None, std::slice::from_ref(&friend)),
+            async { pairing.wait().await.unwrap().confirm().await }
+        );
+        authorized.unwrap();
+        let handed: Vec<_> = paired
+            .unwrap()
+            .servers
+            .into_iter()
+            .map(|s| s.endpoint_id)
+            .collect();
+        assert_eq!(handed, std::slice::from_ref(&friend));
+        let saved = tv.servers().await.unwrap();
+        assert!(saved.iter().any(|s| s.endpoint_id == friend));
+        assert!(!saved.iter().any(|s| s.endpoint_id == home));
+    })
+    .await;
+}
+
 /// #6: a guest paired by QR is listed with the server its phone handed
 /// first, and when: what a "Shared computer" row shows. Forgetting the
 /// guest takes the record too.
@@ -808,7 +861,7 @@ async fn a_guest_paired_by_qr_is_listed_with_its_server_and_when() {
         let at = spoolframe_types::serde_time::unix_seconds::to_wire(at) as u64;
         assert!(at >= before && at <= crate::servers::now(), "{at}");
 
-        tv.portable().forget_guest(id).await.unwrap();
+        tv.forget_guest(id).await.unwrap();
         assert!(tv.portable().guest_pairings().await.unwrap().is_empty());
         assert_eq!(
             tv_storage
@@ -883,7 +936,8 @@ async fn a_pairing_rejected_on_the_tv_installs_nothing() {
             assert_eq!(tv.portable().credential(id).await.unwrap(), None);
             held.reject().await.unwrap();
         });
-        assert_eq!(pairing_error(authorized), PairingError::NotAllowed);
+        // The phone hears it was turned down, not that guests are off.
+        assert_eq!(pairing_error(authorized), PairingError::Rejected);
         assert_eq!(tv.portable().credential(id).await.unwrap(), None);
         assert!(!device_key_stored(&storage, id).await);
         assert!(tv.portable().guests().await.unwrap().is_empty());
@@ -908,9 +962,46 @@ async fn a_held_pairing_dropped_undecided_is_rejected() {
         let (authorized, ()) = tokio::join!(offer.authorize(None), async {
             drop(pairing.wait().await.unwrap());
         });
-        assert_eq!(pairing_error(authorized), PairingError::NotAllowed);
+        // The phone hears it was turned down, not that guests are off.
+        assert_eq!(pairing_error(authorized), PairingError::Rejected);
         assert_eq!(tv.portable().credential(id).await.unwrap(), None);
         assert!(!device_key_stored(&storage, id).await);
+    })
+    .await;
+}
+
+/// A guest's phone that hangs up while the TV holds its pairing is not a
+/// rejection: nobody at the TV said no. The pairing ends aborted, the
+/// phone left, and nothing is installed.
+#[tokio::test]
+async fn a_phone_that_hangs_up_mid_hold_is_not_a_rejection() {
+    within(async {
+        let (_, tv) = tv().await;
+        let (phone, id) = holder("Steve").await;
+        let pairing = tv.start_pairing("TV").await.unwrap();
+        let offer = Arc::new(phone.scan_pairing(pairing.link(), id).await.unwrap());
+        let authorizing = {
+            let offer = offer.clone();
+            tokio::spawn(async move { offer.authorize(None).await })
+        };
+        let held = pairing.wait().await.unwrap();
+        // The phone goes: its answer, and its connection with it.
+        authorizing.abort();
+        let _ = authorizing.await;
+        drop(offer);
+        drop(phone);
+        // The TV hears the connection close before anyone there answers,
+        // as a person takes far longer than a hang-up takes to arrive.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let ended = held.confirm().await;
+        assert!(
+            matches!(
+                ended,
+                Err(SdkError::Pairing(PairingError::Aborted(ref why))) if why == "the phone left"
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(tv.portable().credential(id).await.unwrap(), None);
     })
     .await;
 }
@@ -931,7 +1022,7 @@ async fn a_guest_forgotten_offline_leaves_no_profile() {
         saved_with_session(&storage, &home, "home-id", nowhere, false, Some(id)).await;
         saved_with_session(&storage, &cabin, "cabin-id", nowhere, false, Some(id)).await;
         saved_with_session(&storage, &theirs, "their-id", nowhere, false, Some(other)).await;
-        tv.portable().forget_guest(id).await.unwrap();
+        tv.forget_guest(id).await.unwrap();
         for server in [&home, &cabin] {
             assert!(
                 tv.saved_profiles(server).await.unwrap().is_empty(),
