@@ -32,6 +32,7 @@ be updated together. The changes per revision are in
   [a new password after a reset](#choosing-a-new-password-after-a-reset),
   [app passkeys](#app-passkeys-a-relying-party-per-server),
   [device sign-in](#where-a-device-asked-from),
+  [signing in with a phone](#signing-in-with-a-phone),
   [trusted devices](#trusted-devices)
 - [Invites](#invites) and [relay access](#relay-access)
 - Playback: [profiles and progress](#profiles-and-progress),
@@ -662,6 +663,138 @@ device is not on this network, so approve only a device you can see; a
 code someone sent you is theirs. The SDK re-exports `DeviceAddress` and
 `AddressNetwork`; `Session::lookup_device_sign_in` returns the field.
 
+## Signing in with a phone
+
+A TV learns of a server by LAN discovery, the lookup document or an
+invite; none of them helps a TV on another network than the server, or
+one whose server has no public URL. A phone that is signed in already
+has what the TV needs. "Sign in with phone" puts one QR code on the TV;
+the phone scans it, the person ticks which of the phone's servers to
+sign the TV in to, and the TV saves each and signs in there as the
+profile the phone signs in as.
+
+The QR code is the pairing link ([Pairing](#pairing)), with the same
+one-time code. The TV takes it on two ALPNs while it shows the code, and
+neither after: `spoolframe/signin/1` always, and `spoolframe/pair/1`
+only when it allows guests. A phone signing it in uses the first; a
+guest's phone pairing its own identity uses the second, as before. The
+code goes to whichever presents it first, and an older phone still reads
+the link as a pairing link.
+
+The link has `r` only when the TV's app asked for it ("Use relay") and
+the TV has a home relay. The phone dials the TV's key at the `a`
+addresses, and through the `r` relay only when the link names one,
+whatever the phone's own relay setting.
+
+### Frames
+
+One bidirectional stream, each frame a client-protocol frame of at most
+256 KiB, tagged by `type` (`spoolframe_protocol::phone_sign_in`):
+
+| # | From | Frame | |
+|---|---|---|---|
+| 1 | phone | `{"type": "hello", "code": bytes(32)}` | |
+| 2 | TV | `{"type": "device", "name": "<name>", "platform": "tvos", "client_name": "<app>"}` | or `refused` |
+| 3 | phone | `{"type": "offers", "offers": [{"server": {…}, "request": "<id>", "user_name": "<name>"}]}` | or `{"type": "declined"}` |
+| 4 | TV | `{"type": "done", "results": [{"server": "<64 hex>", "outcome": {"type": "signed_in"}}]}` | |
+
+- `refused` is `{"type": "refused", "reason": r}`, `r` one of
+  `wrong_code`, `expired` and `failed`. The code is taken at `hello` as
+  a pairing's is: used up whether it matches or not.
+- `server` in an offer is a pairing's server card (`endpoint_id`,
+  `server_id`, `name`, `addrs`, `relays`), at most 16 offers. The TV
+  pins each as a pairing does: key and server id, not verified, a server
+  saved already left as it was, one whose server id it has under another
+  key left out.
+- The TV holds the offers until the person at it says: it shows who
+  signs it in (`user_name`) and to which servers. Nothing is saved or
+  redeemed before. It waits 2 minutes for them; no answer is a no.
+- Confirmed, the TV redeems each offer's `request` on its server with
+  `AwaitDeviceSignIn`, all at once, and answers once all are done (at
+  most a minute each). `results` follows the offers' order; an outcome is
+  `{"type": "signed_in"}` or `{"type": "failed", "reason": "…"}` (at
+  most 200 characters).
+- Turned down, the TV saves no server, redeems nothing, and answers each
+  `{"type": "declined"}`. The grants run out on their servers unused.
+- The TV waits 2 minutes for frame 3 and 10 seconds for any other. The
+  phone waits for `done` as long as the TV's person and its sign-ins
+  may take: 2 minutes, a minute, and 10 seconds.
+- Every frame enum, the outcome and the refusal have an unknown variant:
+  a value a newer peer adds decodes as unknown, and ends the exchange as
+  one out of turn does.
+
+### The offer
+
+With feature `spoolframe:phone-sign-in` on, the phone's session on each
+ticked server sends:
+
+```json
+{"type": "offer_device_sign_in", "device": "<TV's endpoint id>", "device_name": "Living Room TV", "platform": "tvos", "remember": false}
+```
+
+and gets `{"type": "device_sign_in_offered", "request": "<id>",
+"expires_in_ms": 300000}`. Its checks are `approve_device_sign_in`'s:
+
+- a local account's session, a portable identity's tied to one
+  included (`not_for_portable_users` for a guest's);
+- signed in within 10 minutes (`recent_sign_in_required`): the app runs
+  "Confirm it's you" on that session, then offers again;
+- `device` is an endpoint id, and not the phone's own (`invalid_input`);
+- the TV's and the server's pending sign-ins, which offers count
+  against, and at most 16 offers of one user's not yet redeemed, the
+  most a phone hands a TV at once (`rate_limited`).
+
+Each offer is its own sign-in; one refused stops none of the rest. The
+offer is not retry-safe: a second is a second sign-in pending.
+
+No session is made at offer time. The offer waits, in memory with the
+device sign-ins, bound to `device` and with no code. Only that endpoint's
+`AwaitDeviceSignIn` redeems it; any other is answered
+`device_sign_in_expired`, as for an unknown request. The first wait
+makes the session, as an approval of a code would: bound to the TV,
+resting on how the phone's session signed in, and trusted for the user
+if `remember`, the phone's choice. It answers `logged_in`. The offering
+session must still be live then: one signed out or revoked since leaves
+the offer `device_sign_in_expired`, with nothing made. An offer not
+redeemed within its 5 minutes ends with nothing made.
+
+### SDK
+
+TV side:
+
+- `Client::start_phone_sign_in(name, relay)` gives a `PhoneSignIn`:
+  `link()` for the QR code, `expires_in()`, `connected()` (a
+  `PhoneConnected`: `SigningIn`, or `Guest(Connected)` with the
+  fingerprint to show), `wait()` and `cancel()`. One code at a time,
+  this or a pairing's (`PairingError::AlreadyPairing`). Dropped, the TV
+  takes neither ALPN.
+- `wait()` gives what the phone handed, held: `HeldPhoneSignIn::SignIn(
+  HeldSignIn)` with `offers()` (each a `HeldOffer { server, user_name }`),
+  or `::Guest(HeldPairing)` for a guest. Each has `confirm()` and
+  `reject()`; dropped undecided it rejects. `HeldSignIn::confirm()`
+  gives `PhoneSignedIn { sessions, failed }`, the shape of
+  `PairedSignIn`; each session is kept with `SignInMethod::Device`.
+  Rejected, the code ends with `PairingError::Rejected`.
+
+Phone side:
+
+- `Client::scan_phone_sign_in(link)` gives a `SignInOffer`:
+  `device_name()`, `platform()`, `client_name()`, `device()`.
+- `SignInOffer::servers()` lists a `SignInChoice { session, server }`
+  per session this phone holds on a server it has verified with its
+  server id pinned, of a local account, where the server has the
+  feature.
+- `SignInOffer::offer(&choice, remember)` makes one sign-in
+  (`On<PhoneSignIn>::offer_device_sign_in`), and `send()` hands the TV
+  all made and gives a `SignInOfferResult` each. `approve(&chosen,
+  remember)` does both: a server that refuses is
+  `SignInOfferOutcome::NotOffered(error)`, and with none offered
+  nothing is sent and the TV keeps waiting. `decline()` tells the TV no.
+
+The FFI has `SpoolClient.start_phone_sign_in(name, relay)` and
+`SpoolClient.scan_phone_sign_in(link)`, giving `SpoolPhoneSignIn` and
+`SpoolSignInOffer` (whose `servers()` are `SpoolSignInChoice`s).
+
 ## Trusted devices
 
 A user can make a device trusted (§24, §40). A trusted device starts a
@@ -679,6 +812,7 @@ it.
 | `BeginDeviceSignIn` | `{remember: bool}`: the device asks to be trusted |
 | `LookupDeviceSignIn` | its reply, `DeviceSignInRequest`, has `remember: bool`: the device asked |
 | `ApproveDeviceSignIn` | `remember: bool`: the approver's answer |
+| `OfferDeviceSignIn` | `remember: bool`: the phone's choice; the TV does not ask |
 | `SetDeviceTrust` | `{device: Option<String>, trusted, auto_login}` |
 
 Clients send `remember: false` unless the user ticked "Remember this
@@ -1908,12 +2042,13 @@ it is off, with nothing sent. A request of a feature that went off since
 | `spoolframe:october-2026` | `profile_removed`, `pin_changed`, `watch_changed`, `next_episode`, `show_next`, `begin_invite_passkey` and `redeem_invite_with_passkey` |
 | `spoolframe:download-addons` | `download_addon_options`, `read_track_subtitle` and `prepare_audio_addon` ([download add-ons](#download-add-ons)) |
 | `spoolframe:diagnostics` | `send_diagnostics` ([sending diagnostics](#sending-diagnostics)) |
+| `spoolframe:phone-sign-in` | `offer_device_sign_in` ([signing in with a phone](#signing-in-with-a-phone)) |
 
 The names are dated: a feature is what was added by its date. Later
-additions get a new dated name, and a name stays once added. Two are
-not: `spoolframe:download-addons` and `spoolframe:diagnostics` are
-named for what they bring, by the user's choice, so an app can name
-each on its own.
+additions get a new dated name, and a name stays once added. Three are
+not: `spoolframe:download-addons`, `spoolframe:diagnostics` and
+`spoolframe:phone-sign-in` are named for what they bring, by the
+user's choice, so an app can name each on its own.
 
 A new reply field needs neither. It is `serde(default)`, so a reply from
 an older server decodes. Where its absence means something other than
@@ -3443,6 +3578,10 @@ Values are percent-encoded as in an invite link. A link longer than 1024
 bytes, a second `e` or `c`, or one that cannot be read is refused; an
 unknown parameter is ignored. A usual link is under 250 bytes.
 
+A TV's "Sign in with phone" code is this same link: a phone may sign
+the TV in to its accounts with it instead, on `spoolframe/signin/1`
+([signing in with a phone](#signing-in-with-a-phone)).
+
 The device accepts `spoolframe/pair/1` only while it shows a code. The
 phone dials `e` with the addresses and relays in the link, and opens one
 bidirectional stream. Each frame is a client-protocol frame (big-endian
@@ -3450,7 +3589,7 @@ bidirectional stream. Each frame is a client-protocol frame (big-endian
 
 | # | From | Frame | |
 |---|---|---|---|
-| 1 | phone | `{"type": "hello", "code": bytes(32), "identity": "<PortableUserId>"}` | |
+| 1 | phone | `{"type": "hello", "code": bytes(32), "identity": "<PortableUserId>", "name": "<name>"}` | |
 | 2 | device | `{"type": "key", "device_key": "<64 hex>", "name": "<name>"}` | or `refused` |
 | 3 | phone | `{"type": "credential", "credential": {…}, "state": {…} or null, "servers": [{…}]}` | or `{"type": "declined"}` |
 | 4 | device | `{"type": "done"}` | or `refused` |
@@ -3459,6 +3598,11 @@ bidirectional stream. Each frame is a client-protocol frame (big-endian
 `not_allowed` (guest sign-ins were turned off after the code was shown),
 `wrong_code`, `expired`, `credential_refused` and `failed`.
 
+- `name` in `hello` is what the person calls the identity, at most 32
+  characters, for the device to show before they answer ("Check this
+  matches Steve's phone"). It is optional: a phone before it was added
+  leaves it out, and the device shows the fingerprint alone. It is the
+  phone's word, not proved.
 - At `hello` the device takes the code: compared in constant time, and
   used up whether it matches or not. A wrong code ends the pairing
   (`wrong_code`); so does a code presented after its 5 minutes
@@ -3470,8 +3614,12 @@ bidirectional stream. Each frame is a client-protocol frame (big-endian
   before it sends anything.
 - `credential` must hold now, name `identity` and the key in `key`.
   `state`, if any, must be `identity`'s, verify, and not revoke that key
-  (`credential_refused` otherwise). The device installs the credential,
-  then takes the state in, by the rules of "Identity state".
+  (`credential_refused` otherwise). The device then holds it for the
+  person at it ("Add Steve as a guest?"), for 2 minutes. Turned down, or
+  not answered, it installs nothing, saves no server, and answers
+  `not_allowed`. Confirmed, it installs the credential, then takes the
+  state in, by the rules of "Identity state". The phone waits for the
+  answer 2 minutes and 10 seconds.
 - `servers` are the servers the phone signs in to as `identity` and has
   verified, at most 16, each `{"endpoint_id": "<64 hex>", "server_id":
   "…", "name": "…", "addrs": ["ip:port", …], "relays": ["https://…", …]}`
@@ -3700,7 +3848,12 @@ at once. The TV's flow:
 2. `connected()`: the phone has scanned it. Show "Check your phone shows
    <fingerprint>". It is `DevicePublicKey::fingerprint()`, the same
    string the phone shows as `PairingOffer::fingerprint()`.
-3. `wait()`: the person on the phone authorized or declined.
+3. `wait()`: the person on the phone authorized, and the pairing is
+   held (`HeldPairing`): identity, name, fingerprint and the servers
+   handed. Nothing is installed until `confirm()`, which gives `Paired`;
+   `reject()`, or dropping it undecided, installs nothing and tells the
+   phone `not_allowed`. Or the error it ended with: declined on the
+   phone, and the rest below.
 
 `connected()` and `wait()` both take `&self`, may run side by side, and
 give the same answer on each call. If the pairing ends before a phone

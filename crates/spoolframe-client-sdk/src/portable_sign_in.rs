@@ -118,11 +118,7 @@ impl Client {
         let storage = self.inner.storage.as_ref();
         let mut found = Vec::new();
         for server in servers::load(storage).await? {
-            if !server.verified {
-                continue;
-            }
-            let (Some(server_id), Ok(id)) = (&server.server_id, parse_id(&server.endpoint_id))
-            else {
+            let Some((id, card)) = vouched_for(&server) else {
                 continue;
             };
             let signs_in = session::load(storage, &id)
@@ -132,13 +128,7 @@ impl Client {
             if !signs_in {
                 continue;
             }
-            found.push(PairedServer {
-                endpoint_id: server.endpoint_id.clone(),
-                server_id: server_id.clone(),
-                name: server.name.clone(),
-                addrs: server.addrs().into_iter().take(MAX_ADDRS).collect(),
-                relays: server.relays.iter().take(MAX_RELAYS).cloned().collect(),
-            });
+            found.push(card);
             if found.len() == MAX_PAIRED_SERVERS {
                 break;
             }
@@ -200,6 +190,27 @@ impl Client {
         self.inner.discovery.changed();
         Ok(kept)
     }
+}
+
+/// `server` as this device hands it to another, if it vouches for it:
+/// verified here, with its server id pinned (the other device could not
+/// pin it whole otherwise). Its key, and the card.
+pub(crate) fn vouched_for(server: &SavedServer) -> Option<(EndpointId, PairedServer)> {
+    if !server.verified {
+        return None;
+    }
+    let server_id = server.server_id.as_ref()?;
+    let id = parse_id(&server.endpoint_id).ok()?;
+    Some((
+        id,
+        PairedServer {
+            endpoint_id: server.endpoint_id.clone(),
+            server_id: server_id.clone(),
+            name: server.name.clone(),
+            addrs: server.addrs().into_iter().take(MAX_ADDRS).collect(),
+            relays: server.relays.iter().take(MAX_RELAYS).cloned().collect(),
+        },
+    ))
 }
 
 fn add_relays(server: &mut SavedServer, relays: &[String]) {

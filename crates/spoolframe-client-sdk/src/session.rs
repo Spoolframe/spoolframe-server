@@ -47,6 +47,23 @@ pub(crate) struct StoredSession {
     /// what signs it in again. `None` for any other sign-in.
     #[serde(default)]
     pub portable: Option<PortableUserId>,
+    /// The user is the server's admin, as the server last said
+    /// ([`StoredSession::note_role`]). False for a session kept before it
+    /// was.
+    #[serde(default)]
+    pub admin: bool,
+}
+
+impl StoredSession {
+    /// Keep what `user` says of the role, and its name: true if either
+    /// changed.
+    pub(crate) fn note_role(&mut self, user: &UserSummary) -> bool {
+        let admin = user.role == spoolframe_types::Role::Admin;
+        let changed = self.admin != admin || self.display_name != user.display_name;
+        self.admin = admin;
+        self.display_name = user.display_name.clone();
+        changed
+    }
 }
 
 /// Someone who signed in on a server from this device, as "Who's
@@ -65,6 +82,12 @@ pub struct SavedProfile {
     /// With [`SignInMethod::Portable`], the identity to sign in again
     /// with: [`crate::Client::sign_in_portable`], no password asked.
     pub portable: Option<PortableUserId>,
+    /// They are the server's admin, as the server last said: for an
+    /// "Admin" label, and to offer "Turn on with <admin>'s PIN" with no
+    /// admin signed in. Kept at sign-in, and again whenever this device
+    /// asks the server who they are ([`crate::Client::profiles`],
+    /// [`Session::whoami`]). False for a profile kept before it was.
+    pub admin: bool,
 }
 
 /// How "Confirm it's you" confirms a user ([`Session::reauth_options`]).
@@ -124,6 +147,7 @@ impl From<&StoredSession> for SavedProfile {
             },
             method: stored.method,
             portable: stored.portable,
+            admin: stored.admin,
         }
     }
 }
@@ -951,7 +975,10 @@ impl Session {
     /// Ask the server who this session is.
     pub async fn whoami(&self) -> Result<UserSummary, SdkError> {
         match self.call(Request::WhoAmI).await? {
-            Reply::WhoAmI(spoolframe_protocol::WhoAmIReply { user, .. }) => Ok(user),
+            Reply::WhoAmI(spoolframe_protocol::WhoAmIReply { user, .. }) => {
+                self.client.note_role(self.server, &user).await?;
+                Ok(user)
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -2647,6 +2674,8 @@ mod tests {
                 sign_in: ProfileSignIn::Automatic,
                 method: None,
                 portable: None,
+                // Kept before the role was: not an admin.
+                admin: false,
             }]
         );
     }
@@ -2697,6 +2726,7 @@ mod tests {
                 display_name: name.into(),
                 method: Some(method),
                 portable: None,
+                admin: false,
             })
             .collect();
         save(&storage, &server, &stored).await.unwrap();

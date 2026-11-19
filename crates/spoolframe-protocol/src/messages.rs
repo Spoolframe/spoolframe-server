@@ -1305,6 +1305,32 @@ pub enum Request {
         report: crate::diagnostics::DiagnosticsReport,
     },
 
+    /// Make a device sign-in for the TV whose key is `device` (64 hex
+    /// digits), as the session user, for the TV to redeem with
+    /// `AwaitDeviceSignIn` (feature `spoolframe:phone-sign-in`):
+    /// `DeviceSignInOffered`. The phone reached the TV directly
+    /// ([`crate::phone_sign_in`]) and hands it the request; no session is
+    /// made until the TV asks, and only the endpoint `device` may.
+    ///
+    /// - `device_name` and `platform` are the TV's, as it told the phone:
+    ///   what its session is listed as.
+    /// - `remember` trusts the TV for the user once it signs in: the
+    ///   approver's choice, as `ApproveDeviceSignIn`'s.
+    ///
+    /// As `ApproveDeviceSignIn`: a local account's session, a portable
+    /// identity's tied one included (`NotForPortableUsers` otherwise),
+    /// signed in within 10 minutes (`RecentSignInRequired`). `device`
+    /// that is not a key is `InvalidInput`, as is this device's own. Too
+    /// many sign-ins pending for the TV, or on the server, is
+    /// `RateLimited`. An offer the TV does not redeem in time
+    /// (`expires_in_ms`) ends with nothing made.
+    OfferDeviceSignIn {
+        device: String,
+        device_name: String,
+        platform: Platform,
+        remember: bool,
+    },
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -1367,6 +1393,7 @@ impl Request {
             | Request::ReadTrackSubtitle { .. }
             | Request::PrepareAudioAddon { .. } => Some(Feature::DownloadAddons),
             Request::SendDiagnostics { .. } => Some(Feature::Diagnostics),
+            Request::OfferDeviceSignIn { .. } => Some(Feature::PhoneSignIn),
             Request::Hello { .. }
             | Request::AuthMethods
             | Request::LoginPassword { .. }
@@ -1905,6 +1932,13 @@ pub enum Reply {
     },
     /// Not approved yet: `AwaitDeviceSignIn` again.
     DeviceSignInPending,
+    /// A sign-in made for a TV (`OfferDeviceSignIn`): hand `request` to
+    /// the TV, which redeems it with `AwaitDeviceSignIn` within
+    /// `expires_in_ms`.
+    DeviceSignInOffered {
+        request: String,
+        expires_in_ms: u64,
+    },
     /// What an invite's code is (`LookupInvite`).
     InviteLookup {
         outcome: InviteLookupOutcome,

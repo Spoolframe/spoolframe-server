@@ -76,8 +76,17 @@ fn pairing_error(result: Result<impl std::fmt::Debug, SdkError>) -> PairingError
 async fn pair(tv: &Client, phone: &Client, id: PortableUserId) -> Paired {
     let pairing = tv.start_pairing("Living room TV").await.unwrap();
     let offer = phone.scan_pairing(pairing.link(), id).await.unwrap();
-    offer.authorize(None).await.unwrap();
-    pairing.wait().await.unwrap()
+    authorized(&offer, &pairing, None).await
+}
+
+/// The phone authorizes, as `label`, and the TV confirms what it holds:
+/// the phone's answer waits for the TV's.
+async fn authorized(offer: &PairingOffer, pairing: &Pairing, label: Option<&str>) -> Paired {
+    let (authorized, paired) = tokio::join!(offer.authorize(label), async {
+        pairing.wait().await.unwrap().confirm().await
+    });
+    authorized.unwrap();
+    paired.unwrap()
 }
 
 #[tokio::test]
@@ -94,9 +103,7 @@ async fn a_guest_pairs_by_qr_and_the_device_proves_as_them() {
         assert_eq!(offer.identity(), id);
         assert_eq!(offer.fingerprint(), offer.device_key().fingerprint());
         assert_eq!(offer.fingerprint().len(), 19);
-        offer.authorize(None).await.unwrap();
-
-        let paired = pairing.wait().await.unwrap();
+        let paired = authorized(&offer, &pairing, None).await;
         let guest = tv.portable();
         assert_eq!(paired.identity, id);
         assert_eq!(paired.device_key, offer.device_key());
@@ -133,19 +140,25 @@ async fn the_device_shows_the_fingerprint_the_phone_does_before_authorizing() {
             tokio::join!(pairing.connected(), phone.scan_pairing(pairing.link(), id));
         let (connected, offer) = (connected.unwrap(), offer.unwrap());
         assert_eq!(connected.identity, id);
+        // Who the guest is, before they answer: "Check this matches
+        // Steve's phone".
+        assert_eq!(connected.name.as_deref(), Some("Steve"));
         assert_eq!(connected.device_key, offer.device_key());
         assert_eq!(connected.fingerprint, offer.fingerprint());
         // Nothing authorized yet.
         assert!(device_key_stored(&storage, id).await);
         assert_eq!(tv.portable().credential(id).await.unwrap(), None);
 
-        offer.authorize(None).await.unwrap();
-        let paired = pairing.wait().await.unwrap();
+        let paired = authorized(&offer, &pairing, None).await;
         assert_eq!(paired.fingerprint, connected.fingerprint);
+        assert_eq!(paired.name.as_deref(), Some("Steve"));
         assert_eq!(paired.device_key, connected.device_key);
         // After the end, the same phone, and the same end again.
         assert_eq!(pairing.connected().await.unwrap(), connected);
-        assert_eq!(pairing.wait().await.unwrap(), paired);
+        assert_eq!(
+            pairing.wait().await.unwrap().confirm().await.unwrap(),
+            paired
+        );
     })
     .await;
 }
@@ -230,8 +243,7 @@ async fn the_label_is_the_phone_s_when_it_gives_one() {
         let (phone, id) = holder("Steve").await;
         let pairing = tv.start_pairing("Living room TV").await.unwrap();
         let offer = phone.scan_pairing(pairing.link(), id).await.unwrap();
-        offer.authorize(Some("Mum's TV")).await.unwrap();
-        pairing.wait().await.unwrap();
+        authorized(&offer, &pairing, Some("Mum's TV")).await;
         let issued = phone.portable().issued(id).await.unwrap();
         assert_eq!(issued[0].label.as_deref(), Some("Mum's TV"));
     })
@@ -339,8 +351,7 @@ async fn a_code_used_once_does_not_pair_again() {
         let pairing = tv.start_pairing("TV").await.unwrap();
         let link = pairing.link().to_owned();
         let offer = phone.scan_pairing(&link, steve).await.unwrap();
-        offer.authorize(None).await.unwrap();
-        pairing.wait().await.unwrap();
+        authorized(&offer, &pairing, None).await;
 
         let (other, ann) = holder("Ann").await;
         assert!(other.scan_pairing(&link, ann).await.is_err());
@@ -663,6 +674,7 @@ async fn saved_with_session(
             display_name: "U".into(),
             method: Some(crate::session::SignInMethod::Portable),
             portable: id,
+            admin: false,
         }],
     )
     .await
@@ -847,6 +859,87 @@ async fn a_guest_stored_before_pairings_were_kept_has_neither() {
                 paired_at: None,
             }]
         );
+    })
+    .await;
+}
+
+/// The TV holds what the phone authorized: nothing is installed, and the
+/// phone has no answer, until the person at the TV says. Rejected, the
+/// credential, the device key and the servers are never kept, and the
+/// phone is told no.
+#[tokio::test]
+async fn a_pairing_rejected_on_the_tv_installs_nothing() {
+    within(async {
+        let (storage, tv) = tv().await;
+        let (phone, id) = holder("Steve").await;
+        let pairing = tv.start_pairing("TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), id).await.unwrap();
+        let (authorized, ()) = tokio::join!(offer.authorize(None), async {
+            let held = pairing.wait().await.unwrap();
+            assert_eq!(held.identity(), id);
+            assert_eq!(held.name(), Some("Steve"));
+            assert_eq!(held.fingerprint(), offer.fingerprint());
+            // Held: nothing kept yet.
+            assert_eq!(tv.portable().credential(id).await.unwrap(), None);
+            held.reject().await.unwrap();
+        });
+        assert_eq!(pairing_error(authorized), PairingError::NotAllowed);
+        assert_eq!(tv.portable().credential(id).await.unwrap(), None);
+        assert!(!device_key_stored(&storage, id).await);
+        assert!(tv.portable().guests().await.unwrap().is_empty());
+        assert!(tv.servers().await.unwrap().is_empty());
+        // The end, to any later call.
+        assert_eq!(
+            pairing_error(pairing.wait().await.unwrap().confirm().await),
+            PairingError::Rejected
+        );
+    })
+    .await;
+}
+
+/// A held pairing dropped undecided is a rejection.
+#[tokio::test]
+async fn a_held_pairing_dropped_undecided_is_rejected() {
+    within(async {
+        let (storage, tv) = tv().await;
+        let (phone, id) = holder("Steve").await;
+        let pairing = tv.start_pairing("TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), id).await.unwrap();
+        let (authorized, ()) = tokio::join!(offer.authorize(None), async {
+            drop(pairing.wait().await.unwrap());
+        });
+        assert_eq!(pairing_error(authorized), PairingError::NotAllowed);
+        assert_eq!(tv.portable().credential(id).await.unwrap(), None);
+        assert!(!device_key_stored(&storage, id).await);
+    })
+    .await;
+}
+
+/// Forgetting a guest drops what it signed in as here even when no server
+/// answers (nothing listens at these addresses): the profiles go, the
+/// servers and another identity's profile stay.
+#[tokio::test]
+async fn a_guest_forgotten_offline_leaves_no_profile() {
+    within(async {
+        let (storage, tv) = tv().await;
+        let (phone, id) = holder("Steve").await;
+        pair(&tv, &phone, id).await;
+        let (_, other) = holder("Ann").await;
+        let key = |n: u8| iroh::SecretKey::from_bytes(&[n; 32]).public().to_string();
+        let (home, cabin, theirs) = (key(1), key(2), key(3));
+        let nowhere = "127.0.0.1:9";
+        saved_with_session(&storage, &home, "home-id", nowhere, false, Some(id)).await;
+        saved_with_session(&storage, &cabin, "cabin-id", nowhere, false, Some(id)).await;
+        saved_with_session(&storage, &theirs, "their-id", nowhere, false, Some(other)).await;
+        tv.portable().forget_guest(id).await.unwrap();
+        for server in [&home, &cabin] {
+            assert!(
+                tv.saved_profiles(server).await.unwrap().is_empty(),
+                "{server}"
+            );
+        }
+        assert_eq!(tv.saved_profiles(&theirs).await.unwrap().len(), 1);
+        assert_eq!(tv.servers().await.unwrap().len(), 3);
     })
     .await;
 }

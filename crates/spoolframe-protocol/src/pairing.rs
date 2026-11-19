@@ -25,8 +25,8 @@
 //! Then, on one bidirectional stream, each frame a [`crate::codec`] frame
 //! (big-endian `u32` length, CBOR) of at most [`MAX_FRAME`] bytes:
 //!
-//! 1. phone → device: [`PhoneFrame::Hello`], the code and the identity
-//!    the phone wants this device to act as;
+//! 1. phone → device: [`PhoneFrame::Hello`], the code, the identity
+//!    the phone wants this device to act as, and its name;
 //! 2. device → phone: [`DeviceFrame::Key`], the device's key for that
 //!    identity and its name, or [`DeviceFrame::Refused`];
 //! 3. phone → device: [`PhoneFrame::Credential`], the root's credential
@@ -252,6 +252,13 @@ pub enum PhoneFrame {
     Hello {
         code: PairingCode,
         identity: PortableUserId,
+        /// What the identity's person calls it ("Steve"), for the device
+        /// to show before they authorize: "Check this matches Steve's
+        /// phone". Cut to [`MAX_NAME`] characters ([`cut_name`]). Left
+        /// out by a phone before it was added, and by one that sends no
+        /// name: `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// The root's credential for the key [`DeviceFrame::Key`] gave, the
     /// identity's newest state if the phone has one, and the servers the
@@ -351,6 +358,11 @@ pub enum Refusal {
 
 fn cut(name: &str) -> String {
     name.chars().take(MAX_NAME).collect()
+}
+
+/// `name` as a pairing carries a name: cut to [`MAX_NAME`] characters.
+pub fn cut_name(name: &str) -> String {
+    cut(name)
 }
 
 fn hex(bytes: &[u8; 32]) -> String {
@@ -616,6 +628,38 @@ mod tests {
                 assert_eq!(parse_link(&link.link()), Ok(link));
             }
         }
+    }
+
+    /// The guest's name rides the hello; a hello without it, as a phone
+    /// before it sent, still reads, with no name.
+    #[test]
+    fn a_hello_carries_the_guest_s_name_or_none() {
+        let identity = PortableUserId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        let hello = PhoneFrame::Hello {
+            code: PairingCode::from_bytes([7; 32]),
+            identity,
+            name: Some("Steve".into()),
+        };
+        let read: PhoneFrame =
+            crate::codec::decode(&crate::codec::encode(&hello).unwrap()).unwrap();
+        assert_eq!(read, hello);
+        assert_eq!(serde_json::to_value(&hello).unwrap()["name"], "Steve");
+        let cbor = crate::codec::encode(&hello).unwrap();
+        let mut value: ciborium::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = &mut value else {
+            panic!("a map");
+        };
+        fields.retain(|(k, _)| k.as_text() != Some("name"));
+        let old: PhoneFrame = crate::codec::decode(&crate::codec::encode(&value).unwrap()).unwrap();
+        assert!(
+            matches!(old, PhoneFrame::Hello { name: None, .. }),
+            "{old:?}"
+        );
     }
 
     #[test]

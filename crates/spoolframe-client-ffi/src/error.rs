@@ -364,6 +364,9 @@ pub enum PairingFailure {
     /// Cut off part way.
     #[error("the pairing was cut off: {message}")]
     Aborted { message: String },
+    /// Turned down on the device, or not answered there in time.
+    #[error("it was turned down on the device")]
+    Rejected,
 }
 
 #[uniffi::export]
@@ -411,6 +414,7 @@ impl From<sdk::PairingError> for PairingFailure {
             sdk::PairingError::CredentialRefused => Self::CredentialRefused,
             sdk::PairingError::Failed => Self::Failed,
             sdk::PairingError::Aborted(message) => Self::Aborted { message },
+            sdk::PairingError::Rejected => Self::Rejected,
         }
     }
 }

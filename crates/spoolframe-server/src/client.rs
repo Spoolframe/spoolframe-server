@@ -45,7 +45,7 @@ use crate::admission::{Peer, SIGN_OUT_DRAIN};
 use crate::announce::Told;
 use crate::artwork::{Artwork, ArtworkError};
 use crate::auth::{self, Approval, LoginError, RECENT_SIGN_IN, SessionToken, UnlockError};
-use crate::device_sign_in::{self, ClaimError, Outcome, Waiting};
+use crate::device_sign_in::{self, ClaimError, Grant, Outcome, Waiting};
 use crate::encode::job::{EncodeJob, JobError, Progress};
 use crate::encode::{Conversion, ConversionSource, Init, hls};
 use crate::events::{Addresses, EventStreams};
@@ -77,7 +77,7 @@ use spoolframe_types::Delivery;
 /// client's `Hello` named. A feature not here is off for every
 /// connection, though this build knows its name.
 pub(crate) fn features() -> Features {
-    Feature::October2026 | Feature::DownloadAddons | Feature::Diagnostics
+    Feature::October2026 | Feature::DownloadAddons | Feature::Diagnostics | Feature::PhoneSignIn
 }
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -1368,6 +1368,41 @@ impl ClientProtocol {
                         Ok(self
                             .logged_in(connection, handover.token, handover.remembered, false)
                             .await)
+                    }
+                    // Made now, as its offer's approval, and handed to the
+                    // wait below, which finds it decided.
+                    Outcome::Offered(redeeming) => {
+                        match self.services.auth.redeem_offer(&redeeming).await {
+                            Ok(Approval::SignedIn) => {
+                                match self
+                                    .services
+                                    .auth
+                                    .sign_ins()
+                                    .wait(&request, &endpoint, device_sign_in::AWAIT)
+                                    .await
+                                {
+                                    Outcome::Approved(handover) => {
+                                        tracing::info!(
+                                            %endpoint,
+                                            remembered = handover.remembered,
+                                            "device signed in by a phone's offer"
+                                        );
+                                        Ok(self
+                                            .logged_in(
+                                                connection,
+                                                handover.token,
+                                                handover.remembered,
+                                                false,
+                                            )
+                                            .await)
+                                    }
+                                    // Another wait of this device's took it.
+                                    _ => Ok(Reply::DeviceSignInPending),
+                                }
+                            }
+                            Ok(Approval::Expired) => Err(Error::DeviceSignInExpired),
+                            Err(e) => Err(internal(e)),
+                        }
                     }
                     Outcome::Pending => Ok(Reply::DeviceSignInPending),
                     Outcome::Denied => Err(Error::DeviceSignInDenied),
@@ -4897,6 +4932,69 @@ impl ClientProtocol {
                         what: "sign-in code".into(),
                     }),
                     Err(e) => Err(internal(e)),
+                }
+            }
+            // As ApproveDeviceSignIn, for a TV the phone reached itself:
+            // approved in advance, the session made when the TV redeems it.
+            Request::OfferDeviceSignIn {
+                device,
+                mut device_name,
+                platform,
+                remember,
+            } => {
+                let user = local(&who)?;
+                recently_signed_in(user, self.services.auth.store().now())?;
+                let device = device
+                    .parse::<EndpointId>()
+                    .map_err(|_| Error::InvalidInput {
+                        message: "device is not an endpoint id".into(),
+                    })?
+                    .to_string();
+                if device == connection.remote_id().to_string() {
+                    return Err(Error::InvalidInput {
+                        message: "sign this device in on another device".into(),
+                    });
+                }
+                if let Some((at, _)) = device_name
+                    .char_indices()
+                    .nth(spoolframe_protocol::MAX_HELLO_TEXT)
+                {
+                    device_name.truncate(at);
+                }
+                let auth = &self.services.auth;
+                let offered = auth.sign_ins().offer(
+                    Waiting {
+                        endpoint: device.clone(),
+                        device_name: Some(device_name).filter(|n| !n.is_empty()),
+                        client_name: String::new(),
+                        platform,
+                        requested_at: auth.store().now(),
+                        remember,
+                        address: None,
+                    },
+                    Grant {
+                        user: user.user,
+                        remember,
+                        signed_in_with: user.signed_in_with,
+                        offered_by: SessionToken(session.0.clone()).hash(),
+                    },
+                );
+                match offered {
+                    Some(request) => {
+                        tracing::info!(
+                            user = %user.username,
+                            %device,
+                            remember,
+                            "device sign-in offered"
+                        );
+                        Ok(Reply::DeviceSignInOffered {
+                            request,
+                            expires_in_ms: auth.sign_ins().lifetime().as_millis() as u64,
+                        })
+                    }
+                    None => Err(Error::RateLimited {
+                        retry_after_ms: device_sign_in::LIFETIME.as_millis() as u64,
+                    }),
                 }
             }
             Request::DenyDeviceSignIn { code } => {

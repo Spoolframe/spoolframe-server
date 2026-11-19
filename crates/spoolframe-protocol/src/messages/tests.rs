@@ -4957,3 +4957,42 @@ fn an_item_s_merge_facts_round_trip() {
     let back: Item = codec::decode(&codec::encode(&item).unwrap()).unwrap();
     assert_eq!(back, item);
 }
+
+/// The phone sign-in's names are promised to the apps: they never change.
+/// The request is of feature `spoolframe:phone-sign-in`, and never sent
+/// again by itself: a second would be a second sign-in pending for the TV.
+#[test]
+fn the_phone_sign_in_wire_names_are_fixed() {
+    use spoolframe_types::Platform;
+    let request = Request::OfferDeviceSignIn {
+        device: "ab".repeat(32),
+        device_name: "Living Room TV".into(),
+        platform: Platform::Tvos,
+        remember: true,
+    };
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::json!({
+            "type": "offer_device_sign_in",
+            "device": "ab".repeat(32),
+            "device_name": "Living Room TV",
+            "platform": "tvos",
+            "remember": true,
+        })
+    );
+    round_trip(request.clone());
+    assert_eq!(request.feature(), Some(crate::Feature::PhoneSignIn));
+    assert!(!crate::policy::retry_safe(&request));
+    assert!(!request.is_pre_auth());
+    let reply = Reply::DeviceSignInOffered {
+        request: "r1".into(),
+        expires_in_ms: 300_000,
+    };
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap(),
+        serde_json::json!({
+            "type": "device_sign_in_offered", "request": "r1", "expires_in_ms": 300_000,
+        })
+    );
+    round_trip(reply);
+}

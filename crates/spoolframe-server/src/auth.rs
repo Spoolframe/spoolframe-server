@@ -17,7 +17,7 @@ use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use spoolframe_types::Role;
 
 use crate::clock::Clock;
-use crate::device_sign_in::{Claim, DeviceSignIns, Handover};
+use crate::device_sign_in::{Claim, DeviceSignIns, Handover, Redeeming};
 use crate::refusals::Refusals;
 use crate::store::sessions::{
     ApiSessionUser, SessionBinding, SessionOwner, SessionUser, SignedInWith,
@@ -856,6 +856,30 @@ impl Auth {
             // with it.
             Err(_) => Err(StoreError::Db(sqlx::Error::PoolClosed)),
         }
+    }
+
+    /// Make the session of an offer its device came to redeem
+    /// ([`crate::device_sign_in::Outcome::Offered`]), as an approval of it
+    /// by the session that offered it, which must still be live: one
+    /// signed out or revoked since leaves the offer [`Approval::Expired`],
+    /// with nothing made. Then [`DeviceSignIns`] hands the session over to
+    /// the device's next wait.
+    pub async fn redeem_offer(&self, redeeming: &Redeeming) -> Result<Approval, StoreError> {
+        let Redeeming { claim, grant } = redeeming;
+        // Failed or gone, the device stops waiting.
+        let live = match self.store.session_owner(&grant.offered_by).await {
+            Ok(owner) => owner.is_some_and(|owner| owner.live),
+            Err(e) => {
+                let _ = self.sign_ins.fulfil(&claim.request, None);
+                return Err(e);
+            }
+        };
+        if !live {
+            let _ = self.sign_ins.fulfil(&claim.request, None);
+            return Ok(Approval::Expired);
+        }
+        self.approve_device(grant.user, claim, grant.remember, grant.signed_in_with)
+            .await
     }
 
     async fn approve_device_to_the_end(

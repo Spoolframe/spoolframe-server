@@ -1393,6 +1393,89 @@ mod sdk {
         invites.server.stop().await;
     }
 
+    /// Forgetting a guest on the TV signs it out everywhere it was signed
+    /// in as that guest: off "Who's watching" on each server, nothing
+    /// opens as it, also once the app starts again on the same storage.
+    /// The servers stay saved.
+    #[tokio::test]
+    async fn a_forgotten_guest_is_signed_out_of_every_server() {
+        let homes = [
+            invites("sdk-forget-guest-a").await,
+            invites("sdk-forget-guest-b").await,
+        ];
+        let phone = new_device().await;
+        let (identity, _phrase) = phone.portable().create("Sam").await.unwrap();
+        let mut servers = Vec::new();
+        for home in &homes {
+            let created = home
+                .create(NewInvite {
+                    kind: spoolframe_admin_api::InviteKind::PortableAccount,
+                    note: Some("Sam".into()),
+                    uses: None,
+                    expires: None,
+                    role: None,
+                })
+                .await;
+            phone
+                .redeem_invite_portable(&created.link, identity, Some("Sam"))
+                .await
+                .unwrap();
+            servers.push(home.server.server.id().to_string());
+        }
+
+        let storage = Arc::new(MemoryStorage::default());
+        let tv = support::sdk_client(storage.clone(), device())
+            .await
+            .unwrap();
+        tv.portable().set_allow_guests(true).await.unwrap();
+        let pairing = tv.start_pairing("Living room TV").await.unwrap();
+        let offer = phone.scan_pairing(pairing.link(), identity).await.unwrap();
+        let (authorized, paired) = tokio::join!(offer.authorize(None), async {
+            pairing.wait().await.unwrap().confirm().await
+        });
+        authorized.unwrap();
+        assert_eq!(paired.unwrap().servers.len(), 2);
+        let signed = tv.sign_in_paired(identity, &servers).await;
+        assert_eq!(signed.sessions.len(), 2, "{:?}", signed.failed);
+        tv.remember_last(&servers[0], &signed.sessions[0].user().username)
+            .await
+            .unwrap();
+        for server in &servers {
+            assert_eq!(tv.whos_watching(server).await.unwrap().profiles.len(), 1);
+        }
+
+        tv.portable().forget_guest(identity).await.unwrap();
+        let gone = |tv: Client| {
+            let servers = servers.clone();
+            async move {
+                for server in &servers {
+                    assert!(tv.whos_watching(server).await.unwrap().profiles.is_empty());
+                    assert!(tv.saved_profiles(server).await.unwrap().is_empty());
+                    assert!(tv.profiles(server).await.unwrap().is_empty());
+                }
+                assert_eq!(tv.last_profile().await.unwrap(), None);
+                // The servers stay.
+                assert_eq!(tv.servers().await.unwrap().len(), 2);
+                tv.close().await;
+            }
+        };
+        gone(tv).await;
+        // Ended on the servers, not only here.
+        for (home, session) in homes.iter().zip(&signed.sessions) {
+            assert_eq!(
+                home.root.grant_list().await.unwrap()[0].live_sessions,
+                1,
+                "only the phone's: {session:?}"
+            );
+        }
+        // And after a restart, on the same storage.
+        gone(support::sdk_client(storage, device()).await.unwrap()).await;
+        phone.close().await;
+        for home in homes {
+            home.server.stop().await;
+        }
+    }
+
     /// P7: the user's goal, end to end. A new portable identity on the
     /// phone joins the server with a guest invite; the living-room TV,
     /// guests allowed, pairs with the phone by QR, saves the server the
@@ -1432,8 +1515,11 @@ mod sdk {
         tv.portable().set_allow_guests(true).await.unwrap();
         let pairing = tv.start_pairing("Living room TV").await.unwrap();
         let offer = phone.scan_pairing(pairing.link(), identity).await.unwrap();
-        offer.authorize(None).await.unwrap();
-        let paired = pairing.wait().await.unwrap();
+        let (authorized, paired) = tokio::join!(offer.authorize(None), async {
+            pairing.wait().await.unwrap().confirm().await
+        });
+        authorized.unwrap();
+        let paired = paired.unwrap();
         assert_eq!(paired.identity, identity);
         let handed: Vec<_> = paired.servers.iter().map(|s| &s.endpoint_id).collect();
         assert_eq!(handed, [&server]);
@@ -1442,7 +1528,31 @@ mod sdk {
         let pinned = tv.servers().await.unwrap();
         let entry = pinned.iter().find(|s| s.endpoint_id == server).unwrap();
         assert!(entry.pinned && !entry.verified, "{entry:?}");
-        let on_tv = tv.sign_in_portable(&server, identity).await.unwrap();
+        // Each server's result as it comes: the one the phone handed, and
+        // one the TV never heard of.
+        let unknown = iroh::SecretKey::from_bytes(&[0x42; 32])
+            .public()
+            .to_string();
+        let mut signing =
+            tv.sign_in_paired_progress(identity, vec![server.clone(), unknown.clone()]);
+        assert_eq!(signing.total(), Some(2));
+        let mut on_tv = None;
+        let mut failed = Vec::new();
+        while let Some(done) = signing.next().await {
+            match done.result {
+                Ok(session) => on_tv = Some((done.server, session)),
+                Err(e) => failed.push((done.server, e)),
+            }
+        }
+        let (signed_to, on_tv) = on_tv.expect("signed in to the handed server");
+        assert_eq!(signed_to, server);
+        assert!(
+            matches!(
+                failed.as_slice(),
+                [(s, spoolframe_client_sdk::SdkError::NotPinned(_))] if *s == unknown
+            ),
+            "{failed:?}"
+        );
         assert_eq!(on_tv.user().user_id, format!("portable:{identity}"));
         let playback = on_tv
             .start_playback(movie().id(), Some(Selection::default()))
@@ -2251,8 +2361,11 @@ mod sdk {
         tv.portable().set_allow_guests(true).await.unwrap();
         let pairing = tv.start_pairing("Living room TV").await.unwrap();
         let offer = phone.scan_pairing(pairing.link(), identity).await.unwrap();
-        offer.authorize(None).await.unwrap();
-        let paired = pairing.wait().await.unwrap();
+        let (authorized, paired) = tokio::join!(offer.authorize(None), async {
+            pairing.wait().await.unwrap().confirm().await
+        });
+        authorized.unwrap();
+        let paired = paired.unwrap();
         let mut servers: Vec<String> = paired
             .servers
             .iter()

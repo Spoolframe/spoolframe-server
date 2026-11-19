@@ -100,6 +100,8 @@ pub struct PortableProfile {
 pub struct SavedProfileName {
     pub username: String,
     pub display_name: String,
+    /// The server's admin, as the server last said.
+    pub admin: bool,
 }
 
 /// This device. One per app.
@@ -530,6 +532,7 @@ impl SpoolClient {
             .map(|p| SavedProfileName {
                 username: p.username,
                 display_name: p.display_name,
+                admin: p.admin,
             })
             .collect())
     }

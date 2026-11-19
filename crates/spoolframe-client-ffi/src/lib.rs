@@ -34,6 +34,7 @@ mod invites;
 mod markers;
 mod paired;
 mod pairing;
+mod phone_sign_in;
 mod playback;
 mod playlists;
 mod portable;
@@ -62,7 +63,13 @@ pub use events::{
 };
 pub use features::{DiagnosticsApi, October2026Api, October2026InvitedApi, diagnostics_log_limit};
 pub use markers::SpoolMarkers;
-pub use pairing::{Connected, Paired, PairedServer, SpoolPairing, SpoolPairingOffer};
+pub use pairing::{
+    Connected, Paired, PairedServer, SpoolHeldPairing, SpoolPairing, SpoolPairingOffer,
+};
+pub use phone_sign_in::{
+    HeldOffer, HeldPhoneSignIn, PhoneConnected, PhoneSignedIn, SignInOfferOutcome,
+    SignInOfferResult, SpoolHeldSignIn, SpoolPhoneSignIn, SpoolSignInChoice, SpoolSignInOffer,
+};
 pub use playback::{PlaybackStart, PlaybackSubtitle, SpoolPlayback, SubtitleEntry};
 pub use portable::{
     Guest, IdentityState, IssuedDevice, NewIdentity, PortableIdentity, RecoveryPhrase,

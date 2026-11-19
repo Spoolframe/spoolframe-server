@@ -25,6 +25,7 @@ pub mod media;
 pub mod messages;
 pub mod pairing;
 pub mod passkeys;
+pub mod phone_sign_in;
 mod plan_summary;
 pub mod playback;
 pub mod playlists;
@@ -98,6 +99,10 @@ pub const FEDERATION_ALPN: &[u8] = b"spoolframe/federation/1";
 /// The ALPN a device pairs with a portable identity's phone on,
 /// directly, with no server: [`pairing`].
 pub use pairing::PAIR_ALPN;
+
+/// The ALPN a TV takes a phone's sign-ins on, directly, with no
+/// server: [`phone_sign_in`].
+pub use phone_sign_in::SIGNIN_ALPN;
 
 /// QUIC application close codes a Spoolframe peer sends, with a
 /// human-readable reason beside them.

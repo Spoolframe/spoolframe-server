@@ -69,6 +69,14 @@ feature!(
     Diagnostics = Feature::Diagnostics
 );
 
+feature!(
+    /// `spoolframe:phone-sign-in`: a sign-in this session makes for a TV
+    /// it reached directly ([`On<PhoneSignIn>`]), as
+    /// [`crate::SignInOffer`] makes them. Not [`crate::PhoneSignIn`],
+    /// the TV's side.
+    PhoneSignIn = Feature::PhoneSignIn
+);
+
 /// Feature `G`'s calls in a session: [`crate::Session::feature`]. Cheap
 /// to clone.
 pub struct On<G: Gate> {
@@ -297,6 +305,43 @@ impl On<Diagnostics> {
             .await?
         {
             Reply::DiagnosticsSent { id } => Ok(id),
+            other => Err(crate::session::unexpected(other)),
+        }
+    }
+}
+
+impl On<PhoneSignIn> {
+    /// Make a device sign-in for the TV whose key is `device`, as this
+    /// session's user, approved now: the request id the TV redeems with
+    /// [`crate::Client::await_device_sign_in`]'s request, within 5
+    /// minutes, from that key alone. Nothing is made on the server until
+    /// it does. `device_name` and `platform` are the TV's, what its
+    /// session is listed as; `remember` trusts it for the user.
+    ///
+    /// As [`Session::approve_device_sign_in`]: only soon after signing
+    /// in ([`SdkError::RecentSignInRequired`]: confirm it is them, then
+    /// ask again), and never for this device ([`SdkError::InvalidInput`]).
+    /// A portable guest's session is [`SdkError::NotForPortableUsers`];
+    /// a portable identity's tied to an account here offers as the
+    /// account. Too many pending for the TV is [`SdkError::RateLimited`].
+    pub async fn offer_device_sign_in(
+        &self,
+        device: EndpointId,
+        device_name: &str,
+        platform: spoolframe_types::Platform,
+        remember: bool,
+    ) -> Result<String, SdkError> {
+        match self
+            .session
+            .call(Request::OfferDeviceSignIn {
+                device: device.to_string(),
+                device_name: device_name.to_owned(),
+                platform,
+                remember,
+            })
+            .await?
+        {
+            Reply::DeviceSignInOffered { request, .. } => Ok(request),
             other => Err(crate::session::unexpected(other)),
         }
     }

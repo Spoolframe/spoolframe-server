@@ -22,6 +22,7 @@ fn saved(username: &str, method: Option<SignInMethod>, portable: bool) -> SavedP
         sign_in: ProfileSignIn::Password,
         method,
         portable: portable.then(|| "ab".repeat(32).parse().unwrap()),
+        admin: false,
     }
 }
 

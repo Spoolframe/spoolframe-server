@@ -12,6 +12,12 @@
 //! the page that approves its code, so a phone needs no app, only a way
 //! to sign in there.
 //!
+//! A phone that reached the TV directly (`spoolframe/signin/1`) may
+//! instead offer it a sign-in ([`DeviceSignIns::offer`]): approved in
+//! advance for the TV's endpoint, with no code. The TV redeems it with the
+//! same wait, and only then is its session made: an offer the TV never
+//! redeems runs out with nothing made.
+//!
 //! Pending sign-ins are only in memory: a restart drops them, and the TV
 //! begins again.
 
@@ -27,6 +33,8 @@ use spoolframe_types::Platform;
 use tokio::sync::watch;
 
 use crate::auth::SessionToken;
+use crate::store::sessions::SignedInWith;
+use crate::store::users::LocalUserId;
 
 /// How long a code can be approved.
 pub const LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -44,6 +52,12 @@ pub const MAX_PENDING_PER_DEVICE: usize = 3;
 /// begin one from a new endpoint id; a household has a few devices
 /// signing in at a time.
 pub const MAX_PENDING: usize = 256;
+
+/// Offers one user may have pending at once
+/// ([`DeviceSignIns::offer`]): the most a phone hands a TV in one go.
+/// Without it one signed-in user could take the server's whole
+/// [`MAX_PENDING`] with offers to keys of their choosing.
+pub const MAX_OFFERS_PER_USER: usize = spoolframe_protocol::phone_sign_in::MAX_OFFERS;
 
 /// A sign-in that was begun.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,10 +225,38 @@ pub enum ClaimError {
     SameDevice,
 }
 
+/// A sign-in approved in advance for a device by a session of `user`'s
+/// ([`DeviceSignIns::offer`]): what its session is made with when the
+/// device redeems it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub user: LocalUserId,
+    /// The device is trusted for `user` once it signs in: the approver's
+    /// choice.
+    pub remember: bool,
+    /// How the offering session signed in: the device's session rests
+    /// on it, as an approved one does.
+    pub signed_in_with: Option<SignedInWith>,
+    /// The offering session's token hash: the offer holds only while that
+    /// session does.
+    pub offered_by: String,
+}
+
+/// An offer the device came to redeem: claimed for it now, so only
+/// [`DeviceSignIns::fulfil`] moves it on, as for a claimed code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redeeming {
+    pub claim: Claim,
+    pub grant: Grant,
+}
+
 /// What the waiting device learns.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Approved(Handover),
+    /// An offer, now claimed for this wait: make its session, then wait
+    /// again for the handover.
+    Offered(Box<Redeeming>),
     /// Not yet; ask again.
     Pending,
     Denied,
@@ -230,6 +272,8 @@ pub enum Outcome {
 enum State {
     /// Its code can be claimed or denied.
     Waiting,
+    /// Approved in advance, with no code: claimed when its device waits.
+    Offered(Grant),
     /// Claimed by an approver making its session; only
     /// [`DeviceSignIns::fulfil`] moves it on.
     Claimed,
@@ -242,7 +286,7 @@ impl State {
     /// What the waiting device is told, once it is decided.
     fn outcome(&self) -> Option<Outcome> {
         match self {
-            State::Waiting | State::Claimed => None,
+            State::Waiting | State::Offered(_) | State::Claimed => None,
             State::Approved(handover) => Some(Outcome::Approved(handover.clone())),
             State::Denied => Some(Outcome::Denied),
             State::Failed => Some(Outcome::Expired),
@@ -258,7 +302,8 @@ const HANDOVER: Duration = AWAIT;
 #[derive(Debug)]
 struct Pending {
     waiting: Waiting,
-    code: String,
+    /// `None` for an offer, which no code names.
+    code: Option<String>,
     expires_at: Instant,
     state: watch::Sender<State>,
     /// How many waits it has had: the latest is the one waiting
@@ -370,7 +415,7 @@ impl DeviceSignIns {
             request.clone(),
             Pending {
                 waiting,
-                code: code.clone(),
+                code: Some(code.clone()),
                 expires_at: self.clock.now() + self.lifetime,
                 state: watch::Sender::new(State::Waiting),
                 waits: watch::Sender::new(0),
@@ -381,6 +426,47 @@ impl DeviceSignIns {
             code,
             expires_in: self.lifetime,
         })
+    }
+
+    /// Offer `waiting.endpoint` a sign-in as `grant` says, approved in
+    /// advance: it redeems it by waiting on the request. Its codes still
+    /// waiting are left as they are; `None` if it already has
+    /// [`MAX_PENDING_PER_DEVICE`] sign-ins pending, the offering user
+    /// [`MAX_OFFERS_PER_USER`] offers not yet redeemed, or the server
+    /// [`MAX_PENDING`]. The request id, which lives [`Self::lifetime`].
+    pub fn offer(&self, waiting: Waiting, grant: Grant) -> Option<String> {
+        let mut inner = self.lock();
+        if inner.by_request.len() >= MAX_PENDING {
+            return None;
+        }
+        let pending = inner
+            .by_request
+            .values()
+            .filter(|p| p.waiting.endpoint == waiting.endpoint)
+            .count();
+        if pending >= MAX_PENDING_PER_DEVICE {
+            return None;
+        }
+        let offered = inner
+            .by_request
+            .values()
+            .filter(|p| matches!(&*p.state.borrow(), State::Offered(g) if g.user == grant.user))
+            .count();
+        if offered >= MAX_OFFERS_PER_USER {
+            return None;
+        }
+        let request = SessionToken::generate().0;
+        inner.by_request.insert(
+            request.clone(),
+            Pending {
+                waiting,
+                code: None,
+                expires_at: self.clock.now() + self.lifetime,
+                state: watch::Sender::new(State::Offered(grant)),
+                waits: watch::Sender::new(0),
+            },
+        );
+        Some(request)
     }
 
     /// The device waiting on `code`, if it can still be approved.
@@ -467,7 +553,29 @@ impl DeviceSignIns {
         let (mut state, mut waits, this) = {
             let inner = self.lock();
             match inner.by_request.get(request) {
+                // An offer is claimed by the first wait of its device,
+                // under the lock: one wait redeems it.
                 Some(p) if p.waiting.endpoint == endpoint => {
+                    let offered = match &*p.state.borrow() {
+                        State::Offered(grant) => Some(grant.clone()),
+                        _ => None,
+                    };
+                    if let Some(grant) = offered {
+                        let redeeming = Redeeming {
+                            claim: Claim {
+                                request: request.to_owned(),
+                                endpoint: p.waiting.endpoint.clone(),
+                                device_name: p.waiting.device_name.clone(),
+                                platform: p.waiting.platform,
+                                // The device asked by taking the offer;
+                                // the grant says whether it is trusted.
+                                remember: true,
+                            },
+                            grant,
+                        };
+                        p.state.send_replace(State::Claimed);
+                        return Outcome::Offered(Box::new(redeeming));
+                    }
                     p.waits.send_modify(|n| *n += 1);
                     let waits = p.waits.subscribe();
                     let this = *waits.borrow();
@@ -518,7 +626,9 @@ impl DeviceSignIns {
         };
         let outcome = pending.state.borrow().outcome()?;
         let pending = inner.by_request.remove(request).expect("just seen");
-        inner.by_code.remove(&pending.code);
+        if let Some(code) = &pending.code {
+            inner.by_code.remove(code);
+        }
         Some(outcome)
     }
 }
@@ -576,6 +686,122 @@ mod tests {
         assert!(sign_ins.lookup(&asked.code).unwrap().remember);
         assert!(sign_ins.claim(&asked.code, None).unwrap().remember);
         assert!(!sign_ins.claim(&did_not.code, None).unwrap().remember);
+    }
+
+    fn grant() -> Grant {
+        Grant {
+            user: LocalUserId::generate(),
+            remember: true,
+            signed_in_with: Some(SignedInWith::Password),
+            offered_by: "hash".into(),
+        }
+    }
+
+    /// An offer is claimed by its device's first wait, which makes its
+    /// session; the next wait is handed it, once.
+    #[tokio::test]
+    async fn an_offer_is_redeemed_by_its_device_once() {
+        let sign_ins = DeviceSignIns::default();
+        let grant = grant();
+        let request = sign_ins.offer(tv("tv"), grant.clone()).unwrap();
+        let Outcome::Offered(redeeming) = sign_ins.wait(&request, "tv", AWAIT).await else {
+            panic!("not offered");
+        };
+        assert_eq!(redeeming.grant, grant);
+        assert_eq!(redeeming.claim.endpoint, "tv");
+        assert_eq!(redeeming.claim.platform, Platform::Tvos);
+        assert!(sign_ins.fulfil(&request, Some(handover("t"))));
+        assert_eq!(
+            sign_ins.wait(&request, "tv", AWAIT).await,
+            Outcome::Approved(handover("t"))
+        );
+        assert_eq!(sign_ins.wait(&request, "tv", AWAIT).await, Outcome::Expired);
+    }
+
+    #[tokio::test]
+    async fn only_the_device_offered_to_redeems_an_offer() {
+        let sign_ins = DeviceSignIns::default();
+        let request = sign_ins.offer(tv("tv"), grant()).unwrap();
+        assert_eq!(
+            sign_ins.wait(&request, "elsewhere", AWAIT).await,
+            Outcome::Expired
+        );
+        assert!(matches!(
+            sign_ins.wait(&request, "tv", AWAIT).await,
+            Outcome::Offered(_)
+        ));
+    }
+
+    /// An offer has no code: it cannot be looked up, claimed or denied,
+    /// and a device beginning a sign-in of its own keeps it.
+    #[tokio::test]
+    async fn an_offer_has_no_code_and_outlives_the_device_s_own_codes() {
+        let sign_ins = DeviceSignIns::default();
+        let request = sign_ins.offer(tv("tv"), grant()).unwrap();
+        sign_ins.begin(tv("tv")).unwrap();
+        sign_ins.begin(tv("tv")).unwrap();
+        assert_eq!(sign_ins.lookup(""), None);
+        assert_eq!(sign_ins.claim("", None), Err(ClaimError::Unknown));
+        assert!(!sign_ins.deny(""));
+        assert!(matches!(
+            sign_ins.wait(&request, "tv", AWAIT).await,
+            Outcome::Offered(_)
+        ));
+    }
+
+    /// Offers count against the device's sign-ins under way.
+    #[test]
+    fn a_device_holds_few_offers() {
+        let sign_ins = DeviceSignIns::default();
+        for _ in 0..MAX_PENDING_PER_DEVICE {
+            assert!(sign_ins.offer(tv("tv"), grant()).is_some());
+        }
+        assert!(sign_ins.offer(tv("tv"), grant()).is_none());
+        assert!(sign_ins.offer(tv("other tv"), grant()).is_some());
+    }
+
+    /// One user holds few offers, whichever devices they are for; another
+    /// user still offers.
+    #[test]
+    fn a_user_holds_few_offers() {
+        let sign_ins = DeviceSignIns::default();
+        let alice = grant();
+        for i in 0..MAX_OFFERS_PER_USER {
+            assert!(
+                sign_ins
+                    .offer(tv(&format!("tv-{i}")), alice.clone())
+                    .is_some()
+            );
+        }
+        assert!(sign_ins.offer(tv("one more tv"), alice).is_none());
+        assert!(sign_ins.offer(tv("one more tv"), grant()).is_some());
+    }
+
+    /// Never redeemed, an offer runs out with nothing made.
+    #[tokio::test]
+    async fn an_offer_not_redeemed_expires() {
+        let clock = Clock::default();
+        let sign_ins = DeviceSignIns::default().with_clock(clock.clone());
+        let request = sign_ins.offer(tv("tv"), grant()).unwrap();
+        clock.advance(LIFETIME);
+        assert_eq!(sign_ins.wait(&request, "tv", AWAIT).await, Outcome::Expired);
+        assert!(sign_ins.lock().by_request.is_empty());
+    }
+
+    /// Redeemed, but its session not made in time: the device is told it
+    /// expired, and the session is not handed over.
+    #[tokio::test]
+    async fn an_offer_whose_session_is_made_too_late_is_not_handed_over() {
+        let clock = Clock::default();
+        let sign_ins = DeviceSignIns::default().with_clock(clock.clone());
+        let request = sign_ins.offer(tv("tv"), grant()).unwrap();
+        assert!(matches!(
+            sign_ins.wait(&request, "tv", AWAIT).await,
+            Outcome::Offered(_)
+        ));
+        clock.advance(LIFETIME);
+        assert_eq!(sign_ins.wait(&request, "tv", AWAIT).await, Outcome::Expired);
+        assert!(!sign_ins.fulfil(&request, Some(handover("t"))));
     }
 
     #[test]

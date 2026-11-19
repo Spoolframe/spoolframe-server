@@ -511,6 +511,7 @@ impl Client {
             .load(client.inner.storage.clone())
             .await?;
         client.inner.downloads.start(Arc::downgrade(&client.inner));
+        client.inner.portable.of(client.downgrade());
         Ok(client)
     }
 
@@ -1503,11 +1504,22 @@ impl Client {
     /// it expires.
     pub async fn await_device_sign_in(&self, sign_in: &DeviceSignIn) -> Result<Session, SdkError> {
         let server = parse_id(&sign_in.server)?;
+        self.await_device_request(server, &sign_in.request).await
+    }
+
+    /// [`Client::await_device_sign_in`] of device sign-in `request` on
+    /// `server`, whether this device began it or a phone offered it
+    /// ([`crate::phone_sign_in`]).
+    pub(crate) async fn await_device_request(
+        &self,
+        server: EndpointId,
+        request: &str,
+    ) -> Result<Session, SdkError> {
         loop {
             // Each round goes on the connection there is then: it may
             // have been replaced since, and the request lives on the server.
             let request = Request::AwaitDeviceSignIn {
-                request: sign_in.request.clone(),
+                request: request.to_owned(),
             };
             match self.call(server, None, request).await? {
                 Response::Ok(Reply::LoggedIn {
@@ -1603,6 +1615,7 @@ impl Client {
             display_name: user.display_name.clone(),
             method,
             portable,
+            admin: user.role == spoolframe_types::Role::Admin,
         };
         match (
             method,
@@ -1714,6 +1727,9 @@ impl Client {
                     user,
                     can_leave,
                 })) => {
+                    if s.note_role(&user) {
+                        self.note_role(server, &user).await?;
+                    }
                     let session = Session {
                         client: self.clone(),
                         server,
@@ -1741,6 +1757,27 @@ impl Client {
             }
         }
         Ok(asked.then_some(profiles))
+    }
+
+    /// Keep what the server just said of `user`'s role (and name) on
+    /// their profile for `server`, if one is saved: what
+    /// [`crate::SavedProfile::admin`] says next, also offline.
+    pub(crate) async fn note_role(
+        &self,
+        server: EndpointId,
+        user: &spoolframe_protocol::UserSummary,
+    ) -> Result<(), SdkError> {
+        let storage = self.inner.storage.as_ref();
+        let _saving = self.inner.saving.lock().await;
+        let mut stored = session::load(storage, &server).await?;
+        let changed = stored
+            .iter_mut()
+            .find(|s| s.username == user.username)
+            .is_some_and(|s| s.note_role(user));
+        if changed {
+            session::save(storage, &server, &stored).await?;
+        }
+        Ok(())
     }
 
     /// Select the foreground profile. Listing profiles or making background
@@ -1793,6 +1830,50 @@ impl Client {
             .downloads
             .forget_playlists(&server.to_string(), Some(username))
             .await;
+        Ok(())
+    }
+
+    /// Every session kept as portable identity `id`, on every saved
+    /// server, ended there as far as the server answers in a few seconds,
+    /// and dropped here, profile and all, whether or not; the profile
+    /// opened last too if it was one. The servers stay.
+    pub(crate) async fn sign_out_identity(&self, id: PortableUserId) -> Result<(), SdkError> {
+        const SIGN_OUT: Duration = Duration::from_secs(5);
+        let storage = self.inner.storage.as_ref();
+        let mut theirs = Vec::new();
+        for saved in servers::load(storage).await? {
+            let Ok(server) = parse_id(&saved.endpoint_id) else {
+                continue;
+            };
+            for s in session::load(storage, &server).await? {
+                if s.portable == Some(id) {
+                    theirs.push((server, s));
+                }
+            }
+        }
+        // Ended on every server at once, each given a few seconds.
+        futures_util::future::join_all(theirs.iter().filter_map(|(server, s)| {
+            let token = SessionId(s.token.clone()?);
+            Some(async move {
+                let ended =
+                    tokio::time::timeout(SIGN_OUT, self.call(*server, Some(&token), Request::Logout))
+                        .await;
+                if !matches!(ended, Ok(Ok(_))) {
+                    tracing::info!(%server, user = s.username, "a forgotten guest's session was not ended there; dropped here");
+                }
+            })
+        }))
+        .await;
+        for (server, s) in &theirs {
+            let endpoint_id = server.to_string();
+            self.forget_last(&endpoint_id, &s.username).await?;
+            self.inner
+                .downloads
+                .forget_playlists(&endpoint_id, Some(&s.username))
+                .await;
+            self.update_sessions(*server, |stored| stored.retain(|s| s.portable != Some(id)))
+                .await?;
+        }
         Ok(())
     }
 

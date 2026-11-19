@@ -3637,3 +3637,57 @@ async fn a_user_with_no_passkey_confirms_with_their_password() {
     client.close().await;
     server.stop().await;
 }
+
+/// A profile says whether its user is the server's admin: kept at
+/// sign-in, so "Who's watching" shows it offline too, and again when the
+/// device next asks the server who they are.
+#[tokio::test]
+async fn a_saved_profile_knows_its_user_is_the_admin() {
+    let (server, client, _) = ready("sdk-admin-profile").await;
+    server
+        .store
+        .set_role("alice", spoolframe_types::Role::Admin)
+        .await
+        .unwrap();
+    alice(&server, &client).await;
+    client
+        .sign_in(&id(&server), "bob", "battery staple", false)
+        .await
+        .unwrap();
+    let admins = |profiles: Vec<spoolframe_client_sdk::SavedProfile>| {
+        profiles
+            .into_iter()
+            .map(|p| (p.username, p.admin))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        admins(client.saved_profiles(&id(&server)).await.unwrap()),
+        [("alice".to_owned(), true), ("bob".to_owned(), false)]
+    );
+    let watching = client.whos_watching(&id(&server)).await.unwrap();
+    let rows: Vec<_> = watching
+        .profiles
+        .iter()
+        .map(|p| (p.username.as_str(), p.admin))
+        .collect();
+    assert_eq!(rows, [("alice", true), ("bob", false)]);
+
+    // Bob is made admin and Alice not: the device learns it when it asks.
+    server
+        .store
+        .set_role("bob", spoolframe_types::Role::Admin)
+        .await
+        .unwrap();
+    server
+        .store
+        .set_role("alice", spoolframe_types::Role::Consumer)
+        .await
+        .unwrap();
+    client.profiles(&id(&server)).await.unwrap();
+    assert_eq!(
+        admins(client.saved_profiles(&id(&server)).await.unwrap()),
+        [("alice".to_owned(), false), ("bob".to_owned(), true)]
+    );
+    client.close().await;
+    server.stop().await;
+}

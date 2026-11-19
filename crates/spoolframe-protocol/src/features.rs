@@ -53,6 +53,14 @@ pub enum Feature {
     /// Not dated, as `spoolframe:download-addons` is not: a feature of its
     /// own that an app names without the rest of a month's.
     Diagnostics,
+    /// `spoolframe:phone-sign-in`: `OfferDeviceSignIn`, a sign-in a
+    /// phone makes for a TV it reached directly
+    /// ([`crate::phone_sign_in`]), which the TV redeems with
+    /// `AwaitDeviceSignIn`.
+    ///
+    /// Not dated, as `spoolframe:diagnostics` is not: a feature of its
+    /// own that an app names without the rest of a month's.
+    PhoneSignIn,
 }
 
 /// A set of features: [`Features::all`] is every one this build knows,
@@ -67,6 +75,7 @@ impl Feature {
             Feature::October2026 => "spoolframe:october-2026",
             Feature::DownloadAddons => "spoolframe:download-addons",
             Feature::Diagnostics => "spoolframe:diagnostics",
+            Feature::PhoneSignIn => "spoolframe:phone-sign-in",
         }
     }
 
@@ -166,6 +175,15 @@ mod tests {
         assert_eq!(
             Feature::of("spoolframe:diagnostics"),
             Some(Feature::Diagnostics)
+        );
+    }
+
+    /// The phone sign-in's name is fixed: an app names it as it is.
+    #[test]
+    fn phone_sign_in_is_named_as_the_apps_name_it() {
+        assert_eq!(
+            Feature::of("spoolframe:phone-sign-in"),
+            Some(Feature::PhoneSignIn)
         );
     }
 

@@ -33,6 +33,11 @@ pub struct WatchingProfile {
     pub auto_login: bool,
     /// The profile browsed last on this server ([`Client::remember_last`]).
     pub last: bool,
+    /// The server's admin: an "Admin" label, and whose PIN turns on what
+    /// only an admin may. As the session's user says, else as the
+    /// profile was saved ([`crate::SavedProfile::admin`]); false for a
+    /// trusted profile never signed in here.
+    pub admin: bool,
 }
 
 /// How a profile on "Who's watching" opens.
@@ -362,6 +367,7 @@ fn merge(
             .find(|t| t.username == username)
             .and_then(|t| t.pin_digits)
     };
+    let saved_admin = |username: &str| saved.iter().any(|s| s.username == username && s.admin);
     let mut profiles: Vec<WatchingProfile> = sessions
         .into_iter()
         .map(|s| WatchingProfile {
@@ -377,6 +383,7 @@ fn merge(
                 .or_else(|| trusted_digits(&s.user().username)),
             auto_login: auto.contains(&s.user().username.as_str()),
             last: false,
+            admin: s.user().role == spoolframe_types::Role::Admin,
             opens: ProfileOpens::Session(s),
         })
         .collect();
@@ -396,6 +403,7 @@ fn merge(
                 pin_digits: t.pin_digits,
                 auto_login: t.auto_login,
                 last: false,
+                admin: saved_admin(&t.username),
             });
         }
     }
@@ -425,6 +433,7 @@ fn merge(
             pin_digits: None,
             auto_login: false,
             last: false,
+            admin: s.admin,
         });
     }
     for p in &mut profiles {

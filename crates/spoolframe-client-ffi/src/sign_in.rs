@@ -46,6 +46,9 @@ pub struct WatchingProfile {
     pub pin_digits: Option<u8>,
     pub auto_login: bool,
     pub last: bool,
+    /// The server's admin: an "Admin" label, whose PIN turns on what
+    /// only an admin may.
+    pub admin: bool,
 }
 
 /// "Who's watching" on one server, and where the app goes.
@@ -67,11 +70,76 @@ pub struct ServerFailure {
     pub message: String,
 }
 
+impl ServerFailure {
+    /// `server` (hex) was not signed in to, for `error`.
+    pub(crate) fn new(server: String, error: sdk::SdkError) -> Self {
+        let error = SpoolError::from(error);
+        Self {
+            server,
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// What `sign_in_paired` did.
 #[derive(uniffi::Record)]
 pub struct PairedSignIn {
     pub sessions: Vec<Arc<SpoolSession>>,
     pub failed: Vec<ServerFailure>,
+}
+
+/// One server's sign-in, done.
+#[derive(uniffi::Enum)]
+pub enum ServerSignIn {
+    SignedIn {
+        server: String,
+        session: Arc<SpoolSession>,
+    },
+    Failed {
+        failure: ServerFailure,
+    },
+}
+
+impl From<sdk::ServerSignIn> for ServerSignIn {
+    fn from(done: sdk::ServerSignIn) -> Self {
+        match done.result {
+            Ok(session) => Self::SignedIn {
+                server: done.server,
+                session: Arc::new(SpoolSession::new(session)),
+            },
+            Err(error) => Self::Failed {
+                failure: ServerFailure::new(done.server, error),
+            },
+        }
+    }
+}
+
+/// Each server's sign-in as it finishes: `next()` until none.
+#[derive(uniffi::Object)]
+pub struct ServerSignInWatch(Arc<tokio::sync::Mutex<sdk::ServerSignIns>>);
+
+impl ServerSignInWatch {
+    pub(crate) fn new(sign_ins: sdk::ServerSignIns) -> Arc<Self> {
+        Arc::new(Self(Arc::new(tokio::sync::Mutex::new(sign_ins))))
+    }
+}
+
+#[uniffi::export]
+impl ServerSignInWatch {
+    /// How many servers in all; none until known.
+    pub async fn total(&self) -> Option<u32> {
+        let total = self.0.lock().await.total();
+        total.map(|t| u32::try_from(t).unwrap_or(u32::MAX))
+    }
+
+    /// The next server done; none once all have been given.
+    pub async fn next(&self) -> Option<ServerSignIn> {
+        let watch = self.0.clone();
+        run(async move { watch.lock().await.next().await })
+            .await
+            .map(Into::into)
+    }
 }
 
 /// How "Confirm it's you" confirms the user.
@@ -119,6 +187,7 @@ impl SpoolClient {
                     pin_digits: p.pin_digits,
                     auto_login: p.auto_login,
                     last: p.last,
+                    admin: p.admin,
                 })
                 .collect(),
         })
@@ -201,16 +270,23 @@ impl SpoolClient {
             failed: signed
                 .failed
                 .into_iter()
-                .map(|(server, error)| {
-                    let error = SpoolError::from(error);
-                    ServerFailure {
-                        server,
-                        kind: error.kind(),
-                        message: error.to_string(),
-                    }
-                })
+                .map(|(server, error)| ServerFailure::new(server, error))
                 .collect(),
         })
+    }
+
+    /// `sign_in_paired`, each server's result as it finishes; all at
+    /// once, going on whether or not it is read.
+    pub async fn sign_in_paired_progress(
+        &self,
+        identity: String,
+        servers: Vec<String>,
+    ) -> Result<Arc<ServerSignInWatch>, SpoolError> {
+        let identity = crate::portable::identity(&identity)?;
+        let client = self.client.clone();
+        // Started on the core's runtime, where its task runs.
+        let sign_ins = run(async move { client.sign_in_paired_progress(identity, servers) }).await;
+        Ok(ServerSignInWatch::new(sign_ins))
     }
 
     /// Join `endpoint_id` with a code typed in: looked up, then redeemed.

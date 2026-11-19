@@ -342,6 +342,10 @@ pub struct Portable {
     storage: Arc<dyn Storage>,
     /// Serializes read-modify-write of the list.
     saving: Arc<tokio::sync::Mutex<()>>,
+    /// The client whose identities these are, once it is open: forgetting
+    /// a guest signs it out of its servers there. Not one that holds the
+    /// client open.
+    client: Arc<std::sync::OnceLock<crate::WeakClient>>,
 }
 
 impl fmt::Debug for Portable {
@@ -355,7 +359,13 @@ impl Portable {
         Self {
             storage,
             saving: Arc::default(),
+            client: Arc::default(),
         }
+    }
+
+    /// These are `client`'s identities ([`crate::Client::portable`]).
+    pub(crate) fn of(&self, client: crate::WeakClient) {
+        let _ = self.client.set(client);
     }
 
     /// A new identity called `name`, kept on this device. Show the phrase
@@ -1119,9 +1129,14 @@ impl Portable {
     }
 
     /// Sign guest `id` out of this device: its credential, its device key
-    /// and the state it brought go. Other guests are untouched. Refused
-    /// for an identity whose root is here ([`Portable::forget`] is for
-    /// that). Forgetting one not here does nothing.
+    /// and the state it brought go, and so does every session signed in
+    /// as it, on every server, with its profile: off "Who's watching",
+    /// and no longer the profile opened last. Each such session is ended
+    /// on its server too, as far as it can be reached; it is dropped here
+    /// whether or not. The servers stay saved. Other guests are
+    /// untouched. Refused for an identity whose root is here
+    /// ([`Portable::forget`] is for that). Forgetting one not here does
+    /// nothing.
     pub async fn forget_guest(&self, id: PortableUserId) -> Result<(), SdkError> {
         let storage = self.storage.as_ref();
         if self.has_root(id).await? {
@@ -1145,6 +1160,10 @@ impl Portable {
         storage
             .set_data(&keys::portable_paired(&id.to_string()), None)
             .await?;
+        drop(_saving);
+        if let Some(client) = self.client.get().and_then(crate::WeakClient::upgrade) {
+            client.sign_out_identity(id).await?;
+        }
         tracing::info!(%id, "forgot a guest");
         Ok(())
     }

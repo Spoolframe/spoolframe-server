@@ -34,6 +34,7 @@ mod federation;
 pub mod gate;
 mod home_network;
 pub use home_network::at_home;
+mod held;
 mod invite_admin;
 mod invites;
 mod lan_servers;
@@ -43,6 +44,7 @@ mod link_meter;
 mod paired;
 pub mod pairing;
 mod pairing_relay;
+mod phone_sign_in;
 mod playlist_cursor;
 mod playlist_edits;
 pub mod playlists;
@@ -59,6 +61,7 @@ mod relay_policy;
 mod search_result;
 mod server_events;
 mod server_lookup;
+mod server_sign_ins;
 mod servers;
 mod session;
 mod sign_in_rules;
@@ -81,6 +84,7 @@ pub use client::{
 };
 pub use connection::Timeouts;
 pub use profile_store::{ProfileStore, profile_hash};
+pub use server_sign_ins::{ServerSignIn, ServerSignIns};
 pub use sign_in_rules::{
     AddressClass, PASSWORD_MIN, PIN_MAX_DIGITS, PIN_MIN_DIGITS, PasswordProblem, Pin, PinFailure,
     PinRefusal, address_class, password_problem,
@@ -131,6 +135,12 @@ pub use spoolframe_protocol::federation::{PairingRefused, PeerServer};
 pub use spoolframe_protocol::{Feature, Features, NextMode};
 // Pairing a guest onto this device by QR code.
 pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
+// Signing a TV in with a phone, by the same QR code.
+pub use held::{HeldOffer, HeldPairing, HeldPhoneSignIn, HeldSignIn};
+pub use phone_sign_in::{
+    PhoneConnected, PhoneSignIn, PhoneSignedIn, SignInChoice, SignInOffer, SignInOfferOutcome,
+    SignInOfferResult,
+};
 pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;
 // Portable identities and their device credentials.

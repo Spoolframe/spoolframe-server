@@ -251,6 +251,8 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ImportPlexPlaylists { .. }
         // A second is a second report, and one a minute is allowed.
         | Request::SendDiagnostics { .. }
+        // A second offer is a second sign-in pending for the TV.
+        | Request::OfferDeviceSignIn { .. }
         | Request::Unknown => false,
     }
 }
