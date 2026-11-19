@@ -1,4 +1,4 @@
-//! Settings › Remote access and the wizard's remote choice (P6-02): the
+//! Settings › Network and the wizard's remote choice (P6-02): the
 //! form as the `network.wan` setting, and back, and what the status card
 //! says. The setting is one table, saved whole; the server checks it as
 //! it checks the config file, and a typed address is refused here with
@@ -148,12 +148,6 @@ impl WanForm {
         wan.insert("mapped_port".into(), Value::Object(mapped));
         Ok(Some(Value::Object(wan)))
     }
-}
-
-/// Whether the `network.ipv6` setting's value has the server listen on
-/// IPv6: on unless it is `false`.
-pub fn listens_on_ipv6(value: Option<&Value>) -> bool {
-    value.and_then(Value::as_bool).unwrap_or(true)
 }
 
 /// A typed port; empty is the server's own.
@@ -491,13 +485,6 @@ mod tests {
             })
         );
         assert_eq!(WanForm::from_setting(Some(&saved)), form);
-    }
-
-    #[test]
-    fn ipv6_is_on_unless_set_to_false() {
-        assert!(listens_on_ipv6(None));
-        assert!(listens_on_ipv6(Some(&json!(true))));
-        assert!(!listens_on_ipv6(Some(&json!(false))));
     }
 
     #[test]

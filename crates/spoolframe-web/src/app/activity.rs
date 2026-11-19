@@ -120,7 +120,7 @@ pub fn ActivityPage() -> Element {
             }
             p { class: "m-0 max-w-[820px] text-sm text-ctp-subtext0 max-md:hidden",
                 "What the server is doing now. Graphs cover the last hour, kept in memory: they start empty when the server restarts. "
-                Link { class: "no-underline", to: Route::Settings { tab: "telemetry".into() }, "Export to Prometheus or OpenTelemetry" }
+                Link { class: "no-underline", to: Route::Settings { tab: "monitoring".into() }, "Export to Prometheus or OpenTelemetry" }
             }
             if let Some(e) = error() {
                 Alert { text: format!("Not updating: {}", e.explain()) }
@@ -290,7 +290,7 @@ fn Cards(seen: Seen, now: i64, version: Option<String>) -> Element {
                     }
                 }
                 div { class: "pt-1 text-xs",
-                    Link { class: "no-underline", to: Route::Settings { tab: "telemetry".into() }, "Set up in Settings › Telemetry" }
+                    Link { class: "no-underline", to: Route::Settings { tab: "monitoring".into() }, "Set up in Settings › Monitoring" }
                 }
             }
         }

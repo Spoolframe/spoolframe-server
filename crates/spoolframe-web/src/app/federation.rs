@@ -76,8 +76,35 @@ async fn change(change: &Change) -> Result<String, ApiError> {
     }
 }
 
+/// The Federation page (P8-01): its paired servers, or its Settings tab,
+/// the switch and the limits each paired server is held to.
 #[component]
-pub fn Federation() -> Element {
+pub fn Federation(tab: String) -> Element {
+    let settings = tab == "settings";
+    let tab_class = |here: bool| if here { "tab tab-here" } else { "tab" };
+    rsx! {
+        div { class: "flex flex-col gap-5",
+            nav { class: "tabs", aria_label: "Federation",
+                super::settings_area::GuardedLink { class: tab_class(!settings), to: Route::Federation { tab: String::new() }, "Paired servers" }
+                super::settings_area::GuardedLink { class: tab_class(settings), to: Route::Federation { tab: "settings".into() }, "Settings" }
+            }
+            if settings {
+                div { class: "flex flex-col gap-1",
+                    h1 { class: "page-title page-title-admin", "Federation" }
+                    span { class: "text-sm text-ctp-subtext0",
+                        "Pairing with other servers, and what each paired server may cache and ask. The limits apply to each one."
+                    }
+                }
+                super::settings::FederationSettings {}
+            } else {
+                PairedServers {}
+            }
+        }
+    }
+}
+
+#[component]
+fn PairedServers() -> Element {
     let mut list = use_resource(peers);
     let toast = use_signal(|| None::<Said>);
     let mut pairing = use_signal(|| false);
@@ -792,7 +819,7 @@ pub fn FederationPeer(id: String) -> Element {
     let current = page.read().clone();
     rsx! {
         div { class: "flex flex-col gap-6",
-            Link { class: "back-link", to: Route::Federation {}, icons::ChevronLeft {} "Federation" }
+            Link { class: "back-link", to: Route::Federation { tab: String::new() }, icons::ChevronLeft {} "Federation" }
             match current {
                 None => rsx! { p { class: "text-ctp-subtext0", "Loading…" } },
                 Some(Err(error)) => rsx! { Alert { text: error.explain() } },
@@ -1022,7 +1049,7 @@ fn PeerView(page: PeerPage, toast: Signal<Option<Said>>, on_changed: EventHandle
                     span {
                         {new_key_line(now, key)}
                         " "
-                        Link { to: Route::Federation {}, "Confirm or reject it on the Federation page." }
+                        Link { to: Route::Federation { tab: String::new() }, "Confirm or reject it on the Federation page." }
                     }
                 }
             }

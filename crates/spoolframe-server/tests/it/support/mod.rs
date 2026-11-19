@@ -739,6 +739,25 @@ pub fn udp_taken(addr: std::net::SocketAddr) -> bool {
     )
 }
 
+/// Whether UDP `port` is held by something else now, on IPv4 or IPv6: a
+/// server binds it on both, and fails if either is taken.
+pub fn udp_port_taken(port: u16) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    udp_taken(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        || udp_taken(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+}
+
+/// A port held on IPv6 alone (another server's, say) is taken for a
+/// server, which binds IPv6 too: its setup is retried, not failed.
+#[test]
+fn a_port_held_on_ipv6_alone_is_taken() {
+    let Ok(held) = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
+        return; // No IPv6 here: nothing to hold.
+    };
+    let port = held.local_addr().unwrap().port();
+    assert!(udp_port_taken(port));
+}
+
 /// A free port on loopback, found by binding port 0 and letting it go:
 /// free when found, and possibly taken again before it is bound. Only
 /// for a [`retry_on_port_race`] setup.

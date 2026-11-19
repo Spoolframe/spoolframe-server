@@ -68,6 +68,34 @@ pub fn Libraries() -> Element {
             say(toast, ok, text);
         }
     });
+    // A setting search and commands opened: `libraries`, `plex.servers`
+    // and `plex.path_mapping` are here (the settings regroup).
+    let jump = try_use_context::<super::palette::SettingJump>();
+    let schema = use_resource(super::settings_area::schema);
+    use_effect(move || {
+        let here = schema
+            .read()
+            .as_ref()
+            .and_then(|s| s.as_ref().ok())
+            .and_then(|s| {
+                s.pages
+                    .iter()
+                    .find(|p| p.place == spoolframe_admin_api::SchemaPlace::Libraries)
+                    .cloned()
+            });
+        if let Some(super::palette::SettingJump(mut jump)) = jump
+            && let Some((anchor, _)) = jump()
+            && here.is_some_and(|p| {
+                p.sections
+                    .iter()
+                    .flat_map(|s| &s.fields)
+                    .any(|f| f.anchor.as_deref() == Some(anchor.as_str()))
+            })
+        {
+            jump.set(None);
+            super::palette::show_field(&anchor);
+        }
+    });
     // A server that is down is asked about again now and then, so its
     // card goes when it is back.
     use_hook(move || {
@@ -167,6 +195,10 @@ pub fn Libraries() -> Element {
                         }
                     } else {
                         section { class: "lib-table",
+                            // Where search and commands takes `libraries`
+                            // and `plex.servers`: their libraries are these.
+                            span { id: "setting-libraries", class: "hidden" }
+                            span { id: "setting-plex-servers", class: "hidden" }
                             div { class: "lib-head",
                                 span {}
                                 span {}
@@ -313,6 +345,18 @@ pub fn Libraries() -> Element {
                         list.restart();
                     }
                 },
+            }
+        }
+        // The first Plex server's path mapping, moved here from Settings ›
+        // Paths: where each Plex library's files are on this server. It
+        // keeps its own Save, as it checks the files after it.
+        section { class: "card mt-6", aria_label: "Path mapping",
+            div { class: "card-body form gap-[18px]",
+                div { class: "flex flex-col gap-1",
+                    h2 { class: "m-0 text-lg font-semibold", "Path mapping" }
+                    p { class: "m-0 text-sm text-ctp-subtext0", "Where each Plex library’s files are on this server." }
+                }
+                super::wizard::PathsForm { mode: super::wizard::Mode::Settings, on_done: move |_| list.restart() }
             }
         }
         Toast { said: toast }

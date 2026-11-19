@@ -463,6 +463,11 @@ impl Layers {
             .collect()
     }
 
+    /// `key`'s built-in default, if it has one.
+    pub fn default_of(&self, key: &str) -> Option<&Value> {
+        tree::get(&self.defaults, key)
+    }
+
     /// Every layer merged: runtime over the file over the defaults.
     pub fn merged(&self) -> Table {
         let mut merged = self.defaults.clone();
@@ -1632,5 +1637,55 @@ mod tests {
         secrets.set(PLEX_TOKEN_SECRET, "from-ui").unwrap();
         assert_eq!(token(false).as_deref(), Some("from-ui"));
         assert_eq!(token(true).as_deref(), Some("from-file"));
+    }
+
+    /// What the server's start refuses, a change is refused too: saved, it
+    /// would stop the next start (each of these was taken, then the
+    /// server would not come back up).
+    #[test]
+    fn a_change_the_next_start_would_refuse_is_refused() {
+        let base = layers(Some(r#"plex { url = "http://nas:32400"; }"#), None).unwrap();
+        let strings = |items: &[&str]| {
+            Value::Array(items.iter().map(|s| Value::String((*s).into())).collect())
+        };
+        for (key, value) in [
+            ("network.uplink.owner_share_percent", Value::Int(150)),
+            ("network.lan_prefixes", strings(&["not a range"])),
+            ("network.wan_prefixes", strings(&["10.0.0.0/99"])),
+            ("media.sandbox", Value::String("sometimes".into())),
+            ("subtitles.sync_at_once", Value::Int(0)),
+            ("network.own_relays", strings(&["not a key"])),
+        ] {
+            let refused = base.with_set(key, value.clone());
+            assert!(
+                matches!(refused, Err(SettingError::Invalid(_))),
+                "{key} = {value:?} was taken"
+            );
+        }
+    }
+
+    /// The schema's bounds are what this check takes: each edge is
+    /// taken, and one past it refused (`settingsSchema` sends them, and
+    /// the web UI checks a number against them before saving).
+    #[test]
+    fn each_schema_bound_is_what_a_change_may_set() {
+        let base = layers(Some(r#"plex { url = "http://nas:32400"; }"#), None).unwrap();
+        let takes = |key: &str, v: i64| base.with_set(key, Value::Int(v)).is_ok();
+        for (key, min, max) in super::super::schema::BOUNDS {
+            assert!(takes(key, *min), "{key} refuses its least, {min}");
+            assert!(
+                !takes(key, min - 1),
+                "{key} takes {}, under its least",
+                min - 1
+            );
+            if let Some(max) = max {
+                assert!(takes(key, *max), "{key} refuses its most, {max}");
+                assert!(
+                    !takes(key, max + 1),
+                    "{key} takes {}, over its most",
+                    max + 1
+                );
+            }
+        }
     }
 }

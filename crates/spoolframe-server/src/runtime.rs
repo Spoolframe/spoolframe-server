@@ -286,6 +286,7 @@ impl RuntimeSettings {
                 apply,
                 restart_pending: false,
                 running: None,
+                default: None,
             };
         }
         let value = tree::get(merged, setting.key);
@@ -303,6 +304,7 @@ impl RuntimeSettings {
                 apply,
                 restart_pending: false,
                 running: None,
+                default: None,
             };
         }
         let running = tree::get(&self.started, setting.key);
@@ -323,6 +325,9 @@ impl RuntimeSettings {
             running: restart_pending
                 .then(|| running.map(|v| layers::shown(setting.key, v).to_json()))
                 .flatten(),
+            default: layers
+                .default_of(setting.key)
+                .map(|v| layers::shown(setting.key, v).to_json()),
         }
     }
 

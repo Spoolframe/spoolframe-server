@@ -3,9 +3,7 @@
 //! site's part of a search went, what a download or a refusal says, and
 //! the settings' fields, testable on the host.
 
-use std::collections::BTreeSet;
-
-use serde_json::{Value, json};
+use serde_json::Value;
 use spoolframe_admin_api::{
     SubtitleAccountCount, SubtitleDownloaded, SubtitleOrigin, SubtitlePairUsage, SubtitleResult,
     SubtitleSearch, SubtitleSiteUsage, SubtitleSource, SubtitleSourceState, SubtitleTimingInfo,
@@ -243,68 +241,6 @@ pub fn downloaded_by(t: &SubtitleTimingInfo) -> String {
     line
 }
 
-/// The sites ticked: the setting's, or every one when it is not set, as
-/// the server reads it.
-pub type Ticked = BTreeSet<SubtitleSource>;
-
-/// Which sites `subtitles.sources` names; every one when it is not set.
-pub fn sources_on(setting: Option<&Value>) -> Ticked {
-    match setting.and_then(Value::as_array) {
-        None => SubtitleSource::ALL.into(),
-        Some(list) => list
-            .iter()
-            .filter_map(|v| SubtitleSource::of(v.as_str()?))
-            .collect(),
-    }
-}
-
-/// `subtitles.sources` once the boxes ticked when the form opened,
-/// `before`, are `now`: `None` when they did not change, so the setting
-/// is left as it is (unset, it follows the server's default). Changed,
-/// the sites keep the order `setting` gives them, the order they are
-/// asked in; one newly ticked comes last.
-pub fn sources_value(setting: Option<&Value>, before: &Ticked, now: &Ticked) -> Option<Value> {
-    if before == now {
-        return None;
-    }
-    let mut order: Vec<SubtitleSource> = match setting.and_then(Value::as_array) {
-        Some(list) => list
-            .iter()
-            .filter_map(|v| SubtitleSource::of(v.as_str()?))
-            .collect(),
-        None => SubtitleSource::ALL.to_vec(),
-    };
-    order.retain(|s| now.contains(s));
-    for s in now {
-        if !order.contains(s) {
-            order.push(*s);
-        }
-    }
-    Some(json!(order.iter().map(|s| s.id()).collect::<Vec<_>>()))
-}
-
-/// The daily limit, every site's.
-pub const LIMIT: &str = "subtitles.daily_limit_per_user";
-
-/// The daily limit as typed: a whole number, or nothing (none).
-pub fn limit_value(typed: &str) -> Result<Option<Value>, String> {
-    let typed = typed.trim();
-    if typed.is_empty() {
-        return Ok(None);
-    }
-    let n: u32 = typed
-        .parse()
-        .map_err(|_| "The daily limit is a whole number.".to_owned())?;
-    Ok(Some(json!(n)))
-}
-
-/// The languages field as the setting: `en, pt-BR` is `["en", "pt-BR"]`;
-/// empty takes the setting out (English).
-pub fn languages_value(typed: &str) -> Option<Value> {
-    let list = crate::logic::entries(typed);
-    (!list.is_empty()).then(|| json!(list))
-}
-
 /// Whether a secret field holds a reference the server reads its secret
 /// from, `${SF_ENV_NAME}`, as the server takes it at run time; the
 /// field's error otherwise, naming `example` (`SF_ENV_SUBDL_KEY`) as the
@@ -333,6 +269,8 @@ pub fn secret_reference(label: &str, typed: &str, example: &str) -> Result<Optio
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn result() -> SubtitleResult {
@@ -525,13 +463,6 @@ mod tests {
         assert_eq!(pair_usage(&bob, 0), "Bob's Media: 12 today");
     }
 
-    #[test]
-    fn the_limit_is_a_whole_number_or_none() {
-        assert_eq!(limit_value(" 3 "), Ok(Some(json!(3))));
-        assert_eq!(limit_value(" "), Ok(None));
-        assert!(limit_value("three").is_err());
-    }
-
     /// A site that failed or ran out is said by name; one that answered
     /// is not.
     #[test]
@@ -569,36 +500,6 @@ mod tests {
         );
     }
 
-    /// The sites are written only when a box changed, keeping the order
-    /// the admin set; a site ticked anew comes last. Unset, both are on.
-    #[test]
-    fn the_sites_ticked_are_the_setting_in_the_admin_s_order() {
-        use SubtitleSource::{OpenSubtitles, SubDl};
-        let ticked = |sites: &[SubtitleSource]| sites.iter().copied().collect::<Ticked>();
-        let both = ticked(&[OpenSubtitles, SubDl]);
-        assert_eq!(sources_value(None, &both, &both), None);
-        let subdl_first = json!(["subdl", "opensubtitles"]);
-        assert_eq!(sources_value(Some(&subdl_first), &both, &both), None);
-        assert_eq!(
-            sources_value(None, &both, &ticked(&[OpenSubtitles])),
-            Some(json!(["opensubtitles"]))
-        );
-        assert_eq!(
-            sources_value(Some(&subdl_first), &both, &ticked(&[SubDl])),
-            Some(json!(["subdl"]))
-        );
-        // OpenSubtitles ticked again: after SubDL, which was alone.
-        let subdl_only = json!(["subdl"]);
-        assert_eq!(
-            sources_value(Some(&subdl_only), &ticked(&[SubDl]), &both),
-            Some(json!(["subdl", "opensubtitles"]))
-        );
-        assert_eq!(sources_value(None, &both, &ticked(&[])), Some(json!([])));
-        assert_eq!(sources_on(None), both);
-        assert_eq!(sources_on(Some(&json!(["subdl"]))), ticked(&[SubDl]));
-        assert_eq!(sources_on(Some(&json!([]))), ticked(&[]));
-    }
-
     #[test]
     fn a_secret_field_takes_only_a_reference() {
         let key = |typed| secret_reference("SubDL's API key", typed, "SF_ENV_SUBDL_KEY");
@@ -612,7 +513,5 @@ mod tests {
                 .unwrap_err()
                 .contains("${SF_ENV_OPENSUBTITLES_PASSWORD}")
         );
-        assert_eq!(languages_value("en, pt-BR"), Some(json!(["en", "pt-BR"])));
-        assert_eq!(languages_value(""), None);
     }
 }

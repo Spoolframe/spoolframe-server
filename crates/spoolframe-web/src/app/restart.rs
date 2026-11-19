@@ -68,7 +68,7 @@ enum Phase {
 /// "Restart the server?", then "Confirm it's you" if the server asks for a
 /// recent sign-in, then "Restarting…" until the server answers again.
 #[component]
-fn RestartDialog(on_cancel: EventHandler<()>) -> Element {
+pub(super) fn RestartDialog(on_cancel: EventHandler<()>) -> Element {
     let settings = use_resource(super::wizard::load_settings);
     let mut phase = use_signal(|| Phase::Asking(None));
     let confirming = use_signal(|| None::<String>);

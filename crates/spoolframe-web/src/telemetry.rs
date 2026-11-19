@@ -1,4 +1,4 @@
-//! What Settings › Telemetry decides (P3-14), apart from the tab: the
+//! What Settings › Monitoring decides (P3-14), apart from the page: the
 //! addresses `/metrics` answers, the OTLP headers as the setting writes
 //! them, and how the export is going in words. Host-compiled, so `cargo
 //! test` covers it.

@@ -11,7 +11,7 @@ mod connect;
 mod connected;
 mod device;
 mod diagnostics;
-mod experimental;
+mod dom;
 mod federation;
 mod gpus;
 mod http;
@@ -23,6 +23,7 @@ mod logs;
 mod optimized;
 mod overview;
 mod paired;
+mod palette;
 mod playback;
 mod playlists;
 mod plex;
@@ -32,10 +33,12 @@ mod remote;
 mod restart;
 mod rpc;
 mod settings;
+mod settings_area;
+mod settings_custom;
+mod settings_extras;
 mod sso;
 mod subtitle_search;
 mod subtitle_timing;
-mod telemetry;
 mod webauthn;
 mod wizard;
 
@@ -66,7 +69,7 @@ use settings::{Settings, SettingsHome};
 use wizard::{Mode, Steps, WizardLayout};
 
 use crate::logic::{ApiError, Landing, avatar_class, landing, setup_without_passkeys};
-use crate::{nav, setup};
+use crate::{nav, settings_layout, setup};
 
 const STYLES: Asset = asset!("/assets/tailwind.css");
 /// The design's fonts, carried with the bundle (the build copies them in
@@ -123,8 +126,10 @@ enum Route {
             // Federation (P8-01, experimental): a section of the sidebar
             // of its own while the server has it on. Its URLs were
             // top-level already, under Users and devices too.
-            #[route("/federation")]
-            Federation {},
+            // `tab`: "settings" for its switch and limits; empty for the
+            // paired servers.
+            #[route("/federation?:tab")]
+            Federation { tab: String },
             // A paired server's own page, linked from its card.
             #[route("/federation/:id")]
             FederationPeer { id: String },
@@ -1356,11 +1361,11 @@ fn WizardStep(step: String) -> Element {
             Steps { current: step.clone(), done }
             section { class: "wizard-card",
                 match step.as_str() {
-                    "server" => rsx! { wizard::ServerForm { mode: Mode::Wizard, on_done: on_next } },
-                    "plex" => rsx! { wizard::PlexForm { mode: Mode::Wizard, on_done: on_next } },
+                    "server" => rsx! { wizard::ServerForm { on_done: on_next } },
+                    "plex" => rsx! { wizard::PlexForm { on_done: on_next } },
                     "paths" => rsx! { wizard::PathsForm { mode: Mode::Wizard, on_done: on_next } },
-                    "playback" => rsx! { wizard::PlaybackForm { mode: Mode::Wizard, on_done: on_next } },
-                    "access" => rsx! { wizard::AccessForm { mode: Mode::Wizard, on_done: on_next } },
+                    "playback" => rsx! { wizard::PlaybackForm { on_done: on_next } },
+                    "access" => rsx! { wizard::AccessForm { on_done: on_next } },
                     _ => rsx! { wizard::DoneCard {} },
                 }
                 if let Some(text) = error() {
@@ -1439,6 +1444,21 @@ fn SignedIn(user: UserInfo) -> Element {
     use_context_provider(|| ShownName(shown));
     let bar_title = use_signal(|| None::<String>);
     use_context_provider(|| BarTitle(bar_title));
+    // Search and commands, on every admin page.
+    let palette_open = use_signal(|| false);
+    use_context_provider(|| palette::PaletteOpen(palette_open));
+    let mut setting_jump = use_signal(|| None::<(String, bool)>);
+    use_context_provider(|| palette::SettingJump(setting_jump));
+    let check_paths = use_signal(|| false);
+    use_context_provider(|| palette::CheckPathsAsked(check_paths));
+    // A settings area's unsaved edits: a link out asks first, and so
+    // does closing the tab (WebSettingsStates 1).
+    let mut unsaved = use_signal(|| 0usize);
+    use_context_provider(|| settings_area::Unsaved(unsaved));
+    let mut leaving = use_signal(|| None::<Route>);
+    use_context_provider(|| settings_area::Leaving(leaving));
+    use_hook(|| std::rc::Rc::new(dom::guard_unload()));
+    use_effect(move || dom::set_unsaved(unsaved()));
     let name = shown();
     let admin = user.role == Role::Admin;
     let avatar = avatar_class(&user);
@@ -1456,7 +1476,7 @@ fn SignedIn(user: UserInfo) -> Element {
         let here = match (&route, &to) {
             (Route::UserSessions { .. }, Route::Users {}) => true,
             (Route::PlaylistView { .. }, Route::MyPlaylists {}) => true,
-            (Route::FederationPeer { .. }, Route::Federation {}) => true,
+            (Route::FederationPeer { .. }, Route::Federation { .. }) => true,
             (a, b) => a == b,
         };
         let class = match (here, divider) {
@@ -1466,7 +1486,7 @@ fn SignedIn(user: UserInfo) -> Element {
             (false, false) => "nav-link",
         };
         rsx! {
-            Link { class, to, "{label}" }
+            settings_area::GuardedLink { class, to, "{label}" }
         }
     };
     let title = match route {
@@ -1474,7 +1494,7 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::Profile {} => "My profile",
         Route::Server {} => "Server",
         Route::Invites {} => "Invites",
-        Route::Federation {} | Route::FederationPeer { .. } => "Federation",
+        Route::Federation { .. } | Route::FederationPeer { .. } => "Federation",
         Route::ActivityPage {} => "Activity",
         Route::LogsPage {} => "Logs",
         Route::DiagnosticsPage {} | Route::DiagnosticsReport { .. } => "Diagnostics",
@@ -1489,7 +1509,6 @@ fn SignedIn(user: UserInfo) -> Element {
         Route::ServerPlaylists {} => "Libraries",
         Route::MyPlaylists {} | Route::PlaylistView { .. } => "Playlists",
         Route::LicensesPage { .. } => "Licenses",
-        Route::Settings { ref tab } if tab == "plex" => "Plex",
         Route::Settings { .. } | Route::SettingsHome {} => "Settings",
         _ => "Users",
     };
@@ -1511,9 +1530,8 @@ fn SignedIn(user: UserInfo) -> Element {
                 let to = match section {
                     nav::Section::Overview => Route::AdminHome {},
                     nav::Section::UsersAndDevices => Route::Users {},
-                    nav::Section::Federation => Route::Federation {},
+                    nav::Section::Federation => Route::Federation { tab: String::new() },
                     nav::Section::Server => Route::Server {},
-                    nav::Section::Plex => plex_page(),
                     nav::Section::MyProfile => Route::Profile {},
                     nav::Section::MyPlaylists => Route::MyPlaylists {},
                 };
@@ -1597,10 +1615,14 @@ fn SignedIn(user: UserInfo) -> Element {
                     {sections().into_iter()}
                 }
                 div { class: "mt-auto flex items-center gap-2.5 rounded-[10px] bg-ctp-base p-2",
-                    span { class: avatar, "{initial(&name)}" }
-                    span { class: "flex min-w-0 flex-grow flex-col",
-                        b { class: "truncate text-sm", "{name}" }
-                        span { class: "text-xs text-ctp-subtext0", "{role_name(user.role)}" }
+                    // The user's own panel opens My profile; sign-out stays
+                    // its own button beside it, not nested in the link.
+                    Link { class: "flex min-w-0 flex-grow items-center gap-2.5 rounded-lg hover:text-ctp-text", to: Route::Profile {}, title: "My profile",
+                        span { class: avatar, "{initial(&name)}" }
+                        span { class: "flex min-w-0 flex-grow flex-col",
+                            b { class: "truncate text-sm", "{name}" }
+                            span { class: "text-xs text-ctp-subtext0", "{role_name(user.role)}" }
+                        }
                     }
                     button { class: "text-ctp-subtext0 hover:text-ctp-text", aria_label: "Sign out", title: "Sign out", onclick: sign_out,
                         icons::LogOut {}
@@ -1622,8 +1644,11 @@ fn SignedIn(user: UserInfo) -> Element {
                     b { class: "font-display text-[17px]", "{title}" }
                 }
                 span { class: "flex items-center gap-3",
+                    palette::PaletteIcon {}
                     button { class: "text-ctp-subtext0", aria_label: "Sign out", onclick: sign_out, icons::LogOut {} }
-                    span { class: "{avatar} avatar-md", "{initial(&name)}" }
+                    Link { to: Route::Profile {}, aria_label: "My profile", title: "My profile",
+                        span { class: "{avatar} avatar-md", "{initial(&name)}" }
+                    }
                 }
             }
             if menu() {
@@ -1634,6 +1659,10 @@ fn SignedIn(user: UserInfo) -> Element {
                 }
             }
             main { class: "box-border min-w-0 flex-[1_1_600px] max-w-[1600px] p-3.5 md:px-10 md:py-8",
+                // The search box, top right; the phone bar has its icon.
+                div { class: "mb-4 hidden justify-end md:flex",
+                    palette::PaletteBox {}
+                }
                 if plain {
                     div { class: "banner", role: "alert",
                         icons::Warning {}
@@ -1649,19 +1678,44 @@ fn SignedIn(user: UserInfo) -> Element {
                             b { "Insecure cookies are on. " }
                             "Sessions can be read by anyone watching the network."
                         }
-                        Link { to: Route::Settings { tab: "security".into() }, "Turn off" }
+                        Link { to: Route::Settings { tab: "sign-in".into() }, "Turn off" }
                     }
                 }
                 Outlet::<Route> {}
             }
+            palette::PaletteHost { federation }
+            if let Some(to) = leaving() {
+                div { class: "scrim",
+                    section { class: "dialog w-[440px]", role: "dialog", aria_label: "Leave with {settings_layout::unsaved_line(unsaved())}?",
+                        div { class: "dialog-head",
+                            h1 { "Leave with {settings_layout::unsaved_line(unsaved())}?" }
+                        }
+                        p { class: "m-0 text-sm text-ctp-subtext1", "They are lost if you leave {title} now." }
+                        div { class: "dialog-actions",
+                            button {
+                                class: "btn-dialog btn-dialog-grey",
+                                // A search hit's field is not shown on staying.
+                                onclick: move |_| {
+                                    leaving.set(None);
+                                    setting_jump.set(None);
+                                },
+                                "Stay"
+                            }
+                            button {
+                                class: "btn-dialog btn-dialog-primary",
+                                onclick: move |_| {
+                                    leaving.set(None);
+                                    unsaved.set(0);
+                                    nav.push(to.clone());
+                                },
+                                "Discard and leave"
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
-}
-
-/// The sidebar's Plex (WebUsers, WebAdminPhone 2): Settings' Plex tab,
-/// where the Plex Media Server and the admin's Plex account are.
-fn plex_page() -> Route {
-    Route::Settings { tab: "plex".into() }
 }
 
 /// Users and devices' sub-page in the sidebar, one step in: Invites
@@ -1673,7 +1727,7 @@ fn users_links(route: &Route) -> Element {
         "nav-link nav-sub"
     };
     rsx! {
-        Link { class, to: Route::Invites {}, "Invites" }
+        settings_area::GuardedLink { class, to: Route::Invites {}, "Invites" }
     }
 }
 
@@ -1743,18 +1797,14 @@ fn server_links(route: &Route) -> Element {
             ),
         ),
         (
-            Route::Settings {
-                tab: "server".into(),
-            },
+            Route::SettingsHome {},
             "Settings",
-            // Settings' Plex tab is the sidebar's Plex, not Settings.
-            matches!(route, Route::Settings { tab } if tab != "plex")
-                || matches!(route, Route::SettingsHome {}),
+            matches!(route, Route::Settings { .. } | Route::SettingsHome {}),
         ),
     ];
     rsx! {
         for (to, label, here) in pages {
-            Link {
+            settings_area::GuardedLink {
                 key: "{label}",
                 class: if here { "nav-link nav-link-here nav-sub" } else { "nav-link nav-sub" },
                 to,

@@ -598,11 +598,6 @@ pub fn list_setting(items: Vec<Value>, current: Option<&SettingEntry>) -> Option
     }
 }
 
-/// A list setting's strings, for [`list_setting`].
-pub fn string_values(items: &[String]) -> Vec<Value> {
-    items.iter().cloned().map(Value::String).collect()
-}
-
 /// A Plex URL as the Server page shows it: its host and port.
 pub fn host_port(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -858,15 +853,8 @@ mod tests {
             apply: spoolframe_admin_api::SettingApply::Restart,
             restart_pending: false,
             running: None,
+            default: None,
         }
-    }
-
-    #[test]
-    fn a_list_with_entries_is_saved_as_a_json_array() {
-        assert_eq!(
-            list_setting(string_values(&["default".into()]), None),
-            Some(json!(["default"]))
-        );
     }
 
     #[test]

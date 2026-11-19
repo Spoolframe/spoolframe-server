@@ -518,6 +518,39 @@ async fn a_search_finds_shows_and_episodes_by_title() {
     assert!(none.rows.is_empty());
 }
 
+/// Search and commands' one search across every library: hits from
+/// each, the same title first, each with the library it is in.
+#[tokio::test]
+async fn one_search_finds_titles_in_every_library() {
+    let s = setup("search-all").await;
+    let hits = s.root.catalog_search("the bear".into(), 10).await.unwrap();
+    let first = hits.first().unwrap();
+    assert_eq!(first.row.item.title(), "The Bear");
+    assert_eq!(first.library, "plex:1");
+    assert_eq!(first.library_title, "TV Shows");
+
+    let hits = s.root.catalog_search(" o ".into(), 50).await.unwrap();
+    let libraries: BTreeSet<_> = hits.iter().map(|h| h.library.as_str()).collect();
+    assert_eq!(libraries, BTreeSet::from(["plex:1", "plex:2"]), "{hits:?}");
+    let few = s.root.catalog_search("o".into(), 2).await.unwrap();
+    assert_eq!(few.len(), 2);
+
+    for (text, limit) in [("  ", 10), ("o", 0), ("o", 51)] {
+        let err = s.root.catalog_search(text.into(), limit).await.unwrap_err();
+        assert_eq!(code(err), error_code::INVALID_INPUT, "{text:?} {limit}");
+    }
+}
+
+/// A library whose Plex server does not answer is left out of the
+/// search, not its error: the palette searches the others.
+#[tokio::test]
+async fn a_library_that_does_not_answer_is_left_out_of_the_search() {
+    let file = r#"plex { url = "http://127.0.0.1:9"; }
+        libraries [ { name = "Movies"; kind = "movies"; plex { server = "plex"; section = "2"; } } ]"#;
+    let (_addr, root, _dir) = served("catalog-search-down", file).await;
+    assert_eq!(root.catalog_search("alien".into(), 10).await.unwrap(), []);
+}
+
 /// The item page's "As clients get it" and Show JSON are the client
 /// protocol's `Item` reply for it, with its external IDs, markers and
 /// artwork.

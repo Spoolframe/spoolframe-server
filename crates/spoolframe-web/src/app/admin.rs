@@ -1892,72 +1892,16 @@ fn ServerCard(children: Element) -> Element {
     }
 }
 
-/// LAN discovery (`network.mdns`) as a switch (WebServer). The setting
-/// applies at the next start: the server announces itself, or stops, only
-/// then, so a change says so and offers the restart where the server can.
-/// `running`: what the server does now.
+/// LAN discovery (`network.mdns`), as the server runs it now (WebServer).
+/// It is changed in Settings › General, with the page's other settings,
+/// rather than saved from here on a click.
 #[component]
 fn LanDiscovery(running: bool) -> Element {
-    let mut settings = use_resource(super::wizard::load_settings);
-    let mut error = use_signal(|| None::<String>);
-    let mut busy = use_signal(|| false);
-    // `network.*` (finding 61): from an old session, "Confirm it's you"
-    // first, then the same flip again (`to`, kept for it).
-    let confirming = use_signal(|| None::<String>);
-    let mut to = use_signal(|| false);
-    let flip = use_callback(move |wanted: bool| {
-        to.set(wanted);
-        busy.set(true);
-        spawn(async move {
-            let set = async {
-                let client = rpc::client().await?;
-                client
-                    .setting_set("network.mdns".into(), serde_json::Value::Bool(wanted))
-                    .await
-                    .map_err(rpc::error)
-            };
-            match set.await {
-                Ok(_) => error.set(None),
-                Err(e) if asks_to_confirm(&e, confirming, "changing LAN discovery") => {}
-                Err(e) => error.set(Some(e.explain())),
-            }
-            busy.set(false);
-            settings.restart();
-        });
-    });
-    let current = settings.read().clone();
-    let Some(Ok(loaded)) = current else {
-        // Until the settings load (or if they cannot), what runs now.
-        return rsx! { LanLine { on: running } };
-    };
-    let entry = super::wizard::entry(&loaded, "network.mdns").cloned();
-    let wanted = entry
-        .as_ref()
-        .and_then(|e| e.value.as_ref())
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(running);
-    let locked = entry.as_ref().is_some_and(|e| e.locked);
     rsx! {
-        div { class: "flex flex-col gap-2",
-            div { class: "flex items-start gap-3",
-                button {
-                    class: "switch shrink-0",
-                    r#type: "button",
-                    role: "switch",
-                    aria_checked: "{wanted}",
-                    aria_label: "LAN discovery",
-                    disabled: busy() || locked,
-                    title: if locked { "Set by the server's config file." } else { "" },
-                    onclick: move |_| flip.call(!wanted),
-                }
-                LanLine { on: wanted }
-            }
-            super::wizard::Note { settings: loaded.clone(), setting: "network.mdns", on_changed: move |_| settings.restart() }
-            if let Some(text) = error() {
-                Alert { text }
-            }
+        div { class: "flex flex-wrap items-center gap-3",
+            LanLine { on: running }
+            Link { class: "text-[13px]", to: Route::Settings { tab: "general".into() }, "Change in Settings › General" }
         }
-        ConfirmItsYou { asking: confirming, on_confirmed: move |_| flip.call(to()) }
     }
 }
 
@@ -2081,7 +2025,7 @@ fn PathCheck() -> Element {
             }
         });
     });
-    let run = move |_| {
+    let mut run = move || {
         busy.set(true);
         spawn(async move {
             let checked = async {
@@ -2092,6 +2036,16 @@ fn PathCheck() -> Element {
             busy.set(false);
         });
     };
+    // "Check media paths" from search and commands: run it on arrival.
+    let asked = try_use_context::<super::palette::CheckPathsAsked>();
+    use_effect(move || {
+        if let Some(super::palette::CheckPathsAsked(mut asked)) = asked
+            && asked()
+        {
+            asked.set(false);
+            run();
+        }
+    });
     let done = result().is_some();
     rsx! {
         section { class: "card",
@@ -2126,9 +2080,9 @@ fn PathCheck() -> Element {
                 }
                 div {
                     if done {
-                        button { class: "btn", disabled: busy(), onclick: run, icons::RotateCcw {} "Check every file again" }
+                        button { class: "btn", disabled: busy(), onclick: move |_| run(), icons::RotateCcw {} "Check every file again" }
                     } else {
-                        button { class: "btn-dialog btn-dialog-primary h-9", disabled: busy(), onclick: run, "Check every file" }
+                        button { class: "btn-dialog btn-dialog-primary h-9", disabled: busy(), onclick: move |_| run(), "Check every file" }
                     }
                 }
             }

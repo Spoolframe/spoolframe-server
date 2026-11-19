@@ -16,153 +16,6 @@ use crate::libraries::unit;
 use crate::logic::{ApiError, thousands};
 use crate::portable::{days_ago, short_date};
 
-/// The setting that turns it on (Settings › Experimental).
-pub const SETTING: &str = "experimental.federation";
-
-/// One of `federation { … }`'s settings as Settings › Experimental shows
-/// it, with "Show advanced settings" on (P8-04).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LimitField {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub unit: &'static str,
-    /// The default and what it is, under the field.
-    pub help: &'static str,
-}
-
-const fn field(
-    key: &'static str,
-    label: &'static str,
-    unit: &'static str,
-    help: &'static str,
-) -> LimitField {
-    LimitField {
-        key,
-        label,
-        unit,
-        help,
-    }
-}
-
-/// Federation's settings: the cache, then what a pair may send and ask.
-/// Every one is advanced (the 2026-10-23 decision).
-pub const LIMITS: &[LimitField] = &[
-    field(
-        "federation.sync_interval_secs",
-        "Sync every",
-        "s",
-        "Default 3600 s · how often each paired server's libraries are synced; 60 at the least",
-    ),
-    field(
-        "federation.cache_max_mb",
-        "Images per server",
-        "MiB",
-        "Default 2048 MiB · a paired server's artwork kept here",
-    ),
-    field(
-        "federation.cache_total_mb",
-        "Images in all",
-        "MiB",
-        "Default 8192 MiB · every paired server's artwork together",
-    ),
-    field(
-        "federation.sync_max_pages",
-        "Pages per sync",
-        "",
-        "Default 2000 · of one library's sync; 10 at the least",
-    ),
-    field(
-        "federation.sync_max_items",
-        "Items per sync",
-        "",
-        "Default 200000 · of one library's sync; raise it for a very large library",
-    ),
-    field(
-        "federation.max_cached_items",
-        "Items per server",
-        "",
-        "Default 500000 · cached of one paired server, every library together",
-    ),
-    field(
-        "federation.sync_max_metadata_mb",
-        "Metadata per sync",
-        "MiB",
-        "Default 1024 MiB · of one library's sync, 16 to 65536",
-    ),
-    field(
-        "federation.max_cached_metadata_mb",
-        "Metadata per server",
-        "MiB",
-        "Default 2048 MiB · cached of one paired server, every library together, 64 to 262144",
-    ),
-    field(
-        "federation.walk_reuse_secs",
-        "Walk reused for",
-        "s",
-        "Default 60 s · one walk of a library answers every pair's sync; 10 at the least",
-    ),
-    field(
-        "federation.max_streams",
-        "Streams per connection",
-        "",
-        "Default 16 · a pair's requests answered at once, 4 to 1024; for connections made after",
-    ),
-    field(
-        "federation.artwork_burst",
-        "Images in a burst",
-        "",
-        "Default 200 · a pair's image requests at once, then 100 a second",
-    ),
-    field(
-        "federation.assertion_burst",
-        "Plays in a burst",
-        "",
-        "Default 30 · plays a pair's users start at once, then 1 a second",
-    ),
-    field(
-        "federation.tokens_per_user",
-        "Play tokens per user",
-        "",
-        "Default 10 · that work at once, for one user of a pair",
-    ),
-    field(
-        "federation.tokens_per_server",
-        "Play tokens per server",
-        "",
-        "Default 500 · that work at once, for a pair",
-    ),
-    field(
-        "federation.download_tokens_per_user",
-        "Download tokens per user",
-        "",
-        "Default 200 · downloads being made or read at once, for one user of a pair",
-    ),
-    field(
-        "federation.download_tokens_per_server",
-        "Download tokens per server",
-        "",
-        "Default 2000 · downloads being made or read at once, for a pair",
-    ),
-    field(
-        "federation.play_sessions_per_server",
-        "Plays per server",
-        "",
-        "Default 200 · plays a pair's users hold open at once, 10 to 10000",
-    ),
-    field(
-        "federation.subtitle_burst",
-        "Subtitle asks in a burst",
-        "",
-        "Default 20 · a pair's subtitle searches and downloads at once, then 1 every 10 s",
-    ),
-    field(
-        "subtitles.daily_limit_per_peer",
-        "Subtitle downloads a day per server",
-        "",
-        "Default 40 · every user of one paired server together, a day; 0 for no limit",
-    ),
-];
-
 /// The experimental feature's name, as `serverStatus` lists it.
 pub const FEATURE: &str = "federation";
 
@@ -617,7 +470,7 @@ pub fn states(now: i64, me: &str, detail: &PeerDetail) -> Vec<State> {
             ),
             text: format!(
                 "Apps on {name} couldn't reach {me} directly, so {name} fetched the media and \
-                 passed it on. Turning on remote access (Settings › Remote access) lets them \
+                 passed it on. Turning on remote access (Settings › Network) lets them \
                  play directly."
             ),
             bad: false,
@@ -670,20 +523,6 @@ pub fn refusal(e: &ApiError) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// Every federation setting is advanced, on the tab its switch is on.
-    #[test]
-    fn every_federation_setting_is_advanced_under_experimental() {
-        for field in super::LIMITS {
-            assert!(crate::advanced::is_advanced(field.key), "{}", field.key);
-            assert!(
-                crate::advanced::on_tab("experimental").contains(&field.key),
-                "{}",
-                field.key
-            );
-        }
-        assert_eq!(super::LIMITS.len(), 19);
-    }
-
     use super::*;
 
     const DAY: i64 = 86_400;
@@ -1129,7 +968,7 @@ mod tests {
             "{}",
             said[1].text
         );
-        assert!(said[2].text.contains("Settings › Remote access"));
+        assert!(said[2].text.contains("Settings › Network"));
         // Unpaired, none of it is news.
         let gone = PeerDetail {
             peer: PeerEntry {

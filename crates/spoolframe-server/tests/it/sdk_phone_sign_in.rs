@@ -688,3 +688,72 @@ async fn a_sign_in_turned_down_on_the_tv_keeps_nothing() {
     phone.close().await;
     stop(servers).await;
 }
+
+/// The hold comes from the phone's retry round (its first approve
+/// offered nothing: "Confirm it's you" was needed), and the person at
+/// the TV rejects it. The phone hears each server was declined, whether
+/// the TV app waits for its reject or closes the code's screen (cancels
+/// it) as soon as it has said no: the hold was answered, so the TV still
+/// tells the phone rather than cutting it off.
+///
+/// The cut-off was a race between the TV's task and the cancel, lost
+/// some of the time on a runtime with several threads (as the apps'
+/// is), so it is run a few times; more would meet the servers' limit on
+/// sign-ins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_retry_rejected_then_cancelled_is_declined_on_the_phone() {
+    use futures_util::FutureExt;
+    let servers = servers("sdk-psi-reject-retry", 2).await;
+    let phone = phone(&servers).await;
+    let rounds = std::iter::once(false).chain(std::iter::repeat_n(true, 7));
+    for cancel_at_once in rounds {
+        let tv = new_client("tv", Platform::Tvos).await;
+        let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+        let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+        let choices = offer.servers().await.unwrap();
+        for server in &servers {
+            crate::app_passkeys::sql(
+                server,
+                "UPDATE sessions SET authenticated_at = authenticated_at - 3600 \
+                 WHERE user_id IN (SELECT id FROM users WHERE username = ?1)",
+                "alice",
+            )
+            .await;
+        }
+        // Nothing offered: nothing goes to the TV, which keeps waiting.
+        let results = offer.approve(&choices, false).await.unwrap();
+        assert!(
+            results.iter().all(|r| matches!(
+                r.outcome,
+                SignInOfferOutcome::NotOffered(SignInFailure::RecentSignInRequired)
+            )),
+            "{results:?}"
+        );
+        for choice in &choices {
+            choice.session.confirm_password(PASSWORD).await.unwrap();
+        }
+        let (results, ()) = tokio::join!(offer.approve(&choices, false), async {
+            let held = held(&shown).await;
+            if cancel_at_once {
+                // The no is said (its first poll decides), then the
+                // screen goes before the TV's task has told the phone.
+                let _ = held.reject().now_or_never();
+                shown.cancel();
+            } else {
+                held.reject().await.unwrap();
+            }
+        });
+        let results = results.unwrap();
+        assert!(
+            results.iter().all(|r| matches!(
+                r.outcome,
+                SignInOfferOutcome::Failed(SignInFailure::Declined)
+            )),
+            "cancel_at_once={cancel_at_once}: {results:?}"
+        );
+        assert!(tv.servers().await.unwrap().is_empty());
+        tv.close().await;
+    }
+    phone.close().await;
+    stop(servers).await;
+}

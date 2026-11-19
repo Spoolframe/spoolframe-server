@@ -8,7 +8,9 @@ use std::sync::Arc;
 use jsonrpsee::ws_client::WsClient;
 use serde_json::json;
 use spoolframe_admin_api::{
-    AdminApiClient, MeApiClient, RestartMode, SettingApply, SettingLayer, error_code,
+    AdminActionKind, AdminApiClient, CustomField, FieldWidget, MeApiClient, RestartMode,
+    SchemaField, SchemaPage, SchemaPlace, SettingApply, SettingArea, SettingBounds, SettingLayer,
+    error_code,
 };
 use spoolframe_server::admin::{
     self, Admin, CookiePolicy, Origins, SetupCode, TrustedProxies, Wizard,
@@ -502,6 +504,202 @@ async fn a_consumer_cannot_see_or_change_settings() {
         ),
         error_code::FORBIDDEN
     );
+    assert_eq!(
+        code(alice.settings_index().await.unwrap_err()),
+        error_code::FORBIDDEN
+    );
+    assert_eq!(
+        code(alice.settings_schema().await.unwrap_err()),
+        error_code::FORBIDDEN
+    );
+    assert_eq!(
+        code(alice.admin_actions().await.unwrap_err()),
+        error_code::FORBIDDEN
+    );
+    assert_eq!(
+        code(alice.catalog_search("alien".into(), 10).await.unwrap_err()),
+        error_code::FORBIDDEN
+    );
+}
+
+/// Each setting comes with its built-in default, so the web says "default
+/// 20 GiB" beside a changed value rather than typing it into help; a
+/// setting the server does without has none, and so has a secret.
+#[tokio::test]
+async fn each_setting_says_its_default() {
+    let (_addr, root, _dir) = served("settings-defaults", "").await;
+    root.setting_set("transcode.scratch_limit_mb".into(), json!(40960))
+        .await
+        .unwrap();
+    let all = root.settings().await.unwrap();
+    let entry = |key: &str| all.entries.iter().find(|e| e.key == key).unwrap().clone();
+    let scratch = entry("transcode.scratch_limit_mb");
+    assert_eq!(scratch.value, Some(json!(40960)));
+    assert_eq!(scratch.default, Some(json!(20480)));
+    assert_eq!(entry("name").default, Some(json!("Spoolframe")));
+    assert_eq!(entry("network.mdns").default, Some(json!(true)));
+    assert_eq!(entry("plex.url").default, None);
+    assert_eq!(entry("plex.token").default, None);
+
+    // Reset to default is settingUnset: the default is the value again.
+    let reset = root
+        .setting_unset("transcode.scratch_limit_mb".into())
+        .await
+        .unwrap();
+    assert_eq!(reset.value, reset.default);
+    assert_eq!(reset.layer, Some(SettingLayer::Default));
+}
+
+/// The actions search and commands offers are the admin API's own:
+/// restart asks first and needs a recent sign-in, and says how many
+/// changes wait for it; finding subtitles needs an item.
+#[tokio::test]
+async fn the_actions_are_the_ones_the_api_has() {
+    let (_addr, root, _dir) = served("admin-actions", "").await;
+    let actions = root.admin_actions().await.unwrap();
+    let kinds: Vec<_> = actions.iter().map(|a| a.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            AdminActionKind::AddSource,
+            AdminActionKind::Invite,
+            AdminActionKind::CheckPaths,
+            AdminActionKind::Restart,
+            AdminActionKind::FindSubtitles,
+        ]
+    );
+    let restart = |all: &[spoolframe_admin_api::AdminAction]| {
+        all.iter()
+            .find(|a| a.kind == AdminActionKind::Restart)
+            .unwrap()
+            .clone()
+    };
+    let before = restart(&actions);
+    assert!(before.confirm && before.recent_sign_in);
+    assert_eq!(
+        before.description,
+        "Connected devices drop for a few seconds"
+    );
+    root.setting_set("admin.listen".into(), json!("127.0.0.1:7499"))
+        .await
+        .unwrap();
+    let after = restart(&root.admin_actions().await.unwrap());
+    assert_eq!(after.description, "Applies 1 change waiting for a restart");
+    assert!(
+        actions
+            .iter()
+            .find(|a| a.kind == AdminActionKind::FindSubtitles)
+            .unwrap()
+            .needs_item
+    );
+}
+
+/// The settings index names every setting `settings` lists, in its
+/// order, each with a label, help, an area and the anchor of its field.
+#[tokio::test]
+async fn the_settings_index_describes_every_setting() {
+    let (_addr, root, _dir) = served("settings-index", "").await;
+    let all = root.settings().await.unwrap();
+    let index = root.settings_index().await.unwrap();
+    assert_eq!(
+        index.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(),
+        all.entries
+            .iter()
+            .map(|e| e.key.as_str())
+            .collect::<Vec<_>>()
+    );
+    let port = index.iter().find(|i| i.key == "network.port").unwrap();
+    assert_eq!(port.label, "App port");
+    assert_eq!(port.area, SettingArea::Network);
+    assert_eq!(port.anchor, "setting-network-port");
+    assert!(!port.advanced);
+    let announce = index
+        .iter()
+        .find(|i| i.key == "network.announce.add")
+        .unwrap();
+    assert!(announce.advanced);
+    let limits = index
+        .iter()
+        .filter(|i| i.area == SettingArea::Federation)
+        .count();
+    // The switch and its 18 limits.
+    assert_eq!(limits, 19);
+}
+
+/// The settings schema draws every setting `settings` lists, once with
+/// its anchor, on its own area's page; a number with the bounds the
+/// server takes, a choice with its options, a Sensitive setting with
+/// what saving it does and the recent sign-in it needs.
+#[tokio::test]
+async fn the_settings_schema_draws_every_setting_once() {
+    let (_addr, root, _dir) = served("settings-schema", "").await;
+    let all = root.settings().await.unwrap();
+    let schema = root.settings_schema().await.unwrap();
+    let fields: Vec<(&SchemaPage, &SchemaField)> = schema
+        .pages
+        .iter()
+        .flat_map(|p| {
+            p.sections
+                .iter()
+                .flat_map(move |s| s.fields.iter().map(move |f| (p, f)))
+        })
+        .collect();
+    let mut anchored: Vec<&str> = fields
+        .iter()
+        .filter(|(_, f)| f.anchor.is_some())
+        .map(|(_, f)| f.key.as_str())
+        .collect();
+    anchored.sort();
+    let mut keys: Vec<&str> = all.entries.iter().map(|e| e.key.as_str()).collect();
+    keys.sort();
+    assert_eq!(anchored, keys);
+    let index = root.settings_index().await.unwrap();
+    for (page, field) in &fields {
+        let indexed = index.iter().find(|i| i.key == field.key).unwrap();
+        assert_eq!(page.area, indexed.area, "{}", field.key);
+    }
+
+    let field = |key: &str| fields.iter().find(|(_, f)| f.key == key).unwrap().1;
+    let share = field("network.uplink.owner_share_percent");
+    assert_eq!(share.widget, FieldWidget::Number);
+    assert_eq!(share.unit, "%");
+    assert_eq!(
+        share.bounds,
+        Some(SettingBounds {
+            min: 0,
+            max: Some(100)
+        })
+    );
+    let tone = field("transcode.tone_map");
+    assert_eq!(tone.widget, FieldWidget::Choice);
+    assert_eq!(
+        tone.options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect::<Vec<_>>(),
+        ["auto", "cpu", "gpu", "libplacebo"]
+    );
+    let public = field("admin.public_url");
+    assert!(public.risk.as_deref().unwrap().contains("passkeys"));
+    assert!(public.recent_sign_in);
+    let name = field("name");
+    assert_eq!((name.risk.as_deref(), name.recent_sign_in), (None, false));
+    // `network.wan`'s Sensitive switch is its second place: no anchor.
+    let switch = fields
+        .iter()
+        .find(|(_, f)| f.custom == Some(CustomField::WanSwitch))
+        .unwrap()
+        .1;
+    assert_eq!(
+        (switch.key.as_str(), switch.anchor.as_ref()),
+        ("network.wan", None)
+    );
+    let federation = schema
+        .pages
+        .iter()
+        .find(|p| p.slug == "federation")
+        .unwrap();
+    assert_eq!(federation.place, SchemaPlace::Federation);
 }
 
 /// The `Set-Cookie` of a password sign-in from the listener's own page.

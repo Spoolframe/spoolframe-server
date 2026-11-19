@@ -21,13 +21,15 @@ use spoolframe_admin_api::{
     RefusedScrape, ResourceAttribute, TelemetryStatus, UserSessionCount,
 };
 use spoolframe_admin_api::{
-    AdminApiServer, Credentials, DeviceEntry, DeviceSignIn, DiscoveredPlex, LibrariesOverview,
-    LibraryPathCheck, LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost,
-    PasskeySetupBegin, PasskeySetupFinish, PasswordChange, PathCheckRun, PathFailures,
-    PathMappingEntry, PathReport, PlexAccountServer, PlexLinkState, PlexPin, PlexPinState,
-    PlexServerEntry, PlexStatus, PlexSyncOverview, PlexSyncReport, PlexUser, Role, ServerStatus,
-    SessionEntry, SettingEntry, Settings, SetupRequest, SetupState, SyncDirection,
-    TranscodingStatus, UserInfo, error_code,
+    AdminAction, AdminActionKind, AdminApiServer, CatalogHit, Credentials, CustomField,
+    DeviceEntry, DeviceSignIn, DiscoveredPlex, FieldWidget, LibrariesOverview, LibraryPathCheck,
+    LoggedIn, MeApiServer, NewUser, PasskeyChallenge, PasskeyEntry, PasskeyHost, PasskeySetupBegin,
+    PasskeySetupFinish, PasswordChange, PathCheckRun, PathFailures, PathMappingEntry, PathReport,
+    PlexAccountServer, PlexLinkState, PlexPin, PlexPinState, PlexServerEntry, PlexStatus,
+    PlexSyncOverview, PlexSyncReport, PlexUser, Role, SchemaField, SchemaPage, SchemaPlace,
+    SchemaSection, SectionKind, ServerStatus, SessionEntry, SettingApply, SettingArea,
+    SettingBounds, SettingEntry, SettingIndexEntry, SettingOption, Settings, SettingsSchema,
+    SetupRequest, SetupState, SyncDirection, TranscodingStatus, UserInfo, error_code,
 };
 use spoolframe_admin_api::{
     ArtworkInfo, CatalogItem, CatalogLibrary, CatalogPage, CatalogQuery, CatalogRow, PathsChecked,
@@ -1716,6 +1718,9 @@ fn sensitive_setting(key: &str) -> bool {
         || key.starts_with("media.")
         || key.starts_with("network.")
         || key.starts_with("telemetry.")
+        // Turning federation on lets other servers pair with this one:
+        // Settings' Sensitive block, with the public address and proxies.
+        || key == "experimental.federation"
         || [PLEX_TOKEN, "plex.token_file", "plex.url", "plex.servers"].contains(&key)
 }
 
@@ -3634,6 +3639,40 @@ impl AdminApiServer for AdminApi {
         Ok(settings.settings())
     }
 
+    async fn admin_actions(&self, ext: &Extensions) -> RpcResult<Vec<AdminAction>> {
+        let (settings, _) = self.settings_as_admin(ext).await?;
+        let waiting = settings
+            .settings()
+            .entries
+            .iter()
+            .filter(|e| e.restart_pending)
+            .count();
+        Ok(admin_actions(waiting))
+    }
+
+    async fn catalog_search(
+        &self,
+        ext: &Extensions,
+        text: String,
+        limit: u32,
+    ) -> RpcResult<Vec<CatalogHit>> {
+        self.admin(ext).await?;
+        self.catalog_search_of(text, limit).await
+    }
+
+    async fn settings_index(&self, ext: &Extensions) -> RpcResult<Vec<SettingIndexEntry>> {
+        self.settings_as_admin(ext).await?;
+        Ok(crate::config::settings::SETTINGS
+            .iter()
+            .map(setting_index_entry)
+            .collect())
+    }
+
+    async fn settings_schema(&self, ext: &Extensions) -> RpcResult<SettingsSchema> {
+        self.settings_as_admin(ext).await?;
+        Ok(settings_schema())
+    }
+
     async fn setting_set(
         &self,
         ext: &Extensions,
@@ -5000,6 +5039,211 @@ impl AdminApi {
     }
 }
 
+/// `adminActions`' list, with `waiting` restart settings changed: the
+/// actions the admin API has, as the WebCommandPalette board offers them.
+fn admin_actions(waiting: usize) -> Vec<AdminAction> {
+    let action = |kind, label: &str, description: String| AdminAction {
+        kind,
+        label: label.to_owned(),
+        description,
+        confirm: false,
+        recent_sign_in: false,
+        needs_item: false,
+    };
+    let restart_line = match waiting {
+        0 => "Connected devices drop for a few seconds".to_owned(),
+        1 => "Applies 1 change waiting for a restart".to_owned(),
+        n => format!("Applies {n} changes waiting for a restart"),
+    };
+    vec![
+        action(
+            AdminActionKind::AddSource,
+            "Add a source…",
+            "Libraries: a Plex library or folders on this server".into(),
+        ),
+        action(
+            AdminActionKind::Invite,
+            "Invite someone…",
+            "A link or code for a new account".into(),
+        ),
+        action(
+            AdminActionKind::CheckPaths,
+            "Check media paths",
+            "Every file Plex lists, read on this server".into(),
+        ),
+        AdminAction {
+            confirm: true,
+            // As `restart` requires (PX-10).
+            recent_sign_in: true,
+            ..action(AdminActionKind::Restart, "Restart server…", restart_line)
+        },
+        AdminAction {
+            needs_item: true,
+            ..action(
+                AdminActionKind::FindSubtitles,
+                "Find subtitles…",
+                "Search OpenSubtitles and SubDL".into(),
+            )
+        },
+    ]
+}
+
+/// `setting` as `admin.settingsIndex` describes it.
+fn setting_index_entry(setting: &crate::config::settings::Setting) -> SettingIndexEntry {
+    SettingIndexEntry {
+        key: setting.key.to_owned(),
+        label: setting.label.to_owned(),
+        help: setting.help.to_owned(),
+        area: setting_area(setting.area),
+        anchor: setting.anchor(),
+        advanced: setting.advanced,
+    }
+}
+
+fn setting_area(area: crate::config::settings::Area) -> SettingArea {
+    use crate::config::settings::Area;
+    match area {
+        Area::General => SettingArea::General,
+        Area::Network => SettingArea::Network,
+        Area::SignIn => SettingArea::SignIn,
+        Area::Plex => SettingArea::Plex,
+        Area::Transcoding => SettingArea::Transcoding,
+        Area::Media => SettingArea::Media,
+        Area::Subtitles => SettingArea::Subtitles,
+        Area::Monitoring => SettingArea::Monitoring,
+        Area::Experimental => SettingArea::Experimental,
+        Area::Federation => SettingArea::Federation,
+        Area::Libraries => SettingArea::Libraries,
+    }
+}
+
+/// `settingsSchema`: the pages of [`crate::config::schema::PAGES`], each
+/// field with its setting's label, help and how it applies, its bounds,
+/// and whether it is Sensitive or needs a recent sign-in.
+fn settings_schema() -> SettingsSchema {
+    use crate::config::schema::{self, Custom, Kind, Place, Widget};
+    use crate::config::settings::{Apply, setting};
+    let options = |list: &[(&str, &str, &str)]| {
+        list.iter()
+            .map(|(value, name, about)| SettingOption {
+                value: (*value).to_owned(),
+                name: (*name).to_owned(),
+                about: (*about).to_owned(),
+            })
+            .collect()
+    };
+    let custom = |c: Custom| match c {
+        Custom::Wan => CustomField::Wan,
+        Custom::WanSwitch => CustomField::WanSwitch,
+        Custom::Pkarr => CustomField::Pkarr,
+        Custom::Budget => CustomField::Budget,
+        Custom::Gpus => CustomField::Gpus,
+        Custom::VideoCodecs => CustomField::VideoCodecs,
+        Custom::Oidc => CustomField::Oidc,
+        Custom::Redirects => CustomField::Redirects,
+        Custom::Headers => CustomField::Headers,
+        Custom::PlexToken => CustomField::PlexToken,
+        Custom::MetricsFrom => CustomField::MetricsFrom,
+        Custom::Libraries => CustomField::Libraries,
+        Custom::PathMapping => CustomField::PathMapping,
+    };
+    let mut anchored = std::collections::HashSet::new();
+    let pages = schema::PAGES
+        .iter()
+        .map(|page| SchemaPage {
+            slug: page.slug.to_owned(),
+            area: setting_area(page.area),
+            name: page.name.to_owned(),
+            line: page.line.to_owned(),
+            place: match page.place {
+                Place::Settings => SchemaPlace::Settings,
+                Place::Federation => SchemaPlace::Federation,
+                Place::Libraries => SchemaPlace::Libraries,
+            },
+            sections: page
+                .sections
+                .iter()
+                .map(|section| SchemaSection {
+                    name: section.name.to_owned(),
+                    help: section.help.to_owned(),
+                    kind: match section.kind {
+                        Kind::Plain => SectionKind::Plain,
+                        Kind::Advanced => SectionKind::Advanced,
+                        Kind::Sensitive => SectionKind::Sensitive,
+                    },
+                    fields: section
+                        .fields
+                        .iter()
+                        .map(|(key, widget)| {
+                            let s = setting(key).expect("every field is a setting's");
+                            let mut field = SchemaField {
+                                key: s.key.to_owned(),
+                                label: s.label.to_owned(),
+                                help: s.help.to_owned(),
+                                // The first place a setting is holds its anchor.
+                                anchor: anchored.insert(s.key).then(|| s.anchor()),
+                                apply: match s.apply {
+                                    Apply::Live => SettingApply::Live,
+                                    Apply::Restart => SettingApply::Restart,
+                                },
+                                widget: FieldWidget::Text,
+                                unit: String::new(),
+                                bounds: schema::bounds(key)
+                                    .map(|(min, max)| SettingBounds { min, max }),
+                                options: Vec::new(),
+                                add_label: None,
+                                env_example: None,
+                                custom: None,
+                                risk: schema::risk(key).map(str::to_owned),
+                                recent_sign_in: sensitive_setting(key),
+                            };
+                            match *widget {
+                                Widget::Text => {}
+                                Widget::Secret => field.widget = FieldWidget::Secret,
+                                Widget::EnvRef(example) => {
+                                    field.widget = FieldWidget::EnvRef;
+                                    field.env_example = Some(example.to_owned());
+                                }
+                                Widget::Number(unit) => {
+                                    field.widget = FieldWidget::Number;
+                                    field.unit = unit.to_owned();
+                                }
+                                Widget::Gib => field.widget = FieldWidget::Gib,
+                                Widget::Switch => field.widget = FieldWidget::Switch,
+                                Widget::Choice(list) => {
+                                    field.widget = FieldWidget::Choice;
+                                    field.options = options(list);
+                                }
+                                Widget::Many(list) => {
+                                    field.widget = FieldWidget::Many;
+                                    field.options = list
+                                        .iter()
+                                        .map(|(value, name)| SettingOption {
+                                            value: (*value).to_owned(),
+                                            name: (*name).to_owned(),
+                                            about: String::new(),
+                                        })
+                                        .collect();
+                                }
+                                Widget::List(add) => {
+                                    field.widget = FieldWidget::List;
+                                    field.add_label = Some(add.to_owned());
+                                }
+                                Widget::Custom(c) => {
+                                    field.widget = FieldWidget::Custom;
+                                    field.custom = Some(custom(c));
+                                }
+                            }
+                            field
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect();
+    SettingsSchema { pages }
+}
+
 #[cfg(test)]
 mod lookup_document_tests {
     use super::LookupDocument;
@@ -5541,5 +5785,29 @@ mod tests {
                 .all(|b| spoolframe_protocol::invite::CODE_ALPHABET.contains(&b))
         );
         assert_ne!(SetupCode::generate(), code);
+    }
+}
+
+#[cfg(test)]
+mod settings_schema_tests {
+    use super::*;
+
+    /// A Sensitive setting asks "Confirm it's you" in the web UI: the
+    /// server must ask for the recent sign-in too, or the confirm would
+    /// guard nothing.
+    #[test]
+    fn every_sensitive_field_needs_a_recent_sign_in() {
+        let schema = settings_schema();
+        let risky: Vec<&SchemaField> = schema
+            .pages
+            .iter()
+            .flat_map(|p| &p.sections)
+            .flat_map(|s| &s.fields)
+            .filter(|f| f.risk.is_some())
+            .collect();
+        assert_eq!(risky.len(), 8, "the seven, network.wan twice");
+        for field in risky {
+            assert!(field.recent_sign_in, "{}", field.key);
+        }
     }
 }

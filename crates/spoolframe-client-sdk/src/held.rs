@@ -71,6 +71,16 @@ impl Hold {
         (Self(Arc::new(Mutex::new(Claim::Kept(decision)))), answered)
     }
 
+    /// Whether the person has answered: decided, or every copy the app
+    /// took dropped undecided (a rejection too). Never while it is only
+    /// kept here.
+    pub(crate) fn answered(&self) -> bool {
+        match &*self.0.lock() {
+            Claim::Kept(decision) => decision.decided(),
+            Claim::Taken(shared) => shared.upgrade().is_none_or(|d| d.decided()),
+        }
+    }
+
     /// The decision, shared with every earlier take while one lives.
     /// Once every copy is gone it was made (or dropped, a rejection):
     /// a spent one then, whose confirm or reject reads that end.

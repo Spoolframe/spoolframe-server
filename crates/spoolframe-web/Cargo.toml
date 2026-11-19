@@ -54,6 +54,16 @@ web-sys = { workspace = true, features = [
     # The output codecs' drag (PGPU-06): the grip keeps the pointer.
     "PointerEvent",
     "Element",
+    # Ctrl K / ⌘K for search and commands, the unload guard, and
+    # scrolling to a setting: listeners, never `eval` (the CSP).
+    "Event",
+    "EventTarget",
+    "KeyboardEvent",
+    "BeforeUnloadEvent",
+    "Node",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
+    "ScrollBehavior",
 ] }
 
 # dx looks for it even for a web-only bundle.

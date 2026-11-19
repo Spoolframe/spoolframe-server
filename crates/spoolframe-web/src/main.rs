@@ -9,8 +9,6 @@
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod activity;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod advanced;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod approve;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod browse;
@@ -20,8 +18,6 @@ mod catalog;
 mod connect;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod diagnostics;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod experimental;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod federation;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -45,6 +41,8 @@ mod optimized;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod overview;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod palette;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod playback;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod playlists;
@@ -60,6 +58,10 @@ mod providers;
 mod remote;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod restart;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod settings_layout;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod settings_marks;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod setup;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

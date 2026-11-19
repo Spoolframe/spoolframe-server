@@ -38,7 +38,7 @@ pub fn Gpus() -> Element {
             div { class: "card-head",
                 icons::Chip {}
                 h2 { "GPUs" }
-                Link { class: "ml-auto text-[13px]", to: Route::Settings { tab: "playback".into() }, "Settings" }
+                Link { class: "ml-auto text-[13px]", to: Route::Settings { tab: "transcoding".into() }, "Settings" }
             }
             div { class: "card-body",
                 match &*status.read() {
@@ -99,7 +99,7 @@ fn GpusBody(transcoding: TranscodingStatus) -> Element {
             }
             p { class: "m-0 max-w-[820px] text-xs text-ctp-subtext0",
                 "The first codec of Output codecs the device plays, HDR kept where its screen shows HDR. Set in "
-                Link { to: Route::Settings { tab: "playback".into() }, "Settings › Playback" }
+                Link { to: Route::Settings { tab: "transcoding".into() }, "Settings › Transcoding" }
                 "."
             }
         }
@@ -153,7 +153,7 @@ fn GpusBody(transcoding: TranscodingStatus) -> Element {
             if filters_off_matter(&t.routes) {
                 p { class: "m-0 max-w-[820px] text-xs text-ctp-subtext0",
                     "GPU filters are off, so these tone maps and burn-ins run on the CPU. Turn them on in "
-                    Link { to: Route::Settings { tab: "playback".into() }, "Settings › Playback" }
+                    Link { to: Route::Settings { tab: "transcoding".into() }, "Settings › Transcoding" }
                     "."
                 }
             }

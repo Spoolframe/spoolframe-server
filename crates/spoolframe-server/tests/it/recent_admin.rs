@@ -318,6 +318,27 @@ async fn sensitive(root: &WsClient) -> Vec<(&'static str, Option<i32>)> {
     ]
 }
 
+/// Settings' Sensitive block (the settings redesign): each of its
+/// settings asks an old session to confirm it's you before it saves, so
+/// the block's Save always ends in "Confirm it's you".
+#[tokio::test]
+async fn every_setting_of_the_sensitive_block_needs_a_recent_sign_in() {
+    let (_addr, root, dir) = served("recent-admin-block", FILE).await;
+    age(dir.as_ref(), "root").await;
+    for (key, value) in [
+        ("admin.insecure_cookies", json!(true)),
+        ("admin.trusted_proxies", json!(["10.10.0.2"])),
+        ("admin.public_url", json!("https://tv.example.org")),
+        ("media.sandbox", json!("off")),
+        ("network.wan", json!({ "static": ["198.51.100.7:7420"] })),
+        ("mcp.enabled", json!(true)),
+        ("experimental.federation", json!(true)),
+    ] {
+        let err = root.setting_set(key.into(), value).await.unwrap_err();
+        assert_eq!(code(err), error_code::RECENT_SIGN_IN_REQUIRED, "{key}");
+    }
+}
+
 /// Signed in an hour ago, an admin's sensitive calls are refused with
 /// `RECENT_SIGN_IN_REQUIRED`, and none of them happens.
 #[tokio::test]

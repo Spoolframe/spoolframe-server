@@ -342,6 +342,23 @@ pub fn top(library: LibraryKind) -> MediaKind {
     kinds(library)[0]
 }
 
+/// The most hits one `catalogSearch` gives.
+const MAX_SEARCH: u32 = 50;
+
+/// How close `title` is to what was searched, `text`: 0 for the same
+/// title, 1 for one that starts with it, 2 for the rest. Letter case
+/// does not count.
+fn closeness(text: &str, title: &str) -> u8 {
+    let (text, title) = (text.to_lowercase(), title.to_lowercase());
+    if title == text {
+        0
+    } else if title.starts_with(&text) {
+        1
+    } else {
+        2
+    }
+}
+
 /// The kinds a title search looks at when no kind is picked. Seasons are
 /// not searched: their titles are "Season 1".
 fn searched(library: LibraryKind) -> Vec<MediaKind> {
@@ -719,6 +736,75 @@ impl AdminApi {
             total: page.total,
             paths,
         })
+    }
+
+    /// `catalogSearch`: `text` in every library of this server's own, at
+    /// most `limit` hits, the closest titles first.
+    pub(super) async fn catalog_search_of(
+        &self,
+        text: String,
+        limit: u32,
+    ) -> RpcResult<Vec<spoolframe_admin_api::CatalogHit>> {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return Err(error(error_code::INVALID_INPUT, "search for something"));
+        }
+        if !(1..=MAX_SEARCH).contains(&limit) {
+            return Err(error(
+                error_code::INVALID_INPUT,
+                format!("from 1 to {MAX_SEARCH} hits"),
+            ));
+        }
+        let composite = self.composite()?;
+        let libraries: Vec<_> = composite
+            .libraries()
+            .await
+            .map_err(catalog_error)?
+            .into_iter()
+            // Paired servers' libraries are catalogPairedItems'.
+            .filter(|l| l.server.is_none())
+            .collect();
+        let searches = libraries.iter().map(|library| {
+            let composite = &composite;
+            let text = text.clone();
+            async move {
+                let page = composite
+                    .browse(
+                        &library.id,
+                        &Browse {
+                            kinds: searched(library.kind),
+                            text: Some(text),
+                            filter: None,
+                            page: Page { offset: 0, limit },
+                        },
+                    )
+                    .await;
+                (library, page)
+            }
+        });
+        let mut hits = Vec::new();
+        for (library, page) in futures_util::future::join_all(searches).await {
+            match page {
+                Ok(page) => {
+                    let (_, check) = self.checks.state(&composite, &library.id.to_string());
+                    hits.extend(page.rows.into_iter().map(|row| {
+                        spoolframe_admin_api::CatalogHit {
+                            library: library.id.to_string(),
+                            library_title: library.title.clone(),
+                            row: catalog_row(row, check.as_deref()),
+                        }
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(library = %library.id, error = %e, "a library was left out of a search");
+                }
+            }
+        }
+        // Stable: within one closeness, library order, then the
+        // library's own.
+        hits.sort_by_key(|hit| closeness(&text, hit.row.item.title()));
+        hits.truncate(limit as usize);
+        Ok(hits)
     }
 
     /// The last check of the library `library` names, if done.

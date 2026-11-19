@@ -460,8 +460,7 @@ async fn behind_own_relay(
             Ok(server) => Ok((server, relay, url)),
             Err(e) => {
                 drop(relay);
-                let any = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
-                Err(match support::udp_taken(any) {
+                Err(match support::udp_port_taken(port) {
                     true => support::SetupFailed::PortTaken(e.to_string()),
                     false => support::SetupFailed::Other(e.to_string()),
                 })

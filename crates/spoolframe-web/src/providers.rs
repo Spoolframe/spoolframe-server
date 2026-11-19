@@ -305,15 +305,6 @@ pub fn callback_url(public_url: &str) -> Option<String> {
     }
 }
 
-/// How many providers use what only the advanced settings show: a secret
-/// from a file, or scopes of their own.
-pub fn advanced_set(value: Option<&Value>) -> usize {
-    providers(value)
-        .iter()
-        .filter(|p| p.from == SecretFrom::File || p.custom_scopes())
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,18 +543,5 @@ mod tests {
             Some("https://media.example.org/auth/oidc/callback")
         );
         assert_eq!(callback_url("  "), None);
-    }
-
-    #[test]
-    fn files_and_scopes_of_their_own_count_as_advanced() {
-        let value = json!([
-            pocket().to_value().unwrap(),
-            {"name": "A", "issuer": "https://a.example.org", "client_id": "x",
-             "client_secret_file": "/run/secrets/a"},
-            {"name": "B", "issuer": "https://b.example.org", "client_id": "x",
-             "scopes": ["openid"]},
-        ]);
-        assert_eq!(advanced_set(Some(&value)), 2);
-        assert_eq!(advanced_set(None), 0);
     }
 }

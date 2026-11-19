@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+- Added, admin API and web: settings say how they differ from their
+  defaults. `SettingEntry` has `default`, the built-in default from the
+  server (none for a setting the server does without, and for a
+  secret). Beside a changed value the web shows "Changed", "default 20
+  GiB", and "Reset to default", which asks first and then calls
+  `settingUnset`. A value the config file sets has no Reset: the file
+  wins. Settings' head counts what changed and what waits for a
+  restart, in all and by area ("Transcoding · 3 changed · 1 restart").
+  Help text no longer types defaults. New `admin.settingsIndex`: each
+  setting's `label`, `help`, `area` (`SettingArea`), the `anchor` of
+  its field (`setting-network-port`) and whether it is `advanced`, for
+  search; admins only.
+- Added, admin API: `admin.settingsSchema`, the settings pages as data
+  (`SettingsSchema`): each area's page (`slug`, `area`, `name`, `line`,
+  `place`), its sections in order (`kind`: plain, advanced or
+  sensitive), and each field: `key`, `label`, `help`, `anchor` (`None`
+  on a setting's second place), `apply`, `widget` (`FieldWidget`),
+  `unit`, `bounds` (`min`, `max`, in the units the setting keeps), the
+  `options` of a choice, a list's `addLabel`, an env reference's
+  `envExample`, a custom field's `custom`, a Sensitive setting's `risk`
+  (what saving it does) and `recentSignIn`. Bounds are what `settingSet`
+  takes. Admins only.
+- Changed, web: settings are regrouped by area. A sub-nav replaces the
+  tabs: an Overview with a card for each area and what changed or waits
+  for a restart, then General, Network, Sign-in & apps, Plex,
+  Transcoding, Media & storage, Subtitles, Monitoring and Experimental.
+  Every setting has a field, the 19 with none before too, with its key,
+  what it is set to against its default, and Reset. Settings few servers
+  need are in a collapsed Advanced section per area; the global "Show
+  advanced settings" switch is gone. The public address, trusted
+  proxies, advertising a public address, insecure cookies, MCP, the
+  media sandbox and federation are in a Sensitive block. Edits collect
+  in one bar, "N unsaved · Discard · Save", which names what waits for a
+  restart and asks before leaving the page, from any link or search
+  hit (one to a field of the same area keeps the draft and goes at
+  once); nothing saves on a click
+  any more (the Server page's LAN discovery links to General). Federation's
+  switch and limits are a Settings tab of the Federation page; path
+  mapping is on the Libraries page; the sidebar's Plex item is gone. The
+  old `/admin/settings/<tab>` addresses lead to their area.
+- Changed, web: every settings page, the sub-nav and the Overview are
+  drawn from the server's `settingsSchema`, so a server's settings are
+  where that server says. A number is checked against the bounds the
+  server takes before Save ("Sync every is at least 10 s."). A recent
+  search hit for a setting, kept by the browser, is dropped once; the
+  other recent hits stay.
+- Changed, admin API: `experimental.federation` needs a recent sign-in
+  to set or unset, as the Sensitive block's other settings do:
+  `RECENT_SIGN_IN_REQUIRED` from an older session.
+- Fixed, web: Ctrl K and a search hit's scroll to its field did nothing
+  in a browser: they ran JavaScript through `eval`, which the server's
+  Content-Security-Policy refuses. They are plain listeners now.
+- Added, web: search and commands. Ctrl K (⌘K on a Mac), or the box at
+  the top of every admin page, opens one search over settings (each with
+  its value; Enter opens its tab, turns on advanced settings if needed,
+  and marks the field), every library, people and their devices, paired
+  servers, admin pages and actions. Chips and Tab filter by group;
+  recent picks stay in the browser. New admin API, admins only:
+  `adminActions` lists the actions the API has (add a source, invite,
+  check media paths, restart, find subtitles), each with whether it asks
+  first (`confirm`), needs a recent sign-in (`recentSignIn`) or an item
+  (`needsItem`); restart's line counts the changes waiting for it.
+  `catalogSearch(text, limit)` searches titles in every library at once,
+  the same title first, with the library each hit is in (`CatalogHit`);
+  a library whose Plex does not answer is left out.
 - Added, SDK: `ServerEntry::last_used_at` (FFI `ServerEntry.last_used_at`),
   when a person last opened a profile on the server from this device,
   to the millisecond. `Client::activate_profile` sets it, and so does
@@ -11,6 +76,18 @@
   `last_connected_at`, which every connect moves, picked whichever
   server a pairing signed in to last. A server saved before reads as
   never used.
+- Fixed, server: a settings change the next start would refuse is
+  refused when it is made. The admins' share of the upload over 100%,
+  a home or outside range that is not one, an unknown media sandbox
+  mode, 0 subtitle syncs at once, or a relay key that is not one were
+  saved, then the server would not start again.
+- Fixed, SDK: a TV that said no to a held phone sign-in (or guest
+  pairing) and then closed the code's screen at once could cut the
+  phone off, which then read "the pairing was cut off: connection
+  lost" instead of each server declined. Cancelling or dropping the
+  code now stops it taking connections, but sees an answered hold
+  through: the phone hears the no, and a confirm is carried out. A
+  hold nobody answered still ends with the code.
 - Fixed, SDK: with guests off, a guest's phone that scanned a TV's
   phone sign-in code failed the handshake ("peer doesn't support any
   known protocol"). The TV now takes `spoolframe/pair/1` while a

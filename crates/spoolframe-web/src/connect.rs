@@ -1,6 +1,6 @@
 //! What the pages about connected apps say (PX-42), apart from the
 //! pages: the consent page's words for each scope, which of them are
-//! granted, the address an MCP client is given in Settings › MCP and the
+//! granted, the address an MCP client is given in Settings › Sign-in & apps and the
 //! commands that add it to Claude Code and Codex, the list of apps allowed
 //! to sign in there, and Connected apps' and the audit list's lines.
 
@@ -105,7 +105,7 @@ pub fn audit_action(action: &str) -> String {
     }
 }
 
-/// `mcp.allowed_redirects` as Settings › MCP lists it: the entries saved,
+/// `mcp.allowed_redirects` as Settings › Sign-in & apps lists it: the entries saved,
 /// or the defaults when no layer has it. A value that is not the list
 /// shows as empty, not as the defaults: what the editor saves is then
 /// what it showed.

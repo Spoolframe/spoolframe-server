@@ -380,16 +380,10 @@ fn artwork_kind(kind: ArtworkKind) -> &'static str {
     }
 }
 
-/// Where to change the mappings of `server`: Settings › Paths for the
-/// first Plex server, Server › Libraries' "Path mapping" for the others.
-fn mappings_route(server: &str) -> Route {
-    if server == "plex" {
-        Route::Settings {
-            tab: "paths".into(),
-        }
-    } else {
-        Route::Libraries {}
-    }
+/// Where to change the mappings of `server`: Libraries' "Path mapping",
+/// for the first Plex server and the others alike.
+fn mappings_route(_server: &str) -> Route {
+    Route::Libraries {}
 }
 
 #[component]

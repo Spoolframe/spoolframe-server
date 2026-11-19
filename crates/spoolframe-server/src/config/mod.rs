@@ -12,6 +12,7 @@
 //! that does not load changes nothing.
 
 pub mod layers;
+pub mod schema;
 pub mod secrets;
 pub mod settings;
 pub mod tree;
@@ -3212,7 +3213,13 @@ impl ServerConfig {
             }
             (None, _) => {}
         }
+        // Every check the server's start makes with `?` is made here too:
+        // a runtime change it would refuse must be refused when made, not
+        // stop the next start.
         parsed.network.endpoint_options()?;
+        parsed.network.uplink()?;
+        parsed.network.own_relays_untold()?;
+        parsed.media.sandbox()?;
         parsed.admin.listen()?;
         parsed.admin.origins()?;
         parsed.admin.trusted_proxies()?;
@@ -3226,6 +3233,7 @@ impl ServerConfig {
         // Any directory: only the values are checked here.
         parsed.transcode.limits(Path::new("/"))?;
         parsed.subtitles.ocr_settings(Path::new("/"))?;
+        parsed.subtitles.sync_settings(Path::new("/"))?;
         parsed.previews.settings()?;
         parsed.areas(Path::new("/"))?;
         parsed.logs.buffer_lines()?;
@@ -3554,9 +3562,14 @@ mod tests {
         let config =
             plex(r#"plex { url = "http://nas:32400"; } media { sandbox = "required"; }"#).unwrap();
         assert_eq!(config.media.sandbox().unwrap(), SandboxMode::Required);
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } media { sandbox = "on"; }"#).unwrap();
-        assert!(config.media.sandbox().is_err());
+        // Refused as the config is read, as the server's start would.
+        assert!(matches!(
+            plex(r#"plex { url = "http://nas:32400"; } media { sandbox = "on"; }"#),
+            Err(ConfigError::Invalid {
+                key: "media.sandbox",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3591,10 +3604,9 @@ mod tests {
                 .at_once,
             2
         );
-        let config =
-            plex(r#"plex { url = "http://nas:32400"; } subtitles { sync_at_once = 0; }"#).unwrap();
+        // Refused as the config is read, as the server's start would.
         assert!(matches!(
-            config.subtitles.sync_settings(Path::new("/s")),
+            plex(r#"plex { url = "http://nas:32400"; } subtitles { sync_at_once = 0; }"#),
             Err(ConfigError::Invalid {
                 key: "subtitles.sync_at_once",
                 ..

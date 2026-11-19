@@ -1,4 +1,4 @@
-//! Settings › Remote access's uplink card (PX-46): the budget, the most
+//! Settings › Network's upload budget (PX-46): the budget, the most
 //! streams off the LAN, the admins' share, and the upload measured. The
 //! server checks what is saved; these only word it.
 

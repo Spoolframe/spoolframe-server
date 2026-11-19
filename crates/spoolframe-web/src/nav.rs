@@ -13,7 +13,6 @@ pub enum Section {
     /// not a page of Users and devices, as it is about other servers.
     Federation,
     Server,
-    Plex,
     MyProfile,
     MyPlaylists,
 }
@@ -26,7 +25,6 @@ impl Section {
             Section::UsersAndDevices => "Users and devices",
             Section::Federation => "Federation",
             Section::Server => "Server",
-            Section::Plex => "Plex",
             Section::MyProfile => "My profile",
             Section::MyPlaylists => "My playlists",
         }
@@ -46,12 +44,7 @@ pub fn sections(federation_on: bool) -> Vec<Section> {
     if federation_on {
         sections.push(Section::Federation);
     }
-    sections.extend([
-        Section::Server,
-        Section::Plex,
-        Section::MyProfile,
-        Section::MyPlaylists,
-    ]);
+    sections.extend([Section::Server, Section::MyProfile, Section::MyPlaylists]);
     sections
 }
 
@@ -70,12 +63,27 @@ mod tests {
                 Section::UsersAndDevices,
                 Section::Federation,
                 Section::Server,
-                Section::Plex,
                 Section::MyProfile,
                 Section::MyPlaylists,
             ]
         );
         assert_eq!(Section::Federation.label(), "Federation");
+    }
+
+    /// Plex is an area of Settings, and its other servers sources in
+    /// Libraries: no section of its own (the settings regroup).
+    #[test]
+    fn plex_has_no_section_of_its_own() {
+        assert_eq!(
+            sections(false),
+            [
+                Section::Overview,
+                Section::UsersAndDevices,
+                Section::Server,
+                Section::MyProfile,
+                Section::MyPlaylists,
+            ]
+        );
     }
 
     /// Off, the sidebar has no Federation.

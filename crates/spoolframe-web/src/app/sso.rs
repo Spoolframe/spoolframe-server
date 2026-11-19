@@ -139,7 +139,7 @@ fn SsoFields(
                             span { class: "mono-value min-w-0 break-all", "{url}" }
                             super::admin::CopyButton { text: url.clone() }
                         }
-                        span { class: "text-xs text-ctp-subtext0", "It is the web UI's public address, set on the Access tab, with /auth/oidc/callback after it." }
+                        span { class: "text-xs text-ctp-subtext0", "It is the web UI's public address, set under Network › Sensitive, with /auth/oidc/callback after it." }
                     }
                 }
             },
@@ -149,7 +149,7 @@ fn SsoFields(
                     span {
                         b { "Sign-in providers need the public address" }
                         "A provider sends people back to the web UI's public address, so set it first. "
-                        Link { to: Route::Settings { tab: "access".into() }, "Set it on the Access tab" }
+                        super::settings_area::GuardedLink { to: Route::Settings { tab: "network".into() }, "Set it under Network › Sensitive" }
                         "."
                     }
                 }

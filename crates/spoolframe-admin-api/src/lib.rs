@@ -1665,6 +1665,281 @@ pub struct SettingEntry {
     /// when nothing set it then; always `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<serde_json::Value>,
+    /// The built-in default, as JSON: "default 20 GiB" beside a changed
+    /// value, and what "Reset to default" (`settingUnset`) brings back
+    /// unless the config file sets it. `None` for a setting with no
+    /// default (the server does without it) and for a secret; absent from
+    /// a server before 0.17.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+/// Where the settings pages show a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingArea {
+    General,
+    Network,
+    SignIn,
+    Plex,
+    Transcoding,
+    Media,
+    Subtitles,
+    Monitoring,
+    Experimental,
+    /// On Federation's page, not under Settings.
+    Federation,
+    /// On Libraries' page, not under Settings.
+    Libraries,
+    /// An area this client does not know (a newer server's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// One setting as `settingsIndex` describes it: what search finds, and
+/// where it leads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingIndexEntry {
+    /// Dotted, as `settings` names it: `network.port`.
+    pub key: String,
+    /// Its name on the settings pages: "App port".
+    pub label: String,
+    /// What it does, in a sentence or two.
+    pub help: String,
+    pub area: SettingArea,
+    /// The id of its field's element on its area's page:
+    /// `setting-network-port`.
+    pub anchor: String,
+    /// Shown with "Show advanced settings" only: a jump to it turns them
+    /// on.
+    pub advanced: bool,
+}
+
+/// The settings pages, as `settingsSchema` describes them: every area's
+/// page, its sections in order, and each field with how it reads and
+/// writes its setting. The same for every server of a version; what each
+/// setting is set to is `settings`'.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSchema {
+    /// In the settings sub-nav's order, then those kept elsewhere.
+    pub pages: Vec<SchemaPage>,
+}
+
+/// Where an area's page is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SchemaPlace {
+    /// Settings › the area.
+    Settings,
+    /// The Federation page's Settings tab.
+    Federation,
+    /// The Libraries page.
+    Libraries,
+    /// A place this client does not know (a newer server's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// One area's page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaPage {
+    /// Its address under Settings: `network`.
+    pub slug: String,
+    pub area: SettingArea,
+    /// "Network".
+    pub name: String,
+    /// The line under its title.
+    pub line: String,
+    pub place: SchemaPlace,
+    pub sections: Vec<SchemaSection>,
+}
+
+/// What a section is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SectionKind {
+    Plain,
+    /// Collapsed until opened: settings few servers need.
+    Advanced,
+    /// A coloured edge, its consequence, and "Confirm it's you" on save.
+    Sensitive,
+    /// A kind this client does not know (a newer server's).
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaSection {
+    pub name: String,
+    /// The line under its name; empty for none.
+    pub help: String,
+    pub kind: SectionKind,
+    pub fields: Vec<SchemaField>,
+}
+
+/// How a field shows and takes its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FieldWidget {
+    /// One line of text; empty takes the default.
+    Text,
+    /// A secret: never shown, only replaced.
+    Secret,
+    /// A secret named by the server's environment variable that holds
+    /// it, as `${SF_ENV_…}`: `envExample` is one.
+    EnvRef,
+    /// A whole number within `bounds`, `unit` after the box.
+    Number,
+    /// A size kept in MiB, shown and typed in GiB; `bounds` in MiB.
+    Gib,
+    Switch,
+    /// One of `options`, each a card with what it does.
+    Choice,
+    /// Any of `options`, in their order.
+    Many,
+    /// A list of text, an item a row; `addLabel` is the button's words.
+    List,
+    /// A field of its own: `custom` says which.
+    Custom,
+    /// A widget this client does not know (a newer server's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// The fields too particular for the generic widgets, each drawn by
+/// the web UI's own component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CustomField {
+    /// `network.wan`'s mapped port and public addresses.
+    Wan,
+    /// `network.wan` present or not: "Advertise a public address".
+    WanSwitch,
+    Pkarr,
+    /// The upload budget, with Measure; a number within `bounds`.
+    Budget,
+    Gpus,
+    VideoCodecs,
+    Oidc,
+    Redirects,
+    Headers,
+    /// `plex.token`, with signing in to Plex.
+    PlexToken,
+    /// `admin.metrics_from`: loopback kept, refused scrapers offered.
+    MetricsFrom,
+    /// The Libraries page's sources and Plex servers.
+    Libraries,
+    PathMapping,
+    /// A field this client does not know (a newer server's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// The whole numbers a number takes, in the units it is kept in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingBounds {
+    pub min: i64,
+    /// `None`: no most but the type's.
+    pub max: Option<i64>,
+}
+
+/// One value a choice offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingOption {
+    /// As the setting keeps it: `bbr`.
+    pub value: String,
+    /// "BBR (the default)".
+    pub name: String,
+    /// What it does, under its name; empty for none.
+    pub about: String,
+}
+
+/// One field: where a setting is set on its page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaField {
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    /// The id of its element, for a jump to it; `None` on a setting's
+    /// second place (`network.wan`'s Sensitive switch).
+    pub anchor: Option<String>,
+    pub apply: SettingApply,
+    pub widget: FieldWidget,
+    /// After a number's box: `s`, `MiB`, `%`; empty for none.
+    pub unit: String,
+    /// A number's, a GiB size's and the upload budget's.
+    pub bounds: Option<SettingBounds>,
+    /// A choice's values, and a many's.
+    pub options: Vec<SettingOption>,
+    /// A list's "Add a range".
+    pub add_label: Option<String>,
+    /// An env reference's example: `SF_ENV_SUBDL_KEY`.
+    pub env_example: Option<String>,
+    pub custom: Option<CustomField>,
+    /// In the Sensitive block: what saving it does, for "Confirm it's
+    /// you before {risk}".
+    pub risk: Option<String>,
+    /// Changing it needs a recent sign-in (`RECENT_SIGN_IN_REQUIRED`
+    /// otherwise): every Sensitive setting's, and more.
+    pub recent_sign_in: bool,
+}
+
+/// What an action the web's search and commands offer does
+/// (`adminActions`). The web runs each by its kind, with the calls that
+/// exist for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdminActionKind {
+    /// Add a library source: Libraries' add flow.
+    AddSource,
+    /// Make an invite: Invites.
+    Invite,
+    /// `plexCheckPaths` over every library.
+    CheckPaths,
+    /// `restart`.
+    Restart,
+    /// `subtitleSearch` for a library item the search found.
+    FindSubtitles,
+    /// An action this client does not know (a newer server's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// One action of `adminActions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAction {
+    pub kind: AdminActionKind,
+    /// "Restart server…"; one ending in "…" asks something first.
+    pub label: String,
+    /// One line under it: "Applies 1 change waiting for a restart".
+    pub description: String,
+    /// Asked "are you sure" before it runs.
+    pub confirm: bool,
+    /// Needs a recent sign-in (PX-10): "Confirm it's you" when the
+    /// session's is older.
+    pub recent_sign_in: bool,
+    /// Acts on a library item: offered beside an item the search found,
+    /// as "Find subtitles for “Alien”…".
+    pub needs_item: bool,
+}
+
+/// An item `catalogSearch` found, with the library it is in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogHit {
+    /// The library's id, as `catalogRows` takes it.
+    pub library: String,
+    /// What the library is called: "Movies".
+    pub library_title: String,
+    pub row: CatalogRow,
 }
 
 /// Every setting, and what the page around them needs to know.
@@ -4293,6 +4568,39 @@ pub trait AdminApi {
     #[method(name = "settings", with_extensions)]
     async fn settings(&self) -> jsonrpsee::core::RpcResult<Settings>;
 
+    /// The actions the web's search and commands offer, each with whether
+    /// it asks first and needs a recent sign-in: only actions the admin
+    /// API has. Restart's description counts the changes waiting for it.
+    #[method(name = "adminActions", with_extensions)]
+    async fn admin_actions(&self) -> jsonrpsee::core::RpcResult<Vec<AdminAction>>;
+
+    /// Items whose titles match `text` (trimmed, at least one character)
+    /// in every library of this server, at most `limit` (1 to 50): an
+    /// exact title first, then those that start with it, then the rest,
+    /// each in library order. A library whose Plex server does not answer
+    /// is left out, not an error. `INVALID_INPUT` for an empty `text` or a
+    /// `limit` out of range.
+    #[method(name = "catalogSearch", with_extensions)]
+    async fn catalog_search(
+        &self,
+        text: String,
+        limit: u32,
+    ) -> jsonrpsee::core::RpcResult<Vec<CatalogHit>>;
+
+    /// Every setting's label, help, area, anchor and whether it is
+    /// advanced, in the order `settings` lists them: for searching the
+    /// settings and jumping to one. The same for every server of a
+    /// version; what each is set to is `settings`'.
+    #[method(name = "settingsIndex", with_extensions)]
+    async fn settings_index(&self) -> jsonrpsee::core::RpcResult<Vec<SettingIndexEntry>>;
+
+    /// The settings pages: each area's page, its sections, and each
+    /// field with its widget, unit, bounds, options, and whether it is
+    /// Sensitive or needs a recent sign-in. The web UI draws its pages
+    /// from it. The same for every server of a version. Admins only.
+    #[method(name = "settingsSchema", with_extensions)]
+    async fn settings_schema(&self) -> jsonrpsee::core::RpcResult<SettingsSchema>;
+
     /// Set `key` in the runtime settings. The value is checked as a config
     /// file is at start: one the server would refuse is `INVALID_INPUT`
     /// with the message the file would get. `SETTING_LOCKED` for what the
@@ -4300,7 +4608,8 @@ pub trait AdminApi {
     /// one is saved, and `restartPending`. `plex.token` is kept as a
     /// secret, never in the runtime settings. An `admin.*`, `auth.*`,
     /// `media.*` or `telemetry.*` key, or `plex.token`,
-    /// `plex.token_file`, `plex.url` or `plex.servers`, needs a recent
+    /// `plex.token_file`, `plex.url`, `plex.servers` or
+    /// `experimental.federation`, needs a recent
     /// sign-in (PX-10), as `me.*` changes do: `RECENT_SIGN_IN_REQUIRED`
     /// otherwise.
     #[method(name = "settingSet", with_extensions)]
@@ -4312,8 +4621,9 @@ pub trait AdminApi {
 
     /// Take `key` out of the runtime settings: the config file's value or
     /// the default applies again. An `admin.*`, `auth.*`, `media.*` or
-    /// `telemetry.*` key, or `plex.token`, `plex.token_file`, `plex.url`
-    /// or `plex.servers`, needs a recent sign-in (PX-10), as `me.*`
+    /// `telemetry.*` key, or `plex.token`, `plex.token_file`, `plex.url`,
+    /// `plex.servers` or `experimental.federation`, needs a recent
+    /// sign-in (PX-10), as `me.*`
     /// changes do: `RECENT_SIGN_IN_REQUIRED` otherwise.
     #[method(name = "settingUnset", with_extensions)]
     async fn setting_unset(&self, key: String) -> jsonrpsee::core::RpcResult<SettingEntry>;

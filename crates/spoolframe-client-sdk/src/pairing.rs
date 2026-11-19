@@ -37,7 +37,7 @@ use spoolframe_protocol::pairing::{
     PairingCode, PairingLink, PhoneFrame, Refusal,
 };
 use tokio::sync::{oneshot, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::client::Client;
@@ -518,13 +518,15 @@ impl Shared {
 
 /// A code shown and the task taking connections for it: what a
 /// [`Pairing`] and a [`crate::PhoneSignIn`] are.
-/// Dropped, it stops the task: the code stops working at once.
+/// Dropped, or cancelled, it stops the code: it stops working at once
+/// ([`serve`]), and a hold nobody answered ends. One answered is still
+/// carried out, so the phone hears that answer and not a cut-off.
 pub(crate) struct Listener {
     pub(crate) link: String,
     expires_at: Instant,
     pub(crate) progress: watch::Receiver<Progress>,
     pub(crate) tally: watch::Receiver<crate::server_sign_ins::Tally>,
-    task: JoinHandle<()>,
+    stop: watch::Sender<bool>,
 }
 
 impl Listener {
@@ -533,13 +535,13 @@ impl Listener {
     }
 
     pub(crate) fn cancel(&self) {
-        self.task.abort();
+        self.stop.send_replace(true);
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.task.abort();
+        self.stop.send_replace(true);
     }
 }
 
@@ -633,9 +635,9 @@ impl Client {
         let progress = shared.progress.subscribe();
         let tally = shared.tally.subscribe();
         let client = self.clone();
-        let task = tokio::spawn(async move {
-            let mut outcome = serve(endpoint, shared.clone()).await;
-            drop(listening);
+        let (stop, stopped) = watch::channel(false);
+        tokio::spawn(async move {
+            let mut outcome = serve(endpoint, shared.clone(), listening, stopped).await;
             if let Ok(PhoneSignInOutcome::Paired(paired)) = &mut outcome {
                 client.keep_paired(paired).await;
             }
@@ -669,7 +671,7 @@ impl Client {
             expires_at: deadline,
             progress,
             tally,
-            task,
+            stop,
         })
     }
 
@@ -983,28 +985,57 @@ impl PairingOffer {
     }
 }
 
-/// Take connections until one decides the code's use, or the code
-/// expires untaken.
-async fn serve(endpoint: Endpoint, shared: Arc<Shared>) -> Result<PhoneSignInOutcome, SdkError> {
+/// Take connections while `listening` lives, until one decides the
+/// code's use, the code expires untaken, or it is stopped.
+///
+/// Stopped, it takes no more at once. If the person had answered what
+/// was held (the app said no, or confirmed, then closed the code's
+/// screen), that connection is still seen through: the phone is told
+/// the answer and not cut off, and a confirm is carried out. Otherwise
+/// every connection ends there.
+async fn serve(
+    endpoint: Endpoint,
+    shared: Arc<Shared>,
+    listening: Listening,
+    mut stopped: watch::Receiver<bool>,
+) -> Result<PhoneSignInOutcome, SdkError> {
     let mut handlers: JoinSet<Option<Result<PhoneSignInOutcome, SdkError>>> = JoinSet::new();
     let mut deadline_passed = false;
+    let mut listening = Some(listening);
     loop {
         tokio::select! {
+            // A dropped Listener closes the channel: stopped too.
+            _ = stopped.wait_for(|stop| *stop), if listening.is_some() => {
+                drop(listening.take());
+                let answered = shared
+                    .progress
+                    .borrow()
+                    .held
+                    .as_ref()
+                    .is_some_and(|(_, hold)| hold.answered());
+                if !answered {
+                    return Err(cancelled());
+                }
+            }
             _ = tokio::time::sleep_until(shared.deadline), if !deadline_passed => {
                 deadline_passed = true;
                 if shared.expire() {
                     return Err(PairingError::Expired.into());
                 }
             }
-            incoming = endpoint.accept() => match incoming {
+            incoming = endpoint.accept(), if listening.is_some() => match incoming {
                 None => return Err(PairingError::Aborted("the endpoint closed".into()).into()),
                 Some(incoming) => {
                     handlers.spawn(handle(shared.clone(), incoming));
                 }
             },
-            Some(handled) = handlers.join_next() => {
-                if let Ok(Some(outcome)) = handled {
-                    return outcome;
+            // While it listens, an empty set waits for a connection;
+            // stopped, it is drained, then over.
+            handled = handlers.join_next(), if !handlers.is_empty() || listening.is_none() => {
+                match handled {
+                    Some(Ok(Some(outcome))) => return outcome,
+                    Some(_) => {}
+                    None => return Err(cancelled()),
                 }
             }
         }
