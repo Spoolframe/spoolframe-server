@@ -10,6 +10,12 @@ output with `serde_json::from_slice::<FfProbe>`.
 
 ## Changes from upstream
 
+- Dates and the Matroska `DURATION` tag are read with jiff, not chrono
+  (unmaintained, RUSTSEC-2026-0543). `creation_time` is a
+  `jiff::Timestamp` and `statistics_writing_date_utc` a
+  `jiff::civil::DateTime`. `DURATION` is parsed as hours, minutes and
+  seconds rather than as a time of day, so a recording longer than a day
+  reads instead of failing the whole file.
 - `Stream::start_pts` is `Option<i64>` (was a required `i64`). ffprobe 9
   leaves it out for the streams of standalone subtitle files (`.srt`,
   `.vtt`, VobSub `.idx`), so upstream fails to parse those at all.

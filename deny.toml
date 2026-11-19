@@ -47,6 +47,14 @@ license-files = []
 # `cargo deny --locked check advisories` passes and a new one stands out.
 [advisories]
 ignore = [
+  # chrono: unmaintained, not vulnerable, with no fixed version. Our own
+  # code has none left (easy-ffprobe reads its dates with jiff; the server
+  # takes chrono only as a dev-dependency, for openidconnect's test claims).
+  # It still comes in, required and with no feature to turn it off, through
+  # openidconnect and oauth2 (OIDC sign-in), rmcp (MCP; it also turns on
+  # schemars' chrono04) and iroh-relay's tokio-rustls-acme, latest releases
+  # included. Drop this once they move to a maintained date crate.
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; openidconnect, oauth2, rmcp and tokio-rustls-acme require it with no way to turn it off" },
   # basic-toml: unmaintained, not vulnerable. Read at build time by
   # askama's derive macro, in uniffi_bindgen: only spoolframe-client-ffi's
   # `bindgen` feature (its uniffi-bindgen bin) builds it, never the

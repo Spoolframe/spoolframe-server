@@ -18,6 +18,9 @@ ignore = [
   # basic-toml: unmaintained; read only by askama's derive macro, at build
   # time, in the FFI crate's optional bindings generator.
   "RUSTSEC-2026-0374",
+  # chrono: unmaintained, not vulnerable; openidconnect, oauth2, rmcp and
+  # iroh-relay's tokio-rustls-acme require it, with no feature to turn it off.
+  "RUSTSEC-2026-0543",
 ]
 
 [output]

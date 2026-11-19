@@ -1,7 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.17.5
 
+- Fixed, server: a Matroska file whose `DURATION` tag passes 24 hours
+  could not be read at all. The probe parsed the tag as a time of day.
+  Dates in probes are read with jiff now, not chrono, which is
+  unmaintained (RUSTSEC-2026-0543).
+- Changed, web: the user panel at the foot of the sidebar (and the phone
+  bar's avatar) opens My profile. Settings' sub-nav no longer lists My
+  profile; it stays in the sidebar next to My playlists.
 - Added, admin API and web: settings say how they differ from their
   defaults. `SettingEntry` has `default`, the built-in default from the
   server (none for a setting the server does without, and for a

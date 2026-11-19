@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime, NaiveTime, Timelike};
+use jiff::{civil, Timestamp};
 use serde::{
     de::{self, IntoDeserializer},
     Deserialize, Deserializer, Serialize, Serializer,
@@ -250,11 +250,11 @@ pub struct StreamTags {
     pub statistics_writing_app: Option<String>,
     #[serde(rename = "_STATISTICS_WRITING_DATE_UTC")]
     #[serde(deserialize_with = "option_string_to_naivedatetime", default)]
-    pub statistics_writing_date_utc: Option<NaiveDateTime>,
+    pub statistics_writing_date_utc: Option<civil::DateTime>,
     #[serde(alias = "HANDLER_NAME")]
     pub handler_name: Option<String>,
     #[serde(deserialize_with = "option_string_to_datetime", default)]
-    pub creation_time: Option<DateTime<FixedOffset>>,
+    pub creation_time: Option<Timestamp>,
     #[serde(alias = "ENCODER")]
     pub encoder: Option<String>,
     #[serde(alias = "VENDOR_ID")]
@@ -335,44 +335,111 @@ where
     D: Deserializer<'de>,
 {
     let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")
-            .map(|time| {
-                let seconds = time.hour() * 3600 + time.minute() * 60 + time.second();
-                Duration::new(seconds as u64, time.nanosecond())
-            })
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        None => Ok(None),
+    s.map(|s| {
+        clock_duration(&s)
+            .ok_or_else(|| de::Error::custom(format!("not a HH:MM:SS.fraction duration: {s:?}")))
+    })
+    .transpose()
+}
+
+/// Matroska's `DURATION` tag, `HH:MM:SS.nnnnnnnnn`. Hours are not capped
+/// at 23: a recording longer than a day is still one duration, which a
+/// time-of-day parser refuses.
+fn clock_duration(s: &str) -> Option<Duration> {
+    let mut parts = s.splitn(3, ':');
+    let hours: u64 = parts.next()?.parse().ok()?;
+    let minutes: u64 = parts.next()?.parse().ok()?;
+    let last = parts.next()?;
+    let (secs, frac) = last.split_once('.').unwrap_or((last, ""));
+    let secs: u64 = secs.parse().ok()?;
+    if minutes > 59 || secs > 59 || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    let nanos: u32 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<9}").parse().ok()?
+    };
+    let whole = hours.checked_mul(3600)?.checked_add(minutes * 60 + secs)?;
+    Some(Duration::new(whole, nanos))
 }
 
 pub fn option_string_to_naivedatetime<'de, D>(
     deserializer: D,
-) -> Result<Option<NaiveDateTime>, D::Error>
+) -> Result<Option<civil::DateTime>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        None => Ok(None),
-    }
+    s.map(|s| civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", &s).map_err(de::Error::custom))
+        .transpose()
 }
 
-pub fn option_string_to_datetime<'de, D>(
-    deserializer: D,
-) -> Result<Option<DateTime<FixedOffset>>, D::Error>
+pub fn option_string_to_datetime<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => DateTime::parse_from_rfc3339(&s)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        None => Ok(None),
+    s.map(|s| s.parse::<Timestamp>().map_err(de::Error::custom))
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Tags {
+        #[serde(deserialize_with = "option_chronostring_to_duration", default)]
+        duration: Option<Duration>,
+        #[serde(deserialize_with = "option_string_to_naivedatetime", default)]
+        written: Option<civil::DateTime>,
+        #[serde(deserialize_with = "option_string_to_datetime", default)]
+        created: Option<Timestamp>,
+    }
+
+    fn tags(json: &str) -> Result<Tags, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn a_matroska_duration_tag_reads_to_the_nanosecond() {
+        let t = tags(r#"{"duration":"01:23:45.678900000"}"#).unwrap();
+        assert_eq!(t.duration, Some(Duration::new(5025, 678_900_000)));
+    }
+
+    #[test]
+    fn a_duration_tag_past_a_day_reads() {
+        let t = tags(r#"{"duration":"25:00:01.000000000"}"#).unwrap();
+        assert_eq!(t.duration, Some(Duration::from_secs(90_001)));
+    }
+
+    #[test]
+    fn a_duration_tag_that_is_not_a_time_fails_the_parse() {
+        assert!(tags(r#"{"duration":"soon"}"#).is_err());
+    }
+
+    #[test]
+    fn the_statistics_writing_date_reads() {
+        let t = tags(r#"{"written":"2024-03-09 18:04:05"}"#).unwrap();
+        assert_eq!(
+            t.written.map(|d| d.to_string()),
+            Some("2024-03-09T18:04:05".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_creation_time_reads_as_its_instant() {
+        let t = tags(r#"{"created":"2024-03-09T18:04:05.000000Z"}"#).unwrap();
+        assert_eq!(
+            t.created.map(|d| d.to_string()),
+            Some("2024-03-09T18:04:05Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn absent_tags_are_none() {
+        let t = tags("{}").unwrap();
+        assert!(t.duration.is_none() && t.written.is_none() && t.created.is_none());
     }
 }
