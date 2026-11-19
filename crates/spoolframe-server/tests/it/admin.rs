@@ -291,7 +291,8 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
             "spoolframe:download-addons",
             "spoolframe:diagnostics",
             "spoolframe:phone-sign-in",
-            "spoolframe:recently-played-row"
+            "spoolframe:recently-played-row",
+            "spoolframe:rating-sources"
         ]
     );
     assert_eq!(status.experimental_features, ["http-playback"]);

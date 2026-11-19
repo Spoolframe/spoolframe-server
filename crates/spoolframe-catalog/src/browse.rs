@@ -177,6 +177,9 @@ pub struct Facts {
     /// 0 to 100: tenths of the 0 to 10 rating.
     pub rating_tenths: Option<u16>,
     pub audience_rating_tenths: Option<u16>,
+    /// Whose each rating is, from the catalog's rating image.
+    pub rating_source: Option<spoolframe_types::RatingSource>,
+    pub audience_rating_source: Option<spoolframe_types::RatingSource>,
     /// A film's first version's file size, in bytes.
     pub size: Option<u64>,
     pub resolution: Option<spoolframe_types::Resolution>,

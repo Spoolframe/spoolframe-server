@@ -4955,6 +4955,8 @@ fn an_item_s_merge_facts_round_trip() {
             added_at: Some(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             rating_tenths: Some(98),
             audience_rating_tenths: Some(94),
+            rating_source: None,
+            audience_rating_source: None,
             size: Some(4_100_000_000),
             external_ids: vec!["tmdb://348".into()],
         },

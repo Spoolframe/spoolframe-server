@@ -241,6 +241,12 @@ pub struct RemoteItem {
     /// The audience rating, in tenths: 0 to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audience_rating_tenths: Option<u16>,
+    /// Whose each rating is (`spoolframe:rating-sources` on the client
+    /// side); left out when not known, and by an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating_source: Option<spoolframe_types::RatingSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience_rating_source: Option<spoolframe_types::RatingSource>,
     /// A film's file size, its first version's, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,

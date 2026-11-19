@@ -251,6 +251,13 @@ fn merge(m: &Metadata) -> MergeFacts {
         added_at: facts.added_at.and_then(unix_seconds::try_from_wire),
         rating_tenths: facts.rating_tenths,
         audience_rating_tenths: facts.audience_rating_tenths,
+        // A source with no rating to say it of is left out.
+        rating_source: facts
+            .rating_source
+            .filter(|_| facts.rating_tenths.is_some()),
+        audience_rating_source: facts
+            .audience_rating_source
+            .filter(|_| facts.audience_rating_tenths.is_some()),
         size: facts.size,
         external_ids: external_ids(m),
     }

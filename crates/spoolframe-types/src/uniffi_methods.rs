@@ -4,7 +4,24 @@
 //! a property beside a method of the same name, SwiftUI lists need
 //! `var id`, and UniFFI's rename table does not reach an enum's methods.
 
-use crate::{Artwork, ArtworkKind, Item, MediaId, PlaybackState, QuotaOf};
+use crate::{
+    Artwork, ArtworkKind, Item, MediaId, PlaybackState, QuotaOf, RatingScale, RatingSource,
+};
+
+#[uniffi::export]
+impl RatingSource {
+    /// How its ratings read: a percentage, or out of 10.
+    #[uniffi::method(name = "rating_scale")]
+    pub fn scale_owned(&self) -> RatingScale {
+        self.scale()
+    }
+
+    /// A rating of `tenths` as the provider shows it: "92%" or "7.9".
+    #[uniffi::method(name = "rating_display")]
+    pub fn display_owned(&self, tenths: u16) -> String {
+        self.display(tenths)
+    }
+}
 
 #[uniffi::export]
 impl Item {

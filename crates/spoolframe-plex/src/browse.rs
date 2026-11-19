@@ -33,7 +33,7 @@ use spoolframe_catalog::{
 };
 use spoolframe_types::{
     Counted, DynamicRange, FilterPart, Item, ItemFilterValues, Library, LibraryId, LibraryKind,
-    MediaId, Resolution, SortKey,
+    MediaId, RatingSource, Resolution, SortKey,
 };
 use std::sync::Mutex;
 
@@ -187,6 +187,11 @@ pub(crate) fn facts(m: &Metadata) -> Facts {
         added_at: m.added_at,
         rating_tenths: m.rating.and_then(Facts::tenths),
         audience_rating_tenths: m.audience_rating.and_then(Facts::tenths),
+        rating_source: m.rating_image.as_deref().and_then(RatingSource::from_image),
+        audience_rating_source: m
+            .audience_rating_image
+            .as_deref()
+            .and_then(RatingSource::from_image),
         size: part.and_then(|p| p.size),
         // Plex's own class first: what this server's filter goes by.
         resolution: media.and_then(|media| {
@@ -769,6 +774,8 @@ mod tests {
                 added_at: Some(1_700_000_000),
                 rating_tenths: Some(98),
                 audience_rating_tenths: Some(94),
+                rating_source: None,
+                audience_rating_source: None,
                 size: Some(1234),
                 resolution: Some(Resolution::FullHd),
                 dynamic_range: Some(DynamicRange::Sdr),

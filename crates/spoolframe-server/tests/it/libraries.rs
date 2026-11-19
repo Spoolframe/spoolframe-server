@@ -386,6 +386,83 @@ fn films_and_cabin() -> serde_json::Value {
     ])
 }
 
+/// Whose each rating is, from Plex's `ratingImage` and
+/// `audienceRatingImage`: sent to a client that named
+/// `spoolframe:rating-sources`, and left out for one that did not, which
+/// still gets the ratings.
+#[tokio::test]
+async fn rating_sources_go_only_to_a_client_with_the_feature() {
+    let tower = pms("Tower", TOWER_SECTIONS, &[]).await;
+    let mut alien = film("11", 1, "Alien", 1_700_000_000).metadata();
+    alien["rating"] = json!(9.2);
+    alien["ratingImage"] = json!("rottentomatoes://image.rating.certified");
+    alien["audienceRating"] = json!(8.4);
+    alien["audienceRatingImage"] = json!("rottentomatoes://image.rating.spilled");
+    Mock::given(method("GET"))
+        .and(path("/library/sections/1/all"))
+        .respond_with(container(json!({
+            "totalSize": 1, "librarySectionTitle": "Movies", "Metadata": [alien],
+        })))
+        .with_priority(1)
+        .mount(&tower)
+        .await;
+    let file = format!(
+        r#"plex {{ url = "{}"; }} libraries [ {{ name = "Films"; kind = "movies"; plex {{ server = "plex"; section = "1"; }} }} ]"#,
+        tower.uri()
+    );
+    let served = Served::start("rating-sources", &file).await;
+    let named = served.server.client().await;
+    named
+        .hello_with_features(
+            spoolframe_types::Platform::Linux,
+            spoolframe_protocol::Feature::RatingSources.into(),
+        )
+        .await;
+    let session = named.login("alice", "correct horse").await;
+    let page = || Request::Items {
+        library: "plex:1".parse().unwrap(),
+        offset: 0,
+        limit: 50,
+        sort: None,
+        filter: None,
+    };
+    let facts = |response: Response| match response {
+        Response::Ok(Reply::Items { items, .. }) => match items.as_slice() {
+            [Item::Movie(movie)] => movie.merge.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("no page: {other:?}"),
+    };
+    let without = facts(served.call(page()).await);
+    let with = facts(named.call(Some(&session), page()).await);
+    let critics = with.rating_source.clone().unwrap();
+    let audience = with.audience_rating_source.clone().unwrap();
+    assert_eq!(
+        (
+            critics.provider,
+            critics.state,
+            critics.display(with.rating_tenths.unwrap()),
+            audience.state,
+            audience.image.as_str(),
+        ),
+        (
+            spoolframe_types::RatingProvider::RottenTomatoes,
+            Some(spoolframe_types::RatingState::CertifiedFresh),
+            "92%".to_owned(),
+            Some(spoolframe_types::RatingState::Spilled),
+            "rottentomatoes://image.rating.spilled",
+        )
+    );
+    assert_eq!(
+        (
+            without.rating_source,
+            without.audience_rating_source,
+            without.rating_tenths
+        ),
+        (None, None, Some(92))
+    );
+}
+
 /// What an app merging libraries from several servers sorts and matches
 /// by, on each item of a library page: when the catalog added it, its
 /// ratings in tenths, its file's size and its agents' ids. A PMS sends

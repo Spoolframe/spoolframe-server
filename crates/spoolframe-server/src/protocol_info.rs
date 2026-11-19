@@ -103,7 +103,7 @@ mod tests {
             lines,
             [
                 "client protocol: 1",
-                "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in, spoolframe:recently-played-row",
+                "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in, spoolframe:recently-played-row, spoolframe:rating-sources",
                 "experimental features on: none",
             ]
         );
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(
             lines.next(),
             Some(
-                "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in, spoolframe:recently-played-row"
+                "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in, spoolframe:recently-played-row, spoolframe:rating-sources"
             )
         );
         assert_eq!(

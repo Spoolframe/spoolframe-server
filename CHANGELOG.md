@@ -123,6 +123,20 @@
   `recently_played_albums` are unchanged. FFI: an optional `source` on
   `play`, `open_playback` and `record_offline_play`, and
   `SpoolSession.recently_played_row()` (`RecentlyPlayedRowApi`).
+- Added, protocol and server: feature `spoolframe:rating-sources`, so
+  an app can say whose a rating is and show its logo. `merge` gains
+  `rating_source` and `audience_rating_source` (`RatingSource {
+  provider, state, image }`): `provider` is `rotten_tomatoes`, `imdb`,
+  `tmdb` or `unknown`; `state` is Rotten Tomatoes' `fresh`,
+  `certified_fresh`, `rotten`, `upright` or `spilled`; `image` is
+  Plex's own name for it (`ratingImage`, `audienceRatingImage`), which
+  the server read and dropped before. Sent only to a client that named
+  the feature, wherever items are listed; a paired server's items carry
+  what that server sent. See PROTOCOL.md's Rating sources.
+- Added, SDK and FFI: `RatingSource`, `RatingProvider`, `RatingState`
+  and `RatingScale`, re-exported. `RatingSource::display(tenths)` gives
+  "92%" for Rotten Tomatoes and "7.9" for IMDb or TMDB; Swift and
+  Kotlin call it as `ratingDisplay(tenths:)`, with `ratingScale()`.
 
 ## 0.17.4 (2026-11-15)
 

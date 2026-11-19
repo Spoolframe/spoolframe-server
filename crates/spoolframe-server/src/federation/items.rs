@@ -67,6 +67,8 @@ pub fn remote(item: &Item, external_ids: Vec<String>, facts: &Facts) -> RemoteIt
         added_at: None,
         rating_tenths: None,
         audience_rating_tenths: None,
+        rating_source: None,
+        audience_rating_source: None,
         size: None,
         resolution: None,
         dynamic_range: None,
@@ -148,6 +150,8 @@ pub fn remote(item: &Item, external_ids: Vec<String>, facts: &Facts) -> RemoteIt
             added_at: facts.added_at,
             rating_tenths: facts.rating_tenths,
             audience_rating_tenths: facts.audience_rating_tenths,
+            rating_source: facts.rating_source.clone(),
+            audience_rating_source: facts.audience_rating_source.clone(),
             genres: if remote.genres.is_empty() {
                 facts.genres.clone()
             } else {
@@ -253,6 +257,9 @@ pub fn local(origin: &str, remote: &RemoteItem) -> Option<Item> {
         added_at: remote.added_at.and_then(unix_seconds::try_from_wire),
         rating_tenths: remote.rating_tenths,
         audience_rating_tenths: remote.audience_rating_tenths,
+        // As the paired server sent them.
+        rating_source: remote.rating_source.clone(),
+        audience_rating_source: remote.audience_rating_source.clone(),
         size: remote.size,
         external_ids: remote.external_ids.clone(),
     };
@@ -456,6 +463,8 @@ mod tests {
             added_at: Some(1_700_000_000),
             rating_tenths: Some(98),
             audience_rating_tenths: Some(94),
+            rating_source: None,
+            audience_rating_source: None,
             size: Some(50 << 30),
             ..Facts::default()
         };
@@ -534,6 +543,8 @@ mod tests {
             added_at: Some(1_700_000_000),
             rating_tenths: Some(98),
             audience_rating_tenths: Some(94),
+            rating_source: None,
+            audience_rating_source: None,
             size: Some(50 << 30),
             resolution: Some(spoolframe_types::Resolution::Uhd),
             dynamic_range: Some(spoolframe_types::DynamicRange::Hdr),
@@ -595,6 +606,8 @@ mod tests {
                 added_at: None,
                 rating_tenths: None,
                 audience_rating_tenths: None,
+                rating_source: None,
+                audience_rating_source: None,
                 size: None,
                 resolution: None,
                 dynamic_range: None,

@@ -166,6 +166,16 @@ pub struct MergeFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "uniffi", uniffi(default = None))]
     pub audience_rating_tenths: Option<u16>,
+    /// Whose `rating_tenths` is: Rotten Tomatoes' critics, IMDb's, TMDB's
+    /// (feature `spoolframe:rating-sources`; a server leaves it out for a
+    /// client without the feature).
+    #[serde(default, skip_serializing_if = "crate::rating::skip_rating_source")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    pub rating_source: Option<crate::RatingSource>,
+    /// Whose `audience_rating_tenths` is, as `rating_source`.
+    #[serde(default, skip_serializing_if = "crate::rating::skip_rating_source")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    pub audience_rating_source: Option<crate::RatingSource>,
     /// Its file's size in bytes: its first version's first part, as the
     /// `size` sort orders by.
     #[serde(default, skip_serializing_if = "Option::is_none")]

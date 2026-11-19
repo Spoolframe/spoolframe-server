@@ -11,7 +11,9 @@
 //!
 //! Every opt-in request and event comes with a feature. A new reply field
 //! needs none: it is `serde(default)`, and an `Option` where its absence
-//! means something else than its default. Nothing is decided from a
+//! means something else than its default. One is gated all the same, at
+//! the owner's word: `spoolframe:rating-sources`'s, which a server leaves
+//! out of its replies to a connection without the feature. Nothing is decided from a
 //! version number. Unlike the experimental features
 //! ([`crate::experimental`]), these are ordinary protocol, with its
 //! stability, and a server that has one always names it when asked.
@@ -68,6 +70,11 @@ pub enum Feature {
     /// how each kind shows in it. Named for what it brings, as
     /// `spoolframe:diagnostics` is.
     RecentlyPlayedRow,
+    /// `spoolframe:rating-sources`: whose each rating is
+    /// (`MergeFacts.rating_source` and `audience_rating_source`): Rotten
+    /// Tomatoes with its verdict, IMDb, TMDB. A reply field, not a
+    /// request: a server leaves them out for a connection without it.
+    RatingSources,
 }
 
 /// A set of features: [`Features::all`] is every one this build knows,
@@ -84,6 +91,7 @@ impl Feature {
             Feature::Diagnostics => "spoolframe:diagnostics",
             Feature::PhoneSignIn => "spoolframe:phone-sign-in",
             Feature::RecentlyPlayedRow => "spoolframe:recently-played-row",
+            Feature::RatingSources => "spoolframe:rating-sources",
         }
     }
 

@@ -82,6 +82,7 @@ pub(crate) fn features() -> Features {
         | Feature::Diagnostics
         | Feature::PhoneSignIn
         | Feature::RecentlyPlayedRow
+        | Feature::RatingSources
 }
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -940,7 +941,23 @@ impl ClientProtocol {
             server: self.instance(),
             reply: response,
         };
-        let sent = match codec::write_reply(&mut send, &response).await {
+        // Whose each rating is goes only to a client that named the
+        // feature; the encode runs here, synchronously, so the context
+        // holds for all of it.
+        let encode = || codec::encode_limited(&response, codec::MAX_REPLY);
+        let encoded = if self
+            .features
+            .has(connection.stable_id(), Feature::RatingSources)
+        {
+            encode()
+        } else {
+            spoolframe_types::without_rating_sources(encode)
+        };
+        let written = match encoded {
+            Ok(bytes) => codec::write_encoded_reply(&mut send, &bytes).await,
+            Err(e) => Err(e),
+        };
+        let sent = match written {
             // Nothing of it was written. The client gets the reason, not a
             // stream that ends with no response.
             Err(codec::CodecError::TooLarge { len }) => {

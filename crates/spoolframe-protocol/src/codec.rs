@@ -65,6 +65,17 @@ pub async fn write_reply<W: AsyncWrite + Unpin, T: Serialize>(
     value: &T,
 ) -> Result<(), CodecError> {
     let encoded = encode_limited(value, MAX_REPLY)?;
+    write_encoded_reply(writer, &encoded).await
+}
+
+/// [`write_reply`] of a reply already encoded, with [`encode_limited`]
+/// to [`MAX_REPLY`]: for a server that encodes it in a context of its own
+/// (rating sources left out for a connection without
+/// `spoolframe:rating-sources`).
+pub async fn write_encoded_reply<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoded: &[u8],
+) -> Result<(), CodecError> {
     writer.write_u64(encoded.len() as u64).await?;
     for chunk in encoded.chunks(MAX_FRAME as usize) {
         writer.write_u32(chunk.len() as u32).await?;

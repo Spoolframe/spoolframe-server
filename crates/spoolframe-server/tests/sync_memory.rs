@@ -99,6 +99,8 @@ fn padded(n: usize) -> RemoteItem {
         added_at: None,
         rating_tenths: None,
         audience_rating_tenths: None,
+        rating_source: None,
+        audience_rating_source: None,
         size: None,
         resolution: None,
         dynamic_range: None,

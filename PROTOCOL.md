@@ -2043,14 +2043,15 @@ it is off, with nothing sent. A request of a feature that went off since
 | `spoolframe:download-addons` | `download_addon_options`, `read_track_subtitle` and `prepare_audio_addon` ([download add-ons](#download-add-ons)) |
 | `spoolframe:diagnostics` | `send_diagnostics` ([sending diagnostics](#sending-diagnostics)) |
 | `spoolframe:phone-sign-in` | `offer_device_sign_in` ([signing in with a phone](#signing-in-with-a-phone)) |
+| `spoolframe:rating-sources` | `rating_source` and `audience_rating_source` in `merge` ([rating sources](#rating-sources)) |
 | `spoolframe:recently-played-row` | `recently_played_row`, `recently_played_preferences` and `set_recently_played_preferences` ([the recently played row](#the-recently-played-row)) |
 
 The names are dated: a feature is what was added by its date. Later
-additions get a new dated name, and a name stays once added. Four are
+additions get a new dated name, and a name stays once added. Five are
 not: `spoolframe:download-addons`, `spoolframe:diagnostics`,
-`spoolframe:phone-sign-in` and `spoolframe:recently-played-row` are
-named for what they bring, by the user's choice, so an app can name
-each on its own.
+`spoolframe:phone-sign-in`, `spoolframe:recently-played-row` and
+`spoolframe:rating-sources` are named for what they bring, by the
+user's choice, so an app can name each on its own.
 
 A new reply field needs neither. It is `serde(default)`, so a reply from
 an older server decodes. Where its absence means something other than
@@ -2677,6 +2678,7 @@ read):
 |---|---|---|
 | `added_at` | movie, show, episode, artist, album, track | Unix seconds: when the catalog added it, as `added` orders by. A show's is Plex's date for the show. |
 | `rating_tenths`, `audience_rating_tenths` | movie, show, episode | 0 to 100: the ratings `rating` and `audience_rating` order by, in tenths (7.9 is 79). |
+| `rating_source`, `audience_rating_source` | movie, show, episode | Whose each rating is ([rating sources](#rating-sources)); only with `spoolframe:rating-sources`. |
 | `size` | movie, episode, track | Bytes: its first version's first file, as `size` orders by. |
 | `external_ids` | movie, show, episode, artist, album, track | Its stable ids as `scheme://id`: Plex's own (`plex://movie/…`) wherever it is listed, and its agents' (`imdb://tt0078748`, `tmdb://348`, `tvdb://…`, `mbid://…` for music) on library pages, search, Home's recently added and an item's own read. Two servers' copies of a title share some of them where both catalogs matched it. |
 
@@ -2685,6 +2687,53 @@ has none of them; an older server sends none. A paired server's (`fed:`) film, s
 added date, ratings and size it sent; its other items carry only the
 external ids. `total` on a page already counts what the filter keeps,
 for "37 of 412".
+
+### Rating sources
+
+With feature `spoolframe:rating-sources`, each rating in `merge` says
+whose it is, so an app shows "Tomatometer 92%" with the right logo
+rather than a bare number. `rating_source` is the critic rating's and
+`audience_rating_source` the audience rating's:
+
+```json
+"rating_source": {"provider": "rotten_tomatoes", "state": "certified_fresh",
+                  "image": "rottentomatoes://image.rating.certified"}
+```
+
+- `provider`: `rotten_tomatoes`, `imdb`, `tmdb`, or `unknown` for one
+  this build does not know.
+- `state`: Rotten Tomatoes' verdict, left out for other providers.
+  `fresh`, `certified_fresh` or `rotten` for the critics; `upright` or
+  `spilled` for the audience; `unknown` for one this build does not
+  know.
+- `image`: the catalog's own name for the image, as Plex gives it in
+  `ratingImage` and `audienceRatingImage`. Use it to tell apart what
+  `unknown` covers.
+
+| Plex image | `provider` | `state` |
+|---|---|---|
+| `rottentomatoes://image.rating.ripe` | `rotten_tomatoes` | `fresh` |
+| `rottentomatoes://image.rating.certified` | `rotten_tomatoes` | `certified_fresh` |
+| `rottentomatoes://image.rating.rotten` | `rotten_tomatoes` | `rotten` |
+| `rottentomatoes://image.rating.upright` | `rotten_tomatoes` | `upright` |
+| `rottentomatoes://image.rating.spilled` | `rotten_tomatoes` | `spilled` |
+| `imdb://image.rating` | `imdb` | none |
+| `themoviedb://image.rating` | `tmdb` | none |
+
+A source is sent only with its rating. Rotten Tomatoes' rating reads
+as a percentage: Plex gives it out of 10, so `rating_tenths` 92 is
+"92%". IMDb's and TMDB's read out of 10: 79 is "7.9".
+
+This is the one reply field gated by a feature. To a connection
+without the feature the server leaves both fields out, and still sends
+the ratings. A paired server's item carries the sources that server
+sent.
+
+SDK: the types are re-exported (`RatingSource`, `RatingProvider`,
+`RatingState`, `RatingScale`). `RatingSource::display(tenths)` gives
+"92%" or "7.9", and `scale()` says which. FFI: the same records and
+enums; Swift and Kotlin call `ratingDisplay(tenths:)` and
+`ratingScale()` on a `RatingSource`.
 
 ## Search groups
 

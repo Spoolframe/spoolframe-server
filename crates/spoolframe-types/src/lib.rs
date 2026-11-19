@@ -18,6 +18,7 @@ pub mod media;
 pub mod model;
 pub mod platform;
 pub mod preferences;
+pub mod rating;
 pub mod required;
 pub mod role;
 pub mod search;
@@ -62,6 +63,7 @@ pub use preferences::{
     RecentShowsMode, RecentlyPlayedPreferences, SdhPreference, SubtitleMode, SubtitlePreferences,
     TrackPreferences,
 };
+pub use rating::{RatingProvider, RatingScale, RatingSource, RatingState, without_rating_sources};
 pub use role::Role;
 pub use search::{Person, PersonRole, SearchKind, SearchScope};
 

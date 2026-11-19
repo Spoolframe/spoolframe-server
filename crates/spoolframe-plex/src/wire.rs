@@ -180,6 +180,14 @@ pub struct Metadata {
     /// The audience rating, 0 to 10.
     #[serde(default, deserialize_with = "lenient")]
     pub audience_rating: Option<f64>,
+    /// Whose `rating` is, as an image name:
+    /// `rottentomatoes://image.rating.ripe`, `imdb://image.rating`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub rating_image: Option<String>,
+    /// Whose `audience_rating` is, as `rating_image`:
+    /// `rottentomatoes://image.rating.upright`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub audience_rating_image: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub last_rated_at: Option<i64>,
     /// A playlist's: `video`, `audio` or `photo` (PX-40).
